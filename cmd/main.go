@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/cozystack/blockstor/pkg/rest"
+	"github.com/cozystack/blockstor/pkg/store"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -189,7 +190,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(&rest.Server{Addr: restAddr}); err != nil {
+	// Phase 1 store: in-memory. Phase 2 swaps in a CRD-backed implementation
+	// behind the same interface.
+	st := store.NewInMemory()
+
+	if err := mgr.Add(&rest.Server{Addr: restAddr, Store: st}); err != nil {
 		setupLog.Error(err, "Failed to register REST API server")
 		os.Exit(1)
 	}

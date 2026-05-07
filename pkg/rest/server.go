@@ -31,12 +31,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/version"
 )
 
 // Server implements manager.Runnable so it shuts down with the manager.
+//
+// Store may be nil for endpoints that don't need it (e.g. /v1/controller/version);
+// handlers that do need it return 503 if it is nil so the binary stays bootable
+// while the persistence backend is still being plumbed in (Phase 2).
 type Server struct {
-	Addr string // e.g. ":3370" — upstream LINSTOR plain-text REST port
+	Addr  string // e.g. ":3370" — upstream LINSTOR plain-text REST port
+	Store store.Store
 }
 
 // NeedLeaderElection reports whether the server requires leader election.
@@ -51,6 +57,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/controller/version", handleVersion)
 	mux.HandleFunc("GET /v1/healthz", handleHealth)
+	s.registerNodes(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,

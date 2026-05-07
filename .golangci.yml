@@ -108,6 +108,8 @@ linters:
           - perfsprint
           - paralleltest
           - maintidx
+          - goconst
+          - noinlineerr
         path: _test\.go
       - linters:
           - forbidigo

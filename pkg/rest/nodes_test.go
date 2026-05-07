@@ -1,0 +1,267 @@
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package rest
+
+import (
+	"bytes"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/url"
+	"testing"
+
+	lapi "github.com/LINBIT/golinstor/client"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
+)
+
+// startServerWithStore is sugar for tests that need a pre-populated store.
+func startServerWithStore(t *testing.T, st store.Store) (string, func()) {
+	t.Helper()
+
+	return startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: st})
+}
+
+// TestNodesListEmpty: empty store returns "[]" not null.
+func TestNodesListEmpty(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	c := newClient(t, base)
+
+	got, err := c.Nodes.GetAll(t.Context())
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	if got == nil {
+		t.Errorf("GetAll returned nil, want empty slice")
+	}
+
+	if len(got) != 0 {
+		t.Errorf("len: got %d, want 0", len(got))
+	}
+}
+
+// TestNodesCreateRoundTrip: POST a node, then GetAll/Get see it.
+func TestNodesCreateRoundTrip(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	c := newClient(t, base)
+
+	if err := c.Nodes.Create(t.Context(), lapi.Node{
+		Name: "alpha",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []lapi.NetInterface{
+			{Name: "default", Address: net.ParseIP("10.0.0.5")},
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := c.Nodes.Get(t.Context(), "alpha")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Name != "alpha" {
+		t.Errorf("Name: got %q, want alpha", got.Name)
+	}
+
+	if got.Type != apiv1.NodeTypeSatellite {
+		t.Errorf("Type: got %q, want %q", got.Type, apiv1.NodeTypeSatellite)
+	}
+
+	all, err := c.Nodes.GetAll(t.Context())
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	if len(all) != 1 {
+		t.Fatalf("len: got %d, want 1", len(all))
+	}
+
+	if all[0].Name != "alpha" {
+		t.Errorf("all[0].Name: got %q, want alpha", all[0].Name)
+	}
+}
+
+// TestNodesGetMissing: 404 from REST, not 500. golinstor turns this into
+// ErrNotFound; we just check the HTTP code so we are independent of golinstor's
+// translation table.
+func TestNodesGetMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/ghost")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodesCreateConflict: POST with a duplicate name returns 409.
+func TestNodesCreateConflict(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409", resp.StatusCode)
+	}
+}
+
+// TestNodesCreateBadJSON: malformed body returns 400, not 500.
+func TestNodesCreateBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes", []byte("{not-json"))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNodesDeleteMissing: 404 on DELETE of an absent node.
+func TestNodesDeleteMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/ghost")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodesDeleteOK: DELETE existing node, then it disappears.
+func TestNodesDeleteOK(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	c := newClient(t, base)
+	if err := c.Nodes.Delete(t.Context(), "n1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	all, err := c.Nodes.GetAll(t.Context())
+	if err != nil {
+		t.Fatalf("GetAll: %v", err)
+	}
+
+	if len(all) != 0 {
+		t.Errorf("after Delete, len=%d, want 0", len(all))
+	}
+}
+
+// TestNodesEndpointsWithoutStore: when Store is nil, every endpoint that
+// needs persistence returns 503 Service Unavailable. The version endpoint
+// continues to work.
+func TestNodesEndpointsWithoutStore(t *testing.T) {
+	base, stop := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: nil})
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status: got %d, want 503", resp.StatusCode)
+	}
+
+	resp2 := httpGet(t, base+"/v1/controller/version")
+	_ = resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("version status: got %d, want 200", resp2.StatusCode)
+	}
+}
+
+// --- helpers ---
+
+func newClient(t *testing.T, base string) *lapi.Client {
+	t.Helper()
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+
+	c, err := lapi.NewClient(lapi.BaseURL(u))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	return c
+}
+
+func httpPost(t *testing.T, addr string, body []byte) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, addr, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	return resp
+}
+
+func httpDelete(t *testing.T, addr string) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodDelete, addr, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	return resp
+}

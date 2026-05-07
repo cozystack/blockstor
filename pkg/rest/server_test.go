@@ -32,33 +32,40 @@ import (
 	"github.com/cozystack/blockstor/pkg/version"
 )
 
-// startServer spins up the REST server on a free loopback port and returns
-// its base URL plus a teardown function. Tests use this helper instead of
-// reaching into Server.Start directly so cancellation semantics are uniform.
-func startServer(t *testing.T) (string, func()) {
+// pickFreeAddr binds an ephemeral port, then closes it, and returns the
+// address string for someone else to listen on. There is a small race window
+// before the caller binds, but it is acceptable for tests.
+func pickFreeAddr(t *testing.T) string {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(t.Context())
-
 	lc := &net.ListenConfig{}
-	ln, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
-		cancel()
 		t.Fatalf("listen: %v", err)
 	}
+
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	srv := &Server{Addr: addr}
+	return addr
+}
+
+// startServerCustom runs the given Server until the returned stop is called.
+// It waits until the listener is reachable so callers can fire requests
+// straight away.
+func startServerCustom(t *testing.T, srv *Server) (string, func()) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start(ctx) }()
 
-	// Wait for the listener to come back up under the server's control.
 	dialer := &net.Dialer{Timeout: 200 * time.Millisecond}
 	deadline := time.Now().Add(5 * time.Second)
 
 	for {
-		c, dErr := dialer.DialContext(ctx, "tcp", addr)
+		c, dErr := dialer.DialContext(ctx, "tcp", srv.Addr)
 		if dErr == nil {
 			_ = c.Close()
 			break
@@ -81,7 +88,15 @@ func startServer(t *testing.T) (string, func()) {
 		}
 	}
 
-	return "http://" + addr, stop
+	return "http://" + srv.Addr, stop
+}
+
+// startServer is the small wrapper used by version tests that don't care
+// about the Store.
+func startServer(t *testing.T) (string, func()) {
+	t.Helper()
+
+	return startServerCustom(t, &Server{Addr: pickFreeAddr(t)})
 }
 
 // TestVersionViaGolinstor verifies the canonical happy path: golinstor — the
