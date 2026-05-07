@@ -116,7 +116,13 @@ sudo -E talosctl cluster create \
 
 sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR"
 
-talosctl --talosconfig "$TALOSCONFIG" kubeconfig --force "$KUBECONFIG"
+# Talos qemu provisioner allocates IPs deterministically: first controlplane
+# is at .2 in the cluster CIDR.
+CP_IP="${NET_CIDR%.*}.2"
+
+talosctl --talosconfig "$TALOSCONFIG" \
+    --endpoints "$CP_IP" --nodes "$CP_IP" \
+    kubeconfig --force "$KUBECONFIG"
 
 echo
 echo ">> cluster '$NAME' is up"
