@@ -77,10 +77,20 @@ echo ">> preflight cleanup for '$NAME'"
 sudo bash "$(dirname "$0")/down.sh" "$NAME" "$WORK_DIR" >/dev/null 2>&1 || true
 mkdir -p "$STATE_DIR"
 
-# Load DRBD modules inside every Talos node. The siderolabs/drbd extension
-# packages the modules but does not auto-load them.
-CONFIG_PATCH=$(cat <<'YAML'
+# Talos qemu provisioner uses --vmlinuz-path/--initrd-path only for *boot*; the
+# on-disk install uses ghcr.io/siderolabs/installer:* by default, which lacks
+# our extensions. Override machine.install.image to the same factory schematic
+# so the installed Talos has DRBD bits, and tell it to load the modules.
+if [[ -n "$SCHEMATIC_ID" ]]; then
+    INSTALL_IMG="factory.talos.dev/installer/$SCHEMATIC_ID:$TALOS_VERSION"
+else
+    INSTALL_IMG="ghcr.io/siderolabs/installer:$TALOS_VERSION"
+fi
+PATCH_FILE="$WORK_DIR/config-patch.yaml"
+cat > "$PATCH_FILE" <<YAML
 machine:
+  install:
+    image: $INSTALL_IMG
   kernel:
     modules:
       - name: drbd
@@ -88,9 +98,6 @@ machine:
           - usermode_helper=disabled
       - name: drbd_transport_tcp
 YAML
-)
-PATCH_FILE="$WORK_DIR/config-patch.yaml"
-echo "$CONFIG_PATCH" > "$PATCH_FILE"
 
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
 # talos qemu provisioner needs root for CNI bridge / netfilter; run via sudo -E
