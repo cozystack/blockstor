@@ -51,7 +51,10 @@ var _ = Describe("StoragePool Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: blockstoriov1alpha1.StoragePoolSpec{
+						NodeName:     "test-node",
+						ProviderKind: "LVM_THIN",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
