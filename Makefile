@@ -53,6 +53,19 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
+.PHONY: proto
+proto: ## Generate Go bindings from proto/. Requires protoc, protoc-gen-go, protoc-gen-go-grpc on PATH.
+	@command -v protoc           >/dev/null || { echo "protoc missing — brew install protobuf"; exit 1; }
+	@command -v protoc-gen-go    >/dev/null || { echo "protoc-gen-go missing — go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"; exit 1; }
+	@command -v protoc-gen-go-grpc >/dev/null || { echo "protoc-gen-go-grpc missing — go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest"; exit 1; }
+	protoc \
+		--proto_path=proto \
+		--go_out=. \
+		--go_opt=module=github.com/cozystack/blockstor \
+		--go-grpc_out=. \
+		--go-grpc_opt=module=github.com/cozystack/blockstor \
+		proto/satellite/v1alpha1/satellite.proto
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
