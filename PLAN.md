@@ -15,15 +15,24 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 1 mostly done; preparing Phase 2 (CRDs + reconcile)
-- **Last action**: kubebuilder-scaffolded controller binary + `pkg/rest` Runnable serving `/v1/controller/version` and `/v1/healthz`, golinstor compatibility verified end-to-end, full-branch tests committed (8 cases). golangci-lint config + auto-lint hook (`golangci-lint@claude-code-companions`) in place. CSI MVP API surface enumerated in `docs/csi-api-surface.md` (1/many endpoints implemented).
+- **Phase**: 1 done; Phase 2 (CRDs + reconcile) starting
+- **Implemented**:
+  - `/v1/controller/version` — pinned to wire shape; golinstor `GetVersion` round-trip green
+  - `/v1/healthz` — 204 probe
+  - `/v1/nodes` — GET list, GET, POST, PUT, DELETE (full CRUD); golinstor `Nodes.{GetAll,Get,Create,Delete}` green
+  - `/v1/view/storage-pools` — read aggregate
+  - `/v1/nodes/{node}/storage-pools[/{pool}]` — read list and read get
+  - InMemory store (sync.RWMutex) for both Node and StoragePool, behind a `Store` interface seam Phase 2 will swap for CRDs
+  - 30+ unit+contract tests, all green; `golangci-lint run ./...` zero issues
+  - `linstor-common` as submodule (properties.json, consts.json, drbdoptions.json)
+  - `apiconsts` reused from `github.com/LINBIT/golinstor` (`linstor.MaskError` etc.) — no separate fork
 - **Blocker**: none
-- **Next concrete steps**:
-    1. Wire `linstor-common` as git submodule (properties.json, consts.json, drbdoptions.json, generated apiconsts).
-    2. Wire `oapi-codegen` to regenerate `pkg/api/v1` from upstream `rest_v1_openapi.yaml` so we don't keep adding types by hand.
-    3. Port `apiconsts.go` from golinstor for ApiCallRc codes (needed for proper error responses).
-    4. Phase 2 begin: `kubebuilder create api --group blockstor.io --version v1 --kind Node`; CRD types + reconciler stubs for `Node`, `StoragePool`, `ResourceDefinition`, `Resource`, `VolumeDefinition`, `Volume`, `Snapshot`, `ResourceGroup`.
-    5. Implement `/v1/nodes` reading from CRD store; tests against golinstor `Nodes.GetAll/Get/Create/Modify/Delete`.
+- **Next concrete steps** (Phase 2):
+  1. `kubebuilder create api --group blockstor.io --version v1 --kind Node` and same for `StoragePool`. Generate DeepCopy + CRD manifests.
+  2. Add `pkg/store/k8s` — implementation of `store.Store` backed by `controller-runtime` client. Same interface as InMemory; identical test suite (table-driven so we can reuse) must pass against an envtest.
+  3. Wire a flag in `cmd/main.go` to choose between InMemory and k8s store (default k8s; InMemory is for tests).
+  4. Reconciler stubs for Node and StoragePool (no-op for now; just make sure manager + scheme + leader-election work).
+  5. Continue per `docs/csi-api-surface.md`: `/v1/resource-groups` (linstor-csi creates one per StorageClass), then `/v1/resource-definitions`, then `/v1/view/resources`.
 
 ---
 
