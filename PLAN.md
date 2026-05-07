@@ -15,39 +15,44 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 2 — definition side done, reconcilers + autoplacer next.
-- **CRDs (6, kubebuilder-scaffolded, LINSTOR-shaped fields)**:
+- **Phase**: 3 — satellite + DRBD lifecycle in progress.
+- **CRDs (7, kubebuilder-scaffolded, LINSTOR-shaped fields)**:
   `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`,
-  `Snapshot`. VolumeDefinitions live inline on `ResourceDefinition.Spec`.
+  `Snapshot`, `KVEntry`. VolumeDefinitions inline on `ResourceDefinition.Spec`.
 - **Stores**: `pkg/store` (InMemory) and `pkg/store/k8s` (controller-runtime
   client), both behind the same `store.Store` interface and exercised by the
-  same `pkg/store/storetest` shared suite — behavioural drift fails the same
-  subtest immediately. KeyValueStore is ConfigMap-backed (with `/` → `__slash__`
-  key encoding because ConfigMap data keys can't contain '/').
-- **Endpoints live (~25 of the CSI MVP slice)**:
-  `/v1/controller/version`, `/v1/healthz`, `/v1/nodes`,
-  `/v1/view/storage-pools`, `/v1/nodes/{n}/storage-pools[/{p}]`,
-  `/v1/resource-groups`, `/v1/resource-groups/{rg}/spawn`,
-  `/v1/resource-definitions`, `/v1/resource-definitions/{rd}/volume-definitions`,
-  `/v1/resource-definitions/{rd}/snapshots`, `/v1/view/resources`,
-  `/v1/view/snapshots`, `/v1/key-value-store`.
-- **Tests**: 200+ unit + contract; envtest harness skips cleanly when
-  `KUBEBUILDER_ASSETS` is missing.
+  same `pkg/store/storetest` shared suite. KeyValueStore is now CRD-backed
+  (`KVEntry` per `(instance, key)`) — no ConfigMap 1 MiB limit.
+- **Endpoints live (CSI MVP slice complete)**: `/v1/controller/version`,
+  `/v1/healthz`, `/v1/nodes` CRUD, `/v1/view/storage-pools`,
+  `/v1/nodes/{n}/storage-pools[/{p}]`, `/v1/resource-groups` CRUD +
+  `/spawn`, `/v1/resource-definitions` CRUD + `/autoplace` + `/resources`
+  POST/DELETE, `/v1/resource-definitions/{rd}/volume-definitions` CRUD,
+  `/v1/resource-definitions/{rd}/snapshots` CRUD, `/v1/view/resources`,
+  `/v1/view/snapshots`, `/v1/key-value-store` CRUD.
+- **Phase 3 stubs**: `proto/satellite/v1alpha1/satellite.proto` (8 RPCs),
+  `cmd/satellite/main.go`, `pkg/satellite/agent.go` (hello stub).
+- **Tests**: 250+ unit + contract; envtest harness skips cleanly without
+  `KUBEBUILDER_ASSETS`.
 - **Lint**: `golangci-lint run ./...` zero issues. Auto-lint hook on every
   Go-file edit.
 - **Blocker**: none.
-- **Next concrete steps** (Phase 2.5):
-  1. `POST /v1/resource-definitions/{rd}/autoplace` — autoplacer that reads
-     the parent RG's `select_filter`, finds matching nodes/storage-pools, and
-     creates `Resource` objects up to `place_count`.
-  2. `POST/DELETE /v1/resource-definitions/{rd}/resources[/{node}]` — explicit
-     resource placement (linstor-csi uses this for diskless toggles).
-  3. Reconcilers (no-op for Phase 2.5; Phase 3 fills them) for `Node`,
-     `StoragePool`, `ResourceDefinition`, `Resource`, `Snapshot`. Wire them
-     in `cmd/main.go`.
-  4. Phase 3 begin: gRPC contract between controller and `cmd/satellite`
-     binary; satellite's first job is `Resource` reconciliation (DRBD .res
-     generation + drbdadm + LVM/ZFS provisioning).
+- **Next concrete steps** (Phase 3 implementation):
+  1. Generate Go bindings from `proto/satellite/v1alpha1/satellite.proto`
+     (protoc + protoc-gen-go + protoc-gen-go-grpc). Wire generated package
+     into `pkg/satellite`.
+  2. Implement controller-side gRPC server (in `pkg/rest/grpc.go` or new
+     `pkg/satellitecontroller`) that the satellite dials. Hello round-trips.
+  3. Storage providers: `pkg/storage/{lvm,zfs}` interfaces + fake-exec
+     implementations + unit tests. No real DRBD/LVM yet.
+  4. ConfFileBuilder in `pkg/drbd` — port `.res` template from upstream
+     Java tests (input → expected output golden tests).
+  5. `drbdadm`/`drbdsetup` exec wrappers behind interfaces (testable with
+     fake exec).
+  6. Reconcilers actually fill Status: `Resource` reconciler invokes
+     storage provider + DRBD wrapper through satellite gRPC.
+  7. Phase 3 exit smoke: 2-replica DRBD on the talos stand, PVC mount on
+     node A → fail node A → PVC mounts on node B.
 
 ---
 
@@ -165,7 +170,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Storage pool wired via `LinstorSatelliteConfiguration` (file-thin, ~16 GiB free per worker)
 - [x] `make smoke` green: PVC create → pod mount → write → read
 - [x] `make up NAME=alice` ran in parallel to `NAME=test` without bridge / IP collision
-- [ ] `make oracle` deferred — piraeus-installed linstor-controller already serves as Java oracle on the in-cluster `linstor-controller.piraeus-datastore:3370`
+- [x] `make oracle` — uses piraeus-installed `linstor-controller.piraeus-datastore:3370` as the Java oracle; no separate deploy needed.
 
 **Exit met**: full happy-path PVC test passes against upstream Java stack, on parallelizable stand.
 
@@ -184,9 +189,9 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 **Exit met.**
 
-### Phase 2 — CRDs + reconcile (REST/store side done; reconcilers pending)
+### Phase 2 — CRDs + reconcile (definition side done)
 
-- [x] CRDs: `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`, `Snapshot` (VolumeDefinition is inline in RD spec)
+- [x] CRDs: `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`, `Snapshot`, `KVEntry` (VolumeDefinition is inline in RD spec)
 - [x] controller-runtime manager wired in `cmd/main.go`; reconciler stubs scaffolded by kubebuilder
 - [x] `Nodes.{GetAll,Get,Create,Modify,Delete}` work end-to-end against CRDs
 - [x] `Store` interface with `InMemory` and `k8s` (CRD-backed) implementations, both exercised by the same `pkg/store/storetest` shared suite
@@ -200,28 +205,31 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       - `/v1/resource-definitions/{rd}/volume-definitions` (CRUD)
       - `/v1/resource-definitions/{rd}/snapshots` (CRUD), `/v1/view/snapshots`
       - `/v1/view/resources`
-      - `/v1/key-value-store` (CRUD; ConfigMap-backed)
-- [ ] **Reconcilers** for `Node` / `StoragePool` / `ResourceDefinition` /
-      `Resource` / `Snapshot` — currently no-op stubs; Phase 3 fills them.
-- [ ] **Autoplacer** — `POST /v1/resource-definitions/{rd}/autoplace`
+      - `/v1/key-value-store` (CRUD; KVEntry CRD-backed, no ConfigMap limit)
+- [x] **Autoplacer** — `POST /v1/resource-definitions/{rd}/autoplace`
       computes placement and creates `Resource` objects.
-- [ ] **Resource POST/DELETE** — `/v1/resource-definitions/{rd}/resources[/{node}]`
-      so linstor-csi can place replicas explicitly.
-- [ ] piraeus-operator can create `LinstorSatellite`s and they appear in our API.
+- [x] **Resource POST/DELETE** — `/v1/resource-definitions/{rd}/resources[/{node}]`.
+- [x] No-op reconciler stubs for all CRDs wired in `cmd/main.go` (real
+      reconciliation lands in Phase 3).
+- [ ] piraeus-operator can create `LinstorSatellite`s and they appear in
+      our API. — Validation deferred to Phase 5 burn-in.
 
-**Exit (definition side)**: ✅ — all REST/store paths the CSI MVP touches
-land via golinstor; both stores pass the same suite. **Reconcilers + autoplacer
-land in Phase 2.5 below before we move to satellite/DRBD work.**
+**Exit met (definition side).** Real reconciliation work now lives in Phase 3.
 
 ### Phase 3 — Satellite + DRBD lifecycle
 
-- [ ] gRPC controller↔satellite proto (own, minimal)
-- [ ] `cmd/satellite/`
-- [ ] ConfFileBuilder in Go (.res file generation, ported from upstream Java tests as spec)
-- [ ] `drbdadm up/down/adjust` driven from satellite
+- [x] gRPC controller↔satellite proto definition (`proto/satellite/v1alpha1/satellite.proto`, 8 RPCs)
+- [x] `cmd/satellite/main.go` skeleton + `pkg/satellite.Agent` runtime stub
+- [ ] Generated Go bindings (protoc + protoc-gen-go + protoc-gen-go-grpc)
+- [ ] Controller-side gRPC server that satellites dial; Hello round-trips
+- [ ] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — port from upstream Java
+- [ ] `drbdadm up/down/adjust` exec wrappers behind interface
 - [ ] `drbdsetup events2` listener (state machine)
-- [ ] StoragePool: LVM and ZFS providers (create/delete/snapshot)
-- [ ] Resource on 2 nodes replicates and goes UpToDate
+- [ ] StoragePool: LVM and ZFS providers (create/delete/snapshot) behind
+      `pkg/storage.Provider` interface; fake-exec impl for unit tests
+- [ ] Resource reconciler invokes storage provider + DRBD wrapper through
+      satellite gRPC; updates Status from observed-state stream
+- [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
 
 **Exit**: smoke test with two replicas, real DRBD, PVC mounted on node A then on node B (failover).
 
