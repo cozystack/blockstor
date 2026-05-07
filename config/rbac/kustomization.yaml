@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the blockstor itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- kventry_admin_role.yaml
+- kventry_editor_role.yaml
+- kventry_viewer_role.yaml
 - snapshot_admin_role.yaml
 - snapshot_editor_role.yaml
 - snapshot_viewer_role.yaml

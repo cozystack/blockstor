@@ -23,7 +23,6 @@ import (
 	"runtime"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -289,17 +288,15 @@ func wipeAll(t *testing.T, c client.Client) {
 	}
 }
 
-// wipeAllKV deletes the ConfigMap-backed KeyValueStore instances between
-// subtests so each one sees an empty store.
+// wipeAllKV deletes the per-(instance,key) KVEntry CRDs between subtests so
+// each one sees an empty store.
 func wipeAllKV(t *testing.T, c client.Client) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := c.DeleteAllOf(ctx, &corev1.ConfigMap{},
-		client.InNamespace(k8s.KVNamespace),
-		client.HasLabels{k8s.LabelKVInstance}); err != nil {
-		t.Logf("wipe KV CMs: %v", err)
+	if err := c.DeleteAllOf(ctx, &crdv1alpha1.KVEntry{}); err != nil {
+		t.Logf("wipe KVEntries: %v", err)
 	}
 }

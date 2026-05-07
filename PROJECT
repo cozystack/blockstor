@@ -57,4 +57,11 @@ resources:
   kind: Snapshot
   path: github.com/cozystack/blockstor/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+  domain: blockstor.io
+  group: blockstor.io
+  kind: KVEntry
+  path: github.com/cozystack/blockstor/api/v1alpha1
+  version: v1alpha1
 version: "3"

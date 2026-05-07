@@ -8,6 +8,7 @@ resources:
 - bases/blockstor.io.blockstor.io_resourcedefinitions.yaml
 - bases/blockstor.io.blockstor.io_resources.yaml
 - bases/blockstor.io.blockstor.io_snapshots.yaml
+- bases/blockstor.io.blockstor.io_kventries.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
