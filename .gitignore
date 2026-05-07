@@ -1,0 +1,6 @@
+.work/
+*.iso
+*.qcow2
+*.kubeconfig
+*.talosconfig
+.DS_Store
