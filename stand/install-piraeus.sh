@@ -12,7 +12,8 @@ kubectl apply --server-side \
     -k "https://github.com/piraeusdatastore/piraeus-operator//config/default?ref=$PIRAEUS_VERSION"
 
 echo ">> waiting for piraeus-operator to be ready"
-kubectl -n piraeus-datastore wait deploy/piraeus-operator --for=condition=Available --timeout=5m
+kubectl -n piraeus-datastore wait deploy/piraeus-operator-controller-manager \
+    --for=condition=Available --timeout=5m
 
 echo ">> creating LinstorCluster"
 kubectl apply -f - <<EOF
