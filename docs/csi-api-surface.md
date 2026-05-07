@@ -86,8 +86,10 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/resource-definitions/{rd}/resources` | GET / POST | ⬜ |
-| `/v1/resource-definitions/{rd}/resources/{node}` | GET / PUT / DELETE | ⬜ |
+| `/v1/resource-definitions/{rd}/resources` | POST | ✅ |
+| `/v1/resource-definitions/{rd}/resources` | GET | ⬜ (use /v1/view/resources) |
+| `/v1/resource-definitions/{rd}/resources/{node}` | DELETE | ✅ |
+| `/v1/resource-definitions/{rd}/resources/{node}` | GET / PUT | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/volumes` | GET | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/volumes/{vn}` | GET / PUT | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/migrate-disk/{from}` | PUT | ⬜ |
@@ -99,7 +101,7 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 | `/v1/resource-definitions/{rd}/resources/{node}/make-available` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/activate` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/resources/{node}/deactivate` | POST | ⬜ |
-| `/v1/resource-definitions/{rd}/autoplace` | POST | ⬜ |
+| `/v1/resource-definitions/{rd}/autoplace` | POST | ✅ |
 
 ## Resource groups
 
