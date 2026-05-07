@@ -33,6 +33,46 @@ for i in {1..60}; do
     sleep 5
 done
 
+echo ">> applying Talos-specific satellite override"
+# Piraeus's default satellite Pod tries to mount paths that don't exist on
+# Talos (/run/systemd, /usr/src, etc.) and runs a drbd-module-loader that
+# builds DRBD from source — we don't need that since the siderolabs/drbd
+# extension already ships the kernel module. Strip the unwanted bits and
+# point LVM bookkeeping at Talos's writable /var/etc.
+kubectl apply -f - <<'EOF'
+apiVersion: piraeus.io/v1
+kind: LinstorSatelliteConfiguration
+metadata:
+  name: talos-loader-override
+spec:
+  podTemplate:
+    spec:
+      initContainers:
+        - name: drbd-shutdown-guard
+          $patch: delete
+        - name: drbd-module-loader
+          $patch: delete
+      volumes:
+        - name: run-systemd-system
+          $patch: delete
+        - name: run-drbd-shutdown-guard
+          $patch: delete
+        - name: systemd-bus-socket
+          $patch: delete
+        - name: lib-modules
+          $patch: delete
+        - name: usr-src
+          $patch: delete
+        - name: etc-lvm-backup
+          hostPath:
+            path: /var/etc/lvm/backup
+            type: DirectoryOrCreate
+        - name: etc-lvm-archive
+          hostPath:
+            path: /var/etc/lvm/archive
+            type: DirectoryOrCreate
+EOF
+
 echo ">> creating LinstorSatelliteConfiguration with a file-thin storage pool"
 # File-thin pool uses an LVM thin volume that piraeus creates from a sparse
 # file under /var/lib/piraeus on each satellite. No host-side prep required.
