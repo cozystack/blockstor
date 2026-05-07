@@ -1,0 +1,204 @@
+// Copyright 2026 Cozystack contributors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package blockstor.satellite.v1alpha1;
+
+option go_package = "github.com/cozystack/blockstor/pkg/satellite/proto;satellitepb";
+
+// Satellite is the controller-side view of a single satellite agent. The
+// agent runs on every storage node, owns the DRBD/LVM/ZFS state of that
+// node, and reports observed state back over a stream.
+//
+// The contract is intentionally narrow: the controller asks the satellite
+// to bring the node to a desired state ("apply this resource set") and the
+// satellite reports back asynchronously. There is no "fire and forget"
+// command channel — every operation is idempotent and reconcile-driven.
+service Satellite {
+  // Hello is the satellite registration handshake. The satellite sends its
+  // identity and capabilities; the controller replies with the cluster
+  // identity it should expect.
+  rpc Hello(HelloRequest) returns (HelloResponse) {}
+
+  // ApplyResources is the central reconcile RPC. The controller sends the
+  // full set of resources that should live on this node; the satellite
+  // brings local state in line with that set (creates new ones, removes
+  // ones not in the set, fixes drift).
+  rpc ApplyResources(ApplyResourcesRequest) returns (ApplyResourcesResponse) {}
+
+  // WatchResources lets the satellite push observed-state updates back to
+  // the controller. The controller reads them and updates the matching
+  // Resource CRD's status.
+  rpc WatchResources(WatchResourcesRequest)
+      returns (stream ResourceObservedEvent) {}
+
+  // ApplyStoragePools mirrors ApplyResources for storage pools.
+  rpc ApplyStoragePools(ApplyStoragePoolsRequest)
+      returns (ApplyStoragePoolsResponse) {}
+
+  // CreateSnapshot asks the satellite to take a snapshot of the named
+  // resource on this node. Returns once the snapshot is durable on disk.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
+
+  // DeleteSnapshot is the dual of CreateSnapshot.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse) {}
+
+  // ShipSnapshot sends a snapshot from this satellite to a peer satellite
+  // for clone / replica-expansion flows. Implemented by `zfs send | zfs recv`
+  // for ZFS pools and `thin-send-recv` for LVM-thin pools.
+  rpc ShipSnapshot(ShipSnapshotRequest) returns (ShipSnapshotResponse) {}
+}
+
+// ----- handshake -----
+
+message HelloRequest {
+  string node_name = 1;
+  string blockstor_version = 2;
+  repeated string layer_kinds = 3;     // e.g. ["DRBD", "STORAGE", "LUKS"]
+  repeated string provider_kinds = 4;  // e.g. ["LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"]
+  string drbd_version = 5;             // value reported by `drbdadm --version`
+}
+
+message HelloResponse {
+  string cluster_id = 1;
+  string controller_endpoint = 2;
+}
+
+// ----- resource reconcile -----
+
+message ApplyResourcesRequest {
+  // The full set this node should own. Anything else gets removed.
+  repeated DesiredResource resources = 1;
+}
+
+message ApplyResourcesResponse {
+  // Per-resource outcome. Errors do not abort the batch — partial success
+  // is reported back so the controller can react to per-replica problems.
+  repeated ResourceApplyResult results = 1;
+}
+
+message DesiredResource {
+  string name = 1;             // ResourceDefinition name
+  string node_name = 2;
+  repeated string flags = 3;   // DISKLESS, EVICTED, ...
+  map<string, string> props = 4;
+  repeated DesiredVolume volumes = 5;
+  repeated string peers = 6;   // node names of replica peers
+  // DRBD-layer config (port, secret, peer_slots ...). Free-form for now;
+  // we'll concretise as soon as ConfFileBuilder is ported.
+  map<string, string> drbd_options = 7;
+}
+
+message DesiredVolume {
+  int32 volume_number = 1;
+  int64 size_kib = 2;
+  string storage_pool = 3;
+}
+
+message ResourceApplyResult {
+  string name = 1;
+  string node_name = 2;
+  bool ok = 3;
+  string message = 4;  // populated when !ok
+}
+
+// ----- observed-state stream -----
+
+message WatchResourcesRequest {
+  string node_name = 1;
+  // Resume token; empty on first connect.
+  string since = 2;
+}
+
+message ResourceObservedEvent {
+  string resource_name = 1;
+  string node_name = 2;
+  bool in_use = 3;
+  repeated VolumeObservation volumes = 4;
+  string drbd_state = 5;   // UpToDate / Outdated / Diskless / ...
+  int64 timestamp_unix = 6;
+}
+
+message VolumeObservation {
+  int32 volume_number = 1;
+  string device_path = 2;
+  int64 allocated_kib = 3;
+  int64 usable_kib = 4;
+  string disk_state = 5;
+}
+
+// ----- storage pools -----
+
+message ApplyStoragePoolsRequest {
+  repeated DesiredStoragePool pools = 1;
+}
+
+message ApplyStoragePoolsResponse {
+  repeated StoragePoolApplyResult results = 1;
+}
+
+message DesiredStoragePool {
+  string name = 1;
+  string provider_kind = 2;        // LVM / LVM_THIN / ZFS / ZFS_THIN / FILE / FILE_THIN / DISKLESS
+  map<string, string> props = 3;
+}
+
+message StoragePoolApplyResult {
+  string name = 1;
+  bool ok = 2;
+  string message = 3;
+  int64 free_capacity_kib = 4;
+  int64 total_capacity_kib = 5;
+  bool supports_snapshots = 6;
+}
+
+// ----- snapshots -----
+
+message CreateSnapshotRequest {
+  string resource_name = 1;
+  string snapshot_name = 2;
+  repeated int32 volume_numbers = 3;
+}
+
+message CreateSnapshotResponse {
+  bool ok = 1;
+  string message = 2;
+  int64 create_timestamp_unix = 3;
+}
+
+message DeleteSnapshotRequest {
+  string resource_name = 1;
+  string snapshot_name = 2;
+}
+
+message DeleteSnapshotResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ShipSnapshotRequest {
+  string resource_name = 1;
+  string snapshot_name = 2;
+  string target_node = 3;
+  // Mechanism hint. Empty means "auto" (zfs send|recv for ZFS pools,
+  // thin-send-recv for LVM-thin).
+  string mechanism = 4;
+}
+
+message ShipSnapshotResponse {
+  bool ok = 1;
+  string message = 2;
+  int64 bytes_transferred = 3;
+}
