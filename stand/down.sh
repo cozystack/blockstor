@@ -3,24 +3,27 @@
 set -uo pipefail
 NAME=${1:?cluster name required}
 WORK_DIR=${2:-.work/$NAME}
-STATE_DIR="$WORK_DIR/talos-state"
+STATE_DIR="$WORK_DIR/talos-state/$NAME"
 
 echo ">> destroying cluster '$NAME'"
-if [[ -d "$STATE_DIR" ]]; then
-    sudo talosctl cluster destroy --name "$NAME" --provisioner qemu --state "$STATE_DIR" 2>/dev/null || true
+if [[ -d "$WORK_DIR/talos-state" ]]; then
+    sudo talosctl cluster destroy --name "$NAME" --provisioner qemu --state "$WORK_DIR/talos-state" 2>/dev/null || true
 else
     sudo talosctl cluster destroy --name "$NAME" --provisioner qemu 2>/dev/null || true
 fi
 
-# Belt-and-braces: kill any residual qemu/talos helpers that referenced this
-# state dir. talosctl process names are >15 chars so plain pkill won't match —
-# we have to use pkill -f.
-ABS_WORK=$(realpath "$WORK_DIR" 2>/dev/null || echo "$WORK_DIR")
-sudo pkill -9 -f "$ABS_WORK"   2>/dev/null || true
-sudo pkill -9 -f "$WORK_DIR"   2>/dev/null || true
-sudo pkill -9 -f "/$NAME/"     2>/dev/null || true
-# Bridge interface name is talos<hash(NAME)>; talosctl makes this deterministic
-# but we don't compute it here — destroy already handles it. Sweep any orphans.
+# Belt-and-braces: any qemu/dhcpd/lb that didn't shut down gracefully — use
+# the PID files Talos drops in the state dir. Avoids pkill -f path which would
+# catch the parent ssh/make processes.
+if [[ -d "$STATE_DIR" ]]; then
+    for pidfile in "$STATE_DIR"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        pid=$(cat "$pidfile" 2>/dev/null)
+        if [[ -n "$pid" ]] && sudo kill -0 "$pid" 2>/dev/null; then
+            sudo kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+fi
 
 sudo rm -rf "$WORK_DIR"
 echo ">> done"
