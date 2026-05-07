@@ -89,6 +89,7 @@ linters:
         - rw
         - ev
         - ch
+        - dr
   exclusions:
     generated: lax
     presets:
