@@ -76,6 +76,9 @@ linters:
         - sp
         - st
         - s
+        - cm
+        - vd
+        - vn
         - rd
         - vd
         - rg
@@ -155,6 +158,7 @@ linters:
           - goconst
           - noinlineerr
           - thelper
+          - unparam
         path: pkg/store/storetest/
       - linters:
           - forbidigo

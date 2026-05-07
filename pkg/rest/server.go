@@ -61,7 +61,10 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerStoragePools(mux)
 	s.registerResourceGroups(mux)
 	s.registerResourceDefinitions(mux)
+	s.registerVolumeDefinitions(mux)
 	s.registerResources(mux)
+	s.registerKeyValueStore(mux)
+	s.registerSpawn(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,

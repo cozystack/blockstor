@@ -47,6 +47,185 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Run("ListSorted", func(t *testing.T) { testNodeListSorted(t, newStore) })
 }
 
+// RunVolumeDefinitionStore exercises every branch of
+// store.VolumeDefinitionStore.
+func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListEmpty", func(t *testing.T) {
+		s := newStore(t)
+
+		// k8s impl needs a parent RD for Get/List to find anything.
+		seedRD(t, s, "pvc-1")
+
+		got, err := s.VolumeDefinitions().List(t.Context(), "pvc-1")
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("got %v, want empty", got)
+		}
+	})
+	t.Run("CreateThenGet", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		ctx := t.Context()
+		vd := apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}
+		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &vd); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		got, err := s.VolumeDefinitions().Get(ctx, "pvc-1", 0)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.VolumeNumber != 0 || got.SizeKib != 1024*1024 {
+			t.Errorf("got %+v", got)
+		}
+	})
+	t.Run("CreateDuplicate", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		ctx := t.Context()
+		vd := apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}
+		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &vd); err != nil {
+			t.Fatalf("first: %v", err)
+		}
+		err := s.VolumeDefinitions().Create(ctx, "pvc-1", &vd)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+		}
+	})
+	t.Run("GetMissing", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		_, err := s.VolumeDefinitions().Get(t.Context(), "pvc-1", 99)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("MissingRD", func(t *testing.T) {
+		s := newStore(t)
+		_, err := s.VolumeDefinitions().Get(t.Context(), "ghost-rd", 0)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("DeleteRemoves", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		ctx := t.Context()
+		if err := s.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := s.VolumeDefinitions().Delete(ctx, "pvc-1", 0); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		_, err := s.VolumeDefinitions().Get(ctx, "pvc-1", 0)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("post-delete: got %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// RunKeyValueStore exercises every branch of store.KeyValueStore.
+func RunKeyValueStore(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListEmpty", func(t *testing.T) {
+		got, err := newStore(t).KeyValueStore().ListInstances(t.Context())
+		if err != nil {
+			t.Fatalf("ListInstances: %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("got %v, want empty", got)
+		}
+	})
+	t.Run("SetThenGet", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+		err := s.SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"foo": "bar", "baz": "qux"},
+		})
+		if err != nil {
+			t.Fatalf("SetKeys: %v", err)
+		}
+		got, err := s.GetInstance(ctx, "csi-volumes")
+		if err != nil {
+			t.Fatalf("GetInstance: %v", err)
+		}
+		if got["foo"] != "bar" || got["baz"] != "qux" {
+			t.Errorf("got %+v", got)
+		}
+	})
+	t.Run("DeleteKeys", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"a": "1", "b": "2"},
+		}); err != nil {
+			t.Fatalf("SetKeys: %v", err)
+		}
+		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+			DeleteProps: []string{"a"},
+		}); err != nil {
+			t.Fatalf("SetKeys delete: %v", err)
+		}
+		got, _ := s.GetInstance(ctx, "x")
+		if _, ok := got["a"]; ok {
+			t.Errorf("a should be deleted: %v", got)
+		}
+		if got["b"] != "2" {
+			t.Errorf("b should remain: %v", got)
+		}
+	})
+	t.Run("DeleteNamespace", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"ns/k1": "v1", "ns/k2": "v2", "other/k": "v"},
+		}); err != nil {
+			t.Fatalf("SetKeys: %v", err)
+		}
+		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+			DeleteNamespace: []string{"ns"},
+		}); err != nil {
+			t.Fatalf("SetKeys delete-ns: %v", err)
+		}
+		got, _ := s.GetInstance(ctx, "x")
+		if _, ok := got["ns/k1"]; ok {
+			t.Errorf("ns/k1 should be deleted: %v", got)
+		}
+		if got["other/k"] != "v" {
+			t.Errorf("other/k should remain: %v", got)
+		}
+	})
+	t.Run("GetMissing", func(t *testing.T) {
+		_, err := newStore(t).KeyValueStore().GetInstance(t.Context(), "ghost")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("DeleteMissing", func(t *testing.T) {
+		err := newStore(t).KeyValueStore().DeleteInstance(t.Context(), "ghost")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// seedRD inserts a minimal valid ResourceDefinition the VolumeDefinition
+// suite can hang volumes off of.
+func seedRD(t *testing.T, s store.Store, name string) {
+	t.Helper()
+
+	err := s.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: name})
+	if err != nil {
+		t.Fatalf("seed RD %q: %v", name, err)
+	}
+}
+
 // RunResourceStore exercises every branch of store.ResourceStore.
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()

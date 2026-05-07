@@ -34,6 +34,8 @@ type InMemory struct {
 	resourceGroups      *inMemoryResourceGroups
 	resourceDefinitions *inMemoryResourceDefinitions
 	resources           *inMemoryResources
+	volumeDefinitions   *inMemoryVolumeDefinitions
+	kv                  *inMemoryKVStore
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
@@ -44,6 +46,8 @@ func NewInMemory() *InMemory {
 		resourceGroups:      &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
 		resourceDefinitions: &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
 		resources:           &inMemoryResources{m: map[rKey]apiv1.Resource{}},
+		volumeDefinitions:   &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
+		kv:                  &inMemoryKVStore{m: map[string]map[string]string{}},
 	}
 }
 
@@ -61,6 +65,12 @@ func (s *InMemory) ResourceDefinitions() ResourceDefinitionStore { return s.reso
 
 // Resources returns the ResourceStore view.
 func (s *InMemory) Resources() ResourceStore { return s.resources }
+
+// VolumeDefinitions returns the VolumeDefinitionStore view.
+func (s *InMemory) VolumeDefinitions() VolumeDefinitionStore { return s.volumeDefinitions }
+
+// KeyValueStore returns the KeyValueStore view.
+func (s *InMemory) KeyValueStore() KeyValueStore { return s.kv }
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

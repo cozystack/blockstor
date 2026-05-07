@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -141,6 +142,34 @@ func TestK8sResourceStore(t *testing.T) {
 	})
 }
 
+// TestK8sVolumeDefinitionStore runs the shared VolumeDefinitionStore suite.
+func TestK8sVolumeDefinitionStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunVolumeDefinitionStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
+// TestK8sKeyValueStore runs the shared KeyValueStore suite.
+func TestK8sKeyValueStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunKeyValueStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAllKV(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
 // envtestAvailable returns whether KUBEBUILDER_ASSETS or a known asset
 // directory exists; without binaries we cannot start envtest.
 func envtestAvailable() bool {
@@ -239,5 +268,20 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.Resource{}); err != nil {
 		t.Logf("wipe Resources: %v", err)
+	}
+}
+
+// wipeAllKV deletes the ConfigMap-backed KeyValueStore instances between
+// subtests so each one sees an empty store.
+func wipeAllKV(t *testing.T, c client.Client) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := c.DeleteAllOf(ctx, &corev1.ConfigMap{},
+		client.InNamespace(k8s.KVNamespace),
+		client.HasLabels{k8s.LabelKVInstance}); err != nil {
+		t.Logf("wipe KV CMs: %v", err)
 	}
 }

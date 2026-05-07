@@ -90,6 +90,29 @@ type ResourceStore interface {
 	Delete(ctx context.Context, rdName, node string) error
 }
 
+// VolumeDefinitionStore persists VolumeDefinition objects. The composite
+// key is (resource_definition_name, volume_number); upstream LINSTOR keeps
+// VolumeDefinitions inline on the ResourceDefinition, and so do we (the CRD
+// has spec.volumeDefinitions). The interface gives REST handlers a clean
+// surface; the implementation stitches it onto the RD CRD.
+type VolumeDefinitionStore interface {
+	List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error)
+	Get(ctx context.Context, rdName string, volumeNumber int32) (apiv1.VolumeDefinition, error)
+	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
+	Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
+	Delete(ctx context.Context, rdName string, volumeNumber int32) error
+}
+
+// KeyValueStore persists arbitrary instance/key/value triples. linstor-csi
+// uses this for its own per-volume bookkeeping (CSI snapshots, parameters
+// ...). The (instance, key) pair is the composite identity.
+type KeyValueStore interface {
+	ListInstances(ctx context.Context) ([]string, error)
+	GetInstance(ctx context.Context, instance string) (map[string]string, error)
+	SetKeys(ctx context.Context, instance string, modify apiv1.GenericPropsModify) error
+	DeleteInstance(ctx context.Context, instance string) error
+}
+
 // Store aggregates per-resource stores. Phase 2 grows this interface as more
 // CRDs land (Snapshot, ...).
 type Store interface {
@@ -98,4 +121,6 @@ type Store interface {
 	ResourceGroups() ResourceGroupStore
 	ResourceDefinitions() ResourceDefinitionStore
 	Resources() ResourceStore
+	VolumeDefinitions() VolumeDefinitionStore
+	KeyValueStore() KeyValueStore
 }

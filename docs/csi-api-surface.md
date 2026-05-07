@@ -66,8 +66,11 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 | `/v1/resource-definitions/{rd}` | GET | ✅ |
 | `/v1/resource-definitions/{rd}` | PUT | ✅ |
 | `/v1/resource-definitions/{rd}` | DELETE | ✅ |
-| `/v1/resource-definitions/{rd}/volume-definitions` | GET / POST | ⬜ |
-| `/v1/resource-definitions/{rd}/volume-definitions/{vn}` | GET / PUT / DELETE | ⬜ |
+| `/v1/resource-definitions/{rd}/volume-definitions` | GET | ✅ |
+| `/v1/resource-definitions/{rd}/volume-definitions` | POST | ✅ |
+| `/v1/resource-definitions/{rd}/volume-definitions/{vn}` | GET | ✅ |
+| `/v1/resource-definitions/{rd}/volume-definitions/{vn}` | PUT | ✅ |
+| `/v1/resource-definitions/{rd}/volume-definitions/{vn}` | DELETE | ✅ |
 | `/v1/resource-definitions/{rd}/clone` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/clone/{target}` | GET (status) | ⬜ |
 | `/v1/resource-definitions/{rd}/sync-status` | GET | ⬜ |
@@ -105,7 +108,7 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 | `/v1/resource-groups/{rg}` | GET | ✅ |
 | `/v1/resource-groups/{rg}` | PUT | ✅ |
 | `/v1/resource-groups/{rg}` | DELETE | ✅ |
-| `/v1/resource-groups/{rg}/spawn` | POST | ⬜ |
+| `/v1/resource-groups/{rg}/spawn` | POST | ✅ |
 | `/v1/resource-groups/{rg}/adjust` | PUT | ⬜ |
 | `/v1/resource-groups/adjustall` | PUT | ⬜ |
 | `/v1/resource-groups/{rg}/query-size-info` | POST | ⬜ |
@@ -133,8 +136,10 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/key-value-store` | GET | ⬜ |
-| `/v1/key-value-store/{instance}` | GET / PUT / DELETE | ⬜ |
+| `/v1/key-value-store` | GET | ✅ |
+| `/v1/key-value-store/{instance}` | GET | ✅ |
+| `/v1/key-value-store/{instance}` | POST / PUT | ✅ |
+| `/v1/key-value-store/{instance}` | DELETE | ✅ |
 
 ## Connections (piraeus-operator drives these via LinstorNodeConnection)
 

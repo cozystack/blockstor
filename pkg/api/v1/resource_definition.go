@@ -45,6 +45,13 @@ type VolumeDefinition struct {
 	UUID         string            `json:"uuid,omitempty"`
 }
 
+// VolumeDefinitionCreate is the upstream POST envelope for
+// /v1/resource-definitions/{rd}/volume-definitions. Mirrors golinstor.
+type VolumeDefinitionCreate struct {
+	VolumeDefinition VolumeDefinition `json:"volume_definition"`
+	DrbdMinorNumber  int32            `json:"drbd_minor_number,omitempty"`
+}
+
 // ResourceDefinitionCreate is the body upstream LINSTOR (and golinstor)
 // expect on `POST /v1/resource-definitions`. It wraps the RD plus optional
 // per-create fields like the DRBD secret.
