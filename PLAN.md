@@ -222,6 +222,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] `cmd/satellite/main.go` skeleton + `pkg/satellite.Agent` runtime stub
 - [x] Generated Go bindings (`make proto` → `pkg/satellite/proto/*.pb.go`)
 - [x] Controller-side gRPC server (`pkg/satellitecontroller`) that satellites dial; Hello registers/idempotently-updates the Node CRD and returns ClusterID. 3 contract tests green.
+- [x] `pkg/satellite.Agent` actually dials the controller and round-trips Hello (2 end-to-end tests). Wired into `cmd/main.go` via `--satellite-grpc-bind-address` (default `:7000`) and `--cluster-id`.
 - [ ] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — port from upstream Java
 - [ ] `drbdadm up/down/adjust` exec wrappers behind interface
 - [ ] `drbdsetup events2` listener (state machine)

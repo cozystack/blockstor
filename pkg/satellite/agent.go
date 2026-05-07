@@ -29,7 +29,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/version"
 )
 
@@ -71,20 +74,31 @@ func NewAgent(cfg Config) *Agent {
 	return &Agent{cfg: cfg, logger: logger}
 }
 
-// Run is the agent's main loop. It performs the hello handshake, then
-// keeps two long-running loops (apply and observe) supervised. When ctx
-// is cancelled the loops drain and Run returns ctx.Err().
+// Run is the agent's main loop. It dials the controller, performs the
+// hello handshake to register the node, then keeps long-running apply
+// and observe loops supervised. When ctx is cancelled the loops drain
+// and Run returns ctx.Err().
 //
-// The body intentionally stays simple in Phase 3.0: connect → hello →
-// idle. Reconcile loops attach in subsequent slices behind the same
-// supervisor.
+// Phase 3.1: hello is the only real RPC; reconcile loops still no-op.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.cfg.NodeName == "" {
+		return errors.New("NodeName is required")
+	}
+
 	a.logger.Info("agent starting",
 		"node", a.cfg.NodeName,
 		"blockstor_version", version.Version,
 		"controller", a.cfg.ControllerAddr)
 
-	err := a.hello(ctx)
+	conn, err := a.dial(ctx)
+	if err != nil {
+		return errors.Wrap(err, "dial controller")
+	}
+	defer func() { _ = conn.Close() }()
+
+	client := satellitepb.NewSatelliteClient(conn)
+
+	err = a.hello(ctx, client)
 	if err != nil {
 		return errors.Wrap(err, "hello")
 	}
@@ -96,23 +110,47 @@ func (a *Agent) Run(ctx context.Context) error {
 	return ctx.Err() //nolint:wrapcheck // bubbling ctx.Err() unwrapped is the convention
 }
 
-// hello is the registration handshake. It is split out so tests can drive
-// it with a fake controller without spinning up the whole agent loop.
-//
-// Phase 3.0 stub: log what we *would* send and respect ctx cancellation.
-// The actual gRPC client lands once we run protoc and import the generated
-// bindings; the signature already returns error so the caller does not need
-// to change.
-func (a *Agent) hello(ctx context.Context) error {
-	a.logger.Info("hello (stub)",
-		"node", a.cfg.NodeName,
-		"layer_kinds", []string{"DRBD", "STORAGE", "LUKS"},
-		"provider_kinds", []string{"LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"})
+// dial opens an insecure gRPC connection to the controller. TLS comes in
+// Phase 6 alongside the rest of the encryption work; cluster traffic is
+// expected to ride a private k8s network until then.
+func (a *Agent) dial(ctx context.Context) (*grpc.ClientConn, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, a.cfg.DialTimeout)
+	defer cancel()
 
-	err := ctx.Err()
+	conn, err := grpc.NewClient(a.cfg.ControllerAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		return errors.Wrap(err, "context cancelled before hello")
+		return nil, errors.Wrapf(err, "grpc dial %q", a.cfg.ControllerAddr)
 	}
+
+	// NewClient is non-blocking; we surface dial-time problems by issuing
+	// the first RPC under DialTimeout. Tests rely on this so they fail
+	// fast when the server is misconfigured.
+	_ = dialCtx
+
+	return conn, nil
+}
+
+// hello is the registration handshake. The satellite tells the controller
+// who it is and what layers / providers it can drive; the controller
+// upserts the corresponding Node CRD and replies with the cluster id.
+func (a *Agent) hello(ctx context.Context, client satellitepb.SatelliteClient) error {
+	rpcCtx, cancel := context.WithTimeout(ctx, a.cfg.DialTimeout)
+	defer cancel()
+
+	resp, err := client.Hello(rpcCtx, &satellitepb.HelloRequest{
+		NodeName:         a.cfg.NodeName,
+		BlockstorVersion: version.Version,
+		LayerKinds:       []string{"DRBD", "STORAGE", "LUKS"},
+		ProviderKinds:    []string{"LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"},
+	})
+	if err != nil {
+		return errors.Wrap(err, "Hello RPC")
+	}
+
+	a.logger.Info("hello complete",
+		"node", a.cfg.NodeName,
+		"cluster_id", resp.GetClusterId())
 
 	return nil
 }

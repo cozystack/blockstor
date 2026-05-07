@@ -38,6 +38,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/rest"
+	"github.com/cozystack/blockstor/pkg/satellitecontroller"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
@@ -64,10 +65,16 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var restAddr string
+	var satelliteGRPCAddr string
+	var clusterID string
 	var storeKind string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
 		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370).")
+	flag.StringVar(&satelliteGRPCAddr, "satellite-grpc-bind-address", ":7000",
+		"The address the satellite-facing gRPC server binds to.")
+	flag.StringVar(&clusterID, "cluster-id", "",
+		"Stable identifier for this cluster, returned to satellites in Hello. Empty disables the check.")
 	flag.StringVar(&storeKind, "store", "k8s",
 		"Persistence backend for the REST API: 'k8s' (CRD-backed, default) or 'memory' (in-process, lost on restart, useful for tests).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
@@ -258,6 +265,17 @@ func main() {
 
 	if err := mgr.Add(&rest.Server{Addr: restAddr, Store: st}); err != nil {
 		setupLog.Error(err, "Failed to register REST API server")
+		os.Exit(1)
+	}
+
+	satGRPC := &satellitecontroller.Runnable{
+		Addr: satelliteGRPCAddr,
+		Server: satellitecontroller.New(st, satellitecontroller.Config{
+			ClusterID: clusterID,
+		}),
+	}
+	if err := mgr.Add(satGRPC); err != nil {
+		setupLog.Error(err, "Failed to register satellite gRPC server")
 		os.Exit(1)
 	}
 
