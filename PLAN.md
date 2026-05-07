@@ -46,9 +46,12 @@ high-bandwidth check-ins with the user.
 - **Intra-cluster snapshot shipping** — required for clone/expand-replica
   flows. Implemented via `zfs send`/`zfs recv` for ZFS pools and
   [`thin-send-recv`](https://github.com/LINBIT/thin-send-recv) for LVM-thin.
-- API surface used by linstor-csi, piraeus-operator, ha-controller,
-  affinity-controller, scheduler-extender, gateway, kubectl-linstor,
-  golinstor consumers
+- API surface used by all upstream LINSTOR clients:
+  - `linstor-csi`, `piraeus-operator`, `piraeus-ha-controller`,
+    `linstor-affinity-controller`, `linstor-scheduler-extender`,
+    `linstor-gateway`, `kubectl-linstor`
+  - The official **`linstor` CLI** (Python, [linstor-client](https://github.com/LINBIT/linstor-client))
+  - Any other consumer of `golinstor` or the REST API
 - Autoplacer with constraints (zones, node properties, replicas-on-different)
 - In-cluster snapshots (LVM/ZFS), snapshot-restore as new ResourceDefinition
 - Cluster bootstrap (passphrase, satellite registration, eviction/restoration)
@@ -125,7 +128,9 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 ### Phase 0 — Dev stand (in progress)
 
 - [x] BM.HPC2.36 provisioned on OCI (terraform applied)
-- [ ] Host packages: qemu-kvm, libvirt, virt-install, talosctl, kubectl, helm, drbd-utils, drbd kmod loaded
+- [x] Host packages installed via `stand/setup-host.sh` (qemu-kvm, libvirt, ovmf, drbd-utils, zfsutils-linux, talosctl, kubectl, helm)
+- [x] NVMe (6.4TB) formatted as xfs, mounted at `/var/lib/blockstor`, `.work` symlinked
+- [x] Default `iptables FORWARD` policy fixed (Ubuntu OCI image ships a catch-all REJECT)
 - [ ] `make up NAME=test` brings up a 3-node Talos+QEMU cluster with DRBD extension
 - [ ] `make piraeus` installs piraeus-operator and a `LinstorCluster`
 - [ ] `make smoke` provisions a PVC, mounts it, writes data — green against upstream piraeus
@@ -236,8 +241,11 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Push rules
 
-- **No push without explicit user approval.**
-- First push: ask user to create the github repo (or grant me permission).
+- During the implementation phases, **push directly to `main`** without asking.
+  The user has explicitly granted this for blockstor; the small-team velocity
+  argument outweighs the formality of a feature-branch+PR loop here.
+- Still rebase, never force-push to `main`.
+- Reverts are fine — push a revert commit, do not rewrite history.
 
 ### When to ask the user
 
