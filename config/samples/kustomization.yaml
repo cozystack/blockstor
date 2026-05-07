@@ -2,4 +2,5 @@
 resources:
 - blockstor.io_v1alpha1_node.yaml
 - blockstor.io_v1alpha1_storagepool.yaml
+- blockstor.io_v1alpha1_resourcegroup.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

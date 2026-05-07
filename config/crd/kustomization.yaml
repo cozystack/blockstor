@@ -4,6 +4,7 @@
 resources:
 - bases/blockstor.io.blockstor.io_nodes.yaml
 - bases/blockstor.io.blockstor.io_storagepools.yaml
+- bases/blockstor.io.blockstor.io_resourcegroups.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

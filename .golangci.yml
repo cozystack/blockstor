@@ -118,6 +118,17 @@ linters:
           - goconst
           - noinlineerr
         path: _test\.go
+      # k8s store implementations follow the same Get/Create/Update/Delete
+      # template per resource — duplication is the point and is shared via
+      # the storetest suite already.
+      - linters:
+          - dupl
+        path: pkg/store/k8s/
+      # REST handlers follow the same Get/Create/Update/Delete shape per
+      # resource for the same reason.
+      - linters:
+          - dupl
+        path: pkg/rest/
       # storetest is a shared test suite imported by both InMemory and k8s
       # store tests. It contains test code, just not in _test.go files, so
       # the same exclusions apply.
@@ -168,6 +179,8 @@ linters:
           - gocritic
           - noinlineerr
           - wsl_v5
+          - cyclop
+          - gocyclo
         path: cmd/main.go
       # api/v1alpha1 and internal/controller are kubebuilder scaffold; the
       # boilerplate (dot-imports for ginkgo/gomega, generated DeepCopy globals,

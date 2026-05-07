@@ -59,6 +59,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/healthz", handleHealth)
 	s.registerNodes(mux)
 	s.registerStoragePools(mux)
+	s.registerResourceGroups(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,

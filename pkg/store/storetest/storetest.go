@@ -47,6 +47,141 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Run("ListSorted", func(t *testing.T) { testNodeListSorted(t, newStore) })
 }
 
+// RunResourceGroupStore exercises every branch of store.ResourceGroupStore.
+func RunResourceGroupStore(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListEmpty", func(t *testing.T) { testRGListEmpty(t, newStore) })
+	t.Run("CreateThenGet", func(t *testing.T) { testRGCreateThenGet(t, newStore) })
+	t.Run("CreateDuplicate", func(t *testing.T) { testRGCreateDuplicate(t, newStore) })
+	t.Run("GetMissing", func(t *testing.T) { testRGGetMissing(t, newStore) })
+	t.Run("UpdateMissing", func(t *testing.T) { testRGUpdateMissing(t, newStore) })
+	t.Run("UpdateChangesProps", func(t *testing.T) { testRGUpdateChangesProps(t, newStore) })
+	t.Run("DeleteMissing", func(t *testing.T) { testRGDeleteMissing(t, newStore) })
+	t.Run("DeleteRemoves", func(t *testing.T) { testRGDeleteRemoves(t, newStore) })
+}
+
+func testRGListEmpty(t *testing.T, newStore Factory) {
+	got, err := newStore(t).ResourceGroups().List(t.Context())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if got == nil || len(got) != 0 {
+		t.Errorf("List: got %v, want empty non-nil", got)
+	}
+}
+
+func testRGCreateThenGet(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	rg := apiv1.ResourceGroup{
+		Name:        "rg-1",
+		Description: "test",
+		Props:       map[string]string{"DrbdOptions/auto-quorum": "io-error"},
+		PeerSlots:   7,
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  3,
+			StoragePool: "pool",
+		},
+	}
+	if err := s.Create(ctx, &rg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Name != "rg-1" || got.Description != "test" || got.PeerSlots != 7 {
+		t.Errorf("Get: got %+v", got)
+	}
+
+	if got.SelectFilter.PlaceCount != 3 || got.SelectFilter.StoragePool != "pool" {
+		t.Errorf("SelectFilter: got %+v", got.SelectFilter)
+	}
+}
+
+func testRGCreateDuplicate(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	rg := apiv1.ResourceGroup{Name: "rg-1"}
+	if err := s.Create(ctx, &rg); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+
+	err := s.Create(ctx, &rg)
+	if !errors.Is(err, store.ErrAlreadyExists) {
+		t.Errorf("second Create: got %v, want ErrAlreadyExists", err)
+	}
+}
+
+func testRGGetMissing(t *testing.T, newStore Factory) {
+	_, err := newStore(t).ResourceGroups().Get(t.Context(), "ghost")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get missing: got %v, want ErrNotFound", err)
+	}
+}
+
+func testRGUpdateMissing(t *testing.T, newStore Factory) {
+	err := newStore(t).ResourceGroups().Update(t.Context(), &apiv1.ResourceGroup{Name: "ghost"})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Update missing: got %v, want ErrNotFound", err)
+	}
+}
+
+func testRGUpdateChangesProps(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	if err := s.Create(ctx, &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.Update(ctx, &apiv1.ResourceGroup{
+		Name:  "rg-1",
+		Props: map[string]string{"foo": "bar"},
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := s.Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Props["foo"] != "bar" {
+		t.Errorf("Props[foo]: got %q, want bar", got.Props["foo"])
+	}
+}
+
+func testRGDeleteMissing(t *testing.T, newStore Factory) {
+	err := newStore(t).ResourceGroups().Delete(t.Context(), "ghost")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Delete missing: got %v, want ErrNotFound", err)
+	}
+}
+
+func testRGDeleteRemoves(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	if err := s.Create(ctx, &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.Delete(ctx, "rg-1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	_, err := s.Get(ctx, "rg-1")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get after Delete: got %v, want ErrNotFound", err)
+	}
+}
+
 // RunStoragePoolStore exercises every branch of store.StoragePoolStore.
 func RunStoragePoolStore(t *testing.T, newStore Factory) {
 	t.Helper()

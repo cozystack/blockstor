@@ -99,6 +99,20 @@ func TestK8sStoragePoolStore(t *testing.T) {
 	})
 }
 
+// TestK8sResourceGroupStore runs the shared ResourceGroupStore suite.
+func TestK8sResourceGroupStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunResourceGroupStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
 // envtestAvailable returns whether KUBEBUILDER_ASSETS or a known asset
 // directory exists; without binaries we cannot start envtest.
 func envtestAvailable() bool {
@@ -185,5 +199,9 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.StoragePool{}); err != nil {
 		t.Logf("wipe StoragePools: %v", err)
+	}
+
+	if err := c.DeleteAllOf(ctx, &crdv1alpha1.ResourceGroup{}); err != nil {
+		t.Logf("wipe ResourceGroups: %v", err)
 	}
 }

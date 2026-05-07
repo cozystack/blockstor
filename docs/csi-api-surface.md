@@ -97,8 +97,11 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/resource-groups` | GET / POST | ⬜ |
-| `/v1/resource-groups/{rg}` | GET / PUT / DELETE | ⬜ |
+| `/v1/resource-groups` | GET | ✅ |
+| `/v1/resource-groups` | POST | ✅ |
+| `/v1/resource-groups/{rg}` | GET | ✅ |
+| `/v1/resource-groups/{rg}` | PUT | ✅ |
+| `/v1/resource-groups/{rg}` | DELETE | ✅ |
 | `/v1/resource-groups/{rg}/spawn` | POST | ⬜ |
 | `/v1/resource-groups/{rg}/adjust` | PUT | ⬜ |
 | `/v1/resource-groups/adjustall` | PUT | ⬜ |
