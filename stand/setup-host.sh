@@ -14,6 +14,8 @@ set -euo pipefail
 TALOS_VERSION=${TALOS_VERSION:-v1.10.5}
 KUBECTL_VERSION=${KUBECTL_VERSION:-v1.34.1}
 HELM_VERSION=${HELM_VERSION:-v3.18.4}
+GO_VERSION=${GO_VERSION:-1.24.4}
+GOLANGCI_LINT_VERSION=${GOLANGCI_LINT_VERSION:-v2.5.0}
 WORK_MOUNT=${WORK_MOUNT:-/var/lib/blockstor}
 
 if [[ $EUID -ne 0 ]]; then
@@ -64,6 +66,15 @@ TMPHELM=$(mktemp -d)
 curl -sfL "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" | tar -xz -C "$TMPHELM"
 install -m0755 "$TMPHELM/linux-amd64/helm" /usr/local/bin/helm
 rm -rf "$TMPHELM"
+
+echo "==> go $GO_VERSION, golangci-lint $GOLANGCI_LINT_VERSION"
+if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "$GO_VERSION"; then
+    rm -rf /usr/local/go
+    curl -sfL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+fi
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b /usr/local/bin "$GOLANGCI_LINT_VERSION" >/dev/null
 
 echo "==> picking work device"
 if mountpoint -q "$WORK_MOUNT"; then

@@ -274,6 +274,21 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ## Test strategy
 
+**TDD is mandatory.** Tests come first, code second. A test is not a coverage
+metric — it is the executable spec of the contract a unit promises to honour.
+Every reasonable branch (success, error, edge case, cancellation, partial
+state) must have a test. Coverage that grows without spec branches growing is
+not coverage worth keeping.
+
+For each new function/endpoint:
+
+1. Write the test for the happy path before the implementation.
+2. Write tests for every distinct error / edge case the function can produce.
+3. Implement until each test goes green; do not generalise beyond what tests
+   demand.
+4. When fixing a bug, the regression test lands in the same commit, and it
+   must fail without the fix.
+
 | Layer | Where | Speed | Required for |
 |-------|-------|-------|--------------|
 | L1 unit | `go test ./...` | seconds | every commit |

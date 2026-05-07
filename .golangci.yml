@@ -1,0 +1,157 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    - depguard
+    - exhaustruct
+    - gochecknoinits
+    - wsl
+    - lll
+    - errchkjson
+    - ireturn
+    - gocheckcompilerdirectives
+  settings:
+    dupl:
+      threshold: 100
+    goconst:
+      min-len: 2
+      min-occurrences: 2
+    gocritic:
+      disabled-checks:
+        - dupImport
+        - unnamedResult
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+    funlen:
+      lines: 60
+      statements: 60
+    gocyclo:
+      min-complexity: 15
+    cyclop:
+      max-complexity: 15
+    mnd:
+      ignored-numbers:
+        - "10"
+        - "100"
+        - "1000"
+        - "2"
+        - "60"
+        - "60.0"
+        - "64"
+        - "500"
+    gomoddirectives:
+      replace-allow-list:
+        - github.com/cloudflare/cloudflared
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    varnamelen:
+      max-distance: 5
+      min-name-length: 3
+      check-receiver: false
+      check-return: false
+      ignore-type-assert-ok: false
+      ignore-map-index-ok: false
+      ignore-chan-recv-ok: false
+      ignore-decls:
+        - wg sync.WaitGroup
+        - wg *sync.WaitGroup
+        - mu sync.Mutex
+        - ok bool
+      ignore-names:
+        - i
+        - w
+        - r
+        - b
+        - c
+        - m
+        - n
+        - tt
+        - rw
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples/
+      - generated\.go$
+    rules:
+      - linters:
+          - funlen
+          - dupl
+          - gocognit
+          - gocyclo
+          - cyclop
+          - errcheck
+          - testableexamples
+          - testpackage
+          - forcetypeassert
+          - gocritic
+          - nlreturn
+          - wsl_v5
+          - varnamelen
+          - unparam
+          - modernize
+          - gosec
+          - testifylint
+          - perfsprint
+          - paralleltest
+          - maintidx
+        path: _test\.go
+      - linters:
+          - forbidigo
+          - gocyclo
+          - cyclop
+          - goconst
+          - funlen
+          - gocognit
+          - nestif
+          - gocritic
+          - maintidx
+        path: examples/
+      # Controller patterns - helper methods near reconcile logic
+      - linters:
+          - funcorder
+        path: internal/controller/
+      # Controller patterns - inline error handling in reconcile
+      - linters:
+          - noinlineerr
+        path: internal/controller/
+      # blockstor reproduces the LINSTOR REST API contract, which uses
+      # snake_case JSON. Keep golinstor-compatible names verbatim.
+      - linters:
+          - tagliatelle
+        path: pkg/api/
+      # cmd/main.go is the kubebuilder manager scaffold — don't lint its
+      # boilerplate (TODOs, function length, globals, inline err checks, wsl).
+      - linters:
+          - funlen
+          - gochecknoglobals
+          - godox
+          - gocritic
+          - noinlineerr
+          - wsl_v5
+        path: cmd/main.go
+formatters:
+  enable:
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples/
+      - generated\.go$
