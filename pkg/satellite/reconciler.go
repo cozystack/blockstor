@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -56,15 +58,25 @@ type ReconcilerConfig struct {
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
-// state. Phase-3 cut: storage provisioning only — Build/.res / drbdadm
-// follow in the next slice.
+// state. Phase-3 cut: storage provisioning + DRBD .res / drbdadm.
+//
+// The Reconciler also keeps an in-memory map of which storage pool each
+// resource lives in (last-seen from Apply). Snapshot RPCs use it to
+// dispatch to the correct provider without the controller having to
+// pass the pool on every call.
 type Reconciler struct {
 	cfg ReconcilerConfig
+
+	mu             sync.Mutex
+	resourceToPool map[string]string
 }
 
 // NewReconciler constructs a Reconciler from cfg.
 func NewReconciler(cfg ReconcilerConfig) *Reconciler {
-	return &Reconciler{cfg: cfg}
+	return &Reconciler{
+		cfg:            cfg,
+		resourceToPool: map[string]string{},
+	}
 }
 
 // Apply walks res and brings local storage in line with each item.
@@ -86,6 +98,53 @@ func (r *Reconciler) Apply(ctx context.Context, res []*satellitepb.DesiredResour
 	}
 
 	return results, nil
+}
+
+// CreateSnapshot dispatches to the storage provider that backs the
+// resource (looked up via the resource→pool map populated by Apply).
+// Returns ok=false in the response when the resource is unknown — the
+// satellite never auto-creates snapshots of state it doesn't own.
+func (r *Reconciler) CreateSnapshot(ctx context.Context, req *satellitepb.CreateSnapshotRequest) (*satellitepb.CreateSnapshotResponse, error) {
+	provider, err := r.providerForResource(req.GetResourceName())
+	if err != nil {
+		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+		return &satellitepb.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	}
+
+	err = provider.CreateSnapshot(ctx, storage.Snapshot{
+		ResourceName: req.GetResourceName(),
+		SnapshotName: req.GetSnapshotName(),
+	})
+	if err != nil {
+		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+		return &satellitepb.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	}
+
+	return &satellitepb.CreateSnapshotResponse{
+		Ok:                  true,
+		CreateTimestampUnix: time.Now().Unix(),
+	}, nil
+}
+
+// DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
+// provider layer (lvremove on missing LV is non-fatal there).
+func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.DeleteSnapshotRequest) (*satellitepb.DeleteSnapshotResponse, error) {
+	provider, err := r.providerForResource(req.GetResourceName())
+	if err != nil {
+		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+		return &satellitepb.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	}
+
+	err = provider.DeleteSnapshot(ctx, storage.Snapshot{
+		ResourceName: req.GetResourceName(),
+		SnapshotName: req.GetSnapshotName(),
+	})
+	if err != nil {
+		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+		return &satellitepb.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+	}
+
+	return &satellitepb.DeleteSnapshotResponse{Ok: true}, nil
 }
 
 // applyOne reconciles a single DesiredResource. Diskless replicas skip
@@ -126,7 +185,9 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 }
 
 // applyStorage walks dr.Volumes and ensures each LV/zvol exists.
-// Idempotent — providers handle "already there" themselves.
+// Idempotent — providers handle "already there" themselves. Records
+// the resource→pool mapping (first volume's pool) so subsequent
+// snapshot RPCs can route without the controller passing the pool.
 func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) error {
 	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
@@ -142,6 +203,10 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 		if err != nil {
 			return errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
+	}
+
+	if len(dr.GetVolumes()) > 0 {
+		r.rememberPool(dr.GetName(), dr.GetVolumes()[0].GetStoragePool())
 	}
 
 	return nil
@@ -179,6 +244,36 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	}
 
 	return nil
+}
+
+// providerForResource resolves the provider that owns the named
+// resource using the in-memory pool map. Returns an error when the
+// resource isn't known or its pool isn't registered.
+func (r *Reconciler) providerForResource(name string) (storage.Provider, error) {
+	r.mu.Lock()
+	pool, ok := r.resourceToPool[name]
+	r.mu.Unlock()
+
+	if !ok {
+		return nil, errors.Errorf("resource %q not known on this satellite", name)
+	}
+
+	provider, ok := r.cfg.Providers[pool]
+	if !ok {
+		return nil, errors.Errorf("storage pool %q not registered", pool)
+	}
+
+	return provider, nil
+}
+
+// rememberPool records the pool that backs a resource, so subsequent
+// snapshot RPCs can route to the right provider. Multi-pool resources
+// are not yet a thing — we record the first volume's pool only.
+func (r *Reconciler) rememberPool(resourceName, pool string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.resourceToPool[resourceName] = pool
 }
 
 // buildResFile assembles a drbd.Resource from dr's flat option map.
