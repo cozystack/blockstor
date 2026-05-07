@@ -8,4 +8,13 @@ layout:
 - go.kubebuilder.io/v4
 projectName: blockstor
 repo: github.com/cozystack/blockstor
+resources:
+- api:
+    crdVersion: v1
+  controller: true
+  domain: blockstor.io
+  group: blockstor.io
+  kind: Node
+  path: github.com/cozystack/blockstor/api/v1alpha1
+  version: v1alpha1
 version: "3"

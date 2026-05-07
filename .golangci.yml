@@ -150,6 +150,47 @@ linters:
           - noinlineerr
           - wsl_v5
         path: cmd/main.go
+      # api/v1alpha1 and internal/controller are kubebuilder scaffold; the
+      # boilerplate (dot-imports for ginkgo/gomega, generated DeepCopy globals,
+      # ginkgo BeforeSuite TODOs, wrapcheck on framework returns) is not
+      # something we should fight.
+      - linters:
+          - gochecknoglobals
+          - godot
+          - godox
+          - revive
+          - wrapcheck
+          - embeddedstructfieldcheck
+          - fatcontext
+          - varnamelen
+        path: api/v1alpha1/
+      - linters:
+          - gochecknoglobals
+          - godot
+          - godox
+          - revive
+          - wrapcheck
+          - embeddedstructfieldcheck
+          - fatcontext
+          - varnamelen
+        path: internal/controller/
+      # test/ is kubebuilder-generated e2e helpers; same scaffolding boilerplate.
+      - linters:
+          - gochecknoglobals
+          - godot
+          - godox
+          - revive
+          - wrapcheck
+          - err113
+          - gocritic
+          - nlreturn
+          - noctx
+          - noinlineerr
+          - nolintlint
+          - wsl_v5
+          - varnamelen
+          - mnd
+        path: test/
 formatters:
   enable:
     - gofmt
@@ -162,3 +203,4 @@ formatters:
       - builtin$
       - examples/
       - generated\.go$
+      - test/utils/
