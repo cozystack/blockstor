@@ -226,7 +226,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] StoragePool: LVM-thin (`pkg/storage/lvm`) and ZFS / ZFS_THIN (`pkg/storage/zfs`) providers behind `pkg/storage.Provider` interface; FakeExec drives them in unit tests, RealExec wraps os/exec in production
 - [x] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — port from upstream Java; deterministic output, 7 contract tests green
 - [x] `drbdadm up/down/adjust/create-md/primary/secondary` exec wrappers behind interface (`pkg/drbd/drbdadm.go`); 7 contract tests via FakeExec
-- [ ] `drbdsetup events2` listener (state machine)
+- [x] `drbdsetup events2` listener (`pkg/drbd/events2.go`): line parser + Watcher streaming `Event{Action,Kind,Fields}` to a channel; 7 contract tests
 - [ ] Resource reconciler invokes storage provider + DRBD wrapper through
       satellite gRPC; updates Status from observed-state stream
 - [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
