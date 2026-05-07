@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # usage: up.sh NAME CONTROLPLANES WORKERS EXTENSIONS WORK_DIR
-# Brings up a Talos cluster on QEMU/KVM with the given system extensions baked in.
+# Brings up a Talos cluster on QEMU/KVM. When EXTENSIONS is set, uses Talos
+# Image Factory to obtain a kernel+initramfs with those extensions baked in
+# and boots the VMs from those artifacts.
 set -euo pipefail
 
 NAME=${1:?cluster name required}
@@ -8,40 +10,61 @@ CONTROLPLANES=${2:-1}
 WORKERS=${3:-3}
 EXTENSIONS=${4:-siderolabs/drbd}
 WORK_DIR=${5:-.work/$NAME}
-TALOS_VERSION=${TALOS_VERSION:-v1.10.4}
-CIDR=${CIDR:-10.5.0.0/24}
+TALOS_VERSION=${TALOS_VERSION:-v1.10.5}
+ARCH=${ARCH:-amd64}
 
 mkdir -p "$WORK_DIR"
 TALOSCONFIG="$WORK_DIR/talosconfig"
 KUBECONFIG="$WORK_DIR/kubeconfig"
 export TALOSCONFIG KUBECONFIG
 
-# Resolve a Talos image factory schematic for the requested extensions.
-# Cached per-extension-set under .work/_factory.
-EXT_KEY=$(echo "$EXTENSIONS" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')
-SCHEMATIC_CACHE=".work/_factory/$(echo "$EXT_KEY" | sha256sum | cut -c1-12)"
-mkdir -p "$(dirname "$SCHEMATIC_CACHE")"
-if [[ ! -f "$SCHEMATIC_CACHE" ]]; then
-    echo ">> registering schematic with image factory for extensions: $EXT_KEY"
-    YAML_EXTS=$(echo "$EXTENSIONS" | tr ',' '\n' | sed 's/^/        - /')
-    SCHEMATIC=$(cat <<EOF
+# Resolve schematic id from extension list (cache per-extension-set).
+SCHEMATIC_DIR=".work/_factory"
+mkdir -p "$SCHEMATIC_DIR"
+if [[ -n "$EXTENSIONS" ]]; then
+    EXT_KEY=$(echo "$EXTENSIONS" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')
+    EXT_HASH=$(echo -n "$EXT_KEY" | sha256sum | cut -c1-12)
+    SCHEMATIC_CACHE="$SCHEMATIC_DIR/$EXT_HASH.id"
+    if [[ ! -f "$SCHEMATIC_CACHE" ]]; then
+        echo ">> registering schematic for extensions: $EXT_KEY"
+        YAML_EXTS=$(echo "$EXTENSIONS" | tr ',' '\n' | sed 's/^/        - /')
+        SCHEMATIC=$(cat <<EOF
 customization:
   systemExtensions:
     officialExtensions:
 $YAML_EXTS
 EOF
 )
-    SCHEMATIC_ID=$(curl -sX POST --data-binary "$SCHEMATIC" https://factory.talos.dev/schematics | jq -r .id)
-    [[ -n "$SCHEMATIC_ID" && "$SCHEMATIC_ID" != "null" ]] || { echo "factory rejected schematic"; exit 1; }
-    echo "$SCHEMATIC_ID" > "$SCHEMATIC_CACHE"
+        SCHEMATIC_ID=$(curl -sX POST --data-binary "$SCHEMATIC" https://factory.talos.dev/schematics | jq -r .id)
+        [[ -n "$SCHEMATIC_ID" && "$SCHEMATIC_ID" != "null" ]] || { echo "factory rejected schematic"; exit 1; }
+        echo "$SCHEMATIC_ID" > "$SCHEMATIC_CACHE"
+    fi
+    SCHEMATIC_ID=$(cat "$SCHEMATIC_CACHE")
+    BOOT_DIR="$SCHEMATIC_DIR/$SCHEMATIC_ID-$TALOS_VERSION-$ARCH"
+else
+    SCHEMATIC_ID=""
+    BOOT_DIR="$SCHEMATIC_DIR/vanilla-$TALOS_VERSION-$ARCH"
 fi
-SCHEMATIC_ID=$(cat "$SCHEMATIC_CACHE")
-INSTALLER="factory.talos.dev/installer/$SCHEMATIC_ID:$TALOS_VERSION"
-echo ">> using installer: $INSTALLER"
+
+mkdir -p "$BOOT_DIR"
+VMLINUZ="$BOOT_DIR/vmlinuz"
+INITRD="$BOOT_DIR/initramfs.xz"
+INSTALLER_IMG="$BOOT_DIR/installer.tar"
+
+if [[ ! -s "$VMLINUZ" || ! -s "$INITRD" ]]; then
+    if [[ -n "$SCHEMATIC_ID" ]]; then
+        BASE="https://factory.talos.dev/image/$SCHEMATIC_ID/$TALOS_VERSION"
+    else
+        BASE="https://github.com/siderolabs/talos/releases/download/$TALOS_VERSION"
+    fi
+    echo ">> downloading kernel/initramfs from $BASE"
+    curl -fL "$BASE/kernel-$ARCH"        -o "$VMLINUZ"
+    curl -fL "$BASE/initramfs-$ARCH.xz"  -o "$INITRD"
+fi
 
 # Per-cluster CIDR offset to avoid collisions when running parallel stands.
 HASH=$(echo -n "$NAME" | sha256sum | cut -c1-2)
-SLOT=$((16#$HASH % 200 + 5))   # 5..204
+SLOT=$((16#$HASH % 200 + 5))
 NET_CIDR="10.${SLOT}.0.0/24"
 
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
@@ -51,7 +74,8 @@ talosctl cluster create \
     --controlplanes "$CONTROLPLANES" \
     --workers "$WORKERS" \
     --cidr "$NET_CIDR" \
-    --installer-image "$INSTALLER" \
+    --vmlinuz-path "$VMLINUZ" \
+    --initrd-path "$INITRD" \
     --talosconfig "$TALOSCONFIG" \
     --kubernetes-version "${KUBERNETES_VERSION:-v1.34.1}" \
     --memory 4096 \
@@ -59,7 +83,6 @@ talosctl cluster create \
     --cpus 2 \
     --cpus-workers 2 \
     --disk 20480 \
-    --user-disk-size 10GB \
     --wait
 
 talosctl --talosconfig "$TALOSCONFIG" kubeconfig --force "$KUBECONFIG"

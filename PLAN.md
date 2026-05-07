@@ -43,6 +43,9 @@ high-bandwidth check-ins with the user.
 - Encryption layer: **LUKS** (volume-level) and DRBD encryption passphrases
 - DRBD options (full set from `drbdoptions.json`)
 - DRBD proxy
+- **Intra-cluster snapshot shipping** — required for clone/expand-replica
+  flows. Implemented via `zfs send`/`zfs recv` for ZFS pools and
+  [`thin-send-recv`](https://github.com/LINBIT/thin-send-recv) for LVM-thin.
 - API surface used by linstor-csi, piraeus-operator, ha-controller,
   affinity-controller, scheduler-extender, gateway, kubectl-linstor,
   golinstor consumers
@@ -55,12 +58,12 @@ high-bandwidth check-ins with the user.
 
 ## Out of scope (will not be built)
 
-- Snapshot shipping between clusters
+- Snapshot shipping **between clusters** (cross-cluster DR)
 - Backup create/restore/ship/abort, backup queue
 - Schedules (cron-driven backups)
 - Remote backends: S3, EBS, Linstor remotes
 - Storage providers: SPDK, NVMe-oF target/initiator, OpenFlex, Exos
-- Anything in golinstor's `BackupProvider`, `RemoteProvider` (delete from API)
+- The cross-cluster halves of golinstor's `BackupProvider`, `RemoteProvider`
 
 These endpoints will return `501 Not Implemented` with a clear message that
 blockstor does not implement them.
@@ -163,14 +166,17 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 **Exit**: smoke test with two replicas, real DRBD, PVC mounted on node A then on node B (failover).
 
-### Phase 4 — Autoplacer + snapshots
+### Phase 4 — Autoplacer + snapshots + intra-cluster shipping
 
 - [ ] Autoplacer: storage-pool-aware replica placement
 - [ ] Snapshot CRD + reconcile (LVM/ZFS snapshot wrappers)
 - [ ] Snapshot restore creates a new ResourceDefinition
+- [ ] Intra-cluster snapshot shipping for clone/replica-expansion:
+      - ZFS pools: `zfs send | ssh | zfs recv` over satellite-to-satellite
+      - LVM-thin: `thin-send-recv` (LINBIT)
 - [ ] csi-sanity passes against our server
 
-**Exit**: csi-sanity green; piraeus-operator e2e green for what they cover.
+**Exit**: csi-sanity green; piraeus-operator e2e green for what they cover; PVC clone across nodes works.
 
 ### Phase 5 — Compatibility burn-in
 
