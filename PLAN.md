@@ -228,7 +228,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] `drbdadm up/down/adjust/create-md/primary/secondary` exec wrappers behind interface (`pkg/drbd/drbdadm.go`); 7 contract tests via FakeExec
 - [x] `drbdsetup events2` listener (`pkg/drbd/events2.go`): line parser + Watcher streaming `Event{Action,Kind,Fields}` to a channel; 7 contract tests
 - [x] Resource reconciler (`pkg/satellite.Reconciler`) routes DesiredResource batches: storage provider CreateVolume per volume, ConfFileBuilder writes /etc/drbd.d/<name>.res, drbdadm create-md (first activation, non-DISKLESS) + adjust. Status writeback from events2 stream is the next slice.
-- [ ] Status writeback: events2 listener pushes ResourceObservedEvent stream back to controller
+- [x] Status writeback first half: `pkg/satellite.Observer` translates parsed drbd.Event values into ResourceObservedEvent (4 contract tests). Wire-up to gRPC stream pending the controller-side handler.
 - [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
 
 **Exit**: smoke test with two replicas, real DRBD, PVC mounted on node A then on node B (failover).
