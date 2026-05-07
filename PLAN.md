@@ -15,15 +15,15 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 0 done; starting Phase 1
-- **Last action**: dev stand fully working — 3-node Talos+QEMU cluster with `siderolabs/drbd` extension, `drbd 9.2.14` loaded, piraeus-operator v2.10.0 installed, file-thin storage pool `pool` provisioned on every satellite, `make smoke` green (PVC create → pod mount → write → read), parallel `NAME=alice` cluster verified.
+- **Phase**: 1 mostly done; preparing Phase 2 (CRDs + reconcile)
+- **Last action**: kubebuilder-scaffolded controller binary + `pkg/rest` Runnable serving `/v1/controller/version` and `/v1/healthz`, golinstor compatibility verified end-to-end, full-branch tests committed (8 cases). golangci-lint config + auto-lint hook (`golangci-lint@claude-code-companions`) in place. CSI MVP API surface enumerated in `docs/csi-api-surface.md` (1/many endpoints implemented).
 - **Blocker**: none
 - **Next concrete steps**:
-    1. Decide layout for the Go monorepo inside this same repo: `cmd/controller`, `cmd/satellite`, `pkg/...`. Add Go module + golangci-lint + Makefile targets for build/test/lint.
-    2. Pull in `linstor-common` as git submodule (apiconsts, properties.json, drbdoptions.json — single source of truth shared with upstream).
-    3. Generate Go types from `rest_v1_openapi.yaml` via `oapi-codegen`.
-    4. Stub `cmd/controller`: HTTP server, `/v1/controller/version` returning a credible response.
-    5. Add `tests/contract/version_test.go`: golinstor.Client.Controller.GetVersion against our server returns no error.
+    1. Wire `linstor-common` as git submodule (properties.json, consts.json, drbdoptions.json, generated apiconsts).
+    2. Wire `oapi-codegen` to regenerate `pkg/api/v1` from upstream `rest_v1_openapi.yaml` so we don't keep adding types by hand.
+    3. Port `apiconsts.go` from golinstor for ApiCallRc codes (needed for proper error responses).
+    4. Phase 2 begin: `kubebuilder create api --group blockstor.io --version v1 --kind Node`; CRD types + reconciler stubs for `Node`, `StoragePool`, `ResourceDefinition`, `Resource`, `VolumeDefinition`, `Volume`, `Snapshot`, `ResourceGroup`.
+    5. Implement `/v1/nodes` reading from CRD store; tests against golinstor `Nodes.GetAll/Get/Create/Modify/Delete`.
 
 ---
 
@@ -147,14 +147,19 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Phase 1 — Skeleton + contracts
 
-- [ ] New module `cmd/controller/`, basic HTTP server
+- [x] New module via `kubebuilder init`; controller-runtime manager + `pkg/rest` Runnable
+- [x] `/v1/controller/version` returns a credible response (`pkg/version` constants pin LINSTOR contract version)
+- [x] `golinstor.Client.Controller.GetVersion()` against our server returns no error (`pkg/rest/server_test.go`)
+- [x] Full-branch tests for the version endpoint and the Runnable lifecycle (8 cases)
+- [x] CSI MVP scope frozen in `docs/csi-api-surface.md`
+- [x] golangci-lint v2 config + auto-lint hook (`golangci-lint@claude-code-companions`) wired
 - [ ] OpenAPI types generated from `linstor-server/docs/rest_v1_openapi.yaml` (oapi-codegen)
-- [ ] `apiconsts` ported from golinstor
-- [ ] `/v1/controller/version` returns a credible response
-- [ ] `golinstor.Client.Controller.GetVersion()` against our server returns no error
-- [ ] CSI MVP scope frozen in `docs/csi-api-surface.md`
+- [ ] `apiconsts` ported from golinstor (ApiCallRc codes for error responses)
+- [ ] `linstor-common` submodule (properties.json, consts.json, drbdoptions.json)
 
-**Exit**: golinstor can talk to us for `GetVersion`; tests in CI green.
+**Exit**: golinstor can talk to us for `GetVersion`; tests in CI green. **Met.**
+Remaining items above land at the start of Phase 2 (codegen wiring is most
+useful once we have many types to generate, which Phase 2 introduces).
 
 ### Phase 2 — CRDs + reconcile
 
