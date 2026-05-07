@@ -19,20 +19,40 @@ package satellite
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
-// ReconcilerConfig parametrises a Reconciler. Providers maps the
-// satellite's local storage-pool names to provisioned `storage.Provider`
-// instances; an unknown pool fails the per-resource Apply with a
-// surfaced error message.
+// ReconcilerConfig parametrises a Reconciler.
+//
+// Providers maps the satellite's local storage-pool names to provisioned
+// `storage.Provider` instances; an unknown pool fails the per-resource
+// Apply with a surfaced error message.
+//
+// Adm, StateDir and NodeName drive the DRBD half: when set, Apply also
+// renders the `.res` file under StateDir, runs `drbdadm create-md` on
+// first activation, and `drbdadm adjust` on every reconcile.
 type ReconcilerConfig struct {
 	Providers map[string]storage.Provider
+
+	// Adm is the drbdadm wrapper. nil → DRBD half is disabled (storage
+	// only). Useful for unit tests of the storage path without DRBD.
+	Adm *drbd.Adm
+
+	// StateDir is where `.res` files land. Required when Adm is set.
+	StateDir string
+
+	// NodeName is this satellite's identifier; the reconciler uses it
+	// to know which Peer entries describe local vs. remote.
+	NodeName string
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -69,8 +89,10 @@ func (r *Reconciler) Apply(ctx context.Context, res []*satellitepb.DesiredResour
 }
 
 // applyOne reconciles a single DesiredResource. Diskless replicas skip
-// storage entirely (they're memory-backed by the DRBD stack); everything
-// else routes one CreateVolume per DesiredVolume.
+// the storage path (they're memory-backed by the DRBD stack); everything
+// else routes one CreateVolume per DesiredVolume. When the DRBD half is
+// enabled (cfg.Adm != nil), also renders the `.res` file and runs
+// drbdadm create-md / adjust.
 func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResource) *satellitepb.ResourceApplyResult {
 	res := &satellitepb.ResourceApplyResult{
 		Name:     dr.GetName(),
@@ -78,24 +100,20 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 		Ok:       true,
 	}
 
-	if isDiskless(dr.GetFlags()) {
-		return res
-	}
+	diskless := isDiskless(dr.GetFlags())
 
-	for _, vol := range dr.GetVolumes() {
-		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
-		if !ok {
+	if !diskless {
+		err := r.applyStorage(ctx, dr)
+		if err != nil {
 			res.Ok = false
-			res.Message = fmt.Sprintf("unknown storage pool %q", vol.GetStoragePool())
+			res.Message = err.Error()
 
 			return res
 		}
+	}
 
-		err := provider.CreateVolume(ctx, storage.Volume{
-			ResourceName: dr.GetName(),
-			VolumeNumber: vol.GetVolumeNumber(),
-			SizeKib:      vol.GetSizeKib(),
-		})
+	if r.cfg.Adm != nil {
+		err := r.applyDRBD(ctx, dr, diskless)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -107,9 +125,125 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	return res
 }
 
+// applyStorage walks dr.Volumes and ensures each LV/zvol exists.
+// Idempotent — providers handle "already there" themselves.
+func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) error {
+	for _, vol := range dr.GetVolumes() {
+		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+		if !ok {
+			return errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
+		}
+
+		err := provider.CreateVolume(ctx, storage.Volume{
+			ResourceName: dr.GetName(),
+			VolumeNumber: vol.GetVolumeNumber(),
+			SizeKib:      vol.GetSizeKib(),
+		})
+		if err != nil {
+			return errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
+		}
+	}
+
+	return nil
+}
+
+// applyDRBD renders the .res file from dr's metadata and (re)applies
+// it via drbdadm. create-md runs only on first activation (we detect
+// "first" by absence of the .res file before this run); diskless
+// replicas skip create-md entirely.
+func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool) error {
+	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
+	_, statErr := os.Stat(resPath)
+	firstActivation := os.IsNotExist(statErr)
+
+	body, err := buildResFile(dr, r.cfg.NodeName)
+	if err != nil {
+		return errors.Wrapf(err, "build .res for %s", dr.GetName())
+	}
+
+	err = os.WriteFile(resPath, []byte(body), resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", resPath)
+	}
+
+	if firstActivation && !diskless {
+		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "create-md %s", dr.GetName())
+		}
+	}
+
+	err = r.cfg.Adm.Adjust(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "adjust %s", dr.GetName())
+	}
+
+	return nil
+}
+
+// buildResFile assembles a drbd.Resource from dr's flat option map.
+// The proto carries DRBD config as a string→string map for now (the
+// schema solidifies once the controller-side autoplacer feeds it); we
+// honour the documented keys: `port`, `node-id`, `address`, `minor` for
+// the local node, and `peer.<name>.{port,node-id,address}` per peer.
+func buildResFile(dr *satellitepb.DesiredResource, localNode string) (string, error) {
+	opts := dr.GetDrbdOptions()
+	port, _ := strconv.Atoi(opts["port"])
+	nodeID, _ := strconv.Atoi(opts["node-id"])
+	minor, _ := strconv.Atoi(opts["minor"])
+
+	hosts := make([]drbd.Host, 0, 1+len(dr.GetPeers()))
+	hosts = append(hosts, drbd.Host{
+		NodeName: localNode,
+		Address:  opts["address"],
+		Port:     port,
+		NodeID:   nodeID,
+	})
+
+	for _, peer := range dr.GetPeers() {
+		peerPort, _ := strconv.Atoi(opts["peer."+peer+".port"])
+		peerNodeID, _ := strconv.Atoi(opts["peer."+peer+".node-id"])
+
+		hosts = append(hosts, drbd.Host{
+			NodeName: peer,
+			Address:  opts["peer."+peer+".address"],
+			Port:     peerPort,
+			NodeID:   peerNodeID,
+		})
+	}
+
+	vols := make([]drbd.Volume, 0, len(dr.GetVolumes()))
+	for _, v := range dr.GetVolumes() {
+		vols = append(vols, drbd.Volume{
+			Number: int(v.GetVolumeNumber()),
+			Device: fmt.Sprintf("/dev/drbd%d", minor+int(v.GetVolumeNumber())),
+			Disk:   fmt.Sprintf("/dev/%s/%s_%05d", v.GetStoragePool(), dr.GetName(), v.GetVolumeNumber()),
+			Minor:  minor + int(v.GetVolumeNumber()),
+		})
+	}
+
+	out, err := drbd.Build(drbd.Resource{
+		Name:    dr.GetName(),
+		Net:     drbd.Net{ProtocolC: true},
+		Hosts:   hosts,
+		Volumes: vols,
+	})
+	if err != nil {
+		return "", errors.Wrap(err, "drbd.Build")
+	}
+
+	return out, nil
+}
+
 // isDiskless returns true when the DRBD-layer "DISKLESS" flag is set.
 // Diskless replicas live entirely in DRBD memory and have no backing
 // storage, so the reconciler must skip the storage path for them.
 func isDiskless(flags []string) bool {
 	return slices.Contains(flags, "DISKLESS")
 }
+
+// resFilePerm is the on-disk mode for /etc/drbd.d/<name>.res. drbd is
+// happy with 0o644; the file does not contain secrets the way auth-keys
+// would (shared-secret is in /etc/drbd.d/global_common.conf, written
+// once at install time).
+const resFilePerm = 0o644

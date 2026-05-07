@@ -227,8 +227,8 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — port from upstream Java; deterministic output, 7 contract tests green
 - [x] `drbdadm up/down/adjust/create-md/primary/secondary` exec wrappers behind interface (`pkg/drbd/drbdadm.go`); 7 contract tests via FakeExec
 - [x] `drbdsetup events2` listener (`pkg/drbd/events2.go`): line parser + Watcher streaming `Event{Action,Kind,Fields}` to a channel; 7 contract tests
-- [ ] Resource reconciler invokes storage provider + DRBD wrapper through
-      satellite gRPC; updates Status from observed-state stream
+- [x] Resource reconciler (`pkg/satellite.Reconciler`) routes DesiredResource batches: storage provider CreateVolume per volume, ConfFileBuilder writes /etc/drbd.d/<name>.res, drbdadm create-md (first activation, non-DISKLESS) + adjust. Status writeback from events2 stream is the next slice.
+- [ ] Status writeback: events2 listener pushes ResourceObservedEvent stream back to controller
 - [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
 
 **Exit**: smoke test with two replicas, real DRBD, PVC mounted on node A then on node B (failover).

@@ -1,0 +1,172 @@
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package satellite_test
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/satellite"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/lvm"
+)
+
+// TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
+// (here under StateDir) reflecting the DesiredResource. The reconciler
+// owns this file — controller never touches it directly.
+func TestApplyWritesResFile(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resPath := filepath.Join(dir, "pvc-1.res")
+
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got := string(body)
+
+	for _, want := range []string{
+		"resource pvc-1 {",
+		"on n1 {",
+		"address 10.0.0.1:7000;",
+		"on n2 {",
+		"address 10.0.0.2:7000;",
+		"connection {",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+}
+
+// TestApplyInvokesDrbdadmAdjust: writing the .res isn't enough — DRBD
+// needs `adjust` to pick up changes. Apply must call it.
+func TestApplyInvokesDrbdadmAdjust(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-1") {
+		t.Errorf("expected drbdadm adjust; got %v", fx.CommandLines())
+	}
+}
+
+// TestApplyDisklessNoCreateMD: DISKLESS replicas have no metadata to
+// initialise. Even though they get a .res file (DRBD still needs to
+// know how to reach them), create-md must not run.
+func TestApplyDisklessNoCreateMD(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm create-md") {
+			t.Errorf("DISKLESS issued create-md: %s", line)
+		}
+	}
+}
