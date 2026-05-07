@@ -15,24 +15,26 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 1 done; Phase 2 (CRDs + reconcile) starting
-- **Implemented**:
-  - `/v1/controller/version` — pinned to wire shape; golinstor `GetVersion` round-trip green
-  - `/v1/healthz` — 204 probe
-  - `/v1/nodes` — GET list, GET, POST, PUT, DELETE (full CRUD); golinstor `Nodes.{GetAll,Get,Create,Delete}` green
-  - `/v1/view/storage-pools` — read aggregate
-  - `/v1/nodes/{node}/storage-pools[/{pool}]` — read list and read get
-  - InMemory store (sync.RWMutex) for both Node and StoragePool, behind a `Store` interface seam Phase 2 will swap for CRDs
-  - 30+ unit+contract tests, all green; `golangci-lint run ./...` zero issues
-  - `linstor-common` as submodule (properties.json, consts.json, drbdoptions.json)
-  - `apiconsts` reused from `github.com/LINBIT/golinstor` (`linstor.MaskError` etc.) — no separate fork
-- **Blocker**: none
-- **Next concrete steps** (Phase 2):
-  1. `kubebuilder create api --group blockstor.io --version v1 --kind Node` and same for `StoragePool`. Generate DeepCopy + CRD manifests.
-  2. Add `pkg/store/k8s` — implementation of `store.Store` backed by `controller-runtime` client. Same interface as InMemory; identical test suite (table-driven so we can reuse) must pass against an envtest.
-  3. Wire a flag in `cmd/main.go` to choose between InMemory and k8s store (default k8s; InMemory is for tests).
-  4. Reconciler stubs for Node and StoragePool (no-op for now; just make sure manager + scheme + leader-election work).
-  5. Continue per `docs/csi-api-surface.md`: `/v1/resource-groups` (linstor-csi creates one per StorageClass), then `/v1/resource-definitions`, then `/v1/view/resources`.
+- **Phase**: 2 well underway. CRD-backed store live, four resource families wired end-to-end.
+- **Implemented (REST + Store + tests, all both InMemory and CRD/envtest backends, golinstor compatibility verified)**:
+  - `/v1/controller/version`, `/v1/healthz`
+  - `/v1/nodes` — full CRUD
+  - `/v1/view/storage-pools`, `/v1/nodes/{node}/storage-pools[/{pool}]` — read
+  - `/v1/resource-groups` — full CRUD
+  - `/v1/resource-definitions` — full CRUD (POST unwraps the upstream `{resource_definition: {...}}` envelope)
+  - `/v1/view/resources` — read
+- **CRDs (kubebuilder-scaffolded, NodeSpec/StatuS filled with LINSTOR-shaped fields)**:
+  - `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource` (composite-keyed via `<a>.<b>` metadata.name + label index)
+- **Stores**: `pkg/store` (InMemory) and `pkg/store/k8s` (controller-runtime client), both behind the same `store.Store` interface and exercised by the same `pkg/store/storetest` shared suite — behavioural drift fails the same subtest immediately.
+- **Tests**: 150+ unit + contract; controller-runtime envtest harness skips cleanly when `KUBEBUILDER_ASSETS` is missing, so plain `go test ./...` is green without `make setup-envtest`.
+- **Lint**: `golangci-lint run ./...` zero issues. Auto-lint hook (`golangci-lint@claude-code-companions`) catches every Go-file edit.
+- **Blocker**: none.
+- **Next concrete steps**:
+  1. `/v1/resource-definitions/{rd}/volume-definitions` (CRUD) — needed before linstor-csi can size a PVC.
+  2. `/v1/resource-groups/{rg}/spawn` — the CSI provisioner calls this on every `CreateVolume`. Needs an `Autoplacer` stub: read RG select-filter, pick `place_count` storage pools, create matching `Resource`s.
+  3. `/v1/key-value-store` — linstor-csi keeps its own per-volume bookkeeping here.
+  4. `/v1/resource-definitions/{rd}/snapshots` + `/v1/view/snapshots` — Snapshot CRD; mostly mirrors Resource shape.
+  5. Reconcilers (no-op for now → satellite-driven in Phase 3) for `Node`, `StoragePool`, `Resource`. Wire `mgr.Add` for them in `cmd/main.go`.
 
 ---
 
