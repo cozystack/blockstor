@@ -29,17 +29,19 @@ import (
 // InMemory is the Phase 1 store: thread-safe, RAM-backed, lost on restart.
 // Phase 2 introduces a CRD-backed store that satisfies the same interface.
 type InMemory struct {
-	nodes          *inMemoryNodes
-	storagePools   *inMemoryStoragePools
-	resourceGroups *inMemoryResourceGroups
+	nodes               *inMemoryNodes
+	storagePools        *inMemoryStoragePools
+	resourceGroups      *inMemoryResourceGroups
+	resourceDefinitions *inMemoryResourceDefinitions
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
 func NewInMemory() *InMemory {
 	return &InMemory{
-		nodes:          &inMemoryNodes{m: map[string]apiv1.Node{}},
-		storagePools:   &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
-		resourceGroups: &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
+		nodes:               &inMemoryNodes{m: map[string]apiv1.Node{}},
+		storagePools:        &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
+		resourceGroups:      &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
+		resourceDefinitions: &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
 	}
 }
 
@@ -51,6 +53,9 @@ func (s *InMemory) StoragePools() StoragePoolStore { return s.storagePools }
 
 // ResourceGroups returns the ResourceGroupStore view of this store.
 func (s *InMemory) ResourceGroups() ResourceGroupStore { return s.resourceGroups }
+
+// ResourceDefinitions returns the ResourceDefinitionStore view.
+func (s *InMemory) ResourceDefinitions() ResourceDefinitionStore { return s.resourceDefinitions }
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

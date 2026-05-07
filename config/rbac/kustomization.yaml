@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the blockstor itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- resourcedefinition_admin_role.yaml
+- resourcedefinition_editor_role.yaml
+- resourcedefinition_viewer_role.yaml
 - resourcegroup_admin_role.yaml
 - resourcegroup_editor_role.yaml
 - resourcegroup_viewer_role.yaml

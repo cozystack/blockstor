@@ -75,6 +75,7 @@ linters:
         - in
         - sp
         - st
+        - s
         - rd
         - vd
         - rg
@@ -124,6 +125,10 @@ linters:
       - linters:
           - dupl
         path: pkg/store/k8s/
+      # Same applies to the in-memory store implementations.
+      - linters:
+          - dupl
+        path: pkg/store/inmemory_
       # REST handlers follow the same Get/Create/Update/Delete shape per
       # resource for the same reason.
       - linters:

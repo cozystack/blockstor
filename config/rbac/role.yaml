@@ -8,6 +8,7 @@ rules:
   - blockstor.io.blockstor.io
   resources:
   - nodes
+  - resourcedefinitions
   - resourcegroups
   - storagepools
   verbs:
@@ -22,6 +23,7 @@ rules:
   - blockstor.io.blockstor.io
   resources:
   - nodes/finalizers
+  - resourcedefinitions/finalizers
   - resourcegroups/finalizers
   - storagepools/finalizers
   verbs:
@@ -30,6 +32,7 @@ rules:
   - blockstor.io.blockstor.io
   resources:
   - nodes/status
+  - resourcedefinitions/status
   - resourcegroups/status
   - storagepools/status
   verbs:

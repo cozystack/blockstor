@@ -33,4 +33,12 @@ resources:
   kind: ResourceGroup
   path: github.com/cozystack/blockstor/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+  controller: true
+  domain: blockstor.io
+  group: blockstor.io
+  kind: ResourceDefinition
+  path: github.com/cozystack/blockstor/api/v1alpha1
+  version: v1alpha1
 version: "3"

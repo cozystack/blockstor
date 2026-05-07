@@ -61,8 +61,11 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/resource-definitions` | GET / POST | ⬜ |
-| `/v1/resource-definitions/{rd}` | GET / PUT / DELETE | ⬜ |
+| `/v1/resource-definitions` | GET | ✅ |
+| `/v1/resource-definitions` | POST | ✅ |
+| `/v1/resource-definitions/{rd}` | GET | ✅ |
+| `/v1/resource-definitions/{rd}` | PUT | ✅ |
+| `/v1/resource-definitions/{rd}` | DELETE | ✅ |
 | `/v1/resource-definitions/{rd}/volume-definitions` | GET / POST | ⬜ |
 | `/v1/resource-definitions/{rd}/volume-definitions/{vn}` | GET / PUT / DELETE | ⬜ |
 | `/v1/resource-definitions/{rd}/clone` | POST | ⬜ |

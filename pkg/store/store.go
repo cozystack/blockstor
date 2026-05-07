@@ -70,10 +70,20 @@ type ResourceGroupStore interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// ResourceDefinitionStore persists ResourceDefinition objects. Keyed by name.
+type ResourceDefinitionStore interface {
+	List(ctx context.Context) ([]apiv1.ResourceDefinition, error)
+	Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
+	Create(ctx context.Context, rd *apiv1.ResourceDefinition) error
+	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error
+	Delete(ctx context.Context, name string) error
+}
+
 // Store aggregates per-resource stores. Phase 2 grows this interface as more
-// CRDs land (ResourceDefinition, Snapshot, ...).
+// CRDs land (Snapshot, Resource, ...).
 type Store interface {
 	Nodes() NodeStore
 	StoragePools() StoragePoolStore
 	ResourceGroups() ResourceGroupStore
+	ResourceDefinitions() ResourceDefinitionStore
 }
