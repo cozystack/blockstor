@@ -15,10 +15,18 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 0 (dev stand)
-- **Last action**: BM.HPC2.36 `linstor-dev-1` provisioned on OCI (IP `129.213.29.101`); blockstor repo skeleton committed locally; SSH timing out, awaiting boot completion.
+- **Phase**: 0 (dev stand) — almost done
+- **Last action**: 3-node Talos+QEMU cluster with DRBD extension is up; kernel module `drbd 9.2.14` loaded on workers; `piraeus-operator v2.10.0` installed; CSI containers initialising. linstor-controller (Java) running.
 - **Blocker**: none
-- **Next concrete step**: SSH into the host, identify OS, install qemu-kvm + talosctl + kubectl + helm + drbd-utils + drbd kmod, run `make up NAME=test`.
+- **Next concrete steps**:
+    1. Add a `LinstorSatelliteConfiguration` to `install-piraeus.sh` that
+       provisions a file-thin storage pool named `pool` on every worker —
+       otherwise `tests/smoke.sh` has nowhere to put a PVC.
+    2. Run `make smoke` end-to-end against upstream piraeus.
+    3. Verify `make up NAME=alice` and `make up NAME=bob` run in parallel
+       without IP / bridge collision.
+    4. Add `make oracle` install for Java LINSTOR controller (separate from
+       piraeus-installed one) for upcoming contract diffs in Phase 3.
 
 ---
 
@@ -130,10 +138,11 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] BM.HPC2.36 provisioned on OCI (terraform applied)
 - [x] Host packages installed via `stand/setup-host.sh` (qemu-kvm, libvirt, ovmf, drbd-utils, zfsutils-linux, talosctl, kubectl, helm)
 - [x] NVMe (6.4TB) formatted as xfs, mounted at `/var/lib/blockstor`, `.work` symlinked
-- [x] Default `iptables FORWARD` policy fixed (Ubuntu OCI image ships a catch-all REJECT)
-- [ ] `make up NAME=test` brings up a 3-node Talos+QEMU cluster with DRBD extension
-- [ ] `make piraeus` installs piraeus-operator and a `LinstorCluster`
+- [x] iptables fixed (Ubuntu OCI image ships catch-all REJECT in INPUT and FORWARD; allow `talos+`/`virbr+` bridges)
+- [x] `make up NAME=test` brings up a 3-node Talos+QEMU cluster with the `siderolabs/drbd` extension; `drbd 9.2.14` module loads
+- [x] `make piraeus` installs piraeus-operator and a `LinstorCluster`; satellite/CSI pods come up
 - [ ] `make smoke` provisions a PVC, mounts it, writes data — green against upstream piraeus
+- [ ] Storage pool wired via `LinstorSatelliteConfiguration` (file-thin)
 - [ ] `make oracle` deploys Java LINSTOR controller (`piraeus-server:v1.33.2`) for contract-diff use
 - [ ] `make up NAME=alice` and `make up NAME=bob` run in parallel without collision
 
