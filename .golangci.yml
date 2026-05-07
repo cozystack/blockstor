@@ -72,6 +72,11 @@ linters:
         - c
         - m
         - n
+        - sp
+        - rd
+        - vd
+        - rg
+        - vg
         - tt
         - rw
   exclusions:

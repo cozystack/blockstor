@@ -29,18 +29,23 @@ import (
 // InMemory is the Phase 1 store: thread-safe, RAM-backed, lost on restart.
 // Phase 2 introduces a CRD-backed store that satisfies the same interface.
 type InMemory struct {
-	nodes *inMemoryNodes
+	nodes        *inMemoryNodes
+	storagePools *inMemoryStoragePools
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
 func NewInMemory() *InMemory {
 	return &InMemory{
-		nodes: &inMemoryNodes{m: map[string]apiv1.Node{}},
+		nodes:        &inMemoryNodes{m: map[string]apiv1.Node{}},
+		storagePools: &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
 	}
 }
 
 // Nodes returns the NodeStore view of this store.
 func (s *InMemory) Nodes() NodeStore { return s.nodes }
+
+// StoragePools returns the StoragePoolStore view of this store.
+func (s *InMemory) StoragePools() StoragePoolStore { return s.storagePools }
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

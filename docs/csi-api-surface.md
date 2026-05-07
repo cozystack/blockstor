@@ -40,17 +40,20 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/nodes` | GET | ⬜ |
-| `/v1/nodes` | POST | ⬜ |
-| `/v1/nodes/{node}` | GET / DELETE | ⬜ |
-| `/v1/nodes/{node}` | PUT (modify) | ⬜ |
+| `/v1/nodes` | GET | ✅ |
+| `/v1/nodes` | POST | ✅ |
+| `/v1/nodes/{node}` | GET | ✅ |
+| `/v1/nodes/{node}` | PUT (modify) | ✅ |
+| `/v1/nodes/{node}` | DELETE | ✅ |
 | `/v1/nodes/{node}/lost` | DELETE | ⬜ |
 | `/v1/nodes/{node}/restore` | PUT | ⬜ |
 | `/v1/nodes/{node}/evacuate` | PUT | ⬜ |
 | `/v1/nodes/{node}/net-interfaces` | GET / POST | ⬜ |
 | `/v1/nodes/{node}/net-interfaces/{nif}` | GET / PUT / DELETE | ⬜ |
-| `/v1/nodes/{node}/storage-pools` | GET / POST | ⬜ |
-| `/v1/nodes/{node}/storage-pools/{pool}` | GET / PUT / DELETE | ⬜ |
+| `/v1/nodes/{node}/storage-pools` | GET | ✅ |
+| `/v1/nodes/{node}/storage-pools` | POST | ⬜ |
+| `/v1/nodes/{node}/storage-pools/{pool}` | GET | ✅ |
+| `/v1/nodes/{node}/storage-pools/{pool}` | PUT / DELETE | ⬜ |
 | `/v1/physical-storage` | GET | ⬜ |
 | `/v1/physical-storage/{node}` | GET / POST | ⬜ |
 
@@ -117,7 +120,7 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 |---|---|---|
 | `/v1/view/resources` | GET | ⬜ |
 | `/v1/view/snapshots` | GET | ⬜ |
-| `/v1/view/storage-pools` | GET | ⬜ |
+| `/v1/view/storage-pools` | GET | ✅ |
 | `/v1/query-max-volume-size` | POST | ⬜ |
 
 ## KeyValueStore (used by linstor-csi for its own bookkeeping)

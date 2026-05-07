@@ -50,8 +50,20 @@ type NodeStore interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// StoragePoolStore persists StoragePool objects. The composite key is
+// (node name, pool name); the same pool name can co-exist on different nodes.
+type StoragePoolStore interface {
+	List(ctx context.Context) ([]apiv1.StoragePool, error)
+	ListByNode(ctx context.Context, node string) ([]apiv1.StoragePool, error)
+	Get(ctx context.Context, node, pool string) (apiv1.StoragePool, error)
+	Create(ctx context.Context, sp *apiv1.StoragePool) error
+	Update(ctx context.Context, sp *apiv1.StoragePool) error
+	Delete(ctx context.Context, node, pool string) error
+}
+
 // Store aggregates per-resource stores. Phase 2 grows this interface as more
-// CRDs land (StoragePool, ResourceDefinition, ...).
+// CRDs land (ResourceDefinition, ResourceGroup, Snapshot, ...).
 type Store interface {
 	Nodes() NodeStore
+	StoragePools() StoragePoolStore
 }
