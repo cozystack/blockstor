@@ -11,6 +11,7 @@ rules:
   - resourcedefinitions
   - resourcegroups
   - resources
+  - snapshots
   - storagepools
   verbs:
   - create
@@ -27,6 +28,7 @@ rules:
   - resourcedefinitions/finalizers
   - resourcegroups/finalizers
   - resources/finalizers
+  - snapshots/finalizers
   - storagepools/finalizers
   verbs:
   - update
@@ -37,6 +39,7 @@ rules:
   - resourcedefinitions/status
   - resourcegroups/status
   - resources/status
+  - snapshots/status
   - storagepools/status
   verbs:
   - get

@@ -77,8 +77,10 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 | `/v1/resource-definitions/{rd}/snapshot-restore-resource/{snap}` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/snapshot-restore-volume-definition/{snap}` | POST | ⬜ |
 | `/v1/resource-definitions/{rd}/snapshot-rollback/{snap}` | POST | ⬜ |
-| `/v1/resource-definitions/{rd}/snapshots` | GET / POST | ⬜ |
-| `/v1/resource-definitions/{rd}/snapshots/{snap}` | GET / DELETE | ⬜ |
+| `/v1/resource-definitions/{rd}/snapshots` | GET | ✅ |
+| `/v1/resource-definitions/{rd}/snapshots` | POST | ✅ |
+| `/v1/resource-definitions/{rd}/snapshots/{snap}` | GET | ✅ |
+| `/v1/resource-definitions/{rd}/snapshots/{snap}` | DELETE | ✅ |
 
 ## Resources
 
@@ -128,7 +130,7 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 | Endpoint | Method | Status |
 |---|---|---|
 | `/v1/view/resources` | GET | ✅ |
-| `/v1/view/snapshots` | GET | ⬜ |
+| `/v1/view/snapshots` | GET | ✅ |
 | `/v1/view/storage-pools` | GET | ✅ |
 | `/v1/query-max-volume-size` | POST | ⬜ |
 

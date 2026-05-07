@@ -113,8 +113,18 @@ type KeyValueStore interface {
 	DeleteInstance(ctx context.Context, instance string) error
 }
 
-// Store aggregates per-resource stores. Phase 2 grows this interface as more
-// CRDs land (Snapshot, ...).
+// SnapshotStore persists Snapshot objects. The composite key is
+// (resource definition, snapshot name).
+type SnapshotStore interface {
+	List(ctx context.Context) ([]apiv1.Snapshot, error)
+	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)
+	Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error)
+	Create(ctx context.Context, snap *apiv1.Snapshot) error
+	Update(ctx context.Context, snap *apiv1.Snapshot) error
+	Delete(ctx context.Context, rdName, snapName string) error
+}
+
+// Store aggregates per-resource stores.
 type Store interface {
 	Nodes() NodeStore
 	StoragePools() StoragePoolStore
@@ -123,4 +133,5 @@ type Store interface {
 	Resources() ResourceStore
 	VolumeDefinitions() VolumeDefinitionStore
 	KeyValueStore() KeyValueStore
+	Snapshots() SnapshotStore
 }

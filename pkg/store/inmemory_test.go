@@ -84,6 +84,14 @@ func TestInMemoryKeyValueStore(t *testing.T) {
 	})
 }
 
+func TestInMemorySnapshotStore(t *testing.T) {
+	storetest.RunSnapshotStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+
+		return store.NewInMemory()
+	})
+}
+
 // TestInMemoryNodeStoreConcurrentAccess: in-memory specific (CRD store has
 // optimistic-concurrency semantics; this guarantee belongs only to the
 // RAM map).

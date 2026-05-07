@@ -46,6 +46,7 @@ type Store struct {
 	resources           *resources
 	volumeDefinitions   *volumeDefinitions
 	kv                  *kvStore
+	snapshots           *snapshots
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
@@ -58,6 +59,7 @@ func New(c ctrlclient.Client) *Store {
 	s.resources = &resources{c: c}
 	s.volumeDefinitions = &volumeDefinitions{c: c}
 	s.kv = &kvStore{c: c}
+	s.snapshots = &snapshots{c: c}
 
 	return s
 }
@@ -82,3 +84,6 @@ func (s *Store) VolumeDefinitions() store.VolumeDefinitionStore { return s.volum
 
 // KeyValueStore returns the KeyValueStore view.
 func (s *Store) KeyValueStore() store.KeyValueStore { return s.kv }
+
+// Snapshots returns the SnapshotStore view.
+func (s *Store) Snapshots() store.SnapshotStore { return s.snapshots }

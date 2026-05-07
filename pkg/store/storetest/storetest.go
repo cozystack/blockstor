@@ -226,6 +226,91 @@ func seedRD(t *testing.T, s store.Store, name string) {
 	}
 }
 
+// RunSnapshotStore exercises every branch of store.SnapshotStore.
+func RunSnapshotStore(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListEmpty", func(t *testing.T) {
+		got, err := newStore(t).Snapshots().List(t.Context())
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("got %v, want empty", got)
+		}
+	})
+	t.Run("CreateThenGet", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+		snap := apiv1.Snapshot{
+			Name:         "snap-1",
+			ResourceName: "pvc-1",
+			Nodes:        []string{"n1", "n2"},
+		}
+		if err := s.Create(ctx, &snap); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1", "snap-1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Name != "snap-1" || got.ResourceName != "pvc-1" {
+			t.Errorf("got %+v", got)
+		}
+	})
+	t.Run("CreateDuplicate", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+		snap := apiv1.Snapshot{Name: "snap-1", ResourceName: "pvc-1"}
+		if err := s.Create(ctx, &snap); err != nil {
+			t.Fatalf("first: %v", err)
+		}
+		err := s.Create(ctx, &snap)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+		}
+	})
+	t.Run("GetMissing", func(t *testing.T) {
+		_, err := newStore(t).Snapshots().Get(t.Context(), "pvc-1", "ghost")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("ListByDefinition", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+		for _, snap := range []apiv1.Snapshot{
+			{Name: "s1", ResourceName: "pvc-1"},
+			{Name: "s2", ResourceName: "pvc-1"},
+			{Name: "s1", ResourceName: "pvc-2"},
+		} {
+			if err := s.Create(ctx, &snap); err != nil {
+				t.Fatalf("Create %+v: %v", snap, err)
+			}
+		}
+		got, err := s.ListByDefinition(ctx, "pvc-1")
+		if err != nil {
+			t.Fatalf("ListByDefinition: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("len: got %d, want 2", len(got))
+		}
+	})
+	t.Run("DeleteRemoves", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := s.Delete(ctx, "pvc-1", "s1"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		_, err := s.Get(ctx, "pvc-1", "s1")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // RunResourceStore exercises every branch of store.ResourceStore.
 func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Helper()
