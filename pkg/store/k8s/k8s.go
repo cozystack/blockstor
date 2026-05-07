@@ -43,6 +43,7 @@ type Store struct {
 	storagePools        *storagePools
 	resourceGroups      *resourceGroups
 	resourceDefinitions *resourceDefinitions
+	resources           *resources
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
@@ -52,6 +53,7 @@ func New(c ctrlclient.Client) *Store {
 	s.storagePools = &storagePools{c: c}
 	s.resourceGroups = &resourceGroups{c: c}
 	s.resourceDefinitions = &resourceDefinitions{c: c}
+	s.resources = &resources{c: c}
 
 	return s
 }
@@ -67,3 +69,6 @@ func (s *Store) ResourceGroups() store.ResourceGroupStore { return s.resourceGro
 
 // ResourceDefinitions returns the ResourceDefinitionStore view.
 func (s *Store) ResourceDefinitions() store.ResourceDefinitionStore { return s.resourceDefinitions }
+
+// Resources returns the ResourceStore view of this store.
+func (s *Store) Resources() store.ResourceStore { return s.resources }

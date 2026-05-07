@@ -33,6 +33,7 @@ type InMemory struct {
 	storagePools        *inMemoryStoragePools
 	resourceGroups      *inMemoryResourceGroups
 	resourceDefinitions *inMemoryResourceDefinitions
+	resources           *inMemoryResources
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
@@ -42,6 +43,7 @@ func NewInMemory() *InMemory {
 		storagePools:        &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
 		resourceGroups:      &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
 		resourceDefinitions: &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
+		resources:           &inMemoryResources{m: map[rKey]apiv1.Resource{}},
 	}
 }
 
@@ -56,6 +58,9 @@ func (s *InMemory) ResourceGroups() ResourceGroupStore { return s.resourceGroups
 
 // ResourceDefinitions returns the ResourceDefinitionStore view.
 func (s *InMemory) ResourceDefinitions() ResourceDefinitionStore { return s.resourceDefinitions }
+
+// Resources returns the ResourceStore view.
+func (s *InMemory) Resources() ResourceStore { return s.resources }
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

@@ -79,11 +79,23 @@ type ResourceDefinitionStore interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// ResourceStore persists Resource (replica placement) objects. The
+// composite key is (resource_definition_name, node_name).
+type ResourceStore interface {
+	List(ctx context.Context) ([]apiv1.Resource, error)
+	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error)
+	Get(ctx context.Context, rdName, node string) (apiv1.Resource, error)
+	Create(ctx context.Context, r *apiv1.Resource) error
+	Update(ctx context.Context, r *apiv1.Resource) error
+	Delete(ctx context.Context, rdName, node string) error
+}
+
 // Store aggregates per-resource stores. Phase 2 grows this interface as more
-// CRDs land (Snapshot, Resource, ...).
+// CRDs land (Snapshot, ...).
 type Store interface {
 	Nodes() NodeStore
 	StoragePools() StoragePoolStore
 	ResourceGroups() ResourceGroupStore
 	ResourceDefinitions() ResourceDefinitionStore
+	Resources() ResourceStore
 }

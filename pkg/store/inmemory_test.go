@@ -60,6 +60,14 @@ func TestInMemoryResourceDefinitionStore(t *testing.T) {
 	})
 }
 
+func TestInMemoryResourceStore(t *testing.T) {
+	storetest.RunResourceStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+
+		return store.NewInMemory()
+	})
+}
+
 // TestInMemoryNodeStoreConcurrentAccess: in-memory specific (CRD store has
 // optimistic-concurrency semantics; this guarantee belongs only to the
 // RAM map).

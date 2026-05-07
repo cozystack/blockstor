@@ -127,6 +127,20 @@ func TestK8sResourceDefinitionStore(t *testing.T) {
 	})
 }
 
+// TestK8sResourceStore runs the shared ResourceStore suite.
+func TestK8sResourceStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunResourceStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
 // envtestAvailable returns whether KUBEBUILDER_ASSETS or a known asset
 // directory exists; without binaries we cannot start envtest.
 func envtestAvailable() bool {
@@ -221,5 +235,9 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.ResourceDefinition{}); err != nil {
 		t.Logf("wipe ResourceDefinitions: %v", err)
+	}
+
+	if err := c.DeleteAllOf(ctx, &crdv1alpha1.Resource{}); err != nil {
+		t.Logf("wipe Resources: %v", err)
 	}
 }

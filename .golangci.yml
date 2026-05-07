@@ -125,10 +125,15 @@ linters:
       - linters:
           - dupl
         path: pkg/store/k8s/
-      # Same applies to the in-memory store implementations.
+      # Same applies to the in-memory store implementations and the
+      # interface definitions in pkg/store/store.go (per-resource Store
+      # interfaces share the same shape on purpose).
       - linters:
           - dupl
         path: pkg/store/inmemory_
+      - linters:
+          - dupl
+        path: pkg/store/store\.go
       # REST handlers follow the same Get/Create/Update/Delete shape per
       # resource for the same reason.
       - linters:

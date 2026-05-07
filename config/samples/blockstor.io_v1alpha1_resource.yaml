@@ -1,0 +1,9 @@
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: Resource
+metadata:
+  labels:
+    app.kubernetes.io/name: blockstor
+    app.kubernetes.io/managed-by: kustomize
+  name: resource-sample
+spec:
+  # TODO(user): Add fields here

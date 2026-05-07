@@ -47,6 +47,81 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Run("ListSorted", func(t *testing.T) { testNodeListSorted(t, newStore) })
 }
 
+// RunResourceStore exercises every branch of store.ResourceStore.
+func RunResourceStore(t *testing.T, newStore Factory) {
+	t.Helper()
+	t.Run("ListEmpty", func(t *testing.T) {
+		got, err := newStore(t).Resources().List(t.Context())
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Errorf("got %v, want empty", got)
+		}
+	})
+	t.Run("CreateThenGet", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		r := apiv1.Resource{Name: "pvc-1", NodeName: "n1", Flags: []string{"DRBD_DISKLESS"}}
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1", "n1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Name != "pvc-1" || got.NodeName != "n1" {
+			t.Errorf("got %+v", got)
+		}
+	})
+	t.Run("CreateDuplicate", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		r := apiv1.Resource{Name: "pvc-1", NodeName: "n1"}
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("first: %v", err)
+		}
+		err := s.Create(ctx, &r)
+		if !errors.Is(err, store.ErrAlreadyExists) {
+			t.Errorf("dup: got %v, want ErrAlreadyExists", err)
+		}
+	})
+	t.Run("ListByDefinition", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		for _, r := range []apiv1.Resource{
+			{Name: "pvc-1", NodeName: "n1"},
+			{Name: "pvc-1", NodeName: "n2"},
+			{Name: "pvc-2", NodeName: "n1"},
+		} {
+			if err := s.Create(ctx, &r); err != nil {
+				t.Fatalf("Create %+v: %v", r, err)
+			}
+		}
+		got, err := s.ListByDefinition(ctx, "pvc-1")
+		if err != nil {
+			t.Fatalf("ListByDefinition: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("len: got %d, want 2", len(got))
+		}
+	})
+	t.Run("DeleteRemoves", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if err := s.Delete(ctx, "pvc-1", "n1"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		_, err := s.Get(ctx, "pvc-1", "n1")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("got %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // RunResourceDefinitionStore exercises every branch of
 // store.ResourceDefinitionStore.
 func RunResourceDefinitionStore(t *testing.T, newStore Factory) {

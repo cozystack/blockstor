@@ -124,7 +124,7 @@ schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST return
 
 | Endpoint | Method | Status |
 |---|---|---|
-| `/v1/view/resources` | GET | ⬜ |
+| `/v1/view/resources` | GET | ✅ |
 | `/v1/view/snapshots` | GET | ⬜ |
 | `/v1/view/storage-pools` | GET | ✅ |
 | `/v1/query-max-volume-size` | POST | ⬜ |

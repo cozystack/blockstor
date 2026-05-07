@@ -10,6 +10,7 @@ rules:
   - nodes
   - resourcedefinitions
   - resourcegroups
+  - resources
   - storagepools
   verbs:
   - create
@@ -25,6 +26,7 @@ rules:
   - nodes/finalizers
   - resourcedefinitions/finalizers
   - resourcegroups/finalizers
+  - resources/finalizers
   - storagepools/finalizers
   verbs:
   - update
@@ -34,6 +36,7 @@ rules:
   - nodes/status
   - resourcedefinitions/status
   - resourcegroups/status
+  - resources/status
   - storagepools/status
   verbs:
   - get
