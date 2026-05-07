@@ -39,6 +39,7 @@ import (
 	"github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
+	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -63,9 +64,12 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var restAddr string
+	var storeKind string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
 		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370).")
+	flag.StringVar(&storeKind, "store", "k8s",
+		"Persistence backend for the REST API: 'k8s' (CRD-backed, default) or 'memory' (in-process, lost on restart, useful for tests).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -189,6 +193,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "node")
 		os.Exit(1)
 	}
+	if err := (&controller.StoragePoolReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "storagepool")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -200,9 +211,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Phase 1 store: in-memory. Phase 2 swaps in a CRD-backed implementation
-	// behind the same interface.
-	st := store.NewInMemory()
+	// REST persistence: Kubernetes CRDs (default) or in-process map (tests).
+	// Both implementations satisfy pkg/store.Store; the same test suite (in
+	// pkg/store/storetest) exercises both, so behaviour cannot diverge.
+	var st store.Store
+
+	switch storeKind {
+	case "k8s":
+		st = storek8s.New(mgr.GetClient())
+	case "memory":
+		st = store.NewInMemory()
+
+		setupLog.Info("Using in-memory store; data will be lost on restart")
+	default:
+		setupLog.Error(nil, "Unknown --store value", "store", storeKind)
+		os.Exit(1)
+	}
 
 	if err := mgr.Add(&rest.Server{Addr: restAddr, Store: st}); err != nil {
 		setupLog.Error(err, "Failed to register REST API server")

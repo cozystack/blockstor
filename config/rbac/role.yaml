@@ -8,6 +8,7 @@ rules:
   - blockstor.io.blockstor.io
   resources:
   - nodes
+  - storagepools
   verbs:
   - create
   - delete
@@ -20,12 +21,14 @@ rules:
   - blockstor.io.blockstor.io
   resources:
   - nodes/finalizers
+  - storagepools/finalizers
   verbs:
   - update
 - apiGroups:
   - blockstor.io.blockstor.io
   resources:
   - nodes/status
+  - storagepools/status
   verbs:
   - get
   - patch

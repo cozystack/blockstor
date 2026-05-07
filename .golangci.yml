@@ -72,7 +72,9 @@ linters:
         - c
         - m
         - n
+        - in
         - sp
+        - st
         - rd
         - vd
         - rg
@@ -116,6 +118,23 @@ linters:
           - goconst
           - noinlineerr
         path: _test\.go
+      # storetest is a shared test suite imported by both InMemory and k8s
+      # store tests. It contains test code, just not in _test.go files, so
+      # the same exclusions apply.
+      - linters:
+          - funlen
+          - dupl
+          - gocognit
+          - gocyclo
+          - cyclop
+          - gocritic
+          - nlreturn
+          - wsl_v5
+          - varnamelen
+          - goconst
+          - noinlineerr
+          - thelper
+        path: pkg/store/storetest/
       - linters:
           - forbidigo
           - gocyclo

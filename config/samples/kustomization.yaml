@@ -1,4 +1,5 @@
 ## Append samples of your project ##
 resources:
 - blockstor.io_v1alpha1_node.yaml
+- blockstor.io_v1alpha1_storagepool.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples
