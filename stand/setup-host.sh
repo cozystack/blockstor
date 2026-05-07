@@ -35,9 +35,20 @@ apt-get install -y --no-install-recommends \
     iproute2 dmidecode socat conntrack ipset \
     iptables-persistent
 
-echo "==> firewall: allow forwarding (Ubuntu OCI image ships a catch-all REJECT)"
+echo "==> firewall: allow traffic for talos qemu provisioner"
+# Ubuntu OCI image ships a catch-all REJECT in FORWARD and INPUT chains;
+# remove FORWARD's, and explicitly allow input/forward from talos+ bridges
+# (each cluster gets a different bridge name like talos<hash>).
 iptables -P FORWARD ACCEPT
 iptables -D FORWARD -j REJECT --reject-with icmp-host-prohibited 2>/dev/null || true
+# Idempotency: -C checks before -I inserts.
+for spec in \
+    "INPUT -i talos+ -j ACCEPT" \
+    "INPUT -i virbr+ -j ACCEPT" \
+    "FORWARD -i talos+ -j ACCEPT" \
+    "FORWARD -o talos+ -j ACCEPT"; do
+    iptables -C $spec 2>/dev/null || iptables -I $spec
+done
 netfilter-persistent save >/dev/null
 
 echo "==> enabling libvirtd"

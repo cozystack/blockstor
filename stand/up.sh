@@ -70,6 +70,28 @@ NET_CIDR="10.${SLOT}.0.0/24"
 STATE_DIR="$WORK_DIR/talos-state"
 mkdir -p "$STATE_DIR"
 
+# Preflight: kill any residual qemu/talosctl processes from a previous run of
+# this same cluster name. Without this, two dhcpd-launch instances race on the
+# bridge and VMs never get their config.
+echo ">> preflight cleanup for '$NAME'"
+sudo bash "$(dirname "$0")/down.sh" "$NAME" "$WORK_DIR" >/dev/null 2>&1 || true
+mkdir -p "$STATE_DIR"
+
+# Load DRBD modules inside every Talos node. The siderolabs/drbd extension
+# packages the modules but does not auto-load them.
+CONFIG_PATCH=$(cat <<'YAML'
+machine:
+  kernel:
+    modules:
+      - name: drbd
+        parameters:
+          - usermode_helper=disabled
+      - name: drbd_transport_tcp
+YAML
+)
+PATCH_FILE="$WORK_DIR/config-patch.yaml"
+echo "$CONFIG_PATCH" > "$PATCH_FILE"
+
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
 # talos qemu provisioner needs root for CNI bridge / netfilter; run via sudo -E
 # and fix ownership afterwards so the user can read configs.
@@ -84,6 +106,7 @@ sudo -E talosctl cluster create \
     --initrd-path "$INITRD" \
     --talosconfig "$TALOSCONFIG" \
     --kubernetes-version "${KUBERNETES_VERSION:-v1.34.1}" \
+    --config-patch "@$PATCH_FILE" \
     --memory 4096 \
     --memory-workers 4096 \
     --cpus 2 \
