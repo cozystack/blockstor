@@ -33,21 +33,37 @@ high-bandwidth check-ins with the user.
 4. Codebase smaller and easier to maintain than upstream Java.
 5. Cozystack can switch to this implementation when it is ready.
 
-## In scope (full project, not just MVP)
+## In scope (full project)
 
 - `linstor-controller` (Java) → `blockstor-controller` (Go)
 - `linstor-satellite` (Java) → `blockstor-satellite` (Go)
-- All storage providers used by upstream: LVM, LVM-thin, ZFS, ZFS-thin,
-  SPDK, NVMe-oF (target/initiator), EBS, OpenFlex, file, exos, remote,
-  diskless
-- All API surface used by any current LINBIT/Piraeus client
-- Backup shipping (S3, L2L), snapshot shipping, schedules
-- Encryption-at-rest (LUKS), DRBD encryption passphrases
-- DRBD proxy, DRBD options
+- Storage providers: **LVM**, **LVM-thin**, **ZFS**, **ZFS-thin**, **file**
+- Replication layer: **DRBD** — and the ability to run **without DRBD**, as
+  pure local storage (single-replica diskful or diskless)
+- Encryption layer: **LUKS** (volume-level) and DRBD encryption passphrases
+- DRBD options (full set from `drbdoptions.json`)
+- DRBD proxy
+- API surface used by linstor-csi, piraeus-operator, ha-controller,
+  affinity-controller, scheduler-extender, gateway, kubectl-linstor,
+  golinstor consumers
 - Autoplacer with constraints (zones, node properties, replicas-on-different)
-- Cluster bootstrap (passphrase, DB-backup/restore, satellite registration)
-- The `linstor-common` artifacts (`properties.json`, `consts.json`,
-  `drbdoptions.json`, generated code) consumed without the Java codegen step
+- In-cluster snapshots (LVM/ZFS), snapshot-restore as new ResourceDefinition
+- Cluster bootstrap (passphrase, satellite registration, eviction/restoration)
+- `linstor-common` artifacts (`properties.json`, `consts.json`,
+  `drbdoptions.json`) consumed without the Java codegen step
+- Stats endpoints, error reports, SOS-report, all `/v1/view/*` aggregates
+
+## Out of scope (will not be built)
+
+- Snapshot shipping between clusters
+- Backup create/restore/ship/abort, backup queue
+- Schedules (cron-driven backups)
+- Remote backends: S3, EBS, Linstor remotes
+- Storage providers: SPDK, NVMe-oF target/initiator, OpenFlex, Exos
+- Anything in golinstor's `BackupProvider`, `RemoteProvider` (delete from API)
+
+These endpoints will return `501 Not Implemented` with a clear message that
+blockstor does not implement them.
 
 ## MVP slice (Phase 1–5 below)
 
@@ -56,10 +72,11 @@ linstor-csi and piraeus-operator drive cozystack-style workloads:
 
 - LVM and ZFS providers (thick + thin)
 - The ~50 REST methods linstor-csi actually calls
-- Replication, snapshots, snapshot-restore (in-cluster only — no shipping)
+- Replication via DRBD; also single-replica local mode without DRBD
+- In-cluster snapshots and snapshot-restore
 - Autoplacer with replica count + storage pool filter
 
-Everything else is **scheduled for Phase 6+, not dropped**.
+Everything else from "In scope" lands in Phases 6+.
 
 ## Architecture
 
@@ -163,48 +180,32 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 **Exit**: 24h+ stable; contract diffs zero on MVP scope.
 
-### Phase 6 — Snapshot/backup shipping
+### Phase 6 — Encryption + DRBD options + file provider
 
-- [ ] Snapshot shipping between nodes/clusters
-- [ ] S3 remote, EBS remote, Linstor remote
-- [ ] Backup create/restore/info/abort/ship
-- [ ] Schedules (cron-driven backups)
-
-**Exit**: feature parity with `BackupProvider` and `RemoteProvider` in golinstor.
-
-### Phase 7 — Encryption + DRBD proxy + extras
-
-- [ ] LUKS encryption layer
+- [ ] LUKS encryption layer (volume-level)
 - [ ] DRBD encryption passphrase
 - [ ] DRBD proxy enable/disable/configure
 - [ ] DRBD options: full set from `drbdoptions.json`
-- [ ] External files
-
-### Phase 8 — Additional storage providers
-
-- [ ] SPDK
-- [ ] NVMe-oF target / initiator
-- [ ] OpenFlex
-- [ ] File / loop
-- [ ] Exos
-- [ ] Diskless / remote layer combinations
-
-### Phase 9 — Cluster operations + admin
-
-- [ ] DB backup/restore (CRDs are the DB; export/import)
-- [ ] Cluster passphrase management
-- [ ] Satellite eviction/restoration
-- [ ] Stats endpoints, error reports, SOS-report
+- [ ] file storage provider (loop file / sparse file backed)
 - [ ] External-file management
-- [ ] All views (`/v1/view/*`)
 
-### Phase 10 — Java decommission
+### Phase 7 — Cluster operations + admin
 
-- [ ] All clients (golinstor, linstor-csi, piraeus-operator) use only blockstor on a real cluster
+- [ ] Cluster passphrase management
+- [ ] Satellite eviction / restoration / lost-and-recover
+- [ ] Stats endpoints (`/v1/stats/*`)
+- [ ] Error reports, SOS-report
+- [ ] All `/v1/view/*` aggregates
+- [ ] Property-info endpoints (`*/properties/info`)
+- [ ] Resource adjust / adjust-all
+
+### Phase 8 — Java decommission
+
+- [ ] Cozystack staging cluster runs only blockstor for >1 week
 - [ ] Cozystack production cluster fully migrated, Java pods removed
-- [ ] Upstream `linstor-server` Java repo no longer referenced anywhere in cozystack
+- [ ] `grep -r piraeus-server cozystack | grep image:` returns nothing
 
-**Exit**: `grep -r piraeus-server cozystack | grep image:` returns nothing.
+**Exit**: zero JVM in the cozystack data-path.
 
 ---
 
@@ -287,7 +288,7 @@ controller, replayed forever in CI.
 
 ## Open questions for the user
 
-1. Github repo: do I create `aenix-io/blockstor` (or which org/name) when we're ready to push, or do you create it and grant me access?
+1. ~~Github repo~~ — `cozystack/blockstor` public, **resolved**.
 2. Pin Java oracle to `piraeus-server:v1.33.2` (current cozystack version) — OK?
 3. Auto-stop schedule for the dev host — nights and weekends UTC, or your timezone? Or no auto-stop?
 4. Where should I post short daily progress — this chat, a Telegram channel, a Slack channel?
