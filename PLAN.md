@@ -235,7 +235,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Phase 4 — Autoplacer + snapshots + intra-cluster shipping
 
-- [ ] Autoplacer: storage-pool-aware replica placement
+- [x] Autoplacer: storage-pool-aware replica placement; weighted by FreeCapacity (greatest-free-first, deterministic ties on NodeName)
 - [x] Snapshot satellite-side reconcile: `Reconciler.CreateSnapshot/DeleteSnapshot` route via in-memory resource→pool map populated by Apply (3 contract tests). Snapshot CRD reconciler controller-side TBD.
 - [ ] Snapshot restore creates a new ResourceDefinition
 - [ ] Intra-cluster snapshot shipping for clone/replica-expansion:

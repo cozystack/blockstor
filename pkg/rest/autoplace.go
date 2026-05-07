@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"sort"
 
 	"github.com/cockroachdb/errors"
 
@@ -164,6 +165,17 @@ func (s *Server) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 
 		out = append(out, pool)
 	}
+
+	// Greatest-free-first; ties break on NodeName for determinism.
+	// Without this the placer skews toward the first-listed pool and
+	// starves a single node faster than the others.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].FreeCapacity != out[j].FreeCapacity {
+			return out[i].FreeCapacity > out[j].FreeCapacity
+		}
+
+		return out[i].NodeName < out[j].NodeName
+	})
 
 	return out, nil
 }

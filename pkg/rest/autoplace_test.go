@@ -167,6 +167,54 @@ func TestAutoplaceInheritsRGFilter(t *testing.T) {
 	}
 }
 
+// TestAutoplacePrefersFreestPool: with three same-kind pools but different
+// free_capacity, the placer picks the highest-free pool first. Production
+// workloads quickly skew capacity across nodes; without weighting, naive
+// first-N placement starves a single pool faster than the others.
+func TestAutoplacePrefersFreestPool(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 5000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 3000},
+	}
+
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d", resp.StatusCode)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 1 {
+		t.Fatalf("placed: got %d, want 1", len(got))
+	}
+
+	if got[0].NodeName != "n2" {
+		t.Errorf("expected placement on n2 (most free); got %s", got[0].NodeName)
+	}
+}
+
 // TestResourceCreateAndDelete: explicit single-replica placement via REST.
 func TestResourceCreateAndDelete(t *testing.T) {
 	st := store.NewInMemory()
