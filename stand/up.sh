@@ -67,10 +67,16 @@ HASH=$(echo -n "$NAME" | sha256sum | cut -c1-2)
 SLOT=$((16#$HASH % 200 + 5))
 NET_CIDR="10.${SLOT}.0.0/24"
 
+STATE_DIR="$WORK_DIR/talos-state"
+mkdir -p "$STATE_DIR"
+
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
-talosctl cluster create \
+# talos qemu provisioner needs root for CNI bridge / netfilter; run via sudo -E
+# and fix ownership afterwards so the user can read configs.
+sudo -E talosctl cluster create \
     --name "$NAME" \
     --provisioner qemu \
+    --state "$STATE_DIR" \
     --controlplanes "$CONTROLPLANES" \
     --workers "$WORKERS" \
     --cidr "$NET_CIDR" \
@@ -84,6 +90,8 @@ talosctl cluster create \
     --cpus-workers 2 \
     --disk 20480 \
     --wait
+
+sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR"
 
 talosctl --talosconfig "$TALOSCONFIG" kubeconfig --force "$KUBECONFIG"
 
