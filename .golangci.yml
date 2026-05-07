@@ -142,6 +142,14 @@ linters:
       - linters:
           - dupl
         path: pkg/rest/
+      # gRPC handlers idiomatically return google.golang.org/grpc/status
+      # errors verbatim — wrapping them via cockroachdb/errors would defeat
+      # gRPC's status code propagation. The same applies to dupl since
+      # every handler follows the validate→store→respond shape.
+      - linters:
+          - wrapcheck
+          - dupl
+        path: pkg/satellitecontroller/
       # storetest is a shared test suite imported by both InMemory and k8s
       # store tests. It contains test code, just not in _test.go files, so
       # the same exclusions apply.
