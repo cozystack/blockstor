@@ -15,18 +15,15 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Phase**: 0 (dev stand) — almost done
-- **Last action**: 3-node Talos+QEMU cluster with DRBD extension is up; kernel module `drbd 9.2.14` loaded on workers; `piraeus-operator v2.10.0` installed; CSI containers initialising. linstor-controller (Java) running.
+- **Phase**: 0 done; starting Phase 1
+- **Last action**: dev stand fully working — 3-node Talos+QEMU cluster with `siderolabs/drbd` extension, `drbd 9.2.14` loaded, piraeus-operator v2.10.0 installed, file-thin storage pool `pool` provisioned on every satellite, `make smoke` green (PVC create → pod mount → write → read), parallel `NAME=alice` cluster verified.
 - **Blocker**: none
 - **Next concrete steps**:
-    1. Add a `LinstorSatelliteConfiguration` to `install-piraeus.sh` that
-       provisions a file-thin storage pool named `pool` on every worker —
-       otherwise `tests/smoke.sh` has nowhere to put a PVC.
-    2. Run `make smoke` end-to-end against upstream piraeus.
-    3. Verify `make up NAME=alice` and `make up NAME=bob` run in parallel
-       without IP / bridge collision.
-    4. Add `make oracle` install for Java LINSTOR controller (separate from
-       piraeus-installed one) for upcoming contract diffs in Phase 3.
+    1. Decide layout for the Go monorepo inside this same repo: `cmd/controller`, `cmd/satellite`, `pkg/...`. Add Go module + golangci-lint + Makefile targets for build/test/lint.
+    2. Pull in `linstor-common` as git submodule (apiconsts, properties.json, drbdoptions.json — single source of truth shared with upstream).
+    3. Generate Go types from `rest_v1_openapi.yaml` via `oapi-codegen`.
+    4. Stub `cmd/controller`: HTTP server, `/v1/controller/version` returning a credible response.
+    5. Add `tests/contract/version_test.go`: golinstor.Client.Controller.GetVersion against our server returns no error.
 
 ---
 
@@ -133,20 +130,20 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ## Phases and exit criteria
 
-### Phase 0 — Dev stand (in progress)
+### Phase 0 — Dev stand (done)
 
 - [x] BM.HPC2.36 provisioned on OCI (terraform applied)
 - [x] Host packages installed via `stand/setup-host.sh` (qemu-kvm, libvirt, ovmf, drbd-utils, zfsutils-linux, talosctl, kubectl, helm)
 - [x] NVMe (6.4TB) formatted as xfs, mounted at `/var/lib/blockstor`, `.work` symlinked
 - [x] iptables fixed (Ubuntu OCI image ships catch-all REJECT in INPUT and FORWARD; allow `talos+`/`virbr+` bridges)
-- [x] `make up NAME=test` brings up a 3-node Talos+QEMU cluster with the `siderolabs/drbd` extension; `drbd 9.2.14` module loads
-- [x] `make piraeus` installs piraeus-operator and a `LinstorCluster`; satellite/CSI pods come up
-- [ ] `make smoke` provisions a PVC, mounts it, writes data — green against upstream piraeus
-- [ ] Storage pool wired via `LinstorSatelliteConfiguration` (file-thin)
-- [ ] `make oracle` deploys Java LINSTOR controller (`piraeus-server:v1.33.2`) for contract-diff use
-- [ ] `make up NAME=alice` and `make up NAME=bob` run in parallel without collision
+- [x] `make up NAME=test` brings up a 3-node Talos+QEMU cluster with the `siderolabs/drbd` extension; `drbd 9.2.14` module loads on workers; install image is also factory-built so the on-disk Talos has the extension
+- [x] `make piraeus` installs piraeus-operator + LinstorCluster + Talos-specific override; satellites Connected/Configured
+- [x] Storage pool wired via `LinstorSatelliteConfiguration` (file-thin, ~16 GiB free per worker)
+- [x] `make smoke` green: PVC create → pod mount → write → read
+- [x] `make up NAME=alice` ran in parallel to `NAME=test` without bridge / IP collision
+- [ ] `make oracle` deferred — piraeus-installed linstor-controller already serves as Java oracle on the in-cluster `linstor-controller.piraeus-datastore:3370`
 
-**Exit**: full happy-path PVC test passes against upstream Java stack, on parallelizable stand.
+**Exit met**: full happy-path PVC test passes against upstream Java stack, on parallelizable stand.
 
 ### Phase 1 — Skeleton + contracts
 
