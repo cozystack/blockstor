@@ -158,8 +158,23 @@ func writeStoreError(w http.ResponseWriter, err error) {
 	}
 }
 
-// writeError sends a minimal JSON error body. Once we wire ApiCallRc in
-// Phase 2 this becomes the real LINSTOR error envelope.
+// writeError sends the LINSTOR-shaped `[]ApiCallRc` error envelope.
+// golinstor (and therefore linstor-csi) unmarshals failure responses
+// into a slice — sending a `{"error": "..."}` object made every
+// failed CSI call surface as `json: cannot unmarshal object into Go
+// value of type client.ApiCallError` instead of the actual error
+// message.
+//
+// retCode follows the upstream convention: high bit set means
+// FATAL/error; we use 0xC000_0000 which is the masked-but-untyped
+// "generic error" the controller uses when no specific code applies.
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: msg,
+	}})
 }
+
+// apiCallRcError is upstream LINSTOR's ERROR mask (high bit set on a
+// 64-bit mask). golinstor checks for this bit to decide pass/fail.
+const apiCallRcError uint64 = 0xC000_0000_0000_0000
