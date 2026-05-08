@@ -18,38 +18,91 @@ package controller
 
 import (
 	"context"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/dispatcher"
 )
 
-// SnapshotReconciler reconciles a Snapshot object
+// SnapshotReconciler dispatches Snapshot CRDs to every diskful
+// replica's satellite.
 type SnapshotReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	Dispatcher *dispatcher.Dispatcher
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=snapshots,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=snapshots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=snapshots/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Snapshot object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+// Reconcile fans the Snapshot out to every diskful replica's
+// satellite via Dispatcher.CreateSnapshot. Failures requeue with a
+// 10 s back-off so satellites that haven't registered yet eventually
+// catch up.
 func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	if r.Dispatcher == nil {
+		return ctrl.Result{}, nil
+	}
+
+	var snap blockstoriov1alpha1.Snapshot
+
+	err := r.Get(ctx, req.NamespacedName, &snap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err = r.List(ctx, &resList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	replicas := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == snap.Spec.ResourceDefinitionName {
+			replicas = append(replicas, resList.Items[i])
+		}
+	}
+
+	var nodeList blockstoriov1alpha1.NodeList
+
+	err = r.List(ctx, &nodeList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	results, err := r.Dispatcher.CreateSnapshot(ctx,
+		snap.Spec.ResourceDefinitionName, snap.Spec.SnapshotName,
+		replicas, nodeList.Items)
+	if err != nil {
+		log.Error(err, "CreateSnapshot dispatch failed", "snapshot", snap.Name)
+
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	for _, res := range results {
+		if !res.GetOk() {
+			log.Info("satellite rejected snapshot", "msg", res.GetMessage(), "snapshot", snap.Name)
+		}
+	}
+
+	log.Info("snapshot dispatched", "snapshot", snap.Name, "replicas", len(results))
 
 	return ctrl.Result{}, nil
 }

@@ -230,6 +230,50 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	return out
 }
 
+// CreateSnapshot dials every satellite that hosts a non-DISKLESS
+// replica of `rdName` and asks it to take a snapshot. Returns the
+// list of per-node results so the controller can surface granular
+// status. We don't fan out concurrently — the snapshot path is
+// rare and dial costs are dwarfed by the actual zfs/lvm operation.
+func (d *Dispatcher) CreateSnapshot(ctx context.Context, rdName, snapName string, replicas []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node) ([]*satellitepb.CreateSnapshotResponse, error) {
+	out := make([]*satellitepb.CreateSnapshotResponse, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Spec.Flags, "DISKLESS") {
+			continue
+		}
+
+		endpoint := lookupEndpoint(replicas[i].Spec.NodeName, nodes)
+		if endpoint == "" {
+			out = append(out, &satellitepb.CreateSnapshotResponse{
+				Ok:      false,
+				Message: "no SatelliteEndpoint for node " + replicas[i].Spec.NodeName,
+			})
+
+			continue
+		}
+
+		client, closer, err := d.dialer.Dial(ctx, endpoint)
+		if err != nil {
+			return out, errors.Wrapf(err, "dial %s", endpoint)
+		}
+
+		resp, err := client.CreateSnapshot(ctx, &satellitepb.CreateSnapshotRequest{
+			ResourceName: rdName,
+			SnapshotName: snapName,
+		})
+		_ = closer()
+
+		if err != nil {
+			return out, errors.Wrap(err, "CreateSnapshot RPC")
+		}
+
+		out = append(out, resp)
+	}
+
+	return out, nil
+}
+
 // peerAddress looks up `nodeName`'s SatelliteEndpoint and returns
 // just the host part (no port). Falls back to the 0.0.0.0 placeholder
 // when the node is unknown or hasn't registered yet — the satellite
