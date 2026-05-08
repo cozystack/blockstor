@@ -250,14 +250,20 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Resource reconciler (`pkg/satellite.Reconciler`) routes DesiredResource batches: storage provider CreateVolume per volume, ConfFileBuilder writes /etc/drbd.d/<name>.res, drbdadm create-md (first activation, non-DISKLESS) + adjust. Status writeback from events2 stream is the next slice.
 - [x] Status writeback first half: `pkg/satellite.Observer` translates parsed drbd.Event values into ResourceObservedEvent (4 contract tests). Wire-up to gRPC stream pending the controller-side handler.
 - [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
-      — Prereqs landed (controller running in-cluster, satellites
-      registered, REST CRUD persists CRDs). Remaining wiring: server-
-      side handler for `ApplyResources` (controller→satellite push) or
-      a periodic pull RPC; controller-side reconcile that diffs the
-      desired set and dispatches per node; storage-pool seeding so the
-      satellite has somewhere to put the LV. Once those land, an
-      autoplaced 2-replica RD walks all the way through to UpToDate
-      without touching the Java oracle.
+      — **gRPC plumbing is now complete on the stand**: proto split
+      into `service Controller` (Hello + ReportObserved) and `service
+      Satellite` (ApplyResources + snapshot RPCs); the satellite
+      hosts its own gRPC server on :7000 (reflection enabled),
+      advertises its endpoint via Hello (`spec.props.SatelliteEndpoint`
+      on the Node CRD), and `grpcurl ... ApplyResources` from a
+      cluster pod actually drives Reconciler.Apply → drbd.Build →
+      drbdadm. End-to-end smoke against `test-worker-1` returned a
+      per-resource error ("drbdadm adjust: no resources defined!"
+      because the test req had no hosts), proving every hop works.
+      Remaining for green UpToDate: controller-side reconciler that
+      diffs RD/Resource CRDs and dispatches a populated
+      ApplyResourcesRequest with hosts/peers/minors; storage-pool
+      seeding so a non-DISKLESS resource has somewhere to put its LV.
 
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
