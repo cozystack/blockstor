@@ -53,6 +53,12 @@ type Config struct {
 	// RPCs, ship). Empty disables the server (useful for unit tests).
 	ListenAddr string
 
+	// AdvertisedEndpoint is the host:port the satellite tells the
+	// controller to dial back at. Differs from ListenAddr when the
+	// satellite binds to 0.0.0.0:7000 but is reachable from the
+	// controller as <pod-ip>:7000.
+	AdvertisedEndpoint string
+
 	// StateDir is the on-disk directory the satellite uses for DRBD .res
 	// files and per-resource state. Required.
 	StateDir string
@@ -209,10 +215,11 @@ func (a *Agent) hello(ctx context.Context, client satellitepb.ControllerClient) 
 	defer cancel()
 
 	resp, err := client.Hello(rpcCtx, &satellitepb.HelloRequest{
-		NodeName:         a.cfg.NodeName,
-		BlockstorVersion: version.Version,
-		LayerKinds:       []string{"DRBD", "STORAGE", "LUKS"},
-		ProviderKinds:    []string{"LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"},
+		NodeName:          a.cfg.NodeName,
+		BlockstorVersion:  version.Version,
+		LayerKinds:        []string{"DRBD", "STORAGE", "LUKS"},
+		ProviderKinds:     []string{"LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"},
+		SatelliteEndpoint: a.cfg.AdvertisedEndpoint,
 	})
 	if err != nil {
 		return errors.Wrap(err, "Hello RPC")

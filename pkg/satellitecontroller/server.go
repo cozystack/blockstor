@@ -70,8 +70,9 @@ func (s *Server) Hello(ctx context.Context, req *satellitepb.HelloRequest) (*sat
 	}
 
 	props := map[string]string{
-		"BlockstorVersion": req.GetBlockstorVersion(),
-		"DrbdVersion":      req.GetDrbdVersion(),
+		"BlockstorVersion":  req.GetBlockstorVersion(),
+		"DrbdVersion":       req.GetDrbdVersion(),
+		"SatelliteEndpoint": req.GetSatelliteEndpoint(),
 	}
 
 	node := apiv1.Node{

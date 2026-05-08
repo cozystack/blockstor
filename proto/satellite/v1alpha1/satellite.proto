@@ -83,6 +83,10 @@ message HelloRequest {
   repeated string layer_kinds = 3;     // e.g. ["DRBD", "STORAGE", "LUKS"]
   repeated string provider_kinds = 4;  // e.g. ["LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"]
   string drbd_version = 5;             // value reported by `drbdadm --version`
+  // satellite_endpoint is the host:port the controller should dial to
+  // push ApplyResources / snapshot RPCs back at this satellite. Empty
+  // when the satellite isn't hosting its own gRPC server.
+  string satellite_endpoint = 6;
 }
 
 message HelloResponse {

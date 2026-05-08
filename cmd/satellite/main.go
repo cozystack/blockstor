@@ -64,6 +64,14 @@ func run() int {
 		"directory the satellite uses to persist DRBD .res files and per-resource state")
 	flag.StringVar(&listenAddr, "listen", ":7000",
 		"bind address for the satellite-side gRPC server (controller dials this for ApplyResources)")
+
+	advertised := os.Getenv("POD_IP")
+	if advertised != "" {
+		advertised += ":7000"
+	}
+
+	flag.StringVar(&advertised, "advertised-endpoint", advertised,
+		"host:port the controller should dial back at (defaults to $POD_IP:7000)")
 	flag.StringVar(&lvmPoolName, "lvm-pool-name", "",
 		"register an LVM-thin pool under this LINSTOR pool name (empty disables LVM)")
 	flag.StringVar(&lvmVG, "lvm-vg", "",
@@ -99,13 +107,14 @@ func run() int {
 	}
 
 	agent := satellite.NewAgent(satellite.Config{
-		NodeName:       nodeName,
-		ControllerAddr: controllerAddr,
-		ListenAddr:     listenAddr,
-		StateDir:       stateDir,
-		Providers:      providers,
-		DialTimeout:    10 * time.Second,
-		Logger:         logger,
+		NodeName:           nodeName,
+		ControllerAddr:     controllerAddr,
+		ListenAddr:         listenAddr,
+		AdvertisedEndpoint: advertised,
+		StateDir:           stateDir,
+		Providers:          providers,
+		DialTimeout:        10 * time.Second,
+		Logger:             logger,
 	})
 
 	providerNames := make([]string, 0, len(providers))
