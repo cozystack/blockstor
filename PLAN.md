@@ -228,6 +228,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       `kubectl get nodes.blockstor.io.blockstor.io` shows 3/3 of them
       seconds after rollout. This proves controller↔satellite gRPC +
       registration + CRD upsert end-to-end on a real cluster.
+- [x] StoragePool auto-registration via Hello (2026-05-08): satellite enumerates its configured Providers and ships them in HelloRequest.Pools; Server.Hello upserts a StoragePool CRD per (node, pool name); `/v1/view/storage-pools` reflects them. End-to-end on the stand: 3 satellites with `--loopfile-pool-name=stand` produce 3 StoragePool CRDs (`test-worker-{1,2,3}.stand`, FILE_THIN) without anyone running `linstor storage-pool create`.
 - [x] piraeus-operator native flip first cut (2026-05-08): patching
       `LinstorCluster.spec.externalController.url=http://blockstor-controller.blockstor-system.svc:3370`
       tells piraeus-operator to skip its own Java controller and
