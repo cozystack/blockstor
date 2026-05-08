@@ -15,6 +15,12 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
+- **Dev stand**: `ssh ubuntu@129.213.29.101` (OCI BM.HPC2.36). Workflow from
+  the repo root: `make up NAME=foo` → Talos+QEMU+DRBD, `make piraeus` →
+  operator + satellites, `make oracle` → Java LINSTOR controller for
+  contract-diff, `make smoke` → end-to-end PVC test. Bring this up before
+  attempting any operational milestone (real-DRBD smoke, csi-sanity,
+  trace recording, piraeus-operator integration).
 - **Phase**: 3 — satellite + DRBD lifecycle in progress.
 - **CRDs (7, kubebuilder-scaffolded, LINSTOR-shaped fields)**:
   `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`,
@@ -161,7 +167,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Phase 0 — Dev stand (done)
 
-- [x] BM.HPC2.36 provisioned on OCI (terraform applied)
+- [x] BM.HPC2.36 provisioned on OCI (terraform applied) — accessible at `ssh ubuntu@129.213.29.101`
 - [x] Host packages installed via `stand/setup-host.sh` (qemu-kvm, libvirt, ovmf, drbd-utils, zfsutils-linux, talosctl, kubectl, helm)
 - [x] NVMe (6.4TB) formatted as xfs, mounted at `/var/lib/blockstor`, `.work` symlinked
 - [x] iptables fixed (Ubuntu OCI image ships catch-all REJECT in INPUT and FORWARD; allow `talos+`/`virbr+` bridges)
