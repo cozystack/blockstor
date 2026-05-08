@@ -30,7 +30,11 @@ spec:
     spec:
       serviceAccountName: blockstor-satellite
       hostPID: true
-      hostNetwork: false
+      # hostNetwork so the container's hostname matches the Talos node
+      # name (drbdadm uses hostname to pick the right `on <node>` block
+      # from the .res file). Pod IP equals node IP under hostNetwork,
+      # which the satellite Hello flow advertises as its endpoint.
+      hostNetwork: true
       tolerations:
         - operator: Exists
       # Run only on workers (controlplane has no DRBD extension loaded).
