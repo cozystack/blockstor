@@ -65,7 +65,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rd := buildSpawnedRD(req, rgName, &rg)
+	rd := buildSpawnedRD(&req, rgName, &rg)
 
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
@@ -85,7 +85,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, rd)
 }
 
-func buildSpawnedRD(req apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.ResourceGroup) apiv1.ResourceDefinition {
+func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.ResourceGroup) apiv1.ResourceDefinition {
 	rd := apiv1.ResourceDefinition{
 		Name:              req.ResourceDefinitionName,
 		ExternalName:      req.ResourceDefinitionExternal,

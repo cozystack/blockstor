@@ -61,10 +61,7 @@ func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 	var rg apiv1.ResourceGroup
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(&rg)
+	err := json.NewDecoder(r.Body).Decode(&rg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -92,10 +89,7 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var rg apiv1.ResourceGroup
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(&rg)
+	err := json.NewDecoder(r.Body).Decode(&rg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 

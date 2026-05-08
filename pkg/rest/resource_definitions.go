@@ -96,10 +96,7 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var rd apiv1.ResourceDefinition
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(&rd)
+	err := json.NewDecoder(r.Body).Decode(&rd)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 

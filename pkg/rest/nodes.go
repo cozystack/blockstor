@@ -78,10 +78,7 @@ func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	var n apiv1.Node
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(&n)
+	err := json.NewDecoder(r.Body).Decode(&n)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -109,10 +106,7 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var n apiv1.Node
 
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-
-	err := dec.Decode(&n)
+	err := json.NewDecoder(r.Body).Decode(&n)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
