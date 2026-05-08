@@ -27,6 +27,14 @@ type ResourceGroup struct {
 	VolumeGroups []VolumeGroup     `json:"volume_groups,omitempty"`
 	UUID         string            `json:"uuid,omitempty"`
 	PeerSlots    int32             `json:"peer_slots,omitempty"`
+
+	// OverrideProps / DeleteProps / DeleteNamespace mirror
+	// GenericPropsModify. golinstor sends them on RG create/modify
+	// through a shared body type, so DisallowUnknownFields decoders
+	// must accept them even though we treat the call idempotently.
+	OverrideProps   map[string]string `json:"override_props,omitempty"`
+	DeleteProps     []string          `json:"delete_props,omitempty"`
+	DeleteNamespace []string          `json:"delete_namespaces,omitempty"`
 }
 
 // VolumeGroup mirrors upstream `VolumeGroup`. It is a per-volume template
@@ -59,10 +67,16 @@ type AutoSelectFilter struct {
 
 // ResourceGroupSpawn is the payload for POST /resource-groups/{rg}/spawn —
 // the call linstor-csi uses to actually create a Resource from a group.
+// Upstream LINSTOR reuses GenericPropsModify here too, so we accept the
+// override_props / delete_props fields even though we don't consume them.
 type ResourceGroupSpawn struct {
-	ResourceDefinitionName     string  `json:"resource_definition_name,omitempty"`
-	ResourceDefinitionExternal string  `json:"resource_definition_external_name,omitempty"`
-	VolumeSizes                []int64 `json:"volume_sizes,omitempty"`
-	PartialFlag                bool    `json:"partial,omitempty"`
-	DefinitionsOnly            bool    `json:"definitions_only,omitempty"`
+	ResourceDefinitionName     string            `json:"resource_definition_name,omitempty"`
+	ResourceDefinitionExternal string            `json:"resource_definition_external_name,omitempty"`
+	VolumeSizes                []int64           `json:"volume_sizes,omitempty"`
+	PartialFlag                bool              `json:"partial,omitempty"`
+	DefinitionsOnly            bool              `json:"definitions_only,omitempty"`
+	SelectFilter               AutoSelectFilter  `json:"select_filter,omitzero"`
+	OverrideProps              map[string]string `json:"override_props,omitempty"`
+	DeleteProps                []string          `json:"delete_props,omitempty"`
+	DeleteNamespace            []string          `json:"delete_namespaces,omitempty"`
 }
