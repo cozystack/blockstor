@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
@@ -166,6 +167,7 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 
 	gs := grpc.NewServer()
 	satellitepb.RegisterSatelliteServer(gs, NewGRPCServer(rec))
+	reflection.Register(gs)
 
 	done := make(chan struct{})
 
