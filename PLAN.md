@@ -260,10 +260,21 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       drbdadm. End-to-end smoke against `test-worker-1` returned a
       per-resource error ("drbdadm adjust: no resources defined!"
       because the test req had no hosts), proving every hop works.
-      Remaining for green UpToDate: controller-side reconciler that
-      diffs RD/Resource CRDs and dispatches a populated
-      ApplyResourcesRequest with hosts/peers/minors; storage-pool
-      seeding so a non-DISKLESS resource has somewhere to put its LV.
+      **Controller-side dispatch landed (2026-05-08):** `pkg/dispatcher`
+      builds a populated DesiredResource (port/minor/node-id derived
+      by SHA256 of the RD name; same-RD peers + per-peer drbd_options
+      for the mesh) and dials the target satellite's
+      `SatelliteEndpoint` over gRPC; ResourceReconciler picks up
+      Resource CRD changes and calls Apply. End-to-end on the stand:
+      `kubectl apply -f Resource{smoke-rd, test-worker-1, DISKLESS}`
+      → controller logs "satellite rejected apply" with the expected
+      "drbdadm adjust: no resources defined!" — every hop on the wire
+      including the kernel shell-out fires.
+      Remaining for green UpToDate: dispatcher needs to pass real peer
+      addresses (currently 0.0.0.0 placeholders); satellite must
+      rewrite its own bind address to $POD_IP at .res render time;
+      storage-pool seeding so a non-DISKLESS resource has somewhere
+      to put its LV.
 
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
