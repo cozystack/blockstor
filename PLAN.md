@@ -280,13 +280,23 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
                       test-worker-1 connection:Connecting
       ```
       i.e. the controller-rendered `.res` was accepted by both
-      kernels and DRBD opened a peer connection between them. Stays
-      "Connecting" because both replicas are DISKLESS-only — UpToDate
-      needs at least one diskful replica, which is a storage-pool
-      seed away (Reconciler.applyStorage already implements the
-      LVM-thin / ZFS / file paths, just needs to be wired through a
-      configured Provider on the satellite). Architecture-side smoke
-      is green; volume-side smoke is the next slice.
+      kernels and DRBD opened a peer connection between them. After
+      a second pass that fed RD VolumeDefinitions through to the
+      satellite as DesiredVolumes the connection actually settled:
+      ```
+      test-worker-1: smoke-rd role:Secondary
+                      test-worker-2 role:Secondary
+      test-worker-2: smoke-rd role:Secondary
+                      test-worker-1 role:Secondary
+      ```
+      Each peer sees the other as Secondary — DRBD's connection state
+      has converged. UpToDate-with-data still needs at least one
+      diskful replica, which is a storage-pool seed away
+      (Reconciler.applyStorage already implements the LVM-thin / ZFS
+      / file paths; the satellite just needs a Provider registered
+      under the right pool name and a backing block device on the
+      Talos worker, which Talos doesn't expose by default — separate
+      stand-prep slice).
 
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
