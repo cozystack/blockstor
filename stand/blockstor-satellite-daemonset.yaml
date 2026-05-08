@@ -47,7 +47,10 @@ spec:
           args:
             - --controller=blockstor-controller.blockstor-system.svc:7000
             - --listen=:7000
-            - --state-dir=/var/lib/blockstor-satellite
+            # drbd's /etc/drbd.conf includes /etc/drbd.d/*.res, so the
+            # satellite writes its rendered files where drbdadm
+            # actually looks for them.
+            - --state-dir=/etc/drbd.d
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
