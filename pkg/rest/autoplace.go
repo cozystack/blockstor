@@ -30,14 +30,63 @@ import (
 )
 
 // registerAutoplace wires `POST /v1/resource-definitions/{rd}/autoplace` and
-// the per-resource POST/DELETE used by linstor-csi for explicit placement.
+// the per-resource list/POST/DELETE used by linstor-csi for explicit placement.
 func (s *Server) registerAutoplace(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/autoplace",
 		s.requireStore(s.handleAutoplace))
+	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resources",
+		s.requireStore(s.handleResourceList))
+	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resources/{node}",
+		s.requireStore(s.handleResourceGet))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources",
 		s.requireStore(s.handleResourceCreate))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resources/{node}",
 		s.requireStore(s.handleResourceDelete))
+}
+
+// handleResourceList answers `GET /v1/resource-definitions/{rd}/resources`,
+// the per-RD aggregate linstor-csi polls during ControllerPublishVolume to
+// answer "is the resource on this node?". Wraps each Resource in
+// ResourceWithVolumes so the wire shape matches /v1/view/resources.
+func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rdName)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
+	for i := range resList {
+		out = append(out, apiv1.ResourceWithVolumes{Resource: resList[i]})
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
+// returning the single Resource on that node or 404.
+func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+
+	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiv1.ResourceWithVolumes{Resource: res})
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage
