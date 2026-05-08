@@ -217,8 +217,12 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] **Resource POST/DELETE** — `/v1/resource-definitions/{rd}/resources[/{node}]`.
 - [x] No-op reconciler stubs for all CRDs wired in `cmd/main.go` (real
       reconciliation lands in Phase 3).
+- [x] **Side-by-side stand deploy proven** (2026-05-08): `stand/blockstor-deploy.yaml` runs `manager` as a Deployment in `blockstor-system` namespace with proper RBAC; image pulled from the host registry `10.164.0.1:5000` (Talos containerd patched to allow http for that mirror); pod 1/1 Running, REST `:3370` + gRPC `:7000` both listening; all 6 CRD reconcilers started. `BLOCKSTOR_BASEURL=http://127.0.0.1:33370 go test -run TestSmokeTraceReplay` — green against the deployed pod via port-forward.
 - [ ] piraeus-operator can create `LinstorSatellite`s and they appear in
-      our API. — Validation deferred to Phase 5 burn-in.
+      our API. — LinstorSatellites are created today by the Java
+      controller; flipping piraeus to dial blockstor:3370 needs a
+      LinstorCluster spec change + matching satellite registration
+      flow. Side-by-side deploy above is the prerequisite.
 
 **Exit met (definition side).** Real reconciliation work now lives in Phase 3.
 
