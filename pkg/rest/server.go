@@ -79,6 +79,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerExternalFiles(mux)
 	s.registerDRBDPassphrase(mux)
 	s.registerRDClone(mux)
+	s.registerSOSReport(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,
