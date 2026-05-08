@@ -312,6 +312,18 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       (7878), which is a separate network/firewall slice; the
       blockstor-side architecture is green.
 
+      **Lifecycle complete**: finalizer-driven teardown via the new
+      `service Satellite.DeleteResource` RPC works end-to-end on the
+      stand. `kubectl delete resource.blockstor.io.blockstor.io
+      data-rd.test-worker-2` triggered drbdadm down → losetup -d → rm
+      /var/lib/blockstor-pool/data-rd_00000.img → rm
+      /etc/drbd.d/data-rd.res, all on the satellite, and only then
+      kube-apiserver finalised the delete. SnapshotReconciler likewise
+      dispatches CreateSnapshot to every diskful replica, and the
+      satellite events2 → controller ReportObserved stream is wired
+      (status writeback body still a placeholder; the wire path is
+      proven so future status fields slot in cleanly).
+
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
 1. `docker build` two-stage Dockerfile — controller (distroless) and
