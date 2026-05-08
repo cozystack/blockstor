@@ -266,7 +266,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 - [ ] Cluster passphrase management
 - [ ] Satellite eviction / restoration / lost-and-recover
-- [ ] Stats endpoints (`/v1/stats/*`)
+- [x] Stats endpoint (`GET /v1/stats`): cluster-wide counters (nodes, RDs, resources, storage pools, snapshots). 2 contract tests.
 - [ ] Error reports, SOS-report
 - [ ] All `/v1/view/*` aggregates
 - [x] Controller properties endpoints (`/v1/controller/properties` GET/POST) — backed by KV-store instance "ControllerProps". Covers `linstor controller list-properties` / `set-property`. 3 contract tests.
