@@ -259,7 +259,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [ ] DRBD encryption passphrase
 - [ ] DRBD proxy enable/disable/configure
 - [ ] DRBD options: full set from `drbdoptions.json`
-- [ ] file storage provider (loop file / sparse file backed)
+- [x] file storage provider (`pkg/storage/file`): FILE / FILE_THIN behind same Provider seam — fallocate (thick) / truncate (thin) for create, statfs(2) for pool capacity, snapshots intentionally unsupported (caller routes to LVM/ZFS instead). 9 contract tests.
 - [ ] External-file management
 
 ### Phase 7 — Cluster operations + admin
