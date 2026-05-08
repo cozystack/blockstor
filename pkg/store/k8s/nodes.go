@@ -19,6 +19,7 @@ package k8s
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -207,9 +208,12 @@ func wireToCRDNode(in *apiv1.Node) *crdv1alpha1.Node {
 }
 
 // wireToCRDNodeSpec is the spec-only converter used by both Create and Update.
+// SatelliteEncryptionType is uppercased on the way in: upstream LINSTOR
+// accepts mixed case ("plain"/"PLAIN") but the CRD validation enum is
+// uppercase-only, so we normalise here to keep wire compatibility.
 func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 	spec := crdv1alpha1.NodeSpec{
-		Type:  in.Type,
+		Type:  strings.ToUpper(in.Type),
 		Props: in.Props,
 		Flags: in.Flags,
 	}
@@ -222,7 +226,7 @@ func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 				Name:                    ni.Name,
 				Address:                 ni.Address,
 				SatellitePort:           int32(ni.SatellitePort), //nolint:gosec // upstream LINSTOR ports fit in int32
-				SatelliteEncryptionType: ni.SatelliteEncryptionType,
+				SatelliteEncryptionType: strings.ToUpper(ni.SatelliteEncryptionType),
 			})
 		}
 	}
