@@ -255,7 +255,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Phase 6 — Encryption + DRBD options + file provider
 
-- [ ] LUKS encryption layer (volume-level)
+- [x] LUKS encryption layer (`pkg/luks`): cryptsetup wrapper (Format/Open/Close + DevicePath helper) routed through `storage.Exec` so the satellite can layer LUKS between the storage provider's raw block device and DRBD's lower disk; key passes via stdin to keep secrets off argv. 5 contract tests. Wiring into the satellite Reconciler reuses the same Open/Close hooks once a per-resource `encrypted` flag flows through ApplyResources.
 - [x] DRBD encryption passphrase (`POST /v1/resource-definitions/{rd}/encryption-passphrase`): writes the per-RD shared secret onto the RD's props under `DrbdOptions/Net/shared-secret`. Flows through to satellites via the existing drbd_options channel. 3 contract tests.
 - [x] DRBD proxy enable/disable/configure: 501 Not Implemented stubs (`/v1/resource-definitions/{rd}/drbd-proxy*`). Cozystack-style clusters run flat L2 so DRBD-9's native protocol suffices; proxy isn't needed. Endpoints exist so `linstor drbd-proxy *` returns a deterministic error.
 - [x] DRBD options catalogue (`pkg/drbd/options.go`): typed Option struct + section constants (net / disk / peer-device / options / handlers) + initial subset of well-known keys (protocol, shared-secret, max-buffers, after-sb-*, on-io-error, al-extents, c-max-rate, auto-promote, quorum, on-no-quorum). 4 contract tests pin LinstorKey shape, section validity, uniqueness, and presence of cozystack-relevant keys. Full upstream catalogue ports as new keys come up.
