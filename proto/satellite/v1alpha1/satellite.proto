@@ -109,6 +109,15 @@ message HelloRequest {
   // push ApplyResources / snapshot RPCs back at this satellite. Empty
   // when the satellite isn't hosting its own gRPC server.
   string satellite_endpoint = 6;
+  // pools are the local storage providers this satellite has been
+  // configured with (by CLI flag / env). The controller upserts a
+  // StoragePool CRD for each so /v1/view/storage-pools reflects them.
+  repeated SatellitePool pools = 7;
+}
+
+message SatellitePool {
+  string name = 1;          // LINSTOR pool name (matches DesiredVolume.storage_pool)
+  string provider_kind = 2; // LVM_THIN / ZFS / FILE_THIN / ...
 }
 
 message HelloResponse {

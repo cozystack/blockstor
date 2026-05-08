@@ -105,6 +105,17 @@ func (s *Server) Hello(ctx context.Context, req *satellitepb.HelloRequest) (*sat
 		return nil, status.Errorf(codes.Internal, "set Node %q ONLINE: %v", req.GetNodeName(), err)
 	}
 
+	// Reflect each pool the satellite reported in StoragePool store
+	// so /v1/view/storage-pools shows it. Idempotent — Update wins
+	// on second-and-subsequent Hellos. Errors don't fail the Hello;
+	// we log and move on (the next Hello will redrive).
+	for _, p := range req.GetPools() {
+		err := s.upsertPool(ctx, req.GetNodeName(), p)
+		if err != nil {
+			_ = err
+		}
+	}
+
 	return &satellitepb.HelloResponse{
 		ClusterId:          s.cfg.ClusterID,
 		ControllerEndpoint: s.cfg.ControllerEndpoint,
@@ -177,4 +188,32 @@ func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObse
 	}
 
 	return nil
+}
+
+// upsertPool reflects a satellite-reported SatellitePool into the
+// StoragePool store. The composite key is (node, pool name); we
+// rely on store.ErrAlreadyExists to fan a Create into an Update so
+// subsequent Hellos refresh provider_kind without losing capacity
+// fields the controller-side reconciler may have already populated.
+func (s *Server) upsertPool(ctx context.Context, nodeName string, pool *satellitepb.SatellitePool) error {
+	sp := apiv1.StoragePool{
+		StoragePoolName: pool.GetName(),
+		NodeName:        nodeName,
+		ProviderKind:    pool.GetProviderKind(),
+	}
+
+	err := s.st.StoragePools().Create(ctx, &sp)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrAlreadyExists):
+		err = s.st.StoragePools().Update(ctx, &sp)
+		if err != nil {
+			return errors.Wrapf(err, "update StoragePool %s/%s", nodeName, pool.GetName())
+		}
+
+		return nil
+	default:
+		return errors.Wrapf(err, "create StoragePool %s/%s", nodeName, pool.GetName())
+	}
 }

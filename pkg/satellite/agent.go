@@ -293,12 +293,21 @@ func (a *Agent) hello(ctx context.Context, client satellitepb.ControllerClient) 
 	rpcCtx, cancel := context.WithTimeout(ctx, a.cfg.DialTimeout)
 	defer cancel()
 
+	pools := make([]*satellitepb.SatellitePool, 0, len(a.cfg.Providers))
+	for name, p := range a.cfg.Providers {
+		pools = append(pools, &satellitepb.SatellitePool{
+			Name:         name,
+			ProviderKind: p.Kind(),
+		})
+	}
+
 	resp, err := client.Hello(rpcCtx, &satellitepb.HelloRequest{
 		NodeName:          a.cfg.NodeName,
 		BlockstorVersion:  version.Version,
 		LayerKinds:        []string{"DRBD", "STORAGE", "LUKS"},
 		ProviderKinds:     []string{"LVM", "LVM_THIN", "ZFS", "ZFS_THIN", "FILE"},
 		SatelliteEndpoint: a.cfg.AdvertisedEndpoint,
+		Pools:             pools,
 	})
 	if err != nil {
 		return errors.Wrap(err, "Hello RPC")
