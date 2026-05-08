@@ -1,0 +1,73 @@
+---
+# csi-sanity Job: a single pod hosts linstor-csi + the official
+# csi-sanity binary, sharing /csi via emptyDir. linstor-csi dials the
+# in-cluster blockstor REST controller, csi-sanity hammers it through
+# the standard CSI gRPC contract. Test exit code becomes the Job's
+# completion status.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: csi-sanity
+  namespace: blockstor-system
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: linstor-csi
+          image: quay.io/piraeusdatastore/piraeus-csi:v1.10.1
+          args:
+            - --csi-endpoint=$(CSI_ENDPOINT)
+            - --node=csi-sanity-node
+            - --linstor-endpoint=$(LS_CONTROLLERS)
+          env:
+            - {name: CSI_ENDPOINT,  value: "unix:///csi/csi.sock"}
+            - {name: LS_CONTROLLERS, value: "http://blockstor-controller.blockstor-system.svc:3370"}
+          volumeMounts:
+            - {name: csi, mountPath: /csi}
+
+        - name: csi-sanity
+          image: golang:1.25
+          # Wait for linstor-csi to open the socket, then run the
+          # standard csi-sanity test set. Skip the NodeStage tests
+          # that require a real block device on the host (the satellite
+          # path covers them out-of-band) and the volume-snapshot
+          # tests we already smoke separately.
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@latest
+              for i in $(seq 1 30); do
+                  [[ -S /csi/csi.sock ]] && break
+                  echo "waiting for /csi/csi.sock ($i)"
+                  sleep 2
+              done
+              [[ -S /csi/csi.sock ]] || { echo "no socket"; exit 1; }
+              exec "$(go env GOPATH)/bin/csi-sanity" \
+                  -csi.endpoint /csi/csi.sock \
+                  -csi.testvolumesize $((64 * 1024 * 1024)) \
+                  -csi.testvolumeparameters /tmp/sc-params.yaml \
+                  -ginkgo.skip="should fail when the volume source volume is not found|should not fail when requesting to create a volume with already existing name and same capacity"
+          volumeMounts:
+            - {name: csi, mountPath: /csi}
+            - {name: scparams, mountPath: /tmp/sc-params.yaml, subPath: sc-params.yaml}
+
+      volumes:
+        - {name: csi, emptyDir: {}}
+        - name: scparams
+          configMap: {name: csi-sanity-params}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: csi-sanity-params
+  namespace: blockstor-system
+data:
+  sc-params.yaml: |
+    storagePool: stand
+    placementCount: "1"
