@@ -76,10 +76,16 @@ func (s *Server) Hello(ctx context.Context, req *satellitepb.HelloRequest) (*sat
 		"SatelliteEndpoint": req.GetSatelliteEndpoint(),
 	}
 
+	// Hello completes only after the satellite has dialled in, so by
+	// the time we're here the node is ONLINE in LINSTOR-speak. The
+	// piraeus init-container `linstor-wait-node-online` checks this
+	// exact field; without it linstor-csi-node DaemonSets stall on
+	// satellites we know perfectly well are alive.
 	node := apiv1.Node{
-		Name:  req.GetNodeName(),
-		Type:  apiv1.NodeTypeSatellite,
-		Props: props,
+		Name:             req.GetNodeName(),
+		Type:             apiv1.NodeTypeSatellite,
+		Props:            props,
+		ConnectionStatus: "ONLINE",
 	}
 
 	err := s.st.Nodes().Create(ctx, &node)
