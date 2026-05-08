@@ -177,6 +177,17 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		"minor":   strconv.Itoa(minor),
 	}
 
+	// Pick a single replica (lexically lowest node name) to seed
+	// initial Primary. Without this every diskful brand-new RD comes
+	// up Inconsistent and stays there until something opens for
+	// write. The seed flag is harmless on subsequent reconciles —
+	// satellite Reconciler runs primary --force only on
+	// firstActivation.
+	if !slices.Contains(target.Spec.Flags, "DISKLESS") &&
+		target.Spec.NodeName == sortedAll[0] {
+		drbdOpts["auto-primary"] = "true"
+	}
+
 	// Per-peer entries — used by ConfFileBuilder on the satellite to
 	// compose the connection mesh. We resolve each peer's
 	// SatelliteEndpoint prop into a real IP so drbd-9 has somewhere

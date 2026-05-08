@@ -344,6 +344,24 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 		return errors.Wrapf(err, "adjust %s", dr.GetName())
 	}
 
+	// On first activation of a diskful replica the controller may
+	// flag it as the auto-primary seed. We promote once (force-
+	// primary then back to secondary) so the metadata moves out of
+	// "Inconsistent" into "UpToDate" without a human running
+	// drbdadm. Subsequent reconciles see firstActivation=false and
+	// skip the seed.
+	if firstActivation && !diskless && dr.GetDrbdOptions()["auto-primary"] == "true" {
+		err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "auto-primary %s", dr.GetName())
+		}
+
+		err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
+		}
+	}
+
 	return nil
 }
 

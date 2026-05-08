@@ -132,12 +132,39 @@ func (s *Server) ReportObserved(stream satellitepb.Controller_ReportObservedServ
 	}
 }
 
-// applyObserved is the per-event Status update — currently a no-op
-// placeholder while the Resource CRD's Status fields settle (we'll
-// land conditions + per-volume disk state in the next slice). Keeping
-// the call site means the wire path is exercised end-to-end on the
-// stand and any future implementation slots in without re-touching
-// the gRPC frame loop.
-func (s *Server) applyObserved(_ context.Context, _ *satellitepb.ResourceObservedEvent) error {
+// applyObserved lands one parsed events2 frame on the matching
+// Resource. We store the DRBD state as a `DrbdState` prop and the
+// "in use" hint via Resource.State.InUse so existing REST callers
+// (linstor-csi, kubectl-linstor) see the live runtime info without
+// the schema needing to change. Granular per-volume disk state lands
+// once the CRD's volume-level status fields settle.
+func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObservedEvent) error {
+	if ev.GetResourceName() == "" || ev.GetNodeName() == "" {
+		return nil
+	}
+
+	res, err := s.st.Resources().Get(ctx, ev.GetResourceName(), ev.GetNodeName())
+	if err != nil {
+		// NotFound is normal during convergence — the satellite may
+		// observe state for a resource the controller hasn't yet
+		// created. Bubble nothing.
+		return nil //nolint:nilerr // best-effort: missing resource isn't a stream-fatal event
+	}
+
+	if res.Props == nil {
+		res.Props = map[string]string{}
+	}
+
+	if disk := ev.GetDrbdState(); disk != "" {
+		res.Props["DrbdState"] = disk
+	}
+
+	res.State.InUse = ev.GetInUse()
+
+	err = s.st.Resources().Update(ctx, &res)
+	if err != nil {
+		return errors.Wrap(err, "update resource state")
+	}
+
 	return nil
 }

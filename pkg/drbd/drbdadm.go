@@ -69,6 +69,14 @@ func (a *Adm) Primary(ctx context.Context, resource string) error {
 	return a.run(ctx, "primary", resource)
 }
 
+// PrimaryForce promotes a resource to Primary even when local disk is
+// Inconsistent and no peer is UpToDate. Used as the initial-sync seed
+// on a brand-new diskful replica — without --force, drbd refuses to
+// promote, leaving the resource permanently "Inconsistent".
+func (a *Adm) PrimaryForce(ctx context.Context, resource string) error {
+	return a.run(ctx, "primary", "--force", resource)
+}
+
 // Secondary flips the resource back to Secondary role. Used after the
 // consumer unmounts and before another peer takes Primary.
 func (a *Adm) Secondary(ctx context.Context, resource string) error {
