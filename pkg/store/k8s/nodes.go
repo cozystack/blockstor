@@ -119,6 +119,33 @@ func (n *nodes) Update(ctx context.Context, in *apiv1.Node) error {
 	return nil
 }
 
+// SetConnectionStatus updates the Node CRD's
+// `.status.connectionStatus` via the Status subresource. Survives
+// subsequent Spec Update calls (which would otherwise overwrite
+// nothing here, but the dedicated subresource is the kubebuilder-
+// idiomatic place to land observed state).
+func (n *nodes) SetConnectionStatus(ctx context.Context, name, status string) error {
+	var existing crdv1alpha1.Node
+
+	err := n.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return errors.Wrapf(store.ErrNotFound, "node %q", name)
+		}
+
+		return errors.Wrapf(err, "get Node %q", name)
+	}
+
+	existing.Status.ConnectionStatus = status
+
+	err = n.c.Status().Update(ctx, &existing)
+	if err != nil {
+		return errors.Wrapf(err, "status update Node %q", name)
+	}
+
+	return nil
+}
+
 // Delete removes the named Node CRD.
 func (n *nodes) Delete(ctx context.Context, name string) error {
 	crd := &crdv1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}

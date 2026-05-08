@@ -48,6 +48,13 @@ type NodeStore interface {
 	Create(ctx context.Context, n *apiv1.Node) error
 	Update(ctx context.Context, n *apiv1.Node) error
 	Delete(ctx context.Context, name string) error
+
+	// SetConnectionStatus writes node.Status.ConnectionStatus directly
+	// via the Status subresource so it survives a subsequent Spec
+	// Update. linstor-csi's `linstor-wait-node-online` init container
+	// polls /v1/nodes/<name> for connection_status:"ONLINE"; this is
+	// where the satellite's gRPC Hello surfaces that state.
+	SetConnectionStatus(ctx context.Context, name, status string) error
 }
 
 // StoragePoolStore persists StoragePool objects. The composite key is

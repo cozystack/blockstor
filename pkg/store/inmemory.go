@@ -161,3 +161,21 @@ func (s *inMemoryNodes) Delete(_ context.Context, name string) error {
 
 	return nil
 }
+
+// SetConnectionStatus mutates only the ConnectionStatus field on the
+// in-memory copy. Returns ErrNotFound if the node hasn't been
+// Create'd yet.
+func (s *inMemoryNodes) SetConnectionStatus(_ context.Context, name, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "node %q", name)
+	}
+
+	node.ConnectionStatus = status
+	s.m[name] = node
+
+	return nil
+}
