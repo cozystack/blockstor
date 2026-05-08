@@ -15,29 +15,19 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      initContainers:
-        # csi-sanity is launched with --node=csi-sanity-node, so
-        # linstor-csi expects that name to exist as a Node before any
-        # CreateVolume call. Pre-register it as a SATELLITE — we don't
-        # care about its actual presence; the topology lookup just
-        # needs an entry.
-        - name: register-csi-sanity-node
-          image: curlimages/curl:8.10.1
-          command:
-            - sh
-            - -c
-            - |
-              set -e
-              curl -fsS -XPOST -H 'content-type: application/json' \
-                http://blockstor-controller.blockstor-system.svc:3370/v1/nodes \
-                -d '{"name":"csi-sanity-node","type":"SATELLITE","net_interfaces":[{"name":"default","address":"127.0.0.1","satellite_port":3366,"satellite_encryption_type":"PLAIN"}]}' \
-                || true
       containers:
         - name: linstor-csi
           image: quay.io/piraeusdatastore/piraeus-csi:v1.10.1
+          # Use a real Node (test-worker-1) so linstor-csi's
+          # ControllerPublishVolume / NodeStageVolume lookups land on
+          # the node where autoplace actually placed the Resource.
+          # csi-sanity drives CSI gRPC against this single pod, so
+          # there's no stricture that --node match the test framework
+          # node — we only need the name to exist in the Node CRD store
+          # and have a storage pool that autoplace will pick.
           args:
             - --csi-endpoint=$(CSI_ENDPOINT)
-            - --node=csi-sanity-node
+            - --node=test-worker-1
             - --linstor-endpoint=$(LS_CONTROLLERS)
           env:
             - {name: CSI_ENDPOINT,  value: "unix:///csi/csi.sock"}
