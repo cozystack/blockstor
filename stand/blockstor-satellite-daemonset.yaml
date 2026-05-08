@@ -35,6 +35,10 @@ spec:
       # from the .res file). Pod IP equals node IP under hostNetwork,
       # which the satellite Hello flow advertises as its endpoint.
       hostNetwork: true
+      # ClusterFirstWithHostNet keeps cluster DNS resolution working
+      # under hostNetwork — without it the satellite can't resolve
+      # `blockstor-controller.blockstor-system.svc`.
+      dnsPolicy: ClusterFirstWithHostNet
       tolerations:
         - operator: Exists
       # Run only on workers (controlplane has no DRBD extension loaded).
