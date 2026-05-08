@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -92,7 +93,7 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
 	}
 
-	desired := buildDesired(target, peers)
+	desired := buildDesired(target, peers, nodes)
 
 	client, closer, err := d.dialer.Dial(ctx, endpoint)
 	if err != nil {
@@ -130,7 +131,11 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // deterministic from the RD name + sorted peer list — good enough for
 // the first stand smoke; the autoplacer will replace it with a real
 // allocator once we wire the IPAM hookup.
-func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) *satellitepb.DesiredResource {
+//
+// nodes is consulted for each peer's `SatelliteEndpoint` prop so
+// `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
+// placeholder; drbd-9 won't replicate to 0.0.0.0.
+func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node) *satellitepb.DesiredResource {
 	rdName := target.Spec.ResourceDefinitionName
 	port := derivePort(rdName)
 	minor := deriveMinor(rdName)
@@ -169,11 +174,13 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	}
 
 	// Per-peer entries — used by ConfFileBuilder on the satellite to
-	// compose the connection mesh.
+	// compose the connection mesh. We resolve each peer's
+	// SatelliteEndpoint prop into a real IP so drbd-9 has somewhere
+	// to actually replicate to (0.0.0.0 won't work as a peer addr).
 	for _, peer := range dropped {
 		drbdOpts["peer."+peer+".port"] = strconv.Itoa(port)
 		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(idOf[peer])
-		drbdOpts["peer."+peer+".address"] = drbdAddrAny
+		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
 	}
 
 	return &satellitepb.DesiredResource{
@@ -184,6 +191,25 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		Peers:       dropped,
 		DrbdOptions: drbdOpts,
 	}
+}
+
+// peerAddress looks up `nodeName`'s SatelliteEndpoint and returns
+// just the host part (no port). Falls back to the 0.0.0.0 placeholder
+// when the node is unknown or hasn't registered yet — the satellite
+// will surface a per-resource error in that case which is exactly the
+// signal the controller needs to retry.
+func peerAddress(nodeName string, nodes []blockstoriov1alpha1.Node) string {
+	endpoint := lookupEndpoint(nodeName, nodes)
+	if endpoint == "" {
+		return drbdAddrAny
+	}
+
+	idx := strings.LastIndex(endpoint, ":")
+	if idx <= 0 {
+		return endpoint
+	}
+
+	return endpoint[:idx]
 }
 
 // derivePort hashes the RD name into the drbd-9 reserved range

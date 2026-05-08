@@ -27,6 +27,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -152,10 +153,11 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 	}
 
 	rec := NewReconciler(ReconcilerConfig{
-		Providers: a.cfg.Providers,
-		Adm:       drbd.NewAdm(storage.RealExec{}),
-		StateDir:  a.cfg.StateDir,
-		NodeName:  a.cfg.NodeName,
+		Providers:    a.cfg.Providers,
+		Adm:          drbd.NewAdm(storage.RealExec{}),
+		StateDir:     a.cfg.StateDir,
+		NodeName:     a.cfg.NodeName,
+		LocalAddress: hostFromEndpoint(a.cfg.AdvertisedEndpoint),
 	})
 
 	listenCfg := &net.ListenConfig{}
@@ -207,6 +209,24 @@ func (a *Agent) dial(ctx context.Context) (*grpc.ClientConn, error) {
 	_ = dialCtx
 
 	return conn, nil
+}
+
+// hostFromEndpoint trims the trailing :port off an endpoint string.
+// Returns the input unchanged when it has no port (e.g. plain host or
+// already host-only) or is empty. We don't use net.SplitHostPort
+// because the leniency the helper needs (returning sane fallbacks)
+// makes a one-line strings split simpler.
+func hostFromEndpoint(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+
+	idx := strings.LastIndex(endpoint, ":")
+	if idx <= 0 {
+		return endpoint
+	}
+
+	return endpoint[:idx]
 }
 
 // hello is the registration handshake. The satellite tells the controller

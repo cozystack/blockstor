@@ -56,6 +56,13 @@ type ReconcilerConfig struct {
 	// to know which Peer entries describe local vs. remote.
 	NodeName string
 
+	// LocalAddress is the IP this satellite's DRBD layer should bind
+	// to. Falls back into the .res file's `address` line on the local
+	// `on <node>` block whenever the controller-supplied address is
+	// the placeholder "0.0.0.0" (which it always is until controller
+	// learns each satellite's pod IP).
+	LocalAddress string
+
 	// ShipExec runs the snapshot-ship subprocess (zfs send|recv,
 	// thin-send-recv, …). Production wires storage.RealExec; tests
 	// inject FakeExec to assert the command line without spinning up
@@ -78,6 +85,8 @@ type Reconciler struct {
 }
 
 // NewReconciler constructs a Reconciler from cfg.
+//
+//nolint:gocritic // value receiver matches the public constructor convention; ReconcilerConfig is the agent's flag bundle.
 func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 	return &Reconciler{
 		cfg:            cfg,
@@ -227,7 +236,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	_, statErr := os.Stat(resPath)
 	firstActivation := os.IsNotExist(statErr)
 
-	body, err := buildResFile(dr, r.cfg.NodeName)
+	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
@@ -287,7 +296,11 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // schema solidifies once the controller-side autoplacer feeds it); we
 // honour the documented keys: `port`, `node-id`, `address`, `minor` for
 // the local node, and `peer.<name>.{port,node-id,address}` per peer.
-func buildResFile(dr *satellitepb.DesiredResource, localNode string) (string, error) {
+//
+// localAddr is the satellite's own IP — when the controller-supplied
+// `address` is the placeholder "0.0.0.0" we substitute localAddr so
+// drbd-9 has a real interface to bind to.
+func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string) (string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -296,7 +309,7 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode string) (string, er
 	hosts := make([]drbd.Host, 0, 1+len(dr.GetPeers()))
 	hosts = append(hosts, drbd.Host{
 		NodeName: localNode,
-		Address:  opts["address"],
+		Address:  resolveAddr(opts["address"], localAddr),
 		Port:     port,
 		NodeID:   nodeID,
 	})
@@ -307,7 +320,7 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode string) (string, er
 
 		hosts = append(hosts, drbd.Host{
 			NodeName: peer,
-			Address:  opts["peer."+peer+".address"],
+			Address:  resolveAddr(opts["peer."+peer+".address"], ""),
 			Port:     peerPort,
 			NodeID:   peerNodeID,
 		})
@@ -334,6 +347,21 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode string) (string, er
 	}
 
 	return out, nil
+}
+
+// resolveAddr substitutes the satellite's own IP whenever the
+// controller-supplied address is the placeholder "0.0.0.0" (which it
+// is until the controller starts learning each satellite's pod IP and
+// passing it down). Empty fallback returns the placeholder unchanged
+// so unit tests don't blow up the way a missing override would.
+func resolveAddr(supplied, fallback string) string {
+	if supplied == "" || supplied == "0.0.0.0" {
+		if fallback != "" {
+			return fallback
+		}
+	}
+
+	return supplied
 }
 
 // isDiskless returns true when the DRBD-layer "DISKLESS" flag is set.
