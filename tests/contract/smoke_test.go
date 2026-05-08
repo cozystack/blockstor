@@ -19,6 +19,7 @@ package contract_test
 import (
 	"context"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ import (
 // here to pin blockstor's own contract. Cross-impl trace recording is
 // future operational work.
 func TestSmokeTraceReplay(t *testing.T) {
-	addr, stop := startServer(t)
+	baseURL, stop := resolveTarget(t)
 	defer stop()
 
 	traces, err := contract.LoadTracesDir("testdata/smoke")
@@ -50,7 +51,7 @@ func TestSmokeTraceReplay(t *testing.T) {
 		t.Fatalf("no smoke traces found")
 	}
 
-	results, err := contract.Replay(t.Context(), nil, "http://"+addr, traces)
+	results, err := contract.Replay(t.Context(), nil, baseURL, traces)
 	if err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
@@ -60,6 +61,22 @@ func TestSmokeTraceReplay(t *testing.T) {
 			t.Errorf("%s diverged: %s", result.Trace, strings.Join(result.Diffs, "; "))
 		}
 	}
+}
+
+// resolveTarget returns a base URL to replay against. If
+// BLOCKSTOR_BASEURL is set in the env (e.g. CI hits a deployed
+// controller via port-forward), use it as-is and skip the in-process
+// server. Otherwise boot one and tear it down via the returned func.
+func resolveTarget(t *testing.T) (string, func()) {
+	t.Helper()
+
+	if url := os.Getenv("BLOCKSTOR_BASEURL"); url != "" {
+		return url, func() {}
+	}
+
+	addr, stop := startServer(t)
+
+	return "http://" + addr, stop
 }
 
 // startServer boots an in-process blockstor REST server on a random
