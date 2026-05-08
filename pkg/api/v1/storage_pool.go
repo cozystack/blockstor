@@ -36,7 +36,11 @@ type StoragePool struct {
 // APICallRc is the upstream `ApiCallRc` envelope. We define a minimal subset
 // here so types compile. Phase 2 will populate it from `golinstor` apiconsts.
 type APICallRc struct {
-	RetCode  uint64            `json:"ret_code"`
+	// RetCode is the LINSTOR-style status mask. golinstor's
+	// `client.ApiCallError` decodes this as int64; the upstream
+	// `MASK_ERROR` bit makes the value negative on the wire (the
+	// high bit of a signed int64), so we use int64 to match.
+	RetCode  int64             `json:"ret_code"`
 	Message  string            `json:"message,omitempty"`
 	Cause    string            `json:"cause,omitempty"`
 	Details  string            `json:"details,omitempty"`

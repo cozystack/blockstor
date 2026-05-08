@@ -54,32 +54,7 @@ func (s *Server) NeedLeaderElection() bool { return false }
 func (s *Server) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("rest")
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/controller/version", handleVersion)
-	mux.HandleFunc("GET /v1/healthz", handleHealth)
-	s.registerNodes(mux)
-	s.registerStoragePools(mux)
-	s.registerResourceGroups(mux)
-	s.registerResourceDefinitions(mux)
-	s.registerVolumeDefinitions(mux)
-	s.registerResources(mux)
-	s.registerKeyValueStore(mux)
-	s.registerSnapshots(mux)
-	s.registerSpawn(mux)
-	s.registerAutoplace(mux)
-	s.registerControllerProperties(mux)
-	s.registerAdjust(mux)
-	s.registerStats(mux)
-	s.registerErrorReports(mux)
-	s.registerPropertiesInfo(mux)
-	s.registerSnapshotRestore(mux)
-	s.registerEncryption(mux)
-	s.registerNodeLifecycle(mux)
-	s.registerDRBDProxy(mux)
-	s.registerExternalFiles(mux)
-	s.registerDRBDPassphrase(mux)
-	s.registerRDClone(mux)
-	s.registerSOSReport(mux)
+	mux := s.buildMux()
 
 	srv := &http.Server{
 		Addr:              s.Addr,
@@ -112,6 +87,41 @@ func (s *Server) Start(ctx context.Context) error {
 
 		return errors.Wrap(err, "REST server failed")
 	}
+}
+
+// buildMux registers every endpoint on a fresh ServeMux. Pulled out
+// of Start to keep the latter under the funlen budget — Start now
+// only handles lifecycle (listener + shutdown), this owns routing.
+func (s *Server) buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/controller/version", handleVersion)
+	mux.HandleFunc("GET /v1/healthz", handleHealth)
+	s.registerNodes(mux)
+	s.registerStoragePools(mux)
+	s.registerResourceGroups(mux)
+	s.registerResourceDefinitions(mux)
+	s.registerVolumeDefinitions(mux)
+	s.registerResources(mux)
+	s.registerKeyValueStore(mux)
+	s.registerSnapshots(mux)
+	s.registerSpawn(mux)
+	s.registerAutoplace(mux)
+	s.registerControllerProperties(mux)
+	s.registerAdjust(mux)
+	s.registerStats(mux)
+	s.registerErrorReports(mux)
+	s.registerPropertiesInfo(mux)
+	s.registerSnapshotRestore(mux)
+	s.registerEncryption(mux)
+	s.registerNodeLifecycle(mux)
+	s.registerDRBDProxy(mux)
+	s.registerExternalFiles(mux)
+	s.registerDRBDPassphrase(mux)
+	s.registerRDClone(mux)
+	s.registerSOSReport(mux)
+	s.registerRemotes(mux)
+
+	return mux
 }
 
 // Compile-time check that we satisfy the runnable contract.

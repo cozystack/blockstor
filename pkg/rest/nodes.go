@@ -175,6 +175,8 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	}})
 }
 
-// apiCallRcError is upstream LINSTOR's ERROR mask (high bit set on a
-// 64-bit mask). golinstor checks for this bit to decide pass/fail.
-const apiCallRcError uint64 = 0xC000_0000_0000_0000
+// apiCallRcError carries upstream LINSTOR's MASK_ERROR + WARN bits.
+// Upstream uses 0xC000_0000_0000_0000 as a `long` literal — that's
+// a negative int64 once you set both top bits. We literal-cast to
+// match the wire shape golinstor expects.
+const apiCallRcError int64 = -0x4000_0000_0000_0000
