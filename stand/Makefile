@@ -13,7 +13,7 @@ KUBECONFIG := $(WORK_DIR)/kubeconfig
 export TALOSCONFIG
 export KUBECONFIG
 
-.PHONY: stand-help up down reset piraeus oracle smoke smoke-blockstor use list stand-clean
+.PHONY: stand-help up down reset piraeus oracle smoke smoke-blockstor burnin-blockstor use list stand-clean
 
 stand-help: ## list dev-stand targets
 	@echo "stand targets (use NAME=<cluster>):"
@@ -39,6 +39,9 @@ smoke: ## run piraeus-stack smoke (PVC + linstor-csi) (NAME=<n>)
 
 smoke-blockstor: ## blockstor end-to-end smoke (RD → 2 replicas → bytes-perfect failover) (NAME=<n>)
 	@./tests/smoke-blockstor.sh "$(WORK_DIR)"
+
+burnin-blockstor: ## continuous PVC churn for DURATION seconds (default 86400 = 24h) (NAME=<n>, DURATION=<sec>)
+	@./tests/burnin-blockstor.sh "$(WORK_DIR)" "$${DURATION:-86400}"
 
 use: ## print TALOSCONFIG/KUBECONFIG exports for shell eval
 	@echo "export TALOSCONFIG=$(abspath $(TALOSCONFIG))"
