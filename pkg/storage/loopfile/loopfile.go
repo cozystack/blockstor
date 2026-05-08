@@ -166,17 +166,27 @@ func (*Provider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return errors.New("loopfile backend does not support snapshots")
 }
 
-// attach runs `losetup --find --show <file>`. Idempotent in the
-// flat sense: if the file is already attached, losetup returns the
-// existing /dev/loopN. We don't pre-check via lookupLoop because the
-// race window between lookup + attach makes that pointless.
+// attach is the idempotent loop-attach step. We pre-check via
+// `losetup -j <path>` and reuse the existing /dev/loopN if there is
+// one — `--find --show` always allocates a fresh dev, which on
+// reconcile-heavy paths would leak hundreds of loop nodes pointing at
+// the same backing file (observed in practice).
 func (p *Provider) attach(ctx context.Context, path string) (string, error) {
+	dev, err := p.lookupLoop(ctx, path)
+	if err != nil {
+		return "", err
+	}
+
+	if dev != "" {
+		return dev, nil
+	}
+
 	out, err := p.exec.Run(ctx, "losetup", "--find", "--show", path)
 	if err != nil {
 		return "", errors.Wrapf(err, "losetup --find --show %s", path)
 	}
 
-	dev := strings.TrimSpace(string(out))
+	dev = strings.TrimSpace(string(out))
 	if dev == "" {
 		return "", errors.Errorf("losetup returned empty device for %s", path)
 	}

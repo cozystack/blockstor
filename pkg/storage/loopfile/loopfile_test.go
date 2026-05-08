@@ -175,6 +175,42 @@ func TestDeleteVolumeDetachesAndRemoves(t *testing.T) {
 	}
 }
 
+// TestCreateVolumeReusesExistingLoop: when the backing file is
+// already attached (losetup -j returns a device), CreateVolume
+// must reuse it and NOT call `losetup --find --show` again. Without
+// this guard reconcile-heavy paths leak hundreds of loop nodes
+// pointing at the same backing file.
+func TestCreateVolumeReusesExistingLoop(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "pvc-1_00000.img")
+
+	// Pre-seed the backing file so CreateVolume skips truncate.
+	if err := os.WriteFile(imgPath, []byte{}, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("losetup -j "+imgPath,
+		storage.FakeResponse{Stdout: []byte("/dev/loop9: [2049]:42 (" + imgPath + ")\n")})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err := p.CreateVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "losetup --find --show") {
+			t.Errorf("re-attach issued: %s", line)
+		}
+	}
+}
+
 // TestSnapshotsUnsupported: both Create/Delete error out.
 func TestSnapshotsUnsupported(t *testing.T) {
 	p := loopfile.NewProvider(loopfile.Config{Dir: t.TempDir()}, storage.NewFakeExec())
