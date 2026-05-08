@@ -68,6 +68,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerSpawn(mux)
 	s.registerAutoplace(mux)
 	s.registerControllerProperties(mux)
+	s.registerAdjust(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,

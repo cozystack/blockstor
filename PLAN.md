@@ -271,7 +271,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [ ] All `/v1/view/*` aggregates
 - [x] Controller properties endpoints (`/v1/controller/properties` GET/POST) — backed by KV-store instance "ControllerProps". Covers `linstor controller list-properties` / `set-property`. 3 contract tests.
 - [ ] Property-info endpoints (`*/properties/info`)
-- [ ] Resource adjust / adjust-all
+- [x] Resource adjust / adjust-all (`POST /v1/resource-definitions/{rd}/adjust` and `.../resources/{node}/adjust`): existence check + 200; per-replica `drbdadm adjust` runs out-of-band via the satellite reconciler. 4 contract tests.
 
 ### Phase 8 — Java decommission
 
