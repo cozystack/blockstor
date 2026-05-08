@@ -367,8 +367,6 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 - [ ] Stand running for 24h continuous PVC churn (create/expand/snapshot/restore/delete)
 - [x] Contract-diff harness landed (`tests/contract`): Trace JSON format, LoadTracesDir loader (lexical order, ignores non-json), Replay against any HTTP base URL, JSON-key-normalising diff. 4 contract tests cover match/status-diff/body-diff/loader. Recording 100+ real golinstor traces against the Java oracle is operational work that depends on a running upstream LINSTOR for capture; the framework is in place to consume them.
-- [ ] On hidora-hikube cozystack cluster: parallel install in a separate namespace, side-by-side smoke
-
 **Exit**: 24h+ stable; contract diffs zero on MVP scope.
 
 ### Phase 6 — Encryption + DRBD options + file provider
@@ -494,8 +492,6 @@ controller, replayed forever in CI.
 2. Pin Java oracle to `piraeus-server:v1.33.2` (current cozystack version) — OK?
 3. Auto-stop schedule for the dev host — nights and weekends UTC, or your timezone? Or no auto-stop?
 4. Where should I post short daily progress — this chat, a Telegram channel, a Slack channel?
-5. When we get to Phase 5, may I run a parallel install on `hidora-hikube` in its own namespace, or strictly a separate test cluster?
-
 ---
 
 ## Layout (target)
