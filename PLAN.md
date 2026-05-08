@@ -383,14 +383,6 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Property-info endpoints (`*/properties/info`): 8 paths return `[]` so linstor CLI's autocomplete catalogue calls don't 404. Real catalogue payload deferred until upstream's property metadata is ported.
 - [x] Resource adjust / adjust-all (`POST /v1/resource-definitions/{rd}/adjust` and `.../resources/{node}/adjust`): existence check + 200; per-replica `drbdadm adjust` runs out-of-band via the satellite reconciler. 4 contract tests.
 
-### Phase 8 — Java decommission
-
-- [ ] Cozystack staging cluster runs only blockstor for >1 week
-- [ ] Cozystack production cluster fully migrated, Java pods removed
-- [ ] `grep -r piraeus-server cozystack | grep image:` returns nothing
-
-**Exit**: zero JVM in the cozystack data-path.
-
 ---
 
 ## Workflow
