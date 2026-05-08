@@ -1,0 +1,19 @@
+# oapi-codegen configuration for the upstream LINSTOR REST spec.
+#
+# We only generate the types — handler scaffolding stays hand-written
+# in pkg/rest because the upstream spec mixes endpoints we deliberately
+# don't implement (snapshot-shipping, RemoteSPDK, EBS, OpenFlex). This
+# config is read by `make rest-types`.
+package: openapi
+
+generate:
+  models: true
+  client: false
+  embedded-spec: false
+  std-http-server: false
+
+# Suppress warnings about unsupported / referenced-only schemas; we
+# don't care about strict completeness, only the types we already use
+# in handlers.
+output-options:
+  skip-prune: false

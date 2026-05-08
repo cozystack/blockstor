@@ -53,6 +53,10 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
+.PHONY: rest-types
+rest-types: ## Regenerate pkg/api/openapi/types.gen.go from upstream LINSTOR's rest_v1_openapi.yaml.
+	@./third_party/linstor-openapi/regen.sh
+
 .PHONY: proto
 proto: ## Generate Go bindings from proto/. Requires protoc, protoc-gen-go, protoc-gen-go-grpc on PATH.
 	@command -v protoc           >/dev/null || { echo "protoc missing — brew install protobuf"; exit 1; }
