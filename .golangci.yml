@@ -197,6 +197,11 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/api/
+      # REST handlers occasionally define request envelopes inline that
+      # mirror the upstream snake_case JSON. Same scope as pkg/api/.
+      - linters:
+          - tagliatelle
+        path: pkg/rest/
       # cmd/main.go is the kubebuilder manager scaffold — don't lint its
       # boilerplate (TODOs, function length, globals, inline err checks, wsl).
       - linters:
