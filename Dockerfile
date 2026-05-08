@@ -20,12 +20,24 @@ COPY . .
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager ./cmd
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o satellite ./cmd/satellite
 
-# Use distroless as minimal base image to package the manager binary
-# Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+# The satellite needs to shell out to drbdadm/lvs/zfs/cryptsetup, none
+# of which are in distroless:static. We use debian-slim for it (and let
+# the controller image stay distroless for the smaller surface). The
+# manager is what ships under "blockstor:dev"; the satellite ships under
+# "blockstor-satellite:dev".
+FROM gcr.io/distroless/static:nonroot AS controller
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532
-
 ENTRYPOINT ["/manager"]
+
+FROM debian:trixie-slim AS satellite
+RUN apt-get update -qq \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        drbd-utils lvm2 zfsutils-linux cryptsetup-bin ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /
+COPY --from=builder /workspace/satellite /usr/local/bin/satellite
+ENTRYPOINT ["/usr/local/bin/satellite"]

@@ -1,0 +1,67 @@
+---
+# blockstor-satellite DaemonSet for the dev stand. Runs on every
+# Talos worker, dials the in-cluster blockstor-controller:7000, and
+# (eventually) drives drbdadm + LVM/ZFS reconcile from there.
+#
+# Privilege footprint mirrors what piraeus-satellite needs:
+#   - hostPID  for /proc namespace access by drbdadm / drbdsetup
+#   - privileged for /dev/drbd* + LV/zvol opens
+#   - hostPath /dev /lib/modules /run/lvm /var/lib/blockstor-satellite
+#
+# We don't yet replace the piraeus satellite. This DaemonSet runs
+# alongside it (different state dir, different controller endpoint) so
+# we can prove registration + reconcile without ripping piraeus out.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blockstor-satellite
+  namespace: blockstor-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: blockstor-satellite
+  namespace: blockstor-system
+  labels: {app: blockstor-satellite}
+spec:
+  selector: {matchLabels: {app: blockstor-satellite}}
+  template:
+    metadata: {labels: {app: blockstor-satellite}}
+    spec:
+      serviceAccountName: blockstor-satellite
+      hostPID: true
+      hostNetwork: false
+      tolerations:
+        - operator: Exists
+      # Run only on workers (controlplane has no DRBD extension loaded).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      containers:
+        - name: satellite
+          image: 10.164.0.1:5000/blockstor-satellite:dev
+          imagePullPolicy: Always
+          args:
+            - --controller=blockstor-controller.blockstor-system.svc:7000
+            - --state-dir=/var/lib/blockstor-satellite
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - {name: dev, mountPath: /dev}
+            - {name: modules, mountPath: /lib/modules, readOnly: true}
+            - {name: lvm-run, mountPath: /run/lvm}
+            - {name: state, mountPath: /var/lib/blockstor-satellite}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      volumes:
+        - {name: dev, hostPath: {path: /dev}}
+        - {name: modules, hostPath: {path: /lib/modules}}
+        - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}
+        - {name: state, hostPath: {path: /var/lib/blockstor-satellite, type: DirectoryOrCreate}}
