@@ -1,0 +1,202 @@
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package dispatcher_test
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/dispatcher"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	"google.golang.org/grpc"
+)
+
+// fakeDialer captures the endpoint a Dispatcher dialled and returns a
+// stub SatelliteClient that records ApplyResources requests.
+type fakeDialer struct {
+	endpoint string
+	stub     *fakeSatelliteClient
+}
+
+type fakeSatelliteClient struct {
+	satellitepb.SatelliteClient
+
+	last *satellitepb.ApplyResourcesRequest
+	resp *satellitepb.ApplyResourcesResponse
+	err  error
+}
+
+func (f *fakeDialer) Dial(_ context.Context, endpoint string) (satellitepb.SatelliteClient, func() error, error) {
+	f.endpoint = endpoint
+	return f.stub, func() error { return nil }, nil
+}
+
+func (f *fakeSatelliteClient) ApplyResources(_ context.Context, req *satellitepb.ApplyResourcesRequest, _ ...grpc.CallOption) (*satellitepb.ApplyResourcesResponse, error) {
+	f.last = req
+	return f.resp, f.err
+}
+
+// TestApplyDialsTargetSatellite: the dispatcher uses the target Node's
+// SatelliteEndpoint to pick where to dial.
+func TestApplyDialsTargetSatellite(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", NodeName: "n1", Ok: true}},
+		},
+	}
+	dialer := &fakeDialer{stub: stub}
+	d := dispatcher.New(dialer)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.244.1.5:7000"},
+		},
+	}}
+
+	result, err := d.Apply(t.Context(), target, nil, nodes)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if dialer.endpoint != "10.244.1.5:7000" {
+		t.Errorf("dialed %q, want 10.244.1.5:7000", dialer.endpoint)
+	}
+
+	if !result.GetOk() {
+		t.Errorf("expected ok; got %v", result)
+	}
+}
+
+// TestApplyMissingEndpoint: no SatelliteEndpoint prop → error before dial.
+func TestApplyMissingEndpoint(t *testing.T) {
+	d := dispatcher.New(&fakeDialer{stub: &fakeSatelliteClient{}})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes)
+	if err == nil {
+		t.Fatalf("expected error when endpoint missing")
+	}
+}
+
+// TestApplyBuildsPeers: a 2-replica RD pushes the other node's name into
+// the Peers slice and into the per-peer drbd_options keys.
+func TestApplyBuildsPeers(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+	}
+
+	peers := []blockstoriov1alpha1.Resource{
+		{Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"}},
+		{Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n2"}},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, peers, nodes)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got := stub.last.GetResources()[0]
+	if !slices.Contains(got.GetPeers(), "n2") {
+		t.Errorf("expected n2 in Peers; got %v", got.GetPeers())
+	}
+
+	for _, key := range []string{"peer.n2.port", "peer.n2.node-id", "peer.n2.address"} {
+		if got.GetDrbdOptions()[key] == "" {
+			t.Errorf("missing drbd option %q in %v", key, got.GetDrbdOptions())
+		}
+	}
+}
+
+// TestApplyDialError surfaces transport-level failures as errors.
+func TestApplyDialError(t *testing.T) {
+	stub := &fakeSatelliteClient{}
+	d := dispatcher.New(&errDialer{err: errFakeDial})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes)
+	if err == nil {
+		t.Fatalf("expected dial error")
+	}
+
+	_ = stub
+}
+
+// errDialer always fails — used to assert the dialErr path.
+type errDialer struct{ err error }
+
+func (e *errDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClient, func() error, error) {
+	return nil, nil, e.err
+}
+
+// errFakeDial is the canned transport-level error errDialer surfaces.
+// Using a package-level sentinel keeps err113 happy.
+var errFakeDial = errors.New("dispatcher_test: connection refused")
+
+// nodeMeta is sugar for setting the only ObjectMeta field this package
+// touches (Name) without dragging the whole metav1 boilerplate into
+// every table entry.
+func nodeMeta(name string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{Name: name}
+}

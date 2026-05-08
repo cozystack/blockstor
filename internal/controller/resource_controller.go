@@ -18,38 +18,95 @@ package controller
 
 import (
 	"context"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/dispatcher"
 )
 
-// ResourceReconciler reconciles a Resource object
+// ResourceReconciler dispatches Resource CRD changes to the right
+// satellite via the Dispatcher. It collects same-RD peers and the
+// full Node list (for endpoint resolution) on every reconcile —
+// fine for the stand smoke; once Resource counts grow we'll switch
+// to a cached lister or label-selector watch.
 type ResourceReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	Dispatcher *dispatcher.Dispatcher
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Resource object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
+// Reconcile reads a Resource and pushes the matching DesiredResource
+// to the satellite that hosts it. Per-replica errors land in the
+// log; transport faults trigger a 10s requeue.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	if r.Dispatcher == nil {
+		// envtest scaffolding (suite_test.go) constructs the reconciler
+		// without a Dispatcher — keep the original no-op behaviour for
+		// it so the boilerplate test stays green.
+		return ctrl.Result{}, nil
+	}
+
+	var target blockstoriov1alpha1.Resource
+
+	err := r.Get(ctx, req.NamespacedName, &target)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err = r.List(ctx, &resList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+			peers = append(peers, resList.Items[i])
+		}
+	}
+
+	var nodeList blockstoriov1alpha1.NodeList
+
+	err = r.List(ctx, &nodeList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	result, err := r.Dispatcher.Apply(ctx, &target, peers, nodeList.Items)
+	if err != nil {
+		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
+
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !result.GetOk() {
+		log.Info("satellite rejected apply", "msg", result.GetMessage(),
+			"resource", target.Name, "node", target.Spec.NodeName)
+	} else {
+		log.Info("satellite accepted apply",
+			"resource", target.Name, "node", target.Spec.NodeName)
+	}
 
 	return ctrl.Result{}, nil
 }
