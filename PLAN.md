@@ -250,6 +250,30 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Resource reconciler (`pkg/satellite.Reconciler`) routes DesiredResource batches: storage provider CreateVolume per volume, ConfFileBuilder writes /etc/drbd.d/<name>.res, drbdadm create-md (first activation, non-DISKLESS) + adjust. Status writeback from events2 stream is the next slice.
 - [x] Status writeback first half: `pkg/satellite.Observer` translates parsed drbd.Event values into ResourceObservedEvent (4 contract tests). Wire-up to gRPC stream pending the controller-side handler.
 - [ ] Resource on 2 nodes replicates and goes UpToDate (real DRBD smoke)
+      — Prereqs landed (controller running in-cluster, satellites
+      registered, REST CRUD persists CRDs). Remaining wiring: server-
+      side handler for `ApplyResources` (controller→satellite push) or
+      a periodic pull RPC; controller-side reconcile that diffs the
+      desired set and dispatches per node; storage-pool seeding so the
+      satellite has somewhere to put the LV. Once those land, an
+      autoplaced 2-replica RD walks all the way through to UpToDate
+      without touching the Java oracle.
+
+**Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
+2026-05-08):
+1. `docker build` two-stage Dockerfile — controller (distroless) and
+   satellite (debian-slim with drbd-utils + lvm2 + cryptsetup), pushed
+   to local registry on `10.164.0.1:5000`.
+2. Talos `MachineConfig` patched once to trust http://10.164.0.1:5000.
+3. `kubectl apply -f config/crd/bases/` — 7 CRDs.
+4. `kubectl apply -f stand/blockstor-deploy.yaml` — controller pod
+   1/1, REST :3370 + gRPC :7000.
+5. `kubectl apply -f stand/blockstor-satellite-daemonset.yaml` —
+   3 satellite pods, each Hello'd the controller; `kubectl get
+   nodes.blockstor.io.blockstor.io` shows the 3 workers.
+6. `curl POST /v1/resource-definitions` — 201, CRD created, `kubectl
+   get resourcedefinitions.blockstor.io.blockstor.io` shows it; stats
+   endpoint reports `{"nodes":3,"resource_definitions":1,...}`.
 
 **Exit**: smoke test with two replicas, real DRBD, PVC mounted on node A then on node B (failover).
 
