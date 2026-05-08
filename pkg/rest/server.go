@@ -73,6 +73,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerErrorReports(mux)
 	s.registerPropertiesInfo(mux)
 	s.registerSnapshotRestore(mux)
+	s.registerEncryption(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,
