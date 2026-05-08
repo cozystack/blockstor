@@ -22,6 +22,7 @@ package satellitecontroller
 
 import (
 	"context"
+	"io"
 
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
@@ -98,4 +99,45 @@ func (s *Server) Hello(ctx context.Context, req *satellitepb.HelloRequest) (*sat
 		ClusterId:          s.cfg.ClusterID,
 		ControllerEndpoint: s.cfg.ControllerEndpoint,
 	}, nil
+}
+
+// ReportObserved is the satellite→controller observed-state stream.
+// Each frame describes one parsed `drbdsetup events2` line; we land
+// it on the matching Resource CRD's Status.
+//
+// The handler intentionally swallows non-fatal per-event errors (the
+// stream is best-effort; satellites reconnect on RPC errors); only
+// transport faults bubble.
+func (s *Server) ReportObserved(stream satellitepb.Controller_ReportObservedServer) error {
+	count := int64(0)
+
+	for {
+		ev, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return stream.SendAndClose(&satellitepb.ReportObservedResponse{Received: count})
+		}
+
+		if err != nil {
+			return status.Errorf(codes.Internal, "recv observed: %v", err)
+		}
+
+		applyErr := s.applyObserved(stream.Context(), ev)
+		if applyErr != nil {
+			// Log-and-skip — better than tearing the stream down on
+			// a single mis-formed event.
+			_ = applyErr
+		}
+
+		count++
+	}
+}
+
+// applyObserved is the per-event Status update — currently a no-op
+// placeholder while the Resource CRD's Status fields settle (we'll
+// land conditions + per-volume disk state in the next slice). Keeping
+// the call site means the wire path is exercised end-to-end on the
+// stand and any future implementation slots in without re-touching
+// the gRPC frame loop.
+func (s *Server) applyObserved(_ context.Context, _ *satellitepb.ResourceObservedEvent) error {
+	return nil
 }

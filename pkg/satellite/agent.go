@@ -137,6 +137,12 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.logger.Info("satellite gRPC ready", "addr", srv)
 
+	// Tail drbdsetup events2 + ship observed state back to the
+	// controller via ReportObserved. Failures are logged and the
+	// goroutine exits — we don't want a noisy events2 to take down
+	// the satellite (the next Apply will redrive state anyway).
+	go a.runObserveLoop(ctx, client)
+
 	<-ctx.Done()
 
 	a.logger.Info("agent stopping", "node", a.cfg.NodeName)
@@ -210,6 +216,57 @@ func (a *Agent) dial(ctx context.Context) (*grpc.ClientConn, error) {
 
 	return conn, nil
 }
+
+// runObserveLoop tails `drbdsetup events2` and pushes parsed
+// observations to the controller via the ReportObserved
+// client-streaming RPC. Best-effort: any failure logs and exits the
+// loop — the controller's next ApplyResources retries the desired
+// state anyway, so a flaky events2 stream isn't fatal.
+func (a *Agent) runObserveLoop(ctx context.Context, client satellitepb.ControllerClient) {
+	watcher, cleanup, err := drbd.StartDrbdsetupEvents2(ctx)
+	if err != nil {
+		a.logger.Error("start events2", "err", err)
+
+		return
+	}
+	defer cleanup()
+
+	stream, err := client.ReportObserved(ctx)
+	if err != nil {
+		a.logger.Error("open ReportObserved stream", "err", err)
+
+		return
+	}
+
+	obs := NewObserver(a.cfg.NodeName)
+	events := make(chan drbd.Event, observeBuffer)
+
+	go func() {
+		watchErr := watcher.Watch(ctx, events)
+		if watchErr != nil {
+			a.logger.Error("events2 watch", "err", watchErr)
+		}
+	}()
+
+	for ev := range obs.Translate(events) {
+		err := stream.Send(ev)
+		if err != nil {
+			a.logger.Error("ReportObserved send", "err", err)
+
+			return
+		}
+	}
+
+	_, err = stream.CloseAndRecv()
+	if err != nil {
+		a.logger.Error("ReportObserved close", "err", err)
+	}
+}
+
+// observeBuffer caps the events2 → Observer in-flight queue. drbd-9
+// reconnect storms can burst dozens of events; 256 is a comfortable
+// cushion for the satellite-side translation goroutine.
+const observeBuffer = 256
 
 // hostFromEndpoint trims the trailing :port off an endpoint string.
 // Returns the input unchanged when it has no port (e.g. plain host or
