@@ -1,0 +1,6 @@
+{
+  "name": "healthz",
+  "method": "GET",
+  "path": "/v1/healthz",
+  "expectedStatus": 204
+}

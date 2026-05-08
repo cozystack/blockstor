@@ -1,0 +1,7 @@
+{
+  "name": "empty error reports",
+  "method": "GET",
+  "path": "/v1/error-reports",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

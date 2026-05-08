@@ -1,0 +1,7 @@
+{
+  "name": "empty nodes list",
+  "method": "GET",
+  "path": "/v1/nodes",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

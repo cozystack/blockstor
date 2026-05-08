@@ -1,0 +1,13 @@
+{
+  "name": "empty stats",
+  "method": "GET",
+  "path": "/v1/stats",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "nodes": 0,
+    "resource_definitions": 0,
+    "resources": 0,
+    "storage_pools": 0,
+    "snapshots": 0
+  }
+}
