@@ -34,9 +34,13 @@ USER 65532:65532
 ENTRYPOINT ["/manager"]
 
 FROM debian:trixie-slim AS satellite
+# zfsutils-linux is in contrib (not in main on trixie). Stand uses
+# LVM-thin so we can ship without zfs for now; we add it back when the
+# satellite needs to drive a ZFS pool. drbd-utils + lvm2 + cryptsetup
+# are the runtime tools the wrappers shell out to.
 RUN apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        drbd-utils lvm2 zfsutils-linux cryptsetup-bin ca-certificates \
+        drbd-utils lvm2 cryptsetup-bin ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /
 COPY --from=builder /workspace/satellite /usr/local/bin/satellite
