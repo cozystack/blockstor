@@ -59,6 +59,11 @@ spec:
             # satellite writes its rendered files where drbdadm
             # actually looks for them.
             - --state-dir=/etc/drbd.d
+            # Sparse-file pool wired through losetup. Talos workers
+            # don't expose a free block device for LVM, so this is
+            # how non-DISKLESS resources get a real /dev/loopN.
+            - --loopfile-pool-name=stand
+            - --loopfile-dir=/var/lib/blockstor-pool
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
@@ -73,6 +78,7 @@ spec:
             - {name: modules, mountPath: /lib/modules, readOnly: true}
             - {name: lvm-run, mountPath: /run/lvm}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
+            - {name: pool, mountPath: /var/lib/blockstor-pool}
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: 500m, memory: 256Mi}
@@ -81,3 +87,4 @@ spec:
         - {name: modules, hostPath: {path: /lib/modules}}
         - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}
         - {name: state, hostPath: {path: /var/lib/blockstor-satellite, type: DirectoryOrCreate}}
+        - {name: pool, hostPath: {path: /var/lib/blockstor-pool, type: DirectoryOrCreate}}

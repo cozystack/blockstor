@@ -176,18 +176,22 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 
 	diskless := isDiskless(dr.GetFlags())
 
+	devices := map[int32]string{}
+
 	if !diskless {
-		err := r.applyStorage(ctx, dr)
+		got, err := r.applyStorage(ctx, dr)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
 
 			return res
 		}
+
+		devices = got
 	}
 
 	if r.cfg.Adm != nil {
-		err := r.applyDRBD(ctx, dr, diskless)
+		err := r.applyDRBD(ctx, dr, diskless, devices)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -199,15 +203,22 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	return res
 }
 
-// applyStorage walks dr.Volumes and ensures each LV/zvol exists.
-// Idempotent — providers handle "already there" themselves. Records
-// the resource→pool mapping (first volume's pool) so subsequent
-// snapshot RPCs can route without the controller passing the pool.
-func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) error {
+// applyStorage walks dr.Volumes and ensures each LV/zvol/loopfile
+// exists. Returns a `volNumber → DevicePath` map the DRBD half uses
+// to wire the `disk` line in the .res file — this is what the
+// kernel actually opens, so we never want the satellite to guess
+// (`/dev/<pool>/<rd>_<vol>` only works for LVM/ZFS, not loopfile).
+//
+// Records the resource→pool mapping (first volume's pool) so
+// subsequent snapshot RPCs can route without the controller passing
+// the pool.
+func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, error) {
+	devices := map[int32]string{}
+
 	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 		if !ok {
-			return errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
+			return nil, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
 
 		err := provider.CreateVolume(ctx, storage.Volume{
@@ -216,27 +227,41 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 			SizeKib:      vol.GetSizeKib(),
 		})
 		if err != nil {
-			return errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
+			return nil, errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
+
+		status, err := provider.VolumeStatus(ctx, storage.Volume{
+			ResourceName: dr.GetName(),
+			VolumeNumber: vol.GetVolumeNumber(),
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
+		}
+
+		devices[vol.GetVolumeNumber()] = status.DevicePath
 	}
 
 	if len(dr.GetVolumes()) > 0 {
 		r.rememberPool(dr.GetName(), dr.GetVolumes()[0].GetStoragePool())
 	}
 
-	return nil
+	return devices, nil
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
 // it via drbdadm. create-md runs only on first activation (we detect
 // "first" by absence of the .res file before this run); diskless
 // replicas skip create-md entirely.
-func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool) error {
+//
+// devices is the volNumber → DevicePath map applyStorage produced.
+// buildResFile uses it as the disk path so a loopfile-backed volume
+// gets `disk /dev/loopN` rather than the LVM-shaped guess.
+func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string) error {
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	_, statErr := os.Stat(resPath)
 	firstActivation := os.IsNotExist(statErr)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress)
+	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
@@ -300,7 +325,12 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // localAddr is the satellite's own IP — when the controller-supplied
 // `address` is the placeholder "0.0.0.0" we substitute localAddr so
 // drbd-9 has a real interface to bind to.
-func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string) (string, error) {
+//
+// devices is volNumber → DevicePath; when present we use it as the
+// disk path. Empty / missing → fall back to the LVM/ZFS-shaped
+// `/dev/<pool>/<rd>_<vol>` guess, which is what works for those
+// providers.
+func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, devices map[int32]string) (string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -327,12 +357,17 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string) 
 	}
 
 	vols := make([]drbd.Volume, 0, len(dr.GetVolumes()))
-	for _, v := range dr.GetVolumes() {
+	for _, vol := range dr.GetVolumes() {
+		disk := devices[vol.GetVolumeNumber()]
+		if disk == "" {
+			disk = fmt.Sprintf("/dev/%s/%s_%05d", vol.GetStoragePool(), dr.GetName(), vol.GetVolumeNumber())
+		}
+
 		vols = append(vols, drbd.Volume{
-			Number: int(v.GetVolumeNumber()),
-			Device: fmt.Sprintf("/dev/drbd%d", minor+int(v.GetVolumeNumber())),
-			Disk:   fmt.Sprintf("/dev/%s/%s_%05d", v.GetStoragePool(), dr.GetName(), v.GetVolumeNumber()),
-			Minor:  minor + int(v.GetVolumeNumber()),
+			Number: int(vol.GetVolumeNumber()),
+			Device: fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
+			Disk:   disk,
+			Minor:  minor + int(vol.GetVolumeNumber()),
 		})
 	}
 

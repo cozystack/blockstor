@@ -35,8 +35,14 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/loopfile"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
+
+// loopfileDirPerm is the mkdir mode for the loopfile pool directory
+// when --loopfile-dir doesn't already exist. 0o700 because the sparse
+// files inside are block-device backers and shouldn't be world-readable.
+const loopfileDirPerm = 0o700
 
 func main() {
 	os.Exit(run())
@@ -78,6 +84,17 @@ func run() int {
 		"LVM volume group backing the lvm-pool-name pool")
 	flag.StringVar(&lvmThinPool, "lvm-thinpool", "",
 		"LVM thinpool LV backing the lvm-pool-name pool")
+
+	var (
+		loopfilePoolName string
+		loopfileDir      string
+	)
+
+	flag.StringVar(&loopfilePoolName, "loopfile-pool-name", "",
+		"register a loopfile (sparse-file + losetup) pool under this LINSTOR pool name (empty disables)")
+	flag.StringVar(&loopfileDir, "loopfile-dir", "/var/lib/blockstor-pool",
+		"directory the loopfile-pool-name pool stores its sparse files in")
+
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -103,6 +120,19 @@ func run() int {
 
 		providers[lvmPoolName] = lvm.NewThin(
 			lvm.ThinConfig{VolumeGroup: lvmVG, ThinPool: lvmThinPool},
+			storage.RealExec{})
+	}
+
+	if loopfilePoolName != "" {
+		err := os.MkdirAll(loopfileDir, loopfileDirPerm)
+		if err != nil {
+			logger.Error("create loopfile dir", "err", err)
+
+			return 1
+		}
+
+		providers[loopfilePoolName] = loopfile.NewProvider(
+			loopfile.Config{Dir: loopfileDir},
 			storage.RealExec{})
 	}
 
