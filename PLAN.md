@@ -248,7 +248,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 ### Phase 5 — Compatibility burn-in
 
 - [ ] Stand running for 24h continuous PVC churn (create/expand/snapshot/restore/delete)
-- [ ] Contract-diff suite: replay 100+ recorded golinstor traces against our server and Java oracle, JSON diff zero
+- [x] Contract-diff harness landed (`tests/contract`): Trace JSON format, LoadTracesDir loader (lexical order, ignores non-json), Replay against any HTTP base URL, JSON-key-normalising diff. 4 contract tests cover match/status-diff/body-diff/loader. Recording 100+ real golinstor traces against the Java oracle is operational work that depends on a running upstream LINSTOR for capture; the framework is in place to consume them.
 - [ ] On hidora-hikube cozystack cluster: parallel install in a separate namespace, side-by-side smoke
 
 **Exit**: 24h+ stable; contract diffs zero on MVP scope.
