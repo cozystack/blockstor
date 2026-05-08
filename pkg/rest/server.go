@@ -78,6 +78,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.registerDRBDProxy(mux)
 	s.registerExternalFiles(mux)
 	s.registerDRBDPassphrase(mux)
+	s.registerRDClone(mux)
 
 	srv := &http.Server{
 		Addr:              s.Addr,
