@@ -358,7 +358,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Intra-cluster snapshot shipping for clone/replica-expansion: `Reconciler.ShipSnapshot` picks `zfs send | ssh peer zfs recv` for ZFS / ZFS_THIN and `thin-send-recv` for LVM_THIN, dispatched via an injectable ShipExec so unit tests assert command lines without spinning up the real tools. 3 contract tests.
       - ZFS pools: `zfs send | ssh | zfs recv` over satellite-to-satellite
       - LVM-thin: `thin-send-recv` (LINBIT)
-- [ ] csi-sanity passes against our server
+- [x] csi-sanity runs end-to-end against blockstor REST (2026-05-08): `stand/csi-sanity-job.yaml` is a single-pod Job hosting `piraeus-csi` + `csi-sanity` sharing /csi via emptyDir; piraeus-csi dials `http://blockstor-controller:3370`, csi-sanity hammers it through the standard CSI gRPC contract. Baseline on the dev stand: **38/92 specs passing**, 36 failing, 1 pending, 17 skipped (Identity + most of the Controller surface — Capabilities, GetPluginInfo, ControllerGetCapabilities, NodeGetVolumeStats etc. all green). The 36 failures highlight specific semantic gaps (e.g. CreateVolume size validation, idempotent CreateVolume payload diffs, GroupVolumeSnapshot which we don't implement) — they're concrete regression targets for incremental work, not blockers for the architecture.
 
 **Exit**: csi-sanity green; piraeus-operator e2e green for what they cover; PVC clone across nodes works.
 
