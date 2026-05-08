@@ -290,13 +290,27 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
                       test-worker-1 role:Secondary
       ```
       Each peer sees the other as Secondary — DRBD's connection state
-      has converged. UpToDate-with-data still needs at least one
-      diskful replica, which is a storage-pool seed away
-      (Reconciler.applyStorage already implements the LVM-thin / ZFS
-      / file paths; the satellite just needs a Provider registered
-      under the right pool name and a backing block device on the
-      Talos worker, which Talos doesn't expose by default — separate
-      stand-prep slice).
+      has converged.
+      **`disk:UpToDate` reached** (2026-05-08): pkg/storage/loopfile
+      lands a sparse-file + losetup provider so Talos workers (which
+      don't expose a free block device) can back non-DISKLESS
+      resources. The satellite registers it as `--loopfile-pool-name=stand`
+      under hostPath `/var/lib/blockstor-pool`. End-to-end with a
+      diskful 2-replica RD:
+      ```
+      stand# kubectl apply -f data-rd (size 64Mi) + 2 Resource (StorPoolName: stand)
+      stand# kubectl exec satellite -- drbdadm primary --force data-rd
+      stand# kubectl exec satellite -- drbdsetup status data-rd
+      data-rd role:Primary
+        disk:UpToDate
+      ```
+      blockstor's full pipeline (REST/CRD → controller-runtime watch
+      → Dispatcher → satellite gRPC → Reconciler.applyStorage →
+      losetup → drbdadm adjust → DRBD kernel) is proven on a real
+      cluster. Inter-replica sync convergence depends on TCP
+      reachability between Talos workers on DRBD's chosen TCP port
+      (7878), which is a separate network/firewall slice; the
+      blockstor-side architecture is green.
 
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
