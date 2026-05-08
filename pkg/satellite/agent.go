@@ -143,6 +143,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	// the satellite (the next Apply will redrive state anyway).
 	go a.runObserveLoop(ctx, client)
 
+	// Periodically push pool capacity so /v1/view/storage-pools shows
+	// live numbers. Best-effort: errors log and the next tick retries.
+	go a.runCapacityLoop(ctx, client)
+
 	<-ctx.Done()
 
 	a.logger.Info("agent stopping", "node", a.cfg.NodeName)
@@ -262,6 +266,56 @@ func (a *Agent) runObserveLoop(ctx context.Context, client satellitepb.Controlle
 		a.logger.Error("ReportObserved close", "err", err)
 	}
 }
+
+// runCapacityLoop walks each registered Provider's PoolStatus on a
+// fixed cadence and pushes free/total bytes to the controller via
+// ReportPoolCapacity. Best-effort: a failed iteration is logged and
+// the next tick retries. Empty Providers map → no-op (the loop still
+// runs, but every tick yields a zero-pool request which the
+// controller treats as a no-op).
+func (a *Agent) runCapacityLoop(ctx context.Context, client satellitepb.ControllerClient) {
+	tick := time.NewTicker(capacityInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		pools := make([]*satellitepb.PoolCapacity, 0, len(a.cfg.Providers))
+
+		for name, p := range a.cfg.Providers {
+			poolStatus, err := p.PoolStatus(ctx)
+			if err != nil {
+				a.logger.Error("PoolStatus", "pool", name, "err", err)
+
+				continue
+			}
+
+			pools = append(pools, &satellitepb.PoolCapacity{
+				PoolName:          name,
+				FreeCapacityKib:   poolStatus.FreeCapacityKib,
+				TotalCapacityKib:  poolStatus.TotalCapacityKib,
+				SupportsSnapshots: poolStatus.SupportsSnapshots,
+			})
+		}
+
+		_, err := client.ReportPoolCapacity(ctx, &satellitepb.ReportPoolCapacityRequest{
+			NodeName: a.cfg.NodeName,
+			Pools:    pools,
+		})
+		if err != nil {
+			a.logger.Error("ReportPoolCapacity", "err", err)
+		}
+	}
+}
+
+// capacityInterval is the periodic-push cadence. Long enough to keep
+// CRD writes cheap, short enough that a freshly-allocated LV shows up
+// in /v1/view/storage-pools' free_capacity within ~half a minute.
+const capacityInterval = 30 * time.Second
 
 // observeBuffer caps the events2 → Observer in-flight queue. drbd-9
 // reconnect storms can burst dozens of events; 256 is a comfortable

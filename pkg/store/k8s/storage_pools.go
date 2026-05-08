@@ -197,6 +197,37 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 	}
 }
 
+// SetCapacity updates the pool's Status subresource with live free /
+// total / supports-snapshots numbers. Avoids a Spec rewrite so a
+// Hello racing with a periodic capacity push doesn't lose either side.
+func (s *storagePools) SetCapacity(ctx context.Context, node, pool string, freeKib, totalKib int64, supportsSnap bool) error {
+	var existing crdv1alpha1.StoragePool
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: crdName(node, pool)}, &existing)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return errors.Wrapf(store.ErrNotFound, "storage pool %q on node %q", pool, node)
+		}
+
+		return errors.Wrapf(err, "get StoragePool %s/%s", node, pool)
+	}
+
+	existing.Status.FreeCapacity = freeKib * bytesPerKib
+	existing.Status.TotalCapacity = totalKib * bytesPerKib
+	existing.Status.SupportsSnapshots = supportsSnap
+
+	err = s.c.Status().Update(ctx, &existing)
+	if err != nil {
+		return errors.Wrapf(err, "status update StoragePool %s/%s", node, pool)
+	}
+
+	return nil
+}
+
+// bytesPerKib so the satellite-side `kib` numbers convert cleanly
+// into the CRD's bytes-shaped Status fields without a magic literal.
+const bytesPerKib = 1024
+
 // wireToCRDStoragePool builds a fresh CRD from an apiv1.StoragePool.
 func wireToCRDStoragePool(in *apiv1.StoragePool) *crdv1alpha1.StoragePool {
 	return &crdv1alpha1.StoragePool{

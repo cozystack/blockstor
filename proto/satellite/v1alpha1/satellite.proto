@@ -40,6 +40,12 @@ service Controller {
   // continuous flow of events without re-connecting on every change.
   rpc ReportObserved(stream ResourceObservedEvent)
       returns (ReportObservedResponse) {}
+
+  // ReportPoolCapacity is the periodic capacity-update push: satellite
+  // walks each Provider, runs PoolStatus, and ships free/total bytes
+  // back so /v1/view/storage-pools surfaces live numbers (linstor-csi
+  // GetCapacity, autoplacer free-space ranking).
+  rpc ReportPoolCapacity(ReportPoolCapacityRequest) returns (ReportPoolCapacityResponse) {}
 }
 
 // Satellite is the gRPC service the satellite agent exposes; the
@@ -78,6 +84,22 @@ service Satellite {
 
 message ReportObservedResponse {
   int64 received = 1;  // count of events the controller accepted
+}
+
+message ReportPoolCapacityRequest {
+  string node_name = 1;
+  repeated PoolCapacity pools = 2;
+}
+
+message PoolCapacity {
+  string pool_name = 1;
+  int64 free_capacity_kib = 2;
+  int64 total_capacity_kib = 3;
+  bool supports_snapshots = 4;
+}
+
+message ReportPoolCapacityResponse {
+  bool ok = 1;
 }
 
 message DeleteResourceRequest {

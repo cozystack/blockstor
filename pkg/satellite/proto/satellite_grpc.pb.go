@@ -33,8 +33,9 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	Controller_Hello_FullMethodName          = "/blockstor.satellite.v1alpha1.Controller/Hello"
-	Controller_ReportObserved_FullMethodName = "/blockstor.satellite.v1alpha1.Controller/ReportObserved"
+	Controller_Hello_FullMethodName              = "/blockstor.satellite.v1alpha1.Controller/Hello"
+	Controller_ReportObserved_FullMethodName     = "/blockstor.satellite.v1alpha1.Controller/ReportObserved"
+	Controller_ReportPoolCapacity_FullMethodName = "/blockstor.satellite.v1alpha1.Controller/ReportPoolCapacity"
 )
 
 // ControllerClient is the client API for Controller service.
@@ -50,6 +51,11 @@ type ControllerClient interface {
 	// Resource CRD's status. Client-streaming so satellites can send a
 	// continuous flow of events without re-connecting on every change.
 	ReportObserved(ctx context.Context, opts ...grpc.CallOption) (Controller_ReportObservedClient, error)
+	// ReportPoolCapacity is the periodic capacity-update push: satellite
+	// walks each Provider, runs PoolStatus, and ships free/total bytes
+	// back so /v1/view/storage-pools surfaces live numbers (linstor-csi
+	// GetCapacity, autoplacer free-space ranking).
+	ReportPoolCapacity(ctx context.Context, in *ReportPoolCapacityRequest, opts ...grpc.CallOption) (*ReportPoolCapacityResponse, error)
 }
 
 type controllerClient struct {
@@ -103,6 +109,15 @@ func (x *controllerReportObservedClient) CloseAndRecv() (*ReportObservedResponse
 	return m, nil
 }
 
+func (c *controllerClient) ReportPoolCapacity(ctx context.Context, in *ReportPoolCapacityRequest, opts ...grpc.CallOption) (*ReportPoolCapacityResponse, error) {
+	out := new(ReportPoolCapacityResponse)
+	err := c.cc.Invoke(ctx, Controller_ReportPoolCapacity_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControllerServer is the server API for Controller service.
 // All implementations must embed UnimplementedControllerServer
 // for forward compatibility
@@ -116,6 +131,11 @@ type ControllerServer interface {
 	// Resource CRD's status. Client-streaming so satellites can send a
 	// continuous flow of events without re-connecting on every change.
 	ReportObserved(Controller_ReportObservedServer) error
+	// ReportPoolCapacity is the periodic capacity-update push: satellite
+	// walks each Provider, runs PoolStatus, and ships free/total bytes
+	// back so /v1/view/storage-pools surfaces live numbers (linstor-csi
+	// GetCapacity, autoplacer free-space ranking).
+	ReportPoolCapacity(context.Context, *ReportPoolCapacityRequest) (*ReportPoolCapacityResponse, error)
 	mustEmbedUnimplementedControllerServer()
 }
 
@@ -128,6 +148,9 @@ func (UnimplementedControllerServer) Hello(context.Context, *HelloRequest) (*Hel
 }
 func (UnimplementedControllerServer) ReportObserved(Controller_ReportObservedServer) error {
 	return status.Errorf(codes.Unimplemented, "method ReportObserved not implemented")
+}
+func (UnimplementedControllerServer) ReportPoolCapacity(context.Context, *ReportPoolCapacityRequest) (*ReportPoolCapacityResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ReportPoolCapacity not implemented")
 }
 func (UnimplementedControllerServer) mustEmbedUnimplementedControllerServer() {}
 
@@ -186,6 +209,24 @@ func (x *controllerReportObservedServer) Recv() (*ResourceObservedEvent, error) 
 	return m, nil
 }
 
+func _Controller_ReportPoolCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportPoolCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).ReportPoolCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_ReportPoolCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).ReportPoolCapacity(ctx, req.(*ReportPoolCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Controller_ServiceDesc is the grpc.ServiceDesc for Controller service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -196,6 +237,10 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Hello",
 			Handler:    _Controller_Hello_Handler,
+		},
+		{
+			MethodName: "ReportPoolCapacity",
+			Handler:    _Controller_ReportPoolCapacity_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

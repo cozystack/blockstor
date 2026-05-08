@@ -129,6 +129,27 @@ func (s *inMemoryStoragePools) Update(_ context.Context, sp *apiv1.StoragePool) 
 	return nil
 }
 
+// SetCapacity mutates only the capacity fields on the in-memory copy.
+// Returns ErrNotFound if the pool isn't present.
+func (s *inMemoryStoragePools) SetCapacity(_ context.Context, node, pool string, freeKib, totalKib int64, supportsSnap bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := spKey{node, pool}
+
+	existing, ok := s.m[key]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
+	}
+
+	existing.FreeCapacity = freeKib
+	existing.TotalCapacity = totalKib
+	existing.SupportsSnapshot = supportsSnap
+	s.m[key] = existing
+
+	return nil
+}
+
 // Delete removes a pool by (node, name). Returns ErrNotFound if absent.
 func (s *inMemoryStoragePools) Delete(_ context.Context, node, pool string) error {
 	s.mu.Lock()

@@ -153,6 +153,31 @@ func (s *Server) ReportObserved(stream satellitepb.Controller_ReportObservedServ
 	}
 }
 
+// ReportPoolCapacity is the satellite's periodic capacity push.
+// Each frame contains every pool's current free/total bytes; we
+// upsert the StoragePool Status subresource so /v1/view/storage-pools
+// surfaces live numbers (linstor-csi GetCapacity, autoplacer ranking).
+//
+// Per-pool failures don't sink the whole call; we log+skip the way
+// applyObserved does.
+func (s *Server) ReportPoolCapacity(ctx context.Context, req *satellitepb.ReportPoolCapacityRequest) (*satellitepb.ReportPoolCapacityResponse, error) {
+	if req.GetNodeName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_name is required")
+	}
+
+	for _, pc := range req.GetPools() {
+		err := s.st.StoragePools().SetCapacity(ctx,
+			req.GetNodeName(), pc.GetPoolName(),
+			pc.GetFreeCapacityKib(), pc.GetTotalCapacityKib(),
+			pc.GetSupportsSnapshots())
+		if err != nil {
+			_ = err
+		}
+	}
+
+	return &satellitepb.ReportPoolCapacityResponse{Ok: true}, nil
+}
+
 // applyObserved lands one parsed events2 frame on the matching
 // Resource. We store the DRBD state as a `DrbdState` prop and the
 // "in use" hint via Resource.State.InUse so existing REST callers

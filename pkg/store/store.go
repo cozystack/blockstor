@@ -66,6 +66,12 @@ type StoragePoolStore interface {
 	Create(ctx context.Context, sp *apiv1.StoragePool) error
 	Update(ctx context.Context, sp *apiv1.StoragePool) error
 	Delete(ctx context.Context, node, pool string) error
+
+	// SetCapacity writes free/total via the Status subresource without
+	// touching Spec — keeps periodic capacity pushes from racing with
+	// ProviderKind / Props edits. linstor-csi GetCapacity reads the
+	// FreeCapacity field; the autoplacer's free-space ranking too.
+	SetCapacity(ctx context.Context, node, pool string, freeKib, totalKib int64, supportsSnap bool) error
 }
 
 // ResourceGroupStore persists ResourceGroup objects. Keyed by name.
