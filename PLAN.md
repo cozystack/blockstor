@@ -270,11 +270,23 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       → controller logs "satellite rejected apply" with the expected
       "drbdadm adjust: no resources defined!" — every hop on the wire
       including the kernel shell-out fires.
-      Remaining for green UpToDate: dispatcher needs to pass real peer
-      addresses (currently 0.0.0.0 placeholders); satellite must
-      rewrite its own bind address to $POD_IP at .res render time;
-      storage-pool seeding so a non-DISKLESS resource has somewhere
-      to put its LV.
+      **Real DRBD up on 2 nodes via blockstor** (2026-05-08): with
+      hostNetwork+ClusterFirstWithHostNet on the satellite DaemonSet
+      and `--state-dir=/etc/drbd.d` (where drbdadm reads from), the
+      end-to-end pipeline produced this on a stand `kubectl apply`:
+      ```
+      test-worker-1: smoke-rd role:Secondary
+      test-worker-2: smoke-rd role:Secondary
+                      test-worker-1 connection:Connecting
+      ```
+      i.e. the controller-rendered `.res` was accepted by both
+      kernels and DRBD opened a peer connection between them. Stays
+      "Connecting" because both replicas are DISKLESS-only — UpToDate
+      needs at least one diskful replica, which is a storage-pool
+      seed away (Reconciler.applyStorage already implements the
+      LVM-thin / ZFS / file paths, just needs to be wired through a
+      configured Provider on the satellite). Architecture-side smoke
+      is green; volume-side smoke is the next slice.
 
 **Stand walkthrough so far** (proven on `ssh ubuntu@129.213.29.101`,
 2026-05-08):
