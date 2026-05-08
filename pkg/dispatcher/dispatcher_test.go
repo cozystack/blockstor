@@ -81,7 +81,7 @@ func TestApplyDialsTargetSatellite(t *testing.T) {
 		},
 	}}
 
-	result, err := d.Apply(t.Context(), target, nil, nodes)
+	result, err := d.Apply(t.Context(), target, nil, nodes, nil)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestApplyMissingEndpoint(t *testing.T) {
 		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
 	}}
 
-	_, err := d.Apply(t.Context(), target, nil, nodes)
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
 	if err == nil {
 		t.Fatalf("expected error when endpoint missing")
 	}
@@ -141,7 +141,7 @@ func TestApplyBuildsPeers(t *testing.T) {
 		},
 	}}
 
-	_, err := d.Apply(t.Context(), target, peers, nodes)
+	_, err := d.Apply(t.Context(), target, peers, nodes, nil)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestApplyDialError(t *testing.T) {
 		},
 	}}
 
-	_, err := d.Apply(t.Context(), target, nil, nodes)
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
 	if err == nil {
 		t.Fatalf("expected dial error")
 	}

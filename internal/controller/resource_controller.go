@@ -93,7 +93,12 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	result, err := r.Dispatcher.Apply(ctx, &target, peers, nodeList.Items)
+	rdPtr, err := r.lookupRD(ctx, target.Spec.ResourceDefinitionName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	result, err := r.Dispatcher.Apply(ctx, &target, peers, nodeList.Items, rdPtr)
 	if err != nil {
 		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
 
@@ -109,6 +114,24 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// lookupRD fetches the parent ResourceDefinition. A NotFound is
+// converted to (nil, nil) so the dispatcher can still push the
+// .res for connection setup; any other error bubbles.
+func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blockstoriov1alpha1.ResourceDefinition, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: name}, &rd)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil //nolint:nilnil // intentional: caller treats nil RD as no-volume push
+		}
+
+		return nil, err
+	}
+
+	return &rd, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
