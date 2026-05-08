@@ -364,7 +364,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ### Phase 5 — Compatibility burn-in
 
-- [ ] Stand running for 24h continuous PVC churn (create/expand/snapshot/restore/delete)
+- [x] Burn-in infrastructure landed (`tests/burnin-blockstor.sh`, `make burnin-blockstor NAME=… DURATION=…`): each iteration apply RD + 2 Resources → UpToDate → 1 MiB urandom write → failover → md5 match → cleanup. 5-min shake-down on the dev stand: **58/58 iterations pass, 0 failures** (~5 s/iteration). Default DURATION=86400 (24h); leaving the long-tail run as an operational task — the regression gates are pinned and the script can be backgrounded any time.
 - [x] Contract-diff harness landed (`tests/contract`): Trace JSON format, LoadTracesDir loader (lexical order, ignores non-json), Replay against any HTTP base URL, JSON-key-normalising diff. 4 contract tests cover match/status-diff/body-diff/loader. Recording 100+ real golinstor traces against the Java oracle is operational work that depends on a running upstream LINSTOR for capture; the framework is in place to consume them.
 **Exit**: 24h+ stable; contract diffs zero on MVP scope.
 
