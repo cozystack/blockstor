@@ -265,7 +265,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 ### Phase 7 — Cluster operations + admin
 
 - [x] Cluster passphrase management (`/v1/encryption/passphrase` POST/PATCH/PUT): seeds, unlocks, rotates the cluster passphrase under ControllerProps. KDF + at-rest encryption of per-volume keys is the LUKS phase 6 work. 3 contract tests.
-- [ ] Satellite eviction / restoration / lost-and-recover
+- [x] Satellite eviction / restoration / lost-and-recover (`POST /v1/nodes/{node}/{evacuate,restore,lost}`): toggles EVICTED / LOST flags on the Node CRD; replica migration is the reconciler's job. 4 contract tests.
 - [x] Stats endpoint (`GET /v1/stats`): cluster-wide counters (nodes, RDs, resources, storage pools, snapshots). 2 contract tests.
 - [x] Error reports stub (`/v1/error-reports` LIST returns []; GET /{id} → 404). Empty-but-present so `linstor error-reports list` doesn't choke. Real persistence lands when the controller starts buffering reports.
 - [ ] All `/v1/view/*` aggregates
