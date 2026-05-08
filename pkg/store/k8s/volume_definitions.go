@@ -162,7 +162,7 @@ func (s *volumeDefinitions) Delete(ctx context.Context, rdName string, volumeNum
 func (s *volumeDefinitions) fetchRD(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
 	var rd crdv1alpha1.ResourceDefinition
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: rdName}, &rd)
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &rd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, errors.Wrapf(store.ErrNotFound, "resource definition %q", rdName)
