@@ -214,7 +214,7 @@ linters:
           - cyclop
           - gocyclo
           - maintidx
-        path: cmd/main.go
+        path: cmd/(main|satellite/main)\.go
       # api/v1alpha1 and internal/controller are kubebuilder scaffold; the
       # boilerplate (dot-imports for ginkgo/gomega, generated DeepCopy globals,
       # ginkgo BeforeSuite TODOs, wrapcheck on framework returns) is not

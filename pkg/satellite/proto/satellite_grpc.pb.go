@@ -33,9 +33,183 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	Satellite_Hello_FullMethodName             = "/blockstor.satellite.v1alpha1.Satellite/Hello"
+	Controller_Hello_FullMethodName          = "/blockstor.satellite.v1alpha1.Controller/Hello"
+	Controller_ReportObserved_FullMethodName = "/blockstor.satellite.v1alpha1.Controller/ReportObserved"
+)
+
+// ControllerClient is the client API for Controller service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type ControllerClient interface {
+	// Hello is the satellite registration handshake. The satellite sends its
+	// identity and capabilities; the controller replies with the cluster
+	// identity it should expect.
+	Hello(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloResponse, error)
+	// ReportObserved lets the satellite push observed-state updates back to
+	// the controller. The controller reads them and updates the matching
+	// Resource CRD's status. Client-streaming so satellites can send a
+	// continuous flow of events without re-connecting on every change.
+	ReportObserved(ctx context.Context, opts ...grpc.CallOption) (Controller_ReportObservedClient, error)
+}
+
+type controllerClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewControllerClient(cc grpc.ClientConnInterface) ControllerClient {
+	return &controllerClient{cc}
+}
+
+func (c *controllerClient) Hello(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloResponse, error) {
+	out := new(HelloResponse)
+	err := c.cc.Invoke(ctx, Controller_Hello_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controllerClient) ReportObserved(ctx context.Context, opts ...grpc.CallOption) (Controller_ReportObservedClient, error) {
+	stream, err := c.cc.NewStream(ctx, &Controller_ServiceDesc.Streams[0], Controller_ReportObserved_FullMethodName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &controllerReportObservedClient{stream}
+	return x, nil
+}
+
+type Controller_ReportObservedClient interface {
+	Send(*ResourceObservedEvent) error
+	CloseAndRecv() (*ReportObservedResponse, error)
+	grpc.ClientStream
+}
+
+type controllerReportObservedClient struct {
+	grpc.ClientStream
+}
+
+func (x *controllerReportObservedClient) Send(m *ResourceObservedEvent) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *controllerReportObservedClient) CloseAndRecv() (*ReportObservedResponse, error) {
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	m := new(ReportObservedResponse)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ControllerServer is the server API for Controller service.
+// All implementations must embed UnimplementedControllerServer
+// for forward compatibility
+type ControllerServer interface {
+	// Hello is the satellite registration handshake. The satellite sends its
+	// identity and capabilities; the controller replies with the cluster
+	// identity it should expect.
+	Hello(context.Context, *HelloRequest) (*HelloResponse, error)
+	// ReportObserved lets the satellite push observed-state updates back to
+	// the controller. The controller reads them and updates the matching
+	// Resource CRD's status. Client-streaming so satellites can send a
+	// continuous flow of events without re-connecting on every change.
+	ReportObserved(Controller_ReportObservedServer) error
+	mustEmbedUnimplementedControllerServer()
+}
+
+// UnimplementedControllerServer must be embedded to have forward compatible implementations.
+type UnimplementedControllerServer struct {
+}
+
+func (UnimplementedControllerServer) Hello(context.Context, *HelloRequest) (*HelloResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Hello not implemented")
+}
+func (UnimplementedControllerServer) ReportObserved(Controller_ReportObservedServer) error {
+	return status.Errorf(codes.Unimplemented, "method ReportObserved not implemented")
+}
+func (UnimplementedControllerServer) mustEmbedUnimplementedControllerServer() {}
+
+// UnsafeControllerServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ControllerServer will
+// result in compilation errors.
+type UnsafeControllerServer interface {
+	mustEmbedUnimplementedControllerServer()
+}
+
+func RegisterControllerServer(s grpc.ServiceRegistrar, srv ControllerServer) {
+	s.RegisterService(&Controller_ServiceDesc, srv)
+}
+
+func _Controller_Hello_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HelloRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerServer).Hello(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Controller_Hello_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerServer).Hello(ctx, req.(*HelloRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Controller_ReportObserved_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ControllerServer).ReportObserved(&controllerReportObservedServer{stream})
+}
+
+type Controller_ReportObservedServer interface {
+	SendAndClose(*ReportObservedResponse) error
+	Recv() (*ResourceObservedEvent, error)
+	grpc.ServerStream
+}
+
+type controllerReportObservedServer struct {
+	grpc.ServerStream
+}
+
+func (x *controllerReportObservedServer) SendAndClose(m *ReportObservedResponse) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *controllerReportObservedServer) Recv() (*ResourceObservedEvent, error) {
+	m := new(ResourceObservedEvent)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// Controller_ServiceDesc is the grpc.ServiceDesc for Controller service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Controller_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "blockstor.satellite.v1alpha1.Controller",
+	HandlerType: (*ControllerServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Hello",
+			Handler:    _Controller_Hello_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ReportObserved",
+			Handler:       _Controller_ReportObserved_Handler,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "satellite/v1alpha1/satellite.proto",
+}
+
+const (
 	Satellite_ApplyResources_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/ApplyResources"
-	Satellite_WatchResources_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/WatchResources"
 	Satellite_ApplyStoragePools_FullMethodName = "/blockstor.satellite.v1alpha1.Satellite/ApplyStoragePools"
 	Satellite_CreateSnapshot_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/CreateSnapshot"
 	Satellite_DeleteSnapshot_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/DeleteSnapshot"
@@ -46,19 +220,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SatelliteClient interface {
-	// Hello is the satellite registration handshake. The satellite sends its
-	// identity and capabilities; the controller replies with the cluster
-	// identity it should expect.
-	Hello(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloResponse, error)
 	// ApplyResources is the central reconcile RPC. The controller sends the
 	// full set of resources that should live on this node; the satellite
 	// brings local state in line with that set (creates new ones, removes
 	// ones not in the set, fixes drift).
 	ApplyResources(ctx context.Context, in *ApplyResourcesRequest, opts ...grpc.CallOption) (*ApplyResourcesResponse, error)
-	// WatchResources lets the satellite push observed-state updates back to
-	// the controller. The controller reads them and updates the matching
-	// Resource CRD's status.
-	WatchResources(ctx context.Context, in *WatchResourcesRequest, opts ...grpc.CallOption) (Satellite_WatchResourcesClient, error)
 	// ApplyStoragePools mirrors ApplyResources for storage pools.
 	ApplyStoragePools(ctx context.Context, in *ApplyStoragePoolsRequest, opts ...grpc.CallOption) (*ApplyStoragePoolsResponse, error)
 	// CreateSnapshot asks the satellite to take a snapshot of the named
@@ -80,15 +246,6 @@ func NewSatelliteClient(cc grpc.ClientConnInterface) SatelliteClient {
 	return &satelliteClient{cc}
 }
 
-func (c *satelliteClient) Hello(ctx context.Context, in *HelloRequest, opts ...grpc.CallOption) (*HelloResponse, error) {
-	out := new(HelloResponse)
-	err := c.cc.Invoke(ctx, Satellite_Hello_FullMethodName, in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *satelliteClient) ApplyResources(ctx context.Context, in *ApplyResourcesRequest, opts ...grpc.CallOption) (*ApplyResourcesResponse, error) {
 	out := new(ApplyResourcesResponse)
 	err := c.cc.Invoke(ctx, Satellite_ApplyResources_FullMethodName, in, out, opts...)
@@ -96,38 +253,6 @@ func (c *satelliteClient) ApplyResources(ctx context.Context, in *ApplyResources
 		return nil, err
 	}
 	return out, nil
-}
-
-func (c *satelliteClient) WatchResources(ctx context.Context, in *WatchResourcesRequest, opts ...grpc.CallOption) (Satellite_WatchResourcesClient, error) {
-	stream, err := c.cc.NewStream(ctx, &Satellite_ServiceDesc.Streams[0], Satellite_WatchResources_FullMethodName, opts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &satelliteWatchResourcesClient{stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-type Satellite_WatchResourcesClient interface {
-	Recv() (*ResourceObservedEvent, error)
-	grpc.ClientStream
-}
-
-type satelliteWatchResourcesClient struct {
-	grpc.ClientStream
-}
-
-func (x *satelliteWatchResourcesClient) Recv() (*ResourceObservedEvent, error) {
-	m := new(ResourceObservedEvent)
-	if err := x.ClientStream.RecvMsg(m); err != nil {
-		return nil, err
-	}
-	return m, nil
 }
 
 func (c *satelliteClient) ApplyStoragePools(ctx context.Context, in *ApplyStoragePoolsRequest, opts ...grpc.CallOption) (*ApplyStoragePoolsResponse, error) {
@@ -170,19 +295,11 @@ func (c *satelliteClient) ShipSnapshot(ctx context.Context, in *ShipSnapshotRequ
 // All implementations must embed UnimplementedSatelliteServer
 // for forward compatibility
 type SatelliteServer interface {
-	// Hello is the satellite registration handshake. The satellite sends its
-	// identity and capabilities; the controller replies with the cluster
-	// identity it should expect.
-	Hello(context.Context, *HelloRequest) (*HelloResponse, error)
 	// ApplyResources is the central reconcile RPC. The controller sends the
 	// full set of resources that should live on this node; the satellite
 	// brings local state in line with that set (creates new ones, removes
 	// ones not in the set, fixes drift).
 	ApplyResources(context.Context, *ApplyResourcesRequest) (*ApplyResourcesResponse, error)
-	// WatchResources lets the satellite push observed-state updates back to
-	// the controller. The controller reads them and updates the matching
-	// Resource CRD's status.
-	WatchResources(*WatchResourcesRequest, Satellite_WatchResourcesServer) error
 	// ApplyStoragePools mirrors ApplyResources for storage pools.
 	ApplyStoragePools(context.Context, *ApplyStoragePoolsRequest) (*ApplyStoragePoolsResponse, error)
 	// CreateSnapshot asks the satellite to take a snapshot of the named
@@ -201,14 +318,8 @@ type SatelliteServer interface {
 type UnimplementedSatelliteServer struct {
 }
 
-func (UnimplementedSatelliteServer) Hello(context.Context, *HelloRequest) (*HelloResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Hello not implemented")
-}
 func (UnimplementedSatelliteServer) ApplyResources(context.Context, *ApplyResourcesRequest) (*ApplyResourcesResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplyResources not implemented")
-}
-func (UnimplementedSatelliteServer) WatchResources(*WatchResourcesRequest, Satellite_WatchResourcesServer) error {
-	return status.Errorf(codes.Unimplemented, "method WatchResources not implemented")
 }
 func (UnimplementedSatelliteServer) ApplyStoragePools(context.Context, *ApplyStoragePoolsRequest) (*ApplyStoragePoolsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplyStoragePools not implemented")
@@ -235,24 +346,6 @@ func RegisterSatelliteServer(s grpc.ServiceRegistrar, srv SatelliteServer) {
 	s.RegisterService(&Satellite_ServiceDesc, srv)
 }
 
-func _Satellite_Hello_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(HelloRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SatelliteServer).Hello(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Satellite_Hello_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SatelliteServer).Hello(ctx, req.(*HelloRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _Satellite_ApplyResources_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ApplyResourcesRequest)
 	if err := dec(in); err != nil {
@@ -269,27 +362,6 @@ func _Satellite_ApplyResources_Handler(srv interface{}, ctx context.Context, dec
 		return srv.(SatelliteServer).ApplyResources(ctx, req.(*ApplyResourcesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
-}
-
-func _Satellite_WatchResources_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(WatchResourcesRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(SatelliteServer).WatchResources(m, &satelliteWatchResourcesServer{stream})
-}
-
-type Satellite_WatchResourcesServer interface {
-	Send(*ResourceObservedEvent) error
-	grpc.ServerStream
-}
-
-type satelliteWatchResourcesServer struct {
-	grpc.ServerStream
-}
-
-func (x *satelliteWatchResourcesServer) Send(m *ResourceObservedEvent) error {
-	return x.ServerStream.SendMsg(m)
 }
 
 func _Satellite_ApplyStoragePools_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -372,10 +444,6 @@ var Satellite_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*SatelliteServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "Hello",
-			Handler:    _Satellite_Hello_Handler,
-		},
-		{
 			MethodName: "ApplyResources",
 			Handler:    _Satellite_ApplyResources_Handler,
 		},
@@ -396,12 +464,6 @@ var Satellite_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Satellite_ShipSnapshot_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "WatchResources",
-			Handler:       _Satellite_WatchResources_Handler,
-			ServerStreams: true,
-		},
-	},
+	Streams:  []grpc.StreamDesc{},
 	Metadata: "satellite/v1alpha1/satellite.proto",
 }

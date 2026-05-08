@@ -45,7 +45,7 @@ func TestHelloRegistersNode(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	c := satellitepb.NewSatelliteClient(conn)
+	c := satellitepb.NewControllerClient(conn)
 
 	resp, err := c.Hello(t.Context(), &satellitepb.HelloRequest{
 		NodeName:         "n1",
@@ -86,7 +86,7 @@ func TestHelloIdempotent(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	c := satellitepb.NewSatelliteClient(conn)
+	c := satellitepb.NewControllerClient(conn)
 
 	for i := range 2 {
 		_, hErr := c.Hello(t.Context(), &satellitepb.HelloRequest{
@@ -121,7 +121,7 @@ func TestHelloRequiresNodeName(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	c := satellitepb.NewSatelliteClient(conn)
+	c := satellitepb.NewControllerClient(conn)
 
 	_, err = c.Hello(t.Context(), &satellitepb.HelloRequest{NodeName: ""})
 	if err == nil {
@@ -146,7 +146,7 @@ func startGRPC(t *testing.T, st store.Store) (string, func()) {
 	})
 
 	gs := grpc.NewServer()
-	satellitepb.RegisterSatelliteServer(gs, srv)
+	satellitepb.RegisterControllerServer(gs, srv)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(ln) }()
@@ -164,7 +164,7 @@ func startGRPC(t *testing.T, st store.Store) (string, func()) {
 }
 
 // Compile-time check: Server implements the generated SatelliteServer.
-var _ satellitepb.SatelliteServer = (*satellitecontroller.Server)(nil)
+var _ satellitepb.ControllerServer = (*satellitecontroller.Server)(nil)
 
 // silence unused warnings if context isn't referenced in this file.
 var _ = context.Background

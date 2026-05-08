@@ -34,6 +34,8 @@ import (
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
 
 func main() {
@@ -48,6 +50,10 @@ func run() int {
 		controllerAddr string
 		nodeName       string
 		stateDir       string
+		listenAddr     string
+		lvmPoolName    string
+		lvmVG          string
+		lvmThinPool    string
 	)
 
 	flag.StringVar(&controllerAddr, "controller", "blockstor-controller:7000",
@@ -56,6 +62,14 @@ func run() int {
 		"name this satellite registers under (defaults to NODE_NAME env)")
 	flag.StringVar(&stateDir, "state-dir", "/var/lib/blockstor-satellite",
 		"directory the satellite uses to persist DRBD .res files and per-resource state")
+	flag.StringVar(&listenAddr, "listen", ":7000",
+		"bind address for the satellite-side gRPC server (controller dials this for ApplyResources)")
+	flag.StringVar(&lvmPoolName, "lvm-pool-name", "",
+		"register an LVM-thin pool under this LINSTOR pool name (empty disables LVM)")
+	flag.StringVar(&lvmVG, "lvm-vg", "",
+		"LVM volume group backing the lvm-pool-name pool")
+	flag.StringVar(&lvmThinPool, "lvm-thinpool", "",
+		"LVM thinpool LV backing the lvm-pool-name pool")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -70,18 +84,41 @@ func run() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	providers := map[string]storage.Provider{}
+
+	if lvmPoolName != "" {
+		if lvmVG == "" || lvmThinPool == "" {
+			logger.Error("lvm-pool-name set but lvm-vg / lvm-thinpool missing")
+
+			return 1
+		}
+
+		providers[lvmPoolName] = lvm.NewThin(
+			lvm.ThinConfig{VolumeGroup: lvmVG, ThinPool: lvmThinPool},
+			storage.RealExec{})
+	}
+
 	agent := satellite.NewAgent(satellite.Config{
 		NodeName:       nodeName,
 		ControllerAddr: controllerAddr,
+		ListenAddr:     listenAddr,
 		StateDir:       stateDir,
+		Providers:      providers,
 		DialTimeout:    10 * time.Second,
 		Logger:         logger,
 	})
 
+	providerNames := make([]string, 0, len(providers))
+	for name := range providers {
+		providerNames = append(providerNames, name)
+	}
+
 	logger.Info("blockstor-satellite starting",
 		"node_name", nodeName,
 		"controller", controllerAddr,
-		"state_dir", stateDir)
+		"state_dir", stateDir,
+		"listen", listenAddr,
+		"providers", providerNames)
 
 	err := agent.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {

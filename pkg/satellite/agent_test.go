@@ -119,7 +119,7 @@ func startServer(t *testing.T, st store.Store, clusterID string) (string, func()
 
 	srv := satellitecontroller.New(st, satellitecontroller.Config{ClusterID: clusterID})
 	gs := grpc.NewServer()
-	satellitepb.RegisterSatelliteServer(gs, srv)
+	satellitepb.RegisterControllerServer(gs, srv)
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(ln) }()

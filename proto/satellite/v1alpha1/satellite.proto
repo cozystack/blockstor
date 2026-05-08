@@ -26,23 +26,31 @@ option go_package = "github.com/cozystack/blockstor/pkg/satellite/proto;satellit
 // to bring the node to a desired state ("apply this resource set") and the
 // satellite reports back asynchronously. There is no "fire and forget"
 // command channel — every operation is idempotent and reconcile-driven.
-service Satellite {
+// Controller is the gRPC service the controller exposes; satellites are
+// the clients. RPCs in this service are always satellite→controller.
+service Controller {
   // Hello is the satellite registration handshake. The satellite sends its
   // identity and capabilities; the controller replies with the cluster
   // identity it should expect.
   rpc Hello(HelloRequest) returns (HelloResponse) {}
 
+  // ReportObserved lets the satellite push observed-state updates back to
+  // the controller. The controller reads them and updates the matching
+  // Resource CRD's status. Client-streaming so satellites can send a
+  // continuous flow of events without re-connecting on every change.
+  rpc ReportObserved(stream ResourceObservedEvent)
+      returns (ReportObservedResponse) {}
+}
+
+// Satellite is the gRPC service the satellite agent exposes; the
+// controller is the client. RPCs here are always controller→satellite —
+// the controller pushes desired state and ad-hoc commands.
+service Satellite {
   // ApplyResources is the central reconcile RPC. The controller sends the
   // full set of resources that should live on this node; the satellite
   // brings local state in line with that set (creates new ones, removes
   // ones not in the set, fixes drift).
   rpc ApplyResources(ApplyResourcesRequest) returns (ApplyResourcesResponse) {}
-
-  // WatchResources lets the satellite push observed-state updates back to
-  // the controller. The controller reads them and updates the matching
-  // Resource CRD's status.
-  rpc WatchResources(WatchResourcesRequest)
-      returns (stream ResourceObservedEvent) {}
 
   // ApplyStoragePools mirrors ApplyResources for storage pools.
   rpc ApplyStoragePools(ApplyStoragePoolsRequest)
@@ -59,6 +67,12 @@ service Satellite {
   // for clone / replica-expansion flows. Implemented by `zfs send | zfs recv`
   // for ZFS pools and `thin-send-recv` for LVM-thin pools.
   rpc ShipSnapshot(ShipSnapshotRequest) returns (ShipSnapshotResponse) {}
+}
+
+// ----- ack envelopes -----
+
+message ReportObservedResponse {
+  int64 received = 1;  // count of events the controller accepted
 }
 
 // ----- handshake -----

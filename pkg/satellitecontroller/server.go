@@ -46,10 +46,10 @@ type Config struct {
 	ControllerEndpoint string
 }
 
-// Server implements satellitepb.SatelliteServer on top of the blockstor
+// Server implements satellitepb.ControllerServer on top of the blockstor
 // state store. It is wired in cmd/main.go via google.golang.org/grpc.
 type Server struct {
-	satellitepb.UnimplementedSatelliteServer
+	satellitepb.UnimplementedControllerServer
 
 	st  store.Store
 	cfg Config

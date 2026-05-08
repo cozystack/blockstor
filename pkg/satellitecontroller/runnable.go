@@ -57,7 +57,7 @@ func (r *Runnable) Start(ctx context.Context) error {
 	}
 
 	gs := grpc.NewServer()
-	satellitepb.RegisterSatelliteServer(gs, r.Server)
+	satellitepb.RegisterControllerServer(gs, r.Server)
 
 	logger.Info("satellite gRPC listening", "addr", ln.Addr().String())
 
