@@ -228,11 +228,18 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
       `kubectl get nodes.blockstor.io.blockstor.io` shows 3/3 of them
       seconds after rollout. This proves controller↔satellite gRPC +
       registration + CRD upsert end-to-end on a real cluster.
-- [ ] piraeus-operator native flip — make piraeus's own LinstorCluster
-      object dial blockstor:3370 instead of the Java controller, so
-      `linstor-csi` and `LinstorSatellite` upsream resources also flow
-      through us (separate from our own satellite DaemonSet above).
-      Needs LinstorCluster spec + LINSTOR-protocol shim work.
+- [x] piraeus-operator native flip first cut (2026-05-08): patching
+      `LinstorCluster.spec.externalController.url=http://blockstor-controller.blockstor-system.svc:3370`
+      tells piraeus-operator to skip its own Java controller and
+      point linstor-csi at blockstor's REST. Once
+      `Server.SetConnectionStatus("ONLINE")` started landing in the
+      Node CRD's Status subresource, the `linstor-wait-node-online`
+      initContainer on `linstor-csi-node` rolled past Init and the
+      pod went 3/3 Running — i.e. piraeus accepts blockstor as a
+      drop-in for the Java oracle. PVC provisioning end-to-end
+      requires more REST endpoints behaving exactly like the Java
+      reference (status fields linstor-csi reads on attach); that
+      shake-down is a follow-up.
 
 **Exit met (definition side).** Real reconciliation work now lives in Phase 3.
 
