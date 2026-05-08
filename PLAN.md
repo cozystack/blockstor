@@ -218,11 +218,21 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] No-op reconciler stubs for all CRDs wired in `cmd/main.go` (real
       reconciliation lands in Phase 3).
 - [x] **Side-by-side stand deploy proven** (2026-05-08): `stand/blockstor-deploy.yaml` runs `manager` as a Deployment in `blockstor-system` namespace with proper RBAC; image pulled from the host registry `10.164.0.1:5000` (Talos containerd patched to allow http for that mirror); pod 1/1 Running, REST `:3370` + gRPC `:7000` both listening; all 6 CRD reconcilers started. `BLOCKSTOR_BASEURL=http://127.0.0.1:33370 go test -run TestSmokeTraceReplay` — green against the deployed pod via port-forward.
-- [ ] piraeus-operator can create `LinstorSatellite`s and they appear in
-      our API. — LinstorSatellites are created today by the Java
-      controller; flipping piraeus to dial blockstor:3370 needs a
-      LinstorCluster spec change + matching satellite registration
-      flow. Side-by-side deploy above is the prerequisite.
+- [x] **Satellites register end-to-end** (2026-05-08):
+      `stand/blockstor-satellite-daemonset.yaml` runs the satellite
+      binary (debian-slim image with drbd-utils + lvm2 + cryptsetup)
+      on every Talos worker as a privileged DaemonSet — hostPID,
+      hostPath /dev /lib/modules /run/lvm. Each pod dials
+      `blockstor-controller.blockstor-system.svc:7000` and the Hello
+      RPC creates a `Node.blockstor.io.blockstor.io` CRD per worker.
+      `kubectl get nodes.blockstor.io.blockstor.io` shows 3/3 of them
+      seconds after rollout. This proves controller↔satellite gRPC +
+      registration + CRD upsert end-to-end on a real cluster.
+- [ ] piraeus-operator native flip — make piraeus's own LinstorCluster
+      object dial blockstor:3370 instead of the Java controller, so
+      `linstor-csi` and `LinstorSatellite` upsream resources also flow
+      through us (separate from our own satellite DaemonSet above).
+      Needs LinstorCluster spec + LINSTOR-protocol shim work.
 
 **Exit met (definition side).** Real reconciliation work now lives in Phase 3.
 
