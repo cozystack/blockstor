@@ -18,6 +18,7 @@ package rest
 
 import (
 	"net/http"
+	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -36,13 +37,61 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wrap each Resource in ResourceWithVolumes so the wire shape matches
-	// upstream golinstor's expectation. Volumes will be populated once the
-	// satellite reports them in Phase 3.
+	// Optional filters golinstor sends: ?nodes=a,b&resources=rd1,rd2.
+	// Java LINSTOR honours both as case-insensitive set-membership; we
+	// match that so linstor-csi's "is this resource on this node?"
+	// poll returns a non-empty list when the answer is yes.
+	nodeFilter := splitCSV(r.URL.Query().Get("nodes"))
+	rdFilter := splitCSV(r.URL.Query().Get("resources"))
+
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
+
 	for i := range resList {
+		if !matchAnyFold(nodeFilter, resList[i].NodeName) {
+			continue
+		}
+
+		if !matchAnyFold(rdFilter, resList[i].Name) {
+			continue
+		}
+
 		out = append(out, apiv1.ResourceWithVolumes{Resource: resList[i]})
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// splitCSV parses the comma-separated query value, trimming whitespace
+// and dropping empty segments. Empty input means no filter.
+func splitCSV(value string) []string {
+	if value == "" {
+		return nil
+	}
+
+	var out []string
+
+	for s := range strings.SplitSeq(value, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+
+	return out
+}
+
+// matchAnyFold reports whether candidate matches any of needles
+// case-insensitively. Empty needles means "no filter — accept".
+func matchAnyFold(needles []string, candidate string) bool {
+	if len(needles) == 0 {
+		return true
+	}
+
+	for _, n := range needles {
+		if strings.EqualFold(n, candidate) {
+			return true
+		}
+	}
+
+	return false
 }
