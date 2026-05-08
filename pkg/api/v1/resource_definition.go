@@ -59,4 +59,11 @@ type ResourceDefinitionCreate struct {
 	ResourceDefinition ResourceDefinition `json:"resource_definition"`
 	DrbdSecret         string             `json:"drbd_secret,omitempty"`
 	ExternalName       string             `json:"external_name,omitempty"`
+
+	// OverrideProps mirrors GenericPropsModify — golinstor stuffs RG
+	// spawn defaults into this when creating an RD via spawn, so the
+	// REST handler must accept it even if we don't yet diff the values.
+	OverrideProps   map[string]string `json:"override_props,omitempty"`
+	DeleteProps     []string          `json:"delete_props,omitempty"`
+	DeleteNamespace []string          `json:"delete_namespaces,omitempty"`
 }

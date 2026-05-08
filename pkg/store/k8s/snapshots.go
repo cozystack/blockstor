@@ -39,7 +39,7 @@ type snapshots struct {
 }
 
 func snapshotCRDName(rdName, snapName string) string {
-	return rdName + "." + snapName
+	return Name(rdName + "." + snapName)
 }
 
 func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {

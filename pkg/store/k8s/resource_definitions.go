@@ -56,7 +56,7 @@ func (s *resourceDefinitions) List(ctx context.Context) ([]apiv1.ResourceDefinit
 func (s *resourceDefinitions) Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error) {
 	var crd crdv1alpha1.ResourceDefinition
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: name}, &crd)
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return apiv1.ResourceDefinition{}, errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
@@ -94,7 +94,7 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 
 	var existing crdv1alpha1.ResourceDefinition
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: in.Name}, &existing)
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "resource definition %q", in.Name)
@@ -114,7 +114,7 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 }
 
 func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
-	crd := &crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	crd := &crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: Name(name)}}
 
 	err := s.c.Delete(ctx, crd)
 	if err != nil {
@@ -130,7 +130,7 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 
 func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 	out := apiv1.ResourceDefinition{
-		Name:              crd.Name,
+		Name:              OriginalName(&crd.ObjectMeta),
 		ExternalName:      crd.Spec.ExternalName,
 		ResourceGroupName: crd.Spec.ResourceGroupName,
 		Props:             crd.Spec.Props,
@@ -142,10 +142,13 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 }
 
 func wireToCRDRD(in *apiv1.ResourceDefinition) *crdv1alpha1.ResourceDefinition {
-	return &crdv1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: in.Name},
+	crd := &crdv1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: Name(in.Name)},
 		Spec:       wireToCRDRDSpec(in),
 	}
+	SetOriginalName(&crd.ObjectMeta, in.Name)
+
+	return crd
 }
 
 func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitionSpec {

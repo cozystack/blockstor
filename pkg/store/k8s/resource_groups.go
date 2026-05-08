@@ -56,7 +56,7 @@ func (s *resourceGroups) List(ctx context.Context) ([]apiv1.ResourceGroup, error
 func (s *resourceGroups) Get(ctx context.Context, name string) (apiv1.ResourceGroup, error) {
 	var crd crdv1alpha1.ResourceGroup
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: name}, &crd)
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return apiv1.ResourceGroup{}, errors.Wrapf(store.ErrNotFound, "resource group %q", name)
@@ -94,7 +94,7 @@ func (s *resourceGroups) Update(ctx context.Context, in *apiv1.ResourceGroup) er
 
 	var existing crdv1alpha1.ResourceGroup
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: in.Name}, &existing)
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "resource group %q", in.Name)
@@ -114,7 +114,7 @@ func (s *resourceGroups) Update(ctx context.Context, in *apiv1.ResourceGroup) er
 }
 
 func (s *resourceGroups) Delete(ctx context.Context, name string) error {
-	crd := &crdv1alpha1.ResourceGroup{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	crd := &crdv1alpha1.ResourceGroup{ObjectMeta: metav1.ObjectMeta{Name: Name(name)}}
 
 	err := s.c.Delete(ctx, crd)
 	if err != nil {
@@ -130,7 +130,7 @@ func (s *resourceGroups) Delete(ctx context.Context, name string) error {
 
 func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
 	out := apiv1.ResourceGroup{
-		Name:        crd.Name,
+		Name:        OriginalName(&crd.ObjectMeta),
 		Description: crd.Spec.Description,
 		Props:       crd.Spec.Props,
 		PeerSlots:   crd.Spec.PeerSlots,
@@ -168,10 +168,13 @@ func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
 }
 
 func wireToCRDRG(in *apiv1.ResourceGroup) *crdv1alpha1.ResourceGroup {
-	return &crdv1alpha1.ResourceGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: in.Name},
+	crd := &crdv1alpha1.ResourceGroup{
+		ObjectMeta: metav1.ObjectMeta{Name: Name(in.Name)},
 		Spec:       wireToCRDRGSpec(in),
 	}
+	SetOriginalName(&crd.ObjectMeta, in.Name)
+
+	return crd
 }
 
 func wireToCRDRGSpec(in *apiv1.ResourceGroup) crdv1alpha1.ResourceGroupSpec {

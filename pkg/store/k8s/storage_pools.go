@@ -37,10 +37,10 @@ type storagePools struct {
 }
 
 // crdName encodes the (node, pool) composite key into a single CRD name.
-// LINSTOR allows almost any character in pool/node names; we restrict to
-// `<node>.<pool>`. RFC 1123 compliance is the caller's responsibility.
+// LINSTOR accepts mixed-case names that k8s would reject, so the result
+// is run through Name() to slugify when needed.
 func crdName(node, pool string) string {
-	return node + "." + pool
+	return Name(node + "." + pool)
 }
 
 // List returns every StoragePool CRD as a wire-shape value, sorted by

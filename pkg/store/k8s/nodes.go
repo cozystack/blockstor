@@ -59,7 +59,7 @@ func (n *nodes) List(ctx context.Context) ([]apiv1.Node, error) {
 func (n *nodes) Get(ctx context.Context, name string) (apiv1.Node, error) {
 	var crd crdv1alpha1.Node
 
-	err := n.c.Get(ctx, types.NamespacedName{Name: name}, &crd)
+	err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &crd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return apiv1.Node{}, errors.Wrapf(store.ErrNotFound, "node %q", name)
@@ -100,7 +100,7 @@ func (n *nodes) Update(ctx context.Context, in *apiv1.Node) error {
 
 	var existing crdv1alpha1.Node
 
-	err := n.c.Get(ctx, types.NamespacedName{Name: in.Name}, &existing)
+	err := n.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "node %q", in.Name)
@@ -127,7 +127,7 @@ func (n *nodes) Update(ctx context.Context, in *apiv1.Node) error {
 func (n *nodes) SetConnectionStatus(ctx context.Context, name, status string) error {
 	var existing crdv1alpha1.Node
 
-	err := n.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
+	err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "node %q", name)
@@ -148,7 +148,7 @@ func (n *nodes) SetConnectionStatus(ctx context.Context, name, status string) er
 
 // Delete removes the named Node CRD.
 func (n *nodes) Delete(ctx context.Context, name string) error {
-	crd := &crdv1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	crd := &crdv1alpha1.Node{ObjectMeta: metav1.ObjectMeta{Name: Name(name)}}
 
 	err := n.c.Delete(ctx, crd)
 	if err != nil {
@@ -165,7 +165,7 @@ func (n *nodes) Delete(ctx context.Context, name string) error {
 // crdToWireNode flattens a Node CRD into the LINSTOR REST shape.
 func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 	out := apiv1.Node{
-		Name:             crd.Name,
+		Name:             OriginalName(&crd.ObjectMeta),
 		Type:             crd.Spec.Type,
 		Props:            crd.Spec.Props,
 		ConnectionStatus: crd.Status.ConnectionStatus,
@@ -197,10 +197,13 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 
 // wireToCRDNode builds a fresh Node CRD from an apiv1.Node — used by Create.
 func wireToCRDNode(in *apiv1.Node) *crdv1alpha1.Node {
-	return &crdv1alpha1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: in.Name},
+	crd := &crdv1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: Name(in.Name)},
 		Spec:       wireToCRDNodeSpec(in),
 	}
+	SetOriginalName(&crd.ObjectMeta, in.Name)
+
+	return crd
 }
 
 // wireToCRDNodeSpec is the spec-only converter used by both Create and Update.

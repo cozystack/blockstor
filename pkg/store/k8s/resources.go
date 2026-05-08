@@ -41,7 +41,7 @@ type resources struct {
 }
 
 func resourceCRDName(rd, node string) string {
-	return rd + "." + node
+	return Name(rd + "." + node)
 }
 
 func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {

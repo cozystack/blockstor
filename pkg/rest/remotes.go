@@ -21,20 +21,31 @@ import (
 )
 
 // registerRemotes wires the LINSTOR `remotes` endpoints. Cozystack
-// doesn't use cross-cluster snapshot shipping, so the typed-by-kind
-// stubs return empty arrays — golinstor's snapshot list path calls
-// `/v1/remotes/s3` before enumerating snapshots, and a 404 there
-// surfaces as `failed to list available s3 remotes` from linstor-csi.
-//
-// Empty `[]` keeps the wire format LINSTOR-shaped without exposing
-// any remote-shipping surface area we don't implement.
+// doesn't use cross-cluster snapshot shipping, so we return an empty
+// `RemoteList` envelope — golinstor's `client.RemoteList` is an
+// object with typed-array fields, NOT a bare array. Returning a raw
+// `[]` surfaces as `cannot unmarshal array into Go value of type
+// client.RemoteList` on every snapshot-list call.
 func (s *Server) registerRemotes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/remotes", handleEmptyArray)
-	mux.HandleFunc("GET /v1/remotes/s3", handleEmptyArray)
-	mux.HandleFunc("GET /v1/remotes/linstor", handleEmptyArray)
-	mux.HandleFunc("GET /v1/remotes/ebs", handleEmptyArray)
+	mux.HandleFunc("GET /v1/remotes", handleEmptyRemotes)
+	mux.HandleFunc("GET /v1/remotes/s3", handleEmptyRemotes)
+	mux.HandleFunc("GET /v1/remotes/linstor", handleEmptyRemotes)
+	mux.HandleFunc("GET /v1/remotes/ebs", handleEmptyRemotes)
 }
 
-func handleEmptyArray(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, []map[string]string{})
+// emptyRemoteList is upstream LINSTOR's `RemoteList` zero-value: an
+// object with three named arrays, all empty. golinstor decodes the
+// response body into this shape unconditionally.
+type emptyRemoteList struct {
+	S3Remotes      []map[string]string `json:"s3_remotes"`
+	LinstorRemotes []map[string]string `json:"linstor_remotes"`
+	EbsRemotes     []map[string]string `json:"ebs_remotes"`
+}
+
+func handleEmptyRemotes(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, emptyRemoteList{
+		S3Remotes:      []map[string]string{},
+		LinstorRemotes: []map[string]string{},
+		EbsRemotes:     []map[string]string{},
+	})
 }
