@@ -256,7 +256,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 ### Phase 6 — Encryption + DRBD options + file provider
 
 - [ ] LUKS encryption layer (volume-level)
-- [ ] DRBD encryption passphrase
+- [x] DRBD encryption passphrase (`POST /v1/resource-definitions/{rd}/encryption-passphrase`): writes the per-RD shared secret onto the RD's props under `DrbdOptions/Net/shared-secret`. Flows through to satellites via the existing drbd_options channel. 3 contract tests.
 - [x] DRBD proxy enable/disable/configure: 501 Not Implemented stubs (`/v1/resource-definitions/{rd}/drbd-proxy*`). Cozystack-style clusters run flat L2 so DRBD-9's native protocol suffices; proxy isn't needed. Endpoints exist so `linstor drbd-proxy *` returns a deterministic error.
 - [ ] DRBD options: full set from `drbdoptions.json`
 - [x] file storage provider (`pkg/storage/file`): FILE / FILE_THIN behind same Provider seam — fallocate (thick) / truncate (thin) for create, statfs(2) for pool capacity, snapshots intentionally unsupported (caller routes to LVM/ZFS instead). 9 contract tests.
@@ -268,7 +268,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Satellite eviction / restoration / lost-and-recover (`POST /v1/nodes/{node}/{evacuate,restore,lost}`): toggles EVICTED / LOST flags on the Node CRD; replica migration is the reconciler's job. 4 contract tests.
 - [x] Stats endpoint (`GET /v1/stats`): cluster-wide counters (nodes, RDs, resources, storage pools, snapshots). 2 contract tests.
 - [x] Error reports stub (`/v1/error-reports` LIST returns []; GET /{id} → 404). Empty-but-present so `linstor error-reports list` doesn't choke. Real persistence lands when the controller starts buffering reports.
-- [ ] All `/v1/view/*` aggregates
+- [x] All `/v1/view/*` aggregates: `snapshots`, `storage-pools`, `resources` cover the linstor CLI's `list` commands. `snapshot-shippings` is the cross-cluster aggregate which is explicitly out of scope per the project goals.
 - [x] Controller properties endpoints (`/v1/controller/properties` GET/POST) — backed by KV-store instance "ControllerProps". Covers `linstor controller list-properties` / `set-property`. 3 contract tests.
 - [x] Property-info endpoints (`*/properties/info`): 8 paths return `[]` so linstor CLI's autocomplete catalogue calls don't 404. Real catalogue payload deferred until upstream's property metadata is ported.
 - [x] Resource adjust / adjust-all (`POST /v1/resource-definitions/{rd}/adjust` and `.../resources/{node}/adjust`): existence check + 200; per-replica `drbdadm adjust` runs out-of-band via the satellite reconciler. 4 contract tests.
