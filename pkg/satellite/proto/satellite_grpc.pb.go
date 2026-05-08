@@ -211,6 +211,7 @@ var Controller_ServiceDesc = grpc.ServiceDesc{
 const (
 	Satellite_ApplyResources_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/ApplyResources"
 	Satellite_ApplyStoragePools_FullMethodName = "/blockstor.satellite.v1alpha1.Satellite/ApplyStoragePools"
+	Satellite_DeleteResource_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/DeleteResource"
 	Satellite_CreateSnapshot_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/CreateSnapshot"
 	Satellite_DeleteSnapshot_FullMethodName    = "/blockstor.satellite.v1alpha1.Satellite/DeleteSnapshot"
 	Satellite_ShipSnapshot_FullMethodName      = "/blockstor.satellite.v1alpha1.Satellite/ShipSnapshot"
@@ -227,6 +228,10 @@ type SatelliteClient interface {
 	ApplyResources(ctx context.Context, in *ApplyResourcesRequest, opts ...grpc.CallOption) (*ApplyResourcesResponse, error)
 	// ApplyStoragePools mirrors ApplyResources for storage pools.
 	ApplyStoragePools(ctx context.Context, in *ApplyStoragePoolsRequest, opts ...grpc.CallOption) (*ApplyStoragePoolsResponse, error)
+	// DeleteResource tears the resource down on this satellite:
+	// drbdadm down → DeleteVolume → remove .res file. Idempotent on
+	// missing.
+	DeleteResource(ctx context.Context, in *DeleteResourceRequest, opts ...grpc.CallOption) (*DeleteResourceResponse, error)
 	// CreateSnapshot asks the satellite to take a snapshot of the named
 	// resource on this node. Returns once the snapshot is durable on disk.
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
@@ -258,6 +263,15 @@ func (c *satelliteClient) ApplyResources(ctx context.Context, in *ApplyResources
 func (c *satelliteClient) ApplyStoragePools(ctx context.Context, in *ApplyStoragePoolsRequest, opts ...grpc.CallOption) (*ApplyStoragePoolsResponse, error) {
 	out := new(ApplyStoragePoolsResponse)
 	err := c.cc.Invoke(ctx, Satellite_ApplyStoragePools_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *satelliteClient) DeleteResource(ctx context.Context, in *DeleteResourceRequest, opts ...grpc.CallOption) (*DeleteResourceResponse, error) {
+	out := new(DeleteResourceResponse)
+	err := c.cc.Invoke(ctx, Satellite_DeleteResource_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +316,10 @@ type SatelliteServer interface {
 	ApplyResources(context.Context, *ApplyResourcesRequest) (*ApplyResourcesResponse, error)
 	// ApplyStoragePools mirrors ApplyResources for storage pools.
 	ApplyStoragePools(context.Context, *ApplyStoragePoolsRequest) (*ApplyStoragePoolsResponse, error)
+	// DeleteResource tears the resource down on this satellite:
+	// drbdadm down → DeleteVolume → remove .res file. Idempotent on
+	// missing.
+	DeleteResource(context.Context, *DeleteResourceRequest) (*DeleteResourceResponse, error)
 	// CreateSnapshot asks the satellite to take a snapshot of the named
 	// resource on this node. Returns once the snapshot is durable on disk.
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
@@ -323,6 +341,9 @@ func (UnimplementedSatelliteServer) ApplyResources(context.Context, *ApplyResour
 }
 func (UnimplementedSatelliteServer) ApplyStoragePools(context.Context, *ApplyStoragePoolsRequest) (*ApplyStoragePoolsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ApplyStoragePools not implemented")
+}
+func (UnimplementedSatelliteServer) DeleteResource(context.Context, *DeleteResourceRequest) (*DeleteResourceResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteResource not implemented")
 }
 func (UnimplementedSatelliteServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateSnapshot not implemented")
@@ -378,6 +399,24 @@ func _Satellite_ApplyStoragePools_Handler(srv interface{}, ctx context.Context, 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SatelliteServer).ApplyStoragePools(ctx, req.(*ApplyStoragePoolsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Satellite_DeleteResource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteResourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SatelliteServer).DeleteResource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Satellite_DeleteResource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SatelliteServer).DeleteResource(ctx, req.(*DeleteResourceRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -450,6 +489,10 @@ var Satellite_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ApplyStoragePools",
 			Handler:    _Satellite_ApplyStoragePools_Handler,
+		},
+		{
+			MethodName: "DeleteResource",
+			Handler:    _Satellite_DeleteResource_Handler,
 		},
 		{
 			MethodName: "CreateSnapshot",

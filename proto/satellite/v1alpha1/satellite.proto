@@ -56,6 +56,11 @@ service Satellite {
   rpc ApplyStoragePools(ApplyStoragePoolsRequest)
       returns (ApplyStoragePoolsResponse) {}
 
+  // DeleteResource tears the resource down on this satellite:
+  // drbdadm down → DeleteVolume → remove .res file. Idempotent on
+  // missing.
+  rpc DeleteResource(DeleteResourceRequest) returns (DeleteResourceResponse) {}
+
   // CreateSnapshot asks the satellite to take a snapshot of the named
   // resource on this node. Returns once the snapshot is durable on disk.
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse) {}
@@ -73,6 +78,23 @@ service Satellite {
 
 message ReportObservedResponse {
   int64 received = 1;  // count of events the controller accepted
+}
+
+message DeleteResourceRequest {
+  string name = 1;
+  // storage_pool is the pool the resource lived on; the satellite
+  // uses it to route DeleteVolume to the right Provider. Optional —
+  // an empty pool lets the satellite skip the storage step.
+  string storage_pool = 2;
+  // volume_numbers is the set of DesiredVolume.volume_number values
+  // the resource owned. Required for non-DISKLESS deletes so the
+  // satellite knows which LVs / loopfiles to drop.
+  repeated int32 volume_numbers = 3;
+}
+
+message DeleteResourceResponse {
+  bool ok = 1;
+  string message = 2;
 }
 
 // ----- handshake -----

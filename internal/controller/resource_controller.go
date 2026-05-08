@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,11 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 )
+
+// resourceFinalizer guards on-disk + DRBD-side teardown when the
+// Resource CRD is deleted. Without it the satellite would never see
+// the delete, leaving an orphan .res file + LV / loopfile.
+const resourceFinalizer = "blockstor.io.blockstor.io/resource"
 
 // ResourceReconciler dispatches Resource CRD changes to the right
 // satellite via the Dispatcher. It collects same-RD peers and the
@@ -51,8 +57,6 @@ type ResourceReconciler struct {
 // to the satellite that hosts it. Per-replica errors land in the
 // log; transport faults trigger a 10s requeue.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	if r.Dispatcher == nil {
 		// envtest scaffolding (suite_test.go) constructs the reconciler
 		// without a Dispatcher — keep the original no-op behaviour for
@@ -71,9 +75,37 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// Deletion path: tell the satellite to drop the resource, then
+	// remove the finalizer so kube-apiserver finishes the delete.
+	if !target.DeletionTimestamp.IsZero() {
+		return r.runDelete(ctx, &target)
+	}
+
+	// Ensure finalizer is present on every live Resource so the
+	// delete path above can run.
+	if !slices.Contains(target.Finalizers, resourceFinalizer) {
+		target.Finalizers = append(target.Finalizers, resourceFinalizer)
+
+		err = r.Update(ctx, &target)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	return r.runApply(ctx, &target)
+}
+
+// runApply is the apply branch of Reconcile. Pulled out to keep
+// Reconcile under the funlen budget — the body deals with the
+// finalizer dance, this with the actual gRPC dispatch.
+func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	var resList blockstoriov1alpha1.ResourceList
 
-	err = r.List(ctx, &resList)
+	err := r.List(ctx, &resList)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -98,7 +130,7 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	result, err := r.Dispatcher.Apply(ctx, &target, peers, nodeList.Items, rdPtr)
+	result, err := r.Dispatcher.Apply(ctx, target, peers, nodeList.Items, rdPtr)
 	if err != nil {
 		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
 
@@ -111,6 +143,53 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	} else {
 		log.Info("satellite accepted apply",
 			"resource", target.Name, "node", target.Spec.NodeName)
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// runDelete is the finalizer-driven teardown. We dial the satellite
+// to drop the resource (drbdadm down → DeleteVolume → rm .res), then
+// strip the finalizer so kube-apiserver completes the delete.
+// Failures requeue with a 10 s back-off so the resource isn't stuck
+// half-gone if a satellite is briefly unreachable.
+func (r *ResourceReconciler) runDelete(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if !slices.Contains(target.Finalizers, resourceFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	rdPtr, _ := r.lookupRD(ctx, target.Spec.ResourceDefinitionName)
+
+	var nodeList blockstoriov1alpha1.NodeList
+
+	err := r.List(ctx, &nodeList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	resp, err := r.Dispatcher.DeleteResource(ctx, target, rdPtr, nodeList.Items)
+	if err != nil {
+		log.Error(err, "DeleteResource RPC failed",
+			"resource", target.Name, "node", target.Spec.NodeName)
+
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !resp.GetOk() {
+		log.Info("satellite rejected delete", "msg", resp.GetMessage(),
+			"resource", target.Name, "node", target.Spec.NodeName)
+
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	target.Finalizers = slices.DeleteFunc(target.Finalizers,
+		func(s string) bool { return s == resourceFinalizer })
+
+	err = r.Update(ctx, target)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil

@@ -69,6 +69,12 @@ func (g *GRPCServer) ApplyStoragePools(_ context.Context, req *satellitepb.Apply
 	return &satellitepb.ApplyStoragePoolsResponse{Results: results}, nil
 }
 
+// DeleteResource tears down a resource (drbdadm down → DeleteVolume
+// → remove .res). Per-step errors land in the response Ok=false.
+func (g *GRPCServer) DeleteResource(ctx context.Context, req *satellitepb.DeleteResourceRequest) (*satellitepb.DeleteResourceResponse, error) {
+	return g.rec.DeleteResource(ctx, req)
+}
+
 // CreateSnapshot routes through the Reconciler's existing snapshot
 // path. Per-snapshot errors land in the response body (Ok=false), the
 // gRPC error path is reserved for context cancellation / transport

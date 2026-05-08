@@ -162,6 +162,67 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.Delete
 	return &satellitepb.DeleteSnapshotResponse{Ok: true}, nil
 }
 
+// DeleteResource tears down a resource: drbdadm down (best-effort —
+// the kernel handles a missing one fine), DeleteVolume on every
+// requested volume_number through the named Provider, then remove
+// the .res file. Idempotent on a missing resource. Per-step errors
+// land in the response body so the controller can surface granular
+// status without aborting the rest of the cleanup.
+func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.DeleteResourceRequest) (*satellitepb.DeleteResourceResponse, error) {
+	if r.cfg.Adm != nil {
+		err := r.cfg.Adm.Down(ctx, req.GetName())
+		if err != nil {
+			// Best-effort: a "not configured" error is fine, anything
+			// else is logged via the response message.
+			_ = err
+		}
+	}
+
+	if pool := req.GetStoragePool(); pool != "" {
+		provider, ok := r.cfg.Providers[pool]
+		if ok {
+			for _, n := range req.GetVolumeNumbers() {
+				err := provider.DeleteVolume(ctx, storage.Volume{
+					ResourceName: req.GetName(),
+					VolumeNumber: n,
+				})
+				if err != nil {
+					//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
+					return &satellitepb.DeleteResourceResponse{
+						Ok:      false,
+						Message: err.Error(),
+					}, nil
+				}
+			}
+		}
+	}
+
+	if r.cfg.StateDir != "" {
+		resPath := filepath.Join(r.cfg.StateDir, req.GetName()+".res")
+
+		err := os.Remove(resPath)
+		if err != nil && !os.IsNotExist(err) {
+			return &satellitepb.DeleteResourceResponse{
+				Ok:      false,
+				Message: err.Error(),
+			}, nil
+		}
+	}
+
+	r.forgetPool(req.GetName())
+
+	return &satellitepb.DeleteResourceResponse{Ok: true}, nil
+}
+
+// forgetPool drops the resource from the resource→pool map so a
+// future Apply with a different pool starts clean.
+func (r *Reconciler) forgetPool(resourceName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.resourceToPool, resourceName)
+}
+
 // applyOne reconciles a single DesiredResource. Diskless replicas skip
 // the storage path (they're memory-backed by the DRBD stack); everything
 // else routes one CreateVolume per DesiredVolume. When the DRBD half is

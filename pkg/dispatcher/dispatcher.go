@@ -230,6 +230,48 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	return out
 }
 
+// DeleteResource dials the target satellite's endpoint and asks it
+// to drop the resource (drbdadm down → DeleteVolume → rm .res).
+// Returns the per-satellite result. Missing endpoint surfaces as a
+// nil response with an error — callers retry once the Node CRD
+// catches up.
+func (d *Dispatcher) DeleteResource(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, nodes []blockstoriov1alpha1.Node) (*satellitepb.DeleteResourceResponse, error) {
+	endpoint := lookupEndpoint(target.Spec.NodeName, nodes)
+	if endpoint == "" {
+		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
+	}
+
+	client, closer, err := d.dialer.Dial(ctx, endpoint)
+	if err != nil {
+		return nil, errors.Wrapf(err, "dial %s", endpoint)
+	}
+	defer func() { _ = closer() }()
+
+	pool := target.Spec.Props["StorPoolName"]
+	if pool == "" && rd != nil {
+		pool = rd.Spec.Props["StorPoolName"]
+	}
+
+	volNumbers := make([]int32, 0)
+
+	if rd != nil {
+		for _, vd := range rd.Spec.VolumeDefinitions {
+			volNumbers = append(volNumbers, vd.VolumeNumber)
+		}
+	}
+
+	resp, err := client.DeleteResource(ctx, &satellitepb.DeleteResourceRequest{
+		Name:          target.Spec.ResourceDefinitionName,
+		StoragePool:   pool,
+		VolumeNumbers: volNumbers,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "DeleteResource RPC")
+	}
+
+	return resp, nil
+}
+
 // CreateSnapshot dials every satellite that hosts a non-DISKLESS
 // replica of `rdName` and asks it to take a snapshot. Returns the
 // list of per-node results so the controller can surface granular
