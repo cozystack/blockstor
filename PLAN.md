@@ -190,8 +190,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] golangci-lint v2 config + auto-lint hook (`golangci-lint@claude-code-companions`) wired
 - [x] `linstor-common` submodule (properties.json, consts.json, drbdoptions.json)
 - [x] `apiconsts` reused from `github.com/LINBIT/golinstor` — no fork needed
-- [ ] OpenAPI types generated from `rest_v1_openapi.yaml` (oapi-codegen) — deferred; types are
-      hand-written for now, codegen lands when we cover stats/error-reports endpoints
+- [x] OpenAPI types generated from upstream `rest_v1_openapi.yaml` (oapi-codegen v2.7.0): `third_party/linstor-openapi/regen.sh` pulls LINSTOR/master, renames every `components.parameters.*` to `*Param` (oapi-codegen rejects parameter+schema name collisions on Node/NetInterface/StoragePool/...), then generates `pkg/api/openapi/types.gen.go` (3306 lines). Hand-written `pkg/api/v1` types stay for the existing REST handlers; generated package is the source-of-truth we'll migrate onto incrementally.
 
 **Exit met.**
 
