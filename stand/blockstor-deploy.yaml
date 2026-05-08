@@ -1,0 +1,104 @@
+---
+# Standalone deployment of the blockstor controller alongside the
+# existing Java LINSTOR. Used by stand smoke tests as the live target
+# for our own REST surface; lets us prove our CRDs reconcile and our
+# REST server answers without ripping out the Java oracle.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: blockstor-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blockstor-controller
+  namespace: blockstor-system
+---
+# Cluster-wide read on core API + full RW on our blockstor.io CRDs.
+# We don't watch any non-blockstor objects, so the verb set stays narrow.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blockstor-controller
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*/status", "*/finalizers"]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blockstor-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blockstor-controller
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-controller
+    namespace: blockstor-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockstor-controller
+  namespace: blockstor-system
+  labels: {app: blockstor-controller}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: blockstor-controller}}
+  template:
+    metadata: {labels: {app: blockstor-controller}}
+    spec:
+      serviceAccountName: blockstor-controller
+      containers:
+        - name: manager
+          image: 10.164.0.1:5000/blockstor:dev
+          imagePullPolicy: Always
+          args:
+            - --rest-bind-address=:3370
+            - --satellite-grpc-bind-address=:7000
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=0
+            - --leader-elect=false
+            - --store=k8s
+            - --cluster-id=blockstor-stand
+          ports:
+            - {name: rest, containerPort: 3370}
+            - {name: grpc, containerPort: 7000}
+            - {name: health, containerPort: 8081}
+          readinessProbe:
+            tcpSocket: {port: 3370}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}
+            initialDelaySeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockstor-controller
+  namespace: blockstor-system
+spec:
+  selector: {app: blockstor-controller}
+  ports:
+    - {name: rest, port: 3370, targetPort: 3370}
+    - {name: grpc, port: 7000, targetPort: 7000}
