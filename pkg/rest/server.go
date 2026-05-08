@@ -120,6 +120,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerRDClone(mux)
 	s.registerSOSReport(mux)
 	s.registerRemotes(mux)
+	s.registerNodeConnections(mux)
 
 	return mux
 }
