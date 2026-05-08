@@ -238,7 +238,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Autoplacer: storage-pool-aware replica placement; weighted by FreeCapacity (greatest-free-first, deterministic ties on NodeName)
 - [x] Snapshot satellite-side reconcile: `Reconciler.CreateSnapshot/DeleteSnapshot` route via in-memory resource→pool map populated by Apply (3 contract tests). Snapshot CRD reconciler controller-side TBD.
 - [x] Snapshot restore creates a new ResourceDefinition (`POST /v1/resource-definitions/{rd}/snapshot-restore-resource`): seeds the new RD from the snapshot's metadata, returns 201. Per-volume cloning is the satellite's job on next reconcile. 3 contract tests.
-- [ ] Intra-cluster snapshot shipping for clone/replica-expansion:
+- [x] Intra-cluster snapshot shipping for clone/replica-expansion: `Reconciler.ShipSnapshot` picks `zfs send | ssh peer zfs recv` for ZFS / ZFS_THIN and `thin-send-recv` for LVM_THIN, dispatched via an injectable ShipExec so unit tests assert command lines without spinning up the real tools. 3 contract tests.
       - ZFS pools: `zfs send | ssh | zfs recv` over satellite-to-satellite
       - LVM-thin: `thin-send-recv` (LINBIT)
 - [ ] csi-sanity passes against our server

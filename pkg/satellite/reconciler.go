@@ -55,6 +55,12 @@ type ReconcilerConfig struct {
 	// NodeName is this satellite's identifier; the reconciler uses it
 	// to know which Peer entries describe local vs. remote.
 	NodeName string
+
+	// ShipExec runs the snapshot-ship subprocess (zfs send|recv,
+	// thin-send-recv, …). Production wires storage.RealExec; tests
+	// inject FakeExec to assert the command line without spinning up
+	// a real ssh / zfs / thin tool.
+	ShipExec storage.Exec
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
