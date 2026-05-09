@@ -52,13 +52,18 @@ create_zfs() {
 create_lvm() {
     local pod=$1
     kubectl -n "$NS" exec "$pod" -- bash -c "
-        if vgs blockstor-lvm >/dev/null 2>&1; then
-            echo 'vg blockstor-lvm already exists'
-        else
+        if ! vgs blockstor-lvm >/dev/null 2>&1; then
             wipefs -a ${LVM_DEV}
             vgcreate -y blockstor-lvm ${LVM_DEV}
-            lvcreate -y -Z n -T -L 14G blockstor-lvm/thin
-            echo 'vg blockstor-lvm + thin pool created'
+        fi
+        if lvs blockstor-lvm/thin >/dev/null 2>&1; then
+            echo 'lv blockstor-lvm/thin already exists'
+        else
+            # Skip both wipesignatures and zeroing — fresh VG, no
+            # stale fs to worry about, and the pre-Phase-9 image's
+            # lvm2 chokes on the default wipe step.
+            lvcreate -y --wipesignatures n -Wn -Zn -T -L 14G blockstor-lvm/thin
+            echo 'lv blockstor-lvm/thin created'
         fi
     "
 }
