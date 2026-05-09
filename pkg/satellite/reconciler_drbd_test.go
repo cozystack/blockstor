@@ -711,6 +711,75 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	}
 }
 
+// TestApplyInactiveOnlyDownsDRBD: a Resource with the INACTIVE flag
+// (the operator called `linstor r deactivate`) must NOT touch storage
+// or render the .res file — just `drbdadm down` to remove the kernel
+// resource. Pins the node-maintenance path piraeus-operator uses:
+// later activate restores without losing port/node-id allocations or
+// having to re-sync.
+func TestApplyInactiveOnlyDownsDRBD(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-inactive",
+			NodeName: "n1",
+			Flags:    []string{"INACTIVE"},
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !results[0].GetOk() {
+		t.Errorf("Ok=false on INACTIVE: %s", results[0].GetMessage())
+	}
+
+	saw := func(needle string) bool {
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, needle) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if !saw("drbdadm down pvc-inactive") {
+		t.Errorf("INACTIVE must run drbdadm down; got %v", fx.CommandLines())
+	}
+
+	if saw("lvcreate") {
+		t.Errorf("INACTIVE must not touch storage; got %v", fx.CommandLines())
+	}
+
+	if saw("drbdadm adjust") || saw("drbdadm create-md") {
+		t.Errorf("INACTIVE must skip the rest of the DRBD cycle; got %v",
+			fx.CommandLines())
+	}
+
+	// .res file must NOT have been touched (deactivate preserves
+	// the on-disk artefact for later activation).
+	if _, statErr := os.Stat(filepath.Join(dir, "pvc-inactive.res")); statErr == nil {
+		t.Errorf("INACTIVE must not write a .res file")
+	}
+}
+
 // TestApplyLUKSWithoutCryptsetupWrapper: LayerStack contains LUKS
 // but the satellite was configured without a Cryptsetup wrapper
 // (e.g. cryptsetup binary missing). applyLUKS must fail loudly with
