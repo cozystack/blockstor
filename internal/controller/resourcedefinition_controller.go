@@ -18,10 +18,11 @@ package controller
 
 import (
 	"context"
-	"errors"
+	stderrors "errors"
 	"slices"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -213,7 +214,7 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	}
 
 	err = r.Store.Resources().Create(ctx, &newWitness)
-	if err != nil && !errors.Is(err, store.ErrAlreadyExists) && !alreadyExists(err) {
+	if err != nil && !stderrors.Is(err, store.ErrAlreadyExists) && !alreadyExists(err) {
 		return err
 	}
 
@@ -238,20 +239,44 @@ func filterTieBreaker(diskless []apiv1.Resource) []apiv1.Resource {
 // Idempotent: returns early if the value is already what we want.
 // The satellite picks up the change on next dispatch and re-renders
 // the .res file with the new quorum policy.
+//
+// Retries on conflict because the RD reconciler races against the
+// resource reconciler — both can write the RD spec under heavy
+// reconcile pressure (e.g. fan-out from a Watches event), and a
+// stale local copy hits "object has been modified" on Update.
 func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
 	const propKey = "DrbdOptions/Resource/quorum"
 
-	if rd.Spec.Props != nil && rd.Spec.Props[propKey] == value {
-		return nil
+	for range 3 {
+		if rd.Spec.Props != nil && rd.Spec.Props[propKey] == value {
+			return nil
+		}
+
+		if rd.Spec.Props == nil {
+			rd.Spec.Props = map[string]string{}
+		}
+
+		rd.Spec.Props[propKey] = value
+
+		err := r.Update(ctx, rd)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return err
+		}
+
+		// Refetch and retry.
+		err = r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd)
+		if err != nil {
+			return err
+		}
 	}
 
-	if rd.Spec.Props == nil {
-		rd.Spec.Props = map[string]string{}
-	}
-
-	rd.Spec.Props[propKey] = value
-
-	return r.Update(ctx, rd)
+	return apierrors.NewConflict(
+		blockstoriov1alpha1.GroupVersion.WithResource("resourcedefinitions").GroupResource(),
+		rd.Name, nil)
 }
 
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.
@@ -260,7 +285,7 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
 	for i := range witnesses {
 		err := r.Store.Resources().Delete(ctx, rdName, witnesses[i].NodeName)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
+		if err != nil && !stderrors.Is(err, store.ErrNotFound) {
 			return err
 		}
 	}
