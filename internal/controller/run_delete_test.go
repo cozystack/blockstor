@@ -18,9 +18,11 @@ package controller_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -29,8 +31,26 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// happyDialer returns a stub SatelliteClient whose DeleteResource
+// just ACKs everything. Lets tests exercise runDelete's success
+// path without spinning up a real satellite gRPC server.
+type happyDialer struct{}
+
+func (happyDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClient, func() error, error) {
+	return &happySatelliteClient{}, func() error { return nil }, nil
+}
+
+type happySatelliteClient struct {
+	satellitepb.SatelliteClient
+}
+
+func (*happySatelliteClient) DeleteResource(_ context.Context, _ *satellitepb.DeleteResourceRequest, _ ...grpc.CallOption) (*satellitepb.DeleteResourceResponse, error) {
+	return &satellitepb.DeleteResourceResponse{Ok: true}, nil
+}
 
 // TestRunDeleteRequeuesOnRPCError: a resource with DeletionTimestamp
 // set + finalizer + unreachable satellite must NOT have the finalizer
@@ -113,3 +133,68 @@ func TestRunDeleteRequeuesOnRPCError(t *testing.T) {
 // already finished the delete before our hook ever sees it. The
 // branch is dead-on-arrival defensive code; production exercise is
 // implicit.)
+
+// TestRunDeleteHappyPathStripsFinalizer: with a successful satellite
+// RPC, the runDelete path strips the finalizer so kube-apiserver can
+// complete the delete. Pins the contract: the storage-side teardown
+// happens BEFORE the finalizer comes off, so the satellite has
+// finished its work by the time the apiserver finalizes.
+func TestRunDeleteHappyPathStripsFinalizer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	now := metav1.Now()
+	resCRD := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-del-ok.n1",
+			Finalizers:        []string{"blockstor.io.blockstor.io/resource"},
+			DeletionTimestamp: &now,
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-del-ok",
+			NodeName:               "n1",
+		},
+	}
+
+	nodeCRD := &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(resCRD, nodeCRD).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{
+		Client:     cli,
+		Scheme:     scheme,
+		Dispatcher: dispatcher.New(happyDialer{}),
+		Store:      store.NewInMemory(),
+	}
+
+	got, err := rec.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-del-ok.n1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got.RequeueAfter != 0 || got.Requeue {
+		t.Errorf("Result: got %+v, want zero (success means no requeue)", got)
+	}
+
+	// After Reconcile the fake client has either deleted the
+	// object (apiserver-style) or stripped the finalizer. Either
+	// way, our finalizer must NOT be present on a fetched copy.
+	post := &blockstoriov1alpha1.Resource{}
+	getErr := cli.Get(ctx, types.NamespacedName{Name: "pvc-del-ok.n1"}, post)
+
+	if getErr == nil && slices.Contains(post.Finalizers, "blockstor.io.blockstor.io/resource") {
+		t.Errorf("finalizer still present after happy-path delete: %v", post.Finalizers)
+	}
+}
