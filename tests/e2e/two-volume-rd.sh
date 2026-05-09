@@ -25,11 +25,16 @@ N2=test-worker-2
 trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply 2-volume RD"
+# Disable auto-tiebreaker — this test only validates per-volume
+# replication on the explicit 2-replica pair, the 3rd-node witness
+# would just slow initial sync and add no value here.
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
+  props:
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
     - {volumeNumber: 1, sizeKib: 32768}

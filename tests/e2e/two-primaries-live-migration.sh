@@ -41,6 +41,9 @@ metadata: {name: ${RD}}
 spec:
   props:
     DrbdOptions/Net/allow-two-primaries: "yes"
+    # 2-replica RD is what live-migration needs; the witness on N3
+    # would slow initial sync without adding test signal.
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 EOF
