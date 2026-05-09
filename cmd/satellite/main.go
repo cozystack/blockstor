@@ -39,6 +39,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/loopfile"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
+	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
 
 // loopfileDirPerm is the mkdir mode for the loopfile pool directory
@@ -96,6 +97,19 @@ func run() int {
 	flag.StringVar(&loopfileDir, "loopfile-dir", "/var/lib/blockstor-pool",
 		"directory the loopfile-pool-name pool stores its sparse files in")
 
+	var (
+		zfsPoolName string
+		zfsZpool    string
+		zfsThin     bool
+	)
+
+	flag.StringVar(&zfsPoolName, "zfs-pool-name", "",
+		"register a ZFS pool under this LINSTOR pool name (empty disables)")
+	flag.StringVar(&zfsZpool, "zfs-zpool", "",
+		"backing zpool name (defaults to zfs-pool-name)")
+	flag.BoolVar(&zfsThin, "zfs-thin", true,
+		"create sparse zvols (ZFS_THIN). Set to false for thick provisioning.")
+
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -147,6 +161,17 @@ func run() int {
 
 		providers[loopfilePoolName] = loopfile.NewProvider(
 			loopfile.Config{Dir: loopfileDir},
+			storage.RealExec{})
+	}
+
+	if zfsPoolName != "" {
+		zpool := zfsZpool
+		if zpool == "" {
+			zpool = zfsPoolName
+		}
+
+		providers[zfsPoolName] = zfs.NewProvider(
+			zfs.Config{Pool: zpool, Thin: zfsThin},
 			storage.RealExec{})
 	}
 
