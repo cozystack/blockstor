@@ -71,14 +71,24 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
 	var crdList crdv1alpha1.ResourceList
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
+	// List all Resources and filter by Spec.ResourceDefinitionName
+	// in-process. We used to use a label selector, but Resources
+	// created directly via kubectl/manifests (rather than through
+	// the REST handler that sets labels) wouldn't be matched. Cluster
+	// resource counts are small enough that the in-process filter is
+	// the right tradeoff for correctness over hashed-label lookups.
+	err := s.c.List(ctx, &crdList)
 	if err != nil {
 		return nil, errors.Wrapf(err, "list Resource CRDs for RD %q", rdName)
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
+
 	for i := range crdList.Items {
+		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
+			continue
+		}
+
 		out = append(out, crdToWireResource(&crdList.Items[i]))
 	}
 
