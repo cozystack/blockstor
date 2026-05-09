@@ -34,6 +34,141 @@ func (s *Server) registerNodes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/nodes", s.requireStore(s.handleNodeCreate))
 	mux.HandleFunc("PUT /v1/nodes/{node}", s.requireStore(s.handleNodeUpdate))
 	mux.HandleFunc("DELETE /v1/nodes/{node}", s.requireStore(s.handleNodeDelete))
+
+	// Per-interface CRUD: clusters with separate replication and
+	// management networks need to add/remove NetInterfaces on a
+	// running Node without a full PUT-of-the-whole-Node round-trip.
+	// Maps onto Node.Spec.NetInterfaces[] inside the same Node CRD.
+	mux.HandleFunc("POST /v1/nodes/{node}/net-interfaces",
+		s.requireStore(s.handleNetInterfaceCreate))
+	mux.HandleFunc("PUT /v1/nodes/{node}/net-interfaces/{name}",
+		s.requireStore(s.handleNetInterfaceUpdate))
+	mux.HandleFunc("DELETE /v1/nodes/{node}/net-interfaces/{name}",
+		s.requireStore(s.handleNetInterfaceDelete))
+}
+
+// handleNetInterfaceCreate appends a NetInterface to the Node's spec.
+// Idempotent: a second create with the same name updates in place.
+func (s *Server) handleNetInterfaceCreate(w http.ResponseWriter, r *http.Request) {
+	mutateNetInterface(w, r, s, func(n *apiv1.Node, iface apiv1.NetInterface) error {
+		for i := range n.NetInterfaces {
+			if n.NetInterfaces[i].Name == iface.Name {
+				n.NetInterfaces[i] = iface
+
+				return nil
+			}
+		}
+
+		n.NetInterfaces = append(n.NetInterfaces, iface)
+
+		return nil
+	})
+}
+
+// handleNetInterfaceUpdate is the per-name replace. The path's
+// {name} wins over any name in the body so callers can omit it.
+func (s *Server) handleNetInterfaceUpdate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	mutateNetInterface(w, r, s, func(n *apiv1.Node, iface apiv1.NetInterface) error {
+		iface.Name = name
+
+		for i := range n.NetInterfaces {
+			if n.NetInterfaces[i].Name == name {
+				n.NetInterfaces[i] = iface
+
+				return nil
+			}
+		}
+
+		// Update on a missing interface is also a create — matches
+		// upstream LINSTOR's PUT-creates semantic for `linstor n
+		// interface modify`.
+		n.NetInterfaces = append(n.NetInterfaces, iface)
+
+		return nil
+	})
+}
+
+// handleNetInterfaceDelete drops the named NetInterface. Missing →
+// no-op (idempotent).
+func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request) {
+	nodeName := r.PathValue("node")
+	name := r.PathValue("name")
+
+	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	out := node.NetInterfaces[:0]
+
+	for i := range node.NetInterfaces {
+		if node.NetInterfaces[i].Name == name {
+			continue
+		}
+
+		out = append(out, node.NetInterfaces[i])
+	}
+
+	node.NetInterfaces = out
+
+	err = s.Store.Nodes().Update(r.Context(), &node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// mutateNetInterface decodes a NetInterface body, runs the supplied
+// mutation against the node's interface list, and persists. Used by
+// both create and update so the decoder + Get + Update plumbing stays
+// in one place.
+func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutate func(*apiv1.Node, apiv1.NetInterface) error) {
+	nodeName := r.PathValue("node")
+
+	var iface apiv1.NetInterface
+
+	err := json.NewDecoder(r.Body).Decode(&iface)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	if iface.Name == "" && r.PathValue("name") == "" {
+		writeError(w, http.StatusBadRequest, "interface name is required")
+
+		return
+	}
+
+	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = mutate(&node, iface)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	err = s.Store.Nodes().Update(r.Context(), &node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, node)
 }
 
 // requireStore guards endpoints that need persistence; it returns 503 if the

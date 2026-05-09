@@ -282,3 +282,20 @@ func httpPatch(t *testing.T, addr string, body []byte) *http.Response {
 
 	return resp
 }
+
+func httpPut(t *testing.T, addr string, body []byte) *http.Response {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, addr, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	return resp
+}
