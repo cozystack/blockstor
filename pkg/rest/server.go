@@ -123,6 +123,8 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerRemotes(mux)
 	s.registerNodeConnections(mux)
 	s.registerSnapshotMulti(mux)
+	s.registerQuerySizeInfo(mux)
+	s.registerAdvise(mux)
 
 	return mux
 }
