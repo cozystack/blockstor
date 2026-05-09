@@ -68,6 +68,19 @@ func (c *Cryptsetup) Open(ctx context.Context, device, dmName string, key []byte
 	return nil
 }
 
+// Resize tells cryptsetup the underlying device has grown — without
+// it the dm-crypt target keeps the original size and `drbdadm resize`
+// only sees the LUKS-mapped portion. Idempotent: a no-op when the
+// device size already matches the dm target.
+func (c *Cryptsetup) Resize(ctx context.Context, dmName string, key []byte) error {
+	err := c.runWithKey(ctx, key, "resize", dmName, "--key-file", "-")
+	if err != nil {
+		return errors.Wrapf(err, "luksResize %s", dmName)
+	}
+
+	return nil
+}
+
 // Close removes the dm-crypt mapping. Counterpart to Open.
 func (c *Cryptsetup) Close(ctx context.Context, dmName string) error {
 	_, err := c.exec.Run(ctx, "cryptsetup", "luksClose", dmName)

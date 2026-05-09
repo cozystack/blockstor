@@ -239,8 +239,10 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 
 	devices := map[int32]string{}
 
+	resized := false
+
 	if !diskless {
-		got, err := r.applyStorage(ctx, dr)
+		got, didResize, err := r.applyStorage(ctx, dr)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -249,10 +251,11 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 		}
 
 		devices = got
+		resized = didResize
 	}
 
 	if r.cfg.Adm != nil {
-		err := r.applyDRBD(ctx, dr, diskless, devices)
+		err := r.applyDRBD(ctx, dr, diskless, devices, resized)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -273,13 +276,14 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 // Records the resource→pool mapping (first volume's pool) so
 // subsequent snapshot RPCs can route without the controller passing
 // the pool.
-func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, error) {
+func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, bool, error) {
 	devices := map[int32]string{}
+	resized := false
 
 	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 		if !ok {
-			return nil, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
+			return nil, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
 
 		err := provider.CreateVolume(ctx, storage.Volume{
@@ -288,7 +292,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 			SizeKib:      vol.GetSizeKib(),
 		})
 		if err != nil {
-			return nil, errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
+			return nil, false, errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
 
 		status, err := provider.VolumeStatus(ctx, storage.Volume{
@@ -296,7 +300,26 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 			VolumeNumber: vol.GetVolumeNumber(),
 		})
 		if err != nil {
-			return nil, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
+			return nil, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
+		}
+
+		// Grow path: the controller's VolumeDefinition update set a
+		// new size that's larger than what the provider has on disk.
+		// Call ResizeVolume to extend the LV/zvol/file; the LUKS
+		// layer (when present) and `drbdadm resize` are layered on
+		// top by their own reconcile steps.
+		if vol.GetSizeKib() > status.UsableKib && status.UsableKib > 0 {
+			err = provider.ResizeVolume(ctx, storage.Volume{
+				ResourceName: dr.GetName(),
+				VolumeNumber: vol.GetVolumeNumber(),
+				SizeKib:      vol.GetSizeKib(),
+			})
+			if err != nil {
+				return nil, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
+					dr.GetName(), vol.GetVolumeNumber(), vol.GetSizeKib())
+			}
+
+			resized = true
 		}
 
 		devices[vol.GetVolumeNumber()] = status.DevicePath
@@ -306,7 +329,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 		r.rememberPool(dr.GetName(), dr.GetVolumes()[0].GetStoragePool())
 	}
 
-	return devices, nil
+	return devices, resized, nil
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
@@ -317,7 +340,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 // devices is the volNumber → DevicePath map applyStorage produced.
 // buildResFile uses it as the disk path so a loopfile-backed volume
 // gets `disk /dev/loopN` rather than the LVM-shaped guess.
-func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string) error {
+func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized bool) error {
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	_, statErr := os.Stat(resPath)
 	firstActivation := os.IsNotExist(statErr)
@@ -342,6 +365,19 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	err = r.cfg.Adm.Adjust(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "adjust %s", dr.GetName())
+	}
+
+	// Pickup-time resize: the storage layer was just grown, drbdadm
+	// resize tells the kernel to extend the replicated device to
+	// match. Adjust on its own won't do this — only resize re-reads
+	// the lower disk's size. Diskless replicas don't have a lower
+	// disk to resize but they still need their internal state to
+	// catch up; drbdadm resize handles that case too.
+	if resized {
+		err = r.cfg.Adm.Resize(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "resize %s", dr.GetName())
+		}
 	}
 
 	// On first activation of a diskful replica the controller may

@@ -92,6 +92,43 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
+// ResizeVolume grows the backing file and re-runs losetup --set-capacity
+// so the kernel picks up the new size on the loop device. Shrinks are
+// rejected. Idempotent: a no-op when current size already meets target.
+func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
+	path := p.volumePath(vol)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errors.Wrapf(storage.ErrNotFound, "resize %s", path)
+		}
+
+		return errors.Wrapf(err, "stat %s", path)
+	}
+
+	target := vol.SizeKib * bytesPerKib
+
+	if info.Size() >= target {
+		return nil
+	}
+
+	_, err = p.exec.Run(ctx, "truncate", "-s", strconv.FormatInt(target, 10), path)
+	if err != nil {
+		return errors.Wrapf(err, "truncate %s", path)
+	}
+
+	dev, err := p.lookupLoop(ctx, path)
+	if err == nil && dev != "" {
+		_, err = p.exec.Run(ctx, "losetup", "-c", dev)
+		if err != nil {
+			return errors.Wrapf(err, "losetup -c %s", dev)
+		}
+	}
+
+	return nil
+}
+
 // DeleteVolume detaches the loop device (if any) and removes the file.
 // Missing → no-op.
 func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {

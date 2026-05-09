@@ -255,3 +255,26 @@ func TestThinExecError(t *testing.T) {
 }
 
 var errLVCreateFailed = errors.New("lvcreate: insufficient free space")
+
+// TestThinResizeVolumeIssuesLvextend pins the lvextend command shape.
+// CSI ControllerExpandVolume → REST PUT → reconciler ResizeVolume,
+// so the wire-visible behaviour is "lvextend --size <newMiB>MiB
+// vg/lv". Refactors that change the args will fail loudly here.
+func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
+	fx := storage.NewFakeExec()
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	err := p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      2048 * 1024, // 2 GiB
+	})
+	if err != nil {
+		t.Fatalf("ResizeVolume: %v", err)
+	}
+
+	want := "lvextend --size 2048MiB vg/pvc-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q; got %v", want, fx.CommandLines())
+	}
+}

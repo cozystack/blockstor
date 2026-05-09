@@ -83,6 +83,16 @@ func (a *Adm) Secondary(ctx context.Context, resource string) error {
 	return a.run(ctx, "secondary", resource)
 }
 
+// Resize rescans the lower disk's size and tells DRBD to grow the
+// replicated volume to match. The lower disk (LV / zvol / dm-crypt
+// target) must already be the target size — this is a notify-only
+// command. `--assume-clean` skips the resync of the new bytes since
+// they were just allocated, which would otherwise serialise growing
+// every replica.
+func (a *Adm) Resize(ctx context.Context, resource string) error {
+	return a.run(ctx, "resize", "--assume-clean", resource)
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {

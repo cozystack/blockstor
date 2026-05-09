@@ -81,6 +81,24 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
+// ResizeVolume sets the zvol's volsize to vol.SizeKib (rounded up
+// to MiB). zfs is happy to set the same size twice, so the call is
+// idempotent. Shrinks are rejected by ZFS itself when the existing
+// volume already holds more data — the CSI grow-only contract makes
+// the no-shrink invariant a non-issue here.
+func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
+	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+
+	_, err := p.exec.Run(ctx, "zfs", "set",
+		"volsize="+strconv.FormatInt(sizeMiB, 10)+"M",
+		p.volumeDataset(vol))
+	if err != nil {
+		return errors.Wrapf(err, "zfs set volsize %s", p.volumeDataset(vol))
+	}
+
+	return nil
+}
+
 // DeleteVolume `zfs destroy -r`s the zvol (recursive to clean up any
 // dependent snapshots automatically). Missing → no-op.
 func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {

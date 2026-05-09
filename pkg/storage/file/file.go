@@ -99,6 +99,37 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
+// ResizeVolume grows the backing file to vol.SizeKib bytes. truncate
+// is the right tool for both thick (fallocate-created) and thin
+// (truncate-created) cases — when the file is shorter than the new
+// size, the OS extends with sparse zero-bytes. Shrinks are rejected
+// to match the rest of the provider contract.
+func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
+	path := p.volumePath(vol)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errors.Wrapf(storage.ErrNotFound, "resize %s", path)
+		}
+
+		return errors.Wrapf(err, "stat %s", path)
+	}
+
+	target := vol.SizeKib * bytesPerKib
+
+	if info.Size() >= target {
+		return nil
+	}
+
+	_, err = p.exec.Run(ctx, "truncate", "-s", strconv.FormatInt(target, 10), path)
+	if err != nil {
+		return errors.Wrapf(err, "truncate %s", path)
+	}
+
+	return nil
+}
+
 // DeleteVolume removes the backing file. Missing → no-op.
 func (p *Provider) DeleteVolume(_ context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)

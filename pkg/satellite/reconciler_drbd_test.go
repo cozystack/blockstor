@@ -170,3 +170,99 @@ func TestApplyDisklessNoCreateMD(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyTriggersResizeOnGrow simulates the satellite picking up a
+// VolumeDefinition update that grew the volume: lvs reports the LV
+// already exists at 1 GiB, the desired size is 2 GiB → reconciler
+// must call lvextend then drbdadm resize. Pins the upstream-style
+// growth-path semantics CSI ControllerExpandVolume relies on.
+func TestApplyTriggersResizeOnGrow(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Volume already exists.
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-grow_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-grow_00000\n")})
+	// VolumeStatus: 1 GiB on disk (1024*1024 KiB).
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-grow_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-grow_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Desired: 2 GiB.
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-grow",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	want := []string{
+		"lvextend --size 2048MiB vg/pvc-grow_00000",
+		"drbdadm resize --assume-clean pvc-grow",
+	}
+
+	for _, w := range want {
+		if !slices.Contains(fx.CommandLines(), w) {
+			t.Errorf("expected %q in calls; got %v", w, fx.CommandLines())
+		}
+	}
+}
+
+// TestApplyNoResizeOnFreshCreate: when the volume doesn't exist yet
+// CreateVolume runs but ResizeVolume must NOT — there's nothing to
+// grow. drbdadm resize is also skipped.
+func TestApplyNoResizeOnFreshCreate(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-new_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-new",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "lvextend ") {
+			t.Errorf("fresh create issued lvextend: %s", line)
+		}
+
+		if strings.HasPrefix(line, "drbdadm resize") {
+			t.Errorf("fresh create issued drbdadm resize: %s", line)
+		}
+	}
+}

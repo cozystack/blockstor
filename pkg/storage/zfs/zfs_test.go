@@ -224,3 +224,25 @@ func TestDeleteSnapshotIssuesZfsDestroy(t *testing.T) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestZFSResizeVolumeIssuesZfsSet locks `zfs set volsize=<MiB>M`
+// as the resize command. Used by the satellite reconciler when a
+// VolumeDefinition update bumps the size.
+func TestZFSResizeVolumeIssuesZfsSet(t *testing.T) {
+	fx := storage.NewFakeExec()
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      2048 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("ResizeVolume: %v", err)
+	}
+
+	want := "zfs set volsize=2048M tank/pvc-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}

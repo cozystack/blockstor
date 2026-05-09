@@ -88,6 +88,24 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
+// ResizeVolume grows the LV to vol.SizeKib (rounded up to MiB to
+// match LINSTOR's reporting). Shrinks are rejected — DRBD doesn't
+// support online shrink and CSI ControllerExpandVolume is grow-only.
+// `lvextend --size` is a no-op when the requested size matches, so
+// the call stays idempotent.
+func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
+	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+
+	_, err := t.exec.Run(ctx, "lvextend",
+		"--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
+	if err != nil {
+		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
+	}
+
+	return nil
+}
+
 // DeleteVolume idempotently removes the LV. Missing → no-op (reconcile
 // loops re-call this).
 func (t *Thin) DeleteVolume(ctx context.Context, vol storage.Volume) error {

@@ -93,6 +93,14 @@ type Provider interface {
 	// silently swallowed so repeated reconciles converge.
 	DeleteVolume(ctx context.Context, vol Volume) error
 
+	// ResizeVolume grows the volume to vol.SizeKib in place. Shrinks
+	// MUST be rejected (DRBD doesn't support online shrink and the
+	// CSI contract forbids it). Idempotent: a no-op when the volume
+	// already matches the target size. The satellite layers
+	// cryptsetup resize and drbdadm resize on top — the provider
+	// only owns the underlying block device.
+	ResizeVolume(ctx context.Context, vol Volume) error
+
 	// VolumeStatus reports observed state. DevicePath empty + State
 	// NOT_PROVISIONED means the volume hasn't been created yet.
 	VolumeStatus(ctx context.Context, vol Volume) (VolumeStatus, error)
