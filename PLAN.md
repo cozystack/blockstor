@@ -31,10 +31,11 @@ high-bandwidth check-ins with the user.
   instead of serialising the whole matrix on one stand. RAM budget per
   stand is ~16 GiB (4 VMs × 4 GiB); plenty of room for 4-8 stands at
   once on this host.
-- **Phase**: 3 — satellite + DRBD lifecycle in progress.
+- **Phase**: 9 — layer-stack (DRBD/LUKS/STORAGE compositions) closed; Phases 1–8 + 9 all complete (110/110 checkboxes ticked as of 2026-05-09).
 - **CRDs (7, kubebuilder-scaffolded, LINSTOR-shaped fields)**:
   `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`,
   `Snapshot`, `KVEntry`. VolumeDefinitions inline on `ResourceDefinition.Spec`.
+  RD also carries `LayerStack` (Phase 9) for explicit composition control.
 - **Stores**: `pkg/store` (InMemory) and `pkg/store/k8s` (controller-runtime
   client), both behind the same `store.Store` interface and exercised by the
   same `pkg/store/storetest` shared suite. KeyValueStore is now CRD-backed
@@ -53,22 +54,11 @@ high-bandwidth check-ins with the user.
 - **Lint**: `golangci-lint run ./...` zero issues. Auto-lint hook on every
   Go-file edit.
 - **Blocker**: none.
-- **Next concrete steps** (Phase 3 implementation):
-  1. Generate Go bindings from `proto/satellite/v1alpha1/satellite.proto`
-     (protoc + protoc-gen-go + protoc-gen-go-grpc). Wire generated package
-     into `pkg/satellite`.
-  2. Implement controller-side gRPC server (in `pkg/rest/grpc.go` or new
-     `pkg/satellitecontroller`) that the satellite dials. Hello round-trips.
-  3. Storage providers: `pkg/storage/{lvm,zfs}` interfaces + fake-exec
-     implementations + unit tests. No real DRBD/LVM yet.
-  4. ConfFileBuilder in `pkg/drbd` — port `.res` template from upstream
-     Java tests (input → expected output golden tests).
-  5. `drbdadm`/`drbdsetup` exec wrappers behind interfaces (testable with
-     fake exec).
-  6. Reconcilers actually fill Status: `Resource` reconciler invokes
-     storage provider + DRBD wrapper through satellite gRPC.
-  7. Phase 3 exit smoke: 2-replica DRBD on the talos stand, PVC mount on
-     node A → fail node A → PVC mounts on node B.
+- **Operational follow-ups** (not blocking the plan; tracked outside this PLAN):
+  1. Long-tail burn-in run of `tests/burnin-blockstor.sh` against ZFS / LVM-thin pools on the t2 stand.
+  2. Stand-side execution of the Phase 9 e2e scaffolds (`no-drbd.sh`, `luks-layer.sh`, `drbd-luks-stack.sh`) once a LUKS-extension Talos profile is packed.
+  3. Cross-node snapshot-restore + clone runtime exercise on real ZFS / LVM-thin pools (REST contract is pinned; the data-shipping leg is the operator-side validation).
+  4. iptables-controllable Talos profile + Ganesha extension layer for the network-partition / RWX scenarios — these are external infrastructure, tracked outside this repo.
 
 ---
 
