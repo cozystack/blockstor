@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -486,17 +487,63 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, 
 		})
 	}
 
+	netOpts, resOpts := splitDRBDOptions(opts)
+
 	out, err := drbd.Build(drbd.Resource{
 		Name:    dr.GetName(),
-		Net:     drbd.Net{ProtocolC: true},
+		Net:     drbd.Net{ProtocolC: true, Options: netOpts},
 		Hosts:   hosts,
 		Volumes: vols,
+		Options: resOpts,
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "drbd.Build")
 	}
 
 	return out, nil
+}
+
+// splitDRBDOptions partitions the satellite-received drbd_options bag
+// into per-section maps. Per-replica wiring (port/node-id/peer.*.…)
+// is dropped — those are not user-tunable knobs. Anything under
+// `DrbdOptions/Net/...` lands on the `net { }` block, anything else
+// under `DrbdOptions/...` lands on the resource-level `options { }`
+// block (drbd's catch-all). The ConfFileBuilder writes the keys
+// verbatim with the `DrbdOptions/<Section>/` prefix stripped — that's
+// the form drbdadm expects.
+func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]string) {
+	netOpts := map[string]string{}
+	resOpts := map[string]string{}
+
+	for key, value := range opts {
+		rest, ok := strings.CutPrefix(key, drbd.PropPrefix)
+		if !ok {
+			continue
+		}
+
+		section, rawKey, hasSection := strings.Cut(rest, "/")
+		if !hasSection {
+			resOpts[rest] = value
+
+			continue
+		}
+
+		switch strings.ToLower(section) {
+		case "net":
+			netOpts[rawKey] = value
+		case "disk", "peerdevice", "peer-device", "handlers":
+			// These sections aren't plumbed through Net struct
+			// today; surface them as resource-level options so
+			// drbdadm at least sees them. Full per-section
+			// emission lands when ConfFileBuilder grows the
+			// disk/peer-device blocks.
+			resOpts[rawKey] = value
+		default:
+			resOpts[rawKey] = value
+		}
+	}
+
+	return netOpts, resOpts
 }
 
 // resolveAddr substitutes the satellite's own IP whenever the

@@ -266,3 +266,51 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyRendersAllowTwoPrimaries verifies the option-hierarchy
+// pipeline lands `allow-two-primaries yes;` in the generated .res
+// file. Required for Ganesha-RWX (NFS export flips Primary on
+// failover) and KubeVirt live-migration (both nodes Primary briefly).
+func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-rwx_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-rwx",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+
+				// The controller-side resolver folds this in from
+				// `linstor c sp DrbdOptions/Net/allow-two-primaries yes`.
+				"DrbdOptions/Net/allow-two-primaries": "yes",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-rwx.res"))
+	if err != nil {
+		t.Fatalf("read .res: %v", err)
+	}
+
+	if !strings.Contains(string(body), "allow-two-primaries yes;") {
+		t.Errorf(".res missing allow-two-primaries; body=%s", body)
+	}
+}
