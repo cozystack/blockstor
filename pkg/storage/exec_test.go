@@ -17,6 +17,7 @@ limitations under the License.
 package storage_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -130,5 +131,53 @@ func TestFakeExecReset(t *testing.T) {
 	out, _ := fx.Run(t.Context(), "lvs")
 	if string(out) != "ok" {
 		t.Errorf("Responses lost across Reset: got %q", out)
+	}
+}
+
+// TestRealExecCapturesStdout: RealExec captures the child process's
+// stdout into the returned byte slice. Pins the production exec
+// path's primary contract — every storage provider parses stdout
+// directly (lvs, zfs list, vgs).
+func TestRealExecCapturesStdout(t *testing.T) {
+	// `printf` is part of POSIX shell builtins on darwin/linux; the
+	// test stays portable without bringing in test-fixture binaries.
+	out, err := storage.RealExec{}.Run(t.Context(), "printf", "%s", "hello-stdout")
+	if err != nil {
+		t.Fatalf("RealExec.Run: %v", err)
+	}
+
+	if string(out) != "hello-stdout" {
+		t.Errorf("stdout: got %q, want %q", string(out), "hello-stdout")
+	}
+}
+
+// TestRealExecFoldsStderrIntoError: when the child fails, the
+// returned error must include both the original exec error AND the
+// stderr text — providers surface that combined message verbatim,
+// so a regression that dropped stderr would leave operators
+// debugging blind.
+func TestRealExecFoldsStderrIntoError(t *testing.T) {
+	// `false` exits non-zero with no output; use `sh -c` to also
+	// emit a stderr line so we can assert it appears in the error.
+	_, err := storage.RealExec{}.Run(t.Context(), "sh", "-c", "echo FAIL-MARKER >&2; exit 7")
+	if err == nil {
+		t.Fatalf("expected non-nil error on exit 7")
+	}
+
+	if !strings.Contains(err.Error(), "FAIL-MARKER") {
+		t.Errorf("stderr swallowed: error %q must contain FAIL-MARKER", err.Error())
+	}
+}
+
+// TestRealExecHonoursContextCancel: a cancelled context kills the
+// child process. Pins the timeout / shutdown contract — without it,
+// a hung lvs / zfs would block the satellite reconciler indefinitely.
+func TestRealExecHonoursContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // already cancelled before the call
+
+	_, err := storage.RealExec{}.Run(ctx, "sh", "-c", "sleep 60")
+	if err == nil {
+		t.Errorf("expected error on cancelled context")
 	}
 }
