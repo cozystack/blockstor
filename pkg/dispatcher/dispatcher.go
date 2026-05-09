@@ -209,15 +209,7 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		drbdOpts["auto-primary"] = "true"
 	}
 
-	// Per-peer entries — used by ConfFileBuilder on the satellite to
-	// compose the connection mesh. We resolve each peer's
-	// SatelliteEndpoint prop into a real IP so drbd-9 has somewhere
-	// to actually replicate to (0.0.0.0 won't work as a peer addr).
-	for _, peer := range dropped {
-		drbdOpts["peer."+peer+".port"] = strconv.Itoa(port)
-		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
-		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
-	}
+	addPeerEntries(drbdOpts, dropped, peers, nodes, port, idOf)
 
 	return &satellitepb.DesiredResource{
 		Name:        rdName,
@@ -241,37 +233,62 @@ func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
 	return *r.Status.DRBDNodeID
 }
 
-// readDRBDPort returns the persisted port (from any sibling, since
-// they all share one) or falls back to deriving when nothing is
-// allocated. The fallback keeps in-flight reconciles working before
-// the controller's allocator catches up.
-func readDRBDPort(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+// readDRBDPort returns the per-replica TCP port. Upstream LINSTOR
+// allocates the port from the hosting node's range, not the RD's, so
+// each replica owns its own value. Fallback to derivePort is the
+// transitional safety net for in-flight reconciles before the
+// controller's allocator catches up — new replicas always go through
+// the per-node allocator.
+func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.Resource) int {
 	if target.Status.DRBDPort != nil {
 		return int(*target.Status.DRBDPort)
-	}
-
-	for i := range peers {
-		if peers[i].Status.DRBDPort != nil {
-			return int(*peers[i].Status.DRBDPort)
-		}
 	}
 
 	return derivePort(target.Spec.ResourceDefinitionName)
 }
 
-// readDRBDMinor mirrors readDRBDPort for the local /dev/drbd<N> minor.
-func readDRBDMinor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+// readDRBDMinor mirrors readDRBDPort. Per-replica because /dev/drbd<N>
+// is a local device path; two replicas on different nodes are free
+// to take unrelated minors.
+func readDRBDMinor(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.Resource) int {
 	if target.Status.DRBDMinor != nil {
 		return int(*target.Status.DRBDMinor)
 	}
 
-	for i := range peers {
-		if peers[i].Status.DRBDMinor != nil {
-			return int(*peers[i].Status.DRBDMinor)
-		}
+	return deriveMinor(target.Spec.ResourceDefinitionName)
+}
+
+// peerPortOf reads the persisted DRBDPort off a peer Resource. The
+// .res file's `peer.<name>.port` must reflect the port that peer
+// listens on (its own allocation), not target's.
+func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
+	if r.Status.DRBDPort != nil {
+		return int(*r.Status.DRBDPort)
 	}
 
-	return deriveMinor(target.Spec.ResourceDefinitionName)
+	return fallback
+}
+
+// addPeerEntries fills in `peer.<name>.{port,node-id,address}` keys
+// on the DesiredResource's drbd_options map. Pulled out of
+// buildDesired to keep the latter under the funlen budget — this
+// owns the per-peer fan-out plus the port/address lookups.
+func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, fallbackPort int, idOf map[string]int32) {
+	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
+	for i := range peers {
+		peerByName[peers[i].Spec.NodeName] = &peers[i]
+	}
+
+	for _, peer := range dropped {
+		peerPort := fallbackPort
+		if p, ok := peerByName[peer]; ok {
+			peerPort = peerPortOf(p, fallbackPort)
+		}
+
+		drbdOpts["peer."+peer+".port"] = strconv.Itoa(peerPort)
+		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
+		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
+	}
 }
 
 // lowestDiskfulID picks the smallest allocated node-id among the

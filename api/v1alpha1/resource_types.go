@@ -56,15 +56,19 @@ type ResourceStatus struct {
 	// +optional
 	DRBDNodeID *int32 `json:"drbdNodeId,omitempty"`
 
-	// drbdPort is the TCP port the controller allocated for this RD's
-	// replication mesh. All replicas of the same RD share the port;
-	// the controller stamps the same value on every sibling Resource.
+	// drbdPort is the TCP port this replica listens on. Allocated
+	// from the hosting node's TCP-port range — different replicas
+	// of the same RD can use different ports because each lives on
+	// a different node and the port is local to that node. Matches
+	// upstream LINSTOR's per-resource (not per-RD) port model.
 	// nil means not yet allocated.
 	// +optional
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 
-	// drbdMinor is the local /dev/drbd<N> minor number. Same scoping
-	// rule as drbdPort.
+	// drbdMinor is the local /dev/drbd<N> minor number on the
+	// hosting node. Like drbdPort, allocated per-replica from the
+	// node's minor-range — minors are local device numbers, so two
+	// replicas on different nodes can have unrelated minors.
 	// +optional
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 

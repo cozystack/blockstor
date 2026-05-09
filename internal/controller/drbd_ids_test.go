@@ -120,26 +120,113 @@ func TestDRBDNodeIDStableAcrossPeerChurn(t *testing.T) {
 	}
 }
 
-// TestDRBDPortShared: every replica of an RD ends up with the same
-// DRBDPort and DRBDMinor. This is the upstream invariant — the
-// .res file uses the same port across the connection mesh.
-func TestDRBDPortShared(t *testing.T) {
+// TestDRBDPortPerReplicaUniqueOnNode pins the per-node, per-replica
+// allocation rule: two replicas on the same node must take distinct
+// ports/minors (port collision = drbd connection failure). Two
+// replicas on different nodes are free to take the same port — that
+// matches upstream LINSTOR's per-node range model.
+func TestDRBDPortPerReplicaUniqueOnNode(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	scheme := newScheme(t)
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
 
-	rd := "pvc-port-shared"
+	// Two RDs, three nodes each, packed onto two physical nodes.
+	// We expect each node's local replicas to have unique ports
+	// among themselves, but ports on n1 are independent of n2.
+	for _, rd := range []string{"pvc-A", "pvc-B"} {
+		for _, node := range []string{"n1", "n2"} {
+			create(ctx, t, cli, rd, node)
+		}
+	}
 
-	for _, node := range []string{"n1", "n2", "n3"} {
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+	allocate(ctx, t, rec, cli, "pvc-A")
+	allocate(ctx, t, rec, cli, "pvc-B")
+
+	list := &blockstoriov1alpha1.ResourceList{}
+	if err := cli.List(ctx, list); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// Build per-node {port,minor} buckets and assert no collisions.
+	portsByNode := map[string]map[int32]string{}
+	minorsByNode := map[string]map[int32]string{}
+
+	for i := range list.Items {
+		node := list.Items[i].Spec.NodeName
+		name := list.Items[i].Name
+
+		if list.Items[i].Status.DRBDPort == nil || list.Items[i].Status.DRBDMinor == nil {
+			t.Fatalf("%s: port/minor not allocated", name)
+		}
+
+		if portsByNode[node] == nil {
+			portsByNode[node] = map[int32]string{}
+		}
+
+		if minorsByNode[node] == nil {
+			minorsByNode[node] = map[int32]string{}
+		}
+
+		port := *list.Items[i].Status.DRBDPort
+		if other, dup := portsByNode[node][port]; dup {
+			t.Errorf("port %d collides on node %q: %s vs %s", port, node, other, name)
+		}
+
+		portsByNode[node][port] = name
+
+		minor := *list.Items[i].Status.DRBDMinor
+		if other, dup := minorsByNode[node][minor]; dup {
+			t.Errorf("minor %d collides on node %q: %s vs %s", minor, node, other, name)
+		}
+
+		minorsByNode[node][minor] = name
+	}
+}
+
+// TestDRBDPortRangePerNodeProp verifies that
+// `DrbdOptions/TcpPortRange` on the Node CRD overrides the
+// controller's default range for replicas hosted on that node. Two
+// nodes with disjoint ranges produce non-overlapping ports — that's
+// the operator-affordance reason upstream went per-node in the
+// first place.
+func TestDRBDPortRangePerNodeProp(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
+
+	// n1: 7000-7000 (one slot), n2: 8000-8001
+	for _, spec := range []struct {
+		name, portRange string
+	}{
+		{"n1", "7000-7000"},
+		{"n2", "8000-8001"},
+	} {
+		n := &blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: spec.name},
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"DrbdOptions/TcpPortRange": spec.portRange},
+			},
+		}
+
+		if err := cli.Create(ctx, n); err != nil {
+			t.Fatalf("create node %s: %v", spec.name, err)
+		}
+	}
+
+	rd := "pvc-range"
+
+	for _, node := range []string{"n1", "n2"} {
 		create(ctx, t, cli, rd, node)
 	}
 
 	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 	allocate(ctx, t, rec, cli, rd)
-
-	var port, minor int32
 
 	list := &blockstoriov1alpha1.ResourceList{}
 	if err := cli.List(ctx, list); err != nil {
@@ -147,23 +234,17 @@ func TestDRBDPortShared(t *testing.T) {
 	}
 
 	for i := range list.Items {
-		if list.Items[i].Status.DRBDPort == nil || list.Items[i].Status.DRBDMinor == nil {
-			t.Fatalf("%s: port/minor not allocated", list.Items[i].Name)
-		}
+		port := *list.Items[i].Status.DRBDPort
 
-		if port == 0 {
-			port = *list.Items[i].Status.DRBDPort
-			minor = *list.Items[i].Status.DRBDMinor
-
-			continue
-		}
-
-		if got := *list.Items[i].Status.DRBDPort; got != port {
-			t.Errorf("%s port mismatch: got %d, want %d", list.Items[i].Name, got, port)
-		}
-
-		if got := *list.Items[i].Status.DRBDMinor; got != minor {
-			t.Errorf("%s minor mismatch: got %d, want %d", list.Items[i].Name, got, minor)
+		switch list.Items[i].Spec.NodeName {
+		case "n1":
+			if port != 7000 {
+				t.Errorf("n1 port: got %d, want 7000", port)
+			}
+		case "n2":
+			if port < 8000 || port > 8001 {
+				t.Errorf("n2 port: got %d, want 8000..8001", port)
+			}
 		}
 	}
 }

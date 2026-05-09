@@ -239,6 +239,13 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // the unallocated target gets a new value. This is the load-bearing
 // invariant: re-using ids on a different node would re-map DRBD
 // bitmaps mid-flight and corrupt data.
+//
+// Port + minor allocation is cluster-wide: we scan every Resource
+// across all RDs to gather taken values, then pick the lowest free
+// from the pool range. Two RDs racing to pick the same port resolve
+// deterministically (same taken set → same answer); the loser's
+// Status update is rejected by Kube's optimistic concurrency check
+// and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
 	original := target.Status.DeepCopy()
 
@@ -264,22 +271,18 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	if target.Status.DRBDPort == nil {
-		// Inherit from any sibling that already has one — every
-		// replica of an RD shares the port. If none exists yet,
-		// derive it from the RD name; the port-pool refactor will
-		// replace this with a controller-side allocator.
-		port := siblingPort(peers)
-		if port == 0 {
-			port = int32(derivePort(target.Spec.ResourceDefinitionName)) //nolint:gosec // deterministic port in 7000-7999
+		port, err := r.allocatePort(ctx, target.Spec.NodeName)
+		if err != nil {
+			return false, err
 		}
 
 		target.Status.DRBDPort = &port
 	}
 
 	if target.Status.DRBDMinor == nil {
-		minor := siblingMinor(peers)
-		if minor == 0 {
-			minor = int32(deriveMinor(target.Spec.ResourceDefinitionName)) //nolint:gosec // deterministic minor in the reserved range
+		minor, err := r.allocateMinor(ctx, target.Spec.NodeName)
+		if err != nil {
+			return false, err
 		}
 
 		target.Status.DRBDMinor = &minor
@@ -295,28 +298,6 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	return true, nil
-}
-
-// siblingPort returns the first non-nil DRBDPort from the peer list,
-// or 0 when nobody has one yet.
-func siblingPort(peers []blockstoriov1alpha1.Resource) int32 {
-	for i := range peers {
-		if peers[i].Status.DRBDPort != nil {
-			return *peers[i].Status.DRBDPort
-		}
-	}
-
-	return 0
-}
-
-func siblingMinor(peers []blockstoriov1alpha1.Resource) int32 {
-	for i := range peers {
-		if peers[i].Status.DRBDMinor != nil {
-			return *peers[i].Status.DRBDMinor
-		}
-	}
-
-	return 0
 }
 
 func equalStatus(a, b *blockstoriov1alpha1.ResourceStatus) bool {
@@ -336,11 +317,120 @@ func ptrEqI32(a, b *int32) bool {
 	}
 }
 
-// derivePort / deriveMinor are kept for the transitional bootstrap
-// path; the production allocator is the cluster-wide pool tracked in
-// Phase 8.1. We re-export them via dispatcher to avoid duplication.
-func derivePort(rd string) int  { return dispatcher.DerivePort(rd) }
-func deriveMinor(rd string) int { return dispatcher.DeriveMinor(rd) }
+// allocatePort picks a TCP port from the hosting node's range.
+// Upstream LINSTOR moved from per-RD to per-resource ports: each
+// replica picks its own port from its node's local range. That way
+// nodes can run unrelated TCP-port pools (port 7000 on n1 has nothing
+// to do with port 7000 on n2), and a port collision on one node
+// doesn't affect the rest of the cluster.
+//
+// Range source: the node's `DrbdOptions/TcpPortRange` prop ("min-max")
+// with controller-wide defaults [DefaultPortMin, DefaultPortMax] when
+// the prop is absent. Taken set: every Resource currently scheduled
+// on the same node.
+func (r *ResourceReconciler) allocatePort(ctx context.Context, nodeName string) (int32, error) {
+	low, high, err := r.portRangeForNode(ctx, nodeName)
+	if err != nil {
+		return 0, err
+	}
+
+	taken, err := r.takenPortsOnNode(ctx, nodeName)
+	if err != nil {
+		return 0, err
+	}
+
+	return drbd.LowestFreePort(taken, low, high)
+}
+
+// allocateMinor mirrors allocatePort for /dev/drbd<N>. Minor numbers
+// are local device-name suffixes; per-node scope is the natural fit.
+func (r *ResourceReconciler) allocateMinor(ctx context.Context, nodeName string) (int32, error) {
+	low, high, err := r.minorRangeForNode(ctx, nodeName)
+	if err != nil {
+		return 0, err
+	}
+
+	taken, err := r.takenMinorsOnNode(ctx, nodeName)
+	if err != nil {
+		return 0, err
+	}
+
+	return drbd.LowestFreeMinor(taken, low, high)
+}
+
+// portRangeForNode reads "DrbdOptions/TcpPortRange" off the named
+// Node CRD, falling back to the controller-wide default. Format
+// matches upstream: "min-max" decimal.
+func (r *ResourceReconciler) portRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
+	return r.rangeProp(ctx, nodeName, "DrbdOptions/TcpPortRange",
+		drbd.DefaultPortMin, drbd.DefaultPortMax)
+}
+
+func (r *ResourceReconciler) minorRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
+	return r.rangeProp(ctx, nodeName, "DrbdOptions/MinorNrRange",
+		drbd.DefaultMinorMin, drbd.DefaultMinorMax)
+}
+
+// rangeProp reads a "min-max" prop off the Node CRD. Missing node or
+// missing prop falls back to defaults (the prop is optional). Bad
+// format returns an error so the operator notices the typo.
+func (r *ResourceReconciler) rangeProp(ctx context.Context, nodeName, prop string, defLow, defHigh int32) (int32, int32, error) {
+	var node blockstoriov1alpha1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
+		if errors.IsNotFound(err) {
+			return defLow, defHigh, nil
+		}
+
+		return 0, 0, err
+	}
+
+	raw := node.Spec.Props[prop]
+	if raw == "" {
+		return defLow, defHigh, nil
+	}
+
+	low, high, err := drbd.ParseRange(raw)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return low, high, nil
+}
+
+// takenPortsOnNode scans every Resource scheduled on the given node
+// and returns its persisted DRBDPort. The allocator uses this to
+// guarantee no two replicas on the same node take the same port.
+func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName string) ([]int32, error) {
+	return r.takenOnNode(ctx, nodeName, func(s *blockstoriov1alpha1.ResourceStatus) *int32 { return s.DRBDPort })
+}
+
+func (r *ResourceReconciler) takenMinorsOnNode(ctx context.Context, nodeName string) ([]int32, error) {
+	return r.takenOnNode(ctx, nodeName, func(s *blockstoriov1alpha1.ResourceStatus) *int32 { return s.DRBDMinor })
+}
+
+// takenOnNode is the shared scan: list every Resource on `nodeName`,
+// pluck the int32 pointer the caller cares about, and return the
+// non-nil set. Used by the per-node port and minor allocators.
+func (r *ResourceReconciler) takenOnNode(ctx context.Context, nodeName string, pick func(*blockstoriov1alpha1.ResourceStatus) *int32) ([]int32, error) {
+	list := &blockstoriov1alpha1.ResourceList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, err
+	}
+
+	out := make([]int32, 0, len(list.Items))
+
+	for i := range list.Items {
+		if list.Items[i].Spec.NodeName != nodeName {
+			continue
+		}
+
+		if v := pick(&list.Items[i].Status); v != nil {
+			out = append(out, *v)
+		}
+	}
+
+	return out, nil
+}
 
 // EnsureDRBDIDsForTest is an exported alias for ensureDRBDIDs. The
 // allocator is package-private because it's an internal reconciler
