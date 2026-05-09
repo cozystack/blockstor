@@ -825,3 +825,143 @@ func TestResourceCreateAndDelete(t *testing.T) {
 		t.Errorf("delete: got %d, want 204", delResp.StatusCode)
 	}
 }
+
+// TestAutoplacePersistsLayerListOntoRD: linstor-csi (and piraeus-operator's
+// LinstorSatelliteConfiguration.spec.storageClasses[*].layerList) sets
+// layer_list on the autoplace request rather than on RD create. The REST
+// handler must persist that onto the RD's LayerStack so the dispatcher /
+// satellite chain sees the right composition.
+func TestAutoplacePersistsLayerListOntoRD(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-csi"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2, StoragePool: "pool"},
+		LayerList:    []string{apiv1.LayerKindDRBD, apiv1.LayerKindLUKS, apiv1.LayerKindStorage},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-csi/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-csi")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := []string{apiv1.LayerKindDRBD, apiv1.LayerKindLUKS, apiv1.LayerKindStorage}
+	if !slices.Equal(got.LayerStack, want) {
+		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
+	}
+}
+
+// TestAutoplaceLayerListDoesNotOverwriteExistingStack: an RD that already
+// has a LayerStack (operator-supplied via REST POST or CRD create) wins over
+// any layer_list the autoplace request smuggles in. Otherwise CSI clients
+// could silently flip an explicitly-set composition on a re-place.
+func TestAutoplaceLayerListDoesNotOverwriteExistingStack(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	existing := []string{apiv1.LayerKindStorage} // single-replica local
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:       "pvc-fixed",
+		LayerStack: existing,
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool"},
+		LayerList:    []string{apiv1.LayerKindDRBD, apiv1.LayerKindStorage},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-fixed/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-fixed")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if !slices.Equal(got.LayerStack, existing) {
+		t.Errorf("LayerStack: got %v, want unchanged %v", got.LayerStack, existing)
+	}
+}
+
+// TestResourceCreatePersistsLayerList: same pass-through but on the
+// per-node resource-create path linstor-csi uses for explicit placement.
+func TestResourceCreatePersistsLayerList(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-csi-explicit"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{
+			Name:     "pvc-csi-explicit",
+			NodeName: "n1",
+		},
+		LayerList: []string{apiv1.LayerKindLUKS, apiv1.LayerKindStorage},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-csi-explicit/resources", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-csi-explicit")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := []string{apiv1.LayerKindLUKS, apiv1.LayerKindStorage}
+	if !slices.Equal(got.LayerStack, want) {
+		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
+	}
+}

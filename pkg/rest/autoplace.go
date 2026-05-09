@@ -111,6 +111,23 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// linstor-csi (and piraeus-operator's
+	// LinstorSatelliteConfiguration.spec.storageClasses[*].layerList) sets
+	// `layer_list` on the autoplace call rather than on RD create. Persist
+	// it onto rd.LayerStack here so the dispatcher → satellite chain sees
+	// the right composition. RD-level LayerStack wins if already set
+	// (operator-supplied via REST POST or CRD create).
+	if len(req.LayerList) > 0 && len(rd.LayerStack) == 0 {
+		rd.LayerStack = append([]string(nil), req.LayerList...)
+
+		err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
+
 	filter := mergeAutoplaceFilter(r.Context(), s.Store, &rd, &req.SelectFilter)
 
 	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, &filter)
@@ -218,6 +235,18 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "node_name is required")
 
 		return
+	}
+
+	// Same CSI pass-through as handleAutoplace: linstor-csi may set
+	// layer_list on the explicit-placement call rather than on RD create.
+	// Persist onto rd.LayerStack if not already set so the satellite
+	// reconciler sees the right composition.
+	if len(body.LayerList) > 0 {
+		rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+		if getErr == nil && len(rd.LayerStack) == 0 {
+			rd.LayerStack = append([]string(nil), body.LayerList...)
+			_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+		}
 	}
 
 	err = s.Store.Resources().Create(r.Context(), &res)
