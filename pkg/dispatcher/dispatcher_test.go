@@ -27,6 +27,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 	"google.golang.org/grpc"
 )
 
@@ -181,6 +182,49 @@ func TestApplyDialError(t *testing.T) {
 	}
 
 	_ = stub
+}
+
+// TestApplyMatchesSlugifiedNode: when the LINSTOR-side node name was
+// slugified at write time, the CRD's metadata.Name differs from
+// target.Spec.NodeName. Apply must still resolve the SatelliteEndpoint
+// by reading the original-name annotation rather than metadata.Name.
+func TestApplyMatchesSlugifiedNode(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", NodeName: "MixedCaseNode", Ok: true}},
+		},
+	}
+	dialer := &fakeDialer{stub: stub}
+	d := dispatcher.New(dialer)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "MixedCaseNode",
+		},
+	}
+
+	meta := metav1.ObjectMeta{
+		Name:        "abcd1234-mixedcasenode",
+		Annotations: map[string]string{k8s.AnnotationLinstorName: "MixedCaseNode"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: meta,
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.244.1.7:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if dialer.endpoint != "10.244.1.7:7000" {
+		t.Errorf("dialed %q, want 10.244.1.7:7000", dialer.endpoint)
+	}
 }
 
 // errDialer always fails — used to assert the dialErr path.
