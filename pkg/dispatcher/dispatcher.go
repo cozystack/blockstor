@@ -92,6 +92,12 @@ type ApplyOptions struct {
 	// nil means "use target.Spec.Props verbatim" — what the dispatch
 	// did before the hierarchy resolver landed.
 	EffectiveProps map[string]string
+
+	// LayerStack is the resolved layer composition (RD → RG → default).
+	// Empty falls back to RD.Spec.LayerStack inside buildDesired so
+	// older call sites that don't compute the stack keep their
+	// behaviour. The satellite skips DRBD when the stack omits it.
+	LayerStack []string
 }
 
 // Apply builds the DesiredResource for this Resource (looking up its
@@ -110,6 +116,9 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 	}
 
 	desired := buildDesired(target, peers, nodes, rd, opts.EffectiveProps)
+	if len(opts.LayerStack) > 0 {
+		desired.LayerStack = opts.LayerStack
+	}
 
 	client, closer, err := d.dialer.Dial(ctx, endpoint)
 	if err != nil {

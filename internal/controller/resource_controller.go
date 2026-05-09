@@ -260,8 +260,13 @@ func (r *ResourceReconciler) dispatchApply(ctx context.Context, target *blocksto
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	stack := r.resolveLayerStack(ctx, rdPtr)
+
 	result, err := r.Dispatcher.Apply(ctx, target, peers, nodes, rdPtr,
-		dispatcher.ApplyOptions{EffectiveProps: effective})
+		dispatcher.ApplyOptions{
+			EffectiveProps: effective,
+			LayerStack:     stack,
+		})
 	if err != nil {
 		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
 
@@ -634,6 +639,32 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 	}
 
 	return drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props), nil
+}
+
+// resolveLayerStack walks the RD → RG hierarchy and returns the
+// effective layer composition. Returns nil for the dispatcher's
+// default-fall-through behaviour when nothing is set anywhere — the
+// dispatcher then defaults to whatever rd.Spec.LayerStack contains
+// (also possibly nil → satellite-side default ["DRBD","STORAGE"]).
+func (r *ResourceReconciler) resolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
+	if rd == nil {
+		return nil
+	}
+
+	if len(rd.Spec.LayerStack) > 0 {
+		return rd.Spec.LayerStack
+	}
+
+	if rd.Spec.ResourceGroupName == "" {
+		return nil
+	}
+
+	var rg blockstoriov1alpha1.ResourceGroup
+	if err := r.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rg); err != nil {
+		return nil
+	}
+
+	return rg.Spec.SelectFilter.LayerStack
 }
 
 // controllerProps reads the cluster-wide ControllerProps KV instance
