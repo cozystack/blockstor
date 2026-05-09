@@ -675,17 +675,21 @@ func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *b
 
 // SetupWithManager sets up the controller with the Manager.
 //
-// We Watch ResourceDefinitions too — every replica's dispatch reads
-// the parent RD's VolumeDefinitions for the satellite render, so an
-// RD-side change (volume size, prop bag, encryption passphrase) must
-// re-fire every replica's reconcile. Without this watch, `linstor
-// volume-definition modify --size` updates Spec.VolumeDefinitions but
-// the satellite never gets the new size.
+// We Watch ResourceDefinitions and sibling Resources too:
+//   - RD changes (volume size, prop bag, encryption passphrase, quorum
+//     toggle) must re-fire every replica's reconcile so the satellite
+//     gets the updated VolumeDefinitions / DRBD options bag.
+//   - Sibling-Resource changes (a witness gets created or removed)
+//     must re-fire the OTHER replicas so their rendered .res reflects
+//     the new peer set. Without this, R1's .res keeps the pre-witness
+//     peer list and R3 can't connect (R1 doesn't know it exists).
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{}).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
+		Watches(&blockstoriov1alpha1.Resource{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
 		Named("resource").
 		Complete(r)
 }
@@ -698,6 +702,25 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 		return nil
 	}
 
+	return r.requestsForRD(ctx, rd.Name, "")
+}
+
+// enqueueSiblings maps a Resource event to every OTHER Resource of
+// the same RD. The originator's own reconcile fires through For(),
+// so we exclude it from the fan-out to avoid the redundant requeue.
+func (r *ResourceReconciler) enqueueSiblings(ctx context.Context, obj client.Object) []reconcile.Request {
+	res, ok := obj.(*blockstoriov1alpha1.Resource)
+	if !ok || res.Spec.ResourceDefinitionName == "" {
+		return nil
+	}
+
+	return r.requestsForRD(ctx, res.Spec.ResourceDefinitionName, res.Name)
+}
+
+// requestsForRD returns reconcile.Request entries for every Resource
+// of the named RD, optionally excluding `excludeName` (used when the
+// originating Resource is already getting its own reconcile via For).
+func (r *ResourceReconciler) requestsForRD(ctx context.Context, rdName, excludeName string) []reconcile.Request {
 	var resList blockstoriov1alpha1.ResourceList
 
 	if err := r.List(ctx, &resList); err != nil {
@@ -707,7 +730,11 @@ func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj clie
 	out := make([]reconcile.Request, 0, len(resList.Items))
 
 	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+		if resList.Items[i].Spec.ResourceDefinitionName != rdName {
+			continue
+		}
+
+		if resList.Items[i].Name == excludeName {
 			continue
 		}
 
