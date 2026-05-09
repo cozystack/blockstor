@@ -61,21 +61,25 @@ device_for_rd() {
 }
 
 # write_random NODE DEV BYTES — write urandom to the device, return md5.
+# BYTES is rounded up to a 4096-byte block (direct I/O alignment).
 write_random() {
     local node=$1 dev=$2 bytes=$3
+    local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
-        dd if=/dev/urandom of=${dev} bs=1 count=${bytes} status=none oflag=direct
-        md5sum < <(dd if=${dev} bs=1 count=${bytes} status=none iflag=direct) | awk '{print \$1}'
+        dd if=/dev/urandom of=${dev} bs=4096 count=${blocks} status=none oflag=direct
+        dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
 }
 
 # read_md5 NODE DEV BYTES — read first BYTES of DEV, return md5.
+# Same alignment rules as write_random.
 read_md5() {
     local node=$1 dev=$2 bytes=$3
+    local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
-        md5sum < <(dd if=${dev} bs=1 count=${bytes} status=none iflag=direct) | awk '{print \$1}'
+        dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
 }
 
