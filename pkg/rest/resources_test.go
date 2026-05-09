@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -68,6 +69,79 @@ func TestResourcesViewAcrossNodes(t *testing.T) {
 
 	if len(got) != 3 {
 		t.Errorf("len: got %d, want 3", len(got))
+	}
+}
+
+// TestResourcesViewNodeFilter: ?nodes=n1 returns only the n1 replicas.
+// Case-insensitive matching mirrors Java LINSTOR behaviour so a client
+// sending mixed-case node names still gets results.
+func TestResourcesViewNodeFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-2", NodeName: "n2"},
+	} {
+		if err := st.Resources().Create(ctx, &r); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources?nodes=N1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1; entries=%v", len(got), got)
+	}
+
+	if got[0].NodeName != "n1" {
+		t.Errorf("filter leaked: got node %q, want n1", got[0].NodeName)
+	}
+}
+
+// TestResourcesViewRDFilter: ?resources=pvc-1 returns only that RD's replicas.
+func TestResourcesViewRDFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-2", NodeName: "n2"},
+	} {
+		if err := st.Resources().Create(ctx, &r); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources?resources=pvc-1")
+	defer func() { _ = resp.Body.Close() }()
+
+	var got []apiv1.ResourceWithVolumes
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 || got[0].Name != "pvc-1" {
+		t.Errorf("got %v, want one entry for pvc-1", got)
 	}
 }
 
