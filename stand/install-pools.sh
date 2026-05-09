@@ -44,19 +44,20 @@ create_zfs() {
             echo 'zpool blockstor-zfs already exists'
             exit 0
         fi
-        # zpool create auto-partitions ${ZFS_DEV} into ${ZFS_DEV}1 +
-        # ${ZFS_DEV}9. If a previous attempt died mid-create we have
-        # those partitions but no pool, and the next try fails on
-        # 'cannot label sda: failed to detect device partitions'.
-        # Wipe + sgdisk + dd + partx to flush kernel state.
+        # zpool create's auto-partition step fails inside the
+        # satellite container ('cannot label sda: failed to detect
+        # device partitions on /dev/sda1: 19') even though sgdisk
+        # itself works. The /dev hostPath bind mount picks up
+        # newly-created partitions but zpool's libzfs probe runs in
+        # a way that doesn't see them. Workaround: pre-create the
+        # ZFS partition with sgdisk + partprobe, then hand zpool
+        // the partition path directly.
         wipefs -af ${ZFS_DEV}* 2>&1 || true
         sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
-        dd if=/dev/zero of=${ZFS_DEV} bs=1M count=10 conv=notrunc 2>&1 || true
-        # Drop kernel partition state. partx -d only takes the disk;
-        # it removes every existing partition entry.
-        partx -d ${ZFS_DEV} 2>&1 || true
+        sgdisk --new=1:0:0 -t 1:bf01 ${ZFS_DEV}
         partprobe ${ZFS_DEV} 2>&1 || true
-        zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}
+        sleep 1
+        zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}1
         echo 'zpool blockstor-zfs created'
     "
 }
@@ -71,26 +72,21 @@ create_lvm() {
         fi
         if lvs blockstor-lvm/thin >/dev/null 2>&1; then
             echo 'lv blockstor-lvm/thin already exists'
-        else
-            # Skip wipesignatures + zeroing — fresh VG, no stale fs,
-            # and the lvm2 build in this image chokes on the default
-            # wipe step ('device not cleared') for thin LVs.
-            # Create metadata + data LVs manually then convert. The
-            # one-shot `lvcreate -T -L` and lvconvert both trip on
-            # 'device not cleared' in this satellite container —
-            # udev doesn't run inside the pod so /dev/<vg>/<lv>
-            # symlinks lag behind the device-mapper node creation.
-            # vgmknodes forces them; --zero/--wipesignatures n suppress
-            # the optional clear step. dd-clear the underlying disk
-            # area where the metadata LV lands, just in case.
-            lvcreate -y -Wn -Zn --noudevsync -L 1G blockstor-lvm -n thin_meta
-            lvcreate -y -Wn -Zn --noudevsync -L 13G blockstor-lvm -n thin
-            vgmknodes
-            dd if=/dev/zero of=/dev/blockstor-lvm/thin_meta bs=1M count=10 conv=notrunc 2>&1 || true
-            dd if=/dev/zero of=/dev/blockstor-lvm/thin bs=1M count=10 conv=notrunc 2>&1 || true
-            lvconvert -y -Wn -Zn --noudevsync --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
-            echo 'lv blockstor-lvm/thin created'
+            exit 0
         fi
+        # The satellite container has no udev. lvm's default behaviour
+        # is to wait for udev to populate /dev/<vg>/<lv> after a
+        # device-mapper create — without udev that wait times out and
+        # fails the LV. --config global{udev_sync=0} bypasses the
+        # wait. -Wn -Zn skip the optional wipe-signatures / zero
+        # steps which also fail (they go through the same
+        # /dev/<vg>/<lv> path that udev never created).
+        OPTS='--config global{udev_sync=0}'
+        lvcreate \$OPTS -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
+        lvcreate \$OPTS -y -Wn -Zn -L 13G blockstor-lvm -n thin
+        lvconvert \$OPTS -y -Wn -Zn --type thin-pool \\
+            --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
+        echo 'lv blockstor-lvm/thin created'
     "
 }
 
