@@ -80,6 +80,17 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	replicas, listErr := r.Store.Resources().ListByDefinition(ctx, rd.Name)
+	if listErr != nil {
+		log.Error(listErr, "list replicas during RD reconcile", "rd", rd.Name)
+	} else {
+		diskful, diskless := splitByDiskless(replicas)
+		log.Info("RD reconcile",
+			"rd", rd.Name,
+			"diskful", len(diskful),
+			"diskless", len(diskless))
+	}
+
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
 		log.Error(err, "ensure tiebreaker", "rd", rd.Name)
