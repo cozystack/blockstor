@@ -292,7 +292,27 @@ func (a *Agent) runObserveLoop(ctx context.Context, client satellitepb.Controlle
 		}
 	}()
 
+	adm := drbd.NewAdm(storage.RealExec{})
+
 	for ev := range obs.Translate(events) {
+		// Backing-device failure handler: when the kernel reports
+		// disk:Failed for a local replica, detach so the lower
+		// disk stops getting hammered. Peers stay UpToDate and
+		// the consumer keeps doing I/O via the network path. The
+		// detach is best-effort — a stale .res or already-Diskless
+		// state surfaces as an error we log and move past.
+		if ev.GetDrbdState() == "Failed" {
+			detachErr := adm.Detach(ctx, ev.GetResourceName())
+			if detachErr != nil {
+				a.logger.Error("auto-detach on Failed",
+					"resource", ev.GetResourceName(),
+					"err", detachErr)
+			} else {
+				a.logger.Info("auto-detached failed replica",
+					"resource", ev.GetResourceName())
+			}
+		}
+
 		err := stream.Send(ev)
 		if err != nil {
 			a.logger.Error("ReportObserved send", "err", err)

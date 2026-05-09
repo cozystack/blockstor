@@ -83,6 +83,17 @@ func (a *Adm) Secondary(ctx context.Context, resource string) error {
 	return a.run(ctx, "secondary", resource)
 }
 
+// Detach drops the local lower-disk binding without bringing the
+// resource down. The replica becomes Diskless on this node — peers
+// stay UpToDate, the consumer keeps doing I/O via DRBD's network
+// path. Used when the storage layer fails (LV evicted, zvol
+// destroyed, file inode gone) and we want the kernel to stop bashing
+// the dead block device. `--force` is required when the disk is
+// already in a transient state.
+func (a *Adm) Detach(ctx context.Context, resource string) error {
+	return a.run(ctx, "detach", "--force", resource)
+}
+
 // Resize rescans the lower disk's size and tells DRBD to grow the
 // replicated volume to match. The lower disk (LV / zvol / dm-crypt
 // target) must already be the target size — this is a notify-only

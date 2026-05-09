@@ -136,3 +136,40 @@ func TestAdmPropagatesError(t *testing.T) {
 }
 
 var errFakeFailure = errors.New("drbdadm: simulated failure")
+
+// TestAdmDetachInvokesDrbdadm: Detach → `drbdadm detach --force <res>`.
+// --force is required because the disk is already in a transient
+// (Failed) state when this gets called; without it drbdadm refuses.
+func TestAdmDetachInvokesDrbdadm(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.Detach(t.Context(), "pvc-1")
+	if err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+
+	want := "drbdadm detach --force pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestAdmResizeInvokesDrbdadm: Resize → `drbdadm resize --assume-clean <res>`.
+// --assume-clean skips re-syncing the new bytes (they're freshly
+// allocated zeros) — without it growing 3 replicas serialises on
+// every resync.
+func TestAdmResizeInvokesDrbdadm(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.Resize(t.Context(), "pvc-1")
+	if err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+
+	want := "drbdadm resize --assume-clean pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
