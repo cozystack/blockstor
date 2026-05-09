@@ -165,3 +165,79 @@ func TestGRPCServerCreateSnapshotUnknownResource(t *testing.T) {
 		t.Errorf("Ok: got true on unknown resource; want false")
 	}
 }
+
+// TestGRPCServerDeleteSnapshotUnknownResource: same body-level-fail
+// invariant for the delete-snapshot path. The snapshot CRD reconciler
+// retries on transport errors but treats Ok=false as a per-replica
+// outcome it logs and moves on from.
+func TestGRPCServerDeleteSnapshotUnknownResource(t *testing.T) {
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		NodeName:  "n1",
+	})
+	srv := satellite.NewGRPCServer(rec)
+
+	resp, err := srv.DeleteSnapshot(t.Context(), &satellitepb.DeleteSnapshotRequest{
+		ResourceName: "unknown-rd",
+		SnapshotName: "snap-1",
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot transport error (want body-level fail): %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true on unknown resource; want false")
+	}
+}
+
+// TestGRPCServerDeleteResourceMissing: DeleteResource on a resource
+// that was never applied (no .res, no LV) is idempotent — Ok=true
+// with no message. Pins the cleanup-during-RD-delete contract: the
+// controller fans DeleteResource at every replica regardless of
+// which ones actually have storage allocated, and a missing one
+// must not surface as a failure.
+func TestGRPCServerDeleteResourceMissing(t *testing.T) {
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		NodeName:  "n1",
+	})
+	srv := satellite.NewGRPCServer(rec)
+
+	resp, err := srv.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
+		Name:          "never-applied",
+		StoragePool:   "thin1", // pool not registered → DeleteVolume just no-ops
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource transport error: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Errorf("Ok=false on missing resource: %s", resp.GetMessage())
+	}
+}
+
+// TestGRPCServerShipSnapshotUnknownResource: ShipSnapshot on a
+// resource the satellite doesn't have a provider for → Ok=false body,
+// no transport error. Pins the same contract for the snapshot-shipping
+// RPC the cross-node clone path uses.
+func TestGRPCServerShipSnapshotUnknownResource(t *testing.T) {
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		NodeName:  "n1",
+	})
+	srv := satellite.NewGRPCServer(rec)
+
+	resp, err := srv.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "unknown-rd",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot transport error (want body-level fail): %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true on unknown resource; want false")
+	}
+}
