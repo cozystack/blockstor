@@ -237,6 +237,23 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	}
 
 	diskless := isDiskless(dr.GetFlags())
+	inactive := isInactive(dr.GetFlags())
+
+	// INACTIVE: keep storage + .res file intact, but drbdadm down so
+	// the kernel resource is gone. Used by piraeus-operator during
+	// node maintenance — activate later restores without losing
+	// port/node-id allocations or having to re-sync.
+	if inactive {
+		if r.cfg.Adm != nil {
+			deactivateErr := r.cfg.Adm.Down(ctx, dr.GetName())
+			if deactivateErr != nil {
+				res.Ok = false
+				res.Message = deactivateErr.Error()
+			}
+		}
+
+		return res
+	}
 
 	devices := map[int32]string{}
 
@@ -559,6 +576,15 @@ func resolveAddr(supplied, fallback string) string {
 	}
 
 	return supplied
+}
+
+// isInactive returns true when the operator has called
+// `linstor r deactivate` on this replica. The reconciler keeps
+// storage and the .res file intact and just drops the kernel
+// resource via `drbdadm down`. Activation reverses it without
+// losing port/node-id allocations.
+func isInactive(flags []string) bool {
+	return slices.Contains(flags, "INACTIVE")
 }
 
 // isDiskless returns true when the DRBD-layer "DISKLESS" flag is set.

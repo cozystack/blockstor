@@ -66,3 +66,83 @@ func (s *Server) handleAdjustOne(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 }
+
+// registerResourceLifecycle wires activate/deactivate. Upstream LINSTOR
+// uses these for piraeus-operator's node-maintenance workflow:
+// deactivate brings the kernel resource down without deleting the
+// .res file or storage; activate brings it back up. We implement both
+// as a flag toggle on Resource.Spec.Flags; the satellite reconciler
+// reads INACTIVE and switches drbdadm up↔down accordingly.
+func (s *Server) registerResourceLifecycle(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/activate",
+		s.requireStore(s.handleResourceActivate))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/deactivate",
+		s.requireStore(s.handleResourceDeactivate))
+}
+
+// handleResourceActivate clears the INACTIVE flag on the named replica.
+// Idempotent: removing an already-absent flag is a no-op. The satellite
+// brings the kernel resource back up on its next reconcile.
+func (s *Server) handleResourceActivate(w http.ResponseWriter, r *http.Request) {
+	mutateResourceFlag(w, r, s, "INACTIVE", false)
+}
+
+// handleResourceDeactivate sets the INACTIVE flag. Storage stays;
+// drbdadm down runs on the satellite. The Resource CRD is intact so
+// activate flips it back without losing port/node-id allocations.
+func (s *Server) handleResourceDeactivate(w http.ResponseWriter, r *http.Request) {
+	mutateResourceFlag(w, r, s, "INACTIVE", true)
+}
+
+// mutateResourceFlag is the shared add/remove path for activate +
+// deactivate. set=true adds the flag; set=false removes every
+// occurrence. Idempotent.
+func mutateResourceFlag(w http.ResponseWriter, r *http.Request, s *Server, flag string, set bool) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+
+	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	res.Flags = applyFlagMutation(res.Flags, flag, set)
+
+	err = s.Store.Resources().Update(r.Context(), &res)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// applyFlagMutation adds or removes flag depending on set. Used by the
+// activate/deactivate handlers; kept distinct from the Node-level
+// addFlag/removeFlag helpers because those are consumed via mutator
+// closures in node_lifecycle.go.
+func applyFlagMutation(flags []string, flag string, set bool) []string {
+	out := flags[:0]
+	seen := false
+
+	for _, existing := range flags {
+		if existing == flag {
+			seen = true
+
+			if !set {
+				continue
+			}
+		}
+
+		out = append(out, existing)
+	}
+
+	if set && !seen {
+		out = append(out, flag)
+	}
+
+	return out
+}

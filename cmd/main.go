@@ -236,6 +236,7 @@ func main() {
 	if err := (&controller.ResourceDefinitionReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Store:  st,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcedefinition")
 		os.Exit(1)

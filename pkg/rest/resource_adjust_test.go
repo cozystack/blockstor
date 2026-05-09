@@ -98,3 +98,77 @@ func TestAdjustResourceUnknown(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestResourceDeactivate sets the INACTIVE flag on the named replica.
+// Idempotent: a second deactivate doesn't append a duplicate flag.
+// Activate clears it.
+func TestResourceDeactivate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for range 2 {
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n1/deactivate", nil)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("deactivate status: got %d, want 200", resp.StatusCode)
+		}
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	count := 0
+
+	for _, f := range got.Flags {
+		if f == "INACTIVE" {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("INACTIVE flag count: got %d, want 1 (idempotent set); flags=%v", count, got.Flags)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n1/activate", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("activate status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, _ = st.Resources().Get(ctx, "pvc-1", "n1")
+	for _, f := range got.Flags {
+		if f == "INACTIVE" {
+			t.Errorf("INACTIVE flag still present after activate: %v", got.Flags)
+		}
+	}
+}
+
+// TestResourceActivateUnknown: 404 when the Resource doesn't exist.
+func TestResourceActivateUnknown(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/ghost/resources/n9/activate", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}

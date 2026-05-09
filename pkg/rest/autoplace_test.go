@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -473,6 +474,75 @@ func TestAutoplaceReplicasOnSame(t *testing.T) {
 
 	if first != "zone-b" {
 		t.Errorf("expected zone-b (the only zone with 2 nodes); got %q", first)
+	}
+}
+
+// TestAutoplaceDisklessOnRemaining: with the flag set + 2 diskful
+// replicas placed, every other healthy node gains a DISKLESS replica
+// so consumers can mount the PVC anywhere.
+func TestAutoplaceDisklessOnRemaining(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-don"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node: %v", err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:          2,
+			StoragePool:         "pool",
+			DisklessOnRemaining: true,
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-don/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-don")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// 4 nodes total: 2 diskful + 2 diskless witnesses.
+	if len(got) != 4 {
+		t.Fatalf("replica count: got %d, want 4 (2 diskful + 2 diskless); entries=%v", len(got), got)
+	}
+
+	diskful := 0
+	diskless := 0
+
+	for _, r := range got {
+		if slices.Contains(r.Flags, "DISKLESS") {
+			diskless++
+		} else {
+			diskful++
+		}
+	}
+
+	if diskful != 2 || diskless != 2 {
+		t.Errorf("split: got %d diskful + %d diskless, want 2/2", diskful, diskless)
 	}
 }
 

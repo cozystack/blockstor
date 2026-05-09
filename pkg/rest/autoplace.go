@@ -186,6 +186,10 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 		out.ReplicasOnDifferent = req.ReplicasOnDifferent
 	}
 
+	if req.DisklessOnRemaining {
+		out.DisklessOnRemaining = true
+	}
+
 	if out.PlaceCount == 0 {
 		out.PlaceCount = 1
 	}

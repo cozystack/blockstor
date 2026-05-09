@@ -97,6 +97,25 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 	want := int(filter.PlaceCount)
 
+	placed, err = p.placeDiskful(ctx, rdName, state, candidates, placed, want)
+	if err != nil {
+		return placed, want, err
+	}
+
+	if filter.DisklessOnRemaining && placed >= want {
+		err := p.placeDisklessOnRemaining(ctx, rdName, state)
+		if err != nil {
+			return placed, want, err
+		}
+	}
+
+	return placed, want, nil
+}
+
+// placeDiskful is the inner loop of Place — tries each candidate pool
+// in order until placed reaches want. Pulled out of Place to keep the
+// main path under the cyclomatic-complexity budget.
+func (p *Placer) placeDiskful(ctx context.Context, rdName string, state *state, candidates []apiv1.StoragePool, placed, want int) (int, error) {
 	for i := range candidates {
 		if placed >= want {
 			break
@@ -104,7 +123,7 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 
 		ok, err := state.tryPlace(ctx, p.store, rdName, &candidates[i])
 		if err != nil {
-			return placed, want, err
+			return placed, err
 		}
 
 		if ok {
@@ -112,7 +131,40 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		}
 	}
 
-	return placed, want, nil
+	return placed, nil
+}
+
+// placeDisklessOnRemaining ensures every healthy node not already
+// hosting a replica gets a DISKLESS one. Upstream LINSTOR uses this
+// for "cluster-wide attachable" volumes — any consumer Pod can mount
+// the PVC because every node has at least the DRBD-network presence.
+//
+// Only runs after the diskful place_count is satisfied; we never
+// substitute diskless for diskful when the diskful target hasn't been
+// met.
+func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, state *state) error {
+	for nodeName, hostProps := range state.nodes {
+		if _, busy := state.taken[nodeName]; busy {
+			continue
+		}
+
+		_ = hostProps // topology constraints don't apply to diskless witnesses
+
+		res := apiv1.Resource{
+			Name:     rdName,
+			NodeName: nodeName,
+			Flags:    []string{"DISKLESS"},
+		}
+
+		err := p.store.Resources().Create(ctx, &res)
+		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+			return errors.Wrap(err, "create diskless witness")
+		}
+
+		state.taken[nodeName] = struct{}{}
+	}
+
+	return nil
 }
 
 // state holds the per-call lookup tables. Pulled out of Placer so a
