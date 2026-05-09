@@ -344,6 +344,35 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want ErrNotFound", err)
 		}
 	})
+	t.Run("UpdateMissing", func(t *testing.T) {
+		err := newStore(t).Snapshots().Update(t.Context(),
+			&apiv1.Snapshot{Name: "ghost", ResourceName: "pvc-1"})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Update missing: got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("UpdateChangesProps", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		err := s.Update(ctx, &apiv1.Snapshot{
+			Name:         "s1",
+			ResourceName: "pvc-1",
+			Nodes:        []string{"n1", "n2"},
+		})
+		if err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1", "s1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if len(got.Nodes) != 2 {
+			t.Errorf("Nodes: got %v, want [n1 n2]", got.Nodes)
+		}
+	})
 }
 
 // RunResourceStore exercises every branch of store.ResourceStore.
@@ -454,6 +483,35 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("SetState on missing: got %v, want ErrNotFound", err)
 		}
 	})
+	t.Run("UpdateMissing", func(t *testing.T) {
+		err := newStore(t).Resources().Update(t.Context(),
+			&apiv1.Resource{Name: "ghost", NodeName: "n1"})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Update missing: got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("UpdateChangesProps", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		err := s.Update(ctx, &apiv1.Resource{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Props:    map[string]string{"StorPoolName": "thin"},
+		})
+		if err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1", "n1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Props["StorPoolName"] != "thin" {
+			t.Errorf("Props: got %v, want StorPoolName=thin", got.Props)
+		}
+	})
 }
 
 // RunResourceDefinitionStore exercises every branch of
@@ -525,6 +583,41 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 		_, err := s.Get(ctx, "pvc-1")
 		if !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("post-delete Get: got %v, want ErrNotFound", err)
+		}
+	})
+	// Update tests pin the props/layer-stack mutation path that the
+	// REST PUT handler and the CSI layer_list pass-through depend on.
+	// Both store implementations must round-trip the new spec verbatim.
+	t.Run("UpdateMissing", func(t *testing.T) {
+		err := newStore(t).ResourceDefinitions().
+			Update(t.Context(), &apiv1.ResourceDefinition{Name: "ghost"})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Update missing: got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("UpdateChangesProps", func(t *testing.T) {
+		s := newStore(t).ResourceDefinitions()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		err := s.Update(ctx, &apiv1.ResourceDefinition{
+			Name:       "pvc-1",
+			Props:      map[string]string{"k": "v"},
+			LayerStack: []string{"DRBD", "STORAGE"},
+		})
+		if err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Props["k"] != "v" {
+			t.Errorf("Props: got %v, want k=v", got.Props)
+		}
+		if len(got.LayerStack) != 2 || got.LayerStack[0] != "DRBD" {
+			t.Errorf("LayerStack: got %v, want [DRBD STORAGE]", got.LayerStack)
 		}
 	})
 }
@@ -682,6 +775,52 @@ func RunStoragePoolStore(t *testing.T, newStore Factory) {
 	// when the autoplacer reads free/total figures.
 	t.Run("SetCapacity", func(t *testing.T) { testSPSetCapacity(t, newStore) })
 	t.Run("SetCapacityMissing", func(t *testing.T) { testSPSetCapacityMissing(t, newStore) })
+	// Update is the path Hello's upsertPool uses on a re-Hello to
+	// refresh provider_kind / props without losing capacity fields.
+	t.Run("UpdateMissing", func(t *testing.T) { testSPUpdateMissing(t, newStore) })
+	t.Run("UpdateChangesProps", func(t *testing.T) { testSPUpdateChangesProps(t, newStore) })
+}
+
+func testSPUpdateMissing(t *testing.T, newStore Factory) {
+	err := newStore(t).StoragePools().Update(t.Context(), &apiv1.StoragePool{
+		StoragePoolName: "ghost",
+		NodeName:        "n1",
+	})
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Update missing: got %v, want ErrNotFound", err)
+	}
+}
+
+func testSPUpdateChangesProps(t *testing.T, newStore Factory) {
+	s := newStore(t).StoragePools()
+	ctx := t.Context()
+
+	if err := s.Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "thin",
+		NodeName:        "n1",
+		ProviderKind:    "LVM_THIN",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	err := s.Update(ctx, &apiv1.StoragePool{
+		StoragePoolName: "thin",
+		NodeName:        "n1",
+		ProviderKind:    "LVM_THIN",
+		Props:           map[string]string{"k": "v"},
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err := s.Get(ctx, "n1", "thin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Props["k"] != "v" {
+		t.Errorf("Props: got %v, want k=v", got.Props)
+	}
 }
 
 func testSPSetCapacity(t *testing.T, newStore Factory) {
