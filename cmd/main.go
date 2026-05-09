@@ -246,6 +246,7 @@ func main() {
 		Client:     mgr.GetClient(),
 		Scheme:     mgr.GetScheme(),
 		Dispatcher: dispatcher.New(dispatcher.NewDialer()),
+		Store:      st,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resource")
 		os.Exit(1)

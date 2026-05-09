@@ -28,8 +28,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // resourceFinalizer guards on-disk + DRBD-side teardown when the
@@ -46,6 +48,11 @@ type ResourceReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
 	Dispatcher *dispatcher.Dispatcher
+
+	// Store is the shared blockstor store. Used by the auto-diskful
+	// promotion path to look up storage pools per node without
+	// requiring a separate StoragePool client cache.
+	Store store.Store
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -144,7 +151,96 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Auto-diskful: when a DISKLESS replica is actively used by a
+	// consumer (InUse=true on this node) AND the hosting node has
+	// a viable storage pool, promote it to diskful so reads stay
+	// local. Cleanup (demote on idle) is intentionally not
+	// automated yet — needs hysteresis to avoid flapping on
+	// transient opens; operators demote via `linstor r d` until
+	// then.
+	promoted, err := r.maybeAutoDiskful(ctx, target)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if promoted {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	return r.dispatchApply(ctx, target, peers, nodeList.Items, rdPtr)
+}
+
+// maybeAutoDiskful flips a DISKLESS-but-actively-used replica to
+// diskful when the hosting node has a usable storage pool. The
+// satellite reconciler picks up the spec change on the next pass
+// and creates the LV/zvol + attach. Returns true when Spec was
+// mutated so the caller can requeue.
+func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+	if !slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		return false, nil
+	}
+
+	if !target.Status.InUse {
+		return false, nil
+	}
+
+	if slices.Contains(target.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+		// Tiebreaker witnesses must stay diskless — they're chosen
+		// for the network presence, not local storage. Promoting a
+		// tiebreaker would defeat the quorum semantic.
+		return false, nil
+	}
+
+	pool, err := r.firstAvailablePool(ctx, target.Spec.NodeName)
+	if err != nil {
+		return false, err
+	}
+
+	if pool == "" {
+		// No pool on this node → can't promote. Stay diskless.
+		return false, nil
+	}
+
+	target.Spec.Flags = slices.DeleteFunc(target.Spec.Flags,
+		func(s string) bool { return s == apiv1.ResourceFlagDiskless })
+
+	if target.Spec.Props == nil {
+		target.Spec.Props = map[string]string{}
+	}
+
+	target.Spec.Props["StorPoolName"] = pool
+
+	err = r.Update(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// firstAvailablePool returns any non-diskless storage pool present on
+// the named node. Used by the auto-diskful promotion to pick a
+// destination for the freshly-attached LV. We don't try to be
+// clever: production clusters typically have one pool per node.
+func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName string) (string, error) {
+	pools, err := r.Store.StoragePools().List(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	for i := range pools {
+		if pools[i].NodeName != nodeName {
+			continue
+		}
+
+		if pools[i].ProviderKind == apiv1.StoragePoolKindDiskless {
+			continue
+		}
+
+		return pools[i].StoragePoolName, nil
+	}
+
+	return "", nil
 }
 
 // dispatchApply resolves DRBD options and pushes the desired state to

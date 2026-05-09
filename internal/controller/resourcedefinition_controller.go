@@ -130,7 +130,7 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	witness := apiv1.Resource{
 		Name:     rd.Name,
 		NodeName: tiebreakerNode,
-		Flags:    []string{"DISKLESS", "TIE_BREAKER"},
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
 	}
 
 	err = r.Store.Resources().Create(ctx, &witness)
@@ -148,7 +148,7 @@ func splitByDiskless(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resou
 	var diskful, diskless []apiv1.Resource
 
 	for i := range replicas {
-		if slices.Contains(replicas[i].Flags, "DISKLESS") {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDiskless) {
 			diskless = append(diskless, replicas[i])
 		} else {
 			diskful = append(diskful, replicas[i])

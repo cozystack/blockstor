@@ -65,3 +65,14 @@ const (
 	NodeFlagEvicted = "EVICTED"
 	NodeFlagLost    = "LOST"
 )
+
+// Resource flag constants — values that appear in `Resource.Flags`.
+// DISKLESS marks a connection-mesh-only replica that doesn't allocate
+// storage; INACTIVE means `drbdadm down` (operator deactivation);
+// TIE_BREAKER tags a controller-created witness so the cleanup path
+// can distinguish it from operator-placed disklesses.
+const (
+	ResourceFlagDiskless   = "DISKLESS"
+	ResourceFlagInactive   = "INACTIVE"
+	ResourceFlagTieBreaker = "TIE_BREAKER"
+)
