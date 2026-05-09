@@ -163,6 +163,45 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("post-delete: got %v, want ErrNotFound", err)
 		}
 	})
+	// Update is the resize hot-path: CSI ControllerExpandVolume →
+	// REST PUT /v1/resource-definitions/{rd}/volume-definitions/{vol}
+	// → VolumeDefinitions.Update. Round-trip must preserve the new
+	// SizeKib so the satellite's reconciler picks up the grow on its
+	// next Apply pass.
+	t.Run("UpdateMissing", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		err := s.VolumeDefinitions().Update(t.Context(), "pvc-1",
+			&apiv1.VolumeDefinition{VolumeNumber: 99, SizeKib: 2048})
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Update missing: got %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("UpdateGrowsSize", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		ctx := t.Context()
+		if err := s.VolumeDefinitions().Create(ctx, "pvc-1",
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		err := s.VolumeDefinitions().Update(ctx, "pvc-1",
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024})
+		if err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+
+		got, err := s.VolumeDefinitions().Get(ctx, "pvc-1", 0)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.SizeKib != 2*1024*1024 {
+			t.Errorf("SizeKib after grow: got %d, want %d", got.SizeKib, 2*1024*1024)
+		}
+	})
 }
 
 // RunKeyValueStore exercises every branch of store.KeyValueStore.
