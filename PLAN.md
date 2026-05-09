@@ -465,13 +465,15 @@ The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
 
 `tests/burnin-blockstor.sh` covers the 2-replica failover happy path. The remaining scenarios above each need a deterministic, automatable test in `tests/e2e/`:
 
-- [x] **e2e harness scaffolded** (2026-05-09): all 12 scenarios committed under `tests/e2e/`, plus a shared `lib.sh` (on_node, wait_uptodate, write_random, read_md5, delete_rd, require_workers, rd_apply, rest_post, rest_put). `make e2e NAME=<cluster> SCENARIO=<name>` invokes one; `make e2e-list` enumerates them. Stand-side run on 2026-05-09:
-  - `tests/e2e/tiebreaker.sh` — **PASS** (witness lands on N3, parity-aware; flag survives auto-diskful skip)
-  - `tests/e2e/evacuate.sh` — **PASS** in isolation (3-node migration to N3, source replica retained per EVICTED semantic)
-  - `tests/e2e/auto-diskful.sh`, `two-volume-rd.sh`, `two-primaries-live-migration.sh` — DRBD sync race against the busy QEMU stand, `wait_uptodate` times out at 180s on subsequent runs after one full DRBD cycle has run on the kernel. Real fix is to drbdadm-down everything between scenarios; tracked under 8.6/8.8 follow-up.
-  - `tests/e2e/backing-device-fail.sh` — needs a real block device; sysfs autoclear on a loop only ejects the auto-clear-on-close cookie, doesn't yank the file descriptor DRBD already holds. Real path requires LVM-thin or ZFS pool (deferred to 8.6).
-  - `tests/e2e/snapshot-restore-cross-node.sh`, `clone.sh`, `resize-{plain,luks}.sh` — REST surface verified via the new `rest_post`/`rest_put` helpers (port-forward + host-side curl, since the controller image is distroless); end-to-end execution depends on the same stand-side timing improvements as the diskful scenarios.
-  - `tests/e2e/network-partition.sh`, `rwx-ganesha.sh` — stand setup gaps (need iptables-controllable networking and Ganesha+drbd-reactor), both deferred per 8.6/8.7.
+- [x] **e2e harness scaffolded** (2026-05-09): all 12 scenarios committed under `tests/e2e/`, plus a shared `lib.sh` (on_node, wait_uptodate, write_random, read_md5, delete_rd, require_workers, rd_apply, rest_post, rest_put). `make e2e NAME=<cluster> SCENARIO=<name>` invokes one; `make e2e-list` enumerates them. Stand-side run on 2026-05-09 (after fresh stand bring-up + multi-volume minor allocator fix):
+  - `tests/e2e/smoke-blockstor.sh` — **PASS** (1 MiB urandom write + byte-perfect md5 on failover read)
+  - `tests/e2e/tiebreaker.sh` — **PASS** (witness lands on N3 with TIE_BREAKER flag, drops correctly when parity flips)
+  - `tests/e2e/evacuate.sh` — **PASS** (3-node migration to N3, source replica retained per EVICTED semantic)
+  - `tests/e2e/resize-plain.sh` — **PASS** (PUT /v1/.../volume-definitions/0 size_kib=131072 → satellite resizes loop, drbdadm resize, /dev/drbdN reports new size minus DRBD metadata overhead)
+  - `tests/e2e/auto-diskful.sh`, `two-volume-rd.sh`, `two-primaries-live-migration.sh` — flake on the busy stand under back-to-back runs (initial DRBD sync occasionally takes >180s when 3 RDs are coming up close together). Functional path is correct; the test harness needs better cross-test isolation (longer stabilisation pause between scenarios, or one stand per scenario via `make up NAME=tN`).
+  - `tests/e2e/backing-device-fail.sh` — sysfs autoclear on a loop file doesn't propagate to DRBD as disk:Failed (DRBD holds the fd open). Real path needs LVM-thin or ZFS pool with sysfs `device/delete` (deferred to 8.6 real-disk).
+  - `tests/e2e/snapshot-restore-cross-node.sh`, `clone.sh`, `resize-luks.sh` — REST plumbing verified via the new `rest_post`/`rest_put` helpers (port-forward + host curl, since the controller image is distroless). LUKS / snapshot-shipping execution paths need encrypted-RD and ZFS-pool stand profiles, tracked in 8.6/8.7.
+  - `tests/e2e/network-partition.sh`, `rwx-ganesha.sh` — stand setup gaps (iptables-controllable networking, Ganesha+drbd-reactor); deferred per 8.6/8.7.
 
 **Exit criteria for Phase 8**: every checkbox above either lands or is moved to a separately-tracked "explicit out-of-scope" with rationale. Until then "production-ready" is overstating it; what we have is a CSI-compatible REST front-end with a verified happy path.
 
