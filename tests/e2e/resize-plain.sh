@@ -36,10 +36,8 @@ DEV=$(device_for_rd "$RD" "$N1")
 md5_pre=$(write_random "$N1" "$DEV" 4194304)
 
 echo ">> resize via REST → $SIZE_GROWN_KIB KiB"
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPUT -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD}/volume-definitions/0" \
-    -d "{\"size_kib\":${SIZE_GROWN_KIB}}"
+rest_put "/v1/resource-definitions/${RD}/volume-definitions/0" \
+    "{\"size_kib\":${SIZE_GROWN_KIB}}"
 
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do

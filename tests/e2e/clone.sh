@@ -48,21 +48,15 @@ md5_src=$(write_random "$N1" "$DEV" 262144)
 SNAP=clone-$(date +%s)
 
 echo ">> internal: take transient snapshot $SNAP for clone"
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_SRC}/snapshots" \
-    -d "{\"name\":\"${SNAP}\",\"nodes\":[\"${N1}\",\"${N2}\"]}"
+rest_post "/v1/resource-definitions/${RD_SRC}/snapshots" \
+    "{\"name\":\"${SNAP}\",\"nodes\":[\"${N1}\",\"${N2}\"]}"
 
 echo ">> clone $RD_SRC → $RD_DST"
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_SRC}/snapshot-restore-resource" \
-    -d "{\"to_resource\":\"${RD_DST}\",\"snapshot_name\":\"${SNAP}\"}"
+rest_post "/v1/resource-definitions/${RD_SRC}/snapshot-restore-resource" \
+    "{\"to_resource\":\"${RD_DST}\",\"snapshot_name\":\"${SNAP}\"}"
 
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_DST}/autoplace" \
-    -d "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"stand\"}}"
+rest_post "/v1/resource-definitions/${RD_DST}/autoplace" \
+    "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"stand\"}}"
 
 RD=$RD_DST
 wait_uptodate "$RD_DST" "$N1" "$N2"

@@ -103,6 +103,45 @@ require_workers() {
     fi
 }
 
+# rest_post POSTs JSON BODY to PATH on the in-cluster controller.
+# Uses kubectl-port-forward + a host-side curl/wget so we don't need
+# curl in the distroless controller image. Path starts with /v1.
+rest_post() {
+    local path=$1 body=$2
+
+    local lport=33370
+    kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
+    local pf=$!
+    # give the forward a moment to bind
+    sleep 1
+
+    local out
+    out=$(curl -fsS -XPOST -H'Content-Type: application/json' \
+        "http://127.0.0.1:${lport}${path}" -d "$body")
+
+    kill "$pf" 2>/dev/null || true
+
+    echo "$out"
+}
+
+# rest_put is the PUT variant of rest_post — same port-forward dance.
+rest_put() {
+    local path=$1 body=$2
+
+    local lport=33371
+    kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
+    local pf=$!
+    sleep 1
+
+    local out
+    out=$(curl -fsS -XPUT -H'Content-Type: application/json' \
+        "http://127.0.0.1:${lport}${path}" -d "$body")
+
+    kill "$pf" 2>/dev/null || true
+
+    echo "$out"
+}
+
 # rd_apply applies a 2-replica RD with given size onto the named pair
 # of workers. Used by scenarios that don't need the full apply boilerplate.
 rd_apply() {

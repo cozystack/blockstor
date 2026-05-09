@@ -43,23 +43,16 @@ RD=$RD_SRC
 md5_src=$(write_random "$N1" "$DEV" 262144)
 
 echo ">> take snapshot $SNAP via REST"
-CTRL=$(kubectl -n "$NS" get svc blockstor-controller -o jsonpath='{.spec.clusterIP}')
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_SRC}/snapshots" \
-    -d "{\"name\":\"${SNAP}\",\"nodes\":[\"${N1}\",\"${N2}\"]}"
+rest_post "/v1/resource-definitions/${RD_SRC}/snapshots" \
+    "{\"name\":\"${SNAP}\",\"nodes\":[\"${N1}\",\"${N2}\"]}"
 
 echo ">> snapshot-restore into $RD_DST"
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_SRC}/snapshot-restore-resource" \
-    -d "{\"to_resource\":\"${RD_DST}\",\"snapshot_name\":\"${SNAP}\"}"
+rest_post "/v1/resource-definitions/${RD_SRC}/snapshot-restore-resource" \
+    "{\"to_resource\":\"${RD_DST}\",\"snapshot_name\":\"${SNAP}\"}"
 
 echo ">> autoplace $RD_DST on $N2 + $N3 (cross-node)"
-kubectl -n "$NS" exec deploy/blockstor-controller -- \
-    curl -fsS -XPOST -H'Content-Type: application/json' \
-    "http://localhost:3370/v1/resource-definitions/${RD_DST}/autoplace" \
-    -d "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"stand\",\"node_name_list\":[\"${N2}\",\"${N3}\"]}}"
+rest_post "/v1/resource-definitions/${RD_DST}/autoplace" \
+    "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"stand\",\"node_name_list\":[\"${N2}\",\"${N3}\"]}}"
 
 echo ">> wait for $RD_DST UpToDate on $N2 + $N3"
 RD=$RD_DST
