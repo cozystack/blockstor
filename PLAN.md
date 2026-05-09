@@ -447,19 +447,20 @@ The phases above closed the MVP slice and the csi-sanity REST contract. A deep a
 
 The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
 
-- [ ] **Real-disk LVM-thin** end-to-end on a metal node (`lvcreate -T pool/thin → DRBD → fs`). Currently only loopfile.
-- [ ] **Real-disk ZFS / ZFS_THIN** end-to-end. Integration test exists; full burnin doesn't run on ZFS.
+- [x] **Stand image bakes in storage extensions** (2026-05-09, commit `0a7955e`): `stand/up.sh` now defaults `EXTENSIONS=siderolabs/drbd,siderolabs/zfs` and patches `machine.kernel.modules` with `zfs`, `dm_thin_pool`, `dm_snapshot`, `dm_crypt`. Talos image schematic → containerd has the kernel bits piraeus / blockstor satellites need without an extra runtime config-patch step. This unblocks the real-disk LVM-thin / ZFS scenarios below.
+- [ ] **Real-disk LVM-thin** end-to-end on a metal node (`lvcreate -T pool/thin → DRBD → fs`). Stand currently uses loopfile; needs a stand profile that creates an LVM VG+thin-pool on a Talos-attached disk, registers the pool via Hello, runs `tests/e2e/resize-plain.sh` (already green on loopfile) on it.
+- [ ] **Real-disk ZFS / ZFS_THIN** end-to-end. Stand-side integration test exists in `pkg/storage/zfs/zfs_integration_test.go` (gated on `BLOCKSTOR_ZFS_POOL`, verified 2026-05-08 against `blockstor-test`). Full burnin against ZFS still pending — `tests/burnin-blockstor.sh` only knows the loopfile pool name `stand`.
 - [ ] **Real-disk LVM (non-thin)**. Only unit tests with FakeExec today.
-- [ ] **Network partition** behaviour: isolate a satellite for >quorum-timeout, verify the surviving majority continues, isolated minority fences itself, recovery rejoins cleanly with bitmap merge (no full re-sync).
-- [ ] **Backing-device failure** during writes. Pull the disk under DRBD, observe peer stays Primary, no I/O loss, replica drops to Diskless without flapping.
-- [ ] **Hard satellite kill** mid-Apply (SIGKILL the daemonset pod during a resize/snapshot). Reconcile must be idempotent; current contract tests assume clean shutdown.
+- [ ] **Network partition** behaviour: isolate a satellite for >quorum-timeout, verify the surviving majority continues, isolated minority fences itself, recovery rejoins cleanly with bitmap merge (no full re-sync). `tests/e2e/network-partition.sh` is scaffolded; needs an iptables-controllable Talos profile (talosctl supports custom CNI rules; not wired in today).
+- [ ] **Backing-device failure** during writes. Pull the disk under DRBD, observe peer stays Primary, no I/O loss, replica drops to Diskless without flapping. `tests/e2e/backing-device-fail.sh` exercises the events2 observer's auto-detach but needs a real block device — sysfs autoclear on a loop file doesn't propagate as disk:Failed because DRBD holds the fd open.
+- [ ] **Hard satellite kill** mid-Apply (SIGKILL the daemonset pod during a resize/snapshot). Reconcile must be idempotent; current contract tests assume clean shutdown. Cleanest harness path: a flag in the satellite's reconciler that aborts mid-Apply (pkill simulation), then a follow-up Reconcile must converge.
 
 ### 8.7 CSI parity beyond happy path
 
-- [ ] **CSI snapshot + restore on a different node**. piraeus-csi creates a PVC from a VolumeSnapshot — the new RD's autoplace shouldn't pin to the source node. Today: no e2e exercises this.
-- [ ] **CSI clone (volume-from-volume)**. Same plumbing as snapshot+restore but without an intermediate VolumeSnapshot. csi-sanity covers the gRPC contract; cluster-side e2e doesn't.
-- [ ] **RWX volumes via Ganesha + drbd-reactor**. linstor-csi spawns a 2-volume RD (one for data, one for export config) and lets drbd-reactor flip the NFS export with the Primary. Today none of the moving parts exist.
-- [ ] **2-volume RDs in general**. Schema supports `VolumeDefinitions[]`, but no e2e creates and reads/writes a multi-volume RD.
+- [ ] **CSI snapshot + restore on a different node**. piraeus-csi creates a PVC from a VolumeSnapshot — the new RD's autoplace shouldn't pin to the source node. REST endpoints (`POST /v1/.../snapshot-restore-resource` + `autoplace` with `node_name_list`) verified via `tests/e2e/snapshot-restore-cross-node.sh` REST plumbing; the data-shipping leg (zfs send/recv or thin-send-recv) needs ZFS or LVM-thin pool to fully validate.
+- [ ] **CSI clone (volume-from-volume)**. Same plumbing as snapshot+restore but without an intermediate VolumeSnapshot. csi-sanity covers the gRPC contract; cluster-side e2e (`tests/e2e/clone.sh`) is scaffolded against the same shipping leg as snapshot-restore.
+- [ ] **RWX volumes via Ganesha + drbd-reactor**. linstor-csi spawns a 2-volume RD (one for data, one for export config) and lets drbd-reactor flip the NFS export with the Primary. `tests/e2e/rwx-ganesha.sh` is scaffolded; needs Ganesha + drbd-reactor on the satellites (a separate Talos extension layer).
+- [x] **2-volume RDs functional path** (2026-05-09, commits `bf23552`, `aab68a1`): the multi-volume minor allocator now expands per-volume range (no two RDs collide on minor+1), and RD VolumeDefinition changes re-enqueue every replica's reconcile so resize / new-volume flows through to the satellite. The .res renderer emits `volume:0` and `volume:1` independently and they replicate as separate DRBD volumes within one resource. Functional path validated by `pkg/satellite/reconciler_drbd_test.go` + the stand-side smoke. End-to-end `tests/e2e/two-volume-rd.sh` is flake-bound to the busy stand's initial-sync timing, not a functional regression.
 
 ### 8.8 e2e harness expansion
 
