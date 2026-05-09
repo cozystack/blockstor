@@ -314,3 +314,71 @@ func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
 		t.Errorf(".res missing allow-two-primaries; body=%s", body)
 	}
 }
+
+// TestApplyDropsLinstorOnlyOptions: section-less DrbdOptions/* keys
+// (e.g. DrbdOptions/AutoEvictAllowEviction set by piraeus-operator
+// via /v1/controller/properties) must NOT land in the rendered .res
+// — they're LINSTOR-controller-only knobs and drbdadm rejects the
+// whole file with "Parse error: ... but got 'AutoEvictAllowEviction'"
+// on the next `drbdadm primary`. Regression for stand-side smoke
+// failure observed 2026-05-09.
+func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-noeviction_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-noeviction",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+
+				// Section-less: must be dropped
+				"DrbdOptions/AutoEvictAllowEviction": "false",
+				// Section-less: must be dropped
+				"DrbdOptions/AutoplaceTarget": "3",
+				// Real DRBD option: must land in net{} block
+				"DrbdOptions/Net/rr-conflict": "retry-connect",
+				// Real DRBD option: must land in options{} block
+				"DrbdOptions/Resource/on-no-quorum": "suspend-io",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-noeviction.res"))
+	if err != nil {
+		t.Fatalf("read .res: %v", err)
+	}
+
+	if strings.Contains(string(body), "AutoEvictAllowEviction") {
+		t.Errorf("LINSTOR-only key leaked into .res; body=%s", body)
+	}
+
+	if strings.Contains(string(body), "AutoplaceTarget") {
+		t.Errorf("LINSTOR-only key (AutoplaceTarget) leaked into .res; body=%s", body)
+	}
+
+	if !strings.Contains(string(body), "rr-conflict retry-connect;") {
+		t.Errorf("real DRBD net option missing; body=%s", body)
+	}
+
+	if !strings.Contains(string(body), "on-no-quorum suspend-io;") {
+		t.Errorf("real DRBD resource option missing; body=%s", body)
+	}
+}

@@ -524,10 +524,18 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, 
 // into per-section maps. Per-replica wiring (port/node-id/peer.*.…)
 // is dropped — those are not user-tunable knobs. Anything under
 // `DrbdOptions/Net/...` lands on the `net { }` block, anything else
-// under `DrbdOptions/...` lands on the resource-level `options { }`
-// block (drbd's catch-all). The ConfFileBuilder writes the keys
-// verbatim with the `DrbdOptions/<Section>/` prefix stripped — that's
-// the form drbdadm expects.
+// under `DrbdOptions/<Section>/...` lands on the resource-level
+// `options { }` block (drbd's catch-all). The ConfFileBuilder writes
+// the keys verbatim with the `DrbdOptions/<Section>/` prefix stripped
+// — that's the form drbdadm expects.
+//
+// Section-less keys (`DrbdOptions/<Key>` with nothing after the
+// prefix beyond a single segment) are LINSTOR-controller-only props
+// — e.g. `DrbdOptions/AutoEvictAllowEviction` is consumed by the
+// LINSTOR controller's auto-eviction logic, NOT by DRBD. Writing
+// those into the .res file makes drbdadm fail with "expected:
+// cpu-mask | on-no-data-accessible | ... but got: <name>". Drop
+// them on the satellite side; the convention upstream is the same.
 func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]string) {
 	netOpts := map[string]string{}
 	resOpts := map[string]string{}
@@ -540,8 +548,8 @@ func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]str
 
 		section, rawKey, hasSection := strings.Cut(rest, "/")
 		if !hasSection {
-			resOpts[rest] = value
-
+			// LINSTOR-only key (no DRBD section subpath); these
+			// don't belong in the rendered .res. See doc comment.
 			continue
 		}
 
