@@ -279,7 +279,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 		resized = didResize
 	}
 
-	devices, err := r.maybeLUKS(ctx, dr, diskless, devices)
+	devices, err := r.maybeLUKS(ctx, dr, diskless, devices, resized)
 	if err != nil {
 		res.Ok = false
 		res.Message = err.Error()
@@ -306,13 +306,15 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 // maybeLUKS conditionally layers cryptsetup over the raw storage
 // devices when the layer stack names "LUKS". Returns the (possibly
 // rewritten) volume → device map for the next layer. Skips entirely
-// for diskless replicas — they never open the underlying disk.
-func (r *Reconciler) maybeLUKS(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string) (map[int32]string, error) {
+// for diskless replicas — they never open the underlying disk. When
+// the storage layer just grew (resized=true), also runs cryptsetup
+// resize so the mapper picks up the new size before DRBD's resize.
+func (r *Reconciler) maybeLUKS(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized bool) (map[int32]string, error) {
 	if diskless || !needsLUKS(dr.GetLayerStack()) {
 		return devices, nil
 	}
 
-	return r.applyLUKS(ctx, dr, devices)
+	return r.applyLUKS(ctx, dr, devices, resized)
 }
 
 // needsLUKS reports whether the satellite should layer cryptsetup
@@ -331,13 +333,14 @@ func needsLUKS(stack []string) bool {
 // applyLUKS formats (first activation only) and opens every volume's
 // raw device under /dev/mapper/<rd>-<volnum>, returning the new
 // volNumber→DevicePath map for downstream layers (DRBD or direct
-// consumer).
+// consumer). When resized=true, also runs cryptsetup resize on each
+// open mapper so the encrypted device picks up the grown LV size.
 //
 // Passphrase source for this slice: dr.Props["LuksPassphrase"]. The
 // controller folds it in from the RD's `DrbdOptions/Encryption/passphrase`
 // prop via the resolver. Empty passphrase fails the apply — explicit
 // rather than silently creating an unencrypted volume.
-func (r *Reconciler) applyLUKS(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string) (map[int32]string, error) {
+func (r *Reconciler) applyLUKS(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, error) {
 	if r.cfg.Cryptsetup == nil {
 		return nil, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
 	}
@@ -365,6 +368,13 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *satellitepb.DesiredResou
 			// because cryptsetup doesn't return a structured error.
 			if !strings.Contains(err.Error(), "already exists") {
 				return nil, errors.Wrapf(err, "luks open %s -> %s", dev, dmName)
+			}
+		}
+
+		if resized {
+			err = r.cfg.Cryptsetup.Resize(ctx, dmName, key)
+			if err != nil {
+				return nil, errors.Wrapf(err, "luks resize %s", dmName)
 			}
 		}
 
