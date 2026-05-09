@@ -816,6 +816,86 @@ func RunResourceGroupStore(t *testing.T, newStore Factory) {
 	t.Run("UpdateChangesProps", func(t *testing.T) { testRGUpdateChangesProps(t, newStore) })
 	t.Run("DeleteMissing", func(t *testing.T) { testRGDeleteMissing(t, newStore) })
 	t.Run("DeleteRemoves", func(t *testing.T) { testRGDeleteRemoves(t, newStore) })
+	t.Run("VolumeGroupsAndFilterRoundTrip", func(t *testing.T) {
+		testRGVolumeGroupsAndFilterRoundTrip(t, newStore)
+	})
+}
+
+// testRGVolumeGroupsAndFilterRoundTrip exercises the rich CRD
+// fields the existing CreateRoundTrip test doesn't touch:
+// VolumeGroups (linstor `linstor rg vd c` template), and the
+// less-common SelectFilter slices (NodeNameList, ReplicasOnSame /
+// Different, NotPlaceWithRsc, ProviderList). Without round-trip
+// pin a regression that dropped one of these on crdToWireRG would
+// silently strip operator-supplied placement constraints.
+func testRGVolumeGroupsAndFilterRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	rg := apiv1.ResourceGroup{
+		Name:        "rg-rich",
+		Description: "rich-fields round-trip",
+		Props:       map[string]string{"DrbdOptions/Resource/quorum": "majority"},
+		PeerSlots:   7,
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:           3,
+			StoragePool:          "thin",
+			StoragePoolList:      []string{"thin", "zfs"},
+			NodeNameList:         []string{"n1", "n2"},
+			ReplicasOnSame:       []string{"Aux/zone"},
+			ReplicasOnDifferent:  []string{"Aux/rack"},
+			NotPlaceWithRsc:      []string{"avoid-1"},
+			NotPlaceWithRscRegex: "^scratch-",
+			ProviderList:         []string{"LVM_THIN", "ZFS_THIN"},
+			LayerStack:           []string{"DRBD", "STORAGE"},
+			DisklessOnRemaining:  true,
+		},
+		VolumeGroups: []apiv1.VolumeGroup{
+			{VolumeNumber: 0, Props: map[string]string{"foo": "vol0"}},
+			{VolumeNumber: 1, Props: map[string]string{"foo": "vol1"}, Flags: []string{"GROSS_SIZE"}},
+		},
+	}
+
+	if err := s.Create(ctx, &rg); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(ctx, "rg-rich")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("PlaceCount: got %d, want 3", got.SelectFilter.PlaceCount)
+	}
+
+	if len(got.SelectFilter.NodeNameList) != 2 {
+		t.Errorf("NodeNameList: got %v", got.SelectFilter.NodeNameList)
+	}
+
+	if got.SelectFilter.NotPlaceWithRscRegex != "^scratch-" {
+		t.Errorf("NotPlaceWithRscRegex: got %q", got.SelectFilter.NotPlaceWithRscRegex)
+	}
+
+	if !got.SelectFilter.DisklessOnRemaining {
+		t.Errorf("DisklessOnRemaining: got false, want true")
+	}
+
+	if len(got.VolumeGroups) != 2 {
+		t.Fatalf("VolumeGroups: got %d, want 2", len(got.VolumeGroups))
+	}
+
+	if got.VolumeGroups[0].Props["foo"] != "vol0" || got.VolumeGroups[1].Props["foo"] != "vol1" {
+		t.Errorf("VolumeGroup props lost: got %+v", got.VolumeGroups)
+	}
+
+	if len(got.VolumeGroups[1].Flags) != 1 || got.VolumeGroups[1].Flags[0] != "GROSS_SIZE" {
+		t.Errorf("VolumeGroup flags lost: got %+v", got.VolumeGroups[1].Flags)
+	}
+
+	if got.PeerSlots != 7 {
+		t.Errorf("PeerSlots: got %d, want 7", got.PeerSlots)
+	}
 }
 
 func testRGListEmpty(t *testing.T, newStore Factory) {
