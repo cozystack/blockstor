@@ -215,6 +215,68 @@ func TestAutoplacePrefersFreestPool(t *testing.T) {
 	}
 }
 
+// TestAutoplaceSkipsEvictedNodes: a node flagged EVICTED is excluded
+// from the candidate pool so autoplace does not undo an eviction
+// the operator just initiated.
+func TestAutoplaceSkipsEvictedNodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	if err := st.Nodes().Update(ctx, &apiv1.Node{
+		Name:  "n2",
+		Type:  apiv1.NodeTypeSatellite,
+		Flags: []string{apiv1.NodeFlagEvicted},
+	}); err != nil {
+		t.Fatalf("evict n2: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	for _, r := range got {
+		if r.NodeName == "n2" {
+			t.Errorf("autoplace landed on EVICTED node n2; replicas=%v", got)
+		}
+	}
+
+	if len(got) != 2 {
+		t.Errorf("placed: got %d, want 2", len(got))
+	}
+}
+
 // TestResourceCreateAndDelete: explicit single-replica placement via REST.
 func TestResourceCreateAndDelete(t *testing.T) {
 	st := store.NewInMemory()
