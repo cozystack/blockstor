@@ -30,11 +30,13 @@ on_node() {
     kubectl -n "$NS" exec "$pod" -- "$@"
 }
 
-# wait_uptodate POD waits up to 60s for both replicas of $RD to reach
+# wait_uptodate POD waits up to 120s for both replicas of $RD to reach
 # disk:UpToDate. Caller defines $RD and the two node names $PRIMARY,
-# $PEER before calling. Exits non-zero on timeout.
+# $PEER before calling. Exits non-zero on timeout. Initial sync on
+# a fresh DRBD resource takes 30-60s on a busy stand; 120s is the
+# margin.
 wait_uptodate() {
-    local rd=$1 primary=$2 peer=$3 deadline=$(( $(date +%s) + 60 ))
+    local rd=$1 primary=$2 peer=$3 deadline=$(( $(date +%s) + 120 ))
 
     while (( $(date +%s) < deadline )); do
         local p1 p2
