@@ -23,9 +23,12 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -220,9 +223,30 @@ func alreadyExists(err error) bool {
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// We Watch Resources too — the tiebreaker logic needs to fire when
+// child Resources land, not just on the RD's own creation. Without
+// the watch, an `apply RD + 2 Resources` race never re-runs the RD
+// reconciler after the Resources finish, and a 2-replica RD sits
+// without its DISKLESS witness until the next periodic re-sync.
 func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.ResourceDefinition{}).
+		Watches(&blockstoriov1alpha1.Resource{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForResource)).
 		Named("resourcedefinition").
 		Complete(r)
+}
+
+// enqueueRDForResource maps a Resource event to its parent RD.
+// Resource.Spec.ResourceDefinitionName is the canonical link.
+func (r *ResourceDefinitionReconciler) enqueueRDForResource(_ context.Context, obj client.Object) []reconcile.Request {
+	res, ok := obj.(*blockstoriov1alpha1.Resource)
+	if !ok || res.Spec.ResourceDefinitionName == "" {
+		return nil
+	}
+
+	return []reconcile.Request{
+		{NamespacedName: types.NamespacedName{Name: res.Spec.ResourceDefinitionName}},
+	}
 }
