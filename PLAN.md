@@ -480,15 +480,11 @@ The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
 
 The project's stated goal includes "ability to run without DRBD, as pure local storage (single-replica diskful or diskless)" and a LUKS encryption layer at the volume level. Today's satellite always renders a `.res` and shells out to `drbdadm`; LUKS exists in `pkg/luks` but isn't wired through `applyStorage`. To match upstream LINSTOR's `layer_list` semantics:
 
-- [ ] **`ResourceDefinition.Spec.LayerStack` (or per-RD prop)** — array of layers, default `["DRBD","STORAGE"]`. Valid values: `STORAGE`, `LUKS`, `DRBD`. Order matters: `[LUKS,STORAGE]` = LUKS-on-LV, no DRBD; `[DRBD,LUKS,STORAGE]` = DRBD-over-LUKS-over-LV (per-volume cipher with replication on top).
-- [ ] **Satellite-side stack execution** — in `applyResource`, walk the layer stack:
-  - `STORAGE` always runs — provider creates the backing block device
-  - `LUKS` (when present) — `pkg/luks.Format` (first activation), `Open` to /dev/mapper/<rd>-<volnum>, `Close` on teardown. Key material from a per-RD passphrase (KV-store under `Cryptokeys/<rd>`)
-  - `DRBD` (when present) — render `.res` against the highest-layer device path (storage device if just `[DRBD,STORAGE]`, mapper device if `[DRBD,LUKS,STORAGE]`); `drbdadm create-md/adjust`. Skip entirely when DRBD isn't in the stack.
+- [x] **`ResourceDefinition.Spec.LayerStack` + plumbing** (2026-05-09, commits `8ff7043` + `f822665`): `[]string` field on the RD CRD, REST shape, and `ResourceGroup.Spec.SelectFilter.LayerStack` for inheritance. `pkg/api/v1/layer_stack.go` exports `ResolveLayerStack(rd, rg)` (RD wins, then RG, then `["DRBD","STORAGE"]` default). Plumbed through `proto/satellite/v1alpha1.DesiredResource.layer_stack`, `dispatcher.ApplyOptions.LayerStack`, and `ResourceReconciler.resolveLayerStack` so the satellite gets the effective composition on every Apply.
+- [x] **Satellite-side: skip DRBD when not in stack** (2026-05-09, commit `8ff7043`): `pkg/satellite/reconciler.applyOne` calls `needsDRBD(dr.GetLayerStack())` and short-circuits the `applyDRBD` step when the stack omits it. Empty stack still defaults to DRBD-on for legacy clients. `TestApplySkipsDRBDWhenLayerStackOmits` pins the satellite contract.
+- [ ] **Satellite-side: LUKS layer** — when `"LUKS"` is in the stack, run `pkg/luks.Format` (first activation), `Open` to /dev/mapper/<rd>-<volnum>, hand the mapper device to DRBD as the lower disk (instead of the raw provider device), `Close` on teardown. Key material from a per-RD passphrase (KV-store under `Cryptokeys/<rd>`) — needs the resolver hook still.
 - [ ] **CSI shape** — linstor-csi reads `layer_list` on RD; pass it through unchanged so existing piraeus-operator flows keep working when they configure `LinstorSatelliteConfiguration.spec.storageClasses[*].layerList`.
-- [ ] **Tests**:
-  - unit: layer stack decoder rejects unknown layers, defaults to `[DRBD,STORAGE]` when empty
-  - satellite contract: `[STORAGE]` apply renders no `.res` and never invokes `drbdadm`
+- [ ] **Remaining tests**:
   - satellite contract: `[LUKS,STORAGE]` apply runs `cryptsetup luksFormat` once, `cryptsetup open` on subsequent reconciles, never DRBD
   - satellite contract: `[DRBD,LUKS,STORAGE]` apply layers all three; `.res` points at /dev/mapper/<rd>-0, not the raw LV
   - e2e: `tests/e2e/no-drbd.sh` (single-replica ZFS-backed PVC, write/read), `tests/e2e/luks-layer.sh` (encrypted single-replica PVC + reboot remount), `tests/e2e/drbd-luks-stack.sh` (3-replica encrypted)
