@@ -338,6 +338,63 @@ func nodeMeta(name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name}
 }
 
+// TestPeerAddress: lookup → host extraction + fallback contract.
+// peerAddress must:
+//   - return just the host part of "host:port"
+//   - return the whole string when there's no port separator
+//   - fall back to the 0.0.0.0 placeholder when the node is unknown
+//     or hasn't published a SatelliteEndpoint yet
+//
+// The placeholder is what the .res renderer drops in until the
+// satellite re-registers with its real endpoint — without the
+// fallback, peerAddress would emit empty strings into the .res
+// `address` field and drbdadm would refuse to parse the resource.
+func TestPeerAddress(t *testing.T) {
+	t.Parallel()
+
+	nodes := []blockstoriov1alpha1.Node{
+		{
+			ObjectMeta: nodeMeta("with-port"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "10.244.1.5:7000"},
+			},
+		},
+		{
+			ObjectMeta: nodeMeta("no-port"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "no-colon-here"},
+			},
+		},
+		{
+			ObjectMeta: nodeMeta("ipv6"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "[fe80::1]:7000"},
+			},
+		},
+	}
+
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"with-port", "10.244.1.5"},
+		{"no-port", "no-colon-here"},
+		// IPv6 has multiple colons; LastIndex picks the right one.
+		{"ipv6", "[fe80::1]"},
+		{"ghost-node", dispatcher.DrbdAddrAny}, // unregistered → placeholder
+	}
+
+	for _, c := range cases {
+		got := dispatcher.PeerAddress(c.name, nodes)
+		if got != c.want {
+			t.Errorf("peerAddress(%q): got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // TestDeriveExports: the public DerivePort / DeriveMinor wrappers must
 // match their unexported implementations. Used by ad-hoc tooling
 // (drbdadm-show-replicas helpers) that imports the dispatcher package
