@@ -168,6 +168,79 @@ func TestNodesDeleteMissing(t *testing.T) {
 	}
 }
 
+// TestNodesUpdate: PUT /v1/nodes/{node} round-trips a Props change
+// onto the existing Node. Path-derived name wins over body so callers
+// can omit it.
+func TestNodesUpdate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		// Body's Name intentionally empty — path's "n1" must win.
+		Type:  apiv1.NodeTypeSatellite,
+		Props: map[string]string{"Aux/zone": "us-east-1a"},
+	})
+
+	resp := httpPut(t, base+"/v1/nodes/n1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Props["Aux/zone"] != "us-east-1a" {
+		t.Errorf("Props after PUT: got %v, want Aux/zone=us-east-1a", got.Props)
+	}
+}
+
+// TestNodesUpdateMissing: PUT against a non-existent node → 404.
+func TestNodesUpdateMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{Type: apiv1.NodeTypeSatellite})
+	resp := httpPut(t, base+"/v1/nodes/ghost", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodesUpdateBadJSON: invalid JSON → 400 before we touch the
+// store. Pins the per-handler decode-error path.
+func TestNodesUpdateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/nodes/n1", []byte("{not json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
 // TestNodesDeleteOK: DELETE existing node, then it disappears.
 func TestNodesDeleteOK(t *testing.T) {
 	st := store.NewInMemory()

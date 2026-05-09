@@ -112,6 +112,67 @@ func TestResourceGroupsGetMissing(t *testing.T) {
 	}
 }
 
+// TestResourceGroupsUpdate: PUT /v1/resource-groups/{rg} round-trips
+// a SelectFilter change onto the existing RG. Pins the path the
+// `linstor rg modify` command drives — and which an operator setting
+// LayerStack on a parent RG depends on (RDs spawned afterwards
+// inherit the new filter).
+func TestResourceGroupsUpdate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount: 3,
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+		},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("PlaceCount: got %d, want 3", got.SelectFilter.PlaceCount)
+	}
+
+	if len(got.SelectFilter.LayerStack) != 3 {
+		t.Errorf("LayerStack: got %v, want [DRBD LUKS STORAGE]", got.SelectFilter.LayerStack)
+	}
+}
+
+// TestResourceGroupsUpdateMissing: PUT against a non-existent RG → 404.
+func TestResourceGroupsUpdateMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{})
+	resp := httpPut(t, base+"/v1/resource-groups/ghost", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestResourceGroupsDelete: round-trip via golinstor.
 func TestResourceGroupsDelete(t *testing.T) {
 	st := store.NewInMemory()
