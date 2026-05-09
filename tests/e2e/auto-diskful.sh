@@ -31,11 +31,17 @@ N3=test-worker-3
 trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply 2 diskful + 1 DISKLESS"
+# Disable the auto-tiebreaker — this test explicitly creates its
+# own DISKLESS replica on N3, and we don't want the RD reconciler
+# racing to create a TIE_BREAKER witness on N3 first (which would
+# then conflict with our explicit apply, ALSO landing on N3).
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
+  props:
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 EOF

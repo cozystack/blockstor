@@ -124,7 +124,14 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	nonWitnessDiskless := len(diskless) - len(witness)
 
 	// Tiebreaker decision (mirrors shouldTieBreakerExist).
-	wantWitness := len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
+	// Gate on DrbdOptions/AutoAddQuorumTiebreaker — upstream LINSTOR
+	// only runs the auto-witness logic when the prop is "true". On
+	// cozystack / piraeus-operator clusters this prop is set
+	// cluster-wide via ControllerProps; vanilla blockstor leaves it
+	// off so explicit DISKLESS replicas don't race with the auto
+	// reconciler.
+	wantWitness := isAutoTieBreakerEnabled(rd) &&
+		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
 
 	disklessAfter, err := r.applyWitnessDecision(ctx, rd, replicas, diskless, witness, wantWitness)
 	if err != nil {
@@ -132,6 +139,34 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	}
 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// isAutoTieBreakerEnabled gates witness auto-creation on the RD's
+// `DrbdOptions/AutoAddQuorumTiebreaker` prop. Default is enabled
+// (matches the effective cozystack / piraeus-operator behaviour
+// where ControllerProps seeds it true) — operators who explicitly
+// place a manual DISKLESS replica disable the auto path with
+// `DrbdOptions/AutoAddQuorumTiebreaker: "false"` on the RD spec.
+//
+// We only check the RD prop bag here; the resolver (controller →
+// RG → RD → Resource hierarchy) doesn't run on the RD reconciler
+// path because that path doesn't dispatch to the satellite. A
+// cluster-wide ControllerProps default still propagates because
+// the REST POST /v1/resource-definitions handler folds parent-RG
+// + ControllerProps into the RD on create.
+func isAutoTieBreakerEnabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
+
+	if rd.Spec.Props == nil {
+		return true
+	}
+
+	value, ok := rd.Spec.Props[propKey]
+	if !ok {
+		return true
+	}
+
+	return !strings.EqualFold(value, "false")
 }
 
 // applyWitnessDecision creates or removes the witness and returns
