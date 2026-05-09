@@ -25,7 +25,24 @@ type ResourceDefinition struct {
 	Props             map[string]string `json:"props,omitempty"`
 	Flags             []string          `json:"flags,omitempty"`
 	LayerData         []ResourceLayer   `json:"layer_data,omitempty"`
-	UUID              string            `json:"uuid,omitempty"`
+	// LayerStack is the layer composition (e.g. ["DRBD","STORAGE"]).
+	// Wire field name matches upstream LINSTOR (`resource_definition.layer_stack`).
+	LayerStack []string `json:"layer_stack,omitempty"`
+	UUID       string   `json:"uuid,omitempty"`
+}
+
+// Layer kind constants — the strings LINSTOR uses on the wire.
+const (
+	LayerKindDRBD    = "DRBD"
+	LayerKindLUKS    = "LUKS"
+	LayerKindStorage = "STORAGE"
+)
+
+// DefaultLayerStack returns the layer stack used when the RD spec
+// (and its parent RG) leave it empty. Matches upstream LINSTOR's
+// default — full DRBD-over-STORAGE replication.
+func DefaultLayerStack() []string {
+	return []string{LayerKindDRBD, LayerKindStorage}
 }
 
 // ResourceLayer is the per-layer descriptor on a ResourceDefinition. We

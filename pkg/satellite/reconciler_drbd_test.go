@@ -382,3 +382,53 @@ func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 		t.Errorf("real DRBD resource option missing; body=%s", body)
 	}
 }
+
+// TestApplySkipsDRBDWhenLayerStackOmits: a Resource with explicit
+// LayerStack=["STORAGE"] must NOT render a .res file or invoke
+// drbdadm. Storage provider still runs (volume is created); the
+// DRBD half is skipped wholesale.
+//
+// This is the foundation of Phase 9 single-replica local-storage
+// mode: a PVC that doesn't need DRBD (e.g. ephemeral cache, single
+// replica scratch space) provisions just an LV and the consumer Pod
+// mounts it directly without a DRBD layer.
+func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-no-drbd_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-no-drbd",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack:  []string{"STORAGE"},
+			DrbdOptions: map[string]string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resPath := filepath.Join(dir, "pvc-no-drbd.res")
+	if _, statErr := os.Stat(resPath); statErr == nil {
+		t.Errorf(".res file rendered despite LayerStack=[STORAGE]: %s", resPath)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") || strings.HasPrefix(line, "drbdsetup ") {
+			t.Errorf("DRBD command issued despite LayerStack=[STORAGE]: %s", line)
+		}
+	}
+}

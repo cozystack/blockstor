@@ -135,6 +135,7 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 		ResourceGroupName: crd.Spec.ResourceGroupName,
 		Props:             crd.Spec.Props,
 		Flags:             crd.Spec.Flags,
+		LayerStack:        crd.Spec.LayerStack,
 		UUID:              string(crd.UID),
 	}
 
@@ -157,5 +158,6 @@ func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitio
 		ResourceGroupName: in.ResourceGroupName,
 		Props:             in.Props,
 		Flags:             in.Flags,
+		LayerStack:        in.LayerStack,
 	}
 }

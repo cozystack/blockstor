@@ -25,7 +25,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -157,8 +156,6 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
 func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *satellitepb.DesiredResource {
-	rdName := target.Spec.ResourceDefinitionName
-
 	// node-id and port/minor are persisted on Status by the controller
 	// before Apply runs. Falling back to derive*() is a transitional
 	// safety net for the case where the allocator hasn't run yet — it
@@ -188,20 +185,15 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		}
 	}
 
-	// Stable iteration: sort peer names so the satellite-side .res
-	// renderer sees a deterministic order. node-id itself is stable
-	// regardless of iteration order because it's persisted.
 	dropped := make([]string, 0, len(idOf))
 
 	for name := range idOf {
-		if name == target.Spec.NodeName {
-			continue
+		if name != target.Spec.NodeName {
+			dropped = append(dropped, name)
 		}
-
-		dropped = append(dropped, name)
 	}
 
-	sort.Strings(dropped)
+	slices.Sort(dropped)
 
 	drbdOpts := map[string]string{
 		"port":    strconv.Itoa(port),
@@ -224,16 +216,30 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 	addPeerEntries(drbdOpts, dropped, peers, nodes, port, idOf)
 
+	return assembleDesired(target, peers, rd, dropped, drbdOpts, effectiveProps)
+}
+
+// assembleDesired packages the per-replica wire payload. Pulled out
+// of buildDesired so the caller stays under the funlen budget.
+func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, dropped []string, drbdOpts, effectiveProps map[string]string) *satellitepb.DesiredResource {
+	_ = peers // peers info already folded into drbdOpts via addPeerEntries
+
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
+	var layerStack []string
+	if rd != nil {
+		layerStack = rd.Spec.LayerStack
+	}
+
 	return &satellitepb.DesiredResource{
-		Name:        rdName,
+		Name:        target.Spec.ResourceDefinitionName,
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
 		Props:       wireProps,
 		Peers:       dropped,
 		Volumes:     buildVolumes(rd, target),
 		DrbdOptions: drbdOpts,
+		LayerStack:  layerStack,
 	}
 }
 

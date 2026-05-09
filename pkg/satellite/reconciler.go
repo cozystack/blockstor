@@ -272,7 +272,10 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 		resized = didResize
 	}
 
-	if r.cfg.Adm != nil {
+	// Skip DRBD when the layer_stack explicitly omits it. Empty
+	// layer_stack defaults to ["DRBD","STORAGE"] so legacy clients
+	// (and pre-Phase-9 dispatchers) keep getting full DRBD treatment.
+	if r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()) {
 		err := r.applyDRBD(ctx, dr, diskless, devices, resized)
 		if err != nil {
 			res.Ok = false
@@ -283,6 +286,24 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	}
 
 	return res
+}
+
+// needsDRBD reports whether the satellite should render a .res and
+// run drbdadm for this resource. Empty stack → default-true (legacy
+// + Phase-1..8 wire compatibility); explicit stack → only run DRBD
+// when it's named in the stack.
+func needsDRBD(stack []string) bool {
+	if len(stack) == 0 {
+		return true
+	}
+
+	for _, s := range stack {
+		if strings.EqualFold(s, "DRBD") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // applyStorage walks dr.Volumes and ensures each LV/zvol/loopfile

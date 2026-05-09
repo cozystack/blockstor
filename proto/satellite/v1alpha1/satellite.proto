@@ -170,6 +170,11 @@ message DesiredResource {
   // DRBD-layer config (port, secret, peer_slots ...). Free-form for now;
   // we'll concretise as soon as ConfFileBuilder is ported.
   map<string, string> drbd_options = 7;
+  // Layer composition for the satellite-side render. ["DRBD","STORAGE"]
+  // (default) renders a .res file and runs drbdadm; ["LUKS","STORAGE"]
+  // layers cryptsetup over the storage device, no DRBD; ["STORAGE"] is
+  // single-replica local mode. Empty == default.
+  repeated string layer_stack = 8;
 }
 
 message DesiredVolume {

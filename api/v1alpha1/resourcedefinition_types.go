@@ -45,6 +45,19 @@ type ResourceDefinitionSpec struct {
 	// volumeDefinitions are the volume slots inside this RD.
 	// +optional
 	VolumeDefinitions []ResourceDefinitionVolume `json:"volumeDefinitions,omitempty"`
+
+	// layerStack is the LINSTOR layer composition for this RD's
+	// satellite-side render — `["DRBD","STORAGE"]` (default) renders a
+	// .res file and runs drbdadm; `["LUKS","STORAGE"]` layers
+	// cryptsetup over the storage device with no DRBD; `["STORAGE"]`
+	// is single-replica local mode (no replication, no encryption).
+	// Order is top-down: the first layer's device is what the
+	// consumer Pod mounts, the last is the raw block device the
+	// storage provider creates.
+	// Empty = inherits from the parent ResourceGroup; both empty =
+	// `["DRBD","STORAGE"]`.
+	// +optional
+	LayerStack []string `json:"layerStack,omitempty"`
 }
 
 // ResourceDefinitionVolume is one volume slot inside an RD.
