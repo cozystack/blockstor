@@ -51,7 +51,7 @@ create_zfs() {
         # newly-created partitions but zpool's libzfs probe runs in
         # a way that doesn't see them. Workaround: pre-create the
         # ZFS partition with sgdisk + partprobe, then hand zpool
-        // the partition path directly.
+        # the partition path directly.
         wipefs -af ${ZFS_DEV}* 2>&1 || true
         sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
         sgdisk --new=1:0:0 -t 1:bf01 ${ZFS_DEV}
@@ -77,15 +77,14 @@ create_lvm() {
         # The satellite container has no udev. lvm's default behaviour
         # is to wait for udev to populate /dev/<vg>/<lv> after a
         # device-mapper create — without udev that wait times out and
-        # fails the LV. --config activation{udev_sync=0,udev_rules=0} bypasses the
-        # wait. -Wn -Zn skip the optional wipe-signatures / zero
+        # fails the LV. activation{udev_sync=0 udev_rules=0} bypasses
+        # the wait. -Wn -Zn skip the optional wipe-signatures / zero
         # steps which also fail (they go through the same
         # /dev/<vg>/<lv> path that udev never created).
-        OPTS='--config activation{udev_sync=0,udev_rules=0}'
-        lvcreate \$OPTS -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
-        lvcreate \$OPTS -y -Wn -Zn -L 13G blockstor-lvm -n thin
-        lvconvert \$OPTS -y -Wn -Zn --type thin-pool \\
-            --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
+        CFG='activation{udev_sync=0 udev_rules=0}'
+        lvcreate --config \"\$CFG\" -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
+        lvcreate --config \"\$CFG\" -y -Wn -Zn -L 13G blockstor-lvm -n thin
+        lvconvert --config \"\$CFG\" -y -Wn -Zn --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
         echo 'lv blockstor-lvm/thin created'
     "
 }
