@@ -465,6 +465,43 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			t.Errorf("Nodes: got %v, want [n1 n2]", got.Nodes)
 		}
 	})
+	// VolumeDefinitions round-trip: linstor-csi reads
+	// snap.VolumeDefinitions to know how big the restored volume
+	// must be on a CSI restore. Pinning the round-trip protects
+	// against a regression where the CRD field gets dropped on
+	// crdToWire conversion (silently breaking restore-from-snapshot).
+	t.Run("VolumeDefinitionsRoundTrip", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		ctx := t.Context()
+
+		want := []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			{VolumeNumber: 1, SizeKib: 2 * 1024 * 1024},
+		}
+		if err := s.Create(ctx, &apiv1.Snapshot{
+			Name:              "s-vd",
+			ResourceName:      "pvc-multi",
+			VolumeDefinitions: want,
+		}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+
+		got, err := s.Get(ctx, "pvc-multi", "s-vd")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+
+		if len(got.VolumeDefinitions) != 2 {
+			t.Fatalf("VolumeDefinitions: got %d, want 2", len(got.VolumeDefinitions))
+		}
+
+		for i, w := range want {
+			if got.VolumeDefinitions[i].VolumeNumber != w.VolumeNumber ||
+				got.VolumeDefinitions[i].SizeKib != w.SizeKib {
+				t.Errorf("VD[%d]: got %+v, want %+v", i, got.VolumeDefinitions[i], w)
+			}
+		}
+	})
 }
 
 // RunResourceStore exercises every branch of store.ResourceStore.
