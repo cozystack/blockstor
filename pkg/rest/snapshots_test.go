@@ -128,3 +128,53 @@ func TestSnapshotsDeleteThenGet(t *testing.T) {
 		t.Errorf("post-delete: got %d, want 404", getResp.StatusCode)
 	}
 }
+
+// TestSnapshotsViewFilters pins ?resources= and ?snapshots= on the
+// cross-RD aggregate. linstor-csi's snapshot-existence poll arrives
+// scoped to one RD + name; without filtering we'd return the whole
+// cluster's snapshot list and force the client to scan.
+func TestSnapshotsViewFilters(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, sn := range []apiv1.Snapshot{
+		{Name: "s1", ResourceName: "pvc-1"},
+		{Name: "s2", ResourceName: "pvc-1"},
+		{Name: "s1", ResourceName: "pvc-2"},
+	} {
+		if err := st.Snapshots().Create(ctx, &sn); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	cases := []struct {
+		query string
+		want  int
+	}{
+		{"resources=pvc-1", 2},
+		{"snapshots=s1", 2},
+		{"resources=pvc-1&snapshots=S2", 1},
+	}
+
+	for _, tc := range cases {
+		resp := httpGet(t, base+"/v1/view/snapshots?"+tc.query)
+
+		var got []apiv1.Snapshot
+
+		err := json.NewDecoder(resp.Body).Decode(&got)
+		_ = resp.Body.Close()
+
+		if err != nil {
+			t.Errorf("%s decode: %v", tc.query, err)
+
+			continue
+		}
+
+		if len(got) != tc.want {
+			t.Errorf("%s: got %d entries, want %d (%v)", tc.query, len(got), tc.want, got)
+		}
+	}
+}
