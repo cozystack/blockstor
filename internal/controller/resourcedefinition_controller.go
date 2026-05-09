@@ -101,50 +101,108 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	return ctrl.Result{}, nil
 }
 
-// ensureTiebreaker maintains the parity-of-replicas invariant for
-// DRBD's `quorum:majority`: the count of non-witness replicas (diskful
-// + user-added diskless) PLUS the witness must always be odd, so a
-// network partition has an unambiguous majority side.
+// ensureTiebreaker keeps both invariants upstream LINSTOR maintains:
 //
-// Rules:
-//   - When non-witness count is EVEN (and ≥2) and no TIE_BREAKER
-//     witness exists, create one on a healthy non-replica node.
-//   - When non-witness count is ODD and a TIE_BREAKER witness exists,
-//     delete it — it's redundant and wastes network presence.
-//   - Single-replica RDs (count = 1) have no quorum to defend; no
-//     witness is added or removed.
+//  1. shouldTieBreakerExist (CtrlRscAutoTieBreakerHelper.java#L468):
+//     create a TIE_BREAKER witness iff diskful ≥ 2 AND diskful is
+//     even AND there are no eligible diskless replicas already.
+//     Drop the witness when the condition no longer holds (e.g. user
+//     scaled to 3 replicas, or added a manual diskless that already
+//     breaks the tie).
 //
-// Counts include diskless replicas the user added explicitly (via
-// `linstor r c --diskless` or DisklessOnRemaining). Only the witness
-// — flagged TIE_BREAKER — is excluded from the parity count, since
-// its presence is what we're deciding.
+//  2. isQuorumFeasible (CtrlRscAutoQuorumHelper.java#L265):
+//     `quorum:majority` is feasible when:
+//     (diskful == 2 AND diskless ≥ 1)  -- 2 + witness
+//     OR diskful ≥ 3
+//     otherwise we set `quorum:off` because a partition would freeze
+//     both halves with no clear winner.
+//
+//     Diskful here = NOT-diskless. Diskless = any DRBD_DISKLESS,
+//     counting both user-added and TIE_BREAKER witnesses.
+//
+// We mirror that logic exactly so a cluster running blockstor sees
+// the same tiebreaker / quorum decisions as one running upstream
+// LINSTOR — important for the cozystack migration story.
 func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
 	replicas, err := r.Store.Resources().ListByDefinition(ctx, rd.Name)
 	if err != nil {
 		return err
 	}
 
-	nonWitness, witness := splitByTieBreaker(replicas)
+	diskful, diskless := splitByDiskless(replicas)
+	witness := filterTieBreaker(diskless)
+	nonWitnessDiskless := len(diskless) - len(witness)
 
-	if len(nonWitness) <= 1 {
-		// 0 or 1 replicas → no quorum question, but still drop a
-		// stale witness if one is somehow lingering.
-		return r.removeWitnesses(ctx, rd.Name, witness)
+	// Tiebreaker decision (mirrors shouldTieBreakerExist).
+	wantWitness := len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
+
+	disklessAfter, err := r.applyWitnessDecision(ctx, rd, replicas, diskless, witness, wantWitness)
+	if err != nil {
+		return err
 	}
 
-	if len(nonWitness)%2 == 1 {
-		// Odd → witness redundant. Drop it.
-		return r.removeWitnesses(ctx, rd.Name, witness)
+	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// applyWitnessDecision creates or removes the witness and returns
+// the diskless slice as it should look after the decision (so the
+// caller's quorum computation reflects the post-write state).
+func (r *ResourceDefinitionReconciler) applyWitnessDecision(
+	ctx context.Context,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	replicas, diskless, witness []apiv1.Resource,
+	wantWitness bool,
+) ([]apiv1.Resource, error) {
+	switch {
+	case wantWitness && len(witness) == 0:
+		err := r.createWitness(ctx, rd, replicas)
+		if err != nil {
+			return nil, err
+		}
+
+		return append(diskless, apiv1.Resource{
+			Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		}), nil
+
+	case !wantWitness && len(witness) > 0:
+		err := r.removeWitnesses(ctx, rd.Name, witness)
+		if err != nil {
+			return nil, err
+		}
+
+		// Drop witnesses from the diskless slice for the quorum
+		// computation.
+		out := make([]apiv1.Resource, 0, len(diskless))
+
+		for i := range diskless {
+			if !slices.Contains(diskless[i].Flags, apiv1.ResourceFlagTieBreaker) {
+				out = append(out, diskless[i])
+			}
+		}
+
+		return out, nil
 	}
 
-	// Even → witness needed.
-	if len(witness) > 0 {
-		// Already have one. Idempotent no-op.
-		return nil
+	return diskless, nil
+}
+
+// quorumPolicy implements upstream LINSTOR's isQuorumFeasible.
+// 2 diskful + ≥1 diskless OR ≥3 diskful → majority; else off.
+func quorumPolicy(diskful, diskless int) string {
+	const minDiskfulForMajority = 3
+
+	if (diskful == 2 && diskless >= 1) || diskful >= minDiskfulForMajority {
+		return "majority"
 	}
 
+	return "off"
+}
+
+// createWitness picks a healthy non-replica node and creates a
+// DISKLESS+TIE_BREAKER Resource on it.
+func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) error {
 	hostingReplica := map[string]bool{}
-	for _, repl := range replicas {
+	for _, repl := range existing {
 		hostingReplica[repl.NodeName] = true
 	}
 
@@ -154,9 +212,8 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	}
 
 	if tiebreakerNode == "" {
-		// No suitable node. The cluster is too small for a
-		// tiebreaker; leave the RD as-is and the next reconcile
-		// retries when nodes change.
+		// No spare healthy node; the witness can't be created
+		// today. Quorum will fall back to off below.
 		return nil
 	}
 
@@ -174,20 +231,38 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	return nil
 }
 
-// splitByTieBreaker partitions replicas into (non-witness, witness).
-// Witnesses are diskless replicas flagged TIE_BREAKER.
-func splitByTieBreaker(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resource) {
-	var nonWitness, witness []apiv1.Resource
+// filterTieBreaker returns the subset of diskless replicas that
+// carry the TIE_BREAKER flag.
+func filterTieBreaker(diskless []apiv1.Resource) []apiv1.Resource {
+	out := make([]apiv1.Resource, 0, len(diskless))
 
-	for i := range replicas {
-		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagTieBreaker) {
-			witness = append(witness, replicas[i])
-		} else {
-			nonWitness = append(nonWitness, replicas[i])
+	for i := range diskless {
+		if slices.Contains(diskless[i].Flags, apiv1.ResourceFlagTieBreaker) {
+			out = append(out, diskless[i])
 		}
 	}
 
-	return nonWitness, witness
+	return out
+}
+
+// setQuorum stamps DrbdOptions/Resource/quorum on the RD's prop bag.
+// Idempotent: returns early if the value is already what we want.
+// The satellite picks up the change on next dispatch and re-renders
+// the .res file with the new quorum policy.
+func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
+	const propKey = "DrbdOptions/Resource/quorum"
+
+	if rd.Spec.Props != nil && rd.Spec.Props[propKey] == value {
+		return nil
+	}
+
+	if rd.Spec.Props == nil {
+		rd.Spec.Props = map[string]string{}
+	}
+
+	rd.Spec.Props[propKey] = value
+
+	return r.Update(ctx, rd)
 }
 
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.
