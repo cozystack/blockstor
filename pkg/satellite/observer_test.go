@@ -145,12 +145,56 @@ func TestObserverDropsEventsWithoutResource(t *testing.T) {
 				"disk": "UpToDate",
 			},
 		},
+		// Same defensive drop must apply to resource-kind events
+		// too — pins translateResource's name-empty branch.
+		{
+			Action: "change",
+			Kind:   "resource",
+			Fields: map[string]string{
+				"role": "Primary",
+			},
+		},
 	}
 
 	out := collectObservations(obs, events)
 
 	if len(out) != 0 {
-		t.Errorf("expected no observations; got %v", out)
+		t.Errorf("expected no observations from name-less events; got %v", out)
+	}
+}
+
+// TestObserverResourceSecondaryEmitsInUseFalse: when a satellite
+// demotes from Primary to Secondary, the events2 stream emits
+// `role:Secondary` and the observer must reflect that as
+// State.InUse=false. Pins the symmetric path of the auto-failover
+// hook — without this the controller would never see "PVC unmounted"
+// and the auto-diskful evictor wouldn't get the demotion signal.
+func TestObserverResourceSecondaryEmitsInUseFalse(t *testing.T) {
+	obs := satellite.NewObserver("n1")
+
+	events := []drbd.Event{
+		{
+			Action: "change",
+			Kind:   "resource",
+			Fields: map[string]string{
+				"name": "pvc-demoted",
+				"role": "Secondary",
+			},
+		},
+	}
+
+	out := collectObservations(obs, events)
+
+	if len(out) != 1 {
+		t.Fatalf("observations: got %d, want 1", len(out))
+	}
+
+	if out[0].InUse {
+		t.Errorf("InUse: got true on role:Secondary; want false")
+	}
+
+	if out[0].ResourceName != "pvc-demoted" {
+		t.Errorf("ResourceName: got %q, want pvc-demoted", out[0].ResourceName)
 	}
 }
 
