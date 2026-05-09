@@ -1160,6 +1160,44 @@ func RunStoragePoolStore(t *testing.T, newStore Factory) {
 	// refresh provider_kind / props without losing capacity fields.
 	t.Run("UpdateMissing", func(t *testing.T) { testSPUpdateMissing(t, newStore) })
 	t.Run("UpdateChangesProps", func(t *testing.T) { testSPUpdateChangesProps(t, newStore) })
+	// SharedSpaceID round-trip: pools physically backed by the same
+	// LUN (SAN attached, EXOS) carry a non-empty SharedSpaceID. The
+	// placer's pkg/placer.tryPlace rejects any candidate whose
+	// SharedSpaceID matches an already-placed replica's pool — a
+	// 2-replica RD must never land on two pools that share storage.
+	// Without round-trip pin a regression dropping the field on
+	// crdToWireStoragePool would silently disable shared-LUN anti-
+	// affinity, making split-brain on a single-disk failure possible.
+	t.Run("SharedSpaceIDRoundTrip", func(t *testing.T) {
+		testSPSharedSpaceIDRoundTrip(t, newStore)
+	})
+}
+
+func testSPSharedSpaceIDRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t).StoragePools()
+	ctx := t.Context()
+
+	// Use LVM_THIN (in the CRD enum) with a SharedSpaceID set —
+	// the unit test cares about the field round-trip, not the
+	// provider class. SAN-attached LVM-thin (DRBD's external
+	// metadata over a shared SAN volume) is a real combination.
+	if err := s.Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "san-thin",
+		NodeName:        "n1",
+		ProviderKind:    "LVM_THIN",
+		SharedSpaceID:   "san-rack-1-controller-a",
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(ctx, "n1", "san-thin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SharedSpaceID != "san-rack-1-controller-a" {
+		t.Errorf("SharedSpaceID lost: got %q", got.SharedSpaceID)
+	}
 }
 
 func testSPUpdateMissing(t *testing.T, newStore Factory) {
