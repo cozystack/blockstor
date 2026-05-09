@@ -43,7 +43,14 @@ create_zfs() {
         if zpool list blockstor-zfs >/dev/null 2>&1; then
             echo 'zpool blockstor-zfs already exists'
         else
-            zpool create -f blockstor-zfs ${ZFS_DEV}
+            # zpool create auto-creates partitions on the disk; if a
+            # previous attempt died mid-create we get sda1+sda9 left
+            # over and the next try fails on 'cannot label sda'.
+            # Wipe + sgdisk --zap-all to reset.
+            wipefs -af ${ZFS_DEV} 2>&1 || true
+            sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
+            partprobe ${ZFS_DEV} 2>&1 || true
+            zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}
             echo 'zpool blockstor-zfs created'
         fi
     "
@@ -62,7 +69,7 @@ create_lvm() {
             # Skip both wipesignatures and zeroing — fresh VG, no
             # stale fs to worry about, and the pre-Phase-9 image's
             # lvm2 chokes on the default wipe step.
-            lvcreate -y --wipesignatures n -Wn -Zn -T -L 14G blockstor-lvm/thin
+            lvcreate -y -Wn -Zn -T -L 14G blockstor-lvm/thin
             echo 'lv blockstor-lvm/thin created'
         fi
     "
