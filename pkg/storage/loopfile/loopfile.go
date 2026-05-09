@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/cockroachdb/errors"
 
@@ -180,17 +181,39 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 }
 
 // PoolStatus reports total/free for the underlying directory's
-// filesystem. We reuse the same statfs path the file backend uses; if
-// callers need finer-grained accounting they should be on LVM/ZFS.
-func (*Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
-	// Intentionally minimal — the loopfile pool is for the dev stand
-	// where capacity tracking isn't load-bearing. Phase 6 wires
-	// statfs(2) here once a use case shows up.
+// filesystem via statfs(2). Without this the linstor-scheduler
+// extender (and our own placer) thinks every node has 0 free space
+// and refuses to schedule any consumer Pod.
+func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
+	free, total, err := statfsBytes(p.cfg.Dir)
+	if err != nil {
+		return storage.PoolStatus{}, errors.Wrapf(err, "statfs %s", p.cfg.Dir)
+	}
+
 	return storage.PoolStatus{
-		FreeCapacityKib:   0,
-		TotalCapacityKib:  0,
+		FreeCapacityKib:   free / bytesPerKib,
+		TotalCapacityKib:  total / bytesPerKib,
 		SupportsSnapshots: false,
 	}, nil
+}
+
+// statfsBytes returns (free, total) bytes on the filesystem holding
+// path. Same statfs(2) approach as the file backend; duplicated here
+// instead of factored into a helper because the providers are
+// otherwise free-standing and we'd rather avoid a circular-dep
+// inducing helper package.
+func statfsBytes(path string) (int64, int64, error) {
+	var stat syscall.Statfs_t
+
+	err := syscall.Statfs(path, &stat)
+	if err != nil {
+		return 0, 0, errors.Wrapf(err, "statfs %s", path)
+	}
+
+	bsize := int64(stat.Bsize)
+
+	//nolint:gosec // statfs block counts don't overflow int64 on real FS
+	return int64(stat.Bavail) * bsize, int64(stat.Blocks) * bsize, nil
 }
 
 // CreateSnapshot returns "not supported"; route via LVM-thin / ZFS.

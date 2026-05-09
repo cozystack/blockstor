@@ -223,3 +223,28 @@ func TestSnapshotsUnsupported(t *testing.T) {
 		t.Errorf("DeleteSnapshot: expected error")
 	}
 }
+
+// TestPoolStatusReportsCapacity: PoolStatus must return non-zero
+// total/free for an existing tmpdir, so the linstor-scheduler-extender
+// "node has free space" check passes. Regression for stand-side
+// 0-free reporting that blocked all PVC scheduling.
+func TestPoolStatusReportsCapacity(t *testing.T) {
+	p := loopfile.NewProvider(loopfile.Config{Dir: t.TempDir()}, storage.NewFakeExec())
+
+	got, err := p.PoolStatus(t.Context())
+	if err != nil {
+		t.Fatalf("PoolStatus: %v", err)
+	}
+
+	if got.TotalCapacityKib == 0 {
+		t.Errorf("TotalCapacityKib zero — statfs(2) didn't fire")
+	}
+
+	if got.FreeCapacityKib == 0 {
+		t.Errorf("FreeCapacityKib zero")
+	}
+
+	if got.FreeCapacityKib > got.TotalCapacityKib {
+		t.Errorf("free %d > total %d", got.FreeCapacityKib, got.TotalCapacityKib)
+	}
+}
