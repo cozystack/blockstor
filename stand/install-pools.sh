@@ -83,11 +83,12 @@ create_lvm() {
             # vgmknodes forces them; --zero/--wipesignatures n suppress
             # the optional clear step. dd-clear the underlying disk
             # area where the metadata LV lands, just in case.
-            lvcreate -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
-            lvcreate -y -Wn -Zn -L 13G blockstor-lvm -n thin
+            lvcreate -y -Wn -Zn --noudevsync -L 1G blockstor-lvm -n thin_meta
+            lvcreate -y -Wn -Zn --noudevsync -L 13G blockstor-lvm -n thin
             vgmknodes
             dd if=/dev/zero of=/dev/blockstor-lvm/thin_meta bs=1M count=10 conv=notrunc 2>&1 || true
-            lvconvert -y -Wn -Zn --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
+            dd if=/dev/zero of=/dev/blockstor-lvm/thin bs=1M count=10 conv=notrunc 2>&1 || true
+            lvconvert -y -Wn -Zn --noudevsync --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
             echo 'lv blockstor-lvm/thin created'
         fi
     "
