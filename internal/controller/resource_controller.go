@@ -23,9 +23,12 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -624,9 +627,47 @@ func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *b
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// We Watch ResourceDefinitions too — every replica's dispatch reads
+// the parent RD's VolumeDefinitions for the satellite render, so an
+// RD-side change (volume size, prop bag, encryption passphrase) must
+// re-fire every replica's reconcile. Without this watch, `linstor
+// volume-definition modify --size` updates Spec.VolumeDefinitions but
+// the satellite never gets the new size.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{}).
+		Watches(&blockstoriov1alpha1.ResourceDefinition{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Named("resource").
 		Complete(r)
+}
+
+// enqueueResourcesForRD maps an RD event to every Resource that
+// references it via Spec.ResourceDefinitionName.
+func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj client.Object) []reconcile.Request {
+	rd, ok := obj.(*blockstoriov1alpha1.ResourceDefinition)
+	if !ok {
+		return nil
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	if err := r.List(ctx, &resList); err != nil {
+		return nil
+	}
+
+	out := make([]reconcile.Request, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+			continue
+		}
+
+		out = append(out, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: resList.Items[i].Name},
+		})
+	}
+
+	return out
 }
