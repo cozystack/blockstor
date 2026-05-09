@@ -490,6 +490,17 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want ErrNotFound", err)
 		}
 	})
+	// Pin the missing-snapshot sentinel so the dispatcher's per-replica
+	// CreateSnapshot fan-out + the Snapshot CRD reconciler's cleanup
+	// paths get a consistent ErrNotFound rather than a generic
+	// transport error to interpret.
+	t.Run("DeleteMissing", func(t *testing.T) {
+		s := newStore(t).Snapshots()
+		err := s.Delete(t.Context(), "pvc-ghost", "s-ghost")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Delete missing: got %v, want ErrNotFound", err)
+		}
+	})
 	t.Run("UpdateMissing", func(t *testing.T) {
 		err := newStore(t).Snapshots().Update(t.Context(),
 			&apiv1.Snapshot{Name: "ghost", ResourceName: "pvc-1"})
