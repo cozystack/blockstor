@@ -70,3 +70,10 @@ func (r *ResourceReconciler) ResolveEffectiveProps(ctx context.Context, target *
 func (r *ResourceReconciler) FirstAvailablePool(ctx context.Context, nodeName string) (string, error) {
 	return r.firstAvailablePool(ctx, nodeName)
 }
+
+// IsAutoTieBreakerEnabled exposes the prop-driven default for the
+// auto-quorum-tiebreaker logic. The default is on; an explicit
+// "false" override (case-insensitive) is the only way to disable it.
+func IsAutoTieBreakerEnabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return isAutoTieBreakerEnabled(rd)
+}
