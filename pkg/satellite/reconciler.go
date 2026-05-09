@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/luks"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -69,6 +70,12 @@ type ReconcilerConfig struct {
 	// inject FakeExec to assert the command line without spinning up
 	// a real ssh / zfs / thin tool.
 	ShipExec storage.Exec
+
+	// Cryptsetup is the LUKS-layer wrapper. nil → LUKS in the layer
+	// stack is rejected (the satellite can't fulfil it). Production
+	// wires luks.NewCryptsetup(storage.RealExec{}); tests inject
+	// FakeExec.
+	Cryptsetup *luks.Cryptsetup
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -272,6 +279,14 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 		resized = didResize
 	}
 
+	devices, err := r.maybeLUKS(ctx, dr, diskless, devices)
+	if err != nil {
+		res.Ok = false
+		res.Message = err.Error()
+
+		return res
+	}
+
 	// Skip DRBD when the layer_stack explicitly omits it. Empty
 	// layer_stack defaults to ["DRBD","STORAGE"] so legacy clients
 	// (and pre-Phase-9 dispatchers) keep getting full DRBD treatment.
@@ -286,6 +301,84 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	}
 
 	return res
+}
+
+// maybeLUKS conditionally layers cryptsetup over the raw storage
+// devices when the layer stack names "LUKS". Returns the (possibly
+// rewritten) volume → device map for the next layer. Skips entirely
+// for diskless replicas — they never open the underlying disk.
+func (r *Reconciler) maybeLUKS(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string) (map[int32]string, error) {
+	if diskless || !needsLUKS(dr.GetLayerStack()) {
+		return devices, nil
+	}
+
+	return r.applyLUKS(ctx, dr, devices)
+}
+
+// needsLUKS reports whether the satellite should layer cryptsetup
+// over the storage device for this resource. Empty stack defaults to
+// the no-LUKS legacy behaviour; LUKS only runs when explicitly named.
+func needsLUKS(stack []string) bool {
+	for _, s := range stack {
+		if strings.EqualFold(s, "LUKS") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// applyLUKS formats (first activation only) and opens every volume's
+// raw device under /dev/mapper/<rd>-<volnum>, returning the new
+// volNumber→DevicePath map for downstream layers (DRBD or direct
+// consumer).
+//
+// Passphrase source for this slice: dr.Props["LuksPassphrase"]. The
+// controller folds it in from the RD's `DrbdOptions/Encryption/passphrase`
+// prop via the resolver. Empty passphrase fails the apply — explicit
+// rather than silently creating an unencrypted volume.
+func (r *Reconciler) applyLUKS(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string) (map[int32]string, error) {
+	if r.cfg.Cryptsetup == nil {
+		return nil, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
+	}
+
+	pass := dr.GetProps()["LuksPassphrase"]
+	if pass == "" {
+		return nil, errors.New("LUKS in layer stack but Props.LuksPassphrase empty")
+	}
+
+	out := make(map[int32]string, len(devices))
+	key := []byte(pass)
+
+	for vol, dev := range devices {
+		dmName := luksMapperName(dr.GetName(), vol)
+
+		err := r.cfg.Cryptsetup.Format(ctx, dev, key)
+		if err != nil {
+			return nil, errors.Wrapf(err, "luks format %s", dev)
+		}
+
+		err = r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
+		if err != nil {
+			// EEXIST is expected on every reconcile after the first —
+			// the device is already opened. Best-effort string check
+			// because cryptsetup doesn't return a structured error.
+			if !strings.Contains(err.Error(), "already exists") {
+				return nil, errors.Wrapf(err, "luks open %s -> %s", dev, dmName)
+			}
+		}
+
+		out[vol] = luks.DevicePath(dmName)
+	}
+
+	return out, nil
+}
+
+// luksMapperName picks the dm-crypt name for an (rd, vol) pair. The
+// satellite needs a stable identifier across reconciles so a re-Open
+// after restart re-uses the existing mapping when present.
+func luksMapperName(rdName string, vol int32) string {
+	return fmt.Sprintf("%s-%d-luks", rdName, vol)
 }
 
 // needsDRBD reports whether the satellite should render a .res and

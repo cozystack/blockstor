@@ -235,6 +235,18 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
+	// LUKS passphrase: lift `DrbdOptions/Encryption/passphrase` from
+	// the resolved options bag onto a stable `LuksPassphrase` prop the
+	// satellite's LUKS layer reads. Match upstream LINSTOR's prop
+	// name for compatibility with `linstor rd set-property`.
+	if pass := drbdOpts[drbdEncryptionPassphraseKey]; pass != "" {
+		if wireProps == nil {
+			wireProps = map[string]string{}
+		}
+
+		wireProps["LuksPassphrase"] = pass
+	}
+
 	var layerStack []string
 	if rd != nil {
 		layerStack = rd.Spec.LayerStack
@@ -251,6 +263,12 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		LayerStack:  layerStack,
 	}
 }
+
+// drbdEncryptionPassphraseKey is the upstream LINSTOR prop key
+// operators set with `linstor rd set-property <rd> Encryption/passphrase`.
+//
+//nolint:gosec // not a credential value, the string is a prop key name
+const drbdEncryptionPassphraseKey = "DrbdOptions/Encryption/passphrase"
 
 // mergeEffectiveProps splits the resolver's output into:
 //   - DRBD options (DrbdOptions/...) → folded into drbdOpts so the

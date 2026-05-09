@@ -17,6 +17,7 @@ limitations under the License.
 package satellite_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,11 +25,14 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
+
+var errNotALUKSDevice = errors.New("not a luks device")
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
 // (here under StateDir) reflecting the DesiredResource. The reconciler
@@ -430,5 +434,111 @@ func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
 		if strings.HasPrefix(line, "drbdadm ") || strings.HasPrefix(line, "drbdsetup ") {
 			t.Errorf("DRBD command issued despite LayerStack=[STORAGE]: %s", line)
 		}
+	}
+}
+
+// TestApplyLayersLUKS: a Resource with LayerStack=["LUKS","STORAGE"]
+// must run cryptsetup luksFormat (first activation) + luksOpen, then
+// hand the /dev/mapper/<rd>-<vol>-luks path to the DRBD layer (when
+// DRBD is also in the stack — here we omit it to isolate the LUKS
+// path). Pins the Phase 9 LUKS plumbing.
+func TestApplyLayersLUKS(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// VolumeStatus query → reports the LV at a known path so the LUKS
+	// layer has a non-empty device to format/open.
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks_00000|1048576\n")})
+	// cryptsetup isLuks fails on a fresh device → format runs.
+	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks_00000",
+		storage.FakeResponse{Err: errNotALUKSDevice})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-luks",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	saw := func(needle string) bool {
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, needle) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if !saw("luksFormat") {
+		t.Errorf("expected cryptsetup luksFormat call; got %v", fx.CommandLines())
+	}
+
+	if !saw("luksOpen") {
+		t.Errorf("expected cryptsetup luksOpen call; got %v", fx.CommandLines())
+	}
+}
+
+// TestApplyLUKSFailsWithoutPassphrase: explicit LUKS in stack but no
+// passphrase prop → apply fails fast rather than silently producing
+// an unencrypted volume.
+func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-empty_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-luks-empty",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"LUKS", "STORAGE"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("expected LUKS-without-passphrase to fail")
+	}
+
+	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "passphrase") {
+		t.Errorf("error message should mention passphrase; got %q", results[0].GetMessage())
 	}
 }

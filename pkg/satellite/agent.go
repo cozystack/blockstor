@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/luks"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/version"
@@ -169,6 +170,7 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 	rec := NewReconciler(ReconcilerConfig{
 		Providers:    a.cfg.Providers,
 		Adm:          drbd.NewAdm(storage.RealExec{}),
+		Cryptsetup:   luks.NewCryptsetup(storage.RealExec{}),
 		StateDir:     a.cfg.StateDir,
 		NodeName:     a.cfg.NodeName,
 		LocalAddress: hostFromEndpoint(a.cfg.AdvertisedEndpoint),
