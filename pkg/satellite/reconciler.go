@@ -177,12 +177,17 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.Delete
 // land in the response body so the controller can surface granular
 // status without aborting the rest of the cleanup.
 func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.DeleteResourceRequest) (*satellitepb.DeleteResourceResponse, error) {
+	var downMsg string
+
 	if r.cfg.Adm != nil {
 		err := r.cfg.Adm.Down(ctx, req.GetName())
 		if err != nil {
-			// Best-effort: a "not configured" error is fine, anything
-			// else is logged via the response message.
-			_ = err
+			// Best-effort: a "not configured" error is fine here
+			// (resource was already torn down on a prior pass), but we
+			// still want to surface the message back to the controller
+			// so it shows up in the gRPC response. Don't fail — DRBD
+			// down errors shouldn't block the storage cleanup.
+			downMsg = "drbdadm down: " + err.Error()
 		}
 	}
 
@@ -229,7 +234,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 
 	r.forgetPool(req.GetName())
 
-	return &satellitepb.DeleteResourceResponse{Ok: true}, nil
+	return &satellitepb.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
 
 // forgetPool drops the resource from the resource→pool map so a

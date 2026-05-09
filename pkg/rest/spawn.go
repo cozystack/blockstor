@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -153,8 +154,7 @@ func rollbackSpawn(ctx context.Context, st store.Store, rdName string) {
 
 	err := st.ResourceDefinitions().Delete(deleteCtx, rdName)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		// Logging would normally go here once we wire a logger through;
-		// for now intentional silence.
-		_ = err
+		log.FromContext(ctx).WithName("rest").
+			Error(err, "rollback spawn: delete RD", "rd", rdName)
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
@@ -110,10 +111,11 @@ func (s *Server) Hello(ctx context.Context, req *satellitepb.HelloRequest) (*sat
 	// so /v1/view/storage-pools shows it. Idempotent — Update wins
 	// on second-and-subsequent Hellos. Errors don't fail the Hello;
 	// we log and move on (the next Hello will redrive).
+	logger := log.FromContext(ctx).WithName("satellite-grpc")
 	for _, p := range req.GetPools() {
 		err := s.upsertPool(ctx, req.GetNodeName(), p)
 		if err != nil {
-			_ = err
+			logger.Error(err, "upsert StoragePool", "node", req.GetNodeName(), "pool", p.GetName())
 		}
 	}
 
@@ -147,7 +149,8 @@ func (s *Server) ReportObserved(stream satellitepb.Controller_ReportObservedServ
 		if applyErr != nil {
 			// Log-and-skip — better than tearing the stream down on
 			// a single mis-formed event.
-			_ = applyErr
+			log.FromContext(stream.Context()).WithName("satellite-grpc").
+				Error(applyErr, "apply observed event", "resource", ev.GetResourceName())
 		}
 
 		count++
@@ -166,13 +169,14 @@ func (s *Server) ReportPoolCapacity(ctx context.Context, req *satellitepb.Report
 		return nil, status.Error(codes.InvalidArgument, "node_name is required")
 	}
 
-	for _, pc := range req.GetPools() {
+	logger := log.FromContext(ctx).WithName("satellite-grpc")
+	for _, capacity := range req.GetPools() {
 		err := s.st.StoragePools().SetCapacity(ctx,
-			req.GetNodeName(), pc.GetPoolName(),
-			pc.GetFreeCapacityKib(), pc.GetTotalCapacityKib(),
-			pc.GetSupportsSnapshots())
+			req.GetNodeName(), capacity.GetPoolName(),
+			capacity.GetFreeCapacityKib(), capacity.GetTotalCapacityKib(),
+			capacity.GetSupportsSnapshots())
 		if err != nil {
-			_ = err
+			logger.Error(err, "SetCapacity", "node", req.GetNodeName(), "pool", capacity.GetPoolName())
 		}
 	}
 
