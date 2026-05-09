@@ -961,6 +961,22 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 	// the response order as its pagination cursor. Without sort,
 	// successive paging tokens would skip / duplicate RDs.
 	t.Run("ListSorted", func(t *testing.T) { testRDListSorted(t, newStore) })
+	// Defensive nil-pointer guard. Both stores reject nil arguments on
+	// Create/Update with a non-nil error rather than panicking — pin
+	// the contract so a future caller that forgets to check can't
+	// crash the controller process.
+	t.Run("CreateNilArg", func(t *testing.T) {
+		err := newStore(t).ResourceDefinitions().Create(t.Context(), nil)
+		if err == nil {
+			t.Errorf("Create(nil): want error, got nil")
+		}
+	})
+	t.Run("UpdateNilArg", func(t *testing.T) {
+		err := newStore(t).ResourceDefinitions().Update(t.Context(), nil)
+		if err == nil {
+			t.Errorf("Update(nil): want error, got nil")
+		}
+	})
 	t.Run("UpdateChangesProps", func(t *testing.T) {
 		s := newStore(t).ResourceDefinitions()
 		ctx := t.Context()
