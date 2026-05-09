@@ -43,12 +43,17 @@ create_zfs() {
         if zpool list blockstor-zfs >/dev/null 2>&1; then
             echo 'zpool blockstor-zfs already exists'
         else
-            # zpool create auto-creates partitions on the disk; if a
-            # previous attempt died mid-create we get sda1+sda9 left
-            # over and the next try fails on 'cannot label sda'.
-            # Wipe + sgdisk --zap-all to reset.
+            # Clean any leftover partition table from a previous
+            # half-failed zpool create. Drop kernel partitions, zap
+            # GPT, dd-clear the first/last MB so wipefs/zpool see a
+            # blank slate.
+            for p in \$(ls ${ZFS_DEV}? 2>/dev/null); do
+                wipefs -af \$p 2>&1 || true
+            done
             wipefs -af ${ZFS_DEV} 2>&1 || true
             sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
+            dd if=/dev/zero of=${ZFS_DEV} bs=1M count=10 conv=notrunc 2>&1 || true
+            partx -d ${ZFS_DEV} 2>&1 || true
             partprobe ${ZFS_DEV} 2>&1 || true
             zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}
             echo 'zpool blockstor-zfs created'
@@ -59,16 +64,17 @@ create_zfs() {
 create_lvm() {
     local pod=$1
     kubectl -n "$NS" exec "$pod" -- bash -c "
+        set -e
         if ! vgs blockstor-lvm >/dev/null 2>&1; then
-            wipefs -a ${LVM_DEV}
+            wipefs -af ${LVM_DEV}
             vgcreate -y blockstor-lvm ${LVM_DEV}
         fi
         if lvs blockstor-lvm/thin >/dev/null 2>&1; then
             echo 'lv blockstor-lvm/thin already exists'
         else
-            # Skip both wipesignatures and zeroing — fresh VG, no
-            # stale fs to worry about, and the pre-Phase-9 image's
-            # lvm2 chokes on the default wipe step.
+            # Skip wipesignatures + zeroing — fresh VG, no stale fs,
+            # and the lvm2 build in this image chokes on the default
+            # wipe step ('device not cleared') for thin LVs.
             lvcreate -y -Wn -Zn -T -L 14G blockstor-lvm/thin
             echo 'lv blockstor-lvm/thin created'
         fi
