@@ -70,11 +70,46 @@ func (o *Observer) Translate(in <-chan drbd.Event) <-chan *Observation {
 
 // translate is the core mapping. Returns ok=false for events we
 // shouldn't surface (wrong kind, missing resource name, etc.).
+//
+// Two event kinds matter to the controller:
+//   - resource: role changes (Primary/Secondary). Drives InUse, which
+//     is what the auto-diskful path keys off of.
+//   - device:   per-volume disk-state changes (UpToDate, Diskless,
+//     Failed, …). Drives DrbdState + per-volume DiskState.
+//
+// Other kinds (connection, peer-device, helper) are ignored for now.
 func (o *Observer) translate(ev drbd.Event) (*Observation, bool) {
-	if ev.Kind != "device" {
+	switch ev.Kind {
+	case "resource":
+		return o.translateResource(ev)
+	case "device":
+		return o.translateDevice(ev)
+	}
+
+	return nil, false
+}
+
+// translateResource emits an observation when a resource's role
+// changes. Sets InUse true on Primary so the controller's
+// auto-diskful path runs.
+func (o *Observer) translateResource(ev drbd.Event) (*Observation, bool) {
+	name := ev.Fields["name"]
+	if name == "" {
 		return nil, false
 	}
 
+	role := ev.Fields["role"]
+
+	return &Observation{
+		ResourceName:  name,
+		NodeName:      o.nodeName,
+		InUse:         role == "Primary",
+		TimestampUnix: o.now().Unix(),
+	}, true
+}
+
+// translateDevice emits per-volume disk-state observations.
+func (o *Observer) translateDevice(ev drbd.Event) (*Observation, bool) {
 	name := ev.Fields["name"]
 	if name == "" {
 		return nil, false

@@ -59,6 +59,51 @@ func TestObserverDeviceEventEmitsState(t *testing.T) {
 	}
 }
 
+// TestObserverResourceRoleEmitsInUse: a `change resource role:Primary`
+// event surfaces a ResourceObservedEvent with InUse=true. This is what
+// drives the controller's auto-diskful path — without it, a manually
+// promoted DISKLESS replica never gets reclassified as actively used.
+func TestObserverResourceRoleEmitsInUse(t *testing.T) {
+	obs := satellite.NewObserver("n1")
+
+	events := []drbd.Event{
+		{
+			Action: "change",
+			Kind:   "resource",
+			Fields: map[string]string{
+				"name": "pvc-promoted",
+				"role": "Primary",
+			},
+		},
+		{
+			Action: "change",
+			Kind:   "resource",
+			Fields: map[string]string{
+				"name": "pvc-promoted",
+				"role": "Secondary",
+			},
+		},
+	}
+
+	out := collectObservations(obs, events)
+
+	if len(out) != 2 {
+		t.Fatalf("len(out): got %d, want 2", len(out))
+	}
+
+	if !out[0].GetInUse() {
+		t.Errorf("Primary event should produce InUse=true; got %+v", out[0])
+	}
+
+	if out[1].GetInUse() {
+		t.Errorf("Secondary event should produce InUse=false; got %+v", out[1])
+	}
+
+	if got := out[0].GetResourceName(); got != "pvc-promoted" {
+		t.Errorf("ResourceName: got %q", got)
+	}
+}
+
 // TestObserverIgnoresUnrelatedKinds: connection / peer-device kinds
 // don't carry per-resource disk state, so they don't drive observations.
 func TestObserverIgnoresUnrelatedKinds(t *testing.T) {
