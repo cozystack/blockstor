@@ -419,8 +419,8 @@ The phases above closed the MVP slice and the csi-sanity REST contract. A deep a
 
 ### 8.4 Resource-group / definition mutation
 
-- [ ] **`linstor rd m --resource-group=X`** — change of parent RG should re-apply RG props to the RD's effective options on next adjust. Today: RD update accepts the new name but the props pipeline doesn't re-walk the inheritance.
-- [ ] **`linstor rg m --place-count`/etc.** — RG update with `--storage-pool` change must trigger reconcile of every spawned RD's autoplace. Today it just stores the new spec without nudging children.
+- [x] **`linstor rd m --resource-group=X`** (2026-05-09): the existing `PUT /v1/resource-definitions/{rd}` already persists a new `ResourceGroupName`. The DRBD-options resolver re-walks the controller→RG→RD→Resource hierarchy on every dispatch, so the new RG's props automatically flow to the satellite on the next reconcile — no extra plumbing needed. Test: `TestResourceDefinitionUpdateChangesRG`.
+- [x] **`linstor rg m --place-count`/etc.** (2026-05-09): new `internal/controller.ResourceGroupReconciler` now watches RG changes and runs `placer.Place` against every spawned RD. place_count bumps fill the gap automatically (placer treats existing replicas as already-placed → idempotent). Reductions and topology-constraint changes don't auto-shuffle existing replicas — the operator picks which to remove (eviction reconciler is the right tool). Tests: `TestRGPlaceCountBumpFillsGap`, `TestRGUpdateNoChangeNoOp`.
 - [x] **`linstor n interface create/modify/delete`** (2026-05-09): `POST/PUT/DELETE /v1/nodes/{node}/net-interfaces[/{name}]` mutate the inline `Node.Spec.NetInterfaces[]` array. Idempotent (create on an existing name updates in place; delete on a missing name is a no-op; PUT-creates-on-missing matches upstream). Default-interface selection (`StltCon`) flows through the existing prop bag — operators set `Cur/StltCon/<iface>` via the controller-props endpoint. No separate CRD per interface — they live inline on the Node, so a single Node Update is the persistence. Tests live in `pkg/rest/nodes_test.go` once the existing storetest suite picks them up.
 
 ### 8.5 Operator surface

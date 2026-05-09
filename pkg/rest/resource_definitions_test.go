@@ -146,3 +146,50 @@ func TestResourceDefinitionsWithoutStore(t *testing.T) {
 		t.Errorf("status: got %d, want 503", resp.StatusCode)
 	}
 }
+
+// TestResourceDefinitionUpdateChangesRG: PUT /v1/resource-definitions/{rd}
+// with a new resource_group_name persists the change. Subsequent
+// reads return the new parent. Ensures `linstor rd m --resource-group=X`
+// works mechanically — the DRBD-options resolver picks up the new
+// RG's props on the next satellite reconcile via the option hierarchy.
+func TestResourceDefinitionUpdateChangesRG(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, rg := range []string{"rg-old", "rg-new"} {
+		if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: rg}); err != nil {
+			t.Fatalf("seed RG %s: %v", rg, err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-1",
+		ResourceGroupName: "rg-old",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceDefinition{
+		Name:              "pvc-1",
+		ResourceGroupName: "rg-new",
+	})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.ResourceGroupName != "rg-new" {
+		t.Errorf("RG: got %q, want rg-new", got.ResourceGroupName)
+	}
+}

@@ -229,6 +229,7 @@ func main() {
 	if err := (&controller.ResourceGroupReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Store:  st,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcegroup")
 		os.Exit(1)
