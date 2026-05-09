@@ -248,3 +248,143 @@ func TestPoolStatusReportsCapacity(t *testing.T) {
 		t.Errorf("free %d > total %d", got.FreeCapacityKib, got.TotalCapacityKib)
 	}
 }
+
+// TestResizeVolumeGrowsAndRefreshesLoop: bump SizeKib → truncate the
+// backing file then `losetup -c <dev>` so the kernel re-reads the new
+// size. Both commands must fire — a missing losetup -c leaves the
+// loop device pointing at the old size and CSI ControllerExpandVolume
+// would silently fail to grow the consumer's view.
+func TestResizeVolumeGrowsAndRefreshesLoop(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	path := filepath.Join(dir, "pvc-1_00000.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	if err := f.Truncate(1024 * 1024 * 1024); err != nil {
+		t.Fatalf("seed truncate: %v", err)
+	}
+	_ = f.Close()
+
+	// Pretend the loop is already attached so the resize path emits losetup -c.
+	fx.Expect("losetup -j "+path, storage.FakeResponse{
+		Stdout: []byte("/dev/loop7: [0801]:12345 (" + path + ")\n"),
+	})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err = p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      2 * 1024 * 1024, // 2 GiB
+	})
+	if err != nil {
+		t.Fatalf("ResizeVolume: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+	wantTrunc := "truncate -s 2147483648 " + path
+	wantLosetupRefresh := "losetup -c /dev/loop7"
+
+	if !slices.Contains(cmds, wantTrunc) {
+		t.Errorf("missing %q; got %v", wantTrunc, cmds)
+	}
+
+	if !slices.Contains(cmds, wantLosetupRefresh) {
+		t.Errorf("missing %q (loop must re-read size after truncate); got %v",
+			wantLosetupRefresh, cmds)
+	}
+}
+
+// TestResizeVolumeNoLoopAttached: the file exists but no loop device
+// is currently attached (e.g. satellite restarted between
+// CreateVolume and a re-Apply). truncate must fire; losetup -c must
+// not (no device to refresh).
+func TestResizeVolumeNoLoopAttached(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	path := filepath.Join(dir, "pvc-1_00000.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	if err := f.Truncate(1024 * 1024 * 1024); err != nil {
+		t.Fatalf("seed truncate: %v", err)
+	}
+	_ = f.Close()
+
+	// Empty losetup -j output → no loop attached.
+	fx.Expect("losetup -j "+path, storage.FakeResponse{Stdout: []byte("")})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err = p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      2 * 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("ResizeVolume: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "losetup -c ") {
+			t.Errorf("losetup -c must not fire when no loop attached: %s", line)
+		}
+	}
+}
+
+// TestResizeVolumeMissingFile: caller bug — surface ErrNotFound
+// rather than silently re-creating.
+func TestResizeVolumeMissingFile(t *testing.T) {
+	dir := t.TempDir()
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, storage.NewFakeExec())
+
+	err := p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+	})
+	if err == nil {
+		t.Errorf("expected error on missing file")
+	}
+}
+
+// TestResizeVolumeShrinkNoOp: smaller-than-current size must not
+// emit truncate (would corrupt the FS sitting on top of the loop
+// device).
+func TestResizeVolumeShrinkNoOp(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	path := filepath.Join(dir, "pvc-1_00000.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	if err := f.Truncate(2 * 1024 * 1024 * 1024); err != nil {
+		t.Fatalf("seed truncate: %v", err)
+	}
+	_ = f.Close()
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err = p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024, // smaller than 2 GiB
+	})
+	if err != nil {
+		t.Fatalf("ResizeVolume shrink: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "truncate ") {
+			t.Errorf("shrink must not emit truncate; got %s", line)
+		}
+	}
+}
