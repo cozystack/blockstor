@@ -232,6 +232,39 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("Update missing: got %v, want ErrNotFound", err)
 		}
 	})
+	// ListSorted: per-RD VolumeDefinitions must be ordered by
+	// VolumeNumber. The satellite reconciler's per-volume Apply walks
+	// this list assuming volume 0 comes before volume 1 — without
+	// the sort, multi-volume RDs would race on minor allocation.
+	t.Run("ListSorted", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-multi")
+		ctx := t.Context()
+
+		// Insert out of order.
+		for _, vol := range []int32{2, 0, 1} {
+			if err := s.VolumeDefinitions().Create(ctx, "pvc-multi",
+				&apiv1.VolumeDefinition{VolumeNumber: vol, SizeKib: int64(vol+1) * 1024}); err != nil {
+				t.Fatalf("Create vol-%d: %v", vol, err)
+			}
+		}
+
+		got, err := s.VolumeDefinitions().List(ctx, "pvc-multi")
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+
+		if len(got) != 3 {
+			t.Fatalf("len: got %d, want 3", len(got))
+		}
+
+		for i, want := range []int32{0, 1, 2} {
+			if got[i].VolumeNumber != want {
+				t.Errorf("[%d]: got VolumeNumber=%d, want %d",
+					i, got[i].VolumeNumber, want)
+			}
+		}
+	})
 	t.Run("UpdateGrowsSize", func(t *testing.T) {
 		s := newStore(t)
 		seedRD(t, s, "pvc-1")
