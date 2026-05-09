@@ -100,3 +100,123 @@ func TestVolumeDefinitionsWithoutStore(t *testing.T) {
 		t.Errorf("status: got %d, want 503", resp.StatusCode)
 	}
 }
+
+// TestVolumeDefinitionsUpdate is the CSI ControllerExpandVolume hot
+// path: PUT /v1/resource-definitions/{rd}/volume-definitions/{vol}
+// with a new SizeKib must round-trip into the store. The path-derived
+// VolumeNumber must win over whatever the body declares so a typo on
+// the body's volume_number can't accidentally resize a different vol.
+func TestVolumeDefinitionsUpdate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-grow"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-grow",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Body's volume_number is intentionally wrong; the path's `0` must win.
+	body, _ := json.Marshal(apiv1.VolumeDefinition{
+		VolumeNumber: 99,
+		SizeKib:      2 * 1024 * 1024,
+	})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-grow/volume-definitions/0", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-grow", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != 2*1024*1024 {
+		t.Errorf("SizeKib after PUT: got %d, want %d", got.SizeKib, 2*1024*1024)
+	}
+
+	// Volume 99 must NOT have been silently created from the body.
+	_, err = st.VolumeDefinitions().Get(ctx, "pvc-grow", 99)
+	if err == nil {
+		t.Errorf("PUT must not silently create vol-99 from body's volume_number")
+	}
+}
+
+// TestVolumeDefinitionsUpdateMissing: PUT against a non-existent VD
+// returns 404. Pins the missing-vol error path.
+func TestVolumeDefinitionsUpdateMissing(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: 2 * 1024 * 1024})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestVolumeDefinitionsUpdateBadVolumeNumber: non-numeric `vn` in
+// the path → 400 (bad request) before we touch the store.
+func TestVolumeDefinitionsUpdateBadVolumeNumber(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/x/volume-definitions/notanum",
+		[]byte(`{"size_kib":1024}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestVolumeDefinitionsDelete: DELETE removes the VD; subsequent
+// GET returns 404. Pins the cleanup path the RD-delete reconciler
+// drives.
+func TestVolumeDefinitionsDelete(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-1",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("DELETE status: got %d, want 204", resp.StatusCode)
+	}
+
+	_, err := st.VolumeDefinitions().Get(ctx, "pvc-1", 0)
+	if err == nil {
+		t.Errorf("VD still present after DELETE")
+	}
+}
