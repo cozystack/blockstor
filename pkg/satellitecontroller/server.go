@@ -22,6 +22,7 @@ package satellitecontroller
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 
 	"github.com/cockroachdb/errors"
@@ -189,27 +190,23 @@ func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObse
 		return nil
 	}
 
-	res, err := s.st.Resources().Get(ctx, ev.GetResourceName(), ev.GetNodeName())
+	drbdProps := map[string]string{}
+	if disk := ev.GetDrbdState(); disk != "" {
+		drbdProps["DrbdState"] = disk
+	}
+
+	state := apiv1.ResourceState{InUse: ev.GetInUse()}
+
+	err := s.st.Resources().SetState(ctx, ev.GetResourceName(), ev.GetNodeName(), state, drbdProps)
 	if err != nil {
 		// NotFound is normal during convergence — the satellite may
 		// observe state for a resource the controller hasn't yet
 		// created. Bubble nothing.
-		return nil //nolint:nilerr // best-effort: missing resource isn't a stream-fatal event
-	}
+		if stderrors.Is(err, store.ErrNotFound) {
+			return nil
+		}
 
-	if res.Props == nil {
-		res.Props = map[string]string{}
-	}
-
-	if disk := ev.GetDrbdState(); disk != "" {
-		res.Props["DrbdState"] = disk
-	}
-
-	res.State.InUse = ev.GetInUse()
-
-	err = s.st.Resources().Update(ctx, &res)
-	if err != nil {
-		return errors.Wrap(err, "update resource state")
+		return errors.Wrap(err, "set resource state")
 	}
 
 	return nil

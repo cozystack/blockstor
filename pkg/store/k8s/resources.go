@@ -18,6 +18,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -169,6 +170,53 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 		}
 
 		return errors.Wrapf(err, "delete Resource %s/%s", rdName, node)
+	}
+
+	return nil
+}
+
+// SetState writes the runtime-observed state via .Status().Update().
+// Called from the satellite's events2 observer path when role/disk
+// state changes — these must not race a concurrent Spec mutation
+// (auto-diskful, resize, evacuation), which a whole-object Update
+// would clobber.
+//
+// drbdProps is folded into Spec.Props (DrbdState etc.) — historically
+// the satellite reported runtime state via Spec props rather than a
+// dedicated Status field. New callers should put runtime info into
+// state directly; the props bag is kept for back-compat.
+func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string) error {
+	var existing crdv1alpha1.Resource
+
+	key := types.NamespacedName{Name: resourceCRDName(rdName, node)}
+
+	err := s.c.Get(ctx, key, &existing)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+		}
+
+		return errors.Wrapf(err, "get Resource %s/%s", rdName, node)
+	}
+
+	if len(drbdProps) > 0 {
+		if existing.Spec.Props == nil {
+			existing.Spec.Props = map[string]string{}
+		}
+
+		maps.Copy(existing.Spec.Props, drbdProps)
+
+		err = s.c.Update(ctx, &existing)
+		if err != nil {
+			return errors.Wrapf(err, "update Resource Spec %s/%s", rdName, node)
+		}
+	}
+
+	existing.Status.InUse = state.InUse
+
+	err = s.c.Status().Update(ctx, &existing)
+	if err != nil {
+		return errors.Wrapf(err, "update Resource Status %s/%s", rdName, node)
 	}
 
 	return nil

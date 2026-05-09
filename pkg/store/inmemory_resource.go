@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"sync"
 
@@ -133,6 +134,35 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	}
 
 	delete(s.m, k)
+
+	return nil
+}
+
+// SetState mutates the runtime-observed state without touching Spec.
+// In the in-memory store there's no Status subresource, so we just
+// merge the runtime fields onto the stored value.
+func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := rKey{rdName, node}
+
+	existing, exists := s.m[key]
+	if !exists {
+		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
+	}
+
+	existing.State = state
+
+	if len(drbdProps) > 0 {
+		if existing.Props == nil {
+			existing.Props = map[string]string{}
+		}
+
+		maps.Copy(existing.Props, drbdProps)
+	}
+
+	s.m[key] = existing
 
 	return nil
 }
