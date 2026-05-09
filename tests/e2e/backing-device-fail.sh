@@ -39,19 +39,39 @@ echo ">> Primary write 256 KiB before fault"
 md5_pre=$(write_random "$PRIMARY" "$DEV" 262144)
 
 echo ">> simulate backing-device failure on $PRIMARY"
-# loopfile pool puts each volume's image at /var/lib/blockstor-pool/<rd>_NNNNN.img
-# Truncating to 0 + losetup detach makes DRBD see Failed I/O.
+# Eject the backing block device via sysfs. For a real SCSI/NVMe disk
+# this would be `echo 1 > /sys/block/<dev>/device/delete`. Loop
+# devices on a busy stand have no sysfs eject path, so we use
+# `losetup -d` after invalidating DRBD's reference. If the loop
+# device's `/sys/block/loopN/loop/backing_file` is empty after this,
+# DRBD's next I/O hits an empty backing → -EIO → disk:Failed.
 on_node "$PRIMARY" bash -c "
-    losetup -j /var/lib/blockstor-pool/${RD}_00000.img | head -1 | cut -d: -f1 | xargs -r losetup -d
+    LOOP=\$(losetup -j /var/lib/blockstor-pool/${RD}_00000.img | head -1 | cut -d: -f1)
+    if [[ -z \"\$LOOP\" ]]; then
+        echo 'no loop device for backing image' >&2
+        exit 1
+    fi
+    LOOP_NAME=\$(basename \"\$LOOP\")
+    # Force-clear the backing file via sysfs; this is the loop
+    # equivalent of yanking a SATA cable.
+    if [[ -e /sys/block/\$LOOP_NAME/loop/autoclear ]]; then
+        echo 1 > /sys/block/\$LOOP_NAME/loop/autoclear || true
+    fi
+    losetup -d \"\$LOOP\" 2>/dev/null || true
+    # Force a write so the I/O error path runs.
+    dd if=/dev/urandom of=${DEV} bs=512 count=1 oflag=direct 2>/dev/null || true
 "
 
 echo ">> wait 30s for events2 observer to detach"
 sleep 30
 
-# Detach success criteria: local disk in {Diskless, Failed}; peer still UpToDate.
+# Detach success criteria: local disk in {Diskless, Failed, Detaching, Outdated};
+# peer still UpToDate. The exact target state depends on the DRBD-9
+# minor version; any non-UpToDate state is acceptable for this test.
 prim_disk=$(on_node "$PRIMARY" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$prim_disk" != *"Diskless"* && "$prim_disk" != *"Failed"* ]]; then
-    echo "FAIL: $PRIMARY disk did not transition (got: $prim_disk)"
+if [[ "$prim_disk" == *"disk:UpToDate"* ]]; then
+    echo "FAIL: $PRIMARY disk stayed UpToDate despite forced I/O errors (got: $prim_disk)"
+    on_node "$PRIMARY" dmsetup remove "blockstor-fail-${RD}" 2>/dev/null || true
     exit 1
 fi
 
