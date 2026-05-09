@@ -400,6 +400,48 @@ func RunKeyValueStore(t *testing.T, newStore Factory) {
 	// DeleteInstance must NOT touch other instances. Pinning this
 	// guards against a regression where the delete fan-out drops the
 	// instance label filter and wipes the whole KV store.
+	// ListInstances dedupes (one entry per (instance, key); two
+	// keys in the same instance must surface as ONE name) and
+	// sorts lexically so the result is stable for golinstor's
+	// `linstor controller drbd-options` cluster scan.
+	t.Run("ListInstancesDedupesAndSorts", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+
+		// `csi-volumes` has two keys → must dedupe to one name.
+		if err := s.SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"a": "1", "b": "2"},
+		}); err != nil {
+			t.Fatalf("seed csi-volumes: %v", err)
+		}
+		// Insert in non-lex order to exercise the sort.
+		if err := s.SetKeys(ctx, "zeta", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"k": "v"},
+		}); err != nil {
+			t.Fatalf("seed zeta: %v", err)
+		}
+		if err := s.SetKeys(ctx, "ControllerProps", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"k": "v"},
+		}); err != nil {
+			t.Fatalf("seed ControllerProps: %v", err)
+		}
+
+		got, err := s.ListInstances(ctx)
+		if err != nil {
+			t.Fatalf("ListInstances: %v", err)
+		}
+
+		want := []string{"ControllerProps", "csi-volumes", "zeta"}
+		if len(got) != len(want) {
+			t.Fatalf("len: got %d, want %d (dedupe failed?); got %v",
+				len(got), len(want), got)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Errorf("[%d]: got %q, want %q (sort failed?)", i, got[i], w)
+			}
+		}
+	})
 	t.Run("DeleteInstanceLeavesOthersAlone", func(t *testing.T) {
 		s := newStore(t).KeyValueStore()
 		ctx := t.Context()
