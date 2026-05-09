@@ -29,6 +29,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // resourceFinalizer guards on-disk + DRBD-side teardown when the
@@ -130,6 +131,21 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{}, err
 	}
 
+	// Allocate DRBD node-id (and port/minor on the first replica) and
+	// persist via Status before pushing to the satellite. node-id MUST
+	// be stable for the lifetime of the replica — re-numbering would
+	// re-map DRBD bitmaps and corrupt data on resync. If allocation
+	// changes Status we requeue so the next reconcile sees the
+	// committed value before dispatching.
+	allocated, err := r.ensureDRBDIDs(ctx, target, peers)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if allocated {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	result, err := r.Dispatcher.Apply(ctx, target, peers, nodeList.Items, rdPtr)
 	if err != nil {
 		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
@@ -211,6 +227,127 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 	}
 
 	return &rd, nil
+}
+
+// ensureDRBDIDs allocates a stable DRBD node-id for target (and a
+// port + minor for the RD if no sibling has one yet) and persists the
+// values on Status. Returns true when Status was changed; the caller
+// requeues so the next reconcile dispatches with the committed values.
+//
+// node-id allocation is the lowest free 0..MaxPeers-1 not held by
+// any sibling Resource of the same RD — sibling ids stay put, only
+// the unallocated target gets a new value. This is the load-bearing
+// invariant: re-using ids on a different node would re-map DRBD
+// bitmaps mid-flight and corrupt data.
+func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	original := target.Status.DeepCopy()
+
+	if target.Status.DRBDNodeID == nil {
+		taken := make([]int32, 0, len(peers))
+
+		for i := range peers {
+			if peers[i].Name == target.Name {
+				continue
+			}
+
+			if peers[i].Status.DRBDNodeID != nil {
+				taken = append(taken, *peers[i].Status.DRBDNodeID)
+			}
+		}
+
+		id, err := drbd.LowestFreeNodeID(taken)
+		if err != nil {
+			return false, err
+		}
+
+		target.Status.DRBDNodeID = &id
+	}
+
+	if target.Status.DRBDPort == nil {
+		// Inherit from any sibling that already has one — every
+		// replica of an RD shares the port. If none exists yet,
+		// derive it from the RD name; the port-pool refactor will
+		// replace this with a controller-side allocator.
+		port := siblingPort(peers)
+		if port == 0 {
+			port = int32(derivePort(target.Spec.ResourceDefinitionName)) //nolint:gosec // deterministic port in 7000-7999
+		}
+
+		target.Status.DRBDPort = &port
+	}
+
+	if target.Status.DRBDMinor == nil {
+		minor := siblingMinor(peers)
+		if minor == 0 {
+			minor = int32(deriveMinor(target.Spec.ResourceDefinitionName)) //nolint:gosec // deterministic minor in the reserved range
+		}
+
+		target.Status.DRBDMinor = &minor
+	}
+
+	if equalStatus(original, &target.Status) {
+		return false, nil
+	}
+
+	err := r.Status().Update(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// siblingPort returns the first non-nil DRBDPort from the peer list,
+// or 0 when nobody has one yet.
+func siblingPort(peers []blockstoriov1alpha1.Resource) int32 {
+	for i := range peers {
+		if peers[i].Status.DRBDPort != nil {
+			return *peers[i].Status.DRBDPort
+		}
+	}
+
+	return 0
+}
+
+func siblingMinor(peers []blockstoriov1alpha1.Resource) int32 {
+	for i := range peers {
+		if peers[i].Status.DRBDMinor != nil {
+			return *peers[i].Status.DRBDMinor
+		}
+	}
+
+	return 0
+}
+
+func equalStatus(a, b *blockstoriov1alpha1.ResourceStatus) bool {
+	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
+		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
+		ptrEqI32(a.DRBDMinor, b.DRBDMinor)
+}
+
+func ptrEqI32(a, b *int32) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return *a == *b
+	}
+}
+
+// derivePort / deriveMinor are kept for the transitional bootstrap
+// path; the production allocator is the cluster-wide pool tracked in
+// Phase 8.1. We re-export them via dispatcher to avoid duplication.
+func derivePort(rd string) int  { return dispatcher.DerivePort(rd) }
+func deriveMinor(rd string) int { return dispatcher.DeriveMinor(rd) }
+
+// EnsureDRBDIDsForTest is an exported alias for ensureDRBDIDs. The
+// allocator is package-private because it's an internal reconciler
+// step, but the property tests live in package controller_test and
+// need a way in. Production callers use Reconcile.
+func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	return r.ensureDRBDIDs(ctx, target, peers)
 }
 
 // SetupWithManager sets up the controller with the Manager.

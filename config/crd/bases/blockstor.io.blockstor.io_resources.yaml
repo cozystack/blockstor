@@ -122,6 +122,30 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              drbdMinor:
+                description: |-
+                  drbdMinor is the local /dev/drbd<N> minor number. Same scoping
+                  rule as drbdPort.
+                format: int32
+                type: integer
+              drbdNodeId:
+                description: |-
+                  drbdNodeID is the DRBD-9 node-id assigned to this replica.
+                  Allocated once when the Resource first reconciles and never
+                  changes for the lifetime of the Resource — re-numbering live
+                  replicas would re-map their DRBD bitmaps and corrupt data on
+                  peer-to-peer resync. Range 0..15 (drbd-9 max-peers). nil means
+                  the controller has not yet allocated.
+                format: int32
+                type: integer
+              drbdPort:
+                description: |-
+                  drbdPort is the TCP port the controller allocated for this RD's
+                  replication mesh. All replicas of the same RD share the port;
+                  the controller stamps the same value on every sibling Resource.
+                  nil means not yet allocated.
+                format: int32
+                type: integer
               inUse:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.

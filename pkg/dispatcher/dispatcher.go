@@ -145,50 +145,67 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
 func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition) *satellitepb.DesiredResource {
 	rdName := target.Spec.ResourceDefinitionName
-	port := derivePort(rdName)
-	minor := deriveMinor(rdName)
 
-	// Collect every node hosting this RD, sorted, with self at front.
-	nodeNames := append([]string{}, target.Spec.NodeName)
-	seen := map[string]bool{target.Spec.NodeName: true}
+	// node-id and port/minor are persisted on Status by the controller
+	// before Apply runs. Falling back to derive*() is a transitional
+	// safety net for the case where the allocator hasn't run yet — it
+	// produces the same value as the legacy behaviour, so existing
+	// clusters don't see ids change on the upgrade reconcile. New
+	// clusters always go through the allocator.
+	port := readDRBDPort(target, peers)
+	minor := readDRBDMinor(target, peers)
+
+	// Collect every replica's (node, id) — id sourced from Status.
+	// We ONLY emit peers whose id is allocated; an unallocated peer
+	// is skipped this round and will reappear once the controller
+	// reconciles its Status and the parent RD requeues.
+	idOf := map[string]int32{}
+
+	if id := nodeIDOf(target); id >= 0 {
+		idOf[target.Spec.NodeName] = id
+	}
 
 	for i := range peers {
-		name := peers[i].Spec.NodeName
-		if seen[name] {
+		if peers[i].Spec.NodeName == target.Spec.NodeName {
 			continue
 		}
 
-		seen[name] = true
-		nodeNames = append(nodeNames, name)
+		if id := nodeIDOf(&peers[i]); id >= 0 {
+			idOf[peers[i].Spec.NodeName] = id
+		}
 	}
 
-	// Sort all (incl. self) so node-id assignment is stable across
-	// reconciles.
-	sortedAll := append([]string{}, nodeNames...)
-	sort.Strings(sortedAll)
+	// Stable iteration: sort peer names so the satellite-side .res
+	// renderer sees a deterministic order. node-id itself is stable
+	// regardless of iteration order because it's persisted.
+	dropped := make([]string, 0, len(idOf))
 
-	idOf := map[string]int{}
-	for i, name := range sortedAll {
-		idOf[name] = i
+	for name := range idOf {
+		if name == target.Spec.NodeName {
+			continue
+		}
+
+		dropped = append(dropped, name)
 	}
 
-	dropped := nodeNames[1:]
+	sort.Strings(dropped)
 
 	drbdOpts := map[string]string{
 		"port":    strconv.Itoa(port),
-		"node-id": strconv.Itoa(idOf[target.Spec.NodeName]),
+		"node-id": strconv.Itoa(int(idOf[target.Spec.NodeName])),
 		"address": drbdAddrAny, // satellite picks pod IP at .res render time
 		"minor":   strconv.Itoa(minor),
 	}
 
-	// Pick a single replica (lexically lowest node name) to seed
-	// initial Primary. Without this every diskful brand-new RD comes
-	// up Inconsistent and stays there until something opens for
-	// write. The seed flag is harmless on subsequent reconciles —
-	// satellite Reconciler runs primary --force only on
-	// firstActivation.
+	// Pick a single replica to seed initial Primary. Use the lowest
+	// node-id that owns a diskful replica — id is stable across
+	// reconciles, so the same replica wins every time. Without this
+	// every diskful brand-new RD comes up Inconsistent and stays
+	// there until something opens for write. The seed flag is
+	// harmless on subsequent reconciles — satellite Reconciler runs
+	// primary --force only on firstActivation.
 	if !slices.Contains(target.Spec.Flags, "DISKLESS") &&
-		target.Spec.NodeName == sortedAll[0] {
+		idOf[target.Spec.NodeName] == lowestDiskfulID(target, peers) {
 		drbdOpts["auto-primary"] = "true"
 	}
 
@@ -198,7 +215,7 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// to actually replicate to (0.0.0.0 won't work as a peer addr).
 	for _, peer := range dropped {
 		drbdOpts["peer."+peer+".port"] = strconv.Itoa(port)
-		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(idOf[peer])
+		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
 		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
 	}
 
@@ -211,6 +228,82 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		Volumes:     buildVolumes(rd, target),
 		DrbdOptions: drbdOpts,
 	}
+}
+
+// nodeIDOf reads the persisted DRBD node-id off a Resource. Returns
+// -1 when the controller hasn't allocated yet — the caller skips the
+// replica from the wire so we never emit a stale id.
+func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
+	if r.Status.DRBDNodeID == nil {
+		return -1
+	}
+
+	return *r.Status.DRBDNodeID
+}
+
+// readDRBDPort returns the persisted port (from any sibling, since
+// they all share one) or falls back to deriving when nothing is
+// allocated. The fallback keeps in-flight reconciles working before
+// the controller's allocator catches up.
+func readDRBDPort(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+	if target.Status.DRBDPort != nil {
+		return int(*target.Status.DRBDPort)
+	}
+
+	for i := range peers {
+		if peers[i].Status.DRBDPort != nil {
+			return int(*peers[i].Status.DRBDPort)
+		}
+	}
+
+	return derivePort(target.Spec.ResourceDefinitionName)
+}
+
+// readDRBDMinor mirrors readDRBDPort for the local /dev/drbd<N> minor.
+func readDRBDMinor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+	if target.Status.DRBDMinor != nil {
+		return int(*target.Status.DRBDMinor)
+	}
+
+	for i := range peers {
+		if peers[i].Status.DRBDMinor != nil {
+			return int(*peers[i].Status.DRBDMinor)
+		}
+	}
+
+	return deriveMinor(target.Spec.ResourceDefinitionName)
+}
+
+// lowestDiskfulID picks the smallest allocated node-id among the
+// diskful replicas of the RD. Used to deterministically choose which
+// replica seeds the initial Primary on first activation.
+func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int32 {
+	const sentinel int32 = 1 << 30
+
+	low := sentinel
+
+	consider := func(r *blockstoriov1alpha1.Resource) {
+		if slices.Contains(r.Spec.Flags, "DISKLESS") {
+			return
+		}
+
+		nodeID := nodeIDOf(r)
+		if nodeID < 0 {
+			return
+		}
+
+		if nodeID < low {
+			low = nodeID
+		}
+	}
+
+	consider(target)
+
+	for i := range peers {
+		consider(&peers[i])
+	}
+
+	return low
 }
 
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
@@ -349,6 +442,17 @@ func peerAddress(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 
 	return endpoint[:idx]
 }
+
+// DerivePort exposes derivePort to the controller's bootstrap-time
+// allocation path — the controller falls back to it for the first
+// replica of a fresh RD when no sibling has a persisted port yet.
+// Production clusters should swap this for a TcpPortPool allocator
+// (Phase 8.1) that detects collisions; deterministic hashing means
+// two RDs with the same name-prefix-hash collide silently today.
+func DerivePort(rd string) int { return derivePort(rd) }
+
+// DeriveMinor mirrors DerivePort for /dev/drbd<N>.
+func DeriveMinor(rd string) int { return deriveMinor(rd) }
 
 // derivePort hashes the RD name into the drbd-9 reserved range
 // 7000–7999. Matches what upstream LINSTOR's TcpPortPool does for

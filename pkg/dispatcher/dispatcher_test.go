@@ -125,13 +125,23 @@ func TestApplyBuildsPeers(t *testing.T) {
 	}
 	d := dispatcher.New(&fakeDialer{stub: stub})
 
+	id0 := int32(0)
+	id1 := int32(1)
+
 	target := &blockstoriov1alpha1.Resource{
-		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+		Spec:   blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id0},
 	}
 
 	peers := []blockstoriov1alpha1.Resource{
-		{Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"}},
-		{Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n2"}},
+		{
+			Spec:   blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+			Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id0},
+		},
+		{
+			Spec:   blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n2"},
+			Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id1},
+		},
 	}
 
 	nodes := []blockstoriov1alpha1.Node{{

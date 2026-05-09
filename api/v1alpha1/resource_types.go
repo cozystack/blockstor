@@ -47,6 +47,27 @@ type ResourceStatus struct {
 	// +optional
 	InUse bool `json:"inUse,omitempty"`
 
+	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
+	// Allocated once when the Resource first reconciles and never
+	// changes for the lifetime of the Resource — re-numbering live
+	// replicas would re-map their DRBD bitmaps and corrupt data on
+	// peer-to-peer resync. Range 0..15 (drbd-9 max-peers). nil means
+	// the controller has not yet allocated.
+	// +optional
+	DRBDNodeID *int32 `json:"drbdNodeId,omitempty"`
+
+	// drbdPort is the TCP port the controller allocated for this RD's
+	// replication mesh. All replicas of the same RD share the port;
+	// the controller stamps the same value on every sibling Resource.
+	// nil means not yet allocated.
+	// +optional
+	DRBDPort *int32 `json:"drbdPort,omitempty"`
+
+	// drbdMinor is the local /dev/drbd<N> minor number. Same scoping
+	// rule as drbdPort.
+	// +optional
+	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
+
 	// volumes is the per-volume runtime state reported by the satellite.
 	// +optional
 	Volumes []ResourceVolumeStatus `json:"volumes,omitempty"`
