@@ -596,6 +596,12 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %+v", got)
 		}
 	})
+	// ListSorted pins the deterministic ordering /v1/view/resources
+	// is documented to return: by RD name first, then NodeName. CSI
+	// callers don't sort the response client-side; without
+	// deterministic order, every poll reorders the list and CSI
+	// pagination would skip / duplicate entries.
+	t.Run("ListSorted", func(t *testing.T) { testResourceListSorted(t, newStore) })
 	t.Run("CreateDuplicate", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -727,6 +733,44 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("Props: got %v, want StorPoolName=thin", got.Props)
 		}
 	})
+}
+
+func testResourceListSorted(t *testing.T, newStore Factory) {
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	// Insert in deliberately-out-of-order sequence.
+	seed := []apiv1.Resource{
+		{Name: "pvc-2", NodeName: "n3"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-1", NodeName: "n1"},
+	}
+	for _, r := range seed {
+		if err := s.Create(ctx, &r); err != nil {
+			t.Fatalf("Create %+v: %v", r, err)
+		}
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	want := []struct{ name, node string }{
+		{"pvc-1", "n1"},
+		{"pvc-1", "n2"},
+		{"pvc-2", "n3"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d, want %d", len(got), len(want))
+	}
+
+	for i, w := range want {
+		if got[i].Name != w.name || got[i].NodeName != w.node {
+			t.Errorf("[%d]: got %s/%s, want %s/%s",
+				i, got[i].Name, got[i].NodeName, w.name, w.node)
+		}
+	}
 }
 
 // RunResourceDefinitionStore exercises every branch of
