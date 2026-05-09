@@ -277,6 +277,81 @@ func TestAutoplaceSkipsEvictedNodes(t *testing.T) {
 	}
 }
 
+// TestResourceListAndGet: GET /v1/resource-definitions/{rd}/resources
+// returns all replicas wrapped as ResourceWithVolumes; the per-node
+// GET returns one entry or 404 when missing. linstor-csi's reconciler
+// hits these on every CreateVolume / ControllerPublishVolume call so
+// the contract has to stay tight.
+func TestResourceListAndGet(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: n}); err != nil {
+			t.Fatalf("seed res %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	listResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resources")
+	defer func() { _ = listResp.Body.Close() }()
+
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list status: got %d, want 200", listResp.StatusCode)
+	}
+
+	var listGot []apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(listResp.Body).Decode(&listGot); err != nil {
+		t.Fatalf("list decode: %v", err)
+	}
+
+	if len(listGot) != 2 {
+		t.Errorf("list len: got %d, want 2", len(listGot))
+	}
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resources/n1")
+	defer func() { _ = getResp.Body.Close() }()
+
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get status: got %d, want 200", getResp.StatusCode)
+	}
+
+	var getGot apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(getResp.Body).Decode(&getGot); err != nil {
+		t.Fatalf("get decode: %v", err)
+	}
+
+	if getGot.NodeName != "n1" {
+		t.Errorf("get node: got %q, want n1", getGot.NodeName)
+	}
+
+	missingResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resources/n9")
+	defer func() { _ = missingResp.Body.Close() }()
+
+	if missingResp.StatusCode != http.StatusNotFound {
+		t.Errorf("missing-node status: got %d, want 404", missingResp.StatusCode)
+	}
+}
+
+// TestResourceListMissingRD: 404 when the parent RD doesn't exist.
+func TestResourceListMissingRD(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/ghost/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestResourceCreateAndDelete: explicit single-replica placement via REST.
 func TestResourceCreateAndDelete(t *testing.T) {
 	st := store.NewInMemory()
