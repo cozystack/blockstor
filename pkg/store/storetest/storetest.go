@@ -1002,6 +1002,37 @@ func RunResourceGroupStore(t *testing.T, newStore Factory) {
 	t.Run("VolumeGroupsAndFilterRoundTrip", func(t *testing.T) {
 		testRGVolumeGroupsAndFilterRoundTrip(t, newStore)
 	})
+	// ListSorted pins lex ordering for /v1/resource-groups — operator
+	// tooling (`linstor rg list`) relies on stable order for diff
+	// comparisons across deploys.
+	t.Run("ListSorted", func(t *testing.T) { testRGListSorted(t, newStore) })
+}
+
+func testRGListSorted(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceGroups()
+	ctx := t.Context()
+
+	for _, name := range []string{"rg-zeta", "rg-alpha", "rg-mu"} {
+		if err := s.Create(ctx, &apiv1.ResourceGroup{Name: name}); err != nil {
+			t.Fatalf("Create %s: %v", name, err)
+		}
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	want := []string{"rg-alpha", "rg-mu", "rg-zeta"}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d, want %d", len(got), len(want))
+	}
+
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("[%d]: got %q, want %q", i, got[i].Name, w)
+		}
+	}
 }
 
 // testRGVolumeGroupsAndFilterRoundTrip exercises the rich CRD
