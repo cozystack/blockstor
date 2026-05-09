@@ -390,6 +390,86 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 
 ---
 
+## Phase 8 — Production gap closure (REQUIRED before prod)
+
+The phases above closed the MVP slice and the csi-sanity REST contract. A deep audit (2026-05-09) surfaced gaps that block a production rollout. None of these are safe to defer behind a compat shim — they are correctness, durability, and operator-affordance issues.
+
+### 8.1 Correctness — DRBD invariants (highest priority)
+
+- [ ] **node-id stability across reconciles**. `pkg/dispatcher/dispatcher.go` re-derives node-id from the current sorted peer set. Removing a replica re-numbers the survivors → DRBD bitmap mapping breaks → silent data corruption. Persist the assigned id in `Resource.Status.DRBD.NodeID` (or a controller-side allocator), free the id only when a Resource is deleted, never reuse for a different node-name on the same RD. Pinned via property test: any sequence of add/remove must keep stable name→id for surviving replicas.
+- [ ] **TCP port pool with collision detection**. Replace `derivePort` (hash mod 1000 + 7000) with a controller-side `TcpPortPool` that allocates monotonically from a configurable range, persists the assignment on the RD, and refuses to hand out an in-use port. Cover: pool exhaustion → 409, hash collision (currently silent) → distinct ports, range reconfiguration drains old assignments. Match upstream `LinstorRemoteAccess`/`TcpPortPool` semantics.
+- [ ] **Drop pool of taken ports also covers DRBD minor numbers** — same risk class as ports. Persist `DRBDMinor` on the RD and allocate from a guarded range.
+- [ ] **`replicas_on_same` / `replicas_on_different`** — fields are accepted on the wire but ignored in `candidatePools`. Apply as anti/affinity over the Aux-prop bag golinstor sends (`Aux/topology/zone` etc.). Wrong scope today: replicas can land on the same failure domain.
+
+### 8.2 Storage correctness
+
+- [ ] **Volume resize** with and without LUKS. No endpoint today (`PUT /v1/resource-definitions/{rd}/volume-definitions/{vn}` doesn't grow the device). Path: VD update → reconciler sees new size → provider grow (`lvextend`/`zfs set`) → `cryptsetup resize` if LUKS layered → `drbdadm resize`. Pin via e2e: 1G PVC → write checksum → resize to 2G → verify checksum + new size on both replicas.
+- [ ] **Backing-device failure under DRBD**. When the storage layer drops out, the satellite must detach the failed replica (don't oscillate it diskful↔diskless). Today nothing watches `/proc/drbd` for `disk:Failed`. Add an event hook in `Reconciler` that flips the replica to a Diskless attach via `drbdsetup detach` and surfaces a Status condition. e2e: pull the LV out from under DRBD, observe peer stays Primary, no I/O loss.
+- [ ] **DRBD options hierarchy** controller → resource-group → resource-definition → resource. Today props are flat on each level; the rendered `.res` doesn't honour the upstream override order. Build a resolver in `pkg/drbd` that walks the inheritance chain and pin via a contract test that checks each level can override its parent.
+- [ ] **`allow-two-primaries` + live migration** path. Ganesha-based RWX and KubeVirt VM live-migration both depend on a small window where two nodes are Primary. Today we set `auto-primary` on the lex-lowest replica only; multiple-primary is unsupported. Add the flag plumbing through DesiredResource and the corresponding fence/dual-primary safety on the satellite.
+
+### 8.3 Replica lifecycle
+
+- [ ] **`linstor node evacuate` actually migrates replicas** (not just sets the flag). Eviction must enumerate Resources on the node, autoplace diskful copies elsewhere first, then drop the local replica. Today: flag-only, no migration. e2e: 3-node cluster, one PVC, evacuate one node, verify replica reappears on the third.
+- [ ] **`linstor node lost` recovery**. Same migration logic as evacuate but assumes the node never returns — should free its TCP-port/node-id allocations. Tested by tearing the satellite pod down hard and asserting the cluster heals without operator intervention.
+- [ ] **auto-diskful / auto-diskful-cleanup**. Upstream watches Resource access patterns and auto-promotes a diskless to diskful when a node uses it heavily, reverses on idle. Implement the controller-side metric collection + threshold. Pin via simulation test that drives synthetic access counts.
+- [ ] **Tiebreaker auto-creation**. 2-replica RDs in a 3+ node cluster need a 3rd diskless replica for `quorum:majority`. Today: no auto-tiebreaker. Add a controller-side reconciler that maintains exactly-one tiebreaker on a separate failure domain.
+- [ ] **Resource activate / deactivate** (`POST /v1/resource-definitions/{rd}/resources/{node}/{activate,deactivate}`). Used by piraeus-operator during node maintenance; today we 404. Implement as drbdadm up/down on the satellite without removing the Resource CRD.
+- [ ] **Diskless replicas as first-class autoplace candidates**. `candidatePools` skips DISKLESS pools entirely. Add a `--diskless` flag and the diskless-on-remaining behaviour upstream has, so manual `linstor resource create --diskless` and the autoplace `diskless_on_remaining=true` path both work.
+
+### 8.4 Resource-group / definition mutation
+
+- [ ] **`linstor rd m --resource-group=X`** — change of parent RG should re-apply RG props to the RD's effective options on next adjust. Today: RD update accepts the new name but the props pipeline doesn't re-walk the inheritance.
+- [ ] **`linstor rg m --place-count`/etc.** — RG update with `--storage-pool` change must trigger reconcile of every spawned RD's autoplace. Today it just stores the new spec without nudging children.
+- [ ] **`linstor n interface create/modify/delete`** + setting the default `StltCon` interface. Schema has `NetInterfaces[]`; CRUD endpoints absent. Required for clusters with separate replication and management networks.
+
+### 8.5 Operator surface
+
+- [ ] **`linstor physical-storage` / `create-device-pool`**. golinstor type exists, no handlers. Required for piraeus-operator's storage-pool auto-creation (`LinstorSatelliteConfiguration.spec.storagePools.lvmThinPool`). Wraps to `lsblk` + `vgcreate` / `zpool create` on the satellite.
+- [ ] **DRBD reactor integration**. Cozystack's RWX (Ganesha) and Postgres failover (Patroni) rely on `drbd-reactor`'s promoter+systemd plugins. Ship a default reactor config the satellite renders into `/etc/drbd-reactor.d/<rd>.toml` per spawned RD that needs it; surface promotion state back via a Status condition.
+- [ ] **`linstor advise`** — placement recommendations endpoint. Used by the linstor CLI's `advise` subcommand. Read-only; can be a thin wrapper over the existing autoplacer that returns candidate node sets without persisting.
+- [ ] **`linstor query-size-info` / spaceinfo**. Pre-flight for `linstor resource create` so the user sees "won't fit" before it half-creates. Wraps over storage-pool capacity + replica count.
+- [ ] **shared LUN provider (EXOS / SHARED)**. Out-of-scope for cozystack at first cut, but golinstor probes for it; today we 501 the kind. Confirm we explicitly reject the shared kind and document the boundary.
+
+### 8.6 Real-world testing
+
+The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
+
+- [ ] **Real-disk LVM-thin** end-to-end on a metal node (`lvcreate -T pool/thin → DRBD → fs`). Currently only loopfile.
+- [ ] **Real-disk ZFS / ZFS_THIN** end-to-end. Integration test exists; full burnin doesn't run on ZFS.
+- [ ] **Real-disk LVM (non-thin)**. Only unit tests with FakeExec today.
+- [ ] **Network partition** behaviour: isolate a satellite for >quorum-timeout, verify the surviving majority continues, isolated minority fences itself, recovery rejoins cleanly with bitmap merge (no full re-sync).
+- [ ] **Backing-device failure** during writes. Pull the disk under DRBD, observe peer stays Primary, no I/O loss, replica drops to Diskless without flapping.
+- [ ] **Hard satellite kill** mid-Apply (SIGKILL the daemonset pod during a resize/snapshot). Reconcile must be idempotent; current contract tests assume clean shutdown.
+
+### 8.7 CSI parity beyond happy path
+
+- [ ] **CSI snapshot + restore on a different node**. piraeus-csi creates a PVC from a VolumeSnapshot — the new RD's autoplace shouldn't pin to the source node. Today: no e2e exercises this.
+- [ ] **CSI clone (volume-from-volume)**. Same plumbing as snapshot+restore but without an intermediate VolumeSnapshot. csi-sanity covers the gRPC contract; cluster-side e2e doesn't.
+- [ ] **RWX volumes via Ganesha + drbd-reactor**. linstor-csi spawns a 2-volume RD (one for data, one for export config) and lets drbd-reactor flip the NFS export with the Primary. Today none of the moving parts exist.
+- [ ] **2-volume RDs in general**. Schema supports `VolumeDefinitions[]`, but no e2e creates and reads/writes a multi-volume RD.
+
+### 8.8 e2e harness expansion
+
+`tests/burnin-blockstor.sh` covers the 2-replica failover happy path. The remaining scenarios above each need a deterministic, automatable test in `tests/e2e/`:
+
+- [ ] `tests/e2e/evacuate.sh` — node evacuate triggers replica migration
+- [ ] `tests/e2e/network-partition.sh` — partition + heal with no full re-sync
+- [ ] `tests/e2e/backing-device-fail.sh` — pull disk, expect graceful diskless-failover
+- [ ] `tests/e2e/snapshot-restore-cross-node.sh`
+- [ ] `tests/e2e/clone.sh`
+- [ ] `tests/e2e/resize-luks.sh`
+- [ ] `tests/e2e/resize-plain.sh`
+- [ ] `tests/e2e/two-primaries-live-migration.sh`
+- [ ] `tests/e2e/rwx-ganesha.sh`
+- [ ] `tests/e2e/two-volume-rd.sh`
+- [ ] `tests/e2e/tiebreaker.sh`
+- [ ] `tests/e2e/auto-diskful.sh`
+
+**Exit criteria for Phase 8**: every checkbox above either lands or is moved to a separately-tracked "explicit out-of-scope" with rationale. Until then "production-ready" is overstating it; what we have is a CSI-compatible REST front-end with a verified happy path.
+
+---
+
 ## Workflow
 
 ### Daily loop
