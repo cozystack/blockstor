@@ -710,13 +710,18 @@ func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]str
 	return netOpts, resOpts
 }
 
+// drbdAddrPlaceholder is what the controller stamps on a Resource
+// before it learns each satellite's pod IP — `resolveAddr`
+// substitutes the satellite's own IP whenever it sees this value.
+const drbdAddrPlaceholder = "0.0.0.0"
+
 // resolveAddr substitutes the satellite's own IP whenever the
-// controller-supplied address is the placeholder "0.0.0.0" (which it
-// is until the controller starts learning each satellite's pod IP and
-// passing it down). Empty fallback returns the placeholder unchanged
-// so unit tests don't blow up the way a missing override would.
+// controller-supplied address is the placeholder (which it is until
+// the controller starts learning each satellite's pod IP and passing
+// it down). Empty fallback returns the placeholder unchanged so unit
+// tests don't blow up the way a missing override would.
 func resolveAddr(supplied, fallback string) string {
-	if supplied == "" || supplied == "0.0.0.0" {
+	if supplied == "" || supplied == drbdAddrPlaceholder {
 		if fallback != "" {
 			return fallback
 		}
