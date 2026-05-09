@@ -186,6 +186,16 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 		}
 	}
 
+	// Tear down LUKS mappers BEFORE DeleteVolume — once the underlying
+	// LV is gone, `cryptsetup luksClose` would either error out or hang
+	// trying to flush the now-missing block device. Best-effort: a
+	// missing mapper (delete-after-restart, never opened) is fine.
+	if r.cfg.Cryptsetup != nil {
+		for _, n := range req.GetVolumeNumbers() {
+			_ = r.cfg.Cryptsetup.Close(ctx, luksMapperName(req.GetName(), n))
+		}
+	}
+
 	if pool := req.GetStoragePool(); pool != "" {
 		provider, ok := r.cfg.Providers[pool]
 		if ok {

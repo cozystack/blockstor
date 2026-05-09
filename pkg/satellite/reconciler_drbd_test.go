@@ -711,6 +711,68 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	}
 }
 
+// TestDeleteResourceClosesLUKSMapper: when the satellite tears down a
+// LUKS-encrypted resource, it must `cryptsetup luksClose` the mapper
+// BEFORE DeleteVolume removes the underlying LV — otherwise the
+// dangling /dev/mapper/<rd>-<vol>-luks node prevents a clean
+// re-create with the same name on the next provision cycle. Pins the
+// last open Phase 9 LUKS gap (luks.Close on teardown).
+func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// DeleteVolume's idempotency probe sees the LV exists.
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-del_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-luks-del_00000\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
+		Name:          "pvc-luks-del",
+		StoragePool:   "thin1",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Fatalf("DeleteResource Ok=false: %s", resp.GetMessage())
+	}
+
+	calls := fx.CommandLines()
+
+	closeIdx := -1
+	removeIdx := -1
+	for i, line := range calls {
+		if strings.Contains(line, "luksClose pvc-luks-del-0-luks") {
+			closeIdx = i
+		}
+		if strings.HasPrefix(line, "lvremove") {
+			removeIdx = i
+		}
+	}
+
+	if closeIdx < 0 {
+		t.Errorf("expected cryptsetup luksClose pvc-luks-del-0-luks; got %v", calls)
+	}
+
+	if removeIdx < 0 {
+		t.Errorf("expected lvremove; got %v", calls)
+	}
+
+	if closeIdx >= 0 && removeIdx >= 0 && closeIdx > removeIdx {
+		t.Errorf("luksClose must run BEFORE lvremove (mapper would dangle on a missing LV); got close@%d remove@%d in %v",
+			closeIdx, removeIdx, calls)
+	}
+}
+
 // TestApplyConvergesAfterMidApplyAbort: simulates a hard satellite kill
 // (SIGKILL of the daemonset pod) between applyStorage and applyDRBD.
 // On the first Apply, drbdadm adjust fails — equivalent to "got SIGKILL
