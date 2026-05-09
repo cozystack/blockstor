@@ -64,3 +64,9 @@ func (r *ResourceReconciler) ResolveLayerStack(ctx context.Context, rd *blocksto
 func (r *ResourceReconciler) ResolveEffectiveProps(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
 	return r.resolveEffectiveProps(ctx, target, rd)
 }
+
+// FirstAvailablePool exposes the auto-diskful pool selector so the
+// test suite can pin its diskless-skip + node-filter rules.
+func (r *ResourceReconciler) FirstAvailablePool(ctx context.Context, nodeName string) (string, error) {
+	return r.firstAvailablePool(ctx, nodeName)
+}
