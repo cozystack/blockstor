@@ -4,3 +4,15 @@
 *.kubeconfig
 *.talosconfig
 .DS_Store
+
+# Build outputs (`make build` produces bin/manager; ad-hoc
+# `go build ./cmd/satellite/` drops the binary at repo root).
+/bin/
+/satellite
+/manager
+
+# Coverage / profiling output (default destinations for `go test
+# -coverprofile=`, `go tool pprof`, etc.).
+*.out
+*.test
+*.prof
