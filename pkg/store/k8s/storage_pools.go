@@ -213,8 +213,15 @@ func (s *storagePools) SetCapacity(ctx context.Context, node, pool string, freeK
 		return errors.Wrapf(err, "get StoragePool %s/%s", node, pool)
 	}
 
-	existing.Status.FreeCapacity = freeKib * bytesPerKib
-	existing.Status.TotalCapacity = totalKib * bytesPerKib
+	// Store raw KiB. The CRD field was originally documented as
+	// "bytes" but the wire shape (gRPC SatellitePool.FreeCapacityKib,
+	// REST `free_capacity_kib`) is KiB end-to-end; multiplying by
+	// 1024 here introduced a 1024x reporting error for /v1/view/
+	// storage-pools and the autoplacer's capacity comparisons. The
+	// shared storetest suite catches the divergence between the
+	// InMemory store (raw KiB) and this implementation.
+	existing.Status.FreeCapacity = freeKib
+	existing.Status.TotalCapacity = totalKib
 	existing.Status.SupportsSnapshots = supportsSnap
 
 	err = s.c.Status().Update(ctx, &existing)
@@ -224,10 +231,6 @@ func (s *storagePools) SetCapacity(ctx context.Context, node, pool string, freeK
 
 	return nil
 }
-
-// bytesPerKib so the satellite-side `kib` numbers convert cleanly
-// into the CRD's bytes-shaped Status fields without a magic literal.
-const bytesPerKib = 1024
 
 // wireToCRDStoragePool builds a fresh CRD from an apiv1.StoragePool.
 func wireToCRDStoragePool(in *apiv1.StoragePool) *crdv1alpha1.StoragePool {

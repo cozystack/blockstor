@@ -45,6 +45,41 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Run("DeleteMissing", func(t *testing.T) { testNodeDeleteMissing(t, newStore) })
 	t.Run("DeleteRemoves", func(t *testing.T) { testNodeDeleteRemoves(t, newStore) })
 	t.Run("ListSorted", func(t *testing.T) { testNodeListSorted(t, newStore) })
+	// SetConnectionStatus is the path the Hello RPC drives — the field
+	// linstor-csi's wait-node-online initContainer polls for. Pinned
+	// here so InMemory and CRD-backed stores stay identical.
+	t.Run("SetConnectionStatus", func(t *testing.T) { testNodeSetConnectionStatus(t, newStore) })
+	t.Run("SetConnectionStatusMissing", func(t *testing.T) { testNodeSetConnectionStatusMissing(t, newStore) })
+}
+
+func testNodeSetConnectionStatus(t *testing.T, newStore Factory) {
+	s := newStore(t).Nodes()
+	ctx := t.Context()
+
+	if err := s.Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := s.SetConnectionStatus(ctx, "n1", "ONLINE"); err != nil {
+		t.Fatalf("SetConnectionStatus: %v", err)
+	}
+
+	got, err := s.Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.ConnectionStatus != "ONLINE" {
+		t.Errorf("ConnectionStatus: got %q, want ONLINE", got.ConnectionStatus)
+	}
+}
+
+func testNodeSetConnectionStatusMissing(t *testing.T, newStore Factory) {
+	s := newStore(t).Nodes()
+	err := s.SetConnectionStatus(t.Context(), "missing", "ONLINE")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("SetConnectionStatus missing: got %v, want ErrNotFound", err)
+	}
 }
 
 // RunVolumeDefinitionStore exercises every branch of
@@ -384,6 +419,41 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want ErrNotFound", err)
 		}
 	})
+	// SetState pins the path the satellite's events2 observer drives:
+	// runtime State (InUse) + DRBD-state props land on the existing
+	// Resource without disturbing Spec. Tested across both InMemory
+	// and CRD-backed stores so they stay behaviourally identical.
+	t.Run("SetState", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+		if err := s.Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		err := s.SetState(ctx, "pvc-1", "n1",
+			apiv1.ResourceState{InUse: true},
+			map[string]string{"DrbdState": "UpToDate"})
+		if err != nil {
+			t.Fatalf("SetState: %v", err)
+		}
+		got, err := s.Get(ctx, "pvc-1", "n1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if !got.State.InUse {
+			t.Errorf("State.InUse: got false, want true")
+		}
+		if got.Props["DrbdState"] != "UpToDate" {
+			t.Errorf("Props[DrbdState]: got %q, want UpToDate", got.Props["DrbdState"])
+		}
+	})
+	t.Run("SetStateMissing", func(t *testing.T) {
+		s := newStore(t).Resources()
+		err := s.SetState(t.Context(), "pvc-missing", "n1",
+			apiv1.ResourceState{InUse: true}, nil)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("SetState on missing: got %v, want ErrNotFound", err)
+		}
+	})
 }
 
 // RunResourceDefinitionStore exercises every branch of
@@ -606,6 +676,53 @@ func RunStoragePoolStore(t *testing.T, newStore Factory) {
 	t.Run("DeleteMissing", func(t *testing.T) { testSPDeleteMissing(t, newStore) })
 	t.Run("DeleteRemoves", func(t *testing.T) { testSPDeleteRemoves(t, newStore) })
 	t.Run("ListSorted", func(t *testing.T) { testSPListSorted(t, newStore) })
+	// SetCapacity is the satellite's hot-path: ReportPoolCapacity gRPC
+	// call lands here every reporting interval. Pinned across
+	// implementations so InMemory and CRD stay behaviourally identical
+	// when the autoplacer reads free/total figures.
+	t.Run("SetCapacity", func(t *testing.T) { testSPSetCapacity(t, newStore) })
+	t.Run("SetCapacityMissing", func(t *testing.T) { testSPSetCapacityMissing(t, newStore) })
+}
+
+func testSPSetCapacity(t *testing.T, newStore Factory) {
+	s := newStore(t).StoragePools()
+	ctx := t.Context()
+
+	pool := apiv1.StoragePool{
+		StoragePoolName: "thin",
+		NodeName:        "n1",
+		ProviderKind:    "LVM_THIN",
+	}
+	if err := s.Create(ctx, &pool); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	err := s.SetCapacity(ctx, "n1", "thin", 500_000, 1_000_000, true)
+	if err != nil {
+		t.Fatalf("SetCapacity: %v", err)
+	}
+
+	got, err := s.Get(ctx, "n1", "thin")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.FreeCapacity != 500_000 || got.TotalCapacity != 1_000_000 {
+		t.Errorf("capacity: got free=%d total=%d, want 500000/1000000",
+			got.FreeCapacity, got.TotalCapacity)
+	}
+
+	if !got.SupportsSnapshot {
+		t.Errorf("SupportsSnapshot: got false, want true")
+	}
+}
+
+func testSPSetCapacityMissing(t *testing.T, newStore Factory) {
+	s := newStore(t).StoragePools()
+	err := s.SetCapacity(t.Context(), "n1", "missing", 0, 0, false)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("SetCapacity on missing pool: got %v, want ErrNotFound", err)
+	}
 }
 
 // --- NodeStore branches ---

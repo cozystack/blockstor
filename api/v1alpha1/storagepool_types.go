@@ -58,11 +58,14 @@ type StoragePoolSpec struct {
 // StoragePoolStatus is the observed state of a storage pool, populated by
 // the satellite once it brings up the backing volume group.
 type StoragePoolStatus struct {
-	// freeCapacity is the free capacity in bytes reported by the satellite.
+	// freeCapacity is the free capacity in KiB reported by the satellite.
+	// Matches the wire shape (gRPC SatellitePool.FreeCapacityKib, REST
+	// `free_capacity_kib`) so /v1/view/storage-pools and the autoplacer
+	// can read this field directly without a unit conversion.
 	// +optional
 	FreeCapacity int64 `json:"freeCapacity,omitempty"`
 
-	// totalCapacity is the total capacity in bytes reported by the satellite.
+	// totalCapacity is the total capacity in KiB reported by the satellite.
 	// +optional
 	TotalCapacity int64 `json:"totalCapacity,omitempty"`
 
