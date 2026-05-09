@@ -17,6 +17,7 @@ limitations under the License.
 package zfs_test
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -246,3 +247,104 @@ func TestZFSResizeVolumeIssuesZfsSet(t *testing.T) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestVolumeStatusMissing: `zfs list` errors out → NOT_PROVISIONED
+// (zfs returns non-zero when the dataset doesn't exist; we treat
+// that as "not yet created", same as an empty stdout).
+func TestVolumeStatusMissing(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(
+		"zfs list -H -p -o name,volsize,used tank/ghost_00000",
+		storage.FakeResponse{Err: errZFSListMissing},
+	)
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	got, err := p.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "ghost",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("VolumeStatus: %v", err)
+	}
+
+	if got.State != "NOT_PROVISIONED" {
+		t.Errorf("State: got %q, want NOT_PROVISIONED", got.State)
+	}
+}
+
+// TestVolumeStatusEmptyOutput: `zfs list` returns empty output (no
+// error, just nothing on stdout) — same NOT_PROVISIONED treatment.
+// Pins the dual no-error / non-empty-but-malformed branch.
+func TestVolumeStatusEmptyOutput(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// Default is empty stdout, no error.
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	got, err := p.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "ghost",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("VolumeStatus: %v", err)
+	}
+
+	if got.State != "NOT_PROVISIONED" {
+		t.Errorf("State: got %q, want NOT_PROVISIONED", got.State)
+	}
+}
+
+// TestVolumeStatusBadColumns: `zfs list` output that doesn't match
+// the expected column count must surface a descriptive error rather
+// than panic on slice access.
+func TestVolumeStatusBadColumns(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(
+		"zfs list -H -p -o name,volsize,used tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("only one column\n")},
+	)
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	_, err := p.VolumeStatus(t.Context(), storage.Volume{ResourceName: "pvc-1"})
+	if err == nil {
+		t.Errorf("expected error on malformed zfs list output")
+	}
+}
+
+// TestPoolStatusBadColumns: zpool list output with the wrong number
+// of columns surfaces a parse error, not a slice panic.
+func TestPoolStatusBadColumns(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(
+		"zpool list -H -p -o size,free tank",
+		storage.FakeResponse{Stdout: []byte("only_one_field\n")},
+	)
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Errorf("expected error on malformed zpool list output")
+	}
+}
+
+// TestPoolStatusBadNumbers: well-shaped output with non-numeric
+// fields → ParseInt error, no panic.
+func TestPoolStatusBadNumbers(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect(
+		"zpool list -H -p -o size,free tank",
+		storage.FakeResponse{Stdout: []byte("nope\tnope\n")},
+	)
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Errorf("expected ParseInt error on non-numeric fields")
+	}
+}
+
+var errZFSListMissing = errors.New("dataset does not exist")
