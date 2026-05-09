@@ -36,6 +36,7 @@ var (
 	errNotALUKSDevice    = errors.New("not a luks device")
 	errLUKSOpenAlready   = errors.New("device pvc-luks-only-0-luks already exists")
 	errDrbdadmAdjustFail = errors.New("drbdadm: simulated mid-Apply abort")
+	errDrbdadmResizeFail = errors.New("drbdadm: resize failed (peer disconnected)")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -708,6 +709,66 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 
 	if !saw("luksOpen") {
 		t.Errorf("expected cryptsetup luksOpen in [DRBD,LUKS,STORAGE] apply; got %v", fx.CommandLines())
+	}
+}
+
+// TestApplyDRBDResizeErrorSurfaces: when storage grew and `drbdadm
+// resize` then fails, the per-resource result must reflect Ok=false
+// with the resize error in the message. The .res file has already
+// been written by this point — the next reconcile picks up where
+// this one left off (same firstActivation=false / no double-create-md
+// invariant the abort-mid-Apply test pins).
+func TestApplyDRBDResizeErrorSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// LV already exists — triggers the resize path in applyStorage.
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-resize-fail_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-resize-fail_00000\n")})
+	// VolumeStatus reports current size 1 GiB; desired is 2 GiB.
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-resize-fail_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-resize-fail_00000|1048576\n")})
+	// drbdadm resize fails (e.g. peer not connected).
+	fx.Expect("drbdadm resize --assume-clean pvc-resize-fail",
+		storage.FakeResponse{Err: errDrbdadmResizeFail})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-resize-fail",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("Ok=true on drbdadm resize failure; want false")
+	}
+
+	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "resize") {
+		t.Errorf("error message must mention resize; got %q", results[0].GetMessage())
+	}
+
+	// .res file must already be on disk so the next reconcile sees
+	// firstActivation=false. Pins the same convergence guarantee the
+	// abort-mid-Apply test relies on.
+	if _, statErr := os.Stat(filepath.Join(dir, "pvc-resize-fail.res")); statErr != nil {
+		t.Errorf(".res file should be written before drbdadm resize; got %v", statErr)
 	}
 }
 
