@@ -67,18 +67,19 @@ rest_put "/v1/resource-definitions/${RD}/volume-definitions/0" \
     "{\"size_kib\":${SIZE_GROWN_KIB}}"
 
 echo ">> wait 60s for satellite resize chain"
+TOLERANCE_KIB=128
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
     cur_kib=$(on_node "$N1" bash -c "blockdev --getsize64 ${DEV}" 2>/dev/null || true)
     cur_kib=$(( ${cur_kib:-0} / 1024 ))
-    if (( cur_kib >= SIZE_GROWN_KIB )); then
+    if (( cur_kib + TOLERANCE_KIB >= SIZE_GROWN_KIB )); then
         break
     fi
     sleep 2
 done
 
-if (( cur_kib < SIZE_GROWN_KIB )); then
-    echo "FAIL: device size $cur_kib < $SIZE_GROWN_KIB after 60s"
+if (( cur_kib + TOLERANCE_KIB < SIZE_GROWN_KIB )); then
+    echo "FAIL: device size $cur_kib < $SIZE_GROWN_KIB after 60s (tolerance ${TOLERANCE_KIB})"
     exit 1
 fi
 

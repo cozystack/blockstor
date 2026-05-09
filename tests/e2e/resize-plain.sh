@@ -39,18 +39,22 @@ echo ">> resize via REST → $SIZE_GROWN_KIB KiB"
 rest_put "/v1/resource-definitions/${RD}/volume-definitions/0" \
     "{\"size_kib\":${SIZE_GROWN_KIB}}"
 
+# DRBD reserves ~44 KiB for internal metadata, so the visible /dev/drbdN
+# size after resize is `requested - <small>`. Accept ≥99% of the
+# requested size as a successful grow.
+TOLERANCE_KIB=128
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
     cur=$(on_node "$N1" bash -c "blockdev --getsize64 ${DEV}" 2>/dev/null || true)
     cur=$(( ${cur:-0} / 1024 ))
-    if (( cur >= SIZE_GROWN_KIB )); then
+    if (( cur + TOLERANCE_KIB >= SIZE_GROWN_KIB )); then
         break
     fi
     sleep 2
 done
 
-if (( cur < SIZE_GROWN_KIB )); then
-    echo "FAIL: device size $cur KiB < $SIZE_GROWN_KIB"
+if (( cur + TOLERANCE_KIB < SIZE_GROWN_KIB )); then
+    echo "FAIL: device size $cur KiB < $SIZE_GROWN_KIB (tolerance ${TOLERANCE_KIB})"
     exit 1
 fi
 
