@@ -50,6 +50,60 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	// here so InMemory and CRD-backed stores stay identical.
 	t.Run("SetConnectionStatus", func(t *testing.T) { testNodeSetConnectionStatus(t, newStore) })
 	t.Run("SetConnectionStatusMissing", func(t *testing.T) { testNodeSetConnectionStatusMissing(t, newStore) })
+	t.Run("NetInterfacesRoundTrip", func(t *testing.T) { testNodeNetInterfacesRoundTrip(t, newStore) })
+}
+
+// testNodeNetInterfacesRoundTrip pins the NetInterfaces field
+// round-trip on Create + Update — linstor-csi and piraeus-operator
+// publish replication-network endpoints via this slice, and a
+// regression that dropped the field on crdToWire would surface here.
+// SatelliteEncryptionType is also uppercase-normalised by the
+// k8s store; the test uses uppercase so it round-trips identically
+// across both implementations.
+func testNodeNetInterfacesRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t).Nodes()
+	ctx := t.Context()
+
+	want := []apiv1.NetInterface{
+		{
+			Name:                    "default",
+			Address:                 "10.244.1.5",
+			SatellitePort:           3366,
+			SatelliteEncryptionType: "PLAIN",
+		},
+		{
+			Name:                    "replication",
+			Address:                 "10.5.0.5",
+			SatellitePort:           3367,
+			SatelliteEncryptionType: "PLAIN",
+		},
+	}
+
+	if err := s.Create(ctx, &apiv1.Node{
+		Name:          "n1",
+		Type:          apiv1.NodeTypeSatellite,
+		NetInterfaces: want,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if len(got.NetInterfaces) != len(want) {
+		t.Fatalf("NetInterfaces: got %d, want %d", len(got.NetInterfaces), len(want))
+	}
+
+	for i := range want {
+		if got.NetInterfaces[i].Name != want[i].Name ||
+			got.NetInterfaces[i].Address != want[i].Address ||
+			got.NetInterfaces[i].SatellitePort != want[i].SatellitePort {
+			t.Errorf("NetInterface[%d]: got %+v, want %+v",
+				i, got.NetInterfaces[i], want[i])
+		}
+	}
 }
 
 func testNodeSetConnectionStatus(t *testing.T, newStore Factory) {
