@@ -44,6 +44,15 @@ type fakeSatelliteClient struct {
 	last *satellitepb.ApplyResourcesRequest
 	resp *satellitepb.ApplyResourcesResponse
 	err  error
+
+	// DeleteResource state, populated when the test exercises that
+	// path (Apply tests leave these zero-valued).
+	delLast *satellitepb.DeleteResourceRequest
+	delResp *satellitepb.DeleteResourceResponse
+
+	// CreateSnapshot state.
+	snapLast []*satellitepb.CreateSnapshotRequest
+	snapResp *satellitepb.CreateSnapshotResponse
 }
 
 func (f *fakeDialer) Dial(_ context.Context, endpoint string) (satellitepb.SatelliteClient, func() error, error) {
@@ -54,6 +63,22 @@ func (f *fakeDialer) Dial(_ context.Context, endpoint string) (satellitepb.Satel
 func (f *fakeSatelliteClient) ApplyResources(_ context.Context, req *satellitepb.ApplyResourcesRequest, _ ...grpc.CallOption) (*satellitepb.ApplyResourcesResponse, error) {
 	f.last = req
 	return f.resp, f.err
+}
+
+func (f *fakeSatelliteClient) DeleteResource(_ context.Context, req *satellitepb.DeleteResourceRequest, _ ...grpc.CallOption) (*satellitepb.DeleteResourceResponse, error) {
+	f.delLast = req
+	if f.delResp == nil {
+		return &satellitepb.DeleteResourceResponse{Ok: true}, nil
+	}
+	return f.delResp, nil
+}
+
+func (f *fakeSatelliteClient) CreateSnapshot(_ context.Context, req *satellitepb.CreateSnapshotRequest, _ ...grpc.CallOption) (*satellitepb.CreateSnapshotResponse, error) {
+	f.snapLast = append(f.snapLast, req)
+	if f.snapResp == nil {
+		return &satellitepb.CreateSnapshotResponse{Ok: true}, nil
+	}
+	return f.snapResp, nil
 }
 
 // TestApplyDialsTargetSatellite: the dispatcher uses the target Node's
@@ -311,4 +336,260 @@ var errFakeDial = errors.New("dispatcher_test: connection refused")
 // every table entry.
 func nodeMeta(name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name}
+}
+
+// TestDeriveExports: the public DerivePort / DeriveMinor wrappers must
+// match their unexported implementations. Used by ad-hoc tooling
+// (drbdadm-show-replicas helpers) that imports the dispatcher package
+// without re-implementing the hash. Different RDs must hash differently;
+// the same RD must be deterministic across calls.
+func TestDeriveExports(t *testing.T) {
+	port := dispatcher.DerivePort("pvc-1")
+	if port < 7000 || port >= 8000 {
+		t.Errorf("DerivePort: got %d, want in [7000, 8000)", port)
+	}
+
+	if dispatcher.DerivePort("pvc-1") != port {
+		t.Errorf("DerivePort non-deterministic")
+	}
+
+	if dispatcher.DerivePort("pvc-1") == dispatcher.DerivePort("pvc-2") {
+		t.Errorf("DerivePort hash collision on different RDs")
+	}
+
+	minor := dispatcher.DeriveMinor("pvc-1")
+	if minor < 1000 || minor >= 10000 {
+		t.Errorf("DeriveMinor: got %d, want in [1000, 10000)", minor)
+	}
+}
+
+// TestDeleteResourceDispatchesToTarget: DeleteResource dials the target
+// satellite's endpoint and forwards (rd_name, storage_pool, volume_numbers)
+// over the gRPC contract. Pins the per-replica teardown path the
+// Resource controller drives on RD deletion.
+func TestDeleteResourceDispatchesToTarget(t *testing.T) {
+	stub := &fakeSatelliteClient{}
+	dialer := &fakeDialer{stub: stub}
+	d := dispatcher.New(dialer)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-del",
+			NodeName:               "n1",
+			Props:                  map[string]string{"StorPoolName": "thin"},
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.244.1.5:7000"},
+		},
+	}}
+
+	resp, err := d.DeleteResource(t.Context(), target, rd, nodes)
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Errorf("expected Ok=true; got %+v", resp)
+	}
+
+	if dialer.endpoint != "10.244.1.5:7000" {
+		t.Errorf("endpoint: got %q, want 10.244.1.5:7000", dialer.endpoint)
+	}
+
+	if stub.delLast.GetName() != "pvc-del" {
+		t.Errorf("Name: got %q, want pvc-del", stub.delLast.GetName())
+	}
+
+	if stub.delLast.GetStoragePool() != "thin" {
+		t.Errorf("StoragePool: got %q, want thin", stub.delLast.GetStoragePool())
+	}
+
+	if !slices.Equal(stub.delLast.GetVolumeNumbers(), []int32{0, 1}) {
+		t.Errorf("VolumeNumbers: got %v, want [0 1]", stub.delLast.GetVolumeNumbers())
+	}
+}
+
+// TestDeleteResourceFallsBackToRDStorPool: when the Resource itself
+// doesn't carry a StorPoolName prop, the dispatcher reaches up to the
+// RD's prop. Mirrors the same fallback Apply does so a teardown after
+// an RD-level pool change still hits the right pool.
+func TestDeleteResourceFallsBackToRDStorPool(t *testing.T) {
+	stub := &fakeSatelliteClient{}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-del",
+			NodeName:               "n1",
+			// StorPoolName intentionally absent on the Resource.
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{"StorPoolName": "rd-pool"},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.244.1.5:7000"},
+		},
+	}}
+
+	_, err := d.DeleteResource(t.Context(), target, rd, nodes)
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	if stub.delLast.GetStoragePool() != "rd-pool" {
+		t.Errorf("StoragePool fallback: got %q, want rd-pool", stub.delLast.GetStoragePool())
+	}
+}
+
+// TestDeleteResourceMissingEndpoint: no SatelliteEndpoint on the
+// target node → error before dial. Caller (Resource controller) is
+// expected to retry once the Node CRD catches up.
+func TestDeleteResourceMissingEndpoint(t *testing.T) {
+	d := dispatcher.New(&fakeDialer{stub: &fakeSatelliteClient{}})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-del", NodeName: "n1"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+	}}
+
+	_, err := d.DeleteResource(t.Context(), target, nil, nodes)
+	if err == nil {
+		t.Errorf("expected error when SatelliteEndpoint missing; got nil")
+	}
+}
+
+// TestCreateSnapshotFanout: CreateSnapshot dials every diskful
+// replica's satellite, skipping DISKLESS replicas (they have no LV
+// to snapshot). Pins the snapshot fan-out path used by the Snapshot
+// CRD reconciler.
+func TestCreateSnapshotFanout(t *testing.T) {
+	stub := &fakeSatelliteClient{}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	replicas := []blockstoriov1alpha1.Resource{
+		{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: "pvc-snap",
+				NodeName:               "n1",
+			},
+		},
+		{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: "pvc-snap",
+				NodeName:               "n2",
+			},
+		},
+		{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: "pvc-snap",
+				NodeName:               "n3",
+				Flags:                  []string{"DISKLESS"},
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{
+		{
+			ObjectMeta: nodeMeta("n1"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "10.244.1.5:7000"},
+			},
+		},
+		{
+			ObjectMeta: nodeMeta("n2"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "10.244.1.6:7000"},
+			},
+		},
+		{
+			ObjectMeta: nodeMeta("n3"),
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:  "SATELLITE",
+				Props: map[string]string{"SatelliteEndpoint": "10.244.1.7:7000"},
+			},
+		},
+	}
+
+	results, err := d.CreateSnapshot(t.Context(), "pvc-snap", "snap-1", replicas, nodes)
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Errorf("results: got %d, want 2 (DISKLESS replica must be skipped)", len(results))
+	}
+
+	if len(stub.snapLast) != 2 {
+		t.Errorf("RPCs sent: got %d, want 2", len(stub.snapLast))
+	}
+
+	for _, req := range stub.snapLast {
+		if req.GetResourceName() != "pvc-snap" || req.GetSnapshotName() != "snap-1" {
+			t.Errorf("RPC payload: got rd=%q snap=%q, want pvc-snap/snap-1",
+				req.GetResourceName(), req.GetSnapshotName())
+		}
+	}
+}
+
+// TestCreateSnapshotMissingEndpointRecorded: a replica whose Node has
+// no SatelliteEndpoint must surface as an Ok=false result rather than
+// failing the whole fan-out (other replicas can still take their snap).
+func TestCreateSnapshotMissingEndpointRecorded(t *testing.T) {
+	stub := &fakeSatelliteClient{}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	replicas := []blockstoriov1alpha1.Resource{
+		{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: "pvc-snap",
+				NodeName:               "n-missing",
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n-missing"),
+		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+	}}
+
+	results, err := d.CreateSnapshot(t.Context(), "pvc-snap", "snap-1", replicas, nodes)
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("missing endpoint must surface as Ok=false; got %+v", results[0])
+	}
 }
