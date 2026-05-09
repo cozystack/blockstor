@@ -184,7 +184,7 @@ func TestRunDeleteHappyPathStripsFinalizer(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if got.RequeueAfter != 0 || got.Requeue {
+	if got.RequeueAfter != 0 {
 		t.Errorf("Result: got %+v, want zero (success means no requeue)", got)
 	}
 

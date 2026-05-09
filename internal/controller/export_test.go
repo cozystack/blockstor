@@ -21,6 +21,8 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
 
 // EnqueueResourcesForRD exposes the internal RD-watch fan-out for
@@ -46,4 +48,12 @@ func (r *ResourceDefinitionReconciler) EnqueueRDForResource(ctx context.Context,
 // races. Tests pin both the positive and the false-positive paths.
 func AlreadyExists(err error) bool {
 	return alreadyExists(err)
+}
+
+// ResolveLayerStack exposes the four-tier layer-stack resolver:
+// RD spec → RG spec → nil (dispatcher default). Tests pin each
+// tier so a refactor that swapped precedence (RG over RD, say)
+// would surface immediately.
+func (r *ResourceReconciler) ResolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
+	return r.resolveLayerStack(ctx, rd)
 }
