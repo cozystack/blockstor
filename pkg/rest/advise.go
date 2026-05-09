@@ -161,6 +161,12 @@ func pickAdvicePools(pools []apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		}
 	}
 
+	// Shared-LUN anti-affinity: the placer would refuse to put two
+	// replicas on pools sharing a backing LUN, so the advice surface
+	// must mirror that — otherwise we'd recommend a layout the
+	// resource-create would then reject.
+	candidates = dedupShared(candidates)
+
 	if want > len(candidates) {
 		want = len(candidates)
 	}

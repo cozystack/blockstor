@@ -80,7 +80,12 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		return 0, 0, err
 	}
 
-	state := newState(filter, existing, nodes)
+	allPools, err := p.store.StoragePools().List(ctx)
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "list storage pools")
+	}
+
+	state := newState(filter, existing, nodes, allPools)
 
 	if state.sameTuple == nil && len(filter.ReplicasOnSame) > 0 {
 		candidates, state.sameTuple = pickSameGroup(candidates, nodes,
@@ -170,24 +175,45 @@ func (p *Placer) placeDisklessOnRemaining(ctx context.Context, rdName string, st
 // state holds the per-call lookup tables. Pulled out of Placer so a
 // concurrent Placer call doesn't share the mutable bookkeeping.
 type state struct {
-	nodes     map[string]map[string]string
-	taken     map[string]struct{}
-	sameTuple map[string]string
-	diffSeen  map[string]struct{}
-	filter    *apiv1.AutoSelectFilter
+	nodes      map[string]map[string]string
+	taken      map[string]struct{}
+	sameTuple  map[string]string
+	diffSeen   map[string]struct{}
+	sharedSeen map[string]struct{} // sharedSpaceIDs already used by an existing replica
+	pools      map[string]apiv1.StoragePool
+	filter     *apiv1.AutoSelectFilter
 }
 
-func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string) *state {
+func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool) *state {
 	s := &state{
-		nodes:     nodes,
-		taken:     make(map[string]struct{}, len(existing)),
-		sameTuple: topologyTuple(existing, nodes, filter.ReplicasOnSame),
-		diffSeen:  topologySeen(existing, nodes, filter.ReplicasOnDifferent),
-		filter:    filter,
+		nodes:      nodes,
+		taken:      make(map[string]struct{}, len(existing)),
+		sameTuple:  topologyTuple(existing, nodes, filter.ReplicasOnSame),
+		diffSeen:   topologySeen(existing, nodes, filter.ReplicasOnDifferent),
+		sharedSeen: make(map[string]struct{}),
+		pools:      poolsByKey(pools),
+		filter:     filter,
 	}
 
 	for i := range existing {
 		s.taken[existing[i].NodeName] = struct{}{}
+
+		// Pre-seed shared-space anti-affinity: if an existing replica
+		// already lives on a shared-LUN pool, no new replica may land
+		// on a pool sharing that LUN identifier.
+		stor := existing[i].Props["StorPoolName"]
+		if stor == "" {
+			continue
+		}
+
+		pool, ok := s.pools[poolKey(existing[i].NodeName, stor)]
+		if !ok {
+			continue
+		}
+
+		if pool.SharedSpaceID != "" {
+			s.sharedSeen[pool.SharedSpaceID] = struct{}{}
+		}
 	}
 
 	return s
@@ -206,6 +232,16 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 
 	if collidesWithDiff(nodeProps, s.filter.ReplicasOnDifferent, s.diffSeen) {
 		return false, nil
+	}
+
+	// Shared-LUN anti-affinity: pools sharing a backing LUN identifier
+	// cannot host two replicas of the same RD — at the physical layer
+	// they are the same disk, so a 2-replica placement onto the same
+	// SharedSpaceID would offer zero redundancy.
+	if pool.SharedSpaceID != "" {
+		if _, dup := s.sharedSeen[pool.SharedSpaceID]; dup {
+			return false, nil
+		}
 	}
 
 	res := apiv1.Resource{
@@ -229,7 +265,26 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		s.diffSeen[k+"="+nodeProps[auxKey(k)]] = struct{}{}
 	}
 
+	if pool.SharedSpaceID != "" {
+		s.sharedSeen[pool.SharedSpaceID] = struct{}{}
+	}
+
 	return true, nil
+}
+
+// poolKey is the composite (node, pool) lookup key used to find a
+// StoragePool from a Resource's StorPoolName + NodeName pair.
+func poolKey(node, pool string) string {
+	return node + "\x1f" + pool
+}
+
+func poolsByKey(pools []apiv1.StoragePool) map[string]apiv1.StoragePool {
+	out := make(map[string]apiv1.StoragePool, len(pools))
+	for i := range pools {
+		out[poolKey(pools[i].NodeName, pools[i].StoragePoolName)] = pools[i]
+	}
+
+	return out
 }
 
 func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter) ([]apiv1.StoragePool, error) {

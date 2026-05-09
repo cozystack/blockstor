@@ -65,6 +65,16 @@ spec:
                 - FILE_THIN
                 - DISKLESS
                 type: string
+              sharedSpaceId:
+                description: |-
+                  sharedSpaceId groups pools that physically share the same backing
+                  LUN (e.g. an EXOS / NetApp / Ceph-RBD-as-shared-disk slice attached
+                  to multiple satellites). Pools in the same group contribute their
+                  free capacity once to cluster totals instead of summing, and the
+                  autoplacer treats them as anti-affine for replica placement so a
+                  2-replica RD never lands twice on the same physical LUN.
+                  Empty string = local pool (default).
+                type: string
             required:
             - nodeName
             - providerKind

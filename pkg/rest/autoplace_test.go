@@ -608,6 +608,120 @@ func TestAutoplaceSkipsEvictedNodes(t *testing.T) {
 	}
 }
 
+// TestAutoplaceSharedLUNAntiAffinity: two pools share the same backing
+// LUN (SharedSpaceID="exos-lun-42"); a 2-replica autoplace must never
+// land both replicas on those pools, even though they live on
+// distinct nodes. Real-world rationale: at the physical layer the
+// LUN is the same disk, so both replicas would sit on the same
+// failure domain — defeating the redundancy a 2-replica RD promises.
+func TestAutoplaceSharedLUNAntiAffinity(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-shared"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// n1 + n2 each see the same EXOS LUN; n3 has its own local pool.
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "exos-lun-42", FreeCapacity: 9000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "exos-lun-42", FreeCapacity: 9000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 5000},
+	}
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-shared/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-shared")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("placed: got %d, want 2", len(got))
+	}
+
+	// Exactly one of {n1, n2} can be picked; n3 (local) MUST be the other.
+	nodes := []string{got[0].NodeName, got[1].NodeName}
+	if !slices.Contains(nodes, "n3") {
+		t.Errorf("expected one replica on n3 (the non-shared node); got %v", nodes)
+	}
+
+	sharedHit := 0
+	for _, n := range nodes {
+		if n == "n1" || n == "n2" {
+			sharedHit++
+		}
+	}
+
+	if sharedHit > 1 {
+		t.Errorf("both replicas on the same shared-LUN pool group: %v", nodes)
+	}
+}
+
+// TestAutoplaceSharedLUNExhausted: 2-replica RD against two pools
+// sharing one LUN — only one replica fits, the other has no
+// candidate and the request must 409. Pins the conflict path.
+func TestAutoplaceSharedLUNExhausted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-shared-2"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			SharedSpaceID:   "exos-lun-42",
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-shared-2/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (only one shared-LUN slot fits)", resp.StatusCode)
+	}
+}
+
 // TestResourceListAndGet: GET /v1/resource-definitions/{rd}/resources
 // returns all replicas wrapped as ResourceWithVolumes; the per-node
 // GET returns one entry or 404 when missing. linstor-csi's reconciler

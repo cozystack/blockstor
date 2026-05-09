@@ -174,3 +174,59 @@ func TestQueryAllSizeInfo(t *testing.T) {
 		t.Errorf("rg-2 max: got %d, want 1024 (both pools fit)", got.Result["rg-2"].SpaceInfo.MaxVlmSizeInKib)
 	}
 }
+
+// TestQuerySizeInfoSharedLUN: pools sharing a backing LUN must
+// contribute their capacity once, not summed. Without dedup, two
+// pools each "seeing" 1000 KiB of the same LUN would report 2000
+// KiB available — and `linstor advise` / golinstor's pre-flight
+// would happily admit a 1500-KiB request that physically can't fit.
+func TestQuerySizeInfoSharedLUN(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-shared",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  2,
+			StoragePool: "pool",
+		},
+	})
+
+	// Two pools sharing the same LUN, plus a third independent pool.
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 700, TotalCapacity: 1400},
+	}
+	for i := range pools {
+		_ = st.StoragePools().Create(ctx, &pools[i])
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-shared/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	// After dedup, candidates are {n1, n3} (n2 collapsed into n1's
+	// shared LUN). place_count=2 → max-vol is the smaller free, 700.
+	if got.SpaceInfo.MaxVlmSizeInKib != 700 {
+		t.Errorf("max vol: got %d, want 700 (n3 = smaller free of the two surviving slots)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+
+	// Available capacity: shared LUN counted once (1000) + n3 (700)
+	// = 1700, NOT 2700 (which would be the un-deduped sum).
+	if got.SpaceInfo.AvailableSizeInKib != 1700 {
+		t.Errorf("available: got %d, want 1700 (shared LUN counted once)",
+			got.SpaceInfo.AvailableSizeInKib)
+	}
+}

@@ -188,6 +188,7 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		StoragePoolName:  poolName,
 		NodeName:         crd.Spec.NodeName,
 		ProviderKind:     crd.Spec.ProviderKind,
+		SharedSpaceID:    crd.Spec.SharedSpaceID,
 		Props:            crd.Spec.Props,
 		FreeCapacity:     crd.Status.FreeCapacity,
 		TotalCapacity:    crd.Status.TotalCapacity,
@@ -245,9 +246,10 @@ func wireToCRDStoragePool(in *apiv1.StoragePool) *crdv1alpha1.StoragePool {
 // wireToCRDStoragePoolSpec is the spec-only converter for Update.
 func wireToCRDStoragePoolSpec(in *apiv1.StoragePool) crdv1alpha1.StoragePoolSpec {
 	return crdv1alpha1.StoragePoolSpec{
-		NodeName:     in.NodeName,
-		PoolName:     in.StoragePoolName,
-		ProviderKind: in.ProviderKind,
-		Props:        in.Props,
+		NodeName:      in.NodeName,
+		PoolName:      in.StoragePoolName,
+		ProviderKind:  in.ProviderKind,
+		SharedSpaceID: in.SharedSpaceID,
+		Props:         in.Props,
 	}
 }

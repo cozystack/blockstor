@@ -40,6 +40,16 @@ type StoragePoolSpec struct {
 	// +kubebuilder:validation:Enum=LVM;LVM_THIN;ZFS;ZFS_THIN;FILE;FILE_THIN;DISKLESS
 	ProviderKind string `json:"providerKind"`
 
+	// sharedSpaceId groups pools that physically share the same backing
+	// LUN (e.g. an EXOS / NetApp / Ceph-RBD-as-shared-disk slice attached
+	// to multiple satellites). Pools in the same group contribute their
+	// free capacity once to cluster totals instead of summing, and the
+	// autoplacer treats them as anti-affine for replica placement so a
+	// 2-replica RD never lands twice on the same physical LUN.
+	// Empty string = local pool (default).
+	// +optional
+	SharedSpaceID string `json:"sharedSpaceId,omitempty"`
+
 	// props is the LINSTOR property map for this pool.
 	// +optional
 	Props map[string]string `json:"props,omitempty"`

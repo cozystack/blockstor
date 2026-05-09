@@ -27,10 +27,16 @@ type StoragePool struct {
 	FreeCapacity     int64             `json:"free_capacity,omitempty"`
 	TotalCapacity    int64             `json:"total_capacity,omitempty"`
 	FreeSpaceMgrName string            `json:"free_space_mgr_name,omitempty"`
-	Reports          []APICallRc       `json:"reports,omitempty"`
-	SupportsSnapshot bool              `json:"supports_snapshots,omitempty"`
-	ExternalLocking  bool              `json:"external_locking,omitempty"`
-	UUID             string            `json:"uuid,omitempty"`
+	// SharedSpaceID groups pools that physically share a backing LUN.
+	// Empty = local pool (default). Pools sharing the same value
+	// contribute one free-capacity figure to cluster totals (instead
+	// of summing) and are treated as anti-affine by the autoplacer.
+	// Wire field name matches upstream LINSTOR (`shared_space`).
+	SharedSpaceID    string      `json:"shared_space,omitempty"`
+	Reports          []APICallRc `json:"reports,omitempty"`
+	SupportsSnapshot bool        `json:"supports_snapshots,omitempty"`
+	ExternalLocking  bool        `json:"external_locking,omitempty"`
+	UUID             string      `json:"uuid,omitempty"`
 }
 
 // APICallRc is the upstream `ApiCallRc` envelope. We define a minimal subset

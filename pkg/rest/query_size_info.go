@@ -106,6 +106,12 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 	)
 
 	candidates := make([]apiv1.StoragePool, 0, len(pools))
+	// sharedSeen collapses pools that share a backing LUN: a SAN /
+	// EXOS / Ceph-RBD-as-shared-disk slice attached to multiple
+	// satellites must only contribute its capacity once to cluster
+	// totals. Without this, two pools each "seeing" 100 GiB of the
+	// same LUN would report 200 GiB free.
+	sharedSeen := map[string]struct{}{}
 
 	for i := range pools {
 		pool := pools[i]
@@ -122,11 +128,20 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 		}
 
 		candidates = append(candidates, pool)
+
+		if pool.SharedSpaceID != "" {
+			if _, dup := sharedSeen[pool.SharedSpaceID]; dup {
+				continue
+			}
+
+			sharedSeen[pool.SharedSpaceID] = struct{}{}
+		}
+
 		totalCapacity += pool.TotalCapacity
 		availableSum += pool.FreeCapacity
 	}
 
-	maxVolKib := worstFreeOfTopN(candidates, replicaCount(filter))
+	maxVolKib := worstFreeOfTopN(dedupShared(candidates), replicaCount(filter))
 
 	return querySizeInfoResponse{
 		SpaceInfo: querySizeInfoSpaceInfo{
@@ -135,6 +150,30 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 			AvailableSizeInKib: availableSum,
 		},
 	}, nil
+}
+
+// dedupShared collapses pools that share a backing LUN to a single
+// representative. The placer's anti-affinity already prevents 2 of N
+// replicas from landing on the same SharedSpaceID; the n-th-largest
+// computation must reflect that, otherwise it would overcount the
+// shared LUN as N independent pools.
+func dedupShared(pools []apiv1.StoragePool) []apiv1.StoragePool {
+	out := make([]apiv1.StoragePool, 0, len(pools))
+	seen := map[string]struct{}{}
+
+	for i := range pools {
+		if pools[i].SharedSpaceID != "" {
+			if _, dup := seen[pools[i].SharedSpaceID]; dup {
+				continue
+			}
+
+			seen[pools[i].SharedSpaceID] = struct{}{}
+		}
+
+		out = append(out, pools[i])
+	}
+
+	return out
 }
 
 // worstFreeOfTopN sorts pools by FreeCapacity desc and returns the
