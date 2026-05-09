@@ -46,7 +46,29 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, snaps)
+	// Optional filters golinstor sends: ?resources=rd1,rd2 &
+	// snapshots=name1,name2 — case-insensitive set membership against
+	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
+	// any snapshots exist for this volume?" poll has to scan the
+	// whole cluster every cycle.
+	rdFilter := splitCSV(r.URL.Query().Get("resources"))
+	nameFilter := splitCSV(r.URL.Query().Get("snapshots"))
+
+	out := make([]apiv1.Snapshot, 0, len(snaps))
+
+	for i := range snaps {
+		if !matchAnyFold(rdFilter, snaps[i].ResourceName) {
+			continue
+		}
+
+		if !matchAnyFold(nameFilter, snaps[i].Name) {
+			continue
+		}
+
+		out = append(out, snaps[i])
+	}
+
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
