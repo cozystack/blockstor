@@ -588,10 +588,16 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 
 // controllerProps reads the cluster-wide ControllerProps KV instance
 // via the KVEntry CRD. Empty when no entries exist (fresh cluster).
+//
+// We list every KVEntry and filter by Instance in-process; an
+// indexed `client.MatchingFields{"spec.instance": "ControllerProps"}`
+// would be cheaper but the controller-runtime cache rejects field
+// selectors that aren't pre-registered as field indexers, and the
+// extra wiring isn't worth it for a small KV store.
 func (r *ResourceReconciler) controllerProps(ctx context.Context) (map[string]string, error) {
 	var list blockstoriov1alpha1.KVEntryList
 
-	err := r.List(ctx, &list, client.MatchingFields{})
+	err := r.List(ctx, &list)
 	if err != nil {
 		return nil, err
 	}
