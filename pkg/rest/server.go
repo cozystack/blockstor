@@ -125,6 +125,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerSnapshotMulti(mux)
 	s.registerQuerySizeInfo(mux)
 	s.registerAdvise(mux)
+	s.registerPhysicalStorage(mux)
 
 	return mux
 }
