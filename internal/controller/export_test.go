@@ -34,3 +34,16 @@ func (r *ResourceReconciler) EnqueueResourcesForRD(ctx context.Context, obj clie
 func (r *ResourceReconciler) EnqueueSiblings(ctx context.Context, obj client.Object) []reconcile.Request {
 	return r.enqueueSiblings(ctx, obj)
 }
+
+// EnqueueRDForResource exposes the RD-side parent lookup for tests.
+// Production wiring stays unexported via SetupWithManager.
+func (r *ResourceDefinitionReconciler) EnqueueRDForResource(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.enqueueRDForResource(ctx, obj)
+}
+
+// AlreadyExists exposes the wrapped-error keyword check the RD
+// reconciler uses to tolerate kube-apiserver "already exists"
+// races. Tests pin both the positive and the false-positive paths.
+func AlreadyExists(err error) bool {
+	return alreadyExists(err)
+}

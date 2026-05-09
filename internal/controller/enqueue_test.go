@@ -18,6 +18,8 @@ package controller_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +29,14 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
+)
+
+// Sentinel errors used by TestAlreadyExistsKeyword. err113 wants
+// static (package-level) errors rather than inline `errors.New`.
+var (
+	errAlreadyExistsTestPlain   = errors.New("some unrelated error")
+	errAlreadyExistsKubeBase    = errors.New(`apierrors.NewAlreadyExists: resource "pvc-1.n1" already exists`)
+	errAlreadyExistsTestWrapped = fmt.Errorf("create Resource pvc-1: %w", errAlreadyExistsKubeBase)
 )
 
 // TestEnqueueResourcesForRD: an RD watch event must fan out to every
@@ -196,5 +206,95 @@ func TestEnqueueSiblingsEmptyRDName(t *testing.T) {
 	got := rec.EnqueueSiblings(context.Background(), orphan)
 	if len(got) != 0 {
 		t.Errorf("orphan Resource must not fan out: got %+v", got)
+	}
+}
+
+// TestEnqueueRDForResource: a Resource event must enqueue exactly its
+// parent RD's reconcile request. This is the watch the RD reconciler
+// uses to fire tiebreaker logic when child Resources land — without
+// it, an `apply RD + 2 Resources` race never re-runs the RD
+// reconciler and the 2-replica RD sits without its DISKLESS witness.
+func TestEnqueueRDForResource(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+		},
+	}
+
+	got := rec.EnqueueRDForResource(context.Background(), res)
+
+	if len(got) != 1 {
+		t.Fatalf("requests: got %d, want 1; got %+v", len(got), got)
+	}
+
+	if got[0].Name != "pvc-1" {
+		t.Errorf("RD name: got %q, want pvc-1", got[0].Name)
+	}
+}
+
+// TestEnqueueRDForResourceWrongType: defensive — non-Resource object
+// from the watch channel must yield nil, not panic.
+func TestEnqueueRDForResourceWrongType(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	got := rec.EnqueueRDForResource(context.Background(), &corev1.Pod{})
+	if got != nil {
+		t.Errorf("wrong-type event must yield nil; got %+v", got)
+	}
+}
+
+// TestEnqueueRDForResourceOrphan: a Resource without
+// ResourceDefinitionName → empty result, no enqueue.
+func TestEnqueueRDForResourceOrphan(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	orphan := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "orphan"},
+	}
+
+	got := rec.EnqueueRDForResource(context.Background(), orphan)
+	if len(got) != 0 {
+		t.Errorf("orphan Resource must not enqueue any RD: got %+v", got)
+	}
+}
+
+// TestAlreadyExistsKeyword pins the wrapped-error string match the RD
+// reconciler uses to tolerate kube-apiserver "AlreadyExists" races
+// (the k8s store wraps the apierror in cockroachdb/errors which
+// breaks errors.Is, so we fall back to keyword matching).
+func TestAlreadyExistsKeyword(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain non-match", errAlreadyExistsTestPlain, false},
+		{"wrapped match", errAlreadyExistsTestWrapped, true},
+	}
+
+	for _, c := range cases {
+		got := controllerpkg.AlreadyExists(c.err)
+		if got != c.want {
+			t.Errorf("%s: got %v, want %v (err=%v)", c.name, got, c.want, c.err)
+		}
 	}
 }
