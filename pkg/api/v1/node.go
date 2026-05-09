@@ -57,3 +57,11 @@ const (
 	NodeTypeConnecting          = "CONNECTING"
 	NodeTypeAuthenticationError = "AUTHENTICATION_ERROR"
 )
+
+// Node flag constants — values that appear in `Node.Flags`. EVICTED is
+// the soft "drain me" hint; LOST is set after eviction confirms the
+// node is gone for good.
+const (
+	NodeFlagEvicted = "EVICTED"
+	NodeFlagLost    = "LOST"
+)

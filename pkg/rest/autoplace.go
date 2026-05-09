@@ -184,11 +184,19 @@ func (s *Server) placeResources(ctx context.Context, rdName string, filter *apiv
 
 // candidatePools returns storage pools that satisfy the placement filter.
 // Empty `StoragePool` and empty `StoragePoolList` mean "any". `NodeNameList`
-// further restricts the candidates.
+// further restricts the candidates. Nodes flagged EVICTED or LOST are
+// filtered out — autoplace must never pick a satellite the operator
+// has marked unavailable, otherwise eviction/evacuation can't drain a
+// node before maintenance.
 func (s *Server) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter) ([]apiv1.StoragePool, error) {
 	all, err := s.Store.StoragePools().List(ctx)
 	if err != nil {
 		return nil, err //nolint:wrapcheck // bubbled to handler
+	}
+
+	disabled, err := s.disabledNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	out := make([]apiv1.StoragePool, 0, len(all))
@@ -197,6 +205,10 @@ func (s *Server) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		pool := all[i]
 
 		if pool.ProviderKind == apiv1.StoragePoolKindDiskless {
+			continue
+		}
+
+		if _, off := disabled[pool.NodeName]; off {
 			continue
 		}
 
@@ -225,6 +237,31 @@ func (s *Server) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 
 		return out[i].NodeName < out[j].NodeName
 	})
+
+	return out, nil
+}
+
+// disabledNodes returns a set of node names that autoplace must never
+// pick — currently the union of EVICTED and LOST flags. The set is
+// rebuilt on every autoplace call so flag changes (evacuate, restore)
+// take effect on the next placement.
+func (s *Server) disabledNodes(ctx context.Context) (map[string]struct{}, error) {
+	nodes, err := s.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // bubbled to handler
+	}
+
+	out := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		for _, f := range nodes[i].Flags {
+			if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
+				out[nodes[i].Name] = struct{}{}
+
+				break
+			}
+		}
+	}
 
 	return out, nil
 }
