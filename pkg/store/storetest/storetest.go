@@ -631,6 +631,27 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want ErrNotFound", err)
 		}
 	})
+	// DeleteMissing pins the per-replica idempotency the controller's
+	// runDelete fan-out depends on. Without ErrNotFound on a missing
+	// Resource the controller would log spurious errors during normal
+	// Resource cleanup races (a peer reconciler beat us to the Delete).
+	t.Run("DeleteMissing", func(t *testing.T) {
+		s := newStore(t).Resources()
+		err := s.Delete(t.Context(), "ghost", "n1")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Delete missing: got %v, want ErrNotFound", err)
+		}
+	})
+	// GetMissing pins the same sentinel so the controller-side
+	// "did this replica disappear under us?" probe works
+	// identically across stores.
+	t.Run("GetMissing", func(t *testing.T) {
+		s := newStore(t).Resources()
+		_, err := s.Get(t.Context(), "ghost", "n1")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Get missing: got %v, want ErrNotFound", err)
+		}
+	})
 	// SetState pins the path the satellite's events2 observer drives:
 	// runtime State (InUse) + DRBD-state props land on the existing
 	// Resource without disturbing Spec. Tested across both InMemory
