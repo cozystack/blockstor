@@ -28,6 +28,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -136,6 +138,17 @@ func run() int {
 			storage.RealExec{})
 	}
 
+	// Wipe stale .res files from previous incarnations of this
+	// satellite process. Each pod restart should hand drbdadm a
+	// clean slate — the controller will re-Apply every Resource
+	// CRD on this node within seconds, so we don't lose state, just
+	// the cruft from prior runs (csi-sanity leftovers, RDs deleted
+	// while the satellite was down, malformed .res from earlier
+	// release versions, etc). Without this drbdadm fails on parse
+	// errors from any one stale file even when the new RD's render
+	// is clean.
+	cleanStateDir(stateDir, logger)
+
 	agent := satellite.NewAgent(satellite.Config{
 		NodeName:           nodeName,
 		ControllerAddr:     controllerAddr,
@@ -167,4 +180,46 @@ func run() int {
 	}
 
 	return 0
+}
+
+// cleanStateDir wipes every *.res file in dir on satellite startup.
+// The controller re-Applies every Resource CRD on this node shortly
+// after Hello, so the contents are reproducible — we don't persist
+// satellite-side state across restarts. Best-effort: log and continue
+// on errors so a single missing dir doesn't stall the whole startup.
+func cleanStateDir(dir string, logger *slog.Logger) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// Missing dir is fine — the satellite's first Apply will
+		// create it on demand.
+		return
+	}
+
+	removed := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".res") {
+			// Leave global_common.conf and any operator-supplied
+			// non-rendered files alone.
+			continue
+		}
+
+		path := filepath.Join(dir, name)
+		if err := os.Remove(path); err != nil {
+			logger.Warn("clean state-dir entry", "path", path, "err", err)
+
+			continue
+		}
+
+		removed++
+	}
+
+	if removed > 0 {
+		logger.Info("wiped stale .res files on startup", "dir", dir, "removed", removed)
+	}
 }
