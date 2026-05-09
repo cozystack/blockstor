@@ -740,6 +740,33 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	})
 }
 
+func testRDListSorted(t *testing.T, newStore Factory) {
+	s := newStore(t).ResourceDefinitions()
+	ctx := t.Context()
+
+	for _, name := range []string{"pvc-c", "pvc-a", "pvc-b"} {
+		if err := s.Create(ctx, &apiv1.ResourceDefinition{Name: name}); err != nil {
+			t.Fatalf("Create %s: %v", name, err)
+		}
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	want := []string{"pvc-a", "pvc-b", "pvc-c"}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d, want %d", len(got), len(want))
+	}
+
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("[%d]: got %q, want %q", i, got[i].Name, w)
+		}
+	}
+}
+
 func testSnapshotListSorted(t *testing.T, newStore Factory) {
 	s := newStore(t).Snapshots()
 	ctx := t.Context()
@@ -896,6 +923,11 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("Update missing: got %v, want ErrNotFound", err)
 		}
 	})
+	// ListSorted pins lex ordering for /v1/resource-definitions —
+	// linstor-csi's ControllerListVolumes pages over this and uses
+	// the response order as its pagination cursor. Without sort,
+	// successive paging tokens would skip / duplicate RDs.
+	t.Run("ListSorted", func(t *testing.T) { testRDListSorted(t, newStore) })
 	t.Run("UpdateChangesProps", func(t *testing.T) {
 		s := newStore(t).ResourceDefinitions()
 		ctx := t.Context()
