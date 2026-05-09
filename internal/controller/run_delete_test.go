@@ -46,10 +46,31 @@ func (happyDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClien
 
 type happySatelliteClient struct {
 	satellitepb.SatelliteClient
+
+	// applyResp lets a test override the ApplyResources reply
+	// (e.g. to simulate the satellite returning Ok=false body-level).
+	applyResp *satellitepb.ApplyResourcesResponse
 }
 
 func (*happySatelliteClient) DeleteResource(_ context.Context, _ *satellitepb.DeleteResourceRequest, _ ...grpc.CallOption) (*satellitepb.DeleteResourceResponse, error) {
 	return &satellitepb.DeleteResourceResponse{Ok: true}, nil
+}
+
+func (h *happySatelliteClient) ApplyResources(_ context.Context, req *satellitepb.ApplyResourcesRequest, _ ...grpc.CallOption) (*satellitepb.ApplyResourcesResponse, error) {
+	if h.applyResp != nil {
+		return h.applyResp, nil
+	}
+
+	results := make([]*satellitepb.ResourceApplyResult, 0, len(req.GetResources()))
+	for _, r := range req.GetResources() {
+		results = append(results, &satellitepb.ResourceApplyResult{
+			Name:     r.GetName(),
+			NodeName: r.GetNodeName(),
+			Ok:       true,
+		})
+	}
+
+	return &satellitepb.ApplyResourcesResponse{Results: results}, nil
 }
 
 // TestRunDeleteRequeuesOnRPCError: a resource with DeletionTimestamp
