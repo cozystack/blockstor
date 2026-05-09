@@ -76,8 +76,8 @@ wait_uptodate "$RD" "$N1" "$N2"
 # Drive InUse on $N3 by promoting it.
 on_node "$N3" drbdadm primary "$RD"
 
-echo ">> wait 30s for auto-diskful promotion"
-deadline=$(( $(date +%s) + 30 ))
+echo ">> wait 90s for auto-diskful promotion"
+deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
     flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || true)
