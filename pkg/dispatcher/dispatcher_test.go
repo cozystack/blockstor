@@ -338,6 +338,88 @@ func nodeMeta(name string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name}
 }
 
+// TestReadDRBDPortPersistedOverridesDerive: with a persisted
+// Status.DRBDPort the dispatcher uses that allocation verbatim (no
+// hash collision with derivePort). Pins the per-replica allocator's
+// invariant — derivePort is only the transitional safety net before
+// the controller's allocator catches up.
+func TestReadDRBDPortPersistedOverridesDerive(t *testing.T) {
+	t.Parallel()
+
+	persistedPort := int32(7042)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1"},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDPort: &persistedPort,
+		},
+	}
+
+	got := dispatcher.ReadDRBDPort(target, nil)
+	if got != int(persistedPort) {
+		t.Errorf("got %d, want %d (persisted Status wins)", got, persistedPort)
+	}
+}
+
+// TestReadDRBDPortFallsBackToDerive: nil Status.DRBDPort → derivePort
+// hash of the RD name. Same call twice must return the same value
+// (deterministic).
+func TestReadDRBDPortFallsBackToDerive(t *testing.T) {
+	t.Parallel()
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-derive"},
+	}
+
+	got := dispatcher.ReadDRBDPort(target, nil)
+	if got != dispatcher.DerivePort("pvc-derive") {
+		t.Errorf("got %d, want derive(pvc-derive)=%d", got, dispatcher.DerivePort("pvc-derive"))
+	}
+}
+
+// TestReadDRBDMinorPersistedOverridesDerive mirrors the port test
+// for /dev/drbd<N>.
+func TestReadDRBDMinorPersistedOverridesDerive(t *testing.T) {
+	t.Parallel()
+
+	persistedMinor := int32(5042)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1"},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDMinor: &persistedMinor,
+		},
+	}
+
+	got := dispatcher.ReadDRBDMinor(target, nil)
+	if got != int(persistedMinor) {
+		t.Errorf("got %d, want %d (persisted Status wins)", got, persistedMinor)
+	}
+}
+
+// TestPeerPortOfFallback: peer with persisted port wins; peer with
+// nil port → fallback (target's own port). Pins the per-peer port
+// resolution the .res renderer's `peer.<name>.port` line depends on.
+func TestPeerPortOfFallback(t *testing.T) {
+	t.Parallel()
+
+	persistedPort := int32(7099)
+	fallback := 7000
+
+	persistedPeer := &blockstoriov1alpha1.Resource{
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDPort: &persistedPort},
+	}
+
+	if got := dispatcher.PeerPortOf(persistedPeer, fallback); got != int(persistedPort) {
+		t.Errorf("persisted peer: got %d, want %d", got, persistedPort)
+	}
+
+	unallocatedPeer := &blockstoriov1alpha1.Resource{}
+	if got := dispatcher.PeerPortOf(unallocatedPeer, fallback); got != fallback {
+		t.Errorf("unallocated peer: got %d, want %d (fallback)", got, fallback)
+	}
+}
+
 // TestPeerAddress: lookup → host extraction + fallback contract.
 // peerAddress must:
 //   - return just the host part of "host:port"

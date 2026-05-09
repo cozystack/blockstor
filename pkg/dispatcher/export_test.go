@@ -33,3 +33,21 @@ func PeerAddress(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // against this constant so a refactor that changed the placeholder
 // string would surface immediately.
 const DrbdAddrAny = drbdAddrAny
+
+// ReadDRBDPort exposes the persisted-port lookup so the test suite
+// can pin both branches (Status set → use persisted; nil → derive).
+func ReadDRBDPort(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+	return readDRBDPort(target, peers)
+}
+
+// ReadDRBDMinor mirrors ReadDRBDPort for the local /dev/drbd<N> path.
+func ReadDRBDMinor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int {
+	return readDRBDMinor(target, peers)
+}
+
+// PeerPortOf exposes the per-peer port lookup. Peer's own DRBDPort
+// wins; falls back to the supplied default (target's port) when the
+// peer hasn't been allocated yet.
+func PeerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
+	return peerPortOf(r, fallback)
+}
