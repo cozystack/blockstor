@@ -88,6 +88,81 @@ func TestViewStoragePoolsAllNodes(t *testing.T) {
 	}
 }
 
+// TestViewStoragePoolsNodeFilter pins ?nodes=N1 returning only that
+// node's pools, case-insensitively. linstor-csi's NodeRegister loop
+// expects the same set-membership semantics Java LINSTOR has.
+func TestViewStoragePoolsNodeFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, sp := range []apiv1.StoragePool{
+		{StoragePoolName: "p1", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "p1", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "p2", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindZFSThin},
+	} {
+		if err := st.StoragePools().Create(ctx, &sp); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/storage-pools?nodes=N1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 || got[0].NodeName != "n1" {
+		t.Errorf("filter: got %v, want one entry on n1", got)
+	}
+}
+
+// TestViewStoragePoolsPoolFilter pins ?storage_pools=p2 returning only
+// pools named "p2", regardless of node.
+func TestViewStoragePoolsPoolFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, sp := range []apiv1.StoragePool{
+		{StoragePoolName: "p1", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "p2", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindZFSThin},
+		{StoragePoolName: "p2", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindZFSThin},
+	} {
+		if err := st.StoragePools().Create(ctx, &sp); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/storage-pools?storage_pools=p2")
+	defer func() { _ = resp.Body.Close() }()
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("filter: got %d entries, want 2; entries=%v", len(got), got)
+	}
+
+	for i := range got {
+		if got[i].StoragePoolName != "p2" {
+			t.Errorf("filter leaked: got pool %q, want p2", got[i].StoragePoolName)
+		}
+	}
+}
+
 // TestNodeStoragePoolsList: GET /v1/nodes/{node}/storage-pools returns only
 // that node's pools.
 func TestNodeStoragePoolsList(t *testing.T) {
