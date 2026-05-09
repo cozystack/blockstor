@@ -75,13 +75,19 @@ create_lvm() {
             # Skip wipesignatures + zeroing — fresh VG, no stale fs,
             # and the lvm2 build in this image chokes on the default
             # wipe step ('device not cleared') for thin LVs.
-            # Create metadata + data LVs manually then convert — the
-            # one-shot `lvcreate -T -L` triggers a 'device not
-            # cleared' error in trixie's lvm2 we can't suppress with
-            # --zero=n / --wipesignatures=n alone.
+            # Create metadata + data LVs manually then convert. The
+            # one-shot `lvcreate -T -L` and lvconvert both trip on
+            # 'device not cleared' in this satellite container —
+            # udev doesn't run inside the pod so /dev/<vg>/<lv>
+            # symlinks lag behind the device-mapper node creation.
+            # vgmknodes forces them; --zero/--wipesignatures n suppress
+            # the optional clear step. dd-clear the underlying disk
+            # area where the metadata LV lands, just in case.
             lvcreate -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
             lvcreate -y -Wn -Zn -L 13G blockstor-lvm -n thin
-            lvconvert -y --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
+            vgmknodes
+            dd if=/dev/zero of=/dev/blockstor-lvm/thin_meta bs=1M count=10 conv=notrunc 2>&1 || true
+            lvconvert -y -Wn -Zn --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
             echo 'lv blockstor-lvm/thin created'
         fi
     "
