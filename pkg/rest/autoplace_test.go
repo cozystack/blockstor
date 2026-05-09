@@ -215,6 +215,60 @@ func TestAutoplacePrefersFreestPool(t *testing.T) {
 	}
 }
 
+// TestAutoplaceSuccessReturnsApiCallRc verifies the response body shape
+// matches Java LINSTOR's: a `[]ApiCallRc` with MASK_INFO set and a
+// non-zero ret_code. Pinned because golinstor proxies and the linstor
+// CLI both surface the message — silent regressions back to "200 with
+// empty body" turn that diagnostic channel off.
+func TestAutoplaceSuccessReturnsApiCallRc(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+
+	const maskInfo int64 = 0x0040_0000_0000_0000
+	if got[0].RetCode&maskInfo == 0 {
+		t.Errorf("ret_code missing MASK_INFO: %x", got[0].RetCode)
+	}
+
+	if got[0].Message == "" {
+		t.Errorf("expected non-empty Message in success entry")
+	}
+}
+
 // TestAutoplaceSkipsEvictedNodes: a node flagged EVICTED is excluded
 // from the candidate pool so autoplace does not undo an eviction
 // the operator just initiated.
