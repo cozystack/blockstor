@@ -59,6 +59,7 @@ func run() int {
 		nodeName       string
 		stateDir       string
 		listenAddr     string
+		advertised     string
 		lvmPoolName    string
 		lvmVG          string
 		lvmThinPool    string
@@ -73,13 +74,11 @@ func run() int {
 	flag.StringVar(&listenAddr, "listen", ":7000",
 		"bind address for the satellite-side gRPC server (controller dials this for ApplyResources)")
 
-	advertised := os.Getenv("POD_IP")
-	if advertised != "" {
-		advertised += ":7000"
-	}
-
-	flag.StringVar(&advertised, "advertised-endpoint", advertised,
-		"host:port the controller should dial back at (defaults to $POD_IP:7000)")
+	// advertised-endpoint flag — actual default is computed AFTER
+	// flag.Parse() because it depends on --listen's port. Initial
+	// value here is just an empty string + a placeholder doc.
+	flag.StringVar(&advertised, "advertised-endpoint", "",
+		"host:port the controller should dial back at (defaults to $POD_IP:<listen-port>)")
 	flag.StringVar(&lvmPoolName, "lvm-pool-name", "",
 		"register an LVM-thin pool under this LINSTOR pool name (empty disables LVM)")
 	flag.StringVar(&lvmVG, "lvm-vg", "",
@@ -106,6 +105,19 @@ func run() int {
 		logger.Error("node-name is required (pass --node-name or set NODE_NAME)")
 
 		return 1
+	}
+
+	// Compute the advertised endpoint default if --advertised-endpoint
+	// wasn't explicitly set. We pull the port from --listen so a
+	// non-default listen port (e.g. when DRBD's tcp-port-range starts
+	// at 7000 and gRPC has to move) doesn't require a second flag.
+	if advertised == "" {
+		host := os.Getenv("POD_IP")
+		port := portFromListen(listenAddr)
+
+		if host != "" && port != "" {
+			advertised = host + ":" + port
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -180,6 +192,19 @@ func run() int {
 	}
 
 	return 0
+}
+
+// portFromListen extracts the port number from a Go-style listen
+// address ("host:port", ":port"). Returns empty when the address
+// doesn't include a port — caller falls back to whatever default
+// they chose. Doesn't validate the host part.
+func portFromListen(addr string) string {
+	idx := strings.LastIndex(addr, ":")
+	if idx < 0 {
+		return ""
+	}
+
+	return addr[idx+1:]
 }
 
 // cleanStateDir wipes every *.res file in dir on satellite startup.
