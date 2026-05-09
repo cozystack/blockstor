@@ -33,8 +33,9 @@ import (
 )
 
 var (
-	errNotALUKSDevice  = errors.New("not a luks device")
-	errLUKSOpenAlready = errors.New("device pvc-luks-only-0-luks already exists")
+	errNotALUKSDevice    = errors.New("not a luks device")
+	errLUKSOpenAlready   = errors.New("device pvc-luks-only-0-luks already exists")
+	errDrbdadmAdjustFail = errors.New("drbdadm: simulated mid-Apply abort")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -707,5 +708,119 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 
 	if !saw("luksOpen") {
 		t.Errorf("expected cryptsetup luksOpen in [DRBD,LUKS,STORAGE] apply; got %v", fx.CommandLines())
+	}
+}
+
+// TestApplyConvergesAfterMidApplyAbort: simulates a hard satellite kill
+// (SIGKILL of the daemonset pod) between applyStorage and applyDRBD.
+// On the first Apply, drbdadm adjust fails — equivalent to "got SIGKILL
+// before the drbdadm child finished" — and the result reports Ok=false.
+// The next Apply must converge: storage was already provisioned (LV
+// idempotency keeps it intact), the .res file from the failed first
+// pass is still on disk so firstActivation flips to false, and the
+// re-run drbdadm adjust now succeeds. No double-create, no double-md,
+// just the same result the controller would see if Apply had completed
+// the first time.
+//
+// Pins the Phase 8 PLAN.md item "Hard satellite kill mid-Apply —
+// reconcile must be idempotent". This is the unit-level proof; the
+// stand-side scenario is the same retry path under SIGKILL pressure.
+func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// applyStorage path (lvs idempotency probe + lvcreate).
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-abort_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// VolumeStatus query for the .res builder.
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-abort_00000|1048576\n")})
+	// First Apply: drbdadm adjust fails — the simulated mid-Apply abort.
+	fx.Expect("drbdadm adjust pvc-abort", storage.FakeResponse{Err: errDrbdadmAdjustFail})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-abort",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (1st) outer error: %v", err)
+	}
+
+	if len(results) != 1 || results[0].GetOk() {
+		t.Fatalf("expected Ok=false on first Apply (drbdadm aborted); got results=%+v", results)
+	}
+
+	saw := func(lines []string, needle string) int {
+		n := 0
+		for _, line := range lines {
+			if strings.Contains(line, needle) {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	first := fx.CommandLines()
+	if saw(first, "lvcreate") < 1 {
+		t.Errorf("first Apply must run lvcreate; got %v", first)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(dir, "pvc-abort.res")); os.IsNotExist(statErr) {
+		t.Errorf(".res file must persist across an aborted Apply; the next reconcile relies on it to skip create-md")
+	}
+
+	// Second Apply: clear the drbdadm error so the same desired state
+	// converges. lvs probe reports the LV exists this time → no
+	// second lvcreate. The reconciler must see firstActivation=false
+	// (the .res file lingers from the aborted first pass) and skip
+	// create-md.
+	fx.Reset()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-abort_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-abort_00000\n")})
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-abort_00000|1048576\n")})
+	// Overwrite the previously-failing drbdadm response with a clean
+	// success — the simulated SIGKILL window has passed.
+	fx.Expect("drbdadm adjust pvc-abort", storage.FakeResponse{})
+
+	results, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (2nd) outer error: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("expected Ok=true on retry; got results=%+v", results)
+	}
+
+	second := fx.CommandLines()
+	if saw(second, "lvcreate") != 0 {
+		t.Errorf("retry must NOT re-run lvcreate (idempotency); got %v", second)
+	}
+
+	if saw(second, "create-md") != 0 {
+		t.Errorf("retry must NOT re-run create-md (.res persists across abort, firstActivation=false); got %v", second)
+	}
+
+	if saw(second, "drbdadm adjust pvc-abort") != 1 {
+		t.Errorf("retry must re-run drbdadm adjust to pick up where the abort left off; got %v", second)
 	}
 }
