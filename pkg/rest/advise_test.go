@@ -136,3 +136,103 @@ func TestAdviseRDInsufficient(t *testing.T) {
 		t.Errorf("expected non-empty conflict for under-capacity advice; got %+v", got)
 	}
 }
+
+// TestAdviseAllResources is the cluster-wide variant the
+// `linstor advise` (no args) shortcut hits. Returns one adviceEntry
+// per RD, surface their per-RD Conflict / Suggestions individually
+// so the operator can scan the whole cluster's recommendations in
+// one call.
+func TestAdviseAllResources(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  2,
+			StoragePool: "pool",
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	for _, name := range []string{"pvc-a", "pvc-b"} {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              name,
+			ResourceGroupName: "rg",
+		}); err != nil {
+			t.Fatalf("seed RD %s: %v", name, err)
+		}
+	}
+
+	for i, free := range []int64{100, 300, 200} {
+		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        []string{"n1", "n2", "n3"}[i],
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    free,
+		})
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/advise/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []adviceEntry
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("entries: got %d, want 2 (one per RD)", len(got))
+	}
+
+	byName := map[string]adviceEntry{}
+	for _, e := range got {
+		byName[e.Name] = e
+	}
+
+	for _, name := range []string{"pvc-a", "pvc-b"} {
+		entry, ok := byName[name]
+		if !ok {
+			t.Errorf("missing entry for %s", name)
+			continue
+		}
+
+		if len(entry.Suggestions) != 2 {
+			t.Errorf("%s: %d suggestions, want 2", name, len(entry.Suggestions))
+		}
+
+		if entry.Conflict != "" {
+			t.Errorf("%s: unexpected conflict %q", name, entry.Conflict)
+		}
+	}
+}
+
+// TestAdviseAllResourcesEmpty: cluster with no RDs → 200 with [].
+func TestAdviseAllResourcesEmpty(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/advise/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []adviceEntry
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("len: got %d, want 0", len(got))
+	}
+}
