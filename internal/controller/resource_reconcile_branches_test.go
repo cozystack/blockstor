@@ -88,6 +88,77 @@ func TestResourceReconcileMissingResource(t *testing.T) {
 	}
 }
 
+// TestMaybeAutoDisklessNoPoolStaysDiskless: an InUse DISKLESS
+// replica on a node with NO available storage pool must NOT get
+// promoted — leave the DISKLESS flag intact and skip the
+// promotion. The reconciler's NEXT pass will retry once a pool
+// gets registered (e.g. operator added storage to the node);
+// without this no-op branch, the auto-promote logic would crash
+// trying to dispatch with an empty StorPoolName.
+func TestMaybeAutoDisklessNoPoolStaysDiskless(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	// Note: no StoragePool registered for n1 → firstAvailablePool
+	// returns empty.
+
+	id := int32(0)
+	port := int32(7000)
+	minor := int32(1000)
+
+	resCRD := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-no-pool.n1",
+			Finalizers: []string{"blockstor.io.blockstor.io/resource"},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-no-pool",
+			NodeName:               "n1",
+			Flags:                  []string{"DISKLESS"},
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			InUse:      true,
+			DRBDNodeID: &id,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithObjects(resCRD).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{
+		Client:     cli,
+		Scheme:     scheme,
+		Dispatcher: dispatcher.New(noopDialer{}),
+		Store:      st,
+	}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-no-pool.n1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	post := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-no-pool.n1"}, post); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !slices.Contains(post.Spec.Flags, "DISKLESS") {
+		t.Errorf("DISKLESS flag stripped despite no pool available: %v", post.Spec.Flags)
+	}
+
+	if _, ok := post.Spec.Props["StorPoolName"]; ok {
+		t.Errorf("StorPoolName stamped despite no pool available: %v", post.Spec.Props)
+	}
+}
+
 // TestResourceReconcileAddsFinalizer: a fresh Resource without our
 // finalizer must get one stamped on the first reconcile pass and
 // then requeue so the next pass actually runs runApply. Pins the
