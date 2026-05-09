@@ -74,6 +74,141 @@ func TestKVGetMissing(t *testing.T) {
 	}
 }
 
+// TestKVList: GET /v1/key-value-store enumerates every instance with
+// its full props map. piraeus-csi consumes this for the storage
+// metadata catalogue, and a list that drops props would silently lose
+// CSI-supplied volume parameters.
+func TestKVList(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, inst := range []struct {
+		name string
+		k, v string
+	}{
+		{"csi-volumes", "size", "1Gi"},
+		{"snapshots", "policy", "daily"},
+	} {
+		err := st.KeyValueStore().SetKeys(ctx, inst.name, apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{inst.k: inst.v},
+		})
+		if err != nil {
+			t.Fatalf("seed %s: %v", inst.name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/key-value-store")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.KV
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2 (got %+v)", len(got), got)
+	}
+
+	byName := map[string]apiv1.KV{}
+	for _, kv := range got {
+		byName[kv.Name] = kv
+	}
+
+	if byName["csi-volumes"].Props["size"] != "1Gi" {
+		t.Errorf("csi-volumes props lost: got %+v", byName["csi-volumes"])
+	}
+
+	if byName["snapshots"].Props["policy"] != "daily" {
+		t.Errorf("snapshots props lost: got %+v", byName["snapshots"])
+	}
+}
+
+// TestKVListEmpty: GET /v1/key-value-store on an empty store returns
+// 200 with [], not 404 (matches upstream LINSTOR's empty-list shape).
+func TestKVListEmpty(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/key-value-store")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.KV
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("len: got %d, want 0", len(got))
+	}
+}
+
+// TestKVSetMergesWithExisting: a second POST against the same
+// instance with new keys must merge with existing props rather than
+// replace the whole map. The CSI driver writes individual volume
+// parameters one at a time, so a non-merging set would clobber the
+// metadata of every other volume on every Set call.
+func TestKVSetMergesWithExisting(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.KeyValueStore().SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"vol1/size": "1Gi"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Add a second key via REST POST.
+	body, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"vol2/size": "2Gi"},
+	})
+	resp := httpPost(t, base+"/v1/key-value-store/csi-volumes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.KeyValueStore().GetInstance(ctx, "csi-volumes")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got["vol1/size"] != "1Gi" {
+		t.Errorf("first key lost on second Set: got %+v", got)
+	}
+
+	if got["vol2/size"] != "2Gi" {
+		t.Errorf("second key not added: got %+v", got)
+	}
+}
+
+// TestKVSetBadJSON: malformed body → 400 before touching the store.
+func TestKVSetBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/key-value-store/x", []byte("{not json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
 // TestKVDeleteThenGet: deleted instance becomes 404.
 func TestKVDeleteThenGet(t *testing.T) {
 	st := store.NewInMemory()
