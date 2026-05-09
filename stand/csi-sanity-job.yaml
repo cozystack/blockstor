@@ -77,4 +77,8 @@ metadata:
 data:
   sc-params.yaml: |
     storagePool: stand
-    placementCount: "1"
+    # 2 replicas so autoplace lands diskful on two of three workers;
+    # linstor-csi's reconciler then treats the publishing node's
+    # missing replica as a diskless attach instead of "no volume here"
+    # and ControllerPublishVolume succeeds without churn.
+    placementCount: "2"
