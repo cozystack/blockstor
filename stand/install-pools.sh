@@ -55,8 +55,9 @@ create_lvm() {
         if vgs blockstor-lvm >/dev/null 2>&1; then
             echo 'vg blockstor-lvm already exists'
         else
+            wipefs -a ${LVM_DEV}
             vgcreate -y blockstor-lvm ${LVM_DEV}
-            lvcreate -y -T -L 14G blockstor-lvm/thin
+            lvcreate -y -Z n -T -L 14G blockstor-lvm/thin
             echo 'vg blockstor-lvm + thin pool created'
         fi
     "
