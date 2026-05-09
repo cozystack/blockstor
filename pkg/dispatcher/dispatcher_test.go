@@ -559,6 +559,107 @@ func TestCreateSnapshotFanout(t *testing.T) {
 	}
 }
 
+// TestApplyDisklessOmitsVolumes: a target with the DISKLESS flag must
+// not push any DesiredVolume entries on the wire — diskless replicas
+// don't allocate local storage. The RD's VolumeDefinitions are still
+// available, but buildVolumes short-circuits.
+func TestApplyDisklessOmitsVolumes(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			Flags:                  []string{"DISKLESS"},
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, rd, dispatcher.ApplyOptions{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	desired := stub.last.GetResources()[0]
+	if len(desired.GetVolumes()) != 0 {
+		t.Errorf("DISKLESS replica must push 0 volumes; got %d (%+v)",
+			len(desired.GetVolumes()), desired.GetVolumes())
+	}
+}
+
+// TestApplyStorPoolFallsBackToRD: a Resource without StorPoolName on
+// its own Spec.Props must inherit it from the RD's Spec.Props. This
+// is what makes `linstor rd set-property pool` propagate to existing
+// Resources without re-applying every Resource CRD.
+func TestApplyStorPoolFallsBackToRD(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			// StorPoolName intentionally absent on the Resource.
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{"StorPoolName": "rd-pool"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, rd, dispatcher.ApplyOptions{})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	desired := stub.last.GetResources()[0]
+	if len(desired.GetVolumes()) != 1 {
+		t.Fatalf("volumes: got %d, want 1", len(desired.GetVolumes()))
+	}
+
+	if desired.GetVolumes()[0].GetStoragePool() != "rd-pool" {
+		t.Errorf("StoragePool fallback: got %q, want rd-pool",
+			desired.GetVolumes()[0].GetStoragePool())
+	}
+}
+
 // TestCreateSnapshotMissingEndpointRecorded: a replica whose Node has
 // no SatelliteEndpoint must surface as an Ok=false result rather than
 // failing the whole fan-out (other replicas can still take their snap).
