@@ -287,6 +287,59 @@ func RunKeyValueStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want ErrNotFound", err)
 		}
 	})
+	// DeleteInstance happy path: an instance with seeded keys gets
+	// every entry wiped, and a subsequent GetInstance returns
+	// ErrNotFound (matches the "delete the whole instance"
+	// semantics linstor's `linstor controller drbd-options --unset`
+	// uses to wipe a cluster-level overrides namespace).
+	t.Run("DeleteInstance", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+		if err := s.SetKeys(ctx, "to-wipe", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"a": "1", "b": "2"},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		if err := s.DeleteInstance(ctx, "to-wipe"); err != nil {
+			t.Fatalf("DeleteInstance: %v", err)
+		}
+
+		_, err := s.GetInstance(ctx, "to-wipe")
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("post-DeleteInstance Get: got %v, want ErrNotFound", err)
+		}
+	})
+	// DeleteInstance must NOT touch other instances. Pinning this
+	// guards against a regression where the delete fan-out drops the
+	// instance label filter and wipes the whole KV store.
+	t.Run("DeleteInstanceLeavesOthersAlone", func(t *testing.T) {
+		s := newStore(t).KeyValueStore()
+		ctx := t.Context()
+		if err := s.SetKeys(ctx, "victim", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"a": "1"},
+		}); err != nil {
+			t.Fatalf("seed victim: %v", err)
+		}
+		if err := s.SetKeys(ctx, "survivor", apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"b": "2"},
+		}); err != nil {
+			t.Fatalf("seed survivor: %v", err)
+		}
+
+		if err := s.DeleteInstance(ctx, "victim"); err != nil {
+			t.Fatalf("DeleteInstance: %v", err)
+		}
+
+		got, err := s.GetInstance(ctx, "survivor")
+		if err != nil {
+			t.Fatalf("survivor Get: %v", err)
+		}
+
+		if got["b"] != "2" {
+			t.Errorf("survivor key wiped along with victim: got %+v", got)
+		}
+	})
 }
 
 // seedRD inserts a minimal valid ResourceDefinition the VolumeDefinition
