@@ -57,3 +57,10 @@ func AlreadyExists(err error) bool {
 func (r *ResourceReconciler) ResolveLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
 	return r.resolveLayerStack(ctx, rd)
 }
+
+// ResolveEffectiveProps exposes the four-tier prop resolver: cluster
+// ControllerProps → RG → RD → Resource. Tests pin each tier and the
+// soft-fail-on-missing-RG path.
+func (r *ResourceReconciler) ResolveEffectiveProps(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
+	return r.resolveEffectiveProps(ctx, target, rd)
+}
