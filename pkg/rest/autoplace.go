@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -149,6 +150,17 @@ const (
 	apiCallRcRDAutoplaceDone int64 = 0x4231 // ApiConsts.RC_RSC_DFN_PLACED
 )
 
+// placerCtx bundles the lookup tables placeResources needs, so the
+// per-candidate hot loop stays readable. Built once per autoplace
+// call from the store's current snapshot.
+type placerCtx struct {
+	nodes     map[string]map[string]string
+	taken     map[string]struct{}
+	sameTuple map[string]string
+	diffSeen  map[string]struct{}
+	filter    *apiv1.AutoSelectFilter
+}
+
 // placeResources picks free pools from the candidates and creates Resource
 // objects up to filter.PlaceCount. Returns (placed, want, err).
 func (s *Server) placeResources(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
@@ -162,9 +174,30 @@ func (s *Server) placeResources(ctx context.Context, rdName string, filter *apiv
 		return 0, 0, err //nolint:wrapcheck // bubbled to handler
 	}
 
-	taken := make(map[string]struct{}, len(existing))
+	nodes, err := s.nodesByName(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	placer := &placerCtx{
+		nodes:     nodes,
+		taken:     make(map[string]struct{}, len(existing)),
+		sameTuple: topologyTuple(existing, nodes, filter.ReplicasOnSame),
+		diffSeen:  topologySeen(existing, nodes, filter.ReplicasOnDifferent),
+		filter:    filter,
+	}
+
 	for i := range existing {
-		taken[existing[i].NodeName] = struct{}{}
+		placer.taken[existing[i].NodeName] = struct{}{}
+	}
+
+	// replicas_on_same with no existing replica yet: greedy
+	// placement picks the wrong tuple half the time. Look ahead —
+	// group candidates by their tuple, lock onto a group that can
+	// fit the whole place_count, drop the rest. After this the
+	// greedy loop respects the constraint trivially.
+	if placer.sameTuple == nil && len(filter.ReplicasOnSame) > 0 {
+		candidates, placer.sameTuple = pickSameGroup(candidates, nodes, filter.ReplicasOnSame, int(filter.PlaceCount))
 	}
 
 	placed := 0
@@ -175,27 +208,237 @@ func (s *Server) placeResources(ctx context.Context, rdName string, filter *apiv
 			break
 		}
 
-		pool := &candidates[i]
-		if _, ok := taken[pool.NodeName]; ok {
-			continue
+		ok, err := placer.tryPlace(ctx, s.Store, rdName, &candidates[i])
+		if err != nil {
+			return placed, want, err
 		}
 
-		res := apiv1.Resource{
-			Name:     rdName,
-			NodeName: pool.NodeName,
-			Props:    map[string]string{"StorPoolName": pool.StoragePoolName},
+		if ok {
+			placed++
 		}
-
-		err = s.Store.Resources().Create(ctx, &res)
-		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-			return placed, want, err //nolint:wrapcheck // bubbled to handler
-		}
-
-		taken[pool.NodeName] = struct{}{}
-		placed++
 	}
 
 	return placed, want, nil
+}
+
+// tryPlace checks the topology guards and (on a pass) creates the
+// Resource + commits the candidate's Aux values into the diff/same
+// bookkeeping. Returns (placed, err).
+func (p *placerCtx) tryPlace(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
+	if _, busy := p.taken[pool.NodeName]; busy {
+		return false, nil
+	}
+
+	nodeProps := p.nodes[pool.NodeName]
+
+	if !matchesTuple(nodeProps, p.filter.ReplicasOnSame, p.sameTuple) {
+		return false, nil
+	}
+
+	if collidesWithDiff(nodeProps, p.filter.ReplicasOnDifferent, p.diffSeen) {
+		return false, nil
+	}
+
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: pool.NodeName,
+		Props:    map[string]string{"StorPoolName": pool.StoragePoolName},
+	}
+
+	err := st.Resources().Create(ctx, &res)
+	if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+		return false, err //nolint:wrapcheck // bubbled to handler
+	}
+
+	p.taken[pool.NodeName] = struct{}{}
+
+	if p.sameTuple == nil && len(p.filter.ReplicasOnSame) > 0 {
+		p.sameTuple = lookupKeys(nodeProps, p.filter.ReplicasOnSame)
+	}
+
+	for _, k := range p.filter.ReplicasOnDifferent {
+		p.diffSeen[k+"="+nodeProps[auxKey(k)]] = struct{}{}
+	}
+
+	return true, nil
+}
+
+// pickSameGroup partitions candidates by their `replicas_on_same`
+// tuple, picks a group big enough to hold place_count, and returns
+// only those candidates plus the locked-in tuple. When no group is
+// large enough we return the candidates unchanged — the placer will
+// then fail the conflict check honestly with 409.
+//
+// Tiebreak between equally-sized feasible groups: the one with the
+// greatest total FreeCapacity wins, alphabetical group key on a tie.
+// Deterministic so two callers see the same answer.
+func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]string, keys []string, want int) ([]apiv1.StoragePool, map[string]string) {
+	type group struct {
+		tuple map[string]string
+		key   string
+		pools []apiv1.StoragePool
+		free  int64
+	}
+
+	byKey := map[string]*group{}
+
+	for i := range candidates {
+		pool := candidates[i]
+		tuple := lookupKeys(nodes[pool.NodeName], keys)
+		key := tupleKey(tuple)
+
+		grp, ok := byKey[key]
+		if !ok {
+			grp = &group{tuple: tuple, key: key}
+			byKey[key] = grp
+		}
+
+		grp.pools = append(grp.pools, pool)
+		grp.free += pool.FreeCapacity
+	}
+
+	groups := make([]*group, 0, len(byKey))
+	for _, grp := range byKey {
+		if len(grp.pools) >= want {
+			groups = append(groups, grp)
+		}
+	}
+
+	if len(groups) == 0 {
+		return candidates, nil
+	}
+
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].free != groups[j].free {
+			return groups[i].free > groups[j].free
+		}
+
+		return groups[i].key < groups[j].key
+	})
+
+	winner := groups[0]
+
+	return winner.pools, winner.tuple
+}
+
+// tupleKey turns the (Aux/k, value) map into a deterministic string
+// key for grouping. Pairs are joined with the field-separator byte
+// (\x1f) so a value containing `=` can't forge a different tuple's key.
+func tupleKey(tuple map[string]string) string {
+	const fieldSep = "\x1f"
+
+	propKeys := make([]string, 0, len(tuple))
+	for propKey := range tuple {
+		propKeys = append(propKeys, propKey)
+	}
+
+	sort.Strings(propKeys)
+
+	var buf strings.Builder
+
+	for i, propKey := range propKeys {
+		if i > 0 {
+			buf.WriteString(fieldSep)
+		}
+
+		buf.WriteString(propKey)
+		buf.WriteByte('=')
+		buf.WriteString(tuple[propKey])
+	}
+
+	return buf.String()
+}
+
+// nodesByName returns a snapshot of the cluster's nodes keyed on
+// metadata.name. The autoplacer needs Node prop bags to evaluate
+// topology constraints (replicas-on-same / different).
+func (s *Server) nodesByName(ctx context.Context) (map[string]map[string]string, error) {
+	list, err := s.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // bubbled to handler
+	}
+
+	out := make(map[string]map[string]string, len(list))
+	for i := range list {
+		out[list[i].Name] = list[i].Props
+	}
+
+	return out, nil
+}
+
+// topologyTuple computes the canonical (key, value) tuple from the
+// first replica of an RD. All future replicas must match this tuple
+// for `replicas_on_same` to hold. Returns nil when no replicas exist
+// yet — in that case the first placement establishes the tuple.
+func topologyTuple(existing []apiv1.Resource, nodes map[string]map[string]string, keys []string) map[string]string {
+	if len(keys) == 0 || len(existing) == 0 {
+		return nil
+	}
+
+	return lookupKeys(nodes[existing[0].NodeName], keys)
+}
+
+// topologySeen builds the "values already used" set for
+// `replicas_on_different`. A new candidate whose Aux/<key>= value
+// is already in this set is rejected. Format: "<key>=<value>" so
+// two keys with overlapping value namespaces don't false-collide.
+func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string, keys []string) map[string]struct{} {
+	out := map[string]struct{}{}
+
+	for _, k := range keys {
+		for i := range existing {
+			value := nodes[existing[i].NodeName][auxKey(k)]
+			out[k+"="+value] = struct{}{}
+		}
+	}
+
+	return out
+}
+
+func matchesTuple(nodeProps map[string]string, keys []string, want map[string]string) bool {
+	if want == nil {
+		return true
+	}
+
+	for _, k := range keys {
+		if nodeProps[auxKey(k)] != want[auxKey(k)] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func collidesWithDiff(nodeProps map[string]string, keys []string, seen map[string]struct{}) bool {
+	for _, k := range keys {
+		if _, dup := seen[k+"="+nodeProps[auxKey(k)]]; dup {
+			return true
+		}
+	}
+
+	return false
+}
+
+// lookupKeys reads Aux/<k> for every k in keys off the Node prop bag.
+func lookupKeys(nodeProps map[string]string, keys []string) map[string]string {
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		out[auxKey(k)] = nodeProps[auxKey(k)]
+	}
+
+	return out
+}
+
+// auxKey wraps a topology key into the upstream LINSTOR `Aux/<k>`
+// namespace. Operators set topology props via
+// `linstor n set-property NODE Aux/zone us-east-1a`.
+func auxKey(key string) string {
+	const prefix = "Aux/"
+	if strings.HasPrefix(key, prefix) {
+		return key
+	}
+
+	return prefix + key
 }
 
 // candidatePools returns storage pools that satisfy the placement filter.
@@ -312,6 +555,14 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 
 	if len(req.NodeNameList) > 0 {
 		out.NodeNameList = req.NodeNameList
+	}
+
+	if len(req.ReplicasOnSame) > 0 {
+		out.ReplicasOnSame = req.ReplicasOnSame
+	}
+
+	if len(req.ReplicasOnDifferent) > 0 {
+		out.ReplicasOnDifferent = req.ReplicasOnDifferent
 	}
 
 	if out.PlaceCount == 0 {

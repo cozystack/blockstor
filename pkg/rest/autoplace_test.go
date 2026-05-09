@@ -269,6 +269,213 @@ func TestAutoplaceSuccessReturnsApiCallRc(t *testing.T) {
 	}
 }
 
+// TestAutoplaceReplicasOnDifferent enforces anti-affinity over a
+// topology key on the Node CRD. Two replicas in the same zone must
+// NEVER both end up placed when `replicas_on_different=["zone"]` is
+// set — that's the whole point of anti-affinity in production.
+func TestAutoplaceReplicasOnDifferent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-anti"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Three nodes, only TWO distinct zones — n1 and n2 share zone-A.
+	// place_count=3 must fail (only two zones available); place_count=2
+	// must spread across distinct zones.
+	for _, spec := range []struct {
+		name, zone string
+	}{
+		{"n1", "zone-a"},
+		{"n2", "zone-a"},
+		{"n3", "zone-b"},
+	} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  spec.name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": spec.zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", spec.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        spec.name,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", spec.name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:          2,
+			StoragePool:         "pool",
+			ReplicasOnDifferent: []string{"zone"},
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-anti/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-anti")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("placed: got %d, want 2", len(got))
+	}
+
+	zones := map[string]string{"n1": "zone-a", "n2": "zone-a", "n3": "zone-b"}
+
+	seen := map[string]string{}
+
+	for _, r := range got {
+		zone := zones[r.NodeName]
+		if other, dup := seen[zone]; dup {
+			t.Errorf("anti-affinity violated: %s and %s both in zone %q", other, r.NodeName, zone)
+		}
+
+		seen[zone] = r.NodeName
+	}
+}
+
+// TestAutoplaceReplicasOnDifferentExhausted: place_count exceeds the
+// number of distinct zones → 409 Conflict.
+func TestAutoplaceReplicasOnDifferentExhausted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-anti"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, spec := range []struct{ name, zone string }{
+		{"n1", "zone-a"},
+		{"n2", "zone-a"},
+	} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  spec.name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": spec.zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", spec.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        spec.name,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", spec.name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:          2,
+			StoragePool:         "pool",
+			ReplicasOnDifferent: []string{"zone"},
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-anti/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (only one zone available)", resp.StatusCode)
+	}
+}
+
+// TestAutoplaceReplicasOnSame: replicas_on_same forces every replica
+// to share the topology value of the first one.
+func TestAutoplaceReplicasOnSame(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-same"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Two zones, but one of them has only one node. With
+	// replicas_on_same+place_count=2 the placer must pick the zone
+	// that has 2+ nodes, never split across zones.
+	for _, spec := range []struct{ name, zone string }{
+		{"n1", "zone-a"},
+		{"n2", "zone-b"},
+		{"n3", "zone-b"},
+	} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  spec.name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": spec.zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", spec.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        spec.name,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", spec.name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:     2,
+			StoragePool:    "pool",
+			ReplicasOnSame: []string{"zone"},
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-same/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-same")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("placed: got %d, want 2", len(got))
+	}
+
+	zones := map[string]string{"n1": "zone-a", "n2": "zone-b", "n3": "zone-b"}
+
+	first := zones[got[0].NodeName]
+	second := zones[got[1].NodeName]
+
+	if first != second {
+		t.Errorf("replicas_on_same violated: %s in %q vs %s in %q",
+			got[0].NodeName, first, got[1].NodeName, second)
+	}
+
+	if first != "zone-b" {
+		t.Errorf("expected zone-b (the only zone with 2 nodes); got %q", first)
+	}
+}
+
 // TestAutoplaceSkipsEvictedNodes: a node flagged EVICTED is excluded
 // from the candidate pool so autoplace does not undo an eviction
 // the operator just initiated.
