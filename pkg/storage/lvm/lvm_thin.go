@@ -125,38 +125,7 @@ func (t *Thin) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 
 // VolumeStatus reports observed disk state via lvs.
 func (t *Thin) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
-	out, err := t.exec.Run(ctx, "lvs",
-		"--noheadings",
-		"--separator", "|",
-		"-o", "lv_path,lv_size",
-		"--units", "k",
-		"--nosuffix",
-		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
-	if err != nil {
-		return storage.VolumeStatus{}, errors.Wrap(err, "lvs")
-	}
-
-	line := strings.TrimSpace(string(out))
-	if line == "" {
-		return storage.VolumeStatus{State: "NOT_PROVISIONED"}, nil
-	}
-
-	parts := strings.SplitN(line, "|", lvsCols)
-	if len(parts) != lvsCols {
-		return storage.VolumeStatus{}, errors.Errorf("lvs: unexpected line %q", line)
-	}
-
-	sizeKib, err := parseFloatToInt64(parts[1])
-	if err != nil {
-		return storage.VolumeStatus{}, errors.Wrap(err, "parse lv_size")
-	}
-
-	return storage.VolumeStatus{
-		DevicePath:   strings.TrimSpace(parts[0]),
-		AllocatedKib: sizeKib,
-		UsableKib:    sizeKib,
-		State:        "PROVISIONED",
-	}, nil
+	return volumeStatusViaLVS(ctx, t.exec, t.cfg.VolumeGroup+"/"+volumeLVName(vol))
 }
 
 // PoolStatus reports the thin pool's free/total capacity.

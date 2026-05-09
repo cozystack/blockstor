@@ -88,6 +88,16 @@ func run() int {
 		"LVM thinpool LV backing the lvm-pool-name pool")
 
 	var (
+		lvmThickPoolName string
+		lvmThickVG       string
+	)
+
+	flag.StringVar(&lvmThickPoolName, "lvm-thick-pool-name", "",
+		"register an LVM (classic, thick) pool under this LINSTOR pool name (empty disables)")
+	flag.StringVar(&lvmThickVG, "lvm-thick-vg", "",
+		"LVM volume group backing the lvm-thick-pool-name pool (defaults to lvm-thick-pool-name)")
+
+	var (
 		loopfilePoolName string
 		loopfileDir      string
 	)
@@ -148,6 +158,17 @@ func run() int {
 
 		providers[lvmPoolName] = lvm.NewThin(
 			lvm.ThinConfig{VolumeGroup: lvmVG, ThinPool: lvmThinPool},
+			storage.RealExec{})
+	}
+
+	if lvmThickPoolName != "" {
+		vg := lvmThickVG
+		if vg == "" {
+			vg = lvmThickPoolName
+		}
+
+		providers[lvmThickPoolName] = lvm.NewThick(
+			lvm.ThickConfig{VolumeGroup: vg},
 			storage.RealExec{})
 	}
 
