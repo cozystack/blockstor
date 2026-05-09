@@ -711,6 +711,129 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	}
 }
 
+// TestApplyLUKSWithoutCryptsetupWrapper: LayerStack contains LUKS
+// but the satellite was configured without a Cryptsetup wrapper
+// (e.g. cryptsetup binary missing). applyLUKS must fail loudly with
+// a clear message rather than silently produce an unencrypted
+// volume — pinning the second of two "fail loud, never silent" gates
+// (the first is the empty-passphrase gate).
+func TestApplyLUKSWithoutCryptsetupWrapper(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-no-cs_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+		// Cryptsetup intentionally nil.
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-no-cs",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("expected LUKS-without-cryptsetup-wrapper to fail; got Ok=true")
+	}
+
+	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "cryptsetup") {
+		t.Errorf("error message should mention cryptsetup; got %q", results[0].GetMessage())
+	}
+}
+
+// TestApplyLUKSResizeChainsThroughMapper: when the storage layer just
+// grew (existing LV resized to a larger SizeKib), applyLUKS must run
+// `cryptsetup resize` on the mapper so DRBD's subsequent resize sees
+// the full grown device. Without this step the consumer's view stays
+// at the original LUKS-mapped portion.
+//
+// Pins the chain: storage grow → cryptsetup resize → drbdadm resize.
+// Critical for ControllerExpandVolume on encrypted PVCs.
+func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// LV already exists (resize path, not first create).
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-grow_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-luks-grow_00000\n")})
+	// VolumeStatus reports current size (1 GiB) — desired is 2 GiB.
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-grow_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-grow_00000|1048576\n")})
+	// isLuks succeeds → already a LUKS device, format skipped.
+	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-grow_00000",
+		storage.FakeResponse{})
+	// luksOpen returns "already exists" — mapper carried over from
+	// previous reconcile.
+	fx.Expect("cryptsetup luksOpen /dev/vg/pvc-luks-grow_00000 pvc-luks-grow-0-luks --key-file -",
+		storage.FakeResponse{Err: errLUKSOpenAlready})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-luks-grow",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	saw := func(needle string) bool {
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, needle) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	if !saw("lvextend") {
+		t.Errorf("storage layer must run lvextend on grow; got %v", fx.CommandLines())
+	}
+
+	// The cryptsetup resize is the chain link between storage grow
+	// and DRBD resize — without it the consumer's view stays at the
+	// original LUKS-mapped portion. runWithKey single-quotes args so
+	// the dm-name appears as 'pvc-luks-grow-0-luks' in the recorded
+	// pipeline.
+	if !saw("'resize' 'pvc-luks-grow-0-luks'") {
+		t.Errorf("expected cryptsetup resize on the LUKS mapper; got %v",
+			fx.CommandLines())
+	}
+}
+
 // TestApplyAutoPrimarySeedFiresOnceOnFirstActivation: with the
 // `auto-primary=true` DRBD option set on first Apply, the satellite
 // must run `drbdadm primary --force` followed by `drbdadm secondary`
