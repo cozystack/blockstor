@@ -82,7 +82,7 @@ func TestApplyDialsTargetSatellite(t *testing.T) {
 		},
 	}}
 
-	result, err := d.Apply(t.Context(), target, nil, nodes, nil)
+	result, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestApplyMissingEndpoint(t *testing.T) {
 		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
 	}}
 
-	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
 	if err == nil {
 		t.Fatalf("expected error when endpoint missing")
 	}
@@ -152,7 +152,7 @@ func TestApplyBuildsPeers(t *testing.T) {
 		},
 	}}
 
-	_, err := d.Apply(t.Context(), target, peers, nodes, nil)
+	_, err := d.Apply(t.Context(), target, peers, nodes, nil, dispatcher.ApplyOptions{})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestApplyDialError(t *testing.T) {
 		},
 	}}
 
-	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
 	if err == nil {
 		t.Fatalf("expected dial error")
 	}
@@ -227,13 +227,71 @@ func TestApplyMatchesSlugifiedNode(t *testing.T) {
 		},
 	}}
 
-	_, err := d.Apply(t.Context(), target, nil, nodes, nil)
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
 	if dialer.endpoint != "10.244.1.7:7000" {
 		t.Errorf("dialed %q, want 10.244.1.7:7000", dialer.endpoint)
+	}
+}
+
+// TestApplyDRBDOptionsFromEffectiveProps pins the option-hierarchy
+// flow: ApplyOptions.EffectiveProps lands on the satellite's
+// drbd_options bag (DrbdOptions/... keys) while non-DRBD entries
+// flow through as Props. The dispatcher itself doesn't merge —
+// the controller does that via drbd.ResolveOptions; this test only
+// asserts the in-out wiring is right.
+func TestApplyDRBDOptionsFromEffectiveProps(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	id0 := int32(0)
+	target := &blockstoriov1alpha1.Resource{
+		Spec:   blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id0},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	effective := map[string]string{
+		"DrbdOptions/Net/protocol":    "C",
+		"DrbdOptions/Net/max-buffers": "8192",
+		"StorPoolName":                "pool",
+	}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{EffectiveProps: effective})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got := stub.last.GetResources()[0]
+	if got.GetDrbdOptions()["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("protocol missing from DrbdOptions: %v", got.GetDrbdOptions())
+	}
+
+	if got.GetDrbdOptions()["DrbdOptions/Net/max-buffers"] != "8192" {
+		t.Errorf("max-buffers missing: %v", got.GetDrbdOptions())
+	}
+
+	if got.GetProps()["StorPoolName"] != "pool" {
+		t.Errorf("StorPoolName must flow through as Props, not DrbdOptions; props=%v drbd=%v",
+			got.GetProps(), got.GetDrbdOptions())
+	}
+
+	if _, leaked := got.GetProps()["DrbdOptions/Net/protocol"]; leaked {
+		t.Errorf("DRBD option leaked into Props: %v", got.GetProps())
 	}
 }
 

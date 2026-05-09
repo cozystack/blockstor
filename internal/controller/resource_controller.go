@@ -102,8 +102,6 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // Reconcile under the funlen budget — the body deals with the
 // finalizer dance, this with the actual gRPC dispatch.
 func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	var resList blockstoriov1alpha1.ResourceList
 
 	err := r.List(ctx, &resList)
@@ -146,7 +144,25 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	result, err := r.Dispatcher.Apply(ctx, target, peers, nodeList.Items, rdPtr)
+	return r.dispatchApply(ctx, target, peers, nodeList.Items, rdPtr)
+}
+
+// dispatchApply resolves DRBD options and pushes the desired state to
+// the satellite. Pulled out of runApply so the latter stays under the
+// funlen budget — the resolver step grew non-trivial with the option
+// hierarchy.
+func (r *ResourceReconciler) dispatchApply(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rdPtr *blockstoriov1alpha1.ResourceDefinition) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	effective, err := r.resolveEffectiveProps(ctx, target, rdPtr)
+	if err != nil {
+		log.Error(err, "resolve effective props", "resource", target.Name)
+
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	result, err := r.Dispatcher.Apply(ctx, target, peers, nodes, rdPtr,
+		dispatcher.ApplyOptions{EffectiveProps: effective})
 	if err != nil {
 		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
 
@@ -427,6 +443,71 @@ func (r *ResourceReconciler) takenOnNode(ctx context.Context, nodeName string, p
 		if v := pick(&list.Items[i].Status); v != nil {
 			out = append(out, *v)
 		}
+	}
+
+	return out, nil
+}
+
+// resolveEffectiveProps walks the controller → RG → RD → Resource
+// scopes and returns the merged DRBD-options bag the dispatcher
+// hands to the satellite. Lower scopes override upper. Each scope is
+// best-effort: a missing controller-props KV instance, missing RG
+// reference, or missing RD all silently degrade to "empty" rather
+// than block the dispatch — the resource can still come up with
+// satellite-only defaults.
+func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *blockstoriov1alpha1.Resource, rdPtr *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
+	controllerProps, err := r.controllerProps(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		rgProps map[string]string
+		rdProps map[string]string
+	)
+
+	if rdPtr != nil {
+		rdProps = rdPtr.Spec.Props
+
+		if rdPtr.Spec.ResourceGroupName != "" {
+			var rg blockstoriov1alpha1.ResourceGroup
+
+			err := r.Get(ctx, client.ObjectKey{Name: rdPtr.Spec.ResourceGroupName}, &rg)
+			switch {
+			case err == nil:
+				rgProps = rg.Spec.Props
+			case errors.IsNotFound(err):
+				// Soft-fail: the RG was deleted out from under
+				// this RD. Skip the level rather than refuse to
+				// dispatch — the rest of the hierarchy still
+				// produces a usable .res.
+			default:
+				return nil, err
+			}
+		}
+	}
+
+	return drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props), nil
+}
+
+// controllerProps reads the cluster-wide ControllerProps KV instance
+// via the KVEntry CRD. Empty when no entries exist (fresh cluster).
+func (r *ResourceReconciler) controllerProps(ctx context.Context) (map[string]string, error) {
+	var list blockstoriov1alpha1.KVEntryList
+
+	err := r.List(ctx, &list, client.MatchingFields{})
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]string{}
+
+	for i := range list.Items {
+		if list.Items[i].Spec.Instance != "ControllerProps" {
+			continue
+		}
+
+		out[list.Items[i].Spec.Key] = list.Items[i].Spec.Value
 	}
 
 	return out, nil

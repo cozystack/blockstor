@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
@@ -83,6 +84,17 @@ func New(dialer Dialer) *Dispatcher {
 	return &Dispatcher{dialer: dialer}
 }
 
+// ApplyOptions carries everything Apply needs beyond the target's own
+// spec. Kept as a struct so future fields (encryption, drbd-reactor
+// hints) can land without breaking the call sites.
+type ApplyOptions struct {
+	// EffectiveProps is the resolved DRBD-options bag after walking
+	// controller → RG → RD → Resource (see drbd.ResolveOptions).
+	// nil means "use target.Spec.Props verbatim" — what the dispatch
+	// did before the hierarchy resolver landed.
+	EffectiveProps map[string]string
+}
+
 // Apply builds the DesiredResource for this Resource (looking up its
 // peers from the full RD-wide list and its volumes from the parent
 // RD) and sends it to the target satellite. Returns the per-resource
@@ -92,13 +104,13 @@ func New(dialer Dialer) *Dispatcher {
 // peer's SatelliteEndpoint property. rd may be nil; when present the
 // RD's VolumeDefinitions become DesiredVolumes for non-DISKLESS
 // replicas (DISKLESS replicas ignore them).
-func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition) (*satellitepb.ResourceApplyResult, error) {
+func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, opts ApplyOptions) (*satellitepb.ResourceApplyResult, error) {
 	endpoint := lookupEndpoint(target.Spec.NodeName, nodes)
 	if endpoint == "" {
 		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
 	}
 
-	desired := buildDesired(target, peers, nodes, rd)
+	desired := buildDesired(target, peers, nodes, rd, opts.EffectiveProps)
 
 	client, closer, err := d.dialer.Dial(ctx, endpoint)
 	if err != nil {
@@ -143,7 +155,7 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // nodes is consulted for each peer's `SatelliteEndpoint` prop so
 // `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
-func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition) *satellitepb.DesiredResource {
+func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *satellitepb.DesiredResource {
 	rdName := target.Spec.ResourceDefinitionName
 
 	// node-id and port/minor are persisted on Status by the controller
@@ -211,15 +223,42 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 	addPeerEntries(drbdOpts, dropped, peers, nodes, port, idOf)
 
+	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
+
 	return &satellitepb.DesiredResource{
 		Name:        rdName,
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
-		Props:       target.Spec.Props,
+		Props:       wireProps,
 		Peers:       dropped,
 		Volumes:     buildVolumes(rd, target),
 		DrbdOptions: drbdOpts,
 	}
+}
+
+// mergeEffectiveProps splits the resolver's output into:
+//   - DRBD options (DrbdOptions/...) → folded into drbdOpts so the
+//     satellite's .res renderer drops them into the right section
+//   - everything else → returned as the wire-side Props map
+//
+// nil effectiveProps falls back to target's own Spec.Props verbatim
+// so the legacy single-scope path keeps working unchanged.
+func mergeEffectiveProps(targetProps, effectiveProps, drbdOpts map[string]string) map[string]string {
+	if effectiveProps == nil {
+		return targetProps
+	}
+
+	wireProps := map[string]string{}
+
+	for key, value := range effectiveProps {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
+			drbdOpts[key] = value
+		} else {
+			wireProps[key] = value
+		}
+	}
+
+	return wireProps
 }
 
 // nodeIDOf reads the persisted DRBD node-id off a Resource. Returns
