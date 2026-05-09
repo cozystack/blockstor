@@ -18,6 +18,8 @@ package rest
 
 import (
 	"net/http"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // registerStoragePools wires endpoints serving golinstor's StoragePool calls.
@@ -39,7 +41,29 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, pools)
+	// Optional filters golinstor sends: ?nodes=a,b&storage_pools=p1,p2.
+	// Java LINSTOR honours both as case-insensitive set-membership;
+	// we match that so /v1/view/storage-pools?nodes=X — the call
+	// linstor-csi makes on every NodeRegister — does not return the
+	// whole cluster's pools when only one node is asked about.
+	nodeFilter := splitCSV(r.URL.Query().Get("nodes"))
+	poolFilter := splitCSV(r.URL.Query().Get("storage_pools"))
+
+	out := make([]apiv1.StoragePool, 0, len(pools))
+
+	for i := range pools {
+		if !matchAnyFold(nodeFilter, pools[i].NodeName) {
+			continue
+		}
+
+		if !matchAnyFold(poolFilter, pools[i].StoragePoolName) {
+			continue
+		}
+
+		out = append(out, pools[i])
+	}
+
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Request) {
