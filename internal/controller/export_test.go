@@ -82,3 +82,11 @@ func IsAutoTieBreakerEnabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 func (r *ResourceDefinitionReconciler) SetQuorum(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
 	return r.setQuorum(ctx, rd, value)
 }
+
+// ControllerProps exposes the cluster-KV ControllerProps reader.
+// Tests pin the instance-filter so KVEntry rows belonging to other
+// instances (e.g. csi-volumes) don't leak into the prop bag the
+// dispatcher hands the satellite.
+func (r *ResourceReconciler) ControllerProps(ctx context.Context) (map[string]string, error) {
+	return r.controllerProps(ctx)
+}
