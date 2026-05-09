@@ -54,7 +54,11 @@ spec:
           imagePullPolicy: Always
           args:
             - --controller=blockstor-controller.blockstor-system.svc:7000
-            - --listen=:7000
+            # gRPC port on a distinct number (NOT in DRBD's default
+            # tcp-port-range 7000-7999), otherwise the first DRBD
+            # resource the controller dispatches will fail to bind
+            # because the satellite already owns 7000 for gRPC.
+            - --listen=:7100
             # drbd's /etc/drbd.conf includes /etc/drbd.d/*.res, so the
             # satellite writes its rendered files where drbdadm
             # actually looks for them.
@@ -70,7 +74,7 @@ spec:
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
           ports:
-            - {name: grpc, containerPort: 7000}
+            - {name: grpc, containerPort: 7100}
           securityContext:
             privileged: true
           volumeMounts:
