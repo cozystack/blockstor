@@ -15,12 +15,22 @@ high-bandwidth check-ins with the user.
 
 ## Current status
 
-- **Dev stand**: `ssh ubuntu@129.213.29.101` (OCI BM.HPC2.36). Workflow from
-  the repo root: `make up NAME=foo` → Talos+QEMU+DRBD, `make piraeus` →
-  operator + satellites, `make oracle` → Java LINSTOR controller for
-  contract-diff, `make smoke` → end-to-end PVC test. Bring this up before
-  attempting any operational milestone (real-DRBD smoke, csi-sanity,
-  trace recording, piraeus-operator integration).
+- **Dev stand**: `ssh ubuntu@129.213.29.101` (OCI BM.HPC2.36; 72 vCPU,
+  376 GiB RAM, 5.7 TiB NVMe at `/var/lib/blockstor`, `/var/lib/docker`
+  symlinked there). Workflow from the repo root: `make up NAME=foo` →
+  Talos+QEMU+DRBD, `make piraeus` → operator + satellites, `make oracle`
+  → Java LINSTOR controller for contract-diff, `make smoke` → end-to-end
+  PVC test. Bring this up before attempting any operational milestone
+  (real-DRBD smoke, csi-sanity, trace recording, piraeus-operator
+  integration).
+- **Parallel stands**: `make up NAME=t1` / `make up NAME=t2` / ... can
+  run side-by-side. Each cluster gets its own `10.<slot>.0.0/24` CIDR
+  (`stand/up.sh` carves a SLOT per NAME) so bridges and IPs never
+  collide. Use this to parallelise e2e: drive `tests/e2e/tiebreaker.sh
+  .work/t1` and `tests/e2e/evacuate.sh .work/t2` simultaneously
+  instead of serialising the whole matrix on one stand. RAM budget per
+  stand is ~16 GiB (4 VMs × 4 GiB); plenty of room for 4-8 stands at
+  once on this host.
 - **Phase**: 3 — satellite + DRBD lifecycle in progress.
 - **CRDs (7, kubebuilder-scaffolded, LINSTOR-shaped fields)**:
   `Node`, `StoragePool`, `ResourceGroup`, `ResourceDefinition`, `Resource`,
