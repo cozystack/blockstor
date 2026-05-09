@@ -607,6 +607,73 @@ func TestApplyDisklessOmitsVolumes(t *testing.T) {
 	}
 }
 
+// TestApplyLiftsLuksPassphrase: when the effective DRBD options
+// carry the upstream LINSTOR `DrbdOptions/Encryption/passphrase`
+// prop, the dispatcher must lift it onto the wire as
+// `LuksPassphrase` so the satellite's LUKS layer can read it via
+// `dr.GetProps()["LuksPassphrase"]`. Pins the cross-name handover —
+// keeps the upstream prop key for `linstor rd set-property` parity
+// while letting the satellite use a less-cluttered key.
+func TestApplyLiftsLuksPassphrase(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			Props:                  map[string]string{"StorPoolName": "thin"},
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	// EffectiveProps carries the upstream Encryption prop.
+	opts := dispatcher.ApplyOptions{
+		EffectiveProps: map[string]string{
+			"DrbdOptions/Encryption/passphrase": "topsecret",
+		},
+	}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, rd, opts)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	desired := stub.last.GetResources()[0]
+
+	// Wire-side LuksPassphrase must be populated.
+	if desired.GetProps()["LuksPassphrase"] != "topsecret" {
+		t.Errorf("LuksPassphrase: got %q, want topsecret (props=%v)",
+			desired.GetProps()["LuksPassphrase"], desired.GetProps())
+	}
+
+	// Layer stack must round-trip onto the wire so the satellite
+	// knows to wire the LUKS layer.
+	if len(desired.GetLayerStack()) != 3 {
+		t.Errorf("LayerStack: got %v, want 3 entries", desired.GetLayerStack())
+	}
+}
+
 // TestApplyStorPoolFallsBackToRD: a Resource without StorPoolName on
 // its own Spec.Props must inherit it from the RD's Spec.Props. This
 // is what makes `linstor rd set-property pool` propagate to existing
