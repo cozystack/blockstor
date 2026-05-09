@@ -501,6 +501,11 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			t.Errorf("Delete missing: got %v, want ErrNotFound", err)
 		}
 	})
+	// ListSorted pins the cluster-wide /v1/view/snapshots ordering:
+	// by ResourceName, then SnapshotName. CSI's ListSnapshots loop
+	// polls this and uses pagination tokens that assume stable order
+	// — without sort the same poll-pair would skip/duplicate entries.
+	t.Run("ListSorted", func(t *testing.T) { testSnapshotListSorted(t, newStore) })
 	t.Run("UpdateMissing", func(t *testing.T) {
 		err := newStore(t).Snapshots().Update(t.Context(),
 			&apiv1.Snapshot{Name: "ghost", ResourceName: "pvc-1"})
@@ -733,6 +738,43 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("Props: got %v, want StorPoolName=thin", got.Props)
 		}
 	})
+}
+
+func testSnapshotListSorted(t *testing.T, newStore Factory) {
+	s := newStore(t).Snapshots()
+	ctx := t.Context()
+
+	seed := []apiv1.Snapshot{
+		{Name: "s2", ResourceName: "pvc-2"},
+		{Name: "s1", ResourceName: "pvc-1"},
+		{Name: "s2", ResourceName: "pvc-1"},
+	}
+	for _, sn := range seed {
+		if err := s.Create(ctx, &sn); err != nil {
+			t.Fatalf("Create %+v: %v", sn, err)
+		}
+	}
+
+	got, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	want := []struct{ rd, snap string }{
+		{"pvc-1", "s1"},
+		{"pvc-1", "s2"},
+		{"pvc-2", "s2"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d, want %d", len(got), len(want))
+	}
+
+	for i, w := range want {
+		if got[i].ResourceName != w.rd || got[i].Name != w.snap {
+			t.Errorf("[%d]: got %s/%s, want %s/%s",
+				i, got[i].ResourceName, got[i].Name, w.rd, w.snap)
+		}
+	}
 }
 
 func testResourceListSorted(t *testing.T, newStore Factory) {
