@@ -87,6 +87,7 @@ func replayOne(ctx context.Context, client *http.Client, baseURL string, trace *
 	if err != nil {
 		return Result{}, errors.Wrap(err, "send request")
 	}
+
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)

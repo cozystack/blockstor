@@ -116,6 +116,7 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 	if err != nil {
 		return nil, errors.Wrapf(err, "dial %s", endpoint)
 	}
+
 	defer func() { _ = closer() }()
 
 	resp, err := client.ApplyResources(ctx, &satellitepb.ApplyResourcesRequest{
@@ -409,6 +410,7 @@ func (d *Dispatcher) DeleteResource(ctx context.Context, target *blockstoriov1al
 	if err != nil {
 		return nil, errors.Wrapf(err, "dial %s", endpoint)
 	}
+
 	defer func() { _ = closer() }()
 
 	pool := target.Spec.Props["StorPoolName"]

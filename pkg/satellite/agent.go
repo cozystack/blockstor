@@ -117,6 +117,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "dial controller")
 	}
+
 	defer func() { _ = conn.Close() }()
 
 	client := satellitepb.NewControllerClient(conn)
@@ -231,7 +232,7 @@ func (a *Agent) dial(ctx context.Context) (*grpc.ClientConn, error) {
 // would never learn we exist again and ApplyResources / DeleteResource
 // RPCs would all fail with "no SatelliteEndpoint for node X".
 func (a *Agent) superviseObserveLoop(ctx context.Context, client satellitepb.ControllerClient) {
-	backoff := observeRetryMin
+	backoff := observeRetryInitial
 
 	for {
 		select {
@@ -244,7 +245,7 @@ func (a *Agent) superviseObserveLoop(ctx context.Context, client satellitepb.Con
 		if err == nil {
 			a.runObserveLoop(ctx, client)
 
-			backoff = observeRetryMin
+			backoff = observeRetryInitial
 		} else {
 			a.logger.Error("re-hello", "err", err)
 		}
@@ -377,13 +378,13 @@ func (a *Agent) runCapacityLoop(ctx context.Context, client satellitepb.Controll
 // in /v1/view/storage-pools' free_capacity within ~half a minute.
 const capacityInterval = 30 * time.Second
 
-// observeRetryMin / observeRetryMax bound the reconnect backoff in
+// observeRetryInitial / observeRetryMax bound the reconnect backoff in
 // superviseObserveLoop. We want fast pickup after a controller restart
 // (300 ms) but no thundering-herd if the controller stays down (cap
 // at 30 s, doubling each failure).
 const (
-	observeRetryMin = 300 * time.Millisecond
-	observeRetryMax = 30 * time.Second
+	observeRetryInitial = 300 * time.Millisecond
+	observeRetryMax     = 30 * time.Second
 )
 
 // observeBuffer caps the events2 → Observer in-flight queue. drbd-9
