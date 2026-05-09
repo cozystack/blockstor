@@ -4,7 +4,7 @@
 NAME ?= blockstor
 WORKERS ?= 3
 CONTROLPLANES ?= 1
-EXTENSIONS ?= siderolabs/drbd
+EXTENSIONS ?= siderolabs/drbd,siderolabs/zfs
 
 WORK_DIR := .work/$(NAME)
 TALOSCONFIG := $(WORK_DIR)/talosconfig

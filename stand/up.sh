@@ -8,7 +8,7 @@ set -euo pipefail
 NAME=${1:?cluster name required}
 CONTROLPLANES=${2:-1}
 WORKERS=${3:-3}
-EXTENSIONS=${4:-siderolabs/drbd}
+EXTENSIONS=${4:-siderolabs/drbd,siderolabs/zfs}
 WORK_DIR=${5:-.work/$NAME}
 TALOS_VERSION=${TALOS_VERSION:-v1.10.5}
 ARCH=${ARCH:-amd64}
@@ -93,10 +93,29 @@ machine:
     image: $INSTALL_IMG
   kernel:
     modules:
+      # Replication layer.
       - name: drbd
         parameters:
           - usermode_helper=disabled
       - name: drbd_transport_tcp
+      # Storage providers — load the kernel bits piraeus / blockstor
+      # rely on so satellites can drive ZFS and LVM-thin pools without
+      # an extra Talos config-patch step.
+      # https://piraeus.io/docs/v2.10.5/how-to/talos/
+      - name: zfs
+      - name: dm_thin_pool
+      - name: dm_snapshot
+      - name: dm_crypt
+  # Trust the host-side Docker registry on 10.164.0.1:5000 via plain
+  # HTTP. The blockstor-controller / blockstor-satellite images we
+  # build live there; without this patch containerd refuses to pull
+  # them ("http: server gave HTTP response to HTTPS client").
+  registries:
+    mirrors:
+      "10.164.0.1:5000":
+        endpoints:
+          - "http://10.164.0.1:5000"
+        skipFallback: true
 YAML
 
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
