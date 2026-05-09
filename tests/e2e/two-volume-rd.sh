@@ -70,12 +70,12 @@ RD=$RD
 on_node "$N1" drbdadm primary "$RD" 2>/dev/null || true
 
 md5_v0=$(on_node "$N1" bash -c "
-    dd if=/dev/urandom of=${DEV0} bs=1 count=4096 status=none oflag=direct
-    md5sum < <(dd if=${DEV0} bs=1 count=4096 status=none iflag=direct) | awk '{print \$1}'
+    dd if=/dev/urandom of=${DEV0} bs=4096 count=1 status=none oflag=direct
+    md5sum < <(dd if=${DEV0} bs=4096 count=1 status=none iflag=direct) | awk '{print \$1}'
 ")
 md5_v1=$(on_node "$N1" bash -c "
-    dd if=/dev/urandom of=${DEV1} bs=1 count=4096 status=none oflag=direct
-    md5sum < <(dd if=${DEV1} bs=1 count=4096 status=none iflag=direct) | awk '{print \$1}'
+    dd if=/dev/urandom of=${DEV1} bs=4096 count=1 status=none oflag=direct
+    md5sum < <(dd if=${DEV1} bs=4096 count=1 status=none iflag=direct) | awk '{print \$1}'
 ")
 on_node "$N1" drbdadm secondary "$RD" || true
 
@@ -86,8 +86,8 @@ fi
 
 # Replica side: both volumes must read identical data after a peer flip.
 on_node "$N2" drbdadm primary "$RD"
-md5_v0_peer=$(on_node "$N2" bash -c "md5sum < <(dd if=${DEV0} bs=1 count=4096 status=none iflag=direct) | awk '{print \$1}'")
-md5_v1_peer=$(on_node "$N2" bash -c "md5sum < <(dd if=${DEV1} bs=1 count=4096 status=none iflag=direct) | awk '{print \$1}'")
+md5_v0_peer=$(on_node "$N2" bash -c "md5sum < <(dd if=${DEV0} bs=4096 count=1 status=none iflag=direct) | awk '{print \$1}'")
+md5_v1_peer=$(on_node "$N2" bash -c "md5sum < <(dd if=${DEV1} bs=4096 count=1 status=none iflag=direct) | awk '{print \$1}'")
 on_node "$N2" drbdadm secondary "$RD"
 
 if [[ "$md5_v0" != "$md5_v0_peer" ]]; then
