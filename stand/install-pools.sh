@@ -42,22 +42,22 @@ create_zfs() {
     kubectl -n "$NS" exec "$pod" -- bash -c "
         if zpool list blockstor-zfs >/dev/null 2>&1; then
             echo 'zpool blockstor-zfs already exists'
-        else
-            # Clean any leftover partition table from a previous
-            # half-failed zpool create. Drop kernel partitions, zap
-            # GPT, dd-clear the first/last MB so wipefs/zpool see a
-            # blank slate.
-            for p in \$(ls ${ZFS_DEV}? 2>/dev/null); do
-                wipefs -af \$p 2>&1 || true
-            done
-            wipefs -af ${ZFS_DEV} 2>&1 || true
-            sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
-            dd if=/dev/zero of=${ZFS_DEV} bs=1M count=10 conv=notrunc 2>&1 || true
-            partx -d ${ZFS_DEV} 2>&1 || true
-            partprobe ${ZFS_DEV} 2>&1 || true
-            zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}
-            echo 'zpool blockstor-zfs created'
+            exit 0
         fi
+        # zpool create auto-partitions ${ZFS_DEV} into ${ZFS_DEV}1 +
+        # ${ZFS_DEV}9. If a previous attempt died mid-create we have
+        # those partitions but no pool, and the next try fails on
+        # 'cannot label sda: failed to detect device partitions'.
+        # Wipe + sgdisk + dd + partx to flush kernel state.
+        wipefs -af ${ZFS_DEV}* 2>&1 || true
+        sgdisk --zap-all ${ZFS_DEV} 2>&1 || true
+        dd if=/dev/zero of=${ZFS_DEV} bs=1M count=10 conv=notrunc 2>&1 || true
+        # Drop kernel partition state. partx -d only takes the disk;
+        # it removes every existing partition entry.
+        partx -d ${ZFS_DEV} 2>&1 || true
+        partprobe ${ZFS_DEV} 2>&1 || true
+        zpool create -f -o cachefile=none blockstor-zfs ${ZFS_DEV}
+        echo 'zpool blockstor-zfs created'
     "
 }
 
@@ -75,7 +75,13 @@ create_lvm() {
             # Skip wipesignatures + zeroing — fresh VG, no stale fs,
             # and the lvm2 build in this image chokes on the default
             # wipe step ('device not cleared') for thin LVs.
-            lvcreate -y -Wn -Zn -T -L 14G blockstor-lvm/thin
+            # Create metadata + data LVs manually then convert — the
+            # one-shot `lvcreate -T -L` triggers a 'device not
+            # cleared' error in trixie's lvm2 we can't suppress with
+            # --zero=n / --wipesignatures=n alone.
+            lvcreate -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
+            lvcreate -y -Wn -Zn -L 13G blockstor-lvm -n thin
+            lvconvert -y --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin
             echo 'lv blockstor-lvm/thin created'
         fi
     "
