@@ -7,6 +7,14 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: blockstor-system
+  labels:
+    # The satellite is privileged + hostNetwork + hostPID + hostPath —
+    # required for drbdadm / losetup / cryptsetup against the kernel.
+    # The default PodSecurity Restricted profile rejects all of these,
+    # so explicitly opt this namespace into the privileged profile.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
 ---
 apiVersion: v1
 kind: ServiceAccount
