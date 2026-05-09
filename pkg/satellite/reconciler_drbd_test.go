@@ -711,6 +711,62 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	}
 }
 
+// TestApplyUnknownStoragePool: a DesiredVolume pointing at a pool
+// not registered with the satellite must surface as a per-resource
+// Ok=false with a clear "unknown storage pool" message — never as a
+// gRPC error. The controller distinguishes pool-misconfiguration
+// (operator visible, retryable) from transport faults; conflating
+// the two would break the ApplyResources batch contract.
+func TestApplyUnknownStoragePool(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		// Only "thin1" is registered; the test asks for "ghost-pool".
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-bad-pool",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "ghost-pool"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply outer error: %v", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("Ok=true on unknown pool; want false")
+	}
+
+	if !strings.Contains(strings.ToLower(results[0].GetMessage()), "ghost-pool") {
+		t.Errorf("error message must mention the missing pool name; got %q",
+			results[0].GetMessage())
+	}
+
+	// No DRBD commands should fire — we bail before applyDRBD.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") {
+			t.Errorf("drbdadm should not run when storage step fails: %s", line)
+		}
+	}
+}
+
 // TestApplyInactiveOnlyDownsDRBD: a Resource with the INACTIVE flag
 // (the operator called `linstor r deactivate`) must NOT touch storage
 // or render the .res file — just `drbdadm down` to remove the kernel
