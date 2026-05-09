@@ -138,6 +138,8 @@ sudo -E talosctl cluster create \
     --cpus 2 \
     --cpus-workers 2 \
     --disk 20480 \
+    --extra-disks ${EXTRA_DISKS:-2} \
+    --extra-disks-size ${EXTRA_DISK_SIZE_MB:-16384} \
     --wait
 
 sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR"
