@@ -77,3 +77,8 @@ func (r *ResourceReconciler) FirstAvailablePool(ctx context.Context, nodeName st
 func IsAutoTieBreakerEnabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	return isAutoTieBreakerEnabled(rd)
 }
+
+// SetQuorum exposes the conflict-retry quorum prop writer for tests.
+func (r *ResourceDefinitionReconciler) SetQuorum(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
+	return r.setQuorum(ctx, rd, value)
+}
