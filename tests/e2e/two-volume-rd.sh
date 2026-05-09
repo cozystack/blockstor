@@ -58,8 +58,8 @@ if (( n_devs < 2 )); then
 fi
 
 # Independent writes per volume — md5 of vol-0 must NOT match vol-1.
-DEV0=$(on_node "$N1" bash -c "grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sed -n 1p")
-DEV1=$(on_node "$N1" bash -c "grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sed -n 2p")
+DEV0=$(on_node "$N1" bash -c "grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sort -u | sed -n 1p")
+DEV1=$(on_node "$N1" bash -c "grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sort -u | sed -n 2p")
 
 RD=$RD
 on_node "$N1" drbdadm primary "$RD" 2>/dev/null || true
