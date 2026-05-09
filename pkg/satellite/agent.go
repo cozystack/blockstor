@@ -138,10 +138,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.logger.Info("satellite gRPC ready", "addr", srv)
 
 	// Tail drbdsetup events2 + ship observed state back to the
-	// controller via ReportObserved. Failures are logged and the
-	// goroutine exits — we don't want a noisy events2 to take down
-	// the satellite (the next Apply will redrive state anyway).
-	go a.runObserveLoop(ctx, client)
+	// controller via ReportObserved. The supervisor restarts the
+	// stream on any error and re-runs Hello first so the controller's
+	// satellite registry sees us again after a controller restart —
+	// otherwise the in-memory dispatcher map stays empty and every
+	// ApplyResources / DeleteResource RPC fails with
+	// "no SatelliteEndpoint for node X".
+	go a.superviseObserveLoop(ctx, client)
 
 	// Periodically push pool capacity so /v1/view/storage-pools shows
 	// live numbers. Best-effort: errors log and the next tick retries.
@@ -221,11 +224,48 @@ func (a *Agent) dial(ctx context.Context) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// superviseObserveLoop wraps runObserveLoop so the satellite
+// transparently survives a controller restart (which closes the
+// ReportObserved client-stream with EOF). On every retry it re-Hellos
+// first — without that, the controller's in-memory satellite registry
+// would never learn we exist again and ApplyResources / DeleteResource
+// RPCs would all fail with "no SatelliteEndpoint for node X".
+func (a *Agent) superviseObserveLoop(ctx context.Context, client satellitepb.ControllerClient) {
+	backoff := observeRetryMin
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		err := a.hello(ctx, client)
+		if err == nil {
+			a.runObserveLoop(ctx, client)
+
+			backoff = observeRetryMin
+		} else {
+			a.logger.Error("re-hello", "err", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2
+		if backoff > observeRetryMax {
+			backoff = observeRetryMax
+		}
+	}
+}
+
 // runObserveLoop tails `drbdsetup events2` and pushes parsed
 // observations to the controller via the ReportObserved
-// client-streaming RPC. Best-effort: any failure logs and exits the
-// loop — the controller's next ApplyResources retries the desired
-// state anyway, so a flaky events2 stream isn't fatal.
+// client-streaming RPC. Returns on any error — superviseObserveLoop
+// owns reconnect.
 func (a *Agent) runObserveLoop(ctx context.Context, client satellitepb.ControllerClient) {
 	watcher, cleanup, err := drbd.StartDrbdsetupEvents2(ctx)
 	if err != nil {
@@ -316,6 +356,15 @@ func (a *Agent) runCapacityLoop(ctx context.Context, client satellitepb.Controll
 // CRD writes cheap, short enough that a freshly-allocated LV shows up
 // in /v1/view/storage-pools' free_capacity within ~half a minute.
 const capacityInterval = 30 * time.Second
+
+// observeRetryMin / observeRetryMax bound the reconnect backoff in
+// superviseObserveLoop. We want fast pickup after a controller restart
+// (300 ms) but no thundering-herd if the controller stays down (cap
+// at 30 s, doubling each failure).
+const (
+	observeRetryMin = 300 * time.Millisecond
+	observeRetryMax = 30 * time.Second
+)
 
 // observeBuffer caps the events2 → Observer in-flight queue. drbd-9
 // reconnect storms can burst dozens of events; 256 is a comfortable
