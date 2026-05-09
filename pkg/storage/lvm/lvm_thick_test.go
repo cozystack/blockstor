@@ -173,3 +173,24 @@ func TestThickCreateSnapshot(t *testing.T) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestThickDeleteSnapshot mirrors TestThinDeleteSnapshot: lvremove
+// --force on the snapshot LV name. Same teardown shape as thin so
+// LINSTOR's snapshot-delete REST call works against either kind.
+func TestThickDeleteSnapshot(t *testing.T) {
+	fx := storage.NewFakeExec()
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	want := "lvremove --force vg/pvc-1_snap-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}

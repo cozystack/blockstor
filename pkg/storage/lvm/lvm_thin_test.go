@@ -278,3 +278,72 @@ func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestThinDeleteSnapshot pins the snapshot teardown command shape.
+// `lvremove --force <vg>/<rd>_<snap>_00000` matches what upstream
+// LINSTOR's LVM_THIN snapshot delete drives.
+func TestThinDeleteSnapshot(t *testing.T) {
+	fx := storage.NewFakeExec()
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	want := "lvremove --force vg/pvc-1_snap-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestThinPoolStatusEmptyOutput: empty `lvs` output → "thin pool not
+// found" error rather than panic. Matches the satellite's expected
+// fail-loud path on a misconfigured pool name.
+func TestThinPoolStatusEmptyOutput(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/missing",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "missing"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Errorf("expected error on empty lvs output")
+	}
+}
+
+// TestThinPoolStatusBadColumns: malformed `lvs` output → parse
+// error, not a slice-out-of-bounds panic.
+func TestThinPoolStatusBadColumns(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
+		storage.FakeResponse{Stdout: []byte("only-one-col\n")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Errorf("expected error on malformed lvs output")
+	}
+}
+
+// TestThinPoolStatusBadDataPercent: well-shaped output but the
+// data_percent column is non-numeric (lvs does this for inactive
+// thin pools). Surfaces a wrapped ParseFloat error rather than a
+// panic on float coercion.
+func TestThinPoolStatusBadDataPercent(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
+		storage.FakeResponse{Stdout: []byte("104857600.00|inactive\n")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Errorf("expected ParseFloat error on non-numeric data_percent")
+	}
+}
