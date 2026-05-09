@@ -121,3 +121,58 @@ func TestDevicePath(t *testing.T) {
 		t.Errorf("DevicePath: got %q, want %q", got, want)
 	}
 }
+
+// TestResizeRunsCryptsetupResize: when the storage layer just grew
+// the underlying LV/zvol/file, the satellite calls Cryptsetup.Resize
+// before drbdadm resize so the dm-crypt target picks up the new
+// size. Without this step, drbdadm only sees the original
+// LUKS-mapped portion and the consumer's view stays at the old size.
+//
+// The pipeline must include the dm name and the --key-file - flag
+// (passphrase fed via stdin to cryptsetup, not as a cryptsetup arg)
+// — runWithKey shell-wraps the key into printf, but the cryptsetup
+// argv itself MUST NOT carry the secret. A regression that swapped
+// to argv would leak the passphrase into cryptsetup's audit logs.
+func TestResizeRunsCryptsetupResize(t *testing.T) {
+	fx := storage.NewFakeExec()
+	c := luks.NewCryptsetup(fx)
+
+	err := c.Resize(t.Context(), "pvc-grow-0-luks", []byte("supersecret"))
+	if err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+
+	saw := func(needles ...string) bool {
+		for _, line := range fx.CommandLines() {
+			ok := true
+			for _, n := range needles {
+				if !strings.Contains(line, n) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !saw("resize", "pvc-grow-0-luks", "--key-file", "-") {
+		t.Errorf("expected `cryptsetup resize pvc-grow-0-luks --key-file -`; got %v",
+			fx.CommandLines())
+	}
+
+	// Defensive: the passphrase must reach cryptsetup via stdin
+	// (`printf %s "$KEY" | cryptsetup ...`), not as a cryptsetup
+	// arg. A regression that put the passphrase directly after
+	// `cryptsetup` would surface here. printf carrying the secret
+	// is the intentional design — it's already pre-existing on
+	// every Format/Open/Close call.
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "cryptsetup 'supersecret'") ||
+			strings.Contains(line, "cryptsetup supersecret") {
+			t.Errorf("passphrase leaked into cryptsetup argv: %s", line)
+		}
+	}
+}
