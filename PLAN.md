@@ -491,7 +491,7 @@ The project's stated goal includes "ability to run without DRBD, as pure local s
   - [x] e2e: `tests/e2e/no-drbd.sh`, `tests/e2e/luks-layer.sh`, `tests/e2e/drbd-luks-stack.sh` — scaffolded scripts in tests/e2e/ exercising each layer composition end-to-end. Stand-side execution deferred behind real-disk + LUKS extension on the Talos profile (8.6 follow-up).
 - [x] **Documentation** (2026-05-09): `docs/layer-stack.md` covers the layer model (`STORAGE` / `LUKS` / `DRBD`), the four supported compositions (`[DRBD,STORAGE]`, `[LUKS,STORAGE]`, `[DRBD,LUKS,STORAGE]`, `[STORAGE]`), how to set the stack via REST / golinstor `--layer-list` / kubectl, the LUKS specifics (passphrase, mapper name, resize chain), the explicit out-of-scope items (pluggable orderings, per-volume keys, mid-stack changes, cluster-passphrase rotation), and the test inventory.
 
-Open question: cluster passphrase rotation (`POST /v1/encryption/passphrase`) already lands in Phase 7 — its interaction with the LUKS layer needs to be pinned (re-encrypt all volumes vs. just rotate the wrapping key).
+Decision (2026-05-09): cluster passphrase rotation (`POST /v1/encryption/passphrase`) only rotates the wrapping key in the controller's KV store — it does NOT re-encrypt per-volume LUKS headers. Operators who want to rotate the actual on-disk encryption must drop and recreate the RD. Rationale: re-encrypting LUKS headers at scale (1000s of volumes) is an operational risk that's better staged via a separate `linstor luks rotate` admin command in a future phase rather than implicitly tied to the cluster-wrapping-key rotation. Documented in `docs/layer-stack.md`.
 
 ---
 

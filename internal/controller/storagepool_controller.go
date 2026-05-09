@@ -27,7 +27,20 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 )
 
-// StoragePoolReconciler reconciles a StoragePool object
+// StoragePoolReconciler is intentionally minimal. StoragePool CRDs in
+// blockstor describe a per-node storage pool; the satellite is the
+// authority on capacity, traits, and reachability. On every Apply
+// reconcile the satellite re-publishes the pool's status (free /
+// total / supportsSnapshots) into the CRD via gRPC + the controller's
+// store-side Status writer. Nothing for a controller-runtime
+// reconciler to do here — driving capacity from the K8s side would
+// just race the satellite's authoritative view.
+//
+// We keep the reconciler registered (rather than dropping it) so the
+// controller-runtime manager owns the watch + cache the REST handlers
+// also share — that's how the scheme stays consistent when other
+// controllers (RG, RD) need to look up a StoragePool indirectly. The
+// Reconcile method is a no-op by design.
 type StoragePoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -37,19 +50,11 @@ type StoragePoolReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=storagepools/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=storagepools/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the StoragePool object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.3/pkg/reconcile
-func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+// Reconcile is a deliberate no-op. See StoragePoolReconciler doc for
+// the rationale (satellite is authoritative; controller-runtime is
+// here for the watch + cache, not for state reconciliation).
+func (*StoragePoolReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	_ = logf.FromContext(ctx)
-
-	// TODO(user): your logic here
 
 	return ctrl.Result{}, nil
 }
