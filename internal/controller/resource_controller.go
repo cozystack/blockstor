@@ -519,8 +519,55 @@ func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName stri
 	return r.takenOnNode(ctx, nodeName, func(s *blockstoriov1alpha1.ResourceStatus) *int32 { return s.DRBDPort })
 }
 
+// takenMinorsOnNode returns every minor consumed on the node. A
+// multi-volume RD consumes N consecutive minors (the .res renderer
+// emits volume k at base+k), so for each Resource we expand its
+// recorded base minor to the full range based on the parent RD's
+// VolumeDefinitions count. Without this expansion, a fresh
+// Resource's allocator would happily pick base+1 on a node where a
+// 2-volume sibling already owns base..base+1.
 func (r *ResourceReconciler) takenMinorsOnNode(ctx context.Context, nodeName string) ([]int32, error) {
-	return r.takenOnNode(ctx, nodeName, func(s *blockstoriov1alpha1.ResourceStatus) *int32 { return s.DRBDMinor })
+	list := &blockstoriov1alpha1.ResourceList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, err
+	}
+
+	rdVolCounts := map[string]int{}
+
+	out := make([]int32, 0, len(list.Items))
+
+	for i := range list.Items {
+		if list.Items[i].Spec.NodeName != nodeName {
+			continue
+		}
+
+		base := list.Items[i].Status.DRBDMinor
+		if base == nil {
+			continue
+		}
+
+		rdName := list.Items[i].Spec.ResourceDefinitionName
+		volCount, cached := rdVolCounts[rdName]
+
+		if !cached {
+			volCount = 1 // safe default: at least the base is taken
+
+			var rd blockstoriov1alpha1.ResourceDefinition
+			if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd); err == nil {
+				if n := len(rd.Spec.VolumeDefinitions); n > 0 {
+					volCount = n
+				}
+			}
+
+			rdVolCounts[rdName] = volCount
+		}
+
+		for off := range int32(volCount) {
+			out = append(out, *base+off)
+		}
+	}
+
+	return out, nil
 }
 
 // takenOnNode is the shared scan: list every Resource on `nodeName`,
