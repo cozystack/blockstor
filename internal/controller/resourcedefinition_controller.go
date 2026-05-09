@@ -101,26 +101,45 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	return ctrl.Result{}, nil
 }
 
-// ensureTiebreaker creates a DISKLESS replica when the RD's diskful
-// replica count is exactly 2 AND there's a satellite node not
-// already hosting a replica. The diskless replica is placed on a
-// non-disabled node — eviction filtering reuses the disabledNodes
-// semantics from the placer.
+// ensureTiebreaker maintains the parity-of-replicas invariant for
+// DRBD's `quorum:majority`: the count of non-witness replicas (diskful
+// + user-added diskless) PLUS the witness must always be odd, so a
+// network partition has an unambiguous majority side.
+//
+// Rules:
+//   - When non-witness count is EVEN (and ≥2) and no TIE_BREAKER
+//     witness exists, create one on a healthy non-replica node.
+//   - When non-witness count is ODD and a TIE_BREAKER witness exists,
+//     delete it — it's redundant and wastes network presence.
+//   - Single-replica RDs (count = 1) have no quorum to defend; no
+//     witness is added or removed.
+//
+// Counts include diskless replicas the user added explicitly (via
+// `linstor r c --diskless` or DisklessOnRemaining). Only the witness
+// — flagged TIE_BREAKER — is excluded from the parity count, since
+// its presence is what we're deciding.
 func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
 	replicas, err := r.Store.Resources().ListByDefinition(ctx, rd.Name)
 	if err != nil {
 		return err
 	}
 
-	diskful, diskless := splitByDiskless(replicas)
+	nonWitness, witness := splitByTieBreaker(replicas)
 
-	// Tiebreaker rules:
-	// - Need exactly 2 diskful replicas. Fewer means we're still
-	//   converging; more means majority is already guaranteed.
-	// - No diskless replica already exists.
-	// - At least one satellite node exists that's not already
-	//   hosting a replica.
-	if len(diskful) != 2 || len(diskless) > 0 {
+	if len(nonWitness) <= 1 {
+		// 0 or 1 replicas → no quorum question, but still drop a
+		// stale witness if one is somehow lingering.
+		return r.removeWitnesses(ctx, rd.Name, witness)
+	}
+
+	if len(nonWitness)%2 == 1 {
+		// Odd → witness redundant. Drop it.
+		return r.removeWitnesses(ctx, rd.Name, witness)
+	}
+
+	// Even → witness needed.
+	if len(witness) > 0 {
+		// Already have one. Idempotent no-op.
 		return nil
 	}
 
@@ -141,15 +160,45 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return nil
 	}
 
-	witness := apiv1.Resource{
+	newWitness := apiv1.Resource{
 		Name:     rd.Name,
 		NodeName: tiebreakerNode,
 		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
 	}
 
-	err = r.Store.Resources().Create(ctx, &witness)
+	err = r.Store.Resources().Create(ctx, &newWitness)
 	if err != nil && !errors.Is(err, store.ErrAlreadyExists) && !alreadyExists(err) {
 		return err
+	}
+
+	return nil
+}
+
+// splitByTieBreaker partitions replicas into (non-witness, witness).
+// Witnesses are diskless replicas flagged TIE_BREAKER.
+func splitByTieBreaker(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resource) {
+	var nonWitness, witness []apiv1.Resource
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagTieBreaker) {
+			witness = append(witness, replicas[i])
+		} else {
+			nonWitness = append(nonWitness, replicas[i])
+		}
+	}
+
+	return nonWitness, witness
+}
+
+// removeWitnesses deletes every TIE_BREAKER replica of the named RD.
+// Best-effort: ErrNotFound is swallowed so concurrent reconciles
+// converge.
+func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
+	for i := range witnesses {
+		err := r.Store.Resources().Delete(ctx, rdName, witnesses[i].NodeName)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
 	}
 
 	return nil
