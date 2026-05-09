@@ -77,11 +77,11 @@ create_lvm() {
         # The satellite container has no udev. lvm's default behaviour
         # is to wait for udev to populate /dev/<vg>/<lv> after a
         # device-mapper create — without udev that wait times out and
-        # fails the LV. --config global{udev_sync=0} bypasses the
+        # fails the LV. --config activation{udev_sync=0,udev_rules=0} bypasses the
         # wait. -Wn -Zn skip the optional wipe-signatures / zero
         # steps which also fail (they go through the same
         # /dev/<vg>/<lv> path that udev never created).
-        OPTS='--config global{udev_sync=0}'
+        OPTS='--config activation{udev_sync=0,udev_rules=0}'
         lvcreate \$OPTS -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
         lvcreate \$OPTS -y -Wn -Zn -L 13G blockstor-lvm -n thin
         lvconvert \$OPTS -y -Wn -Zn --type thin-pool \\
