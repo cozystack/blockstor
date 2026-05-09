@@ -13,7 +13,7 @@ KUBECONFIG := $(WORK_DIR)/kubeconfig
 export TALOSCONFIG
 export KUBECONFIG
 
-.PHONY: stand-help up down reset piraeus oracle smoke smoke-blockstor burnin-blockstor use list stand-clean
+.PHONY: stand-help up down reset piraeus oracle smoke smoke-blockstor burnin-blockstor e2e e2e-list use list stand-clean
 
 stand-help: ## list dev-stand targets
 	@echo "stand targets (use NAME=<cluster>):"
@@ -42,6 +42,13 @@ smoke-blockstor: ## blockstor end-to-end smoke (RD → 2 replicas → bytes-perf
 
 burnin-blockstor: ## continuous PVC churn for DURATION seconds (default 86400 = 24h) (NAME=<n>, DURATION=<sec>)
 	@./tests/burnin-blockstor.sh "$(WORK_DIR)" "$${DURATION:-86400}"
+
+e2e: ## run a single e2e scenario (NAME=<cluster>, SCENARIO=<basename without .sh>)
+	@test -n "$${SCENARIO}" || (echo "usage: make e2e NAME=<cluster> SCENARIO=<name>"; exit 2)
+	@./tests/e2e/$${SCENARIO}.sh "$(WORK_DIR)"
+
+e2e-list: ## list available e2e scenarios
+	@ls tests/e2e/*.sh | xargs -n1 basename | grep -v '^lib\.sh$$' | sed 's/\.sh$$//'
 
 use: ## print TALOSCONFIG/KUBECONFIG exports for shell eval
 	@echo "export TALOSCONFIG=$(abspath $(TALOSCONFIG))"

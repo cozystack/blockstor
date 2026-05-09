@@ -431,13 +431,7 @@ The phases above closed the MVP slice and the csi-sanity REST contract. A deep a
   - `piraeus-ha-controller` ([upstream](https://github.com/piraeusdatastore/piraeus-ha-controller)) — separate Kubernetes-aware controller. Watches Pod / Node / LINSTOR-resource state and does the cluster-aware actions: pod eviction on DRBD `StandAlone`, force-detach when a backing device fails, mount-node migration when the consumer Pod reschedules. It dials the LINSTOR REST API as a client. Verify against blockstor: end-to-end run with piraeus-ha-controller against our REST surface, document which endpoints it hits, fix any gaps. No code changes from blockstor expected unless an endpoint shape diverges from upstream; the audit needs to happen on the dev stand.
 - [x] **`linstor advise`** (2026-05-09): `GET /v1/view/advise/resources` and `GET /v1/resource-definitions/{rd}/advise` return per-RD recommendations (top-N pools by free capacity, sorted desc) without persisting anything. Surfaces a `Conflict` string when the request can't be satisfied so the CLI prints it. Tests: `TestAdviseRD`, `TestAdviseRDInsufficient`.
 - [x] **`linstor query-size-info` / spaceinfo** (2026-05-09): `POST /v1/resource-groups/{rg}/query-size-info` answers `max_vlm_size_in_kib = FreeCapacity of the n-th-largest pool` (n = place_count) — the cap that all replicas can fit at once, the value golinstor's pre-flight uses. `POST /v1/query-all-size-info` returns the per-RG map in one shot. EVICTED/LOST nodes excluded from capacity. Tests: 3 cases covering happy path, exhausted, and the cluster-wide aggregate.
-- [ ] **shared LUN provider (EXOS / SHARED) — deferred, not out-of-scope** (2026-05-09 reclassified). The SAN-shared-LUN model isn't needed today, but the architecture should leave room to slice volumes over a shared LUN later (e.g. multiple satellites carving an EXOS / NetApp / Ceph-RBD-as-shared-disk LUN). Upstream LINSTOR's accounting trick: a single "shared free-space" key keyed off the LUN identifier — multiple StoragePool CRDs on different nodes report the same shared key, the controller subtracts allocations once instead of summing per-node. Architectural hooks needed:
-  - StoragePool gains an optional `SharedSpaceID` field (free-form key; empty = local pool)
-  - the placer's free-capacity / query-size-info paths consult shared-space groups: pools sharing an ID contribute one free-capacity figure to the cluster total instead of summing
-  - storage.Provider gets a notion of "this pool is backed by a LUN identified by X" so the satellite knows not to double-count
-  - autoplace anti-affinity respects shared-space groups: don't place 2 replicas on pools that physically share the same backing LUN
-
-  Current behaviour stays as-is (501 on EXOS/REMOTE_SPDK kinds in pool create); that's a placeholder, not a design statement.
+- [x] **shared LUN provider (EXOS / SHARED) architectural hooks** (2026-05-09): `StoragePool` (CRD spec + REST shape) gains an optional `SharedSpaceID` field (empty = local pool). `pkg/placer` tracks `sharedSeen` alongside the existing `diffSeen` and rejects any candidate whose `SharedSpaceID` matches an already-placed replica's pool — a 2-replica RD will never land on two pools that physically share the same backing LUN. `pkg/rest/query_size_info.dedupShared` collapses pool list to one representative per shared LUN before computing capacity totals and the n-th-largest free figure, so two satellites each "seeing" 1000 KiB of the same LUN contribute 1000, not 2000. `pkg/rest/advise` runs the same dedup so recommendations match what the placer would actually accept. Tests: `TestAutoplaceSharedLUNAntiAffinity`, `TestAutoplaceSharedLUNExhausted`, `TestQuerySizeInfoSharedLUN`. The actual SAN-attached-LUN provider implementation is still a follow-up — when it lands, it'll set `SharedSpaceID` on its `StoragePool` CRDs and the placer/advice/query-size-info paths will already do the right thing.
 
 ### 8.6 Real-world testing
 
@@ -461,18 +455,19 @@ The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
 
 `tests/burnin-blockstor.sh` covers the 2-replica failover happy path. The remaining scenarios above each need a deterministic, automatable test in `tests/e2e/`:
 
-- [ ] `tests/e2e/evacuate.sh` — node evacuate triggers replica migration
-- [ ] `tests/e2e/network-partition.sh` — partition + heal with no full re-sync
-- [ ] `tests/e2e/backing-device-fail.sh` — pull disk, expect graceful diskless-failover
-- [ ] `tests/e2e/snapshot-restore-cross-node.sh`
-- [ ] `tests/e2e/clone.sh`
-- [ ] `tests/e2e/resize-luks.sh`
-- [ ] `tests/e2e/resize-plain.sh`
-- [ ] `tests/e2e/two-primaries-live-migration.sh`
-- [ ] `tests/e2e/rwx-ganesha.sh`
-- [ ] `tests/e2e/two-volume-rd.sh`
-- [ ] `tests/e2e/tiebreaker.sh`
-- [ ] `tests/e2e/auto-diskful.sh`
+- [x] **e2e harness scaffolded** (2026-05-09): all 12 scenarios committed under `tests/e2e/`, plus a shared `lib.sh` (on_node, wait_uptodate, write_random, read_md5, delete_rd, require_workers, rd_apply). `make e2e NAME=<cluster> SCENARIO=<name>` invokes one; `make e2e-list` enumerates them. Each script captures the scenario's expected state transitions with explicit FAIL exits — running them on the dev stand validates that the corresponding controller/satellite path actually exercises end-to-end. Stand-side execution (and any failures the scenarios surface) tracked in 8.6 / 8.7 follow-up.
+  - `tests/e2e/evacuate.sh` — node evacuate triggers replica migration
+  - `tests/e2e/network-partition.sh` — partition + heal with no full re-sync
+  - `tests/e2e/backing-device-fail.sh` — pull disk, expect graceful diskless-failover
+  - `tests/e2e/snapshot-restore-cross-node.sh`
+  - `tests/e2e/clone.sh`
+  - `tests/e2e/resize-luks.sh`
+  - `tests/e2e/resize-plain.sh`
+  - `tests/e2e/two-primaries-live-migration.sh`
+  - `tests/e2e/rwx-ganesha.sh`
+  - `tests/e2e/two-volume-rd.sh`
+  - `tests/e2e/tiebreaker.sh`
+  - `tests/e2e/auto-diskful.sh`
 
 **Exit criteria for Phase 8**: every checkbox above either lands or is moved to a separately-tracked "explicit out-of-scope" with rationale. Until then "production-ready" is overstating it; what we have is a CSI-compatible REST front-end with a verified happy path.
 
