@@ -455,19 +455,13 @@ The dev stand has been Talos+QEMU loopfile-backed. Production parity needs:
 
 `tests/burnin-blockstor.sh` covers the 2-replica failover happy path. The remaining scenarios above each need a deterministic, automatable test in `tests/e2e/`:
 
-- [x] **e2e harness scaffolded** (2026-05-09): all 12 scenarios committed under `tests/e2e/`, plus a shared `lib.sh` (on_node, wait_uptodate, write_random, read_md5, delete_rd, require_workers, rd_apply). `make e2e NAME=<cluster> SCENARIO=<name>` invokes one; `make e2e-list` enumerates them. Each script captures the scenario's expected state transitions with explicit FAIL exits — running them on the dev stand validates that the corresponding controller/satellite path actually exercises end-to-end. Stand-side execution (and any failures the scenarios surface) tracked in 8.6 / 8.7 follow-up.
-  - `tests/e2e/evacuate.sh` — node evacuate triggers replica migration
-  - `tests/e2e/network-partition.sh` — partition + heal with no full re-sync
-  - `tests/e2e/backing-device-fail.sh` — pull disk, expect graceful diskless-failover
-  - `tests/e2e/snapshot-restore-cross-node.sh`
-  - `tests/e2e/clone.sh`
-  - `tests/e2e/resize-luks.sh`
-  - `tests/e2e/resize-plain.sh`
-  - `tests/e2e/two-primaries-live-migration.sh`
-  - `tests/e2e/rwx-ganesha.sh`
-  - `tests/e2e/two-volume-rd.sh`
-  - `tests/e2e/tiebreaker.sh`
-  - `tests/e2e/auto-diskful.sh`
+- [x] **e2e harness scaffolded** (2026-05-09): all 12 scenarios committed under `tests/e2e/`, plus a shared `lib.sh` (on_node, wait_uptodate, write_random, read_md5, delete_rd, require_workers, rd_apply, rest_post, rest_put). `make e2e NAME=<cluster> SCENARIO=<name>` invokes one; `make e2e-list` enumerates them. Stand-side run on 2026-05-09:
+  - `tests/e2e/tiebreaker.sh` — **PASS** (witness lands on N3, parity-aware; flag survives auto-diskful skip)
+  - `tests/e2e/evacuate.sh` — **PASS** in isolation (3-node migration to N3, source replica retained per EVICTED semantic)
+  - `tests/e2e/auto-diskful.sh`, `two-volume-rd.sh`, `two-primaries-live-migration.sh` — DRBD sync race against the busy QEMU stand, `wait_uptodate` times out at 180s on subsequent runs after one full DRBD cycle has run on the kernel. Real fix is to drbdadm-down everything between scenarios; tracked under 8.6/8.8 follow-up.
+  - `tests/e2e/backing-device-fail.sh` — needs a real block device; sysfs autoclear on a loop only ejects the auto-clear-on-close cookie, doesn't yank the file descriptor DRBD already holds. Real path requires LVM-thin or ZFS pool (deferred to 8.6).
+  - `tests/e2e/snapshot-restore-cross-node.sh`, `clone.sh`, `resize-{plain,luks}.sh` — REST surface verified via the new `rest_post`/`rest_put` helpers (port-forward + host-side curl, since the controller image is distroless); end-to-end execution depends on the same stand-side timing improvements as the diskful scenarios.
+  - `tests/e2e/network-partition.sh`, `rwx-ganesha.sh` — stand setup gaps (need iptables-controllable networking and Ganesha+drbd-reactor), both deferred per 8.6/8.7.
 
 **Exit criteria for Phase 8**: every checkbox above either lands or is moved to a separately-tracked "explicit out-of-scope" with rationale. Until then "production-ready" is overstating it; what we have is a CSI-compatible REST front-end with a verified happy path.
 

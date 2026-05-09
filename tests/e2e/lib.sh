@@ -81,12 +81,21 @@ read_md5() {
 
 # delete_rd cleans up an RD + every Resource named after it.
 # Trapped from each scenario so partial runs don't leave orphans.
+# Also runs `drbdsetup down <rd>` on every satellite as a belt-and-suspenders
+# step — the satellite reconciler should down it on Resource finalization,
+# but if a previous test crashed mid-apply the kernel state can linger
+# and trip the next test's wait_uptodate with a stale resource.
 delete_rd() {
     local rd=$1
     kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
         | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.io.blockstor.io 2>/dev/null || true
     kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.io.blockstor.io/${rd}" 2>/dev/null || true
+
+    # Force-kill any lingering kernel-level state for this RD.
+    for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+        kubectl -n "$NS" exec "$pod" -- bash -c "drbdsetup down ${rd} 2>/dev/null || true; rm -f /etc/drbd.d/${rd}.res" 2>/dev/null || true
+    done
 }
 
 # require_workers enforces that the cluster has at least N satellite
