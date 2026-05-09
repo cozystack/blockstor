@@ -35,6 +35,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // drbdAddrAny is the placeholder address we put into the .res file at
@@ -119,10 +120,13 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 	return resp.GetResults()[0], nil
 }
 
-// lookupEndpoint reads SatelliteEndpoint from the Node prop bag.
+// lookupEndpoint reads SatelliteEndpoint from the Node prop bag. We
+// match by the original LINSTOR name (annotation when slugified, else
+// metadata.Name) so non-RFC1123 LINSTOR names still resolve back to
+// the right CRD on the controller side.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if nodes[i].Name == nodeName {
+		if k8s.OriginalName(&nodes[i].ObjectMeta) == nodeName {
 			return nodes[i].Spec.Props["SatelliteEndpoint"]
 		}
 	}
