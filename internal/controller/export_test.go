@@ -90,3 +90,10 @@ func (r *ResourceDefinitionReconciler) SetQuorum(ctx context.Context, rd *blocks
 func (r *ResourceReconciler) ControllerProps(ctx context.Context) (map[string]string, error) {
 	return r.controllerProps(ctx)
 }
+
+// LookupRD exposes the soft-fail RD fetcher. Tests pin the
+// (nil, nil) return on NotFound so the dispatcher can still set up
+// connection state when the RD is being deleted concurrently.
+func (r *ResourceReconciler) LookupRD(ctx context.Context, name string) (*blockstoriov1alpha1.ResourceDefinition, error) {
+	return r.lookupRD(ctx, name)
+}
