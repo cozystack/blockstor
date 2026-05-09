@@ -105,6 +105,36 @@ func TestAdmPrimary(t *testing.T) {
 	}
 }
 
+// TestAdmPrimaryForce pins the initial-sync seed command shape:
+// `drbdadm primary --force <res>`. Used on a brand-new diskful
+// replica when no peer is UpToDate — without --force, drbd refuses
+// to promote and the resource sits permanently Inconsistent.
+//
+// The --force flag MUST appear in the args; a regression that
+// accidentally dropped it would silently turn first-Apply into a
+// no-op promotion and leave the auto-primary seed broken.
+func TestAdmPrimaryForce(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	if err := adm.PrimaryForce(t.Context(), "pvc-1"); err != nil {
+		t.Fatalf("PrimaryForce: %v", err)
+	}
+
+	want := "drbdadm primary --force pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
+	}
+
+	// And the plain `drbdadm primary pvc-1` (no --force) must NOT
+	// appear — the regression risk is reverting to non-forced.
+	for _, line := range fx.CommandLines() {
+		if line == "drbdadm primary pvc-1" {
+			t.Errorf("PrimaryForce emitted non-forced primary: %s", line)
+		}
+	}
+}
+
 // TestAdmSecondary: `drbdadm secondary <res>` after unmount.
 func TestAdmSecondary(t *testing.T) {
 	fx := storage.NewFakeExec()
