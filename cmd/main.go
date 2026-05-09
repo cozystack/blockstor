@@ -194,9 +194,27 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Construct the store before reconciler wiring so the
+	// NodeReconciler can drive eviction-triggered migration via the
+	// shared placer. Same instance the REST server uses below.
+	var st store.Store
+
+	switch storeKind {
+	case "k8s":
+		st = storek8s.New(mgr.GetClient())
+	case "memory":
+		st = store.NewInMemory()
+
+		setupLog.Info("Using in-memory store; data will be lost on restart")
+	default:
+		setupLog.Error(nil, "Unknown --store value", "store", storeKind)
+		os.Exit(1)
+	}
+
 	if err := (&controller.NodeReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Store:  st,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "node")
 		os.Exit(1)
@@ -246,23 +264,6 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Failed to set up ready check")
-		os.Exit(1)
-	}
-
-	// REST persistence: Kubernetes CRDs (default) or in-process map (tests).
-	// Both implementations satisfy pkg/store.Store; the same test suite (in
-	// pkg/store/storetest) exercises both, so behaviour cannot diverge.
-	var st store.Store
-
-	switch storeKind {
-	case "k8s":
-		st = storek8s.New(mgr.GetClient())
-	case "memory":
-		st = store.NewInMemory()
-
-		setupLog.Info("Using in-memory store; data will be lost on restart")
-	default:
-		setupLog.Error(nil, "Unknown --store value", "store", storeKind)
 		os.Exit(1)
 	}
 
