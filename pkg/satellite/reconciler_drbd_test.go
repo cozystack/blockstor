@@ -711,6 +711,86 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	}
 }
 
+// TestApplyAutoPrimarySeedFiresOnceOnFirstActivation: with the
+// `auto-primary=true` DRBD option set on first Apply, the satellite
+// must run `drbdadm primary --force` followed by `drbdadm secondary`
+// to seed the resource out of `Inconsistent`. On subsequent reconciles
+// (firstActivation=false because the .res file persists) the seed
+// must NOT fire — running it twice would needlessly bump the bitmap
+// and trigger a network re-sync between peers.
+func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-seed",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"auto-primary": "true",
+			},
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (1st): %v", err)
+	}
+
+	first := fx.CommandLines()
+
+	saw := func(lines []string, needle string) int {
+		n := 0
+		for _, line := range lines {
+			if strings.Contains(line, needle) {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	if saw(first, "drbdadm primary --force pvc-seed") != 1 {
+		t.Errorf("first Apply must run primary --force exactly once; got %v", first)
+	}
+
+	if saw(first, "drbdadm secondary pvc-seed") != 1 {
+		t.Errorf("first Apply must run drbdadm secondary exactly once; got %v", first)
+	}
+
+	// Second Apply: .res persists → firstActivation=false → seed
+	// must NOT fire again.
+	fx.Reset()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-seed_00000\n")})
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-seed_00000|1048576\n")})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (2nd): %v", err)
+	}
+
+	second := fx.CommandLines()
+	if saw(second, "primary --force") != 0 {
+		t.Errorf("idempotent reconcile must NOT re-seed; got %v", second)
+	}
+}
+
 // TestDeleteResourceClosesLUKSMapper: when the satellite tears down a
 // LUKS-encrypted resource, it must `cryptsetup luksClose` the mapper
 // BEFORE DeleteVolume removes the underlying LV — otherwise the
