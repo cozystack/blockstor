@@ -24,16 +24,17 @@ export KUBECONFIG="$WORK_DIR/kubeconfig"
 
 NS=blockstor-system
 
-# zfs and lvm devices (per the up.sh extra-disks order).
-ZFS_DEV=/dev/sdb
-LVM_DEV=/dev/sdc
+# Talos qemu attaches extra disks as /dev/sda, /dev/sdb (vda is the
+# root). zfs gets the first, lvm-thin the second when both are
+# requested; single-type stands use the first available.
+ZFS_DEV=${ZFS_DEV:-/dev/sda}
+LVM_DEV=${LVM_DEV:-/dev/sdb}
 
-if [[ "$TYPE" == "zfs" ]]; then
-    ZFS_DEV=/dev/sdb
-fi
-
-if [[ "$TYPE" == "lvm" ]]; then
-    LVM_DEV=/dev/sdb
+if [[ "$TYPE" == "zfs" || "$TYPE" == "lvm" ]]; then
+    # single-type stand: both pool drivers default to the first
+    # extra disk (since only one was provisioned).
+    ZFS_DEV=/dev/sda
+    LVM_DEV=/dev/sda
 fi
 
 create_zfs() {
