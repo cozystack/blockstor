@@ -116,3 +116,56 @@ func TestSnapshotRestoreMissingFields(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestSnapshotRestoreBadJSON: malformed body → 400.
+func TestSnapshotRestoreBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshot-restore-resource", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestSnapshotRestoreConflict: target RD already exists → 409 from
+// writeStoreError surfacing ErrAlreadyExists. Pinned because
+// linstor-csi reconciles VolumeSnapshot → PVC restore by retrying;
+// a 5xx surface here would loop forever on a name that is
+// fundamentally already taken (operator must rename or delete).
+func TestSnapshotRestoreConflict(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-existing"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-existing", // target name already taken
+		FromSnapshot: "snap-1",
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (target RD already exists)", resp.StatusCode)
+	}
+}
