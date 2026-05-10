@@ -207,6 +207,36 @@ func TestHelloErrorWraps(t *testing.T) {
 	}
 }
 
+// TestDialReturnsConnForValidAddr pins the happy-path of dial:
+// grpc.NewClient with a syntactically-valid address must produce
+// a non-nil ClientConn (NewClient is non-blocking, so the actual
+// dial happens lazily on first RPC — we assert only that the
+// constructor doesn't surface an error).
+//
+// Pinned because the satellite's Run() invokes dial() once per
+// supervise iteration; a regression that always errored here
+// would make the satellite never connect.
+func TestDialReturnsConnForValidAddr(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{
+		NodeName:       "n1",
+		ControllerAddr: "127.0.0.1:7000",
+		DialTimeout:    100,
+	})
+
+	conn, err := a.dial(t.Context())
+	if err != nil {
+		t.Fatalf("dial: got %v, want nil", err)
+	}
+
+	if conn == nil {
+		t.Fatalf("dial: got nil conn")
+	}
+
+	_ = conn.Close()
+}
+
 // TestPickMechanism pins the provider-kind → ship-mechanism table
 // the snapshot-shipping dispatcher relies on. The bare "default"
 // branch (returning "") is the load-bearing fallback: an unknown
