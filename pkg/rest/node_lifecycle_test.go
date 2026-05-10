@@ -127,3 +127,72 @@ func TestNodeEvacuateUnknown(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestNodeEvacuateIdempotent: a second POST to /evacuate must not
+// duplicate the EVICTED flag — addFlag's slices.Contains branch
+// short-circuits on already-set flags. Pinned because operators
+// often re-fire evacuate after a controller restart; without
+// idempotency the flag list would grow unbounded.
+func TestNodeEvacuateIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name:  "n1",
+		Flags: []string{"EVICTED"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/n1/evacuate", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, _ := st.Nodes().Get(t.Context(), "n1")
+
+	count := 0
+
+	for _, f := range got.Flags {
+		if f == "EVICTED" {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("EVICTED count after re-evacuate: got %d, want 1; flags=%v", count, got.Flags)
+	}
+}
+
+// TestNodeRestoreUnknown: 404 if the node doesn't exist on restore.
+// Pinned alongside Evacuate's 404 so the entire lifecycle matrix
+// has consistent error surfaces — operator scripts that loop
+// restore + evacuate calls don't have to special-case which
+// endpoint returns what.
+func TestNodeRestoreUnknown(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/ghost/restore", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodeLostUnknown: ditto for /lost.
+func TestNodeLostUnknown(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/ghost/lost", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
