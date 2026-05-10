@@ -751,10 +751,10 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Attach flow (controller-side REST shim):**
 
-- [ ] `POST /v1/physical-storage/<node>` with upstream-shaped body (`{provider_kind, pool_name, vg_name, lv_name, device_paths}`). Resolve `device_paths` → matching `PhysicalDevice` CRDs on `<node>` (lookup by `Status.CurrentDevPath` or stable ID).
+- [x] `POST /v1/physical-storage/<node>` with upstream-shaped body (2026-05-10). `pkg/rest/physical_storage.go.handlePhysicalStorageCreate` accepts `{provider_kind, pool_name, with_storage_pool{name, props}, device_paths}` (the upstream-LINSTOR `PhysicalStorageCreate` envelope), walks PhysicalDevices for the named node via `Store.PhysicalDevices().ListForNode`, picks the first device whose `Status.DevicePath` or `Status.CurrentDevPath` matches a requested path via `pickFreeDeviceForAttach`, builds `AttachTo` from the request (kind, pool name, VG/thin/zpool/dir from props) via `buildAttachTo`, and Updates the CRD's `Spec.AttachTo`.
 - [ ] If the target `StoragePool` CRD doesn't exist yet, controller creates it (`Spec.NodeName=<node>`, provider-specific config). The PhysicalDevice CRDs become OwnerReference children of the pool so cascade-delete works.
 - [ ] For each matched device: `client.Patch(device, attachTo: {...})` with **server-side-apply** (one field manager) so two simultaneous CDP requests can't both win the patch race.
-- [ ] Return 202 Accepted with a `Location:` header; clients poll `GET /v1/physical-storage/<node>` and consider the request done when the matching `PhysicalDevice` CRDs have disappeared (success) or report `Status.Phase=Failed` (failure).
+- [x] Return 202 Accepted with a `Location:` header (2026-05-10). `handlePhysicalStorageCreate` now writes `Location: /v1/nodes/<node>/physical-storage` + `Status: 202 Accepted`; clients poll the list endpoint and treat the request as done when the matching PhysicalDevice CRD has disappeared (delete-as-completion from `PhysicalDeviceReconciler`) or reports `Status.Phase=Failed`. Pinned by an assertion on the existing happy-path test.
 
 **Attach flow (satellite-side reconciler):**
 

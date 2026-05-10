@@ -120,7 +120,15 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Upstream-LINSTOR contract for `POST /v1/physical-storage/<node>`
+	// is async: 202 Accepted + Location header pointing back at the
+	// per-node list endpoint. Clients (golinstor, piraeus-operator)
+	// poll `GET /v1/nodes/<node>/physical-storage` and treat the
+	// request as done when the matching PhysicalDevice CRD has
+	// disappeared (success) or reports `Status.Phase=Failed`.
+	// Phase 10.7.
+	w.Header().Set("Location", "/v1/nodes/"+node+"/physical-storage")
+	w.WriteHeader(http.StatusAccepted)
 }
 
 // pickFreeDeviceForAttach finds the first PhysicalDevice whose

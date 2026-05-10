@@ -220,8 +220,12 @@ func TestPhysicalStorageCreateFlipsAttachTo(t *testing.T) {
 		}`))
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status: got %d, want 202 (upstream-shaped async response)", resp.StatusCode)
+	}
+
+	if loc := resp.Header.Get("Location"); loc != "/v1/nodes/n1/physical-storage" {
+		t.Errorf("Location header: got %q, want /v1/nodes/n1/physical-storage", loc)
 	}
 
 	got, err := st.PhysicalDevices().Get(t.Context(), "n1-sda")
