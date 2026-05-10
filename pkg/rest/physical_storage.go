@@ -24,6 +24,9 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -143,6 +146,18 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Stamp the PhysicalDevice as an OwnerReference child of the
+	// target StoragePool when the apiserver client is wired
+	// (production path). Cascade-delete on the StoragePool then
+	// reaps orphaned PhysicalDevices via Kubernetes GC — useful
+	// when an operator tears down a pool while some device
+	// attaches are stalled in `Phase=Failed`. Best-effort: an
+	// error here doesn't roll back the AttachTo flip; the
+	// satellite's reconciler still completes the attach and the
+	// missing OwnerReference is a recoverable papercut. Phase
+	// 10.7 cascade-delete contract.
+	_ = setStoragePoolOwnership(r.Context(), s.Client, target.Name, target.AttachTo.StoragePoolName)
+
 	// Upstream-LINSTOR contract for `POST /v1/physical-storage/<node>`
 	// is async: 202 Accepted + Location header pointing back at the
 	// per-node list endpoint. Clients (golinstor, piraeus-operator)
@@ -152,6 +167,82 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 	// Phase 10.7.
 	w.Header().Set("Location", "/v1/nodes/"+node+"/physical-storage")
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// setStoragePoolOwnership wires a PhysicalDevice CRD as an
+// OwnerReference child of its target StoragePool. The
+// `client.Client` field on `Server` is populated by `cmd/main.go`
+// in production but stays nil in pure-store tests — both this
+// helper and the caller handle the nil case as no-op. Looked up
+// across the cluster-scoped pool list since we don't yet plumb
+// (node, name) → CRD-name through the store API.
+func setStoragePoolOwnership(ctx context.Context, c ctrlclient.Client, deviceName, poolName string) error {
+	if c == nil || deviceName == "" || poolName == "" {
+		return nil
+	}
+
+	var dev crdv1alpha1.PhysicalDevice
+
+	err := c.Get(ctx, ctrlclient.ObjectKey{Name: deviceName}, &dev)
+	if err != nil {
+		return errors.Wrap(err, "get PhysicalDevice for ownership")
+	}
+
+	var pools crdv1alpha1.StoragePoolList
+
+	err = c.List(ctx, &pools)
+	if err != nil {
+		return errors.Wrap(err, "list StoragePool for ownership")
+	}
+
+	pool := findStoragePoolByName(&pools, dev.Labels[crdv1alpha1.PhysicalDeviceLabelNode], poolName)
+	if pool == nil {
+		return errors.Errorf("StoragePool %q not found for ownership", poolName)
+	}
+
+	if hasOwnerReference(dev.OwnerReferences, pool.UID) {
+		return nil
+	}
+
+	dev.OwnerReferences = append(dev.OwnerReferences, metav1.OwnerReference{
+		APIVersion: crdv1alpha1.GroupVersion.String(),
+		Kind:       "StoragePool",
+		Name:       pool.Name,
+		UID:        pool.UID,
+	})
+
+	err = c.Update(ctx, &dev)
+	if err != nil {
+		return errors.Wrap(err, "stamp OwnerReference")
+	}
+
+	return nil
+}
+
+// findStoragePoolByName picks the cluster-scoped StoragePool CRD
+// matching (node, pool-name). Phase 10.7 ownership wiring lookup.
+func findStoragePoolByName(pools *crdv1alpha1.StoragePoolList, nodeName, poolName string) *crdv1alpha1.StoragePool {
+	for i := range pools.Items {
+		p := &pools.Items[i]
+		if p.Spec.NodeName == nodeName && p.Spec.PoolName == poolName {
+			return p
+		}
+	}
+
+	return nil
+}
+
+// hasOwnerReference returns true when refs already contains an
+// OwnerReference for the given UID — idempotency probe for
+// setStoragePoolOwnership.
+func hasOwnerReference(refs []metav1.OwnerReference, uid types.UID) bool {
+	for i := range refs {
+		if refs[i].UID == uid {
+			return true
+		}
+	}
+
+	return false
 }
 
 // pickFreeDeviceForAttach finds the first PhysicalDevice whose
