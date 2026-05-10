@@ -390,5 +390,66 @@ func TestPlaceFilterPlaceCountZero(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnSamePicksLargestGroup pins replicas_on_same:
+// when the filter requires all replicas to share an Aux/zone label,
+// the placer must partition candidates by zone, pick the group big
+// enough to hold place_count, and reject candidates outside that
+// group. Two zones — "us-east-1a" with 2 nodes and "us-west-1b"
+// with 1 — and place_count=2: the placer must pick both nodes in
+// us-east-1a, never crossing zones.
+//
+// A regression that flattened the partitioning would silently spread
+// replicas across zones, breaking the operator-declared topology
+// invariant (e.g. low-latency cohort, regulatory data residency).
+func TestPlaceReplicasOnSamePicksLargestGroup(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "p",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: 100,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("east-a", "us-east-1a")
+	mk("east-b", "us-east-1a")
+	mk("west-a", "us-west-1b") // singleton — too small to satisfy place_count=2
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		ReplicasOnSame: []string{"zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	for _, r := range got {
+		if r.NodeName == "west-a" {
+			t.Errorf("cross-zone leak: west-a placed despite replicas_on_same=zone; %+v", got)
+		}
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
