@@ -418,6 +418,52 @@ func TestReportObservedSwallowsNotFound(t *testing.T) {
 	}
 }
 
+// TestReportObservedSkipsBlankNames pins the silent-skip surface
+// of applyObserved: an event frame missing either ResourceName or
+// NodeName is no-op'd rather than treated as a NotFound retry —
+// the satellite shouldn't be sending these in production, but if
+// drbdsetup events2 ever emits a malformed line, the satellite's
+// runObserveLoop must NOT requeue forever on an event that can
+// never match a Resource. Pinned here so a regression that
+// surfaced "blank" as an error would be caught.
+func TestReportObservedSkipsBlankNames(t *testing.T) {
+	st := store.NewInMemory()
+
+	addr, stop := startGRPC(t, st)
+	defer stop()
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	c := satellitepb.NewControllerClient(conn)
+	stream, err := c.ReportObserved(t.Context())
+	if err != nil {
+		t.Fatalf("ReportObserved: %v", err)
+	}
+
+	// Two malformed frames: one missing resource_name, one missing node_name.
+	for _, ev := range []*satellitepb.ResourceObservedEvent{
+		{ResourceName: "", NodeName: "n1", DrbdState: "Connected"},
+		{ResourceName: "pvc-1", NodeName: "", DrbdState: "Connected"},
+	} {
+		if sErr := stream.Send(ev); sErr != nil {
+			t.Fatalf("Send: %v", sErr)
+		}
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		t.Fatalf("CloseAndRecv: %v", err)
+	}
+
+	if resp.GetReceived() != 2 {
+		t.Errorf("Received: got %d, want 2 (blank names must be skipped silently, not abort)", resp.GetReceived())
+	}
+}
+
 // TestRunnableNeedLeaderElection pins the manager-runnable contract:
 // the satellite-facing gRPC endpoint must be reachable on every replica
 // (so satellites can connect to whichever pod they hit), so it MUST NOT
