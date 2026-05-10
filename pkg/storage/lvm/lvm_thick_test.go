@@ -324,3 +324,47 @@ func TestThickDeleteSnapshotErrorWraps(t *testing.T) {
 }
 
 var errLVMCmdFailed = errors.New("lvm: command failed")
+
+// TestThickVolumeStatusGarbageFromLVS pins the parse-error branch
+// of volumeStatusViaLVS: a malformed lvs output (LVM-side bug,
+// locale issue, garbled pipe) must surface as a "parse lv_size"
+// error rather than crash or report zero.
+func TestThickVolumeStatusGarbageFromLVS(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-1_00000|not-a-number\n")})
+
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	_, err := thick.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err == nil {
+		t.Fatalf("VolumeStatus on garbage lvs output: got nil, want parse error")
+	}
+}
+
+// TestThickVolumeStatusUnexpectedColumnsFromLVS pins the
+// "unexpected line" surface of volumeStatusViaLVS: lvs output that
+// doesn't split into the expected (path, size) pair must error
+// out rather than silently misparse.
+func TestThickVolumeStatusUnexpectedColumnsFromLVS(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("only-one-column-no-pipe\n")})
+
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	_, err := thick.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err == nil {
+		t.Fatalf("VolumeStatus on truncated lvs output: got nil, want unexpected-line error")
+	}
+
+	if !strings.Contains(err.Error(), "unexpected line") {
+		t.Errorf("error msg: got %q, want substring \"unexpected line\"", err.Error())
+	}
+}
