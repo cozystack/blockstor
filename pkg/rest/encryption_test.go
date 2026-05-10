@@ -17,10 +17,18 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -293,5 +301,201 @@ func TestPassphraseEnterMismatch(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status: got %d, want 403 (mismatched passphrase)", resp.StatusCode)
+	}
+}
+
+// passphraseSecretTestNamespace is the namespace the Secret-path
+// tests pin the controller to. The exact value doesn't matter so
+// long as it's stable across reads + writes.
+const passphraseSecretTestNamespace = "blockstor-system"
+
+// newSecretPathServer constructs a Server wired with a fake
+// controller-runtime client + a Store, so the Secret-backed
+// passphrase path is exercised end-to-end (POST → Secret created,
+// PATCH → Secret read).
+func newSecretPathServer(t *testing.T) *Server {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1 to scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("blockstor to scheme: %v", err)
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	return &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     store.NewInMemory(),
+		Client:    cli,
+		Namespace: passphraseSecretTestNamespace,
+	}
+}
+
+// TestPassphraseSecretCreateLandsInSecret POSTs against the
+// Secret-backed path and asserts the data lands in a native
+// Secret rather than the KV store.
+func TestPassphraseSecretCreateLandsInSecret(t *testing.T) {
+	srv := newSecretPathServer(t)
+	cli := srv.Client
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{"new_passphrase": "topsecret"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: got %d, want 201", resp.StatusCode)
+	}
+
+	var sec corev1.Secret
+
+	err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace,
+		Name:      defaultPassphraseSecretName,
+	}, &sec)
+	if err != nil {
+		t.Fatalf("Secret should exist after POST: %v", err)
+	}
+
+	if got := string(sec.Data[passphraseSecretKey]); got != "topsecret" {
+		t.Errorf("Secret data: got %q, want %q", got, "topsecret")
+	}
+}
+
+// TestPassphraseSecretEnterMatchesSecret PATCHes against the
+// Secret-backed path and asserts the right passphrase unlocks +
+// the wrong one is forbidden — symmetric to the KV-path tests
+// but proving the Secret is the source of truth.
+func TestPassphraseSecretEnterMatchesSecret(t *testing.T) {
+	srv := newSecretPathServer(t)
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	createBody, _ := json.Marshal(map[string]string{"new_passphrase": "right"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", createBody)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
+	}
+
+	rightBody, _ := json.Marshal(map[string]string{"new_passphrase": "right"})
+
+	okResp := httpPatch(t, base+"/v1/encryption/passphrase", rightBody)
+	_ = okResp.Body.Close()
+
+	if okResp.StatusCode != http.StatusOK {
+		t.Errorf("PATCH with right passphrase: got %d, want 200", okResp.StatusCode)
+	}
+
+	wrongBody, _ := json.Marshal(map[string]string{"new_passphrase": "wrong"})
+
+	noResp := httpPatch(t, base+"/v1/encryption/passphrase", wrongBody)
+	_ = noResp.Body.Close()
+
+	if noResp.StatusCode != http.StatusForbidden {
+		t.Errorf("PATCH with wrong passphrase: got %d, want 403", noResp.StatusCode)
+	}
+}
+
+// TestPassphraseSecretModifyRotatesSecret PUTs against the
+// Secret-backed path and asserts the rotation lands in the
+// Secret's data — proving writePassphraseSecret does an Update
+// (not a Create) on the second call.
+func TestPassphraseSecretModifyRotatesSecret(t *testing.T) {
+	srv := newSecretPathServer(t)
+	cli := srv.Client
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	createBody, _ := json.Marshal(map[string]string{"new_passphrase": "v1"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", createBody)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
+	}
+
+	modifyBody, _ := json.Marshal(map[string]string{
+		"old_passphrase": "v1",
+		"new_passphrase": "v2",
+	})
+
+	modifyResp := httpPut(t, base+"/v1/encryption/passphrase", modifyBody)
+	_ = modifyResp.Body.Close()
+
+	if modifyResp.StatusCode != http.StatusOK {
+		t.Fatalf("modify: got %d, want 200", modifyResp.StatusCode)
+	}
+
+	var sec corev1.Secret
+
+	err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace,
+		Name:      defaultPassphraseSecretName,
+	}, &sec)
+	if err != nil {
+		t.Fatalf("Secret missing after rotate: %v", err)
+	}
+
+	if got := string(sec.Data[passphraseSecretKey]); got != "v2" {
+		t.Errorf("rotated Secret data: got %q, want %q", got, "v2")
+	}
+}
+
+// TestPassphraseSecretHonoursControllerConfigRef pins that the
+// ControllerConfig.Spec.PassphraseSecretRef.Name override routes
+// reads + writes to the configured Secret rather than the default.
+func TestPassphraseSecretHonoursControllerConfigRef(t *testing.T) {
+	srv := newSecretPathServer(t)
+	cli := srv.Client
+
+	const customName = "my-org-passphrase"
+
+	err := cli.Create(context.Background(), &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			PassphraseSecretRef: &blockstoriov1alpha1.PassphraseSecretRef{Name: customName},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{"new_passphrase": "x"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create: got %d, want 201", resp.StatusCode)
+	}
+
+	// The named Secret must exist.
+	var sec corev1.Secret
+
+	err = cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace, Name: customName,
+	}, &sec)
+	if err != nil {
+		t.Fatalf("custom-named Secret missing: %v", err)
+	}
+
+	// The default-named one must NOT have been touched.
+	err = cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace, Name: defaultPassphraseSecretName,
+	}, &sec)
+	if err == nil {
+		t.Errorf("default-named Secret was created when override was set")
 	}
 }

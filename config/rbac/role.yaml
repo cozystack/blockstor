@@ -45,3 +45,24 @@ rules:
   - get
   - patch
   - update
+# Phase 10.4: REST encryption endpoints read+write the cluster passphrase
+# from a native Secret rather than the legacy ControllerProps KV bag.
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - controllerconfigs
+  verbs:
+  - get
+  - list
+  - watch

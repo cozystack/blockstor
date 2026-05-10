@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -40,9 +41,16 @@ import (
 // Store may be nil for endpoints that don't need it (e.g. /v1/controller/version);
 // handlers that do need it return 503 if it is nil so the binary stays bootable
 // while the persistence backend is still being plumbed in (Phase 2).
+//
+// Client + Namespace are wired by Phase 10.4 so endpoints that operate
+// on native Kubernetes objects (e.g. the cluster passphrase Secret) can
+// reach the apiserver directly. Both may be nil/empty in tests that
+// only exercise the legacy KV-backed path.
 type Server struct {
-	Addr  string // e.g. ":3370" — upstream LINSTOR plain-text REST port
-	Store store.Store
+	Addr      string // e.g. ":3370" — upstream LINSTOR plain-text REST port
+	Store     store.Store
+	Client    client.Client // controller-runtime client for native-object endpoints
+	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
 }
 
 // NeedLeaderElection reports whether the server requires leader election.

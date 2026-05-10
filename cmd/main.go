@@ -69,6 +69,7 @@ func main() {
 	var satelliteGRPCAddr string
 	var clusterID string
 	var storeKind string
+	var controllerNamespace string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
 		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370).")
@@ -78,6 +79,8 @@ func main() {
 		"Stable identifier for this cluster, returned to satellites in Hello. Empty disables the check.")
 	flag.StringVar(&storeKind, "store", "k8s",
 		"Persistence backend for the REST API: 'k8s' (CRD-backed, default) or 'memory' (in-process, lost on restart, useful for tests).")
+	flag.StringVar(&controllerNamespace, "controller-namespace", "",
+		"Namespace where the controller's own Secrets/ConfigMaps live (default: $POD_NAMESPACE, then 'blockstor-system').")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -102,6 +105,8 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	controllerNamespace = resolveControllerNamespace(controllerNamespace)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -266,7 +271,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := mgr.Add(&rest.Server{Addr: restAddr, Store: st}); err != nil {
+	if err := mgr.Add(&rest.Server{
+		Addr:      restAddr,
+		Store:     st,
+		Client:    mgr.GetClient(),
+		Namespace: controllerNamespace,
+	}); err != nil {
 		setupLog.Error(err, "Failed to register REST API server")
 		os.Exit(1)
 	}
@@ -287,4 +297,21 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// resolveControllerNamespace picks the namespace the controller's
+// own Secrets/ConfigMaps live in. Precedence: explicit flag value
+// wins, then $POD_NAMESPACE (the standard downward-API env var),
+// then the kustomize default `blockstor-system`. Centralised so
+// the flag's help text and the runtime default never drift.
+func resolveControllerNamespace(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+
+	return "blockstor-system"
 }
