@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -328,5 +329,25 @@ func TestPoolStatusReportsCapacity(t *testing.T) {
 
 	if got.SupportsSnapshots {
 		t.Errorf("SupportsSnapshots: file backend never supports snapshots")
+	}
+}
+
+// TestPoolStatusErrorWrapsOnMissingDir pins the statfs-error wrap:
+// when the configured Dir doesn't exist (operator typo, mount race,
+// missing privilege), PoolStatus must surface an error tagged with
+// the "statfs" keyword so operators can grep it.
+func TestPoolStatusErrorWrapsOnMissingDir(t *testing.T) {
+	t.Parallel()
+
+	bogus := filepath.Join(t.TempDir(), "does-not-exist")
+	p := file.NewProvider(file.Config{Dir: bogus}, storage.NewFakeExec())
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Fatalf("PoolStatus on missing dir: got nil, want error")
+	}
+
+	if msg := err.Error(); !strings.Contains(msg, "statfs") {
+		t.Errorf("error wrap: got %q, want substring \"statfs\"", msg)
 	}
 }
