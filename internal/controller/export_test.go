@@ -136,3 +136,16 @@ func SplitByDiskless(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resou
 func FilterTieBreaker(diskless []apiv1.Resource) []apiv1.Resource {
 	return filterTieBreaker(diskless)
 }
+
+// PickTiebreakerNode exposes the witness-node selector for tests.
+// Production wiring stays unexported via createWitness.
+func (r *ResourceDefinitionReconciler) PickTiebreakerNode(ctx context.Context, hostingReplica map[string]bool) (string, error) {
+	return r.pickTiebreakerNode(ctx, hostingReplica)
+}
+
+// IsDisabledNode exposes the EVICTED/LOST flag check used by both
+// the placer and the RD-level tiebreaker path. Pins the "drain
+// signal" flag set so the witness path doesn't pin a dying node.
+func IsDisabledNode(node *apiv1.Node) bool {
+	return isDisabledNode(node)
+}
