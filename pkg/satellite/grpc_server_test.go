@@ -18,6 +18,7 @@ package satellite_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -276,3 +277,67 @@ func TestGRPCServerApplyResourcesCtxCancelBubbles(t *testing.T) {
 		t.Fatalf("ApplyResources with cancelled ctx: got nil, want gRPC-shaped error")
 	}
 }
+
+// TestGRPCServerDeleteResourceProviderError pins the per-replica
+// Ok=false body-level surface when the provider's DeleteVolume
+// fails (lvremove EBUSY, zfs destroy held). DeleteResource must
+// surface the error in the response Message rather than bubble it
+// as a gRPC error — the dispatcher requires this distinction to
+// avoid retrying the whole batch on one replica's lvremove EBUSY.
+func TestGRPCServerDeleteResourceProviderError(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// First Apply succeeds (registers resource→pool map + creates LV).
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-del-busy_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// During DeleteResource: lvExists → "yes", lvremove fails (busy).
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-del-busy_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-del-busy_00000\n")})
+	fx.Expect("lvremove --force vg/pvc-del-busy_00000",
+		storage.FakeResponse{Err: errLVRemoveEBUSY})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Seed the resource→pool map by running Apply first.
+	if _, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-del-busy", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Apply (seed): %v", err)
+	}
+
+	srv := satellite.NewGRPCServer(rec)
+
+	resp, err := srv.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
+		Name:          "pvc-del-busy",
+		StoragePool:   "thin1",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: got transport error %v, want Ok=false body-level", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true, want false on lvremove failure")
+	}
+
+	if resp.GetMessage() == "" {
+		t.Errorf("expected non-empty message describing the lvremove failure")
+	}
+}
+
+var errLVRemoveEBUSY = errors.New("lvremove: device or resource busy")
