@@ -104,6 +104,61 @@ func TestSnapshotsListMissingRD(t *testing.T) {
 	}
 }
 
+// TestSnapshotsListPerRD pins the per-RD list happy path: a GET on
+// /v1/resource-definitions/{rd}/snapshots returns 200 + a bare JSON
+// slice scoped to that RD only. linstor-csi calls this endpoint when
+// reconciling a tenant's VolumeSnapshot lifecycle; if the handler ever
+// regressed to leak snapshots from sibling RDs, two unrelated PVCs
+// would see each other's snapshot metadata in the CSI driver — a
+// silent multi-tenant boundary break.
+func TestSnapshotsListPerRD(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD pvc-1: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-2"}); err != nil {
+		t.Fatalf("seed RD pvc-2: %v", err)
+	}
+
+	for _, sn := range []apiv1.Snapshot{
+		{Name: "s1", ResourceName: "pvc-1"},
+		{Name: "s2", ResourceName: "pvc-1"},
+		{Name: "s1", ResourceName: "pvc-2"},
+	} {
+		if err := st.Snapshots().Create(ctx, &sn); err != nil {
+			t.Fatalf("seed snap: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-1/snapshots")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2 (only pvc-1's snapshots); %+v", len(got), got)
+	}
+
+	for _, s := range got {
+		if s.ResourceName != "pvc-1" {
+			t.Errorf("leak: got snapshot %s/%s in pvc-1 list", s.ResourceName, s.Name)
+		}
+	}
+}
+
 // TestSnapshotsDeleteThenGet: delete then 404.
 func TestSnapshotsDeleteThenGet(t *testing.T) {
 	st := store.NewInMemory()
