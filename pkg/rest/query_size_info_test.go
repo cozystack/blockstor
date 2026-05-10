@@ -320,3 +320,49 @@ func TestReplicaCount(t *testing.T) {
 		}
 	}
 }
+
+// TestQuerySizeInfoMissingRG: POST /v1/resource-groups/{rg}/query-size-info
+// with an unknown RG → 404. linstor-csi calls this on every CreateVolume
+// to gate sizing; a regression that returned 5xx would flip golinstor's
+// retry classification (5xx retryable, 4xx fatal) and bury operator typos
+// in the RG name behind infinite retries.
+func TestQuerySizeInfoMissingRG(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/ghost/query-size-info", []byte(`{}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestQueryAllSizeInfoEmpty: POST /v1/query-all-size-info on a cluster
+// with no RGs → 200 + empty result map. Pinned because golinstor's
+// CLI auto-completion runs this every keystroke; an empty cluster
+// must produce a usable JSON response, not a 500.
+func TestQueryAllSizeInfoEmpty(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/query-all-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got queryAllSizeInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Result == nil {
+		t.Errorf("Result: got nil map; want empty map (golinstor expects a JSON object, not null)")
+	}
+}
