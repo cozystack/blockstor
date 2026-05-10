@@ -420,6 +420,42 @@ func TestPeerPortOfFallback(t *testing.T) {
 	}
 }
 
+// TestApplyEmptyResultsErrorsOut: a satellite that returned an
+// ApplyResourcesResponse with an empty Results slice (corrupt
+// reply, or a custom satellite implementation that ack'd 0 of N
+// requested resources) must surface as an error rather than a
+// silent nil ResourceApplyResult. Without this guard, the
+// Resource reconciler would dereference a nil pointer reading
+// result.GetOk() on the next line up.
+func TestApplyEmptyResultsErrorsOut(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		// Empty Results — no entries at all.
+		resp: &satellitepb.ApplyResourcesResponse{},
+	}
+
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-empty-resp",
+			NodeName:               "n1",
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
+	if err == nil {
+		t.Errorf("empty Results must surface as error; got nil")
+	}
+}
+
 // TestLowestDiskfulIDSkipsDiskless: the auto-primary seed picker
 // must NEVER pick a DISKLESS replica even if it has the lowest
 // node-id. Promoting a witness to Primary defeats its purpose
