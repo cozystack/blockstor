@@ -19,6 +19,7 @@ package zfs_test
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -348,3 +349,84 @@ func TestPoolStatusBadNumbers(t *testing.T) {
 }
 
 var errZFSListMissing = errors.New("dataset does not exist")
+
+// TestDeleteVolumeMissingIsNoop pins the idempotent-delete invariant:
+// if `zfs list` says the dataset is gone, DeleteVolume returns nil
+// without issuing a destroy. linstor-csi calls Delete on the volume
+// teardown path (sometimes after a controller restart that lost the
+// in-flight state); a regression that surfaced "dataset doesn't
+// exist" as an error would re-fire forever.
+func TestDeleteVolumeMissingIsNoop(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// First probe → "dataset doesn't exist" (zfs list returns non-zero).
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+		storage.FakeResponse{Err: errZFSListMissing})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume on missing dataset: got %v, want nil", err)
+	}
+
+	// destroy must NOT have run.
+	for _, cmd := range fx.CommandLines() {
+		if cmd == "zfs destroy -r tank/pvc-1_00000" {
+			t.Errorf("destroy ran despite missing dataset: %v", fx.CommandLines())
+		}
+	}
+}
+
+// TestCreateSnapshotErrorWraps pins the cockroachdb error wrap on
+// the CreateSnapshot path: a `zfs snapshot` failure (e.g. dataset
+// missing, insufficient permissions) must surface with the
+// "zfs snapshot" prefix so operators can grep the wrap keyword
+// in logs.
+func TestCreateSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs snapshot tank/pvc-1_00000@snap-1",
+		storage.FakeResponse{Err: errZFSListMissing})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.CreateSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("CreateSnapshot: got nil, want error")
+	}
+
+	if !slices.Contains([]string{"zfs snapshot tank/pvc-1_00000@snap-1"}, fx.CommandLines()[0]) {
+		t.Errorf("expected snapshot cmd in calls; got %v", fx.CommandLines())
+	}
+
+	if msg := err.Error(); !strings.Contains(msg, "zfs snapshot") {
+		t.Errorf("wrap: %q must contain \"zfs snapshot\" for operator grep", msg)
+	}
+}
+
+// TestDeleteSnapshotErrorWraps mirrors CreateSnapshot: a `zfs destroy
+// <snap>` failure must surface with the "zfs destroy" wrap keyword.
+func TestDeleteSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs destroy tank/pvc-1_00000@snap-1",
+		storage.FakeResponse{Err: errZFSListMissing})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("DeleteSnapshot: got nil, want error")
+	}
+
+	if msg := err.Error(); !strings.Contains(msg, "zfs destroy") {
+		t.Errorf("wrap: %q must contain \"zfs destroy\" for operator grep", msg)
+	}
+}
