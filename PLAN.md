@@ -535,7 +535,7 @@ and per-object configuration lives in typed Spec / Status fields.
 
 - [x] Audit every site where observed state currently writes to `Spec.Props` (2026-05-10). `applyObserved` now sets `state.DrbdState` directly on the typed `apiv1.ResourceState`; the k8s store routes the whole write through `.Status().Update()` to `Resource.Status.DrbdState`. SetState's legacy `drbdProps map[string]string` parameter is gone. No production Spec.Props side-writes remain on the observation path.
 - [ ] Add `ResourceVolumeStatus.CurrentGi string` (also covered by Phase 8.1 follow-up) and `ResourceVolumeStatus.HistoryGi []string` if split-brain visibility matters for the UI.
-- [ ] Document the Spec/Status split rule in `docs/architecture.md`: anything observed by the satellite from the kernel goes to Status, never Spec; anything the operator or controller asks the satellite to do goes to Spec, never Status.
+- [x] Document the Spec/Status split rule in `docs/architecture.md` (2026-05-10). Includes the cheatsheet table per typed field, the multi-writer Status / SSA story, the hierarchy-resolver nil-vs-set discipline, the wire-vs-CRD format boundary, and the DRBD initial-sync skip pipeline as a worked example of the rule.
 - [ ] Use Kubernetes server-side-apply field managers when both controller (writes parts of Status — e.g. allocator outputs `DRBDPort`) and satellite (writes other parts of Status — `DiskState`, `CurrentGi`) touch the same Status, so neither clobbers the other. Today the controller uses regular `Update` which can clobber Status writes that landed between Get and Update.
 
 ### 10.3 — Typed fields replace `Spec.Props map[string]string`
