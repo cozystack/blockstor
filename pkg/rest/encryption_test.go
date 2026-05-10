@@ -197,3 +197,37 @@ func TestPassphraseModifyBadJSON(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestPassphraseCreateBadJSON: malformed body → 400.
+func TestPassphraseCreateBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/encryption/passphrase", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestPassphraseCreateMissingNew: POST with empty new_passphrase →
+// 400. Pinned because a regression that allowed empty values would
+// "unlock" the cluster with the empty string and silently downgrade
+// at-rest encryption to no-op.
+func TestPassphraseCreateMissingNew(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(passphraseRequest{}) // NewPassphrase omitted
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/encryption/passphrase", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}

@@ -123,3 +123,20 @@ func TestControllerPropertiesDelete(t *testing.T) {
 		t.Errorf("KeepMe lost: got %v", got)
 	}
 }
+
+// TestControllerPropertiesModifyBadJSON: malformed body → 400 from
+// the JSON decoder. Pinned because controller-prop sets are how
+// satellites learn about TLS, ports, AutoBlockSize policy etc — a
+// regression that surfaced decoder errors as 500 would mask
+// operator typos behind golinstor's retry loop.
+func TestControllerPropertiesModifyBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/controller/properties", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
