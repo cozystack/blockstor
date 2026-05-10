@@ -580,6 +580,77 @@ Once 10.1-10.5 land, the gRPC paths are unused. Final demolition:
 - [ ] Delete the gRPC supervise loops in `pkg/satellite/agent.go` (`runObserveLoop`, `superviseObserveLoop`, `runCapacityLoop`, `dial`, `hello`, `startGRPCServer`).
 - [ ] Satellite's `Run` becomes: build controller-runtime manager, register the per-CRD reconcilers, start manager. Mirror image of `cmd/manager/main.go`.
 
+### 10.7 — `physical-storage create-device-pool` via `PhysicalDevice` CRD
+
+Today `POST /v1/physical-storage/{node}` returns 501. After Phase 10 it
+becomes a fully-CRD-driven flow with stable device identifiers and a
+satellite-owned discovery loop. Replaces the upstream PropsContainers /
+gRPC pattern with the same satellite-publish + controller-attach +
+satellite-execute model the rest of Phase 10 uses.
+
+**`PhysicalDevice` CRD design:**
+
+- [ ] New cluster-scoped CRD `PhysicalDevice` (one per free raw block device per node). `metadata.name = <nodeName>-<stable-id-slug>` so the CRD survives `/dev/sdN` re-lettering across reboots. `metadata.labels[blockstor.io/node]` carries the node name for efficient `client.MatchingLabels` filters.
+- [ ] `Spec.AttachTo *AttachToPool` — empty when the device is published as available. Set by the controller (REST shim or operator-via-kubectl) when the device should be added to a pool. Carries `StoragePoolName`, `ProviderKind`, provider-specific fields (`VGName`, `ThinPoolName`, `ZPoolName`, `Directory`), and an explicit `Wipe bool` consent flag.
+- [ ] `Status.NodeName / StableID / DevicePath / CurrentDevPath / SizeBytes / Model / Serial / Rotational / Transport / Phase` — populated by the satellite's discovery loop. `Phase` is `Available` / `Attaching` / `Failed` (no `Ready` — successful attach **deletes** the CRD, see below).
+
+**Stable identifier rules:**
+
+- [ ] Satellite picks the most stable identifier in this order: `/dev/disk/by-id/wwn-*` → `/dev/disk/by-id/scsi-SATA_<vendor>_<model>_<serial>` → `/dev/disk/by-id/nvme-<model>_<serial>` → `/dev/disk/by-path/...` (last resort). For platforms without any (e.g. virtio without serial passthrough), fall back to `lsblk -o WWN,SERIAL`. The chosen ID becomes part of the CRD name and lives in `Status.StableID`. `Status.CurrentDevPath` is volatile and refreshed on every discovery tick.
+
+**Discovery loop (satellite, periodic + udev-triggered):**
+
+- [ ] Run `lsblk -P -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,ROTA,TRAN,PARTLABEL` and filter to `TYPE=disk` with no `FSTYPE`, no `MOUNTPOINT`, no children (no partition table). Cross-check via `pvs --noheadings` (no LVM signature), `zpool list -PHv` (not in any zpool), `drbdmeta show-md` (no DRBD signature), `wipefs -n` (no other signature).
+- [ ] Set-difference against existing `PhysicalDevice` CRDs labelled with this node:
+  - New free device → `client.Create(PhysicalDevice{name: <node>-<id-slug>, status: ...})`
+  - Already published, attributes changed (e.g. drive replaced) → `client.Status().Update(...)`
+  - Previously published but no longer free (consumed by a pool, or removed physically) → `client.Delete(...)`
+- [ ] Discovery is convergent — re-runs match state. On satellite restart it re-publishes from scratch.
+
+**Upstream-LINSTOR filter parity:**
+
+- [ ] Match the filter rules in upstream's `LsBlkUtils.java` + `CmdPhysicalStorage.java` so `linstor physical-storage list` shows the same set of devices when pointed at blockstor — protects piraeus-operator + golinstor users from surprise differences.
+
+**Attach flow (controller-side REST shim):**
+
+- [ ] `POST /v1/physical-storage/<node>` with upstream-shaped body (`{provider_kind, pool_name, vg_name, lv_name, device_paths}`). Resolve `device_paths` → matching `PhysicalDevice` CRDs on `<node>` (lookup by `Status.CurrentDevPath` or stable ID).
+- [ ] If the target `StoragePool` CRD doesn't exist yet, controller creates it (`Spec.NodeName=<node>`, provider-specific config). The PhysicalDevice CRDs become OwnerReference children of the pool so cascade-delete works.
+- [ ] For each matched device: `client.Patch(device, attachTo: {...})` with **server-side-apply** (one field manager) so two simultaneous CDP requests can't both win the patch race.
+- [ ] Return 202 Accepted with a `Location:` header; clients poll `GET /v1/physical-storage/<node>` and consider the request done when the matching `PhysicalDevice` CRDs have disappeared (success) or report `Status.Phase=Failed` (failure).
+
+**Attach flow (satellite-side reconciler):**
+
+- [ ] Reconciler watches `PhysicalDevice` filtered by `metadata.labels[blockstor.io/node]=self`. On `Spec.AttachTo` set:
+  1. Resolve `Status.StableID` → current `/dev/sdN` (may have changed since discovery). If gone → `Phase=Failed`, condition `DeviceMissing`.
+  2. Idempotency check: is the device **already** in the target pool (`pvs grep`, `zpool status grep`)? If yes → skip to Delete (this is a re-run after a crash post-vgextend pre-Delete).
+  3. Set `Phase=Attaching` via Status subresource.
+  4. If `Spec.AttachTo.Wipe`: `wipefs -a /dev/sdN`.
+  5. Provider-specific commands (each idempotent — check existing state with `pvs` / `zpool status` before issuing):
+     - `LVM_THIN`: `pvcreate` if not PV → if VG exists `vgextend` else `vgcreate` → if thin LV missing `lvcreate -T -l 100%FREE`
+     - `LVM`: `pvcreate` + `vgcreate` / `vgextend`
+     - `ZFS` / `ZFS_THIN`: `zpool create` if pool missing else `zpool add`
+     - `FILE` / `FILE_THIN`: `mkdir -p` + `mount` (less device-y; the bind-mount form)
+  6. **Delete the `PhysicalDevice` CRD** as the completion signal. No `Phase=Ready` state — successful attach equals "the device is no longer free, so it disappears from the available list".
+- [ ] On failure between `Phase=Attaching` and Delete (satellite crash), restart-time reconcile re-runs idempotently from step 2.
+
+**Race-handling matrix:**
+
+- [ ] Two simultaneous CDP requests on the same device: SSA field-manager identity → second `Patch` rejects with conflict. REST shim returns 409 to the loser.
+- [ ] CDP request races with a discovery pass that removes the device (because something else just consumed it): `client.Patch` of `Spec.AttachTo` against a `ResourceVersion` that was already deleted → 404. REST shim re-fetches and returns `RaceLost` to caller.
+- [ ] Satellite crashes mid-`vgcreate`: on restart, discovery loop **does not re-publish** the device (it's now a PV / partial VG). Old `PhysicalDevice` with `Spec.AttachTo` set + `Status.Phase=Attaching` still exists — reconcile hits the idempotency path and finishes (vgextend / lvcreate the missing pieces, then Delete).
+- [ ] CDP request creates `PhysicalDevice.Spec.AttachTo` referencing a `StoragePool` that doesn't exist (race with controller creating both): satellite reconciler sees missing pool → `RequeueAfter: 10s` until pool lands. If pool never lands → eventually `Phase=Failed condition: PoolMissing` after some bounded retries.
+
+**`GET /v1/nodes/{node}/physical-storage`:**
+
+- [ ] List all `PhysicalDevice` CRDs labelled with `<node>`, return the upstream-LINSTOR shape so `linstor physical-storage list` and piraeus-operator's `LinstorSatelliteConfiguration.spec.storagePools` match. (Today returns hardcoded empty array.)
+
+### 10.8 — Pool teardown / device free-back path
+
+- [ ] When `kubectl delete storagepool <name>` runs with `propagationPolicy=Foreground`, satellite's `StoragePool` reconciler picks up the `DeletionTimestamp`. If `Spec.DestroyOnDelete=true` (default `false` — explicit consent), it runs `vgremove --force <vg>/<lv> && vgremove --force <vg>` (LVM) or `zpool destroy <pool>` (ZFS) on every device that was attached, plus `wipefs -a` to clear residual signatures so the next discovery tick sees them as free again.
+- [ ] If `Spec.DestroyOnDelete=false`, the pool's `StoragePool` CRD is removed but the underlying VG/zpool stays intact on disk. Operators who want to re-import the data later can `vgchange -ay` / `zpool import` manually. A future re-`linstor physical-storage create-device-pool` against the same VG name behaves idempotently (vgextend etc.).
+- [ ] Discovery loop on next tick re-publishes the freed devices as new `PhysicalDevice` CRDs (with the same stable-ID-derived names — they're the same physical drives — so re-attach via GitOps is deterministic).
+- [ ] Finalizers on `PhysicalDevice` (only set while `Spec.AttachTo` is non-nil) prevent kube-apiserver from removing the CRD before the satellite's teardown ran. After teardown the satellite strips its own finalizer.
+
 ### Open design questions for the user
 
 - [ ] Single binary with `--mode={controller,satellite}` flag, or stay two binaries? Two is simpler RBAC-wise but doubles the build artifacts; one is what kube-controller-manager-style operators usually pick.
