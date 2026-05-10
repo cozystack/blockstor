@@ -50,6 +50,7 @@ type fakeSatelliteClient struct {
 	// path (Apply tests leave these zero-valued).
 	delLast *satellitepb.DeleteResourceRequest
 	delResp *satellitepb.DeleteResourceResponse
+	delErr  error // when set, every DeleteResource RPC returns this error
 
 	// CreateSnapshot state.
 	snapLast []*satellitepb.CreateSnapshotRequest
@@ -69,6 +70,9 @@ func (f *fakeSatelliteClient) ApplyResources(_ context.Context, req *satellitepb
 
 func (f *fakeSatelliteClient) DeleteResource(_ context.Context, req *satellitepb.DeleteResourceRequest, _ ...grpc.CallOption) (*satellitepb.DeleteResourceResponse, error) {
 	f.delLast = req
+	if f.delErr != nil {
+		return nil, f.delErr
+	}
 	if f.delResp == nil {
 		return &satellitepb.DeleteResourceResponse{Ok: true}, nil
 	}
@@ -1249,3 +1253,41 @@ func TestApplyOptsLayerStackOverridesRD(t *testing.T) {
 		t.Errorf("LayerStack[1]: got %q, want LUKS (opts override on RD)", got[1])
 	}
 }
+
+// TestDeleteResourceRPCErrorBubbles pins the previously-uncovered
+// DeleteResource RPC-error wrap branch (was 94.7%). When the dial
+// succeeds but the actual DeleteResource gRPC fails (transport
+// blip, satellite mid-restart), the dispatcher must surface the
+// error tagged with the "DeleteResource RPC" wrap keyword.
+//
+// The Resource reconciler's runDelete path treats this as a
+// transport fault and requeues with the 10s back-off — the
+// finalizer stays put so kube-apiserver doesn't garbage-collect
+// a resource the satellite still has lingering state for.
+func TestDeleteResourceRPCErrorBubbles(t *testing.T) {
+	stub := &fakeSatelliteClient{delErr: errDeleteResourceRPCDown}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.DeleteResource(t.Context(), target, nil, nodes)
+	if err == nil {
+		t.Fatalf("DeleteResource: got nil, want RPC error")
+	}
+
+	if !strings.Contains(err.Error(), "DeleteResource RPC") {
+		t.Errorf("wrap: got %q, want substring \"DeleteResource RPC\"", err.Error())
+	}
+}
+
+var errDeleteResourceRPCDown = errors.New("rpc: satellite mid-restart")
