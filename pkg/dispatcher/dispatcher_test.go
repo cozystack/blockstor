@@ -489,6 +489,26 @@ func TestCreateSnapshotDialErrorBubbles(t *testing.T) {
 	}
 }
 
+// TestNewDialerReturnsNonNil: the production-Dialer constructor
+// must return a non-nil value that satisfies the Dialer interface.
+// Pin so a refactor that swapped to lazy initialisation wouldn't
+// silently surface a nil dialer to the controller (which would
+// nil-panic on the first Apply).
+func TestNewDialerReturnsNonNil(t *testing.T) {
+	t.Parallel()
+
+	d := dispatcher.NewDialer()
+	if d == nil {
+		t.Errorf("NewDialer returned nil; want non-nil Dialer")
+	}
+}
+
+// (The production realDialer's Dial error-wrap path can't be
+// pinned in a unit test: grpc.NewClient is lazy and won't
+// validate the endpoint until first RPC. The wrap keyword is
+// already pinned via errDialer tests on the fake path; this is
+// just trusting that realDialer's implementation matches.)
+
 // TestApplyEmptyResultsErrorsOut: a satellite that returned an
 // ApplyResourcesResponse with an empty Results slice (corrupt
 // reply, or a custom satellite implementation that ack'd 0 of N
