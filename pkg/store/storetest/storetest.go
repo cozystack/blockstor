@@ -294,73 +294,15 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 // RunKeyValueStore exercises every branch of store.KeyValueStore.
 func RunKeyValueStore(t *testing.T, newStore Factory) {
 	t.Helper()
-	t.Run("ListEmpty", func(t *testing.T) {
-		got, err := newStore(t).KeyValueStore().ListInstances(t.Context())
-		if err != nil {
-			t.Fatalf("ListInstances: %v", err)
-		}
-		if got == nil || len(got) != 0 {
-			t.Errorf("got %v, want empty", got)
-		}
+	t.Run("ListEmpty", func(t *testing.T) { testKVListEmpty(t, newStore) })
+	t.Run("SetThenGet", func(t *testing.T) { testKVSetThenGet(t, newStore) })
+	t.Run("DeleteKeys", func(t *testing.T) { testKVDeleteKeys(t, newStore) })
+	t.Run("DeleteNamespace", func(t *testing.T) { testKVDeleteNamespace(t, newStore) })
+	t.Run("DeleteNamespaceExactMatch", func(t *testing.T) {
+		testKVDeleteNamespaceExactMatch(t, newStore)
 	})
-	t.Run("SetThenGet", func(t *testing.T) {
-		s := newStore(t).KeyValueStore()
-		ctx := t.Context()
-		err := s.SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
-			OverrideProps: map[string]string{"foo": "bar", "baz": "qux"},
-		})
-		if err != nil {
-			t.Fatalf("SetKeys: %v", err)
-		}
-		got, err := s.GetInstance(ctx, "csi-volumes")
-		if err != nil {
-			t.Fatalf("GetInstance: %v", err)
-		}
-		if got["foo"] != "bar" || got["baz"] != "qux" {
-			t.Errorf("got %+v", got)
-		}
-	})
-	t.Run("DeleteKeys", func(t *testing.T) {
-		s := newStore(t).KeyValueStore()
-		ctx := t.Context()
-		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
-			OverrideProps: map[string]string{"a": "1", "b": "2"},
-		}); err != nil {
-			t.Fatalf("SetKeys: %v", err)
-		}
-		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
-			DeleteProps: []string{"a"},
-		}); err != nil {
-			t.Fatalf("SetKeys delete: %v", err)
-		}
-		got, _ := s.GetInstance(ctx, "x")
-		if _, ok := got["a"]; ok {
-			t.Errorf("a should be deleted: %v", got)
-		}
-		if got["b"] != "2" {
-			t.Errorf("b should remain: %v", got)
-		}
-	})
-	t.Run("DeleteNamespace", func(t *testing.T) {
-		s := newStore(t).KeyValueStore()
-		ctx := t.Context()
-		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
-			OverrideProps: map[string]string{"ns/k1": "v1", "ns/k2": "v2", "other/k": "v"},
-		}); err != nil {
-			t.Fatalf("SetKeys: %v", err)
-		}
-		if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
-			DeleteNamespace: []string{"ns"},
-		}); err != nil {
-			t.Fatalf("SetKeys delete-ns: %v", err)
-		}
-		got, _ := s.GetInstance(ctx, "x")
-		if _, ok := got["ns/k1"]; ok {
-			t.Errorf("ns/k1 should be deleted: %v", got)
-		}
-		if got["other/k"] != "v" {
-			t.Errorf("other/k should remain: %v", got)
-		}
+	t.Run("DeleteNamespaceMultiple", func(t *testing.T) {
+		testKVDeleteNamespaceMultiple(t, newStore)
 	})
 	t.Run("GetMissing", func(t *testing.T) {
 		_, err := newStore(t).KeyValueStore().GetInstance(t.Context(), "ghost")
@@ -473,6 +415,167 @@ func RunKeyValueStore(t *testing.T, newStore Factory) {
 
 // seedRD inserts a minimal valid ResourceDefinition the VolumeDefinition
 // suite can hang volumes off of.
+func testKVListEmpty(t *testing.T, newStore Factory) {
+	got, err := newStore(t).KeyValueStore().ListInstances(t.Context())
+	if err != nil {
+		t.Fatalf("ListInstances: %v", err)
+	}
+
+	if got == nil || len(got) != 0 {
+		t.Errorf("got %v, want empty", got)
+	}
+}
+
+func testKVSetThenGet(t *testing.T, newStore Factory) {
+	s := newStore(t).KeyValueStore()
+	ctx := t.Context()
+
+	err := s.SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"foo": "bar", "baz": "qux"},
+	})
+	if err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+
+	got, err := s.GetInstance(ctx, "csi-volumes")
+	if err != nil {
+		t.Fatalf("GetInstance: %v", err)
+	}
+
+	if got["foo"] != "bar" || got["baz"] != "qux" {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func testKVDeleteKeys(t *testing.T, newStore Factory) {
+	s := newStore(t).KeyValueStore()
+	ctx := t.Context()
+
+	if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"a": "1", "b": "2"},
+	}); err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+
+	if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+		DeleteProps: []string{"a"},
+	}); err != nil {
+		t.Fatalf("SetKeys delete: %v", err)
+	}
+
+	got, _ := s.GetInstance(ctx, "x")
+	if _, ok := got["a"]; ok {
+		t.Errorf("a should be deleted: %v", got)
+	}
+
+	if got["b"] != "2" {
+		t.Errorf("b should remain: %v", got)
+	}
+}
+
+func testKVDeleteNamespace(t *testing.T, newStore Factory) {
+	s := newStore(t).KeyValueStore()
+	ctx := t.Context()
+
+	if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"ns/k1": "v1", "ns/k2": "v2", "other/k": "v"},
+	}); err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+
+	if err := s.SetKeys(ctx, "x", apiv1.GenericPropsModify{
+		DeleteNamespace: []string{"ns"},
+	}); err != nil {
+		t.Fatalf("SetKeys delete-ns: %v", err)
+	}
+
+	got, _ := s.GetInstance(ctx, "x")
+	if _, ok := got["ns/k1"]; ok {
+		t.Errorf("ns/k1 should be deleted: %v", got)
+	}
+
+	if got["other/k"] != "v" {
+		t.Errorf("other/k should remain: %v", got)
+	}
+}
+
+// testKVDeleteNamespaceExactMatch pins the dual key==ns /
+// strings.HasPrefix(key, ns+"/") condition: a namespace value that
+// equals a key (no slash suffix) deletes that bare key. Without
+// exact-match a `linstor c kv ns d --namespace foo` where `foo` is
+// itself a key (not just a prefix) silently fails.
+func testKVDeleteNamespaceExactMatch(t *testing.T, newStore Factory) {
+	s := newStore(t).KeyValueStore()
+	ctx := t.Context()
+
+	if err := s.SetKeys(ctx, "y", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{
+			"foo":     "bare",
+			"foo/sub": "child",
+			"bar":     "untouched",
+		},
+	}); err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+
+	if err := s.SetKeys(ctx, "y", apiv1.GenericPropsModify{
+		DeleteNamespace: []string{"foo"},
+	}); err != nil {
+		t.Fatalf("SetKeys delete-foo: %v", err)
+	}
+
+	got, _ := s.GetInstance(ctx, "y")
+	if _, ok := got["foo"]; ok {
+		t.Errorf("bare `foo` not deleted by DeleteNamespace=[foo]: %v", got)
+	}
+
+	if _, ok := got["foo/sub"]; ok {
+		t.Errorf("`foo/sub` not deleted: %v", got)
+	}
+
+	if got["bar"] != "untouched" {
+		t.Errorf("`bar` wiped despite different namespace: %v", got)
+	}
+}
+
+// testKVDeleteNamespaceMultiple pins the multi-namespace fan-out:
+// passing two namespaces in one call deletes from both. Without
+// this, an operator wiping `audit/` and `legacy/` in one PUT would
+// only get the first applied.
+func testKVDeleteNamespaceMultiple(t *testing.T, newStore Factory) {
+	s := newStore(t).KeyValueStore()
+	ctx := t.Context()
+
+	if err := s.SetKeys(ctx, "z", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{
+			"audit/x":  "1",
+			"legacy/y": "2",
+			"keep/z":   "3",
+		},
+	}); err != nil {
+		t.Fatalf("SetKeys: %v", err)
+	}
+
+	if err := s.SetKeys(ctx, "z", apiv1.GenericPropsModify{
+		DeleteNamespace: []string{"audit", "legacy"},
+	}); err != nil {
+		t.Fatalf("SetKeys delete-multi: %v", err)
+	}
+
+	got, _ := s.GetInstance(ctx, "z")
+	if _, ok := got["audit/x"]; ok {
+		t.Errorf("audit/x not deleted: %v", got)
+	}
+
+	if _, ok := got["legacy/y"]; ok {
+		t.Errorf("legacy/y not deleted: %v", got)
+	}
+
+	if got["keep/z"] != "3" {
+		t.Errorf("keep/z wiped despite different namespace: %v", got)
+	}
+}
+
 func seedRD(t *testing.T, s store.Store, name string) {
 	t.Helper()
 
