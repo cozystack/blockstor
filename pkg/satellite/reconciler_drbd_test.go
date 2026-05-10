@@ -1339,3 +1339,55 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 }
 
 var errLUKSFormatBusy = errors.New("cryptsetup: device busy")
+
+// TestApplyDRBDCreateMDErrorWraps pins the create-md error-wrap
+// branch of applyDRBD (was 82.1%): on first activation of a
+// diskful replica, when `drbdadm create-md` fails (metadata area
+// unwritable, kernel module missing), applyOne must surface
+// the error tagged with "create-md" in the per-resource
+// ApplyResources reply. The dispatcher needs to see this as
+// Ok=false body-level so it doesn't tear down the entire batch.
+func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-md-fail_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// drbdadm create-md fails.
+	fx.Expect("drbdadm create-md --force pvc-md-fail",
+		storage.FakeResponse{Err: errCreateMDFailed})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-md-fail",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: got transport error %v, want Ok=false body-level", err)
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("Ok: got true, want false on create-md failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), "create-md") {
+		t.Errorf("message: got %q, want substring \"create-md\"", results[0].GetMessage())
+	}
+}
+
+var errCreateMDFailed = errors.New("drbdadm: create-md kernel module missing")
