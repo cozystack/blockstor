@@ -1275,3 +1275,67 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 		t.Errorf("retry must re-run drbdadm adjust to pick up where the abort left off; got %v", second)
 	}
 }
+
+// TestApplyLUKSFormatErrorWraps pins the Format error-wrap path of
+// applyLUKS (was 81.8%). When `cryptsetup luksFormat` fails (disk
+// busy, hardware lock, etc.), applyOne must surface the error
+// tagged with the "luks format" wrap keyword in the per-resource
+// ApplyResources reply, NOT bubble it as a transport-level gRPC
+// error.
+//
+// The dispatcher distinguishes "satellite said no" (Ok=false body-
+// level) from "transport failed". Without the wrap keyword, an
+// operator can't grep the satellite log to identify a stuck format
+// vs. e.g. a stuck open.
+func TestApplyLUKSFormatErrorWraps(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-format_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-format_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
+	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
+		storage.FakeResponse{Err: errNotALUKSDevice})
+	// luksFormat fails: simulate the device being busy.
+	fx.Expect(`sh -c printf %s "topsecret" | cryptsetup 'luksFormat' '--batch-mode' '/dev/vg/pvc-luks-format_00000' '--key-file' '-'`,
+		storage.FakeResponse{Err: errLUKSFormatBusy})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-luks-format",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: got transport error %v, want per-resource Ok=false", err)
+	}
+
+	if len(results) != 1 {
+		t.Fatalf("results: got %d, want 1", len(results))
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("Ok: got true, want false on luksFormat failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), "luks format") {
+		t.Errorf("message: got %q, want substring \"luks format\"", results[0].GetMessage())
+	}
+}
+
+var errLUKSFormatBusy = errors.New("cryptsetup: device busy")
