@@ -18,6 +18,7 @@ package drbd
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/errors"
 
@@ -102,6 +103,35 @@ func (a *Adm) Detach(ctx context.Context, resource string) error {
 // every replica.
 func (a *Adm) Resize(ctx context.Context, resource string) error {
 	return a.run(ctx, "resize", "--assume-clean", resource)
+}
+
+// SetGi pre-seeds this replica's DRBD metadata with the GI tuple of
+// an existing UpToDate peer, so DRBD's GI handshake on first connect
+// recognises the new replica as already-in-sync and skips the full
+// initial-sync. Must be called AFTER `create-md` (which writes the
+// fresh metadata block this then mutates) and BEFORE `drbdadm up`
+// (which reads the metadata into kernel state).
+//
+// The GI tuple format DRBD's `set-gi` accepts is
+// `<current>:<bitmap>:<history0>:<history1>`. We set both
+// current_uuid and bitmap_uuid to peerCurrentGi so the new replica
+// claims "I'm at the peer's generation; I have no dirty bits relative
+// to the peer". History is zeroed — DRBD's handshake never matches
+// against history when current+bitmap match, so it doesn't matter.
+//
+// Tested via FakeExec capture in pkg/drbd/drbdadm_test.go and
+// pinned end-to-end in pkg/satellite/reconciler_drbd_test.go's
+// first-activation case.
+func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device, peerCurrentGi string) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+	gi := fmt.Sprintf("%s:%s:0:0", peerCurrentGi, peerCurrentGi)
+
+	_, err := a.exec.Run(ctx, "drbdmeta", "--force", target, "v09", device, "internal", "set-gi", gi)
+	if err != nil {
+		return errors.Wrapf(err, "drbdmeta set-gi %s", target)
+	}
+
+	return nil
 }
 
 // run is the single shell-out site so every drbdadm error gets

@@ -422,10 +422,26 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			VolumeNumber: vd.VolumeNumber,
 			SizeKib:      vd.SizeKib,
 			StoragePool:  pool,
+			SeedFromGi:   seedFromGi(target, vd.VolumeNumber),
 		})
 	}
 
 	return out
+}
+
+// seedFromGi looks up the controller-allocated SeedFromGi for the
+// given volume number. Empty when the controller hasn't picked a peer
+// yet (fresh-cluster, no UpToDate peer to seed from); the satellite
+// then skips drbdmeta seeding and pays the full initial-sync cost
+// for that volume. Phase 8.1.
+func seedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+	for i := range target.Spec.Volumes {
+		if target.Spec.Volumes[i].VolumeNumber == volumeNumber {
+			return target.Spec.Volumes[i].SeedFromGi
+		}
+	}
+
+	return ""
 }
 
 // DeleteResource dials the target satellite's endpoint and asks it

@@ -517,6 +517,18 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 		if err != nil {
 			return errors.Wrapf(err, "create-md %s", dr.GetName())
 		}
+
+		// Initial-sync skip seeding (Phase 8.1): when the controller
+		// has picked an UpToDate peer's GI, stamp this replica's
+		// freshly-created metadata block with that GI BEFORE drbdadm
+		// adjust so DRBD's GI handshake on first connect sees the new
+		// peer as already-in-sync and skips the full initial-sync.
+		// Per-volume — a multi-volume RD may have one volume seeded
+		// and another not (e.g. fresh cluster, no peer for vol 1 yet).
+		err = r.seedInitialGi(ctx, dr, devices)
+		if err != nil {
+			return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
+		}
 	}
 
 	err = r.cfg.Adm.Adjust(ctx, dr.GetName())
@@ -552,6 +564,36 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 		err = r.cfg.Adm.Secondary(ctx, dr.GetName())
 		if err != nil {
 			return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
+		}
+	}
+
+	return nil
+}
+
+// seedInitialGi pre-stamps each diskful volume's freshly-created
+// DRBD metadata block with the GI the controller picked from an
+// UpToDate peer (Phase 8.1). When SeedFromGi is empty (fresh
+// cluster, no peer to seed from) the volume is skipped — DRBD will
+// fall through to the full initial-sync on first connect, which is
+// the acceptable cost for the first replica in a new RD.
+//
+// Must be called between create-md (which writes the metadata
+// block this then mutates) and drbdadm adjust (which reads the
+// metadata into kernel state).
+func (r *Reconciler) seedInitialGi(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string) error {
+	for _, vol := range dr.GetVolumes() {
+		if vol.GetSeedFromGi() == "" {
+			continue
+		}
+
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			continue
+		}
+
+		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, vol.GetSeedFromGi())
+		if err != nil {
+			return errors.Wrapf(err, "set-gi vol %d", vol.GetVolumeNumber())
 		}
 	}
 

@@ -1446,3 +1446,138 @@ func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 }
 
 var errPrimaryForceFailed = errors.New("drbdadm: device busy")
+
+// TestApplyFirstActivationSeedsGiBeforeAdjust pins the Phase 8.1
+// initial-sync skip pipeline: when the controller has filled in
+// SeedFromGi on a freshly-created replica, the satellite must
+// (a) run create-md to lay down a fresh metadata block, then
+// (b) run drbdmeta set-gi to stamp it with the peer's GI, then
+// (c) run drbdadm adjust to bring the resource up — all in that
+// order. A regression that swaps (b)/(c) or skips (b) would let
+// DRBD bring the resource up with zero GI, mismatch the peer's
+// current_uuid on first connect, and trigger the full initial
+// sync we built this whole pipeline to skip.
+func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// VolumeStatus reports the LV's path after CreateVolume so the
+	// reconciler picks up the device for drbdmeta seeding.
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-seed_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-seed",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{
+					VolumeNumber: 0,
+					SizeKib:      1024 * 1024,
+					StoragePool:  "thin1",
+					SeedFromGi:   "78A0DDDABCDEF000",
+				},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	createMD := indexOfPrefix(calls, "drbdadm create-md --force pvc-seed")
+	setGi := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
+	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
+
+	if createMD < 0 {
+		t.Fatalf("missing drbdadm create-md in calls: %v", calls)
+	}
+
+	if setGi < 0 {
+		t.Fatalf("missing drbdmeta set-gi in calls: %v", calls)
+	}
+
+	if adjust < 0 {
+		t.Fatalf("missing drbdadm adjust in calls: %v", calls)
+	}
+
+	if createMD >= setGi || setGi >= adjust {
+		t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending); calls=%v",
+			createMD, setGi, adjust, calls)
+	}
+
+	// Pin the exact GI tuple shape so the seed gets the peer's
+	// current_uuid in BOTH current_uuid and bitmap_uuid slots.
+	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	if !slices.Contains(calls, wantSetGi) {
+		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGi, calls)
+	}
+}
+
+// TestApplyFirstActivationNoSeedSkipsSetGi pins the negative case:
+// SeedFromGi="" (e.g. the first replica in a fresh RD with no peer
+// to seed from) MUST NOT run drbdmeta — the freshly-created
+// metadata block stays at zero GI and DRBD pays the full
+// initial-sync cost on first connect, which is the acceptable
+// outcome.
+func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-noseed_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-noseed",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdmeta") {
+			t.Errorf("drbdmeta ran without SeedFromGi: %s", line)
+		}
+	}
+}
+
+// indexOfPrefix returns the index of the first call line that
+// begins with the given prefix, or -1.
+func indexOfPrefix(lines []string, prefix string) int {
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			return i
+		}
+	}
+
+	return -1
+}

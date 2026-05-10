@@ -185,6 +185,31 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 	}
 }
 
+// TestAdmSetGiInvokesDrbdmeta pins the initial-sync skip seeding
+// command shape: `drbdmeta --force <res>/<vol> v09 <device>
+// internal set-gi <peer_gi>:<peer_gi>:0:0`. Phase 8.1.
+//
+// The format MUST be peer-gi twice (current_uuid + bitmap_uuid both
+// match the peer's current_uuid), then two zero history slots — a
+// regression that emits just the bare GI or that swaps current/
+// bitmap order would silently break the GI-handshake match and
+// re-introduce the full initial-sync this whole pipeline exists to
+// avoid.
+func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", "78A0DDDABCDEF000")
+	if err != nil {
+		t.Fatalf("SetGi: %v", err)
+	}
+
+	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
 // TestAdmResizeInvokesDrbdadm: Resize → `drbdadm resize --assume-clean <res>`.
 // --assume-clean skips re-syncing the new bytes (they're freshly
 // allocated zeros) — without it growing 3 replicas serialises on

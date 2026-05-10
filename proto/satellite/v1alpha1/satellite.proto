@@ -181,6 +181,15 @@ message DesiredVolume {
   int32 volume_number = 1;
   int64 size_kib = 2;
   string storage_pool = 3;
+  // seed_from_gi is the DRBD-9 generation identifier of an existing
+  // UpToDate peer's volume, picked by the controller so the satellite
+  // can pre-seed this replica's freshly-created metadata block before
+  // `drbdadm up`. With matching current_uuid+bitmap_uuid, DRBD's GI
+  // handshake on first connect sees the replica as already-in-sync
+  // and skips the full initial-sync. Empty → satellite skips seeding
+  // and pays the (acceptable) full-sync cost for the first replica
+  // in a fresh cluster. Phase 8.1.
+  string seed_from_gi = 4;
 }
 
 message ResourceApplyResult {
