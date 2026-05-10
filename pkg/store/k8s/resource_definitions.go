@@ -129,11 +129,17 @@ func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 }
 
 func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
+	// Re-emit typed DRBDOptions + ExtraProps back as a flat Props
+	// bag so golinstor (which only knows the upstream
+	// `props["DrbdOptions/..."]` shape) keeps working unmodified
+	// across the typed-fields migration.
+	props := mergeProps(crd.Spec.Props, typedToProps(crd.Spec.DRBDOptions, crd.Spec.ExtraProps))
+
 	out := apiv1.ResourceDefinition{
 		Name:              OriginalName(&crd.ObjectMeta),
 		ExternalName:      crd.Spec.ExternalName,
 		ResourceGroupName: crd.Spec.ResourceGroupName,
-		Props:             crd.Spec.Props,
+		Props:             props,
 		Flags:             crd.Spec.Flags,
 		LayerStack:        crd.Spec.LayerStack,
 		UUID:              string(crd.UID),
@@ -153,11 +159,22 @@ func wireToCRDRD(in *apiv1.ResourceDefinition) *crdv1alpha1.ResourceDefinition {
 }
 
 func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitionSpec {
+	// Split the wire Props bag into typed DRBDOptions (recognised
+	// keys → admission-validated structured fields) + ExtraProps
+	// (unknown DrbdOptions/* keys, kept as forward-compat shim).
+	// Non-DRBD props (StorPoolName, Aux/zone, …) stay in Spec.Props
+	// for now — Phase 10.3 only owns the DRBD slice; Phase 10.4
+	// drops Spec.Props entirely.
+	typed, extras := propsToTyped(in.Props)
+	residual := stripDRBDProps(in.Props)
+
 	return crdv1alpha1.ResourceDefinitionSpec{
 		ExternalName:      in.ExternalName,
 		ResourceGroupName: in.ResourceGroupName,
-		Props:             in.Props,
+		Props:             residual,
 		Flags:             in.Flags,
 		LayerStack:        in.LayerStack,
+		DRBDOptions:       typed,
+		ExtraProps:        extras,
 	}
 }

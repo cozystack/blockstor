@@ -262,10 +262,12 @@ func mergeVolumeObservations(dst *[]crdv1alpha1.ResourceVolumeStatus, observatio
 }
 
 func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
+	props := mergeProps(crd.Spec.Props, typedToProps(crd.Spec.DRBDOptions, crd.Spec.ExtraProps))
+
 	return apiv1.Resource{
 		Name:     crd.Spec.ResourceDefinitionName,
 		NodeName: crd.Spec.NodeName,
-		Props:    crd.Spec.Props,
+		Props:    props,
 		Flags:    crd.Spec.Flags,
 		State:    apiv1.ResourceState{InUse: crd.Status.InUse},
 		UUID:     string(crd.UID),
@@ -286,10 +288,15 @@ func wireToCRDResource(in *apiv1.Resource) *crdv1alpha1.Resource {
 }
 
 func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
+	typed, extras := propsToTyped(in.Props)
+	residual := stripDRBDProps(in.Props)
+
 	return crdv1alpha1.ResourceSpec{
 		ResourceDefinitionName: in.Name,
 		NodeName:               in.NodeName,
-		Props:                  in.Props,
+		Props:                  residual,
+		DRBDOptions:            typed,
+		ExtraProps:             extras,
 		Flags:                  in.Flags,
 	}
 }

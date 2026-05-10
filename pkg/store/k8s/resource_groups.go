@@ -129,10 +129,12 @@ func (s *resourceGroups) Delete(ctx context.Context, name string) error {
 }
 
 func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
+	props := mergeProps(crd.Spec.Props, typedToProps(crd.Spec.DRBDOptions, crd.Spec.ExtraProps))
+
 	out := apiv1.ResourceGroup{
 		Name:        OriginalName(&crd.ObjectMeta),
 		Description: crd.Spec.Description,
-		Props:       crd.Spec.Props,
+		Props:       props,
 		PeerSlots:   crd.Spec.PeerSlots,
 		UUID:        string(crd.UID),
 	}
@@ -178,9 +180,14 @@ func wireToCRDRG(in *apiv1.ResourceGroup) *crdv1alpha1.ResourceGroup {
 }
 
 func wireToCRDRGSpec(in *apiv1.ResourceGroup) crdv1alpha1.ResourceGroupSpec {
+	typed, extras := propsToTyped(in.Props)
+	residual := stripDRBDProps(in.Props)
+
 	spec := crdv1alpha1.ResourceGroupSpec{
 		Description: in.Description,
-		Props:       in.Props,
+		Props:       residual,
+		DRBDOptions: typed,
+		ExtraProps:  extras,
 		PeerSlots:   in.PeerSlots,
 		SelectFilter: crdv1alpha1.ResourceGroupSelectFilter{
 			PlaceCount:              in.SelectFilter.PlaceCount,
