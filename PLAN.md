@@ -737,16 +737,13 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Stable identifier rules:**
 
-- [ ] Satellite picks the most stable identifier in this order: `/dev/disk/by-id/wwn-*` → `/dev/disk/by-id/scsi-SATA_<vendor>_<model>_<serial>` → `/dev/disk/by-id/nvme-<model>_<serial>` → `/dev/disk/by-path/...` (last resort). For platforms without any (e.g. virtio without serial passthrough), fall back to `lsblk -o WWN,SERIAL`. The chosen ID becomes part of the CRD name and lives in `Status.StableID`. `Status.CurrentDevPath` is volatile and refreshed on every discovery tick.
+- [x] Stable-identifier picker (2026-05-10). `pkg/satellite/discovery.go.PickStableID` walks WWN → scsi-SATA → nvme → by-path fallback per upstream `LsBlkUtils.java`. `PhysicalDeviceCRDName(node, stableID)` composes the k8s name (underscore→hyphen, lowercase, drop chars outside `[a-z0-9-]`, cap at 253). Pinned by 4 PickStableID + 1 PhysicalDeviceCRDName test covering the virtio-no-serial fallback explicitly.
 
 **Discovery loop (satellite, periodic + udev-triggered):**
 
 - [x] `lsblk` parser + free-disk filter + signature cross-checks (2026-05-10). `pkg/satellite/lsblk.go` — `Lsblk(ctx, exec)` runs `lsblk -Pb -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN`; `parseLsblkPairs` handles embedded-space MODEL strings via a hand-rolled KEY="value" reader; `IsFreeBlockDevice` enforces `TYPE=disk ∧ no FSTYPE ∧ no MOUNTPOINT`. `pkg/satellite/signatures.go` adds `HasLVMSignature` / `HasZFSSignature` / `HasDRBDSignature` / `HasOtherSignature` cross-checks plus `IsDeviceFree(ctx, exec, lsblkDevice)` which composes the chain with first-positive short-circuit + lsblk-rejection skip. Both pinned by unit tests covering missing-tool fallthrough and short-circuit invariants.
-- [ ] Set-difference against existing `PhysicalDevice` CRDs labelled with this node:
-  - New free device → `client.Create(PhysicalDevice{name: <node>-<id-slug>, status: ...})`
-  - Already published, attributes changed (e.g. drive replaced) → `client.Status().Update(...)`
-  - Previously published but no longer free (consumed by a pool, or removed physically) → `client.Delete(...)`
-- [ ] Discovery is convergent — re-runs match state. On satellite restart it re-publishes from scratch.
+- [x] Set-difference logic (2026-05-10). `pkg/satellite/discovery.go.DiscoveryDiff(discovered, existing)` returns the action plan: Create for new devices, Update for attribute changes (size, currentDevPath, model, serial, rotational, transport — Phase / AttachTo never compared since those are write-only-from-elsewhere), Delete for devices that disappeared from the host scan AND aren't currently being attached. Pinned by 6 sub-tests covering happy paths + the in-flight skip invariant. The actual `client.Create/Update/Delete` wiring lands when Phase 10.1 promotes the satellite to a controller-runtime manager.
+- [x] Discovery is convergent — re-runs match state (2026-05-10). `TestDiscoveryDiffNoOpOnIdenticalState` pins it: identical `discovered` + `existing` → empty action list.
 
 **Upstream-LINSTOR filter parity:**
 
