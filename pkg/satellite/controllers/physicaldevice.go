@@ -62,6 +62,14 @@ const poolMissingTimeout = 10 * time.Minute
 // observed at" timestamp used to bound the requeue window.
 const physicalDeviceConditionPoolMissing = "PoolMissing"
 
+// physicalDeviceConditionDeviceMissing is the
+// Status.Conditions[type] the reconciler stamps when the
+// PhysicalDevice's discovery-observed device path is empty
+// (the operator flipped Spec.AttachTo for a device that
+// vanished between discovery and reconcile, or never had a
+// device path stamped). Paired with `Phase=Failed`.
+const physicalDeviceConditionDeviceMissing = "DeviceMissing"
+
 // PhysicalDeviceAttachFinalizer guards a PhysicalDevice CRD
 // while `Spec.AttachTo` is set + the satellite hasn't yet
 // completed the attach. Without it, an operator running
@@ -98,8 +106,6 @@ type PhysicalDeviceReconciler struct {
 //   - {Requeue:true}   — Attach failed; controller-runtime back-off retries.
 //   - {}, error        — apiserver-level failure (Get/Update/Delete).
 func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("physicaldevice", req.Name)
-
 	var dev blockstoriov1alpha1.PhysicalDevice
 
 	err := r.Get(ctx, req.NamespacedName, &dev)
@@ -143,14 +149,11 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Step 1: target device must still be reachable. A discovery
 	// pass that wiped DevicePath while we were waiting on a
 	// `Spec.AttachTo` flip means the device is gone — bail out
-	// with `Phase=Failed` so the operator sees the cause rather
-	// than `Attach` returning a generic "no DevicePath" error.
+	// with `Phase=Failed` + an explicit `DeviceMissing` Condition
+	// so the operator sees the cause rather than `Attach`
+	// returning a generic "no DevicePath" error.
 	if deviceMissing(&dev) {
-		_ = r.setPhase(ctx, &dev, blockstoriov1alpha1.PhysicalDevicePhaseFailed)
-
-		logger.Info("PhysicalDevice has no DevicePath — DeviceMissing")
-
-		return ctrl.Result{}, nil
+		return r.handleDeviceMissing(ctx, &dev)
 	}
 
 	// Step 4 race-handling: an attach request may land before the
@@ -288,6 +291,33 @@ func deviceMissing(dev *blockstoriov1alpha1.PhysicalDevice) bool {
 	}
 
 	return dev.Status.DevicePath == "" && dev.Status.CurrentDevPath == ""
+}
+
+// handleDeviceMissing stamps both `Phase=Failed` and a
+// `DeviceMissing` Status Condition when a non-FILE attach
+// request can't resolve to a real block device. Pulled out
+// of Reconcile to keep the latter under the funlen budget.
+func (r *PhysicalDeviceReconciler) handleDeviceMissing(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("physicaldevice", dev.Name)
+
+	meta.SetStatusCondition(&dev.Status.Conditions, metav1.Condition{
+		Type:               physicalDeviceConditionDeviceMissing,
+		Status:             metav1.ConditionTrue,
+		Reason:             "DiscoveryDevicePathEmpty",
+		Message:            "PhysicalDevice has no Status.DevicePath/CurrentDevPath; device was removed between discovery and attach",
+		LastTransitionTime: metav1.Now(),
+	})
+
+	dev.Status.Phase = blockstoriov1alpha1.PhysicalDevicePhaseFailed
+
+	err := r.Status().Update(ctx, dev)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "stamp DeviceMissing")
+	}
+
+	logger.Info("PhysicalDevice has no DevicePath — DeviceMissing")
+
+	return ctrl.Result{}, nil
 }
 
 // handlePoolMissing implements the Phase 10.7 race-matrix
