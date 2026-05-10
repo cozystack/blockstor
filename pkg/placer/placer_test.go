@@ -566,5 +566,62 @@ func TestPlaceReplicasOnSameNoQualifyingGroup(t *testing.T) {
 	}
 }
 
+// TestPlaceCandidatePoolsFiltersByStoragePoolList pins the
+// StoragePoolList filter in candidatePools (was 84%): when the
+// filter carries a non-empty allow-list of pool names, only pools
+// whose StoragePoolName matches are considered.
+//
+// The list-based filter is what golinstor's CLI passes for "place
+// only on pools that match this name set" semantics. Without the
+// pin, a regression that flipped the slices.Contains polarity would
+// silently invert the allow-list into a deny-list — operators
+// would see replicas land on pools they explicitly excluded.
+func TestPlaceCandidatePoolsFiltersByStoragePoolList(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	// Two pools per node: "fast" and "slow". The filter allows only "fast".
+	for _, p := range []apiv1.StoragePool{
+		{NodeName: "n1", StoragePoolName: "fast", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+		{NodeName: "n1", StoragePoolName: "slow", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+		{NodeName: "n2", StoragePoolName: "fast", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+		{NodeName: "n2", StoragePoolName: "slow", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+	} {
+		if err := st.StoragePools().Create(ctx, &p); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	plc := placer.New(st)
+
+	placed, _, err := plc.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:      2,
+		StoragePoolList: []string{"fast"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 {
+		t.Errorf("placed: got %d, want 2", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	for _, r := range got {
+		if r.Props["StorPoolName"] != "fast" {
+			t.Errorf("expected StoragePool=fast, got %q on %s",
+				r.Props["StorPoolName"], r.NodeName)
+		}
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
