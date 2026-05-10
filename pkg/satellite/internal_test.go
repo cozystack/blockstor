@@ -16,7 +16,11 @@ limitations under the License.
 
 package satellite
 
-import "testing"
+import (
+	"testing"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+)
 
 // TestHostFromEndpoint pins the trailing-port stripper Hello uses to
 // derive the dial-back host from a SatelliteEndpoint prop. Same
@@ -68,6 +72,39 @@ func TestResolveAddr(t *testing.T) {
 		got := resolveAddr(c.supplied, c.fallback)
 		if got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestPickMechanism pins the provider-kind → ship-mechanism table
+// the snapshot-shipping dispatcher relies on. The bare "default"
+// branch (returning "") is the load-bearing fallback: an unknown
+// provider kind must NOT silently map to one of the known
+// mechanisms (e.g. defaulting to "zfs" on an LVM-classic pool
+// would issue `zfs send` against an LV and fail in a confusing
+// way). Explicit "" forces the caller to emit a clear
+// "unsupported-mechanism" error.
+func TestPickMechanism(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		kind string
+		want string
+	}{
+		{kindZFS, "zfs"},
+		{kindZFSThin, "zfs"},
+		{kindLVMThin, "thin"},
+		{apiv1.StoragePoolKindLVM, ""},      // classic LVM has no incremental ship — fall through
+		{apiv1.StoragePoolKindFile, ""},     // file backend no-op
+		{apiv1.StoragePoolKindDiskless, ""}, // diskless can't ship at all
+		{"", ""},                            // empty kind
+		{"GARBAGE", ""},                     // typo / unknown
+	}
+
+	for _, c := range cases {
+		got := pickMechanism(c.kind)
+		if got != c.want {
+			t.Errorf("pickMechanism(%q): got %q, want %q", c.kind, got, c.want)
 		}
 	}
 }
