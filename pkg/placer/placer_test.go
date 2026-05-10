@@ -451,5 +451,64 @@ func TestPlaceReplicasOnSamePicksLargestGroup(t *testing.T) {
 	}
 }
 
+// TestPlaceExistingReplicaWithStaleStorPool pins the newState
+// resilience to a Resource that references a StoragePool by name
+// in its Props but that pool no longer exists in the StoragePools
+// store (operator deleted it while a Resource still pointed at it,
+// or the satellite hasn't re-pushed it on Hello yet). The placer
+// must silently skip the pool-lookup miss and continue placing
+// new replicas — not panic, not double-count.
+//
+// Without this defensive path, a stale Resource→Pool reference
+// would lift the placer's nil-deref into a controller crash, and
+// a healthy cluster's autoplacer would stop dead on a single
+// dangling Resource.
+func TestPlaceExistingReplicaWithStaleStorPool(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Two healthy nodes.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node: %v", err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: n, StoragePoolName: "live",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: 100,
+		}); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	// Pre-existing Resource on n1 pointing at a pool name that ISN'T
+	// in the StoragePools store (operator deleted it while the
+	// Resource still referenced it via Props).
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-stale", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "ghost-pool"},
+	}); err != nil {
+		t.Fatalf("seed existing: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-stale", &apiv1.AutoSelectFilter{
+		PlaceCount:  2,
+		StoragePool: "live",
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	// 1 existing on n1 + 1 new on n2 → placed=2, want=2.
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2 (stale pool ref must be skipped, not crash)", placed, want)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
