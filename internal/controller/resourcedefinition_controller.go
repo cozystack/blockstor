@@ -212,15 +212,24 @@ func (r *ResourceDefinitionReconciler) applyWitnessDecision(
 }
 
 // quorumPolicy implements upstream LINSTOR's isQuorumFeasible.
+// QuorumPolicyMajority / QuorumPolicyOff are the two values
+// `quorumPolicy` returns; exposed as constants so test files
+// elsewhere in the package can reference them by name (and so
+// goconst stops flagging the literals).
+const (
+	QuorumPolicyMajority = "majority"
+	QuorumPolicyOff      = "off"
+)
+
 // 2 diskful + ≥1 diskless OR ≥3 diskful → majority; else off.
 func quorumPolicy(diskful, diskless int) string {
 	const minDiskfulForMajority = 3
 
 	if (diskful == 2 && diskless >= 1) || diskful >= minDiskfulForMajority {
-		return "majority"
+		return QuorumPolicyMajority
 	}
 
-	return "off"
+	return QuorumPolicyOff
 }
 
 // createWitness picks a healthy non-replica node and creates a

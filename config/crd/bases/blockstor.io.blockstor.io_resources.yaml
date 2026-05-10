@@ -39,6 +39,180 @@ spec:
           spec:
             description: spec defines the desired state of Resource
             properties:
+              drbdOptions:
+                description: |-
+                  drbdOptions is the typed DRBD configuration applied to this
+                  specific replica. Overrides the parent RD's drbdOptions
+                  field-by-field. Rare — most config lives at RD or RG scope.
+                  Phase 10.3.
+                properties:
+                  disk:
+                    description: |-
+                      disk configures the `disk { ... }` section (on-io-error,
+                      activity-log size, resync hints).
+                    properties:
+                      alExtents:
+                        description: |-
+                          alExtents is the activity-log size (in extents). Larger values
+                          reduce metadata write amplification at the cost of longer
+                          resync windows.
+                        format: int32
+                        type: integer
+                      onIoError:
+                        description: |-
+                          onIOError is the action when the local backing device returns
+                          an I/O error. `detach` is the production-safe default — the
+                          satellite drops the local replica to Diskless and consumers
+                          keep going via the network path.
+                        enum:
+                        - detach
+                        - pass-on
+                        - call-local-io-error
+                        type: string
+                    type: object
+                  handlers:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      handlers maps event names to script paths (e.g. fence-peer,
+                      before-resync-target). Free-form for now; the rendered .res
+                      emits one line per pair under `handlers { }`.
+                    type: object
+                  net:
+                    description: |-
+                      net configures the `net { ... }` section of the rendered .res
+                      file (replication protocol, secret, dual-primary, after-sb).
+                    properties:
+                      afterSb0Pri:
+                        description: |-
+                          afterSb0Pri is the recovery action when DRBD detects split-
+                          brain and both sides were Secondary at the time.
+                        enum:
+                        - disconnect
+                        - discard-younger-primary
+                        - discard-older-primary
+                        - discard-zero-changes
+                        - discard-least-changes
+                        - discard-local
+                        - discard-remote
+                        type: string
+                      afterSb1Pri:
+                        description: afterSb1Pri is the recovery action when one side
+                          was Primary.
+                        enum:
+                        - disconnect
+                        - consensus
+                        - violently-as0p
+                        - discard-secondary
+                        - call-pri-lost-after-sb
+                        type: string
+                      afterSb2Pri:
+                        description: |-
+                          afterSb2Pri is the recovery action when both sides were Primary
+                          (only possible if allow-two-primaries was enabled).
+                        enum:
+                        - disconnect
+                        - violently-as0p
+                        - call-pri-lost-after-sb
+                        type: string
+                      allowTwoPrimaries:
+                        description: |-
+                          allowTwoPrimaries enables dual-primary mode (live-migration,
+                          shared-export NFS Ganesha). Must be paired with consumer-side
+                          fencing — DRBD does NOT serialise concurrent writes from two
+                          primaries.
+                        type: boolean
+                      maxBuffers:
+                        description: maxBuffers is the maximum number of in-flight
+                          network buffers.
+                        format: int32
+                        type: integer
+                      protocol:
+                        description: |-
+                          protocol picks the DRBD replication protocol. A=async (writer
+                          returns once data hits local disk), B=memory-sync (returns on
+                          peer ACK after kernel buffer), C=sync (returns on peer disk
+                          fsync). DRBD-9 default is C.
+                        enum:
+                        - A
+                        - B
+                        - C
+                        type: string
+                      sharedSecretRef:
+                        description: |-
+                          sharedSecretRef references a Secret containing the DRBD network
+                          authentication shared secret under the key `shared-secret`.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                  peerDevice:
+                    description: |-
+                      peerDevice configures the `peer-device { ... }` block (per-peer
+                      resync rate caps and similar).
+                    properties:
+                      cMaxRate:
+                        description: |-
+                          cMaxRate caps the per-peer resync transfer rate. Format
+                          matches DRBD: integer + suffix (`100M`, `1G`).
+                        type: string
+                    type: object
+                  resource:
+                    description: |-
+                      resource configures resource-level `options { ... }` (auto-
+                      promote, quorum mode, on-no-quorum action).
+                    properties:
+                      autoPromote:
+                        description: |-
+                          autoPromote causes DRBD to promote the resource to Primary
+                          automatically when a consumer opens the device, provided no
+                          other peer is already Primary. Cluster-wide default true.
+                        type: boolean
+                      onNoQuorum:
+                        description: |-
+                          onNoQuorum is the action when quorum is lost. `io-error`
+                          returns EIO to the consumer (drbd-reactor's typical trigger
+                          for failover). `suspend-io` blocks I/O until quorum returns
+                          (useful for deliberate maintenance windows).
+                        enum:
+                        - io-error
+                        - suspend-io
+                        - freeze-io
+                        type: string
+                      quorum:
+                        description: |-
+                          quorum picks the quorum policy. `majority` requires more than
+                          half of all replicas (including diskless witnesses) to be
+                          connected before allowing writes. `off` allows writes from any
+                          replica regardless of partition state — split-brain risk.
+                          `all` requires every replica to be reachable, useful only for
+                          strict 2-replica configurations under deliberate operator
+                          control.
+                        enum:
+                        - "off"
+                        - majority
+                        - all
+                        type: string
+                    type: object
+                type: object
+              extraProps:
+                additionalProperties:
+                  type: string
+                description: |-
+                  extraProps carries upstream-LINSTOR property keys we have not
+                  yet typed into structured fields. Forward-compat shim populated
+                  only by the REST shim when golinstor sends an unknown key.
+                  Phase 10.3.
+                type: object
               flags:
                 description: flags carries the user-controlled placement flags.
                 items:
@@ -55,6 +229,45 @@ spec:
               resourceDefinitionName:
                 description: resourceDefinitionName is the parent ResourceDefinition.
                 type: string
+              volumes:
+                description: |-
+                  volumes carries per-volume seed configuration that the
+                  satellite applies once on first activation of this replica.
+                  Today the only field is SeedFromGi (Phase 8.1) — when set,
+                  the satellite stamps the new replica's DRBD metadata with
+                  this generation identifier before `drbdadm up` so the GI
+                  handshake sees the new device as already-in-sync with that
+                  peer, skipping the full initial-sync.
+                items:
+                  description: |-
+                    ResourceVolumeSpec is one volume's per-replica configuration knobs.
+                    Distinct from ResourceVolumeStatus: this carries one-shot seeding
+                    hints the satellite consumes during first activation, the Status
+                    counterpart carries observed runtime state.
+                  properties:
+                    seedFromGi:
+                      description: |-
+                        seedFromGi pre-seeds the DRBD-9 generation identifier of this
+                        replica's metadata block before the first `drbdadm up`. When
+                        set to the CurrentGi of an existing UpToDate peer, DRBD's GI
+                        handshake on first connect sees the match and skips the full
+                        initial-sync — turning hours of resync on multi-TiB volumes
+                        into instant. Phase 8.1.
+
+                        Consumed once on first activation; subsequent reconciles
+                        ignore it (the satellite checks `drbdmeta show-gi` before
+                        re-stamping).
+                      type: string
+                    volumeNumber:
+                      description: |-
+                        volumeNumber matches the corresponding ResourceDefinition
+                        VolumeDefinition. +required when this struct is populated.
+                      format: int32
+                      type: integer
+                  required:
+                  - volumeNumber
+                  type: object
+                type: array
             required:
             - nodeName
             - resourceDefinitionName
@@ -164,10 +377,29 @@ spec:
                     allocatedKib:
                       format: int64
                       type: integer
+                    currentGi:
+                      description: |-
+                        currentGi is the DRBD-9 current generation identifier reported
+                        by `drbdsetup events2` for this replica's local volume. The
+                        controller reads it when adding a new replica to skip the full
+                        initial-sync: pre-seeding the new metadata block with this GI
+                        makes DRBD's GI handshake see the new peer as already-in-sync,
+                        turning hours of resync on multi-TiB volumes into instant.
+                        Updated by the satellite-side observer; never set in Spec.
+                      type: string
                     devicePath:
                       type: string
                     diskState:
                       type: string
+                    historyGi:
+                      description: |-
+                        historyGi carries the historical GI chain (DRBD keeps 3-4
+                        previous generations). Useful for split-brain forensics and
+                        cluster-state UI; may be elided when we run tight on Status
+                        budget. Order is newest-first.
+                      items:
+                        type: string
+                      type: array
                     storagePool:
                       type: string
                     usableKib:

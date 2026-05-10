@@ -144,8 +144,11 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               freeCapacity:
-                description: freeCapacity is the free capacity in bytes reported by
-                  the satellite.
+                description: |-
+                  freeCapacity is the free capacity in KiB reported by the satellite.
+                  Matches the wire shape (gRPC SatellitePool.FreeCapacityKib, REST
+                  `free_capacity_kib`) so /v1/view/storage-pools and the autoplacer
+                  can read this field directly without a unit conversion.
                 format: int64
                 type: integer
               staticTraits:
@@ -159,8 +162,8 @@ spec:
                   create snapshots.
                 type: boolean
               totalCapacity:
-                description: totalCapacity is the total capacity in bytes reported
-                  by the satellite.
+                description: totalCapacity is the total capacity in KiB reported by
+                  the satellite.
                 format: int64
                 type: integer
             type: object

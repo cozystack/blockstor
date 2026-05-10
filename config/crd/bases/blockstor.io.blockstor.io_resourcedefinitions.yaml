@@ -40,11 +40,210 @@ spec:
           spec:
             description: spec defines the desired state of ResourceDefinition
             properties:
+              drbdOptions:
+                description: |-
+                  drbdOptions is the typed DRBD configuration applied to this
+                  RD. Overrides the parent ResourceGroup's drbdOptions
+                  field-by-field; in turn overridden by per-Resource drbdOptions
+                  at the Resource scope. Phase 10.3.
+                properties:
+                  disk:
+                    description: |-
+                      disk configures the `disk { ... }` section (on-io-error,
+                      activity-log size, resync hints).
+                    properties:
+                      alExtents:
+                        description: |-
+                          alExtents is the activity-log size (in extents). Larger values
+                          reduce metadata write amplification at the cost of longer
+                          resync windows.
+                        format: int32
+                        type: integer
+                      onIoError:
+                        description: |-
+                          onIOError is the action when the local backing device returns
+                          an I/O error. `detach` is the production-safe default — the
+                          satellite drops the local replica to Diskless and consumers
+                          keep going via the network path.
+                        enum:
+                        - detach
+                        - pass-on
+                        - call-local-io-error
+                        type: string
+                    type: object
+                  handlers:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      handlers maps event names to script paths (e.g. fence-peer,
+                      before-resync-target). Free-form for now; the rendered .res
+                      emits one line per pair under `handlers { }`.
+                    type: object
+                  net:
+                    description: |-
+                      net configures the `net { ... }` section of the rendered .res
+                      file (replication protocol, secret, dual-primary, after-sb).
+                    properties:
+                      afterSb0Pri:
+                        description: |-
+                          afterSb0Pri is the recovery action when DRBD detects split-
+                          brain and both sides were Secondary at the time.
+                        enum:
+                        - disconnect
+                        - discard-younger-primary
+                        - discard-older-primary
+                        - discard-zero-changes
+                        - discard-least-changes
+                        - discard-local
+                        - discard-remote
+                        type: string
+                      afterSb1Pri:
+                        description: afterSb1Pri is the recovery action when one side
+                          was Primary.
+                        enum:
+                        - disconnect
+                        - consensus
+                        - violently-as0p
+                        - discard-secondary
+                        - call-pri-lost-after-sb
+                        type: string
+                      afterSb2Pri:
+                        description: |-
+                          afterSb2Pri is the recovery action when both sides were Primary
+                          (only possible if allow-two-primaries was enabled).
+                        enum:
+                        - disconnect
+                        - violently-as0p
+                        - call-pri-lost-after-sb
+                        type: string
+                      allowTwoPrimaries:
+                        description: |-
+                          allowTwoPrimaries enables dual-primary mode (live-migration,
+                          shared-export NFS Ganesha). Must be paired with consumer-side
+                          fencing — DRBD does NOT serialise concurrent writes from two
+                          primaries.
+                        type: boolean
+                      maxBuffers:
+                        description: maxBuffers is the maximum number of in-flight
+                          network buffers.
+                        format: int32
+                        type: integer
+                      protocol:
+                        description: |-
+                          protocol picks the DRBD replication protocol. A=async (writer
+                          returns once data hits local disk), B=memory-sync (returns on
+                          peer ACK after kernel buffer), C=sync (returns on peer disk
+                          fsync). DRBD-9 default is C.
+                        enum:
+                        - A
+                        - B
+                        - C
+                        type: string
+                      sharedSecretRef:
+                        description: |-
+                          sharedSecretRef references a Secret containing the DRBD network
+                          authentication shared secret under the key `shared-secret`.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                  peerDevice:
+                    description: |-
+                      peerDevice configures the `peer-device { ... }` block (per-peer
+                      resync rate caps and similar).
+                    properties:
+                      cMaxRate:
+                        description: |-
+                          cMaxRate caps the per-peer resync transfer rate. Format
+                          matches DRBD: integer + suffix (`100M`, `1G`).
+                        type: string
+                    type: object
+                  resource:
+                    description: |-
+                      resource configures resource-level `options { ... }` (auto-
+                      promote, quorum mode, on-no-quorum action).
+                    properties:
+                      autoPromote:
+                        description: |-
+                          autoPromote causes DRBD to promote the resource to Primary
+                          automatically when a consumer opens the device, provided no
+                          other peer is already Primary. Cluster-wide default true.
+                        type: boolean
+                      onNoQuorum:
+                        description: |-
+                          onNoQuorum is the action when quorum is lost. `io-error`
+                          returns EIO to the consumer (drbd-reactor's typical trigger
+                          for failover). `suspend-io` blocks I/O until quorum returns
+                          (useful for deliberate maintenance windows).
+                        enum:
+                        - io-error
+                        - suspend-io
+                        - freeze-io
+                        type: string
+                      quorum:
+                        description: |-
+                          quorum picks the quorum policy. `majority` requires more than
+                          half of all replicas (including diskless witnesses) to be
+                          connected before allowing writes. `off` allows writes from any
+                          replica regardless of partition state — split-brain risk.
+                          `all` requires every replica to be reachable, useful only for
+                          strict 2-replica configurations under deliberate operator
+                          control.
+                        enum:
+                        - "off"
+                        - majority
+                        - all
+                        type: string
+                    type: object
+                type: object
+              encryption:
+                description: |-
+                  encryption configures LUKS encryption for the volumes in this
+                  RD. The passphrase is held in a referenced Secret rather than
+                  inline in the spec. Phase 10.3.
+                properties:
+                  passphraseSecretRef:
+                    description: |-
+                      passphraseSecretRef references the Secret carrying the LUKS
+                      passphrase under the key `passphrase`. The satellite reads it
+                      via the apiserver during reconcile; the passphrase never lands
+                      on Spec in plaintext.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                type: object
               externalName:
                 description: |-
                   externalName is the user-facing name surfaced by csi (CSI volume id).
                   Empty means the same as metadata.name.
                 type: string
+              extraProps:
+                additionalProperties:
+                  type: string
+                description: |-
+                  extraProps carries upstream-LINSTOR property keys we have not
+                  yet typed into structured fields. Forward-compat shim populated
+                  only by the REST shim when golinstor sends an unknown key.
+                  Phase 10.3.
+                type: object
               flags:
                 description: flags carries user-controlled RD flags (DELETE, INACTIVE,
                   ...).
