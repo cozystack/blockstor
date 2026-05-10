@@ -51,6 +51,27 @@ func RunNodeStore(t *testing.T, newStore Factory) {
 	t.Run("SetConnectionStatus", func(t *testing.T) { testNodeSetConnectionStatus(t, newStore) })
 	t.Run("SetConnectionStatusMissing", func(t *testing.T) { testNodeSetConnectionStatusMissing(t, newStore) })
 	t.Run("NetInterfacesRoundTrip", func(t *testing.T) { testNodeNetInterfacesRoundTrip(t, newStore) })
+	// Defensive nil-pointer guard — same pattern as the RD/Snapshot suites.
+	t.Run("CreateNilArg", func(t *testing.T) { testNodeCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testNodeUpdateNilArg(t, newStore) })
+}
+
+func testNodeCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Nodes().Create(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testNodeUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Nodes().Update(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 // testNodeNetInterfacesRoundTrip pins the NetInterfaces field
@@ -289,6 +310,32 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("SizeKib after grow: got %d, want %d", got.SizeKib, 2*1024*1024)
 		}
 	})
+	t.Run("CreateNilArg", func(t *testing.T) { testVDCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testVDUpdateNilArg(t, newStore) })
+}
+
+func testVDCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	seedRD(t, s, "pvc-nil")
+
+	err := s.VolumeDefinitions().Create(t.Context(), "pvc-nil", nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testVDUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t)
+	seedRD(t, s, "pvc-nil")
+
+	err := s.VolumeDefinitions().Update(t.Context(), "pvc-nil", nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 // RunKeyValueStore exercises every branch of store.KeyValueStore.
@@ -597,6 +644,12 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			t.Errorf("got %v, want empty", got)
 		}
 	})
+	// Defensive nil-pointer guard. Both stores reject nil arguments
+	// on Create/Update with a non-nil error rather than panicking —
+	// pin the contract so a future caller that forgets to check
+	// can't crash the controller process.
+	t.Run("CreateNilArg", func(t *testing.T) { testSnapshotCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testSnapshotUpdateNilArg(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) {
 		s := newStore(t).Snapshots()
 		ctx := t.Context()
@@ -750,6 +803,24 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 			}
 		}
 	})
+}
+
+func testSnapshotCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Snapshots().Create(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testSnapshotUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Snapshots().Update(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 // RunResourceStore exercises every branch of store.ResourceStore.
@@ -916,6 +987,26 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("Props: got %v, want StorPoolName=thin", got.Props)
 		}
 	})
+	t.Run("CreateNilArg", func(t *testing.T) { testResourceCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testResourceUpdateNilArg(t, newStore) })
+}
+
+func testResourceCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Resources().Create(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testResourceUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).Resources().Update(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 func testRDListSorted(t *testing.T, newStore Factory) {
@@ -1167,6 +1258,26 @@ func RunResourceGroupStore(t *testing.T, newStore Factory) {
 	// tooling (`linstor rg list`) relies on stable order for diff
 	// comparisons across deploys.
 	t.Run("ListSorted", func(t *testing.T) { testRGListSorted(t, newStore) })
+	t.Run("CreateNilArg", func(t *testing.T) { testRGCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testRGUpdateNilArg(t, newStore) })
+}
+
+func testRGCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).ResourceGroups().Create(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testRGUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).ResourceGroups().Update(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 func testRGListSorted(t *testing.T, newStore Factory) {
@@ -1428,6 +1539,26 @@ func RunStoragePoolStore(t *testing.T, newStore Factory) {
 	t.Run("SharedSpaceIDRoundTrip", func(t *testing.T) {
 		testSPSharedSpaceIDRoundTrip(t, newStore)
 	})
+	t.Run("CreateNilArg", func(t *testing.T) { testSPCreateNilArg(t, newStore) })
+	t.Run("UpdateNilArg", func(t *testing.T) { testSPUpdateNilArg(t, newStore) })
+}
+
+func testSPCreateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).StoragePools().Create(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Create(nil): want error, got nil")
+	}
+}
+
+func testSPUpdateNilArg(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	err := newStore(t).StoragePools().Update(t.Context(), nil)
+	if err == nil {
+		t.Errorf("Update(nil): want error, got nil")
+	}
 }
 
 func testSPSharedSpaceIDRoundTrip(t *testing.T, newStore Factory) {
