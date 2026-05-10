@@ -255,3 +255,59 @@ func TestNetInterfaceCreateUnknownNode(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestNetInterfaceUpdateCreatesOnMissing pins the upstream LINSTOR
+// "PUT-creates" semantic: a PUT to /v1/nodes/{node}/net-interfaces/{name}
+// on a name the node doesn't have yet must CREATE the interface
+// rather than 404. This matches `linstor n interface modify` in
+// upstream — the CLI is "fire and forget", caller doesn't need to
+// know whether the interface already exists.
+func TestNetInterfaceUpdateCreatesOnMissing(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.NetInterface{Address: "10.10.0.5"})
+
+	resp := httpPut(t, base+"/v1/nodes/n1/net-interfaces/replication", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, _ := st.Nodes().Get(ctx, "n1")
+	if len(got.NetInterfaces) != 2 {
+		t.Fatalf("count: got %d, want 2 (PUT-creates contract); ifaces=%v",
+			len(got.NetInterfaces), got.NetInterfaces)
+	}
+
+	var found *apiv1.NetInterface
+	for i := range got.NetInterfaces {
+		if got.NetInterfaces[i].Name == "replication" {
+			found = &got.NetInterfaces[i]
+
+			break
+		}
+	}
+
+	if found == nil {
+		t.Fatalf("replication iface not appended; got %v", got.NetInterfaces)
+	}
+
+	if found.Address != "10.10.0.5" {
+		t.Errorf("address: got %q, want 10.10.0.5", found.Address)
+	}
+}
