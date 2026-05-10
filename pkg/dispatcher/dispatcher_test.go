@@ -54,6 +54,7 @@ type fakeSatelliteClient struct {
 	// CreateSnapshot state.
 	snapLast []*satellitepb.CreateSnapshotRequest
 	snapResp *satellitepb.CreateSnapshotResponse
+	snapErr  error // when set, every CreateSnapshot RPC returns this error
 }
 
 func (f *fakeDialer) Dial(_ context.Context, endpoint string) (satellitepb.SatelliteClient, func() error, error) {
@@ -76,6 +77,9 @@ func (f *fakeSatelliteClient) DeleteResource(_ context.Context, req *satellitepb
 
 func (f *fakeSatelliteClient) CreateSnapshot(_ context.Context, req *satellitepb.CreateSnapshotRequest, _ ...grpc.CallOption) (*satellitepb.CreateSnapshotResponse, error) {
 	f.snapLast = append(f.snapLast, req)
+	if f.snapErr != nil {
+		return nil, f.snapErr
+	}
 	if f.snapResp == nil {
 		return &satellitepb.CreateSnapshotResponse{Ok: true}, nil
 	}
@@ -1112,3 +1116,44 @@ func TestCreateSnapshotMissingEndpointRecorded(t *testing.T) {
 		t.Errorf("missing endpoint must surface as Ok=false; got %+v", results[0])
 	}
 }
+
+// TestCreateSnapshotRPCErrorBubbles pins the per-replica RPC-error
+// short-circuit in the snapshot fan-out: if the satellite's
+// CreateSnapshot returns a transport-shaped gRPC error (the
+// satellite mid-restart, network blip), the dispatcher must
+// return immediately with the wrap keyword "CreateSnapshot RPC".
+//
+// We deliberately don't run through to remaining replicas — a
+// transport fault means the dial state is suspect, and the
+// next reconcile retries the entire batch anyway. The Snapshot
+// reconciler's 10s requeue handles the back-off.
+func TestCreateSnapshotRPCErrorBubbles(t *testing.T) {
+	stub := &fakeSatelliteClient{snapErr: errSnapshotRPCFailed}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	replicas := []blockstoriov1alpha1.Resource{{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+		},
+	}}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.CreateSnapshot(t.Context(), "pvc-1", "snap-1", replicas, nodes)
+	if err == nil {
+		t.Fatalf("CreateSnapshot: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "CreateSnapshot RPC") {
+		t.Errorf("wrap: got %q, want substring \"CreateSnapshot RPC\"", err.Error())
+	}
+}
+
+var errSnapshotRPCFailed = errors.New("rpc: satellite unreachable")
