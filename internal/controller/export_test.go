@@ -155,3 +155,16 @@ func IsDisabledNode(node *apiv1.Node) bool {
 func (r *ResourceDefinitionReconciler) RemoveWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
 	return r.removeWitnesses(ctx, rdName, witnesses)
 }
+
+// ApplyWitnessDecision exposes the witness create-or-remove gate
+// for tests. Pinning the want=true/witnesses=0 → create branch and
+// the want=false/witnesses>0 → remove branch keeps the auto-quorum
+// reconcile logic from drifting.
+func (r *ResourceDefinitionReconciler) ApplyWitnessDecision(
+	ctx context.Context,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	replicas, diskless, witness []apiv1.Resource,
+	wantWitness bool,
+) ([]apiv1.Resource, error) {
+	return r.applyWitnessDecision(ctx, rd, replicas, diskless, witness, wantWitness)
+}
