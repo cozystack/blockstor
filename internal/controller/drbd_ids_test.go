@@ -356,3 +356,91 @@ func newScheme(t *testing.T) *runtime.Scheme {
 
 	return s
 }
+
+// TestDRBDMinorMultiVolumeRangeReserved pins the load-bearing
+// multi-volume expansion in takenMinorsOnNode. A multi-volume RD
+// consumes N consecutive minors (the .res renderer emits volume k
+// at base+k). When a NEW Resource lands on the same node, the
+// allocator MUST treat all N consecutive slots as taken — not just
+// the base — otherwise the new replica picks base+1 and DRBD ends
+// up with two devices claiming the same /dev/drbdN.
+//
+// This test seeds a 3-volume RD with DRBDMinor=1000 already
+// allocated on n1, then drives the allocator for a fresh second RD
+// on n1 and asserts the new minor is ≥ 1003 (skipping 1000, 1001,
+// 1002 from the multi-volume RD).
+//
+// Without the expansion loop, the allocator would happily return
+// 1001 here and corrupt DRBD's device map.
+func TestDRBDMinorMultiVolumeRangeReserved(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	multiVolRD := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-multi"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+				{VolumeNumber: 1, SizeKib: 1024},
+				{VolumeNumber: 2, SizeKib: 1024},
+			},
+		},
+	}
+	if err := cli.Create(ctx, multiVolRD); err != nil {
+		t.Fatalf("create multiVolRD: %v", err)
+	}
+
+	// Pre-allocated multi-volume Resource on n1, base minor = 1000
+	// → reserves 1000, 1001, 1002.
+	multiResName := "pvc-multi.n1"
+	multiRes := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: multiResName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-multi",
+			NodeName:               "n1",
+		},
+	}
+	if err := cli.Create(ctx, multiRes); err != nil {
+		t.Fatalf("create multiRes: %v", err)
+	}
+
+	base := int32(1000)
+	zero := int32(0)
+	port := int32(7000)
+
+	multiRes.Status = blockstoriov1alpha1.ResourceStatus{
+		DRBDNodeID: &zero,
+		DRBDPort:   &port,
+		DRBDMinor:  &base,
+	}
+	if err := cli.Status().Update(ctx, multiRes); err != nil {
+		t.Fatalf("status update multiRes: %v", err)
+	}
+
+	// New single-volume RD's replica also lands on n1. Its allocator
+	// must skip 1000-1002 and pick ≥1003.
+	create(ctx, t, cli, "pvc-fresh", "n1")
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+	allocate(ctx, t, rec, cli, "pvc-fresh")
+
+	freshRes := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-fresh.n1"}, freshRes); err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+
+	if freshRes.Status.DRBDMinor == nil {
+		t.Fatalf("fresh DRBDMinor not allocated")
+	}
+
+	got := *freshRes.Status.DRBDMinor
+
+	if got < 1003 {
+		t.Errorf("fresh minor: got %d, want ≥1003 (must skip multi-vol's 1000-1002 range)", got)
+	}
+}
