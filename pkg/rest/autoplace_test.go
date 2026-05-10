@@ -965,3 +965,66 @@ func TestResourceCreatePersistsLayerList(t *testing.T) {
 		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
 	}
 }
+
+// TestResourceCreateBadJSON: malformed body → 400.
+func TestResourceCreateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceCreateMissingNodeName: POST with empty node_name → 400.
+// Pinned because linstor-csi calls this for explicit-placement
+// requests where node selection is operator-driven; an empty node
+// in the body must not silently land as "wherever" — the satellite
+// reconciler relies on a definite NodeName to apply the resource.
+func TestResourceCreateMissingNodeName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{}, // NodeName omitted
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400 (missing node_name)", resp.StatusCode)
+	}
+}
+
+// TestResourceDeleteMissing: DELETE on a non-existent (RD, node) →
+// 404. Pinned because linstor-csi performs idempotent replica
+// removal during volume teardown; the 404 must surface cleanly so
+// csi treats it as "already gone" rather than retrying forever.
+func TestResourceDeleteMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/ghost/resources/n1")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
