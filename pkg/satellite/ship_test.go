@@ -33,6 +33,10 @@ import (
 // error-wrap test. err113-friendly (static, package-level).
 var errZfsShipPeerDown = errors.New("ssh: connect to host n2 port 22: Connection refused")
 
+// errThinShipMetaCorrupt is the canned exec failure for the
+// thin-send-recv error-wrap test.
+var errThinShipMetaCorrupt = errors.New("thin metadata: bad magic in superblock")
+
 // TestShipSnapshotZFSUsesZfsSendRecv: when the source pool is ZFS,
 // ShipSnapshot dispatches `zfs send | zfs recv` over SSH.
 func TestShipSnapshotZFSUsesZfsSendRecv(t *testing.T) {
@@ -279,6 +283,55 @@ func TestShipSnapshotZFSExecErrorSurfaces(t *testing.T) {
 	// The error keyword must thread through so operators can grep.
 	if !strings.Contains(resp.GetMessage(), "zfs send|recv") {
 		t.Errorf("error message must mention zfs send|recv wrap; got %q",
+			resp.GetMessage())
+	}
+}
+
+// TestShipSnapshotThinExecErrorSurfaces mirrors the zfs error-wrap
+// pin for the thin-send-recv path. A regression that dropped the
+// "thin-send-recv" wrap would silently break operator grep — operators
+// would see "exit status 1" rather than "thin-send-recv: thin metadata:
+// bad magic in superblock".
+func TestShipSnapshotThinExecErrorSurfaces(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-thin-fail_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("thin-send-recv --source pvc-thin-fail_snap-1_00000 --target n2",
+		storage.FakeResponse{Err: errThinShipMetaCorrupt})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		ShipExec:  fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-thin-fail", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-thin-fail",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot transport error: %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true on exec failure; want false")
+	}
+
+	if !strings.Contains(resp.GetMessage(), "thin-send-recv") {
+		t.Errorf("error message must mention thin-send-recv wrap; got %q",
 			resp.GetMessage())
 	}
 }
