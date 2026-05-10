@@ -102,40 +102,6 @@ func TestPickStableIDByPathFallback(t *testing.T) {
 	}
 }
 
-// TestPhysicalDeviceCRDNameSanitises pins the k8s name shape:
-// underscores → hyphens, uppercase → lowercase, anything outside
-// `[a-z0-9-]` dropped, max 253 chars total.
-func TestPhysicalDeviceCRDNameSanitises(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		node, stable, want string
-	}{
-		{
-			node:   "n1",
-			stable: "wwn-0x5000c500a3b1c2d3",
-			want:   "n1-wwn-0x5000c500a3b1c2d3",
-		},
-		{
-			node:   "N1-Worker",
-			stable: "scsi-SATA_Samsung_SSD_980_PRO_S6BUNS0R123456",
-			want:   "n1-worker-scsi-sata-samsung-ssd-980-pro-s6buns0r123456",
-		},
-		{
-			node:   "n2",
-			stable: "nvme-INTEL@SSDPF21Q400GB_PHM2!1234",
-			want:   "n2-nvme-intelssdpf21q400gb-phm21234",
-		},
-	}
-
-	for _, tc := range cases {
-		got := satellite.PhysicalDeviceCRDName(tc.node, tc.stable)
-		if got != tc.want {
-			t.Errorf("%s + %s: got %q, want %q", tc.node, tc.stable, got, tc.want)
-		}
-	}
-}
-
 // TestDiscoveryDiffCreate pins the new-device case: a device in
 // `discovered` that isn't in `existing` becomes an OpCreate.
 func TestDiscoveryDiffCreate(t *testing.T) {

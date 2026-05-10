@@ -35,6 +35,22 @@ type physicalDevices struct {
 	c ctrlclient.Client
 }
 
+// PhysicalDeviceCRDName encodes the (node, stable-id) composite
+// key into a single CRD name. Uses the same `<node>.<key>` shape
+// as `crdName` (StoragePool), `resourceCRDName` (Resource), and
+// `snapshotCRDName` (Snapshot) — every composite-key CRD in the
+// project follows this convention so operators can grep for
+// `node.something` and find every related CRD across kinds.
+//
+// Run through `Name()` to slugify: stable identifiers carry
+// upstream udev shapes (`wwn-0x...`, `scsi-SATA_<vendor>_...`)
+// with characters k8s names reject; `Name()` lowercases,
+// substitutes invalid runes with `-`, and prepends an 8-char
+// SHA256 prefix when slugification was lossy. Phase 10.7.
+func PhysicalDeviceCRDName(nodeName, stableID string) string {
+	return Name(nodeName + "." + stableID)
+}
+
 func (s *physicalDevices) List(ctx context.Context) ([]apiv1.PhysicalDevice, error) {
 	var crdList crdv1alpha1.PhysicalDeviceList
 

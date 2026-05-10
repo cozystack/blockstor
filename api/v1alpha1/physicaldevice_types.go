@@ -180,7 +180,10 @@ type PhysicalDevice struct {
 	metav1.TypeMeta `json:",inline"`
 
 	// metadata is a standard object metadata. The expected name
-	// shape is `<nodeName>-<stable-id-slug>`; the metadata.labels
+	// shape is `<nodeName>.<stable-id-slug>` (matching every
+	// other composite-key CRD in the project — Resource,
+	// StoragePool, Snapshot — so operators can grep across
+	// kinds with a single `<node>.` pattern); the metadata.labels
 	// must carry `blockstor.io/node=<nodeName>` so per-node
 	// filters work via label selectors.
 	// +optional

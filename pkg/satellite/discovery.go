@@ -105,47 +105,6 @@ func slugifyForLSStableID(in string) string {
 	return b.String()
 }
 
-// PhysicalDeviceCRDName composes the `metadata.name` for a
-// PhysicalDevice CRD: `<nodeName>-<stable-id-slug>`. K8s name
-// constraints (RFC 1123 label, lowercase alphanumeric + `-`,
-// max 63 chars per segment) drive the further sanitisation:
-// underscores become hyphens, every other invalid char is
-// dropped, the whole thing is lowercased, and we cap at 63 chars
-// after the node-name + separator (truncating the slug if
-// needed; collisions are vanishingly unlikely with stable-id
-// entropy).
-func PhysicalDeviceCRDName(nodeName, stableID string) string {
-	const (
-		maxK8sName        = 253
-		stableIDMaxLength = 200
-	)
-
-	slug := strings.ToLower(strings.ReplaceAll(stableID, "_", "-"))
-
-	var b strings.Builder
-
-	for _, r := range slug {
-		switch {
-		case r >= 'a' && r <= 'z',
-			r >= '0' && r <= '9',
-			r == '-':
-			b.WriteRune(r)
-		}
-	}
-
-	clean := b.String()
-	if len(clean) > stableIDMaxLength {
-		clean = clean[:stableIDMaxLength]
-	}
-
-	out := strings.ToLower(nodeName) + "-" + clean
-	if len(out) > maxK8sName {
-		out = out[:maxK8sName]
-	}
-
-	return out
-}
-
 // DiscoveryAction is one entry in the diff plan the discovery
 // loop computes. Pure data — the actual store mutations happen
 // in the loop's caller using a `store.PhysicalDeviceStore`.

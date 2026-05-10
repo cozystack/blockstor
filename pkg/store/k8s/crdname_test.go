@@ -117,3 +117,29 @@ func TestSetOriginalName_PassThroughDoesNotAnnotate(t *testing.T) {
 		t.Errorf("OriginalName = %q, want %q", got, original)
 	}
 }
+
+// TestPhysicalDeviceCRDNameUsesDotSeparator pins the cross-CRD
+// naming convention: every composite-key CRD in the project
+// (StoragePool, Resource, Snapshot, PhysicalDevice) uses
+// `<key1>.<key2>` and routes through `Name()` for slug
+// discipline. Operators rely on this — `kubectl get … | grep
+// '<node>\.' ` works across kinds. A regression that switched
+// PhysicalDevice to a hyphen separator would silently break that
+// grep workflow.
+func TestPhysicalDeviceCRDNameUsesDotSeparator(t *testing.T) {
+	t.Parallel()
+
+	// RFC1123-clean inputs pass through verbatim with the dot.
+	got := k8s.PhysicalDeviceCRDName("n1", "wwn-0xabcdef0123456789")
+	if got != "n1.wwn-0xabcdef0123456789" {
+		t.Errorf("got %q, want n1.wwn-0xabcdef0123456789", got)
+	}
+
+	// Inputs with characters k8s rejects (uppercase, underscore,
+	// at-sign) get slugified by Name() — same path other
+	// composite-key CRDs travel through.
+	got = k8s.PhysicalDeviceCRDName("N1-Worker", "scsi-SATA_Samsung_SSD_980_PRO_S6BUNS0R")
+	if !strings.Contains(got, "n1-worker") {
+		t.Errorf("got %q, want substring n1-worker (slugified node)", got)
+	}
+}
