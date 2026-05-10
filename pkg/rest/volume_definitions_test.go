@@ -349,3 +349,46 @@ func TestVolumeDefinitionsDeleteMissingVD(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestVolumeDefinitionsCreateBadJSON: malformed body → 400. The
+// decoder error must surface as 4xx so golinstor doesn't loop.
+func TestVolumeDefinitionsCreateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/volume-definitions", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestVolumeDefinitionsUpdateBadJSON: malformed body on PUT → 400.
+func TestVolumeDefinitionsUpdateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
