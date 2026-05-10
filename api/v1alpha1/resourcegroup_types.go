@@ -44,6 +44,20 @@ type ResourceGroupSpec struct {
 	// volumeGroups templates the per-volume props/flags for spawned resources.
 	// +optional
 	VolumeGroups []ResourceGroupVolumeGroup `json:"volumeGroups,omitempty"`
+
+	// drbdOptions is the typed DRBD configuration applied to every
+	// ResourceDefinition spawned from this ResourceGroup. Lower scope
+	// (RD, Resource) overrides this field-by-field. Phase 10.3.
+	// +optional
+	DRBDOptions *DRBDOptions `json:"drbdOptions,omitempty"`
+
+	// extraProps carries upstream-LINSTOR property keys we have not
+	// yet typed into structured fields. Populated only by the REST
+	// compatibility shim when golinstor sends a key we don't
+	// recognise. Operators editing via kubectl should prefer the
+	// typed fields above. Phase 10.3.
+	// +optional
+	ExtraProps map[string]string `json:"extraProps,omitempty"`
 }
 
 // ResourceGroupSelectFilter is the in-CRD shape of LINSTOR's AutoSelectFilter.

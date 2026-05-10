@@ -58,6 +58,26 @@ type ResourceDefinitionSpec struct {
 	// `["DRBD","STORAGE"]`.
 	// +optional
 	LayerStack []string `json:"layerStack,omitempty"`
+
+	// drbdOptions is the typed DRBD configuration applied to this
+	// RD. Overrides the parent ResourceGroup's drbdOptions
+	// field-by-field; in turn overridden by per-Resource drbdOptions
+	// at the Resource scope. Phase 10.3.
+	// +optional
+	DRBDOptions *DRBDOptions `json:"drbdOptions,omitempty"`
+
+	// encryption configures LUKS encryption for the volumes in this
+	// RD. The passphrase is held in a referenced Secret rather than
+	// inline in the spec. Phase 10.3.
+	// +optional
+	Encryption *EncryptionConfig `json:"encryption,omitempty"`
+
+	// extraProps carries upstream-LINSTOR property keys we have not
+	// yet typed into structured fields. Forward-compat shim populated
+	// only by the REST shim when golinstor sends an unknown key.
+	// Phase 10.3.
+	// +optional
+	ExtraProps map[string]string `json:"extraProps,omitempty"`
 }
 
 // ResourceDefinitionVolume is one volume slot inside an RD.

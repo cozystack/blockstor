@@ -39,6 +39,20 @@ type ResourceSpec struct {
 	// flags carries the user-controlled placement flags.
 	// +optional
 	Flags []string `json:"flags,omitempty"`
+
+	// drbdOptions is the typed DRBD configuration applied to this
+	// specific replica. Overrides the parent RD's drbdOptions
+	// field-by-field. Rare — most config lives at RD or RG scope.
+	// Phase 10.3.
+	// +optional
+	DRBDOptions *DRBDOptions `json:"drbdOptions,omitempty"`
+
+	// extraProps carries upstream-LINSTOR property keys we have not
+	// yet typed into structured fields. Forward-compat shim populated
+	// only by the REST shim when golinstor sends an unknown key.
+	// Phase 10.3.
+	// +optional
+	ExtraProps map[string]string `json:"extraProps,omitempty"`
 }
 
 // ResourceStatus is the observed state of a placed resource.
