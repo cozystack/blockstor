@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/satellite"
 )
 
 // StoragePoolReconciler watches StoragePool CRDs filtered to
@@ -68,13 +69,33 @@ func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		"kind", pool.Spec.ProviderKind,
 		"deletionTimestamp", pool.DeletionTimestamp)
 
-	// Phase 10.1 follow-up: instantiate via
-	// `satellite.NewProviderFromKind(pool.Spec.ProviderKind,
-	// pool.Spec.Props, exec)` and call
-	// `Config.Apply.RegisterProvider(poolName, provider)`. The
-	// per-pool capacity reporting (Status writes) flips to a
-	// periodic loop here too — Phase 10.5's stub gets replaced
-	// with the c-r-driven real path.
+	// On delete: deregister the provider (its in-memory
+	// instance goes away). The actual on-disk teardown
+	// (`vgremove --force` / `zpool destroy`) is a Phase 10.8
+	// finalizer that runs separately when
+	// `Spec.DestroyOnDelete=true`.
+	if !pool.DeletionTimestamp.IsZero() {
+		r.Config.Apply.RegisterProvider(pool.Spec.PoolName, nil)
+
+		return ctrl.Result{}, nil
+	}
+
+	provider, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, r.Config.Exec)
+	if err != nil {
+		// Per-pool failure: log and let the next reconcile
+		// retry (controller-runtime back-off handles the
+		// retry cadence). The pool stays unavailable until
+		// the operator fixes the config — same semantic the
+		// gRPC `ApplyStoragePools` path had via Ok=false.
+		logger.Info("NewProviderFromKind failed", "kind", pool.Spec.ProviderKind, "err", err)
+
+		return ctrl.Result{}, nil
+	}
+
+	// nil provider = DISKLESS kind; RegisterProvider's nil path
+	// deregisters, which is the right semantic.
+	r.Config.Apply.RegisterProvider(pool.Spec.PoolName, provider)
+
 	return ctrl.Result{}, nil
 }
 

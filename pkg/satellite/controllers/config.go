@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // Config carries the bits the four reconcilers need beyond what
@@ -38,4 +39,10 @@ type Config struct {
 	// the storage + DRBD + LUKS chain. Phase 10.1 reuses it so
 	// the controller-runtime path doesn't duplicate logic.
 	Apply *satellite.Reconciler
+
+	// Exec is the shell-out interface the StoragePool reconciler
+	// hands to `satellite.NewProviderFromKind` when materialising
+	// a Provider instance from a StoragePool CRD. Production
+	// wires `storage.RealExec{}`; tests inject `storage.FakeExec`.
+	Exec storage.Exec
 }
