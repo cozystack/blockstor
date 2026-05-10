@@ -167,17 +167,25 @@ func (n *nodes) Delete(ctx context.Context, name string) error {
 // crdToWireNode flattens a Node CRD into the LINSTOR REST shape.
 // Phase 10.3: re-emits typed `Spec.SatelliteEndpoint` back into the
 // wire `Props["SatelliteEndpoint"]` so golinstor + the dispatcher's
-// fallback path keep seeing the same shape on GET.
+// fallback path keep seeing the same shape on GET. Native
+// `topology.blockstor.io/<key>` labels on the Node CRD ALSO get
+// folded back into `Props["Aux/<key>"]` so the autoplacer's
+// existing replicas_on_same / replicas_on_different filters keep
+// working unchanged across the labels migration.
 func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 	props := crd.Spec.Props
 
-	if crd.Spec.SatelliteEndpoint != "" {
+	if crd.Spec.SatelliteEndpoint != "" || hasTopologyLabels(crd.Labels) {
 		props = maps.Clone(props)
 		if props == nil {
 			props = map[string]string{}
 		}
 
-		props["SatelliteEndpoint"] = crd.Spec.SatelliteEndpoint
+		if crd.Spec.SatelliteEndpoint != "" {
+			props["SatelliteEndpoint"] = crd.Spec.SatelliteEndpoint
+		}
+
+		foldTopologyLabels(props, crd.Labels)
 	}
 
 	out := apiv1.Node{
@@ -254,4 +262,52 @@ func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 	}
 
 	return spec
+}
+
+// TopologyLabelPrefix is the native Kubernetes label namespace
+// blockstor uses for topology placement keys (zone, rack, …).
+// Replaces upstream LINSTOR's `Props["Aux/<key>"]` shape so that
+// the autoplacer can use `client.MatchingLabels` selectors and the
+// keys feed into `topologySpreadConstraints` for free. Phase 10.3.
+const TopologyLabelPrefix = "topology.blockstor.io/"
+
+// hasTopologyLabels reports whether any of the Node's metadata
+// labels lives under the blockstor topology prefix. Cheap pre-
+// check so we only allocate a fresh Props map when we actually
+// have labels to fold in.
+func hasTopologyLabels(labels map[string]string) bool {
+	for k := range labels {
+		if strings.HasPrefix(k, TopologyLabelPrefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// foldTopologyLabels copies every `topology.blockstor.io/<key>`
+// label into `props["Aux/<key>"]` so existing readers (autoplacer
+// auxKey lookups, golinstor over the wire) see the topology
+// information without any changes. Mutates props in place.
+//
+// The Aux/ Props side stays the source of truth for now — when a
+// caller writes via the wire API the legacy key path is what gets
+// persisted. The label-side path is purely additive (operators
+// who set the native label see it surface as an Aux/ prop on
+// GET); future phases will flip the source-of-truth direction
+// once linstor-csi etc. learn to set labels directly.
+func foldTopologyLabels(props, labels map[string]string) {
+	for label, value := range labels {
+		if !strings.HasPrefix(label, TopologyLabelPrefix) {
+			continue
+		}
+
+		auxKey := "Aux/" + strings.TrimPrefix(label, TopologyLabelPrefix)
+		// Don't clobber an explicit Props value — the operator may
+		// have set both and the Props side wins (matches the
+		// auxKey() lookup precedence in the placer).
+		if _, exists := props[auxKey]; !exists {
+			props[auxKey] = value
+		}
+	}
 }
