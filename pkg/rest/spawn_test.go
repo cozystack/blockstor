@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -159,6 +160,54 @@ func TestSpawnRollsBackOnVDFailure(t *testing.T) {
 
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("status: got %d, want 409 (RD already exists)", resp.StatusCode)
+	}
+}
+
+// TestRollbackSpawn pins the half-spawn cleanup contract: when handleSpawn
+// has already created the RD but a downstream VolumeDefinitions().Create
+// fails, rollbackSpawn must remove the orphan RD so the next spawn isn't
+// blocked by a 409 on the same name. Two branches matter:
+//
+//  1. RD exists → Delete succeeds, RD gone afterwards.
+//  2. RD already missing (e.g. another reconciler swept it) → ErrNotFound
+//     is silently swallowed, no panic.
+//
+// We also verify the cancelled-parent-context branch: rollbackSpawn uses
+// context.WithoutCancel internally so even if the request context was
+// already cancelled (client gave up, body-write deadline hit), the
+// cleanup still runs.
+func TestRollbackSpawn(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-orphan"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Branch 1: existing RD → cleared.
+	rollbackSpawn(ctx, st, "pvc-orphan")
+
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-orphan"); err == nil {
+		t.Errorf("RD survived rollback")
+	}
+
+	// Branch 2: missing RD → no panic, no-op.
+	rollbackSpawn(ctx, st, "pvc-orphan") // already deleted
+	rollbackSpawn(ctx, st, "ghost")      // never existed
+
+	// Cancelled parent ctx: cleanup must still run thanks to WithoutCancel.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-cancelled-parent"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	rollbackSpawn(cancelled, st, "pvc-cancelled-parent")
+
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-cancelled-parent"); err == nil {
+		t.Errorf("RD survived rollback under cancelled parent ctx (WithoutCancel must shield Delete)")
 	}
 }
 
