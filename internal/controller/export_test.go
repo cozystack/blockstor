@@ -106,3 +106,11 @@ func (r *ResourceReconciler) LookupRD(ctx context.Context, name string) (*blocks
 func PtrEqI32(a, b *int32) bool {
 	return ptrEqI32(a, b)
 }
+
+// RangeProp exposes the Node-prop range parser the per-node port
+// and minor allocators use. Tests pin the three-tier fallback
+// (missing node → defaults; missing prop → defaults; bad format →
+// error) without spinning up the full allocator path.
+func (r *ResourceReconciler) RangeProp(ctx context.Context, nodeName, prop string, defLow, defHigh int32) (int32, int32, error) {
+	return r.rangeProp(ctx, nodeName, prop, defLow, defHigh)
+}
