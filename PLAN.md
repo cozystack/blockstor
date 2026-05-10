@@ -730,9 +730,9 @@ satellite-execute model the rest of Phase 10 uses.
 
 **`PhysicalDevice` CRD design:**
 
-- [ ] New cluster-scoped CRD `PhysicalDevice` (one per free raw block device per node). `metadata.name = <nodeName>-<stable-id-slug>` so the CRD survives `/dev/sdN` re-lettering across reboots. `metadata.labels[blockstor.io/node]` carries the node name for efficient `client.MatchingLabels` filters.
-- [ ] `Spec.AttachTo *AttachToPool` — empty when the device is published as available. Set by the controller (REST shim or operator-via-kubectl) when the device should be added to a pool. Carries `StoragePoolName`, `ProviderKind`, provider-specific fields (`VGName`, `ThinPoolName`, `ZPoolName`, `Directory`), and an explicit `Wipe bool` consent flag.
-- [ ] `Status.NodeName / StableID / DevicePath / CurrentDevPath / SizeBytes / Model / Serial / Rotational / Transport / Phase` — populated by the satellite's discovery loop. `Phase` is `Available` / `Attaching` / `Failed` (no `Ready` — successful attach **deletes** the CRD, see below).
+- [x] New cluster-scoped CRD `PhysicalDevice` (2026-05-10). `api/v1alpha1/physicaldevice_types.go` with the cluster-scoped + status-subresource markers; `metadata.labels["blockstor.io/node"]` exposed as `PhysicalDeviceLabelNode` constant for `client.MatchingLabels` filters.
+- [x] `Spec.AttachTo *AttachToPool` (2026-05-10). Carries `StoragePoolName`, `ProviderKind` (kubebuilder enum), `VGName` / `ThinPoolName` / `ZPoolName` / `Directory`, and the explicit `Wipe bool` consent flag.
+- [x] `Status.NodeName / StableID / DevicePath / CurrentDevPath / SizeBytes / Model / Serial / Rotational / Transport / Phase / Conditions` (2026-05-10). Phase is a kubebuilder enum (Available / Attaching / Failed); successful attach deletes the CRD entirely (delete-as-completion semantic — no Ready phase).
 
 **Stable identifier rules:**
 
