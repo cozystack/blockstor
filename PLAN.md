@@ -506,7 +506,16 @@ honest. Each item names the original Phase that ticked it.
 
 - [ ] 100+ real golinstor traces captured against the Java oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
 
-### Phase 8.2 follow-up — Storage correctness
+### Phase 8.1 follow-up — DRBD invariants
+
+- [ ] **Initial-sync skip on replica-add** (currently every 2→3-replica transition triggers a full resync of the whole volume — hours on multi-TiB devices). Upstream LINSTOR persists `DrbdCurrentGi` per (resource, volume) in PropsContainers and stamps a new replica's metadata with the existing peer's GI before `drbdadm up`; DRBD-9's GI handshake then sees the match and skips full sync. Pieces we need:
+  - `pkg/satellite/observer.go` reads `current-uuid:` and `bitmap-uuid:` from drbdsetup events2 `device` frames (today only `disk:` is parsed → `DiskState`).
+  - `Resource.Status.Volumes[i].CurrentGi` typed field (observed state, not Spec — written by satellite, read by controller).
+  - When the controller adds a new replica (autoplacer / explicit place), it picks any existing UpToDate peer's `Status.Volumes[i].CurrentGi` and stamps the new `Resource.Spec.Volumes[i].SeedFromGi` (or one-shot `Spec.AssumeCleanFromPeer NodeName`).
+  - Satellite reconciler reads `SeedFromGi`, runs `drbdmeta <minor> v09 <device> internal new-current-uuid --clear-bitmap` (or `drbdmeta set-gi`) **before** `drbdadm up` so the freshly-created metadata block carries the seed GI rather than zeros.
+  - Pin via unit test (FakeExec captures the drbdmeta command line on first activation when SeedFromGi is set) + e2e (`tests/e2e/replica-add-no-resync.sh`: 2-replica RD → write known checksum → add 3rd replica → assert `drbd-overview` shows UpToDate within seconds, not hours).
+
+
 
 - [ ] Volume resize end-to-end with a real PVC: write checksum, grow via REST, verify checksum + filesystem sees the new size. Currently only the satellite-side resize chain is unit-tested.
 - [ ] Backing-device failure e2e: pull the LV / disk out from under DRBD on a real-disk stand, assert peer stays Primary, source drops to Diskless. Satellite-side detach hook is unit-tested; real-stand exercise pending.
