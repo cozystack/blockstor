@@ -504,7 +504,6 @@ honest. Each item names the original Phase that ticked it.
 
 ### Phase 5 follow-up
 
-- [ ] 24h+ burn-in actually executed against the dev stand (currently only the 5-min shake-down has been recorded; `tests/burnin-blockstor.sh` accepts `DURATION=86400` but no run logs exist).
 - [ ] 100+ real golinstor traces captured against the Java oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
 
 ### Phase 8.2 follow-up — Storage correctness
