@@ -18,7 +18,6 @@ package k8s
 
 import (
 	"context"
-	"maps"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -181,11 +180,10 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 // (auto-diskful, resize, evacuation), which a whole-object Update
 // would clobber.
 //
-// drbdProps is folded into Spec.Props (DrbdState etc.) — historically
-// the satellite reported runtime state via Spec props rather than a
-// dedicated Status field. New callers should put runtime info into
-// state directly; the props bag is kept for back-compat.
-func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string, volumes []apiv1.VolumeObservation) error {
+// state.DrbdState lands on Status.DrbdState (Phase 10.2 — observed
+// state never touches Spec). Per-volume DiskState/CurrentGi land on
+// Status.Volumes[i] via mergeVolumeObservations.
+func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, volumes []apiv1.VolumeObservation) error {
 	var existing crdv1alpha1.Resource
 
 	key := types.NamespacedName{Name: resourceCRDName(rdName, node)}
@@ -199,20 +197,11 @@ func (s *resources) SetState(ctx context.Context, rdName, node string, state api
 		return errors.Wrapf(err, "get Resource %s/%s", rdName, node)
 	}
 
-	if len(drbdProps) > 0 {
-		if existing.Spec.Props == nil {
-			existing.Spec.Props = map[string]string{}
-		}
-
-		maps.Copy(existing.Spec.Props, drbdProps)
-
-		err = s.c.Update(ctx, &existing)
-		if err != nil {
-			return errors.Wrapf(err, "update Resource Spec %s/%s", rdName, node)
-		}
-	}
-
 	existing.Status.InUse = state.InUse
+
+	if state.DrbdState != "" {
+		existing.Status.DrbdState = state.DrbdState
+	}
 
 	mergeVolumeObservations(&existing.Status.Volumes, volumes)
 
@@ -269,8 +258,11 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		NodeName: crd.Spec.NodeName,
 		Props:    props,
 		Flags:    crd.Spec.Flags,
-		State:    apiv1.ResourceState{InUse: crd.Status.InUse},
-		UUID:     string(crd.UID),
+		State: apiv1.ResourceState{
+			InUse:     crd.Status.InUse,
+			DrbdState: crd.Status.DrbdState,
+		},
+		UUID: string(crd.UID),
 	}
 }
 

@@ -309,9 +309,9 @@ func TestReportPoolCapacityRequiresNodeName(t *testing.T) {
 
 // TestReportObservedAppliesEvent: a streamed events2 frame describing
 // "resource X on node Y is Primary, in_use=true" must land on the
-// matching Resource's State (InUse=true) and DrbdState prop.
-// Pins the applyObserved path the network-partition / failover items
-// rely on.
+// matching Resource's State (InUse=true) and Status.DrbdState
+// (Phase 10.2 — observed state never touches Spec). Pins the
+// applyObserved path the network-partition / failover items rely on.
 func TestReportObservedAppliesEvent(t *testing.T) {
 	st := store.NewInMemory()
 
@@ -370,8 +370,8 @@ func TestReportObservedAppliesEvent(t *testing.T) {
 		t.Errorf("State.InUse: got false, want true (events2 Primary should flip InUse)")
 	}
 
-	if got.Props["DrbdState"] != "UpToDate" {
-		t.Errorf("Props[DrbdState]: got %q, want UpToDate", got.Props["DrbdState"])
+	if got.State.DrbdState != "UpToDate" {
+		t.Errorf("State.DrbdState: got %q, want UpToDate", got.State.DrbdState)
 	}
 }
 

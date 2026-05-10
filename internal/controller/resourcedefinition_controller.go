@@ -236,8 +236,8 @@ func quorumPolicy(diskful, diskless int) string {
 // DISKLESS+TIE_BREAKER Resource on it.
 func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) error {
 	hostingReplica := map[string]bool{}
-	for _, repl := range existing {
-		hostingReplica[repl.NodeName] = true
+	for i := range existing {
+		hostingReplica[existing[i].NodeName] = true
 	}
 
 	tiebreakerNode, err := r.pickTiebreakerNode(ctx, hostingReplica)

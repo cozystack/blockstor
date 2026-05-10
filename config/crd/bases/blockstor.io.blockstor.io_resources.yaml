@@ -363,6 +363,14 @@ spec:
                   nil means not yet allocated.
                 format: int32
                 type: integer
+              drbdState:
+                description: |-
+                  drbdState is the current resource-level DRBD state reported by
+                  `drbdsetup events2` — `UpToDate`, `Outdated`, `Connected`,
+                  `Failed`, etc. Phase 10.2: written by the satellite via the
+                  Status subresource so a concurrent Spec mutation
+                  (auto-diskful, resize) can't clobber it.
+                type: string
               inUse:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.

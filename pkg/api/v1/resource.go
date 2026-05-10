@@ -32,6 +32,14 @@ type Resource struct {
 // ResourceState is the runtime state surface of a Resource.
 type ResourceState struct {
 	InUse bool `json:"in_use,omitempty"`
+
+	// DrbdState is the current DRBD role/connection state observed by
+	// the satellite via `drbdsetup events2` — `UpToDate`, `Outdated`,
+	// `Connected`, `Failed`, etc. Phase 10.2: this lives in Status,
+	// not Spec; satellite writes it via the Status subresource so a
+	// concurrent Spec mutation (auto-diskful, resize) can't clobber
+	// it and vice-versa.
+	DrbdState string `json:"drbd_state,omitempty"`
 }
 
 // ResourceWithVolumes is the shape `/v1/view/resources` returns — Resource

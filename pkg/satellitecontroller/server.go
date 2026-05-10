@@ -184,22 +184,19 @@ func (s *Server) ReportPoolCapacity(ctx context.Context, req *satellitepb.Report
 }
 
 // applyObserved lands one parsed events2 frame on the matching
-// Resource. We store the DRBD state as a `DrbdState` prop and the
-// "in use" hint via Resource.State.InUse so existing REST callers
-// (linstor-csi, kubectl-linstor) see the live runtime info without
-// the schema needing to change. Granular per-volume disk state lands
-// once the CRD's volume-level status fields settle.
+// Resource. We surface the DRBD state via Status.DrbdState (Phase
+// 10.2 — observed state never touches Spec) and the "in use" hint
+// via Status.InUse. Per-volume DiskState/CurrentGi land on
+// Status.Volumes[i].
 func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObservedEvent) error {
 	if ev.GetResourceName() == "" || ev.GetNodeName() == "" {
 		return nil
 	}
 
-	drbdProps := map[string]string{}
-	if disk := ev.GetDrbdState(); disk != "" {
-		drbdProps["DrbdState"] = disk
+	state := apiv1.ResourceState{
+		InUse:     ev.GetInUse(),
+		DrbdState: ev.GetDrbdState(),
 	}
-
-	state := apiv1.ResourceState{InUse: ev.GetInUse()}
 
 	// Per-volume observations — surface DiskState + CurrentGi onto
 	// Resource.Status.Volumes[i] so the controller's seed-from-peer
@@ -216,7 +213,7 @@ func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObse
 		})
 	}
 
-	err := s.st.Resources().SetState(ctx, ev.GetResourceName(), ev.GetNodeName(), state, drbdProps, volObs)
+	err := s.st.Resources().SetState(ctx, ev.GetResourceName(), ev.GetNodeName(), state, volObs)
 	if err != nil {
 		// NotFound is normal during convergence — the satellite may
 		// observe state for a resource the controller hasn't yet

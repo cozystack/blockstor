@@ -18,7 +18,6 @@ package store
 
 import (
 	"context"
-	"maps"
 	"sort"
 	"sync"
 
@@ -149,7 +148,7 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 // type intentionally has no Volumes slice — `ResourceWithVolumes`
 // at the REST boundary stitches per-volume state separately — so
 // the side-map is the InMemory equivalent.
-func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string, volumes []apiv1.VolumeObservation) error {
+func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, state apiv1.ResourceState, volumes []apiv1.VolumeObservation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -161,14 +160,6 @@ func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, sta
 	}
 
 	existing.State = state
-
-	if len(drbdProps) > 0 {
-		if existing.Props == nil {
-			existing.Props = map[string]string{}
-		}
-
-		maps.Copy(existing.Props, drbdProps)
-	}
 
 	s.m[key] = existing
 

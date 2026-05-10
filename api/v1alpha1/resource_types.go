@@ -94,6 +94,14 @@ type ResourceStatus struct {
 	// +optional
 	InUse bool `json:"inUse,omitempty"`
 
+	// drbdState is the current resource-level DRBD state reported by
+	// `drbdsetup events2` — `UpToDate`, `Outdated`, `Connected`,
+	// `Failed`, etc. Phase 10.2: written by the satellite via the
+	// Status subresource so a concurrent Spec mutation
+	// (auto-diskful, resize) can't clobber it.
+	// +optional
+	DrbdState string `json:"drbdState,omitempty"`
+
 	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
 	// Allocated once when the Resource first reconciles and never
 	// changes for the lifetime of the Resource — re-numbering live
