@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // EnqueueResourcesForRD exposes the internal RD-watch fan-out for
@@ -120,4 +121,18 @@ func (r *ResourceReconciler) RangeProp(ctx context.Context, nodeName, prop strin
 // else off. Tests pin every (diskful, diskless) combination.
 func QuorumPolicy(diskful, diskless int) string {
 	return quorumPolicy(diskful, diskless)
+}
+
+// SplitByDiskless exposes the disk-class partitioner the quorum
+// helper feeds. A regression that swapped which slice a Resource
+// lands in would silently flip the quorum decision for every RD.
+func SplitByDiskless(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resource) {
+	return splitByDiskless(replicas)
+}
+
+// FilterTieBreaker exposes the TIE_BREAKER subset filter — pins
+// "regular diskless mixed with witnesses" → only-witnesses shape
+// the witness-create / witness-remove decision relies on.
+func FilterTieBreaker(diskless []apiv1.Resource) []apiv1.Resource {
+	return filterTieBreaker(diskless)
 }
