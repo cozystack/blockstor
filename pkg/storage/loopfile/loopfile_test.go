@@ -17,6 +17,7 @@ limitations under the License.
 package loopfile_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -483,3 +484,68 @@ func TestVolumeStatusEmptyLosetupOutput(t *testing.T) {
 		t.Errorf("error wrap: got %q, want substring \"empty device\"", err.Error())
 	}
 }
+
+// TestCreateVolumeTruncateErrorWraps pins the truncate-failure
+// branch of CreateVolume (was 76.9%): when `truncate -s <bytes>`
+// fails (disk full, permission denied, hostpath read-only), the
+// error must surface with the "truncate" wrap keyword for
+// operator grep. Without this, satellite logs would just show a
+// bare "no such file or directory" with no breadcrumb to the
+// fundamental cause.
+func TestCreateVolumeTruncateErrorWraps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pvc-fail_00000.img")
+
+	fx := storage.NewFakeExec()
+	fx.Expect("truncate -s 1024 "+path, storage.FakeResponse{Err: errLoopExecFailed})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err := p.CreateVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-fail",
+		VolumeNumber: 0,
+		SizeKib:      1, // → 1024 bytes
+	})
+	if err == nil {
+		t.Fatalf("CreateVolume: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "truncate") {
+		t.Errorf("wrap: %q must contain \"truncate\"", err.Error())
+	}
+}
+
+// TestResizeVolumeTruncateErrorWraps mirrors the create path: a
+// failing truncate during grow must surface with the wrap keyword.
+// Pinned because controller-side ExpandVolume calls this on every
+// CSI ControllerExpandVolume; a regression that swallowed the
+// truncate error would leave the operator wondering why resize
+// hangs without an actionable log line.
+func TestResizeVolumeTruncateErrorWraps(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pvc-resize_00000.img")
+
+	if err := os.WriteFile(path, make([]byte, 1024), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("truncate -s 4096 "+path, storage.FakeResponse{Err: errLoopExecFailed})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	err := p.ResizeVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-resize",
+		VolumeNumber: 0,
+		SizeKib:      4, // → 4096 bytes (grow from 1024)
+	})
+	if err == nil {
+		t.Fatalf("ResizeVolume: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "truncate") {
+		t.Errorf("wrap: %q must contain \"truncate\"", err.Error())
+	}
+}
+
+var errLoopExecFailed = errors.New("losetup: command failed")
