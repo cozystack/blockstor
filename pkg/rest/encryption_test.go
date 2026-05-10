@@ -231,3 +231,40 @@ func TestPassphraseCreateMissingNew(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestPassphraseEnterBadJSON: malformed body → 400.
+func TestPassphraseEnterBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPatch(t, base+"/v1/encryption/passphrase", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestPassphraseModifyWithoutCreate: PUT before any prior POST →
+// 412 Precondition Failed. The operator must POST first to establish
+// the cluster passphrase; this surface is what golinstor's
+// `linstor encryption modify` checks.
+func TestPassphraseModifyWithoutCreate(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(passphraseRequest{
+		OldPassphrase: "doesnt-matter",
+		NewPassphrase: "new",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/encryption/passphrase", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Errorf("status: got %d, want 412", resp.StatusCode)
+	}
+}
