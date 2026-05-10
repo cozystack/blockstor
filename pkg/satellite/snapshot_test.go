@@ -17,6 +17,7 @@ limitations under the License.
 package satellite_test
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -135,3 +136,101 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestCreateSnapshotProviderErrorReturnsOkFalse pins the
+// per-resource error path of CreateSnapshot: when the provider's
+// CreateSnapshot fails (lvcreate exit code != 0, e.g. thin-pool
+// metadata exhausted), the satellite must surface Ok=false with
+// the error message rather than bubble it as a gRPC error.
+//
+// The dispatcher distinguishes "satellite said no" (Ok=false,
+// per-replica) from "transport failed" (gRPC error, retry whole
+// batch); a regression here would let one bad replica's snapshot
+// failure look like the whole satellite is unreachable.
+func TestCreateSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// Apply path: lvs returns empty so CreateVolume runs.
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Snapshot path: lvcreate -s fails.
+	fx.Expect("lvcreate --snapshot --name pvc-1_snap-fail_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Err: errSnapshotProviderFailed})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-1", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply (seed): %v", err)
+	}
+
+	resp, err := rec.CreateSnapshot(t.Context(), &satellitepb.CreateSnapshotRequest{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-fail",
+	})
+	if err != nil {
+		t.Fatalf("CreateSnapshot: got gRPC error %v, want Ok=false body-level", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true, want false on provider failure")
+	}
+
+	if resp.GetMessage() == "" {
+		t.Errorf("expected non-empty message describing the provider failure")
+	}
+}
+
+// TestDeleteSnapshotProviderErrorReturnsOkFalse mirrors
+// TestCreateSnapshotProviderErrorReturnsOkFalse for the delete path.
+func TestDeleteSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvremove --force vg/pvc-1_snap-fail_00000",
+		storage.FakeResponse{Err: errSnapshotProviderFailed})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-1", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply (seed): %v", err)
+	}
+
+	resp, err := rec.DeleteSnapshot(t.Context(), &satellitepb.DeleteSnapshotRequest{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-fail",
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: got gRPC error %v, want Ok=false body-level", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true, want false on provider failure")
+	}
+
+	if resp.GetMessage() == "" {
+		t.Errorf("expected non-empty message describing the provider failure")
+	}
+}
+
+var errSnapshotProviderFailed = errors.New("lvm: thin pool metadata exhausted")
