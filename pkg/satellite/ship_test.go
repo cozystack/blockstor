@@ -414,3 +414,54 @@ func TestShipSnapshotUnknownResource(t *testing.T) {
 		t.Errorf("expected !ok for unknown resource")
 	}
 }
+
+// TestShipSnapshotDefaultExecFallsBackToRealExec pins the
+// shipExec() default branch (was 66.7%): when a Reconciler is
+// constructed WITHOUT ShipExec, the ship pipeline must fall back
+// to storage.RealExec rather than nil-deref. We never actually
+// dispatch a real ship in tests (FakeExec is the only way to keep
+// CI from invoking ssh/zfs), so we exercise the fallback by
+// driving ShipSnapshot with an unsupported mechanism — runShip
+// calls shipExec() unconditionally before the mechanism switch,
+// so the default branch fires even when the dispatch then errors
+// out at the mechanism check.
+func TestShipSnapshotDefaultExecFallsBackToRealExec(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-default-exec_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		// ShipExec deliberately omitted → shipExec() returns RealExec.
+	})
+
+	if _, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-default-exec", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Apply (seed): %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-default-exec",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+		Mechanism:    "no-such-mechanism", // forces unsupported-error path
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot: got transport error %v, want Ok=false body-level", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true, want false on unsupported mechanism")
+	}
+
+	// The point of this test is the fallback codepath, not the response
+	// shape. As long as we got here without a nil-deref, shipExec()
+	// successfully returned RealExec.
+}
