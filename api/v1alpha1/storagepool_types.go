@@ -53,6 +53,18 @@ type StoragePoolSpec struct {
 	// props is the LINSTOR property map for this pool.
 	// +optional
 	Props map[string]string `json:"props,omitempty"`
+
+	// destroyOnDelete controls whether `kubectl delete storagepool`
+	// also runs the destructive teardown — `vgremove --force` /
+	// `zpool destroy` plus `wipefs -a` so the discovery loop can
+	// re-publish the freed devices as `PhysicalDevice` CRDs.
+	// Default false: deleting the CRD only removes the LINSTOR-side
+	// pool registration; the on-disk VG / zpool stays intact and
+	// can be re-imported manually with `vgchange -ay` / `zpool
+	// import`. Operators must opt in to the destructive path
+	// explicitly. Phase 10.8.
+	// +optional
+	DestroyOnDelete bool `json:"destroyOnDelete,omitempty"`
 }
 
 // StoragePoolStatus is the observed state of a storage pool, populated by
