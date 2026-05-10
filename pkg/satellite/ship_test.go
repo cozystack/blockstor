@@ -132,6 +132,64 @@ func TestShipSnapshotLVMThinUsesThinSendRecv(t *testing.T) {
 	}
 }
 
+// TestShipSnapshotUnsupportedMechanism: the dispatcher rejects an
+// explicit unsupported Mechanism (e.g. controller-side typo, or a
+// future mechanism the satellite hasn't implemented yet) with
+// Ok=false body-level. Without this gate the satellite would
+// silently swallow the request — controller would think the ship
+// succeeded and expose a phantom destination snapshot to the CSI
+// CreateVolume(from-snapshot) flow.
+func TestShipSnapshotUnsupportedMechanism(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		ShipExec:  fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-1", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+		Mechanism:    "rsync-over-pigeon", // not real
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot transport error (want body-level fail): %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true on unsupported mechanism; want false")
+	}
+
+	if !strings.Contains(strings.ToLower(resp.GetMessage()), "unsupported") {
+		t.Errorf("error message must mention unsupported mechanism; got %q",
+			resp.GetMessage())
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "rsync-over-pigeon") ||
+			strings.Contains(line, "zfs send") ||
+			strings.Contains(line, "thin-send-recv") {
+			t.Errorf("ship pipeline must not run on unsupported mechanism: %s", line)
+		}
+	}
+}
+
 // TestShipSnapshotUnknownResource → ok=false with message.
 func TestShipSnapshotUnknownResource(t *testing.T) {
 	fx := storage.NewFakeExec()
