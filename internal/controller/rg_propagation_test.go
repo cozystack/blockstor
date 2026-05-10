@@ -156,3 +156,54 @@ func TestRGUpdateNoChangeNoOp(t *testing.T) {
 		t.Errorf("replica count drifted: got %d, want 2; entries=%v", len(got), got)
 	}
 }
+
+// TestRGReconcilePlaceCountZeroDefaultsToOne pins the
+// default-place-count-to-1 branch of applyRGToRD (was 80%).
+// An RG with PlaceCount=0 (operator explicitly omitted, or RG
+// upgraded from a schema that didn't have the field) must
+// produce exactly 1 replica per spawned RD — not zero, which
+// would create RDs with no replicas at all.
+//
+// Mirrors upstream LINSTOR's "1 replica until told otherwise"
+// default. A regression that dropped the explicit fallback would
+// silently leave fresh RDs with empty replica sets.
+func TestRGReconcilePlaceCountZeroDefaultsToOne(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	for _, n := range []string{"n1", "n2"} {
+		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		})
+	}
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-zero",
+		SelectFilter: apiv1.AutoSelectFilter{
+			// PlaceCount intentionally zero.
+			StoragePool: "pool",
+		},
+	})
+	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-zero",
+		ResourceGroupName: "rg-zero",
+	})
+
+	rec := &controllerpkg.ResourceGroupReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg-zero"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-zero")
+	if len(got) != 1 {
+		t.Errorf("replicas: got %d, want 1 (default-place-count-to-1); entries=%v", len(got), got)
+	}
+}
