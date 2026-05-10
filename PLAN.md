@@ -485,6 +485,82 @@ Decision (2026-05-09): cluster passphrase rotation (`POST /v1/encryption/passphr
 
 ---
 
+## Outstanding work (boxes ticked above, exit-criteria not yet met)
+
+The checkboxes in Phases 4 / 5 / 8 / 9 are stamped `[x]` whenever the
+in-tree contract is pinned via unit tests. Several items, however, have
+exit-criteria that require runtime exercise on a real-disk stand or
+external infrastructure that **has not yet been executed**. Phase 8
+itself notes this in its closing paragraph: *"Until then 'production-
+ready' is overstating it; what we have is a CSI-compatible REST front-
+end with a verified happy path."*
+
+The list below makes the gap explicit so claims of "110/110 done" stay
+honest. Each item names the original Phase that ticked it.
+
+### Phase 4 follow-up
+
+- [ ] csi-sanity remaining 21 failures resolved (the `volume not present in storage backend` and node-specific lookups that need a live satellite on the csi-sanity test node — currently 53/74 specs pass).
+
+### Phase 5 follow-up
+
+- [ ] 24h+ burn-in actually executed against the dev stand (currently only the 5-min shake-down has been recorded; `tests/burnin-blockstor.sh` accepts `DURATION=86400` but no run logs exist).
+- [ ] 100+ real golinstor traces captured against the Java oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
+
+### Phase 8.2 follow-up — Storage correctness
+
+- [ ] Volume resize end-to-end with a real PVC: write checksum, grow via REST, verify checksum + filesystem sees the new size. Currently only the satellite-side resize chain is unit-tested.
+- [ ] Backing-device failure e2e: pull the LV / disk out from under DRBD on a real-disk stand, assert peer stays Primary, source drops to Diskless. Satellite-side detach hook is unit-tested; real-stand exercise pending.
+
+### Phase 8.6 follow-up — Real-world testing
+
+- [ ] Long-tail burn-in (24h+) against the ZFS_THIN pool (`STORPOOL=zfs-thin make burnin-blockstor NAME=…` parametrised; not yet run for 24 h).
+- [ ] `tests/e2e/network-partition.sh` actually executable: iptables-controllable Talos profile in place + script run with zero quorum-loss data corruption. Currently the contract is pinned via unit tests only; runtime is "out-of-scope" but the e2e gap remains real.
+- [ ] Backing-device-failure-during-writes e2e: real disk pulled mid-write workload, peer survives, this satellite Diskless. Contract pinned via unit tests; runtime exercise pending the real-disk stand profile.
+
+### Phase 8.7 follow-up — CSI parity beyond happy path
+
+- [ ] `tests/e2e/snapshot-restore-cross-node.sh` executed end-to-end on the ZFS+LVM-thin stand (REST plumbing + ship pipeline are unit-tested).
+- [ ] `tests/e2e/clone.sh` executed end-to-end on the ZFS+LVM-thin stand.
+- [ ] `tests/e2e/rwx-ganesha.sh` executed against a Talos profile carrying nfs-ganesha + drbd-reactor extensions, OR formally moved to "Out of scope" with a downstream-tracking link. Currently both ticked AND noted as "out-of-scope, separate Talos extension" — the box should pick one.
+- [ ] `tests/e2e/two-volume-rd.sh` made stable on a busy stand (currently flake-bound to initial-sync timing).
+
+### Phase 8.8 follow-up — e2e harness
+
+The Phase 8.8 box itself enumerates these as flake/unfinished/deferred but
+is still ticked. Promoting them to first-class unchecked items:
+
+- [ ] `tests/e2e/auto-diskful.sh` — controller doesn't promote DISKLESS on a manual `drbdadm primary` (events2 InUse update missing for non-Pod promotion).
+- [ ] `tests/e2e/two-primaries-live-migration.sh` — `wait_uptodate` times out under back-to-back runs.
+- [ ] `tests/e2e/resize-plain.sh` — flakes when scheduled after long DRBD churn.
+- [ ] `tests/e2e/backing-device-fail.sh` — needs real LVM-thin/ZFS stand profile.
+- [ ] `tests/e2e/snapshot-restore-cross-node.sh` — needs ZFS+LVM-thin stand profile.
+- [ ] `tests/e2e/clone.sh` — needs ZFS+LVM-thin stand profile.
+- [ ] `tests/e2e/resize-luks.sh` — needs the LUKS-extension stand profile.
+- [ ] `tests/e2e/network-partition.sh` — needs an iptables-controllable Talos profile.
+- [ ] `tests/e2e/rwx-ganesha.sh` — needs Ganesha + drbd-reactor extensions on the stand.
+
+### Phase 9 follow-up — Layer stack
+
+- [ ] `tests/e2e/no-drbd.sh`, `tests/e2e/luks-layer.sh`, `tests/e2e/drbd-luks-stack.sh` — stand-side execution against the real-disk + LUKS-extension Talos profile (scripts scaffolded, runtime not yet exercised).
+
+### Architectural debt — Satellite `Provider` registry vs `StoragePool` CRD
+
+Phase 3 documents the limitation in passing — *"the satellite uses a
+Provider registry seeded at startup (CLI flags / env), so the controller's
+pool spec is informational today"* — but it stays a real gap:
+`ApplyStoragePools` is an Ok=true stub, the satellite can only materialise
+pools that were named on its startup CLI, and adding a new
+LVM-thick / ZFS / file pool requires a DaemonSet edit (new
+`--lvm-thick-pool-name=…` / `--lvm-thick-vg=…` / etc. flag) instead of a
+plain `StoragePool` CRD apply. That's why the LVM-thick + ZFS pools added
+in 8.6 needed new flags in the DaemonSet despite already being expressible
+as CRDs.
+
+- [ ] `ApplyStoragePools` RPC made non-stub: controller pushes desired provider config (kind + VG / pool / dir / etc.) per `StoragePool` CRD, the satellite dynamically instantiates the matching `storage.Provider` and registers it in its in-memory map. Removes the `--lvm-thick-pool-name` / `--lvm-thick-vg` / `--zfs-pool` / `--lvm-thin-vg` / `--lvm-thin-pool` / `--file-pool-dir` / `--loopfile-pool-dir` CLI flags from `cmd/satellite/main.go` so pool config lives only in `StoragePool` CRDs. Provides a clean upgrade path (CRD edit, no DaemonSet rollout) and aligns the architecture with the bidirectional desired-state contract the satellite already has for `ApplyResources`.
+
+---
+
 ## Workflow
 
 ### Daily loop
