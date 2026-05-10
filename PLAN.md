@@ -555,6 +555,141 @@ LINSTOR boundary.
 - [ ] REST shim transcoder: `/v1/resource-definitions` and `/v1/resource-groups` POST/PUT accept upstream-shaped `{props: {...}}` payloads from golinstor, decode into the typed structs, write `ExtraProps` only for keys we don't recognise. GET responses re-emit the typed fields as `props` on the wire so golinstor stays happy.
 - [ ] Validation via kubebuilder enums (`+kubebuilder:validation:Enum=majority;off`) — apiserver rejects garbage values at admission, satellite stops parsing strings at runtime.
 
+#### 10.3 design summary
+
+Typed structs (Go pseudocode):
+
+```go
+// api/v1alpha1/drbd_options.go
+type DRBDOptions struct {
+    Net        *DRBDNetOptions        `json:"net,omitempty"`
+    Disk       *DRBDDiskOptions       `json:"disk,omitempty"`
+    PeerDevice *DRBDPeerDeviceOptions `json:"peerDevice,omitempty"`
+    Resource   *DRBDResourceOptions   `json:"resource,omitempty"`
+    Handlers   map[string]string      `json:"handlers,omitempty"`
+}
+
+type DRBDNetOptions struct {
+    // +kubebuilder:validation:Enum=A;B;C
+    Protocol          string                          `json:"protocol,omitempty"`
+    SharedSecretRef   *corev1.LocalObjectReference    `json:"sharedSecretRef,omitempty"`
+    AllowTwoPrimaries *bool                           `json:"allowTwoPrimaries,omitempty"`
+    MaxBuffers        *int32                          `json:"maxBuffers,omitempty"`
+    // +kubebuilder:validation:Enum=disconnect;discard-younger-primary;discard-older-primary;discard-zero-changes;discard-least-changes;discard-local;discard-remote
+    AfterSb0Pri       string                          `json:"afterSb0Pri,omitempty"`
+    // ...
+}
+
+type DRBDResourceOptions struct {
+    AutoPromote *bool  `json:"autoPromote,omitempty"`
+    // +kubebuilder:validation:Enum=off;majority;all
+    Quorum      string `json:"quorum,omitempty"`
+    // +kubebuilder:validation:Enum=io-error;suspend-io;freeze-io
+    OnNoQuorum  string `json:"onNoQuorum,omitempty"`
+}
+
+// api/v1alpha1/encryption.go
+type EncryptionConfig struct {
+    PassphraseSecretRef *corev1.LocalObjectReference `json:"passphraseSecretRef,omitempty"`
+}
+
+// Embedded on RG / RD / Resource:
+//   Spec.DRBDOptions  *DRBDOptions
+//   Spec.Encryption   *EncryptionConfig (RD only)
+//   Spec.ExtraProps   map[string]string  // legacy compat shim
+```
+
+`*int32` / `*bool` so `nil` means "not overridden" and any non-nil
+value (including zero) means "explicitly set". Override semantics
+flow Cluster → RG → RD → Resource, lowest scope wins per-field.
+
+ResourceDefinition before/after:
+
+```yaml
+# Before (current)
+kind: ResourceDefinition
+spec:
+  resourceGroupName: rg-fast
+  props:
+    "DrbdOptions/Net/protocol": "B"
+    "DrbdOptions/Encryption/passphrase": "topsecret"     # plaintext in spec
+    "StorPoolName": "nvme"
+  volumeDefinitions:
+  - volumeNumber: 0
+    sizeKib: 1048576
+    props:
+      "DrbdCurrentGi": "78A0DDD..."                      # observed in spec (bug)
+
+# After (Phase 10.3)
+kind: ResourceDefinition
+spec:
+  resourceGroupName: rg-fast
+  drbdOptions:
+    net:
+      protocol: B                                        # admission-validated enum
+  encryption:
+    passphraseSecretRef:
+      name: pvc-41cc4aa3-luks                            # ref instead of plaintext
+  volumeDefinitions:
+  - volumeNumber: 0
+    sizeKib: 1048576
+status:
+  volumes:
+  - volumeNumber: 0
+    currentGi: "78A0DDD..."                              # observed in Status (10.2)
+```
+
+Node before/after — topology moves to native labels:
+
+```yaml
+# Before
+kind: Node
+metadata:
+  name: n1
+spec:
+  type: SATELLITE
+  props:
+    "Aux/zone": "us-east-1a"                             # string-keyed topology
+    "DrbdOptions/TcpPortRange": "7000-7999"
+    "BlockstorVersion": "0.0.0-test"                     # observed in spec
+
+# After
+kind: Node
+metadata:
+  name: n1
+  labels:
+    topology.blockstor.io/zone: us-east-1a               # native labels
+spec:
+  type: SATELLITE
+  drbdPortRange: { min: 7000, max: 7999 }                # typed range
+  autoTieBreaker: true
+status:
+  blockstorVersion: "0.0.0-test"                         # observed → Status
+```
+
+REST shim (`pkg/rest/transcode.go`) does bidirectional translation
+so golinstor sees the upstream-shaped `{props: {...}}` wire format
+unchanged. Unknown keys land in `Spec.ExtraProps`; on the next
+release we either type them into `DRBDOptions` (transcoder routes
+to typed field, ExtraProps stops carrying them) or leave them in
+ExtraProps if upstream's semantic is too unstable to commit a typed
+schema. Goal: `ExtraProps` is empty on a steady-state production
+cluster.
+
+Validation:
+- kubebuilder `+kubebuilder:validation:Enum=...` for string enums →
+  apiserver rejects garbage at admission
+- `+kubebuilder:default:=...` for sane defaults
+- CEL validation for cross-field invariants (e.g. "AllowTwoPrimaries
+  requires Protocol=C" — DRBD-9 doesn't allow async dual-primary)
+
+The `pkg/drbd/options.go` resolver becomes a per-section field-by-
+field merge instead of `map[string]string` overlay. The `.res` file
+renderer in `pkg/satellite/reconciler.buildResFile` reads typed
+fields directly and emits each non-zero one into the right
+`drbdadm` section block — same line count as today's
+`splitDRBDOptions` + section-detection but without string parsing.
+
 ### 10.4 — Eliminate `KVEntry` CRD
 
 - [ ] **`ControllerProps` instance → typed singleton CRD**. New `ControllerConfig` cluster-scoped CRD, name=`default`, with structured fields (`Spec.DRBDOptions`, `Spec.AutoQuorum`, `Spec.AutoAddQuorumTiebreaker`, `Spec.PassphraseSecretRef`). Migration job seeds one from existing `KVEntry/ControllerProps` items.
