@@ -141,20 +141,26 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
 }
 
-// isAutoTieBreakerEnabled gates witness auto-creation on the RD's
-// `DrbdOptions/AutoAddQuorumTiebreaker` prop. Default is enabled
-// (matches the effective cozystack / piraeus-operator behaviour
-// where ControllerProps seeds it true) — operators who explicitly
-// place a manual DISKLESS replica disable the auto path with
-// `DrbdOptions/AutoAddQuorumTiebreaker: "false"` on the RD spec.
+// isAutoTieBreakerEnabled gates witness auto-creation. Default is
+// enabled (matches the effective cozystack / piraeus-operator
+// behaviour where ControllerProps seeds it true). Operators who
+// explicitly place a manual DISKLESS replica disable the auto path
+// per-RD.
 //
-// We only check the RD prop bag here; the resolver (controller →
-// RG → RD → Resource hierarchy) doesn't run on the RD reconciler
-// path because that path doesn't dispatch to the satellite. A
-// cluster-wide ControllerProps default still propagates because
-// the REST POST /v1/resource-definitions handler folds parent-RG
-// + ControllerProps into the RD on create.
+// Phase 10.3: typed `Spec.DRBDOptions.Resource.AutoTieBreaker` wins;
+// legacy `Spec.Props["DrbdOptions/AutoAddQuorumTiebreaker"]` is the
+// forward-compat fallback. We only check the RD here; the resolver
+// (controller → RG → RD → Resource hierarchy) doesn't run on the
+// RD reconciler path because that path doesn't dispatch to the
+// satellite. A cluster-wide ControllerProps default still propagates
+// because the REST POST /v1/resource-definitions handler folds
+// parent-RG + ControllerProps into the RD on create.
 func isAutoTieBreakerEnabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if rd.Spec.DRBDOptions != nil && rd.Spec.DRBDOptions.Resource != nil &&
+		rd.Spec.DRBDOptions.Resource.AutoTieBreaker != nil {
+		return *rd.Spec.DRBDOptions.Resource.AutoTieBreaker
+	}
+
 	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
 
 	if rd.Spec.Props == nil {

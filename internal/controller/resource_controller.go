@@ -655,23 +655,38 @@ func (r *ResourceReconciler) allocateMinor(ctx context.Context, nodeName string)
 	return drbd.LowestFreeMinor(taken, low, high)
 }
 
-// portRangeForNode reads "DrbdOptions/TcpPortRange" off the named
-// Node CRD, falling back to the controller-wide default. Format
-// matches upstream: "min-max" decimal.
+// portRangeForNode reads the DRBD TCP port range off the named Node
+// CRD, falling back to the controller-wide default. Phase 10.3:
+// typed `Spec.DRBDPortRange` wins; legacy `Props["DrbdOptions/
+// TcpPortRange"]` is the forward-compat fallback. Default
+// (7000-7999) covers fresh clusters with neither set.
 func (r *ResourceReconciler) portRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
-	return r.rangeProp(ctx, nodeName, "DrbdOptions/TcpPortRange",
+	return r.nodeRange(ctx, nodeName,
+		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDPortRange },
+		"DrbdOptions/TcpPortRange",
 		drbd.DefaultPortMin, drbd.DefaultPortMax)
 }
 
 func (r *ResourceReconciler) minorRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
-	return r.rangeProp(ctx, nodeName, "DrbdOptions/MinorNrRange",
+	return r.nodeRange(ctx, nodeName,
+		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDMinorRange },
+		"DrbdOptions/MinorNrRange",
 		drbd.DefaultMinorMin, drbd.DefaultMinorMax)
 }
 
-// rangeProp reads a "min-max" prop off the Node CRD. Missing node or
-// missing prop falls back to defaults (the prop is optional). Bad
-// format returns an error so the operator notices the typo.
-func (r *ResourceReconciler) rangeProp(ctx context.Context, nodeName, prop string, defLow, defHigh int32) (int32, int32, error) {
+// nodeRange resolves a port/minor range for the named Node. Reads
+// the typed pointer first via the picker; on nil/missing falls back
+// to the legacy "min-max" Props key; on absent both, returns
+// defaults. Bad format on the Props side returns an error so the
+// operator notices a typo. Missing Node CRD silently uses defaults
+// (consistent with the legacy behaviour).
+func (r *ResourceReconciler) nodeRange(
+	ctx context.Context,
+	nodeName string,
+	pick func(*blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange,
+	legacyProp string,
+	defLow, defHigh int32,
+) (int32, int32, error) {
 	var node blockstoriov1alpha1.Node
 	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		if errors.IsNotFound(err) {
@@ -681,7 +696,11 @@ func (r *ResourceReconciler) rangeProp(ctx context.Context, nodeName, prop strin
 		return 0, 0, err
 	}
 
-	raw := node.Spec.Props[prop]
+	if typed := pick(&node.Spec); typed != nil {
+		return typed.Min, typed.Max, nil
+	}
+
+	raw := node.Spec.Props[legacyProp]
 	if raw == "" {
 		return defLow, defHigh, nil
 	}

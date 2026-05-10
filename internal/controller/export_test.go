@@ -108,12 +108,17 @@ func PtrEqI32(a, b *int32) bool {
 	return ptrEqI32(a, b)
 }
 
-// RangeProp exposes the Node-prop range parser the per-node port
-// and minor allocators use. Tests pin the three-tier fallback
-// (missing node → defaults; missing prop → defaults; bad format →
-// error) without spinning up the full allocator path.
+// RangeProp exposes the Node-range resolver the per-node port and
+// minor allocators use. Tests pin the four-tier fallback (missing
+// node → defaults; typed pointer set → wins; legacy Props key set
+// → falls through; bad format → error) without spinning up the
+// full allocator path. Backwards-compat shim for the existing
+// test signature: this wrapper resolves typed via the legacy
+// Props-key path so old tests keep working without rewriting.
 func (r *ResourceReconciler) RangeProp(ctx context.Context, nodeName, prop string, defLow, defHigh int32) (int32, int32, error) {
-	return r.rangeProp(ctx, nodeName, prop, defLow, defHigh)
+	return r.nodeRange(ctx, nodeName,
+		func(*blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return nil },
+		prop, defLow, defHigh)
 }
 
 // QuorumPolicy exposes upstream-LINSTOR's isQuorumFeasible

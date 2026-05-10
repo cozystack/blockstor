@@ -155,6 +155,14 @@ type DRBDResourceOptions struct {
 	// +kubebuilder:validation:Enum=io-error;suspend-io;freeze-io
 	// +optional
 	OnNoQuorum string `json:"onNoQuorum,omitempty"`
+
+	// autoTieBreaker gates auto-creation of a DISKLESS+TIE_BREAKER
+	// witness when a parent RD has an even number of diskful
+	// replicas and no operator-placed diskless replica. Replaces
+	// `Props["DrbdOptions/AutoAddQuorumTiebreaker"]`. nil inherits
+	// the cluster-wide default (true). Phase 10.3.
+	// +optional
+	AutoTieBreaker *bool `json:"autoTieBreaker,omitempty"`
 }
 
 // EncryptionConfig configures LUKS encryption for a ResourceDefinition.

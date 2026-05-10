@@ -132,6 +132,33 @@ func applyTypedKey(opts *crdv1alpha1.DRBDOptions, key, val string) bool {
 		return applyHandlerKey(opts, strings.TrimPrefix(rest, "Handlers/"), val)
 	}
 
+	// Section-less DRBD keys — upstream LINSTOR uses
+	// `DrbdOptions/<Key>` (no inner `<Section>/`) for a handful of
+	// controller-level toggles consumed by the controller, not by
+	// drbdadm. Route the few we care about into typed slots.
+	return applySectionlessKey(opts, rest, val)
+}
+
+// applySectionlessKey routes section-less `DrbdOptions/<Key>` props
+// into typed slots. AutoAddQuorumTiebreaker is the only one we
+// currently type — it gates the RD reconciler's witness creation.
+// Phase 10.3.
+func applySectionlessKey(opts *crdv1alpha1.DRBDOptions, name, val string) bool {
+	if name == "AutoAddQuorumTiebreaker" {
+		b, ok := parseBool(val)
+		if !ok {
+			return false
+		}
+
+		if opts.Resource == nil {
+			opts.Resource = &crdv1alpha1.DRBDResourceOptions{}
+		}
+
+		opts.Resource.AutoTieBreaker = &b
+
+		return true
+	}
+
 	return false
 }
 
@@ -310,6 +337,13 @@ func emitResourceProps(out map[string]string, res *crdv1alpha1.DRBDResourceOptio
 
 	if res.OnNoQuorum != "" {
 		out["DrbdOptions/Resource/on-no-quorum"] = res.OnNoQuorum
+	}
+
+	if res.AutoTieBreaker != nil {
+		// Upstream uses the section-less spelling for this controller-
+		// level toggle; round-trip preserves it so golinstor sees the
+		// same key it sent in.
+		out["DrbdOptions/AutoAddQuorumTiebreaker"] = formatBool(*res.AutoTieBreaker)
 	}
 }
 

@@ -57,6 +57,35 @@ type NodeSpec struct {
 	// path is gone.
 	// +optional
 	SatelliteEndpoint string `json:"satelliteEndpoint,omitempty"`
+
+	// drbdPortRange is the inclusive [min, max] TCP port range the
+	// allocator picks DRBD listen ports from for replicas placed on
+	// this node. Replaces `Props["DrbdOptions/TcpPortRange"]`. nil
+	// inherits the controller-wide default (7000–7999). Phase 10.3.
+	// +optional
+	DRBDPortRange *PortRange `json:"drbdPortRange,omitempty"`
+
+	// drbdMinorRange is the inclusive [min, max] /dev/drbd<N> minor
+	// range the allocator picks from. Replaces
+	// `Props["DrbdOptions/MinorNrRange"]`. nil inherits the
+	// controller-wide default (1000–1099). Phase 10.3.
+	// +optional
+	DRBDMinorRange *PortRange `json:"drbdMinorRange,omitempty"`
+}
+
+// PortRange is an inclusive [Min, Max] integer range. Used for
+// DRBD TCP port ranges and /dev/drbd<N> minor ranges. Empty (nil)
+// means "inherit cluster-wide default".
+type PortRange struct {
+	// min is the lower bound (inclusive).
+	// +kubebuilder:validation:Minimum=0
+	// +required
+	Min int32 `json:"min"`
+
+	// max is the upper bound (inclusive). Must be ≥ Min.
+	// +kubebuilder:validation:Minimum=0
+	// +required
+	Max int32 `json:"max"`
 }
 
 // NodeNetInterface is one advertised endpoint of a satellite.

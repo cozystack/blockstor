@@ -179,6 +179,14 @@ spec:
                           automatically when a consumer opens the device, provided no
                           other peer is already Primary. Cluster-wide default true.
                         type: boolean
+                      autoTieBreaker:
+                        description: |-
+                          autoTieBreaker gates auto-creation of a DISKLESS+TIE_BREAKER
+                          witness when a parent RD has an even number of diskful
+                          replicas and no operator-placed diskless replica. Replaces
+                          `Props["DrbdOptions/AutoAddQuorumTiebreaker"]`. nil inherits
+                          the cluster-wide default (true). Phase 10.3.
+                        type: boolean
                       onNoQuorum:
                         description: |-
                           onNoQuorum is the action when quorum is lost. `io-error`

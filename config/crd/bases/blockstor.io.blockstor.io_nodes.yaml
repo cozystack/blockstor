@@ -39,6 +39,48 @@ spec:
           spec:
             description: spec defines the desired state of Node
             properties:
+              drbdMinorRange:
+                description: |-
+                  drbdMinorRange is the inclusive [min, max] /dev/drbd<N> minor
+                  range the allocator picks from. Replaces
+                  `Props["DrbdOptions/MinorNrRange"]`. nil inherits the
+                  controller-wide default (1000–1099). Phase 10.3.
+                properties:
+                  max:
+                    description: max is the upper bound (inclusive). Must be ≥ Min.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  min:
+                    description: min is the lower bound (inclusive).
+                    format: int32
+                    minimum: 0
+                    type: integer
+                required:
+                - max
+                - min
+                type: object
+              drbdPortRange:
+                description: |-
+                  drbdPortRange is the inclusive [min, max] TCP port range the
+                  allocator picks DRBD listen ports from for replicas placed on
+                  this node. Replaces `Props["DrbdOptions/TcpPortRange"]`. nil
+                  inherits the controller-wide default (7000–7999). Phase 10.3.
+                properties:
+                  max:
+                    description: max is the upper bound (inclusive). Must be ≥ Min.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  min:
+                    description: min is the lower bound (inclusive).
+                    format: int32
+                    minimum: 0
+                    type: integer
+                required:
+                - max
+                - min
+                type: object
               flags:
                 description: |-
                   flags is the desired set of LINSTOR flags. Most node flags are
