@@ -236,3 +236,21 @@ func TestAdviseAllResourcesEmpty(t *testing.T) {
 		t.Errorf("len: got %d, want 0", len(got))
 	}
 }
+
+// TestAdviseRDMissing: GET /v1/resource-definitions/{rd}/advise on
+// a non-existent RD → 404 (writeStoreError surfaces ErrNotFound).
+// Pinned because golinstor's `advise` retry classification depends
+// on this surface — a 5xx would loop forever.
+func TestAdviseRDMissing(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/ghost/advise")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
