@@ -189,7 +189,7 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 	}
 
 	gs := grpc.NewServer()
-	satellitepb.RegisterSatelliteServer(gs, NewGRPCServer(rec))
+	satellitepb.RegisterSatelliteServer(gs, NewGRPCServer(rec, storage.RealExec{}))
 	reflection.Register(gs)
 
 	done := make(chan struct{})

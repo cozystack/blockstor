@@ -96,10 +96,42 @@ type Reconciler struct {
 //
 //nolint:gocritic // value receiver matches the public constructor convention; ReconcilerConfig is the agent's flag bundle.
 func NewReconciler(cfg ReconcilerConfig) *Reconciler {
+	if cfg.Providers == nil {
+		// ApplyStoragePools registers providers into this map at
+		// runtime; nil-init would panic on the first dynamic pool.
+		cfg.Providers = map[string]storage.Provider{}
+	}
+
 	return &Reconciler{
 		cfg:            cfg,
 		resourceToPool: map[string]string{},
 	}
+}
+
+// RegisterProvider adds (or replaces) a `storage.Provider` in the
+// reconciler's pool registry under the given pool name. Phase 10.5:
+// gives `ApplyStoragePools` a way to wire dynamic pools without
+// restarting the satellite. Idempotent — re-registering the same
+// pool overwrites the old Provider, which is what
+// piraeus-operator-style "edit pool config" workflows expect.
+//
+// `nil` provider deregisters the pool (used for `DISKLESS` apply
+// frames the controller pushes for completeness).
+func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.cfg.Providers == nil {
+		r.cfg.Providers = map[string]storage.Provider{}
+	}
+
+	if provider == nil {
+		delete(r.cfg.Providers, pool)
+
+		return
+	}
+
+	r.cfg.Providers[pool] = provider
 }
 
 // Apply walks res and brings local storage in line with each item.

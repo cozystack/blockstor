@@ -20,6 +20,7 @@ import (
 	"context"
 
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // GRPCServer is the satellite-side implementation of `service Satellite`.
@@ -27,15 +28,23 @@ import (
 // CreateSnapshot, DeleteSnapshot, ShipSnapshot) onto an in-process
 // Reconciler. Agent.Run wires this into a gRPC listener so the
 // controller can push desired state.
+//
+// `exec` is used by `ApplyStoragePools` to construct freshly-arrived
+// `storage.Provider` instances (Phase 10.5 — dynamic pool wiring).
+// In tests `exec` is `storage.FakeExec`; production uses `storage.RealExec{}`.
 type GRPCServer struct {
 	satellitepb.UnimplementedSatelliteServer
 
-	rec *Reconciler
+	rec  *Reconciler
+	exec storage.Exec
 }
 
-// NewGRPCServer constructs a server backed by rec.
-func NewGRPCServer(rec *Reconciler) *GRPCServer {
-	return &GRPCServer{rec: rec}
+// NewGRPCServer constructs a server backed by rec. `exec` plumbs into
+// dynamically-instantiated providers in `ApplyStoragePools`. nil
+// disables dynamic pool registration (the request frame falls back to
+// reporting Ok=false for every requested pool).
+func NewGRPCServer(rec *Reconciler, exec storage.Exec) *GRPCServer {
+	return &GRPCServer{rec: rec, exec: exec}
 }
 
 // ApplyResources delegates to Reconciler.Apply. Per-resource failures
@@ -50,18 +59,39 @@ func (g *GRPCServer) ApplyResources(ctx context.Context, req *satellitepb.ApplyR
 	return &satellitepb.ApplyResourcesResponse{Results: results}, nil
 }
 
-// ApplyStoragePools is a placeholder that just OKs every requested pool
-// for now. The satellite uses a Provider registry seeded at startup
-// (CLI flags / env), so the controller's pool spec is informational
-// today; we'll wire dynamic pool wiring once the per-pool runtime
-// state lands.
+// ApplyStoragePools instantiates a `storage.Provider` for each
+// incoming `DesiredStoragePool` and registers it on the satellite's
+// reconciler. Phase 10.5: replaces the previous Ok=true stub —
+// pool config now flows controller→satellite at runtime, no
+// DaemonSet rollout for "add a new pool". Per-pool failures (bad
+// kind, missing config key) surface via Ok=false in the response so
+// a single broken pool doesn't sink the rest of the batch.
+//
+// DISKLESS pools deregister any existing same-named registration
+// (the kind has no underlying storage but the name is still valid
+// as an allocator target placeholder).
 func (g *GRPCServer) ApplyStoragePools(_ context.Context, req *satellitepb.ApplyStoragePoolsRequest) (*satellitepb.ApplyStoragePoolsResponse, error) {
 	pools := req.GetPools()
 	results := make([]*satellitepb.StoragePoolApplyResult, 0, len(pools))
 
 	for _, pool := range pools {
+		name := pool.GetName()
+		kind := pool.GetProviderKind()
+
+		provider, err := NewProviderFromKind(kind, pool.GetProps(), g.exec)
+		if err != nil {
+			results = append(results, &satellitepb.StoragePoolApplyResult{
+				Name:    name,
+				Ok:      false,
+				Message: err.Error(),
+			})
+
+			continue
+		}
+
+		g.rec.RegisterProvider(name, provider)
 		results = append(results, &satellitepb.StoragePoolApplyResult{
-			Name: pool.GetName(),
+			Name: name,
 			Ok:   true,
 		})
 	}

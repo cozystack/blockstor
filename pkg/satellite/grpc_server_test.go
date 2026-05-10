@@ -46,7 +46,7 @@ func TestGRPCServerApplyResources(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.ApplyResources(t.Context(), &satellitepb.ApplyResourcesRequest{
 		Resources: []*satellitepb.DesiredResource{
@@ -75,52 +75,73 @@ func TestGRPCServerApplyResources(t *testing.T) {
 	}
 }
 
-// TestGRPCServerApplyStoragePoolsAcksAll pins the placeholder
-// behaviour: every requested pool is ACK'd with Ok=true. The
-// satellite uses a startup-flag Provider registry, so the
-// controller's pool spec is informational today; the controller
-// must not interpret a missing pool ACK as a failure on this
-// transitional path.
-func TestGRPCServerApplyStoragePoolsAcksAll(t *testing.T) {
+// TestGRPCServerApplyStoragePoolsRegistersValid pins the Phase 10.5
+// dynamic-pool contract: each well-formed (kind + required props)
+// DesiredStoragePool ACKs Ok=true and the matching `storage.Provider`
+// becomes available in the reconciler's registry; malformed pools
+// (unknown kind or missing required prop) ACK Ok=false with a
+// readable Message so the controller can surface it.
+func TestGRPCServerApplyStoragePoolsRegistersValid(t *testing.T) {
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.ApplyStoragePools(t.Context(), &satellitepb.ApplyStoragePoolsRequest{
 		Pools: []*satellitepb.DesiredStoragePool{
-			{Name: "thin1"},
-			{Name: "zfs1"},
-			{Name: "loopfile"},
+			{
+				Name:         "thin1",
+				ProviderKind: "LVM_THIN",
+				Props:        map[string]string{"StorDriver/LvmVg": "vg", "StorDriver/ThinPool": "tp"},
+			},
+			{
+				Name:         "zfs1",
+				ProviderKind: "ZFS",
+				Props:        map[string]string{"StorDriver/ZPool": "rpool"},
+			},
+			{
+				Name:         "broken",
+				ProviderKind: "MADE_UP_KIND",
+			},
+			{
+				Name:         "incomplete",
+				ProviderKind: "LVM_THIN",
+				// missing StorDriver/LvmVg
+			},
 		},
 	})
 	if err != nil {
 		t.Fatalf("ApplyStoragePools: %v", err)
 	}
 
-	if len(resp.GetResults()) != 3 {
-		t.Fatalf("results: got %d, want 3", len(resp.GetResults()))
+	if len(resp.GetResults()) != 4 {
+		t.Fatalf("results: got %d, want 4", len(resp.GetResults()))
 	}
 
-	wantNames := map[string]bool{"thin1": false, "zfs1": false, "loopfile": false}
+	byName := map[string]*satellitepb.StoragePoolApplyResult{}
 	for _, r := range resp.GetResults() {
-		if !r.GetOk() {
-			t.Errorf("pool %s: Ok=false unexpectedly", r.GetName())
-		}
-
-		if _, ok := wantNames[r.GetName()]; !ok {
-			t.Errorf("unexpected pool name in results: %s", r.GetName())
-			continue
-		}
-
-		wantNames[r.GetName()] = true
+		byName[r.GetName()] = r
 	}
 
-	for name, seen := range wantNames {
-		if !seen {
-			t.Errorf("missing pool ACK for %s", name)
-		}
+	if !byName["thin1"].GetOk() {
+		t.Errorf("thin1: want Ok=true, got false (%s)", byName["thin1"].GetMessage())
+	}
+
+	if !byName["zfs1"].GetOk() {
+		t.Errorf("zfs1: want Ok=true, got false (%s)", byName["zfs1"].GetMessage())
+	}
+
+	if byName["broken"].GetOk() {
+		t.Errorf("broken: want Ok=false (unknown kind), got true")
+	}
+
+	if byName["incomplete"].GetOk() {
+		t.Errorf("incomplete: want Ok=false (missing LvmVg), got true")
+	}
+
+	if byName["incomplete"].GetMessage() == "" {
+		t.Errorf("incomplete: expected non-empty Message naming the missing key")
 	}
 }
 
@@ -132,7 +153,7 @@ func TestGRPCServerApplyStoragePoolsEmpty(t *testing.T) {
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.ApplyStoragePools(t.Context(), &satellitepb.ApplyStoragePoolsRequest{})
 	if err != nil {
@@ -153,7 +174,7 @@ func TestGRPCServerCreateSnapshotUnknownResource(t *testing.T) {
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.CreateSnapshot(t.Context(), &satellitepb.CreateSnapshotRequest{
 		ResourceName: "unknown-rd",
@@ -177,7 +198,7 @@ func TestGRPCServerDeleteSnapshotUnknownResource(t *testing.T) {
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.DeleteSnapshot(t.Context(), &satellitepb.DeleteSnapshotRequest{
 		ResourceName: "unknown-rd",
@@ -203,7 +224,7 @@ func TestGRPCServerDeleteResourceMissing(t *testing.T) {
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
 		Name:          "never-applied",
@@ -228,7 +249,7 @@ func TestGRPCServerShipSnapshotUnknownResource(t *testing.T) {
 		Providers: map[string]storage.Provider{},
 		NodeName:  "n1",
 	})
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
 		ResourceName: "unknown-rd",
@@ -263,7 +284,7 @@ func TestGRPCServerApplyResourcesCtxCancelBubbles(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -320,7 +341,7 @@ func TestGRPCServerDeleteResourceProviderError(t *testing.T) {
 		t.Fatalf("Apply (seed): %v", err)
 	}
 
-	srv := satellite.NewGRPCServer(rec)
+	srv := satellite.NewGRPCServer(rec, storage.NewFakeExec())
 
 	resp, err := srv.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
 		Name:          "pvc-del-busy",
