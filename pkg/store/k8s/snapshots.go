@@ -138,6 +138,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 	}
 
 	existing.Spec = wireToCRDSnapshotSpec(in)
+	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -168,6 +169,7 @@ func crdToWireSnapshot(crd *crdv1alpha1.Snapshot) apiv1.Snapshot {
 		ResourceName: crd.Spec.ResourceDefinitionName,
 		Nodes:        crd.Spec.Nodes,
 		Props:        crd.Spec.Props,
+		Annotations:  userAnnotations(crd.Annotations),
 		UUID:         string(crd.UID),
 	}
 
@@ -203,6 +205,7 @@ func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 				LabelResourceDefinition: in.ResourceName,
 				LabelSnapshot:           in.Name,
 			},
+			Annotations: cloneAnnotations(in.Annotations),
 		},
 		Spec: wireToCRDSnapshotSpec(in),
 	}

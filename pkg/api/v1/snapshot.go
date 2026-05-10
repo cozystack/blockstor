@@ -18,11 +18,20 @@ package v1
 
 // Snapshot mirrors the upstream `Snapshot` shape. linstor-csi calls
 // /v1/view/snapshots in its CSI ListSnapshots loop.
+//
+// Phase 10.4: `Annotations` carries the K8s-native
+// metadata.annotations of the underlying CRD. Used by the REST
+// KV-store rewrite to surface `blockstor.io/csi-shipping-data`
+// (linstor-csi-snapshot-shipper per-snapshot bookkeeping)
+// without going through the deprecated KVEntry CRD. Not part of
+// upstream LINSTOR's wire shape — golinstor ignores unknown JSON
+// fields, so the new key flows through transparently.
 type Snapshot struct {
 	Name              string              `json:"name"`
 	ResourceName      string              `json:"resource_name"`
 	Nodes             []string            `json:"nodes,omitempty"`
 	Props             map[string]string   `json:"props,omitempty"`
+	Annotations       map[string]string   `json:"annotations,omitempty"`
 	Flags             []string            `json:"flags,omitempty"`
 	VolumeDefinitions []SnapshotVolumeDef `json:"volume_definitions,omitempty"`
 	Snapshots         []SnapshotPerNode   `json:"snapshots,omitempty"`
