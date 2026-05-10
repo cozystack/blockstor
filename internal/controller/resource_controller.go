@@ -154,6 +154,22 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Initial-sync skip seeding (Phase 8.1): on a freshly-added
+	// replica, pick the CurrentGi of an existing UpToDate peer and
+	// stamp it into Spec.Volumes[i].SeedFromGi. The satellite
+	// reconciler then pre-seeds the new replica's DRBD metadata
+	// before drbdadm up so DRBD's GI handshake skips the full
+	// initial-sync. Idempotent: re-runs on a Resource whose
+	// SeedFromGi is already set leave Spec alone.
+	seeded, err := r.ensureSeedFromGi(ctx, target, peers, rdPtr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if seeded {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Auto-diskful: when a DISKLESS replica is actively used by a
 	// consumer (InUse=true on this node) AND the hosting node has
 	// a viable storage pool, promote it to diskful so reads stay
@@ -424,6 +440,161 @@ func equalStatus(a, b *blockstoriov1alpha1.ResourceStatus) bool {
 	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
 		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
 		ptrEqI32(a.DRBDMinor, b.DRBDMinor)
+}
+
+// ensureSeedFromGi pre-seeds Spec.Volumes[i].SeedFromGi on a
+// freshly-added replica with an existing UpToDate peer's CurrentGi
+// so DRBD-9's GI handshake on first connect skips the full
+// initial-sync. Returns true when Spec was mutated so the caller
+// requeues with the persisted value (the next reconcile dispatches
+// to the satellite, which consumes SeedFromGi via drbdmeta).
+//
+// Idempotency: any volume that already has SeedFromGi set is left
+// alone — the satellite reconciler is responsible for consuming
+// it once and the controller never rewrites. Volumes whose RD
+// VolumeDefinition has no peer with a non-empty CurrentGi (fresh
+// cluster, all-new replicas) get nothing set; they pay the
+// (acceptable) full initial-sync cost on first activation.
+//
+// Skipped entirely for DISKLESS replicas — they have no metadata
+// block to seed.
+func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
+	if rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
+		return false, nil
+	}
+
+	if slices.Contains(target.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		return false, nil
+	}
+
+	mutated := false
+
+	for _, vd := range rd.Spec.VolumeDefinitions {
+		if seedAlreadySet(target, vd.VolumeNumber) {
+			continue
+		}
+
+		seed := pickSeedFromPeers(peers, target.Name, vd.VolumeNumber)
+		if seed == "" {
+			continue
+		}
+
+		setSeedFromGi(target, vd.VolumeNumber, seed)
+
+		mutated = true
+	}
+
+	if !mutated {
+		return false, nil
+	}
+
+	if err := r.Update(context.Background(), target); err != nil { //nolint:contextcheck // ctx-cancel survives Update — propagating it would race the requeue
+		return false, err
+	}
+
+	return true, nil
+}
+
+// seedAlreadySet reports whether target.Spec.Volumes already has a
+// SeedFromGi for the given volume number. Used to make
+// ensureSeedFromGi idempotent.
+func seedAlreadySet(target *blockstoriov1alpha1.Resource, volumeNumber int32) bool {
+	for i := range target.Spec.Volumes {
+		if target.Spec.Volumes[i].VolumeNumber == volumeNumber && target.Spec.Volumes[i].SeedFromGi != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// pickSeedFromPeers picks an existing peer's CurrentGi for the given
+// volume number. Deterministic: peers are sorted by Name and the
+// first matching one wins, so two reconcile races converge on the
+// same answer (no thrashing of Spec.Volumes[i].SeedFromGi).
+//
+// Excludes the target itself, peers without a CurrentGi for this
+// volume, and peers whose Status.Volumes[i].DiskState != UpToDate
+// (a peer that's still syncing wouldn't have the authoritative GI).
+func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, volumeNumber int32) string {
+	candidates := make([]blockstoriov1alpha1.Resource, 0, len(peers))
+
+	for i := range peers {
+		if peers[i].Name == targetName {
+			continue
+		}
+
+		gi := volumeCurrentGi(&peers[i], volumeNumber)
+		if gi == "" {
+			continue
+		}
+
+		if volumeDiskState(&peers[i], volumeNumber) != "UpToDate" {
+			continue
+		}
+
+		candidates = append(candidates, peers[i])
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	slices.SortFunc(candidates, func(a, b blockstoriov1alpha1.Resource) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	return volumeCurrentGi(&candidates[0], volumeNumber)
+}
+
+// volumeCurrentGi returns the CurrentGi for the given volume number
+// from a Resource's Status, or "" if not present.
+func volumeCurrentGi(res *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+	for i := range res.Status.Volumes {
+		if res.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return res.Status.Volumes[i].CurrentGi
+		}
+	}
+
+	return ""
+}
+
+// volumeDiskState returns the DiskState for the given volume number
+// from a Resource's Status, or "" if not present.
+func volumeDiskState(res *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+	for i := range res.Status.Volumes {
+		if res.Status.Volumes[i].VolumeNumber == volumeNumber {
+			return res.Status.Volumes[i].DiskState
+		}
+	}
+
+	return ""
+}
+
+// setSeedFromGi mutates target.Spec.Volumes to record the seed GI
+// for the given volume number. Appends a new entry if no
+// ResourceVolumeSpec exists for the volume; otherwise updates in
+// place.
+func setSeedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32, seed string) {
+	for i := range target.Spec.Volumes {
+		if target.Spec.Volumes[i].VolumeNumber == volumeNumber {
+			target.Spec.Volumes[i].SeedFromGi = seed
+
+			return
+		}
+	}
+
+	target.Spec.Volumes = append(target.Spec.Volumes, blockstoriov1alpha1.ResourceVolumeSpec{
+		VolumeNumber: volumeNumber,
+		SeedFromGi:   seed,
+	})
 }
 
 func ptrEqI32(a, b *int32) bool {
