@@ -18,11 +18,19 @@ package v1
 
 // ResourceDefinition mirrors the upstream `ResourceDefinition` shape. Each
 // PVC ends up as one ResourceDefinition with one or more VolumeDefinitions.
+//
+// Phase 10.4: `Annotations` carries the K8s-native metadata.annotations
+// of the underlying CRD. Used by the REST KV-store rewrite to surface
+// `blockstor.io/csi-volume-data` (linstor-csi per-PVC JSON metadata)
+// without going through the deprecated KVEntry CRD. Not part of
+// upstream LINSTOR's wire shape — golinstor ignores unknown JSON
+// fields, so the new key flows through transparently.
 type ResourceDefinition struct {
 	Name              string            `json:"name"`
 	ExternalName      string            `json:"external_name,omitempty"`
 	ResourceGroupName string            `json:"resource_group_name,omitempty"`
 	Props             map[string]string `json:"props,omitempty"`
+	Annotations       map[string]string `json:"annotations,omitempty"`
 	Flags             []string          `json:"flags,omitempty"`
 	LayerData         []ResourceLayer   `json:"layer_data,omitempty"`
 	// LayerStack is the layer composition (e.g. ["DRBD","STORAGE"]).

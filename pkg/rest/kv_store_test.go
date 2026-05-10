@@ -25,9 +25,18 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// TestKVSetThenGet: round-trip through REST.
+// TestKVSetThenGet: round-trip through REST. Phase 10.4 routes
+// `csi-volumes` through RD annotations, so we seed an RD whose
+// name matches the key — that's the production-shape contract
+// linstor-csi follows (each csi-volumes entry's key is the PVC's
+// RD name).
 func TestKVSetThenGet(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "k"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
 	defer stop()
 
 	body, err := json.Marshal(apiv1.GenericPropsModify{
@@ -153,45 +162,78 @@ func TestKVListEmpty(t *testing.T) {
 	}
 }
 
-// TestKVSetMergesWithExisting: a second POST against the same
-// instance with new keys must merge with existing props rather than
-// replace the whole map. The CSI driver writes individual volume
-// parameters one at a time, so a non-merging set would clobber the
-// metadata of every other volume on every Set call.
+// TestKVSetMergesWithExisting: a second POST against `csi-volumes`
+// with a new key (= a new RD's name) must NOT clobber the
+// annotation on a different RD set by an earlier call. The CSI
+// driver writes individual volumes' parameters one at a time, so
+// a non-merging set would clobber the metadata of every other
+// volume on every Set call.
+//
+// Phase 10.4: under the new RD-annotations routing, "merge" is
+// inherent — each key targets a different RD; the second key's
+// RD update doesn't touch the first RD's annotation.
 func TestKVSetMergesWithExisting(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	if err := st.KeyValueStore().SetKeys(ctx, "csi-volumes", apiv1.GenericPropsModify{
-		OverrideProps: map[string]string{"vol1/size": "1Gi"},
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "vol1"}); err != nil {
+		t.Fatalf("seed RD vol1: %v", err)
 	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "vol2"}); err != nil {
+		t.Fatalf("seed RD vol2: %v", err)
+	}
+
+	// Seed vol1 via REST.
+	body1, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"vol1": "1Gi"},
+	})
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
+	resp := httpPost(t, base+"/v1/key-value-store/csi-volumes", body1)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed status: got %d, want 200", resp.StatusCode)
+	}
+
 	// Add a second key via REST POST.
-	body, _ := json.Marshal(apiv1.GenericPropsModify{
-		OverrideProps: map[string]string{"vol2/size": "2Gi"},
+	body2, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"vol2": "2Gi"},
 	})
-	resp := httpPost(t, base+"/v1/key-value-store/csi-volumes", body)
+	resp = httpPost(t, base+"/v1/key-value-store/csi-volumes", body2)
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	got, err := st.KeyValueStore().GetInstance(ctx, "csi-volumes")
+	rd1, err := st.ResourceDefinitions().Get(ctx, "vol1")
 	if err != nil {
-		t.Fatalf("Get: %v", err)
+		t.Fatalf("Get vol1: %v", err)
 	}
 
-	if got["vol1/size"] != "1Gi" {
+	rd2, err := st.ResourceDefinitions().Get(ctx, "vol2")
+	if err != nil {
+		t.Fatalf("Get vol2: %v", err)
+	}
+
+	got := map[string]string{}
+	if v := rd1.Annotations["blockstor.io/csi-volume-data"]; v != "" {
+		got["vol1"] = v
+	}
+
+	if v := rd2.Annotations["blockstor.io/csi-volume-data"]; v != "" {
+		got["vol2"] = v
+	}
+
+	if got["vol1"] != "1Gi" {
 		t.Errorf("first key lost on second Set: got %+v", got)
 	}
 
-	if got["vol2/size"] != "2Gi" {
+	if got["vol2"] != "2Gi" {
 		t.Errorf("second key not added: got %+v", got)
 	}
 }
@@ -279,5 +321,139 @@ func TestKVDeleteMissing(t *testing.T) {
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestCSIVolumesPersistsToRDAnnotation pins the Phase 10.4
+// migration: a POST /v1/key-value-store/csi-volumes with
+// `OverrideProps[pvc-name]=jsonblob` ends up on the matching
+// RD's `metadata.annotations["blockstor.io/csi-volume-data"]`
+// — the new home, not the legacy KVEntry instance.
+func TestCSIVolumesPersistsToRDAnnotation(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-abc"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"pvc-abc": `{"size":"5Gi","pool":"thin1"}`},
+	})
+
+	resp := httpPost(t, base+"/v1/key-value-store/csi-volumes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "pvc-abc")
+	if err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	if rd.Annotations["blockstor.io/csi-volume-data"] != `{"size":"5Gi","pool":"thin1"}` {
+		t.Errorf("annotation: got %q, want the JSON blob",
+			rd.Annotations["blockstor.io/csi-volume-data"])
+	}
+}
+
+// TestCSIVolumesDeleteSpecificKey pins the per-key delete via
+// DeleteProps: an entry in `DeleteProps` clears the annotation
+// on that one RD, leaving every other RD's annotation alone.
+func TestCSIVolumesDeleteSpecificKey(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:        "pvc-keep",
+		Annotations: map[string]string{"blockstor.io/csi-volume-data": "stays"},
+	}); err != nil {
+		t.Fatalf("seed pvc-keep: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:        "pvc-drop",
+		Annotations: map[string]string{"blockstor.io/csi-volume-data": "goes"},
+	}); err != nil {
+		t.Fatalf("seed pvc-drop: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.GenericPropsModify{
+		DeleteProps: []string{"pvc-drop"},
+	})
+
+	resp := httpPost(t, base+"/v1/key-value-store/csi-volumes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	keep, _ := st.ResourceDefinitions().Get(ctx, "pvc-keep")
+	if keep.Annotations["blockstor.io/csi-volume-data"] != "stays" {
+		t.Errorf("pvc-keep annotation lost: %v", keep.Annotations)
+	}
+
+	drop, _ := st.ResourceDefinitions().Get(ctx, "pvc-drop")
+	if v, has := drop.Annotations["blockstor.io/csi-volume-data"]; has {
+		t.Errorf("pvc-drop annotation still present: %q", v)
+	}
+}
+
+// TestCSIVolumesGetAssemblesFromAnnotations pins the GET path:
+// walks every RD and assembles the `{name: annotation}` map
+// golinstor expects when calling GET csi-volumes.
+func TestCSIVolumesGetAssemblesFromAnnotations(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:        "pvc-1",
+		Annotations: map[string]string{"blockstor.io/csi-volume-data": "blob1"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:        "pvc-2",
+		Annotations: map[string]string{"blockstor.io/csi-volume-data": "blob2"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// An RD without the annotation must NOT appear in the output.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-no-annotation",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/key-value-store/csi-volumes")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var kv apiv1.KV
+	if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if kv.Props["pvc-1"] != "blob1" || kv.Props["pvc-2"] != "blob2" {
+		t.Errorf("props: got %+v, want pvc-1=blob1 + pvc-2=blob2", kv.Props)
+	}
+
+	if _, has := kv.Props["pvc-no-annotation"]; has {
+		t.Errorf("RD without annotation leaked into csi-volumes view: %+v", kv.Props)
 	}
 }

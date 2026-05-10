@@ -18,6 +18,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -104,6 +105,7 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 	}
 
 	existing.Spec = wireToCRDRDSpec(in)
+	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -111,6 +113,42 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 	}
 
 	return nil
+}
+
+// mergeUserAnnotationsInto applies the wire-side annotation map
+// onto existing.Annotations. Behavior:
+//   - nil wire input: no-op (preserves whatever the controller-side
+//     reconciler may have stamped under blockstor.io/* keys).
+//   - non-nil: replaces ALL non-blockstor.io annotations with the
+//     wire set; blockstor.io/* keys (the OriginalName store-internal
+//     marker) survive.
+//
+// Phase 10.4: lets the REST KV-store handler write
+// `blockstor.io/csi-volume-data` via Update without losing the
+// store-internal `blockstor.io/original-name`.
+func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string) {
+	if wire == nil {
+		return
+	}
+
+	if meta.Annotations == nil {
+		meta.Annotations = map[string]string{}
+	}
+
+	// Drop existing user keys.
+	for k := range meta.Annotations {
+		if k == AnnotationLinstorName {
+			continue
+		}
+
+		delete(meta.Annotations, k)
+	}
+
+	maps.Copy(meta.Annotations, wire)
+
+	if len(meta.Annotations) == 0 {
+		meta.Annotations = nil
+	}
 }
 
 func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
@@ -140,6 +178,7 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 		ExternalName:      crd.Spec.ExternalName,
 		ResourceGroupName: crd.Spec.ResourceGroupName,
 		Props:             props,
+		Annotations:       userAnnotations(crd.Annotations),
 		Flags:             crd.Spec.Flags,
 		LayerStack:        crd.Spec.LayerStack,
 		UUID:              string(crd.UID),
@@ -148,14 +187,55 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 	return out
 }
 
+// userAnnotations strips the store-internal annotation keys
+// (`blockstor.io/original-name` etc.) from a CRD's metadata.annotations
+// before surfacing it on the wire — only operator/CSI-managed keys
+// (e.g. `blockstor.io/csi-volume-data`) reach the REST layer.
+// Returns nil when no user-facing annotation survives the filter.
+func userAnnotations(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make(map[string]string, len(in))
+
+	for k, v := range in {
+		if k == AnnotationLinstorName {
+			continue
+		}
+
+		out[k] = v
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
 func wireToCRDRD(in *apiv1.ResourceDefinition) *crdv1alpha1.ResourceDefinition {
 	crd := &crdv1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: Name(in.Name)},
-		Spec:       wireToCRDRDSpec(in),
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        Name(in.Name),
+			Annotations: cloneAnnotations(in.Annotations),
+		},
+		Spec: wireToCRDRDSpec(in),
 	}
 	SetOriginalName(&crd.ObjectMeta, in.Name)
 
 	return crd
+}
+
+// cloneAnnotations returns a defensive copy of the wire annotation
+// map. nil → nil. Used by Create/Update so callers can mutate the
+// input apiv1.ResourceDefinition without us silently writing through.
+func cloneAnnotations(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+
+	return maps.Clone(in)
 }
 
 func wireToCRDRDSpec(in *apiv1.ResourceDefinition) crdv1alpha1.ResourceDefinitionSpec {
