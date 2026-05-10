@@ -141,15 +141,24 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 	return resp.GetResults()[0], nil
 }
 
-// lookupEndpoint reads SatelliteEndpoint from the Node prop bag. We
-// match by the original LINSTOR name (annotation when slugified, else
-// metadata.Name) so non-RFC1123 LINSTOR names still resolve back to
-// the right CRD on the controller side.
+// lookupEndpoint reads SatelliteEndpoint from the matching Node CRD.
+// Phase 10.3: typed `Spec.SatelliteEndpoint` wins; falls back to the
+// legacy `Spec.Props["SatelliteEndpoint"]` so a partially-migrated
+// cluster (or a satellite that still pushes the prop in its Hello
+// handshake) keeps working unchanged. Match by the original LINSTOR
+// name (annotation when slugified, else metadata.Name) so
+// non-RFC1123 LINSTOR names still resolve back to the right CRD.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) == nodeName {
-			return nodes[i].Spec.Props["SatelliteEndpoint"]
+		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+			continue
 		}
+
+		if ep := nodes[i].Spec.SatelliteEndpoint; ep != "" {
+			return ep
+		}
+
+		return nodes[i].Spec.Props["SatelliteEndpoint"]
 	}
 
 	return ""

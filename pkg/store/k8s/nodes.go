@@ -18,6 +18,7 @@ package k8s
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"strings"
 
@@ -164,11 +165,25 @@ func (n *nodes) Delete(ctx context.Context, name string) error {
 }
 
 // crdToWireNode flattens a Node CRD into the LINSTOR REST shape.
+// Phase 10.3: re-emits typed `Spec.SatelliteEndpoint` back into the
+// wire `Props["SatelliteEndpoint"]` so golinstor + the dispatcher's
+// fallback path keep seeing the same shape on GET.
 func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
+	props := crd.Spec.Props
+
+	if crd.Spec.SatelliteEndpoint != "" {
+		props = maps.Clone(props)
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		props["SatelliteEndpoint"] = crd.Spec.SatelliteEndpoint
+	}
+
 	out := apiv1.Node{
 		Name:             OriginalName(&crd.ObjectMeta),
 		Type:             crd.Spec.Type,
-		Props:            crd.Spec.Props,
+		Props:            props,
 		ConnectionStatus: crd.Status.ConnectionStatus,
 	}
 
@@ -211,11 +226,18 @@ func wireToCRDNode(in *apiv1.Node) *crdv1alpha1.Node {
 // SatelliteEncryptionType is uppercased on the way in: upstream LINSTOR
 // accepts mixed case ("plain"/"PLAIN") but the CRD validation enum is
 // uppercase-only, so we normalise here to keep wire compatibility.
+//
+// Phase 10.3: lifts `Props["SatelliteEndpoint"]` into the typed
+// `Spec.SatelliteEndpoint` field. The dispatcher reads typed first
+// (so this is the source of truth going forward); we still keep the
+// original key in Props for forward-compat with any pre-migration
+// reader that hasn't been updated.
 func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 	spec := crdv1alpha1.NodeSpec{
-		Type:  strings.ToUpper(in.Type),
-		Props: in.Props,
-		Flags: in.Flags,
+		Type:              strings.ToUpper(in.Type),
+		Props:             in.Props,
+		Flags:             in.Flags,
+		SatelliteEndpoint: in.Props["SatelliteEndpoint"],
 	}
 
 	if len(in.NetInterfaces) > 0 {

@@ -48,6 +48,15 @@ type NodeSpec struct {
 	// The first interface is treated as the satellite endpoint.
 	// +optional
 	NetInterfaces []NodeNetInterface `json:"netInterfaces,omitempty"`
+
+	// satelliteEndpoint is the controller→satellite gRPC endpoint
+	// (`host:port`). Phase 10.3: replaces `Props["SatelliteEndpoint"]`
+	// — the dispatcher reads this typed field first, falling back to
+	// the props bag for forward-compat with pre-migration data. The
+	// field becomes irrelevant once Phase 10.6 lands and the gRPC
+	// path is gone.
+	// +optional
+	SatelliteEndpoint string `json:"satelliteEndpoint,omitempty"`
 }
 
 // NodeNetInterface is one advertised endpoint of a satellite.
