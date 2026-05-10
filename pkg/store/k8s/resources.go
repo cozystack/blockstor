@@ -174,21 +174,43 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 	return nil
 }
 
-// SetState writes the runtime-observed state via .Status().Update().
-// Called from the satellite's events2 observer path when role/disk
-// state changes — these must not race a concurrent Spec mutation
-// (auto-diskful, resize, evacuation), which a whole-object Update
-// would clobber.
+// SatelliteFieldOwner is the SSA field-manager identity the
+// satellite uses for its observed-state writes (DrbdState,
+// per-volume DiskState/CurrentGi). The controller uses
+// `ControllerFieldOwner` for its allocator outputs (DRBDPort,
+// DRBDMinor, DRBDNodeID). Distinct field owners let SSA's merge
+// algorithm preserve each side's writes when the two collide on
+// the same Status subresource. Phase 10.2.
+const (
+	SatelliteFieldOwner  = "blockstor-satellite"
+	ControllerFieldOwner = "blockstor-controller"
+)
+
+// SetState writes the runtime-observed state via Server-Side Apply
+// on the Status subresource. Called from the satellite's events2
+// observer path when role/disk state changes — these must not race
+// concurrent Spec mutations (auto-diskful, resize, evacuation) nor
+// the controller's allocator writes to DRBDPort/Minor/NodeID.
 //
-// state.DrbdState lands on Status.DrbdState (Phase 10.2 — observed
-// state never touches Spec). Per-volume DiskState/CurrentGi land on
-// Status.Volumes[i] via mergeVolumeObservations.
+// SSA with `FieldOwner=blockstor-satellite` makes the merge
+// per-field: only the fields the satellite explicitly sets in the
+// apply object are claimed; the controller's allocator outputs
+// (`DRBDPort`, `DRBDMinor`, `DRBDNodeID`) stay untouched even
+// across racing Status writes. Phase 10.2.
+//
+// state.DrbdState lands on Status.DrbdState; per-volume
+// DiskState/CurrentGi land on Status.Volumes[i] (the listMapKey is
+// `volumeNumber`, so SSA matches up entries correctly).
 func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, volumes []apiv1.VolumeObservation) error {
+	name := resourceCRDName(rdName, node)
+
+	// Verify the Resource exists before applying — apiserver Apply
+	// would happily create a half-formed Resource if it didn't,
+	// and we'd rather surface NotFound to callers (events2
+	// observer treats it as a convergence-pending case and skips).
 	var existing crdv1alpha1.Resource
 
-	key := types.NamespacedName{Name: resourceCRDName(rdName, node)}
-
-	err := s.c.Get(ctx, key, &existing)
+	err := s.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
@@ -197,57 +219,57 @@ func (s *resources) SetState(ctx context.Context, rdName, node string, state api
 		return errors.Wrapf(err, "get Resource %s/%s", rdName, node)
 	}
 
-	existing.Status.InUse = state.InUse
-
-	if state.DrbdState != "" {
-		existing.Status.DrbdState = state.DrbdState
+	apply := &crdv1alpha1.Resource{
+		TypeMeta:   metav1.TypeMeta{Kind: "Resource", APIVersion: crdv1alpha1.GroupVersion.String()},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: crdv1alpha1.ResourceStatus{
+			InUse:     state.InUse,
+			DrbdState: state.DrbdState,
+			Volumes:   buildVolumeStatusForApply(volumes),
+		},
 	}
 
-	mergeVolumeObservations(&existing.Status.Volumes, volumes)
-
-	err = s.c.Status().Update(ctx, &existing)
+	// Note: client.Apply is the Patch-type-based SSA path. The
+	// newer Client.Apply / SubResource.Apply methods need
+	// applyconfiguration-gen output for our CRDs, which we don't
+	// produce yet — sticking to the patch-type API keeps the
+	// dependency tree shallow.
+	err = s.c.Status().Patch(ctx, apply,
+		ctrlclient.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
+		ctrlclient.FieldOwner(SatelliteFieldOwner),
+		ctrlclient.ForceOwnership)
 	if err != nil {
-		return errors.Wrapf(err, "update Resource Status %s/%s", rdName, node)
+		return errors.Wrapf(err, "ssa apply Resource Status %s/%s", rdName, node)
 	}
 
 	return nil
 }
 
-// mergeVolumeObservations applies satellite-side per-volume
-// observations onto a Resource's Status.Volumes slice in place.
-// New volume numbers are appended; matching numbers update only the
-// non-empty fields (so we don't blow away CurrentGi when a frame
-// only carries DiskState, or vice versa).
-func mergeVolumeObservations(dst *[]crdv1alpha1.ResourceVolumeStatus, observations []apiv1.VolumeObservation) {
-	for _, vol := range observations {
-		idx := -1
-
-		for i := range *dst {
-			if (*dst)[i].VolumeNumber == vol.VolumeNumber {
-				idx = i
-
-				break
-			}
-		}
-
-		if idx == -1 {
-			*dst = append(*dst, crdv1alpha1.ResourceVolumeStatus{
-				VolumeNumber: vol.VolumeNumber,
-				DiskState:    vol.State.DiskState,
-				CurrentGi:    vol.State.CurrentGi,
-			})
-
-			continue
-		}
-
-		if vol.State.DiskState != "" {
-			(*dst)[idx].DiskState = vol.State.DiskState
-		}
-
-		if vol.State.CurrentGi != "" {
-			(*dst)[idx].CurrentGi = vol.State.CurrentGi
-		}
+// buildVolumeStatusForApply turns a slice of per-volume
+// observations into the SSA-shaped Status.Volumes payload. Only
+// non-empty fields land in the apply object so SSA doesn't claim
+// ownership of fields the satellite didn't explicitly set.
+//
+// The Status.Volumes slice is a `+listType=map +listMapKey=volumeNumber`
+// list, so the apiserver merges the apply against the existing
+// state by volume number — a frame that only carries DiskState
+// for vol 0 leaves vol 1's CurrentGi alone.
+func buildVolumeStatusForApply(observations []apiv1.VolumeObservation) []crdv1alpha1.ResourceVolumeStatus {
+	if len(observations) == 0 {
+		return nil
 	}
+
+	out := make([]crdv1alpha1.ResourceVolumeStatus, 0, len(observations))
+
+	for _, vol := range observations {
+		out = append(out, crdv1alpha1.ResourceVolumeStatus{
+			VolumeNumber: vol.VolumeNumber,
+			DiskState:    vol.State.DiskState,
+			CurrentGi:    vol.State.CurrentGi,
+		})
+	}
+
+	return out
 }
 
 func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {

@@ -283,6 +283,9 @@ spec:
                   - volumeNumber
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - volumeNumber
+                x-kubernetes-list-type: map
             required:
             - nodeName
             - resourceDefinitionName
@@ -435,6 +438,9 @@ spec:
                   - volumeNumber
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - volumeNumber
+                x-kubernetes-list-type: map
             type: object
         required:
         - spec

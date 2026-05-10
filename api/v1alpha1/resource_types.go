@@ -68,6 +68,8 @@ type ResourceSpec struct {
 	// this generation identifier before `drbdadm up` so the GI
 	// handshake sees the new device as already-in-sync with that
 	// peer, skipping the full initial-sync.
+	// +listType=map
+	// +listMapKey=volumeNumber
 	// +optional
 	Volumes []ResourceVolumeSpec `json:"volumes,omitempty"`
 }
@@ -135,6 +137,8 @@ type ResourceStatus struct {
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 
 	// volumes is the per-volume runtime state reported by the satellite.
+	// +listType=map
+	// +listMapKey=volumeNumber
 	// +optional
 	Volumes []ResourceVolumeStatus `json:"volumes,omitempty"`
 
