@@ -45,7 +45,7 @@ var (
 func TestApplyWritesResFile(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -107,7 +107,7 @@ func TestApplyWritesResFile(t *testing.T) {
 func TestApplyInvokesDrbdadmAdjust(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -189,10 +189,10 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	// Volume already exists.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-grow_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-grow_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-grow_00000\n")})
 	// VolumeStatus: 1 GiB on disk (1024*1024 KiB).
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-grow_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-grow_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-grow_00000|1048576\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -221,7 +221,7 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	}
 
 	want := []string{
-		"lvextend --size 2048MiB vg/pvc-grow_00000",
+		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-grow_00000",
 		"drbdadm resize --assume-clean pvc-grow",
 	}
 
@@ -238,7 +238,7 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-new_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-new_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -266,7 +266,7 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 	}
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "lvextend ") {
+		if strings.HasPrefix(line, "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } ") {
 			t.Errorf("fresh create issued lvextend: %s", line)
 		}
 
@@ -283,7 +283,7 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-rwx_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-rwx_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -334,7 +334,7 @@ func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
 func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-noeviction_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-noeviction_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -404,7 +404,7 @@ func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-no-drbd_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-no-drbd_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -450,11 +450,11 @@ func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
 func TestApplyLayersLUKS(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// VolumeStatus query → reports the LV at a known path so the LUKS
 	// layer has a non-empty device to format/open.
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks_00000|1048576\n")})
 	// cryptsetup isLuks fails on a fresh device → format runs.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks_00000",
@@ -509,7 +509,7 @@ func TestApplyLayersLUKS(t *testing.T) {
 func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-empty_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-empty_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -556,9 +556,9 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-only_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-only_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-only_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-only_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-only_00000|1048576\n")})
 	// First reconcile: not yet a LUKS device → luksFormat will run.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-only_00000",
@@ -594,9 +594,9 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 	// luksOpen returns "already exists" because the mapper is still
 	// open from the previous reconcile. Format must NOT run again.
 	fx.Reset()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-only_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-only_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-luks-only_00000\n")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-only_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-only_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-only_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-only_00000",
 		storage.FakeResponse{}) // success — already a LUKS device
@@ -646,9 +646,9 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-stack_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-stack_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-stack_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-stack_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-stack_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-stack_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
@@ -723,10 +723,10 @@ func TestApplyDRBDResizeErrorSurfaces(t *testing.T) {
 	fx := storage.NewFakeExec()
 
 	// LV already exists — triggers the resize path in applyStorage.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-resize-fail_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-resize-fail_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-resize-fail_00000\n")})
 	// VolumeStatus reports current size 1 GiB; desired is 2 GiB.
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-resize-fail_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-resize-fail_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-resize-fail_00000|1048576\n")})
 	// drbdadm resize fails (e.g. peer not connected).
 	fx.Expect("drbdadm resize --assume-clean pvc-resize-fail",
@@ -906,7 +906,7 @@ func TestApplyInactiveOnlyDownsDRBD(t *testing.T) {
 func TestApplyLUKSWithoutCryptsetupWrapper(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-no-cs_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-no-cs_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -958,10 +958,10 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	// LV already exists (resize path, not first create).
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-grow_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-grow_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-luks-grow_00000\n")})
 	// VolumeStatus reports current size (1 GiB) — desired is 2 GiB.
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-grow_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-grow_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-grow_00000|1048576\n")})
 	// isLuks succeeds → already a LUKS device, format skipped.
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-grow_00000",
@@ -1030,7 +1030,7 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -1084,9 +1084,9 @@ func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 	// Second Apply: .res persists → firstActivation=false → seed
 	// must NOT fire again.
 	fx.Reset()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-seed_00000\n")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-seed_00000|1048576\n")})
 
 	_, err = rec.Apply(t.Context(), dr)
@@ -1110,7 +1110,7 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	// DeleteVolume's idempotency probe sees the LV exists.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-del_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-del_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-luks-del_00000\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -1181,10 +1181,10 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 	fx := storage.NewFakeExec()
 
 	// applyStorage path (lvs idempotency probe + lvcreate).
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-abort_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-abort_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// VolumeStatus query for the .res builder.
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-abort_00000|1048576\n")})
 	// First Apply: drbdadm adjust fails — the simulated mid-Apply abort.
 	fx.Expect("drbdadm adjust pvc-abort", storage.FakeResponse{Err: errDrbdadmAdjustFail})
@@ -1245,9 +1245,9 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 	// (the .res file lingers from the aborted first pass) and skip
 	// create-md.
 	fx.Reset()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-abort_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-abort_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-abort_00000\n")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-abort_00000|1048576\n")})
 	// Overwrite the previously-failing drbdadm response with a clean
 	// success — the simulated SIGKILL window has passed.
@@ -1291,9 +1291,9 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-luks-format_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-format_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-format_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-format_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
@@ -1351,7 +1351,7 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-md-fail_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-md-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// drbdadm create-md fails.
 	fx.Expect("drbdadm create-md --force pvc-md-fail",
@@ -1406,7 +1406,7 @@ func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed-fail_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-seed-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("drbdadm primary --force pvc-seed-fail",
 		storage.FakeResponse{Err: errPrimaryForceFailed})
@@ -1460,11 +1460,11 @@ var errPrimaryForceFailed = errors.New("drbdadm: device busy")
 func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// VolumeStatus reports the LV's path after CreateVolume so the
 	// reconciler picks up the device for drbdmeta seeding.
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-seed_00000|1048576\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -1536,7 +1536,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-noseed_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-noseed_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

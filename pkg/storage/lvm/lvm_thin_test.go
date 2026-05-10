@@ -41,7 +41,7 @@ func TestThinKind(t *testing.T) {
 func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 	fx := storage.NewFakeExec()
 	// Idempotency check: pretend the volume does not exist yet.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -55,7 +55,7 @@ func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "lvcreate --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -66,7 +66,7 @@ func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 // them safe.
 func TestThinCreateVolumeIdempotent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-1_00000\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -81,7 +81,7 @@ func TestThinCreateVolumeIdempotent(t *testing.T) {
 	}
 
 	for _, line := range fx.CommandLines() {
-		if line == "lvcreate" || (len(line) > 9 && line[:9] == "lvcreate ") {
+		if line == "lvcreate" || (len(line) > 9 && line[:9] == "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } ") {
 			t.Errorf("idempotent CreateVolume issued lvcreate: %s", line)
 		}
 	}
@@ -91,7 +91,7 @@ func TestThinCreateVolumeIdempotent(t *testing.T) {
 func TestThinDeleteVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
 	// Pretend the LV exists so Delete actually fires.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-1_00000\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -104,7 +104,7 @@ func TestThinDeleteVolume(t *testing.T) {
 		t.Fatalf("DeleteVolume: %v", err)
 	}
 
-	want := "lvremove --force vg/pvc-1_00000"
+	want := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -113,7 +113,7 @@ func TestThinDeleteVolume(t *testing.T) {
 // TestThinDeleteVolumeIdempotent: missing LV → swallow, no lvremove.
 func TestThinDeleteVolumeIdempotent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -127,7 +127,7 @@ func TestThinDeleteVolumeIdempotent(t *testing.T) {
 	}
 
 	for _, line := range fx.CommandLines() {
-		if len(line) > 9 && line[:9] == "lvremove " {
+		if len(line) > 9 && line[:9] == "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } " {
 			t.Errorf("idempotent DeleteVolume issued lvremove: %s", line)
 		}
 	}
@@ -137,7 +137,7 @@ func TestThinDeleteVolumeIdempotent(t *testing.T) {
 // returns DevicePath + sizes.
 func TestThinVolumeStatusParsesLvs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-1_00000|1048576.00\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -166,7 +166,7 @@ func TestThinVolumeStatusParsesLvs(t *testing.T) {
 // TestThinVolumeStatusMissing: empty lvs output → NOT_PROVISIONED.
 func TestThinVolumeStatusMissing(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -191,7 +191,7 @@ func TestThinVolumeStatusMissing(t *testing.T) {
 // TestThinPoolStatusParsesVgsLvs: PoolStatus reports free + total + can-snap.
 func TestThinPoolStatusParsesVgsLvs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
 		storage.FakeResponse{Stdout: []byte("104857600.00|25.00\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -229,7 +229,7 @@ func TestThinCreateSnapshot(t *testing.T) {
 	}
 
 	// LV layout: snapshot taken of the resource's volume 0.
-	want := "lvcreate --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -238,9 +238,9 @@ func TestThinCreateSnapshot(t *testing.T) {
 // TestThinExecError surfaces the wrapped exec error verbatim.
 func TestThinExecError(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")}) // not exists
-	fx.Expect("lvcreate --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/thinpool",
 		storage.FakeResponse{Err: errLVCreateFailed})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -259,7 +259,7 @@ var errLVCreateFailed = errors.New("lvcreate: insufficient free space")
 
 // TestThinResizeVolumeIssuesLvextend pins the lvextend command shape.
 // CSI ControllerExpandVolume → REST PUT → reconciler ResizeVolume,
-// so the wire-visible behaviour is "lvextend --size <newMiB>MiB
+// so the wire-visible behaviour is "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size <newMiB>MiB
 // vg/lv". Refactors that change the args will fail loudly here.
 func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 	fx := storage.NewFakeExec()
@@ -274,7 +274,7 @@ func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "lvextend --size 2048MiB vg/pvc-1_00000"
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
@@ -295,7 +295,7 @@ func TestThinDeleteSnapshot(t *testing.T) {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 
-	want := "lvremove --force vg/pvc-1_snap-1_00000"
+	want := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
@@ -306,7 +306,7 @@ func TestThinDeleteSnapshot(t *testing.T) {
 // fail-loud path on a misconfigured pool name.
 func TestThinPoolStatusEmptyOutput(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/missing",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/missing",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "missing"}, fx)
@@ -321,7 +321,7 @@ func TestThinPoolStatusEmptyOutput(t *testing.T) {
 // error, not a slice-out-of-bounds panic.
 func TestThinPoolStatusBadColumns(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
 		storage.FakeResponse{Stdout: []byte("only-one-col\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -338,7 +338,7 @@ func TestThinPoolStatusBadColumns(t *testing.T) {
 // panic on float coercion.
 func TestThinPoolStatusBadDataPercent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/tp",
 		storage.FakeResponse{Stdout: []byte("104857600.00|inactive\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -357,7 +357,7 @@ func TestThinPoolStatusBadDataPercent(t *testing.T) {
 // (which previously sat at 75%).
 func TestThinPoolStatusGarbageFromLvs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
 		storage.FakeResponse{Stdout: []byte("not-a-number|25.00\n")})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -369,10 +369,10 @@ func TestThinPoolStatusGarbageFromLvs(t *testing.T) {
 }
 
 // TestThinCreateSnapshotErrorWraps: lvcreate -s failure must
-// surface with the "lvcreate -s" wrap keyword for operator grep.
+// surface with the "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } -s" wrap keyword for operator grep.
 func TestThinCreateSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvcreate --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
@@ -391,10 +391,10 @@ func TestThinCreateSnapshotErrorWraps(t *testing.T) {
 }
 
 // TestThinDeleteSnapshotErrorWraps: lvremove on a snapshot LV must
-// surface with the "lvremove -f" wrap keyword.
+// surface with the "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } -f" wrap keyword.
 func TestThinDeleteSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvremove --force vg/pvc-1_snap-1_00000",
+	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)

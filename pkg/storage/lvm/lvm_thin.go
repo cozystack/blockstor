@@ -77,10 +77,10 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
-		"--thin",
-		"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
-		"--name", volumeLVName(vol),
-		t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)
+		Args("--thin",
+			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--name", volumeLVName(vol),
+			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate %s", volumeLVName(vol))
 	}
@@ -97,8 +97,8 @@ func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
-		"--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
+		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
 	}
@@ -114,8 +114,8 @@ func (t *Thin) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	_, err := t.exec.Run(ctx, "lvremove",
-		"--force",
-		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
+		Args("--force",
+			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvremove %s", volumeLVName(vol))
 	}
@@ -131,12 +131,12 @@ func (t *Thin) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.Vo
 // PoolStatus reports the thin pool's free/total capacity.
 func (t *Thin) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	out, err := t.exec.Run(ctx, "lvs",
-		"--noheadings",
-		"--separator", "|",
-		"-o", "lv_size,data_percent",
-		"--units", "k",
-		"--nosuffix",
-		t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)
+		Args("--noheadings",
+			"--separator", "|",
+			"-o", "lv_size,data_percent",
+			"--units", "k",
+			"--nosuffix",
+			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return storage.PoolStatus{}, errors.Wrap(err, "lvs (pool)")
 	}
@@ -177,9 +177,9 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	source := fmt.Sprintf("%s_%05d", snap.ResourceName, 0)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
-		"--snapshot",
-		"--name", snapshotLVName(snap),
-		t.cfg.VolumeGroup+"/"+source)
+		Args("--snapshot",
+			"--name", snapshotLVName(snap),
+			t.cfg.VolumeGroup+"/"+source)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate -s %s", snapshotLVName(snap))
 	}
@@ -190,8 +190,8 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 // DeleteSnapshot mirrors DeleteVolume on the snapshot LV.
 func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
 	_, err := t.exec.Run(ctx, "lvremove",
-		"--force",
-		t.cfg.VolumeGroup+"/"+snapshotLVName(snap))
+		Args("--force",
+			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvremove -f %s", snapshotLVName(snap))
 	}
@@ -205,9 +205,9 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 // surfaces the real cause anyway.
 func (t *Thin) lvExists(ctx context.Context, lvName string) bool {
 	out, err := t.exec.Run(ctx, "lvs",
-		"--noheadings",
-		"-o", "lv_name",
-		t.cfg.VolumeGroup+"/"+lvName)
+		Args("--noheadings",
+			"-o", "lv_name",
+			t.cfg.VolumeGroup+"/"+lvName)...)
 	if err != nil {
 		return false
 	}

@@ -59,14 +59,14 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
-		"--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-		"--name", volumeLVName(vol),
-		// Skip the optional zero-on-create step — the satellite
-		// container has no udev daemon, and the wipe trips on the
-		// missing /dev/<vg>/<lv> symlink. Same trick as install-pools.sh.
-		"--config", "activation{udev_sync=0 udev_rules=0}",
-		"-Wn", "-Zn",
-		t.cfg.VolumeGroup)
+		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--name", volumeLVName(vol),
+			// Skip the optional zero-on-create step — the satellite
+			// container has no udev daemon, and the wipe trips on the
+			// missing /dev/<vg>/<lv> symlink. Same trick as install-pools.sh.
+			"--config", "activation{udev_sync=0 udev_rules=0}",
+			"-Wn", "-Zn",
+			t.cfg.VolumeGroup)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate %s", volumeLVName(vol))
 	}
@@ -80,8 +80,8 @@ func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
-		"--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
+		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
 	}
@@ -96,8 +96,8 @@ func (t *Thick) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	_, err := t.exec.Run(ctx, "lvremove",
-		"--force",
-		t.cfg.VolumeGroup+"/"+volumeLVName(vol))
+		Args("--force",
+			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvremove %s", volumeLVName(vol))
 	}
@@ -113,12 +113,12 @@ func (t *Thick) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.V
 // PoolStatus reports the VG's free/total capacity.
 func (t *Thick) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	out, err := t.exec.Run(ctx, "vgs",
-		"--noheadings",
-		"--separator", "|",
-		"-o", "vg_size,vg_free",
-		"--units", "k",
-		"--nosuffix",
-		t.cfg.VolumeGroup)
+		Args("--noheadings",
+			"--separator", "|",
+			"-o", "vg_size,vg_free",
+			"--units", "k",
+			"--nosuffix",
+			t.cfg.VolumeGroup)...)
 	if err != nil {
 		return storage.PoolStatus{}, errors.Wrap(err, "vgs")
 	}
@@ -157,10 +157,10 @@ func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error
 	source := fmt.Sprintf("%s_%05d", snap.ResourceName, 0)
 
 	_, err := t.exec.Run(ctx, "lvcreate",
-		"--snapshot",
-		"--extents", "25%ORIGIN",
-		"--name", snapshotLVName(snap),
-		t.cfg.VolumeGroup+"/"+source)
+		Args("--snapshot",
+			"--extents", "25%ORIGIN",
+			"--name", snapshotLVName(snap),
+			t.cfg.VolumeGroup+"/"+source)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate --snapshot %s", snapshotLVName(snap))
 	}
@@ -171,8 +171,8 @@ func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error
 // DeleteSnapshot mirrors Thin's.
 func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
 	_, err := t.exec.Run(ctx, "lvremove",
-		"--force",
-		t.cfg.VolumeGroup+"/"+snapshotLVName(snap))
+		Args("--force",
+			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvremove -f %s", snapshotLVName(snap))
 	}
@@ -183,9 +183,9 @@ func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error
 // lvExists is the same idempotency primitive Thin uses.
 func (t *Thick) lvExists(ctx context.Context, lvName string) bool {
 	out, err := t.exec.Run(ctx, "lvs",
-		"--noheadings",
-		"-o", "lv_name",
-		t.cfg.VolumeGroup+"/"+lvName)
+		Args("--noheadings",
+			"-o", "lv_name",
+			t.cfg.VolumeGroup+"/"+lvName)...)
 	if err != nil {
 		return false
 	}

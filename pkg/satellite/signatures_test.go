@@ -37,7 +37,7 @@ func TestHasLVMSignaturePvsMatch(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("pvs --noheadings -o pv_name",
+	fx.Expect("pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o pv_name",
 		storage.FakeResponse{Stdout: []byte("  /dev/sda\n  /dev/nvme0n1\n")})
 
 	has, err := satellite.HasLVMSignature(t.Context(), fx, "/dev/sda")
@@ -56,7 +56,7 @@ func TestHasLVMSignatureNoMatch(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("pvs --noheadings -o pv_name",
+	fx.Expect("pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o pv_name",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	has, err := satellite.HasLVMSignature(t.Context(), fx, "/dev/sda")
@@ -119,7 +119,7 @@ func TestIsDeviceFreeAllChecksPassButLVM(t *testing.T) {
 	t.Parallel()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("pvs --noheadings -o pv_name",
+	fx.Expect("pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o pv_name",
 		storage.FakeResponse{Stdout: []byte("/dev/sda\n")})
 
 	dev := &satellite.LsblkDevice{
@@ -141,7 +141,7 @@ func TestIsDeviceFreeAllChecksPassButLVM(t *testing.T) {
 	// Pin the short-circuit: zpool / drbdmeta / wipefs MUST NOT
 	// have been called once LVM said "no".
 	for _, line := range fx.CommandLines() {
-		if line != "pvs --noheadings -o pv_name" {
+		if line != "pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o pv_name" {
 			t.Errorf("unexpected exec call after LVM positive: %q", line)
 		}
 	}

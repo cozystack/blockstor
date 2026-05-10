@@ -31,7 +31,7 @@ import (
 // the resource → pool mapping, CreateSnapshot dispatches `lvcreate -s`.
 func TestCreateSnapshotDispatchesToProvider(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -63,7 +63,7 @@ func TestCreateSnapshotDispatchesToProvider(t *testing.T) {
 		t.Fatalf("expected ok; got %s", resp.GetMessage())
 	}
 
-	want := "lvcreate --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
@@ -99,7 +99,7 @@ func TestCreateSnapshotUnknownResource(t *testing.T) {
 // pool mapping.
 func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -131,7 +131,7 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 		t.Errorf("expected ok; got %s", resp.GetMessage())
 	}
 
-	want := "lvremove --force vg/pvc-1_snap-1_00000"
+	want := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
@@ -150,10 +150,10 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 func TestCreateSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 	fx := storage.NewFakeExec()
 	// Apply path: lvs returns empty so CreateVolume runs.
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// Snapshot path: lvcreate -s fails.
-	fx.Expect("lvcreate --snapshot --name pvc-1_snap-fail_00000 vg/pvc-1_00000",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-fail_00000 vg/pvc-1_00000",
 		storage.FakeResponse{Err: errSnapshotProviderFailed})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -194,9 +194,9 @@ func TestCreateSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 // TestCreateSnapshotProviderErrorReturnsOkFalse for the delete path.
 func TestDeleteSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect("lvremove --force vg/pvc-1_snap-fail_00000",
+	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-fail_00000",
 		storage.FakeResponse{Err: errSnapshotProviderFailed})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

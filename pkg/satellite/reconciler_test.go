@@ -32,7 +32,7 @@ import (
 // volume on the registered LVM-thin pool ends up calling lvcreate.
 func TestApplyCreatesVolumeViaProvider(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -58,7 +58,7 @@ func TestApplyCreatesVolumeViaProvider(t *testing.T) {
 	}
 
 	if !slices.Contains(fx.CommandLines(),
-		"lvcreate --thin --virtualsize 1024MiB --name pvc-1_00000 vg/tp") {
+		"lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize 1024MiB --name pvc-1_00000 vg/tp") {
 		t.Errorf("expected lvcreate; got %v", fx.CommandLines())
 	}
 }
@@ -132,9 +132,9 @@ func TestApplyDisklessSkipsStorage(t *testing.T) {
 // every input gets a result, regardless of individual outcome.
 func TestApplyHandlesMultipleResources(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-2_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-2_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

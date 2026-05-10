@@ -41,7 +41,7 @@ func TestThickKind(t *testing.T) {
 // /dev symlinks.
 func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -55,7 +55,7 @@ func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "lvcreate --size 1024MiB --name pvc-1_00000 --config activation{udev_sync=0 udev_rules=0} -Wn -Zn vg"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 1024MiB --name pvc-1_00000 --config activation{udev_sync=0 udev_rules=0} -Wn -Zn vg"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -64,7 +64,7 @@ func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 // TestThickCreateVolumeIdempotent: existing LV → no lvcreate.
 func TestThickCreateVolumeIdempotent(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-1_00000\n")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -79,7 +79,7 @@ func TestThickCreateVolumeIdempotent(t *testing.T) {
 	}
 
 	for _, line := range fx.CommandLines() {
-		if line == "lvcreate" || (len(line) > 9 && line[:9] == "lvcreate ") {
+		if line == "lvcreate" || (len(line) > 9 && line[:9] == "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } ") {
 			t.Errorf("idempotent CreateVolume issued lvcreate: %s", line)
 		}
 	}
@@ -99,7 +99,7 @@ func TestThickResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "lvextend --size 2048MiB vg/pvc-1_00000"
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
@@ -108,7 +108,7 @@ func TestThickResizeVolumeIssuesLvextend(t *testing.T) {
 // TestThickDeleteVolume: lvremove --force.
 func TestThickDeleteVolume(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-1_00000\n")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -121,7 +121,7 @@ func TestThickDeleteVolume(t *testing.T) {
 		t.Fatalf("DeleteVolume: %v", err)
 	}
 
-	want := "lvremove --force vg/pvc-1_00000"
+	want := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -132,7 +132,7 @@ func TestThickDeleteVolume(t *testing.T) {
 // the thin pool snapshot store).
 func TestThickPoolStatusParsesVgs(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("vgs --noheadings --separator | -o vg_size,vg_free --units k --nosuffix vg",
+	fx.Expect("vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o vg_size,vg_free --units k --nosuffix vg",
 		storage.FakeResponse{Stdout: []byte("104857600.00|78643200.00\n")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -170,7 +170,7 @@ func TestThickCreateSnapshot(t *testing.T) {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
 
-	want := "lvcreate --snapshot --extents 25%ORIGIN --name pvc-1_snap-1_00000 vg/pvc-1_00000"
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --extents 25%ORIGIN --name pvc-1_snap-1_00000 vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -191,7 +191,7 @@ func TestThickDeleteSnapshot(t *testing.T) {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 
-	want := "lvremove --force vg/pvc-1_snap-1_00000"
+	want := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -203,7 +203,7 @@ func TestThickDeleteSnapshot(t *testing.T) {
 // exists at provisioned size.
 func TestThickVolumeStatusViaLVS(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-1_00000|1024.00\n")})
 
 	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -237,7 +237,7 @@ func TestThickVolumeStatusViaLVS(t *testing.T) {
 func TestThickDeleteVolumeMissingIsNoop(t *testing.T) {
 	fx := storage.NewFakeExec()
 	// lvExists path: lvs returns empty (no such LV).
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -251,8 +251,8 @@ func TestThickDeleteVolumeMissingIsNoop(t *testing.T) {
 	}
 
 	for _, cmd := range fx.CommandLines() {
-		if cmd == "lvremove --force vg/pvc-1_00000" {
-			t.Errorf("lvremove ran despite missing LV: %v", fx.CommandLines())
+		if cmd == "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_00000" {
+			t.Errorf("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } ran despite missing LV: %v", fx.CommandLines())
 		}
 	}
 }
@@ -263,7 +263,7 @@ func TestThickDeleteVolumeMissingIsNoop(t *testing.T) {
 // placer's roll-up).
 func TestThickPoolStatusMissingVG(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("vgs --noheadings --separator | -o vg_size,vg_free --units k --nosuffix ghost-vg",
+	fx.Expect("vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o vg_size,vg_free --units k --nosuffix ghost-vg",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "ghost-vg"}, fx)
@@ -279,11 +279,11 @@ func TestThickPoolStatusMissingVG(t *testing.T) {
 }
 
 // TestThickCreateSnapshotErrorWraps: lvcreate --snapshot failure
-// must surface with the "lvcreate --snapshot" wrap keyword for
+// must surface with the "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot" wrap keyword for
 // operator grep.
 func TestThickCreateSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvcreate --snapshot --extents 25%ORIGIN --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --extents 25%ORIGIN --name pvc-1_snap-1_00000 vg/pvc-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -302,10 +302,10 @@ func TestThickCreateSnapshotErrorWraps(t *testing.T) {
 }
 
 // TestThickDeleteSnapshotErrorWraps: lvremove on a snapshot LV must
-// surface with the "lvremove -f" wrap keyword.
+// surface with the "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } -f" wrap keyword.
 func TestThickDeleteSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvremove --force vg/pvc-1_snap-1_00000",
+	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -331,7 +331,7 @@ var errLVMCmdFailed = errors.New("lvm: command failed")
 // error rather than crash or report zero.
 func TestThickVolumeStatusGarbageFromLVS(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-1_00000|not-a-number\n")})
 
 	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
@@ -351,7 +351,7 @@ func TestThickVolumeStatusGarbageFromLVS(t *testing.T) {
 // out rather than silently misparse.
 func TestThickVolumeStatusUnexpectedColumnsFromLVS(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("only-one-column-no-pipe\n")})
 
 	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)

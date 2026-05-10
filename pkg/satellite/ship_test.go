@@ -95,7 +95,7 @@ func TestShipSnapshotZFSUsesZfsSendRecv(t *testing.T) {
 // thin-send-recv mechanism.
 func TestShipSnapshotLVMThinUsesThinSendRecv(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -196,7 +196,7 @@ func TestShipSnapshotZFSPipelineShape(t *testing.T) {
 // thin-send-recv subprocess.
 func TestShipSnapshotThinPipelineShape(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-thin_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-thin_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -294,7 +294,7 @@ func TestShipSnapshotZFSExecErrorSurfaces(t *testing.T) {
 // bad magic in superblock".
 func TestShipSnapshotThinExecErrorSurfaces(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-thin-fail_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-thin-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	fx.Expect("thin-send-recv --source pvc-thin-fail_snap-1_00000 --target n2",
 		storage.FakeResponse{Err: errThinShipMetaCorrupt})
@@ -345,7 +345,7 @@ func TestShipSnapshotThinExecErrorSurfaces(t *testing.T) {
 // CreateVolume(from-snapshot) flow.
 func TestShipSnapshotUnsupportedMechanism(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -427,7 +427,7 @@ func TestShipSnapshotUnknownResource(t *testing.T) {
 // out at the mechanism check.
 func TestShipSnapshotDefaultExecFallsBackToRealExec(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-default-exec_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-default-exec_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

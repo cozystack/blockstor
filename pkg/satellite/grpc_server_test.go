@@ -35,7 +35,7 @@ import (
 func TestGRPCServerApplyResources(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -310,12 +310,12 @@ func TestGRPCServerDeleteResourceProviderError(t *testing.T) {
 	fx := storage.NewFakeExec()
 
 	// First Apply succeeds (registers resource→pool map + creates LV).
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-del-busy_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-del-busy_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// During DeleteResource: lvExists → "yes", lvremove fails (busy).
-	fx.Expect("lvs --noheadings -o lv_name vg/pvc-del-busy_00000",
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-del-busy_00000",
 		storage.FakeResponse{Stdout: []byte("pvc-del-busy_00000\n")})
-	fx.Expect("lvremove --force vg/pvc-del-busy_00000",
+	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-del-busy_00000",
 		storage.FakeResponse{Err: errLVRemoveEBUSY})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

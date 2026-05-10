@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
 
 // HasLVMSignature reports whether the named device is already a
@@ -37,7 +38,7 @@ import (
 // means no PVs at all on this host (fresh install) — return
 // false. Phase 10.7.
 func HasLVMSignature(ctx context.Context, exec storage.Exec, devicePath string) (bool, error) {
-	out, err := exec.Run(ctx, "pvs", "--noheadings", "-o", "pv_name")
+	out, err := exec.Run(ctx, "pvs", lvm.Args("--noheadings", "-o", "pv_name")...)
 	if err != nil {
 		return false, errors.Wrap(err, "pvs")
 	}
