@@ -19,6 +19,7 @@ package lvm_test
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -364,5 +365,49 @@ func TestThinPoolStatusGarbageFromLvs(t *testing.T) {
 	_, err := p.PoolStatus(t.Context())
 	if err == nil {
 		t.Fatalf("PoolStatus on garbage lvs output: got nil, want parse error")
+	}
+}
+
+// TestThinCreateSnapshotErrorWraps: lvcreate -s failure must
+// surface with the "lvcreate -s" wrap keyword for operator grep.
+func TestThinCreateSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvcreate --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Err: errLVMCmdFailed})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	err := p.CreateSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("CreateSnapshot: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "lvcreate -s") {
+		t.Errorf("wrap: %q must contain \"lvcreate -s\"", err.Error())
+	}
+}
+
+// TestThinDeleteSnapshotErrorWraps: lvremove on a snapshot LV must
+// surface with the "lvremove -f" wrap keyword.
+func TestThinDeleteSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvremove --force vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Err: errLVMCmdFailed})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("DeleteSnapshot: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "lvremove -f") {
+		t.Errorf("wrap: %q must contain \"lvremove -f\"", err.Error())
 	}
 }
