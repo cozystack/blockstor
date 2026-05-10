@@ -420,6 +420,93 @@ func TestPeerPortOfFallback(t *testing.T) {
 	}
 }
 
+// TestLowestDiskfulIDSkipsDiskless: the auto-primary seed picker
+// must NEVER pick a DISKLESS replica even if it has the lowest
+// node-id. Promoting a witness to Primary defeats its purpose
+// (network-only quorum presence) and would corrupt DRBD's wire
+// protocol — the witness has no local data to seed from.
+func TestLowestDiskfulIDSkipsDiskless(t *testing.T) {
+	t.Parallel()
+
+	id0 := int32(0)
+	id1 := int32(1)
+	id2 := int32(2)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			// Witness with id=0 — must be skipped.
+			Flags: []string{"DISKLESS"},
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id0},
+	}
+
+	peers := []blockstoriov1alpha1.Resource{
+		// Diskful with id=1.
+		{
+			Spec:   blockstoriov1alpha1.ResourceSpec{NodeName: "n2"},
+			Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id1},
+		},
+		// Diskful with id=2.
+		{
+			Spec:   blockstoriov1alpha1.ResourceSpec{NodeName: "n3"},
+			Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id2},
+		},
+	}
+
+	got := dispatcher.LowestDiskfulID(target, peers)
+	if got != 1 {
+		t.Errorf("got %d, want 1 (diskless target with id=0 must be skipped)", got)
+	}
+}
+
+// TestLowestDiskfulIDSkipsUnallocated: replicas whose Status hasn't
+// yet been written (DRBDNodeID == nil) yield -1 from nodeIDOf and
+// must be skipped — picking an unallocated replica would seed with
+// id=-1 which DRBD would reject.
+func TestLowestDiskfulIDSkipsUnallocated(t *testing.T) {
+	t.Parallel()
+
+	id5 := int32(5)
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+		},
+		// DRBDNodeID intentionally nil.
+	}
+
+	peers := []blockstoriov1alpha1.Resource{
+		{
+			Spec:   blockstoriov1alpha1.ResourceSpec{NodeName: "n2"},
+			Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &id5},
+		},
+	}
+
+	got := dispatcher.LowestDiskfulID(target, peers)
+	if got != 5 {
+		t.Errorf("got %d, want 5 (unallocated target must be skipped)", got)
+	}
+}
+
+// TestLowestDiskfulIDAllUnallocated: when nothing is allocated yet,
+// the helper returns its sentinel (1<<30) so the caller can detect
+// "no diskful seed candidate" rather than panic on min-of-empty.
+func TestLowestDiskfulIDAllUnallocated(t *testing.T) {
+	t.Parallel()
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{NodeName: "n1"},
+	}
+
+	got := dispatcher.LowestDiskfulID(target, nil)
+	if got != (1 << 30) {
+		t.Errorf("got %d, want sentinel 1<<30 (no diskful candidate)", got)
+	}
+}
+
 // TestPeerAddress: lookup → host extraction + fallback contract.
 // peerAddress must:
 //   - return just the host part of "host:port"

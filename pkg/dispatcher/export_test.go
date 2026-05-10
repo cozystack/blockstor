@@ -51,3 +51,11 @@ func ReadDRBDMinor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1al
 func PeerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 	return peerPortOf(r, fallback)
 }
+
+// LowestDiskfulID exposes the diskful-replica node-id picker. Tests
+// pin the DISKLESS-skip + unallocated-skip rules so the auto-primary
+// seed always lands on a real diskful replica (never on a witness or
+// an as-yet-unallocated replica).
+func LowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int32 {
+	return lowestDiskfulID(target, peers)
+}
