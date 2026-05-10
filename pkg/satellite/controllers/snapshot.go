@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 )
 
 // SnapshotReconciler watches Snapshot CRDs and acts on those
@@ -76,10 +77,11 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		"name", snap.Spec.SnapshotName,
 		"deletionTimestamp", snap.DeletionTimestamp)
 
-	// Phase 10.1 follow-up: delegate to
-	// Config.Apply.CreateSnapshot / DeleteSnapshot. Until then
-	// the gRPC consumer drives snapshot ops.
-	return ctrl.Result{}, nil
+	if !snap.DeletionTimestamp.IsZero() {
+		return r.handleDelete(ctx, &snap)
+	}
+
+	return r.handleCreate(ctx, &snap)
 }
 
 // SetupWithManager wires the reconciler with a node-membership
@@ -95,6 +97,59 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// handleCreate translates a Snapshot CRD into a CreateSnapshot
+// gRPC-shaped request and dispatches it to the existing
+// `Config.Apply.CreateSnapshot` body. Idempotent — re-running
+// on an existing snapshot is a no-op (the provider-side
+// `lvcreate --snapshot` already short-circuits on existing LV).
+func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	req := &satellitepb.CreateSnapshotRequest{
+		ResourceName: snap.Spec.ResourceDefinitionName,
+		SnapshotName: snap.Spec.SnapshotName,
+	}
+
+	for i := range snap.Spec.VolumeDefinitions {
+		req.VolumeNumbers = append(req.VolumeNumbers, snap.Spec.VolumeDefinitions[i].VolumeNumber)
+	}
+
+	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "CreateSnapshot")
+	}
+
+	if !resp.GetOk() {
+		// Body-level failure (per-snapshot, not transport). Log
+		// and let the next reconcile retry — controller-runtime's
+		// rate limiter handles back-off.
+		log.FromContext(ctx).Info("CreateSnapshot per-snapshot failure",
+			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// handleDelete mirrors handleCreate for the DeletionTimestamp
+// case. Idempotent — DeleteSnapshot on a missing snapshot is
+// a no-op so a re-run after a satellite restart is safe.
+func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	req := &satellitepb.DeleteSnapshotRequest{
+		ResourceName: snap.Spec.ResourceDefinitionName,
+		SnapshotName: snap.Spec.SnapshotName,
+	}
+
+	resp, err := r.Config.Apply.DeleteSnapshot(ctx, req)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "DeleteSnapshot")
+	}
+
+	if !resp.GetOk() {
+		log.FromContext(ctx).Info("DeleteSnapshot per-snapshot failure",
+			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+	}
+
+	return ctrl.Result{}, nil
 }
 
 // snapshotNodePredicate filters Snapshot events to those whose
