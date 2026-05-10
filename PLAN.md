@@ -692,12 +692,17 @@ fields directly and emits each non-zero one into the right
 
 ### 10.4 — Eliminate `KVEntry` CRD
 
-- [ ] **`ControllerProps` instance → typed singleton CRD**. New `ControllerConfig` cluster-scoped CRD, name=`default`, with structured fields (`Spec.DRBDOptions`, `Spec.AutoQuorum`, `Spec.AutoAddQuorumTiebreaker`, `Spec.PassphraseSecretRef`). Migration job seeds one from existing `KVEntry/ControllerProps` items.
+**No data migration**: existing dev / pre-prod environments are
+recreated from scratch when this lands. Phase 10 is pre-1.0; the
+operational cost of writing a one-shot migration job exceeds the
+cost of `kubectl delete -f manifests/ && kubectl apply -f manifests/`
+on the affected clusters.
+
+- [ ] **`ControllerProps` instance → typed singleton CRD**. New `ControllerConfig` cluster-scoped CRD, name=`default`, with structured fields (`Spec.DRBDOptions`, `Spec.AutoQuorum`, `Spec.AutoAddQuorumTiebreaker`, `Spec.PassphraseSecretRef`). Operators populate it on a fresh install via manifest / Helm chart values.
 - [ ] **Cluster passphrase → native `Secret`**. New Secret (default name `blockstor-cluster-passphrase`, key `passphrase`). `ControllerConfig.Spec.PassphraseSecretRef` points at it. REST endpoints (`/v1/encryption/passphrase` POST/PATCH/PUT) rewritten to mutate the Secret.
 - [ ] **`csi-volumes` instance → per-Resource annotation**. linstor-csi's per-PVC JSON metadata moves to `Resource.metadata.annotations["blockstor.io/csi-volume-data"]`. Annotations have no size limit issue at csi-typical payloads (typically 1-4 KiB; per-object annotation cap is 256 KiB).
 - [ ] **`csi-snapshot-shippings` instance → per-Snapshot annotation** (`blockstor.io/csi-shipping-data`).
 - [ ] **REST `/v1/key-value-store/{instance}` rewritten** on top of the new homes. `GET csi-volumes` does `client.List(Resources)` and assembles a map from annotations; `POST csi-volumes/{key}` writes the annotation on the matching Resource. golinstor sees the same shape.
-- [ ] **Migration job**: on first run after upgrade, list every `KVEntry`, write to the new home (annotation / Secret / ControllerConfig), then delete the KVEntries. Fails fast if any entry has an instance the migrator doesn't know about — operator must triage.
 - [ ] **Drop `kventries.blockstor.io.blockstor.io` CRD** type registration, `api/v1alpha1/kventry_types.go`, `pkg/store/k8s/kv_store.go`, the `KeyValueStore` interface in `pkg/store/store.go`.
 
 ### 10.5 — `ApplyStoragePools` made non-stub (absorbs the existing architectural-debt item)
