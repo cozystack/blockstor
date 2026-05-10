@@ -17,12 +17,17 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 
+	"github.com/cockroachdb/errors"
+
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerPhysicalStorage wires the `linstor physical-storage`
@@ -113,6 +118,24 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 
 	target.AttachTo = buildAttachTo(&req)
 
+	// Phase 10.7 step 2 (controller-side pool create): if the
+	// target StoragePool CRD doesn't exist yet, create it from
+	// the request envelope so the satellite's PhysicalDevice
+	// reconciler doesn't sit in `PoolMissing` until an operator
+	// applies the pool separately. `with_storage_pool.props`
+	// carries the provider-specific config (vg name, thin pool
+	// name, zpool name) the satellite's NewProviderFromKind
+	// reads. Lossy on race with a parallel `kubectl apply -f
+	// storagepool.yaml` — store.ErrAlreadyExists is treated as
+	// success (the existing CRD wins, the operator's intent
+	// rather than the CDP request's wins).
+	err = ensureStoragePoolForAttach(r.Context(), s.Store, node, target.AttachTo, &req)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	err = s.Store.PhysicalDevices().Update(r.Context(), target)
 	if err != nil {
 		writeStoreError(w, err)
@@ -164,6 +187,86 @@ func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) *apiv1
 	}
 
 	return nil
+}
+
+// ensureStoragePoolForAttach creates a StoragePool CRD that
+// matches the inbound attach request if one doesn't already
+// exist on the named node. Phase 10.7 step 2.
+//
+// The pool's Spec.Props carries the provider-specific config
+// (StorDriver/LvmVg, StorDriver/ThinPool, StorDriver/ZPool,
+// StorDriver/FileDir) the satellite's NewProviderFromKind
+// reads. We pull those from `with_storage_pool.props`
+// (operator-supplied) and fall back to mirroring the AttachTo
+// fields so a minimal request without a `with_storage_pool`
+// block still produces a working pool.
+//
+// store.ErrAlreadyExists on Create is treated as success — a
+// parallel `kubectl apply -f storagepool.yaml` already won the
+// race and the existing CRD takes precedence over the CDP
+// request's inferred config.
+func ensureStoragePoolForAttach(ctx context.Context, st store.Store, node string, attach *apiv1.PhysicalDeviceAttachTo, req *physicalStorageCreateRequest) error {
+	if attach == nil || attach.StoragePoolName == "" {
+		return nil
+	}
+
+	_, err := st.StoragePools().Get(ctx, node, attach.StoragePoolName)
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrap(err, "lookup StoragePool")
+	}
+
+	pool := &apiv1.StoragePool{
+		StoragePoolName: attach.StoragePoolName,
+		NodeName:        node,
+		ProviderKind:    attach.ProviderKind,
+		Props:           buildPoolPropsForAttach(attach, req),
+	}
+
+	err = st.StoragePools().Create(ctx, pool)
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyExists) {
+			return nil
+		}
+
+		return errors.Wrap(err, "create StoragePool")
+	}
+
+	return nil
+}
+
+// buildPoolPropsForAttach assembles the per-pool Props bag from
+// the operator's `with_storage_pool.props` block, filling in
+// provider-specific defaults from `AttachTo` when the operator
+// didn't supply them. The satellite's NewProviderFromKind reads
+// these keys to instantiate the right provider.
+func buildPoolPropsForAttach(attach *apiv1.PhysicalDeviceAttachTo, req *physicalStorageCreateRequest) map[string]string {
+	props := map[string]string{}
+
+	if req.WithStoragePool != nil {
+		maps.Copy(props, req.WithStoragePool.Props)
+	}
+
+	if attach.VGName != "" && props["StorDriver/LvmVg"] == "" {
+		props["StorDriver/LvmVg"] = attach.VGName
+	}
+
+	if attach.ThinPoolName != "" && props["StorDriver/ThinPool"] == "" {
+		props["StorDriver/ThinPool"] = attach.ThinPoolName
+	}
+
+	if attach.ZPoolName != "" && props["StorDriver/ZPool"] == "" {
+		props["StorDriver/ZPool"] = attach.ZPoolName
+	}
+
+	if attach.Directory != "" && props["StorDriver/FileDir"] == "" {
+		props["StorDriver/FileDir"] = attach.Directory
+	}
+
+	return props
 }
 
 // buildAttachTo turns the upstream PhysicalStorageCreate envelope

@@ -254,6 +254,122 @@ func TestPhysicalStorageCreateFlipsAttachTo(t *testing.T) {
 	}
 }
 
+// TestPhysicalStorageCreateAutoCreatesStoragePool pins the
+// Phase 10.7 step-2 contract: a CDP POST that names a
+// StoragePool which doesn't exist yet must materialise the
+// pool via the same request rather than leaving the satellite
+// in PoolMissing until an operator applies the pool
+// separately. The pool's Spec carries the provider-specific
+// Props the satellite reads to instantiate the backend.
+func TestPhysicalStorageCreateAutoCreatesStoragePool(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/wwn-0xWWN-A",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "LVM_THIN",
+			"device_paths": ["/dev/disk/by-id/wwn-0xWWN-A"],
+			"with_storage_pool": {
+				"name": "thin1",
+				"props": {
+					"StorDriver/LvmVg": "vg",
+					"StorDriver/ThinPool": "tp"
+				}
+			}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	pool, err := st.StoragePools().Get(t.Context(), "n1", "thin1")
+	if err != nil {
+		t.Fatalf("StoragePool should exist after CDP: %v", err)
+	}
+
+	if pool.ProviderKind != "LVM_THIN" {
+		t.Errorf("ProviderKind: got %q, want LVM_THIN", pool.ProviderKind)
+	}
+
+	if pool.Props["StorDriver/LvmVg"] != "vg" {
+		t.Errorf("StorDriver/LvmVg: got %q, want vg", pool.Props["StorDriver/LvmVg"])
+	}
+
+	if pool.Props["StorDriver/ThinPool"] != "tp" {
+		t.Errorf("StorDriver/ThinPool: got %q, want tp", pool.Props["StorDriver/ThinPool"])
+	}
+}
+
+// TestPhysicalStorageCreatePreservesExistingStoragePool pins
+// the operator-wins half of the contract: a pre-existing
+// StoragePool CRD must not be overwritten by a CDP request,
+// even when the request's `with_storage_pool.props` would have
+// produced a different config. The GitOps source of truth wins.
+func TestPhysicalStorageCreatePreservesExistingStoragePool(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/wwn-0xWWN-A",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed device: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "thin1",
+		NodeName:        "n1",
+		ProviderKind:    "LVM_THIN",
+		Props: map[string]string{
+			"StorDriver/LvmVg":    "operator-vg",
+			"StorDriver/ThinPool": "operator-tp",
+		},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "LVM_THIN",
+			"device_paths": ["/dev/disk/by-id/wwn-0xWWN-A"],
+			"with_storage_pool": {
+				"name": "thin1",
+				"props": {"StorDriver/LvmVg": "cdp-vg"}
+			}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	pool, err := st.StoragePools().Get(ctx, "n1", "thin1")
+	if err != nil {
+		t.Fatalf("StoragePool Get: %v", err)
+	}
+
+	if pool.Props["StorDriver/LvmVg"] != "operator-vg" {
+		t.Errorf("pre-existing pool config overwritten: %+v", pool.Props)
+	}
+}
+
 // TestPhysicalStorageCreateRejectsAttached: 404 when the matching
 // device is already attached (Spec.AttachTo set). Operators must
 // re-run discovery / wait for delete-as-completion before re-using
