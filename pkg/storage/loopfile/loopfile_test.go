@@ -408,3 +408,78 @@ func TestPoolStatusErrorWrapsOnMissingDir(t *testing.T) {
 		t.Errorf("error wrap: got %q, want substring \"statfs\"", err.Error())
 	}
 }
+
+// TestVolumeStatusReusesExistingLoop pins the attach() reuse-existing
+// branch: when `losetup -j <path>` reports an existing /dev/loopN
+// already pointing at the file, attach must return THAT device
+// rather than allocate a fresh one. Without this short-circuit, a
+// reconcile-heavy path leaks loop nodes pointing at the same
+// backing file (observed in production).
+func TestVolumeStatusReusesExistingLoop(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "pvc-reuse_00000.img")
+
+	if err := os.WriteFile(imgPath, make([]byte, 4096), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	// losetup -j returns "/dev/loop3: ..." for an already-attached file.
+	fx.Expect("losetup -j "+imgPath,
+		storage.FakeResponse{Stdout: []byte("/dev/loop3: 0 (" + imgPath + ")\n")})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	got, err := p.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "pvc-reuse",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("VolumeStatus: %v", err)
+	}
+
+	if got.DevicePath != "/dev/loop3" {
+		t.Errorf("DevicePath: got %q, want /dev/loop3 (must reuse, not re-attach)", got.DevicePath)
+	}
+
+	for _, cmd := range fx.CommandLines() {
+		if strings.HasPrefix(cmd, "losetup --find --show") {
+			t.Errorf("losetup --find --show ran despite existing attach: %v", fx.CommandLines())
+		}
+	}
+}
+
+// TestVolumeStatusEmptyLosetupOutput pins the "losetup returned
+// empty device" error. losetup --find --show should never emit an
+// empty line on success; if it ever does (kernel bug, container
+// /dev mounting weirdness), the satellite must surface it as an
+// error rather than persist DevicePath="" on the Status writeback,
+// which would later trip drbd-9 looking for the disk.
+func TestVolumeStatusEmptyLosetupOutput(t *testing.T) {
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "pvc-empty_00000.img")
+
+	if err := os.WriteFile(imgPath, make([]byte, 4096), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	// First losetup -j returns nothing → no existing attach.
+	fx.Expect("losetup -j "+imgPath, storage.FakeResponse{Stdout: []byte("")})
+	// losetup --find --show then returns blank.
+	fx.Expect("losetup --find --show "+imgPath, storage.FakeResponse{Stdout: []byte("\n")})
+
+	p := loopfile.NewProvider(loopfile.Config{Dir: dir}, fx)
+
+	_, err := p.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "pvc-empty",
+		VolumeNumber: 0,
+	})
+	if err == nil {
+		t.Fatalf("VolumeStatus: got nil, want error on empty losetup output")
+	}
+
+	if !strings.Contains(err.Error(), "empty device") {
+		t.Errorf("error wrap: got %q, want substring \"empty device\"", err.Error())
+	}
+}
