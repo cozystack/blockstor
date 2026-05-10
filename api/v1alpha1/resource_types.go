@@ -54,6 +54,13 @@ type ResourceSpec struct {
 	// +optional
 	ExtraProps map[string]string `json:"extraProps,omitempty"`
 
+	// storagePool is the LINSTOR storage pool name this replica
+	// allocates from. Replaces `Spec.Props["StorPoolName"]` (which
+	// the dispatcher's buildVolumes already prefers when set).
+	// Phase 10.3 step.
+	// +optional
+	StoragePool string `json:"storagePool,omitempty"`
+
 	// volumes carries per-volume seed configuration that the
 	// satellite applies once on first activation of this replica.
 	// Today the only field is SeedFromGi (Phase 8.1) — when set,

@@ -253,6 +253,17 @@ func mergeVolumeObservations(dst *[]crdv1alpha1.ResourceVolumeStatus, observatio
 func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 	props := mergeProps(crd.Spec.Props, typedToProps(crd.Spec.DRBDOptions, crd.Spec.ExtraProps))
 
+	// Phase 10.3 step: re-emit typed StoragePool back into Props
+	// so golinstor + the dispatcher's legacy fallback see the
+	// upstream-compatible shape on GET.
+	if crd.Spec.StoragePool != "" {
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		props["StorPoolName"] = crd.Spec.StoragePool
+	}
+
 	return apiv1.Resource{
 		Name:     crd.Spec.ResourceDefinitionName,
 		NodeName: crd.Spec.NodeName,
@@ -290,5 +301,10 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 		DRBDOptions:            typed,
 		ExtraProps:             extras,
 		Flags:                  in.Flags,
+		// Phase 10.3 step: lift Props["StorPoolName"] into the
+		// typed slot. The legacy key stays in residual Props (it's
+		// non-DRBD, so stripDRBDProps left it alone) for forward-
+		// compat — readers still consulting Props will see it.
+		StoragePool: in.Props["StorPoolName"],
 	}
 }

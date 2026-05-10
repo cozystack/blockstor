@@ -224,6 +224,11 @@ func (r *ResourceReconciler) maybeAutoDiskful(ctx context.Context, target *block
 	target.Spec.Flags = slices.DeleteFunc(target.Spec.Flags,
 		func(s string) bool { return s == apiv1.ResourceFlagDiskless })
 
+	// Phase 10.3 step: prefer typed Spec.StoragePool. Keep the
+	// legacy Props key in sync for forward-compat with any reader
+	// that hasn't migrated.
+	target.Spec.StoragePool = pool
+
 	if target.Spec.Props == nil {
 		target.Spec.Props = map[string]string{}
 	}

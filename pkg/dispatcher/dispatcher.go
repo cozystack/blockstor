@@ -419,7 +419,18 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 		return nil
 	}
 
-	pool := target.Spec.Props["StorPoolName"]
+	// Phase 10.3 step: typed `Spec.StoragePool` wins over the legacy
+	// `Spec.Props["StorPoolName"]` so we don't read stale data when
+	// the controller has already migrated. RD-level fallback still
+	// goes through Props since RD has no typed slot for the pool
+	// name (it lives on a per-volume VG.Props in
+	// ResourceGroupVolumeGroup; the RD-prop fallback is the legacy
+	// shim).
+	pool := target.Spec.StoragePool
+	if pool == "" {
+		pool = target.Spec.Props["StorPoolName"]
+	}
+
 	if pool == "" {
 		pool = rd.Spec.Props["StorPoolName"]
 	}
@@ -471,7 +482,11 @@ func (d *Dispatcher) DeleteResource(ctx context.Context, target *blockstoriov1al
 
 	defer func() { _ = closer() }()
 
-	pool := target.Spec.Props["StorPoolName"]
+	pool := target.Spec.StoragePool
+	if pool == "" {
+		pool = target.Spec.Props["StorPoolName"]
+	}
+
 	if pool == "" && rd != nil {
 		pool = rd.Spec.Props["StorPoolName"]
 	}

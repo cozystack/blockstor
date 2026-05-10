@@ -229,6 +229,13 @@ spec:
               resourceDefinitionName:
                 description: resourceDefinitionName is the parent ResourceDefinition.
                 type: string
+              storagePool:
+                description: |-
+                  storagePool is the LINSTOR storage pool name this replica
+                  allocates from. Replaces `Spec.Props["StorPoolName"]` (which
+                  the dispatcher's buildVolumes already prefers when set).
+                  Phase 10.3 step.
+                type: string
               volumes:
                 description: |-
                   volumes carries per-volume seed configuration that the
