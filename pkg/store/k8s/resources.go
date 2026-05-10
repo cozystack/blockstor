@@ -185,7 +185,7 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 // the satellite reported runtime state via Spec props rather than a
 // dedicated Status field. New callers should put runtime info into
 // state directly; the props bag is kept for back-compat.
-func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string) error {
+func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string, volumes []apiv1.VolumeObservation) error {
 	var existing crdv1alpha1.Resource
 
 	key := types.NamespacedName{Name: resourceCRDName(rdName, node)}
@@ -214,12 +214,51 @@ func (s *resources) SetState(ctx context.Context, rdName, node string, state api
 
 	existing.Status.InUse = state.InUse
 
+	mergeVolumeObservations(&existing.Status.Volumes, volumes)
+
 	err = s.c.Status().Update(ctx, &existing)
 	if err != nil {
 		return errors.Wrapf(err, "update Resource Status %s/%s", rdName, node)
 	}
 
 	return nil
+}
+
+// mergeVolumeObservations applies satellite-side per-volume
+// observations onto a Resource's Status.Volumes slice in place.
+// New volume numbers are appended; matching numbers update only the
+// non-empty fields (so we don't blow away CurrentGi when a frame
+// only carries DiskState, or vice versa).
+func mergeVolumeObservations(dst *[]crdv1alpha1.ResourceVolumeStatus, observations []apiv1.VolumeObservation) {
+	for _, vol := range observations {
+		idx := -1
+
+		for i := range *dst {
+			if (*dst)[i].VolumeNumber == vol.VolumeNumber {
+				idx = i
+
+				break
+			}
+		}
+
+		if idx == -1 {
+			*dst = append(*dst, crdv1alpha1.ResourceVolumeStatus{
+				VolumeNumber: vol.VolumeNumber,
+				DiskState:    vol.State.DiskState,
+				CurrentGi:    vol.State.CurrentGi,
+			})
+
+			continue
+		}
+
+		if vol.State.DiskState != "" {
+			(*dst)[idx].DiskState = vol.State.DiskState
+		}
+
+		if vol.State.CurrentGi != "" {
+			(*dst)[idx].CurrentGi = vol.State.CurrentGi
+		}
+	}
 }
 
 func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {

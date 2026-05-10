@@ -201,7 +201,22 @@ func (s *Server) applyObserved(ctx context.Context, ev *satellitepb.ResourceObse
 
 	state := apiv1.ResourceState{InUse: ev.GetInUse()}
 
-	err := s.st.Resources().SetState(ctx, ev.GetResourceName(), ev.GetNodeName(), state, drbdProps)
+	// Per-volume observations — surface DiskState + CurrentGi onto
+	// Resource.Status.Volumes[i] so the controller's seed-from-peer
+	// path can read CurrentGi when adding a new replica (Phase 8.1).
+	var volObs []apiv1.VolumeObservation
+
+	for _, vol := range ev.GetVolumes() {
+		volObs = append(volObs, apiv1.VolumeObservation{
+			VolumeNumber: vol.GetVolumeNumber(),
+			State: apiv1.VolumeState{
+				DiskState: vol.GetDiskState(),
+				CurrentGi: vol.GetCurrentUuid(),
+			},
+		})
+	}
+
+	err := s.st.Resources().SetState(ctx, ev.GetResourceName(), ev.GetNodeName(), state, drbdProps, volObs)
 	if err != nil {
 		// NotFound is normal during convergence — the satellite may
 		// observe state for a resource the controller hasn't yet

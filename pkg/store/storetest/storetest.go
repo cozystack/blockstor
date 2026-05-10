@@ -951,7 +951,8 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 		}
 		err := s.SetState(ctx, "pvc-1", "n1",
 			apiv1.ResourceState{InUse: true},
-			map[string]string{"DrbdState": "UpToDate"})
+			map[string]string{"DrbdState": "UpToDate"},
+			nil)
 		if err != nil {
 			t.Fatalf("SetState: %v", err)
 		}
@@ -969,7 +970,7 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Run("SetStateMissing", func(t *testing.T) {
 		s := newStore(t).Resources()
 		err := s.SetState(t.Context(), "pvc-missing", "n1",
-			apiv1.ResourceState{InUse: true}, nil)
+			apiv1.ResourceState{InUse: true}, nil, nil)
 		if !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("SetState on missing: got %v, want ErrNotFound", err)
 		}
@@ -1047,7 +1048,7 @@ func testResourceSetStateNilProps(t *testing.T, newStore Factory) {
 	}
 
 	err := s.SetState(ctx, "pvc-nil", "n1",
-		apiv1.ResourceState{InUse: true}, nil) // explicit nil drbdProps
+		apiv1.ResourceState{InUse: true}, nil, nil) // explicit nil drbdProps + no per-volume state
 	if err != nil {
 		t.Fatalf("SetState: %v", err)
 	}

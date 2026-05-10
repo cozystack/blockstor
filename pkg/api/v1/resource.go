@@ -59,4 +59,18 @@ type Volume struct {
 // VolumeState is the runtime state surface of a Volume.
 type VolumeState struct {
 	DiskState string `json:"disk_state,omitempty"`
+
+	// CurrentGi is the DRBD-9 generation identifier reported by
+	// `drbdsetup events2 --full` for this replica's local volume.
+	// The controller reads it when adding a new replica to skip the
+	// full initial-sync (Phase 8.1).
+	CurrentGi string `json:"current_gi,omitempty"`
+}
+
+// VolumeObservation carries per-volume observed state propagated from
+// the satellite's events2 observer into the store. Used by SetState
+// to update per-volume Status fields without touching Spec.
+type VolumeObservation struct {
+	VolumeNumber int32
+	State        VolumeState
 }

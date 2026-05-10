@@ -103,12 +103,17 @@ type ResourceStore interface {
 	Delete(ctx context.Context, rdName, node string) error
 
 	// SetState writes the runtime-observed state subresource (InUse,
-	// DRBD state prop bag) without touching Spec. Required because
-	// the satellite's events2 observer can race a Spec mutation
-	// (auto-diskful, resize) and naive whole-object Updates would
-	// either lose State or clobber Spec. The k8s store routes this
-	// through .Status().Update().
-	SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string) error
+	// DRBD state prop bag, per-volume observations) without touching
+	// Spec. Required because the satellite's events2 observer can
+	// race a Spec mutation (auto-diskful, resize) and naive whole-
+	// object Updates would either lose State or clobber Spec. The
+	// k8s store routes this through .Status().Update().
+	//
+	// volumes carries per-volume observed state (DiskState,
+	// CurrentGi) the controller's seed-from-peer path reads to skip
+	// the full initial-sync on replica-add (Phase 8.1). Empty slice
+	// is fine — only resource-level state gets updated.
+	SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string, volumes []apiv1.VolumeObservation) error
 }
 
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite

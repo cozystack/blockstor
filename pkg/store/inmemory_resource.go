@@ -35,8 +35,9 @@ type rKey struct {
 }
 
 type inMemoryResources struct {
-	mu sync.RWMutex
-	m  map[rKey]apiv1.Resource
+	mu        sync.RWMutex
+	m         map[rKey]apiv1.Resource
+	volStates map[rKey]map[int32]apiv1.VolumeState
 }
 
 func (s *inMemoryResources) List(_ context.Context) ([]apiv1.Resource, error) {
@@ -141,7 +142,14 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 // SetState mutates the runtime-observed state without touching Spec.
 // In the in-memory store there's no Status subresource, so we just
 // merge the runtime fields onto the stored value.
-func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string) error {
+//
+// volumes carries per-volume observed state (DiskState, CurrentGi);
+// stashed in a side-map keyed by (rd, node) so consumers that need
+// per-volume CurrentGi readback can ask. The wire-shape `Resource`
+// type intentionally has no Volumes slice — `ResourceWithVolumes`
+// at the REST boundary stitches per-volume state separately — so
+// the side-map is the InMemory equivalent.
+func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, state apiv1.ResourceState, drbdProps map[string]string, volumes []apiv1.VolumeObservation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -164,5 +172,37 @@ func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, sta
 
 	s.m[key] = existing
 
+	if len(volumes) > 0 {
+		if s.volStates == nil {
+			s.volStates = map[rKey]map[int32]apiv1.VolumeState{}
+		}
+
+		if s.volStates[key] == nil {
+			s.volStates[key] = map[int32]apiv1.VolumeState{}
+		}
+
+		for _, vol := range volumes {
+			s.volStates[key][vol.VolumeNumber] = vol.State
+		}
+	}
+
 	return nil
+}
+
+// VolumeStateForTest exposes per-volume state for the in-memory store
+// to the shared storetest suite. Production callers read per-volume
+// state via the K8s store's `Resource.Status.Volumes[i]` (CRD Status
+// subresource) — InMemory mirrors the same data via this helper so
+// the lock-step test suite can assert both stores agree.
+func (s *inMemoryResources) VolumeStateForTest(rdName, node string, volumeNumber int32) (apiv1.VolumeState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.volStates == nil {
+		return apiv1.VolumeState{}, false
+	}
+
+	st, ok := s.volStates[rKey{rdName, node}][volumeNumber]
+
+	return st, ok
 }
