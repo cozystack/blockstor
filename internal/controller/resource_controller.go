@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"maps"
 	"slices"
 	"time"
 
@@ -35,6 +34,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -795,116 +795,14 @@ func (r *ResourceReconciler) takenOnNode(ctx context.Context, nodeName string, p
 	return out, nil
 }
 
-// resolveEffectiveProps walks the controller → RG → RD → Resource
-// scopes and returns the merged DRBD-options bag the dispatcher
-// hands to the satellite. Lower scopes override upper. Each scope is
-// best-effort: a missing controller-props KV instance, missing RG
-// reference, or missing RD all silently degrade to "empty" rather
-// than block the dispatch — the resource can still come up with
-// satellite-only defaults.
-//
-// As of Phase 10.3 step 5 the typed `Spec.DRBDOptions` is the source
-// of truth — we resolve via `drbd.ResolveDRBDOptions`, then flatten
-// to a string Props map for the satellite proto (typed proto comes
-// in a later step). Legacy `Spec.Props` keys + `ExtraProps` are
-// merged in too so a partially-migrated cluster keeps rendering
-// the same .res file.
+// resolveEffectiveProps delegates to the shared `pkg/effectiveprops`
+// package (Phase 10.1 lift-out) so the satellite-side reconciler
+// can use the same hierarchy resolution without duplicating
+// 80 lines of merge logic. The wrapper survives because the
+// existing call sites are `r.resolveEffectiveProps(ctx, target, rd)`
+// and we don't want to churn them.
 func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *blockstoriov1alpha1.Resource, rdPtr *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
-	controllerProps, err := r.controllerProps(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ctrlCfg, err := r.controllerConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var (
-		ctrlTyped  *blockstoriov1alpha1.DRBDOptions
-		ctrlExtras map[string]string
-		rgProps    map[string]string
-		rdProps    map[string]string
-		rgTyped    *blockstoriov1alpha1.DRBDOptions
-		rdTyped    *blockstoriov1alpha1.DRBDOptions
-		rgExtras   map[string]string
-		rdExtras   map[string]string
-	)
-
-	if ctrlCfg != nil {
-		ctrlTyped = ctrlCfg.Spec.DRBDOptions
-		ctrlExtras = ctrlCfg.Spec.ExtraProps
-	}
-
-	if rdPtr != nil {
-		rdProps = rdPtr.Spec.Props
-		rdTyped = rdPtr.Spec.DRBDOptions
-		rdExtras = rdPtr.Spec.ExtraProps
-
-		if rdPtr.Spec.ResourceGroupName != "" {
-			var rg blockstoriov1alpha1.ResourceGroup
-
-			err := r.Get(ctx, client.ObjectKey{Name: rdPtr.Spec.ResourceGroupName}, &rg)
-			switch {
-			case err == nil:
-				rgProps = rg.Spec.Props
-				rgTyped = rg.Spec.DRBDOptions
-				rgExtras = rg.Spec.ExtraProps
-			case errors.IsNotFound(err):
-				// Soft-fail: the RG was deleted out from under
-				// this RD. Skip the level rather than refuse to
-				// dispatch — the rest of the hierarchy still
-				// produces a usable .res.
-			default:
-				return nil, err
-			}
-		}
-	}
-
-	// Resolve typed options through the same scope hierarchy as the
-	// legacy Props resolver. Lower scope wins per non-nil field.
-	// Phase 10.4: ControllerConfig.Spec.DRBDOptions is the typed
-	// controller scope. The legacy KVEntry-shaped controllerProps
-	// remains for forward-compat with any pre-migration cluster.
-	typed := drbd.ResolveDRBDOptions(ctrlTyped, rgTyped, rdTyped, target.Spec.DRBDOptions)
-
-	// Flatten typed → string Props so the existing satellite-side
-	// renderer keeps working. Then layer on the legacy Props
-	// hierarchy (controller → RG → RD → Resource) so any keys still
-	// living on Spec.Props (residual non-DRBD or pre-migration data)
-	// or in ExtraProps still feed into the .res file. Lower scope
-	// wins on conflict, matching the typed resolver's semantics.
-	out := drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props)
-
-	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
-	maps.Copy(out, ctrlExtras)
-	maps.Copy(out, rgExtras)
-	maps.Copy(out, rdExtras)
-	maps.Copy(out, target.Spec.ExtraProps)
-
-	return out, nil
-}
-
-// controllerConfig fetches the singleton ControllerConfig CRD. We
-// only recognise the canonical name `default`; any other instance
-// is silently ignored so a stale or duplicated ControllerConfig
-// can't quietly take effect. Missing CRD or missing object both
-// return (nil, nil) — the reconciler falls through to legacy
-// KVEntry-based controllerProps for forward-compat with
-// pre-migration clusters.
-func (r *ResourceReconciler) controllerConfig(ctx context.Context) (*blockstoriov1alpha1.ControllerConfig, error) {
-	var cfg blockstoriov1alpha1.ControllerConfig
-
-	err := r.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &cfg)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return nil, nil //nolint:nilnil // optional singleton — nil means "not configured"
-		}
-
-		return nil, err
-	}
-
-	return &cfg, nil
+	return effectiveprops.Resolve(ctx, r.Client, target, rdPtr)
 }
 
 // resolveLayerStack walks the RD → RG hierarchy and returns the
@@ -931,35 +829,6 @@ func (r *ResourceReconciler) resolveLayerStack(ctx context.Context, rd *blocksto
 	}
 
 	return rg.Spec.SelectFilter.LayerStack
-}
-
-// controllerProps reads the cluster-wide ControllerProps KV instance
-// via the KVEntry CRD. Empty when no entries exist (fresh cluster).
-//
-// We list every KVEntry and filter by Instance in-process; an
-// indexed `client.MatchingFields{"spec.instance": "ControllerProps"}`
-// would be cheaper but the controller-runtime cache rejects field
-// selectors that aren't pre-registered as field indexers, and the
-// extra wiring isn't worth it for a small KV store.
-func (r *ResourceReconciler) controllerProps(ctx context.Context) (map[string]string, error) {
-	var list blockstoriov1alpha1.KVEntryList
-
-	err := r.List(ctx, &list)
-	if err != nil {
-		return nil, err
-	}
-
-	out := map[string]string{}
-
-	for i := range list.Items {
-		if list.Items[i].Spec.Instance != "ControllerProps" {
-			continue
-		}
-
-		out[list.Items[i].Spec.Key] = list.Items[i].Spec.Value
-	}
-
-	return out, nil
 }
 
 // EnsureDRBDIDsForTest is an exported alias for ensureDRBDIDs. The

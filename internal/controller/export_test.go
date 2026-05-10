@@ -84,14 +84,6 @@ func (r *ResourceDefinitionReconciler) SetQuorum(ctx context.Context, rd *blocks
 	return r.setQuorum(ctx, rd, value)
 }
 
-// ControllerProps exposes the cluster-KV ControllerProps reader.
-// Tests pin the instance-filter so KVEntry rows belonging to other
-// instances (e.g. csi-volumes) don't leak into the prop bag the
-// dispatcher hands the satellite.
-func (r *ResourceReconciler) ControllerProps(ctx context.Context) (map[string]string, error) {
-	return r.controllerProps(ctx)
-}
-
 // LookupRD exposes the soft-fail RD fetcher. Tests pin the
 // (nil, nil) return on NotFound so the dispatcher can still set up
 // connection state when the RD is being deleted concurrently.

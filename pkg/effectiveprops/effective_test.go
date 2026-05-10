@@ -14,33 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller_test
+package effectiveprops_test
 
 import (
 	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	controllerpkg "github.com/cozystack/blockstor/internal/controller"
+	"github.com/cozystack/blockstor/pkg/effectiveprops"
 )
 
-// TestControllerPropsFiltersByInstance: only KVEntry rows with
-// Instance="ControllerProps" surface in the result. The KV store
-// is shared across instances (csi-volumes for piraeus-csi metadata,
+func newScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	return scheme
+}
+
+// TestLegacyControllerPropsFiltersByInstance: only KVEntry rows
+// with Instance="ControllerProps" surface. The KV store is
+// shared across instances (csi-volumes for piraeus-csi metadata,
 // snapshot-policies, ControllerProps for cluster DRBD options) —
-// without the filter the dispatcher would feed CSI volume metadata
-// into the satellite's prop bag, polluting the .res file.
-func TestControllerPropsFiltersByInstance(t *testing.T) {
+// without the filter the resolver would feed CSI volume
+// metadata into the prop bag, polluting the .res file.
+func TestLegacyControllerPropsFiltersByInstance(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
 
 	objs := []client.Object{
-		// In-instance: must surface.
 		&blockstoriov1alpha1.KVEntry{
 			ObjectMeta: metav1.ObjectMeta{Name: "controllerprops-quorum"},
 			Spec: blockstoriov1alpha1.KVEntrySpec{
@@ -49,7 +60,6 @@ func TestControllerPropsFiltersByInstance(t *testing.T) {
 				Value:    "majority",
 			},
 		},
-		// In-instance: must surface.
 		&blockstoriov1alpha1.KVEntry{
 			ObjectMeta: metav1.ObjectMeta{Name: "controllerprops-net"},
 			Spec: blockstoriov1alpha1.KVEntrySpec{
@@ -58,9 +68,7 @@ func TestControllerPropsFiltersByInstance(t *testing.T) {
 				Value:    "C",
 			},
 		},
-		// Other instance (csi-volumes): MUST NOT surface in the
-		// controller props bag — it's CSI driver metadata, not DRBD
-		// options.
+		// csi-volumes data MUST NOT surface.
 		&blockstoriov1alpha1.KVEntry{
 			ObjectMeta: metav1.ObjectMeta{Name: "csi-volumes-vol1"},
 			Spec: blockstoriov1alpha1.KVEntrySpec{
@@ -72,11 +80,10 @@ func TestControllerPropsFiltersByInstance(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
-	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 
-	got, err := rec.ControllerProps(context.Background())
+	got, err := effectiveprops.LegacyControllerProps(context.Background(), cli)
 	if err != nil {
-		t.Fatalf("ControllerProps: %v", err)
+		t.Fatalf("LegacyControllerProps: %v", err)
 	}
 
 	if got["DrbdOptions/Resource/quorum"] != "majority" {
@@ -87,26 +94,23 @@ func TestControllerPropsFiltersByInstance(t *testing.T) {
 		t.Errorf("protocol prop missing or wrong: %+v", got)
 	}
 
-	// Critical: csi-volumes data must NOT leak into the controller
-	// prop bag.
 	if _, leaked := got["vol1/sizeBytes"]; leaked {
 		t.Errorf("csi-volumes data leaked into ControllerProps bag: %+v", got)
 	}
 }
 
-// TestControllerPropsEmpty: fresh cluster (no KVEntry rows) → empty
-// (non-nil) map, no error. The merger downstream treats empty as
-// "no cluster-level overrides" and falls through to RG/RD/Resource.
-func TestControllerPropsEmpty(t *testing.T) {
+// TestLegacyControllerPropsEmpty: fresh cluster (no KVEntry rows)
+// → empty (non-nil) map, no error. Downstream resolver treats
+// empty as "no cluster-level overrides" and falls through.
+func TestLegacyControllerPropsEmpty(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
-	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 
-	got, err := rec.ControllerProps(context.Background())
+	got, err := effectiveprops.LegacyControllerProps(context.Background(), cli)
 	if err != nil {
-		t.Fatalf("ControllerProps: %v", err)
+		t.Fatalf("LegacyControllerProps: %v", err)
 	}
 
 	if got == nil {
