@@ -17,6 +17,7 @@ limitations under the License.
 package satellite_test
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -27,6 +28,10 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
+
+// errZfsShipPeerDown is the canned exec failure for the zfs-ship
+// error-wrap test. err113-friendly (static, package-level).
+var errZfsShipPeerDown = errors.New("ssh: connect to host n2 port 22: Connection refused")
 
 // TestShipSnapshotZFSUsesZfsSendRecv: when the source pool is ZFS,
 // ShipSnapshot dispatches `zfs send | zfs recv` over SSH.
@@ -224,6 +229,57 @@ func TestShipSnapshotThinPipelineShape(t *testing.T) {
 	want := "thin-send-recv --source pvc-thin_snap-1_00000 --target n2"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected exact %q; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestShipSnapshotZFSExecErrorSurfaces: when `zfs send | ssh ... zfs
+// recv` fails (peer down, ssh refused, recv-side dataset missing),
+// the runZfsShip wrap surfaces the underlying exec error chained
+// through cockroachdb/errors.Wrap so the controller can log it
+// verbatim in the Resource event stream.
+func TestShipSnapshotZFSExecErrorSurfaces(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -p -o name,volsize,used tank/pvc-zfs-fail_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// The ship pipeline fails — simulate ssh peer-unreachable.
+	fx.Expect("sh -c zfs send snap-1 | ssh n2 zfs recv -F pvc-zfs-fail",
+		storage.FakeResponse{Err: errZfsShipPeerDown})
+
+	zfsP := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"zfs1": zfsP},
+		ShipExec:  fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-zfs-fail", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "zfs1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-zfs-fail",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot transport error (want body-level fail): %v", err)
+	}
+
+	if resp.GetOk() {
+		t.Errorf("Ok: got true on exec failure; want false")
+	}
+
+	// The error keyword must thread through so operators can grep.
+	if !strings.Contains(resp.GetMessage(), "zfs send|recv") {
+		t.Errorf("error message must mention zfs send|recv wrap; got %q",
+			resp.GetMessage())
 	}
 }
 
