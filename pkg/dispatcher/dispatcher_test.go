@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -417,6 +418,74 @@ func TestPeerPortOfFallback(t *testing.T) {
 	unallocatedPeer := &blockstoriov1alpha1.Resource{}
 	if got := dispatcher.PeerPortOf(unallocatedPeer, fallback); got != fallback {
 		t.Errorf("unallocated peer: got %d, want %d (fallback)", got, fallback)
+	}
+}
+
+// TestDeleteResourceDialErrorPropagates: an unreachable satellite
+// surfaces as wrapped "dial <endpoint>" — the Resource controller's
+// runDelete catches that, requeues with 10s back-off, keeps the
+// finalizer in place. Pin the wrap keyword so operator log-greps
+// for "dial" + the endpoint still resolve.
+func TestDeleteResourceDialErrorPropagates(t *testing.T) {
+	d := dispatcher.New(&errDialer{err: errFakeDial})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-del",
+			NodeName:               "n1",
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.DeleteResource(t.Context(), target, nil, nodes)
+	if err == nil {
+		t.Fatalf("expected dial error to surface; got nil")
+	}
+
+	if !strings.Contains(err.Error(), "dial") {
+		t.Errorf("error must contain `dial`; got %q", err.Error())
+	}
+
+	if !strings.Contains(err.Error(), "10.0.0.1:7000") {
+		t.Errorf("error must include the endpoint; got %q", err.Error())
+	}
+}
+
+// TestCreateSnapshotDialErrorBubbles: an unreachable satellite on
+// the snapshot fan-out path bubbles up through the per-replica
+// loop's `return` — the loop intentionally short-circuits on
+// transport faults rather than running through to the next replica
+// (we'd retry on the next reconcile anyway). Pin the early-exit.
+func TestCreateSnapshotDialErrorBubbles(t *testing.T) {
+	d := dispatcher.New(&errDialer{err: errFakeDial})
+
+	replicas := []blockstoriov1alpha1.Resource{
+		{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: "pvc-1",
+				NodeName:               "n1",
+			},
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.CreateSnapshot(t.Context(), "pvc-1", "snap-1", replicas, nodes)
+	if err == nil {
+		t.Errorf("expected dial error to bubble; got nil")
 	}
 }
 
