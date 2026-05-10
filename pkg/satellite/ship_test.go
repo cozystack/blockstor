@@ -17,6 +17,7 @@ limitations under the License.
 package satellite_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -129,6 +130,100 @@ func TestShipSnapshotLVMThinUsesThinSendRecv(t *testing.T) {
 
 	if !found {
 		t.Errorf("expected thin-send-recv in calls; got %v", fx.CommandLines())
+	}
+}
+
+// TestShipSnapshotZFSPipelineShape pins the exact `zfs send <snap>
+// | ssh <target> zfs recv -F <rd>` pipeline string. The existing
+// substring-check test catches gross regressions but a refactor
+// that flipped the order of `<snap>` and `<rd>` in the format
+// string would silently ship the snapshot to a wrong dataset.
+func TestShipSnapshotZFSPipelineShape(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -p -o name,volsize,used tank/pvc-zfs_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	zfsP := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"zfs1": zfsP},
+		ShipExec:  fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-zfs", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "zfs1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-zfs",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Fatalf("Ok=false: %s", resp.GetMessage())
+	}
+
+	want := "sh -c zfs send snap-1 | ssh n2 zfs recv -F pvc-zfs"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected pipeline %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestShipSnapshotThinPipelineShape pins the exact thin-send-recv
+// invocation: `thin-send-recv --source <rd>_<snap>_00000 --target
+// <node>`. The naming convention is what Linbit's tool expects;
+// a regression that flipped the format would silently fail at the
+// thin-send-recv subprocess.
+func TestShipSnapshotThinPipelineShape(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-thin_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		ShipExec:  fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name: "pvc-thin", NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resp, err := rec.ShipSnapshot(t.Context(), &satellitepb.ShipSnapshotRequest{
+		ResourceName: "pvc-thin",
+		SnapshotName: "snap-1",
+		TargetNode:   "n2",
+	})
+	if err != nil {
+		t.Fatalf("ShipSnapshot: %v", err)
+	}
+
+	if !resp.GetOk() {
+		t.Fatalf("Ok=false: %s", resp.GetMessage())
+	}
+
+	want := "thin-send-recv --source pvc-thin_snap-1_00000 --target n2"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected exact %q; got %v", want, fx.CommandLines())
 	}
 }
 
