@@ -17,11 +17,28 @@ limitations under the License.
 package satellite
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 )
+
+// helloErrorClient is a minimal ControllerClient stub whose Hello
+// always fails. Used to exercise hello()'s error-wrap path.
+type helloErrorClient struct {
+	satellitepb.ControllerClient
+}
+
+func (helloErrorClient) Hello(_ context.Context, _ *satellitepb.HelloRequest, _ ...grpc.CallOption) (*satellitepb.HelloResponse, error) {
+	return nil, errHelloRPCDown
+}
+
+var errHelloRPCDown = errors.New("controller unreachable")
 
 // TestHostFromEndpoint pins the trailing-port stripper Hello uses to
 // derive the dial-back host from a SatelliteEndpoint prop. Same
@@ -162,6 +179,31 @@ func TestStartGRPCServerListenError(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "listen") {
 		t.Errorf("error wrap: got %q, want substring \"listen\"", err.Error())
+	}
+}
+
+// TestHelloErrorWraps pins the error-wrap on the registration RPC:
+// when the controller's Hello returns an error (controller mid-
+// restart, network partition, TLS handshake failure), the satellite's
+// hello() must surface it with the operator-grep keyword "Hello RPC"
+// so the satellite log line "Hello RPC: <transport-detail>" is
+// locatable. superviseObserveLoop relies on this signal to retry
+// registration with backoff.
+func TestHelloErrorWraps(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{NodeName: "n1", DialTimeout: 100 * 0})
+
+	// DialTimeout 0 → context.WithTimeout becomes already-deadline,
+	// but our helloErrorClient ignores ctx and returns its synthetic
+	// error directly, so we still exercise the wrap path.
+	err := a.hello(context.Background(), helloErrorClient{})
+	if err == nil {
+		t.Fatalf("hello: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "Hello RPC") {
+		t.Errorf("error wrap: got %q, want substring \"Hello RPC\"", err.Error())
 	}
 }
 
