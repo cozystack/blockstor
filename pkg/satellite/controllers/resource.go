@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,10 +30,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 )
+
+// SatelliteResourceFinalizer is the per-satellite-instance
+// finalizer key the satellite reconciler stamps on every
+// Resource it owns. The controller-side reconciler uses a
+// distinct key (`blockstor.io.blockstor.io/resource`) so the
+// two paths coexist during the Phase 10.6 cutover without
+// stepping on each other.
+const SatelliteResourceFinalizer = "blockstor.io.blockstor.io/satellite-resource"
 
 // ResourceReconciler watches Resource CRDs filtered to those
 // placed on this satellite's node and translates them into the
@@ -52,7 +62,9 @@ type ResourceReconciler struct {
 
 // Reconcile reads a Resource and drives the satellite-side
 // apply chain when the Resource is placed on this node.
-// Deletion is handled via finalizer in a follow-up commit.
+// Finalizer-aware: stamps `SatelliteResourceFinalizer` on
+// every live Resource so kube-apiserver waits for our tear-down
+// before allowing the object to disappear.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 
@@ -74,10 +86,18 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	if !res.DeletionTimestamp.IsZero() {
-		// Phase 10.1 follow-up: finalizer-driven tear-down.
-		// Until then the controller-side ResourceReconciler's
-		// runDelete path still owns deletion via gRPC.
-		return ctrl.Result{}, nil
+		return r.handleDelete(ctx, &res)
+	}
+
+	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+		res.Finalizers = append(res.Finalizers, SatelliteResourceFinalizer)
+
+		err := r.Update(ctx, &res)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
+		}
+
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	desired, err := r.buildDesiredFromCRD(ctx, &res)
@@ -90,13 +110,31 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	for _, res := range results {
-		if !res.GetOk() {
-			logger.Info("Apply per-resource failure", "name", res.GetName(), "message", res.GetMessage())
+	for _, ar := range results {
+		if !ar.GetOk() {
+			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
 		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// resolveDeleteStoragePool picks the pool name the
+// satellite's DeleteVolume should route through. Phase 10.3
+// typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
+// is the forward-compat fallback (pre-migration Resources may
+// still carry only the prop). DISKLESS replicas have no pool
+// — the satellite reconciler handles the empty case fine.
+func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
+	if slices.Contains(res.Spec.Flags, apiv1.ResourceFlagDiskless) {
+		return ""
+	}
+
+	if res.Spec.StoragePool != "" {
+		return res.Spec.StoragePool
+	}
+
+	return res.Spec.Props["StorPoolName"]
 }
 
 // SetupWithManager wires this reconciler with a node-name
@@ -167,6 +205,89 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	}
 
 	return dispatcher.BuildDesired(target, peers, nodeList.Items, &rd, effectiveProps), nil
+}
+
+// handleDelete runs the satellite-side teardown when a Resource
+// gets a DeletionTimestamp. Idempotent — re-runs after a
+// satellite restart safely re-issue `drbdadm down` /
+// `DeleteVolume` / `cryptsetup luksClose`, all of which are
+// no-ops on already-torn-down state. Removes our finalizer on
+// success so kube-apiserver finalises the delete.
+//
+// Phase 10.1. Once Phase 10.6 retires the gRPC contract,
+// `internal/controller.ResourceReconciler.runDelete` and its
+// finalizer (`blockstor.io.blockstor.io/resource`) go away —
+// satellite-side teardown becomes the only finalizer path.
+func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
+	if !slices.Contains(res.Finalizers, SatelliteResourceFinalizer) {
+		// Either we never stamped it (object created before this
+		// satellite came up) or someone already stripped it.
+		// Either way, nothing for us to do — let the apiserver
+		// finalise.
+		return ctrl.Result{}, nil
+	}
+
+	volumeNumbers, err := r.lookupVolumeNumbers(ctx, res.Spec.ResourceDefinitionName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	req := &satellitepb.DeleteResourceRequest{
+		Name:          res.Spec.ResourceDefinitionName,
+		StoragePool:   resolveDeleteStoragePool(res),
+		VolumeNumbers: volumeNumbers,
+	}
+
+	resp, err := r.Config.Apply.DeleteResource(ctx, req)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "DeleteResource")
+	}
+
+	if !resp.GetOk() {
+		// Body-level failure — log and let controller-runtime
+		// back-off retry. We keep the finalizer in place so the
+		// CRD doesn't vanish before our tear-down succeeds.
+		log.FromContext(ctx).Info("DeleteResource per-resource failure",
+			"resource", res.Spec.ResourceDefinitionName, "message", resp.GetMessage())
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	res.Finalizers = slices.DeleteFunc(res.Finalizers,
+		func(f string) bool { return f == SatelliteResourceFinalizer })
+
+	err = r.Update(ctx, res)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "strip finalizer")
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// lookupVolumeNumbers reads the parent RD and returns its
+// VolumeDefinitions' numbers. The satellite's DeleteResource
+// uses the list to drop matching LVs / loopfiles. A missing RD
+// (e.g. cascade-delete already removed it) silently returns an
+// empty list — the satellite's `DeleteVolume` paths short-
+// circuit on missing storage anyway.
+func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, rdName string) ([]int32, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, errors.Wrap(err, "get parent RD for delete")
+	}
+
+	out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+	for i := range rd.Spec.VolumeDefinitions {
+		out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+	}
+
+	return out, nil
 }
 
 // nodeNamePredicate filters events down to objects whose
