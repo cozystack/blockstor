@@ -485,6 +485,115 @@ Decision (2026-05-09): cluster passphrase rotation (`POST /v1/encryption/passphr
 
 ---
 
+## Phase 10 — Kubernetes-native architecture (eliminate satellite gRPC + PropsContainers pattern)
+
+Phases 1-9 produced a working CSI front-end on top of CRDs but kept two
+upstream-LINSTOR design choices that don't fit Kubernetes well:
+
+1. **A controller→satellite gRPC contract** (`pkg/satellite/proto`,
+   `pkg/dispatcher`, `pkg/satellitecontroller`) for `ApplyResources`,
+   `DeleteResource`, snapshot RPCs and the inverse `Hello` /
+   `ReportObserved` / `ReportPoolCapacity` streams. The controller does
+   most of the per-Resource computation (DRBD-id allocator, effective-
+   options resolver, peer-list assembly) and pushes the full
+   `DesiredResource` over the wire each reconcile. Satellites can't
+   start without a healthy gRPC connection in either direction.
+
+2. **A `KVEntry` CRD that mirrors upstream's `propscontainers` pattern**
+   (`Instance × Key × Value` per object) plus a `Spec.Props map[string]string`
+   on every CRD that absorbs DRBD options, encryption passphrases,
+   topology hints, satellite endpoints and DRBD-observed state into the
+   same untyped bag.
+
+Phase 10 migrates to a pure-Kubernetes architecture: the satellite is a
+controller-runtime controller scoped to its node, the controller runs
+autoplace + admission logic, both sides speak only to kube-apiserver,
+and per-object configuration lives in typed Spec / Status fields.
+
+**Exit criteria** (both required):
+
+- No gRPC contract between controller and satellite. `proto/satellite/`,
+  `pkg/dispatcher/`, `pkg/satellite/grpc_server.go`,
+  `pkg/satellitecontroller/` are gone. The satellite's `Run` registers
+  controller-runtime reconcilers and a manager; that's it.
+- The `kventries.blockstor.io.blockstor.io` CRD type is gone. Cluster-
+  wide config lives in a typed `ControllerConfig` singleton CRD plus a
+  native `Secret` for the cluster passphrase. linstor-csi's
+  `csi-volumes` / `csi-snapshot-shippings` bookkeeping moves onto
+  per-Resource / per-Snapshot annotations. The REST `/v1/key-value-store`
+  surface stays for golinstor compat but is rewritten on top of the new
+  homes.
+
+### 10.1 — Satellite as a controller-runtime controller
+
+- [ ] New `pkg/satellite/controllers/` package wired into the satellite agent. Reconcilers for Resource (filtered by `Spec.NodeName == cfg.NodeName`), ResourceDefinition (parent lookup, no own reconcile), Snapshot (filtered by `Spec.Nodes ∋ cfg.NodeName`), StoragePool (filtered by `Spec.NodeName == cfg.NodeName`).
+- [ ] Resource reconciler on satellite replaces the gRPC `ApplyResources` consumer with a native CRD watch. On reconcile: read Resource Spec + parent RD + peers (List by RD-name) + Node info + effective DRBD options (resolver re-runs satellite-side, reading RG via apiserver) → drive `pkg/satellite/reconciler.applyOne` (existing logic, lifted out from the gRPC handler).
+- [ ] DeleteResource flow: on Resource with non-zero `DeletionTimestamp` + the satellite's own finalizer, satellite runs the existing teardown (`drbdadm down` → `DeleteVolume` → `rm .res` → `cryptsetup luksClose`) then strips its own finalizer. Today's controller-side `runDelete` (`internal/controller.ResourceReconciler.runDelete`) goes away — finalizer ownership transfers to the satellite.
+- [ ] ServiceAccount + RBAC manifests: satellite needs `get/list/watch` on RD/Resource/Snapshot/Node/StoragePool/ResourceGroup, `update/patch` on its own Resources (Spec + finalizer), `update/patch` on `*/status` subresources for observed-state writes.
+
+### 10.2 — Status is the only home for observed state
+
+- [ ] Audit every site where observed state currently writes to `Spec.Props`. Today `pkg/satellitecontroller/server.applyObserved` lands `DrbdState` into Resource Spec via `SetState`'s `drbdProps`; that's a Spec write triggered by an observation stream — race with desired-state writers. Move `DrbdState` to the existing `Resource.Status.Volumes[i].DiskState` (typed) and drop the Spec side-write entirely.
+- [ ] Add `ResourceVolumeStatus.CurrentGi string` (also covered by Phase 8.1 follow-up) and `ResourceVolumeStatus.HistoryGi []string` if split-brain visibility matters for the UI.
+- [ ] Document the Spec/Status split rule in `docs/architecture.md`: anything observed by the satellite from the kernel goes to Status, never Spec; anything the operator or controller asks the satellite to do goes to Spec, never Status.
+- [ ] Use Kubernetes server-side-apply field managers when both controller (writes parts of Status — e.g. allocator outputs `DRBDPort`) and satellite (writes other parts of Status — `DiskState`, `CurrentGi`) touch the same Status, so neither clobbers the other. Today the controller uses regular `Update` which can clobber Status writes that landed between Get and Update.
+
+### 10.3 — Typed fields replace `Spec.Props map[string]string`
+
+Migrate known keys from the generic `Props` bag to typed structs. Hybrid:
+keep `Spec.ExtraProps map[string]string` only as forward-compat for keys
+we haven't modelled yet, populated only by the REST shim on the upstream-
+LINSTOR boundary.
+
+- [ ] `ResourceDefinition.Spec.DRBDOptions { Net { Protocol, SharedSecret SecretRef, AllowTwoPrimaries bool, MaxBuffers int, AfterSb0pri, AfterSb1pri, AfterSb2pri string }, Disk { OnIOError string, ALExtents int }, Resource { Quorum string (enum majority/off), AutoQuorum string }, Handlers { ... } }` — replaces every `Props["DrbdOptions/<Section>/<Key>"]`. Same hierarchy resolver still walks RG → RD → Resource but on typed fields.
+- [ ] `ResourceDefinition.Spec.Encryption.PassphraseSecretRef LocalObjectReference` — replaces `Props["DrbdOptions/Encryption/passphrase"]`. Secret lives in a controller-managed namespace; the satellite reads it via the apiserver on reconcile.
+- [ ] `Node.Spec.SatelliteEndpoint string` — replaces `Props["SatelliteEndpoint"]`. (Or removed entirely once 10.6 lands and the endpoint is no longer dialled.)
+- [ ] `Node.Spec.DRBDPortRange / DRBDMinorRange { Min, Max int32 }` — replaces `Props["DrbdOptions/TcpPortRange"]` / `"DrbdOptions/MinorNrRange"`. Defaults baked in via kubebuilder.
+- [ ] `Node.Spec.AutoTieBreaker *bool` — replaces `Props["DrbdOptions/AutoAddQuorumTiebreaker"]`.
+- [ ] `Resource.Spec.StoragePool string` — replaces `Props["StorPoolName"]`. Already half-typed via dispatcher's `buildVolumes`; finish the migration.
+- [ ] Topology: drop `Props["Aux/zone"]` / `"Aux/rack"`. Use Kubernetes-native `metadata.labels["topology.blockstor.io/zone"]` etc. Autoplacer reads labels via `client.MatchingLabels`. This is also the upgrade path to label-aware features like `topologySpreadConstraints` later.
+- [ ] REST shim transcoder: `/v1/resource-definitions` and `/v1/resource-groups` POST/PUT accept upstream-shaped `{props: {...}}` payloads from golinstor, decode into the typed structs, write `ExtraProps` only for keys we don't recognise. GET responses re-emit the typed fields as `props` on the wire so golinstor stays happy.
+- [ ] Validation via kubebuilder enums (`+kubebuilder:validation:Enum=majority;off`) — apiserver rejects garbage values at admission, satellite stops parsing strings at runtime.
+
+### 10.4 — Eliminate `KVEntry` CRD
+
+- [ ] **`ControllerProps` instance → typed singleton CRD**. New `ControllerConfig` cluster-scoped CRD, name=`default`, with structured fields (`Spec.DRBDOptions`, `Spec.AutoQuorum`, `Spec.AutoAddQuorumTiebreaker`, `Spec.PassphraseSecretRef`). Migration job seeds one from existing `KVEntry/ControllerProps` items.
+- [ ] **Cluster passphrase → native `Secret`**. New Secret (default name `blockstor-cluster-passphrase`, key `passphrase`). `ControllerConfig.Spec.PassphraseSecretRef` points at it. REST endpoints (`/v1/encryption/passphrase` POST/PATCH/PUT) rewritten to mutate the Secret.
+- [ ] **`csi-volumes` instance → per-Resource annotation**. linstor-csi's per-PVC JSON metadata moves to `Resource.metadata.annotations["blockstor.io/csi-volume-data"]`. Annotations have no size limit issue at csi-typical payloads (typically 1-4 KiB; per-object annotation cap is 256 KiB).
+- [ ] **`csi-snapshot-shippings` instance → per-Snapshot annotation** (`blockstor.io/csi-shipping-data`).
+- [ ] **REST `/v1/key-value-store/{instance}` rewritten** on top of the new homes. `GET csi-volumes` does `client.List(Resources)` and assembles a map from annotations; `POST csi-volumes/{key}` writes the annotation on the matching Resource. golinstor sees the same shape.
+- [ ] **Migration job**: on first run after upgrade, list every `KVEntry`, write to the new home (annotation / Secret / ControllerConfig), then delete the KVEntries. Fails fast if any entry has an instance the migrator doesn't know about — operator must triage.
+- [ ] **Drop `kventries.blockstor.io.blockstor.io` CRD** type registration, `api/v1alpha1/kventry_types.go`, `pkg/store/k8s/kv_store.go`, the `KeyValueStore` interface in `pkg/store/store.go`.
+
+### 10.5 — `ApplyStoragePools` made non-stub (absorbs the existing architectural-debt item)
+
+- [ ] Today the satellite's `Provider` registry is seeded by CLI flags (`--lvm-thick-pool-name=…`, `--zfs-pool=…`, etc.) at startup, and `ApplyStoragePools` is an Ok=true stub. After 10.5 the controller pushes desired pool config via the existing `StoragePool` CRDs (which carry `ProviderKind`, `Props`, etc.); satellite's StoragePool reconciler watches own pools (`Spec.NodeName == self`), instantiates the matching `storage.Provider` dynamically with the configured VG / pool / dir / mountpoint, registers in its in-memory map. Pool capacity reporting flips to a satellite-side periodic write to `StoragePool.Status` (already on the type).
+- [ ] Drop the `--lvm-thick-pool-name` / `--lvm-thick-vg` / `--zfs-pool` / `--lvm-thin-vg` / `--lvm-thin-pool` / `--file-pool-dir` / `--loopfile-pool-dir` flags from `cmd/satellite/main.go`. Adding a new pool becomes `kubectl apply -f storagepool.yaml`, no DaemonSet rollout.
+
+### 10.6 — Remove the gRPC contract entirely
+
+Once 10.1-10.5 land, the gRPC paths are unused. Final demolition:
+
+- [ ] Delete `proto/satellite/v1alpha1/satellite.proto` + `pkg/satellite/proto/`.
+- [ ] Delete `pkg/satellite/grpc_server.go` + `pkg/satellitecontroller/`.
+- [ ] Delete `pkg/dispatcher/` (controller-side gRPC client). `internal/controller.ResourceReconciler.dispatchApply` and the runDelete dispatch path go away — already replaced by the satellite's own reconciler.
+- [ ] Delete the gRPC supervise loops in `pkg/satellite/agent.go` (`runObserveLoop`, `superviseObserveLoop`, `runCapacityLoop`, `dial`, `hello`, `startGRPCServer`).
+- [ ] Satellite's `Run` becomes: build controller-runtime manager, register the per-CRD reconcilers, start manager. Mirror image of `cmd/manager/main.go`.
+
+### Open design questions for the user
+
+- [ ] Single binary with `--mode={controller,satellite}` flag, or stay two binaries? Two is simpler RBAC-wise but doubles the build artifacts; one is what kube-controller-manager-style operators usually pick.
+- [ ] csi-volumes annotation size budget: real-world golinstor traces show typical JSON blob size <2 KiB; need to confirm against a production cluster snapshot before committing to "annotations are enough" — if any operator writes oversize blobs, fall back to a per-instance ConfigMap.
+- [ ] Should `ResourceVolumeStatus.HistoryGi` exist? Useful for split-brain forensics but clutters the Status if the cluster isn't actively split-brain'ing. Probably yes — DRBD only keeps last-4 GIs anyway, so the Status field is bounded.
+- [ ] Server-side apply field managers vs optimistic concurrency: SSA is the K8s-native answer for multi-writer Status, but it's heavier on the apiserver. Worth benchmarking in 10.2 before committing.
+
+### Cross-phase notes
+
+- 8.1 follow-up (DRBD initial-sync skip on replica-add) is a **prerequisite** for 10.1 — once observed state moves to satellite-side reconciler writes, the GI plumbing slots in naturally there. Order of operations: 8.1 → 10.2 → 10.1.
+- 10.5 absorbs the existing `Architectural debt — Satellite Provider registry vs StoragePool CRD` item from "Outstanding work"; that section's standalone entry is removed below.
+
+---
+
 ## Outstanding work (boxes ticked above, exit-criteria not yet met)
 
 The checkboxes in Phases 4 / 5 / 8 / 9 are stamped `[x]` whenever the
@@ -552,20 +661,13 @@ is still ticked. Promoting them to first-class unchecked items:
 
 - [ ] `tests/e2e/no-drbd.sh`, `tests/e2e/luks-layer.sh`, `tests/e2e/drbd-luks-stack.sh` — stand-side execution against the real-disk + LUKS-extension Talos profile (scripts scaffolded, runtime not yet exercised).
 
-### Architectural debt — Satellite `Provider` registry vs `StoragePool` CRD
+### Architectural debt — moved to Phase 10.5
 
-Phase 3 documents the limitation in passing — *"the satellite uses a
-Provider registry seeded at startup (CLI flags / env), so the controller's
-pool spec is informational today"* — but it stays a real gap:
-`ApplyStoragePools` is an Ok=true stub, the satellite can only materialise
-pools that were named on its startup CLI, and adding a new
-LVM-thick / ZFS / file pool requires a DaemonSet edit (new
-`--lvm-thick-pool-name=…` / `--lvm-thick-vg=…` / etc. flag) instead of a
-plain `StoragePool` CRD apply. That's why the LVM-thick + ZFS pools added
-in 8.6 needed new flags in the DaemonSet despite already being expressible
-as CRDs.
-
-- [ ] `ApplyStoragePools` RPC made non-stub: controller pushes desired provider config (kind + VG / pool / dir / etc.) per `StoragePool` CRD, the satellite dynamically instantiates the matching `storage.Provider` and registers it in its in-memory map. Removes the `--lvm-thick-pool-name` / `--lvm-thick-vg` / `--zfs-pool` / `--lvm-thin-vg` / `--lvm-thin-pool` / `--file-pool-dir` / `--loopfile-pool-dir` CLI flags from `cmd/satellite/main.go` so pool config lives only in `StoragePool` CRDs. Provides a clean upgrade path (CRD edit, no DaemonSet rollout) and aligns the architecture with the bidirectional desired-state contract the satellite already has for `ApplyResources`.
+The `ApplyStoragePools` non-stub item previously listed here is now
+tracked as Phase 10.5; killing the satellite gRPC contract makes that
+work strictly easier (the satellite's StoragePool reconciler runs
+against the apiserver, not against an `ApplyStoragePools` push), so it
+fits naturally inside Phase 10's scope.
 
 ---
 
