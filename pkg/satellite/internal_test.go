@@ -237,6 +237,29 @@ func TestDialReturnsConnForValidAddr(t *testing.T) {
 	_ = conn.Close()
 }
 
+// TestRunRequiresNodeName pins the early-validation branch of Run:
+// an Agent constructed without NodeName must fail-fast with an
+// explicit error, not crash later inside dial() with a confusing
+// gRPC stack trace. Pinned because the satellite binary's main()
+// trusts Run's err to surface bad config — a regression that
+// silently let an empty NodeName through would propagate as
+// "Hello: missing node_name" from the controller side, miles
+// away from the actual misconfiguration.
+func TestRunRequiresNodeName(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{}) // empty NodeName
+
+	err := a.Run(t.Context())
+	if err == nil {
+		t.Fatalf("Run with empty NodeName: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "NodeName") {
+		t.Errorf("error must name the missing field; got %q", err.Error())
+	}
+}
+
 // TestPickMechanism pins the provider-kind → ship-mechanism table
 // the snapshot-shipping dispatcher relies on. The bare "default"
 // branch (returning "") is the load-bearing fallback: an unknown
