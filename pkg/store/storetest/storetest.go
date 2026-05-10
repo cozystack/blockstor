@@ -974,6 +974,7 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("SetState on missing: got %v, want ErrNotFound", err)
 		}
 	})
+	t.Run("SetStateNilProps", func(t *testing.T) { testResourceSetStateNilProps(t, newStore) })
 	t.Run("UpdateMissing", func(t *testing.T) {
 		err := newStore(t).Resources().Update(t.Context(),
 			&apiv1.Resource{Name: "ghost", NodeName: "n1"})
@@ -1022,6 +1023,46 @@ func testResourceUpdateNilArg(t *testing.T, newStore Factory) {
 	err := newStore(t).Resources().Update(t.Context(), nil)
 	if err == nil {
 		t.Errorf("Update(nil): want error, got nil")
+	}
+}
+
+// testResourceSetStateNilProps pins the drbdProps==nil branch:
+// only the Status subresource gets touched, Spec.Props left
+// untouched. This is the common path on the events2 observer
+// (initial frame for a resource has only InUse, no DRBD-state
+// props yet); a regression that always ran the Spec Update would
+// race the per-Resource reconciler's own Spec writes and clobber
+// concurrent updates.
+func testResourceSetStateNilProps(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	s := newStore(t).Resources()
+	ctx := t.Context()
+
+	if err := s.Create(ctx, &apiv1.Resource{
+		Name: "pvc-nil", NodeName: "n1",
+		Props: map[string]string{"original": "preserved"},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	err := s.SetState(ctx, "pvc-nil", "n1",
+		apiv1.ResourceState{InUse: true}, nil) // explicit nil drbdProps
+	if err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+
+	got, err := s.Get(ctx, "pvc-nil", "n1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !got.State.InUse {
+		t.Errorf("State.InUse: got false, want true")
+	}
+
+	if got.Props["original"] != "preserved" {
+		t.Errorf("Props.original: got %q, want preserved (nil-drbdProps must NOT touch Spec)", got.Props["original"])
 	}
 }
 
