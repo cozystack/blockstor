@@ -347,3 +347,22 @@ func TestThinPoolStatusBadDataPercent(t *testing.T) {
 		t.Errorf("expected ParseFloat error on non-numeric data_percent")
 	}
 }
+
+// TestThinPoolStatusGarbageFromLvs pins the parse-error wrap on the
+// thin pool's capacity calculation: when lvs emits a non-numeric
+// fragment (LVM-side bug, locale issue, garbled pipe), the
+// PoolStatus call must surface it as a wrapped error rather than
+// crash or return zero. Reaches the parseFloatToInt64 error branch
+// (which previously sat at 75%).
+func TestThinPoolStatusGarbageFromLvs(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
+		storage.FakeResponse{Stdout: []byte("not-a-number|25.00\n")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Fatalf("PoolStatus on garbage lvs output: got nil, want parse error")
+	}
+}
