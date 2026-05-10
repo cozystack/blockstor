@@ -280,3 +280,72 @@ func TestVolumeDefinitionsDelete(t *testing.T) {
 		t.Errorf("VD still present after DELETE")
 	}
 }
+
+// TestVolumeDefinitionsDeleteHappyPath: DELETE on a real VD → 204
+// + the VD vanishes from a subsequent GET. Pins the success branch
+// (delete handler was at 60%).
+func TestVolumeDefinitionsDeleteHappyPath(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("delete status: got %d, want 204", resp.StatusCode)
+	}
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")
+	_ = getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusNotFound {
+		t.Errorf("post-delete get: got %d, want 404", getResp.StatusCode)
+	}
+}
+
+// TestVolumeDefinitionsDeleteBadVolumeNumber: non-numeric vn on the
+// DELETE path → 400. parseVolNum is shared with GET but the handler
+// branch is distinct; pin it explicitly.
+func TestVolumeDefinitionsDeleteBadVolumeNumber(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/notanum")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestVolumeDefinitionsDeleteMissingVD: DELETE on a non-existent
+// vol_num → 404 from writeStoreError. Pinned because linstor-csi
+// performs idempotent VD-delete on volume removal; the 404 must
+// surface cleanly so csi can treat it as "already gone".
+func TestVolumeDefinitionsDeleteMissingVD(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/42")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
