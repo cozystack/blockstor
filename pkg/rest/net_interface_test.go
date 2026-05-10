@@ -311,3 +311,53 @@ func TestNetInterfaceUpdateCreatesOnMissing(t *testing.T) {
 		t.Errorf("address: got %q, want 10.10.0.5", found.Address)
 	}
 }
+
+// TestNetInterfaceDeleteUnknownNode pins the 404 branch on
+// handleNetInterfaceDelete (was 76.5%): DELETE against an unknown
+// {node} pathvar must surface a clean 404 rather than 500. Operator
+// scripts that idempotently delete interfaces on node teardown
+// expect 404 when the node is already gone.
+func TestNetInterfaceDeleteUnknownNode(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/ghost/net-interfaces/default")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNetInterfaceDeleteMissingIsIdempotent pins that DELETE on an
+// interface name the node doesn't have is a no-op (returns 204
+// without modifying the iface list). Symmetric with the DELETE-on-
+// already-deleted path that TestNetInterfaceDelete already covers
+// for the same name re-fired.
+func TestNetInterfaceDeleteMissingIsIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/n1/net-interfaces/never-existed")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status: got %d, want 204 (idempotent delete)", resp.StatusCode)
+	}
+
+	got, _ := st.Nodes().Get(t.Context(), "n1")
+	if len(got.NetInterfaces) != 1 || got.NetInterfaces[0].Name != "default" {
+		t.Errorf("existing interface lost: %v", got.NetInterfaces)
+	}
+}
