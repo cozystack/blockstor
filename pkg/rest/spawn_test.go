@@ -259,3 +259,23 @@ func TestCopyVolumeGroupProps(t *testing.T) {
 		t.Errorf("template mutated: src[2].Props[new] leaked from copy")
 	}
 }
+
+// TestSpawnBadJSON: malformed body → 400. Pinned because
+// linstor-csi calls /spawn on every CreateVolume; a regression
+// flipping decoder errors to 5xx would loop the csi retry path.
+func TestSpawnBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-1/spawn", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
