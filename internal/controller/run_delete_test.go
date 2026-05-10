@@ -219,3 +219,95 @@ func TestRunDeleteHappyPathStripsFinalizer(t *testing.T) {
 		t.Errorf("finalizer still present after happy-path delete: %v", post.Finalizers)
 	}
 }
+
+// deleteOkFalseDialer returns a satellite client whose DeleteResource
+// always responds with Ok=false body-level (e.g. "drbdadm down: device
+// busy"). The Reconciler must NOT strip the finalizer in this case;
+// instead it requeues with the 10s back-off so the satellite gets
+// another chance once the device frees up.
+type deleteOkFalseDialer struct{}
+
+func (deleteOkFalseDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClient, func() error, error) {
+	return &deleteOkFalseClient{}, func() error { return nil }, nil
+}
+
+type deleteOkFalseClient struct {
+	satellitepb.SatelliteClient
+}
+
+func (*deleteOkFalseClient) DeleteResource(_ context.Context, _ *satellitepb.DeleteResourceRequest, _ ...grpc.CallOption) (*satellitepb.DeleteResourceResponse, error) {
+	return &satellitepb.DeleteResourceResponse{Ok: false, Message: "drbdadm down: device busy"}, nil
+}
+
+// TestRunDeleteOkFalseRequeuesAndKeepsFinalizer pins the body-level
+// Ok=false branch of runDelete: when the satellite acknowledges the
+// RPC but reports the teardown failed (device busy, .res missing,
+// volume already gone but bookkeeping out of sync), the Reconciler
+// must:
+//
+//  1. NOT strip the finalizer (so kube-apiserver doesn't garbage-
+//     collect a resource the satellite still has lingering state
+//     for)
+//  2. Requeue with the 10s back-off
+//
+// A regression that flipped this path to "strip + return clean"
+// would orphan the satellite-side .res file and leak the underlying
+// LV / dm-crypt mapping.
+func TestRunDeleteOkFalseRequeuesAndKeepsFinalizer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	now := metav1.Now()
+	resCRD := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-stuck.n1",
+			Finalizers:        []string{"blockstor.io.blockstor.io/resource"},
+			DeletionTimestamp: &now,
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-stuck",
+			NodeName:               "n1",
+		},
+	}
+
+	nodeCRD := &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(resCRD, nodeCRD).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{
+		Client:     cli,
+		Scheme:     scheme,
+		Dispatcher: dispatcher.New(deleteOkFalseDialer{}),
+		Store:      store.NewInMemory(),
+	}
+
+	got, err := rec.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-stuck.n1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if got.RequeueAfter != 10*time.Second {
+		t.Errorf("RequeueAfter: got %v, want 10s (Ok=false must requeue)", got.RequeueAfter)
+	}
+
+	post := &blockstoriov1alpha1.Resource{}
+	if getErr := cli.Get(ctx, types.NamespacedName{Name: "pvc-stuck.n1"}, post); getErr != nil {
+		t.Fatalf("Get: %v", getErr)
+	}
+
+	if !slices.Contains(post.Finalizers, "blockstor.io.blockstor.io/resource") {
+		t.Errorf("finalizer stripped despite Ok=false; would orphan satellite-side .res / LV")
+	}
+}
