@@ -758,6 +758,7 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Attach flow (satellite-side reconciler):**
 
+- [~] Attach reconciler (2026-05-10, partial). Pure-function `pkg/satellite/attach.go.Attach(ctx, exec, dev)` runs the kind-specific create sequence (`pvcreate → vgcreate` for LVM, `+ lvcreate --type thin-pool 100%FREE` for LVM_THIN, `zpool create -f -O compression=off -O atime=off` for ZFS, no-op for FILE). Wipe is consent-gated and runs BEFORE the create (ordering pinned). Every LVM command goes through `lvm.Args(...)` so the Phase 8.2 filter stays applied. Returns `AttachResult{PoolName, ProviderKind, Props}` ready for `Reconciler.RegisterProvider`. The watch + Status.Phase transitions + delete-on-success bookkeeping land when Phase 10.1 promotes the satellite to a controller-runtime manager. 8 unit tests pinning each kind, the wipefs ordering, and three precondition rejects.
 - [ ] Reconciler watches `PhysicalDevice` filtered by `metadata.labels[blockstor.io/node]=self`. On `Spec.AttachTo` set:
   1. Resolve `Status.StableID` → current `/dev/sdN` (may have changed since discovery). If gone → `Phase=Failed`, condition `DeviceMissing`.
   2. Idempotency check: is the device **already** in the target pool (`pvs grep`, `zpool status grep`)? If yes → skip to Delete (this is a re-run after a crash post-vgextend pre-Delete).
