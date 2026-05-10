@@ -749,7 +749,7 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Upstream-LINSTOR filter parity:**
 
-- [ ] Match the filter rules in upstream's `LsBlkUtils.java` + `CmdPhysicalStorage.java` so `linstor physical-storage list` shows the same set of devices when pointed at blockstor — protects piraeus-operator + golinstor users from surprise differences.
+- [~] `linstor physical-storage list` parity (2026-05-10, partial). `pkg/rest/physical_storage.go` now surfaces PhysicalDevice CRDs in the upstream-LINSTOR `PhysicalStorage` shape: cluster-wide groups devices by (size, rotational); per-node returns the flat slice. AttachTo + non-Available phase exclusion mirrors upstream's "available for new pool" filter. `pkg/store.PhysicalDeviceStore` interface (in-memory + k8s impls) is the seam. Full filter parity with `CmdPhysicalStorage.java`'s edge cases (RAID arrays, mpath, encrypted devices) waits on a real-stand verification pass.
 
 **Attach flow (controller-side REST shim):**
 
