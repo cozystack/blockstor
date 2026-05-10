@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,15 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/satellite"
 )
+
+// StoragePoolFinalizer guards a StoragePool CRD while it is
+// registered on this satellite. Without it `kubectl delete
+// storagepool X` would race the satellite: the apiserver would
+// remove the CRD before the satellite ran the on-disk teardown
+// (`vgremove --force` / `zpool destroy`), leaving orphaned
+// VGs/zpools the next discovery pass wouldn't re-publish.
+// Phase 10.8.
+const StoragePoolFinalizer = "blockstor.io.blockstor.io/satellite-storagepool"
 
 // StoragePoolReconciler watches StoragePool CRDs filtered to
 // those scoped to this satellite's node. Replaces the gRPC
@@ -69,15 +79,19 @@ func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		"kind", pool.Spec.ProviderKind,
 		"deletionTimestamp", pool.DeletionTimestamp)
 
-	// On delete: deregister the provider (its in-memory
-	// instance goes away). The actual on-disk teardown
-	// (`vgremove --force` / `zpool destroy`) is a Phase 10.8
-	// finalizer that runs separately when
-	// `Spec.DestroyOnDelete=true`.
 	if !pool.DeletionTimestamp.IsZero() {
-		r.Config.Apply.RegisterProvider(pool.Spec.PoolName, nil)
+		return r.handlePoolDelete(ctx, &pool)
+	}
 
-		return ctrl.Result{}, nil
+	if !slices.Contains(pool.Finalizers, StoragePoolFinalizer) {
+		pool.Finalizers = append(pool.Finalizers, StoragePoolFinalizer)
+
+		err := r.Update(ctx, &pool)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add storagepool finalizer")
+		}
+
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	provider, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, r.Config.Exec)
@@ -113,4 +127,59 @@ func (r *StoragePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// handlePoolDelete runs the satellite-side teardown when a
+// StoragePool gets a DeletionTimestamp. Always deregisters the
+// in-memory provider; runs the on-disk destroy chain when
+// `Spec.DestroyOnDelete=true`. Phase 10.8.
+//
+// DestroyOnDelete=false (the default): the LINSTOR-side
+// registration is removed but the underlying VG/zpool stays
+// intact on disk; operators who want to re-import the data
+// later can `vgchange -ay` / `zpool import` manually.
+//
+// DestroyOnDelete=true: `vgremove --force` (LVM) or `zpool
+// destroy -f` (ZFS) — provider's Destroy is idempotent so a
+// re-run after a partial teardown finishes cleanly.
+func (r *StoragePoolReconciler) handlePoolDelete(ctx context.Context, pool *blockstoriov1alpha1.StoragePool) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("storagepool", pool.Name)
+
+	if !slices.Contains(pool.Finalizers, StoragePoolFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	if pool.Spec.DestroyOnDelete {
+		provider, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, r.Config.Exec)
+		if err != nil {
+			// Can't even build a provider — log and keep the
+			// finalizer so operator can fix the config and
+			// retry. Stripping here would orphan the on-disk
+			// VG/zpool.
+			logger.Info("NewProviderFromKind failed during teardown", "err", err)
+
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		err = provider.Destroy(ctx)
+		if err != nil {
+			logger.Info("Destroy failed", "err", err)
+
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
+	// Deregister the in-memory provider so future ApplyResources
+	// for this pool fail fast rather than racing the now-gone VG.
+	r.Config.Apply.RegisterProvider(pool.Spec.PoolName, nil)
+
+	pool.Finalizers = slices.DeleteFunc(pool.Finalizers,
+		func(f string) bool { return f == StoragePoolFinalizer })
+
+	err := r.Update(ctx, pool)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "strip storagepool finalizer")
+	}
+
+	return ctrl.Result{}, nil
 }

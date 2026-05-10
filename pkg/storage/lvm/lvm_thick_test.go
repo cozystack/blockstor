@@ -368,3 +368,46 @@ func TestThickVolumeStatusUnexpectedColumnsFromLVS(t *testing.T) {
 		t.Errorf("error msg: got %q, want substring \"unexpected line\"", err.Error())
 	}
 }
+
+// TestThickDestroyRunsVgremove pins the Phase 10.8 teardown
+// command shape: `vgs` probe (idempotency) then `vgremove
+// --force` when the VG exists.
+func TestThickDestroyRunsVgremove(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg",
+		storage.FakeResponse{Stdout: []byte("vg\n")})
+	fx.Expect("vgremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.Destroy(t.Context())
+	if err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if len(fx.Calls) != 2 {
+		t.Fatalf("Calls: got %d (%v), want 2 (vgs probe, vgremove)", len(fx.Calls), fx.Calls)
+	}
+}
+
+// TestThickDestroyIdempotentOnMissingVG pins the idempotency
+// contract: a missing VG returns nil without issuing vgremove.
+func TestThickDestroyIdempotentOnMissingVG(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.Destroy(t.Context())
+	if err != nil {
+		t.Fatalf("Destroy on missing VG: got %v, want nil", err)
+	}
+
+	for _, call := range fx.Calls {
+		if call.Name == "vgremove" {
+			t.Errorf("vgremove issued against missing VG: %s %v", call.Name, call.Args)
+		}
+	}
+}

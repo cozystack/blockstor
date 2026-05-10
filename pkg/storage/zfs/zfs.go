@@ -201,6 +201,34 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// Destroy tears the zpool down. Idempotent: missing pool
+// returns nil so a re-run after a partial teardown finishes
+// cleanly. `zpool destroy -f` removes the pool and every
+// dataset (volume zvols, snapshots) inside it in one call.
+// Phase 10.8.
+func (p *Provider) Destroy(ctx context.Context) error {
+	if !p.poolExists(ctx) {
+		return nil
+	}
+
+	_, err := p.exec.Run(ctx, "zpool", "destroy", "-f", p.cfg.Pool)
+	if err != nil {
+		return errors.Wrapf(err, "zpool destroy -f %s", p.cfg.Pool)
+	}
+
+	return nil
+}
+
+// poolExists is the pool-level idempotency probe for Destroy.
+func (p *Provider) poolExists(ctx context.Context) bool {
+	out, err := p.exec.Run(ctx, "zpool", "list", "-H", "-o", "name", p.cfg.Pool)
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(out)) != ""
+}
+
 // datasetExists is the idempotency primitive — analogous to lvExists.
 func (p *Provider) datasetExists(ctx context.Context, ds string) bool {
 	out, err := p.exec.Run(ctx, "zfs", "list", "-H", "-o", "name", ds)

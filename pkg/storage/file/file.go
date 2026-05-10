@@ -193,6 +193,20 @@ func (*Provider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return errors.New("file backend does not support snapshots")
 }
 
+// Destroy removes the pool directory and everything inside it.
+// FILE/FILE_THIN doesn't own a block device — there's no
+// vgremove/zpool destroy equivalent; the only on-disk state is
+// the `.img` files in `cfg.Dir`. Idempotent: missing directory
+// returns nil. Phase 10.8.
+func (p *Provider) Destroy(_ context.Context) error {
+	err := os.RemoveAll(p.cfg.Dir)
+	if err != nil {
+		return errors.Wrapf(err, "remove file pool dir %s", p.cfg.Dir)
+	}
+
+	return nil
+}
+
 // volumePath is `<dir>/<resource>_<vol5digits>.img`.
 func (p *Provider) volumePath(vol storage.Volume) string {
 	return filepath.Join(p.cfg.Dir, fmt.Sprintf("%s_%05d.img", vol.ResourceName, vol.VolumeNumber))
