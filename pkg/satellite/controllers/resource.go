@@ -1,0 +1,125 @@
+/*
+Copyright 2026 Cozystack contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+
+	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+)
+
+// ResourceReconciler watches Resource CRDs filtered to those
+// placed on this satellite's node and translates them into the
+// existing apply chain. Phase 10.1: replaces the gRPC
+// `ApplyResources` consumer.
+//
+// The reconciler is intentionally minimal in this initial
+// commit — it logs what it sees and exits. Subsequent commits
+// fill in the desired-state-builder + apply path by delegating
+// to `Config.Apply` (the pre-existing satellite reconciler that
+// owns storage + DRBD + LUKS).
+type ResourceReconciler struct {
+	client.Client
+
+	Config Config
+}
+
+// Reconcile reads a Resource and drives the satellite-side
+// apply chain when the Resource is placed on this node.
+// Deletion is handled via finalizer in a follow-up commit.
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("resource", req.Name)
+
+	var res blockstoriov1alpha1.Resource
+
+	err := r.Get(ctx, req.NamespacedName, &res)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, errors.Wrap(err, "get Resource")
+	}
+
+	if res.Spec.NodeName != r.Config.NodeName {
+		// Predicate should have filtered this out — defensive
+		// check in case the watch cache is mid-resync.
+		return ctrl.Result{}, nil
+	}
+
+	logger.V(1).Info("observed Resource",
+		"rd", res.Spec.ResourceDefinitionName,
+		"flags", res.Spec.Flags,
+		"deletionTimestamp", res.DeletionTimestamp)
+
+	// Phase 10.1 follow-up: translate to DesiredResource +
+	// call r.Config.Apply.Apply(...). Until then the gRPC
+	// `ApplyResources` consumer continues to drive applies.
+	return ctrl.Result{}, nil
+}
+
+// SetupWithManager wires this reconciler with a node-name
+// predicate so only Resources placed on this satellite trigger
+// reconciles. The predicate also fires on Delete events (the
+// CRD finalizer dance still needs us to clean up local state).
+func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	err := ctrl.NewControllerManagedBy(mgr).
+		For(&blockstoriov1alpha1.Resource{},
+			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
+		Named("satellite-resource").
+		Complete(r)
+	if err != nil {
+		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	return nil
+}
+
+// nodeNamePredicate filters events down to objects whose
+// `Spec.NodeName` matches the given node. Centralised so the
+// StoragePool reconciler can reuse the same shape.
+func nodeNamePredicate(nodeName string) predicate.Predicate {
+	matches := func(obj client.Object) bool {
+		if r, ok := obj.(*blockstoriov1alpha1.Resource); ok {
+			return r.Spec.NodeName == nodeName
+		}
+
+		if sp, ok := obj.(*blockstoriov1alpha1.StoragePool); ok {
+			return sp.Spec.NodeName == nodeName
+		}
+
+		return false
+	}
+
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool { return matches(e.Object) },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return matches(e.ObjectNew) || matches(e.ObjectOld)
+		},
+		DeleteFunc:  func(e event.DeleteEvent) bool { return matches(e.Object) },
+		GenericFunc: func(e event.GenericEvent) bool { return matches(e.Object) },
+	}
+}
