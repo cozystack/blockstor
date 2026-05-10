@@ -17,7 +17,9 @@ limitations under the License.
 package satellite_test
 
 import (
+	"context"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -166,5 +168,37 @@ func TestApplyHandlesMultipleResources(t *testing.T) {
 		if !r.GetOk() {
 			t.Errorf("expected ok for %s; got %s", r.GetName(), r.GetMessage())
 		}
+	}
+}
+
+// TestApplyCtxCancelBubblesAsError pins the context-cancel surface
+// of Apply. Per-resource failures land in ResourceApplyResult, but
+// a cancelled context bubbles up as a real (gRPC-shaped) error so
+// the satellite-side gRPC wrapper can surface a transport-level
+// failure to the controller — which then retries the batch on the
+// next dispatch tick rather than treating it as "satellite said
+// every replica failed".
+func TestApplyCtxCancelBubblesAsError(t *testing.T) {
+	fx := storage.NewFakeExec()
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // cancel immediately
+
+	_, err := rec.Apply(ctx, []*satellitepb.DesiredResource{
+		{Name: "pvc-1", NodeName: "n1"},
+	})
+	if err == nil {
+		t.Fatalf("Apply with cancelled ctx: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "context cancelled") {
+		t.Errorf("error wrap: got %q, want substring \"context cancelled\"", err.Error())
 	}
 }
