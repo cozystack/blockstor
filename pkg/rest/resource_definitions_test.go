@@ -193,3 +193,98 @@ func TestResourceDefinitionUpdateChangesRG(t *testing.T) {
 		t.Errorf("RG: got %q, want rg-new", got.ResourceGroupName)
 	}
 }
+
+// TestResourceDefinitionsCreateBadJSON: malformed body → 400 from
+// the JSON decoder. Pinned because golinstor is the primary client
+// here; a regression that surfaced raw decoder errors as 500 would
+// flip golinstor's retry classification (it retries 5xx, gives up
+// on 4xx) and bury operator typos in infinite loops.
+func TestResourceDefinitionsCreateBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceDefinitionsCreateMissingName: empty name in body → 400.
+// The spawn-flow always supplies a name, but the bare-RD-create
+// endpoint is also used by external tooling (linstor-csi reconciler
+// edge cases); without this validator the store would persist a
+// nameless RD that no later reconcile can address.
+func TestResourceDefinitionsCreateMissingName(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{}, // Name omitted
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400 (missing name)", resp.StatusCode)
+	}
+}
+
+// TestResourceDefinitionsUpdateBadJSON: malformed body → 400 from
+// the JSON decoder on the PUT path.
+func TestResourceDefinitionsUpdateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-1", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceDefinitionsUpdateMissingRD: PUT against a non-existent
+// {rd} pathvar → 404 (writeStoreError translates ErrNotFound).
+func TestResourceDefinitionsUpdateMissingRD(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinition{ResourceGroupName: "rg-new"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/resource-definitions/ghost", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestResourceDefinitionsDeleteMissingRD: DELETE on missing RD →
+// 404 surface from writeStoreError (idempotent delete is the
+// store's job, not the handler's, but the handler must surface
+// the not-found cleanly).
+func TestResourceDefinitionsDeleteMissingRD(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/ghost")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
