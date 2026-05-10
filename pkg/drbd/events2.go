@@ -120,12 +120,19 @@ func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 	return nil
 }
 
-// StartDrbdsetupEvents2 launches `drbdsetup events2 --statistics` and
-// returns a Watcher hooked to its stdout, plus a cleanup func that
+// StartDrbdsetupEvents2 launches `drbdsetup events2 --statistics --full`
+// and returns a Watcher hooked to its stdout, plus a cleanup func that
 // kills the child process. Production wiring; not used in unit tests
 // (those feed Watcher a fake io.Reader instead).
+//
+// `--statistics` adds performance counters (read/written byte tallies)
+// to device frames. `--full` adds the DRBD-9 generation identifier
+// fields (`current-uuid`, `bitmap-uuid`) to device frames so the
+// observer can surface them on `Resource.Status.Volumes[i].CurrentGi` —
+// which the controller reads when adding a new replica to skip the
+// full initial-sync (Phase 8.1).
 func StartDrbdsetupEvents2(ctx context.Context) (*Watcher, func(), error) {
-	cmd := exec.CommandContext(ctx, "drbdsetup", "events2", "--statistics")
+	cmd := exec.CommandContext(ctx, "drbdsetup", "events2", "--statistics", "--full")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

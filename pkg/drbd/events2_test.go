@@ -246,3 +246,38 @@ func TestWatcherClosesChannelOnEOF(t *testing.T) {
 		t.Errorf("channel not closed after EOF — runObserveLoop would hang")
 	}
 }
+
+// TestParseEventDeviceFullCurrentUuid pins that ParseEvent surfaces
+// the DRBD-9 generation-identifier fields (`current-uuid:` /
+// `bitmap-uuid:`) emitted by `drbdsetup events2 --full`. The
+// satellite observer reads these to populate
+// `Resource.Status.Volumes[i].CurrentGi`, which the controller uses
+// when seeding new replicas to skip the full initial-sync (Phase
+// 8.1).
+//
+// Without `--full`, drbdsetup omits these fields entirely; with the
+// flag they appear in `device` frames as ordinary key:value pairs
+// the generic parser already handles. Pinning them here defends
+// against a regression that swapped the parser to a fixed-field
+// schema and silently dropped UUIDs.
+func TestParseEventDeviceFullCurrentUuid(t *testing.T) {
+	line := "exists device name:pvc-1 volume:0 minor:1000 disk:UpToDate " +
+		"current-uuid:78A0DDD26421EBA4 bitmap-uuid:0000000000000000"
+
+	ev, err := drbd.ParseEvent(line)
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+
+	if got := ev.Fields["current-uuid"]; got != "78A0DDD26421EBA4" {
+		t.Errorf("current-uuid: got %q, want 78A0DDD26421EBA4", got)
+	}
+
+	if got := ev.Fields["bitmap-uuid"]; got != "0000000000000000" {
+		t.Errorf("bitmap-uuid: got %q, want 0000000000000000", got)
+	}
+
+	if ev.Fields["disk"] != "UpToDate" {
+		t.Errorf("disk: got %q, want UpToDate (existing fields must still parse alongside UUIDs)", ev.Fields["disk"])
+	}
+}
