@@ -194,3 +194,35 @@ func TestThickDeleteSnapshot(t *testing.T) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestThickVolumeStatusViaLVS pins the Thick.VolumeStatus passthrough
+// to volumeStatusViaLVS — the function had 0% coverage despite being
+// what the satellite calls every reconcile to learn whether an LV
+// exists at provisioned size.
+func TestThickVolumeStatusViaLVS(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-1_00000|1024.00\n")})
+
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	got, err := thick.VolumeStatus(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("VolumeStatus: %v", err)
+	}
+
+	if got.State != "PROVISIONED" {
+		t.Errorf("State: got %q, want PROVISIONED", got.State)
+	}
+
+	if got.UsableKib != 1024 {
+		t.Errorf("UsableKib: got %d, want 1024", got.UsableKib)
+	}
+
+	if got.DevicePath != "/dev/vg/pvc-1_00000" {
+		t.Errorf("DevicePath: got %q, want /dev/vg/pvc-1_00000", got.DevicePath)
+	}
+}
