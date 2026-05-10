@@ -37,6 +37,7 @@ type InMemory struct {
 	volumeDefinitions   *inMemoryVolumeDefinitions
 	kv                  *inMemoryKVStore
 	snapshots           *inMemorySnapshots
+	physicalDevices     *inMemoryPhysicalDevices
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
@@ -50,6 +51,7 @@ func NewInMemory() *InMemory {
 		volumeDefinitions:   &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
 		kv:                  &inMemoryKVStore{m: map[string]map[string]string{}},
 		snapshots:           &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
+		physicalDevices:     &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},
 	}
 }
 
@@ -76,6 +78,9 @@ func (s *InMemory) KeyValueStore() KeyValueStore { return s.kv }
 
 // Snapshots returns the SnapshotStore view.
 func (s *InMemory) Snapshots() SnapshotStore { return s.snapshots }
+
+// PhysicalDevices returns the PhysicalDeviceStore view.
+func (s *InMemory) PhysicalDevices() PhysicalDeviceStore { return s.physicalDevices }
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

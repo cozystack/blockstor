@@ -153,6 +153,24 @@ type SnapshotStore interface {
 	Delete(ctx context.Context, rdName, snapName string) error
 }
 
+// PhysicalDeviceStore persists PhysicalDevice objects (Phase 10.7).
+// The discovery loop on each satellite Creates / Updates / Deletes
+// rows here; the REST shim Reads them to surface upstream
+// `linstor physical-storage list`; the controller-side reconciler
+// (or operator via `kubectl edit`) sets Spec.AttachTo by Updating.
+//
+// The composite key is just `name` — the CRD already encodes
+// (node, stable-id) via its metadata.name, and the store passes
+// that through unchanged.
+type PhysicalDeviceStore interface {
+	List(ctx context.Context) ([]apiv1.PhysicalDevice, error)
+	ListForNode(ctx context.Context, nodeName string) ([]apiv1.PhysicalDevice, error)
+	Get(ctx context.Context, name string) (apiv1.PhysicalDevice, error)
+	Create(ctx context.Context, dev *apiv1.PhysicalDevice) error
+	Update(ctx context.Context, dev *apiv1.PhysicalDevice) error
+	Delete(ctx context.Context, name string) error
+}
+
 // Store aggregates per-resource stores.
 type Store interface {
 	Nodes() NodeStore
@@ -163,4 +181,5 @@ type Store interface {
 	VolumeDefinitions() VolumeDefinitionStore
 	KeyValueStore() KeyValueStore
 	Snapshots() SnapshotStore
+	PhysicalDevices() PhysicalDeviceStore
 }

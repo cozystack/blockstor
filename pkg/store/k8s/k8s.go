@@ -47,6 +47,7 @@ type Store struct {
 	volumeDefinitions   *volumeDefinitions
 	kv                  *kvStore
 	snapshots           *snapshots
+	physicalDevices     *physicalDevices
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
@@ -60,6 +61,7 @@ func New(c ctrlclient.Client) *Store {
 	s.volumeDefinitions = &volumeDefinitions{c: c}
 	s.kv = &kvStore{c: c}
 	s.snapshots = &snapshots{c: c}
+	s.physicalDevices = &physicalDevices{c: c}
 
 	return s
 }
@@ -87,3 +89,6 @@ func (s *Store) KeyValueStore() store.KeyValueStore { return s.kv }
 
 // Snapshots returns the SnapshotStore view.
 func (s *Store) Snapshots() store.SnapshotStore { return s.snapshots }
+
+// PhysicalDevices returns the PhysicalDeviceStore view.
+func (s *Store) PhysicalDevices() store.PhysicalDeviceStore { return s.physicalDevices }
