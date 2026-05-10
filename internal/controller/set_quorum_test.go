@@ -20,9 +20,13 @@ import (
 	"context"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
@@ -131,5 +135,99 @@ func TestSetQuorumReplacesExistingValue(t *testing.T) {
 
 	if got.Spec.Props["DrbdOptions/Resource/quorum"] != "majority" {
 		t.Errorf("quorum prop: got %q, want majority", got.Spec.Props["DrbdOptions/Resource/quorum"])
+	}
+}
+
+// TestSetQuorumRetriesOnConflict pins the conflict-retry loop:
+// when the apiserver returns a Conflict error on Update (because
+// another reconciler bumped resourceVersion in flight), setQuorum
+// must refetch the RD and retry. Without this, two concurrent
+// reconcilers would race each other to fail the quorum-prop write
+// and leave the RD stuck in the wrong quorum state.
+func TestSetQuorumRetriesOnConflict(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+	}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	var updateCalls int
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalls++
+			if updateCalls == 1 {
+				gr := schema.GroupResource{Group: blockstoriov1alpha1.GroupVersion.Group, Resource: "resourcedefinitions"}
+
+				return apierrors.NewConflict(gr, obj.GetName(), nil)
+			}
+
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	if err := rec.SetQuorum(context.Background(), rd, "majority"); err != nil {
+		t.Fatalf("SetQuorum: got %v, want nil after retry", err)
+	}
+
+	if updateCalls < 2 {
+		t.Errorf("Update calls: got %d, want >=2 (retry must happen)", updateCalls)
+	}
+
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := base.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, final); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if final.Spec.Props["DrbdOptions/Resource/quorum"] != "majority" {
+		t.Errorf("quorum prop after retry: got %q, want majority", final.Spec.Props["DrbdOptions/Resource/quorum"])
+	}
+}
+
+// TestSetQuorumGivesUpAfterThreeConflicts: a permanently-conflicting
+// apiserver makes setQuorum return Conflict after the third attempt
+// rather than looping forever. Pins the bounded-retry budget so a
+// hot-reconcile loop can't melt CPU.
+func TestSetQuorumGivesUpAfterThreeConflicts(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+	}
+
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	var updateCalls int
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+			updateCalls++
+			gr := schema.GroupResource{Group: blockstoriov1alpha1.GroupVersion.Group, Resource: "resourcedefinitions"}
+
+			return apierrors.NewConflict(gr, obj.GetName(), nil)
+		},
+	})
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	err := rec.SetQuorum(context.Background(), rd, "majority")
+	if err == nil {
+		t.Fatalf("SetQuorum: got nil, want bounded-retry Conflict error")
+	}
+
+	if !apierrors.IsConflict(err) {
+		t.Errorf("error kind: got %v, want Conflict (bounded retry)", err)
+	}
+
+	if updateCalls != 3 {
+		t.Errorf("Update calls: got %d, want exactly 3 (bounded retry budget)", updateCalls)
 	}
 }
