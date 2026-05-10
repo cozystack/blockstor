@@ -17,6 +17,7 @@ limitations under the License.
 package satellite_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -239,5 +240,39 @@ func TestGRPCServerShipSnapshotUnknownResource(t *testing.T) {
 
 	if resp.GetOk() {
 		t.Errorf("Ok: got true on unknown resource; want false")
+	}
+}
+
+// TestGRPCServerApplyResourcesCtxCancelBubbles pins the
+// transport-error branch of GRPCServer.ApplyResources: when the
+// underlying Reconciler.Apply returns an error (today: cancelled
+// context), the gRPC handler must propagate it as a gRPC error
+// rather than swallow it as Ok=false body-level. This is the
+// signal the controller's dispatcher uses to distinguish "satellite
+// rejected this batch" (per-replica) from "transport failed,
+// retry the batch" (gRPC error).
+func TestGRPCServerApplyResourcesCtxCancelBubbles(t *testing.T) {
+	fx := storage.NewFakeExec()
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  t.TempDir(),
+		NodeName:  "n1",
+	})
+
+	srv := satellite.NewGRPCServer(rec)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := srv.ApplyResources(ctx, &satellitepb.ApplyResourcesRequest{
+		Resources: []*satellitepb.DesiredResource{
+			{Name: "pvc-1", NodeName: "n1"},
+		},
+	})
+	if err == nil {
+		t.Fatalf("ApplyResources with cancelled ctx: got nil, want gRPC-shaped error")
 	}
 }
