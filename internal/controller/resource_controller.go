@@ -815,14 +815,26 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 		return nil, err
 	}
 
+	ctrlCfg, err := r.controllerConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var (
-		rgProps  map[string]string
-		rdProps  map[string]string
-		rgTyped  *blockstoriov1alpha1.DRBDOptions
-		rdTyped  *blockstoriov1alpha1.DRBDOptions
-		rgExtras map[string]string
-		rdExtras map[string]string
+		ctrlTyped  *blockstoriov1alpha1.DRBDOptions
+		ctrlExtras map[string]string
+		rgProps    map[string]string
+		rdProps    map[string]string
+		rgTyped    *blockstoriov1alpha1.DRBDOptions
+		rdTyped    *blockstoriov1alpha1.DRBDOptions
+		rgExtras   map[string]string
+		rdExtras   map[string]string
 	)
+
+	if ctrlCfg != nil {
+		ctrlTyped = ctrlCfg.Spec.DRBDOptions
+		ctrlExtras = ctrlCfg.Spec.ExtraProps
+	}
 
 	if rdPtr != nil {
 		rdProps = rdPtr.Spec.Props
@@ -851,7 +863,10 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 
 	// Resolve typed options through the same scope hierarchy as the
 	// legacy Props resolver. Lower scope wins per non-nil field.
-	typed := drbd.ResolveDRBDOptions(nil, rgTyped, rdTyped, target.Spec.DRBDOptions)
+	// Phase 10.4: ControllerConfig.Spec.DRBDOptions is the typed
+	// controller scope. The legacy KVEntry-shaped controllerProps
+	// remains for forward-compat with any pre-migration cluster.
+	typed := drbd.ResolveDRBDOptions(ctrlTyped, rgTyped, rdTyped, target.Spec.DRBDOptions)
 
 	// Flatten typed → string Props so the existing satellite-side
 	// renderer keeps working. Then layer on the legacy Props
@@ -862,11 +877,34 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 	out := drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props)
 
 	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
+	maps.Copy(out, ctrlExtras)
 	maps.Copy(out, rgExtras)
 	maps.Copy(out, rdExtras)
 	maps.Copy(out, target.Spec.ExtraProps)
 
 	return out, nil
+}
+
+// controllerConfig fetches the singleton ControllerConfig CRD. We
+// only recognise the canonical name `default`; any other instance
+// is silently ignored so a stale or duplicated ControllerConfig
+// can't quietly take effect. Missing CRD or missing object both
+// return (nil, nil) — the reconciler falls through to legacy
+// KVEntry-based controllerProps for forward-compat with
+// pre-migration clusters.
+func (r *ResourceReconciler) controllerConfig(ctx context.Context) (*blockstoriov1alpha1.ControllerConfig, error) {
+	var cfg blockstoriov1alpha1.ControllerConfig
+
+	err := r.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &cfg)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil, nil //nolint:nilnil // optional singleton — nil means "not configured"
+		}
+
+		return nil, err
+	}
+
+	return &cfg, nil
 }
 
 // resolveLayerStack walks the RD → RG hierarchy and returns the
