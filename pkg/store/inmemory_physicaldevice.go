@@ -102,8 +102,17 @@ func (s *inMemoryPhysicalDevices) Update(_ context.Context, dev *apiv1.PhysicalD
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[dev.Name]; !exists {
+	existing, exists := s.m[dev.Name]
+	if !exists {
 		return errors.Wrapf(ErrNotFound, "physical device %q", dev.Name)
+	}
+
+	// CAS guard for the attach race — see the same check in the
+	// k8s store's Update for the why. Two concurrent attach
+	// requests both pass `pickFreeDeviceForAttach`; the second
+	// to land must lose with ErrAlreadyExists.
+	if dev.AttachTo != nil && existing.AttachTo != nil {
+		return errors.Wrapf(ErrAlreadyExists, "physical device %q already attached", dev.Name)
 	}
 
 	s.m[dev.Name] = *dev

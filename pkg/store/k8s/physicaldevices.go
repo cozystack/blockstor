@@ -138,6 +138,17 @@ func (s *physicalDevices) Update(ctx context.Context, dev *apiv1.PhysicalDevice)
 		return errors.Wrapf(err, "get PhysicalDevice %q", dev.Name)
 	}
 
+	// CAS guard for the attach race (Phase 10.7 race-matrix line
+	// 767): two concurrent CDP requests both pass `pickFreeDevice`
+	// because each sees `AttachTo=nil`. Without this check the
+	// last writer would silently overwrite the first and both
+	// callers would think they'd won. Refusing the second
+	// attach with `ErrAlreadyExists` lets the REST handler
+	// surface a 409 to the loser.
+	if dev.AttachTo != nil && existing.Spec.AttachTo != nil {
+		return errors.Wrapf(store.ErrAlreadyExists, "physical device %q already attached", dev.Name)
+	}
+
 	existing.Spec = wireToCRDPhysicalDeviceSpec(dev)
 
 	// Reflect typed-but-Spec.AttachTo-related label maintenance
