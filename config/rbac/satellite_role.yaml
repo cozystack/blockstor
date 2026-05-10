@@ -1,0 +1,146 @@
+---
+# Phase 10.1 satellite-side RBAC. The satellite — once promoted to a
+# controller-runtime controller in Phase 10.1 — watches the apiserver
+# directly for the CRDs it acts on. Until that lands the satellite
+# still talks to the controller via gRPC; this role is the contract
+# the migration moves to.
+#
+# Verbs follow the principle of least privilege:
+#   - read-only on resources the satellite consumes (RG, RD, Node, Snapshot, ControllerConfig).
+#   - write on Resource (own finalizer) + Resource/status (observed state).
+#   - write on StoragePool/status (capacity reports).
+#   - write on PhysicalDevice + PhysicalDevice/status (discovery loop publishes
+#     and consumes).
+#   - read on Secret (LUKS passphrase + DRBD shared secret are stored as
+#     Secrets in the controller's namespace; the satellite mounts them
+#     as in-cluster reads via the apiserver, not via volume mounts —
+#     volume mounts would require restart on rotation).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: satellite-role
+rules:
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - resourcegroups
+  - resourcedefinitions
+  - nodes
+  - snapshots
+  - controllerconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - resources
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - resources/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - resources/status
+  - storagepools/status
+  - nodes/status
+  - snapshots/status
+  - physicaldevices/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - storagepools
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - blockstor.io.blockstor.io
+  resources:
+  - physicaldevices
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# Secrets — read-only access to the controller's namespace where
+# DRBD shared secrets and LUKS passphrases live. Limited to specific
+# names via a Role binding in the deployment manifest (the
+# ClusterRole only enumerates the verbs).
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+# Events — emit per-Resource events the operator can `kubectl
+# describe` to debug a stuck reconcile.
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+# Leader election — the satellite is per-node singleton via host
+# DaemonSet, so leader election is technically optional, but the
+# controller-runtime manager wires it by default. Use a Lease per
+# node-name to keep the locking blast radius scoped.
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blockstor-satellite
+  # The DaemonSet that runs the satellite mounts this ServiceAccount;
+  # populated when the deployment manifest is generated in Phase
+  # 10.1. namespace is controller-managed.
+---
+# Cluster-wide binding: satellite needs to read RGs / RDs / Nodes
+# everywhere because Resource placement is a cross-namespace concern
+# (Nodes are cluster-scoped CRDs; the controller-managed namespace
+# is irrelevant to a satellite that just reads them).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blockstor-satellite-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: blockstor-satellite
+  # namespace populated at deploy time
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: satellite-role

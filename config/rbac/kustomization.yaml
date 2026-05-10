@@ -43,4 +43,9 @@ resources:
 - node_admin_role.yaml
 - node_editor_role.yaml
 - node_viewer_role.yaml
+# Phase 10.1: ClusterRole + ServiceAccount + binding the satellite
+# DaemonSet (or controller-runtime-promoted satellite agent) uses
+# to watch the apiserver directly. ClusterRoleBinding subjects'
+# namespace is patched at deploy time.
+- satellite_role.yaml
 
