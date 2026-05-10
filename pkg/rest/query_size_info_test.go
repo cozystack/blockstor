@@ -230,3 +230,61 @@ func TestQuerySizeInfoSharedLUN(t *testing.T) {
 			got.SpaceInfo.AvailableSizeInKib)
 	}
 }
+
+// TestDisabledNodes pins which node-flag values cause a node to be
+// excluded from the query-size-info / advise capacity rollup. Both
+// EVICTED and LOST must surface in the disabled set; any other flag
+// (or no flags at all) leaves the node in the available pool.
+//
+// A regression that dropped one of the two flags would silently
+// over-count free capacity — operators rely on this to keep an
+// EVICTED node's pools out of the autoplace candidate list, and to
+// stop linstor-csi from sizing volumes against capacity that is
+// definitionally unreachable.
+func TestDisabledNodes(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []apiv1.Node{
+		{Name: "healthy", Flags: nil},
+		{Name: "online-with-other-flag", Flags: []string{"SOME_OTHER_FLAG"}},
+		{Name: "evicted", Flags: []string{apiv1.NodeFlagEvicted}},
+		{Name: "lost", Flags: []string{apiv1.NodeFlagLost}},
+		{Name: "evicted-and-lost", Flags: []string{apiv1.NodeFlagEvicted, apiv1.NodeFlagLost}},
+	} {
+		if err := st.Nodes().Create(ctx, &n); err != nil {
+			t.Fatalf("seed %s: %v", n.Name, err)
+		}
+	}
+
+	srv := &Server{Store: st}
+
+	got, err := srv.disabledNodes(ctx)
+	if err != nil {
+		t.Fatalf("disabledNodes: %v", err)
+	}
+
+	want := map[string]struct{}{
+		"evicted":          {},
+		"lost":             {},
+		"evicted-and-lost": {},
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("got %d disabled, want %d; got=%v", len(got), len(want), got)
+	}
+
+	for name := range want {
+		if _, ok := got[name]; !ok {
+			t.Errorf("missing %q from disabled set; got=%v", name, got)
+		}
+	}
+
+	for _, ok := range []string{"healthy", "online-with-other-flag"} {
+		if _, bad := got[ok]; bad {
+			t.Errorf("%q must NOT be disabled (has no EVICTED/LOST flag)", ok)
+		}
+	}
+}
