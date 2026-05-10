@@ -1157,3 +1157,38 @@ func TestCreateSnapshotRPCErrorBubbles(t *testing.T) {
 }
 
 var errSnapshotRPCFailed = errors.New("rpc: satellite unreachable")
+
+// TestApplyRPCErrorBubbles pins the ApplyResources RPC-error wrap:
+// when the satellite ACKs the dial but the actual ApplyResources
+// gRPC call fails (transport blip mid-stream, satellite restart
+// between dial and call), the dispatcher must surface the error
+// with the "ApplyResources RPC" wrap keyword. The Resource
+// reconciler's dispatchApply path treats this as a transport
+// fault and requeues with the 10s back-off.
+func TestApplyRPCErrorBubbles(t *testing.T) {
+	stub := &fakeSatelliteClient{err: errApplyRPCDown}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{ResourceDefinitionName: "pvc-1", NodeName: "n1"},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, nil, dispatcher.ApplyOptions{})
+	if err == nil {
+		t.Fatalf("Apply: got nil, want RPC error")
+	}
+
+	if !strings.Contains(err.Error(), "ApplyResources RPC") {
+		t.Errorf("wrap: got %q, want substring \"ApplyResources RPC\"", err.Error())
+	}
+}
+
+var errApplyRPCDown = errors.New("rpc: satellite mid-restart")
