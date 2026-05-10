@@ -253,6 +253,22 @@ func RunVolumeDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("Update missing: got %v, want ErrNotFound", err)
 		}
 	})
+	// DeleteMissing pins the not-found surface on Delete: the VD
+	// record exists at the RD level (CRD-backed) or in the per-RD
+	// map (in-memory), so a missing volume_number must surface as
+	// ErrNotFound rather than panic or silently succeed. linstor-csi
+	// performs idempotent VD-delete on volume teardown — but
+	// idempotency is the handler's job (returns 204 on csi side),
+	// not the store's; the store reports the truth.
+	t.Run("DeleteMissing", func(t *testing.T) {
+		s := newStore(t)
+		seedRD(t, s, "pvc-1")
+
+		err := s.VolumeDefinitions().Delete(t.Context(), "pvc-1", 99)
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Delete missing: got %v, want ErrNotFound", err)
+		}
+	})
 	// ListSorted: per-RD VolumeDefinitions must be ordered by
 	// VolumeNumber. The satellite reconciler's per-volume Apply walks
 	// this list assuming volume 0 comes before volume 1 — without
