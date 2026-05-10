@@ -288,3 +288,35 @@ func TestDisabledNodes(t *testing.T) {
 		}
 	}
 }
+
+// TestReplicaCount pins the autoplace-default-1 fallback. Three
+// branches: nil filter (RG with no AutoSelectFilter set), zero
+// PlaceCount, negative PlaceCount — all collapse to 1, matching
+// upstream autoplacer's "1-replica until told otherwise" default.
+//
+// A regression that returned 0 here would make query-size-info
+// claim infinite available volume size (the n-th-largest pool of
+// zero pools is 0 → divide by zero in capacity rollup) and cause
+// linstor-csi's CreateVolume sizing logic to either OOM or oversize.
+func TestReplicaCount(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		f    *apiv1.AutoSelectFilter
+		want int
+	}{
+		{"nil", nil, 1},
+		{"zero", &apiv1.AutoSelectFilter{PlaceCount: 0}, 1},
+		{"negative", &apiv1.AutoSelectFilter{PlaceCount: -3}, 1},
+		{"explicit 1", &apiv1.AutoSelectFilter{PlaceCount: 1}, 1},
+		{"explicit 3", &apiv1.AutoSelectFilter{PlaceCount: 3}, 3},
+	}
+
+	for _, c := range cases {
+		got := replicaCount(c.f)
+		if got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
