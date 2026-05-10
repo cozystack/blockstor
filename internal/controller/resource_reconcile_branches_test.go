@@ -196,8 +196,10 @@ func TestResourceReconcileAddsFinalizer(t *testing.T) {
 	}
 
 	// First pass requests a requeue so the next pass picks up the
-	// finalizer-stamped object.
-	if !got.Requeue {
+	// finalizer-stamped object. controller-runtime's Result counts
+	// any non-zero value as "requeue", whether the deprecated bool
+	// or the durationField is set — assert via the zero comparison.
+	if got == (ctrl.Result{}) {
 		t.Errorf("first-pass must requeue after stamping finalizer; got %+v", got)
 	}
 

@@ -97,3 +97,12 @@ func (r *ResourceReconciler) ControllerProps(ctx context.Context) (map[string]st
 func (r *ResourceReconciler) LookupRD(ctx context.Context, name string) (*blockstoriov1alpha1.ResourceDefinition, error) {
 	return r.lookupRD(ctx, name)
 }
+
+// PtrEqI32 exposes the nil-aware *int32 equality helper. Tests pin
+// every branch of the three-way nil check so a refactor that flipped
+// the nil-vs-non-nil case wouldn't silently make ID-equality tests
+// always-false (which would trigger spurious Status updates on
+// every reconcile).
+func PtrEqI32(a, b *int32) bool {
+	return ptrEqI32(a, b)
+}
