@@ -168,3 +168,12 @@ func (r *ResourceDefinitionReconciler) ApplyWitnessDecision(
 ) ([]apiv1.Resource, error) {
 	return r.applyWitnessDecision(ctx, rd, replicas, diskless, witness, wantWitness)
 }
+
+// EnsureTiebreaker exposes the full ensure-tiebreaker pipeline
+// (decision + quorum prop write) for tests. The wired-up version
+// fires from RD reconcile; tests pin the boundary cases (witness
+// auto-add on 2-replica, quorum off on 1-replica, quorum majority
+// on 3-replica) without reconstructing the full Reconcile call.
+func (r *ResourceDefinitionReconciler) EnsureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	return r.ensureTiebreaker(ctx, rd)
+}
