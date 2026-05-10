@@ -161,3 +161,52 @@ func TestSpawnRollsBackOnVDFailure(t *testing.T) {
 		t.Errorf("status: got %d, want 409 (RD already exists)", resp.StatusCode)
 	}
 }
+
+// TestCopyVolumeGroupProps pins the per-volume props lookup spawn uses
+// to lift VolumeGroup-template props onto the freshly-created VD. The
+// branches matter because spawn writes the result straight into the
+// VD; a regression in any branch silently corrupts the RG → VD prop
+// inheritance contract that operators rely on for per-volume tuning
+// (e.g. fs-type, encrypt-passphrase, drbd-net options).
+//
+//  1. miss → nil (caller must NOT propagate any props for this volNum)
+//  2. match with empty Props → nil (don't return an empty map; spawn
+//     skips the SetProps call entirely on nil, vs a needless empty
+//     write on map-len-zero)
+//  3. match with non-empty Props → independent copy (mutation by the
+//     caller must NOT bleed back into the RG template, otherwise a
+//     later spawn for sibling RDs would inherit the mutation)
+func TestCopyVolumeGroupProps(t *testing.T) {
+	t.Parallel()
+
+	src := []apiv1.VolumeGroup{
+		{VolumeNumber: 0, Props: map[string]string{"k0": "v0"}},
+		{VolumeNumber: 1, Props: nil}, // empty-props branch
+		{VolumeNumber: 2, Props: map[string]string{"k2a": "v2a", "k2b": "v2b"}},
+	}
+
+	if got := copyVolumeGroupProps(src, 99); got != nil {
+		t.Errorf("miss: got %v, want nil", got)
+	}
+
+	if got := copyVolumeGroupProps(src, 1); got != nil {
+		t.Errorf("empty-props: got %v, want nil (spawn skips SetProps on nil)", got)
+	}
+
+	got := copyVolumeGroupProps(src, 2)
+	if got == nil || got["k2a"] != "v2a" || got["k2b"] != "v2b" || len(got) != 2 {
+		t.Fatalf("match: got %v, want {k2a:v2a, k2b:v2b}", got)
+	}
+
+	// Mutate the copy: the source must NOT change.
+	got["k2a"] = "MUTATED"
+	got["new"] = "added"
+
+	if src[2].Props["k2a"] != "v2a" {
+		t.Errorf("template mutated: src[2].Props[k2a]=%q, want v2a", src[2].Props["k2a"])
+	}
+
+	if _, ok := src[2].Props["new"]; ok {
+		t.Errorf("template mutated: src[2].Props[new] leaked from copy")
+	}
+}
