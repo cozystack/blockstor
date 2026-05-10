@@ -109,6 +109,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerControllerProperties(mux)
 	s.registerAdjust(mux)
 	s.registerResourceLifecycle(mux)
+	s.registerResourceToggleDisk(mux)
 	s.registerStats(mux)
 	s.registerErrorReports(mux)
 	s.registerPropertiesInfo(mux)
