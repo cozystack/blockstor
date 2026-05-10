@@ -510,5 +510,61 @@ func TestPlaceExistingReplicaWithStaleStorPool(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnSameNoQualifyingGroup pins the
+// pickSameGroup fallback: when no replicas_on_same group is
+// large enough to hold place_count, it returns the candidates
+// unchanged (with nil tuple) so the placer can run through the
+// regular flow and fail the conflict check honestly with
+// placed < want — rather than silently picking a too-small
+// group that would leave the RD under-replicated.
+//
+// Three zones × 1 node each, place_count=2 → no group has 2.
+// Result: placer can't satisfy 2-on-same and surfaces placed=0.
+func TestPlaceReplicasOnSameNoQualifyingGroup(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "p",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: 100,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// Each zone has exactly 1 node — no group big enough for 2.
+	mk("east-a", "us-east-1a")
+	mk("west-a", "us-west-1b")
+	mk("eu-a", "eu-west-1a")
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		ReplicasOnSame: []string{"zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	// pickSameGroup returns candidates unchanged with nil tuple →
+	// placer falls through, the first replica locks in a tuple, the
+	// second can't find a same-tuple peer → placed=1.
+	if placed != 1 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 1/2 (no group ≥2 → fall back to regular flow)", placed, want)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
