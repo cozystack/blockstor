@@ -740,7 +740,7 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Discovery loop (satellite, periodic + udev-triggered):**
 
-- [ ] Run `lsblk -P -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,ROTA,TRAN,PARTLABEL` and filter to `TYPE=disk` with no `FSTYPE`, no `MOUNTPOINT`, no children (no partition table). Cross-check via `pvs --noheadings` (no LVM signature), `zpool list -PHv` (not in any zpool), `drbdmeta show-md` (no DRBD signature), `wipefs -n` (no other signature).
+- [~] `lsblk` parser + free-disk filter (2026-05-10, partial). `pkg/satellite/lsblk.go` — `Lsblk(ctx, exec)` runs `lsblk -Pb -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN`; `parseLsblkPairs` handles embedded-space MODEL strings via a hand-rolled KEY="value" reader; `IsFreeBlockDevice` enforces `TYPE=disk ∧ no FSTYPE ∧ no MOUNTPOINT` (pinned by 7 sub-tests). Cross-checks against `pvs --noheadings` / `zpool list -PHv` / `drbdmeta show-md` / `wipefs -n` come with the discovery loop wiring (controller-runtime satellite required).
 - [ ] Set-difference against existing `PhysicalDevice` CRDs labelled with this node:
   - New free device → `client.Create(PhysicalDevice{name: <node>-<id-slug>, status: ...})`
   - Already published, attributes changed (e.g. drive replaced) → `client.Status().Update(...)`
