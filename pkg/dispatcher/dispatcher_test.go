@@ -1192,3 +1192,60 @@ func TestApplyRPCErrorBubbles(t *testing.T) {
 }
 
 var errApplyRPCDown = errors.New("rpc: satellite mid-restart")
+
+// TestApplyOptsLayerStackOverridesRD pins the opts.LayerStack
+// override branch in Apply. linstor-csi can pass a layer stack via
+// the autoplace REST envelope (rather than on the RD itself); when
+// that path fires, the dispatcher must use opts.LayerStack as
+// authoritative — overriding whatever the RD spec carries.
+//
+// Without this override path, an operator who corrected the
+// stack via REST would see the RD's stale LayerStack continue to
+// drive the satellite reconcile.
+func TestApplyOptsLayerStackOverridesRD(t *testing.T) {
+	stub := &fakeSatelliteClient{
+		resp: &satellitepb.ApplyResourcesResponse{
+			Results: []*satellitepb.ResourceApplyResult{{Name: "pvc-1", Ok: true}},
+		},
+	}
+	d := dispatcher.New(&fakeDialer{stub: stub})
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			LayerStack: []string{"DRBD", "STORAGE"}, // RD-side stale stack
+		},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{{
+		ObjectMeta: nodeMeta("n1"),
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}}
+
+	opts := dispatcher.ApplyOptions{
+		LayerStack: []string{"DRBD", "LUKS", "STORAGE"}, // operator-corrected
+	}
+
+	_, err := d.Apply(t.Context(), target, nil, nodes, rd, opts)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	got := stub.last.GetResources()[0].GetLayerStack()
+	if len(got) != 3 {
+		t.Fatalf("LayerStack: got %v, want 3 entries (opts override)", got)
+	}
+
+	if got[1] != "LUKS" {
+		t.Errorf("LayerStack[1]: got %q, want LUKS (opts override on RD)", got[1])
+	}
+}
