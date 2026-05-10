@@ -63,23 +63,11 @@ spec:
             # satellite writes its rendered files where drbdadm
             # actually looks for them.
             - --state-dir=/etc/drbd.d
-            # Sparse-file pool wired through losetup. Talos workers
-            # without an extra disk fall back to this; with extra
-            # disks the lvm-thin and zfs pools below are preferred.
-            - --loopfile-pool-name=stand
-            - --loopfile-dir=/var/lib/blockstor-pool
-            # Real-disk LVM-thin pool. install-pools.sh creates the
-            # blockstor-lvm VG + thin LV on each worker before this
-            # satellite starts; an empty/missing pool just produces
-            # no LV-create calls until the operator wires it.
-            - --lvm-pool-name=lvm-thin
-            - --lvm-vg=blockstor-lvm
-            - --lvm-thinpool=thin
-            # Real-disk ZFS_THIN pool. Same idea — install-pools.sh
-            # creates `blockstor-zfs`.
-            - --zfs-pool-name=zfs-thin
-            - --zfs-zpool=blockstor-zfs
-            - --zfs-thin=true
+            # Storage pools are declared via StoragePool CRDs in
+            # stand/blockstor-storagepools.yaml (Phase 10.5 — the
+            # satellite's c-r reconciler picks them up via watch).
+            # install-pools.sh on each worker creates the backing
+            # VG/zpool/dir before the CRDs reach the satellite.
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}

@@ -41,15 +41,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/storage"
-	"github.com/cozystack/blockstor/pkg/storage/loopfile"
-	"github.com/cozystack/blockstor/pkg/storage/lvm"
-	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
-
-// loopfileDirPerm is the mkdir mode for the loopfile pool directory
-// when --loopfile-dir doesn't already exist. 0o700 because the sparse
-// files inside are block-device backers and shouldn't be world-readable.
-const loopfileDirPerm = 0o700
 
 func main() {
 	os.Exit(run())
@@ -65,9 +57,6 @@ func run() int {
 		stateDir       string
 		listenAddr     string
 		advertised     string
-		lvmPoolName    string
-		lvmVG          string
-		lvmThinPool    string
 	)
 
 	flag.StringVar(&controllerAddr, "controller", "blockstor-controller:7000",
@@ -84,45 +73,6 @@ func run() int {
 	// value here is just an empty string + a placeholder doc.
 	flag.StringVar(&advertised, "advertised-endpoint", "",
 		"host:port the controller should dial back at (defaults to $POD_IP:<listen-port>)")
-	flag.StringVar(&lvmPoolName, "lvm-pool-name", "",
-		"register an LVM-thin pool under this LINSTOR pool name (empty disables LVM)")
-	flag.StringVar(&lvmVG, "lvm-vg", "",
-		"LVM volume group backing the lvm-pool-name pool")
-	flag.StringVar(&lvmThinPool, "lvm-thinpool", "",
-		"LVM thinpool LV backing the lvm-pool-name pool")
-
-	var (
-		lvmThickPoolName string
-		lvmThickVG       string
-	)
-
-	flag.StringVar(&lvmThickPoolName, "lvm-thick-pool-name", "",
-		"register an LVM (classic, thick) pool under this LINSTOR pool name (empty disables)")
-	flag.StringVar(&lvmThickVG, "lvm-thick-vg", "",
-		"LVM volume group backing the lvm-thick-pool-name pool (defaults to lvm-thick-pool-name)")
-
-	var (
-		loopfilePoolName string
-		loopfileDir      string
-	)
-
-	flag.StringVar(&loopfilePoolName, "loopfile-pool-name", "",
-		"register a loopfile (sparse-file + losetup) pool under this LINSTOR pool name (empty disables)")
-	flag.StringVar(&loopfileDir, "loopfile-dir", "/var/lib/blockstor-pool",
-		"directory the loopfile-pool-name pool stores its sparse files in")
-
-	var (
-		zfsPoolName string
-		zfsZpool    string
-		zfsThin     bool
-	)
-
-	flag.StringVar(&zfsPoolName, "zfs-pool-name", "",
-		"register a ZFS pool under this LINSTOR pool name (empty disables)")
-	flag.StringVar(&zfsZpool, "zfs-zpool", "",
-		"backing zpool name (defaults to zfs-pool-name)")
-	flag.BoolVar(&zfsThin, "zfs-thin", true,
-		"create sparse zvols (ZFS_THIN). Set to false for thick provisioning.")
 
 	flag.Parse()
 
@@ -151,54 +101,14 @@ func run() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Providers map starts empty — pools are registered by the
+	// satellite c-r `StoragePoolReconciler` as it observes
+	// StoragePool CRDs (Phase 10.5 retirement of the pool-flag
+	// bootstrap path). Until the c-r manager fires its first
+	// reconcile the gRPC `ApplyStoragePools` handler can still
+	// seed providers; once Phase 10.6 retires gRPC the CRD-driven
+	// path is the only one.
 	providers := map[string]storage.Provider{}
-
-	if lvmPoolName != "" {
-		if lvmVG == "" || lvmThinPool == "" {
-			logger.Error("lvm-pool-name set but lvm-vg / lvm-thinpool missing")
-
-			return 1
-		}
-
-		providers[lvmPoolName] = lvm.NewThin(
-			lvm.ThinConfig{VolumeGroup: lvmVG, ThinPool: lvmThinPool},
-			storage.RealExec{})
-	}
-
-	if lvmThickPoolName != "" {
-		vg := lvmThickVG
-		if vg == "" {
-			vg = lvmThickPoolName
-		}
-
-		providers[lvmThickPoolName] = lvm.NewThick(
-			lvm.ThickConfig{VolumeGroup: vg},
-			storage.RealExec{})
-	}
-
-	if loopfilePoolName != "" {
-		err := os.MkdirAll(loopfileDir, loopfileDirPerm)
-		if err != nil {
-			logger.Error("create loopfile dir", "err", err)
-
-			return 1
-		}
-
-		providers[loopfilePoolName] = loopfile.NewProvider(
-			loopfile.Config{Dir: loopfileDir},
-			storage.RealExec{})
-	}
-
-	if zfsPoolName != "" {
-		zpool := zfsZpool
-		if zpool == "" {
-			zpool = zfsPoolName
-		}
-
-		providers[zfsPoolName] = zfs.NewProvider(
-			zfs.Config{Pool: zpool, Thin: zfsThin},
-			storage.RealExec{})
-	}
 
 	// Wipe stale .res files from previous incarnations of this
 	// satellite process. Each pod restart should hand drbdadm a

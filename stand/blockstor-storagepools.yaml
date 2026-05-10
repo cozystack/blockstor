@@ -1,0 +1,133 @@
+---
+# StoragePool CRDs for the dev stand. Phase 10.5 retires the
+# satellite's CLI pool flags; pools are now operator-declared
+# via these manifests and the satellite's c-r
+# `StoragePoolReconciler` registers them on observation.
+#
+# The three pools mirror what `cmd/satellite/main.go`'s flags
+# used to seed on each Talos worker. install-pools.sh on the
+# stand creates the backing VG/zpool/dir before these CRDs are
+# applied; without that setup the satellite's
+# `NewProviderFromKind` will instantiate a provider that fails
+# on first volume create (`vgcreate` not run yet) — operator
+# fixes the backing storage and re-reconciles.
+#
+# CRDs are cluster-scoped + per-node: the same pool name on a
+# different node is a different CRD (the satellite's predicate
+# filters by `Spec.NodeName`). Apply with `kubectl apply -f`
+# OR templated per-node via cozystack's StoragePool generator.
+
+# Sparse-file + losetup pool. Default fallback when an extra
+# disk isn't available — every Talos worker mounts
+# /var/lib/blockstor-pool as ext4, so `Dir` resolves and the
+# satellite's loopfile provider runs.
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: stand-w1
+spec:
+  nodeName: talos-stand-w1
+  poolName: stand
+  providerKind: FILE_THIN
+  props:
+    StorDriver/FileDir: /var/lib/blockstor-pool
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: stand-w2
+spec:
+  nodeName: talos-stand-w2
+  poolName: stand
+  providerKind: FILE_THIN
+  props:
+    StorDriver/FileDir: /var/lib/blockstor-pool
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: stand-w3
+spec:
+  nodeName: talos-stand-w3
+  poolName: stand
+  providerKind: FILE_THIN
+  props:
+    StorDriver/FileDir: /var/lib/blockstor-pool
+---
+# LVM-thin pool — install-pools.sh creates the
+# blockstor-lvm/thin pair on each worker before this CRD takes
+# effect. Empty/missing VG produces a provider that returns
+# `vg not found` on PoolStatus until the operator fixes the
+# stand.
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: lvm-thin-w1
+spec:
+  nodeName: talos-stand-w1
+  poolName: lvm-thin
+  providerKind: LVM_THIN
+  props:
+    StorDriver/LvmVg: blockstor-lvm
+    StorDriver/ThinPool: thin
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: lvm-thin-w2
+spec:
+  nodeName: talos-stand-w2
+  poolName: lvm-thin
+  providerKind: LVM_THIN
+  props:
+    StorDriver/LvmVg: blockstor-lvm
+    StorDriver/ThinPool: thin
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: lvm-thin-w3
+spec:
+  nodeName: talos-stand-w3
+  poolName: lvm-thin
+  providerKind: LVM_THIN
+  props:
+    StorDriver/LvmVg: blockstor-lvm
+    StorDriver/ThinPool: thin
+---
+# ZFS pool — install-pools.sh creates blockstor-zfs as a zpool
+# on each worker. `StorDriver/ZPool` is what the satellite's
+# factory.go reads; provider kind ZFS_THIN matches the legacy
+# `--zfs-thin=true` flag default.
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: zfs-thin-w1
+spec:
+  nodeName: talos-stand-w1
+  poolName: zfs-thin
+  providerKind: ZFS_THIN
+  props:
+    StorDriver/ZPool: blockstor-zfs
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: zfs-thin-w2
+spec:
+  nodeName: talos-stand-w2
+  poolName: zfs-thin
+  providerKind: ZFS_THIN
+  props:
+    StorDriver/ZPool: blockstor-zfs
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: zfs-thin-w3
+spec:
+  nodeName: talos-stand-w3
+  poolName: zfs-thin
+  providerKind: ZFS_THIN
+  props:
+    StorDriver/ZPool: blockstor-zfs
