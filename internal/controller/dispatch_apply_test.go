@@ -18,7 +18,9 @@ package controller_test
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -128,5 +130,86 @@ func TestDispatchApplyOkFalseDoesNotRequeue(t *testing.T) {
 
 	if got.RequeueAfter != 0 {
 		t.Errorf("Ok=false body-level must NOT requeue (operator action needed, not retry); got %+v", got)
+	}
+}
+
+// applyTransportErrorDialer always fails the Dial step. dispatchApply
+// must surface this as a requeue (operator-recoverable: satellite
+// briefly down, transient network), NOT as an error result that
+// would mark the Reconcile as failed.
+type applyTransportErrorDialer struct{}
+
+func (applyTransportErrorDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClient, func() error, error) {
+	return nil, nil, errApplyDialerDown
+}
+
+var errApplyDialerDown = errors.New("dial: satellite unreachable")
+
+// TestDispatchApplyTransportErrorRequeues pins the requeue-on-transport-error
+// branch: when Dispatcher.Apply returns an error (dial failure, gRPC
+// transport blip, satellite mid-restart), the Reconciler must log + requeue
+// with the 10s back-off — never bubble the transport error up as a
+// Reconcile failure that would let controller-runtime exponentially
+// back off until the satellite comes back. 10s is the chosen cadence
+// matching the kubelet's CSI probe period.
+func TestDispatchApplyTransportErrorRequeues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	id := int32(0)
+	port := int32(7000)
+	minor := int32(1000)
+
+	resCRD := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-down.n1",
+			Finalizers: []string{"blockstor.io.blockstor.io/resource"},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-down",
+			NodeName:               "n1",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: &id,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	rdCRD := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-down"},
+	}
+
+	nodeCRD := &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  "SATELLITE",
+			Props: map[string]string{"SatelliteEndpoint": "10.0.0.1:7000"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithObjects(resCRD, rdCRD, nodeCRD).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{
+		Client:     cli,
+		Scheme:     scheme,
+		Dispatcher: dispatcher.New(applyTransportErrorDialer{}),
+		Store:      store.NewInMemory(),
+	}
+
+	got, err := rec.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-down.n1"},
+	})
+	if err != nil {
+		t.Fatalf("transport error must NOT bubble as Reconcile error (controller-runtime would back off exponentially); got %v", err)
+	}
+
+	if got.RequeueAfter != 10*time.Second {
+		t.Errorf("RequeueAfter: got %v, want 10s (matches kubelet CSI probe cadence)", got.RequeueAfter)
 	}
 }
