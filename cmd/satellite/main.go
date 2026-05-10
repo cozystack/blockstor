@@ -34,8 +34,12 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/loopfile"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
@@ -207,6 +211,8 @@ func run() int {
 	// is clean.
 	cleanStateDir(stateDir, logger)
 
+	restCfg, mgrFactory := buildControllerRuntime(logger)
+
 	agent := satellite.NewAgent(satellite.Config{
 		NodeName:           nodeName,
 		ControllerAddr:     controllerAddr,
@@ -216,6 +222,8 @@ func run() int {
 		Providers:          providers,
 		DialTimeout:        10 * time.Second,
 		Logger:             logger,
+		RESTConfig:         restCfg,
+		ManagerFactory:     mgrFactory,
 	})
 
 	providerNames := make([]string, 0, len(providers))
@@ -238,6 +246,33 @@ func run() int {
 	}
 
 	return 0
+}
+
+// buildControllerRuntime returns (restCfg, factory) when an
+// in-cluster Kubernetes config is reachable — the production
+// path under the DaemonSet. When the config can't be loaded
+// (off-cluster `go run`, unit tests with no kubeconfig), both
+// return values are nil and the agent falls back to the gRPC-
+// only path. Phase 10.1: the c-r manager runs alongside gRPC
+// so CRD events drive the same apply chain.
+func buildControllerRuntime(logger *slog.Logger) (*rest.Config, satellite.ManagerFactory) {
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		logger.Info("no Kubernetes config; skipping controller-runtime manager",
+			"reason", err)
+
+		return nil, nil
+	}
+
+	factory := func(restCfg *rest.Config, nodeName string, rec *satellite.Reconciler) (manager.Manager, error) {
+		return controllers.NewManager(restCfg, controllers.Config{
+			NodeName: nodeName,
+			Apply:    rec,
+			Exec:     storage.RealExec{},
+		})
+	}
+
+	return cfg, factory
 }
 
 // portFromListen extracts the port number from a Go-style listen

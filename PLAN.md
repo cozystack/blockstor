@@ -719,7 +719,7 @@ Once 10.1-10.5 land, the gRPC paths are unused. Final demolition:
 - [ ] Delete `pkg/satellite/grpc_server.go` + `pkg/satellitecontroller/`.
 - [ ] Delete `pkg/dispatcher/` (controller-side gRPC client). `internal/controller.ResourceReconciler.dispatchApply` and the runDelete dispatch path go away — already replaced by the satellite's own reconciler.
 - [ ] Delete the gRPC supervise loops in `pkg/satellite/agent.go` (`runObserveLoop`, `superviseObserveLoop`, `runCapacityLoop`, `dial`, `hello`, `startGRPCServer`).
-- [ ] Satellite's `Run` becomes: build controller-runtime manager, register the per-CRD reconcilers, start manager. Mirror image of `cmd/manager/main.go`.
+- [~] Satellite's `Run` becomes: build controller-runtime manager, register the per-CRD reconcilers, start manager (2026-05-10, side-by-side). `agent.Run` now boots a controller-runtime manager whenever `Config.RESTConfig` + `Config.ManagerFactory` are set — wired by `cmd/satellite/main.go` via `controllers.NewManager`. Both the manager and the gRPC server run from the same `*Reconciler` instance so CRD events and `ApplyResources` RPCs converge on one apply chain. Full cutover (gRPC paths removed) still depends on the four `[ ]` items below.
 
 ### 10.7 — `physical-storage create-device-pool` via `PhysicalDevice` CRD
 

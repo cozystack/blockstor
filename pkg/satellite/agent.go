@@ -34,6 +34,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -41,6 +43,13 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/version"
 )
+
+// ManagerFactory builds a controller-runtime manager wired with
+// the satellite's per-CRD reconcilers. Injected by
+// cmd/satellite/main.go so pkg/satellite stays free of an
+// import on pkg/satellite/controllers (which itself imports
+// pkg/satellite for *Reconciler — direct import would cycle).
+type ManagerFactory func(restCfg *rest.Config, nodeName string, rec *Reconciler) (manager.Manager, error)
 
 // Config holds the parameters that come in from the satellite binary's
 // command-line flags or its container env.
@@ -78,6 +87,15 @@ type Config struct {
 	// Logger is the structured logger used by the agent and its sub-loops.
 	// Defaults to slog.Default if nil.
 	Logger *slog.Logger
+
+	// RESTConfig + ManagerFactory together opt the agent into
+	// starting a controller-runtime manager alongside the gRPC
+	// server. Both nil keeps the legacy gRPC-only path. Set by
+	// cmd/satellite/main.go during in-cluster boot; the factory
+	// indirection avoids a pkg/satellite → pkg/satellite/controllers
+	// import cycle.
+	RESTConfig     *rest.Config
+	ManagerFactory ManagerFactory
 }
 
 // Agent is the satellite runtime. It is constructed with NewAgent and run
@@ -128,16 +146,35 @@ func (a *Agent) Run(ctx context.Context) error {
 		return errors.Wrap(err, "hello")
 	}
 
+	// Build the reconciler once so the gRPC server and (optionally)
+	// the controller-runtime manager share a single apply chain
+	// targeting the same storage / DRBD / LUKS state.
+	rec := a.newReconciler()
+
 	// Bring up the satellite-side gRPC server so the controller can push
 	// ApplyResources / snapshot RPCs at us. The Reconciler is wired with
 	// the configured providers + drbdadm wrapper + state dir.
-	srv, stop, err := a.startGRPCServer(ctx)
+	srv, stop, err := a.startGRPCServer(ctx, rec)
 	if err != nil {
 		return errors.Wrap(err, "start gRPC server")
 	}
 	defer stop()
 
 	a.logger.Info("satellite gRPC ready", "addr", srv)
+
+	// When RESTConfig + ManagerFactory are both set, the satellite
+	// also runs a controller-runtime manager so CRD events drive
+	// the same reconciler. The manager exits when ctx cancels;
+	// errors are logged but don't stop the gRPC path — Phase 10.1
+	// keeps both paths alive during the cutover.
+	if a.cfg.RESTConfig != nil && a.cfg.ManagerFactory != nil {
+		err := a.startControllerRuntime(ctx, rec)
+		if err != nil {
+			return errors.Wrap(err, "start controller-runtime manager")
+		}
+
+		a.logger.Info("satellite controller-runtime manager ready")
+	}
 
 	// Tail drbdsetup events2 + ship observed state back to the
 	// controller via ReportObserved. The supervisor restarts the
@@ -164,15 +201,11 @@ func (a *Agent) Run(ctx context.Context) error {
 // surfacing an empty string into operator logs.
 const grpcServerDisabled = "<disabled>"
 
-// startGRPCServer binds the satellite's `service Satellite` listener.
-// Empty cfg.ListenAddr disables the server (returns a no-op stop) so
-// unit tests that only exercise Hello don't need a free port.
-func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
-	if a.cfg.ListenAddr == "" {
-		return grpcServerDisabled, func() {}, nil
-	}
-
-	rec := NewReconciler(ReconcilerConfig{
+// newReconciler builds the satellite's apply-chain Reconciler.
+// Pulled out so the gRPC server and the controller-runtime
+// manager (when RESTConfig is set) share one instance.
+func (a *Agent) newReconciler() *Reconciler {
+	return NewReconciler(ReconcilerConfig{
 		Providers:    a.cfg.Providers,
 		Adm:          drbd.NewAdm(storage.RealExec{}),
 		Cryptsetup:   luks.NewCryptsetup(storage.RealExec{}),
@@ -180,6 +213,15 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 		NodeName:     a.cfg.NodeName,
 		LocalAddress: hostFromEndpoint(a.cfg.AdvertisedEndpoint),
 	})
+}
+
+// startGRPCServer binds the satellite's `service Satellite` listener.
+// Empty cfg.ListenAddr disables the server (returns a no-op stop) so
+// unit tests that only exercise Hello don't need a free port.
+func (a *Agent) startGRPCServer(ctx context.Context, rec *Reconciler) (string, func(), error) {
+	if a.cfg.ListenAddr == "" {
+		return grpcServerDisabled, func() {}, nil
+	}
 
 	listenCfg := &net.ListenConfig{}
 
@@ -209,6 +251,32 @@ func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 	}
 
 	return listener.Addr().String(), stop, nil
+}
+
+// startControllerRuntime launches a controller-runtime manager
+// that wires the four per-CRD satellite reconcilers (Resource,
+// StoragePool, Snapshot, ResourceDefinition) onto the shared
+// apply chain `rec`. Manager runs in a goroutine and exits when
+// ctx cancels; Serve errors log but do not abort the agent —
+// gRPC stays primary until Phase 10.6 retires it.
+//
+// Returns once `mgr.Start` is in flight. Constructed via the
+// `controllers.NewManager` factory so this stays a one-liner if
+// the manager's scheme / leader-election story changes later.
+func (a *Agent) startControllerRuntime(ctx context.Context, rec *Reconciler) error {
+	mgr, err := a.cfg.ManagerFactory(a.cfg.RESTConfig, a.cfg.NodeName, rec)
+	if err != nil {
+		return errors.Wrap(err, "build manager")
+	}
+
+	go func() {
+		err := mgr.Start(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			a.logger.Error("controller-runtime manager exited", "err", err)
+		}
+	}()
+
+	return nil
 }
 
 // dial opens an insecure gRPC connection to the controller. TLS comes in

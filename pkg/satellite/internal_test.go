@@ -106,7 +106,7 @@ func TestStartGRPCServerEmptyListenAddrIsNoOp(t *testing.T) {
 
 	a := NewAgent(Config{NodeName: "n1"}) // no ListenAddr
 
-	addr, stop, err := a.startGRPCServer(t.Context())
+	addr, stop, err := a.startGRPCServer(t.Context(), a.newReconciler())
 	if err != nil {
 		t.Fatalf("startGRPCServer with empty ListenAddr: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestStartGRPCServerBindsAndStops(t *testing.T) {
 		ListenAddr: "127.0.0.1:0", // ephemeral port
 	})
 
-	addr, stop, err := a.startGRPCServer(t.Context())
+	addr, stop, err := a.startGRPCServer(t.Context(), a.newReconciler())
 	if err != nil {
 		t.Fatalf("startGRPCServer: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestStartGRPCServerListenError(t *testing.T) {
 		ListenAddr: "not-an-addr",
 	})
 
-	addr, stop, err := a.startGRPCServer(t.Context())
+	addr, stop, err := a.startGRPCServer(t.Context(), a.newReconciler())
 	if err == nil {
 		t.Fatalf("got nil error; want listen failure (addr=%q stop=%v)", addr, stop != nil)
 	}
