@@ -17,6 +17,7 @@ limitations under the License.
 package satellite
 
 import (
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -103,6 +104,65 @@ func TestStartGRPCServerEmptyListenAddrIsNoOp(t *testing.T) {
 
 	// The no-op stop must not panic.
 	stop()
+}
+
+// TestStartGRPCServerBindsAndStops drives the non-empty-ListenAddr
+// branch of startGRPCServer: it binds a real loopback listener,
+// returns the actual addr, and produces a stop func that gracefully
+// drains the gRPC server. Pins the listener-spawn path that
+// production satellites take when they expose the dispatcher RPC,
+// and confirms stop() blocks until the goroutine has exited (so a
+// Run-loop teardown doesn't race with a half-closed listener).
+func TestStartGRPCServerBindsAndStops(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{
+		NodeName:   "n1",
+		ListenAddr: "127.0.0.1:0", // ephemeral port
+	})
+
+	addr, stop, err := a.startGRPCServer(t.Context())
+	if err != nil {
+		t.Fatalf("startGRPCServer: %v", err)
+	}
+
+	if addr == grpcServerDisabled {
+		t.Fatalf("addr: got placeholder %q, want a real bound address", grpcServerDisabled)
+	}
+
+	if !strings.HasPrefix(addr, "127.0.0.1:") {
+		t.Errorf("addr: got %q, want 127.0.0.1:<port>", addr)
+	}
+
+	if stop == nil {
+		t.Fatalf("stop func nil")
+	}
+
+	// stop() must block until the Serve goroutine exits — otherwise a
+	// caller racing into the next bind on the same port would EADDRINUSE.
+	stop()
+}
+
+// TestStartGRPCServerListenError pins the listener-bind error wrap:
+// an unparseable ListenAddr surfaces as an error tagged with the
+// "listen" keyword so a typo in CONTROLLER_GRPC_ADDR is grep-able
+// in the satellite log.
+func TestStartGRPCServerListenError(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{
+		NodeName:   "n1",
+		ListenAddr: "not-an-addr",
+	})
+
+	addr, stop, err := a.startGRPCServer(t.Context())
+	if err == nil {
+		t.Fatalf("got nil error; want listen failure (addr=%q stop=%v)", addr, stop != nil)
+	}
+
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("error wrap: got %q, want substring \"listen\"", err.Error())
+	}
 }
 
 // TestPickMechanism pins the provider-kind → ship-mechanism table
