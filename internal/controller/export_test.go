@@ -149,3 +149,9 @@ func (r *ResourceDefinitionReconciler) PickTiebreakerNode(ctx context.Context, h
 func IsDisabledNode(node *apiv1.Node) bool {
 	return isDisabledNode(node)
 }
+
+// RemoveWitnesses exposes the witness-cleanup helper for tests.
+// Production wiring stays unexported via applyWitnessDecision.
+func (r *ResourceDefinitionReconciler) RemoveWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
+	return r.removeWitnesses(ctx, rdName, witnesses)
+}
