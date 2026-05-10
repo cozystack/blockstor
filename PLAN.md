@@ -698,7 +698,7 @@ operational cost of writing a one-shot migration job exceeds the
 cost of `kubectl delete -f manifests/ && kubectl apply -f manifests/`
 on the affected clusters.
 
-- [ ] **`ControllerProps` instance → typed singleton CRD**. New `ControllerConfig` cluster-scoped CRD, name=`default`, with structured fields (`Spec.DRBDOptions`, `Spec.AutoQuorum`, `Spec.AutoAddQuorumTiebreaker`, `Spec.PassphraseSecretRef`). Operators populate it on a fresh install via manifest / Helm chart values.
+- [x] **`ControllerProps` instance → typed singleton CRD** (2026-05-10). `ControllerConfig` cluster-scoped CRD with `Spec.DRBDOptions` + `Spec.PassphraseSecretRef` + `Spec.ExtraProps`; canonical name `default`. ResourceReconciler.resolveEffectiveProps feeds the typed scope into `drbd.ResolveDRBDOptions` (was nil before) and folds ExtraProps into the output Props bag. Legacy KVEntry-shaped controllerProps() reader stays as forward-compat fallback for pre-migration clusters; both paths converge on the same wire shape.
 - [ ] **Cluster passphrase → native `Secret`**. New Secret (default name `blockstor-cluster-passphrase`, key `passphrase`). `ControllerConfig.Spec.PassphraseSecretRef` points at it. REST endpoints (`/v1/encryption/passphrase` POST/PATCH/PUT) rewritten to mutate the Secret.
 - [ ] **`csi-volumes` instance → per-Resource annotation**. linstor-csi's per-PVC JSON metadata moves to `Resource.metadata.annotations["blockstor.io/csi-volume-data"]`. Annotations have no size limit issue at csi-typical payloads (typically 1-4 KiB; per-object annotation cap is 256 KiB).
 - [ ] **`csi-snapshot-shippings` instance → per-Snapshot annotation** (`blockstor.io/csi-shipping-data`).
