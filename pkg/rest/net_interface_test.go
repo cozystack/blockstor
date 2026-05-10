@@ -184,3 +184,74 @@ func TestNetInterfaceDelete(t *testing.T) {
 		t.Errorf("wrong interface survived: %v", got.NetInterfaces[0])
 	}
 }
+
+// TestNetInterfaceCreateBadJSON pins the 400 branch on a malformed
+// NetInterface body. Without this, a satellite-bootstrap script that
+// posts truncated JSON would silently get 500 (or worse, leak the
+// raw JSON error to the client) — the contract is "client error,
+// body identifies the problem".
+func TestNetInterfaceCreateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNetInterfaceCreateMissingName pins the 400 branch when neither
+// the URL path nor the body supplies an interface name. Both create
+// (no path-name) and update (path-name) share the same decoder, so
+// the validator must accept body-name on POST and reject only when
+// both sources are empty.
+func TestNetInterfaceCreateMissingName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.NetInterface{Address: "10.0.0.1"}) // Name omitted
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400 (missing name)", resp.StatusCode)
+	}
+}
+
+// TestNetInterfaceCreateUnknownNode pins the 404 branch when the
+// {node} pathvar doesn't resolve. linstor-csi's bootstrap retries on
+// 404 (waiting for the node CRD to appear) but treats 5xx as fatal —
+// a regression that returned 500 here would deadlock satellite
+// initialisation behind csi.
+func TestNetInterfaceCreateUnknownNode(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.NetInterface{Name: "default", Address: "10.0.0.1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/ghost/net-interfaces", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
