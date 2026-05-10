@@ -96,6 +96,23 @@ type ResourceVolumeStatus struct {
 	UsableKib int64 `json:"usableKib,omitempty"`
 	// +optional
 	DiskState string `json:"diskState,omitempty"`
+
+	// currentGi is the DRBD-9 current generation identifier reported
+	// by `drbdsetup events2` for this replica's local volume. The
+	// controller reads it when adding a new replica to skip the full
+	// initial-sync: pre-seeding the new metadata block with this GI
+	// makes DRBD's GI handshake see the new peer as already-in-sync,
+	// turning hours of resync on multi-TiB volumes into instant.
+	// Updated by the satellite-side observer; never set in Spec.
+	// +optional
+	CurrentGi string `json:"currentGi,omitempty"`
+
+	// historyGi carries the historical GI chain (DRBD keeps 3-4
+	// previous generations). Useful for split-brain forensics and
+	// cluster-state UI; may be elided when we run tight on Status
+	// budget. Order is newest-first.
+	// +optional
+	HistoryGi []string `json:"historyGi,omitempty"`
 }
 
 // +kubebuilder:object:root=true
