@@ -174,3 +174,75 @@ func TestEventStreamReplay(t *testing.T) {
 		t.Errorf("got[4]: %+v", got[4])
 	}
 }
+
+// TestWatcherStreamsEvents pins the Watcher's parse-and-emit pipeline
+// against an in-memory reader. drbdsetup events2 sends one event per
+// line; the Watcher must surface each one as a parsed Event on the
+// channel. Pinned because the satellite's runObserveLoop wires this
+// straight into its observation pipeline — a regression in line
+// boundary handling would silently drop kernel events and stale the
+// controller's view of replication state.
+func TestWatcherStreamsEvents(t *testing.T) {
+	t.Parallel()
+
+	src := strings.NewReader(strings.Join([]string{
+		"exists resource name:pvc-1 role:Primary",
+		"change device name:pvc-1 minor:1000 disk:UpToDate",
+		"", // blank line — must be skipped, not abort the pipeline
+		"exists -",
+	}, "\n") + "\n")
+
+	w := drbd.NewWatcher(src)
+	ch := make(chan drbd.Event, 8)
+
+	if err := w.Watch(t.Context(), ch); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
+	got := make([]drbd.Event, 0, 4)
+	for ev := range ch {
+		got = append(got, ev)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("event count: got %d, want 3 (blank line must be skipped); %+v", len(got), got)
+	}
+
+	if got[0].Action != "exists" || got[0].Kind != "resource" || got[0].Fields["name"] != "pvc-1" {
+		t.Errorf("event[0]: got %+v", got[0])
+	}
+
+	if got[1].Action != "change" || got[1].Fields["disk"] != "UpToDate" {
+		t.Errorf("event[1]: got %+v", got[1])
+	}
+
+	if got[2].Action != "exists" || got[2].Kind != "-" {
+		t.Errorf("event[2] (initial-sync marker): got %+v", got[2])
+	}
+}
+
+// TestWatcherClosesChannelOnEOF: the channel must be closed when the
+// source EOFs (e.g. drbdsetup exits). Without this the consumer
+// goroutine in runObserveLoop hangs forever.
+func TestWatcherClosesChannelOnEOF(t *testing.T) {
+	t.Parallel()
+
+	src := strings.NewReader("") // immediate EOF
+
+	w := drbd.NewWatcher(src)
+	ch := make(chan drbd.Event, 1)
+
+	if err := w.Watch(t.Context(), ch); err != nil {
+		t.Fatalf("Watch on empty source: got %v, want nil", err)
+	}
+
+	// Reading from a closed channel returns immediately with zero-value.
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Errorf("channel got an event from empty source: %+v", ev)
+		}
+	default:
+		t.Errorf("channel not closed after EOF — runObserveLoop would hang")
+	}
+}
