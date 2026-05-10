@@ -176,3 +176,64 @@ func TestResizeRunsCryptsetupResize(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenErrorWraps pins the cockroachdb error wrap on Open: a
+// `cryptsetup luksOpen` failure (wrong passphrase, dm name busy)
+// must surface with the "luksOpen" keyword for operator grep.
+func TestOpenErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("sh -c printf %s \"k\" | cryptsetup 'luksOpen' '/dev/sda' 'pvc-1' '--key-file' '-'",
+		storage.FakeResponse{Err: errLuksFailed})
+
+	c := luks.NewCryptsetup(fx)
+
+	err := c.Open(t.Context(), "/dev/sda", "pvc-1", []byte("k"))
+	if err == nil {
+		t.Fatalf("Open: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "luksOpen") {
+		t.Errorf("wrap: %q must contain \"luksOpen\"", err.Error())
+	}
+}
+
+// TestCloseErrorWraps mirrors Open for the Close path.
+func TestCloseErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("cryptsetup luksClose pvc-1",
+		storage.FakeResponse{Err: errLuksFailed})
+
+	c := luks.NewCryptsetup(fx)
+
+	err := c.Close(t.Context(), "pvc-1")
+	if err == nil {
+		t.Fatalf("Close: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "luksClose") {
+		t.Errorf("wrap: %q must contain \"luksClose\"", err.Error())
+	}
+}
+
+// TestResizeErrorWraps mirrors Open for the Resize path. Pinned
+// because resize failures are silently swallowed by the satellite
+// reconciler today (best-effort); a regression that dropped the
+// wrap would erase the operator-visible breadcrumb in the log.
+func TestResizeErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("sh -c printf %s \"k\" | cryptsetup 'resize' 'pvc-1' '--key-file' '-'",
+		storage.FakeResponse{Err: errLuksFailed})
+
+	c := luks.NewCryptsetup(fx)
+
+	err := c.Resize(t.Context(), "pvc-1", []byte("k"))
+	if err == nil {
+		t.Fatalf("Resize: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "luksResize") {
+		t.Errorf("wrap: %q must contain \"luksResize\"", err.Error())
+	}
+}
+
+var errLuksFailed = errors.New("cryptsetup: command failed")
