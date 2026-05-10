@@ -277,3 +277,20 @@ func TestSnapshotsCreateMissingName(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestSnapshotsDeleteMissing: DELETE on a non-existent (RD, snap)
+// → 404 from writeStoreError. Pins the idempotent-delete contract
+// linstor-csi relies on during VolumeSnapshot deletion.
+func TestSnapshotsDeleteMissing(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/ghost/snapshots/s1")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}

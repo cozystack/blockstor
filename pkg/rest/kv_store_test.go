@@ -235,3 +235,49 @@ func TestKVDeleteThenGet(t *testing.T) {
 		t.Errorf("post-delete: got %d, want 404", getResp.StatusCode)
 	}
 }
+
+// TestKVDeleteHappyPath: DELETE /v1/key-value-store/{instance} → 204
+// + the instance is gone afterwards. Pins the success branch of
+// handleKVDelete (was 66.7%).
+func TestKVDeleteHappyPath(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.KeyValueStore().SetKeys(t.Context(), "csi-vols", apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"k": "v"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/key-value-store/csi-vols")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("delete status: got %d, want 204", resp.StatusCode)
+	}
+
+	// Subsequent GET → 404.
+	getResp := httpGet(t, base+"/v1/key-value-store/csi-vols")
+	_ = getResp.Body.Close()
+
+	if getResp.StatusCode != http.StatusNotFound {
+		t.Errorf("post-delete: got %d, want 404", getResp.StatusCode)
+	}
+}
+
+// TestKVDeleteMissing: DELETE on a non-existent instance → 404
+// from writeStoreError. Pinned because csi calls this idempotently
+// on volume teardown to clear ephemeral kv state — the 404 must
+// surface cleanly so csi treats it as "already gone".
+func TestKVDeleteMissing(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/key-value-store/ghost")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
