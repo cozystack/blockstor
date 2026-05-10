@@ -19,6 +19,7 @@ package satellitecontroller_test
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -414,5 +415,112 @@ func TestReportObservedSwallowsNotFound(t *testing.T) {
 
 	if resp.GetReceived() != 1 {
 		t.Errorf("Received: got %d, want 1 (NotFound must not abort the stream)", resp.GetReceived())
+	}
+}
+
+// TestRunnableNeedLeaderElection pins the manager-runnable contract:
+// the satellite-facing gRPC endpoint must be reachable on every replica
+// (so satellites can connect to whichever pod they hit), so it MUST NOT
+// gate on leader election. A regression that flipped this to true would
+// silently make HA controller deployments stop accepting satellite
+// connections on non-leader replicas, breaking the dispatch path.
+func TestRunnableNeedLeaderElection(t *testing.T) {
+	t.Parallel()
+
+	r := &satellitecontroller.Runnable{}
+	if r.NeedLeaderElection() {
+		t.Errorf("NeedLeaderElection: got true, want false (gRPC must run on all replicas)")
+	}
+}
+
+// TestRunnableStartServesAndStopsOnContextCancel pins the Start()
+// lifecycle: bind the listener, accept a Hello round-trip, cancel the
+// supplied ctx, observe Start return nil cleanly. Pinned because a
+// regression that swallowed ctx.Done would leak goroutines/ports
+// across manager restarts.
+func TestRunnableStartServesAndStopsOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	srv := satellitecontroller.New(st, satellitecontroller.Config{ClusterID: "test"})
+
+	// Find a free port: bind, get the addr, close — race-prone but acceptable
+	// for this test (loopback, parallel-safe enough).
+	probeLC := &net.ListenConfig{}
+
+	probe, err := probeLC.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+
+	addr := probe.Addr().String()
+	_ = probe.Close()
+
+	r := &satellitecontroller.Runnable{Addr: addr, Server: srv}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan error, 1)
+	go func() { done <- r.Start(ctx) }()
+
+	// Wait until the listener is actually accepting connections.
+	dialer := &net.Dialer{Timeout: 100 * time.Millisecond}
+	deadline := time.Now().Add(2 * time.Second)
+
+	for time.Now().Before(deadline) {
+		conn, dErr := dialer.DialContext(t.Context(), "tcp", addr)
+		if dErr == nil {
+			_ = conn.Close()
+
+			break
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Round-trip a Hello to confirm the server is wired in correctly.
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	c := satellitepb.NewControllerClient(conn)
+
+	if _, hErr := c.Hello(t.Context(), &satellitepb.HelloRequest{NodeName: "runnable-test"}); hErr != nil {
+		t.Errorf("Hello round-trip: %v", hErr)
+	}
+
+	_ = conn.Close()
+
+	// Cancel ctx → Start must return nil within the GracefulStop budget.
+	cancel()
+
+	select {
+	case startErr := <-done:
+		if startErr != nil {
+			t.Errorf("Start returned %v on ctx-cancel, want nil", startErr)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Start did not return within 15s after ctx-cancel")
+	}
+}
+
+// TestRunnableStartListenError pins the listener-bind error wrap: when
+// the configured Addr is malformed, Start must return an error tagged
+// with the operator-grep keyword "listen". Without this surface, a
+// typo'd CONTROLLER_GRPC_ADDR would surface as a bare "address X:Y:
+// bind syntax error" with no log breadcrumb to find.
+func TestRunnableStartListenError(t *testing.T) {
+	t.Parallel()
+
+	r := &satellitecontroller.Runnable{Addr: "not-an-addr"}
+
+	err := r.Start(t.Context())
+	if err == nil {
+		t.Fatalf("Start: got nil error, want listen failure")
+	}
+
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("error wrap: got %q, want substring \"listen\" for operator grep", err.Error())
 	}
 }
