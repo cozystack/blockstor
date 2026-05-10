@@ -53,6 +53,39 @@ type ResourceSpec struct {
 	// Phase 10.3.
 	// +optional
 	ExtraProps map[string]string `json:"extraProps,omitempty"`
+
+	// volumes carries per-volume seed configuration that the
+	// satellite applies once on first activation of this replica.
+	// Today the only field is SeedFromGi (Phase 8.1) — when set,
+	// the satellite stamps the new replica's DRBD metadata with
+	// this generation identifier before `drbdadm up` so the GI
+	// handshake sees the new device as already-in-sync with that
+	// peer, skipping the full initial-sync.
+	// +optional
+	Volumes []ResourceVolumeSpec `json:"volumes,omitempty"`
+}
+
+// ResourceVolumeSpec is one volume's per-replica configuration knobs.
+// Distinct from ResourceVolumeStatus: this carries one-shot seeding
+// hints the satellite consumes during first activation, the Status
+// counterpart carries observed runtime state.
+type ResourceVolumeSpec struct {
+	// volumeNumber matches the corresponding ResourceDefinition
+	// VolumeDefinition. +required when this struct is populated.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// seedFromGi pre-seeds the DRBD-9 generation identifier of this
+	// replica's metadata block before the first `drbdadm up`. When
+	// set to the CurrentGi of an existing UpToDate peer, DRBD's GI
+	// handshake on first connect sees the match and skips the full
+	// initial-sync — turning hours of resync on multi-TiB volumes
+	// into instant. Phase 8.1.
+	//
+	// Consumed once on first activation; subsequent reconciles
+	// ignore it (the satellite checks `drbdmeta show-gi` before
+	// re-stamping).
+	// +optional
+	SeedFromGi string `json:"seedFromGi,omitempty"`
 }
 
 // ResourceStatus is the observed state of a placed resource.
