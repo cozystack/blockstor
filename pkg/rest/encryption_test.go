@@ -268,3 +268,30 @@ func TestPassphraseModifyWithoutCreate(t *testing.T) {
 		t.Errorf("status: got %d, want 412", resp.StatusCode)
 	}
 }
+
+// TestPassphraseEnterMismatch: PATCH with the wrong passphrase
+// against an established cluster → 403 (forbidden). Pinned because
+// the passphrase is the master key for at-rest LUKS volume keys —
+// a regression that flipped this to 200 would silently grant unlock
+// access to any caller, breaking the encryption boundary.
+func TestPassphraseEnterMismatch(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	createBody, _ := json.Marshal(map[string]string{"new_passphrase": "right"})
+	createResp := httpPost(t, base+"/v1/encryption/passphrase", createBody)
+	_ = createResp.Body.Close()
+
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", createResp.StatusCode)
+	}
+
+	wrongBody, _ := json.Marshal(map[string]string{"new_passphrase": "WRONG"})
+
+	resp := httpPatch(t, base+"/v1/encryption/passphrase", wrongBody)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status: got %d, want 403 (mismatched passphrase)", resp.StatusCode)
+	}
+}
