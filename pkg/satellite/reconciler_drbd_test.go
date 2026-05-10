@@ -1391,3 +1391,58 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 }
 
 var errCreateMDFailed = errors.New("drbdadm: create-md kernel module missing")
+
+// TestApplyAutoPrimaryForceErrorWraps pins the auto-primary force
+// error-wrap branch of applyDRBD: when the seed step
+// `drbdadm primary --force` fails on first activation, applyOne
+// must surface the error tagged with "auto-primary" in the
+// per-resource reply.
+//
+// Without the wrap keyword, an operator can't distinguish a stuck
+// seed (kernel module missing, /dev/drbdN already busy) from the
+// downstream `drbdadm secondary` failure mode that follows the
+// same metadata-shape concerns.
+func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-seed-fail_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdadm primary --force pvc-seed-fail",
+		storage.FakeResponse{Err: errPrimaryForceFailed})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+		{
+			Name:     "pvc-seed-fail",
+			NodeName: "n1",
+			Volumes: []*satellitepb.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: got transport error %v, want Ok=false body-level", err)
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("Ok: got true, want false on auto-primary failure")
+	}
+
+	if !strings.Contains(results[0].GetMessage(), "auto-primary") {
+		t.Errorf("message: got %q, want substring \"auto-primary\"", results[0].GetMessage())
+	}
+}
+
+var errPrimaryForceFailed = errors.New("drbdadm: device busy")
