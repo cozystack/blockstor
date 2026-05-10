@@ -142,6 +142,55 @@ func TestSnapshotNodePredicateRejectsAbsentNode(t *testing.T) {
 	}
 }
 
+// TestPhysicalDeviceNodePredicateMatchesLabel pins the
+// label-keyed filter: only PhysicalDevices whose node-label
+// matches the satellite's own name pass. Watch-layer is the
+// load-bearing filter — without it every satellite would
+// reconcile every PhysicalDevice in the cluster.
+func TestPhysicalDeviceNodePredicateMatchesLabel(t *testing.T) {
+	t.Parallel()
+
+	p := physicalDeviceNodePredicate("n1")
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "n1.wwn-deadbeef",
+			Labels: map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"},
+		},
+	}
+
+	if !p.Create(event.CreateEvent{Object: dev}) {
+		t.Errorf("CreateEvent on own-node PhysicalDevice: predicate dropped it")
+	}
+
+	if !p.Delete(event.DeleteEvent{Object: dev}) {
+		t.Errorf("DeleteEvent on own-node PhysicalDevice: predicate dropped it")
+	}
+}
+
+// TestPhysicalDeviceNodePredicateRejectsForeignNode pins the
+// inverse: a PhysicalDevice labelled for a different node MUST
+// be filtered out — even a device with no node label at all
+// (unlikely in practice; discovery always sets the label) drops.
+func TestPhysicalDeviceNodePredicateRejectsForeignNode(t *testing.T) {
+	t.Parallel()
+
+	p := physicalDeviceNodePredicate("n1")
+
+	foreign := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n2"},
+		},
+	}
+	if p.Create(event.CreateEvent{Object: foreign}) {
+		t.Errorf("CreateEvent on foreign-node PhysicalDevice: predicate let it through")
+	}
+
+	noLabel := &blockstoriov1alpha1.PhysicalDevice{}
+	if p.Create(event.CreateEvent{Object: noLabel}) {
+		t.Errorf("CreateEvent on unlabelled PhysicalDevice: predicate let it through")
+	}
+}
+
 // TestDropAllEventsPredicateAlwaysFalse pins the cache-warming
 // invariant: the ResourceDefinitionReconciler's predicate
 // MUST drop every event so the cache fills (via the watch the

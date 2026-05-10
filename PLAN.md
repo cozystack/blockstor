@@ -759,17 +759,7 @@ satellite-execute model the rest of Phase 10 uses.
 **Attach flow (satellite-side reconciler):**
 
 - [~] Attach reconciler (2026-05-10, partial). Pure-function `pkg/satellite/attach.go.Attach(ctx, exec, dev)` runs the kind-specific create sequence (`pvcreate → vgcreate` for LVM, `+ lvcreate --type thin-pool 100%FREE` for LVM_THIN, `zpool create -f -O compression=off -O atime=off` for ZFS, no-op for FILE). Wipe is consent-gated and runs BEFORE the create (ordering pinned). Every LVM command goes through `lvm.Args(...)` so the Phase 8.2 filter stays applied. Returns `AttachResult{PoolName, ProviderKind, Props}` ready for `Reconciler.RegisterProvider`. The watch + Status.Phase transitions + delete-on-success bookkeeping land when Phase 10.1 promotes the satellite to a controller-runtime manager. 8 unit tests pinning each kind, the wipefs ordering, and three precondition rejects.
-- [ ] Reconciler watches `PhysicalDevice` filtered by `metadata.labels[blockstor.io/node]=self`. On `Spec.AttachTo` set:
-  1. Resolve `Status.StableID` → current `/dev/sdN` (may have changed since discovery). If gone → `Phase=Failed`, condition `DeviceMissing`.
-  2. Idempotency check: is the device **already** in the target pool (`pvs grep`, `zpool status grep`)? If yes → skip to Delete (this is a re-run after a crash post-vgextend pre-Delete).
-  3. Set `Phase=Attaching` via Status subresource.
-  4. If `Spec.AttachTo.Wipe`: `wipefs -a /dev/sdN`.
-  5. Provider-specific commands (each idempotent — check existing state with `pvs` / `zpool status` before issuing):
-     - `LVM_THIN`: `pvcreate` if not PV → if VG exists `vgextend` else `vgcreate` → if thin LV missing `lvcreate -T -l 100%FREE`
-     - `LVM`: `pvcreate` + `vgcreate` / `vgextend`
-     - `ZFS` / `ZFS_THIN`: `zpool create` if pool missing else `zpool add`
-     - `FILE` / `FILE_THIN`: `mkdir -p` + `mount` (less device-y; the bind-mount form)
-  6. **Delete the `PhysicalDevice` CRD** as the completion signal. No `Phase=Ready` state — successful attach equals "the device is no longer free, so it disappears from the available list".
+- [~] Reconciler watches `PhysicalDevice` filtered by `metadata.labels[blockstor.io/node]=self` (2026-05-10, scaffolded). `pkg/satellite/controllers/physicaldevice.go.PhysicalDeviceReconciler` lands the watch + label predicate, flips `Status.Phase=Attaching`, dispatches to the existing `satellite.Attach` pure function (covers Wipe + provider-specific create commands — all idempotent via the underlying `pvcreate` / `vgcreate` / `zpool create` short-circuits), registers the resulting provider via `Config.Apply.RegisterProvider`, and Deletes the CRD as completion signal. Wired into `controllers.NewManager`. Predicate pinned by 2 unit tests (own-node label match, foreign-node + unlabelled reject). Remaining for full closure: explicit Step-1 `DeviceMissing` condition, Step-2 pre-Attach `pvs grep` / `zpool status grep` idempotency probe (today's idempotency relies on the create commands; a missing-target-pool race surfaces as `Phase=Failed` rather than `RequeueAfter:10s`).
 - [ ] On failure between `Phase=Attaching` and Delete (satellite crash), restart-time reconcile re-runs idempotently from step 2.
 
 **Race-handling matrix:**

@@ -104,5 +104,10 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
 	}
 
+	err = (&PhysicalDeviceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	if err != nil {
+		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
+	}
+
 	return mgr, nil
 }
