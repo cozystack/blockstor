@@ -114,3 +114,10 @@ func PtrEqI32(a, b *int32) bool {
 func (r *ResourceReconciler) RangeProp(ctx context.Context, nodeName, prop string, defLow, defHigh int32) (int32, int32, error) {
 	return r.rangeProp(ctx, nodeName, prop, defLow, defHigh)
 }
+
+// QuorumPolicy exposes upstream-LINSTOR's isQuorumFeasible
+// decision: 2 diskful + ≥1 diskless OR ≥3 diskful → majority,
+// else off. Tests pin every (diskful, diskless) combination.
+func QuorumPolicy(diskful, diskless int) string {
+	return quorumPolicy(diskful, diskless)
+}
