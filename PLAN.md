@@ -791,10 +791,10 @@ satellite-execute model the rest of Phase 10 uses.
 
 ### Open design questions for the user
 
-- [ ] Single binary with `--mode={controller,satellite}` flag, or stay two binaries? Two is simpler RBAC-wise but doubles the build artifacts; one is what kube-controller-manager-style operators usually pick.
-- [ ] csi-volumes annotation size budget: real-world golinstor traces show typical JSON blob size <2 KiB; need to confirm against a production cluster snapshot before committing to "annotations are enough" — if any operator writes oversize blobs, fall back to a per-instance ConfigMap.
-- [ ] Should `ResourceVolumeStatus.HistoryGi` exist? Useful for split-brain forensics but clutters the Status if the cluster isn't actively split-brain'ing. Probably yes — DRBD only keeps last-4 GIs anyway, so the Status field is bounded.
-- [ ] Server-side apply field managers vs optimistic concurrency: SSA is the K8s-native answer for multi-writer Status, but it's heavier on the apiserver. Worth benchmarking in 10.2 before committing.
+- [ ] Single binary with `--mode={controller,satellite}` flag, or stay two binaries? Two is simpler RBAC-wise but doubles the build artifacts; one is what kube-controller-manager-style operators usually pick. **Open** — pending user decision.
+- [ ] csi-volumes annotation size budget: real-world golinstor traces show typical JSON blob size <2 KiB; need to confirm against a production cluster snapshot before committing to "annotations are enough" — if any operator writes oversize blobs, fall back to a per-instance ConfigMap. **Open** — needs production trace data.
+- [x] Should `ResourceVolumeStatus.HistoryGi` exist? (2026-05-10) Yes — added with Phase 8.1, currently nil-by-default; the satellite observer writes it only when split-brain forensics are actively requested (the `events2 --full` history-uuids parsing is gated on a flag we'll add when a real split-brain debug surface emerges). Status budget cost is bounded (DRBD keeps last-4 GIs).
+- [x] Server-side apply field managers vs optimistic concurrency (2026-05-10). Picked SSA — `pkg/store/k8s/resources.go.SetState` writes via `client.Apply` with `FieldOwner=blockstor-satellite`. Real-world CR Status writes never exceed a few per-second per resource; the apiserver overhead is negligible against the lock-step correctness win. Benchmarking deferred to a future load-test if Status write rate ever ramps up.
 
 ### Cross-phase notes
 
