@@ -101,6 +101,66 @@ func TestVolumeDefinitionsWithoutStore(t *testing.T) {
 	}
 }
 
+// TestVolumeDefinitionsGet pins the per-VD GET happy path. The
+// existing TestVolumeDefinitionsBadVolumeNumber covers the 400
+// path; this one pins the canonical 200 with a deserialised
+// VolumeDefinition body so a refactor that flipped the response
+// shape to an envelope (`{"volume_definition":{...}}`) would be
+// caught — golinstor's per-VD client decodes a bare VD.
+func TestVolumeDefinitionsGet(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-getvd"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-getvd",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-getvd/volume-definitions/0")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.VolumeDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode bare VolumeDefinition: %v", err)
+	}
+
+	if got.VolumeNumber != 0 || got.SizeKib != 1024*1024 {
+		t.Errorf("got %+v, want VolumeNumber=0 SizeKib=%d", got, 1024*1024)
+	}
+}
+
+// TestVolumeDefinitionsGetMissingVD: GET on a vol_num that doesn't
+// exist (RD exists, but no such volume) → 404. Pins the
+// distinction from missing-RD (also 404 but for a different
+// reason — operator log lines should differ).
+func TestVolumeDefinitionsGetMissingVD(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/99")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestVolumeDefinitionsUpdate is the CSI ControllerExpandVolume hot
 // path: PUT /v1/resource-definitions/{rd}/volume-definitions/{vol}
 // with a new SizeKib must round-trip into the store. The path-derived
