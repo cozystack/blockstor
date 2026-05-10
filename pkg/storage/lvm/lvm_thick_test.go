@@ -17,7 +17,9 @@ limitations under the License.
 package lvm_test
 
 import (
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -226,3 +228,99 @@ func TestThickVolumeStatusViaLVS(t *testing.T) {
 		t.Errorf("DevicePath: got %q, want /dev/vg/pvc-1_00000", got.DevicePath)
 	}
 }
+
+// TestThickDeleteVolumeMissingIsNoop pins the idempotent-delete
+// invariant: when lvs reports the LV doesn't exist, DeleteVolume
+// returns nil without issuing lvremove. linstor-csi performs
+// idempotent volume teardown — a regression that surfaced "doesn't
+// exist" as an error would loop the csi retry forever.
+func TestThickDeleteVolumeMissingIsNoop(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// lvExists path: lvs returns empty (no such LV).
+	fx.Expect("lvs --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume on missing LV: got %v, want nil", err)
+	}
+
+	for _, cmd := range fx.CommandLines() {
+		if cmd == "lvremove --force vg/pvc-1_00000" {
+			t.Errorf("lvremove ran despite missing LV: %v", fx.CommandLines())
+		}
+	}
+}
+
+// TestThickPoolStatusMissingVG: vgs against a non-existent VG
+// returns empty stdout; PoolStatus must surface a "vg not found"
+// error rather than report zero capacity (which would mislead the
+// placer's roll-up).
+func TestThickPoolStatusMissingVG(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("vgs --noheadings --separator | -o vg_size,vg_free --units k --nosuffix ghost-vg",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "ghost-vg"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Fatalf("PoolStatus on missing VG: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "ghost-vg") {
+		t.Errorf("error must name the missing VG; got %q", err.Error())
+	}
+}
+
+// TestThickCreateSnapshotErrorWraps: lvcreate --snapshot failure
+// must surface with the "lvcreate --snapshot" wrap keyword for
+// operator grep.
+func TestThickCreateSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvcreate --snapshot --extents 25%ORIGIN --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Err: errLVMCmdFailed})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.CreateSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("CreateSnapshot: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "lvcreate --snapshot") {
+		t.Errorf("wrap: %q must contain \"lvcreate --snapshot\"", err.Error())
+	}
+}
+
+// TestThickDeleteSnapshotErrorWraps: lvremove on a snapshot LV must
+// surface with the "lvremove -f" wrap keyword.
+func TestThickDeleteSnapshotErrorWraps(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("lvremove --force vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Err: errLVMCmdFailed})
+
+	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "pvc-1",
+		SnapshotName: "snap-1",
+	})
+	if err == nil {
+		t.Fatalf("DeleteSnapshot: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "lvremove -f") {
+		t.Errorf("wrap: %q must contain \"lvremove -f\"", err.Error())
+	}
+}
+
+var errLVMCmdFailed = errors.New("lvm: command failed")
