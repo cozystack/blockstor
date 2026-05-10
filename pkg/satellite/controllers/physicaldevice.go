@@ -23,6 +23,8 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,6 +44,23 @@ import (
 // enough that we don't spin if the operator never applies the
 // pool. Phase 10.7 race-handling matrix line 4.
 const poolMissingRequeue = 10 * time.Second
+
+// poolMissingTimeout caps how long the reconciler keeps
+// requeuing for a missing target StoragePool before giving up
+// with `Phase=Failed`. 10 minutes is long enough for an
+// operator-driven create-pool-and-device GitOps apply to
+// land, short enough that an operator who forgot to apply the
+// pool sees the failure within a kubectl-get cycle rather than
+// after a multi-hour silent wait. Phase 10.7 race-matrix line
+// 4 final state.
+const poolMissingTimeout = 10 * time.Minute
+
+// physicalDeviceConditionPoolMissing is the
+// Status.Conditions[type] the reconciler stamps when it sees
+// `Spec.AttachTo.StoragePoolName` referencing a pool that
+// doesn't exist yet. Its `LastTransitionTime` is the "first
+// observed at" timestamp used to bound the requeue window.
+const physicalDeviceConditionPoolMissing = "PoolMissing"
 
 // PhysicalDeviceAttachFinalizer guards a PhysicalDevice CRD
 // while `Spec.AttachTo` is set + the satellite hasn't yet
@@ -145,10 +164,7 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if !poolReady {
-		logger.Info("target StoragePool not yet known; requeuing",
-			"pool", dev.Spec.AttachTo.StoragePoolName)
-
-		return ctrl.Result{RequeueAfter: poolMissingRequeue}, nil
+		return r.handlePoolMissing(ctx, &dev)
 	}
 
 	// Mark in-flight so kubectl get + status views reflect what's
@@ -272,6 +288,50 @@ func deviceMissing(dev *blockstoriov1alpha1.PhysicalDevice) bool {
 	}
 
 	return dev.Status.DevicePath == "" && dev.Status.CurrentDevPath == ""
+}
+
+// handlePoolMissing implements the Phase 10.7 race-matrix
+// line 4 final state: short waits during the common
+// CDP-creates-pool-and-attach race resolve via
+// `RequeueAfter:10s`, but once `poolMissingTimeout` elapses
+// without the pool appearing the reconciler stops requeuing
+// and stamps `Phase=Failed` so the operator sees the cause.
+// First observation lays down a `PoolMissing` Condition whose
+// `LastTransitionTime` is the wall-clock anchor for the
+// timeout.
+func (r *PhysicalDeviceReconciler) handlePoolMissing(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("physicaldevice", dev.Name)
+
+	cond := meta.FindStatusCondition(dev.Status.Conditions, physicalDeviceConditionPoolMissing)
+	if cond != nil && time.Since(cond.LastTransitionTime.Time) > poolMissingTimeout {
+		logger.Info("PoolMissing timeout exceeded; failing attach",
+			"pool", dev.Spec.AttachTo.StoragePoolName,
+			"since", cond.LastTransitionTime.Time)
+
+		_ = r.setPhase(ctx, dev, blockstoriov1alpha1.PhysicalDevicePhaseFailed)
+
+		return ctrl.Result{}, nil
+	}
+
+	if cond == nil {
+		meta.SetStatusCondition(&dev.Status.Conditions, metav1.Condition{
+			Type:               physicalDeviceConditionPoolMissing,
+			Status:             metav1.ConditionTrue,
+			Reason:             "TargetStoragePoolNotFound",
+			Message:            "Spec.AttachTo.StoragePoolName references a StoragePool that doesn't exist on this node yet",
+			LastTransitionTime: metav1.Now(),
+		})
+
+		err := r.Status().Update(ctx, dev)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "stamp PoolMissing condition")
+		}
+	}
+
+	logger.Info("target StoragePool not yet known; requeuing",
+		"pool", dev.Spec.AttachTo.StoragePoolName)
+
+	return ctrl.Result{RequeueAfter: poolMissingRequeue}, nil
 }
 
 // targetPoolExists returns true when a StoragePool CRD named
