@@ -235,6 +235,49 @@ func TestObserverIncludesVolumeObservation(t *testing.T) {
 	}
 }
 
+// TestObserverSurfacesCurrentUuid: `drbdsetup events2 --full` device
+// frames carry `current-uuid:` and `bitmap-uuid:` for the DRBD-9
+// generation identifier chain. The Observer must lift the current
+// uuid into VolumeObservation.CurrentUuid so the controller can
+// persist it on Resource.Status.Volumes[i].CurrentGi and seed new
+// replicas to skip full initial-sync (Phase 8.1).
+//
+// A regression that dropped the field would silently break the
+// initial-sync-skip optimisation: every 2→3 replica transition
+// would resync the entire device.
+func TestObserverSurfacesCurrentUuid(t *testing.T) {
+	obs := satellite.NewObserver("n1")
+
+	events := []drbd.Event{
+		{
+			Action: "exists",
+			Kind:   "device",
+			Fields: map[string]string{
+				"name":         "pvc-1",
+				"volume":       "0",
+				"disk":         "UpToDate",
+				"current-uuid": "78A0DDD26421EBA4",
+				"bitmap-uuid":  "0000000000000000",
+			},
+		},
+	}
+
+	out := collectObservations(obs, events)
+
+	if len(out) != 1 {
+		t.Fatalf("len(out): got %d", len(out))
+	}
+
+	vols := out[0].GetVolumes()
+	if len(vols) != 1 {
+		t.Fatalf("len(volumes): got %d", len(vols))
+	}
+
+	if got := vols[0].GetCurrentUuid(); got != "78A0DDD26421EBA4" {
+		t.Errorf("CurrentUuid: got %q, want 78A0DDD26421EBA4", got)
+	}
+}
+
 // collectObservations is a shared helper to drain Observer.Observe over
 // a fixed input slice. We push into the input channel, close it, then
 // read everything off the output channel.

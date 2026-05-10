@@ -213,6 +213,12 @@ message VolumeObservation {
   int64 allocated_kib = 3;
   int64 usable_kib = 4;
   string disk_state = 5;
+  // current_uuid is the DRBD-9 generation identifier emitted by
+  // `drbdsetup events2 --full` for this replica's local volume. The
+  // controller persists it on Resource.Status.Volumes[i].CurrentGi
+  // and seeds new replicas' metadata with this value to skip the
+  // full initial-sync (Phase 8.1).
+  string current_uuid = 6;
 }
 
 // ----- storage pools -----

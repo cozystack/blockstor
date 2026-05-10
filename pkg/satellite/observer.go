@@ -109,6 +109,10 @@ func (o *Observer) translateResource(ev drbd.Event) (*Observation, bool) {
 }
 
 // translateDevice emits per-volume disk-state observations.
+//
+// Surfaces `current-uuid:` from `drbdsetup events2 --full` device
+// frames as VolumeObservation.CurrentUuid so the controller can
+// seed new replicas to skip the full initial-sync (Phase 8.1).
 func (o *Observer) translateDevice(ev drbd.Event) (*Observation, bool) {
 	name := ev.Fields["name"]
 	if name == "" {
@@ -131,6 +135,7 @@ func (o *Observer) translateDevice(ev drbd.Event) (*Observation, bool) {
 			obs.Volumes = []*satellitepb.VolumeObservation{{
 				VolumeNumber: int32(volNum), //nolint:gosec // volume numbers are small (<32) per drbd-9 limits
 				DiskState:    disk,
+				CurrentUuid:  ev.Fields["current-uuid"],
 			}}
 		}
 	}
