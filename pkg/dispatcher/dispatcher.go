@@ -94,7 +94,7 @@ type ApplyOptions struct {
 	EffectiveProps map[string]string
 
 	// LayerStack is the resolved layer composition (RD → RG → default).
-	// Empty falls back to RD.Spec.LayerStack inside buildDesired so
+	// Empty falls back to RD.Spec.LayerStack inside BuildDesired so
 	// older call sites that don't compute the stack keep their
 	// behaviour. The satellite skips DRBD when the stack omits it.
 	LayerStack []string
@@ -115,7 +115,7 @@ func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Reso
 		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
 	}
 
-	desired := buildDesired(target, peers, nodes, rd, opts.EffectiveProps)
+	desired := BuildDesired(target, peers, nodes, rd, opts.EffectiveProps)
 	if len(opts.LayerStack) > 0 {
 		desired.LayerStack = opts.LayerStack
 	}
@@ -164,7 +164,7 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	return ""
 }
 
-// buildDesired translates a Resource + its same-RD peers into the
+// BuildDesired translates a Resource + its same-RD peers into the
 // satellite-facing DesiredResource. Port/minor/node-id assignment is
 // deterministic from the RD name + sorted peer list — good enough for
 // the first stand smoke; the autoplacer will replace it with a real
@@ -173,7 +173,7 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 // nodes is consulted for each peer's `SatelliteEndpoint` prop so
 // `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
-func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *satellitepb.DesiredResource {
+func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *satellitepb.DesiredResource {
 	// node-id and port/minor are persisted on Status by the controller
 	// before Apply runs. Falling back to derive*() is a transitional
 	// safety net for the case where the allocator hasn't run yet — it
@@ -238,7 +238,7 @@ func buildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 }
 
 // assembleDesired packages the per-replica wire payload. Pulled out
-// of buildDesired so the caller stays under the funlen budget.
+// of BuildDesired so the caller stays under the funlen budget.
 func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, dropped []string, drbdOpts, effectiveProps map[string]string) *satellitepb.DesiredResource {
 	_ = peers // peers info already folded into drbdOpts via addPeerEntries
 
@@ -353,7 +353,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 
 // addPeerEntries fills in `peer.<name>.{port,node-id,address}` keys
 // on the DesiredResource's drbd_options map. Pulled out of
-// buildDesired to keep the latter under the funlen budget — this
+// BuildDesired to keep the latter under the funlen budget — this
 // owns the per-peer fan-out plus the port/address lookups.
 func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, fallbackPort int, idOf map[string]int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))

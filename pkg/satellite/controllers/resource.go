@@ -29,6 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/effectiveprops"
+	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 )
 
 // ResourceReconciler watches Resource CRDs filtered to those
@@ -70,14 +73,29 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	logger.V(1).Info("observed Resource",
-		"rd", res.Spec.ResourceDefinitionName,
-		"flags", res.Spec.Flags,
-		"deletionTimestamp", res.DeletionTimestamp)
+	if !res.DeletionTimestamp.IsZero() {
+		// Phase 10.1 follow-up: finalizer-driven tear-down.
+		// Until then the controller-side ResourceReconciler's
+		// runDelete path still owns deletion via gRPC.
+		return ctrl.Result{}, nil
+	}
 
-	// Phase 10.1 follow-up: translate to DesiredResource +
-	// call r.Config.Apply.Apply(...). Until then the gRPC
-	// `ApplyResources` consumer continues to drive applies.
+	desired, err := r.buildDesiredFromCRD(ctx, &res)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	results, err := r.Config.Apply.Apply(ctx, []*satellitepb.DesiredResource{desired})
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
+	}
+
+	for _, res := range results {
+		if !res.GetOk() {
+			logger.Info("Apply per-resource failure", "name", res.GetName(), "message", res.GetMessage())
+		}
+	}
+
 	return ctrl.Result{}, nil
 }
 
@@ -96,6 +114,59 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// buildDesiredFromCRD packages a Resource CRD into the
+// satellite-facing DesiredResource by walking the apiserver
+// for parent RD + same-RD peers + Node list, then resolving
+// effective DRBD options via the shared
+// `pkg/effectiveprops` package and finally handing everything
+// to `dispatcher.BuildDesired`.
+//
+// This is the load-bearing replacement for the gRPC dispatch
+// path — the controller-runtime reconciler does exactly the
+// same work the controller's dispatcher did, just on the
+// satellite side. Phase 10.1.
+func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource) (*satellitepb.DesiredResource, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: target.Spec.ResourceDefinitionName}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, errors.Errorf("parent RD %q not found", target.Spec.ResourceDefinitionName)
+		}
+
+		return nil, errors.Wrap(err, "get parent RD")
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err = r.List(ctx, &resList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list Resources for peer set")
+	}
+
+	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+			peers = append(peers, resList.Items[i])
+		}
+	}
+
+	var nodeList blockstoriov1alpha1.NodeList
+
+	err = r.List(ctx, &nodeList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list Nodes")
+	}
+
+	effectiveProps, err := effectiveprops.Resolve(ctx, r.Client, target, &rd)
+	if err != nil {
+		return nil, errors.Wrap(err, "resolve effective props")
+	}
+
+	return dispatcher.BuildDesired(target, peers, nodeList.Items, &rd, effectiveProps), nil
 }
 
 // nodeNamePredicate filters events down to objects whose
