@@ -159,12 +159,17 @@ func (a *Agent) Run(ctx context.Context) error {
 	return ctx.Err() //nolint:wrapcheck // bubbling ctx.Err() unwrapped is the convention
 }
 
+// grpcServerDisabled is the placeholder address the agent reports
+// when no ListenAddr is set — keeps the call site happy without
+// surfacing an empty string into operator logs.
+const grpcServerDisabled = "<disabled>"
+
 // startGRPCServer binds the satellite's `service Satellite` listener.
 // Empty cfg.ListenAddr disables the server (returns a no-op stop) so
 // unit tests that only exercise Hello don't need a free port.
 func (a *Agent) startGRPCServer(ctx context.Context) (string, func(), error) {
 	if a.cfg.ListenAddr == "" {
-		return "<disabled>", func() {}, nil
+		return grpcServerDisabled, func() {}, nil
 	}
 
 	rec := NewReconciler(ReconcilerConfig{

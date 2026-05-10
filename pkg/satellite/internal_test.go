@@ -76,6 +76,35 @@ func TestResolveAddr(t *testing.T) {
 	}
 }
 
+// TestStartGRPCServerEmptyListenAddrIsNoOp: when ListenAddr is
+// empty the satellite skips the gRPC server bootstrap entirely and
+// returns a no-op stop func + the placeholder address string.
+// This is the path unit tests of Hello-only flows exercise (no
+// free port needed). Pinning it ensures a refactor that removed
+// the early-return wouldn't silently start eating ports during
+// tests run on parallel CI shards.
+func TestStartGRPCServerEmptyListenAddrIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	a := NewAgent(Config{NodeName: "n1"}) // no ListenAddr
+
+	addr, stop, err := a.startGRPCServer(t.Context())
+	if err != nil {
+		t.Fatalf("startGRPCServer with empty ListenAddr: %v", err)
+	}
+
+	if addr != grpcServerDisabled {
+		t.Errorf("addr: got %q, want %q", addr, grpcServerDisabled)
+	}
+
+	if stop == nil {
+		t.Errorf("stop func nil; want callable no-op")
+	}
+
+	// The no-op stop must not panic.
+	stop()
+}
+
 // TestPickMechanism pins the provider-kind → ship-mechanism table
 // the snapshot-shipping dispatcher relies on. The bare "default"
 // branch (returning "") is the load-bearing fallback: an unknown
