@@ -233,3 +233,47 @@ func TestSnapshotsViewFilters(t *testing.T) {
 		}
 	}
 }
+
+// TestSnapshotsCreateBadJSON: malformed body → 400.
+func TestSnapshotsCreateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestSnapshotsCreateMissingName: empty snap name → 400. linstor-csi
+// derives the snap name from a VolumeSnapshot UID — a regression
+// that allowed nameless snapshots would orphan rows that no later
+// reconcile can address.
+func TestSnapshotsCreateMissingName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Nodes: []string{"n1"}}) // Name omitted
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}

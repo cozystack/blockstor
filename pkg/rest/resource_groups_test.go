@@ -215,3 +215,65 @@ func TestResourceGroupsWithoutStore(t *testing.T) {
 		}
 	}
 }
+
+// TestResourceGroupsCreateBadJSON: malformed body → 400.
+func TestResourceGroupsCreateBadJSON(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceGroupsCreateMissingName: empty name → 400.
+func TestResourceGroupsCreateMissingName(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroup{}) // Name omitted
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceGroupsUpdateBadJSON: malformed body → 400 on PUT.
+func TestResourceGroupsUpdateBadJSON(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", []byte("{not-json"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceGroupsDeleteMissingRG: DELETE on missing RG → 404.
+func TestResourceGroupsDeleteMissingRG(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-groups/ghost")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
