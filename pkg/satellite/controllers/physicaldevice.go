@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -41,6 +42,17 @@ import (
 // enough that we don't spin if the operator never applies the
 // pool. Phase 10.7 race-handling matrix line 4.
 const poolMissingRequeue = 10 * time.Second
+
+// PhysicalDeviceAttachFinalizer guards a PhysicalDevice CRD
+// while `Spec.AttachTo` is set + the satellite hasn't yet
+// completed the attach. Without it, an operator running
+// `kubectl delete physicaldevice X` mid-attach would race the
+// satellite's Step-6 Delete, potentially removing the CRD before
+// the in-progress provider commands complete. The reconciler
+// stamps the finalizer on first observation of `Spec.AttachTo`,
+// and strips it just before its delete-as-completion call.
+// Phase 10.7 step 5 / 10.8 line 4.
+const PhysicalDeviceAttachFinalizer = "blockstor.io.blockstor.io/physicaldevice-attach"
 
 // PhysicalDeviceReconciler runs the attach sequence on
 // PhysicalDevice CRDs scoped to this satellite's node. It is
@@ -86,11 +98,27 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, nil
 	}
 
-	if dev.Spec.AttachTo == nil {
-		// Discovery-side state — nothing for the attach reconciler
-		// to do until an operator (or piraeus-operator) flips
-		// Spec.AttachTo.
-		return ctrl.Result{}, nil
+	// Discovery-side state (no AttachTo) and operator-driven
+	// delete both reduce to "strip our finalizer if we stamped
+	// one and stop." The provider commands `Attach` ran are
+	// idempotent + safe to leave on disk; pool teardown is
+	// Phase 10.8's StoragePool CRD concern, not this reconciler's.
+	if dev.Spec.AttachTo == nil || !dev.DeletionTimestamp.IsZero() {
+		return r.stripAttachFinalizer(ctx, &dev)
+	}
+
+	// Stamp our finalizer before touching the device so a racing
+	// `kubectl delete` can't whisk the CRD out from under the
+	// in-flight Attach commands.
+	if !slices.Contains(dev.Finalizers, PhysicalDeviceAttachFinalizer) {
+		dev.Finalizers = append(dev.Finalizers, PhysicalDeviceAttachFinalizer)
+
+		err := r.Update(ctx, &dev)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add attach finalizer")
+		}
+
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Step 1: target device must still be reachable. A discovery
@@ -186,12 +214,47 @@ func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstor
 
 	r.Config.Apply.RegisterProvider(result.PoolName, provider)
 
+	// Strip our finalizer BEFORE Delete; otherwise the apiserver
+	// keeps the CRD around with a DeletionTimestamp until the
+	// next reconcile pass, leaving a window where
+	// `linstor physical-storage list` still shows the device.
+	dev.Finalizers = slices.DeleteFunc(dev.Finalizers,
+		func(f string) bool { return f == PhysicalDeviceAttachFinalizer })
+
+	err = r.Update(ctx, dev)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "strip attach finalizer")
+	}
+
 	// Delete-as-completion: a successful attach removes the CRD
 	// so `linstor physical-storage list` stops surfacing the
 	// device as free.
 	err = r.Delete(ctx, dev)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return ctrl.Result{}, errors.Wrap(err, "delete PhysicalDevice")
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// stripAttachFinalizer removes our finalizer from the CRD when
+// it's present, and no-ops when it isn't. Used by both the
+// "AttachTo cleared after a failed attempt" path (operator
+// gave up; let the CRD be deletable normally) and the
+// "kubectl delete physicaldevice X mid-attach" path (apiserver
+// holds Delete pending our consent — drop it and let things
+// finalise; pool teardown is Phase 10.8's concern).
+func (r *PhysicalDeviceReconciler) stripAttachFinalizer(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice) (ctrl.Result, error) {
+	if !slices.Contains(dev.Finalizers, PhysicalDeviceAttachFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	dev.Finalizers = slices.DeleteFunc(dev.Finalizers,
+		func(f string) bool { return f == PhysicalDeviceAttachFinalizer })
+
+	err := r.Update(ctx, dev)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "strip attach finalizer")
 	}
 
 	return ctrl.Result{}, nil
