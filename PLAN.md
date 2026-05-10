@@ -839,6 +839,7 @@ honest. Each item names the original Phase that ticked it.
 
 - [ ] Volume resize end-to-end with a real PVC: write checksum, grow via REST, verify checksum + filesystem sees the new size. Currently only the satellite-side resize chain is unit-tested.
 - [ ] Backing-device failure e2e: pull the LV / disk out from under DRBD on a real-disk stand, assert peer stays Primary, source drops to Diskless. Satellite-side detach hook is unit-tested; real-stand exercise pending.
+- [ ] **`linstor r toggle-disk` parity** — upstream's `linstor resource toggle-disk <node> <res> [<storage-pool>]` flips a single replica between diskless and diskful in one command (used heavily by ops scripts when migrating data off a node before maintenance). golinstor calls `PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk[/storage-pool/{pool}]` which we don't yet implement: handler should set/clear the `DISKLESS` flag, stamp `StorPoolName` when promoting, and return 200 once the controller has reconciled the spec change (the satellite-side promotion/demotion is already covered by the auto-diskful + manual-detach paths, so this is a thin REST + reconciler-trigger shim). Pin via contract test mirroring upstream's response shape and an e2e (`tests/e2e/toggle-disk.sh`: 2-replica RD → toggle-disk on the diskless witness → assert UpToDate within seconds; toggle-disk back → assert satellite drops to Diskless).
 
 ### Phase 8.6 follow-up — Real-world testing
 
