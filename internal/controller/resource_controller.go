@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"time"
 
@@ -777,6 +778,13 @@ func (r *ResourceReconciler) takenOnNode(ctx context.Context, nodeName string, p
 // reference, or missing RD all silently degrade to "empty" rather
 // than block the dispatch — the resource can still come up with
 // satellite-only defaults.
+//
+// As of Phase 10.3 step 5 the typed `Spec.DRBDOptions` is the source
+// of truth — we resolve via `drbd.ResolveDRBDOptions`, then flatten
+// to a string Props map for the satellite proto (typed proto comes
+// in a later step). Legacy `Spec.Props` keys + `ExtraProps` are
+// merged in too so a partially-migrated cluster keeps rendering
+// the same .res file.
 func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *blockstoriov1alpha1.Resource, rdPtr *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
 	controllerProps, err := r.controllerProps(ctx)
 	if err != nil {
@@ -784,12 +792,18 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 	}
 
 	var (
-		rgProps map[string]string
-		rdProps map[string]string
+		rgProps  map[string]string
+		rdProps  map[string]string
+		rgTyped  *blockstoriov1alpha1.DRBDOptions
+		rdTyped  *blockstoriov1alpha1.DRBDOptions
+		rgExtras map[string]string
+		rdExtras map[string]string
 	)
 
 	if rdPtr != nil {
 		rdProps = rdPtr.Spec.Props
+		rdTyped = rdPtr.Spec.DRBDOptions
+		rdExtras = rdPtr.Spec.ExtraProps
 
 		if rdPtr.Spec.ResourceGroupName != "" {
 			var rg blockstoriov1alpha1.ResourceGroup
@@ -798,6 +812,8 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 			switch {
 			case err == nil:
 				rgProps = rg.Spec.Props
+				rgTyped = rg.Spec.DRBDOptions
+				rgExtras = rg.Spec.ExtraProps
 			case errors.IsNotFound(err):
 				// Soft-fail: the RG was deleted out from under
 				// this RD. Skip the level rather than refuse to
@@ -809,7 +825,24 @@ func (r *ResourceReconciler) resolveEffectiveProps(ctx context.Context, target *
 		}
 	}
 
-	return drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props), nil
+	// Resolve typed options through the same scope hierarchy as the
+	// legacy Props resolver. Lower scope wins per non-nil field.
+	typed := drbd.ResolveDRBDOptions(nil, rgTyped, rdTyped, target.Spec.DRBDOptions)
+
+	// Flatten typed → string Props so the existing satellite-side
+	// renderer keeps working. Then layer on the legacy Props
+	// hierarchy (controller → RG → RD → Resource) so any keys still
+	// living on Spec.Props (residual non-DRBD or pre-migration data)
+	// or in ExtraProps still feed into the .res file. Lower scope
+	// wins on conflict, matching the typed resolver's semantics.
+	out := drbd.ResolveOptions(controllerProps, rgProps, rdProps, target.Spec.Props)
+
+	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
+	maps.Copy(out, rgExtras)
+	maps.Copy(out, rdExtras)
+	maps.Copy(out, target.Spec.ExtraProps)
+
+	return out, nil
 }
 
 // resolveLayerStack walks the RD → RG hierarchy and returns the
