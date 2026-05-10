@@ -171,10 +171,11 @@ func TestPhysicalStorageListForNodeFiltersAttachTo(t *testing.T) {
 	}
 }
 
-// TestPhysicalStorageCreateNotImplemented: the device-pool create
-// endpoint returns 501 with a LINSTOR-shaped ApiCallRc explaining
-// the cozystack boundary.
-func TestPhysicalStorageCreateNotImplemented(t *testing.T) {
+// TestPhysicalStorageCreateNoMatchingDevice: 404 when none of the
+// requested device paths matches a free PhysicalDevice on the
+// node — surfaces the failure rather than silently succeeding so
+// piraeus-operator can retry after the discovery loop catches up.
+func TestPhysicalStorageCreateNoMatchingDevice(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
@@ -182,7 +183,101 @@ func TestPhysicalStorageCreateNotImplemented(t *testing.T) {
 		[]byte(`{"provider_kind":"LVM_THIN","device_paths":["/dev/sdb"]}`))
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("status: got %d, want 501", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestPhysicalStorageCreateFlipsAttachTo: the happy path. POST
+// with a matching DevicePath flips Spec.AttachTo on the chosen
+// PhysicalDevice; the satellite reconciler later picks it up.
+func TestPhysicalStorageCreateFlipsAttachTo(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/wwn-0xWWN-A",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "LVM_THIN",
+			"device_paths": ["/dev/disk/by-id/wwn-0xWWN-A"],
+			"with_storage_pool": {
+				"name": "thin1",
+				"props": {
+					"StorDriver/LvmVg": "vg",
+					"StorDriver/ThinPool": "tp"
+				}
+			}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.PhysicalDevices().Get(t.Context(), "n1-sda")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.AttachTo == nil {
+		t.Fatalf("AttachTo: got nil, want set")
+	}
+
+	if got.AttachTo.StoragePoolName != "thin1" {
+		t.Errorf("StoragePoolName: got %q, want thin1", got.AttachTo.StoragePoolName)
+	}
+
+	if got.AttachTo.ProviderKind != "LVM_THIN" {
+		t.Errorf("ProviderKind: got %q, want LVM_THIN", got.AttachTo.ProviderKind)
+	}
+
+	if got.AttachTo.VGName != "vg" {
+		t.Errorf("VGName: got %q, want vg", got.AttachTo.VGName)
+	}
+
+	if got.AttachTo.ThinPoolName != "tp" {
+		t.Errorf("ThinPoolName: got %q, want tp", got.AttachTo.ThinPoolName)
+	}
+}
+
+// TestPhysicalStorageCreateRejectsAttached: 404 when the matching
+// device is already attached (Spec.AttachTo set). Operators must
+// re-run discovery / wait for delete-as-completion before re-using
+// the device — silently succeeding here would race the reconciler.
+func TestPhysicalStorageCreateRejectsAttached(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/wwn-0xWWN-A",
+		Phase:      "Attaching",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "earlier-pool",
+			ProviderKind:    "LVM_THIN",
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{"provider_kind":"LVM_THIN","device_paths":["/dev/disk/by-id/wwn-0xWWN-A"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404 (device already attached)", resp.StatusCode)
 	}
 }

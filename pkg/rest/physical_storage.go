@@ -17,7 +17,9 @@ limitations under the License.
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
+	"strings"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -37,7 +39,151 @@ func (s *Server) registerPhysicalStorage(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/nodes/{node}/physical-storage",
 		s.requireStore(s.handlePhysicalStorageListForNode))
 	mux.HandleFunc("POST /v1/physical-storage/{node}",
-		handlePhysicalStorageCreateNotImplemented)
+		s.requireStore(s.handlePhysicalStorageCreate))
+}
+
+// physicalStorageCreateRequest mirrors upstream golinstor's
+// `PhysicalStorageCreate`. We accept only the subset blockstor
+// can interpret without VDO / RAID / SED — those upstream knobs
+// silently get ignored and the attach falls through to a plain
+// pool create. piraeus-operator only sets the simple subset, so
+// this lossy mapping is fine in practice.
+type physicalStorageCreateRequest struct {
+	DevicePaths     []string                          `json:"device_paths"`
+	ProviderKind    string                            `json:"provider_kind"`
+	PoolName        string                            `json:"pool_name,omitempty"`
+	WithStoragePool *physicalStorageCreatePoolDetails `json:"with_storage_pool,omitempty"`
+}
+
+// physicalStorageCreatePoolDetails carries optional pool-side
+// parameters the operator passes alongside the device list.
+type physicalStorageCreatePoolDetails struct {
+	Name  string            `json:"name,omitempty"`
+	Props map[string]string `json:"props,omitempty"`
+}
+
+// handlePhysicalStorageCreate is the Phase 10.7 attach trigger.
+// Decodes the upstream-LINSTOR `PhysicalStorageCreate` envelope,
+// finds matching PhysicalDevice CRDs on the named node by their
+// `Status.DevicePath`, and flips `Spec.AttachTo` so the satellite
+// reconciler picks them up on its next pass.
+//
+// Returns 404 when none of the requested device paths match a
+// free PhysicalDevice on this node — surfacing the failure
+// rather than silently succeeding lets piraeus-operator retry
+// after the discovery loop catches up.
+func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	var req physicalStorageCreateRequest
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	if req.ProviderKind == "" {
+		writeError(w, http.StatusBadRequest, "provider_kind is required")
+
+		return
+	}
+
+	if len(req.DevicePaths) == 0 {
+		writeError(w, http.StatusBadRequest, "device_paths is required")
+
+		return
+	}
+
+	devs, err := s.Store.PhysicalDevices().ListForNode(r.Context(), node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	target := pickFreeDeviceForAttach(devs, req.DevicePaths)
+	if target == nil {
+		writeError(w, http.StatusNotFound,
+			"no free PhysicalDevice on node "+node+" matches device_paths ["+strings.Join(req.DevicePaths, " ")+"]")
+
+		return
+	}
+
+	target.AttachTo = buildAttachTo(&req)
+
+	err = s.Store.PhysicalDevices().Update(r.Context(), target)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// pickFreeDeviceForAttach finds the first PhysicalDevice whose
+// `Status.DevicePath` (or `Status.CurrentDevPath`, as a fallback
+// since some operators pass volatile /dev/sdN paths) appears in
+// the requested device_paths list. Skips devices that are already
+// being attached or assigned. Returns nil when no match.
+//
+// Note: this picks the first match deterministically by store
+// order (which the in-memory + k8s impls both stable-sort by
+// name). Multi-device pool requests trigger one PhysicalDevice
+// flip per device — piraeus-operator already POSTs per-device
+// in practice.
+func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) *apiv1.PhysicalDevice {
+	want := map[string]bool{}
+	for _, p := range paths {
+		want[p] = true
+	}
+
+	for i := range devs {
+		dev := &devs[i]
+		if dev.AttachTo != nil {
+			continue
+		}
+
+		if dev.Phase != "" && dev.Phase != crdv1alpha1.PhysicalDevicePhaseAvailable {
+			continue
+		}
+
+		if want[dev.DevicePath] || want[dev.CurrentDevPath] {
+			return dev
+		}
+	}
+
+	return nil
+}
+
+// buildAttachTo turns the upstream PhysicalStorageCreate envelope
+// into the typed AttachTo our PhysicalDevice CRD spec carries.
+// The pool name comes from `with_storage_pool.name` when present
+// (the upstream-shaped payload), falling back to `pool_name` for
+// callers that pass it at the top level. Provider-kind-specific
+// fields (`vg_name`, `thin_pool`, `zpool`, `directory`) come from
+// the props bag the operator may have included.
+func buildAttachTo(req *physicalStorageCreateRequest) *apiv1.PhysicalDeviceAttachTo {
+	out := &apiv1.PhysicalDeviceAttachTo{
+		ProviderKind: req.ProviderKind,
+	}
+
+	if req.WithStoragePool != nil && req.WithStoragePool.Name != "" {
+		out.StoragePoolName = req.WithStoragePool.Name
+	} else {
+		out.StoragePoolName = req.PoolName
+	}
+
+	if req.WithStoragePool != nil {
+		out.VGName = req.WithStoragePool.Props["StorDriver/LvmVg"]
+		out.ThinPoolName = req.WithStoragePool.Props["StorDriver/ThinPool"]
+		out.ZPoolName = req.WithStoragePool.Props["StorDriver/ZPool"]
+		out.Directory = req.WithStoragePool.Props["StorDriver/FileDir"]
+	}
+
+	return out
 }
 
 // physicalStorageEntry is the envelope golinstor expects on
@@ -177,18 +323,4 @@ func groupPhysicalDevices(devs []apiv1.PhysicalDevice) []physicalStorageEntry {
 	}
 
 	return out
-}
-
-// handlePhysicalStorageCreateNotImplemented surfaces 501 with a
-// LINSTOR-shaped ApiCallRc body explaining the boundary. piraeus-
-// operator's `LinstorSatelliteConfiguration.spec.storagePools` would
-// otherwise retry the call indefinitely.
-//
-// The Phase 10.7 design will replace this with a handler that flips
-// `PhysicalDevice.Spec.AttachTo` on a free device matching the
-// request — once the satellite-side reconciler is wired up.
-func handlePhysicalStorageCreateNotImplemented(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotImplemented,
-		"physical-storage create is out of scope for blockstor; "+
-			"provision storage pools via Talos extensions / static node config")
 }
