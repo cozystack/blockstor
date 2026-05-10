@@ -388,3 +388,23 @@ func TestResizeVolumeShrinkNoOp(t *testing.T) {
 		}
 	}
 }
+
+// TestPoolStatusErrorWrapsOnMissingDir pins the statfs-error wrap:
+// when the configured Dir doesn't exist (operator typo, mount race,
+// missing privilege), PoolStatus must surface an error tagged with
+// the "statfs" keyword so operators can grep it.
+func TestPoolStatusErrorWrapsOnMissingDir(t *testing.T) {
+	t.Parallel()
+
+	bogus := filepath.Join(t.TempDir(), "does-not-exist")
+	p := loopfile.NewProvider(loopfile.Config{Dir: bogus}, storage.NewFakeExec())
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Fatalf("PoolStatus on missing dir: got nil, want error")
+	}
+
+	if !strings.Contains(err.Error(), "statfs") {
+		t.Errorf("error wrap: got %q, want substring \"statfs\"", err.Error())
+	}
+}
