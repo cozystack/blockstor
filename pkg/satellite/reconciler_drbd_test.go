@@ -18,6 +18,7 @@ package satellite_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1354,7 +1355,7 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-md-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 	// drbdadm create-md fails.
-	fx.Expect("drbdadm create-md --force pvc-md-fail",
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-md-fail", drbd.MaxPeers-1),
 		storage.FakeResponse{Err: errCreateMDFailed})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -1498,7 +1499,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 
 	calls := fx.CommandLines()
 
-	createMD := indexOfPrefix(calls, "drbdadm create-md --force pvc-seed")
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.MaxPeers-1))
 	setGi := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
 

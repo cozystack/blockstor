@@ -18,6 +18,7 @@ package drbd_test
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
@@ -84,7 +85,9 @@ func TestAdmCreateMD(t *testing.T) {
 		t.Fatalf("CreateMD: %v", err)
 	}
 
-	want := "drbdadm create-md --force pvc-1"
+	// --max-peers pinned to MaxPeers-1 so the kernel can hold the
+	// connection mesh the allocator hands out.
+	want := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-1", drbd.MaxPeers-1)
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
