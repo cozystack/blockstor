@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -110,14 +111,36 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
+	var anyFailed bool
+
 	for _, ar := range results {
 		if !ar.GetOk() {
+			anyFailed = true
+
 			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
 		}
 	}
 
+	// Apply chain reports its own per-resource errors via results (e.g.
+	// drbdadm adjust failing on a stale .res rendered from a partially-
+	// allocated peer Status). Returning `nil` would let c-r stop and
+	// never retry until an external event (peer Status update) drove
+	// another reconcile. Requeue with a short backoff so the next
+	// attempt sees the freshly-committed peer state.
+	if anyFailed {
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
 	return ctrl.Result{}, nil
 }
+
+// applyFailureRequeue is the backoff between satellite Apply
+// retries when at least one per-resource result reported failure.
+// Short enough that a transient stale-peer .res renders converge
+// within a couple of ticks; long enough that a permanently failing
+// drbdadm command (e.g. missing kernel module) doesn't flood the
+// log.
+const applyFailureRequeue = 5 * time.Second
 
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
