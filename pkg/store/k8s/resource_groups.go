@@ -140,7 +140,7 @@ func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
 	}
 
 	out.SelectFilter = apiv1.AutoSelectFilter{
-		PlaceCount:              crd.Spec.SelectFilter.PlaceCount,
+		PlaceCount:              apiv1.LaxInt32(crd.Spec.SelectFilter.PlaceCount),
 		StoragePool:             crd.Spec.SelectFilter.StoragePool,
 		StoragePoolList:         crd.Spec.SelectFilter.StoragePoolList,
 		StoragePoolDisklessList: crd.Spec.SelectFilter.StoragePoolDisklessList,
@@ -190,7 +190,7 @@ func wireToCRDRGSpec(in *apiv1.ResourceGroup) crdv1alpha1.ResourceGroupSpec {
 		ExtraProps:  extras,
 		PeerSlots:   in.PeerSlots,
 		SelectFilter: crdv1alpha1.ResourceGroupSelectFilter{
-			PlaceCount:              in.SelectFilter.PlaceCount,
+			PlaceCount:              int32(in.SelectFilter.PlaceCount),
 			StoragePool:             in.SelectFilter.StoragePool,
 			StoragePoolList:         in.SelectFilter.StoragePoolList,
 			StoragePoolDisklessList: in.SelectFilter.StoragePoolDisklessList,

@@ -47,9 +47,15 @@ type VolumeGroup struct {
 }
 
 // AutoSelectFilter is the placement constraint set used by Autoplacer.
+//
+// PlaceCount and AdditionalPlaceCount use the LaxInt32 type because
+// upstream LINSTOR's CLI (linstor-client) marshals integer flags as
+// quoted strings (e.g. `"place_count":"2"`) — the wire shape differs
+// from the OpenAPI int32 spec. LaxInt32 accepts both forms so neither
+// the CLI nor a strictly-typed client breaks.
 type AutoSelectFilter struct {
-	PlaceCount              int32            `json:"place_count,omitempty"`
-	AdditionalPlaceCount    int32            `json:"additional_place_count,omitempty"`
+	PlaceCount              LaxInt32         `json:"place_count,omitempty"`
+	AdditionalPlaceCount    LaxInt32         `json:"additional_place_count,omitempty"`
 	NodeNameList            []string         `json:"node_name_list,omitempty"`
 	StoragePool             string           `json:"storage_pool,omitempty"`
 	StoragePoolList         []string         `json:"storage_pool_list,omitempty"`

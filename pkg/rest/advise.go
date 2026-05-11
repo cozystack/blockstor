@@ -120,7 +120,7 @@ func (s *Server) adviseOne(ctx context.Context, rd *apiv1.ResourceDefinition) (a
 
 	entry := adviceEntry{
 		Name:        rd.Name,
-		PlaceCount:  filter.PlaceCount,
+		PlaceCount:  int32(filter.PlaceCount),
 		Suggestions: picks,
 	}
 
