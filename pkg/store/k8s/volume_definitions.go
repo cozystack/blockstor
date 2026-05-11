@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -74,25 +75,30 @@ func (s *volumeDefinitions) Create(ctx context.Context, rdName string, vd *apiv1
 		return errors.New("nil VolumeDefinition")
 	}
 
-	rd, err := s.fetchRD(ctx, rdName)
-	if err != nil {
-		return err
-	}
-
-	for i := range rd.Spec.VolumeDefinitions {
-		if rd.Spec.VolumeDefinitions[i].VolumeNumber == vd.VolumeNumber {
-			return errors.Wrapf(store.ErrAlreadyExists, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
+	// VolumeDefinitions live inline on the parent RD's spec, which
+	// the RD reconciler also writes (annotations, layer-stack
+	// defaulting, derived flags). A bare Get-modify-Update races
+	// those writes — we observed "the object has been modified"
+	// 409s on `linstor rg spawn-resources` right after RD create.
+	// We also retry on NotFound: the informer cache may not have
+	// observed the just-created RD yet on a write that arrives
+	// milliseconds after the POST /v1/resource-definitions response.
+	return errors.Wrapf(retry.OnError(retry.DefaultRetry, isConflictOrNotFound, func() error {
+		rd, err := s.fetchRD(ctx, rdName)
+		if err != nil {
+			return err
 		}
-	}
 
-	rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions, wireToCRDVD(vd))
+		for i := range rd.Spec.VolumeDefinitions {
+			if rd.Spec.VolumeDefinitions[i].VolumeNumber == vd.VolumeNumber {
+				return errors.Wrapf(store.ErrAlreadyExists, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
+			}
+		}
 
-	err = s.c.Update(ctx, rd)
-	if err != nil {
-		return errors.Wrapf(err, "update RD %q to add volume %d", rdName, vd.VolumeNumber)
-	}
+		rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions, wireToCRDVD(vd))
 
-	return nil
+		return s.c.Update(ctx, rd)
+	}), "update RD %q to add volume %d", rdName, vd.VolumeNumber)
 }
 
 func (s *volumeDefinitions) Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error {
@@ -100,63 +106,73 @@ func (s *volumeDefinitions) Update(ctx context.Context, rdName string, vd *apiv1
 		return errors.New("nil VolumeDefinition")
 	}
 
-	rd, err := s.fetchRD(ctx, rdName)
-	if err != nil {
-		return err
-	}
-
-	idx := -1
-
-	for i := range rd.Spec.VolumeDefinitions {
-		if rd.Spec.VolumeDefinitions[i].VolumeNumber == vd.VolumeNumber {
-			idx = i
-
-			break
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		rd, err := s.fetchRD(ctx, rdName)
+		if err != nil {
+			return err
 		}
-	}
 
-	if idx == -1 {
-		return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
-	}
+		idx := -1
 
-	rd.Spec.VolumeDefinitions[idx] = wireToCRDVD(vd)
+		for i := range rd.Spec.VolumeDefinitions {
+			if rd.Spec.VolumeDefinitions[i].VolumeNumber == vd.VolumeNumber {
+				idx = i
 
-	err = s.c.Update(ctx, rd)
-	if err != nil {
-		return errors.Wrapf(err, "update RD %q for volume %d", rdName, vd.VolumeNumber)
-	}
+				break
+			}
+		}
 
-	return nil
+		if idx == -1 {
+			return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", vd.VolumeNumber, rdName)
+		}
+
+		rd.Spec.VolumeDefinitions[idx] = wireToCRDVD(vd)
+
+		return s.c.Update(ctx, rd)
+	}), "update RD %q for volume %d", rdName, vd.VolumeNumber)
 }
 
 func (s *volumeDefinitions) Delete(ctx context.Context, rdName string, volumeNumber int32) error {
-	rd, err := s.fetchRD(ctx, rdName)
-	if err != nil {
-		return err
-	}
-
-	idx := -1
-
-	for i := range rd.Spec.VolumeDefinitions {
-		if rd.Spec.VolumeDefinitions[i].VolumeNumber == volumeNumber {
-			idx = i
-
-			break
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		rd, err := s.fetchRD(ctx, rdName)
+		if err != nil {
+			return err
 		}
+
+		idx := -1
+
+		for i := range rd.Spec.VolumeDefinitions {
+			if rd.Spec.VolumeDefinitions[i].VolumeNumber == volumeNumber {
+				idx = i
+
+				break
+			}
+		}
+
+		if idx == -1 {
+			return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
+		}
+
+		rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions[:idx], rd.Spec.VolumeDefinitions[idx+1:]...)
+
+		return s.c.Update(ctx, rd)
+	}), "update RD %q to remove volume %d", rdName, volumeNumber)
+}
+
+// isConflictOrNotFound flags errors that justify a retry on the
+// VolumeDefinitions Create path. Conflict = RD spec mutated between
+// Get and Update (RD reconciler races our write). NotFound = the
+// informer cache hasn't yet observed the just-created RD; the
+// caller's POST handler returns before the watch event lands, so a
+// follow-up VD Create on the same connection sees the stale cache.
+func isConflictOrNotFound(err error) bool {
+	if err == nil {
+		return false
 	}
 
-	if idx == -1 {
-		return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
-	}
-
-	rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions[:idx], rd.Spec.VolumeDefinitions[idx+1:]...)
-
-	err = s.c.Update(ctx, rd)
-	if err != nil {
-		return errors.Wrapf(err, "update RD %q to remove volume %d", rdName, volumeNumber)
-	}
-
-	return nil
+	return apierrors.IsConflict(err) ||
+		apierrors.IsNotFound(err) ||
+		errors.Is(err, store.ErrNotFound)
 }
 
 func (s *volumeDefinitions) fetchRD(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
