@@ -67,11 +67,26 @@ EOF
 
 wait_uptodate "$RD" "$N1" "$N2"
 
+# REST endpoint is on the in-cluster Service. Port-forward to a
+# free local port — distroless controller image has no curl, so
+# `kubectl exec` would fail.
+PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
+    >/tmp/toggle-disk-pf.log 2>&1 &
+PF_PID=$!
+trap 'kill $PF_PID 2>/dev/null || true; delete_rd "$RD"' EXIT
+
+for _ in $(seq 1 10); do
+    if curl -sf -m1 "http://localhost:$PF_PORT/v1/nodes" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+
 # 1. Promote witness via REST.
 echo ">> toggle-disk N3 → diskful (pool=${POOL})"
-controller_pod=$(kubectl get pod -n blockstor-system -l app=blockstor-controller -o jsonpath='{.items[0].metadata.name}')
-kubectl -n blockstor-system exec "$controller_pod" -- \
-    curl -fsS -X PUT "http://127.0.0.1:3370/v1/resource-definitions/${RD}/resources/${N3}/toggle-disk/storage-pool/${POOL}"
+curl -fsS -X PUT \
+    "http://localhost:$PF_PORT/v1/resource-definitions/${RD}/resources/${N3}/toggle-disk/storage-pool/${POOL}"
 
 echo ">> wait up to 90s for N3 to become UpToDate"
 deadline=$(( $(date +%s) + 90 ))
@@ -90,8 +105,8 @@ fi
 
 # 2. Demote back to diskless.
 echo ">> toggle-disk N3 → diskless"
-kubectl -n blockstor-system exec "$controller_pod" -- \
-    curl -fsS -X PUT "http://127.0.0.1:3370/v1/resource-definitions/${RD}/resources/${N3}/toggle-disk"
+curl -fsS -X PUT \
+    "http://localhost:$PF_PORT/v1/resource-definitions/${RD}/resources/${N3}/toggle-disk"
 
 echo ">> wait up to 60s for satellite to detach"
 deadline=$(( $(date +%s) + 60 ))
