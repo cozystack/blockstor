@@ -208,32 +208,26 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 		for i := range crd.Spec.NetInterfaces {
 			iface := &crd.Spec.NetInterfaces[i]
 
-			port := int(iface.SatellitePort)
-			if port == 0 {
-				// Upstream LINSTOR defaults to 3366/3367 for the
-				// satellite gRPC port. blockstor's satellite doesn't
-				// listen there (Phase 10.6 retired gRPC entirely),
-				// but `linstor node list` won't render the Addresses
-				// column unless we report a non-zero port, so emit
-				// the LINSTOR default. Consumers parsing the wire
-				// see the canonical shape; nothing actually dials it.
-				port = defaultSatellitePort
-			}
-
-			encType := iface.SatelliteEncryptionType
-			if encType == "" {
-				encType = defaultSatelliteEncryptionType
-			}
-
-			// First interface is the active satellite endpoint, by
-			// the same convention dispatcher.lookupEndpoint uses
-			// when resolving peer addresses. The CLI's "Addresses"
-			// column reads `is_active && stlt_port`.
+			// We DON'T default SatellitePort here: blockstor's
+			// satellite doesn't listen on the upstream-LINSTOR
+			// 3366/3367 (Phase 10.6 retired the gRPC wire — every
+			// satellite ↔ controller exchange flows through the
+			// Kubernetes apiserver). Synthesising "3366 (PLAIN)"
+			// just to make `linstor node list` render its
+			// Addresses column would be a lie; consumers that
+			// blindly dial that port would hang. Leave the value
+			// as the operator set it (usually 0) and accept the
+			// blank column.
+			//
+			// First interface still gets is_active=true so the
+			// CLI's `node info` reports a coherent shape; the
+			// flag is descriptive (= "this is the routable
+			// endpoint we advertise"), not a dial guarantee.
 			out.NetInterfaces = append(out.NetInterfaces, apiv1.NetInterface{
 				Name:                    iface.Name,
 				Address:                 iface.Address,
-				SatellitePort:           port,
-				SatelliteEncryptionType: encType,
+				SatellitePort:           int(iface.SatellitePort),
+				SatelliteEncryptionType: iface.SatelliteEncryptionType,
 				IsActive:                i == 0,
 			})
 		}
@@ -293,20 +287,6 @@ func wireToCRDNodeSpec(in *apiv1.Node) crdv1alpha1.NodeSpec {
 // the autoplacer can use `client.MatchingLabels` selectors and the
 // keys feed into `topologySpreadConstraints` for free. Phase 10.3.
 const TopologyLabelPrefix = "topology.blockstor.io/"
-
-// defaultSatellitePort is the upstream LINSTOR satellite gRPC port
-// blockstor emits on the wire when an operator-declared NetInterface
-// leaves SatellitePort=0. Phase 10.6 retired the gRPC path entirely
-// — nothing actually dials this — but `linstor node list` won't
-// render the Addresses column without a non-zero port, so we keep
-// the canonical shape for golinstor / CLI compatibility.
-const defaultSatellitePort = 3366
-
-// defaultSatelliteEncryptionType pairs with defaultSatellitePort
-// for the same wire-shape reason. PLAIN matches what piraeus-operator
-// stamps on the upstream LINSTOR NetInterface when it doesn't set
-// SSL bits.
-const defaultSatelliteEncryptionType = "PLAIN"
 
 // hasTopologyLabels reports whether any of the Node's metadata
 // labels lives under the blockstor topology prefix. Cheap pre-
