@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"slices"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,6 +66,15 @@ type ResourceReconciler struct {
 	// nodeID off the cache and pick the same lowest-free value.
 	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
 	APIReader client.Reader
+
+	// allocMu serialises DRBD-ID allocation across replicas of the
+	// same RD. APIReader bypasses the informer cache but doesn't
+	// help if two goroutines fan-read simultaneously — both still
+	// see the same not-yet-written state. A per-RD mutex held
+	// across read+write makes the allocation atomic in the
+	// single-controller process. Different RDs still allocate in
+	// parallel.
+	allocMu sync.Map // RD name → *sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -346,30 +356,24 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
 	original := target.Status.DeepCopy()
 
-	if target.Status.DRBDNodeID == nil {
-		// Re-fetch peers via the apiserver-direct reader so we don't
-		// race against another replica's recently-committed
-		// allocation. Cached `peers` may still have nodeID=nil for
-		// a sibling that wrote 0 milliseconds ago — taking the
-		// cached snapshot at face value gives both reconciles the
-		// same answer and produces a `conflicting use of node-id`
-		// drbdadm error.
-		taken, err := r.collectTakenNodeIDs(ctx, target)
-		if err != nil {
-			return false, err
-		}
+	// Serialise allocation across replicas of the same RD. The
+	// APIReader-direct read alone doesn't fix the race — two
+	// goroutines can both observe taken=[] simultaneously and
+	// each pick 0. The mutex held across {read taken → pick →
+	// Status().Update} forces a strict serial order so the
+	// second goroutine reads the first one's committed Status.
+	// Different RDs allocate in parallel.
+	mu := r.rdAllocMu(target.Spec.ResourceDefinitionName)
+	mu.Lock()
+	defer mu.Unlock()
 
-		id, err := drbd.LowestFreeNodeID(taken)
+	if target.Status.DRBDNodeID == nil {
+		id, err := r.allocateNodeIDLocked(ctx, target)
 		if err != nil {
 			return false, err
 		}
 
 		target.Status.DRBDNodeID = &id
-
-		// Silence the lint that wants `peers` consumed: we still use
-		// it for downstream allocations (port, minor); we just don't
-		// trust its DRBDNodeID values.
-		_ = peers
 	}
 
 	if target.Status.DRBDPort == nil {
@@ -389,6 +393,11 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 
 		target.Status.DRBDMinor = &minor
 	}
+
+	// `peers` is plumbed in for completeness with the rest of the
+	// reconciler; its DRBDNodeID values aren't used (we re-read via
+	// APIReader for correctness).
+	_ = peers
 
 	if equalStatus(original, &target.Status) {
 		return false, nil
@@ -822,6 +831,38 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
 		Named("resource").
 		Complete(r)
+}
+
+// rdAllocMu returns the per-RD allocation mutex, lazily creating
+// one on first use. Different RDs see different mutexes so they
+// allocate in parallel; replicas of the same RD serialise.
+func (r *ResourceReconciler) rdAllocMu(rdName string) *sync.Mutex {
+	loaded, _ := r.allocMu.LoadOrStore(rdName, &sync.Mutex{})
+
+	muTyped, _ := loaded.(*sync.Mutex)
+
+	return muTyped
+}
+
+// allocateNodeIDLocked picks the next free DRBD node-id for target.
+// Caller MUST hold rdAllocMu(target.Spec.ResourceDefinitionName).
+//
+// The APIReader bypasses the informer cache so we observe any
+// sibling's freshly-committed Status. Combined with the mutex,
+// concurrent reconciles of the same RD see a strict serial order:
+// the second reconcile observes the first one's allocation.
+func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *blockstoriov1alpha1.Resource) (int32, error) {
+	taken, err := r.collectTakenNodeIDs(ctx, target)
+	if err != nil {
+		return 0, err
+	}
+
+	id, err := drbd.LowestFreeNodeID(taken)
+	if err != nil {
+		return 0, err
+	}
+
+	return id, nil
 }
 
 // collectTakenNodeIDs returns the DRBDNodeIDs already assigned to
