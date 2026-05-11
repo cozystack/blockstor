@@ -118,5 +118,10 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "add ObserverRunnable")
 	}
 
+	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
+	if err != nil {
+		return nil, errors.Wrap(err, "register HeartbeatRunnable")
+	}
+
 	return mgr, nil
 }

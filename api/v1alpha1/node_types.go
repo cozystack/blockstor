@@ -108,8 +108,10 @@ type NodeNetInterface struct {
 
 // NodeStatus is the observed state of a node.
 type NodeStatus struct {
-	// connectionStatus is the satellite connection state reported by the
-	// controller (CONNECTED, OFFLINE, …).
+	// connectionStatus is a coarse projection of the Ready condition
+	// (CONNECTED when Ready=True, OFFLINE when False/Unknown) kept for
+	// kubectl-friendly columns + golinstor round-trip compatibility.
+	// Written by the controller-side heartbeat watchdog; do not hand-set.
 	// +optional
 	ConnectionStatus string `json:"connectionStatus,omitempty"`
 
@@ -117,12 +119,41 @@ type NodeStatus struct {
 	// +optional
 	Flags []string `json:"flags,omitempty"`
 
+	// lastHeartbeatTime is when this node's satellite last stamped the
+	// status (kubelet-style liveness). The controller-side watchdog
+	// flips the Ready condition to Unknown when this is older than the
+	// node-monitor grace period. Updated on every satellite reconcile
+	// tick regardless of state changes — the "did we hear from this
+	// satellite recently?" signal.
+	// +optional
+	LastHeartbeatTime *metav1.Time `json:"lastHeartbeatTime,omitempty"`
+
 	// conditions represents the current state of the Node resource.
+	// The well-known `Ready` condition (status=True when the satellite
+	// is healthy, Unknown when its heartbeat is stale, False when the
+	// satellite reports a fatal state) is what consumers should look
+	// at. Other conditions may follow as we surface more invariants.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
+
+// Well-known Node condition types + ConnectionStatus projections.
+const (
+	// NodeConditionReady is the Condition.Type the satellite stamps on
+	// every heartbeat tick. Mirrors core/v1.NodeReady semantics so any
+	// operator already familiar with k8s nodes reads blockstor nodes
+	// the same way.
+	NodeConditionReady = "Ready"
+
+	// NodeConnectionStatusConnected / Offline are the coarse string
+	// projections kept on `Status.ConnectionStatus` for kubectl
+	// columns + golinstor round-trip. The Condition is the source of
+	// truth — these strings are derived.
+	NodeConnectionStatusConnected = "CONNECTED"
+	NodeConnectionStatusOffline   = "OFFLINE"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status

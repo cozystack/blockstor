@@ -156,7 +156,12 @@ spec:
             description: status defines the observed state of Node
             properties:
               conditions:
-                description: conditions represents the current state of the Node resource.
+                description: |-
+                  conditions represents the current state of the Node resource.
+                  The well-known `Ready` condition (status=True when the satellite
+                  is healthy, Unknown when its heartbeat is stale, False when the
+                  satellite reports a fatal state) is what consumers should look
+                  at. Other conditions may follow as we surface more invariants.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -217,14 +222,26 @@ spec:
                 x-kubernetes-list-type: map
               connectionStatus:
                 description: |-
-                  connectionStatus is the satellite connection state reported by the
-                  controller (CONNECTED, OFFLINE, …).
+                  connectionStatus is a coarse projection of the Ready condition
+                  (CONNECTED when Ready=True, OFFLINE when False/Unknown) kept for
+                  kubectl-friendly columns + golinstor round-trip compatibility.
+                  Written by the controller-side heartbeat watchdog; do not hand-set.
                 type: string
               flags:
                 description: flags computed by the satellite (e.g. EVICTED, EVACUATING).
                 items:
                   type: string
                 type: array
+              lastHeartbeatTime:
+                description: |-
+                  lastHeartbeatTime is when this node's satellite last stamped the
+                  status (kubelet-style liveness). The controller-side watchdog
+                  flips the Ready condition to Unknown when this is older than the
+                  node-monitor grace period. Updated on every satellite reconcile
+                  tick regardless of state changes — the "did we hear from this
+                  satellite recently?" signal.
+                format: date-time
+                type: string
             type: object
         required:
         - spec
