@@ -59,6 +59,18 @@ echo ">> linstor resource-definition + volume-definition create $RD"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 32M >/dev/null
 
+# Disable the auto-quorum-tiebreaker: blockstor's RD reconciler
+# otherwise spawns a 3rd DISKLESS replica on whichever worker
+# isn't part of the 2-replica set, which would collide with our
+# explicit `resource create $WORKER_3 …` below (409 from the REST
+# layer). The test wants $WORKER_3 to be a real diskful replica
+# we add and then drop, not a witness someone else planted.
+curl -sf -X PUT \
+    -H 'Content-Type: application/json' \
+    -d '{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"false"}}' \
+    "http://localhost:$PF_PORT/v1/resource-definitions/$RD/properties" \
+    >/dev/null
+
 echo ">> linstor resource create $WORKER_1 / $WORKER_2 $RD (initial 2 replicas)"
 "${LCTL[@]}" resource create "$WORKER_1" "$RD" --storage-pool stand >/dev/null
 "${LCTL[@]}" resource create "$WORKER_2" "$RD" --storage-pool stand >/dev/null

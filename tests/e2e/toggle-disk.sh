@@ -69,7 +69,7 @@ wait_uptodate "$RD" "$N1" "$N2"
 
 # 1. Promote witness via REST.
 echo ">> toggle-disk N3 → diskful (pool=${POOL})"
-controller_pod=$(kubectl get pod -n blockstor-system -l app=blockstor-manager -o jsonpath='{.items[0].metadata.name}')
+controller_pod=$(kubectl get pod -n blockstor-system -l app=blockstor-controller -o jsonpath='{.items[0].metadata.name}')
 kubectl -n blockstor-system exec "$controller_pod" -- \
     curl -fsS -X PUT "http://127.0.0.1:3370/v1/resource-definitions/${RD}/resources/${N3}/toggle-disk/storage-pool/${POOL}"
 
