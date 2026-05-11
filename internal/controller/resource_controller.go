@@ -58,6 +58,13 @@ type ResourceReconciler struct {
 	// promotion path to look up storage pools per node without
 	// requiring a separate StoragePool client cache.
 	Store store.Store
+
+	// APIReader is the uncached, apiserver-direct client. Used
+	// specifically before DRBD node-id allocation so two replicas
+	// reconciling in parallel can't both read a stale (nil)
+	// nodeID off the cache and pick the same lowest-free value.
+	// Wired from `mgr.GetAPIReader()` in SetupWithManager.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -340,16 +347,16 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	original := target.Status.DeepCopy()
 
 	if target.Status.DRBDNodeID == nil {
-		taken := make([]int32, 0, len(peers))
-
-		for i := range peers {
-			if peers[i].Name == target.Name {
-				continue
-			}
-
-			if peers[i].Status.DRBDNodeID != nil {
-				taken = append(taken, *peers[i].Status.DRBDNodeID)
-			}
+		// Re-fetch peers via the apiserver-direct reader so we don't
+		// race against another replica's recently-committed
+		// allocation. Cached `peers` may still have nodeID=nil for
+		// a sibling that wrote 0 milliseconds ago — taking the
+		// cached snapshot at face value gives both reconciles the
+		// same answer and produces a `conflicting use of node-id`
+		// drbdadm error.
+		taken, err := r.collectTakenNodeIDs(ctx, target)
+		if err != nil {
+			return false, err
 		}
 
 		id, err := drbd.LowestFreeNodeID(taken)
@@ -358,6 +365,11 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 		}
 
 		target.Status.DRBDNodeID = &id
+
+		// Silence the lint that wants `peers` consumed: we still use
+		// it for downstream allocations (port, minor); we just don't
+		// trust its DRBDNodeID values.
+		_ = peers
 	}
 
 	if target.Status.DRBDPort == nil {
@@ -798,6 +810,10 @@ func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *b
 //     the new peer set. Without this, R1's .res keeps the pre-witness
 //     peer list and R3 can't connect (R1 doesn't know it exists).
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{}).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
@@ -806,6 +822,50 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.enqueueSiblings)).
 		Named("resource").
 		Complete(r)
+}
+
+// collectTakenNodeIDs returns the DRBDNodeIDs already assigned to
+// sibling Resources of the same RD, reading directly from the
+// apiserver (no informer cache) to avoid the stale-read race that
+// otherwise lets two concurrent reconciles both pick the lowest
+// free id.
+func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
+	// Fall back to the cached client when APIReader hasn't been
+	// wired — tests construct `ResourceReconciler{}` directly with
+	// a fake client and skip SetupWithManager; the race we're
+	// guarding against only matters under real-cluster
+	// informer-cache load, which the fake client doesn't simulate.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err := reader.List(ctx, &resList)
+	if err != nil {
+		return nil, err
+	}
+
+	taken := make([]int32, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		res := &resList.Items[i]
+
+		if res.Name == target.Name {
+			continue
+		}
+
+		if res.Spec.ResourceDefinitionName != target.Spec.ResourceDefinitionName {
+			continue
+		}
+
+		if res.Status.DRBDNodeID != nil {
+			taken = append(taken, *res.Status.DRBDNodeID)
+		}
+	}
+
+	return taken, nil
 }
 
 // enqueueResourcesForRD maps an RD event to every Resource that
