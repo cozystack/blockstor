@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,16 +30,23 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/satellite"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // StoragePoolFinalizer guards a StoragePool CRD while it is
-// registered on this satellite. Without it `kubectl delete
-// storagepool X` would race the satellite: the apiserver would
-// remove the CRD before the satellite ran the on-disk teardown
-// (`vgremove --force` / `zpool destroy`), leaving orphaned
-// VGs/zpools the next discovery pass wouldn't re-publish.
-// Phase 10.8.
+// registered on this satellite. Strips on delete so the
+// apiserver finalises only after the in-memory provider has
+// been deregistered. Phase 10.8.
 const StoragePoolFinalizer = "blockstor.io.blockstor.io/satellite-storagepool"
+
+// capacityResyncInterval is the cadence the StoragePoolReconciler
+// reschedules itself at to refresh `Status.FreeCapacity` /
+// `TotalCapacity`. Long enough that the apiserver isn't peppered
+// with Status updates for an unchanged pool, short enough that a
+// freshly-allocated LV shows up in `/v1/view/storage-pools` within
+// half a minute. Mirrors the cadence the retired gRPC
+// `runCapacityLoop` ticked at.
+const capacityResyncInterval = 30 * time.Second
 
 // StoragePoolReconciler watches StoragePool CRDs filtered to
 // those scoped to this satellite's node. Replaces the gRPC
@@ -110,7 +118,17 @@ func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// deregisters, which is the right semantic.
 	r.Config.Apply.RegisterProvider(pool.Spec.PoolName, provider)
 
-	return ctrl.Result{}, nil
+	// Refresh Status.FreeCapacity / TotalCapacity from the
+	// provider. Replaces the retired gRPC `runCapacityLoop`
+	// push path — the satellite now writes capacity directly
+	// via the apiserver. Best-effort: a transient PoolStatus
+	// error logs + the next requeue retries.
+	r.writeCapacity(ctx, &pool, provider)
+
+	// Reschedule for capacity refresh. The c-r manager fires
+	// Reconcile on any CRD event AND after the requeue
+	// timeout, whichever lands first.
+	return ctrl.Result{RequeueAfter: capacityResyncInterval}, nil
 }
 
 // SetupWithManager wires the reconciler with the same
@@ -127,6 +145,44 @@ func (r *StoragePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// writeCapacity pushes the live PoolStatus from `provider` into
+// the StoragePool CRD's Status subresource. Best-effort: a
+// transient PoolStatus / apiserver error logs + the next
+// Reconcile retries. A nil provider (DISKLESS) is a no-op since
+// there's nothing to query.
+func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockstoriov1alpha1.StoragePool, provider storage.Provider) {
+	logger := log.FromContext(ctx).WithValues("storagepool", pool.Name)
+
+	if provider == nil {
+		return
+	}
+
+	status, err := provider.PoolStatus(ctx)
+	if err != nil {
+		logger.Info("PoolStatus failed", "err", err)
+
+		return
+	}
+
+	if pool.Status.FreeCapacity == status.FreeCapacityKib &&
+		pool.Status.TotalCapacity == status.TotalCapacityKib &&
+		pool.Status.SupportsSnapshots == status.SupportsSnapshots {
+		// No-op write: nothing changed since the last Reconcile.
+		// Skipping the apiserver round-trip keeps the
+		// every-30-seconds resync cheap.
+		return
+	}
+
+	pool.Status.FreeCapacity = status.FreeCapacityKib
+	pool.Status.TotalCapacity = status.TotalCapacityKib
+	pool.Status.SupportsSnapshots = status.SupportsSnapshots
+
+	err = r.Status().Update(ctx, pool)
+	if err != nil {
+		logger.Info("Status.Update for capacity", "err", err)
+	}
 }
 
 // handlePoolDelete runs the satellite-side cleanup when a
