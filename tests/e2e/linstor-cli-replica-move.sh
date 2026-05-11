@@ -65,9 +65,16 @@ echo ">> linstor resource-definition + volume-definition create $RD"
 # explicit `resource create $WORKER_3 …` below (409 from the REST
 # layer). The test wants $WORKER_3 to be a real diskful replica
 # we add and then drop, not a witness someone else planted.
+rd_json=$(curl -sf "http://localhost:$PF_PORT/v1/resource-definitions/$RD")
+patched=$(echo "$rd_json" | python3 -c '
+import json, sys
+rd = json.load(sys.stdin)
+rd.setdefault("props", {})["DrbdOptions/AutoAddQuorumTiebreaker"] = "false"
+print(json.dumps(rd))
+')
 curl -sf -X PUT \
     -H 'Content-Type: application/json' \
-    -d "{\"props\":{\"DrbdOptions/AutoAddQuorumTiebreaker\":\"false\"}}" \
+    -d "$patched" \
     "http://localhost:$PF_PORT/v1/resource-definitions/$RD" \
     >/dev/null
 
