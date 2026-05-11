@@ -27,8 +27,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -164,14 +166,63 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // predicate so only Resources placed on this satellite trigger
 // reconciles. The predicate also fires on Delete events (the
 // CRD finalizer dance still needs us to clean up local state).
+//
+// We additionally watch sibling Resources (same RD, different
+// node) via Watches — when a peer's Resource is created /
+// updated / deleted on another satellite, this satellite must
+// re-render its .res to add or drop the `on <peer>` block.
+// Without that hook, the initial reconcile saw only the local
+// Resource (peer hadn't been observed yet through the cache),
+// rendered a peer-less .res, and never re-rendered because
+// later peer events get filtered out by nodeNamePredicate
+// before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	err := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
 			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
+		Watches(&blockstoriov1alpha1.Resource{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Named("satellite-resource").
 		Complete(r)
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	return nil
+}
+
+// enqueueLocalSiblings maps a Resource event to the LOCAL Resource
+// of the same RD (if any). When a peer on another node appears or
+// changes, the local satellite must re-reconcile so its .res
+// picks up the new peer block / port / node-id.
+//
+// Returns nothing when the local node has no replica for the
+// affected RD — we don't watch RDs we're not party to.
+func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj client.Object) []reconcile.Request {
+	res, ok := obj.(*blockstoriov1alpha1.Resource)
+	if !ok {
+		return nil
+	}
+
+	// Ignore events for the local Resource itself — `For` already
+	// drives that path through nodeNamePredicate.
+	if res.Spec.NodeName == r.Config.NodeName {
+		return nil
+	}
+
+	var localList blockstoriov1alpha1.ResourceList
+
+	err := r.List(ctx, &localList)
+	if err != nil {
+		return nil
+	}
+
+	for i := range localList.Items {
+		local := &localList.Items[i]
+		if local.Spec.ResourceDefinitionName == res.Spec.ResourceDefinitionName &&
+			local.Spec.NodeName == r.Config.NodeName {
+			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
+		}
 	}
 
 	return nil

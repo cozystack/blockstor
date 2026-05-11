@@ -99,7 +99,7 @@ func (r *StoragePoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, errors.Wrap(err, "add storagepool finalizer")
 		}
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	provider, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, r.Config.Exec)

@@ -22,11 +22,10 @@ import (
 
 // requeueRequested reports whether the reconciler asked
 // controller-runtime to retry — either the legacy `Requeue=true`
-// flag or a positive `RequeueAfter`. Wraps `result.Requeue` so the
-// production assertions stay readable while the deprecation of the
-// bool field is invisible at the call sites. Once the reconcilers
-// migrate to `RequeueAfter` everywhere, this helper folds into a
-// plain `result.RequeueAfter > 0` check.
+// positive `RequeueAfter`. Pre-Kubebuilder-1.30 reconcilers also
+// used the now-deprecated `result.Requeue` bool, which we no
+// longer set anywhere in this tree — the asserts only need the
+// RequeueAfter branch.
 func requeueRequested(result ctrl.Result) bool {
-	return result.Requeue || result.RequeueAfter > 0
+	return result.RequeueAfter > 0
 }

@@ -143,7 +143,7 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, errors.Wrap(err, "add attach finalizer")
 		}
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	// Step 1: target device must still be reachable. A discovery
@@ -215,7 +215,7 @@ func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstor
 		// off via controller-runtime's rate limiter.
 		_ = r.setPhase(ctx, dev, blockstoriov1alpha1.PhysicalDevicePhaseFailed)
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	provider, err := satellite.NewProviderFromKind(result.ProviderKind, result.Props, r.Config.Exec)
@@ -228,7 +228,7 @@ func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstor
 
 		_ = r.setPhase(ctx, dev, blockstoriov1alpha1.PhysicalDevicePhaseFailed)
 
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	r.Config.Apply.RegisterProvider(result.PoolName, provider)
