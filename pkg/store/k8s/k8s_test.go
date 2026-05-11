@@ -48,16 +48,23 @@ var fixture *envtestFixture
 
 func TestMain(m *testing.M) {
 	if !envtestAvailable() {
-		// Skip the whole package: every test needs envtest, and there is no
-		// useful test-time fallback (controller-runtime's fake client does
-		// not honour our label selector / status subresource semantics).
-		os.Exit(0)
+		// envtest binaries not installed — run only the
+		// pure-function tests (they don't need k8s). Each
+		// envtest-dependent test individually skips via
+		// `if fixture == nil { t.Skip(...) }`.
+		os.Exit(m.Run())
 	}
 
 	f, err := startEnvtest()
 	if err != nil {
+		// Asset directory present but startup failed (most
+		// commonly: wrong-arch etcd/kube-apiserver on a shared
+		// dev stand, or a kernel/permission quirk). Surface the
+		// error so it's visible, but still run the package —
+		// pure-function tests are valuable on their own and
+		// envtest-dependent tests will skip cleanly.
 		_, _ = os.Stderr.WriteString("envtest start: " + err.Error() + "\n")
-		os.Exit(1)
+		os.Exit(m.Run())
 	}
 
 	fixture = f
