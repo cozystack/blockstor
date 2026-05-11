@@ -106,8 +106,11 @@ wait_uptodate "$RD" "$WORKER_1" "$WORKER_2"
 echo ">> linstor resource delete $WORKER_2 $RD"
 "${LCTL[@]}" resource delete "$WORKER_2" "$RD" >/dev/null
 
-echo ">> wait up to 60s for blockstor to delete the Resource CRD"
-deadline=$(( $(date +%s) + 60 ))
+echo ">> wait up to 120s for blockstor to delete the Resource CRD"
+# 120s rather than 60s because under heavy parallel-iter load the
+# satellite's finalizer-strip path queues alongside every other
+# reconcile and may not fire within 60s.
+deadline=$(( $(date +%s) + 120 ))
 while (( $(date +%s) < deadline )); do
     if ! kubectl get resource "$RD.$WORKER_2" >/dev/null 2>&1; then
         break
