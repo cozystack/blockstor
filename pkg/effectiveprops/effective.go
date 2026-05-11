@@ -42,12 +42,6 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
-// LegacyControllerPropsInstance is the KVEntry-instance name
-// the pre-Phase-10.4 `ControllerProps` used. Read-only fallback
-// — once every cluster has migrated to `ControllerConfig` this
-// path stops firing and the KVEntry CRD can go.
-const LegacyControllerPropsInstance = "ControllerProps"
-
 // Resolve walks the four scopes and returns the merged Props
 // map. The `c` reader is typically a controller-runtime
 // `manager.GetClient()` — both controller and satellite hold
@@ -59,11 +53,6 @@ const LegacyControllerPropsInstance = "ControllerProps"
 func Resolve(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (map[string]string, error) {
 	if target == nil {
 		return map[string]string{}, nil
-	}
-
-	controllerProps, err := LegacyControllerProps(ctx, c)
-	if err != nil {
-		return nil, err
 	}
 
 	ctrlCfg, err := controllerConfig(ctx, c)
@@ -88,7 +77,7 @@ func Resolve(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.R
 
 	typed := drbd.ResolveDRBDOptions(ctrlTyped, rgInfo.Typed, rdInfo.Typed, target.Spec.DRBDOptions)
 
-	out := drbd.ResolveOptions(controllerProps, rgInfo.Props, rdInfo.Props, target.Spec.Props)
+	out := drbd.ResolveOptions(nil, rgInfo.Props, rdInfo.Props, target.Spec.Props)
 
 	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
 	maps.Copy(out, ctrlExtras)
@@ -164,31 +153,4 @@ func controllerConfig(ctx context.Context, c client.Reader) (*blockstoriov1alpha
 	}
 
 	return &cfg, nil
-}
-
-// LegacyControllerProps reads the KVEntry-shaped ControllerProps
-// instance and returns its flat `{key: value}` view. Drained as
-// more keys migrate to ControllerConfig's typed fields;
-// eventually disappears with the KVEntry CRD. Exported so the
-// controller_props test can pin the instance-filter invariant
-// directly against the package.
-func LegacyControllerProps(ctx context.Context, c client.Reader) (map[string]string, error) {
-	var list blockstoriov1alpha1.KVEntryList
-
-	err := c.List(ctx, &list)
-	if err != nil {
-		return nil, errors.Wrap(err, "list KVEntries")
-	}
-
-	out := map[string]string{}
-
-	for i := range list.Items {
-		if list.Items[i].Spec.Instance != LegacyControllerPropsInstance {
-			continue
-		}
-
-		out[list.Items[i].Spec.Key] = list.Items[i].Spec.Value
-	}
-
-	return out, nil
 }

@@ -45,7 +45,6 @@ type Store struct {
 	resourceDefinitions *resourceDefinitions
 	resources           *resources
 	volumeDefinitions   *volumeDefinitions
-	kv                  *kvStore
 	snapshots           *snapshots
 	physicalDevices     *physicalDevices
 }
@@ -59,7 +58,6 @@ func New(c ctrlclient.Client) *Store {
 	s.resourceDefinitions = &resourceDefinitions{c: c}
 	s.resources = &resources{c: c}
 	s.volumeDefinitions = &volumeDefinitions{c: c}
-	s.kv = &kvStore{c: c}
 	s.snapshots = &snapshots{c: c}
 	s.physicalDevices = &physicalDevices{c: c}
 
@@ -83,9 +81,6 @@ func (s *Store) Resources() store.ResourceStore { return s.resources }
 
 // VolumeDefinitions returns the VolumeDefinitionStore view.
 func (s *Store) VolumeDefinitions() store.VolumeDefinitionStore { return s.volumeDefinitions }
-
-// KeyValueStore returns the KeyValueStore view.
-func (s *Store) KeyValueStore() store.KeyValueStore { return s.kv }
 
 // Snapshots returns the SnapshotStore view.
 func (s *Store) Snapshots() store.SnapshotStore { return s.snapshots }

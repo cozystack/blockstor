@@ -155,20 +155,6 @@ func TestK8sVolumeDefinitionStore(t *testing.T) {
 	})
 }
 
-// TestK8sKeyValueStore runs the shared KeyValueStore suite.
-func TestK8sKeyValueStore(t *testing.T) {
-	if fixture == nil {
-		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
-	}
-
-	storetest.RunKeyValueStore(t, func(t *testing.T) store.Store {
-		t.Helper()
-		t.Cleanup(func() { wipeAllKV(t, fixture.client) })
-
-		return k8s.New(fixture.client)
-	})
-}
-
 // TestK8sSnapshotStore runs the shared SnapshotStore suite.
 func TestK8sSnapshotStore(t *testing.T) {
 	if fixture == nil {
@@ -285,18 +271,5 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.Snapshot{}); err != nil {
 		t.Logf("wipe Snapshots: %v", err)
-	}
-}
-
-// wipeAllKV deletes the per-(instance,key) KVEntry CRDs between subtests so
-// each one sees an empty store.
-func wipeAllKV(t *testing.T, c client.Client) {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := c.DeleteAllOf(ctx, &crdv1alpha1.KVEntry{}); err != nil {
-		t.Logf("wipe KVEntries: %v", err)
 	}
 }

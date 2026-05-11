@@ -19,44 +19,59 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerControllerProperties wires the cluster-wide controller
 // property bag. linstor CLI's `controller list-properties` calls
 // /v1/controller/properties; `controller set-property` calls POST.
+// Backed by the singleton `ControllerConfig` CRD's
+// `Spec.ExtraProps` (Phase 10.4 — replaces the legacy KVEntry
+// "ControllerProps" instance).
 func (s *Server) registerControllerProperties(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/controller/properties", s.requireStore(s.handleControllerPropsGet))
 	mux.HandleFunc("POST /v1/controller/properties", s.requireStore(s.handleControllerPropsModify))
 }
 
-// handleControllerPropsGet returns the controller property map. We
-// store it under a fixed KV instance ("ControllerProps") so it shares
-// the same scaling story as the per-resource KV state.
+// handleControllerPropsGet returns ControllerConfig.Spec.ExtraProps
+// as a flat map. A missing ControllerConfig CRD returns an empty
+// map (LINSTOR CLI happily renders zero properties).
 func (s *Server) handleControllerPropsGet(w http.ResponseWriter, r *http.Request) {
-	props, err := s.Store.KeyValueStore().GetInstance(r.Context(), controllerPropsInstance)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if s.Client == nil {
+		writeJSON(w, http.StatusOK, map[string]string{})
+
+		return
+	}
+
+	props, err := readControllerProps(r.Context(), s.Client)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return
 	}
 
-	if props == nil {
-		props = map[string]string{}
-	}
-
 	writeJSON(w, http.StatusOK, props)
 }
 
-// handleControllerPropsModify applies a GenericPropsModify in one
-// transaction. Set keys take precedence over delete keys when both
-// reference the same key (LINSTOR's behaviour).
+// handleControllerPropsModify applies an OverrideProps /
+// DeleteProps batch onto ControllerConfig.Spec.ExtraProps. The
+// CRD is auto-created on first write (canonical name `default`).
 func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Request) {
+	if s.Client == nil {
+		writeError(w, http.StatusServiceUnavailable, "controller properties require an apiserver client")
+
+		return
+	}
+
 	var modify apiv1.GenericPropsModify
 
 	err := json.NewDecoder(r.Body).Decode(&modify)
@@ -66,7 +81,7 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	err = applyControllerProps(r.Context(), s.Store, &modify)
+	err = applyControllerProps(r.Context(), s.Client, &modify)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -76,20 +91,79 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 	w.WriteHeader(http.StatusOK)
 }
 
-// applyControllerProps delegates to the KV store's SetKeys, which
-// already implements the upstream "merge into existing" semantic. We
-// keep a wrapper for the named instance + error mapping.
-func applyControllerProps(ctx context.Context, st store.Store, modify *apiv1.GenericPropsModify) error {
-	err := st.KeyValueStore().SetKeys(ctx, controllerPropsInstance, *modify)
+// readControllerProps fetches the singleton ControllerConfig and
+// returns its ExtraProps bag. NotFound is folded into an empty
+// map so the LINSTOR CLI never sees a 500 on a fresh cluster.
+func readControllerProps(ctx context.Context, c client.Client) (map[string]string, error) {
+	var ctrlConfig blockstoriov1alpha1.ControllerConfig
+
+	err := c.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &ctrlConfig)
 	if err != nil {
-		return errors.Wrap(err, "write controller props")
+		if apierrors.IsNotFound(err) {
+			return map[string]string{}, nil
+		}
+
+		return nil, errors.Wrap(err, "get ControllerConfig")
+	}
+
+	if ctrlConfig.Spec.ExtraProps == nil {
+		return map[string]string{}, nil
+	}
+
+	return ctrlConfig.Spec.ExtraProps, nil
+}
+
+// applyControllerProps merges an OverrideProps / DeleteProps
+// batch into ControllerConfig.Spec.ExtraProps. Creates the CRD
+// on first write so a fresh cluster doesn't need an explicit
+// `kubectl apply` of the ControllerConfig manifest before
+// `linstor controller set-property` works.
+func applyControllerProps(ctx context.Context, c client.Client, modify *apiv1.GenericPropsModify) error {
+	var ctrlConfig blockstoriov1alpha1.ControllerConfig
+
+	err := c.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &ctrlConfig)
+	if apierrors.IsNotFound(err) {
+		ctrlConfig = blockstoriov1alpha1.ControllerConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+			Spec:       blockstoriov1alpha1.ControllerConfigSpec{ExtraProps: map[string]string{}},
+		}
+
+		mergeControllerProps(&ctrlConfig, modify)
+
+		err = c.Create(ctx, &ctrlConfig)
+		if err != nil {
+			return errors.Wrap(err, "create ControllerConfig")
+		}
+
+		return nil
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "get ControllerConfig")
+	}
+
+	mergeControllerProps(&ctrlConfig, modify)
+
+	err = c.Update(ctx, &ctrlConfig)
+	if err != nil {
+		return errors.Wrap(err, "update ControllerConfig")
 	}
 
 	return nil
 }
 
-// controllerPropsInstance is the KV-store instance name we reuse for
-// the cluster-wide controller property bag. Picked to match the
-// upstream "ControllerProps" namespace so satellites that look it up
-// by name keep working.
-const controllerPropsInstance = "ControllerProps"
+// mergeControllerProps applies the OverrideProps / DeleteProps
+// merge semantic LINSTOR uses: set keys land first, then delete
+// keys remove their entries. Same precedence as the upstream
+// "merge into existing" rule.
+func mergeControllerProps(ctrlConfig *blockstoriov1alpha1.ControllerConfig, modify *apiv1.GenericPropsModify) {
+	if ctrlConfig.Spec.ExtraProps == nil {
+		ctrlConfig.Spec.ExtraProps = map[string]string{}
+	}
+
+	maps.Copy(ctrlConfig.Spec.ExtraProps, modify.OverrideProps)
+
+	for _, k := range modify.DeleteProps {
+		delete(ctrlConfig.Spec.ExtraProps, k)
+	}
+}

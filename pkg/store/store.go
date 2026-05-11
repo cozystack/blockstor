@@ -132,16 +132,6 @@ type VolumeDefinitionStore interface {
 	Delete(ctx context.Context, rdName string, volumeNumber int32) error
 }
 
-// KeyValueStore persists arbitrary instance/key/value triples. linstor-csi
-// uses this for its own per-volume bookkeeping (CSI snapshots, parameters
-// ...). The (instance, key) pair is the composite identity.
-type KeyValueStore interface {
-	ListInstances(ctx context.Context) ([]string, error)
-	GetInstance(ctx context.Context, instance string) (map[string]string, error)
-	SetKeys(ctx context.Context, instance string, modify apiv1.GenericPropsModify) error
-	DeleteInstance(ctx context.Context, instance string) error
-}
-
 // SnapshotStore persists Snapshot objects. The composite key is
 // (resource definition, snapshot name).
 type SnapshotStore interface {
@@ -179,7 +169,6 @@ type Store interface {
 	ResourceDefinitions() ResourceDefinitionStore
 	Resources() ResourceStore
 	VolumeDefinitions() VolumeDefinitionStore
-	KeyValueStore() KeyValueStore
 	Snapshots() SnapshotStore
 	PhysicalDevices() PhysicalDeviceStore
 }

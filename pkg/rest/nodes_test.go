@@ -30,11 +30,19 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// startServerWithStore is sugar for tests that need a pre-populated store.
+// startServerWithStore is sugar for tests that need a pre-populated
+// store. Wires a fake controller-runtime client so the Secret-backed
+// passphrase path and ControllerConfig-backed controller-properties
+// path work end-to-end without an envtest harness.
 func startServerWithStore(t *testing.T, st store.Store) (string, func()) {
 	t.Helper()
 
-	return startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: st})
+	return startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	})
 }
 
 // TestNodesListEmpty: empty store returns "[]" not null.

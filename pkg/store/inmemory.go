@@ -35,7 +35,6 @@ type InMemory struct {
 	resourceDefinitions *inMemoryResourceDefinitions
 	resources           *inMemoryResources
 	volumeDefinitions   *inMemoryVolumeDefinitions
-	kv                  *inMemoryKVStore
 	snapshots           *inMemorySnapshots
 	physicalDevices     *inMemoryPhysicalDevices
 }
@@ -49,7 +48,6 @@ func NewInMemory() *InMemory {
 		resourceDefinitions: &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
 		resources:           &inMemoryResources{m: map[rKey]apiv1.Resource{}},
 		volumeDefinitions:   &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
-		kv:                  &inMemoryKVStore{m: map[string]map[string]string{}},
 		snapshots:           &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
 		physicalDevices:     &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},
 	}
@@ -72,9 +70,6 @@ func (s *InMemory) Resources() ResourceStore { return s.resources }
 
 // VolumeDefinitions returns the VolumeDefinitionStore view.
 func (s *InMemory) VolumeDefinitions() VolumeDefinitionStore { return s.volumeDefinitions }
-
-// KeyValueStore returns the KeyValueStore view.
-func (s *InMemory) KeyValueStore() KeyValueStore { return s.kv }
 
 // Snapshots returns the SnapshotStore view.
 func (s *InMemory) Snapshots() SnapshotStore { return s.snapshots }

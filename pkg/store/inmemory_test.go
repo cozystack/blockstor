@@ -76,14 +76,6 @@ func TestInMemoryVolumeDefinitionStore(t *testing.T) {
 	})
 }
 
-func TestInMemoryKeyValueStore(t *testing.T) {
-	storetest.RunKeyValueStore(t, func(t *testing.T) store.Store {
-		t.Helper()
-
-		return store.NewInMemory()
-	})
-}
-
 func TestInMemorySnapshotStore(t *testing.T) {
 	storetest.RunSnapshotStore(t, func(t *testing.T) store.Store {
 		t.Helper()

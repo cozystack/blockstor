@@ -6,5 +6,4 @@ resources:
 - blockstor.io_v1alpha1_resourcedefinition.yaml
 - blockstor.io_v1alpha1_resource.yaml
 - blockstor.io_v1alpha1_snapshot.yaml
-- blockstor.io_v1alpha1_kventry.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

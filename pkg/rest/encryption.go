@@ -28,8 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // passphraseRequest is the body upstream linstor expects on the
@@ -38,14 +36,6 @@ type passphraseRequest struct {
 	NewPassphrase string `json:"new_passphrase"`
 	OldPassphrase string `json:"old_passphrase,omitempty"`
 }
-
-// passphraseKey is the legacy property key under ControllerProps
-// where the cluster passphrase lives in pre-Phase-10.4 clusters.
-// Kept for the KV fallback path (in-memory tests, pre-migration
-// data); production reads/writes go through the Secret instead.
-//
-//nolint:gosec // this is the storage key name, not the secret value itself
-const passphraseKey = "Cluster/EncryptionPassphrase"
 
 // defaultPassphraseSecretName is the Secret the controller falls
 // back to when ControllerConfig.Spec.PassphraseSecretRef is unset.
@@ -195,26 +185,25 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
-// readPassphrase reads the current cluster passphrase. Empty string
-// (not error) means "not yet set". Picks the Secret path when the
-// Server is wired with a controller-runtime Client, falls back to
-// the legacy KV path otherwise.
+// readPassphrase reads the current cluster passphrase. Empty
+// string (not error) means "not yet set". Secret-backed only —
+// the legacy KVEntry fallback was retired in Phase 10.6.
 func (s *Server) readPassphrase(ctx context.Context) (string, error) {
-	if s.Client != nil {
-		return s.readPassphraseSecret(ctx)
+	if s.Client == nil {
+		return "", errors.New("cluster passphrase requires an apiserver client")
 	}
 
-	return getPassphraseKV(ctx, s.Store)
+	return s.readPassphraseSecret(ctx)
 }
 
 // writePassphrase persists the cluster passphrase. Same path
 // selection as readPassphrase.
 func (s *Server) writePassphrase(ctx context.Context, value string) error {
-	if s.Client != nil {
-		return s.writePassphraseSecret(ctx, value)
+	if s.Client == nil {
+		return errors.New("cluster passphrase requires an apiserver client")
 	}
 
-	return setPassphraseKV(ctx, s.Store, value)
+	return s.writePassphraseSecret(ctx, value)
 }
 
 // readPassphraseSecret reads the passphrase from a native Secret.
@@ -309,34 +298,4 @@ func (s *Server) resolvePassphraseSecretName(ctx context.Context) (string, error
 	}
 
 	return defaultPassphraseSecretName, nil
-}
-
-// getPassphraseKV reads the current cluster passphrase from the
-// legacy KV-store path. Kept for in-memory-store tests and
-// pre-migration clusters.
-func getPassphraseKV(ctx context.Context, st store.Store) (string, error) {
-	props, err := st.KeyValueStore().GetInstance(ctx, controllerPropsInstance)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return "", nil
-		}
-
-		return "", errors.Wrap(err, "read passphrase")
-	}
-
-	return props[passphraseKey], nil
-}
-
-// setPassphraseKV writes the cluster passphrase via SetKeys (so the
-// merge semantic preserves any sibling controller props). Legacy
-// KV-path counterpart to writePassphraseSecret.
-func setPassphraseKV(ctx context.Context, st store.Store, value string) error {
-	err := st.KeyValueStore().SetKeys(ctx, controllerPropsInstance, apiv1.GenericPropsModify{
-		OverrideProps: map[string]string{passphraseKey: value},
-	})
-	if err != nil {
-		return errors.Wrap(err, "write passphrase")
-	}
-
-	return nil
 }

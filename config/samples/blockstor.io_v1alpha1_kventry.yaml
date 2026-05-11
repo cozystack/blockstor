@@ -1,9 +1,0 @@
-apiVersion: blockstor.io.blockstor.io/v1alpha1
-kind: KVEntry
-metadata:
-  labels:
-    app.kubernetes.io/name: blockstor
-    app.kubernetes.io/managed-by: kustomize
-  name: kventry-sample
-spec:
-  # TODO(user): Add fields here

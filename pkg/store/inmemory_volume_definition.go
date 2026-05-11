@@ -18,7 +18,6 @@ package store
 
 import (
 	"context"
-	"maps"
 	"sort"
 	"sync"
 
@@ -115,94 +114,4 @@ func (s *inMemoryVolumeDefinitions) Delete(_ context.Context, rdName string, vol
 	delete(s.m, k)
 
 	return nil
-}
-
-type inMemoryKVStore struct {
-	mu sync.RWMutex
-	m  map[string]map[string]string
-}
-
-func (s *inMemoryKVStore) ListInstances(_ context.Context) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make([]string, 0, len(s.m))
-	for k := range s.m {
-		out = append(out, k)
-	}
-
-	sort.Strings(out)
-
-	return out, nil
-}
-
-func (s *inMemoryKVStore) GetInstance(_ context.Context, instance string) (map[string]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	props, ok := s.m[instance]
-	if !ok {
-		return nil, errors.Wrapf(ErrNotFound, "kv instance %q", instance)
-	}
-
-	out := make(map[string]string, len(props))
-	maps.Copy(out, props)
-
-	return out, nil
-}
-
-// SetKeys applies the upstream override/delete payload atomically. Creates
-// the instance on first set so callers don't have to do a separate Create.
-func (s *inMemoryKVStore) SetKeys(_ context.Context, instance string, modify apiv1.GenericPropsModify) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	props, ok := s.m[instance]
-	if !ok {
-		props = map[string]string{}
-		s.m[instance] = props
-	}
-
-	maps.Copy(props, modify.OverrideProps)
-
-	for _, k := range modify.DeleteProps {
-		delete(props, k)
-	}
-
-	for _, ns := range modify.DeleteNamespace {
-		for k := range props {
-			if hasPrefixSegment(k, ns) {
-				delete(props, k)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *inMemoryKVStore) DeleteInstance(_ context.Context, instance string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.m[instance]; !ok {
-		return errors.Wrapf(ErrNotFound, "kv instance %q", instance)
-	}
-
-	delete(s.m, instance)
-
-	return nil
-}
-
-// hasPrefixSegment reports whether key sits under the namespace path prefix.
-// LINSTOR namespaces are slash-separated, so we anchor on `<ns>` or `<ns>/`.
-func hasPrefixSegment(key, ns string) bool {
-	if key == ns {
-		return true
-	}
-
-	if len(key) > len(ns) && key[:len(ns)] == ns && key[len(ns)] == '/' {
-		return true
-	}
-
-	return false
 }
