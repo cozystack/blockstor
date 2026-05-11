@@ -24,17 +24,33 @@ import (
 )
 
 // snapshotRestoreRequest is the JSON body upstream linstor expects on
-// the restore endpoint.
+// the restore endpoint. The snapshot name has two wire dialects:
+//
+//   - upstream LINSTOR CLI / golinstor: snapshot in URL path
+//     (`/snapshot-restore-resource/{snap}`); body carries `nodes`,
+//     `stor_pool_rename`, `to_resource` only.
+//   - blockstor CSI clone shim + older callers: snapshot in body
+//     under `snapshot_name`; URL is the bare path.
+//   - legacy in-tree callers: snapshot in body under `from_snapshot`.
+//
+// Accept all three so the existing tests / linstor-csi / linstor CLI
+// can all hit this endpoint without translation glue. The handler
+// resolves the snapshot name in that precedence order: path > body
+// `from_snapshot` > body `snapshot_name`.
 type snapshotRestoreRequest struct {
 	ToResource   string   `json:"to_resource"`
-	FromSnapshot string   `json:"from_snapshot"`
+	FromSnapshot string   `json:"from_snapshot,omitempty"`
+	SnapshotName string   `json:"snapshot_name,omitempty"`
 	NodeNames    []string `json:"node_names,omitempty"`
+	Nodes        []string `json:"nodes,omitempty"`
 }
 
 // registerSnapshotRestore wires the controller-side restore endpoint.
 // linstor CLI's `snapshot resource restore` lands here.
 func (s *Server) registerSnapshotRestore(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-restore-resource",
+		s.requireStore(s.handleSnapshotRestore))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-restore-resource/{snap}",
 		s.requireStore(s.handleSnapshotRestore))
 }
 
@@ -60,7 +76,26 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := s.Store.Snapshots().Get(r.Context(), srcRD, req.FromSnapshot)
+	// Snapshot name precedence: URL path (upstream LINSTOR shape) >
+	// body `from_snapshot` > body `snapshot_name`. Empty after all
+	// three lookups → 400 with a meaningful message instead of the
+	// confusing 404 from a NotFound on Get(ctx, rd, "").
+	snapName := r.PathValue("snap")
+	if snapName == "" {
+		snapName = req.FromSnapshot
+	}
+
+	if snapName == "" {
+		snapName = req.SnapshotName
+	}
+
+	if snapName == "" {
+		writeError(w, http.StatusBadRequest, "snapshot name required (URL path, from_snapshot, or snapshot_name)")
+
+		return
+	}
+
+	snap, err := s.Store.Snapshots().Get(r.Context(), srcRD, snapName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -79,5 +114,8 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, newRD)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "snapshot restored: " + snapName + " → " + newRD.Name,
+	}})
 }
