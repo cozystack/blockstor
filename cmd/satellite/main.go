@@ -26,6 +26,7 @@ import (
 	"flag"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -98,6 +99,16 @@ func run() int {
 	// clean slate — the c-r reconciler will re-render every
 	// Resource CRD on this node shortly after startup.
 	cleanStateDir(stateDir, logger)
+
+	// Best-effort: tear down every DRBD resource the kernel
+	// still has loaded from the previous satellite incarnation.
+	// Without this, a reconcile that re-allocates a node-id
+	// (e.g. the dispatcher picked a different id after a peer
+	// joined / left) hits "peer node id cannot be my own node
+	// id" because the old node-id is still pinned in kernel
+	// state. The c-r reconciler re-renders + `drbdadm adjust`s
+	// every Resource shortly after, so a transient down is safe.
+	cleanKernelState(ctx, logger)
 
 	restCfg, mgrFactory, err := buildControllerRuntime()
 	if err != nil {
@@ -193,5 +204,34 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 
 	if removed > 0 {
 		logger.Info("wiped stale .res files on startup", "dir", dir, "removed", removed)
+	}
+}
+
+// cleanKernelState runs `drbdadm down all` to detach every resource
+// the kernel still holds from the previous satellite incarnation.
+// Best-effort: failures are logged + ignored. The c-r reconciler will
+// re-render and `drbdadm adjust` each Resource CRD shortly after.
+//
+// Why: a reconcile cycle that re-allocates a node-id (different
+// dispatcher run after a peer left/joined) hits `peer node id cannot
+// be my own node id` because the kernel still has the old id pinned
+// for that resource. `drbdadm down` clears that.
+func cleanKernelState(ctx context.Context, logger *slog.Logger) {
+	cmd := exec.CommandContext(ctx, "drbdadm", "down", "all")
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// "no resources defined" / "no kernel module loaded" / etc.
+		// are routine on the first satellite start of a fresh node,
+		// so don't escalate — just trace at INFO with the output.
+		logger.Info("drbdadm down all (best-effort)",
+			"err", err.Error(),
+			"output", strings.TrimSpace(string(out)))
+
+		return
+	}
+
+	if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+		logger.Info("drbdadm down all", "output", trimmed)
 	}
 }
