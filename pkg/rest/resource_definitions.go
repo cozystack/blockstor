@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -94,21 +95,72 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// resourceDefinitionModifyBody is the shape upstream golinstor sends
+// on `PUT /v1/resource-definitions/{rd}` — driven by `linstor rd
+// set-property`, `linstor rd modify --resource-group`, and similar
+// CLI subcommands. Top-level fields are the modify delta, not the
+// full RD spec; the bare RD wire shape doesn't carry these
+// modify-only keys.
+type resourceDefinitionModifyBody struct {
+	OverrideProps    map[string]string `json:"override_props,omitempty"`
+	DeleteProps      []string          `json:"delete_props,omitempty"`
+	DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
+	DrbdPeerSlots    int32             `json:"drbd_peer_slots,omitempty"`
+	DrbdPort         int32             `json:"drbd_port,omitempty"`
+	// resource_group: upstream linstor CLI's `rd modify --resource-group`
+	// (matches golinstor `ResourceDefinitionCreate.ResourceGroup`).
+	ResourceGroup string `json:"resource_group,omitempty"`
+	// resource_group_name: legacy callers that PUT the full RD shape
+	// instead of the modify envelope (matches the read-side
+	// `ResourceDefinition` wire field). Accept both — first non-empty wins.
+	ResourceGroupName string `json:"resource_group_name,omitempty"`
+}
+
 func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rd")
 
-	var rd apiv1.ResourceDefinition
+	var patch resourceDefinitionModifyBody
 
-	err := json.NewDecoder(r.Body).Decode(&rd)
+	err := json.NewDecoder(r.Body).Decode(&patch)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	rd.Name = name
+	// PUT semantics for the upstream linstor CLI's `rd set-property`
+	// are MERGE, not REPLACE — golinstor sends only the override_props
+	// / delete_props delta and expects the rest of the RD spec to be
+	// preserved. A naïve Decode(&fullRD) + Update wipes the whole
+	// spec (VolumeDefinitions vanish, the resource reconciler can't
+	// spawn replicas, the cluster stalls). Fetch + merge instead.
+	existing, err := s.Store.ResourceDefinitions().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
 
-	err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+		return
+	}
+
+	if existing.Props == nil && len(patch.OverrideProps) > 0 {
+		existing.Props = map[string]string{}
+	}
+
+	maps.Copy(existing.Props, patch.OverrideProps)
+
+	for _, k := range patch.DeleteProps {
+		delete(existing.Props, k)
+	}
+
+	rgChange := patch.ResourceGroup
+	if rgChange == "" {
+		rgChange = patch.ResourceGroupName
+	}
+
+	if rgChange != "" {
+		existing.ResourceGroupName = rgChange
+	}
+
+	err = s.Store.ResourceDefinitions().Update(r.Context(), &existing)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -117,7 +169,7 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "resource definition modified: " + rd.Name,
+		Message: "resource definition modified: " + existing.Name,
 	}})
 }
 
