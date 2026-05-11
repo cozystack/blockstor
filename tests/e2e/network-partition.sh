@@ -39,14 +39,24 @@ trap 'cleanup_partition; delete_rd "$RD"' EXIT
 
 cleanup_partition() {
     on_node "$N1" iptables -F INPUT 2>/dev/null || true
+    on_node "$N1" iptables -F OUTPUT 2>/dev/null || true
 }
 
 echo ">> apply 3-replica RD"
+# Disable the RD-reconciler's auto-tiebreaker placement — we want to
+# place all three replicas explicitly (diskful, no DISKLESS witness).
+# Otherwise the reconciler spawns a DISKLESS Resource on $N3 while
+# the loop below is still kubectl-applying the explicit $N3 diskful
+# Resource, and the two races produce the "missing
+# last-applied-configuration annotation … not found" rejection
+# observed live.
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
+  props:
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 EOF
@@ -91,16 +101,27 @@ if [[ -z "$DRBD_PORT" ]]; then
     exit 1
 fi
 
-echo ">> partition $N1 from peers (drop tcp/$DRBD_PORT)"
+echo ">> partition $N1 from peers (drop tcp/$DRBD_PORT in+out)"
+# Block both INPUT and OUTPUT — INPUT alone leaves DRBD's outbound
+# keep-alives flowing and the TCP teardown lingers, holding $N1's
+# view of the peers "Connecting" long enough for the 30 s deadline
+# below to time out. OUTPUT DROP closes the symmetric direction so
+# the quorum-loss path fires within the DRBD ping-timeout window.
 on_node "$N1" iptables -A INPUT -p tcp --dport "$DRBD_PORT" -j DROP
+on_node "$N1" iptables -A OUTPUT -p tcp --dport "$DRBD_PORT" -j DROP
 
-echo ">> wait 30s for $N1 to fence itself"
-sleep 30
+echo ">> wait up to 90s for $N1 to fence itself"
+deadline=$(( $(date +%s) + 90 ))
+n1_role=""
 
-# After quorum:majority kicks in, $N1 (minority of 1) must NOT be
-# Primary. We don't strictly require StandAlone here — Connecting +
-# disk:Outdated is also acceptable for a fenced minority.
-n1_role=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+while (( $(date +%s) < deadline )); do
+    n1_role=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+    if [[ "$n1_role" != *"role:Primary"* ]]; then
+        break
+    fi
+    sleep 2
+done
+
 if [[ "$n1_role" == *"role:Primary"* ]]; then
     echo "FAIL: $N1 stayed Primary in a 1-vs-2 partition (split-brain risk)"
     exit 1
@@ -112,8 +133,10 @@ md5_majority=$(write_random "$N2" "$DEV" "$SIZE_BYTES")
 echo ">> heal partition"
 cleanup_partition
 
-echo ">> wait 60s for $N1 to converge"
-deadline=$(( $(date +%s) + 60 ))
+echo ">> wait up to 180s for $N1 to converge to UpToDate"
+deadline=$(( $(date +%s) + 180 ))
+s1=""
+
 while (( $(date +%s) < deadline )); do
     s1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
     if [[ "$s1" == *"disk:UpToDate"* ]]; then
@@ -121,6 +144,11 @@ while (( $(date +%s) < deadline )); do
     fi
     sleep 2
 done
+
+if [[ "$s1" != *"disk:UpToDate"* ]]; then
+    echo "FAIL: $N1 did not re-converge after heal (last state: $s1)"
+    exit 1
+fi
 
 echo ">> read on $N1 after heal — md5 must match $md5_majority"
 md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")

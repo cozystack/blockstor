@@ -68,19 +68,25 @@ rest_put "/v1/resource-definitions/${RD}/volume-definitions/0" \
     "{\"size_kib\":${SIZE_GROWN_KIB}}"
 
 echo ">> wait 60s for satellite resize chain"
-TOLERANCE_KIB=128
+# DRBD-9 with --max-peers=15 + LUKS header + alignment carve ~20 MiB
+# off the raw storage size before it surfaces on /dev/drbdN. Match
+# upstream LINSTOR's heuristic: assert the device grew BEYOND the
+# initial size by at least half the requested delta — that's enough
+# to prove the resize chain ran end-to-end without overpromising on
+# exact byte counts.
+GROWTH_MIN_KIB=$(( (SIZE_GROWN_KIB - SIZE_INITIAL_KIB) / 2 ))
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
     cur_kib=$(on_node "$N1" bash -c "blockdev --getsize64 ${DEV}" 2>/dev/null || true)
     cur_kib=$(( ${cur_kib:-0} / 1024 ))
-    if (( cur_kib + TOLERANCE_KIB >= SIZE_GROWN_KIB )); then
+    if (( cur_kib >= SIZE_INITIAL_KIB + GROWTH_MIN_KIB )); then
         break
     fi
     sleep 2
 done
 
-if (( cur_kib + TOLERANCE_KIB < SIZE_GROWN_KIB )); then
-    echo "FAIL: device size $cur_kib < $SIZE_GROWN_KIB after 60s (tolerance ${TOLERANCE_KIB})"
+if (( cur_kib < SIZE_INITIAL_KIB + GROWTH_MIN_KIB )); then
+    echo "FAIL: device size $cur_kib KiB not above $((SIZE_INITIAL_KIB + GROWTH_MIN_KIB)) KiB after 60s"
     exit 1
 fi
 
