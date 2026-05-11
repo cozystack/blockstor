@@ -354,12 +354,18 @@ func seedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	return ""
 }
 
-// lookupEndpoint reads SatelliteEndpoint from the matching Node CRD.
-// Phase 10.3: typed `Spec.SatelliteEndpoint` wins; falls back to the
-// legacy `Spec.Props["SatelliteEndpoint"]` for partially-migrated
-// clusters. Match by the original LINSTOR name (annotation when
-// slugified, else metadata.Name) so non-RFC1123 LINSTOR names still
-// resolve back to the right CRD.
+// lookupEndpoint reads the satellite endpoint from the matching Node CRD.
+// Precedence:
+//
+//  1. typed `Spec.SatelliteEndpoint` (Phase 10.3 native field)
+//  2. legacy `Spec.Props["SatelliteEndpoint"]` (partially-migrated clusters)
+//  3. `Spec.NetInterfaces[0].Address` (first advertised interface — the
+//     upstream-LINSTOR convention is "first interface is the satellite
+//     endpoint"; piraeus-operator and operator-supplied manifests
+//     populate this field)
+//
+// Match is on the original LINSTOR name (annotation when slugified,
+// else metadata.Name) so non-RFC1123 LINSTOR names still resolve.
 func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 	for i := range nodes {
 		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
@@ -370,7 +376,15 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 			return ep
 		}
 
-		return nodes[i].Spec.Props["SatelliteEndpoint"]
+		if ep := nodes[i].Spec.Props["SatelliteEndpoint"]; ep != "" {
+			return ep
+		}
+
+		if len(nodes[i].Spec.NetInterfaces) > 0 && nodes[i].Spec.NetInterfaces[0].Address != "" {
+			return nodes[i].Spec.NetInterfaces[0].Address
+		}
+
+		return ""
 	}
 
 	return ""
