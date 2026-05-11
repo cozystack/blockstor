@@ -61,7 +61,7 @@ const (
 // satellite-side heartbeat runnable stamps it every ~10s):
 //
 //   - fresh (within NodeMonitorGracePeriod) → ensure Ready=True
-//     and `ConnectionStatus=CONNECTED`
+//     and `ConnectionStatus=ONLINE`
 //   - stale → flip Ready=Unknown, `ConnectionStatus=OFFLINE`
 //
 // Requeues every NodeMonitorPeriod regardless of state — without
@@ -145,7 +145,7 @@ func (r *NodeHeartbeatReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // isHeartbeatStale returns true when the satellite hasn't stamped
 // LastHeartbeatTime within NodeMonitorGracePeriod. Nil heartbeat
 // (Node just created, satellite never reported) is treated as
-// stale immediately — there is no satellite yet to call CONNECTED.
+// stale immediately — there is no satellite yet to call ONLINE.
 func isHeartbeatStale(lastHeartbeat *metav1.Time, now time.Time) bool {
 	if lastHeartbeat == nil {
 		return true
@@ -166,7 +166,7 @@ func (*NodeHeartbeatReconciler) desiredState(stale bool) (metav1.ConditionStatus
 	}
 
 	return metav1.ConditionTrue,
-		blockstoriov1alpha1.NodeConnectionStatusConnected,
+		blockstoriov1alpha1.NodeConnectionStatusOnline,
 		"SatelliteHeartbeat",
 		"satellite heartbeat is fresh"
 }

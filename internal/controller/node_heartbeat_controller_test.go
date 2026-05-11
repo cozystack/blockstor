@@ -48,7 +48,7 @@ func TestNodeHeartbeat_StaleFlipsToUnknown(t *testing.T) {
 		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
 		Status: blockstoriov1alpha1.NodeStatus{
 			LastHeartbeatTime: &metav1.Time{Time: stale},
-			ConnectionStatus:  blockstoriov1alpha1.NodeConnectionStatusConnected,
+			ConnectionStatus:  blockstoriov1alpha1.NodeConnectionStatusOnline,
 			Conditions: []metav1.Condition{
 				{
 					Type:               blockstoriov1alpha1.NodeConditionReady,
@@ -99,7 +99,7 @@ func TestNodeHeartbeat_StaleFlipsToUnknown(t *testing.T) {
 }
 
 // TestNodeHeartbeat_FreshStaysConnected: a Node with a fresh heartbeat
-// keeps Ready=True / CONNECTED — the watchdog must not overwrite the
+// keeps Ready=True / ONLINE — the watchdog must not overwrite the
 // satellite's happy-path state.
 func TestNodeHeartbeat_FreshStaysConnected(t *testing.T) {
 	t.Parallel()
@@ -114,7 +114,7 @@ func TestNodeHeartbeat_FreshStaysConnected(t *testing.T) {
 		Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
 		Status: blockstoriov1alpha1.NodeStatus{
 			LastHeartbeatTime: &metav1.Time{Time: fresh},
-			ConnectionStatus:  blockstoriov1alpha1.NodeConnectionStatusConnected,
+			ConnectionStatus:  blockstoriov1alpha1.NodeConnectionStatusOnline,
 			Conditions: []metav1.Condition{
 				{
 					Type:               blockstoriov1alpha1.NodeConditionReady,
@@ -145,9 +145,9 @@ func TestNodeHeartbeat_FreshStaysConnected(t *testing.T) {
 		t.Fatalf("Get post-reconcile: %v", err)
 	}
 
-	if got.Status.ConnectionStatus != blockstoriov1alpha1.NodeConnectionStatusConnected {
+	if got.Status.ConnectionStatus != blockstoriov1alpha1.NodeConnectionStatusOnline {
 		t.Errorf("ConnectionStatus drift: got %q, want %q",
-			got.Status.ConnectionStatus, blockstoriov1alpha1.NodeConnectionStatusConnected)
+			got.Status.ConnectionStatus, blockstoriov1alpha1.NodeConnectionStatusOnline)
 	}
 
 	cond := findReady(&got)

@@ -109,7 +109,7 @@ type NodeNetInterface struct {
 // NodeStatus is the observed state of a node.
 type NodeStatus struct {
 	// connectionStatus is a coarse projection of the Ready condition
-	// (CONNECTED when Ready=True, OFFLINE when False/Unknown) kept for
+	// (ONLINE when Ready=True, OFFLINE when False/Unknown) kept for
 	// kubectl-friendly columns + golinstor round-trip compatibility.
 	// Written by the controller-side heartbeat watchdog; do not hand-set.
 	// +optional
@@ -147,12 +147,14 @@ const (
 	// the same way.
 	NodeConditionReady = "Ready"
 
-	// NodeConnectionStatusConnected / Offline are the coarse string
+	// NodeConnectionStatusOnline / Offline are the coarse string
 	// projections kept on `Status.ConnectionStatus` for kubectl
 	// columns + golinstor round-trip. The Condition is the source of
-	// truth — these strings are derived.
-	NodeConnectionStatusConnected = "CONNECTED"
-	NodeConnectionStatusOffline   = "OFFLINE"
+	// truth — these strings are derived. ONLINE / OFFLINE matches
+	// upstream LINSTOR's NodeApiCallHandler so existing operators
+	// and `linstor node list` consumers see the values they expect.
+	NodeConnectionStatusOnline  = "ONLINE"
+	NodeConnectionStatusOffline = "OFFLINE"
 )
 
 // +kubebuilder:object:root=true
