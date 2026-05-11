@@ -821,8 +821,10 @@ func TestResourceCreateAndDelete(t *testing.T) {
 	delResp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/resources/n1")
 	_ = delResp.Body.Close()
 
-	if delResp.StatusCode != http.StatusNoContent {
-		t.Errorf("delete: got %d, want 204", delResp.StatusCode)
+	// Upstream LINSTOR replies with HTTP 200 + ApiCallRc envelope; the
+	// `linstor` CLI rejects a bare 204 No Content.
+	if delResp.StatusCode != http.StatusOK {
+		t.Errorf("delete: got %d, want 200", delResp.StatusCode)
 	}
 }
 

@@ -165,6 +165,7 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 const (
 	apiCallRcInfo            int64 = 0x0040_0000_0000_0000
 	apiCallRcRDAutoplaceDone int64 = 0x4231 // ApiConsts.RC_RSC_DFN_PLACED
+	apiCallRcRscDeleted      int64 = 0x4200 // ApiConsts.RC_RSC_DELETED
 )
 
 // mergeAutoplaceFilter merges the request's filter on top of the parent
@@ -313,6 +314,11 @@ func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 }
 
 // handleResourceDelete drops a single Resource (replica) on a node.
+// Upstream LINSTOR replies with an `[]ApiCallRc` JSON envelope; the
+// `linstor` CLI insists on parsing one even when the HTTP status is
+// 200/204. Returning a bare `204 No Content` makes the CLI emit
+// "Unable to parse REST json data: Expecting value", so we mirror
+// the upstream shape: HTTP 200 + `MASK_INFO | RC_RSC_DELETED` entry.
 func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
@@ -324,5 +330,8 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
+		Message: "Resource '" + rdName + "' on node '" + node + "' deleted",
+	}})
 }
