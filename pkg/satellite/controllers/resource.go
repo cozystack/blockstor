@@ -159,10 +159,46 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
+		Watches(&blockstoriov1alpha1.ResourceDefinition{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
 		Named("satellite-resource").
 		Complete(r)
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
+	}
+
+	return nil
+}
+
+// enqueueResourcesForRD maps a ResourceDefinition event to the local
+// Resource (if any) of that RD. The satellite-side reconciler needs
+// this hook so spec-level RD changes (volume resize, layerStack edit,
+// new VolumeDefinition added) trigger a local re-apply — without it
+// the user could PUT a bigger size_kib via REST, the CRD updates
+// cleanly, but the satellite never picks up the delta and the
+// kernel device stays at the old size.
+//
+// Returns nothing when this satellite has no replica of the affected
+// RD — we don't process RDs we're not party to.
+func (r *ResourceReconciler) enqueueResourcesForRD(ctx context.Context, obj client.Object) []reconcile.Request {
+	rd, ok := obj.(*blockstoriov1alpha1.ResourceDefinition)
+	if !ok {
+		return nil
+	}
+
+	var localList blockstoriov1alpha1.ResourceList
+
+	err := r.List(ctx, &localList)
+	if err != nil {
+		return nil
+	}
+
+	for i := range localList.Items {
+		local := &localList.Items[i]
+		if local.Spec.ResourceDefinitionName == rd.Name &&
+			local.Spec.NodeName == r.Config.NodeName {
+			return []reconcile.Request{{NamespacedName: client.ObjectKey{Name: local.Name}}}
+		}
 	}
 
 	return nil
