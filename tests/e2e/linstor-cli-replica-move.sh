@@ -55,22 +55,16 @@ done
 
 LCTL=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 
-echo ">> REST RD create with auto-tiebreaker=false (CLI can't set props on create)"
-# Why not "linstor resource-definition create"? blockstor's RD
-# reconciler auto-spawns a 3rd DISKLESS replica ("TIE_BREAKER"
-# flag) on the worker not covered by the initial 2-replica set,
-# and the explicit `resource create $WORKER_3 …` below would
-# then 409 against that witness. Disabling the auto-tiebreaker
-# at create time is the cleanest way around it; the upstream CLI
-# `--auxprop` flag varies across versions, so we POST directly.
-curl -sf -X POST \
-    -H 'Content-Type: application/json' \
-    -d "{\"resource_definition\":{\"name\":\"$RD\",\"props\":{\"DrbdOptions/AutoAddQuorumTiebreaker\":\"false\"}}}" \
-    "http://localhost:$PF_PORT/v1/resource-definitions" \
-    >/dev/null
-
-echo ">> linstor volume-definition create $RD 32M"
+echo ">> linstor resource-definition + volume-definition create $RD"
+"${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 32M >/dev/null
+
+# blockstor's RD reconciler auto-spawns a 3rd DISKLESS / TIE_BREAKER
+# replica on whichever worker isn't part of the 2-replica set. The
+# explicit `resource create $WORKER_3 …` below intentionally lands
+# on the witness — our REST handler treats that as "promote the
+# diskless replica to diskful" (upstream LINSTOR semantics), so
+# the test exercises the implicit toggle-disk path end-to-end.
 
 echo ">> linstor resource create $WORKER_1 / $WORKER_2 $RD (initial 2 replicas)"
 "${LCTL[@]}" resource create "$WORKER_1" "$RD" --storage-pool stand >/dev/null
