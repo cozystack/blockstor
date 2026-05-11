@@ -36,8 +36,11 @@ fi
 RD=e2e-linstor-cli
 
 # port-forward blockstor-controller:3370 so the host-side `linstor`
-# CLI can reach the REST endpoint without poking a NodePort.
-kubectl -n blockstor-system port-forward svc/blockstor-controller 3370:3370 \
+# CLI can reach the REST endpoint without poking a NodePort. Bind to
+# a free random port — parallel `iter` runs on the same host would
+# otherwise race on a fixed local port.
+PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
     >/tmp/linstor-cli-pf.log 2>&1 &
 PF_PID=$!
 
@@ -50,13 +53,13 @@ trap cleanup EXIT
 
 # Give the port-forward a beat to bind.
 for _ in $(seq 1 10); do
-    if curl -sf -m1 http://localhost:3370/v1/nodes >/dev/null 2>&1; then
+    if curl -sf -m1 "http://localhost:$PF_PORT/v1/nodes" >/dev/null 2>&1; then
         break
     fi
     sleep 0.5
 done
 
-LCTL=(linstor --controllers http://localhost:3370 --machine-readable)
+LCTL=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 
 echo ">> linstor node list — every worker the controller knows about must appear"
 nodes_json=$("${LCTL[@]}" node list)
