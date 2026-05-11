@@ -13,7 +13,7 @@ KUBECONFIG := $(WORK_DIR)/kubeconfig
 export TALOSCONFIG
 export KUBECONFIG
 
-.PHONY: stand-help up down reset piraeus oracle build-images blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list iter use list stand-clean
+.PHONY: stand-help up down reset piraeus oracle build-images rebuild blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list iter use list stand-clean
 
 stand-help: ## list dev-stand targets
 	@echo "stand targets (use NAME=<cluster>):"
@@ -59,9 +59,13 @@ e2e: ## run a single e2e scenario (NAME=<cluster>, SCENARIO=<basename without .s
 e2e-list: ## list available e2e scenarios
 	@ls tests/e2e/*.sh | xargs -n1 basename | grep -v '^lib\.sh$$' | sed 's/\.sh$$//'
 
-iter: ## one dev-loop iteration: pull + rebuild + rollout + e2e (NAME=<cluster>, SCENARIO=<name>)
+iter: ## one dev-loop iteration on a single stand: rollout + cleanup + e2e (NAME=<cluster>, SCENARIO=<name>). Run `make rebuild` first.
 	@test -n "$${SCENARIO}" || (echo "usage: make iter NAME=<cluster> SCENARIO=<name>"; exit 2)
 	@./stand/iter.sh "$(NAME)" "$${SCENARIO}"
+
+rebuild: ## pull HEAD + rebuild images. One-shot before fanning iters out across stands.
+	@git pull --ff-only origin main 2>&1 | tail -3
+	@$(MAKE) build-images
 
 use: ## print TALOSCONFIG/KUBECONFIG exports for shell eval
 	@echo "export TALOSCONFIG=$(abspath $(TALOSCONFIG))"

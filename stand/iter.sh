@@ -2,20 +2,26 @@
 #
 # usage: iter.sh <stand-name> <scenario>
 #
-# One iteration of the dev loop: pull HEAD, rebuild images (cached
-# layers when code is unchanged), roll the controller+satellite on
-# the named stand, clean any leftover blockstor RDs, and run a
-# single e2e scenario.
+# One iteration of the dev loop on ONE stand: roll the
+# controller+satellite to the latest image already in the local
+# registry, clean any leftover blockstor RDs, and run a single
+# e2e scenario.
 #
-# Idiomatic flow:
-#   - operator edits + git pushes a fix
-#   - on the stand: `make iter NAME=eXX SCENARIO=foo`
-#   - while the e2e is running, operator reads other stands' logs,
-#     spots the next bug, pushes another fix
-#   - `make iter NAME=eYY SCENARIO=bar` updates a different stand
-#     to the new image while eXX is still running its scenario
+# IMPORTANT: iter does NOT rebuild — it expects `make build-images`
+# to have been run once by the operator after their `git push`.
+# That keeps multiple parallel iters on different stands from
+# racing on the same `docker build`. Workflow:
 #
-# Result lands in /tmp/iter-<stand>.{log,result}.
+#   # one-shot, after editing+pushing a fix:
+#   git pull && make build-images
+#   # then fan out to as many stands as needed:
+#   make iter NAME=e2e1 SCENARIO=auto-diskful &
+#   make iter NAME=e2e2 SCENARIO=two-volume-rd &
+#   make iter NAME=e2e3 SCENARIO=tiebreaker &
+#   …
+#
+# Each stand's result lands in /tmp/iter-<stand>.{log,result};
+# `grep PASS /tmp/iter-*.result` gives the current matrix.
 
 set -u
 
@@ -46,12 +52,6 @@ step() {
     echo "<<< $(date +%H:%M:%S) $NAME: $1 rc=$rc" | tee -a "$LOG"
     return $rc
 }
-
-step "git pull" "git pull --ff-only origin main 2>&1 | tail -5" \
-    || { echo "$NAME pull FAIL" > "$RESULT"; exit 1; }
-
-step "build-images" "make build-images" \
-    || { echo "$NAME build FAIL" > "$RESULT"; exit 1; }
 
 step "rollout-restart" "kubectl -n blockstor-system rollout restart deploy/blockstor-controller ds/blockstor-satellite" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
