@@ -296,18 +296,24 @@ func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 }
 
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
-// into DesiredVolumes for the satellite. DISKLESS replicas get an
-// empty list — they don't allocate local storage. The StoragePool name
-// comes from the Resource's `StorPoolName` prop (LINSTOR-compatible
-// key) with the RD-level fallback.
+// into DesiredVolumes for the satellite. DISKLESS replicas still get
+// volume entries — DRBD-9 needs a `volume { ... }` block per peer in
+// the .res file (with `disk none;` for the diskless ones), otherwise
+// the kernel side reports `"devices": []` and `drbdsetup status` has
+// no per-volume info to surface state on. The applyStorage path on
+// the satellite is gated by `!diskless` so emitting Volumes here is
+// safe — it only feeds the .res renderer.
+//
+// StoragePool name comes from the Resource's `StorPoolName` prop
+// (LINSTOR-compatible key) with the RD-level fallback. For DISKLESS
+// replicas it stays empty — the .res renderer treats empty as "no
+// disk on this peer".
 func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstoriov1alpha1.Resource) []*satellitepb.DesiredVolume {
 	if rd == nil {
 		return nil
 	}
 
-	if slices.Contains(target.Spec.Flags, "DISKLESS") {
-		return nil
-	}
+	diskless := slices.Contains(target.Spec.Flags, "DISKLESS")
 
 	// Phase 10.3 step: typed `Spec.StoragePool` wins over the legacy
 	// `Spec.Props["StorPoolName"]` so we don't read stale data when
@@ -316,13 +322,17 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	// name (it lives on a per-volume VG.Props in
 	// ResourceGroupVolumeGroup; the RD-prop fallback is the legacy
 	// shim).
-	pool := target.Spec.StoragePool
-	if pool == "" {
-		pool = target.Spec.Props["StorPoolName"]
-	}
+	pool := ""
 
-	if pool == "" {
-		pool = rd.Spec.Props["StorPoolName"]
+	if !diskless {
+		pool = target.Spec.StoragePool
+		if pool == "" {
+			pool = target.Spec.Props["StorPoolName"]
+		}
+
+		if pool == "" {
+			pool = rd.Spec.Props["StorPoolName"]
+		}
 	}
 
 	out := make([]*satellitepb.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
