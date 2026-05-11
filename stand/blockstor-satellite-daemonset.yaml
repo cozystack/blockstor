@@ -17,6 +17,45 @@ metadata:
   name: blockstor-satellite
   namespace: blockstor-system
 ---
+# The satellite runs c-r reconcilers for ResourceDefinitions /
+# Resources / Snapshots / StoragePools and writes node-scoped Status
+# back via SSA — it needs full CRUD on blockstor.io CRDs and access
+# to Status / Finalizers subresources, same as the controller. Events
+# permission is for `EventRecorder` traces from reconcile loops.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blockstor-satellite
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*/status", "*/finalizers"]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blockstor-satellite
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blockstor-satellite
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-satellite
+    namespace: blockstor-system
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
