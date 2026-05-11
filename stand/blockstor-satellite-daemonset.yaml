@@ -50,7 +50,7 @@ spec:
                   - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
       containers:
         - name: satellite
-          image: 10.164.0.1:5000/blockstor-satellite:dev
+          image: __REGISTRY__/blockstor-satellite:dev
           imagePullPolicy: Always
           args:
             # drbd's /etc/drbd.conf includes /etc/drbd.d/*.res, so the

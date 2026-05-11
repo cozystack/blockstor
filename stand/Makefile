@@ -13,7 +13,7 @@ KUBECONFIG := $(WORK_DIR)/kubeconfig
 export TALOSCONFIG
 export KUBECONFIG
 
-.PHONY: stand-help up down reset piraeus oracle blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list use list stand-clean
+.PHONY: stand-help up down reset piraeus oracle build-images blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list use list stand-clean
 
 stand-help: ## list dev-stand targets
 	@echo "stand targets (use NAME=<cluster>):"
@@ -33,6 +33,9 @@ piraeus: ## install piraeus-operator + linstor-csi (NAME=<n>)
 
 oracle: ## install Java LINSTOR controller as in-cluster oracle (NAME=<n>)
 	@./stand/install-oracle.sh "$(WORK_DIR)"
+
+build-images: ## build + push blockstor/blockstor-satellite to localhost:5000 (shared across all stands)
+	@./stand/build-images.sh
 
 blockstor: ## install blockstor CRDs + controller + satellites (NAME=<n>)
 	@./stand/install-blockstor.sh "$(WORK_DIR)"

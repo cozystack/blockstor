@@ -13,9 +13,13 @@
 #   3. apply blockstor-satellite-daemonset.yaml
 #   4. wait for controller + satellites Running
 #
-# Assumes the host registry on 10.164.0.1:5000 is reachable from the
-# cluster (Talos config-patch trusts http for that mirror — see
-# stand/up.sh).
+# Assumes the host registry is reachable from the cluster on the
+# bridge gateway (.1 of this cluster's NET_CIDR). Talos config-patch
+# trusts http for that mirror — see stand/up.sh. The deploy manifests
+# carry an `__REGISTRY__` placeholder which this script substitutes
+# with the actual bridge IP, computed from the first node's
+# InternalIP — this is how parallel stands on the same host all see
+# the same registry-on-host without colliding on a single IP.
 
 set -euo pipefail
 
@@ -24,14 +28,20 @@ export KUBECONFIG="$WORK_DIR/kubeconfig"
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+# Bridge gateway = .1 of the cluster CIDR. Read it off any node's
+# InternalIP (Talos VMs all live in the same /24 as the host bridge).
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+REGISTRY="${NODE_IP%.*}.1:5000"
+echo ">> using host registry at $REGISTRY"
+
 echo ">> apply CRDs"
 kubectl apply -f "$REPO_ROOT/config/crd/bases/" 2>&1 | tail -5
 
 echo ">> apply controller + RBAC"
-kubectl apply -f "$REPO_ROOT/stand/blockstor-deploy.yaml" 2>&1 | tail -5
+sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5
 
 echo ">> apply satellite DaemonSet"
-kubectl apply -f "$REPO_ROOT/stand/blockstor-satellite-daemonset.yaml" 2>&1 | tail -5
+sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-satellite-daemonset.yaml" | kubectl apply -f - 2>&1 | tail -5
 
 echo ">> wait for controller Running"
 kubectl -n blockstor-system rollout status deploy/blockstor-controller --timeout=120s

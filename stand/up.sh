@@ -106,15 +106,17 @@ machine:
       - name: dm_thin_pool
       - name: dm_snapshot
       - name: dm_crypt
-  # Trust the host-side Docker registry on 10.164.0.1:5000 via plain
-  # HTTP. The blockstor-controller / blockstor-satellite images we
-  # build live there; without this patch containerd refuses to pull
-  # them ("http: server gave HTTP response to HTTPS client").
+  # Trust the host-side Docker registry on the bridge gateway (.1 of
+  # this cluster's NET_CIDR) via plain HTTP. The blockstor-controller
+  # / blockstor-satellite images we build live there; without this
+  # patch containerd refuses to pull them ("http: server gave HTTP
+  # response to HTTPS client"). The bridge IP varies per cluster
+  # because parallel stands each get their own /24, hashed off NAME.
   registries:
     mirrors:
-      "10.164.0.1:5000":
+      "${NET_CIDR%.*}.1:5000":
         endpoints:
-          - "http://10.164.0.1:5000"
+          - "http://${NET_CIDR%.*}.1:5000"
         skipFallback: true
 YAML
 

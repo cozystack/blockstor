@@ -70,7 +70,7 @@ spec:
       serviceAccountName: blockstor-controller
       containers:
         - name: manager
-          image: 10.164.0.1:5000/blockstor:dev
+          image: __REGISTRY__/blockstor:dev
           imagePullPolicy: Always
           args:
             - --rest-bind-address=:3370
