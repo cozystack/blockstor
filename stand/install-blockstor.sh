@@ -63,4 +63,23 @@ if [[ "$ready" != "3" ]]; then
     exit 1
 fi
 
+# Bootstrap blockstor Node CRDs from k8s worker nodes so the
+# satellite reconciler's peer-resolution path has an address per
+# node — otherwise multi-replica .res files render a 0.0.0.0
+# placeholder for any peer this satellite hasn't directly seen.
+# Cluster-scoped CRD; metadata.name == k8s node name.
+echo ">> register blockstor Node CRDs from k8s workers"
+for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}'); do
+    ip=$(kubectl get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+    cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: Node
+metadata: {name: $node}
+spec:
+  type: SATELLITE
+  netInterfaces:
+    - {name: default, address: $ip}
+EOF
+done
+
 echo ">> blockstor stack ready on $(basename "$WORK_DIR")"

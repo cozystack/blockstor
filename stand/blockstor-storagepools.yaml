@@ -28,7 +28,7 @@ metadata:
 spec:
   nodeName: __WORKER_1__
   poolName: stand
-  providerKind: FILE_THIN
+  providerKind: LOOPFILE
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
@@ -39,7 +39,7 @@ metadata:
 spec:
   nodeName: __WORKER_2__
   poolName: stand
-  providerKind: FILE_THIN
+  providerKind: LOOPFILE
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
@@ -50,7 +50,7 @@ metadata:
 spec:
   nodeName: __WORKER_3__
   poolName: stand
-  providerKind: FILE_THIN
+  providerKind: LOOPFILE
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
