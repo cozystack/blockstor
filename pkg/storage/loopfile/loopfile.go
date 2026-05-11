@@ -226,26 +226,6 @@ func (*Provider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return errors.New("loopfile backend does not support snapshots")
 }
 
-// Destroy removes the pool directory and every .img inside it.
-// Mirror of the FILE backend: there's no vgremove/zpool destroy
-// equivalent for a sparse-file pool. Idempotent: missing
-// directory returns nil. Phase 10.8.
-//
-// Note: any still-attached loop devices need `losetup -d` first
-// or `RemoveAll` will fail on an in-use mount. The satellite's
-// upstream DeleteResource path runs `losetup -d` per-volume
-// before this method is reached, so in the documented teardown
-// order (delete resources → delete pool) Destroy sees only
-// detached files.
-func (p *Provider) Destroy(_ context.Context) error {
-	err := os.RemoveAll(p.cfg.Dir)
-	if err != nil {
-		return errors.Wrapf(err, "remove loopfile pool dir %s", p.cfg.Dir)
-	}
-
-	return nil
-}
-
 // attach is the idempotent loop-attach step. We pre-check via
 // `losetup -j <path>` and reuse the existing /dev/loopN if there is
 // one — `--find --show` always allocates a fresh dev, which on

@@ -180,35 +180,6 @@ func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error
 	return nil
 }
 
-// Destroy tears the VG down on disk. Idempotent: a missing
-// VG returns nil so a re-run after a partial teardown finishes
-// cleanly. The satellite's StoragePool reconciler runs this
-// when `Spec.DestroyOnDelete=true`. Phase 10.8.
-func (t *Thick) Destroy(ctx context.Context) error {
-	if !t.vgExists(ctx) {
-		return nil
-	}
-
-	_, err := t.exec.Run(ctx, "vgremove", Args("--force", t.cfg.VolumeGroup)...)
-	if err != nil {
-		return errors.Wrapf(err, "vgremove --force %s", t.cfg.VolumeGroup)
-	}
-
-	return nil
-}
-
-// vgExists is the pool-level counterpart to lvExists. Used by
-// Destroy's idempotency check.
-func (t *Thick) vgExists(ctx context.Context) bool {
-	out, err := t.exec.Run(ctx, "vgs",
-		Args("--noheadings", "-o", "vg_name", t.cfg.VolumeGroup)...)
-	if err != nil {
-		return false
-	}
-
-	return strings.TrimSpace(string(out)) != ""
-}
-
 // lvExists is the same idempotency primitive Thin uses.
 func (t *Thick) lvExists(ctx context.Context, lvName string) bool {
 	out, err := t.exec.Run(ctx, "lvs",

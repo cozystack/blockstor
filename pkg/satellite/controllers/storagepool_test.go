@@ -121,91 +121,15 @@ func TestStoragePoolReconcileStampsFinalizer(t *testing.T) {
 	}
 }
 
-// TestStoragePoolReconcileRunsDestroyWhenConsentGiven pins the
-// Phase 10.8 destructive teardown path: a StoragePool with
-// `Spec.DestroyOnDelete=true` + a DeletionTimestamp + our
-// finalizer triggers `provider.Destroy` (verified through the
-// FakeExec call log), deregisters the in-memory provider, and
-// strips the finalizer so the apiserver finalises.
-func TestStoragePoolReconcileRunsDestroyWhenConsentGiven(t *testing.T) {
-	t.Parallel()
-
-	scheme := newStoragePoolScheme(t)
-	now := metav1.Now()
-
-	pool := &blockstoriov1alpha1.StoragePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "lvm-thin-n1",
-			Finalizers:        []string{controllers.StoragePoolFinalizer},
-			DeletionTimestamp: &now,
-		},
-		Spec: blockstoriov1alpha1.StoragePoolSpec{
-			NodeName:        "n1",
-			PoolName:        "lvm-thin",
-			ProviderKind:    "LVM_THIN",
-			DestroyOnDelete: true,
-			Props: map[string]string{
-				"StorDriver/LvmVg":    "vg",
-				"StorDriver/ThinPool": "tp",
-			},
-		},
-	}
-
-	cli := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(pool).
-		Build()
-
-	rec := newSatelliteReconcilerForTests()
-	fx := storage.NewFakeExec()
-
-	// Satellite.NewProviderFromKind for LVM_THIN constructs a
-	// real provider; we don't need to register it on `rec`
-	// because handlePoolDelete builds a fresh one + calls
-	// Destroy. The FakeExec response for the `vgs` idempotency
-	// probe must return a non-empty stdout so Destroy proceeds
-	// to vgremove.
-	fx.Expect("vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg",
-		storage.FakeResponse{Stdout: []byte("vg\n")})
-	fx.Expect("vgremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg",
-		storage.FakeResponse{Stdout: []byte("")})
-
-	reconciler := &controllers.StoragePoolReconciler{
-		Client: cli,
-		Config: controllers.Config{
-			NodeName: "n1",
-			Apply:    rec,
-			Exec:     fx,
-		},
-	}
-
-	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "lvm-thin-n1"},
-	})
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-
-	// FakeExec saw both the probe and vgremove.
-	if len(fx.Calls) != 2 {
-		t.Errorf("expected 2 exec calls (vgs probe + vgremove), got %d: %+v", len(fx.Calls), fx.Calls)
-	}
-
-	// Finalizer stripped — apiserver can now finalise.
-	var got blockstoriov1alpha1.StoragePool
-
-	err = cli.Get(context.Background(), client.ObjectKey{Name: "lvm-thin-n1"}, &got)
-	if err == nil && slices.Contains(got.Finalizers, controllers.StoragePoolFinalizer) {
-		t.Errorf("finalizer still present after destructive delete: %v", got.Finalizers)
-	}
-}
-
-// TestStoragePoolReconcileSkipsDestroyByDefault pins the safe
-// default: `Spec.DestroyOnDelete=false` (the default) MUST NOT
-// run vgremove on delete. The CRD's finalizer is stripped and
-// the in-memory provider is deregistered, but the on-disk VG
-// stays intact so operators can manually re-import the data.
-func TestStoragePoolReconcileSkipsDestroyByDefault(t *testing.T) {
+// TestStoragePoolReconcileDeleteIsDeregisterOnly pins the
+// safety contract: deleting a StoragePool CRD MUST NOT touch
+// the backend (no `vgremove`, no `zpool destroy`). The
+// satellite-side delete handler only deregisters the
+// in-memory provider + strips the finalizer; on-disk pool
+// lifecycle is the operator's concern via
+// `linstor physical-storage create-device-pool` (creation
+// path) and out-of-band cleanup tooling (teardown path).
+func TestStoragePoolReconcileDeleteIsDeregisterOnly(t *testing.T) {
 	t.Parallel()
 
 	scheme := newStoragePoolScheme(t)
@@ -221,7 +145,6 @@ func TestStoragePoolReconcileSkipsDestroyByDefault(t *testing.T) {
 			NodeName:     "n1",
 			PoolName:     "lvm-thin",
 			ProviderKind: "LVM_THIN",
-			// DestroyOnDelete defaults to false.
 			Props: map[string]string{
 				"StorDriver/LvmVg":    "vg",
 				"StorDriver/ThinPool": "tp",
@@ -253,9 +176,20 @@ func TestStoragePoolReconcileSkipsDestroyByDefault(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
+	// Backend MUST be untouched — no vgremove / zpool destroy /
+	// rm calls of any flavour.
 	for _, call := range fx.Calls {
-		if call.Name == "vgremove" || call.Name == "zpool" {
-			t.Errorf("destructive command issued under DestroyOnDelete=false: %s %v", call.Name, call.Args)
+		switch call.Name {
+		case "vgremove", "zpool", "rm":
+			t.Errorf("destructive backend command issued on StoragePool delete: %s %v", call.Name, call.Args)
 		}
+	}
+
+	// Finalizer stripped — apiserver can finalise.
+	var got blockstoriov1alpha1.StoragePool
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "lvm-thin-n1"}, &got)
+	if err == nil && slices.Contains(got.Finalizers, controllers.StoragePoolFinalizer) {
+		t.Errorf("finalizer still present after deregister: %v", got.Finalizers)
 	}
 }

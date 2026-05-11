@@ -199,34 +199,6 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	return nil
 }
 
-// Destroy tears the VG (and its thin pool) down on disk.
-// Idempotent: missing VG returns nil. `vgremove --force` cascades
-// LV removal, so a single call cleans up the thin pool LV + any
-// volume LVs in one shot. Phase 10.8.
-func (t *Thin) Destroy(ctx context.Context) error {
-	if !t.vgExists(ctx) {
-		return nil
-	}
-
-	_, err := t.exec.Run(ctx, "vgremove", Args("--force", t.cfg.VolumeGroup)...)
-	if err != nil {
-		return errors.Wrapf(err, "vgremove --force %s", t.cfg.VolumeGroup)
-	}
-
-	return nil
-}
-
-// vgExists is the pool-level idempotency probe for Destroy.
-func (t *Thin) vgExists(ctx context.Context) bool {
-	out, err := t.exec.Run(ctx, "vgs",
-		Args("--noheadings", "-o", "vg_name", t.cfg.VolumeGroup)...)
-	if err != nil {
-		return false
-	}
-
-	return strings.TrimSpace(string(out)) != ""
-}
-
 // lvExists is the idempotency primitive used by Create/Delete. Errors
 // from `lvs` are folded into "missing": we can't distinguish "lv not
 // found" from "vg locked" via stdout, and the caller's subsequent op

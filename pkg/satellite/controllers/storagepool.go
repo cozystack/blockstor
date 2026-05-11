@@ -129,48 +129,22 @@ func (r *StoragePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-// handlePoolDelete runs the satellite-side teardown when a
-// StoragePool gets a DeletionTimestamp. Always deregisters the
-// in-memory provider; runs the on-disk destroy chain when
-// `Spec.DestroyOnDelete=true`. Phase 10.8.
-//
-// DestroyOnDelete=false (the default): the LINSTOR-side
-// registration is removed but the underlying VG/zpool stays
-// intact on disk; operators who want to re-import the data
-// later can `vgchange -ay` / `zpool import` manually.
-//
-// DestroyOnDelete=true: `vgremove --force` (LVM) or `zpool
-// destroy -f` (ZFS) — provider's Destroy is idempotent so a
-// re-run after a partial teardown finishes cleanly.
+// handlePoolDelete runs the satellite-side cleanup when a
+// StoragePool gets a DeletionTimestamp. StoragePool lifecycle
+// is pure registration: deleting the CRD ONLY deregisters the
+// in-memory provider and never touches the underlying disk.
+// On-disk pool creation is operator-driven via `linstor
+// physical-storage create-device-pool`; on-disk teardown is
+// an out-of-band operator concern — blockstor refuses to
+// `vgremove`/`zpool destroy` to avoid surprising data loss.
 func (r *StoragePoolReconciler) handlePoolDelete(ctx context.Context, pool *blockstoriov1alpha1.StoragePool) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("storagepool", pool.Name)
-
 	if !slices.Contains(pool.Finalizers, StoragePoolFinalizer) {
 		return ctrl.Result{}, nil
 	}
 
-	if pool.Spec.DestroyOnDelete {
-		provider, err := satellite.NewProviderFromKind(pool.Spec.ProviderKind, pool.Spec.Props, r.Config.Exec)
-		if err != nil {
-			// Can't even build a provider — log and keep the
-			// finalizer so operator can fix the config and
-			// retry. Stripping here would orphan the on-disk
-			// VG/zpool.
-			logger.Info("NewProviderFromKind failed during teardown", "err", err)
-
-			return ctrl.Result{Requeue: true}, nil
-		}
-
-		err = provider.Destroy(ctx)
-		if err != nil {
-			logger.Info("Destroy failed", "err", err)
-
-			return ctrl.Result{Requeue: true}, nil
-		}
-	}
-
 	// Deregister the in-memory provider so future ApplyResources
-	// for this pool fail fast rather than racing the now-gone VG.
+	// for this pool fail fast rather than writing into a pool
+	// the operator has unregistered.
 	r.Config.Apply.RegisterProvider(pool.Spec.PoolName, nil)
 
 	pool.Finalizers = slices.DeleteFunc(pool.Finalizers,

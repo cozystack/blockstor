@@ -112,13 +112,4 @@ type Provider interface {
 
 	// DeleteSnapshot is the inverse of CreateSnapshot.
 	DeleteSnapshot(ctx context.Context, snap Snapshot) error
-
-	// Destroy tears the pool itself down on disk: `vgremove
-	// --force` for LVM, `zpool destroy` for ZFS, recursive
-	// directory removal for FILE/LOOPFILE. Idempotent — a
-	// missing pool returns nil so a re-run after a partial
-	// teardown finishes cleanly. The satellite's StoragePool
-	// reconciler runs this when `Spec.DestroyOnDelete=true` on
-	// a CRD with non-zero DeletionTimestamp. Phase 10.8.
-	Destroy(ctx context.Context) error
 }

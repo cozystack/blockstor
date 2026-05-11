@@ -39,18 +39,6 @@ spec:
           spec:
             description: spec defines the desired state of StoragePool
             properties:
-              destroyOnDelete:
-                description: |-
-                  destroyOnDelete controls whether `kubectl delete storagepool`
-                  also runs the destructive teardown — `vgremove --force` /
-                  `zpool destroy` plus `wipefs -a` so the discovery loop can
-                  re-publish the freed devices as `PhysicalDevice` CRDs.
-                  Default false: deleting the CRD only removes the LINSTOR-side
-                  pool registration; the on-disk VG / zpool stays intact and
-                  can be re-imported manually with `vgchange -ay` / `zpool
-                  import`. Operators must opt in to the destructive path
-                  explicitly. Phase 10.8.
-                type: boolean
               nodeName:
                 description: |-
                   nodeName is the name of the satellite hosting this pool. Same as the
