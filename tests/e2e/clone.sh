@@ -28,8 +28,8 @@ require_workers 2
 
 RD_SRC=e2e-clone-src
 RD_DST=e2e-clone-dst
-N1=test-worker-1
-N2=test-worker-2
+N1=$WORKER_1
+N2=$WORKER_2
 
 trap 'delete_rd "$RD_SRC"; delete_rd "$RD_DST"' EXIT
 

@@ -33,7 +33,7 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 1
 
 RD=e2e-no-drbd
-N1=test-worker-1
+N1=$WORKER_1
 SIZE_KIB=131072    # 128 MiB
 STORPOOL=${STORPOOL:-stand}
 

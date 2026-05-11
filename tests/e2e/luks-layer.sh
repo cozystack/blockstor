@@ -37,7 +37,7 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 1
 
 RD=e2e-luks-layer
-N1=test-worker-1
+N1=$WORKER_1
 SIZE_KIB=131072    # 128 MiB
 PASSPHRASE='this-is-a-32-byte-test-passphrase!!'
 STORPOOL=${STORPOOL:-stand}

@@ -27,9 +27,9 @@ require_workers 3
 RD_SRC=e2e-snap-src
 RD_DST=e2e-snap-dst
 SNAP=snap-$(date +%s)
-N1=test-worker-1
-N2=test-worker-2
-N3=test-worker-3
+N1=$WORKER_1
+N2=$WORKER_2
+N3=$WORKER_3
 
 trap 'delete_rd "$RD_SRC"; delete_rd "$RD_DST"' EXIT
 

@@ -13,6 +13,19 @@ set -euo pipefail
 
 NS=${NS:-blockstor-system}
 
+# Discover the cluster's worker node names so scripts can reference
+# them as $WORKER_1, $WORKER_2, $WORKER_3 instead of hardcoding a
+# specific cluster prefix (parallel stands name workers `<NAME>-worker-N`).
+# Sorted alphabetically so $WORKER_1 == worker-1, etc.
+mapfile -t _BS_WORKERS < <(
+    kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+        -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
+)
+WORKER_1="${_BS_WORKERS[0]:-}"
+WORKER_2="${_BS_WORKERS[1]:-}"
+WORKER_3="${_BS_WORKERS[2]:-}"
+export WORKER_1 WORKER_2 WORKER_3
+
 # on_node runs CMD inside the satellite pod scheduled on NODE.
 # Wraps the jsonpath dance; quote args carefully.
 on_node() {

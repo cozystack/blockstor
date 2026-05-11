@@ -24,8 +24,8 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 2
 
 RD=e2e-disk-fail
-PRIMARY=test-worker-1
-PEER=test-worker-2
+PRIMARY=$WORKER_1
+PEER=$WORKER_2
 
 trap 'delete_rd "$RD"' EXIT
 

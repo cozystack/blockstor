@@ -35,8 +35,8 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 2
 
 RD=e2e-drbd-luks
-N1=test-worker-1
-N2=test-worker-2
+N1=$WORKER_1
+N2=$WORKER_2
 SIZE_KIB=131072    # 128 MiB
 PASSPHRASE='this-is-a-32-byte-test-passphrase!!'
 STORPOOL=${STORPOOL:-stand}

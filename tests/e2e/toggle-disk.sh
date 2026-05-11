@@ -25,9 +25,9 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 RD=e2e-toggle-disk
-N1=test-worker-1
-N2=test-worker-2
-N3=test-worker-3
+N1=$WORKER_1
+N2=$WORKER_2
+N3=$WORKER_3
 POOL=${STORPOOL:-thin1}
 
 trap 'delete_rd "$RD"' EXIT

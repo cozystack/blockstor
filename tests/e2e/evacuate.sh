@@ -23,9 +23,9 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 RD=e2e-evacuate
-SOURCE=test-worker-1
-PEER=test-worker-2
-TARGET=test-worker-3
+SOURCE=$WORKER_1
+PEER=$WORKER_2
+TARGET=$WORKER_3
 
 trap 'delete_rd "$RD"' EXIT
 

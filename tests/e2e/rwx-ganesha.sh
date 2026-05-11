@@ -34,14 +34,14 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 2
 
 # Pre-flight: skip if drbd-reactor / ganesha aren't on the satellites.
-if ! on_node test-worker-1 which drbd-reactorctl >/dev/null 2>&1; then
+if ! on_node "$WORKER_1" which drbd-reactorctl >/dev/null 2>&1; then
     echo "SKIP: drbd-reactor not installed on the stand (cozystack-only)"
     exit 0
 fi
 
 RD=e2e-rwx
-N1=test-worker-1
-N2=test-worker-2
+N1=$WORKER_1
+N2=$WORKER_2
 
 trap 'delete_rd "$RD"' EXIT
 

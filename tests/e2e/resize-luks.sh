@@ -28,8 +28,8 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 2
 
 RD=e2e-resize-luks
-N1=test-worker-1
-N2=test-worker-2
+N1=$WORKER_1
+N2=$WORKER_2
 SIZE_INITIAL_KIB=65536    # 64 MiB
 SIZE_GROWN_KIB=131072     # 128 MiB
 
