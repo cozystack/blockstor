@@ -83,8 +83,8 @@ func TestPhysicalDeviceReconcileStampsFinalizer(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	if !result.Requeue {
-		t.Errorf("expected Requeue=true after stamping finalizer, got %+v", result)
+	if !requeueRequested(result) {
+		t.Errorf("expected requeue after stamping finalizer, got %+v", result)
 	}
 
 	var got blockstoriov1alpha1.PhysicalDevice
