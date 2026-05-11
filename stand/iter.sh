@@ -53,6 +53,13 @@ step() {
     return $rc
 }
 
+# Reapply CRDs first — schema additions in this branch (Resource.
+# Status.Connections etc.) only land when the apiserver knows about
+# them, otherwise the satellite observer's SSA fails with `field not
+# declared in schema` and the resource reconciler stalls.
+step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
+    || { echo "$NAME apply-crds FAIL" > "$RESULT"; exit 1; }
+
 step "rollout-restart" "kubectl -n blockstor-system rollout restart deploy/blockstor-controller ds/blockstor-satellite" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
