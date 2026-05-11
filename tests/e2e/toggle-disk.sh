@@ -28,7 +28,7 @@ RD=e2e-toggle-disk
 N1=$WORKER_1
 N2=$WORKER_2
 N3=$WORKER_3
-POOL=${STORPOOL:-thin1}
+POOL=${STORPOOL:-stand}
 
 trap 'delete_rd "$RD"' EXIT
 

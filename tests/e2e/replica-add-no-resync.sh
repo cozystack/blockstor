@@ -59,6 +59,7 @@ metadata: {name: ${RD}.${n}}
 spec:
   resourceDefinitionName: ${RD}
   nodeName: ${n}
+  props: {StorPoolName: stand}
 EOF
 done
 
@@ -91,6 +92,7 @@ metadata: {name: ${RD}.${N3}}
 spec:
   resourceDefinitionName: ${RD}
   nodeName: ${N3}
+  props: {StorPoolName: stand}
 EOF
 
 echo ">> wait up to 60s for $N3 to reach UpToDate"
