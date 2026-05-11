@@ -135,7 +135,12 @@ require_workers() {
 rest_post() {
     local path=$1 body=$2
 
-    local lport=33370
+    # Random ephemeral port so back-to-back rest_post / rest_put
+    # calls don't collide on TIME_WAIT remnants from the previous
+    # port-forward — observed on clone.sh where the second
+    # rest_post would bind a stale socket and curl would error 22.
+    local lport
+    lport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
     kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
 
@@ -146,6 +151,7 @@ rest_post() {
         "http://127.0.0.1:${lport}${path}" -d "$body")
 
     kill "$pf" 2>/dev/null || true
+    wait "$pf" 2>/dev/null || true
 
     echo "$out"
 }
@@ -154,7 +160,8 @@ rest_post() {
 rest_put() {
     local path=$1 body=$2
 
-    local lport=33371
+    local lport
+    lport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
     kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
 
@@ -165,6 +172,7 @@ rest_put() {
         "http://127.0.0.1:${lport}${path}" -d "$body")
 
     kill "$pf" 2>/dev/null || true
+    wait "$pf" 2>/dev/null || true
 
     echo "$out"
 }
