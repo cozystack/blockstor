@@ -90,6 +90,17 @@ if [[ "$state3" != *"disk:UpToDate"* ]]; then
     exit 1
 fi
 
+# Now that W3 has converged to diskful, disable the auto-tiebreaker
+# prop. Without this, the post-delete reconcile (after we drop W1
+# below) sees 2 diskful + 0 witnesses and auto-spawns a new DISKLESS
+# Resource on whichever worker is empty — typically the just-deleted
+# W1 — which trips the "Resource CRD must vanish" assertion. Test
+# intent here is to verify the CLI's DELETE wired through; the
+# auto-witness rebalance is a separate behaviour we exercise in
+# other scenarios (tiebreaker.sh).
+"${LCTL[@]}" resource-definition set-property "$RD" \
+    DrbdOptions/AutoAddQuorumTiebreaker false >/dev/null
+
 echo ">> linstor resource delete $WORKER_1 $RD (drop old replica)"
 "${LCTL[@]}" resource delete "$WORKER_1" "$RD" >/dev/null
 

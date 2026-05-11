@@ -138,8 +138,8 @@ rest_post() {
     local lport=33370
     kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
-    # give the forward a moment to bind
-    sleep 1
+
+    _wait_port_forward "$lport" "$pf"
 
     local out
     out=$(curl -fsS -XPOST -H'Content-Type: application/json' \
@@ -157,7 +157,8 @@ rest_put() {
     local lport=33371
     kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
-    sleep 1
+
+    _wait_port_forward "$lport" "$pf"
 
     local out
     out=$(curl -fsS -XPUT -H'Content-Type: application/json' \
@@ -166,6 +167,27 @@ rest_put() {
     kill "$pf" 2>/dev/null || true
 
     echo "$out"
+}
+
+# _wait_port_forward blocks until the forwarded socket actually
+# answers (probed via /v1/healthz which is a no-store, no-cache
+# 204 from the controller). The flat `sleep 1` it replaces lost
+# races under 17-stand parallel-iter load — kubectl port-forward
+# can take >1 s to bind to a free local port when the apiserver
+# is busy, and curl then fails with `(7) Failed to connect`.
+_wait_port_forward() {
+    local lport=$1 pf=$2 attempt
+
+    for attempt in $(seq 1 30); do
+        if curl -fsS -m 1 "http://127.0.0.1:${lport}/v1/healthz" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "rest_post/put: port-forward to :${lport} never bound" >&2
+    kill "$pf" 2>/dev/null || true
+    return 1
 }
 
 # rd_apply applies a 2-replica RD with given size onto the named pair
