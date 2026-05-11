@@ -41,8 +41,9 @@ apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
+  layerStack: ["DRBD", "LUKS", "STORAGE"]
   props:
-    DrbdOptions/Encryption/Enabled: "true"
+    DrbdOptions/Encryption/passphrase: "this-is-a-32-byte-test-passphrase!!"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_INITIAL_KIB}}
 EOF
