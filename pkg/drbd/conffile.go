@@ -86,6 +86,21 @@ type Host struct {
 	// NodeID is the drbd-9 node identifier (0..31). Must be unique
 	// within the resource's host list.
 	NodeID int
+
+	// IsLocal marks this host as the satellite rendering the .res
+	// file (only one host per resource has this true). Peer hosts
+	// get a placeholder `disk` value upstream LINSTOR uses
+	// (`/dev/drbd/this/is/not/used`) — drbd never reads the peer
+	// host's `disk` field, but the parser refuses an empty one and
+	// treats `none` as DISKLESS, so a constant placeholder is what
+	// upstream emits.
+	IsLocal bool
+
+	// Diskless marks the host as a DRBD diskless replica — `disk`
+	// must be rendered as the literal `none`. Same value on local
+	// vs. peer hosts: a peer that's diskless still gets `none`,
+	// not the placeholder.
+	Diskless bool
 }
 
 // Volume is one data volume on the resource.
@@ -178,21 +193,46 @@ func writeOptions(b *strings.Builder, opts map[string]string) {
 }
 
 // writeOnBlock emits one `on <node> { … }` block including every volume
-// definition for this peer.
-func writeOnBlock(b *strings.Builder, h *Host, vols []Volume) {
-	fmt.Fprintf(b, "  on %s {\n", h.NodeName)
-	fmt.Fprintf(b, "    address %s:%d;\n", h.Address, h.Port)
-	fmt.Fprintf(b, "    node-id %d;\n", h.NodeID)
+// definition for this peer. The `disk` value follows upstream LINSTOR's
+// ConfFileBuilder:
+//   - DISKLESS host (local or peer) → `none`
+//   - local diskful host → the real backing path (Volume.Disk)
+//   - peer diskful host → the literal placeholder `/dev/drbd/this/is/not/used`
+//
+// The peer placeholder exists because drbd never reads the peer's
+// `disk` field but the parser rejects empty / requires a stable
+// non-`none` token; using each peer's actual backing path would
+// also clash when a peer is mid-conversion from diskless and its
+// path is reported as `none`.
+const peerDiskPlaceholder = "/dev/drbd/this/is/not/used"
 
-	for _, v := range vols {
-		fmt.Fprintf(b, "    volume %d {\n", v.Number)
-		fmt.Fprintf(b, "      device %s minor %d;\n", v.Device, v.Minor)
-		fmt.Fprintf(b, "      disk %s;\n", v.Disk)
+func writeOnBlock(b *strings.Builder, host *Host, vols []Volume) {
+	fmt.Fprintf(b, "  on %s {\n", host.NodeName)
+	fmt.Fprintf(b, "    address %s:%d;\n", host.Address, host.Port)
+	fmt.Fprintf(b, "    node-id %d;\n", host.NodeID)
+
+	for _, vol := range vols {
+		fmt.Fprintf(b, "    volume %d {\n", vol.Number)
+		fmt.Fprintf(b, "      device %s minor %d;\n", vol.Device, vol.Minor)
+		fmt.Fprintf(b, "      disk %s;\n", diskField(host, vol))
 		b.WriteString("      meta-disk internal;\n")
 		b.WriteString("    }\n")
 	}
 
 	b.WriteString("  }\n")
+}
+
+// diskField picks the `disk` value to render for one (host, volume)
+// pair. See writeOnBlock for the precedence.
+func diskField(host *Host, vol Volume) string {
+	switch {
+	case host.Diskless:
+		return "none"
+	case host.IsLocal:
+		return vol.Disk
+	default:
+		return peerDiskPlaceholder
+	}
 }
 
 // writeConnectionMesh emits one `connection { … }` block per (i, j)

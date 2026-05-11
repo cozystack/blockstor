@@ -41,6 +41,12 @@ import (
 // it renders the file (drbd doesn't accept literal 0.0.0.0).
 const drbdAddrAny = "0.0.0.0"
 
+// boolPropTrue is the canonical string-form `true` value blockstor
+// stamps on drbd_options bag keys that are flag-like (auto-primary,
+// peer.<n>.diskless, …). Pinning the literal avoids consumer-side
+// drift between `"true"`/`"True"`/`"1"`.
+const boolPropTrue = "true"
+
 // BuildDesired translates a Resource + its same-RD peers into the
 // satellite-facing DesiredResource. Port/minor/node-id assignment is
 // deterministic from the RD name + sorted peer list — good enough for
@@ -106,7 +112,7 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// primary --force only on firstActivation.
 	if !slices.Contains(target.Spec.Flags, "DISKLESS") &&
 		idOf[target.Spec.NodeName] == lowestDiskfulID(target, peers) {
-		drbdOpts["auto-primary"] = "true"
+		drbdOpts["auto-primary"] = boolPropTrue
 	}
 
 	addPeerEntries(drbdOpts, dropped, peers, nodes, port, idOf)
@@ -247,6 +253,13 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 		drbdOpts["peer."+peer+".port"] = strconv.Itoa(peerPort)
 		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
 		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
+
+		// Surface the peer's DISKLESS flag so the satellite's .res
+		// renderer can emit `disk none;` instead of the diskful
+		// placeholder for diskless peers.
+		if p, ok := peerByName[peer]; ok && slices.Contains(p.Spec.Flags, "DISKLESS") {
+			drbdOpts["peer."+peer+".diskless"] = boolPropTrue
+		}
 	}
 }
 

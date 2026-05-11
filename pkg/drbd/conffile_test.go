@@ -47,7 +47,7 @@ func TestBuildSinglePeerSingleVolume(t *testing.T) {
 		Name: "pvc-1",
 		Net:  drbd.Net{ProtocolC: true},
 		Hosts: []drbd.Host{
-			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0},
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
 			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
 		},
 		Volumes: []drbd.Volume{
@@ -66,9 +66,14 @@ func TestBuildSinglePeerSingleVolume(t *testing.T) {
 		"    node-id 0;",
 		"    volume 0 {",
 		"      device /dev/drbd1000 minor 1000;",
+		// Local node uses the real backing disk path.
 		"      disk /dev/vg/pvc-1_00000;",
 		"      meta-disk internal;",
 		"  on n2 {",
+		// Peer node uses upstream's placeholder — drbd never reads
+		// the peer-side `disk`, but the parser requires a stable
+		// non-empty / non-`none` token.
+		"      disk /dev/drbd/this/is/not/used;",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in output:\n%s", want, got)
@@ -162,6 +167,43 @@ func TestBuildEmitsResourceOptions(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in output:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuildPeerDisks pins the `disk` precedence upstream LINSTOR
+// uses: local diskful → real path; local diskless → `none`;
+// peer diskful → `/dev/drbd/this/is/not/used`; peer diskless →
+// `none` (not the placeholder).
+func TestBuildPeerDisks(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{ProtocolC: true},
+		Hosts: []drbd.Host{
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+			{NodeName: "n3", Address: "10.0.0.3", Port: 7000, NodeID: 2, Diskless: true},
+		},
+		Volumes: []drbd.Volume{
+			{Number: 0, Device: "/dev/drbd1000", Disk: "/dev/loop42", Minor: 1000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	cases := []struct {
+		needle string
+		why    string
+	}{
+		{"  on n1 {\n    address 10.0.0.1:7000;\n    node-id 0;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk /dev/loop42;\n", "local diskful → real path"},
+		{"  on n2 {\n    address 10.0.0.2:7000;\n    node-id 1;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk /dev/drbd/this/is/not/used;\n", "peer diskful → placeholder"},
+		{"  on n3 {\n    address 10.0.0.3:7000;\n    node-id 2;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk none;\n", "peer diskless → none"},
+	}
+
+	for _, c := range cases {
+		if !strings.Contains(got, c.needle) {
+			t.Errorf("%s: missing block\n  want substring %q\n  in:\n%s", c.why, c.needle, got)
 		}
 	}
 }

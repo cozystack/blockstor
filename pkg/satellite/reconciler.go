@@ -587,7 +587,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	// "Inconsistent" into "UpToDate" without a human running
 	// drbdadm. Subsequent reconciles see firstActivation=false and
 	// skip the seed.
-	if firstActivation && !diskless && dr.GetDrbdOptions()["auto-primary"] == "true" {
+	if firstActivation && !diskless && dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue {
 		err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
 		if err != nil {
 			return errors.Wrapf(err, "auto-primary %s", dr.GetName())
@@ -688,6 +688,8 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, 
 		Address:  resolveAddr(opts["address"], localAddr),
 		Port:     port,
 		NodeID:   nodeID,
+		IsLocal:  true,
+		Diskless: isDiskless(dr.GetFlags()),
 	})
 
 	for _, peer := range dr.GetPeers() {
@@ -699,6 +701,7 @@ func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, 
 			Address:  resolveAddr(opts["peer."+peer+".address"], ""),
 			Port:     peerPort,
 			NodeID:   peerNodeID,
+			Diskless: opts["peer."+peer+".diskless"] == drbdBoolPropTrue,
 		})
 	}
 
@@ -788,6 +791,12 @@ func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]str
 // before it learns each satellite's pod IP — `resolveAddr`
 // substitutes the satellite's own IP whenever it sees this value.
 const drbdAddrPlaceholder = "0.0.0.0"
+
+// drbdBoolPropTrue mirrors dispatcher.boolPropTrue — the literal
+// `true` the dispatcher stamps on flag-like drbd_options keys. We
+// inline rather than re-export to keep `pkg/satellite` from
+// importing `pkg/dispatcher` just for one constant.
+const drbdBoolPropTrue = "true"
 
 // resolveAddr substitutes the satellite's own IP whenever the
 // controller-supplied address is the placeholder (which it is until
