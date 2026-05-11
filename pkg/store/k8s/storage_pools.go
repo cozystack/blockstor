@@ -184,6 +184,16 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		}
 	}
 
+	// Upstream LINSTOR populates FreeSpaceMgrName with `<Node>:<Pool>`
+	// for local pools. The Python CLI does `':' not in
+	// free_space_mgr_name` and crashes with TypeError when the field
+	// is null. Mirror upstream — for shared pools, upstream uses the
+	// shared_space identifier; we follow the same convention.
+	fsmName := crd.Spec.NodeName + ":" + poolName
+	if crd.Spec.SharedSpaceID != "" {
+		fsmName = crd.Spec.SharedSpaceID
+	}
+
 	return apiv1.StoragePool{
 		StoragePoolName:  poolName,
 		NodeName:         crd.Spec.NodeName,
@@ -194,6 +204,7 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		TotalCapacity:    crd.Status.TotalCapacity,
 		SupportsSnapshot: crd.Status.SupportsSnapshots,
 		StaticTraits:     crd.Status.StaticTraits,
+		FreeSpaceMgrName: fsmName,
 		UUID:             string(crd.UID),
 	}
 }
