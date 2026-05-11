@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -100,40 +101,10 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, errors.Wrap(err, "add finalizer")
 		}
 
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	desired, err := r.buildDesiredFromCRD(ctx, &res)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	results, err := r.Config.Apply.Apply(ctx, []*satellitepb.DesiredResource{desired})
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
-	}
-
-	var anyFailed bool
-
-	for _, ar := range results {
-		if !ar.GetOk() {
-			anyFailed = true
-
-			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
-		}
-	}
-
-	// Apply chain reports its own per-resource errors via results (e.g.
-	// drbdadm adjust failing on a stale .res rendered from a partially-
-	// allocated peer Status). Returning `nil` would let c-r stop and
-	// never retry until an external event (peer Status update) drove
-	// another reconcile. Requeue with a short backoff so the next
-	// attempt sees the freshly-committed peer state.
-	if anyFailed {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
-	return ctrl.Result{}, nil
+	return r.runApply(ctx, &res, logger)
 }
 
 // applyFailureRequeue is the backoff between satellite Apply
@@ -189,6 +160,50 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return nil
+}
+
+// runApply gates on the controller-side allocation, builds the
+// DesiredResource for this satellite, and drives the apply chain.
+// Returns RequeueAfter when allocation is stale or any per-resource
+// apply failed so the reconcile self-heals once peer state catches
+// up. Pulled out of Reconcile to keep the orchestration under the
+// cyclomatic / funlen budgets.
+func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
+	if waitResult, waitOK := r.waitForControllerAllocation(res, logger); !waitOK {
+		return waitResult, nil
+	}
+
+	desired, err := r.buildDesiredFromCRD(ctx, res)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	results, err := r.Config.Apply.Apply(ctx, []*satellitepb.DesiredResource{desired})
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
+	}
+
+	var anyFailed bool
+
+	for _, ar := range results {
+		if !ar.GetOk() {
+			anyFailed = true
+
+			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
+		}
+	}
+
+	// Apply chain surfaces per-resource errors via results (e.g.
+	// drbdadm adjust failing on a stale .res rendered before the
+	// peer's Status caught up). Returning nil here would let c-r
+	// stop until an external event drove another reconcile;
+	// RequeueAfter ensures the next attempt sees the freshly-
+	// committed peer state.
+	if anyFailed {
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
+	return ctrl.Result{}, nil
 }
 
 // enqueueLocalSiblings maps a Resource event to the LOCAL Resource
@@ -279,6 +294,31 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	}
 
 	return dispatcher.BuildDesired(target, peers, nodeList.Items, &rd, effectiveProps), nil
+}
+
+// waitForControllerAllocation gates the apply path on the
+// controller-side allocator having stamped Status.DRBDNodeID /
+// DRBDPort / DRBDMinor. Without this, dispatcher.BuildDesired
+// silently defaults the missing fields to 0 / "0.0.0.0" / minor 0
+// and we'd render a .res claiming the local node is `node-id 0`.
+// drbdsetup new-resource burns that into kernel state at first
+// adjust, and the next reconcile (after the controller writes the
+// real allocation) hits `peer node id cannot be my own node id`
+// forever because the kernel's recorded my-id never moves.
+//
+// Returns ok=true when allocation is fresh; ok=false with a
+// short-backoff requeue Result when one of the IDs is still nil.
+func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
+	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
+		logger.Info("waiting for controller-side DRBD-ID allocation",
+			"nodeID", res.Status.DRBDNodeID,
+			"port", res.Status.DRBDPort,
+			"minor", res.Status.DRBDMinor)
+
+		return ctrl.Result{RequeueAfter: applyFailureRequeue}, false
+	}
+
+	return ctrl.Result{}, true
 }
 
 // handleDelete runs the satellite-side teardown when a Resource
