@@ -135,6 +135,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerQuerySizeInfo(mux)
 	s.registerAdvise(mux)
 	s.registerPhysicalStorage(mux)
+	s.registerResourceGroupExtras(mux)
 
 	return mux
 }
