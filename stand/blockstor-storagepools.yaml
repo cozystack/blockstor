@@ -26,7 +26,7 @@ kind: StoragePool
 metadata:
   name: stand-w1
 spec:
-  nodeName: talos-stand-w1
+  nodeName: __WORKER_1__
   poolName: stand
   providerKind: FILE_THIN
   props:
@@ -37,7 +37,7 @@ kind: StoragePool
 metadata:
   name: stand-w2
 spec:
-  nodeName: talos-stand-w2
+  nodeName: __WORKER_2__
   poolName: stand
   providerKind: FILE_THIN
   props:
@@ -48,7 +48,7 @@ kind: StoragePool
 metadata:
   name: stand-w3
 spec:
-  nodeName: talos-stand-w3
+  nodeName: __WORKER_3__
   poolName: stand
   providerKind: FILE_THIN
   props:
@@ -64,7 +64,7 @@ kind: StoragePool
 metadata:
   name: lvm-thin-w1
 spec:
-  nodeName: talos-stand-w1
+  nodeName: __WORKER_1__
   poolName: lvm-thin
   providerKind: LVM_THIN
   props:
@@ -76,7 +76,7 @@ kind: StoragePool
 metadata:
   name: lvm-thin-w2
 spec:
-  nodeName: talos-stand-w2
+  nodeName: __WORKER_2__
   poolName: lvm-thin
   providerKind: LVM_THIN
   props:
@@ -88,7 +88,7 @@ kind: StoragePool
 metadata:
   name: lvm-thin-w3
 spec:
-  nodeName: talos-stand-w3
+  nodeName: __WORKER_3__
   poolName: lvm-thin
   providerKind: LVM_THIN
   props:
@@ -104,7 +104,7 @@ kind: StoragePool
 metadata:
   name: zfs-thin-w1
 spec:
-  nodeName: talos-stand-w1
+  nodeName: __WORKER_1__
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:
@@ -115,7 +115,7 @@ kind: StoragePool
 metadata:
   name: zfs-thin-w2
 spec:
-  nodeName: talos-stand-w2
+  nodeName: __WORKER_2__
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:
@@ -126,7 +126,7 @@ kind: StoragePool
 metadata:
   name: zfs-thin-w3
 spec:
-  nodeName: talos-stand-w3
+  nodeName: __WORKER_3__
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:

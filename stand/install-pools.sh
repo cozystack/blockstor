@@ -111,3 +111,26 @@ for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name); do
 done
 
 echo ">> pools provisioned on all workers"
+
+# Apply StoragePool CRDs so the satellite's StoragePoolReconciler
+# discovers them and registers the matching storage.Provider. The
+# yaml ships with `__WORKER_N__` placeholders; substitute with the
+# actual cluster's worker node names (sorted) before applying.
+mapfile -t _WORKERS < <(
+    kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+        -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | sort
+)
+W1="${_WORKERS[0]:-}"
+W2="${_WORKERS[1]:-}"
+W3="${_WORKERS[2]:-}"
+
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+echo ">> applying StoragePool CRDs (workers: $W1 $W2 $W3)"
+sed -e "s|__WORKER_1__|$W1|g" \
+    -e "s|__WORKER_2__|$W2|g" \
+    -e "s|__WORKER_3__|$W3|g" \
+    "$REPO_ROOT/stand/blockstor-storagepools.yaml" | kubectl apply -f -
+
+echo ">> waiting for satellite StoragePoolReconciler to pick up CRDs"
+sleep 5
+kubectl get storagepools -o wide
