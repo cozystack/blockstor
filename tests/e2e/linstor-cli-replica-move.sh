@@ -55,28 +55,22 @@ done
 
 LCTL=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 
-echo ">> linstor resource-definition + volume-definition create $RD"
-"${LCTL[@]}" resource-definition create "$RD" >/dev/null
-"${LCTL[@]}" volume-definition create "$RD" 32M >/dev/null
-
-# Disable the auto-quorum-tiebreaker: blockstor's RD reconciler
-# otherwise spawns a 3rd DISKLESS replica on whichever worker
-# isn't part of the 2-replica set, which would collide with our
-# explicit `resource create $WORKER_3 …` below (409 from the REST
-# layer). The test wants $WORKER_3 to be a real diskful replica
-# we add and then drop, not a witness someone else planted.
-rd_json=$(curl -sf "http://localhost:$PF_PORT/v1/resource-definitions/$RD")
-patched=$(echo "$rd_json" | python3 -c '
-import json, sys
-rd = json.load(sys.stdin)
-rd.setdefault("props", {})["DrbdOptions/AutoAddQuorumTiebreaker"] = "false"
-print(json.dumps(rd))
-')
-curl -sf -X PUT \
+echo ">> REST RD create with auto-tiebreaker=false (CLI can't set props on create)"
+# Why not "linstor resource-definition create"? blockstor's RD
+# reconciler auto-spawns a 3rd DISKLESS replica ("TIE_BREAKER"
+# flag) on the worker not covered by the initial 2-replica set,
+# and the explicit `resource create $WORKER_3 …` below would
+# then 409 against that witness. Disabling the auto-tiebreaker
+# at create time is the cleanest way around it; the upstream CLI
+# `--auxprop` flag varies across versions, so we POST directly.
+curl -sf -X POST \
     -H 'Content-Type: application/json' \
-    -d "$patched" \
-    "http://localhost:$PF_PORT/v1/resource-definitions/$RD" \
+    -d "{\"resource_definition\":{\"name\":\"$RD\",\"props\":{\"DrbdOptions/AutoAddQuorumTiebreaker\":\"false\"}}}" \
+    "http://localhost:$PF_PORT/v1/resource-definitions" \
     >/dev/null
+
+echo ">> linstor volume-definition create $RD 32M"
+"${LCTL[@]}" volume-definition create "$RD" 32M >/dev/null
 
 echo ">> linstor resource create $WORKER_1 / $WORKER_2 $RD (initial 2 replicas)"
 "${LCTL[@]}" resource create "$WORKER_1" "$RD" --storage-pool stand >/dev/null
