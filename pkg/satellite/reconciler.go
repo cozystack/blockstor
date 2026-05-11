@@ -531,7 +531,17 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 // gets `disk /dev/loopN` rather than the LVM-shaped guess.
 func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized bool) error {
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
-	_, statErr := os.Stat(resPath)
+	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
+
+	// firstActivation is "did create-md succeed previously?" — keyed
+	// off a separate marker file written AFTER create-md returns
+	// success. We can't gate on the .res-file existence: a previous
+	// reconcile that wrote the .res but failed `drbdadm create-md`
+	// (e.g. .res had a stale conflicting node-id from a race that
+	// later got fixed) would otherwise report firstActivation=false
+	// on every subsequent attempt → create-md is skipped → adjust
+	// reports "No valid meta data found" forever.
+	_, statErr := os.Stat(mdMarkerPath)
 	firstActivation := os.IsNotExist(statErr)
 
 	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
@@ -545,21 +555,9 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	}
 
 	if firstActivation && !diskless {
-		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
+		err = r.runFirstActivation(ctx, dr, devices, mdMarkerPath)
 		if err != nil {
-			return errors.Wrapf(err, "create-md %s", dr.GetName())
-		}
-
-		// Initial-sync skip seeding (Phase 8.1): when the controller
-		// has picked an UpToDate peer's GI, stamp this replica's
-		// freshly-created metadata block with that GI BEFORE drbdadm
-		// adjust so DRBD's GI handshake on first connect sees the new
-		// peer as already-in-sync and skips the full initial-sync.
-		// Per-volume — a multi-volume RD may have one volume seeded
-		// and another not (e.g. fresh cluster, no peer for vol 1 yet).
-		err = r.seedInitialGi(ctx, dr, devices)
-		if err != nil {
-			return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
+			return err
 		}
 	}
 
@@ -612,6 +610,32 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 // Must be called between create-md (which writes the metadata
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
+// runFirstActivation runs the one-shot per-replica bring-up:
+// `drbdadm create-md`, drop the md-created marker file (so the
+// next reconcile sees firstActivation=false even across a
+// satellite restart), then seed initial-sync GI when the
+// controller has stamped a peer's UpToDate GI on the volume.
+// Pulled out of applyDRBD so the orchestration function stays
+// under the cyclomatic budget.
+func (r *Reconciler) runFirstActivation(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string, mdMarkerPath string) error {
+	err := r.cfg.Adm.CreateMD(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "create-md %s", dr.GetName())
+	}
+
+	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", mdMarkerPath)
+	}
+
+	err = r.seedInitialGi(ctx, dr, devices)
+	if err != nil {
+		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
+	}
+
+	return nil
+}
+
 func (r *Reconciler) seedInitialGi(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string) error {
 	for _, vol := range dr.GetVolumes() {
 		if vol.GetSeedFromGi() == "" {
