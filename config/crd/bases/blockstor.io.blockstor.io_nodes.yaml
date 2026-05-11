@@ -223,7 +223,7 @@ spec:
               connectionStatus:
                 description: |-
                   connectionStatus is a coarse projection of the Ready condition
-                  (CONNECTED when Ready=True, OFFLINE when False/Unknown) kept for
+                  (ONLINE when Ready=True, OFFLINE when False/Unknown) kept for
                   kubectl-friendly columns + golinstor round-trip compatibility.
                   Written by the controller-side heartbeat watchdog; do not hand-set.
                 type: string
