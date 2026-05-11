@@ -38,7 +38,6 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
 	"github.com/cozystack/blockstor/pkg/rest"
-	"github.com/cozystack/blockstor/pkg/satellitecontroller"
 	"github.com/cozystack/blockstor/pkg/store"
 	storek8s "github.com/cozystack/blockstor/pkg/store/k8s"
 	// +kubebuilder:scaffold:imports
@@ -275,17 +274,6 @@ func main() {
 		Namespace: controllerNamespace,
 	}); err != nil {
 		setupLog.Error(err, "Failed to register REST API server")
-		os.Exit(1)
-	}
-
-	satGRPC := &satellitecontroller.Runnable{
-		Addr: satelliteGRPCAddr,
-		Server: satellitecontroller.New(st, satellitecontroller.Config{
-			ClusterID: clusterID,
-		}),
-	}
-	if err := mgr.Add(satGRPC); err != nil {
-		setupLog.Error(err, "Failed to register satellite gRPC server")
 		os.Exit(1)
 	}
 

@@ -17,52 +17,9 @@ limitations under the License.
 package satellite
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
-
-	"google.golang.org/grpc"
-
-	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 )
-
-// helloErrorClient is a minimal ControllerClient stub whose Hello
-// always fails. Used to exercise hello()'s error-wrap path.
-type helloErrorClient struct {
-	satellitepb.ControllerClient
-}
-
-func (helloErrorClient) Hello(_ context.Context, _ *satellitepb.HelloRequest, _ ...grpc.CallOption) (*satellitepb.HelloResponse, error) {
-	return nil, errHelloRPCDown
-}
-
-var errHelloRPCDown = errors.New("controller unreachable")
-
-// TestHostFromEndpoint pins the trailing-port stripper Hello uses to
-// derive the dial-back host from a SatelliteEndpoint prop. Same
-// LastIndex shape as the dispatcher's peerAddress (IPv6-aware).
-func TestHostFromEndpoint(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		in, want string
-	}{
-		{"", ""},
-		{"10.244.1.5:7000", "10.244.1.5"},
-		{"localhost:7001", "localhost"},
-		{"no-colon-here", "no-colon-here"}, // returned verbatim when no port
-		{"[fe80::1]:7000", "[fe80::1]"},    // IPv6 (LastIndex picks rightmost colon)
-		{":7000", ":7000"},                 // empty-host edge case → leniency, return as-is
-	}
-	for _, c := range cases {
-		got := hostFromEndpoint(c.in)
-		if got != c.want {
-			t.Errorf("hostFromEndpoint(%q): got %q, want %q", c.in, got, c.want)
-		}
-	}
-}
 
 // TestResolveAddr: whenever the controller-supplied address is empty
 // or the 0.0.0.0 placeholder, resolveAddr substitutes the satellite's
@@ -97,58 +54,6 @@ func TestResolveAddr(t *testing.T) {
 // TestHelloErrorWraps pins the error-wrap on the registration RPC:
 // when the controller's Hello returns an error (controller mid-
 // restart, network partition, TLS handshake failure), the satellite's
-// hello() must surface it with the operator-grep keyword "Hello RPC"
-// so the satellite log line "Hello RPC: <transport-detail>" is
-// locatable. superviseObserveLoop relies on this signal to retry
-// registration with backoff.
-func TestHelloErrorWraps(t *testing.T) {
-	t.Parallel()
-
-	a := NewAgent(Config{NodeName: "n1", DialTimeout: 100 * 0})
-
-	// DialTimeout 0 → context.WithTimeout becomes already-deadline,
-	// but our helloErrorClient ignores ctx and returns its synthetic
-	// error directly, so we still exercise the wrap path.
-	err := a.hello(context.Background(), helloErrorClient{})
-	if err == nil {
-		t.Fatalf("hello: got nil, want error")
-	}
-
-	if !strings.Contains(err.Error(), "Hello RPC") {
-		t.Errorf("error wrap: got %q, want substring \"Hello RPC\"", err.Error())
-	}
-}
-
-// TestDialReturnsConnForValidAddr pins the happy-path of dial:
-// grpc.NewClient with a syntactically-valid address must produce
-// a non-nil ClientConn (NewClient is non-blocking, so the actual
-// dial happens lazily on first RPC — we assert only that the
-// constructor doesn't surface an error).
-//
-// Pinned because the satellite's Run() invokes dial() once per
-// supervise iteration; a regression that always errored here
-// would make the satellite never connect.
-func TestDialReturnsConnForValidAddr(t *testing.T) {
-	t.Parallel()
-
-	a := NewAgent(Config{
-		NodeName:       "n1",
-		ControllerAddr: "127.0.0.1:7000",
-		DialTimeout:    100,
-	})
-
-	conn, err := a.dial(t.Context())
-	if err != nil {
-		t.Fatalf("dial: got %v, want nil", err)
-	}
-
-	if conn == nil {
-		t.Fatalf("dial: got nil conn")
-	}
-
-	_ = conn.Close()
-}
-
 // TestRunRequiresNodeName pins the early-validation branch of Run:
 // an Agent constructed without NodeName must fail-fast with an
 // explicit error, not crash later inside dial() with a confusing
@@ -169,38 +74,5 @@ func TestRunRequiresNodeName(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "NodeName") {
 		t.Errorf("error must name the missing field; got %q", err.Error())
-	}
-}
-
-// TestPickMechanism pins the provider-kind → ship-mechanism table
-// the snapshot-shipping dispatcher relies on. The bare "default"
-// branch (returning "") is the load-bearing fallback: an unknown
-// provider kind must NOT silently map to one of the known
-// mechanisms (e.g. defaulting to "zfs" on an LVM-classic pool
-// would issue `zfs send` against an LV and fail in a confusing
-// way). Explicit "" forces the caller to emit a clear
-// "unsupported-mechanism" error.
-func TestPickMechanism(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		kind string
-		want string
-	}{
-		{kindZFS, "zfs"},
-		{kindZFSThin, "zfs"},
-		{kindLVMThin, "thin"},
-		{apiv1.StoragePoolKindLVM, ""},      // classic LVM has no incremental ship — fall through
-		{apiv1.StoragePoolKindFile, ""},     // file backend no-op
-		{apiv1.StoragePoolKindDiskless, ""}, // diskless can't ship at all
-		{"", ""},                            // empty kind
-		{"GARBAGE", ""},                     // typo / unknown
-	}
-
-	for _, c := range cases {
-		got := pickMechanism(c.kind)
-		if got != c.want {
-			t.Errorf("pickMechanism(%q): got %q, want %q", c.kind, got, c.want)
-		}
 	}
 }

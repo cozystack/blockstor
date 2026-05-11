@@ -15,11 +15,10 @@ limitations under the License.
 */
 
 // Command satellite is the per-node agent that owns local DRBD/LVM/ZFS
-// state and reconciles it with what the blockstor-controller dictates.
-//
-// Phase 3 milestone (this file): boot the binary, register with the
-// controller via gRPC, log the hello round-trip. DRBD/LVM/ZFS work lands
-// in subsequent slices, each behind the same `apply / observe` contract.
+// state and reconciles it against the Resource / StoragePool /
+// Snapshot / PhysicalDevice CRDs via a controller-runtime manager.
+// Phase 10.6 retired the gRPC wire — every interaction with the
+// controller now flows through the apiserver.
 package main
 
 import (
@@ -31,7 +30,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"k8s.io/client-go/rest"
@@ -52,27 +50,14 @@ func main() {
 // as the os.Exit call.
 func run() int {
 	var (
-		controllerAddr string
-		nodeName       string
-		stateDir       string
-		listenAddr     string
-		advertised     string
+		nodeName string
+		stateDir string
 	)
 
-	flag.StringVar(&controllerAddr, "controller", "blockstor-controller:7000",
-		"gRPC address of the blockstor controller")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
 		"name this satellite registers under (defaults to NODE_NAME env)")
 	flag.StringVar(&stateDir, "state-dir", "/var/lib/blockstor-satellite",
 		"directory the satellite uses to persist DRBD .res files and per-resource state")
-	flag.StringVar(&listenAddr, "listen", ":7000",
-		"bind address for the satellite-side gRPC server (controller dials this for ApplyResources)")
-
-	// advertised-endpoint flag — actual default is computed AFTER
-	// flag.Parse() because it depends on --listen's port. Initial
-	// value here is just an empty string + a placeholder doc.
-	flag.StringVar(&advertised, "advertised-endpoint", "",
-		"host:port the controller should dial back at (defaults to $POD_IP:<listen-port>)")
 
 	flag.Parse()
 
@@ -85,70 +70,49 @@ func run() int {
 		return 1
 	}
 
-	// Compute the advertised endpoint default if --advertised-endpoint
-	// wasn't explicitly set. We pull the port from --listen so a
-	// non-default listen port (e.g. when DRBD's tcp-port-range starts
-	// at 7000 and gRPC has to move) doesn't require a second flag.
-	if advertised == "" {
-		host := os.Getenv("POD_IP")
-		port := portFromListen(listenAddr)
-
-		if host != "" && port != "" {
-			advertised = host + ":" + port
-		}
-	}
+	// LocalAddress = $POD_IP under the standard DaemonSet downward-API
+	// injection. Empty falls back to drbdadm's default routing, which
+	// is fine on a single-NIC host.
+	localAddress := os.Getenv("POD_IP")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Providers map starts empty — pools are registered by the
-	// satellite c-r `StoragePoolReconciler` as it observes
-	// StoragePool CRDs (Phase 10.5 retirement of the pool-flag
-	// bootstrap path). Until the c-r manager fires its first
-	// reconcile the gRPC `ApplyStoragePools` handler can still
-	// seed providers; once Phase 10.6 retires gRPC the CRD-driven
-	// path is the only one.
+	// Providers map starts empty — the c-r `StoragePoolReconciler`
+	// registers entries as it observes StoragePool CRDs (Phase 10.5
+	// retired the bootstrap-from-flags path; Phase 10.6 retired the
+	// gRPC `ApplyStoragePools` fallback).
 	providers := map[string]storage.Provider{}
 
 	// Wipe stale .res files from previous incarnations of this
 	// satellite process. Each pod restart should hand drbdadm a
-	// clean slate — the controller will re-Apply every Resource
-	// CRD on this node within seconds, so we don't lose state, just
-	// the cruft from prior runs (csi-sanity leftovers, RDs deleted
-	// while the satellite was down, malformed .res from earlier
-	// release versions, etc). Without this drbdadm fails on parse
-	// errors from any one stale file even when the new RD's render
-	// is clean.
+	// clean slate — the c-r reconciler will re-render every
+	// Resource CRD on this node shortly after startup.
 	cleanStateDir(stateDir, logger)
 
-	restCfg, mgrFactory := buildControllerRuntime(logger)
+	restCfg, mgrFactory, err := buildControllerRuntime()
+	if err != nil {
+		logger.Error("no Kubernetes config", "err", err)
+
+		return 1
+	}
 
 	agent := satellite.NewAgent(satellite.Config{
-		NodeName:           nodeName,
-		ControllerAddr:     controllerAddr,
-		ListenAddr:         listenAddr,
-		AdvertisedEndpoint: advertised,
-		StateDir:           stateDir,
-		Providers:          providers,
-		DialTimeout:        10 * time.Second,
-		Logger:             logger,
-		RESTConfig:         restCfg,
-		ManagerFactory:     mgrFactory,
+		NodeName:       nodeName,
+		StateDir:       stateDir,
+		Providers:      providers,
+		LocalAddress:   localAddress,
+		Logger:         logger,
+		RESTConfig:     restCfg,
+		ManagerFactory: mgrFactory,
 	})
-
-	providerNames := make([]string, 0, len(providers))
-	for name := range providers {
-		providerNames = append(providerNames, name)
-	}
 
 	logger.Info("blockstor-satellite starting",
 		"node_name", nodeName,
-		"controller", controllerAddr,
 		"state_dir", stateDir,
-		"listen", listenAddr,
-		"providers", providerNames)
+		"local_address", localAddress)
 
-	err := agent.Run(ctx)
+	err = agent.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Error("satellite exited", "err", err)
 
@@ -158,20 +122,15 @@ func run() int {
 	return 0
 }
 
-// buildControllerRuntime returns (restCfg, factory) when an
-// in-cluster Kubernetes config is reachable — the production
-// path under the DaemonSet. When the config can't be loaded
-// (off-cluster `go run`, unit tests with no kubeconfig), both
-// return values are nil and the agent falls back to the gRPC-
-// only path. Phase 10.1: the c-r manager runs alongside gRPC
-// so CRD events drive the same apply chain.
-func buildControllerRuntime(logger *slog.Logger) (*rest.Config, satellite.ManagerFactory) {
+// buildControllerRuntime returns the in-cluster Kubernetes config
+// + a manager factory the agent uses to spin up the c-r manager.
+// Phase 10.6 made the c-r path mandatory; failing to load the
+// config now aborts startup rather than silently falling back to
+// the (removed) gRPC path.
+func buildControllerRuntime() (*rest.Config, satellite.ManagerFactory, error) {
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
-		logger.Info("no Kubernetes config; skipping controller-runtime manager",
-			"reason", err)
-
-		return nil, nil
+		return nil, nil, errors.Wrap(err, "load Kubernetes config")
 	}
 
 	factory := func(restCfg *rest.Config, nodeName string, rec *satellite.Reconciler) (manager.Manager, error) {
@@ -182,27 +141,15 @@ func buildControllerRuntime(logger *slog.Logger) (*rest.Config, satellite.Manage
 		})
 	}
 
-	return cfg, factory
-}
-
-// portFromListen extracts the port number from a Go-style listen
-// address ("host:port", ":port"). Returns empty when the address
-// doesn't include a port — caller falls back to whatever default
-// they chose. Doesn't validate the host part.
-func portFromListen(addr string) string {
-	idx := strings.LastIndex(addr, ":")
-	if idx < 0 {
-		return ""
-	}
-
-	return addr[idx+1:]
+	return cfg, factory, nil
 }
 
 // cleanStateDir wipes every *.res file in dir on satellite startup.
-// The controller re-Applies every Resource CRD on this node shortly
-// after Hello, so the contents are reproducible — we don't persist
-// satellite-side state across restarts. Best-effort: log and continue
-// on errors so a single missing dir doesn't stall the whole startup.
+// The c-r reconciler re-renders every Resource CRD on this node
+// shortly after startup, so the contents are reproducible — we
+// don't persist satellite-side state across restarts. Best-effort:
+// log and continue on errors so a single missing dir doesn't stall
+// the whole startup.
 func cleanStateDir(dir string, logger *slog.Logger) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

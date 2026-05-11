@@ -109,5 +109,14 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
 	}
 
+	err = mgr.Add(&ObserverRunnable{
+		Client:   mgr.GetClient(),
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "add ObserverRunnable")
+	}
+
 	return mgr, nil
 }
