@@ -60,8 +60,40 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 // CreateMD initialises on-disk metadata for the resource. We always use
 // --force: a freshly-allocated LV may carry leftover signature bytes
 // from its previous tenant, and DRBD bails without --force.
+//
+// DANGER: `--force` overwrites whatever metadata is on the underlying
+// disk. Callers MUST guarantee no valid DRBD metadata is already there
+// — `--force` will happily wipe a healthy replica's GI/bitmap state,
+// dropping the node's claim on its replicated data. The satellite's
+// `runFirstActivation` gates the call behind a `HasMD` pre-check so
+// this stays safe across satellite restarts / failed first attempts.
 func (a *Adm) CreateMD(ctx context.Context, resource string) error {
 	return a.run(ctx, "create-md", "--force", resource)
+}
+
+// HasMD reports whether DRBD-9 metadata already exists for the
+// resource. `drbdadm dump-md <res>` exits 0 + prints a multi-line
+// dump when there's a parseable metadata block on the lower disk;
+// exit non-zero (with a "No valid meta data found" message) when
+// there isn't. Used as the safety guard before re-running CreateMD:
+// if metadata exists, the satellite must keep it (recreating with
+// --force destroys the local generation identifier + dirty bitmap).
+//
+// Requires BOTH zero exit AND non-empty stdout to count as "present"
+// — real drbdadm never returns success with no output, but a faked
+// exec in unit tests can, and we'd rather err on the side of
+// "missing → safe to create-md".
+func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
+	out, err := a.exec.Run(ctx, "drbdadm", "dump-md", resource)
+	if err != nil {
+		// `No valid meta data found` / drbdmeta "missing image" / etc.
+		// all bubble up as non-zero exit. Treat as "not yet
+		// initialised" — the caller's create-md will either succeed
+		// (truly missing) or surface a more specific failure.
+		return false, nil //nolint:nilerr // non-zero exit is the "metadata absent" signal, not a bubble-up error
+	}
+
+	return len(out) > 0, nil
 }
 
 // Primary flips the resource to Primary role so it can be opened

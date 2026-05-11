@@ -617,10 +617,28 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 // controller has stamped a peer's UpToDate GI on the volume.
 // Pulled out of applyDRBD so the orchestration function stays
 // under the cyclomatic budget.
+//
+// SAFETY: `drbdadm create-md --force` wipes any existing metadata —
+// running it on a healthy replica would drop the local
+// generation-id / dirty-bitmap and effectively orphan the data
+// from the cluster. Before calling create-md we ask DRBD whether
+// metadata already exists (`drbdadm dump-md`). If it does, we
+// adopt it: skip create-md, write the marker so subsequent
+// reconciles see firstActivation=false, and continue to GI-seed
+// (which is itself a no-op when SeedFromGi is empty). This makes
+// the marker-file gate safe against accidental deletion / bare
+// satellite restarts that lose the marker.
 func (r *Reconciler) runFirstActivation(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string, mdMarkerPath string) error {
-	err := r.cfg.Adm.CreateMD(ctx, dr.GetName())
+	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
 	if err != nil {
-		return errors.Wrapf(err, "create-md %s", dr.GetName())
+		return errors.Wrapf(err, "dump-md %s", dr.GetName())
+	}
+
+	if !hasMD {
+		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "create-md %s", dr.GetName())
+		}
 	}
 
 	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
@@ -628,6 +646,9 @@ func (r *Reconciler) runFirstActivation(ctx context.Context, dr *satellitepb.Des
 		return errors.Wrapf(err, "write %s", mdMarkerPath)
 	}
 
+	// GI-seed is a no-op when the controller hasn't stamped a peer's
+	// CurrentGi on the volume (fresh-cluster case) and is idempotent
+	// when it has; safe to run even when we adopted existing metadata.
 	err = r.seedInitialGi(ctx, dr, devices)
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
