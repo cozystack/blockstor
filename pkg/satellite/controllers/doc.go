@@ -40,7 +40,7 @@ limitations under the License.
 // `NewManager` builds the controller-runtime manager and
 // registers all four reconcilers. Once Phase 10.1 lands, the
 // satellite's `agent.Run` becomes "build manager, register
-// reconcilers, start manager" — mirroring `cmd/main.go` on
+// reconcilers, start manager" — mirroring `cmd/controller/main.go` on
 // the controller side. Until then the gRPC server keeps
 // running; this package's reconcilers are scaffolded but not
 // yet wired into the agent.

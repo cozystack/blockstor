@@ -32,8 +32,8 @@ import (
 // blockstor CRDs + the core Kubernetes types (Secrets for
 // passphrases / shared-secret references the satellite reads
 // directly). Package-level state matches controller-runtime's
-// own convention (`cmd/main.go` does the same on the
-// controller side).
+// own convention (`cmd/controller/main.go` does the same on
+// the controller side).
 //
 //nolint:gochecknoglobals // package-init scheme registry, controller-runtime convention
 var scheme = runtime.NewScheme()

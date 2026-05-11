@@ -171,7 +171,7 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 
 // setStoragePoolOwnership wires a PhysicalDevice CRD as an
 // OwnerReference child of its target StoragePool. The
-// `client.Client` field on `Server` is populated by `cmd/main.go`
+// `client.Client` field on `Server` is populated by `cmd/controller/main.go`
 // in production but stays nil in pure-store tests — both this
 // helper and the caller handle the nil case as no-op. Looked up
 // across the cluster-scoped pool list since we don't yet plumb

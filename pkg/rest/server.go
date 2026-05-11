@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package rest exposes the LINSTOR REST API contract on top of the
-// controller-runtime manager. It is wired in cmd/main.go via mgr.Add so the
+// controller-runtime manager. It is wired in cmd/controller/main.go via mgr.Add so the
 // HTTP server's lifecycle follows the manager's.
 package rest
 

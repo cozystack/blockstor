@@ -2,7 +2,7 @@
 
 This document captures load-bearing invariants the codebase relies
 on. It is NOT a tour of the code — for that, follow the call graph
-from `cmd/main.go` (controller) and `cmd/satellite/main.go`
+from `cmd/controller/main.go` and `cmd/satellite/main.go`
 (satellite). The pieces below are the rules whose violation would
 quietly corrupt cluster state.
 

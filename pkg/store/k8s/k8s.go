@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package k8s provides a CRD-backed implementation of pkg/store.Store.
 //
-// Phase 2 swaps the InMemory store for this one in cmd/main.go (default).
+// Phase 2 swaps the InMemory store for this one in cmd/controller/main.go (default).
 // Both implementations satisfy the same interface and are exercised by the
 // same test suite, so behavioural drift is caught immediately.
 package k8s

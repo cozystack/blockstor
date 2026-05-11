@@ -202,8 +202,9 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/rest/
-      # cmd/main.go is the kubebuilder manager scaffold — don't lint its
-      # boilerplate (TODOs, function length, globals, inline err checks, wsl).
+      # cmd/{controller,satellite}/main.go is kubebuilder manager scaffold —
+      # don't lint its boilerplate (TODOs, function length, globals, inline
+      # err checks, wsl).
       - linters:
           - funlen
           - gochecknoglobals
@@ -214,7 +215,7 @@ linters:
           - cyclop
           - gocyclo
           - maintidx
-        path: cmd/(main|satellite/main)\.go
+        path: cmd/(controller|satellite)/main\.go
       # api/v1alpha1 and internal/controller are kubebuilder scaffold; the
       # boilerplate (dot-imports for ginkgo/gomega, generated DeepCopy globals,
       # ginkgo BeforeSuite TODOs, wrapcheck on framework returns) is not
