@@ -247,6 +247,21 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	created, ok := s.createResources(w, r, rdName, envelopes)
+	if !ok {
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// createResources walks the envelopes from a POST to
+// /v1/resource-definitions/{rd}/resources and either creates each
+// Resource fresh or promotes an existing diskless/tiebreaker replica
+// to diskful (upstream LINSTOR semantics). Returns (created, true) on
+// success; writes the HTTP error and returns (nil, false) on the
+// first failure.
+func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName string, envelopes []apiv1.ResourceCreate) ([]apiv1.Resource, bool) {
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -257,7 +272,7 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		if res.NodeName == "" {
 			writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
 
-			return
+			return nil, false
 		}
 
 		// Same CSI pass-through as handleAutoplace: linstor-csi may set
@@ -272,17 +287,97 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		err = s.Store.Resources().Create(r.Context(), &res)
-		if err != nil {
-			writeStoreError(w, err)
-
-			return
+		out, ok := s.createOrPromoteResource(w, r, &res)
+		if !ok {
+			return nil, false
 		}
 
-		created = append(created, res)
+		created = append(created, *out)
 	}
 
-	writeJSON(w, http.StatusCreated, created)
+	return created, true
+}
+
+// createOrPromoteResource creates res or promotes an existing
+// diskless replica in place. Writes the HTTP error and returns
+// (nil, false) on failure.
+func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) (*apiv1.Resource, bool) {
+	err := s.Store.Resources().Create(r.Context(), res)
+	if err == nil {
+		return res, true
+	}
+
+	// Upstream LINSTOR semantics: `resource create <node> <rd>
+	// --storage-pool <pool>` on top of an existing DISKLESS or
+	// TIE_BREAKER replica converts it to diskful (effectively an
+	// implicit toggle-disk-to-diskful). Mirror that here when
+	// the only thing in the way is the diskless/tiebreaker flag.
+	if errors.Is(err, store.ErrAlreadyExists) && res.Props["StorPoolName"] != "" {
+		promoted, promErr := s.promoteDisklessReplica(r.Context(), res)
+		if promErr != nil {
+			writeStoreError(w, promErr)
+
+			return nil, false
+		}
+
+		return promoted, true
+	}
+
+	writeStoreError(w, err)
+
+	return nil, false
+}
+
+// promoteDisklessReplica takes a Resource the caller just tried to
+// create-as-diskful, looks up the existing one on the same (node, RD),
+// and if it's a DISKLESS / TIE_BREAKER replica converts it to diskful
+// by dropping those flags and stamping the new StorPoolName onto
+// Spec.Props. The satellite reconciler picks the Resource change up
+// via its watch and runs the normal storage-attach chain.
+//
+// Returns the updated Resource on success, or wraps ErrAlreadyExists
+// when the existing replica is NOT a diskless witness (i.e. a real
+// conflict the caller should surface as 409).
+func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resource) (*apiv1.Resource, error) {
+	existing, err := s.Store.Resources().Get(ctx, target.Name, target.NodeName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "lookup existing replica %s.%s", target.Name, target.NodeName)
+	}
+
+	wasDiskless := false
+
+	keep := existing.Flags[:0]
+
+	for _, flag := range existing.Flags {
+		if flag == apiv1.ResourceFlagDiskless || flag == apiv1.ResourceFlagTieBreaker {
+			wasDiskless = true
+
+			continue
+		}
+
+		keep = append(keep, flag)
+	}
+
+	if !wasDiskless {
+		// Existing replica is a real diskful one — true conflict.
+		return nil, errors.Wrapf(store.ErrAlreadyExists,
+			"resource %q on node %q already diskful", target.Name, target.NodeName)
+	}
+
+	existing.Flags = keep
+
+	if existing.Props == nil {
+		existing.Props = map[string]string{}
+	}
+
+	existing.Props["StorPoolName"] = target.Props["StorPoolName"]
+
+	err = s.Store.Resources().Update(ctx, &existing)
+	if err != nil {
+		return nil, errors.Wrapf(err, "promote diskless %s.%s", target.Name, target.NodeName)
+	}
+
+	return &existing, nil
 }
 
 // decodeResourceCreateBody accepts either the upstream-LINSTOR
