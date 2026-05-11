@@ -26,14 +26,12 @@ package satellite
 import (
 	"context"
 	"log/slog"
-	"net"
 	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/reflection"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -117,10 +115,12 @@ func NewAgent(cfg Config) *Agent {
 	return &Agent{cfg: cfg, logger: logger}
 }
 
-// Run is the agent's main loop. It dials the controller, performs the
-// hello handshake to register the node, starts the satellite-side
-// gRPC server (so the controller can push desired state), then waits
-// for ctx to cancel.
+// Run is the agent's main loop. It dials the controller for the
+// observe-stream channel (Resource.Status is pushed via gRPC
+// ReportObserved until Phase 10 finishes the satellite-side
+// direct-SSA migration), then starts the controller-runtime
+// manager so CRD events drive the apply chain. Returns when
+// ctx cancels.
 func (a *Agent) Run(ctx context.Context) error {
 	if a.cfg.NodeName == "" {
 		return errors.New("NodeName is required")
@@ -129,8 +129,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.logger.Info("agent starting",
 		"node", a.cfg.NodeName,
 		"blockstor_version", version.Version,
-		"controller", a.cfg.ControllerAddr,
-		"listen", a.cfg.ListenAddr)
+		"controller", a.cfg.ControllerAddr)
 
 	conn, err := a.dial(ctx)
 	if err != nil {
@@ -146,27 +145,14 @@ func (a *Agent) Run(ctx context.Context) error {
 		return errors.Wrap(err, "hello")
 	}
 
-	// Build the reconciler once so the gRPC server and (optionally)
-	// the controller-runtime manager share a single apply chain
-	// targeting the same storage / DRBD / LUKS state.
+	// Build the reconciler once so the c-r manager and the gRPC
+	// observe/capacity loops share the same apply chain.
 	rec := a.newReconciler()
 
-	// Bring up the satellite-side gRPC server so the controller can push
-	// ApplyResources / snapshot RPCs at us. The Reconciler is wired with
-	// the configured providers + drbdadm wrapper + state dir.
-	srv, stop, err := a.startGRPCServer(ctx, rec)
-	if err != nil {
-		return errors.Wrap(err, "start gRPC server")
-	}
-	defer stop()
-
-	a.logger.Info("satellite gRPC ready", "addr", srv)
-
 	// When RESTConfig + ManagerFactory are both set, the satellite
-	// also runs a controller-runtime manager so CRD events drive
-	// the same reconciler. The manager exits when ctx cancels;
-	// errors are logged but don't stop the gRPC path — Phase 10.1
-	// keeps both paths alive during the cutover.
+	// runs a controller-runtime manager that drives the apply chain
+	// from CRD events. Phase 10.6 retired the controller-side gRPC
+	// dispatcher; the c-r path is now the only inbound channel.
 	if a.cfg.RESTConfig != nil && a.cfg.ManagerFactory != nil {
 		err := a.startControllerRuntime(ctx, rec)
 		if err != nil {
@@ -179,10 +165,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// Tail drbdsetup events2 + ship observed state back to the
 	// controller via ReportObserved. The supervisor restarts the
 	// stream on any error and re-runs Hello first so the controller's
-	// satellite registry sees us again after a controller restart —
-	// otherwise the in-memory dispatcher map stays empty and every
-	// ApplyResources / DeleteResource RPC fails with
-	// "no SatelliteEndpoint for node X".
+	// satellite registry sees us again after a controller restart.
 	go a.superviseObserveLoop(ctx, client)
 
 	// Periodically push pool capacity so /v1/view/storage-pools shows
@@ -196,11 +179,6 @@ func (a *Agent) Run(ctx context.Context) error {
 	return ctx.Err() //nolint:wrapcheck // bubbling ctx.Err() unwrapped is the convention
 }
 
-// grpcServerDisabled is the placeholder address the agent reports
-// when no ListenAddr is set — keeps the call site happy without
-// surfacing an empty string into operator logs.
-const grpcServerDisabled = "<disabled>"
-
 // newReconciler builds the satellite's apply-chain Reconciler.
 // Pulled out so the gRPC server and the controller-runtime
 // manager (when RESTConfig is set) share one instance.
@@ -213,44 +191,6 @@ func (a *Agent) newReconciler() *Reconciler {
 		NodeName:     a.cfg.NodeName,
 		LocalAddress: hostFromEndpoint(a.cfg.AdvertisedEndpoint),
 	})
-}
-
-// startGRPCServer binds the satellite's `service Satellite` listener.
-// Empty cfg.ListenAddr disables the server (returns a no-op stop) so
-// unit tests that only exercise Hello don't need a free port.
-func (a *Agent) startGRPCServer(ctx context.Context, rec *Reconciler) (string, func(), error) {
-	if a.cfg.ListenAddr == "" {
-		return grpcServerDisabled, func() {}, nil
-	}
-
-	listenCfg := &net.ListenConfig{}
-
-	listener, err := listenCfg.Listen(ctx, "tcp", a.cfg.ListenAddr)
-	if err != nil {
-		return "", nil, errors.Wrapf(err, "listen %s", a.cfg.ListenAddr)
-	}
-
-	gs := grpc.NewServer()
-	satellitepb.RegisterSatelliteServer(gs, NewGRPCServer(rec, storage.RealExec{}))
-	reflection.Register(gs)
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		err := gs.Serve(listener)
-		if err != nil {
-			a.logger.Error("gRPC Serve returned", "err", err)
-		}
-	}()
-
-	stop := func() {
-		gs.GracefulStop()
-		<-done
-	}
-
-	return listener.Addr().String(), stop, nil
 }
 
 // startControllerRuntime launches a controller-runtime manager

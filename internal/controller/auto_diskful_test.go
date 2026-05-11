@@ -18,7 +18,6 @@ package controller_test
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"testing"
 
@@ -30,21 +29,8 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/dispatcher"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
 	"github.com/cozystack/blockstor/pkg/store"
 )
-
-// noopDialer always fails the dial. The Reconcile path's
-// dispatchApply step then returns RequeueAfter without crashing —
-// fine for tests that only assert the pre-dispatch CRD mutations.
-type noopDialer struct{}
-
-func (noopDialer) Dial(_ context.Context, _ string) (satellitepb.SatelliteClient, func() error, error) {
-	return nil, nil, errNoopDial
-}
-
-var errNoopDial = errors.New("auto_diskful_test: noop dialer")
 
 // TestAutoDisklessPromoted: a DISKLESS replica that becomes InUse on
 // a node with a viable storage pool gets promoted to diskful — the
@@ -83,10 +69,9 @@ func TestAutoDisklessPromoted(t *testing.T) {
 		Build()
 
 	rec := &controllerpkg.ResourceReconciler{
-		Client:     cli,
-		Scheme:     scheme,
-		Dispatcher: dispatcher.New(noopDialer{}),
-		Store:      st,
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
 	}
 
 	// Reconcile drives several converging passes (DRBD-id allocation
@@ -149,10 +134,9 @@ func TestAutoDisklessSkipsTiebreaker(t *testing.T) {
 		Build()
 
 	rec := &controllerpkg.ResourceReconciler{
-		Client:     cli,
-		Scheme:     scheme,
-		Dispatcher: dispatcher.New(noopDialer{}),
-		Store:      st,
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
 	}
 
 	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-tb.n1"}})
@@ -198,10 +182,9 @@ func TestAutoDisklessSkipsWhenNoPool(t *testing.T) {
 		Build()
 
 	rec := &controllerpkg.ResourceReconciler{
-		Client:     cli,
-		Scheme:     scheme,
-		Dispatcher: dispatcher.New(noopDialer{}),
-		Store:      st,
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
 	}
 
 	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "pvc-nopool.n1"}})

@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"slices"
-	"time"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,31 +26,33 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// resourceFinalizer guards on-disk + DRBD-side teardown when the
-// Resource CRD is deleted. Without it the satellite would never see
-// the delete, leaving an orphan .res file + LV / loopfile.
+// resourceFinalizer is the legacy controller-side finalizer the
+// reconciler used to manage. Phase 10.6 retires it — the
+// satellite's own `blockstor.io.blockstor.io/satellite-resource`
+// finalizer now owns teardown end-to-end. The constant + cleanup
+// code stay so the controller strips the legacy finalizer off
+// any Resource that still carries it (rolling upgrade case);
+// the controller no longer stamps it on new Resources.
 const resourceFinalizer = "blockstor.io.blockstor.io/resource"
 
-// ResourceReconciler dispatches Resource CRD changes to the right
-// satellite via the Dispatcher. It collects same-RD peers and the
-// full Node list (for endpoint resolution) on every reconcile —
-// fine for the stand smoke; once Resource counts grow we'll switch
-// to a cached lister or label-selector watch.
+// ResourceReconciler runs controller-side housekeeping on every
+// Resource: DRBD-ID allocation (port/minor), seed-from-Gi for
+// the initial-sync-skip pipeline, and auto-diskful promotion of
+// actively-used DISKLESS replicas. Phase 10.6 removed the
+// gRPC-dispatch path — the satellite picks the Resource up via
+// its c-r watch and runs the apply chain locally.
 type ResourceReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	Dispatcher *dispatcher.Dispatcher
+	Scheme *runtime.Scheme
 
 	// Store is the shared blockstor store. Used by the auto-diskful
 	// promotion path to look up storage pools per node without
@@ -69,13 +70,6 @@ type ResourceReconciler struct {
 // to the satellite that hosts it. Per-replica errors land in the
 // log; transport faults trigger a 10s requeue.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	if r.Dispatcher == nil {
-		// envtest scaffolding (suite_test.go) constructs the reconciler
-		// without a Dispatcher — keep the original no-op behaviour for
-		// it so the boilerplate test stays green.
-		return ctrl.Result{}, nil
-	}
-
 	var target blockstoriov1alpha1.Resource
 
 	err := r.Get(ctx, req.NamespacedName, &target)
@@ -87,16 +81,19 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Deletion path: tell the satellite to drop the resource, then
-	// remove the finalizer so kube-apiserver finishes the delete.
+	// Deletion path: strip the legacy controller-side finalizer if
+	// it's still around so the apiserver can finalise. Satellite
+	// teardown runs under its own
+	// `blockstor.io.blockstor.io/satellite-resource` finalizer.
 	if !target.DeletionTimestamp.IsZero() {
-		return r.runDelete(ctx, &target)
+		return r.stripLegacyFinalizer(ctx, &target)
 	}
 
-	// Ensure finalizer is present on every live Resource so the
-	// delete path above can run.
-	if !slices.Contains(target.Finalizers, resourceFinalizer) {
-		target.Finalizers = append(target.Finalizers, resourceFinalizer)
+	// Drop a stale controller-side finalizer on a live Resource —
+	// rolling-upgrade carry-over from the pre-Phase-10.6 code.
+	if slices.Contains(target.Finalizers, resourceFinalizer) {
+		target.Finalizers = slices.DeleteFunc(target.Finalizers,
+			func(s string) bool { return s == resourceFinalizer })
 
 		err = r.Update(ctx, &target)
 		if err != nil {
@@ -106,12 +103,19 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Skip housekeeping for malformed Resources — without a
+	// parent RD reference the seed-from-Gi / DRBD-ID allocation
+	// have nothing to anchor against. The scaffolded envtest
+	// suite exercises this path.
+	if target.Spec.ResourceDefinitionName == "" {
+		return ctrl.Result{}, nil
+	}
+
 	return r.runApply(ctx, &target)
 }
 
 // runApply is the apply branch of Reconcile. Pulled out to keep
-// Reconcile under the funlen budget — the body deals with the
-// finalizer dance, this with the actual gRPC dispatch.
+// Reconcile under the funlen budget.
 func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
 	var resList blockstoriov1alpha1.ResourceList
 
@@ -187,7 +191,14 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	return r.dispatchApply(ctx, target, peers, nodeList.Items, rdPtr)
+	// Housekeeping done. The satellite's c-r reconciler watches
+	// Resource and runs Apply locally — the controller no longer
+	// dispatches via gRPC (Phase 10.6).
+	_ = peers
+	_ = nodeList
+	_ = rdPtr
+
+	return ctrl.Result{}, nil
 }
 
 // maybeAutoDiskful flips a DISKLESS-but-actively-used replica to
@@ -268,84 +279,21 @@ func (r *ResourceReconciler) firstAvailablePool(ctx context.Context, nodeName st
 	return "", nil
 }
 
-// dispatchApply resolves DRBD options and pushes the desired state to
-// the satellite. Pulled out of runApply so the latter stays under the
-// funlen budget — the resolver step grew non-trivial with the option
-// hierarchy.
-func (r *ResourceReconciler) dispatchApply(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rdPtr *blockstoriov1alpha1.ResourceDefinition) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	effective, err := r.resolveEffectiveProps(ctx, target, rdPtr)
-	if err != nil {
-		log.Error(err, "resolve effective props", "resource", target.Name)
-
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	stack := r.resolveLayerStack(ctx, rdPtr)
-
-	result, err := r.Dispatcher.Apply(ctx, target, peers, nodes, rdPtr,
-		dispatcher.ApplyOptions{
-			EffectiveProps: effective,
-			LayerStack:     stack,
-		})
-	if err != nil {
-		log.Error(err, "Apply RPC failed", "resource", target.Name, "node", target.Spec.NodeName)
-
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	if !result.GetOk() {
-		log.Info("satellite rejected apply", "msg", result.GetMessage(),
-			"resource", target.Name, "node", target.Spec.NodeName)
-	} else {
-		log.Info("satellite accepted apply",
-			"resource", target.Name, "node", target.Spec.NodeName)
-	}
-
-	return ctrl.Result{}, nil
-}
-
-// runDelete is the finalizer-driven teardown. We dial the satellite
-// to drop the resource (drbdadm down → DeleteVolume → rm .res), then
-// strip the finalizer so kube-apiserver completes the delete.
-// Failures requeue with a 10 s back-off so the resource isn't stuck
-// half-gone if a satellite is briefly unreachable.
-func (r *ResourceReconciler) runDelete(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
+// stripLegacyFinalizer removes the pre-Phase-10.6 controller-
+// side finalizer when a Resource is being deleted. The
+// satellite's own `blockstor.io.blockstor.io/satellite-resource`
+// finalizer owns the teardown chain end-to-end now; this hook
+// only exists to clean up Resources that still carry the old
+// finalizer after a rolling upgrade.
+func (r *ResourceReconciler) stripLegacyFinalizer(ctx context.Context, target *blockstoriov1alpha1.Resource) (ctrl.Result, error) {
 	if !slices.Contains(target.Finalizers, resourceFinalizer) {
 		return ctrl.Result{}, nil
-	}
-
-	rdPtr, _ := r.lookupRD(ctx, target.Spec.ResourceDefinitionName)
-
-	var nodeList blockstoriov1alpha1.NodeList
-
-	err := r.List(ctx, &nodeList)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	resp, err := r.Dispatcher.DeleteResource(ctx, target, rdPtr, nodeList.Items)
-	if err != nil {
-		log.Error(err, "DeleteResource RPC failed",
-			"resource", target.Name, "node", target.Spec.NodeName)
-
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	if !resp.GetOk() {
-		log.Info("satellite rejected delete", "msg", resp.GetMessage(),
-			"resource", target.Name, "node", target.Spec.NodeName)
-
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	target.Finalizers = slices.DeleteFunc(target.Finalizers,
 		func(s string) bool { return s == resourceFinalizer })
 
-	err = r.Update(ctx, target)
+	err := r.Update(ctx, target)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

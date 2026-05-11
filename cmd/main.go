@@ -37,7 +37,6 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
-	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/satellitecontroller"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -244,18 +243,16 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ResourceReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Dispatcher: dispatcher.New(dispatcher.NewDialer()),
-		Store:      st,
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Store:  st,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "resource")
 		os.Exit(1)
 	}
 	if err := (&controller.SnapshotReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Dispatcher: dispatcher.New(dispatcher.NewDialer()),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "snapshot")
 		os.Exit(1)

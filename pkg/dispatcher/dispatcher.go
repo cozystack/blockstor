@@ -14,23 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package dispatcher is the controller-side glue that turns Resource
-// CRDs into satellite-side ApplyResources calls. The kubebuilder
-// reconciler delegates here so the wire format and the gRPC dial /
-// retry logic live in one testable place.
+// Package dispatcher hosts the CRD → DesiredResource translation
+// the satellite c-r reconciler runs every time it observes a
+// Resource event. Phase 10.6 retired the controller-side gRPC
+// dispatch path; what remains is the pure-function `BuildDesired`
+// + its helpers, kept in this package so the original RD → peer
+// → DRBD-options walk has one home rather than being inlined
+// across reconcilers.
 package dispatcher
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"slices"
 	"strconv"
 	"strings"
-
-	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -42,127 +40,6 @@ import (
 // dispatch time. The satellite rewrites it to its actual pod IP when
 // it renders the file (drbd doesn't accept literal 0.0.0.0).
 const drbdAddrAny = "0.0.0.0"
-
-// Dialer abstracts how we open a gRPC connection. Production wires
-// the actual `grpc.NewClient`; tests inject a stub that returns a
-// canned client.
-type Dialer interface {
-	Dial(ctx context.Context, endpoint string) (satellitepb.SatelliteClient, func() error, error)
-}
-
-// realDialer wraps grpc.NewClient with our standard insecure (cluster-
-// internal) transport.
-type realDialer struct{}
-
-// NewDialer returns a production Dialer. We export it so the
-// reconciler in main.go can wire it without leaking grpc imports
-// across packages.
-func NewDialer() Dialer {
-	return realDialer{}
-}
-
-// Dial opens a connection to endpoint and returns the satellite
-// client, a close func, or an error.
-func (realDialer) Dial(_ context.Context, endpoint string) (satellitepb.SatelliteClient, func() error, error) {
-	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, errors.Wrapf(err, "dial %s", endpoint)
-	}
-
-	return satellitepb.NewSatelliteClient(conn), conn.Close, nil
-}
-
-// Dispatcher pushes a Resource's desired state to the satellite that
-// hosts it.
-type Dispatcher struct {
-	dialer Dialer
-}
-
-// New constructs a Dispatcher with the given Dialer.
-func New(dialer Dialer) *Dispatcher {
-	return &Dispatcher{dialer: dialer}
-}
-
-// ApplyOptions carries everything Apply needs beyond the target's own
-// spec. Kept as a struct so future fields (encryption, drbd-reactor
-// hints) can land without breaking the call sites.
-type ApplyOptions struct {
-	// EffectiveProps is the resolved DRBD-options bag after walking
-	// controller → RG → RD → Resource (see drbd.ResolveOptions).
-	// nil means "use target.Spec.Props verbatim" — what the dispatch
-	// did before the hierarchy resolver landed.
-	EffectiveProps map[string]string
-
-	// LayerStack is the resolved layer composition (RD → RG → default).
-	// Empty falls back to RD.Spec.LayerStack inside BuildDesired so
-	// older call sites that don't compute the stack keep their
-	// behaviour. The satellite skips DRBD when the stack omits it.
-	LayerStack []string
-}
-
-// Apply builds the DesiredResource for this Resource (looking up its
-// peers from the full RD-wide list and its volumes from the parent
-// RD) and sends it to the target satellite. Returns the per-resource
-// result the satellite reported.
-//
-// nodes is the full Node CRD list — Apply uses it to resolve each
-// peer's SatelliteEndpoint property. rd may be nil; when present the
-// RD's VolumeDefinitions become DesiredVolumes for non-DISKLESS
-// replicas (DISKLESS replicas ignore them).
-func (d *Dispatcher) Apply(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, opts ApplyOptions) (*satellitepb.ResourceApplyResult, error) {
-	endpoint := lookupEndpoint(target.Spec.NodeName, nodes)
-	if endpoint == "" {
-		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
-	}
-
-	desired := BuildDesired(target, peers, nodes, rd, opts.EffectiveProps)
-	if len(opts.LayerStack) > 0 {
-		desired.LayerStack = opts.LayerStack
-	}
-
-	client, closer, err := d.dialer.Dial(ctx, endpoint)
-	if err != nil {
-		return nil, errors.Wrapf(err, "dial %s", endpoint)
-	}
-
-	defer func() { _ = closer() }()
-
-	resp, err := client.ApplyResources(ctx, &satellitepb.ApplyResourcesRequest{
-		Resources: []*satellitepb.DesiredResource{desired},
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "ApplyResources RPC")
-	}
-
-	if len(resp.GetResults()) == 0 {
-		return nil, errors.New("empty ApplyResources response")
-	}
-
-	return resp.GetResults()[0], nil
-}
-
-// lookupEndpoint reads SatelliteEndpoint from the matching Node CRD.
-// Phase 10.3: typed `Spec.SatelliteEndpoint` wins; falls back to the
-// legacy `Spec.Props["SatelliteEndpoint"]` so a partially-migrated
-// cluster (or a satellite that still pushes the prop in its Hello
-// handshake) keeps working unchanged. Match by the original LINSTOR
-// name (annotation when slugified, else metadata.Name) so
-// non-RFC1123 LINSTOR names still resolve back to the right CRD.
-func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
-	for i := range nodes {
-		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
-			continue
-		}
-
-		if ep := nodes[i].Spec.SatelliteEndpoint; ep != "" {
-			return ep
-		}
-
-		return nodes[i].Spec.Props["SatelliteEndpoint"]
-	}
-
-	return ""
-}
 
 // BuildDesired translates a Resource + its same-RD peers into the
 // satellite-facing DesiredResource. Port/minor/node-id assignment is
@@ -464,95 +341,26 @@ func seedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	return ""
 }
 
-// DeleteResource dials the target satellite's endpoint and asks it
-// to drop the resource (drbdadm down → DeleteVolume → rm .res).
-// Returns the per-satellite result. Missing endpoint surfaces as a
-// nil response with an error — callers retry once the Node CRD
-// catches up.
-func (d *Dispatcher) DeleteResource(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, nodes []blockstoriov1alpha1.Node) (*satellitepb.DeleteResourceResponse, error) {
-	endpoint := lookupEndpoint(target.Spec.NodeName, nodes)
-	if endpoint == "" {
-		return nil, errors.Errorf("no SatelliteEndpoint for node %q", target.Spec.NodeName)
-	}
-
-	client, closer, err := d.dialer.Dial(ctx, endpoint)
-	if err != nil {
-		return nil, errors.Wrapf(err, "dial %s", endpoint)
-	}
-
-	defer func() { _ = closer() }()
-
-	pool := target.Spec.StoragePool
-	if pool == "" {
-		pool = target.Spec.Props["StorPoolName"]
-	}
-
-	if pool == "" && rd != nil {
-		pool = rd.Spec.Props["StorPoolName"]
-	}
-
-	volNumbers := make([]int32, 0)
-
-	if rd != nil {
-		for _, vd := range rd.Spec.VolumeDefinitions {
-			volNumbers = append(volNumbers, vd.VolumeNumber)
-		}
-	}
-
-	resp, err := client.DeleteResource(ctx, &satellitepb.DeleteResourceRequest{
-		Name:          target.Spec.ResourceDefinitionName,
-		StoragePool:   pool,
-		VolumeNumbers: volNumbers,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "DeleteResource RPC")
-	}
-
-	return resp, nil
-}
-
-// CreateSnapshot dials every satellite that hosts a non-DISKLESS
-// replica of `rdName` and asks it to take a snapshot. Returns the
-// list of per-node results so the controller can surface granular
-// status. We don't fan out concurrently — the snapshot path is
-// rare and dial costs are dwarfed by the actual zfs/lvm operation.
-func (d *Dispatcher) CreateSnapshot(ctx context.Context, rdName, snapName string, replicas []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node) ([]*satellitepb.CreateSnapshotResponse, error) {
-	out := make([]*satellitepb.CreateSnapshotResponse, 0, len(replicas))
-
-	for i := range replicas {
-		if slices.Contains(replicas[i].Spec.Flags, "DISKLESS") {
+// lookupEndpoint reads SatelliteEndpoint from the matching Node CRD.
+// Phase 10.3: typed `Spec.SatelliteEndpoint` wins; falls back to the
+// legacy `Spec.Props["SatelliteEndpoint"]` for partially-migrated
+// clusters. Match by the original LINSTOR name (annotation when
+// slugified, else metadata.Name) so non-RFC1123 LINSTOR names still
+// resolve back to the right CRD.
+func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
+	for i := range nodes {
+		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
 			continue
 		}
 
-		endpoint := lookupEndpoint(replicas[i].Spec.NodeName, nodes)
-		if endpoint == "" {
-			out = append(out, &satellitepb.CreateSnapshotResponse{
-				Ok:      false,
-				Message: "no SatelliteEndpoint for node " + replicas[i].Spec.NodeName,
-			})
-
-			continue
+		if ep := nodes[i].Spec.SatelliteEndpoint; ep != "" {
+			return ep
 		}
 
-		client, closer, err := d.dialer.Dial(ctx, endpoint)
-		if err != nil {
-			return out, errors.Wrapf(err, "dial %s", endpoint)
-		}
-
-		resp, err := client.CreateSnapshot(ctx, &satellitepb.CreateSnapshotRequest{
-			ResourceName: rdName,
-			SnapshotName: snapName,
-		})
-		_ = closer()
-
-		if err != nil {
-			return out, errors.Wrap(err, "CreateSnapshot RPC")
-		}
-
-		out = append(out, resp)
+		return nodes[i].Spec.Props["SatelliteEndpoint"]
 	}
 
-	return out, nil
+	return ""
 }
 
 // peerAddress looks up `nodeName`'s SatelliteEndpoint and returns
