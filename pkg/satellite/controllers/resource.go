@@ -175,11 +175,29 @@ func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // up. Pulled out of Reconcile to keep the orchestration under the
 // cyclomatic / funlen budgets.
 func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, error) {
-	if waitResult, waitOK := r.waitForControllerAllocation(res, logger); !waitOK {
-		return waitResult, nil
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res)
+	// The DRBD-ID allocation gate only matters when the RD actually
+	// uses DRBD. A LayerStack=["STORAGE"] (or ["LUKS","STORAGE"]) RD
+	// renders no .res and the kernel never sees a node-id, so waiting
+	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
+	// block apply forever — they never come.
+	if rdNeedsDRBD(&rd) {
+		if waitResult, waitOK := r.waitForControllerAllocation(res, logger); !waitOK {
+			return waitResult, nil
+		}
+	}
+
+	desired, err := r.buildDesiredFromCRD(ctx, res, &rd)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -316,21 +334,10 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 // path — the controller-runtime reconciler does exactly the
 // same work the controller's dispatcher did, just on the
 // satellite side. Phase 10.1.
-func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource) (*satellitepb.DesiredResource, error) {
-	var rd blockstoriov1alpha1.ResourceDefinition
-
-	err := r.Get(ctx, client.ObjectKey{Name: target.Spec.ResourceDefinitionName}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, errors.Errorf("parent RD %q not found", target.Spec.ResourceDefinitionName)
-		}
-
-		return nil, errors.Wrap(err, "get parent RD")
-	}
-
+func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (*satellitepb.DesiredResource, error) {
 	var resList blockstoriov1alpha1.ResourceList
 
-	err = r.List(ctx, &resList)
+	err := r.List(ctx, &resList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Resources for peer set")
 	}
@@ -350,12 +357,24 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "list Nodes")
 	}
 
-	effectiveProps, err := effectiveprops.Resolve(ctx, r.Client, target, &rd)
+	effectiveProps, err := effectiveprops.Resolve(ctx, r.Client, target, rd)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	return dispatcher.BuildDesired(target, peers, nodeList.Items, &rd, effectiveProps), nil
+	return dispatcher.BuildDesired(target, peers, nodeList.Items, rd, effectiveProps), nil
+}
+
+// rdNeedsDRBD mirrors pkg/satellite/reconciler.go's needsDRBD but
+// over the RD CRD: empty LayerStack defaults to ["DRBD","STORAGE"]
+// (legacy semantics), any explicit stack must list "DRBD".
+func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	stack := rd.Spec.LayerStack
+	if len(stack) == 0 {
+		return true
+	}
+
+	return slices.Contains(stack, "DRBD")
 }
 
 // waitForControllerAllocation gates the apply path on the
