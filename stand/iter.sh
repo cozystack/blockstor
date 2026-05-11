@@ -60,7 +60,13 @@ step() {
 step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
     || { echo "$NAME apply-crds FAIL" > "$RESULT"; exit 1; }
 
-step "rollout-restart" "kubectl -n blockstor-system rollout restart deploy/blockstor-controller ds/blockstor-satellite" \
+# Force-delete pods (not just rollout restart) — observed on the
+# 17-stand matrix: a plain rollout-restart with imagePullPolicy:Always
+# still uses the previously-pulled image layer for ~half the stands
+# even after a `--no-cache` rebuild + push. Force-delete makes
+# kubelet do a fresh `containerd images pull` on pod recreate, which
+# resolves the `:dev` tag to the current registry manifest digest.
+step "force-delete pods" "kubectl -n blockstor-system delete pod -l app=blockstor-controller --grace-period=0 --force --ignore-not-found 2>&1 | tail -2; kubectl -n blockstor-system delete pod -l app=blockstor-satellite --grace-period=0 --force --ignore-not-found 2>&1 | tail -3" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
 step "rollout-status (controller)" "kubectl -n blockstor-system rollout status deploy/blockstor-controller --timeout=120s" \
