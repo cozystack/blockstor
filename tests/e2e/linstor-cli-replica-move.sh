@@ -67,8 +67,8 @@ echo ">> linstor resource-definition + volume-definition create $RD"
 # we add and then drop, not a witness someone else planted.
 curl -sf -X PUT \
     -H 'Content-Type: application/json' \
-    -d '{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"false"}}' \
-    "http://localhost:$PF_PORT/v1/resource-definitions/$RD/properties" \
+    -d "{\"props\":{\"DrbdOptions/AutoAddQuorumTiebreaker\":\"false\"}}" \
+    "http://localhost:$PF_PORT/v1/resource-definitions/$RD" \
     >/dev/null
 
 echo ">> linstor resource create $WORKER_1 / $WORKER_2 $RD (initial 2 replicas)"
