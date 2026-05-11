@@ -81,7 +81,15 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, rg)
+	// Upstream LINSTOR convention: write APIs respond with an
+	// `ApiCallRc` list — not the object that was created. golinstor
+	// discards the body, but the Python CLI walks `replies[0].ret_code`
+	// unconditionally and crashes ("TypeError: string indices must be
+	// integers") when handed the bare object.
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource group created: " + rg.Name,
+	}})
 }
 
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
@@ -105,7 +113,10 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, rg)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource group modified: " + rg.Name,
+	}})
 }
 
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
@@ -118,5 +129,8 @@ func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource group deleted: " + name,
+	}})
 }

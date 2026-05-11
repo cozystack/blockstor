@@ -170,8 +170,8 @@ func TestNetInterfaceDelete(t *testing.T) {
 		resp := httpDelete(t, base+"/v1/nodes/n1/net-interfaces/replication")
 		_ = resp.Body.Close()
 
-		if resp.StatusCode != http.StatusNoContent {
-			t.Fatalf("delete status: got %d, want 204", resp.StatusCode)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
 		}
 	}
 
@@ -352,8 +352,8 @@ func TestNetInterfaceDeleteMissingIsIdempotent(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/nodes/n1/net-interfaces/never-existed")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("status: got %d, want 204 (idempotent delete)", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200 (idempotent delete)", resp.StatusCode)
 	}
 
 	got, _ := st.Nodes().Get(t.Context(), "n1")

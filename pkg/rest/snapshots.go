@@ -51,8 +51,8 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
 	// any snapshots exist for this volume?" poll has to scan the
 	// whole cluster every cycle.
-	rdFilter := splitCSV(r.URL.Query().Get("resources"))
-	nameFilter := splitCSV(r.URL.Query().Get("snapshots"))
+	rdFilter := multiValueQuery(r, "resources")
+	nameFilter := multiValueQuery(r, "snapshots")
 
 	out := make([]apiv1.Snapshot, 0, len(snaps))
 
@@ -133,7 +133,10 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, snap)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "snapshot created: " + snap.Name,
+	}})
 }
 
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
@@ -147,5 +150,8 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "snapshot deleted: " + snapName,
+	}})
 }

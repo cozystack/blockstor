@@ -247,12 +247,17 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	created, ok := s.createResources(w, r, rdName, envelopes)
+	_, ok := s.createResources(w, r, rdName, envelopes)
 	if !ok {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, created)
+	// Python CLI demands an ApiCallRc list envelope; upstream's
+	// `linstor r c` walks it on every reply.
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource(s) created on resource-definition: " + rdName,
+	}})
 }
 
 // createResources walks the envelopes from a POST to

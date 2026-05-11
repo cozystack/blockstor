@@ -68,13 +68,17 @@ func TestSnapshotsCreateRoundTrip(t *testing.T) {
 		t.Fatalf("status: got %d, want 201", resp.StatusCode)
 	}
 
-	var got apiv1.Snapshot
-	if jErr := json.NewDecoder(resp.Body).Decode(&got); jErr != nil {
+	// POST now returns an `[]ApiCallRc` envelope (upstream LINSTOR
+	// convention; the Python CLI parses replies[0].ret_code). The
+	// snapshot itself comes back via the View endpoint a few lines
+	// below — assert its observable state, not the create echo.
+	var rc []apiv1.APICallRc
+	if jErr := json.NewDecoder(resp.Body).Decode(&rc); jErr != nil {
 		t.Fatalf("decode: %v", jErr)
 	}
 
-	if got.Name != "snap-1" || got.ResourceName != "pvc-1" {
-		t.Errorf("got %+v", got)
+	if len(rc) == 0 || rc[0].RetCode <= 0 {
+		t.Errorf("ApiCallRc envelope: got %+v", rc)
 	}
 
 	// View aggregate must contain it.
@@ -172,8 +176,8 @@ func TestSnapshotsDeleteThenGet(t *testing.T) {
 	delResp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1")
 	_ = delResp.Body.Close()
 
-	if delResp.StatusCode != http.StatusNoContent {
-		t.Fatalf("delete: got %d, want 204", delResp.StatusCode)
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete: got %d, want 200", delResp.StatusCode)
 	}
 
 	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1")

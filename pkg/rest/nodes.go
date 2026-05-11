@@ -122,7 +122,10 @@ func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "net-interface deleted: " + name,
+	}})
 }
 
 // mutateNetInterface decodes a NetInterface body, runs the supplied
@@ -233,7 +236,10 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, n)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node created: " + n.Name,
+	}})
 }
 
 func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +264,10 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, n)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node modified: " + n.Name,
+	}})
 }
 
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
@@ -271,7 +280,10 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node deleted: " + name,
+	}})
 }
 
 // writeStoreError maps store sentinel errors to HTTP statuses so handlers

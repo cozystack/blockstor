@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // rdCloneRequest is the body for `resource-definition clone`. Only the
@@ -81,5 +83,8 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, clone)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource definition cloned: " + clone.Name,
+	}})
 }

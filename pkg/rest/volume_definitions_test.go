@@ -271,8 +271,8 @@ func TestVolumeDefinitionsDelete(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("DELETE status: got %d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("DELETE status: got %d, want 200", resp.StatusCode)
 	}
 
 	_, err := st.VolumeDefinitions().Get(ctx, "pvc-1", 0)
@@ -302,8 +302,8 @@ func TestVolumeDefinitionsDeleteHappyPath(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Errorf("delete status: got %d, want 204", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("delete status: got %d, want 200", resp.StatusCode)
 	}
 
 	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/0")

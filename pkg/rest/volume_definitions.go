@@ -107,7 +107,10 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, vd)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "volume definition created",
+	}})
 }
 
 func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +141,10 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, vd)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "volume definition modified",
+	}})
 }
 
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +164,10 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "volume definition deleted",
+	}})
 }
 
 func parseVolNum(raw string) (int32, error) {

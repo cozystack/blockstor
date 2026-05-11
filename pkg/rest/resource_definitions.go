@@ -88,7 +88,10 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, rd)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource definition created: " + rd.Name,
+	}})
 }
 
 func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +115,10 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, rd)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource definition modified: " + rd.Name,
+	}})
 }
 
 func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
@@ -125,5 +131,8 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource definition deleted: " + name,
+	}})
 }
