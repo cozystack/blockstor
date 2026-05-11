@@ -63,6 +63,7 @@ spec:
                 - ZFS_THIN
                 - FILE
                 - FILE_THIN
+                - LOOPFILE
                 - DISKLESS
                 type: string
               sharedSpaceId:
