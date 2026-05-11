@@ -17,9 +17,13 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+
+	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/placer"
@@ -214,49 +218,98 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 	return out
 }
 
-// handleResourceCreate creates a single Resource on a named node from the
-// upstream `ResourceCreate` envelope.
+// handleResourceCreate creates one or more Resources from the upstream
+// `[]ResourceCreate` envelope. The upstream OpenAPI shape is an array
+// (the CLI's `linstor resource create n1 n2 n3 rd` posts one item per
+// node); we also accept a bare object for backwards-compat with
+// pre-existing blockstor callers.
 func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 
-	var body apiv1.ResourceCreate
-
-	err := json.NewDecoder(r.Body).Decode(&body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	res := body.Resource
-	res.Name = rdName
-
-	if res.NodeName == "" {
-		writeError(w, http.StatusBadRequest, "node_name is required")
-
-		return
-	}
-
-	// Same CSI pass-through as handleAutoplace: linstor-csi may set
-	// layer_list on the explicit-placement call rather than on RD create.
-	// Persist onto rd.LayerStack if not already set so the satellite
-	// reconciler sees the right composition.
-	if len(body.LayerList) > 0 {
-		rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-		if getErr == nil && len(rd.LayerStack) == 0 {
-			rd.LayerStack = append([]string(nil), body.LayerList...)
-			_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
-		}
-	}
-
-	err = s.Store.Resources().Create(r.Context(), &res)
+	envelopes, err := decodeResourceCreateBody(body)
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, res)
+	if len(envelopes) == 0 {
+		writeError(w, http.StatusBadRequest, "empty resource create body")
+
+		return
+	}
+
+	created := make([]apiv1.Resource, 0, len(envelopes))
+
+	for i := range envelopes {
+		env := &envelopes[i]
+		res := env.Resource
+		res.Name = rdName
+
+		if res.NodeName == "" {
+			writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
+
+			return
+		}
+
+		// Same CSI pass-through as handleAutoplace: linstor-csi may set
+		// layer_list on the explicit-placement call rather than on RD create.
+		// Persist onto rd.LayerStack if not already set so the satellite
+		// reconciler sees the right composition.
+		if len(env.LayerList) > 0 {
+			rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+			if getErr == nil && len(rd.LayerStack) == 0 {
+				rd.LayerStack = append([]string(nil), env.LayerList...)
+				_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+			}
+		}
+
+		err = s.Store.Resources().Create(r.Context(), &res)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		created = append(created, res)
+	}
+
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// decodeResourceCreateBody accepts either the upstream-LINSTOR
+// `[]ResourceCreate` envelope (the shape the CLI posts) or a bare
+// `ResourceCreate` object (legacy blockstor callers). Returns a
+// normalised slice the handler iterates over.
+func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var envelopes []apiv1.ResourceCreate
+
+		err := json.Unmarshal(body, &envelopes)
+		if err != nil {
+			return nil, errors.Wrap(err, "decode resource create array")
+		}
+
+		return envelopes, nil
+	}
+
+	var single apiv1.ResourceCreate
+
+	err := json.Unmarshal(body, &single)
+	if err != nil {
+		return nil, errors.Wrap(err, "decode resource create object")
+	}
+
+	return []apiv1.ResourceCreate{single}, nil
 }
 
 // handleResourceDelete drops a single Resource (replica) on a node.
