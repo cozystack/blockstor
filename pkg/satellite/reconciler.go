@@ -769,7 +769,7 @@ func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]str
 		switch strings.ToLower(section) {
 		case "net":
 			netOpts[rawKey] = value
-		case "disk", "peerdevice", "peer-device", "handlers": //nolint:goconst // DRBD section name, semantic-distinct from LsblkTypeDisk
+		case "disk", "peerdevice", "peer-device", "handlers": //nolint:goconst,nolintlint // DRBD section name, semantic-distinct from LsblkTypeDisk
 			// These sections aren't plumbed through Net struct
 			// today; surface them as resource-level options so
 			// drbdadm at least sees them. Full per-section

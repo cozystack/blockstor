@@ -15,12 +15,16 @@ limitations under the License.
 */
 
 // Package file is the FILE / FILE_THIN storage backend. Volumes are
-// regular files under a configured directory, mounted by DRBD via
-// loop devices. Thick volumes are fallocate-pre-allocated; thin volumes
-// are sparse (truncated to size, allocated on first write).
+// regular files under a configured directory, attached to a
+// /dev/loopN via `losetup --find --show` so DRBD (and any other
+// consumer that needs a block device) can use them. Thick volumes
+// are fallocate-pre-allocated; thin volumes are sparse (truncated
+// to size, allocated on first write).
 //
-// This is the simplest provider — useful as the dev-stand backend
-// because it needs no LVM/ZFS host setup.
+// This mirrors upstream LINSTOR's FILE / FILE_THIN providers — the
+// file is the backing store, the loop dev is the consumer-facing
+// `disk` path. `losetup --find` goes through /dev/loop-control so
+// the same dir can hold hundreds of files without hardcoded numbers.
 package file
 
 import (
@@ -29,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -46,14 +51,15 @@ type Config struct {
 	Thin bool
 }
 
-// Provider implements storage.Provider against regular files.
+// Provider implements storage.Provider against regular files + losetup.
 type Provider struct {
 	cfg  Config
 	exec storage.Exec
 }
 
 // NewProvider constructs a file Provider. The Exec is injected so
-// tests can drive fallocate/truncate without actually allocating.
+// tests can drive fallocate/truncate/losetup without touching the
+// kernel.
 func NewProvider(cfg Config, ex storage.Exec) *Provider {
 	return &Provider{cfg: cfg, exec: ex}
 }
@@ -67,43 +73,49 @@ func (p *Provider) Kind() string {
 	return "FILE"
 }
 
-// CreateVolume idempotently creates the backing file at full size
-// (fallocate) or as a sparse file (truncate). Existing file → no-op.
+// CreateVolume idempotently:
+//   - creates the backing file at full size (fallocate, thick) or
+//     as a sparse file (truncate, thin)
+//   - attaches it to a /dev/loopN via `losetup --find --show`
+//
+// Re-runs no-op cleanly: stat skips the allocation step and the
+// attach helper reuses any existing loop dev for the file.
 func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
-
-	_, err := os.Stat(path)
-	if err == nil {
-		return nil
-	}
-
-	if !os.IsNotExist(err) {
-		return errors.Wrapf(err, "stat %s", path)
-	}
-
 	sizeBytes := vol.SizeKib * bytesPerKib
 
-	tool := "fallocate"
-	flag := "-l"
+	_, err := os.Stat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return errors.Wrapf(err, "stat %s", path)
+		}
 
-	if p.cfg.Thin {
-		tool = "truncate"
-		flag = "-s"
+		tool := "fallocate"
+		flag := "-l"
+
+		if p.cfg.Thin {
+			tool = "truncate"
+			flag = "-s"
+		}
+
+		_, err = p.exec.Run(ctx, tool, flag, strconv.FormatInt(sizeBytes, 10), path)
+		if err != nil {
+			return errors.Wrapf(err, "%s %s", tool, path)
+		}
 	}
 
-	_, err = p.exec.Run(ctx, tool, flag, strconv.FormatInt(sizeBytes, 10), path)
+	_, err = p.attach(ctx, path)
 	if err != nil {
-		return errors.Wrapf(err, "%s %s", tool, path)
+		return errors.Wrapf(err, "losetup %s", path)
 	}
 
 	return nil
 }
 
-// ResizeVolume grows the backing file to vol.SizeKib bytes. truncate
-// is the right tool for both thick (fallocate-created) and thin
-// (truncate-created) cases — when the file is shorter than the new
-// size, the OS extends with sparse zero-bytes. Shrinks are rejected
-// to match the rest of the provider contract.
+// ResizeVolume grows the backing file to vol.SizeKib bytes and
+// refreshes the loop device's reported capacity with `losetup -c`.
+// truncate handles both thick (fallocate-created) and thin
+// (truncate-created) cases. Shrinks are rejected.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 
@@ -127,14 +139,31 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 		return errors.Wrapf(err, "truncate %s", path)
 	}
 
+	dev, lerr := p.lookupLoop(ctx, path)
+	if lerr == nil && dev != "" {
+		_, err = p.exec.Run(ctx, "losetup", "-c", dev)
+		if err != nil {
+			return errors.Wrapf(err, "losetup -c %s", dev)
+		}
+	}
+
 	return nil
 }
 
-// DeleteVolume removes the backing file. Missing → no-op.
-func (p *Provider) DeleteVolume(_ context.Context, vol storage.Volume) error {
+// DeleteVolume detaches the loop device (if any) and removes the
+// backing file. Missing file → no-op.
+func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 
-	err := os.Remove(path)
+	dev, err := p.lookupLoop(ctx, path)
+	if err == nil && dev != "" {
+		_, detachErr := p.exec.Run(ctx, "losetup", "-d", dev)
+		if detachErr != nil {
+			return errors.Wrapf(detachErr, "losetup -d %s", dev)
+		}
+	}
+
+	err = os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "remove %s", path)
 	}
@@ -142,8 +171,12 @@ func (p *Provider) DeleteVolume(_ context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// VolumeStatus stats the file. Missing file → NOT_PROVISIONED.
-func (p *Provider) VolumeStatus(_ context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
+// VolumeStatus stats the file and reports DevicePath = the current
+// /dev/loopN. Missing file → NOT_PROVISIONED. The status path also
+// attaches the loop dev if it is not currently associated, so a
+// satellite restart re-establishes the loop before DRBD picks the
+// .res back up.
+func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
 	path := p.volumePath(vol)
 
 	info, err := os.Stat(path)
@@ -155,10 +188,15 @@ func (p *Provider) VolumeStatus(_ context.Context, vol storage.Volume) (storage.
 		return storage.VolumeStatus{}, errors.Wrapf(err, "stat %s", path)
 	}
 
+	dev, err := p.attach(ctx, path)
+	if err != nil {
+		return storage.VolumeStatus{}, errors.Wrapf(err, "losetup %s", path)
+	}
+
 	sizeKib := info.Size() / bytesPerKib
 
 	return storage.VolumeStatus{
-		DevicePath:   path,
+		DevicePath:   dev,
 		UsableKib:    sizeKib,
 		AllocatedKib: sizeKib,
 		State:        "PROVISIONED",
@@ -191,6 +229,58 @@ func (*Provider) CreateSnapshot(_ context.Context, _ storage.Snapshot) error {
 // DeleteSnapshot mirrors CreateSnapshot.
 func (*Provider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return errors.New("file backend does not support snapshots")
+}
+
+// attach is the idempotent loop-attach step. We pre-check via
+// `losetup -j <path>` and reuse the existing /dev/loopN if there
+// is one — `--find --show` always allocates a fresh dev, which on
+// reconcile-heavy paths would leak hundreds of loop nodes pointing
+// at the same backing file.
+func (p *Provider) attach(ctx context.Context, path string) (string, error) {
+	dev, err := p.lookupLoop(ctx, path)
+	if err != nil {
+		return "", err
+	}
+
+	if dev != "" {
+		return dev, nil
+	}
+
+	out, err := p.exec.Run(ctx, "losetup", "--find", "--show", path)
+	if err != nil {
+		return "", errors.Wrapf(err, "losetup --find --show %s", path)
+	}
+
+	dev = strings.TrimSpace(string(out))
+	if dev == "" {
+		return "", errors.Errorf("losetup returned empty device for %s", path)
+	}
+
+	return dev, nil
+}
+
+// lookupLoop greps `losetup -j <file>` for an existing loop device.
+// Empty result → no attach. Returns ("", nil) cleanly when nothing
+// matches; only real exec failures bubble up.
+func (p *Provider) lookupLoop(ctx context.Context, path string) (string, error) {
+	out, err := p.exec.Run(ctx, "losetup", "-j", path)
+	if err != nil {
+		return "", errors.Wrapf(err, "losetup -j %s", path)
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return "", nil
+	}
+
+	// Format: `/dev/loopN: [hex] inode (path)`. We only need the
+	// /dev/loopN prefix.
+	colon := strings.Index(line, ":")
+	if colon <= 0 {
+		return "", nil
+	}
+
+	return line[:colon], nil
 }
 
 // volumePath is `<dir>/<resource>_<vol5digits>.img`.

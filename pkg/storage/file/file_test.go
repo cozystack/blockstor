@@ -27,6 +27,16 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage/file"
 )
 
+// fakeLosetup pre-loads the FakeExec so it answers the two losetup
+// invocations every CreateVolume / VolumeStatus path issues: a
+// `losetup -j <path>` lookup (returns empty = no existing loop) and
+// the `losetup --find --show <path>` attach (returns /dev/loop42).
+// dev is the device the caller wants the fake to surface.
+func fakeLosetup(fx *storage.FakeExec, path, dev string) {
+	fx.Expect("losetup -j "+path, storage.FakeResponse{})
+	fx.Expect("losetup --find --show "+path, storage.FakeResponse{Stdout: []byte(dev + "\n")})
+}
+
 // TestKindThick: thick provider declares LINSTOR's `FILE` kind.
 func TestKindThick(t *testing.T) {
 	p := file.NewProvider(file.Config{Dir: t.TempDir()}, storage.NewFakeExec())
@@ -47,6 +57,7 @@ func TestKindThin(t *testing.T) {
 func TestCreateVolumeAllocates(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	fakeLosetup(fx, filepath.Join(dir, "pvc-1_00000.img"), "/dev/loop42")
 
 	p := file.NewProvider(file.Config{Dir: dir}, fx)
 
@@ -70,6 +81,7 @@ func TestCreateVolumeAllocates(t *testing.T) {
 func TestCreateVolumeThinSparse(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
+	fakeLosetup(fx, filepath.Join(dir, "pvc-1_00000.img"), "/dev/loop42")
 
 	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, fx)
 
@@ -88,7 +100,8 @@ func TestCreateVolumeThinSparse(t *testing.T) {
 	}
 }
 
-// TestCreateVolumeIdempotent: existing file → no-op.
+// TestCreateVolumeIdempotent: existing file → no allocator run; the
+// losetup attach still runs to ensure the loop dev exists.
 func TestCreateVolumeIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
@@ -98,6 +111,8 @@ func TestCreateVolumeIdempotent(t *testing.T) {
 	if err := os.WriteFile(preexisting, []byte{}, 0o600); err != nil {
 		t.Fatalf("pre-seed: %v", err)
 	}
+
+	fakeLosetup(fx, preexisting, "/dev/loop42")
 
 	p := file.NewProvider(file.Config{Dir: dir}, fx)
 
@@ -158,13 +173,17 @@ func TestDeleteVolumeMissing(t *testing.T) {
 // TestVolumeStatusReportsSize: stat the file, report bytes / 1024.
 func TestVolumeStatusReportsSize(t *testing.T) {
 	dir := t.TempDir()
+	path := filepath.Join(dir, "pvc-1_00000.img")
 
 	body := make([]byte, 1024*1024) // 1 MiB
-	if err := os.WriteFile(filepath.Join(dir, "pvc-1_00000.img"), body, 0o600); err != nil {
+	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	p := file.NewProvider(file.Config{Dir: dir}, storage.NewFakeExec())
+	fx := storage.NewFakeExec()
+	fakeLosetup(fx, path, "/dev/loop42")
+
+	p := file.NewProvider(file.Config{Dir: dir}, fx)
 
 	got, err := p.VolumeStatus(t.Context(), storage.Volume{
 		ResourceName: "pvc-1",

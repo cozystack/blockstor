@@ -37,7 +37,7 @@ type StoragePoolSpec struct {
 	PoolName string `json:"poolName,omitempty"`
 
 	// providerKind is the storage backend.
-	// +kubebuilder:validation:Enum=LVM;LVM_THIN;ZFS;ZFS_THIN;FILE;FILE_THIN;LOOPFILE;DISKLESS
+	// +kubebuilder:validation:Enum=LVM;LVM_THIN;ZFS;ZFS_THIN;FILE;FILE_THIN;DISKLESS
 	ProviderKind string `json:"providerKind"`
 
 	// sharedSpaceId groups pools that physically share the same backing

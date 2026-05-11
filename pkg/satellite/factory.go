@@ -21,7 +21,6 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/file"
-	"github.com/cozystack/blockstor/pkg/storage/loopfile"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
@@ -36,7 +35,6 @@ const (
 	ProviderKindZFSThin  = "ZFS_THIN"
 	ProviderKindFile     = "FILE"
 	ProviderKindFileThin = "FILE_THIN"
-	ProviderKindLoopfile = "LOOPFILE"
 	ProviderKindDiskless = "DISKLESS"
 )
 
@@ -48,7 +46,6 @@ const (
 	propThinPool = "StorDriver/ThinPool"
 	propZPool    = "StorDriver/ZPool"
 	propFileDir  = "StorDriver/FileDir"
-	propLoopDir  = "StorDriver/LoopDir"
 )
 
 // NewProviderFromKind instantiates the matching `storage.Provider`
@@ -76,8 +73,6 @@ func NewProviderFromKind(kind string, props map[string]string, exec storage.Exec
 		return newFile(props, exec, false)
 	case ProviderKindFileThin:
 		return newFile(props, exec, true)
-	case ProviderKindLoopfile:
-		return newLoopfile(props, exec)
 	case ProviderKindDiskless:
 		// DISKLESS pools never own local storage — they exist as
 		// allocator targets only. Returning nil tells the caller
@@ -137,18 +132,4 @@ func newFile(props map[string]string, exec storage.Exec, thin bool) (storage.Pro
 	}
 
 	return file.NewProvider(file.Config{Dir: dir, Thin: thin}, exec), nil
-}
-
-func newLoopfile(props map[string]string, exec storage.Exec) (storage.Provider, error) {
-	dir := props[propLoopDir]
-	if dir == "" {
-		// Fall back to the FILE_DIR key — some operators reuse it.
-		dir = props[propFileDir]
-	}
-
-	if dir == "" {
-		return nil, errors.Errorf("LOOPFILE provider requires %q (or %q) in props", propLoopDir, propFileDir)
-	}
-
-	return loopfile.NewProvider(loopfile.Config{Dir: dir}, exec), nil
 }
