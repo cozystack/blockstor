@@ -46,8 +46,8 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 	// we match that so /v1/view/storage-pools?nodes=X — the call
 	// linstor-csi makes on every NodeRegister — does not return the
 	// whole cluster's pools when only one node is asked about.
-	nodeFilter := splitCSV(r.URL.Query().Get("nodes"))
-	poolFilter := splitCSV(r.URL.Query().Get("storage_pools"))
+	nodeFilter := multiValueQuery(r, "nodes")
+	poolFilter := multiValueQuery(r, "storage_pools")
 
 	out := make([]apiv1.StoragePool, 0, len(pools))
 

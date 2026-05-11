@@ -37,12 +37,17 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional filters golinstor sends: ?nodes=a,b&resources=rd1,rd2.
+	// Optional filters. Two wire dialects in the wild:
+	//   - golinstor (csi side): comma-joined `?nodes=a,b`
+	//   - python-linstor CLI:   repeat-key `?nodes=a&nodes=b` (via
+	//     urlencode(doseq=True))
+	// `multiValueQuery` accepts both, so `linstor r l -r foo -n bar`
+	// and linstor-csi's existing requests land in the same filter.
 	// Java LINSTOR honours both as case-insensitive set-membership; we
 	// match that so linstor-csi's "is this resource on this node?"
 	// poll returns a non-empty list when the answer is yes.
-	nodeFilter := splitCSV(r.URL.Query().Get("nodes"))
-	rdFilter := splitCSV(r.URL.Query().Get("resources"))
+	nodeFilter := multiValueQuery(r, "nodes")
+	rdFilter := multiValueQuery(r, "resources")
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 
@@ -55,10 +60,41 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		out = append(out, apiv1.ResourceWithVolumes{Resource: resList[i]})
+		// Resource.Volumes is sourced from CRD Status by
+		// crdToWireResource; ResourceWithVolumes is kept as a
+		// distinct wrapper for backwards-compat with anything
+		// still consuming the embedded shape — its Volumes field
+		// shadows Resource.Volumes via field promotion ordering,
+		// so the JSON output remains a single `volumes` key.
+		out = append(out, apiv1.ResourceWithVolumes{
+			Resource: resList[i],
+			Volumes:  resList[i].Volumes,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// multiValueQuery returns the union of all values for a query
+// parameter, supporting both wire dialects:
+//
+//   - `?key=a,b,c`        (comma-joined — golinstor)
+//   - `?key=a&key=b&key=c` (repeat-key — python-linstor urlencode(doseq=True))
+//
+// Empty result = no filter on this key.
+func multiValueQuery(r *http.Request, key string) []string {
+	values := r.URL.Query()[key]
+	if len(values) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(values))
+
+	for _, v := range values {
+		out = append(out, splitCSV(v)...)
+	}
+
+	return out
 }
 
 // splitCSV parses the comma-separated query value, trimming whitespace
