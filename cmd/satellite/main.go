@@ -32,6 +32,7 @@ import (
 	"syscall"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -63,6 +64,14 @@ func run() int {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	// Bridge controller-runtime's logr into our slog so every reconcile
+	// log from the c-r manager / per-CRD reconcilers shows up next to
+	// the satellite's own startup events. Without this c-r silently
+	// drops every log call (its `log.SetLogger(...) was never called`
+	// goroutine dump prints once on startup and reconciler errors
+	// disappear).
+	ctrl.SetLogger(logr.FromSlogHandler(logger.Handler()))
 
 	if nodeName == "" {
 		logger.Error("node-name is required (pass --node-name or set NODE_NAME)")
