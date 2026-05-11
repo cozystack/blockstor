@@ -337,7 +337,8 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	// Skip DRBD when the layer_stack explicitly omits it. Empty
 	// layer_stack defaults to ["DRBD","STORAGE"] so legacy clients
 	// (and pre-Phase-9 dispatchers) keep getting full DRBD treatment.
-	if r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack()) {
+	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
+	if withDRBD {
 		err := r.applyDRBD(ctx, dr, diskless, devices, resized)
 		if err != nil {
 			res.Ok = false
@@ -346,6 +347,8 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 			return res
 		}
 	}
+
+	res.Volumes = buildVolumeResults(dr, devices, diskless, withDRBD)
 
 	return res
 }
@@ -872,6 +875,55 @@ func isInactive(flags []string) bool {
 // storage, so the reconciler must skip the storage path for them.
 func isDiskless(flags []string) bool {
 	return slices.Contains(flags, "DISKLESS")
+}
+
+// buildVolumeResults assembles per-volume devicePath entries for
+// the ResourceApplyResult, choosing the path the consumer should
+// see:
+//
+//   - When DRBD is in the layer stack, the consumer-facing device
+//     is `/dev/drbd<minor>` regardless of the lower-disk path
+//     (loop/LV/zvol/dm-crypt). drbdMinor + volumeNumber follow
+//     the dispatcher's per-replica allocation.
+//   - When DRBD is not in the stack (LayerStack=["STORAGE"] or
+//     ["LUKS","STORAGE"]), the consumer sees the raw storage /
+//     dm-crypt device — that's exactly what `devices` already
+//     holds after applyStorage + maybeLUKS.
+//   - DISKLESS replicas have no consumer-facing device; we emit
+//     no Volumes entries.
+func buildVolumeResults(dr *satellitepb.DesiredResource, devices map[int32]string, diskless, withDRBD bool) []*satellitepb.ResourceApplyVolumeResult {
+	if diskless {
+		return nil
+	}
+
+	out := make([]*satellitepb.ResourceApplyVolumeResult, 0, len(dr.GetVolumes()))
+
+	if withDRBD {
+		minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
+
+		for _, vol := range dr.GetVolumes() {
+			out = append(out, &satellitepb.ResourceApplyVolumeResult{
+				VolumeNumber: vol.GetVolumeNumber(),
+				DevicePath:   fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
+			})
+		}
+
+		return out
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		dev, ok := devices[vol.GetVolumeNumber()]
+		if !ok {
+			continue
+		}
+
+		out = append(out, &satellitepb.ResourceApplyVolumeResult{
+			VolumeNumber: vol.GetVolumeNumber(),
+			DevicePath:   dev,
+		})
+	}
+
+	return out
 }
 
 // resFilePerm is the on-disk mode for /etc/drbd.d/<name>.res. drbd is

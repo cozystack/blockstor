@@ -234,7 +234,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev observation) erro
 	}
 
 	apply := &blockstoriov1alpha1.Resource{
-		TypeMeta:   metav1.TypeMeta{Kind: "Resource", APIVersion: blockstoriov1alpha1.GroupVersion.String()},
+		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
 			InUse:     ev.InUse,

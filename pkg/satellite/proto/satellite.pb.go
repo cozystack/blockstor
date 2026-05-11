@@ -174,6 +174,50 @@ type ResourceApplyResult struct {
 	NodeName string
 	Ok       bool
 	Message  string
+
+	// Volumes carries per-volume DevicePath the satellite materialised
+	// during this apply. Empty when the resource is DISKLESS or the
+	// apply chain failed before assigning a device. The c-r reconciler
+	// surfaces these via SSA into Resource.Status.Volumes[i].devicePath
+	// so linstor-csi / consumers reading the CRD can resolve the
+	// backing /dev path without an extra round-trip.
+	Volumes []*ResourceApplyVolumeResult
+}
+
+// ResourceApplyVolumeResult is the per-volume slice item the
+// satellite emits for the consumer side. Only the fields the
+// satellite owns end up here — DRBD-side state (DiskState,
+// CurrentGi) flows via the separate events2 observer.
+type ResourceApplyVolumeResult struct {
+	VolumeNumber int32
+	DevicePath   string
+}
+
+// GetVolumes returns the per-volume slice — nil-safe.
+func (x *ResourceApplyResult) GetVolumes() []*ResourceApplyVolumeResult {
+	if x == nil {
+		return nil
+	}
+
+	return x.Volumes
+}
+
+// GetVolumeNumber returns the volume index — nil-safe.
+func (v *ResourceApplyVolumeResult) GetVolumeNumber() int32 {
+	if v == nil {
+		return 0
+	}
+
+	return v.VolumeNumber
+}
+
+// GetDevicePath returns the materialised device — nil-safe.
+func (v *ResourceApplyVolumeResult) GetDevicePath() string {
+	if v == nil {
+		return ""
+	}
+
+	return v.DevicePath
 }
 
 // GetName returns the resource name the result refers to.

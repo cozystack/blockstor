@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,6 +48,11 @@ import (
 // two paths coexist during the Phase 10.6 cutover without
 // stepping on each other.
 const SatelliteResourceFinalizer = "blockstor.io.blockstor.io/satellite-resource"
+
+// resourceKind is the apiserver Kind for the blockstor Resource
+// CRD. Defined once so SSA Patch payloads in this package share
+// one source of truth.
+const resourceKind = "Resource"
 
 // ResourceReconciler watches Resource CRDs filtered to those
 // placed on this satellite's node and translates them into the
@@ -193,6 +199,16 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		}
 	}
 
+	// Stamp per-volume DevicePath into Status.Volumes so
+	// linstor-csi / any consumer that reads the CRD sees the
+	// /dev path the satellite materialised. Done even when one
+	// volume's apply failed: a partial success is still useful
+	// to surface (volumes that did apply have a real device).
+	err = r.stampVolumeStatus(ctx, res, results)
+	if err != nil {
+		logger.Error(err, "stamp Status.Volumes")
+	}
+
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
 	// peer's Status caught up). Returning nil here would let c-r
@@ -205,6 +221,52 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	return ctrl.Result{}, nil
 }
+
+// stampVolumeStatus SSA-patches Resource.Status.Volumes with the
+// per-volume DevicePath the apply chain materialised. Uses a
+// dedicated FieldOwner so the apiserver merges cleanly against the
+// observer's DiskState / CurrentGi writes on the same Volume[i]
+// (listMapKey=volumeNumber means the slice is merged by volume
+// number, not replaced wholesale).
+func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, results []*satellitepb.ResourceApplyResult) error {
+	if len(results) == 0 || len(results[0].GetVolumes()) == 0 {
+		return nil
+	}
+
+	vols := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(results[0].GetVolumes()))
+	for _, v := range results[0].GetVolumes() {
+		vols = append(vols, blockstoriov1alpha1.ResourceVolumeStatus{
+			VolumeNumber: v.GetVolumeNumber(),
+			DevicePath:   v.GetDevicePath(),
+		})
+	}
+
+	apply := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       resourceKind,
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
+		Status:     blockstoriov1alpha1.ResourceStatus{Volumes: vols},
+	}
+
+	err := r.Status().Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
+		client.FieldOwner(volumeStatusFieldOwner),
+		client.ForceOwnership)
+	if err != nil {
+		return errors.Wrap(err, "ssa Status.Volumes")
+	}
+
+	return nil
+}
+
+// volumeStatusFieldOwner is the SSA field-manager the satellite
+// uses when it writes per-volume DevicePath. Distinct from the
+// observer's owner (which writes DiskState / CurrentGi) so the
+// apiserver merges the two slices cleanly under
+// `listMapKey=volumeNumber`.
+const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
 
 // enqueueLocalSiblings maps a Resource event to the LOCAL Resource
 // of the same RD (if any). When a peer on another node appears or
