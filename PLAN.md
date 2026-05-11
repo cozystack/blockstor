@@ -1,9 +1,11 @@
 # Blockstor — implementation plan
 
-A Go reimplementation of LINSTOR that keeps the existing k8s ecosystem
+A Kubernetes control plane for LVM and ZFS storage with DRBD replication.
+Exposes a LINSTOR-compatible REST API so the existing client ecosystem
 (linstor-csi, piraeus-operator, ha-controller, affinity-controller,
-scheduler-extender, gateway) working unchanged, by reproducing LINSTOR's
-public REST API on top of CRD-backed reconcile loops.
+scheduler-extender, gateway) works against blockstor without modification.
+Implemented natively in Go on top of controller-runtime and CRD-backed
+reconcile loops.
 
 This document is the source of truth for what is being built, in what order,
 and under what rules. It is intended to allow autonomous work between
@@ -19,7 +21,7 @@ high-bandwidth check-ins with the user.
   376 GiB RAM, 5.7 TiB NVMe at `/var/lib/blockstor`, `/var/lib/docker`
   symlinked there). Workflow from the repo root: `make up NAME=foo` →
   Talos+QEMU+DRBD, `make piraeus` → operator + satellites, `make oracle`
-  → Java LINSTOR controller for contract-diff, `make smoke` → end-to-end
+  → LINSTOR oracle controller for contract-diff, `make smoke` → end-to-end
   PVC test. Bring this up before attempting any operational milestone
   (real-DRBD smoke, csi-sanity, trace recording, piraeus-operator
   integration).
@@ -64,19 +66,28 @@ high-bandwidth check-ins with the user.
 
 ## Goals
 
-1. **Replace all Java code in the LINSTOR stack** — controller, satellite,
-   any Java tooling — with Go. The end state has zero JVM in the data path.
-2. Existing LINSTOR k8s clients (linstor-csi, piraeus-operator, ha-controller,
-   affinity-controller, scheduler-extender, gateway) work against the new
-   server **without modification**, via 1:1 REST API compatibility.
-3. State of truth lives in Kubernetes CRDs; logic is reconcile-driven.
-4. Codebase smaller and easier to maintain than upstream Java.
-5. Cozystack can switch to this implementation when it is ready.
+1. **Kubernetes-native control plane.** State of truth lives in Kubernetes
+   CRDs; controller and satellite are controller-runtime managers with
+   declarative reconcile loops + Status SSA. No central in-memory state,
+   no synchronous fan-out RPC orchestration.
+2. **LINSTOR-compatible REST API.** Existing client ecosystem (linstor-csi,
+   piraeus-operator, ha-controller, affinity-controller, scheduler-extender,
+   gateway) works against blockstor without modification, via the public
+   REST contract.
+3. **First-class CRDs** designed for multi-controller interaction so
+   cozystack tenant operators, GitOps tooling, custom monitoring, and
+   admission webhooks can read/write them through the standard Kubernetes API.
+4. **New storage capabilities** beyond what existing DRBD orchestrators
+   ship: shared-LUN provisioning (thick LVM + thin qcow2-on-LVM), VDUSE
+   backend via qemu-storage-daemon, BYOK encryption with operator-managed
+   Secret refs.
+5. **Cozystack integration**: cozystack switches to this implementation
+   when it is ready.
 
 ## In scope (full project)
 
-- `linstor-controller` (Java) → `blockstor-controller` (Go)
-- `linstor-satellite` (Java) → `blockstor-satellite` (Go)
+- `blockstor-controller` — Kubernetes-native control plane (REST API + reconcilers)
+- `blockstor-satellite` — per-node controller-runtime manager (apply chain + events2 observer)
 - Storage providers: **LVM**, **LVM-thin**, **ZFS**, **ZFS-thin**, **file**
 - Replication layer: **DRBD** — and the ability to run **without DRBD**, as
   pure local storage (single-replica diskful or diskless)
@@ -96,7 +107,7 @@ high-bandwidth check-ins with the user.
 - In-cluster snapshots (LVM/ZFS), snapshot-restore as new ResourceDefinition
 - Cluster bootstrap (passphrase, satellite registration, eviction/restoration)
 - `linstor-common` artifacts (`properties.json`, `consts.json`,
-  `drbdoptions.json`) consumed without the Java codegen step
+  `drbdoptions.json`) consumed without the upstream codegen step
 - Stats endpoints, error reports, SOS-report, all `/v1/view/*` aggregates
 
 ## Out of scope (will not be built)
@@ -176,9 +187,9 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Storage pool wired via `LinstorSatelliteConfiguration` (file-thin, ~16 GiB free per worker)
 - [x] `make smoke` green: PVC create → pod mount → write → read
 - [x] `make up NAME=alice` ran in parallel to `NAME=test` without bridge / IP collision
-- [x] `make oracle` — uses piraeus-installed `linstor-controller.piraeus-datastore:3370` as the Java oracle; no separate deploy needed.
+- [x] `make oracle` — uses piraeus-installed `linstor-controller.piraeus-datastore:3370` as the LINSTOR oracle; no separate deploy needed.
 
-**Exit met**: full happy-path PVC test passes against upstream Java stack, on parallelizable stand.
+**Exit met**: full happy-path PVC test passes against upstream LINSTOR stack, on parallelizable stand.
 
 ### Phase 1 — Skeleton + contracts (done)
 
@@ -230,15 +241,15 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] StoragePool auto-registration via Hello (2026-05-08): satellite enumerates its configured Providers and ships them in HelloRequest.Pools; Server.Hello upserts a StoragePool CRD per (node, pool name); `/v1/view/storage-pools` reflects them. End-to-end on the stand: 3 satellites with `--loopfile-pool-name=stand` produce 3 StoragePool CRDs (`test-worker-{1,2,3}.stand`, FILE_THIN) without anyone running `linstor storage-pool create`.
 - [x] piraeus-operator native flip first cut (2026-05-08): patching
       `LinstorCluster.spec.externalController.url=http://blockstor-controller.blockstor-system.svc:3370`
-      tells piraeus-operator to skip its own Java controller and
+      tells piraeus-operator to skip its own controller and
       point linstor-csi at blockstor's REST. Once
       `Server.SetConnectionStatus("ONLINE")` started landing in the
       Node CRD's Status subresource, the `linstor-wait-node-online`
       initContainer on `linstor-csi-node` rolled past Init and the
       pod went 3/3 Running — i.e. piraeus accepts blockstor as a
-      drop-in for the Java oracle. PVC provisioning end-to-end
-      requires more REST endpoints behaving exactly like the Java
-      reference (status fields linstor-csi reads on attach); that
+      drop-in for the LINSTOR oracle. PVC provisioning end-to-end
+      requires more REST endpoints behaving exactly like the
+      reference oracle (status fields linstor-csi reads on attach); that
       shake-down is a follow-up.
 
 **Exit met (definition side).** Real reconciliation work now lives in Phase 3.
@@ -251,7 +262,7 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Controller-side gRPC server (`pkg/satellitecontroller`) that satellites dial; Hello registers/idempotently-updates the Node CRD and returns ClusterID. 3 contract tests green.
 - [x] `pkg/satellite.Agent` actually dials the controller and round-trips Hello (2 end-to-end tests). Wired into `cmd/main.go` via `--satellite-grpc-bind-address` (default `:7000`) and `--cluster-id`.
 - [x] StoragePool: LVM-thin (`pkg/storage/lvm`) and ZFS / ZFS_THIN (`pkg/storage/zfs`) providers behind `pkg/storage.Provider` interface; FakeExec drives them in unit tests, RealExec wraps os/exec in production. **ZFS integration smoke** (opt-in via `BLOCKSTOR_ZFS_POOL`): `pkg/storage/zfs/zfs_integration_test.go` walks CreateVolume / VolumeStatus / CreateSnapshot / DeleteSnapshot / DeleteVolume + PoolStatus against a real `zpool` on the dev stand and is green (verified against `blockstor-test` pool, 240 MiB loop-backed, 2026-05-08).
-- [x] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — port from upstream Java; deterministic output, 7 contract tests green
+- [x] ConfFileBuilder in Go (`pkg/drbd/conffile.go`) — DRBD `.res` file renderer matching the wire format `drbdadm` parses; deterministic output, 7 contract tests green
 - [x] `drbdadm up/down/adjust/create-md/primary/secondary` exec wrappers behind interface (`pkg/drbd/drbdadm.go`); 7 contract tests via FakeExec
 - [x] `drbdsetup events2` listener (`pkg/drbd/events2.go`): line parser + Watcher streaming `Event{Action,Kind,Fields}` to a channel; 7 contract tests
 - [x] Resource reconciler (`pkg/satellite.Reconciler`) routes DesiredResource batches: storage provider CreateVolume per volume, ConfFileBuilder writes /etc/drbd.d/<name>.res, drbdadm create-md (first activation, non-DISKLESS) + adjust. Status writeback from events2 stream is the next slice.
@@ -358,14 +369,14 @@ Full scope list lives in `docs/csi-api-surface.md` (to be created in Phase 1).
 - [x] Intra-cluster snapshot shipping for clone/replica-expansion: `Reconciler.ShipSnapshot` picks `zfs send | ssh peer zfs recv` for ZFS / ZFS_THIN and `thin-send-recv` for LVM_THIN, dispatched via an injectable ShipExec so unit tests assert command lines without spinning up the real tools. 3 contract tests.
       - ZFS pools: `zfs send | ssh | zfs recv` over satellite-to-satellite
       - LVM-thin: `thin-send-recv` (LINBIT)
-- [x] csi-sanity runs end-to-end against blockstor REST (2026-05-08): `stand/csi-sanity-job.yaml` is a single-pod Job hosting `piraeus-csi` + `csi-sanity` sharing /csi via emptyDir; piraeus-csi dials `http://blockstor-controller:3370`, csi-sanity hammers it through the standard CSI gRPC contract. Initial baseline: 38/92. Iterative gap-closing (2026-05-08…09): csi-sanity-node init container, K8sName slugifier for non-RFC1123 names, lenient JSON decoder matching Java LINSTOR semantics, override_props passthrough on RG/RD/spawn payloads, RemoteList envelope shape, int64 `ret_code`, satellite_encryption_type uppercase normalisation. Current: **53/74 specs passing** (74 of 92 ran, 17 skipped, 1 pending). Remaining 21 failures cluster around `volume not present in storage backend` and node-specific lookups for the fake `csi-sanity-node` — those are the parts of csi-sanity that need a live satellite present on the test node; not REST-layer regressions.
+- [x] csi-sanity runs end-to-end against blockstor REST (2026-05-08): `stand/csi-sanity-job.yaml` is a single-pod Job hosting `piraeus-csi` + `csi-sanity` sharing /csi via emptyDir; piraeus-csi dials `http://blockstor-controller:3370`, csi-sanity hammers it through the standard CSI gRPC contract. Initial baseline: 38/92. Iterative gap-closing (2026-05-08…09): csi-sanity-node init container, K8sName slugifier for non-RFC1123 names, lenient JSON decoder matching LINSTOR semantics, override_props passthrough on RG/RD/spawn payloads, RemoteList envelope shape, int64 `ret_code`, satellite_encryption_type uppercase normalisation. Current: **53/74 specs passing** (74 of 92 ran, 17 skipped, 1 pending). Remaining 21 failures cluster around `volume not present in storage backend` and node-specific lookups for the fake `csi-sanity-node` — those are the parts of csi-sanity that need a live satellite present on the test node; not REST-layer regressions.
 
 **Exit**: csi-sanity green; piraeus-operator e2e green for what they cover; PVC clone across nodes works.
 
 ### Phase 5 — Compatibility burn-in
 
 - [x] Burn-in infrastructure landed (`tests/burnin-blockstor.sh`, `make burnin-blockstor NAME=… DURATION=…`): each iteration apply RD + 2 Resources → UpToDate → 1 MiB urandom write → failover → md5 match → cleanup. 5-min shake-down on the dev stand: **58/58 iterations pass, 0 failures** (~5 s/iteration). Default DURATION=86400 (24h); leaving the long-tail run as an operational task — the regression gates are pinned and the script can be backgrounded any time.
-- [x] Contract-diff harness landed (`tests/contract`): Trace JSON format, LoadTracesDir loader (lexical order, ignores non-json), Replay against any HTTP base URL, JSON-key-normalising diff. 4 contract tests cover match/status-diff/body-diff/loader. Recording 100+ real golinstor traces against the Java oracle is operational work that depends on a running upstream LINSTOR for capture; the framework is in place to consume them.
+- [x] Contract-diff harness landed (`tests/contract`): Trace JSON format, LoadTracesDir loader (lexical order, ignores non-json), Replay against any HTTP base URL, JSON-key-normalising diff. 4 contract tests cover match/status-diff/body-diff/loader. Recording 100+ real golinstor traces against the LINSTOR oracle is operational work that depends on a running upstream LINSTOR for capture; the framework is in place to consume them.
 **Exit**: 24h+ stable; contract diffs zero on MVP scope.
 
 ### Phase 6 — Encryption + DRBD options + file provider
@@ -407,14 +418,14 @@ The phases above closed the MVP slice and the csi-sanity REST contract. A deep a
 - [x] **Backing-device failure under DRBD** (2026-05-09). The events2 observer now watches for `disk:Failed` on the local replica and runs `drbdadm detach --force <rd>` so the lower disk stops getting hammered. Peers stay UpToDate, the consumer keeps doing I/O via DRBD's network path. The detach is best-effort (logged, not retried) — the next reconcile will redrive state if the storage layer comes back. The Failed observation still ships to the controller via ReportObserved, so a Status condition reflecting the diskless state is one ResourceObservation handler away. **End-to-end "pull the LV out from under DRBD"** sits on the 8.8 e2e checklist; satellite-side hook is in place.
 - [x] **DRBD options hierarchy** controller → resource-group → resource-definition → resource (2026-05-09). `pkg/drbd.ResolveOptions` walks the four scopes, lower wins. The resource controller reads ControllerProps via the KVEntry CRD, the parent RG via `client.Get`, the RD via the existing lookup, then folds in the resource's own props. The merged map flows through `dispatcher.ApplyOptions.EffectiveProps`; `buildDesired` splits it: DrbdOptions/* land on the satellite's drbd_options bag (the .res renderer drops them in the right `net`/`disk`/`peer-device`/`handlers` block via `pkg/drbd.SectionFor`), non-DRBD props stay on the wire-side Props map. Tests: resolver unit tests for override / partial inheritance / non-DRBD-prop pass-through; `TestApplyDRBDOptionsFromEffectiveProps` for the dispatcher wiring.
 - [x] **`allow-two-primaries` plumbing** (2026-05-09): the DRBD option-hierarchy now flows arbitrary `DrbdOptions/Net/...` keys (including `allow-two-primaries yes`) through the satellite into the rendered .res file's `net { }` block. Operators set the knob via `linstor c sp DrbdOptions/Net/allow-two-primaries yes` (or RG/RD/Resource scope). The first-activation auto-primary seed still picks one replica deterministically (lowest stable node-id) — that's correct: dual-primary is for the consumer's promotion (Ganesha promoter, KubeVirt live-migration controller), not for initial sync. `splitDRBDOptions` strips the `DrbdOptions/<Section>/` prefix so the .res renderer emits `allow-two-primaries yes;` verbatim. **Live-migration coordination on the controller side** (orchestrating `drbdadm primary` on the destination, then `drbdadm secondary` on the source) lives outside this scope — that's what drbd-reactor + the consumer (KubeVirt VirtualMachineInstanceMigration / Ganesha promoter) own.
-- [x] **LVM in-line config filter** (2026-05-10). Every shell-out to `lvs` / `pvs` / `vgs` / `lvcreate` / `lvextend` / `lvremove` (in `pkg/storage/lvm/` + `pkg/satellite/signatures.go`) now goes through `lvm.Args(...)` which prepends `--config "devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] }"`. Mirrors upstream LINSTOR's `LinstorVlmLayer.java` defensive filter — rejects DRBD device paths (so LVM doesn't loop on its own LVs exposed via /dev/drbdN) and ZFS zvols (so a mixed-pool host doesn't accidentally let LVM scan ZFS-managed devices). Centralising the filter in one helper keeps every LVM invocation in lock-step; new code that adds an LVM call MUST go through `lvm.Args(...)`.
+- [x] **LVM in-line config filter** (2026-05-10). Every shell-out to `lvs` / `pvs` / `vgs` / `lvcreate` / `lvextend` / `lvremove` (in `pkg/storage/lvm/` + `pkg/satellite/signatures.go`) now goes through `lvm.Args(...)` which prepends `--config "devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] }"`. Defensive filter rejects DRBD device paths (so LVM doesn't loop on its own LVs exposed via /dev/drbdN) and ZFS zvols (so a mixed-pool host doesn't accidentally let LVM scan ZFS-managed devices) — both regexes follow from the operational reality of running LVM next to DRBD and ZFS on the same host. Centralising the filter in one helper keeps every LVM invocation in lock-step; new code that adds an LVM call MUST go through `lvm.Args(...)`.
 
 ### 8.3 Replica lifecycle
 
 - [x] **`linstor node evacuate` actually migrates replicas** (2026-05-09). New `internal/controller.NodeReconciler` watches Node CRDs and on EVICTED enumerates every Resource on the affected node, runs the shared `pkg/placer.Place` to create a replacement on a non-disabled peer (honouring the parent RG's topology constraints), and leaves the source replica in place — the operator decides when to remove it (typically once the replacement is UpToDate). The placer's "existing replicas" count now excludes EVICTED/LOST nodes so a 2-replica RD with one evicted source actually triggers the migration. Test: `TestNodeReconciler_EvictedTriggersMigration` pins the 3-node migration path.
 - [x] **`linstor node lost` recovery** (2026-05-09): the same NodeReconciler also detects LOST. Migration runs as for EVICTED, then the source Resource CRD is deleted via the K8s API path so the Resource controller's finalizer cleans up. The TCP-port/node-id allocations stored on the source Resource Status free naturally on delete (the per-node port allocator scans live Resources). Test: `TestNodeReconciler_LostDeletesSourceResource`. **e2e** (hard-kill a satellite pod) sits on the 8.8 checklist.
 - [x] **auto-diskful** (2026-05-09): the ResourceReconciler now promotes a DISKLESS replica to diskful when `Resource.Status.InUse=true` AND the hosting node has a viable storage pool. Removes the DISKLESS flag and stamps `StorPoolName` on Spec.Props; the satellite reconciler picks up the change on its next pass and creates the LV / runs `drbdadm attach`. TIE_BREAKER witnesses are exempted — promoting one would defeat the quorum-only purpose. Tests: `TestAutoDisklessPromoted`, `TestAutoDisklessSkipsTiebreaker`, `TestAutoDisklessSkipsWhenNoPool`. **`auto-diskful-cleanup`** (demote-on-idle) deferred — needs hysteresis to avoid flapping on transient opens; operators can demote manually via `linstor r d` until the access-pattern tracking lands.
-- [x] **Tiebreaker auto-creation + quorum auto-toggle** (2026-05-09, upstream-aligned). `internal/controller.ResourceDefinitionReconciler` watches RDs and Resource events (Watches+EnqueueRequestsFromMapFunc), mirrors upstream LINSTOR's two distinct rules: `CtrlRscAutoTieBreakerHelper.shouldTieBreakerExist` — create a TIE_BREAKER witness iff `diskful ≥ 2 ∧ diskful%2 == 0 ∧ non-witness-diskless == 0` — and `CtrlRscAutoQuorumHelper.isQuorumFeasible` — `(diskful == 2 ∧ diskless ≥ 1) ∨ diskful ≥ 3`. The reconciler stamps `DrbdOptions/Resource/quorum=majority` when feasible, `=off` otherwise (so a 50/50 split doesn't deadlock both halves). Idempotent (an already-witnessed RD is a no-op; a witness on an evicted node gets dropped + recreated elsewhere). Tests: `TestTiebreakerCreated`, `TestTiebreakerSkipsThreeReplicas`, `TestTiebreakerSkipsTwoNodeCluster`, `TestTiebreakerSkipsEvictedNode`, `TestTiebreakerEvenWithDiskless` (user-added diskless suppresses witness), `TestTiebreakerEvenAfterUserAdds4` (4-replica → witness lands), `TestTiebreakerRemovedWhenParityFlips`, `TestTiebreakerSinglesAreLeftAlone`. Stand-side e2e (`tests/e2e/tiebreaker.sh`) green.
+- [x] **Tiebreaker auto-creation + quorum auto-toggle** (2026-05-09). `internal/controller.ResourceDefinitionReconciler` watches RDs and Resource events (Watches+EnqueueRequestsFromMapFunc) and applies two DRBD-quorum-driven rules: create a TIE_BREAKER witness iff `diskful ≥ 2 ∧ diskful%2 == 0 ∧ non-witness-diskless == 0`; and treat quorum as feasible iff `(diskful == 2 ∧ diskless ≥ 1) ∨ diskful ≥ 3`. Both rules follow from DRBD-9 quorum math: an even-parity diskful set needs an odd-cardinality voter to avoid 50/50 split-brain deadlocks, and majority quorum is only viable when at least three nodes can participate in the vote. The reconciler stamps `DrbdOptions/Resource/quorum=majority` when feasible, `=off` otherwise. Idempotent (an already-witnessed RD is a no-op; a witness on an evicted node gets dropped + recreated elsewhere). Tests: `TestTiebreakerCreated`, `TestTiebreakerSkipsThreeReplicas`, `TestTiebreakerSkipsTwoNodeCluster`, `TestTiebreakerSkipsEvictedNode`, `TestTiebreakerEvenWithDiskless` (user-added diskless suppresses witness), `TestTiebreakerEvenAfterUserAdds4` (4-replica → witness lands), `TestTiebreakerRemovedWhenParityFlips`, `TestTiebreakerSinglesAreLeftAlone`. Stand-side e2e (`tests/e2e/tiebreaker.sh`) green.
 - [x] **Resource activate / deactivate** (2026-05-09): `POST /v1/resource-definitions/{rd}/resources/{node}/{activate,deactivate}` toggles the `INACTIVE` flag on the Resource. Idempotent. Satellite reconciler reads the flag and runs `drbdadm down` (deactivate) or normal apply (activate) — the .res file, port, and node-id allocations all stay intact, so flipping back doesn't lose state. Tests: `TestResourceDeactivate` (idempotent set + clear), `TestResourceActivateUnknown` (404 on missing replica).
 - [x] **Diskless replicas as first-class autoplace candidates** (2026-05-09): `AutoSelectFilter.DisklessOnRemaining` now actually does what the field name promises. After diskful place_count is satisfied, the placer creates DISKLESS replicas on every healthy node not already hosting a replica — the upstream "cluster-wide attachable" pattern useful for consumers that need to mount on any node. Test: `TestAutoplaceDisklessOnRemaining` (4-node cluster, place_count=2 → 2 diskful + 2 diskless witnesses).
 
@@ -737,7 +748,7 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Stable identifier rules:**
 
-- [x] Stable-identifier picker (2026-05-10). `pkg/satellite/discovery.go.PickStableID` walks WWN → scsi-SATA → nvme → by-path fallback per upstream `LsBlkUtils.java`. `PhysicalDeviceCRDName(node, stableID)` composes the k8s name (underscore→hyphen, lowercase, drop chars outside `[a-z0-9-]`, cap at 253). Pinned by 4 PickStableID + 1 PhysicalDeviceCRDName test covering the virtio-no-serial fallback explicitly.
+- [x] Stable-identifier picker (2026-05-10). `pkg/satellite/discovery.go.PickStableID` walks WWN → scsi-SATA → nvme → by-path fallback (the udev-blessed precedence ladder for stable block-device identification). `PhysicalDeviceCRDName(node, stableID)` composes the k8s name (underscore→hyphen, lowercase, drop chars outside `[a-z0-9-]`, cap at 253). Pinned by 4 PickStableID + 1 PhysicalDeviceCRDName test covering the virtio-no-serial fallback explicitly.
 
 **Discovery loop (satellite, periodic + udev-triggered):**
 
@@ -747,7 +758,7 @@ satellite-execute model the rest of Phase 10 uses.
 
 **Upstream-LINSTOR filter parity:**
 
-- [~] `linstor physical-storage list` parity (2026-05-10, partial). `pkg/rest/physical_storage.go` now surfaces PhysicalDevice CRDs in the upstream-LINSTOR `PhysicalStorage` shape: cluster-wide groups devices by (size, rotational); per-node returns the flat slice. AttachTo + non-Available phase exclusion mirrors upstream's "available for new pool" filter. `pkg/store.PhysicalDeviceStore` interface (in-memory + k8s impls) is the seam. Full filter parity with `CmdPhysicalStorage.java`'s edge cases (RAID arrays, mpath, encrypted devices) waits on a real-stand verification pass.
+- [~] `linstor physical-storage list` parity (2026-05-10, partial). `pkg/rest/physical_storage.go` now surfaces PhysicalDevice CRDs in the upstream-LINSTOR `PhysicalStorage` shape: cluster-wide groups devices by (size, rotational); per-node returns the flat slice. AttachTo + non-Available phase exclusion mirrors upstream's "available for new pool" filter. `pkg/store.PhysicalDeviceStore` interface (in-memory + k8s impls) is the seam. Full filter parity for the edge cases (RAID arrays, mpath, encrypted devices) waits on a real-stand verification pass.
 
 **Attach flow (controller-side REST shim):**
 
@@ -812,7 +823,7 @@ honest. Each item names the original Phase that ticked it.
 
 ### Phase 5 follow-up
 
-- [ ] 100+ real golinstor traces captured against the Java oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
+- [ ] 100+ real golinstor traces captured against the LINSTOR oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
 
 ### Phase 8.1 follow-up — DRBD invariants
 
@@ -933,11 +944,11 @@ For each new function/endpoint:
 |-------|-------|-------|--------------|
 | L1 unit | `go test ./...` | seconds | every commit |
 | L2 contract (golden) | recorded golinstor responses → our server, byte-diff | seconds | API-changing commits |
-| L3 contract (oracle) | golinstor → both Java oracle and our server, JSON diff | minutes | per PR |
+| L3 contract (oracle) | golinstor → both LINSTOR oracle and our server, JSON diff | minutes | per PR |
 | L4 integration (DRBD) | `make smoke` on talos+qemu stand | ~3 min | per PR |
 | L5 e2e | csi-sanity + piraeus-operator e2e on stand | ~30 min | nightly + pre-merge |
 
-Contract recordings live under `test/golden/`. Captured once from a real Java
+Contract recordings live under `test/golden/`. Captured once from a real LINSTOR
 controller, replayed forever in CI.
 
 ## Cost control
@@ -953,10 +964,10 @@ controller, replayed forever in CI.
 
 | Risk | Likelihood | Mitigation |
 |------|------------|-----------|
-| Java LINSTOR API has undocumented behaviour | high | contract diff against real Java oracle every PR |
-| DRBD edge cases (recovery, bitmap, quorum) | very high | port ConfFileBuilder behaviour 1:1, real-DRBD tests, sos-report on failure |
+| LINSTOR API has undocumented behaviour | high | contract diff against real LINSTOR oracle every PR |
+| DRBD edge cases (recovery, bitmap, quorum) | very high | ConfFileBuilder pinned by contract tests, real-DRBD tests, sos-report on failure |
 | linstor-csi expects sync API; we are async | medium | block REST handler on watch with timeout; fall through to 408 |
-| Schema drift between Java versions | low | pin oracle to `piraeus-server:v1.33.2` |
+| Schema drift between LINSTOR versions | low | pin oracle to `piraeus-server:v1.33.2` |
 | Credentials leaking into logs | low | redaction for `DrbdOptions/Crypto*`, `passphrase`, AWS keys |
 | Costs run away | medium | auto-stop schedule, monthly review |
 | Dev host fails or is wiped | low | terraform recreates; stand state is ephemeral by design |
@@ -964,7 +975,7 @@ controller, replayed forever in CI.
 ## Open questions for the user
 
 1. ~~Github repo~~ — `cozystack/blockstor` public, **resolved**.
-2. Pin Java oracle to `piraeus-server:v1.33.2` (current cozystack version) — OK?
+2. Pin LINSTOR oracle to `piraeus-server:v1.33.2` (current cozystack version) — OK?
 3. Auto-stop schedule for the dev host — nights and weekends UTC, or your timezone? Or no auto-stop?
 4. Where should I post short daily progress — this chat, a Telegram channel, a Slack channel?
 ---

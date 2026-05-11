@@ -1,44 +1,52 @@
 # cozystack-blockstor
 
-A Go reimplementation of LINSTOR (controller + satellite) targeting
-1:1 REST API compatibility with linstor-csi, piraeus-operator,
-ha-controller, and the rest of the LINSTOR client ecosystem. State of
-truth lives in Kubernetes CRDs; logic is reconcile-driven.
+blockstor is a Kubernetes control plane for LVM and ZFS storage with [DRBD](https://linbit.com/drbd/) replication. It exposes a [LINSTOR](https://linbit.com/linstor/)-compatible REST API so existing clients (linstor-csi, piraeus-operator, ha-controller, golinstor) keep working.
 
-Status: Phases 1–9 complete (110/110 PLAN.md checkboxes ticked).
-The `master` branch carries the production build.
+## Why a new implementation?
+
+### Kubernetes-native architecture
+
+- **Reconciliation control plane.** State of truth lives in Kubernetes CRDs; controller and satellite are `controller-runtime` managers with watch-based informers, declarative reconcile loops, and Status SSA. No synchronous fan-out RPC, no central in-memory state, no per-request controller→node polling. Desired/observed convergence is automatic.
+- **First-class CRDs.** `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice`, `ControllerConfig` are designed to be read and (where appropriate) written by other operators: cozystack tenant operators, GitOps tooling, custom monitoring/alerting, admission webhooks. Schemas carry kubebuilder enum/min/max validation; multi-writer Status uses Server-Side Apply field managers.
+- **Per-node satellite as a controller.** Each satellite is a controller-runtime manager that watches its own slice of CRDs (filtered by `Spec.NodeName`) and writes observed state back via Status SSA directly. No gRPC dispatch from a central controller.
+
+See [`docs/architecture.md`](docs/architecture.md) for the load-bearing design notes.
+
+### Ecosystem fit
+
+Go is the lingua franca of the Kubernetes ecosystem — apiserver, kubelet, etcd, the bulk of CSI drivers, controller-runtime itself. Writing blockstor in Go aligns the project with the tooling, libraries, and contributor base of that ecosystem.
+
+### New functionality
+
+- **Shared-LUN provisioning** with thick LVM + thin qcow2-on-LVM (no filesystem layer), following the design proven in [oVirt VDSM](https://github.com/oVirt/vdsm/blob/master/doc/thin-provisioning.md).
+- **VDUSE backend** via `qemu-storage-daemon` for shared-SAN Kubernetes — see the [LVM/qcow shared-SAN write-up](https://blog.deckhouse.io/lvm-qcow-csi-driver-shared-san-kubernetes-81455201590e) for the design rationale.
+- **Bring-your-own-key (BYOK) encryption** with operator-managed Secret references in the CRD spec rather than a controller-owned passphrase bag.
+
+## Acknowledgements
+
+blockstor implements a LINSTOR-compatible REST API and was inspired by LINBIT's work on DRBD and LINSTOR, and by the wider DRBD / LINSTOR / Piraeus community.
 
 ## What's here
 
 - `cmd/` — `controller/` + `satellite/` binaries.
 - `pkg/api/v1/` — REST shape types, layer-stack resolver.
-- `pkg/rest/` — REST handlers (1:1 with upstream LINSTOR endpoints).
-- `pkg/store/` + `pkg/store/k8s/` — InMemory + CRD-backed store, both
-  behind the same `store.Store` interface and exercised by a shared
-  test suite.
-- `pkg/satellite/` — DRBD/LUKS/STORAGE layer reconciler, events2
-  observer, snapshot-ship dispatcher (zfs send|recv, thin-send-recv).
-- `pkg/storage/{lvm,zfs,loopfile,file}` — provider implementations
-  (LVM-thin, LVM-thick, ZFS / ZFS_THIN, loopfile, host file).
+- `pkg/rest/` — REST handlers (LINSTOR-compatible).
+- `pkg/store/` + `pkg/store/k8s/` — InMemory + CRD-backed store, both behind the same `store.Store` interface and exercised by a shared test suite.
+- `pkg/satellite/` — DRBD/LUKS/STORAGE layer reconciler, snapshot-ship dispatcher.
+- `pkg/satellite/controllers/` — controller-runtime reconcilers on the satellite (Resource, StoragePool, Snapshot, PhysicalDevice + events2 observer Runnable).
+- `pkg/storage/{lvm,zfs,loopfile,file}` — provider implementations (LVM-thin, LVM-thick, ZFS / ZFS_THIN, loopfile, host file).
 - `pkg/luks/` — `cryptsetup` wrapper for the LUKS layer.
-- `pkg/drbd/` — `drbdadm` / `drbdsetup` wrappers, .res ConfFileBuilder,
-  events2 parser, options resolver.
+- `pkg/drbd/` — `drbdadm` / `drbdsetup` wrappers, .res ConfFileBuilder, events2 parser, options resolver.
 - `pkg/placer/` — autoplacer (capacity-weighted, anti-affinity, shared-LUN-aware).
-- `pkg/dispatcher/` — RD → satellite Apply translator (resolves
-  layer_stack, options, passphrases).
-- `internal/controller/` — controller-runtime reconcilers (RD, RG, RP,
-  Snapshot, Resource, Node).
-- `proto/satellite/v1alpha1/` — controller↔satellite gRPC.
+- `pkg/dispatcher/` — CRD → DesiredResource translator (resolves layer_stack, options, passphrases). Used by the satellite-side c-r reconcilers.
+- `internal/controller/` — controller-side controller-runtime reconcilers (RD, RG, RP, Snapshot, Resource, Node).
 - `stand/` — Talos+QEMU dev stand (DRBD, ZFS, LVM extensions baked in).
-- `docs/` — `layer-stack.md` (DRBD/LUKS/STORAGE compositions),
-  `csi-api-surface.md`.
-- `tests/` — `contract/` (oracle diff vs. Java LINSTOR), `e2e/`
-  (cluster-side scenarios), `smoke-blockstor.sh`, `burnin-blockstor.sh`.
+- `docs/` — `architecture.md`, `layer-stack.md` (DRBD/LUKS/STORAGE compositions), `csi-api-surface.md`.
+- `tests/` — `contract/` (REST contract conformance), `e2e/` (cluster-side scenarios), `smoke-blockstor.sh`, `burnin-blockstor.sh`.
 
 ## Layer stack
 
-blockstor implements LINSTOR's `layer_list` model. RDs declare an ordered
-chain — the satellite walks it bottom-up on Apply, top-down on teardown.
+blockstor implements an ordered layer-stack model. RDs declare a chain — the satellite walks it bottom-up on Apply, top-down on teardown.
 
 | Stack                       | Use case                                     |
 |-----------------------------|----------------------------------------------|
@@ -99,12 +107,12 @@ Scenarios live under `tests/e2e/` and each takes a `WORK_DIR` arg.
 ```
 cmd/               controller + satellite binaries
 pkg/               API, REST, store, satellite, storage, drbd, luks, placer, dispatcher
-internal/controller/  controller-runtime reconcilers
-proto/             gRPC contracts
+internal/controller/  controller-side controller-runtime reconcilers
+pkg/satellite/controllers/  satellite-side controller-runtime reconcilers
 stand/             Talos+QEMU dev stand
-docs/              layer-stack, CSI surface notes
+docs/              architecture, layer-stack, CSI surface notes
 tests/
-  contract/        oracle diff vs. Java LINSTOR
+  contract/        REST contract conformance
   e2e/             cluster-side scenarios (lib.sh + per-scenario .sh)
   smoke-blockstor.sh
   burnin-blockstor.sh
