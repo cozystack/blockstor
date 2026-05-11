@@ -84,7 +84,7 @@ if [[ -z "$DEV" ]]; then
 fi
 
 echo ">> assert no .res rendered (no DRBD)"
-if on_node "$N1" bash -c "test -f /var/lib/blockstor-satellite/${RD}.res"; then
+if on_node "$N1" bash -c "test -f /etc/drbd.d/${RD}.res"; then
     echo "FAIL: .res file rendered despite LayerStack=[LUKS,STORAGE]"
     exit 1
 fi

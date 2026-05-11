@@ -94,7 +94,7 @@ if [[ "$md5_pre" != "$md5_post" ]]; then
 fi
 
 echo ">> assert no .res file rendered"
-if on_node "$N1" bash -c "test -f /var/lib/blockstor-satellite/${RD}.res"; then
+if on_node "$N1" bash -c "test -f /etc/drbd.d/${RD}.res"; then
     echo "FAIL: .res file rendered despite LayerStack=[STORAGE]"
     exit 1
 fi

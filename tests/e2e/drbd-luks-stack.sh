@@ -71,7 +71,7 @@ done
 wait_uptodate "$RD" "$N1" "$N2"
 
 echo ">> assert .res disk line points at LUKS mapper, not raw LV"
-res_body=$(on_node "$N1" cat "/var/lib/blockstor-satellite/${RD}.res")
+res_body=$(on_node "$N1" cat "/etc/drbd.d/${RD}.res")
 if ! grep -q "/dev/mapper/${RD}-0-luks" <<< "$res_body"; then
     echo "FAIL: .res does not point at LUKS mapper; body=$res_body"
     exit 1
