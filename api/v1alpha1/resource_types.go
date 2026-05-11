@@ -142,11 +142,43 @@ type ResourceStatus struct {
 	// +optional
 	Volumes []ResourceVolumeStatus `json:"volumes,omitempty"`
 
+	// connections is the per-peer DRBD connection state observed by the
+	// satellite (from `drbdsetup events2` / `drbdsetup status`). The
+	// Python `linstor r list --faulty` reads this through the REST
+	// `layer_object.drbd.connections` map — without it, the CLI cannot
+	// distinguish a healthy three-peer mesh from one with a broken
+	// connection. Keyed by peer node name.
+	// +listType=map
+	// +listMapKey=peerNodeName
+	// +optional
+	Connections []ResourceConnectionStatus `json:"connections,omitempty"`
+
 	// conditions represent the current state of the Resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ResourceConnectionStatus is the state of one DRBD peer connection
+// from this replica's point of view. Maps 1:1 to upstream LINSTOR's
+// `DrbdConnection` REST shape — the Python CLI walks the `connected`
+// flag to color the Conns column red on `linstor r list`.
+type ResourceConnectionStatus struct {
+	// peerNodeName is the name of the peer Resource (and the node
+	// it lives on — Resource names are RD.node).
+	PeerNodeName string `json:"peerNodeName"`
+	// connected is true iff DRBD reports the connection as
+	// `Connected` (handshake complete, replication active).
+	// +optional
+	Connected bool `json:"connected,omitempty"`
+	// message is the human-readable DRBD connection state
+	// (`Connected`, `StandAlone`, `BrokenPipe`, `NetworkFailure`,
+	// `Connecting`, `Timeout`, etc.) as reported by `drbdsetup
+	// events2`. Populated even when Connected — useful for
+	// surfacing transitional states.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.

@@ -56,9 +56,49 @@ func DefaultLayerStack() []string {
 // ResourceLayer is the per-layer descriptor on a ResourceDefinition. We
 // store the discriminator and an opaque payload — golinstor's structs vary
 // per layer (DRBD, LUKS, …) and we don't yet need to interpret them.
+//
+// Children + NameSuffix mirror upstream's `ResourceLayerData`. The
+// Python CLI's `rsc.layer_data.layer_stack` walks Children recursively;
+// without these, `linstor r list` fails with AttributeError on
+// `layer_data is None` because the JSON key is omitted entirely.
+//
+// Drbd is populated only on DRBD-layer entries. The Python CLI reads
+// `layer_data.drbd_resource.connections` to color disconnected peers
+// red and to decide `--faulty` inclusion — empty `drbd` produces an
+// "Ok" Conns column regardless of actual peer state.
 type ResourceLayer struct {
-	Type string         `json:"type"`
-	Data map[string]any `json:"data,omitempty"`
+	Type       string             `json:"type"`
+	NameSuffix string             `json:"rsc_name_suffix,omitempty"`
+	Children   []ResourceLayer    `json:"children,omitempty"`
+	Drbd       *DrbdResourceLayer `json:"drbd,omitempty"`
+	Data       map[string]any     `json:"data,omitempty"`
+}
+
+// DrbdResourceLayer carries DRBD-layer-specific runtime state surfaced
+// to the REST CLI. Subset of upstream LINSTOR's `DrbdRscData` — we
+// only fill in the fields the CLI / linstor-csi actually read.
+type DrbdResourceLayer struct {
+	// TCPPorts is the list of DRBD listen ports for this replica;
+	// upstream surfaces this as a list because multi-volume / proxy
+	// setups can advertise more than one. We typically have exactly
+	// one entry (the per-replica DRBDPort).
+	TCPPorts []int32 `json:"tcp_ports,omitempty"`
+
+	// Connections maps peer node name → per-peer connection state.
+	// Empty map = no peers (single-replica setup) — distinct from
+	// missing field which the Python CLI interprets as "no DRBD
+	// layer present".
+	Connections map[string]DrbdConnection `json:"connections,omitempty"`
+}
+
+// DrbdConnection is one peer's connection state as reported by
+// `drbdsetup events2` on the local replica. Wire shape matches
+// upstream's `DrbdConnection` exactly so the Python CLI's
+// `conn.connected` / `conn.message` properties parse without
+// translation.
+type DrbdConnection struct {
+	Connected bool   `json:"connected"`
+	Message   string `json:"message,omitempty"`
 }
 
 // VolumeDefinition is one volume slot inside a ResourceDefinition.

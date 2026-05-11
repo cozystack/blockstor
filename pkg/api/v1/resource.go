@@ -19,14 +19,30 @@ package v1
 // Resource is a single replica of a ResourceDefinition placed on a node.
 // linstor-csi reads this heavily via /v1/view/resources during volume
 // reconciliation.
+//
+// LayerObject is a single layer-stack descriptor — upstream LINSTOR's
+// `layer_object` is a SINGLE ResourceLayer, not a list. The Python CLI
+// dereferences `rsc.layer_data.layer_stack` unconditionally on
+// `linstor r list`, so emitting nothing crashes the CLI with
+// AttributeError.
 type Resource struct {
-	Name      string            `json:"name"`
-	NodeName  string            `json:"node_name"`
-	Props     map[string]string `json:"props,omitempty"`
-	Flags     []string          `json:"flags,omitempty"`
-	State     ResourceState     `json:"state,omitzero"`
-	UUID      string            `json:"uuid,omitempty"`
-	LayerData []ResourceLayer   `json:"layer_object,omitempty"`
+	Name        string            `json:"name"`
+	NodeName    string            `json:"node_name"`
+	Props       map[string]string `json:"props,omitempty"`
+	Flags       []string          `json:"flags,omitempty"`
+	State       ResourceState     `json:"state,omitzero"`
+	UUID        string            `json:"uuid,omitempty"`
+	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
+
+	// Volumes is the per-replica volume slice — sourced from
+	// Resource.Status.Volumes which the satellite observer writes.
+	// Upstream LINSTOR's `Resource` carries volumes inline; the
+	// Python CLI's rsc_state derivation reads
+	// `rsc.volumes[i].state.disk_state` and gates the Conns column
+	// + `--faulty` filter on whether at least one disk_state is
+	// present. Without Volumes, every resource appears as "Unknown"
+	// and Conns silently hides peer-connection state.
+	Volumes []Volume `json:"volumes,omitempty"`
 }
 
 // ResourceState is the runtime state surface of a Resource.

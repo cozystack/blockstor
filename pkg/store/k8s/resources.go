@@ -69,17 +69,30 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 }
 
 func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	// Fast path: label-selector via apiserver. REST-created Resources
+	// always carry `LabelResourceDefinition`, so the cache filters
+	// server-side. For clusters with thousands of Resources this
+	// avoids a full scan on every `linstor r l -r <rd>` and every CSI
+	// reconcile loop.
 	var crdList crdv1alpha1.ResourceList
 
-	// List all Resources and filter by Spec.ResourceDefinitionName
-	// in-process. We used to use a label selector, but Resources
-	// created directly via kubectl/manifests (rather than through
-	// the REST handler that sets labels) wouldn't be matched. Cluster
-	// resource counts are small enough that the in-process filter is
-	// the right tradeoff for correctness over hashed-label lookups.
-	err := s.c.List(ctx, &crdList)
+	err := s.c.List(ctx, &crdList,
+		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
 	if err != nil {
 		return nil, errors.Wrapf(err, "list Resource CRDs for RD %q", rdName)
+	}
+
+	// Correctness backstop: Resources applied via `kubectl apply`
+	// (e2e fixtures, operator-authored manifests) may lack the label.
+	// On an empty hit, fall back to a full scan and filter by
+	// Spec.ResourceDefinitionName. If the label-selector found
+	// matches, trust it — a partial-but-correct subset isn't possible
+	// here since every REST writer sets the label.
+	if len(crdList.Items) == 0 {
+		err = s.c.List(ctx, &crdList)
+		if err != nil {
+			return nil, errors.Wrapf(err, "fallback list Resource CRDs for RD %q", rdName)
+		}
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
@@ -291,12 +304,166 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		NodeName: crd.Spec.NodeName,
 		Props:    props,
 		Flags:    crd.Spec.Flags,
+		// Resource CRD has no LayerStack — that lives on the parent RD.
+		// Looking it up here turns every list/view into an N+1 query, so
+		// we approximate with the default stack. The Python CLI only
+		// uses this to render the Layers column on `linstor r list`;
+		// blockstor's actual layer placement is driven by the RD spec
+		// at apply time, not by this read-only echo.
+		LayerObject: layerObjectFromCRD(crd),
 		State: apiv1.ResourceState{
 			InUse:     crd.Status.InUse,
 			DrbdState: crd.Status.DrbdState,
 		},
-		UUID: string(crd.UID),
+		Volumes: volumesFromStatus(crd.Status.Volumes),
+		UUID:    string(crd.UID),
 	}
+}
+
+// volumesFromStatus projects the CRD `Status.Volumes` onto wire
+// `[]Volume`. State carries DiskState + CurrentGi (Generation
+// Identifier) — the latter is what the controller seeds new
+// replicas with for skipping the full initial-sync. The Python CLI
+// derives the per-resource rsc_state from `volumes[].state.disk_state`;
+// without this projection, the rsc_state stays "Unknown" and the
+// CLI suppresses the Conns column + --faulty filter.
+func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make([]apiv1.Volume, 0, len(in))
+
+	for i := range in {
+		volStatus := &in[i]
+		out = append(out, apiv1.Volume{
+			VolumeNumber: volStatus.VolumeNumber,
+			StoragePool:  volStatus.StoragePool,
+			DevicePath:   volStatus.DevicePath,
+			AllocatedKib: volStatus.AllocatedKib,
+			UsableKib:    volStatus.UsableKib,
+			State: apiv1.VolumeState{
+				DiskState: volStatus.DiskState,
+				CurrentGi: volStatus.CurrentGi,
+			},
+		})
+	}
+
+	return out
+}
+
+// layerObjectFromCRD wraps `layerObjectFromStack` with the CRD-side
+// glue: it injects the per-replica DRBD runtime state (TCP port,
+// per-peer connection map) into the top-of-stack `Drbd` field. The
+// Python CLI's `--faulty` filter reads `connections[*].connected`
+// to color broken peers red and to gate inclusion in the faulty
+// subset; without this `r list --faulty` cannot see disconnected
+// peers and silently passes them as healthy.
+func layerObjectFromCRD(crd *crdv1alpha1.Resource) *apiv1.ResourceLayer {
+	top := layerObjectFromStack(nil, crd.Spec.Flags)
+	if top == nil {
+		return nil
+	}
+
+	// Inject DRBD runtime only on the DRBD layer itself (top of the
+	// default stack). If a future RG advertises a non-DRBD stack
+	// (`[STORAGE]` only) this is a no-op — `Drbd` stays nil and the
+	// CLI renders an empty Conns column for that resource.
+	if top.Type == apiv1.LayerKindDRBD {
+		top.Drbd = drbdLayerFromStatus(&crd.Status)
+	}
+
+	return top
+}
+
+// drbdLayerFromStatus builds the wire-side `DrbdResourceLayer` from
+// the satellite-observed CRD Status. Returns nil when no observable
+// runtime state exists yet (Resource just created, satellite hasn't
+// reconciled it).
+func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLayer {
+	var out apiv1.DrbdResourceLayer
+
+	hasAny := false
+
+	if st.DRBDPort != nil {
+		out.TCPPorts = []int32{*st.DRBDPort}
+		hasAny = true
+	}
+
+	if len(st.Connections) > 0 {
+		out.Connections = make(map[string]apiv1.DrbdConnection, len(st.Connections))
+		for i := range st.Connections {
+			c := &st.Connections[i]
+			out.Connections[c.PeerNodeName] = apiv1.DrbdConnection{
+				Connected: c.Connected,
+				Message:   c.Message,
+			}
+		}
+
+		hasAny = true
+	}
+
+	if !hasAny {
+		return nil
+	}
+
+	return &out
+}
+
+// layerObjectFromStack assembles the upstream-LINSTOR `layer_object`
+// tree from a flat layer-stack slice. Returns nil when the stack is
+// empty — the wire shape uses `omitempty`, but the Python CLI's
+// `rsc.layer_data.layer_stack` dereferences the result
+// unconditionally, so callers that need CLI compatibility should
+// supply a fallback (default DRBD/STORAGE) before invoking this.
+//
+// DISKLESS resources have no STORAGE child even when the stack lists
+// it — drop the STORAGE leaf when the flag is set, so the wire shape
+// matches the actual on-disk layout the satellite renders.
+func layerObjectFromStack(stack, flags []string) *apiv1.ResourceLayer {
+	if len(stack) == 0 {
+		stack = apiv1.DefaultLayerStack()
+	}
+
+	diskless := false
+
+	for _, f := range flags {
+		if f == apiv1.ResourceFlagDiskless || f == apiv1.ResourceFlagTieBreaker {
+			diskless = true
+
+			break
+		}
+	}
+
+	if diskless {
+		out := make([]string, 0, len(stack))
+
+		for _, s := range stack {
+			if s == apiv1.LayerKindStorage {
+				continue
+			}
+
+			out = append(out, s)
+		}
+
+		stack = out
+	}
+
+	if len(stack) == 0 {
+		return nil
+	}
+
+	top := &apiv1.ResourceLayer{Type: stack[0]}
+
+	cursor := top
+
+	for _, t := range stack[1:] {
+		child := apiv1.ResourceLayer{Type: t}
+		cursor.Children = []apiv1.ResourceLayer{child}
+		cursor = &cursor.Children[0]
+	}
+
+	return top
 }
 
 func wireToCRDResource(in *apiv1.Resource) *crdv1alpha1.Resource {

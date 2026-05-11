@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"strconv"
+	"sync"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +44,7 @@ type observation struct {
 	InUse        bool
 	DrbdState    string
 	Volumes      []volumeObservation
+	Connections  []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -52,6 +54,16 @@ type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
 	CurrentUUID  string
+}
+
+// connectionObservation carries one per-peer DRBD connection state.
+// Maps directly onto `ResourceStatus.Connections[i]` — the wire-side
+// `linstor r list --faulty` reads `Connected` to color disconnected
+// peers red.
+type connectionObservation struct {
+	PeerNodeName string
+	Connected    bool
+	Message      string
 }
 
 // translateEvent maps one parsed events2 frame into the
@@ -98,6 +110,31 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 		}
 
 		return out, true
+	case eventKindConnection:
+		// `drbdsetup events2` emits:
+		//   exists connection name:<rd> peer-node-id:<id> conn-name:<peer> connection:<state> ...
+		//   change connection name:<rd> peer-node-id:<id> connection:<state> ...
+		// `conn-name` is the LINSTOR peer node name; `connection` is
+		// the DRBD-9 state (`Connected`, `StandAlone`, `BrokenPipe`,
+		// `Connecting`, `NetworkFailure`, `Timeout`, ...). The Python
+		// CLI's `--faulty` filter goes red on anything other than
+		// `Connected`.
+		name := ev.Fields["name"]
+		peer := ev.Fields["conn-name"]
+		state := ev.Fields[eventKindConnection]
+
+		if name == "" || peer == "" || state == "" {
+			return observation{}, false
+		}
+
+		return observation{
+			ResourceName: name,
+			Connections: []connectionObservation{{
+				PeerNodeName: peer,
+				Connected:    state == drbdStateConnected,
+				Message:      state,
+			}},
+		}, true
 	}
 
 	return observation{}, false
@@ -129,6 +166,17 @@ func observationsFrom(in <-chan drbd.Event) <-chan observation {
 // matches the value the retired gRPC observer used.
 const observerEventBuffer = 256
 
+const (
+	// eventKindConnection is the events2 `kind` token for peer
+	// connection state-change frames.
+	eventKindConnection = "connection"
+	// drbdStateConnected is the DRBD-9 connection-state token
+	// meaning "handshake complete, replication active". Anything
+	// else (`StandAlone`, `BrokenPipe`, `Connecting`, ...) lands
+	// in the Python CLI's `--faulty` set.
+	drbdStateConnected = "Connected"
+)
+
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
 // observations onto matching Resource CRDs' Status subresource
 // via SSA. Phase 10.6: replaces the retired gRPC
@@ -148,6 +196,15 @@ type ObserverRunnable struct {
 	// onto Resource.Status as the host signal the controller
 	// uses to route observations to the right CRD.
 	NodeName string
+
+	// connCache holds the latest observed per-peer connection state
+	// keyed by `<resource>/<peer>`. We apply the full snapshot per
+	// resource on every connection event because SSA with the same
+	// FieldOwner re-applying `Connections=[<one>]` drops the other
+	// peers from this owner's claims, deleting them. Aggregating
+	// before apply preserves all peers.
+	connMu    sync.Mutex
+	connCache map[string]map[string]connectionObservation
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -182,7 +239,8 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 	adm := drbd.NewAdm(o.Exec)
 
 	for ev := range observationsFrom(events) {
-		o.handleObservation(ctx, adm, ev)
+		obs := ev
+		o.handleObservation(ctx, adm, &obs)
 	}
 
 	return nil
@@ -191,7 +249,7 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 // handleObservation runs the per-event side-effects: the
 // backing-device-failure auto-detach (kernel-reported disk:Failed
 // → drbdadm detach) and the Resource.Status SSA write.
-func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm, ev observation) {
+func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm, ev *observation) {
 	logger := log.FromContext(ctx).WithName("observer")
 
 	if ev.DrbdState == "Failed" {
@@ -203,10 +261,60 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 		}
 	}
 
+	// Connection observations arrive one peer at a time. SSA with the
+	// same FieldOwner replaces the full list each apply, so we
+	// aggregate per-resource state in-memory and emit the full
+	// snapshot. Without the merge, Apply N drops Apply N-1's other
+	// peers from this owner's claims and they vanish from Status.
+	o.mergeConnections(ev)
+
 	err := o.writeStatus(ctx, ev)
 	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
 	}
+}
+
+// mergeConnections updates the per-resource peer-state cache from
+// the latest event and replaces ev.Connections with the full
+// snapshot the SSA apply must emit. Volume / role events still pass
+// through their existing paths — only connection state needs
+// aggregation because every peer is a separate listMap key under
+// the same FieldOwner.
+func (o *ObserverRunnable) mergeConnections(ev *observation) {
+	if ev.ResourceName == "" {
+		return
+	}
+
+	o.connMu.Lock()
+	defer o.connMu.Unlock()
+
+	if o.connCache == nil {
+		o.connCache = map[string]map[string]connectionObservation{}
+	}
+
+	peers, ok := o.connCache[ev.ResourceName]
+	if !ok {
+		peers = map[string]connectionObservation{}
+		o.connCache[ev.ResourceName] = peers
+	}
+
+	for _, c := range ev.Connections {
+		peers[c.PeerNodeName] = c
+	}
+
+	// Only overwrite the slice when this event actually carried
+	// connection data; otherwise role/disk events would re-broadcast
+	// the cache redundantly on every kernel frame.
+	if len(ev.Connections) == 0 {
+		return
+	}
+
+	snapshot := make([]connectionObservation, 0, len(peers))
+	for _, c := range peers {
+		snapshot = append(snapshot, c)
+	}
+
+	ev.Connections = snapshot
 }
 
 // writeStatus applies the observation onto the matching Resource
@@ -219,7 +327,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 // satellite may observe state for a resource the controller
 // hasn't yet created. Surface it so handleObservation drops
 // the event without noise.
-func (o *ObserverRunnable) writeStatus(ctx context.Context, ev observation) error {
+func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) error {
 	if ev.ResourceName == "" {
 		return nil
 	}
@@ -237,9 +345,10 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev observation) erro
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
-			InUse:     ev.InUse,
-			DrbdState: ev.DrbdState,
-			Volumes:   buildObserverVolumeStatus(ev),
+			InUse:       ev.InUse,
+			DrbdState:   ev.DrbdState,
+			Volumes:     buildObserverVolumeStatus(ev),
+			Connections: buildObserverConnectionStatus(ev),
 		},
 	}
 
@@ -259,7 +368,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev observation) erro
 // non-empty fields propagate so the apply object stays narrow
 // — broader claims would steal field ownership from other
 // writers (controller-side seed allocator, etc.).
-func buildObserverVolumeStatus(ev observation) []blockstoriov1alpha1.ResourceVolumeStatus {
+func buildObserverVolumeStatus(ev *observation) []blockstoriov1alpha1.ResourceVolumeStatus {
 	if len(ev.Volumes) == 0 {
 		return nil
 	}
@@ -271,6 +380,28 @@ func buildObserverVolumeStatus(ev observation) []blockstoriov1alpha1.ResourceVol
 			VolumeNumber: v.VolumeNumber,
 			DiskState:    v.DiskState,
 			CurrentGi:    v.CurrentUUID,
+		})
+	}
+
+	return out
+}
+
+// buildObserverConnectionStatus packs the per-peer DRBD connection
+// observations onto Status.Connections. With listMapKey=peerNodeName
+// SSA merges per-peer — a single connection-changed event updates
+// just that peer's entry, leaving others untouched.
+func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.ResourceConnectionStatus {
+	if len(ev.Connections) == 0 {
+		return nil
+	}
+
+	out := make([]blockstoriov1alpha1.ResourceConnectionStatus, 0, len(ev.Connections))
+
+	for _, c := range ev.Connections {
+		out = append(out, blockstoriov1alpha1.ResourceConnectionStatus{
+			PeerNodeName: c.PeerNodeName,
+			Connected:    c.Connected,
+			Message:      c.Message,
 		})
 	}
 
