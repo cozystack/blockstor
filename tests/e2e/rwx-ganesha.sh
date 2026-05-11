@@ -2,25 +2,21 @@
 #
 # usage: rwx-ganesha.sh WORK_DIR
 #
-# Tests RWX volumes via Ganesha NFS + drbd-reactor (Phase 8.7).
-# Layout:
-#   - 2-volume RD: vol 0 = data (xfs), vol 1 = ganesha export config
-#   - 2-replica RD on workers 1+2
-#   - drbd-reactor on each worker has a per-RD promoter unit:
-#       on Primary acquired → mount xfs → systemctl start nfs-ganesha@<rd>
-#       on Primary lost → systemctl stop, umount
+# RWX validation through linstor-csi: claim a PVC with
+# accessModes=ReadWriteMany against a piraeus-backed StorageClass,
+# mount it from two Pods on different worker nodes, and verify a
+# marker written on one is readable on the other.
 #
-# This script:
-#   1. provisions the 2-volume RD
-#   2. promotes $N1 to Primary (drbd-reactor brings up Ganesha)
-#   3. mounts the export from a Pod
-#   4. writes a marker file
-#   5. simulates failover by killing $N1 (drbd-reactor on $N2 takes over)
-#   6. mount continues to work, marker file readable
+# linstor-csi auto-publishes an RWX PVC over its NFS-Ganesha sidecar
+# (the `linstor-csi-nfs-server` DaemonSet piraeus-operator ships) —
+# the dev stand has those Pods Running after `make piraeus`, so this
+# test only needs to drive the upper-layer Pod / PVC plumbing. No
+# drbd-reactor or hand-rolled Ganesha config required.
 #
-# Skipped on a stand without drbd-reactor configured. The blockstor
-# side simply provisions the 2-volume RD; the actual NFS handoff is
-# drbd-reactor's job.
+# This is technically a piraeus-stack smoke (the underlying volume
+# is provisioned by Java LINSTOR), kept in tests/e2e/ because it
+# exercises the same RWX surface blockstor will expose through its
+# LINSTOR-compatible REST API in a later phase.
 
 set -euo pipefail
 
@@ -33,55 +29,95 @@ source "$SCRIPT_DIR/lib.sh"
 
 require_workers 2
 
-# Pre-flight: skip if drbd-reactor / ganesha aren't on the satellites.
-if ! on_node "$WORKER_1" which drbd-reactorctl >/dev/null 2>&1; then
-    echo "SKIP: drbd-reactor not installed on the stand (cozystack-only)"
-    exit 0
-fi
+SC=e2e-rwx-sc
+PVC=e2e-rwx
+P1=e2e-rwx-pod-1
+P2=e2e-rwx-pod-2
 
-RD=e2e-rwx
-N1=$WORKER_1
-N2=$WORKER_2
+cleanup() {
+    kubectl delete pod "$P1" "$P2" --ignore-not-found --wait=false 2>/dev/null || true
+    kubectl delete pvc "$PVC" --ignore-not-found 2>/dev/null || true
+    kubectl delete sc "$SC" --ignore-not-found 2>/dev/null || true
+}
+trap cleanup EXIT
 
-trap 'delete_rd "$RD"' EXIT
-
-echo ">> apply 2-volume RD (data + ganesha-config)"
+echo ">> StorageClass against piraeus' linstor-csi (pool=pool, replicas=2)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
-kind: ResourceDefinition
-metadata: {name: ${RD}}
-spec:
-  volumeDefinitions:
-    - {volumeNumber: 0, sizeKib: 65536}   # data
-    - {volumeNumber: 1, sizeKib: 4096}    # ganesha config
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: $SC}
+provisioner: linstor.csi.linbit.com
+parameters:
+  linstor.csi.linbit.com/storagePool: pool
+  linstor.csi.linbit.com/placementCount: "2"
+  csi.storage.k8s.io/fstype: ext4
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
 EOF
-for n in "$N1" "$N2"; do
-    cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
-kind: Resource
-metadata: {name: ${RD}.${n}}
+
+echo ">> PVC 128Mi accessModes=ReadWriteMany"
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: $PVC}
 spec:
-  resourceDefinitionName: ${RD}
-  nodeName: ${n}
-  props: {StorPoolName: stand}
+  accessModes: [ReadWriteMany]
+  storageClassName: $SC
+  resources:
+    requests: {storage: 128Mi}
 EOF
+
+echo ">> wait for PVC Bound (90s)"
+deadline=$(( $(date +%s) + 90 ))
+phase=""
+while (( $(date +%s) < deadline )); do
+    phase=$(kubectl get pvc "$PVC" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    [[ "$phase" == "Bound" ]] && break
+    sleep 3
 done
 
-wait_uptodate "$RD" "$N1" "$N2"
-
-# Verify both volume devices exist on $N1.
-DEV0=$(on_node "$N1" bash -c "ls /dev/drbd_${RD}_0 2>/dev/null || grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sed -n 1p")
-DEV1=$(on_node "$N1" bash -c "ls /dev/drbd_${RD}_1 2>/dev/null || grep -oE '/dev/drbd[0-9]+' /etc/drbd.d/${RD}.res | sed -n 2p")
-
-if [[ -z "$DEV0" || -z "$DEV1" ]]; then
-    echo "FAIL: 2-volume RD did not produce 2 DRBD devices ($DEV0, $DEV1)"
+if [[ "$phase" != "Bound" ]]; then
+    echo "FAIL: PVC never Bound (phase=$phase)"
+    kubectl describe pvc "$PVC" | tail -20
     exit 1
 fi
 
-# We can't drive Ganesha mount in this script without a privileged Pod
-# spec; the goal here is to prove the blockstor-side 2-volume RD shape
-# is right and drbd-reactor sees it. End-to-end Ganesha lives in the
-# cozystack integration suite.
-on_node "$N1" drbdadm primary "$RD" || true
+echo ">> two Pods on $WORKER_1 + $WORKER_2 mount the PVC"
+for spec in "$P1:$WORKER_1" "$P2:$WORKER_2"; do
+    name=${spec%:*}
+    node=${spec#*:}
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata: {name: $name}
+spec:
+  nodeName: $node
+  restartPolicy: Never
+  containers:
+    - name: w
+      image: alpine:3
+      command: ["sleep", "300"]
+      volumeMounts:
+        - {name: data, mountPath: /data}
+  volumes:
+    - name: data
+      persistentVolumeClaim: {claimName: $PVC}
+EOF
+done
 
-echo ">> RWX-GANESHA OK (2-volume RD provisioned, drbd-reactor takeover left to cozystack suite)"
+echo ">> wait both Pods Ready (120s)"
+kubectl wait --for=condition=Ready --timeout=120s pod/"$P1" pod/"$P2"
+
+MARK="rwx-$(date +%s)-$$"
+echo ">> write marker '$MARK' from $P1"
+kubectl exec "$P1" -- sh -c "echo $MARK > /data/marker && sync"
+
+echo ">> read marker from $P2"
+got=$(kubectl exec "$P2" -- cat /data/marker)
+if [[ "$got" != "$MARK" ]]; then
+    echo "FAIL: marker mismatch — got '$got', want '$MARK'"
+    exit 1
+fi
+
+echo ">> RWX-GANESHA OK (marker round-tripped between $P1 on $WORKER_1 and $P2 on $WORKER_2)"
