@@ -64,7 +64,10 @@ echo ">> wait up to 60s for satellite to provision raw LV"
 deadline=$(( $(date +%s) + 60 ))
 DEV=""
 while (( $(date +%s) < deadline )); do
-    DEV=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.devicePath}' 2>/dev/null || true)
+    # Per-volume DevicePath; this test has one volume (number 0).
+    DEV=$(kubectl get resource "${RD}.${N1}" \
+        -o jsonpath='{.status.volumes[?(@.volumeNumber==0)].devicePath}' \
+        2>/dev/null || true)
     if [[ -n "$DEV" ]]; then
         break
     fi
