@@ -123,5 +123,20 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "register HeartbeatRunnable")
 	}
 
+	wireCrossNodeFetcher(mgr, cfg)
+
 	return mgr, nil
+}
+
+// wireCrossNodeFetcher injects the SnapshotFetcher into the Apply
+// chain so materializeVolume's no-local-snapshot branch streams from
+// a peer satellite instead of falling through to a blank create. The
+// fetcher needs the manager's cached client, which is why it ships
+// here rather than at NewReconciler time. Pulled out of NewManager
+// to keep that function under the funlen budget.
+func wireCrossNodeFetcher(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
+		Client:   mgr.GetClient(),
+		NodeName: cfg.NodeName,
+	})
 }

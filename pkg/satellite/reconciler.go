@@ -19,6 +19,7 @@ package satellite
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -76,6 +77,29 @@ type ReconcilerConfig struct {
 	// wires luks.NewCryptsetup(storage.RealExec{}); tests inject
 	// FakeExec.
 	Cryptsetup *luks.Cryptsetup
+
+	// CrossNodeFetcher pulls a snapshot from a peer satellite when
+	// the local node doesn't host it. nil → no cross-node fallback,
+	// materializeVolume falls through to a blank CreateVolume (the
+	// pre-Phase-11 behaviour). The agent injects this post-manager
+	// construction via SetCrossNodeFetcher because the implementation
+	// needs the controller-runtime client only the manager owns.
+	CrossNodeFetcher CrossNodeFetcher
+}
+
+// CrossNodeFetcher abstracts the "fetch a snapshot from a peer that
+// hosts it locally" half of the cross-node clone path. Lives behind
+// an interface so satellite.Reconciler stays free of a direct
+// controller-runtime client dependency — the K8s lookup + peer-IP
+// resolution + stream HTTP GET sits in pkg/satellite/controllers
+// where the cached client already lives.
+type CrossNodeFetcher interface {
+	// Fetch opens a byte stream of (srcRD, snap, vol) from a peer
+	// satellite. Returns the stream + the peer node name it came
+	// from (for logging). On storage.ErrNotFound, NO peer hosts the
+	// snapshot locally — the caller must decide whether to fall
+	// through to a blank create or surface the error.
+	Fetch(ctx context.Context, srcRD, snap string, vol int32) (io.ReadCloser, string, error)
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -132,6 +156,17 @@ func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
 	}
 
 	r.cfg.Providers[pool] = provider
+}
+
+// SetCrossNodeFetcher injects the cross-node fetcher post-construction.
+// Called by the agent after the controller-runtime manager is built —
+// the fetcher needs the manager's cached client to look up Snapshot +
+// Node CRDs which doesn't exist at NewReconciler time. Safe to call
+// before the first Apply: applyOne reads cfg.CrossNodeFetcher inside
+// a single struct-field load, no extra synchronisation needed under
+// "set once, then read many" semantics.
+func (r *Reconciler) SetCrossNodeFetcher(f CrossNodeFetcher) {
+	r.cfg.CrossNodeFetcher = f
 }
 
 // Apply walks res and brings local storage in line with each item.
@@ -500,7 +535,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 		// of CreateVolume so the new replica starts populated with
 		// the snapshot's data. Idempotent: provider's clone op skips
 		// when the target volume already exists.
-		err := materializeVolume(ctx, provider, dr.GetName(), vol)
+		err := r.materializeVolume(ctx, provider, dr.GetName(), vol)
 		if err != nil {
 			return nil, false, false, errors.Wrapf(err, "create/restore volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
@@ -552,13 +587,16 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResourc
 // clone form — matches what the snapshot-restore-resource REST
 // handler stamps onto the target RD's Props.
 //
-// Cross-node fallback: when SourceSnapshot is set but the snapshot
+// Cross-node path: when SourceSnapshot is set but the snapshot
 // doesn't physically exist on THIS node (autoplace landed the new
-// replica on a node that wasn't part of the snapshot set), the
-// clone returns storage.ErrNotFound. Fall back to a blank
-// CreateVolume — DRBD's network resync from a peer that DID clone
-// locally will populate the data. Matches upstream LINSTOR.
-func materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
+// replica on a node outside snap.Nodes), the local clone returns
+// storage.ErrNotFound. With a configured CrossNodeFetcher we then
+// stream the snapshot from a peer satellite that hosts it locally
+// (upstream LINSTOR's `zfs send | zfs recv` shape). Without one,
+// fall back to a blank CreateVolume — DRBD network resync will
+// populate the data, at the cost of a known cloned-metadata vs
+// fresh-metadata GI mismatch on the wire (see Phase 11 notes).
+func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
 	target := storage.Volume{
 		ResourceName: rdName,
 		VolumeNumber: vol.GetVolumeNumber(),
@@ -580,13 +618,59 @@ func materializeVolume(ctx context.Context, provider storage.Provider, rdName st
 		SnapshotName: snapName,
 		PoolName:     vol.GetStoragePool(),
 	})
-	if errors.Is(err, storage.ErrNotFound) {
-		// Snapshot absent on this node — let DRBD resync from a
-		// peer that did clone locally.
+	if !errors.Is(err, storage.ErrNotFound) {
+		return err //nolint:wrapcheck // caller wraps
+	}
+
+	// Local snapshot missing. Try the cross-node fetcher; if that
+	// also doesn't pan out we fall through to a blank CreateVolume
+	// so DRBD has something to resync into.
+	if r.cfg.CrossNodeFetcher == nil {
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
-	return err //nolint:wrapcheck // caller wraps
+	return r.crossNodeClone(ctx, provider, target, srcRD, snapName, vol.GetVolumeNumber())
+}
+
+// crossNodeClone is materializeVolume's cross-node fallback branch.
+// Fetches the snapshot byte stream from a peer satellite and pipes
+// it into the local provider's RecvSnapshot. The provider must
+// implement storage.SnapshotShipper — backends that can't ship
+// (legacy file driver pre-Phase-11) fall through to a blank create
+// so DRBD network resync still has somewhere to drop bytes.
+func (r *Reconciler) crossNodeClone(
+	ctx context.Context,
+	provider storage.Provider,
+	target storage.Volume,
+	srcRD, snapName string,
+	volNum int32,
+) error {
+	shipper, ok := provider.(storage.SnapshotShipper)
+	if !ok {
+		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
+	}
+
+	body, peer, err := r.cfg.CrossNodeFetcher.Fetch(ctx, srcRD, snapName, volNum)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			// No peer has the snapshot — DRBD resync is the last
+			// resort. Returns wrong-data on receive (split-brain
+			// from metadata mismatch); upstream behaviour with
+			// FILE_THIN matches this for now.
+			return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
+		}
+
+		return errors.Wrapf(err, "cross-node fetch %s/%s", srcRD, snapName)
+	}
+
+	defer func() { _ = body.Close() }()
+
+	err = shipper.RecvSnapshot(ctx, target, body)
+	if err != nil {
+		return errors.Wrapf(err, "recv %s/%s from %s", srcRD, snapName, peer)
+	}
+
+	return nil
 }
 
 // tearDownRemovedPeers runs `drbdadm del-peer` for every peer that
