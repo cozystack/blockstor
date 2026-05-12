@@ -70,9 +70,10 @@ type volumeObservation struct {
 // `linstor r list --faulty` reads `Connected` to color disconnected
 // peers red.
 type connectionObservation struct {
-	PeerNodeName string
-	Connected    bool
-	Message      string
+	PeerNodeName     string
+	Connected        bool
+	Message          string
+	ReplicationState string
 }
 
 // translateEvent maps one parsed events2 frame into the
@@ -175,14 +176,15 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 //	   conn-name:<peer> replication:<state> peer-disk:<state>
 //	   out-of-sync:<kib> ...
 //
-// Only out-of-sync stats are surfaced; UI/CLI derive a sync-%
-// from VolumeDefinition.SizeKib.
+// Two pieces flow out: out-of-sync stats (for sync-progress %) and
+// replication state (for the Python CLI's `linstor v l` Repl
+// column). Both go through their respective merge caches; the
+// observation produced here carries whichever the event provided.
 func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 	name := ev.Fields["name"]
 	volStr, hasVol := ev.Fields["volume"]
-	oosStr, hasOOS := ev.Fields["out-of-sync"]
 
-	if name == "" || !hasVol || !hasOOS {
+	if name == "" || !hasVol {
 		return observation{}, false
 	}
 
@@ -191,19 +193,33 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 		return observation{}, false
 	}
 
-	oos, err := strconv.ParseInt(oosStr, 10, 64)
-	if err != nil {
+	out := observation{ResourceName: name}
+
+	if oosStr, ok := ev.Fields["out-of-sync"]; ok {
+		oos, parseErr := strconv.ParseInt(oosStr, 10, 64)
+		if parseErr == nil {
+			out.Volumes = []volumeObservation{{
+				VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+				OutOfSyncKib: oos,
+				HasSync:      true,
+			}}
+		}
+	}
+
+	if peer := ev.Fields["conn-name"]; peer != "" {
+		if repl := ev.Fields["replication"]; repl != "" {
+			out.Connections = []connectionObservation{{
+				PeerNodeName:     peer,
+				ReplicationState: repl,
+			}}
+		}
+	}
+
+	if len(out.Volumes) == 0 && len(out.Connections) == 0 {
 		return observation{}, false
 	}
 
-	return observation{
-		ResourceName: name,
-		Volumes: []volumeObservation{{
-			VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
-			OutOfSyncKib: oos,
-			HasSync:      true,
-		}},
-	}, true
+	return out, true
 }
 
 // observationsFrom transforms a stream of events2 lines into a
@@ -462,8 +478,23 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 		o.connCache[ev.ResourceName] = peers
 	}
 
+	// Field-wise merge so the two event-kinds (connection-kind sets
+	// Connected/Message; peer-device-kind sets ReplicationState)
+	// don't clobber each other's contributions.
 	for _, c := range ev.Connections {
-		peers[c.PeerNodeName] = c
+		merged := peers[c.PeerNodeName]
+		merged.PeerNodeName = c.PeerNodeName
+
+		if c.Message != "" {
+			merged.Connected = c.Connected
+			merged.Message = c.Message
+		}
+
+		if c.ReplicationState != "" {
+			merged.ReplicationState = c.ReplicationState
+		}
+
+		peers[c.PeerNodeName] = merged
 	}
 
 	// Only overwrite the slice when this event actually carried
@@ -564,9 +595,10 @@ func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.Resour
 
 	for _, c := range ev.Connections {
 		out = append(out, blockstoriov1alpha1.ResourceConnectionStatus{
-			PeerNodeName: c.PeerNodeName,
-			Connected:    c.Connected,
-			Message:      c.Message,
+			PeerNodeName:     c.PeerNodeName,
+			Connected:        c.Connected,
+			Message:          c.Message,
+			ReplicationState: c.ReplicationState,
 		})
 	}
 

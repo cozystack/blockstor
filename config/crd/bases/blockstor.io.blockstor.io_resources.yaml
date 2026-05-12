@@ -386,6 +386,15 @@ spec:
                         peerNodeName is the name of the peer Resource (and the node
                         it lives on — Resource names are RD.node).
                       type: string
+                    replicationState:
+                      description: |-
+                        replicationState is the DRBD-9 replication state for this
+                        peer reported by `drbdsetup events2 --statistics` peer-
+                        device frames: Established / SyncSource / SyncTarget /
+                        PausedSync* / VerifyS / VerifyT / Ahead / Behind / Off /
+                        WFBitMap* / WFSyncUUID / StartingSyncS / StartingSyncT. The
+                        Python CLI's `linstor v l` Repl column reads this.
+                      type: string
                   required:
                   - peerNodeName
                   type: object

@@ -115,6 +115,15 @@ type DrbdVolume struct {
 type DrbdConnection struct {
 	Connected bool   `json:"connected"`
 	Message   string `json:"message,omitempty"`
+
+	// ReplicationState is the DRBD-9 replication state for this
+	// peer as reported by `drbdsetup events2 --statistics`
+	// peer-device frames: Established / SyncSource / SyncTarget /
+	// PausedSync* / VerifyS / VerifyT / Ahead / Behind / Off /
+	// WFBitMap* / WFSyncUUID / StartingSyncS / StartingSyncT.
+	// The Python CLI's `linstor v list` Repl column reads this to
+	// summarise per-volume replication progress.
+	ReplicationState string `json:"replication_state,omitempty"`
 }
 
 // VolumeDefinition is one volume slot inside a ResourceDefinition.

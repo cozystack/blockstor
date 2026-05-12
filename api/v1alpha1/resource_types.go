@@ -179,6 +179,15 @@ type ResourceConnectionStatus struct {
 	// surfacing transitional states.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// replicationState is the DRBD-9 replication state for this
+	// peer reported by `drbdsetup events2 --statistics` peer-
+	// device frames: Established / SyncSource / SyncTarget /
+	// PausedSync* / VerifyS / VerifyT / Ahead / Behind / Off /
+	// WFBitMap* / WFSyncUUID / StartingSyncS / StartingSyncT. The
+	// Python CLI's `linstor v l` Repl column reads this.
+	// +optional
+	ReplicationState string `json:"replicationState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.

@@ -416,8 +416,9 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 		for i := range st.Connections {
 			c := &st.Connections[i]
 			out.Connections[c.PeerNodeName] = apiv1.DrbdConnection{
-				Connected: c.Connected,
-				Message:   c.Message,
+				Connected:        c.Connected,
+				Message:          c.Message,
+				ReplicationState: c.ReplicationState,
 			}
 		}
 
