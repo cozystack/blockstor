@@ -126,9 +126,14 @@ delete_rd() {
     # makes the next re-create with the same RD name silently skip
     # drbdadm create-md, so drbdadm adjust then fails with 'No valid
     # meta data found' on the freshly-allocated lower disk.
+    #
+    # Outer + inner timeouts: `drbdsetup down` can hang forever if
+    # the kernel module has a half-open connection to a force-deleted
+    # peer (DRBD-9 keeps trying to gracefully tear). Without these
+    # the test's EXIT trap blocks the next scenario indefinitely.
     for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
-        kubectl -n "$NS" exec "$pod" -- bash -c "
-            drbdsetup down ${rd} 2>/dev/null || true
+        timeout 15 kubectl -n "$NS" exec "$pod" -- bash -c "
+            timeout 5 drbdsetup down ${rd} 2>/dev/null || true
             rm -f /etc/drbd.d/${rd}.res /etc/drbd.d/${rd}.md-created
             rm -f /var/lib/blockstor-pool/${rd}_*.partial 2>/dev/null || true
         " 2>/dev/null || true
