@@ -28,15 +28,16 @@ import (
 // flip a single replica between diskless and diskful in one
 // call, typically before/after a node-maintenance rotation.
 //
-// Both shapes are accepted, mirroring upstream:
+// Three shapes are accepted, mirroring upstream / python-linstor:
 //
 //	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk
 //	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/storage-pool/{pool}
+//	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless
 //
-// Without `/storage-pool/{pool}` we toggle to the side opposite the
-// current state and let the controller pick a pool when promoting
-// (the existing auto-diskful path); with the pool path we stamp
-// it explicitly so an operator can target a specific pool.
+// Without a suffix we toggle to the side opposite the current state.
+// With `/storage-pool/{pool}` we stamp the pool when promoting to
+// diskful. With `/diskless` we force a demote to diskless, regardless
+// of current state — this is what `linstor r td --diskless` POSTs.
 //
 // The work itself (drbdadm attach / detach) happens out-of-band on
 // the satellite reconciler — this endpoint is a thin spec-flag
@@ -47,6 +48,8 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceToggleDisk))
 	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/storage-pool/{pool}",
 		s.requireStore(s.handleResourceToggleDisk))
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless",
+		s.requireStore(s.handleResourceToggleDiskToDiskless))
 }
 
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
@@ -95,7 +98,45 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	state := "diskful"
+	if !wasDiskless {
+		state = "diskless"
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' on '" + node + "' toggled to " + state,
+	}})
+}
+
+// handleResourceToggleDiskToDiskless forces the replica to diskless,
+// regardless of its current state. Matches python-linstor's
+// `linstor r td --diskless` shape (PUT .../toggle-disk/diskless).
+// Idempotent: a replica that's already diskless stays diskless.
+func (s *Server) handleResourceToggleDiskToDiskless(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+
+	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, true)
+
+	err = s.Store.Resources().Update(r.Context(), &res)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' on '" + node + "' toggled to diskless",
+	}})
 }
 
 // stampStoragePool sets both the typed StoragePool field

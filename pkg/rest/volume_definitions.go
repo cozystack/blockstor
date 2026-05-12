@@ -27,6 +27,8 @@ import (
 // registerVolumeDefinitions wires
 // /v1/resource-definitions/{rd}/volume-definitions[/{vn}] CRUD.
 func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/view/volume-definitions",
+		s.requireStore(s.handleVDView))
 	mux.HandleFunc("GET /v1/resource-definitions/{rd}/volume-definitions",
 		s.requireStore(s.handleVDList))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/volume-definitions",
@@ -37,6 +39,48 @@ func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
 		s.requireStore(s.handleVDUpdate))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/volume-definitions/{vn}",
 		s.requireStore(s.handleVDDelete))
+}
+
+// handleVDView is the cluster-wide aggregate for
+// `linstor vd l` / golinstor's VolumeDefinitions.GetAll(). Iterates
+// over every RD and flattens each (rd, volume_definition) pair onto
+// the response, embedding the parent RD name so consumers can group.
+// Matches upstream LINSTOR's `/v1/view/volume-definitions` shape:
+// each entry wraps the VolumeDefinition plus `resource_name` so the
+// Python CLI's table renderer has the column it expects.
+func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
+	rds, err := s.Store.ResourceDefinitions().List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	type entry struct {
+		apiv1.VolumeDefinition
+
+		ResourceName string `json:"resource_name"`
+	}
+
+	out := make([]entry, 0)
+
+	for i := range rds {
+		vds, listErr := s.Store.VolumeDefinitions().List(r.Context(), rds[i].Name)
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr.Error())
+
+			return
+		}
+
+		for j := range vds {
+			out = append(out, entry{
+				VolumeDefinition: vds[j],
+				ResourceName:     rds[i].Name,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
