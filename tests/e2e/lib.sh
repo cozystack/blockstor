@@ -96,23 +96,84 @@ read_md5() {
     "
 }
 
-# delete_rd cleans up an RD + every Resource named after it.
-# Trapped from each scenario so partial runs don't leave orphans.
-# Also runs `drbdsetup down <rd>` on every satellite as a belt-and-suspenders
-# step — the satellite reconciler should down it on Resource finalization,
-# but if a previous test crashed mid-apply the kernel state can linger
-# and trip the next test's wait_uptodate with a stale resource.
+# delete_rd cleans up an RD + every Resource named after it + every
+# Snapshot of the RD. Trapped from each scenario so partial runs
+# don't leave orphans that trip the next test's wait_uptodate with
+# stale kernel / .res / marker / snapshot state. Belt-and-suspenders
+# at every layer:
+#
+#   - delete Snapshot CRDs (otherwise the satellite-side reconciler
+#     re-asserts kernel state for "still-needed-for-snapshot" devices)
+#   - delete Resource CRDs (waits on finalizers; the satellite-side
+#     teardown chain runs drbdadm down + provider.DeleteVolume)
+#   - delete the RD CRD
+#   - on every satellite: drbdsetup down + remove .res + remove the
+#     .md-created marker (otherwise re-create with the same name
+#     skips drbdadm create-md and trips 'No valid meta data found')
 delete_rd() {
     local rd=$1
+
+    kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
+        | xargs -r kubectl delete --wait=true --timeout=30s snapshots.blockstor.io.blockstor.io 2>/dev/null || true
     kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
         | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.io.blockstor.io 2>/dev/null || true
     kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.io.blockstor.io/${rd}" 2>/dev/null || true
 
-    # Force-kill any lingering kernel-level state for this RD.
+    # Force-kill any lingering kernel-level state for this RD. The
+    # marker-file cleanup is essential — leaving .md-created behind
+    # makes the next re-create with the same RD name silently skip
+    # drbdadm create-md, so drbdadm adjust then fails with 'No valid
+    # meta data found' on the freshly-allocated lower disk.
     for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
-        kubectl -n "$NS" exec "$pod" -- bash -c "drbdsetup down ${rd} 2>/dev/null || true; rm -f /etc/drbd.d/${rd}.res" 2>/dev/null || true
+        kubectl -n "$NS" exec "$pod" -- bash -c "
+            drbdsetup down ${rd} 2>/dev/null || true
+            rm -f /etc/drbd.d/${rd}.res /etc/drbd.d/${rd}.md-created
+            rm -f /var/lib/blockstor-pool/${rd}_*.partial 2>/dev/null || true
+        " 2>/dev/null || true
     done
+}
+
+# wait_cluster_idle waits until the stand is back to a clean slate
+# between back-to-back e2e scenarios on the same cluster — no
+# blockstor CRDs for resources / RDs / snapshots, and no kernel-side
+# DRBD configuration. Returns success once both layers are empty or
+# after the deadline expires (best-effort; logs to stderr but doesn't
+# fail). The batch driver should call this before launching the next
+# scenario so resize-luks / linstor-cli / cross-node don't observe
+# the previous test's residue.
+wait_cluster_idle() {
+    local deadline=$(( $(date +%s) + 30 ))
+
+    while (( $(date +%s) < deadline )); do
+        local crd_count drbd_busy=0
+        crd_count=$( {
+            kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null
+        } | grep -cv '^$' || true )
+
+        for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+            local out
+            out=$(kubectl -n "$NS" exec "$pod" -- drbdsetup status 2>/dev/null || true)
+            if [[ "$out" != "" && "$out" != *"No currently configured DRBD found"* ]]; then
+                drbd_busy=1
+
+                break
+            fi
+        done
+
+        if [[ "$crd_count" == "0" && "$drbd_busy" == "0" ]]; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    echo "wait_cluster_idle: timed out, stand may still have residue" >&2
+
+    return 0
 }
 
 # require_workers enforces that the cluster has at least N satellite
