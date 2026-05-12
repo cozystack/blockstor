@@ -19,6 +19,7 @@ package drbd
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -187,7 +188,11 @@ func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device, 
 //
 // `disconnect` first so a connected peer is quiesced; `del-peer`
 // then removes the kernel-side connection slot entirely. Both
-// commands are idempotent on already-detached peers.
+// commands are idempotent on already-detached peers; del-peer's
+// "not defined in your config" failure mode is swallowed because
+// it means there's nothing to delete (the .res was rewritten
+// without the peer before drbdadm saw it — del-peer is a clean
+// no-op in that branch).
 func (a *Adm) DelPeer(ctx context.Context, resource, peerNode string) error {
 	target := peerNode + ":" + resource
 
@@ -195,12 +200,21 @@ func (a *Adm) DelPeer(ctx context.Context, resource, peerNode string) error {
 	// returns non-zero, which we don't care about here.
 	_, _ = a.exec.Run(ctx, "drbdadm", "disconnect", target)
 
-	_, err := a.exec.Run(ctx, "drbdadm", "del-peer", target)
-	if err != nil {
-		return errors.Wrapf(err, "drbdadm del-peer %s", target)
+	out, err := a.exec.Run(ctx, "drbdadm", "del-peer", target)
+	if err == nil {
+		return nil
 	}
 
-	return nil
+	// drbdadm prints "'<peer>:<rd>' not defined in your config (for
+	// this host)." when the .res no longer mentions the peer block.
+	// The kernel slot we wanted to drop also wouldn't exist in that
+	// state, so the operation has already converged.
+	if strings.Contains(string(out), "not defined in your config") ||
+		strings.Contains(err.Error(), "not defined in your config") {
+		return nil
+	}
+
+	return errors.Wrapf(err, "drbdadm del-peer %s", target)
 }
 
 // run is the single shell-out site so every drbdadm error gets
