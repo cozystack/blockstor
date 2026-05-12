@@ -21,9 +21,11 @@ import (
 	"slices"
 	"sync"
 
+	cerrors "github.com/cockroachdb/errors"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -354,23 +356,82 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // Status update is rejected by Kube's optimistic concurrency check
 // and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
-	original := target.Status.DeepCopy()
-
 	// Serialise allocation across replicas of the same RD. The
 	// APIReader-direct read alone doesn't fix the race — two
 	// goroutines can both observe taken=[] simultaneously and
 	// each pick 0. The mutex held across {read taken → pick →
-	// Status().Update} forces a strict serial order so the
-	// second goroutine reads the first one's committed Status.
-	// Different RDs allocate in parallel.
+	// Status().Update} forces a strict serial order so the second
+	// goroutine reads the first one's committed Status. Different
+	// RDs allocate in parallel.
 	mu := r.rdAllocMu(target.Spec.ResourceDefinitionName)
 	mu.Lock()
 	defer mu.Unlock()
 
+	// `peers` is plumbed in for completeness with the rest of the
+	// reconciler; its DRBDNodeID values aren't used (we re-read via
+	// APIReader for correctness).
+	_ = peers
+
+	mutated := false
+
+	// retry-on-conflict because the satellite-side observer
+	// constantly writes Status.Volumes / Status.Connections via SSA
+	// while we're trying to write Status.DRBD{NodeID,Port,Minor}.
+	// Without a retry loop the allocator gives up after a single
+	// stale-version conflict and the satellite stays stuck
+	// "waiting for controller-side DRBD-ID allocation" until the
+	// next controller-runtime backoff window, which can be minutes.
+	// Tests construct ResourceReconciler{} directly with a fake
+	// client and skip SetupWithManager; the cached client doubles
+	// as the APIReader when the latter wasn't injected.
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		err := reader.Get(ctx, client.ObjectKey{Name: target.Name}, target)
+		if err != nil {
+			return err
+		}
+
+		original := target.Status.DeepCopy()
+
+		err = r.allocateDRBDFields(ctx, target)
+		if err != nil {
+			return err
+		}
+
+		if equalStatus(original, &target.Status) {
+			mutated = false
+
+			return nil
+		}
+
+		err = r.Status().Update(ctx, target)
+		if err != nil {
+			return err
+		}
+
+		mutated = true
+
+		return nil
+	})
+	if err != nil {
+		return false, cerrors.Wrap(err, "allocate DRBD ids")
+	}
+
+	return mutated, nil
+}
+
+// allocateDRBDFields fills in any missing DRBD-{NodeID,Port,Minor}
+// fields on target.Status. Pulled out of ensureDRBDIDs so the retry
+// loop body stays under the funlen budget.
+func (r *ResourceReconciler) allocateDRBDFields(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
 	if target.Status.DRBDNodeID == nil {
 		id, err := r.allocateNodeIDLocked(ctx, target)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		target.Status.DRBDNodeID = &id
@@ -379,7 +440,7 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	if target.Status.DRBDPort == nil {
 		port, err := r.allocatePort(ctx, target.Spec.NodeName)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		target.Status.DRBDPort = &port
@@ -388,27 +449,13 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	if target.Status.DRBDMinor == nil {
 		minor, err := r.allocateMinor(ctx, target.Spec.NodeName)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		target.Status.DRBDMinor = &minor
 	}
 
-	// `peers` is plumbed in for completeness with the rest of the
-	// reconciler; its DRBDNodeID values aren't used (we re-read via
-	// APIReader for correctness).
-	_ = peers
-
-	if equalStatus(original, &target.Status) {
-		return false, nil
-	}
-
-	err := r.Status().Update(ctx, target)
-	if err != nil {
-		return false, err
-	}
-
-	return true, nil
+	return nil
 }
 
 func equalStatus(a, b *blockstoriov1alpha1.ResourceStatus) bool {
