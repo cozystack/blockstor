@@ -17,11 +17,15 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"net/http"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerResourceDefinitions wires /v1/resource-definitions CRUD. Spawn,
@@ -82,6 +86,19 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream LINSTOR parity: every RD belongs to an RG. The
+	// well-known DfltRscGrp serves as the catch-all for clients that
+	// don't specify one (linstor-csi, the legacy CSI shipper, manual
+	// `linstor rd create` without `--resource-group`, etc). Without
+	// this default some CLI subcommands fail open lookups and operator
+	// workflows that walk `rd → rg → spawn args` break silently.
+	err = s.ensureDefaultRGAssignment(r.Context(), &rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
@@ -93,6 +110,48 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition created: " + rd.Name,
 	}})
+}
+
+// DefaultResourceGroupName is the well-known RG every RD falls into
+// when the caller didn't pin one. Matches upstream LINSTOR's
+// `DfltRscGrp` literal so golinstor / linstor-csi callers that walk
+// rd → rg discovery see the expected name.
+const DefaultResourceGroupName = "DfltRscGrp"
+
+// ensureDefaultRGAssignment sets rd.ResourceGroupName to the default
+// when the caller didn't supply one, and lazily creates the
+// well-known RG on first use. An explicit caller-supplied RG is left
+// alone (existence is the caller's concern — matches upstream's
+// "RD-create doesn't validate RG existence at the wire layer").
+// Idempotent across concurrent RD-create races: ErrAlreadyExists from
+// the RG-create path is swallowed.
+func (s *Server) ensureDefaultRGAssignment(ctx context.Context, rd *apiv1.ResourceDefinition) error {
+	if rd.ResourceGroupName != "" {
+		return nil
+	}
+
+	rd.ResourceGroupName = DefaultResourceGroupName
+
+	_, err := s.Store.ResourceGroups().Get(ctx, DefaultResourceGroupName)
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, store.ErrNotFound) {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	defaultRG := apiv1.ResourceGroup{
+		Name:        DefaultResourceGroupName,
+		Description: "Default LINSTOR resource group — autoplace catch-all for RDs without an explicit RG.",
+	}
+
+	err = s.Store.ResourceGroups().Create(ctx, &defaultRG)
+	if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	return nil
 }
 
 // resourceDefinitionModifyBody is the shape upstream golinstor sends
