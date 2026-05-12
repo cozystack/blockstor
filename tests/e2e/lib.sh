@@ -207,7 +207,7 @@ rest_post() {
     # rest_post would bind a stale socket and curl would error 22.
     local lport
     lport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-    kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
+    kubectl -n "$NS" port-forward svc/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
 
     _wait_port_forward "$lport" "$pf"
@@ -228,7 +228,7 @@ rest_put() {
 
     local lport
     lport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-    kubectl -n "$NS" port-forward deploy/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
+    kubectl -n "$NS" port-forward svc/blockstor-controller "${lport}:3370" >/dev/null 2>&1 &
     local pf=$!
 
     _wait_port_forward "$lport" "$pf"
