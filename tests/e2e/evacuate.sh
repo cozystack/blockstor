@@ -27,7 +27,16 @@ SOURCE=$WORKER_1
 PEER=$WORKER_2
 TARGET=$WORKER_3
 
-trap 'delete_rd "$RD"' EXIT
+cleanup() {
+    delete_rd "$RD"
+    # Clear the EVICTED flag we stamped on $SOURCE — otherwise later
+    # tests on the same cluster can't autoplace replicas there and
+    # fail with "not enough candidate storage pools".
+    kubectl patch nodes.blockstor.io.blockstor.io "$SOURCE" --type=merge \
+        -p '{"spec":{"flags":null}}' >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT
 
 echo ">> apply 2-replica RD ($SOURCE + $PEER)"
 rd_apply "$RD" "$SOURCE" "$PEER"
