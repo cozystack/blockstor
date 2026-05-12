@@ -145,6 +145,8 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
+	logf.FromContext(ctx).Info("ensureTiebreaker", "rd", rd.Name, "replicas", len(replicas))
+
 	diskful, diskless := splitByDiskless(replicas)
 	witness := filterTieBreaker(diskless)
 	nonWitnessDiskless := len(diskless) - len(witness)
