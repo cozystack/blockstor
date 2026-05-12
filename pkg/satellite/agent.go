@@ -25,6 +25,7 @@ package satellite
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/cockroachdb/errors"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
+	"github.com/cozystack/blockstor/pkg/satellite/stream"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/version"
 )
@@ -129,6 +131,8 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	a.logger.Info("satellite controller-runtime manager ready")
 
+	a.startStreamServer(ctx, rec)
+
 	<-ctx.Done()
 
 	a.logger.Info("agent stopping", "node", a.cfg.NodeName)
@@ -149,6 +153,42 @@ func (a *Agent) newReconciler() *Reconciler {
 		NodeName:     a.cfg.NodeName,
 		LocalAddress: a.cfg.LocalAddress,
 	})
+}
+
+// poolResolverAdapter wires the satellite Reconciler's private
+// resource→provider lookup into the public stream.PoolResolver
+// interface. Adapter pattern (rather than exporting the method
+// directly) keeps the Reconciler's unexported funcorder layout
+// intact.
+type poolResolverAdapter struct {
+	rec *Reconciler
+}
+
+// ProviderForResource implements stream.PoolResolver.
+func (a poolResolverAdapter) ProviderForResource(name string) (storage.Provider, error) {
+	return a.rec.providerForResource(name)
+}
+
+// startStreamServer launches the satellite-to-satellite snapshot
+// stream HTTP server in a goroutine. Bound to 0.0.0.0:stream.Port
+// — the DaemonSet runs on hostNetwork so this is the node's IP.
+//
+// A bind failure logs but does not abort the agent — without the
+// stream server, cross-node snapshot-restore on this satellite
+// falls back to "peer has no snapshot here" and the receiving
+// satellite tries other peers. Same-node clone keeps working.
+func (a *Agent) startStreamServer(ctx context.Context, rec *Reconciler) {
+	addr := fmt.Sprintf("0.0.0.0:%d", stream.Port)
+	srv := stream.NewServer(poolResolverAdapter{rec: rec})
+
+	go func() {
+		err := stream.ListenAndServe(ctx, addr, srv)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			a.logger.Error("snapshot stream server exited", "addr", addr, "err", err)
+		}
+	}()
+
+	a.logger.Info("snapshot stream server listening", "addr", addr)
 }
 
 // startControllerRuntime launches a controller-runtime manager

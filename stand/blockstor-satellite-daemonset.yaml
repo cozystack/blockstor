@@ -109,6 +109,18 @@ spec:
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
+          ports:
+            # Satellite-to-satellite snapshot stream (cross-node clone).
+            # The receiving satellite GETs the raw byte stream from a
+            # peer that hosts the snapshot locally; without this port
+            # open peers see ECONNREFUSED and cross-node clone falls
+            # back to DRBD initial-sync. hostNetwork=true means this
+            # is the node's real port — must stay outside the DRBD
+            # range (7000-7999) and any LINSTOR controller port.
+            - name: snap-stream
+              containerPort: 9100
+              hostPort: 9100
+              protocol: TCP
           securityContext:
             privileged: true
           volumeMounts:
