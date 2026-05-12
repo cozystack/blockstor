@@ -358,6 +358,13 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 		}
 	}
 
+	// Pre-merge state for the diagnostic log: mergeVolumes/Connections
+	// may zero ev.Volumes if nothing changed since the last cache write,
+	// which made it impossible to tell from logs whether the satellite
+	// actually saw a device-kind frame or just dropped it silently.
+	volsIn := len(ev.Volumes)
+	connsIn := len(ev.Connections)
+
 	// Connection observations arrive one peer at a time. SSA with the
 	// same FieldOwner replaces the full list each apply, so we
 	// aggregate per-resource state in-memory and emit the full
@@ -365,6 +372,15 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// peers from this owner's claims and they vanish from Status.
 	o.mergeConnections(ev)
 	o.mergeVolumes(ev)
+
+	logger.Info("observation",
+		"resource", ev.ResourceName,
+		"drbdState", ev.DrbdState,
+		"vols_in", volsIn,
+		"vols_out", len(ev.Volumes),
+		"conns_in", connsIn,
+		"conns_out", len(ev.Connections),
+	)
 
 	err := o.writeStatus(ctx, ev)
 	if err != nil && !apierrors.IsNotFound(err) {
