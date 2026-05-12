@@ -45,8 +45,15 @@ type observation struct {
 	ResourceName string
 	InUse        bool
 	DrbdState    string
-	Volumes      []volumeObservation
-	Connections  []connectionObservation
+	// HasResource marks observations that carry a fresh resource-
+	// kind frame (role transition → InUse, disk transition →
+	// DrbdState). mergeResource only updates its cache from
+	// observations with HasResource=true; for other event kinds it
+	// re-emits the cached values so writeStatus' SSA apply keeps
+	// the f:inUse / f:drbdState claims alive.
+	HasResource bool
+	Volumes     []volumeObservation
+	Connections []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -138,6 +145,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 	return observation{
 		ResourceName: name,
 		InUse:        ev.Fields["role"] == "Primary",
+		HasResource:  true,
 	}, true
 }
 
@@ -304,6 +312,24 @@ type ObserverRunnable struct {
 	// the full per-resource snapshot.
 	volMu    sync.Mutex
 	volCache map[string]map[int32]volumeObservation
+
+	// resourceCache holds the latest observed resource-kind fields
+	// (InUse, DrbdState) keyed by resource name. Same SSA-merge
+	// reason as the other caches: only the resource-kind event
+	// carries InUse, but connection / peer-device events still go
+	// through writeStatus — without re-emitting cached InUse the
+	// next apply (with InUse=false, omitempty-stripped) drops this
+	// owner's f:inUse claim and the apiserver deletes the field.
+	resMu    sync.Mutex
+	resCache map[string]resourceObservation
+}
+
+// resourceObservation is the cached per-resource state observer
+// re-emits on every apply so SSA-merge doesn't drop InUse between
+// connection / peer-device events.
+type resourceObservation struct {
+	InUse     bool
+	DrbdState string
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -402,7 +428,8 @@ func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
 }
 
 // cachedResourceNames returns the union of resource keys held by
-// the per-volume and per-connection caches. Used by resyncOnce.
+// the per-volume, per-connection, and resource-state caches. Used
+// by resyncOnce.
 func (o *ObserverRunnable) cachedResourceNames() []string {
 	seen := map[string]struct{}{}
 
@@ -418,6 +445,12 @@ func (o *ObserverRunnable) cachedResourceNames() []string {
 	}
 	o.connMu.Unlock()
 
+	o.resMu.Lock()
+	for name := range o.resCache {
+		seen[name] = struct{}{}
+	}
+	o.resMu.Unlock()
+
 	out := make([]string, 0, len(seen))
 	for name := range seen {
 		out = append(out, name)
@@ -427,8 +460,9 @@ func (o *ObserverRunnable) cachedResourceNames() []string {
 }
 
 // snapshotFor returns the full cached observation for one
-// resource: every known volume and every known peer connection.
-// Used by resyncOnce to rebuild the SSA payload from cache.
+// resource: every known volume, every known peer connection, and
+// the resource-level InUse/DrbdState. Used by resyncOnce to
+// rebuild the SSA payload from cache.
 func (o *ObserverRunnable) snapshotFor(name string) observation {
 	out := observation{ResourceName: name}
 
@@ -448,7 +482,60 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 	}
 	o.connMu.Unlock()
 
+	o.resMu.Lock()
+	if r, ok := o.resCache[name]; ok {
+		out.InUse = r.InUse
+		out.DrbdState = r.DrbdState
+	}
+	o.resMu.Unlock()
+
 	return out
+}
+
+// mergeResource caches the resource-kind observation (InUse,
+// DrbdState) so subsequent connection / peer-device event applies
+// re-emit them. Without this, an event that doesn't carry InUse
+// strips f:inUse off the observer's owner claim and the apiserver
+// deletes the field — manifesting as the auto-diskful promotion
+// regression where the controller never sees InUse=true even
+// though DRBD reports the replica as Primary.
+func (o *ObserverRunnable) mergeResource(ev *observation) {
+	if ev.ResourceName == "" {
+		return
+	}
+
+	o.resMu.Lock()
+	defer o.resMu.Unlock()
+
+	if o.resCache == nil {
+		o.resCache = map[string]resourceObservation{}
+	}
+
+	cur := o.resCache[ev.ResourceName]
+
+	// HasResource events (translateResourceEvent) carry an
+	// authoritative role transition. Update cached InUse only
+	// from these; other event kinds leave InUse at zero-value
+	// which would falsely clear the cache.
+	if ev.HasResource {
+		cur.InUse = ev.InUse
+	}
+
+	// DrbdState flows from device-kind events (translateDeviceEvent
+	// sets it from the `disk` field). Update whenever the event
+	// carries a non-empty value.
+	if ev.DrbdState != "" {
+		cur.DrbdState = ev.DrbdState
+	}
+
+	o.resCache[ev.ResourceName] = cur
+
+	// Re-emit cached values so writeStatus' apply sees them every
+	// time, not just on the event kind that produced them. Without
+	// this, a connection event right after a role transition
+	// strips the f:inUse claim and the apiserver deletes the field.
+	ev.InUse = cur.InUse
+	ev.DrbdState = cur.DrbdState
 }
 
 // handleObservation runs the per-event side-effects: the
@@ -473,6 +560,7 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// peers from this owner's claims and they vanish from Status.
 	o.mergeConnections(ev)
 	o.mergeVolumes(ev)
+	o.mergeResource(ev)
 
 	err := o.writeStatus(ctx, ev)
 	if err == nil {
@@ -662,13 +750,6 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 			Connections: buildObserverConnectionStatus(ev),
 		},
 	}
-
-	log.FromContext(ctx).WithName("observer").V(0).Info("ssa apply",
-		"resource", ev.ResourceName,
-		"inUse", ev.InUse,
-		"drbdState", ev.DrbdState,
-		"vols", len(apply.Status.Volumes),
-		"conns", len(apply.Status.Connections))
 
 	// No ForceOwnership: observer only owns the runtime-state
 	// subfields (diskState / currentGi / connections / inUse /
