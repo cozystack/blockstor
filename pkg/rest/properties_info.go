@@ -39,6 +39,12 @@ func (s *Server) registerPropertiesInfo(mux *http.ServeMux) {
 func propertiesInfoPaths() []string {
 	return []string{
 		"/v1/controller/properties/info",
+		// `properties/info/all` is the wider variant golinstor's
+		// `GetPropsInfosAll(...)` calls — includes drbd_options and
+		// other namespaces that the basic `/info` endpoint hides.
+		// Same empty-array stub; populating with the upstream
+		// catalogue is Phase 6 work.
+		"/v1/controller/properties/info/all",
 		"/v1/nodes/properties/info",
 		"/v1/storage-pool-definitions/properties/info",
 		"/v1/resource-definitions/properties/info",

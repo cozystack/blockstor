@@ -46,6 +46,22 @@ func (s *Server) registerControllerProperties(mux *http.ServeMux) {
 	// default `{key}` only matches a single non-slash segment and
 	// every Aux/Foo-style key would 404.
 	mux.HandleFunc("DELETE /v1/controller/properties/{key...}", s.requireStore(s.handleControllerPropDelete))
+	// GET /v1/controller/config is golinstor's `Controller.GetConfig()`.
+	// Upstream returns a deep ControllerConfig tree (db / http / log /
+	// debug / ...); blockstor doesn't run the JVM-based config layer so
+	// every field would be zero. Return an empty object — every field
+	// is `omitempty` so the wire shape is `{}` which deserializes into
+	// a zero-value ControllerConfig without error.
+	mux.HandleFunc("GET /v1/controller/config", handleControllerConfig)
+}
+
+// handleControllerConfig returns an empty ControllerConfig object.
+// blockstor's config lives in k8s (Deployment env, ConfigMaps, the
+// ControllerConfig CRD's typed fields) — there's no JVM-style flat
+// config file to expose. The empty `{}` satisfies golinstor's decoder
+// without leaking anything implementation-specific.
+func handleControllerConfig(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, struct{}{})
 }
 
 // handleControllerPropsGet returns ControllerConfig.Spec.ExtraProps

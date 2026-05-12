@@ -124,6 +124,33 @@ func TestControllerPropertiesDelete(t *testing.T) {
 	}
 }
 
+// TestControllerConfigEmptyObject pins the GET /v1/controller/config
+// stub: golinstor's `Controller.GetConfig()` parses the response into
+// a ControllerConfig struct (all fields `omitempty`) so an empty `{}`
+// is the minimal-but-correct response. blockstor doesn't run a JVM
+// config layer; the endpoint exists only because the CLI calls it
+// at startup and breaks on 404.
+func TestControllerConfigEmptyObject(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/controller/config")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("expected empty object; got %v", got)
+	}
+}
+
 // TestControllerPropertiesDeleteSingleKey pins the per-key DELETE
 // route added for golinstor's `controller.DeleteProp(...)` call. The
 // route's `{key...}` wildcard must capture slash-bearing keys like
