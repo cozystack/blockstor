@@ -39,12 +39,63 @@ func (s *Server) registerNodes(mux *http.ServeMux) {
 	// management networks need to add/remove NetInterfaces on a
 	// running Node without a full PUT-of-the-whole-Node round-trip.
 	// Maps onto Node.Spec.NetInterfaces[] inside the same Node CRD.
+	mux.HandleFunc("GET /v1/nodes/{node}/net-interfaces",
+		s.requireStore(s.handleNetInterfaceList))
+	mux.HandleFunc("GET /v1/nodes/{node}/net-interfaces/{name}",
+		s.requireStore(s.handleNetInterfaceGet))
 	mux.HandleFunc("POST /v1/nodes/{node}/net-interfaces",
 		s.requireStore(s.handleNetInterfaceCreate))
 	mux.HandleFunc("PUT /v1/nodes/{node}/net-interfaces/{name}",
 		s.requireStore(s.handleNetInterfaceUpdate))
 	mux.HandleFunc("DELETE /v1/nodes/{node}/net-interfaces/{name}",
 		s.requireStore(s.handleNetInterfaceDelete))
+}
+
+// handleNetInterfaceList returns the Node's NetInterfaces[] array.
+// Used by golinstor's `Nodes.GetNetInterfaces(...)` and `linstor n
+// interface list <node>`.
+func (s *Server) handleNetInterfaceList(w http.ResponseWriter, r *http.Request) {
+	nodeName := r.PathValue("node")
+
+	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if node.NetInterfaces == nil {
+		writeJSON(w, http.StatusOK, []apiv1.NetInterface{})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, node.NetInterfaces)
+}
+
+// handleNetInterfaceGet returns a single NetInterface by name. 404
+// when the named interface doesn't exist on the node — matches
+// upstream LINSTOR's "name not found" semantic.
+func (s *Server) handleNetInterfaceGet(w http.ResponseWriter, r *http.Request) {
+	nodeName := r.PathValue("node")
+	name := r.PathValue("name")
+
+	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	for i := range node.NetInterfaces {
+		if node.NetInterfaces[i].Name == name {
+			writeJSON(w, http.StatusOK, node.NetInterfaces[i])
+
+			return
+		}
+	}
+
+	writeError(w, http.StatusNotFound, "net-interface not found: "+name)
 }
 
 // handleNetInterfaceCreate appends a NetInterface to the Node's spec.

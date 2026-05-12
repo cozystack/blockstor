@@ -65,6 +65,7 @@ func selectPhases(name string) []phase {
 		{"key-value-store", phaseKeyValueStore},
 		{"nodes", phaseNodes},
 		{"node-ops", phaseNodeOps},
+		{"net-interfaces", phaseNetInterfaces},
 		{"resource-groups", phaseResourceGroups},
 		{"resource-definitions", phaseResourceDefinitions},
 		{"view-empty", phaseViewEmpty},

@@ -221,3 +221,103 @@ func phaseNodeOps(ctx context.Context, c *client.Client) error {
 
 	return nil
 }
+
+// phaseNetInterfaces captures the per-interface CRUD chain on a
+// recorder-owned node. Clusters with split replication / management
+// networks need this surface for `linstor n interface ...`. The
+// phase is self-contained: creates trace-n4 with a default
+// interface, then exercises:
+//
+//	GET    /v1/nodes/trace-n4/net-interfaces
+//	GET    /v1/nodes/trace-n4/net-interfaces/default
+//	POST   /v1/nodes/trace-n4/net-interfaces     → add "repl-net"
+//	GET    /v1/nodes/trace-n4/net-interfaces     → list with two
+//	PUT    /v1/nodes/trace-n4/net-interfaces/repl-net → bump port
+//	DELETE /v1/nodes/trace-n4/net-interfaces/repl-net
+//	GET    /v1/nodes/trace-n4/net-interfaces     → back to one
+//	DELETE /v1/nodes/trace-n4                    → teardown
+const (
+	traceN4         = "trace-n4"
+	traceIfaceRepl  = "repl-net"
+	traceReplIfPort = 3367
+)
+
+func phaseNetInterfaces(ctx context.Context, c *client.Client) error {
+	err := c.Nodes.Create(ctx, client.Node{
+		Name: traceN4,
+		Type: nodeTypeSatellite,
+		NetInterfaces: []client.NetInterface{{
+			Name:                    nodeIfaceDefaultName,
+			Address:                 net.ParseIP("127.0.0.1"),
+			SatellitePort:           loopbackSatellitePort,
+			SatelliteEncryptionType: nodeEncryptionPlain,
+		}},
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s", traceN4)
+	}
+
+	err = netIfCRUD(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	err = c.Nodes.Delete(ctx, traceN4)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s", traceN4)
+	}
+
+	return nil
+}
+
+// netIfCRUD runs the per-interface mutation chain on trace-n4 between
+// the node create and the node teardown. Split out so the parent
+// phase function stays under the funlen budget.
+func netIfCRUD(ctx context.Context, c *client.Client) error {
+	_, err := c.Nodes.GetNetInterfaces(ctx, traceN4)
+	if err != nil {
+		return errors.Wrapf(err, "list interfaces on %s", traceN4)
+	}
+
+	_, err = c.Nodes.GetNetInterface(ctx, traceN4, nodeIfaceDefaultName)
+	if err != nil {
+		return errors.Wrapf(err, "get %s/%s", traceN4, nodeIfaceDefaultName)
+	}
+
+	err = c.Nodes.CreateNetInterface(ctx, traceN4, client.NetInterface{
+		Name:                    traceIfaceRepl,
+		Address:                 net.ParseIP("127.0.0.2"),
+		SatellitePort:           traceReplIfPort,
+		SatelliteEncryptionType: nodeEncryptionPlain,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s/%s", traceN4, traceIfaceRepl)
+	}
+
+	_, err = c.Nodes.GetNetInterfaces(ctx, traceN4)
+	if err != nil {
+		return errors.Wrapf(err, "list interfaces after add on %s", traceN4)
+	}
+
+	err = c.Nodes.ModifyNetInterface(ctx, traceN4, traceIfaceRepl, client.NetInterface{
+		Name:                    traceIfaceRepl,
+		Address:                 net.ParseIP("127.0.0.2"),
+		SatellitePort:           traceReplIfPort + 1,
+		SatelliteEncryptionType: nodeEncryptionPlain,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "modify %s/%s", traceN4, traceIfaceRepl)
+	}
+
+	err = c.Nodes.DeleteNetinterface(ctx, traceN4, traceIfaceRepl)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s/%s", traceN4, traceIfaceRepl)
+	}
+
+	_, err = c.Nodes.GetNetInterfaces(ctx, traceN4)
+	if err != nil {
+		return errors.Wrapf(err, "list interfaces after teardown on %s", traceN4)
+	}
+
+	return nil
+}

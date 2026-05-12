@@ -185,6 +185,88 @@ func TestNetInterfaceDelete(t *testing.T) {
 	}
 }
 
+// TestNetInterfaceListReturnsArray pins the GET /v1/nodes/{n}/net-interfaces
+// shape: a JSON array of NetInterface objects. golinstor's
+// `Nodes.GetNetInterfaces(...)` parses this into []client.NetInterface;
+// without an explicit empty-array branch a fresh node would deserialise
+// `null` into a nil slice instead of an empty one.
+func TestNetInterfaceListReturnsArray(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1", SatellitePort: 3366},
+			{Name: "repl", Address: "10.10.0.1", SatellitePort: 7000},
+		},
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1/net-interfaces")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.NetInterface
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("count: got %d, want 2", len(got))
+	}
+}
+
+// TestNetInterfaceGetByName pins the GET /v1/nodes/{n}/net-interfaces/{name}
+// happy path and the 404 branch. The single-fetch endpoint is what
+// `linstor n interface modify` uses to read the existing config
+// before patching it.
+func TestNetInterfaceGetByName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1", SatellitePort: 3366},
+		},
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1/net-interfaces/default")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.NetInterface
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Name != "default" || got.Address != "10.0.0.1" {
+		t.Errorf("body mismatch: %+v", got)
+	}
+
+	missing := httpGet(t, base+"/v1/nodes/n1/net-interfaces/nope")
+	_ = missing.Body.Close()
+
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("missing status: got %d, want 404", missing.StatusCode)
+	}
+}
+
 // TestNetInterfaceCreateBadJSON pins the 400 branch on a malformed
 // NetInterface body. Without this, a satellite-bootstrap script that
 // posts truncated JSON would silently get 500 (or worse, leak the
