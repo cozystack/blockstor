@@ -18,16 +18,6 @@ set -euo pipefail
 WORK_DIR=${1:?work_dir required}
 export KUBECONFIG="$WORK_DIR/kubeconfig"
 
-# Cross-node snapshot restore needs the satellite-side data clone +
-# DRBD GI-seed pipeline (see clone.sh for the full chain). The
-# snapshot-restore-resource endpoint creates the target RD with
-# its VolumeDefinitions hydrated from the snapshot, but the actual
-# data copy is a separate product feature still on the roadmap.
-# SKIP until it lands; API-surface plumbing is covered by
-# pkg/rest/snapshot_restore_test.go.
-echo "SKIP: needs satellite-side data clone (Provider.RestoreFromSnapshot + GI-seed)"
-exit 0
-
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"

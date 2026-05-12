@@ -253,14 +253,19 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 	}
 
 	if r.cfg.StateDir != "" {
-		resPath := filepath.Join(r.cfg.StateDir, req.GetName()+".res")
-
-		err := os.Remove(resPath)
-		if err != nil && !os.IsNotExist(err) {
-			return &satellitepb.DeleteResourceResponse{
-				Ok:      false,
-				Message: err.Error(),
-			}, nil
+		// Drop the per-resource state files together. Leaving
+		// `.md-created` behind would make a re-created RD with the
+		// same name see firstActivation=false on its first apply,
+		// skip create-md, and fail drbdadm adjust with
+		// "No valid meta data found".
+		for _, suffix := range []string{".res", ".md-created"} {
+			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
+			if err != nil && !os.IsNotExist(err) {
+				return &satellitepb.DeleteResourceResponse{
+					Ok:      false,
+					Message: err.Error(),
+				}, nil
+			}
 		}
 	}
 
