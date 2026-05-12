@@ -529,13 +529,15 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 
 	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
 
-	var existing blockstoriov1alpha1.Resource
-
-	err := o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
-	if err != nil {
-		return errors.Wrapf(err, "get Resource %s", name)
-	}
-
+	// No prior Get: SSA Patch is the existence check. The cached
+	// client's local cache trails the apiserver during the first
+	// seconds of a fresh Resource's life; a Get round-trip through
+	// the cache returned NotFound, the satellite silenced it, and
+	// the apply for the UpToDate device-kind frame never reached
+	// the apiserver — leaving Status.Volumes[i].diskState blank for
+	// the rest of the lifetime. SSA Patch on a not-yet-existing
+	// Resource returns NotFound which we silence the same way the
+	// Get used to.
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -547,7 +549,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
-	err = o.Client.Status().Patch(ctx, apply,
+	err := o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner),
 		client.ForceOwnership)
