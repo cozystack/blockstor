@@ -304,10 +304,15 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 		Status:     blockstoriov1alpha1.ResourceStatus{Volumes: vols},
 	}
 
+	// Intentionally NO ForceOwnership: this writer only owns
+	// devicePath. Force-ownership on a listMap entry that the
+	// observer also touches causes the apiserver to evict
+	// observer's subfield claims (diskState / currentGi /
+	// outOfSyncKib) for the same listMap key. Without the force,
+	// SSA merges per-field cleanly and both owners' claims survive.
 	err := r.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
-		client.FieldOwner(volumeStatusFieldOwner),
-		client.ForceOwnership)
+		client.FieldOwner(volumeStatusFieldOwner))
 	if err != nil {
 		return errors.Wrap(err, "ssa Status.Volumes")
 	}

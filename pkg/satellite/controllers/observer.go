@@ -549,10 +549,16 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
+	// No ForceOwnership: observer only owns the runtime-state
+	// subfields (diskState / currentGi / connections / inUse /
+	// drbdState / outOfSyncKib / replicationState). The
+	// reconciler-stamp owns devicePath under the same listMap key
+	// volumes[volumeNumber=0]; ForceOwnership on either side would
+	// kick the other's subfield claims off the listMap entry.
+	// SSA's per-field merge already covers what we need.
 	err := o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
-		client.FieldOwner(k8s.SatelliteFieldOwner),
-		client.ForceOwnership)
+		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
 	}
