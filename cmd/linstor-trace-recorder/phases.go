@@ -52,7 +52,11 @@ const (
 func selectPhases(name string) []phase {
 	all := []phase{
 		{"bootstrap", phaseBootstrap},
+		{"controller-props", phaseControllerProps},
+		{"error-reports", phaseErrorReports},
 		{"nodes", phaseNodes},
+		{"resource-groups", phaseResourceGroups},
+		{"resource-definitions", phaseResourceDefinitions},
 	}
 
 	if name == "all" {
@@ -65,7 +69,14 @@ func selectPhases(name string) []phase {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "unknown phase %q; available: bootstrap, nodes, all\n", name)
+	names := make([]string, 0, len(all)+1)
+	for _, p := range all {
+		names = append(names, p.name)
+	}
+
+	names = append(names, "all")
+
+	fmt.Fprintf(os.Stderr, "unknown phase %q; available: %v\n", name, names)
 	os.Exit(2)
 
 	return nil
@@ -134,7 +145,7 @@ func phaseNodes(ctx context.Context, c *client.Client) error {
 	err = c.Nodes.Modify(ctx, traceNode1, client.NodeModify{
 		GenericPropsModify: client.GenericPropsModify{
 			OverrideProps: map[string]string{
-				"Aux/recorder-stamp": "yes",
+				"Aux/recorder-stamp": traceStampYes,
 			},
 		},
 	})
