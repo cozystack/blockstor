@@ -97,9 +97,9 @@ type connectionObservation struct {
 //     Failed, …). Drives DrbdState + per-volume DiskState.
 func translateEvent(ev drbd.Event) (observation, bool) {
 	switch ev.Kind {
-	case "resource":
+	case eventKindResource:
 		return translateResourceEvent(ev)
-	case "device":
+	case eventKindDevice:
 		return translateDeviceEvent(ev)
 	case eventKindPeerDevice:
 		return translatePeerDeviceEvent(ev)
@@ -144,7 +144,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 
 	return observation{
 		ResourceName: name,
-		InUse:        ev.Fields["role"] == "Primary",
+		InUse:        ev.Fields["role"] == drbdRolePrimary,
 		HasResource:  true,
 	}, true
 }
@@ -259,6 +259,12 @@ func observationsFrom(in <-chan drbd.Event) <-chan observation {
 const observerEventBuffer = 256
 
 const (
+	// eventKindResource is the events2 `kind` token for resource-
+	// level role/disk transitions. Drives the InUse field.
+	eventKindResource = "resource"
+	// eventKindDevice is the events2 `kind` token for per-volume
+	// disk-state frames (UpToDate, Diskless, Failed, …).
+	eventKindDevice = "device"
 	// eventKindConnection is the events2 `kind` token for peer
 	// connection state-change frames.
 	eventKindConnection = "connection"
@@ -272,6 +278,9 @@ const (
 	// else (`StandAlone`, `BrokenPipe`, `Connecting`, ...) lands
 	// in the Python CLI's `--faulty` set.
 	drbdStateConnected = "Connected"
+	// drbdRolePrimary is the DRBD-9 role token meaning the
+	// replica is open for write. Maps to ResourceStatus.InUse.
+	drbdRolePrimary = "Primary"
 )
 
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed

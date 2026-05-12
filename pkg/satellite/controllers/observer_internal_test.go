@@ -319,3 +319,192 @@ func sameSet(got, want []string) bool {
 
 	return true
 }
+
+// TestTranslateResourceEventHasResource pins the HasResource flag on
+// the resource-kind observation. mergeResource keys off this flag
+// when deciding whether to cache InUse — without HasResource=true,
+// connection-kind events would clobber the cached value with their
+// zero-default and the apiserver-side f:inUse claim disappears.
+func TestTranslateResourceEventHasResource(t *testing.T) {
+	cases := []struct {
+		name      string
+		role      string
+		wantInUse bool
+	}{
+		{"primary => InUse=true", "Primary", true},
+		{"secondary => InUse=false", "Secondary", false},
+		{"unknown role still emits HasResource", "Connecting", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := drbd.Event{
+				Kind:   "resource",
+				Action: "change",
+				Fields: map[string]string{
+					"name": "pvc-0",
+					"role": tc.role,
+				},
+			}
+
+			obs, ok := translateResourceEvent(ev)
+			if !ok {
+				t.Fatalf("translateResourceEvent rejected %+v", ev)
+			}
+
+			if !obs.HasResource {
+				t.Errorf("HasResource: got false, want true (always set on resource-kind events)")
+			}
+
+			if obs.InUse != tc.wantInUse {
+				t.Errorf("InUse: got %v, want %v", obs.InUse, tc.wantInUse)
+			}
+		})
+	}
+}
+
+// TestMergeResourceCachesInUseAcrossNonResourceEvents pins the
+// session-fix root cause: after a resource-kind event sets
+// InUse=true, a subsequent connection-kind event would carry
+// InUse=false (zero-default). Without mergeResource caching the
+// last HasResource value, the second event's apply strips the
+// f:inUse claim and the apiserver deletes the field.
+//
+// Auto-diskful + two-primaries-live-migration both regress when
+// this caching breaks.
+func TestMergeResourceCachesInUseAcrossNonResourceEvents(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// 1. resource-kind event flips the replica to Primary.
+	primary := observation{
+		ResourceName: "pvc-0",
+		InUse:        true,
+		HasResource:  true,
+	}
+	o.mergeResource(&primary)
+
+	if !primary.InUse {
+		t.Fatalf("primary event: InUse got %v, want true", primary.InUse)
+	}
+
+	// 2. Connection-kind event ~10ms later carries InUse=false
+	//    (zero-default) and HasResource=false. mergeResource must
+	//    re-emit the cached true value.
+	connEvent := observation{
+		ResourceName: "pvc-0",
+		// InUse unset (zero) — simulating non-resource event
+		Connections: []connectionObservation{{
+			PeerNodeName: "peer-a",
+			Connected:    true,
+			Message:      "Connected",
+		}},
+	}
+	o.mergeResource(&connEvent)
+
+	if !connEvent.InUse {
+		t.Errorf("connection event after Primary: InUse re-emit got %v, want true", connEvent.InUse)
+	}
+
+	// 3. Explicit Secondary transition (HasResource=true,
+	//    InUse=false) replaces the cache.
+	secondary := observation{
+		ResourceName: "pvc-0",
+		InUse:        false,
+		HasResource:  true,
+	}
+	o.mergeResource(&secondary)
+
+	if secondary.InUse {
+		t.Errorf("secondary event: InUse got %v, want false (HasResource overrides cache)", secondary.InUse)
+	}
+
+	// 4. Subsequent non-resource event must NOT spring back to
+	//    the previously-cached true — Secondary is now the
+	//    authoritative state.
+	connAfterSecondary := observation{
+		ResourceName: "pvc-0",
+		Connections: []connectionObservation{{
+			PeerNodeName: "peer-a",
+			Message:      "Connected",
+		}},
+	}
+	o.mergeResource(&connAfterSecondary)
+
+	if connAfterSecondary.InUse {
+		t.Errorf("connection event after Secondary: InUse got %v, want false", connAfterSecondary.InUse)
+	}
+}
+
+// TestMergeResourceCachesDrbdStateAcrossNonResourceEvents pins the
+// same re-emit guarantee for DrbdState. Disk transitions only fire
+// on device-kind events; without the cache, connection events
+// between disk transitions would strip the f:drbdState claim.
+func TestMergeResourceCachesDrbdStateAcrossNonResourceEvents(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	deviceUpToDate := observation{
+		ResourceName: "pvc-0",
+		DrbdState:    "UpToDate",
+	}
+	o.mergeResource(&deviceUpToDate)
+
+	if deviceUpToDate.DrbdState != "UpToDate" {
+		t.Fatalf("device event: DrbdState got %q, want UpToDate", deviceUpToDate.DrbdState)
+	}
+
+	connEvent := observation{
+		ResourceName: "pvc-0",
+		Connections: []connectionObservation{{
+			PeerNodeName: "peer-a",
+		}},
+	}
+	o.mergeResource(&connEvent)
+
+	if connEvent.DrbdState != "UpToDate" {
+		t.Errorf("connection event: DrbdState re-emit got %q, want UpToDate", connEvent.DrbdState)
+	}
+}
+
+// TestMergeResourceIsolatesResources pins the per-resource keying.
+// The InUse=true on pvc-0 must not leak into pvc-1's observations.
+func TestMergeResourceIsolatesResources(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	o.mergeResource(&observation{
+		ResourceName: "pvc-0",
+		InUse:        true,
+		HasResource:  true,
+	})
+
+	other := observation{
+		ResourceName: "pvc-1",
+		Connections: []connectionObservation{{
+			PeerNodeName: "peer-a",
+		}},
+	}
+	o.mergeResource(&other)
+
+	if other.InUse {
+		t.Errorf("pvc-1 inherited pvc-0's InUse=true (got %v, want false)", other.InUse)
+	}
+}
+
+// TestMergeResourceEmptyResourceNameNoop guards the early return.
+// Events without a resource name must NOT populate the cache —
+// otherwise a malformed event would corrupt the per-resource
+// state map.
+func TestMergeResourceEmptyResourceNameNoop(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	o.mergeResource(&observation{HasResource: true, InUse: true})
+
+	realEv := observation{
+		ResourceName: "pvc-0",
+		Connections:  []connectionObservation{{PeerNodeName: "peer-a"}},
+	}
+	o.mergeResource(&realEv)
+
+	if realEv.InUse {
+		t.Errorf("malformed event leaked into pvc-0 cache: InUse got %v, want false", realEv.InUse)
+	}
+}
