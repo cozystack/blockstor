@@ -236,7 +236,7 @@ func (s *resources) SetState(ctx context.Context, rdName, node string, state api
 		TypeMeta:   metav1.TypeMeta{Kind: "Resource", APIVersion: crdv1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: crdv1alpha1.ResourceStatus{
-			InUse:     state.InUse,
+			InUse:     ptrBoolOrFalse(state.InUse),
 			DrbdState: state.DrbdState,
 			Volumes:   buildVolumeStatusForApply(volumes),
 		},
@@ -312,7 +312,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// at apply time, not by this read-only echo.
 		LayerObject: layerObjectFromCRD(crd),
 		State: apiv1.ResourceState{
-			InUse:     crd.Status.InUse,
+			InUse:     boolPtr(crd.Status.InUse),
 			DrbdState: crd.Status.DrbdState,
 		},
 		Volumes: volumesFromStatus(crd.Status.Volumes),
@@ -327,6 +327,26 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 // derives the per-resource rsc_state from `volumes[].state.disk_state`;
 // without this projection, the rsc_state stays "Unknown" and the
 // CLI suppresses the Conns column + --faulty filter.
+// boolPtr returns a *bool pointing at the value. Used to satisfy the
+// apiv1 tri-state contract for ResourceState.InUse: nil means "not
+// observed yet"; *false means "observed Secondary"; *true means
+// "observed Primary". Without the pointer, false serialises as
+// absent under omitempty.
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+// ptrBoolOrFalse is the inverse of boolPtr for the SSA-Apply path:
+// the CRD's Status.InUse field is a plain bool, so nil from the
+// apiv1 shape must collapse to false before write.
+func ptrBoolOrFalse(p *bool) bool {
+	if p == nil {
+		return false
+	}
+
+	return *p
+}
+
 func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 	if len(in) == 0 {
 		return nil

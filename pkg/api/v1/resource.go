@@ -47,7 +47,13 @@ type Resource struct {
 
 // ResourceState is the runtime state surface of a Resource.
 type ResourceState struct {
-	InUse bool `json:"in_use,omitempty"`
+	// InUse is intentionally a pointer with no omitempty: upstream
+	// LINSTOR (and the Python CLI's Usage column) read it as a
+	// tri-state — true=Primary, false=Secondary, unset=satellite
+	// hasn't reported yet. Plain bool with omitempty would always
+	// serialize as "absent" for Secondary, which the CLI shows as
+	// an empty Usage column instead of the expected `Unused`.
+	InUse *bool `json:"in_use,omitempty"`
 
 	// DrbdState is the current DRBD role/connection state observed by
 	// the satellite via `drbdsetup events2` — `UpToDate`, `Outdated`,

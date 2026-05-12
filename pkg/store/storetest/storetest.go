@@ -668,7 +668,7 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Fatalf("Create: %v", err)
 		}
 		err := s.SetState(ctx, "pvc-1", "n1",
-			apiv1.ResourceState{InUse: true, DrbdState: "UpToDate"},
+			apiv1.ResourceState{InUse: trueBool(), DrbdState: "UpToDate"},
 			nil)
 		if err != nil {
 			t.Fatalf("SetState: %v", err)
@@ -677,8 +677,8 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if !got.State.InUse {
-			t.Errorf("State.InUse: got false, want true")
+		if got.State.InUse == nil || !*got.State.InUse {
+			t.Errorf("State.InUse: got %v, want true", got.State.InUse)
 		}
 		if got.State.DrbdState != "UpToDate" {
 			t.Errorf("State.DrbdState: got %q, want UpToDate", got.State.DrbdState)
@@ -687,7 +687,7 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	t.Run("SetStateMissing", func(t *testing.T) {
 		s := newStore(t).Resources()
 		err := s.SetState(t.Context(), "pvc-missing", "n1",
-			apiv1.ResourceState{InUse: true}, nil)
+			apiv1.ResourceState{InUse: trueBool()}, nil)
 		if !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("SetState on missing: got %v, want ErrNotFound", err)
 		}
@@ -765,7 +765,7 @@ func testResourceSetStateNilProps(t *testing.T, newStore Factory) {
 	}
 
 	err := s.SetState(ctx, "pvc-nil", "n1",
-		apiv1.ResourceState{InUse: true}, nil) // no per-volume observations
+		apiv1.ResourceState{InUse: trueBool()}, nil) // no per-volume observations
 	if err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
@@ -775,8 +775,8 @@ func testResourceSetStateNilProps(t *testing.T, newStore Factory) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if !got.State.InUse {
-		t.Errorf("State.InUse: got false, want true")
+	if got.State.InUse == nil || !*got.State.InUse {
+		t.Errorf("State.InUse: got %v, want true", got.State.InUse)
 	}
 
 	if got.Props["original"] != "preserved" {
@@ -1800,4 +1800,13 @@ func testSPListSorted(t *testing.T, newStore Factory) {
 				i, got[i].NodeName, got[i].StoragePoolName, want[0], want[1])
 		}
 	}
+}
+
+// trueBool returns *bool pointing at true. Used by SetState tests
+// after ResourceState.InUse became a *bool (tri-state: nil = not yet
+// observed, false = Secondary, true = Primary).
+func trueBool() *bool {
+	v := true
+
+	return &v
 }
