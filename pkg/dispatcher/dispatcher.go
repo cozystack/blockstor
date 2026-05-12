@@ -56,7 +56,7 @@ const boolPropTrue = "true"
 // nodes is consulted for each peer's `SatelliteEndpoint` prop so
 // `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
-func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *intent.DesiredResource {
+func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *intent.DesiredResource {
 	// node-id and port/minor are persisted on Status by the controller
 	// before Apply runs. Falling back to derive*() is a transitional
 	// safety net for the case where the allocator hasn't run yet — it
@@ -99,7 +99,11 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	drbdOpts := map[string]string{
 		"port":    strconv.Itoa(port),
 		"node-id": strconv.Itoa(int(idOf[target.Spec.NodeName])),
-		"address": drbdAddrAny, // satellite picks pod IP at .res render time
+		// PrefNic on the target's pool (storage pool prop) overrides
+		// the default placeholder so DRBD binds replication to the
+		// requested interface. Empty fallback → satellite picks its
+		// pod IP at .res render time.
+		"address": prefNicAddress(target.Spec.NodeName, targetPoolName(target), nodes, pools),
 		"minor":   strconv.Itoa(minor),
 	}
 
@@ -115,7 +119,7 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		drbdOpts["auto-primary"] = boolPropTrue
 	}
 
-	addPeerEntries(drbdOpts, dropped, peers, nodes, port, idOf)
+	addPeerEntries(drbdOpts, dropped, peers, nodes, pools, port, idOf)
 
 	return assembleDesired(target, peers, rd, dropped, drbdOpts, effectiveProps)
 }
@@ -247,7 +251,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 // on the DesiredResource's drbd_options map. Pulled out of
 // BuildDesired to keep the latter under the funlen budget — this
 // owns the per-peer fan-out plus the port/address lookups.
-func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, fallbackPort int, idOf map[string]int32) {
+func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
 		peerByName[peers[i].Spec.NodeName] = &peers[i]
@@ -255,13 +259,17 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 
 	for _, peer := range dropped {
 		peerPort := fallbackPort
+
+		peerPool := ""
+
 		if p, ok := peerByName[peer]; ok {
 			peerPort = peerPortOf(p, fallbackPort)
+			peerPool = targetPoolName(p)
 		}
 
 		drbdOpts["peer."+peer+".port"] = strconv.Itoa(peerPort)
 		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
-		drbdOpts["peer."+peer+".address"] = peerAddress(peer, nodes)
+		drbdOpts["peer."+peer+".address"] = peerAddressWithPrefNic(peer, peerPool, nodes, pools)
 
 		// Surface the peer's DISKLESS flag so the satellite's .res
 		// renderer can emit `disk none;` instead of the diskful
@@ -270,6 +278,99 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 			drbdOpts["peer."+peer+".diskless"] = boolPropTrue
 		}
 	}
+}
+
+// targetPoolName extracts the StoragePool name a Resource lives in.
+// Typed Spec.StoragePool wins (Phase 10.3); legacy props["StorPoolName"]
+// is the fallback for clusters mid-migration.
+func targetPoolName(r *blockstoriov1alpha1.Resource) string {
+	if r.Spec.StoragePool != "" {
+		return r.Spec.StoragePool
+	}
+
+	return r.Spec.Props["StorPoolName"]
+}
+
+// prefNicAddress resolves the node's NetInterface address named by
+// the storage pool's PrefNic prop, falling back to drbdAddrAny when
+// the pool / interface / prop isn't set. drbdAddrAny is the empty-
+// placeholder the satellite swaps for its own pod IP at .res render
+// time.
+func prefNicAddress(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
+	if poolName == "" {
+		return drbdAddrAny
+	}
+
+	prefNic := lookupPrefNic(nodeName, poolName, pools)
+	if prefNic == "" {
+		return drbdAddrAny
+	}
+
+	addr := lookupNetInterfaceAddress(nodeName, prefNic, nodes)
+	if addr == "" {
+		return drbdAddrAny
+	}
+
+	return addr
+}
+
+// peerAddressWithPrefNic returns the peer node's DRBD address with
+// the PrefNic override on top: when the peer's storage pool has a
+// PrefNic prop, the matching NetInterface address wins over the
+// generic SatelliteEndpoint discovery. Falls back to peerAddress()
+// when nothing pins it (typical single-NIC clusters).
+func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
+	if poolName != "" {
+		prefNic := lookupPrefNic(nodeName, poolName, pools)
+		if prefNic != "" {
+			if addr := lookupNetInterfaceAddress(nodeName, prefNic, nodes); addr != "" {
+				return addr
+			}
+		}
+	}
+
+	return peerAddress(nodeName, nodes)
+}
+
+// lookupPrefNic reads spec.Props["PrefNic"] off the StoragePool that
+// hosts (nodeName, poolName). Returns "" when the pool isn't in the
+// passed slice or the prop isn't set.
+func lookupPrefNic(nodeName, poolName string, pools []blockstoriov1alpha1.StoragePool) string {
+	for i := range pools {
+		if pools[i].Spec.NodeName != nodeName {
+			continue
+		}
+
+		if pools[i].Spec.PoolName != poolName {
+			continue
+		}
+
+		return pools[i].Spec.Props["PrefNic"]
+	}
+
+	return ""
+}
+
+// lookupNetInterfaceAddress finds the NetInterface named ifaceName on
+// the named Node CRD and returns its Address. Empty on any miss; the
+// caller uses the empty result to fall through to the next address
+// source rather than 500-ing.
+func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1alpha1.Node) string {
+	for i := range nodes {
+		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
+			continue
+		}
+
+		for j := range nodes[i].Spec.NetInterfaces {
+			if nodes[i].Spec.NetInterfaces[j].Name == ifaceName {
+				return nodes[i].Spec.NetInterfaces[j].Address
+			}
+		}
+
+		return ""
+	}
+
+	return ""
 }
 
 // lowestDiskfulID picks the smallest allocated node-id among the

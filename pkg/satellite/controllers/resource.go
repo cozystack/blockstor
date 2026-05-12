@@ -393,12 +393,19 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "list Nodes")
 	}
 
+	var poolList blockstoriov1alpha1.StoragePoolList
+
+	err = r.List(ctx, &poolList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list StoragePools")
+	}
+
 	effectiveProps, err := effectiveprops.Resolve(ctx, r.Client, target, rd)
 	if err != nil {
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	return dispatcher.BuildDesired(target, peers, nodeList.Items, rd, effectiveProps), nil
+	return dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps), nil
 }
 
 // rdNeedsDRBD mirrors pkg/satellite/reconciler.go's needsDRBD but
