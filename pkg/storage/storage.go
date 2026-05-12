@@ -23,6 +23,7 @@ package storage
 
 import (
 	"context"
+	"io"
 
 	"github.com/cockroachdb/errors"
 )
@@ -124,4 +125,30 @@ type Provider interface {
 	//                       --name <tgt> <pool>/<src-snap>`
 	//   FILE / FILE_THIN: `cp --reflink=auto <src-snap>.img <tgt>.img`
 	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
+}
+
+// SnapshotShipper is the optional cross-node-clone capability — a
+// provider that implements it can stream a snapshot to a peer
+// satellite and reconstitute it on the receiving side. ZFS / LVM
+// thin / FILE all support this; legacy backends don't. Callers do a
+// type-assert and fall back to DRBD initial-sync when the assert
+// fails.
+//
+// Pulled out of Provider so the base interface stays under the
+// interfacebloat budget — most call sites don't need the shipper
+// methods at all.
+type SnapshotShipper interface {
+	// SendSnapshot opens a byte stream of the snapshot's contents
+	// suitable for receiving on another node. ZFS returns
+	// `zfs send` (incremental-replay format); LVM thin returns
+	// `thin_send` (binary delta); FILE returns `dd` of the
+	// file (raw bytes). The caller closes the reader when done.
+	SendSnapshot(ctx context.Context, snap Snapshot) (io.ReadCloser, error)
+
+	// RecvSnapshot materialises target from a stream produced by
+	// SendSnapshot on a peer satellite. After this returns, target
+	// is fully populated with the snapshot's bytes; the caller
+	// wires drbdmeta drop-md + create-md to stamp fresh DRBD
+	// metadata for the local node-id.
+	RecvSnapshot(ctx context.Context, target Volume, src io.Reader) error
 }
