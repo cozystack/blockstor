@@ -180,6 +180,37 @@ func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error
 	return nil
 }
 
+// RestoreVolumeFromSnapshot for thick LV uses `lvconvert --merge`
+// semantics indirectly: take a writable snapshot of the source
+// snapshot's COW area (acts as a fresh thin-style overlay), name it
+// as the target. Thick snapshots are size-bounded so this CAN
+// overflow under heavy churn — upstream LINSTOR recommends thin
+// pools for clone-heavy workloads.
+//
+// Idempotent: target LV present → resumed reconcile, no-op.
+func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
+	tgtName := volumeLVName(target)
+	if t.lvExists(ctx, tgtName) {
+		return nil
+	}
+
+	srcName := snapshotLVName(src)
+	if !t.lvExists(ctx, srcName) {
+		return errors.Wrapf(storage.ErrNotFound, "snapshot LV %s/%s for clone", t.cfg.VolumeGroup, srcName)
+	}
+
+	_, err := t.exec.Run(ctx, "lvcreate",
+		Args("--snapshot",
+			"--extents", "25%ORIGIN",
+			"--name", tgtName,
+			t.cfg.VolumeGroup+"/"+srcName)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
+	}
+
+	return nil
+}
+
 // lvExists is the same idempotency primitive Thin uses.
 func (t *Thick) lvExists(ctx context.Context, lvName string) bool {
 	out, err := t.exec.Run(ctx, "lvs",

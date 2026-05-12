@@ -201,6 +201,31 @@ func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
+// RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
+// the source snapshot. ZFS clones are CoW — instant create, lazy
+// allocation as writes diverge from the snapshot.
+//
+// Upstream LINSTOR equivalent: `zfs clone <pool>/<src>@<snap> <pool>/<tgt>`.
+// Idempotent: target dataset present → treat as resumed reconcile.
+func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
+	tgtDS := p.volumeDataset(target)
+	if p.datasetExists(ctx, tgtDS) {
+		return nil
+	}
+
+	srcDS := p.snapshotDataset(src)
+	if !p.datasetExists(ctx, srcDS) {
+		return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", srcDS)
+	}
+
+	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
+	if err != nil {
+		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
+	}
+
+	return nil
+}
+
 // datasetExists is the idempotency primitive — analogous to lvExists.
 func (p *Provider) datasetExists(ctx context.Context, ds string) bool {
 	out, err := p.exec.Run(ctx, "zfs", "list", "-H", "-o", "name", ds)

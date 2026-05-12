@@ -217,18 +217,121 @@ func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
 	}, nil
 }
 
-// CreateSnapshot — file backend has no first-class snapshot. We could
-// hard-link or `cp --reflink=auto` but that's lossy for thick volumes.
-// Until we know the underlying FS supports reflinks, we surface "not
-// supported" via the error so callers don't silently get a coherent
-// but uncorrelated copy.
-func (*Provider) CreateSnapshot(_ context.Context, _ storage.Snapshot) error {
-	return errors.New("file backend does not support snapshots; use a reflink-capable FS or LVM/ZFS")
+// CreateSnapshot captures the volume by copying its backing file
+// with `cp --reflink=auto`. On a reflink-capable FS (XFS, btrfs,
+// most modern ext4 on copy-on-write FS, ZFS-backed) this is O(1)
+// + CoW; otherwise cp falls back to a full byte copy. Snapshots
+// always live next to the volume in the same pool dir.
+//
+// The CSI snapshot-restore path needs this to function — `linstor
+// snapshot create` over a FILE_THIN pool used to refuse outright,
+// which broke clone / snapshot-restore-cross-node e2e on the dev
+// stand (the only pool there is file_thin).
+func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	srcPath := p.volumePathByResource(snap.ResourceName, 0)
+	dstPath := p.snapshotPath(snap)
+
+	_, err := os.Stat(srcPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errors.Wrapf(storage.ErrNotFound, "snapshot source %s", srcPath)
+		}
+
+		return errors.Wrapf(err, "stat %s", srcPath)
+	}
+
+	// Idempotent: presence of the snapshot file → resumed reconcile.
+	_, err = os.Stat(dstPath)
+	if err == nil {
+		return nil
+	}
+
+	_, err = p.exec.Run(ctx, "cp", "--reflink=auto", srcPath, dstPath)
+	if err != nil {
+		return errors.Wrapf(err, "cp --reflink %s → %s", srcPath, dstPath)
+	}
+
+	return nil
 }
 
-// DeleteSnapshot mirrors CreateSnapshot.
-func (*Provider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
-	return errors.New("file backend does not support snapshots")
+// DeleteSnapshot removes the .img copy. Missing → no-op.
+func (*Provider) DeleteSnapshot(_ context.Context, snap storage.Snapshot) error {
+	path := snapshotPathRaw(snap)
+
+	err := os.Remove(path)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove %s", path)
+	}
+
+	return nil
+}
+
+// RestoreVolumeFromSnapshot materialises target.img by reflink-copying
+// the snapshot .img then attaching it to a loop device, matching the
+// CreateVolume tail. Pre-existing target → resumed reconcile, no-op.
+//
+// Upstream LINSTOR for FILE/FILE_THIN: `cp --reflink=auto <snap>.img
+// <vol>.img`. Reflink keeps the copy O(1); writes diverge lazily.
+func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
+	dstPath := p.volumePath(target)
+
+	_, err := os.Stat(dstPath)
+	if err == nil {
+		// Target file exists — still need to ensure the loop is up.
+		_, err = p.attach(ctx, dstPath)
+		if err != nil {
+			return errors.Wrapf(err, "losetup %s", dstPath)
+		}
+
+		return nil
+	}
+
+	if !os.IsNotExist(err) {
+		return errors.Wrapf(err, "stat %s", dstPath)
+	}
+
+	srcPath := p.snapshotPath(src)
+
+	_, sErr := os.Stat(srcPath)
+	if sErr != nil {
+		if os.IsNotExist(sErr) {
+			return errors.Wrapf(storage.ErrNotFound, "snapshot %s for clone", srcPath)
+		}
+
+		return errors.Wrapf(sErr, "stat %s", srcPath)
+	}
+
+	_, err = p.exec.Run(ctx, "cp", "--reflink=auto", srcPath, dstPath)
+	if err != nil {
+		return errors.Wrapf(err, "cp --reflink %s → %s", srcPath, dstPath)
+	}
+
+	_, err = p.attach(ctx, dstPath)
+	if err != nil {
+		return errors.Wrapf(err, "losetup %s", dstPath)
+	}
+
+	return nil
+}
+
+// snapshotPath is `<dir>/<resource>_<snap>_00000.img`. Matches the
+// LV-side `<rd>_<snap>_00000` naming (volume #0 only — multi-volume
+// snapshots land in Phase 4).
+func (p *Provider) snapshotPath(snap storage.Snapshot) string {
+	return filepath.Join(p.cfg.Dir, fmt.Sprintf("%s_%s_00000.img", snap.ResourceName, snap.SnapshotName))
+}
+
+// snapshotPathRaw is the package-level shape used by DeleteSnapshot
+// (which doesn't have access to cfg.Dir at that callsite when the
+// receiver is the bare type).
+func snapshotPathRaw(snap storage.Snapshot) string {
+	return filepath.Join(snap.PoolName, fmt.Sprintf("%s_%s_00000.img", snap.ResourceName, snap.SnapshotName))
+}
+
+// volumePathByResource is volumePath but indexed by resource name +
+// vol number directly, for snapshot-source lookups.
+func (p *Provider) volumePathByResource(rd string, vol int32) string {
+	return filepath.Join(p.cfg.Dir, fmt.Sprintf("%s_%05d.img", rd, vol))
 }
 
 // attach is the idempotent loop-attach step. We pre-check via

@@ -307,20 +307,38 @@ func TestResizeVolumeShrinkNoOp(t *testing.T) {
 	}
 }
 
-// TestSnapshotsUnsupported: file backend explicitly rejects snapshots
-// so callers don't silently get a coherent-but-stale copy. Hard-link
-// or `cp --reflink=auto` would be lossy on thick volumes.
-func TestSnapshotsUnsupported(t *testing.T) {
-	p := file.NewProvider(file.Config{Dir: t.TempDir()}, storage.NewFakeExec())
+// TestSnapshotsCpReflink: file backend now copies the .img with
+// `cp --reflink=auto`. On a reflink-capable FS this is O(1) + CoW;
+// otherwise cp falls back to a full byte copy. The CSI snapshot-
+// restore path needs this so clone / snapshot-restore-cross-node
+// e2e can function on the dev stand's FILE_THIN pool.
+func TestSnapshotsCpReflink(t *testing.T) {
+	dir := t.TempDir()
+	fake := storage.NewFakeExec()
+	p := file.NewProvider(file.Config{Dir: dir}, fake)
 
-	err := p.CreateSnapshot(t.Context(), storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"})
-	if err == nil {
-		t.Errorf("CreateSnapshot must error")
+	// Seed a source .img so the snapshot copy has something to read.
+	srcPath := filepath.Join(dir, "pvc-1_00000.img")
+	if err := os.WriteFile(srcPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("seed src: %v", err)
 	}
 
-	err = p.DeleteSnapshot(t.Context(), storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"})
-	if err == nil {
-		t.Errorf("DeleteSnapshot must error")
+	err := p.CreateSnapshot(t.Context(), storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"})
+	if err != nil {
+		t.Errorf("CreateSnapshot: %v", err)
+	}
+
+	if len(fake.Calls) == 0 ||
+		fake.Calls[0].Name != "cp" ||
+		!slices.Contains(fake.Calls[0].Args, "--reflink=auto") {
+		t.Errorf("expected cp --reflink=auto, got %+v", fake.Calls)
+	}
+
+	// DeleteSnapshot is a plain os.Remove — exit cleanly on missing.
+	err = p.DeleteSnapshot(t.Context(),
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1", PoolName: dir})
+	if err != nil {
+		t.Errorf("DeleteSnapshot: %v", err)
 	}
 }
 

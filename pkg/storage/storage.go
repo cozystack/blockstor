@@ -112,4 +112,16 @@ type Provider interface {
 
 	// DeleteSnapshot is the inverse of CreateSnapshot.
 	DeleteSnapshot(ctx context.Context, snap Snapshot) error
+
+	// RestoreVolumeFromSnapshot materialises target as a clone of
+	// sourceSnapshot. Both must live in the same pool on the same
+	// node (cross-node restore happens via DRBD network resync after
+	// at least one peer was restored locally). Idempotent: if target
+	// already exists with the same size it returns nil. Upstream
+	// LINSTOR pattern:
+	//   ZFS / ZFS_THIN: `zfs clone <pool>/<src>@<snap> <pool>/<tgt>`
+	//   LVM_THIN:       `lvcreate -s --kernel --activate y \
+	//                       --name <tgt> <pool>/<src-snap>`
+	//   FILE / FILE_THIN: `cp --reflink=auto <src-snap>.img <tgt>.img`
+	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
 }

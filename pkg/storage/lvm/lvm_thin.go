@@ -199,6 +199,41 @@ func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	return nil
 }
 
+// RestoreVolumeFromSnapshot materialises target as a thin-pool LV
+// clone of the snapshot. Thin snapshots in LVM are CoW by default
+// (no `--addtag pvmove` flag toggling required) — instant create,
+// lazy allocation on diverging writes.
+//
+// Upstream LINSTOR equivalent:
+//
+//	lvcreate -s --kernel --activate y --name <tgt> <vg>/<src-snap>
+//
+// Idempotent: target LV present → resumed reconcile, no-op.
+func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
+	tgtName := volumeLVName(target)
+	if t.lvExists(ctx, tgtName) {
+		return nil
+	}
+
+	srcName := snapshotLVName(src)
+	if !t.lvExists(ctx, srcName) {
+		return errors.Wrapf(storage.ErrNotFound, "snapshot LV %s/%s for clone", t.cfg.VolumeGroup, srcName)
+	}
+
+	_, err := t.exec.Run(ctx, "lvcreate",
+		Args("--snapshot",
+			"--kernel",
+			"--setactivationskip", "n",
+			"--activate", "y",
+			"--name", tgtName,
+			t.cfg.VolumeGroup+"/"+srcName)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
+	}
+
+	return nil
+}
+
 // lvExists is the idempotency primitive used by Create/Delete. Errors
 // from `lvs` are folded into "missing": we can't distinguish "lv not
 // found" from "vg locked" via stdout, and the caller's subsequent op
