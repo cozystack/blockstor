@@ -23,6 +23,7 @@ import (
 
 	cerrors "github.com/cockroachdb/errors"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -46,6 +47,14 @@ import (
 // any Resource that still carries it (rolling upgrade case);
 // the controller no longer stamps it on new Resources.
 const resourceFinalizer = "blockstor.io.blockstor.io/resource"
+
+// controllerDRBDIDsFieldOwner is the SSA field-manager identity the
+// controller-side allocator uses when it writes Status.DRBD{NodeID,
+// Port,Minor}. Distinct from the satellite-side observer + reconciler
+// owners so the apiserver merges the three claims cleanly. Replacing
+// the old Status().Update path was necessary to stop the controller
+// from clobbering observer-owned fields (disk_state, in_use, etc).
+const controllerDRBDIDsFieldOwner = "blockstor-controller-drbd-ids"
 
 // ResourceReconciler runs controller-side housekeeping on every
 // Resource: DRBD-ID allocation (port/minor), seed-from-Gi for
@@ -390,32 +399,11 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 	}
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		err := reader.Get(ctx, client.ObjectKey{Name: target.Name}, target)
-		if err != nil {
-			return err
-		}
+		var inner error
 
-		original := target.Status.DeepCopy()
+		mutated, inner = r.allocateAndApplyDRBDIDs(ctx, reader, target)
 
-		err = r.allocateDRBDFields(ctx, target)
-		if err != nil {
-			return err
-		}
-
-		if equalStatus(original, &target.Status) {
-			mutated = false
-
-			return nil
-		}
-
-		err = r.Status().Update(ctx, target)
-		if err != nil {
-			return err
-		}
-
-		mutated = true
-
-		return nil
+		return inner
 	})
 	if err != nil {
 		return false, cerrors.Wrap(err, "allocate DRBD ids")
@@ -425,6 +413,57 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 }
 
 // allocateDRBDFields fills in any missing DRBD-{NodeID,Port,Minor}
+// allocateAndApplyDRBDIDs runs the per-retry body of ensureDRBDIDs:
+// refetch target, allocate any missing ids, and SSA-Patch the
+// three fields back. Returns (mutated, err).
+//
+// SSA Apply (not Update) so the satellite-observer's per-volume
+// diskState / connections / replicationState field-ownership
+// survives. A plain Status().Update writes the whole status object
+// and the apiserver drops observer's claims on the merge, leaving
+// Status.Volumes[i].diskState blank for the rest of the resource
+// lifetime.
+func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader client.Reader, target *blockstoriov1alpha1.Resource) (bool, error) {
+	err := reader.Get(ctx, client.ObjectKey{Name: target.Name}, target)
+	if err != nil {
+		return false, err
+	}
+
+	original := target.Status.DeepCopy()
+
+	err = r.allocateDRBDFields(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
+	if equalStatus(original, &target.Status) {
+		return false, nil
+	}
+
+	apply := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Resource",
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: target.Name},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: target.Status.DRBDNodeID,
+			DRBDPort:   target.Status.DRBDPort,
+			DRBDMinor:  target.Status.DRBDMinor,
+		},
+	}
+
+	err = r.Status().Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
+		client.FieldOwner(controllerDRBDIDsFieldOwner),
+		client.ForceOwnership)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // fields on target.Status. Pulled out of ensureDRBDIDs so the retry
 // loop body stays under the funlen budget.
 func (r *ResourceReconciler) allocateDRBDFields(ctx context.Context, target *blockstoriov1alpha1.Resource) error {

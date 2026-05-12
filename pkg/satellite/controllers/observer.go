@@ -18,9 +18,7 @@ package controllers
 
 import (
 	"context"
-	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -360,13 +358,6 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 		}
 	}
 
-	// Pre-merge state for the diagnostic log: mergeVolumes/Connections
-	// may zero ev.Volumes if nothing changed since the last cache write,
-	// which made it impossible to tell from logs whether the satellite
-	// actually saw a device-kind frame or just dropped it silently.
-	volsIn := len(ev.Volumes)
-	connsIn := len(ev.Connections)
-
 	// Connection observations arrive one peer at a time. SSA with the
 	// same FieldOwner replaces the full list each apply, so we
 	// aggregate per-resource state in-memory and emit the full
@@ -374,15 +365,6 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// peers from this owner's claims and they vanish from Status.
 	o.mergeConnections(ev)
 	o.mergeVolumes(ev)
-
-	logger.Info("observation",
-		"resource", ev.ResourceName,
-		"drbdState", ev.DrbdState,
-		"vols_in", volsIn,
-		"vols_out", len(ev.Volumes),
-		"conns_in", connsIn,
-		"conns_out", len(ev.Connections),
-	)
 
 	err := o.writeStatus(ctx, ev)
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -565,16 +547,6 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
-	logger := log.FromContext(ctx).WithName("observer")
-	logger.Info("writeStatus pre-patch",
-		"name", name,
-		"vols", len(apply.Status.Volumes),
-		"vols_diskState", volumesDiskStateSummary(apply.Status.Volumes),
-		"conns", len(apply.Status.Connections),
-		"inUse", apply.Status.InUse,
-		"drbdState", apply.Status.DrbdState,
-	)
-
 	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner),
@@ -583,24 +555,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
 	}
 
-	logger.Info("writeStatus post-patch ok", "name", name)
-
 	return nil
-}
-
-// volumesDiskStateSummary formats Volumes for the diagnostic log so
-// we can see what disk states are being SSA-claimed at each Patch.
-func volumesDiskStateSummary(vols []blockstoriov1alpha1.ResourceVolumeStatus) string {
-	if len(vols) == 0 {
-		return "[]"
-	}
-
-	parts := make([]string, 0, len(vols))
-	for i := range vols {
-		parts = append(parts, fmt.Sprintf("vol%d=%q", vols[i].VolumeNumber, vols[i].DiskState))
-	}
-
-	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // buildObserverVolumeStatus packs the per-volume observations
