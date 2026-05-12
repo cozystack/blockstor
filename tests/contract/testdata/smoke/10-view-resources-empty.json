@@ -1,0 +1,7 @@
+{
+  "name": "view resources empty",
+  "method": "GET",
+  "path": "/v1/view/resources",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

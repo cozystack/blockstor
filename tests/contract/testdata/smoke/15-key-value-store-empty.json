@@ -1,0 +1,7 @@
+{
+  "name": "key-value store empty list",
+  "method": "GET",
+  "path": "/v1/key-value-store",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

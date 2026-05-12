@@ -1,0 +1,7 @@
+{
+  "name": "view storage pools empty",
+  "method": "GET",
+  "path": "/v1/view/storage-pools",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

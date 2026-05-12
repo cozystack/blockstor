@@ -1,0 +1,7 @@
+{
+  "name": "resource groups empty",
+  "method": "GET",
+  "path": "/v1/resource-groups",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

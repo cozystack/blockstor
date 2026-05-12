@@ -1,0 +1,11 @@
+{
+  "name": "remotes empty RemoteList envelope",
+  "method": "GET",
+  "path": "/v1/remotes",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "s3_remotes": [],
+    "linstor_remotes": [],
+    "ebs_remotes": []
+  }
+}

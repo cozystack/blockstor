@@ -1,0 +1,7 @@
+{
+  "name": "view snapshots empty",
+  "method": "GET",
+  "path": "/v1/view/snapshots",
+  "expectedStatus": 200,
+  "expectedBody": []
+}
