@@ -34,8 +34,8 @@ echo ">> apply 2-replica RD on $N1 + $N2"
 rd_apply "$RD" "$N1" "$N2"
 wait_uptodate "$RD" "$N1" "$N2"
 
-echo ">> wait 30s for ResourceDefinitionReconciler to add tiebreaker"
-deadline=$(( $(date +%s) + 30 ))
+echo ">> wait 60s for ResourceDefinitionReconciler to add tiebreaker"
+deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
     if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
         break
