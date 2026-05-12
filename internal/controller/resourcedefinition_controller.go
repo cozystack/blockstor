@@ -21,6 +21,7 @@ import (
 	stderrors "errors"
 	"slices"
 	"strings"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -88,8 +89,22 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	// Belt-and-braces re-enqueue: the witness-decision read in
+	// ensureTiebreaker goes through the cached client, and an RD
+	// reconciled right when the second Resource arrives may see a
+	// stale 1-diskful view and skip witness creation. Watches on
+	// Resource events re-enqueue the RD as the cache fills, but if
+	// only one Resource event lands before the reconciler drains
+	// the queue we'd wait for the next periodic re-sync (minutes)
+	// before the witness appears. A short requeue closes that
+	// window without changing the steady-state behaviour: once the
+	// witness exists, the next ensureTiebreaker is a no-op.
+	return ctrl.Result{RequeueAfter: rdReconcileRequeue}, nil
 }
+
+// rdReconcileRequeue is the cache-warmup safety net for the RD
+// reconciler. See the comment in Reconcile for why it exists.
+const rdReconcileRequeue = 5 * time.Second
 
 // ensureTiebreaker keeps both invariants upstream LINSTOR maintains:
 //
