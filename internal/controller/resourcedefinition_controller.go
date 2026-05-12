@@ -55,6 +55,17 @@ type ResourceDefinitionReconciler struct {
 	// Store is the shared blockstor store. Same instance the
 	// NodeReconciler and REST server use.
 	Store store.Store
+
+	// APIReader is a direct apiserver reader used to enumerate
+	// Resources for the witness-decision. Bypasses the informer
+	// cache, which trails the apiserver during the first 100ms
+	// after a `kubectl apply` of multiple Resources — a stale read
+	// would see only 1 diskful replica, skip witness creation, and
+	// wait for the next watch event to re-enqueue. Wired from
+	// `mgr.GetAPIReader()` in SetupWithManager; tests construct the
+	// reconciler directly and skip this — the field is nil-safe
+	// and falls back to the cached client below.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
@@ -129,7 +140,7 @@ const rdReconcileRequeue = 5 * time.Second
 // the same tiebreaker / quorum decisions as one running upstream
 // LINSTOR — important for the cozystack migration story.
 func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
-	replicas, err := r.Store.Resources().ListByDefinition(ctx, rd.Name)
+	replicas, err := r.listReplicasDirect(ctx, rd.Name)
 	if err != nil {
 		return err
 	}
@@ -154,6 +165,42 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	}
 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// listReplicasDirect enumerates the Resource children of an RD by
+// reading apiserver-direct via APIReader, bypassing the informer
+// cache. The cache trails the apiserver by tens to hundreds of
+// milliseconds, which means a Reconcile triggered by the FIRST
+// Resource Create event sees only 1 diskful replica when the test
+// just `kubectl apply`-d two. The cache-based read would miss the
+// witness-creation window until the next sync. Tests that
+// construct the reconciler directly leave APIReader nil — fall
+// back to the Store path so unit tests don't need an apiserver.
+func (r *ResourceDefinitionReconciler) listReplicasDirect(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
+	if r.APIReader == nil {
+		return r.Store.Resources().ListByDefinition(ctx, rdName)
+	}
+
+	var crdList blockstoriov1alpha1.ResourceList
+	if err := r.APIReader.List(ctx, &crdList); err != nil {
+		return nil, err
+	}
+
+	out := make([]apiv1.Resource, 0, len(crdList.Items))
+
+	for i := range crdList.Items {
+		if crdList.Items[i].Spec.ResourceDefinitionName != rdName {
+			continue
+		}
+
+		out = append(out, apiv1.Resource{
+			Name:     crdList.Items[i].Spec.ResourceDefinitionName,
+			NodeName: crdList.Items[i].Spec.NodeName,
+			Flags:    crdList.Items[i].Spec.Flags,
+		})
+	}
+
+	return out, nil
 }
 
 // isAutoTieBreakerEnabled gates witness auto-creation. Default is
@@ -444,6 +491,10 @@ func alreadyExists(err error) bool {
 // reconciler after the Resources finish, and a 2-replica RD sits
 // without its DISKLESS witness until the next periodic re-sync.
 func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.ResourceDefinition{}).
 		Watches(&blockstoriov1alpha1.Resource{},
