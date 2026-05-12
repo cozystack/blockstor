@@ -45,8 +45,10 @@ func TestVolumeDefinitionsCreateRoundTrip(t *testing.T) {
 	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/volume-definitions", body)
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	// Upstream LINSTOR returns 200 (not 201) for child-volume
+	// creates under an existing parent RD. Mirrors that.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
 	listResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/volume-definitions")

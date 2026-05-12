@@ -132,6 +132,11 @@ var volatileTopLevel = map[string]struct{}{ //nolint:gochecknoglobals // table-d
 	"storage_providers":     {},
 	"unsupported_layers":    {},
 	"unsupported_providers": {},
+	// Version strings drift between LINSTOR releases. The contract
+	// that matters is the REST shape, not the build version.
+	// linstor-csi / piraeus-operator don't gate on either.
+	"version":          {},
+	"rest_api_version": {},
 }
 
 func scrubWith(value any, opts NormalizeOptions) any {

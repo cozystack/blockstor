@@ -289,7 +289,14 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Mirror upstream LINSTOR: DELETE returns 200 + an
+	// ApiCallRc[] envelope, not 204 / empty body. golinstor's
+	// `Delete` decodes the body to detect downstream warnings
+	// even on success.
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "volume group deleted",
+	}})
 }
 
 // handleQueryMaxVolumeSize answers the deprecated-but-still-used

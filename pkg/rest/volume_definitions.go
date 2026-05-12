@@ -151,7 +151,12 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	// Matches upstream LINSTOR: POST /v1/resource-definitions/<n>/
+	// volume-definitions returns 200 OK (not 201 Created). Java
+	// LINSTOR is consistent about this — only top-level entity
+	// creates return 201, child-volume creates stay 200 because
+	// the parent already exists.
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition created",
 	}})

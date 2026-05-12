@@ -199,14 +199,15 @@ func TestNormalizeBuildTimeAndGitHashDropped(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	for _, dropped := range []string{"build_time", "git_hash"} {
+	// version strings drift between LINSTOR releases; we drop
+	// `version` and `rest_api_version` alongside build_time and
+	// git_hash so the contract test doesn't gate on the release
+	// number. linstor-csi / piraeus-operator don't gate on either
+	// string either.
+	for _, dropped := range []string{"build_time", "git_hash", "version", "rest_api_version"} {
 		if _, present := decoded[dropped]; present {
 			t.Errorf("%s should be dropped: %s", dropped, out)
 		}
-	}
-
-	if decoded["rest_api_version"] != "1.26.0" {
-		t.Errorf("rest_api_version lost: %s", out)
 	}
 }
 
