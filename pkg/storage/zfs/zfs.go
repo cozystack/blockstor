@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -103,14 +104,29 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 
 // DeleteVolume `zfs destroy -r`s the zvol (recursive to clean up any
 // dependent snapshots automatically). Missing → no-op.
+//
+// Before the destroy we read the volume's `origin` property — if it
+// points at a deferred-delete marker (DeleteSnapshot's
+// `__DELETED__<ts>` rename), drop the marker after the volume is
+// gone. That's the GC half of upstream's deferred-delete pattern:
+// snapshots blocked by clones get renamed; when the last clone goes
+// away the marker becomes destroyable. Best-effort — sweep errors
+// don't bubble because the snapshot is now an internal artefact.
 func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
-	if !p.datasetExists(ctx, p.volumeDataset(vol)) {
+	tgtDS := p.volumeDataset(vol)
+	if !p.datasetExists(ctx, tgtDS) {
 		return nil
 	}
 
-	_, err := p.exec.Run(ctx, "zfs", "destroy", "-r", p.volumeDataset(vol))
+	origin := p.volumeOrigin(ctx, tgtDS)
+
+	_, err := p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 	if err != nil {
-		return errors.Wrapf(err, "zfs destroy %s", p.volumeDataset(vol))
+		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
+	}
+
+	if origin != "" && strings.Contains(origin, "__DELETED__") {
+		_, _ = p.exec.Run(ctx, "zfs", "destroy", origin)
 	}
 
 	return nil
@@ -193,14 +209,43 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 	return nil
 }
 
-// DeleteSnapshot is the inverse `zfs destroy <pool>/<rd>_00000@<snap>`.
+// DeleteSnapshot removes the snapshot, with upstream LINSTOR's
+// "has dependent clones → rename to deferred-delete marker" fallback.
+//
+// `zfs destroy` fails when a clone still references the snapshot
+// (cross-node clone, snapshot-restore-resource); upstream renames
+// the snapshot to `<dataset>@<orig>__DELETED__<unix-ts>` so it
+// disappears from the LINSTOR view while staying on disk to keep
+// the dependent clone alive. When the last clone is destroyed, the
+// marker is swept by DeleteVolume's origin check.
 func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	_, err := p.exec.Run(ctx, "zfs", "destroy", p.snapshotDataset(snap))
-	if err != nil {
-		return errors.Wrapf(err, "zfs destroy %s", p.snapshotDataset(snap))
+	src := p.snapshotDataset(snap)
+
+	out, err := p.exec.Run(ctx, "zfs", "destroy", src)
+	if err == nil {
+		return nil
+	}
+
+	if !hasDependentClonesError(string(out), err.Error()) {
+		return errors.Wrapf(err, "zfs destroy %s", src)
+	}
+
+	marker := fmt.Sprintf("%s__DELETED__%d", src, time.Now().Unix())
+
+	_, rErr := p.exec.Run(ctx, "zfs", "rename", src, marker)
+	if rErr != nil {
+		return errors.Wrapf(rErr, "zfs rename %s → %s (deferred delete)", src, marker)
 	}
 
 	return nil
+}
+
+// hasDependentClonesError matches zfs destroy's "has dependent
+// clones" error text. ZFS prints it in stdout (combined-output) or
+// stderr depending on the version; both substrings are checked.
+func hasDependentClonesError(stdout, stderr string) bool {
+	return strings.Contains(stdout, "has dependent clones") ||
+		strings.Contains(stderr, "has dependent clones")
 }
 
 // RestoreVolumeFromSnapshot materialises target as a `zfs clone` of
@@ -317,6 +362,24 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	}
 
 	return nil
+}
+
+// volumeOrigin reads the zvol's `origin` property — the snapshot
+// dataset name when this volume was created via `zfs clone`, or
+// `-` for a standalone dataset. Returns "" on either case + on any
+// error (best-effort lookup for the deferred-delete sweep).
+func (p *Provider) volumeOrigin(ctx context.Context, ds string) string {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-H", "-o", "value", "origin", ds)
+	if err != nil {
+		return ""
+	}
+
+	value := strings.TrimSpace(string(out))
+	if value == "" || value == "-" {
+		return ""
+	}
+
+	return value
 }
 
 // datasetExists is the idempotency primitive — analogous to lvExists.
