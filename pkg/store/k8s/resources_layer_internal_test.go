@@ -69,6 +69,12 @@ func TestVolumesFromStatus(t *testing.T) {
 	if got[1].VolumeNumber != 1 || got[1].State.DiskState != "Inconsistent" {
 		t.Errorf("vol[1] wrong: %+v", got[1])
 	}
+
+	// Python CLI gates State-column trust on layer_data_list[0].type ==
+	// DRBD. Without this, even a UpToDate disk_state shows as "Created".
+	if len(got[0].LayerDataList) == 0 || got[0].LayerDataList[0].Type != apiv1.LayerKindDRBD {
+		t.Errorf("vol[0] layer_data_list: %+v (expected first entry DRBD)", got[0].LayerDataList)
+	}
 }
 
 // TestDrbdLayerFromStatus pins the DRBD-layer projection. Empty

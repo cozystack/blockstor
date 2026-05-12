@@ -352,6 +352,13 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 		return nil
 	}
 
+	// Per-resource layer stack isn't stored on the Resource CRD (it
+	// lives on the parent RD). For the rsc_state gating the Python
+	// CLI does, the only thing that matters is that the FIRST entry
+	// is DRBD; the default stack DRBD/STORAGE covers every diskful
+	// layout we currently materialise.
+	layerDataList := volumeLayerDataFromStack(apiv1.DefaultLayerStack())
+
 	out := make([]apiv1.Volume, 0, len(in))
 
 	for i := range in {
@@ -367,7 +374,26 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 				CurrentGi:    volStatus.CurrentGi,
 				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
+			LayerDataList: layerDataList,
 		})
+	}
+
+	return out
+}
+
+// volumeLayerDataFromStack mirrors the resource-level layer stack
+// onto each volume's `layer_data_list`. The Python CLI's
+// `volume_expects_disk_state` reads `layer_data_list[0].type == DRBD`
+// to decide whether the State column should trust the observed
+// `disk_state` — without this, the column always shows "Created".
+func volumeLayerDataFromStack(stack []string) []apiv1.VolumeLayerData {
+	if len(stack) == 0 {
+		stack = apiv1.DefaultLayerStack()
+	}
+
+	out := make([]apiv1.VolumeLayerData, 0, len(stack))
+	for _, kind := range stack {
+		out = append(out, apiv1.VolumeLayerData{Type: kind})
 	}
 
 	return out

@@ -84,6 +84,22 @@ type Volume struct {
 	Flags        []string          `json:"flags,omitempty"`
 	UUID         string            `json:"uuid,omitempty"`
 	State        VolumeState       `json:"state,omitzero"`
+
+	// LayerDataList is the per-volume layer-stack the Python CLI's
+	// `volume_expects_disk_state` reads to decide whether the State
+	// column should trust the observed `state.disk_state`. Without
+	// at least one entry whose `type` is `DRBD`, the CLI falls back
+	// to a literal "Created" regardless of what disk_state we set.
+	// listMapKey type matches upstream's repeated layer_data shape.
+	LayerDataList []VolumeLayerData `json:"layer_data_list,omitempty"`
+}
+
+// VolumeLayerData mirrors upstream LINSTOR's per-volume layer
+// descriptor: a `type` (DRBD/STORAGE/LUKS/…) plus an opaque
+// `data` blob (we leave it empty for now — the CLI only reads
+// the type discriminator to gate the disk_state trust path).
+type VolumeLayerData struct {
+	Type string `json:"type"`
 }
 
 // VolumeState is the runtime state surface of a Volume.
