@@ -4,14 +4,7 @@
   "path": "/v1/nodes",
   "body": {
     "name": "trace-n2",
-    "net_interfaces": [
-      {
-        "address": "\u003cip\u003e",
-        "name": "default",
-        "satellite_encryption_type": "PLAIN",
-        "satellite_port": 3366
-      }
-    ],
+    "net_interfaces": [],
     "type": "SATELLITE"
   },
   "expectedStatus": 201,

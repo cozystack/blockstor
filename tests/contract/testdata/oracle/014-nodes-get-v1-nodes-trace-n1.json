@@ -6,15 +6,7 @@
   "expectedBody": {
     "connection_status": "OFFLINE",
     "name": "trace-n1",
-    "net_interfaces": [
-      {
-        "address": "\u003cip\u003e",
-        "is_active": true,
-        "name": "default",
-        "satellite_encryption_type": "PLAIN",
-        "satellite_port": 3366
-      }
-    ],
+    "net_interfaces": [],
     "props": {},
     "resource_layers": [
       "STORAGE"

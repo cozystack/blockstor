@@ -22,17 +22,17 @@
     },
     {
       "created_at": "\u003ctimestamp\u003e",
+      "message": "(e2e6-worker-3) Controller properties applied",
+      "ret_code": 4611686018461991000
+    },
+    {
+      "created_at": "\u003ctimestamp\u003e",
       "message": "(e2e6-worker-1) Controller properties applied",
       "ret_code": 4611686018461991000
     },
     {
       "created_at": "\u003ctimestamp\u003e",
       "message": "(e2e6-worker-2) Controller properties applied",
-      "ret_code": 4611686018461991000
-    },
-    {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "(e2e6-worker-3) Controller properties applied",
       "ret_code": 4611686018461991000
     }
   ]

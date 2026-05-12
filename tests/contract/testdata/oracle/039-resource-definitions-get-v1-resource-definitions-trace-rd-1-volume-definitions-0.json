@@ -5,7 +5,7 @@
   "expectedStatus": 200,
   "expectedBody": {
     "props": {
-      "DrbdCurrentGi": "EB0EE67EEFD1FDF0"
+      "DrbdCurrentGi": "1D08F62C65161F04"
     },
     "size_kib": 65536,
     "volume_number": 0

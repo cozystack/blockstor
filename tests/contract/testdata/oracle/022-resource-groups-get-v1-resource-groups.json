@@ -5,12 +5,6 @@
   "expectedStatus": 200,
   "expectedBody": [
     {
-      "name": "DfltRscGrp",
-      "select_filter": {
-        "place_count": 2
-      }
-    },
-    {
       "name": "trace-rg-1",
       "select_filter": {
         "place_count": 1
