@@ -177,6 +177,32 @@ func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device, 
 	return nil
 }
 
+// DelPeer disconnects and forgets a peer node for the given resource.
+// Run this BEFORE rewriting the .res file with the peer removed —
+// drbdadm needs the peer's `on <peer>` block in the .res to resolve
+// its node-id. Running adjust on a .res that no longer mentions the
+// peer leaves the kernel's connection object alive in StandAlone
+// state forever (drbdadm adjust never tears down connections, only
+// adds / reconfigures them).
+//
+// `disconnect` first so a connected peer is quiesced; `del-peer`
+// then removes the kernel-side connection slot entirely. Both
+// commands are idempotent on already-detached peers.
+func (a *Adm) DelPeer(ctx context.Context, resource, peerNode string) error {
+	target := peerNode + ":" + resource
+
+	// Best-effort disconnect — a peer that's already StandAlone
+	// returns non-zero, which we don't care about here.
+	_, _ = a.exec.Run(ctx, "drbdadm", "disconnect", target)
+
+	_, err := a.exec.Run(ctx, "drbdadm", "del-peer", target)
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm del-peer %s", target)
+	}
+
+	return nil
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {

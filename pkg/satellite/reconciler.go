@@ -589,6 +589,87 @@ func materializeVolume(ctx context.Context, provider storage.Provider, rdName st
 	return err //nolint:wrapcheck // caller wraps
 }
 
+// tearDownRemovedPeers runs `drbdadm del-peer` for every peer that
+// was in the previous .res but is no longer in the new desired set.
+// `drbdadm adjust` only adds / reconfigures peers; the kernel's
+// connection slot for a dropped peer would otherwise stay alive in
+// StandAlone forever. del-peer needs the peer's `on <node>` block
+// still in the .res to resolve its node-id, so run it BEFORE
+// overwriting the file.
+func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *satellitepb.DesiredResource, resPath string) error {
+	removed := computeRemovedPeers(resPath, dr, r.cfg.NodeName)
+	for _, p := range removed {
+		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), p)
+		if err != nil {
+			return errors.Wrapf(err, "del-peer %s from %s", p, dr.GetName())
+		}
+	}
+
+	return nil
+}
+
+// computeRemovedPeers diffs the previously-rendered .res file against
+// the new desired peer set. Returns peer node names that were present
+// before but are NOT in the new layout. Empty when the .res file
+// doesn't exist (first apply) or when the read fails — we'd rather
+// skip the del-peer pass than wedge the reconcile.
+func computeRemovedPeers(resPath string, dr *satellitepb.DesiredResource, localNode string) []string {
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		return nil
+	}
+
+	old := extractResFilePeers(string(body))
+	if len(old) == 0 {
+		return nil
+	}
+
+	want := make(map[string]struct{}, len(dr.GetPeers())+1)
+	want[localNode] = struct{}{}
+
+	for _, p := range dr.GetPeers() {
+		want[p] = struct{}{}
+	}
+
+	var removed []string
+
+	for _, p := range old {
+		if _, keep := want[p]; !keep {
+			removed = append(removed, p)
+		}
+	}
+
+	return removed
+}
+
+// extractResFilePeers parses an `on <node> {` block list out of a
+// rendered .res file. We don't need a full DRBD parser — only the
+// peer node-name set, which writeOnBlock emits as `  on <name> {`.
+func extractResFilePeers(body string) []string {
+	var peers []string
+
+	for line := range strings.SplitSeq(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "on ") {
+			continue
+		}
+
+		rest := strings.TrimPrefix(trimmed, "on ")
+
+		head, _, ok := strings.Cut(rest, "{")
+		if !ok {
+			continue
+		}
+
+		name := strings.TrimSpace(head)
+		if name != "" {
+			peers = append(peers, name)
+		}
+	}
+
+	return peers
+}
+
 // applyDRBD renders the .res file from dr's metadata and (re)applies
 // it via drbdadm. create-md runs only on first activation (we detect
 // "first" by absence of the .res file before this run); diskless
@@ -615,6 +696,11 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
+	}
+
+	err = r.tearDownRemovedPeers(ctx, dr, resPath)
+	if err != nil {
+		return err
 	}
 
 	err = os.WriteFile(resPath, []byte(body), resFilePerm)
