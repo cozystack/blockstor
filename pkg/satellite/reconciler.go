@@ -291,42 +291,22 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	}
 
 	diskless := isDiskless(dr.GetFlags())
-	inactive := isInactive(dr.GetFlags())
 
-	// INACTIVE: keep storage + .res file intact, but drbdadm down so
-	// the kernel resource is gone. Used by piraeus-operator during
-	// node maintenance — activate later restores without losing
-	// port/node-id allocations or having to re-sync.
-	if inactive {
-		if r.cfg.Adm != nil {
-			deactivateErr := r.cfg.Adm.Down(ctx, dr.GetName())
-			if deactivateErr != nil {
-				res.Ok = false
-				res.Message = deactivateErr.Error()
-			}
-		}
+	if isInactive(dr.GetFlags()) {
+		r.applyInactive(ctx, dr, res)
 
 		return res
 	}
 
-	devices := map[int32]string{}
+	devices, resized, cloned, err := r.applyStorageIfDiskful(ctx, dr, diskless)
+	if err != nil {
+		res.Ok = false
+		res.Message = err.Error()
 
-	resized := false
-
-	if !diskless {
-		got, didResize, err := r.applyStorage(ctx, dr)
-		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
-
-			return res
-		}
-
-		devices = got
-		resized = didResize
+		return res
 	}
 
-	devices, err := r.maybeLUKS(ctx, dr, diskless, devices, resized)
+	devices, err = r.maybeLUKS(ctx, dr, diskless, devices, resized)
 	if err != nil {
 		res.Ok = false
 		res.Message = err.Error()
@@ -339,7 +319,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 	// (and pre-Phase-9 dispatchers) keep getting full DRBD treatment.
 	withDRBD := r.cfg.Adm != nil && needsDRBD(dr.GetLayerStack())
 	if withDRBD {
-		err := r.applyDRBD(ctx, dr, diskless, devices, resized)
+		err := r.applyDRBD(ctx, dr, diskless, devices, resized, cloned)
 		if err != nil {
 			res.Ok = false
 			res.Message = err.Error()
@@ -467,24 +447,61 @@ func needsDRBD(stack []string) bool {
 //
 // Records the resource→pool mapping (first volume's pool) so
 // subsequent snapshot RPCs can route without the controller passing
+// applyInactive runs the `drbdadm down` half of the INACTIVE flag
+// path. Pulled out of applyOne to keep the latter under funlen.
+// Storage + .res file are intentionally untouched — activate later
+// brings the kernel resource back without losing port/node-id or
+// triggering a re-sync.
+func (r *Reconciler) applyInactive(ctx context.Context, dr *satellitepb.DesiredResource, res *satellitepb.ResourceApplyResult) {
+	if r.cfg.Adm == nil {
+		return
+	}
+
+	err := r.cfg.Adm.Down(ctx, dr.GetName())
+	if err != nil {
+		res.Ok = false
+		res.Message = err.Error()
+	}
+}
+
+// applyStorageIfDiskful skips storage provisioning for diskless
+// replicas (they have no backing disk) and routes diskful ones to
+// applyStorage. Pulled out of applyOne to keep the latter under
+// funlen.
+func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
+	if diskless {
+		return map[int32]string{}, false, false, nil
+	}
+
+	return r.applyStorage(ctx, dr)
+}
+
 // the pool.
-func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, bool, error) {
+func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, bool, bool, error) {
 	devices := map[int32]string{}
 	resized := false
+	cloned := false
 
 	for _, vol := range dr.GetVolumes() {
 		provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 		if !ok {
-			return nil, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
+			return nil, false, false, errors.Errorf("unknown storage pool %q", vol.GetStoragePool())
 		}
 
-		err := provider.CreateVolume(ctx, storage.Volume{
-			ResourceName: dr.GetName(),
-			VolumeNumber: vol.GetVolumeNumber(),
-			SizeKib:      vol.GetSizeKib(),
-		})
+		// Clone path: when DesiredVolume.SourceSnapshot is set (the
+		// snapshot-restore-resource handler stamps it on the target
+		// RD's Props, the dispatcher pipes it through), materialise
+		// the volume via Provider.RestoreVolumeFromSnapshot instead
+		// of CreateVolume so the new replica starts populated with
+		// the snapshot's data. Idempotent: provider's clone op skips
+		// when the target volume already exists.
+		err := materializeVolume(ctx, provider, dr.GetName(), vol)
 		if err != nil {
-			return nil, false, errors.Wrapf(err, "create volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
+			return nil, false, false, errors.Wrapf(err, "create/restore volume %s/%d", dr.GetName(), vol.GetVolumeNumber())
+		}
+
+		if vol.GetSourceSnapshot() != "" {
+			cloned = true
 		}
 
 		status, err := provider.VolumeStatus(ctx, storage.Volume{
@@ -492,7 +509,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 			VolumeNumber: vol.GetVolumeNumber(),
 		})
 		if err != nil {
-			return nil, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
+			return nil, false, false, errors.Wrapf(err, "volume status %s/%d", dr.GetName(), vol.GetVolumeNumber())
 		}
 
 		// Grow path: the controller's VolumeDefinition update set a
@@ -507,7 +524,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 				SizeKib:      vol.GetSizeKib(),
 			})
 			if err != nil {
-				return nil, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
+				return nil, false, false, errors.Wrapf(err, "resize volume %s/%d to %d KiB",
 					dr.GetName(), vol.GetVolumeNumber(), vol.GetSizeKib())
 			}
 
@@ -521,7 +538,36 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 		r.rememberPool(dr.GetName(), dr.GetVolumes()[0].GetStoragePool())
 	}
 
-	return devices, resized, nil
+	return devices, resized, cloned, nil
+}
+
+// materializeVolume picks the right provider call: clone from a
+// snapshot when SourceSnapshot is set on the desired volume,
+// otherwise create blank. Parses `<srcRD>:<snapName>` for the
+// clone form — matches what the snapshot-restore-resource REST
+// handler stamps onto the target RD's Props.
+func materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *satellitepb.DesiredVolume) error {
+	target := storage.Volume{
+		ResourceName: rdName,
+		VolumeNumber: vol.GetVolumeNumber(),
+		SizeKib:      vol.GetSizeKib(),
+	}
+
+	src := vol.GetSourceSnapshot()
+	if src == "" {
+		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
+	}
+
+	srcRD, snapName, ok := strings.Cut(src, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return errors.Errorf("SourceSnapshot %q must be <srcRD>:<snapName>", src)
+	}
+
+	return provider.RestoreVolumeFromSnapshot(ctx, target, storage.Snapshot{ //nolint:wrapcheck // caller wraps
+		ResourceName: srcRD,
+		SnapshotName: snapName,
+		PoolName:     vol.GetStoragePool(),
+	})
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
@@ -532,7 +578,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 // devices is the volNumber → DevicePath map applyStorage produced.
 // buildResFile uses it as the disk path so a loopfile-backed volume
 // gets `disk /dev/loopN` rather than the LVM-shaped guess.
-func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized bool) error {
+func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized, cloned bool) error {
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
@@ -582,13 +628,15 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 		}
 	}
 
-	// On first activation of a diskful replica the controller may
-	// flag it as the auto-primary seed. We promote once (force-
-	// primary then back to secondary) so the metadata moves out of
-	// "Inconsistent" into "UpToDate" without a human running
-	// drbdadm. Subsequent reconciles see firstActivation=false and
-	// skip the seed.
-	if firstActivation && !diskless && dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue {
+	// Force-primary trigger: either the RD-prop `auto-primary` is
+	// set (controller-initiated seed) OR the replica was just
+	// cloned from a snapshot. The clone case promotes-then-demotes
+	// to flush the fresh DRBD metadata's GI into "UpToDate" without
+	// kicking a full initial-sync against the cloned bits.
+	autoPromote := firstActivation && !diskless &&
+		(cloned || dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue)
+
+	if autoPromote {
 		err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
 		if err != nil {
 			return errors.Wrapf(err, "auto-primary %s", dr.GetName())

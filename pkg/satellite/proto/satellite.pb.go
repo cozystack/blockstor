@@ -128,6 +128,13 @@ type DesiredVolume struct {
 	SizeKib      int64
 	StoragePool  string
 	SeedFromGi   string
+	// SourceSnapshot, when non-empty, tells the satellite to
+	// materialise this volume by cloning the named snapshot via the
+	// provider's RestoreVolumeFromSnapshot instead of CreateVolume.
+	// Carries the SOURCE RD + snapshot name in `<rd>:<snap>` form;
+	// the satellite splits before issuing the storage call. Used by
+	// the CSI clone + snapshot-restore-resource paths.
+	SourceSnapshot string
 }
 
 // GetVolumeNumber returns the per-RD volume index.
@@ -165,6 +172,16 @@ func (x *DesiredVolume) GetSeedFromGi() string {
 	}
 
 	return x.SeedFromGi
+}
+
+// GetSourceSnapshot returns the `<rd>:<snap>` clone source, or
+// "" when this volume should be created blank.
+func (x *DesiredVolume) GetSourceSnapshot() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.SourceSnapshot
 }
 
 // ResourceApplyResult is the per-resource outcome of one

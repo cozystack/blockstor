@@ -344,14 +344,28 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 		}
 	}
 
+	// Optional clone source — set by the snapshot-restore-resource
+	// REST handler on the target RD's Props. Format `<srcRD>:<snap>`.
+	// When present, satellite materialises each volume via
+	// Provider.RestoreVolumeFromSnapshot instead of CreateVolume so
+	// the new replica starts with the snapshot's data instead of an
+	// empty volume.
+	const restoreFromKey = "BlockstorRestoreFromSnapshot"
+
+	srcSnapshot := ""
+	if rd.Spec.Props != nil {
+		srcSnapshot = rd.Spec.Props[restoreFromKey]
+	}
+
 	out := make([]*satellitepb.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
 		out = append(out, &satellitepb.DesiredVolume{
-			VolumeNumber: vd.VolumeNumber,
-			SizeKib:      vd.SizeKib,
-			StoragePool:  pool,
-			SeedFromGi:   seedFromGi(target, vd.VolumeNumber),
+			VolumeNumber:   vd.VolumeNumber,
+			SizeKib:        vd.SizeKib,
+			StoragePool:    pool,
+			SeedFromGi:     seedFromGi(target, vd.VolumeNumber),
+			SourceSnapshot: srcSnapshot,
 		})
 	}
 

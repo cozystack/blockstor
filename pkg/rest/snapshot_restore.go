@@ -19,6 +19,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -131,13 +132,26 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 
 	newRD := apiv1.ResourceDefinition{
 		Name:       req.ToResource,
-		Props:      snap.Props,
+		Props:      maps.Clone(snap.Props),
 		LayerStack: srcRDObj.LayerStack,
 	}
 
 	if newRD.Props == nil {
-		newRD.Props = srcRDObj.Props
+		newRD.Props = maps.Clone(srcRDObj.Props)
 	}
+
+	// Stamp the clone-source so the dispatcher's buildVolumes (called
+	// at every satellite-reconcile of placed Resources) emits
+	// DesiredVolume.SourceSnapshot, which routes the storage provider
+	// to RestoreVolumeFromSnapshot instead of CreateVolume.
+	// `<srcRD>:<snapName>` is the agreed encoding — satellite splits
+	// on the colon. We persist on the RD (not per-Resource) because
+	// every replica of the new RD clones from the same source.
+	if newRD.Props == nil {
+		newRD.Props = map[string]string{}
+	}
+
+	newRD.Props["BlockstorRestoreFromSnapshot"] = srcRD + ":" + snap.Name
 
 	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
 	if err != nil {
