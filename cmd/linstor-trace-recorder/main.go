@@ -71,9 +71,10 @@ const (
 
 func main() {
 	var (
-		controllerURL string
-		outDir        string
-		phaseName     string
+		controllerURL  string
+		outDir         string
+		phaseName      string
+		keepListPrefix string
 	)
 
 	flag.StringVar(&controllerURL, "controller", "http://localhost:3370",
@@ -82,7 +83,14 @@ func main() {
 		"Directory to write trace JSON files into. Created if absent.")
 	flag.StringVar(&phaseName, "phase", "all",
 		"Which phase to record: bootstrap, nodes, all.")
+	flag.StringVar(&keepListPrefix, "keep-list-name-prefix", "trace-",
+		"Drop entries from list responses whose `name` doesn't start with this. "+
+			"Set to \"\" to disable. Default keeps only the fixtures the phase script created.")
 	flag.Parse()
+
+	recorderNormalizeOpts = contract.NormalizeOptions{
+		KeepListNamePrefix: keepListPrefix,
+	}
 
 	err := os.MkdirAll(outDir, dirMode)
 	if err != nil {
@@ -236,15 +244,29 @@ func (r *recorder) write(method, path string, reqBody []byte, status int, respBo
 	fmt.Printf("  %s\n", name)
 }
 
+// recorderNormalizeOpts captures the additional scrubbing the
+// recorder applies on top of the baseline `contract.Normalize`.
+// Currently just the list-name prefix filter so list endpoints
+// don't bake pre-existing oracle state (e2e6 workers,
+// DfltRscGrp) into the committed corpus.
+//
+// Set in main() once flags are parsed; consumed inside
+// normalizeOrCanonical via package-global. Package globals are
+// idiomatic for "config fixed at startup" in CLI binaries.
+//
+//nolint:gochecknoglobals // CLI startup-time config
+var recorderNormalizeOpts contract.NormalizeOptions
+
 // normalizeOrCanonical scrubs the body through `tests/contract.Normalize`
-// so stand-specific volatile values (UUIDs, timestamps, real worker
-// IPs, operator-managed props) are replaced with stable placeholders
-// before the trace lands on disk. Falls back to the JSON canonical
-// form (stable key ordering, same as encoding/json's default
-// re-marshal) if normalisation fails — better to commit a slightly
-// noisy trace than to skip the call entirely.
+// (with the recorder's list-name prefix filter) so stand-specific
+// volatile values (UUIDs, timestamps, real worker IPs, operator-
+// managed props, pre-existing oracle list entries) are replaced
+// with stable placeholders before the trace lands on disk. Falls
+// back to the JSON canonical form (stable key ordering, same as
+// encoding/json's default re-marshal) if normalisation fails —
+// better to commit a slightly noisy trace than to skip the call.
 func normalizeOrCanonical(in []byte) json.RawMessage {
-	scrubbed, err := contract.Normalize(in)
+	scrubbed, err := contract.NormalizeWith(in, recorderNormalizeOpts)
 	if err == nil && len(scrubbed) > 0 {
 		return scrubbed
 	}

@@ -24,33 +24,45 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// Normalize rewrites a JSON body to a deterministic form so traces
-// recorded against one LINSTOR controller compare equal to the
-// blockstor REST response on replay. Volatile values that vary
+// NormalizeOptions tunes Normalize's behaviour for caller-specific
+// needs. The zero value gives the baseline scrubber the replay
+// harness uses; the trace recorder additionally sets
+// KeepListNamePrefix so list responses don't leak pre-existing
+// oracle state (e2e6 workers, default groups) into the committed
+// corpus.
+type NormalizeOptions struct {
+	// KeepListNamePrefix, when non-empty, filters JSON arrays of
+	// objects: only entries whose `name` field starts with the
+	// given prefix are kept. Applied recursively, so a list of
+	// resources containing a list of net_interfaces (each with
+	// its own `name` like "default") is NOT filtered out — only
+	// the outer array of objects with a top-level `name` is.
+	// Set to "trace-" by the recorder so the corpus contains
+	// only the fixtures the phase script created.
+	KeepListNamePrefix string
+}
+
+// Normalize is the baseline scrubber. Equivalent to NormalizeWith
+// with a zero-value NormalizeOptions. Kept as the package-level
+// entry point so existing callers (the replay harness) don't need
+// the options dance.
+func Normalize(body json.RawMessage) (json.RawMessage, error) {
+	return NormalizeWith(body, NormalizeOptions{})
+}
+
+// NormalizeWith rewrites a JSON body to a deterministic form so
+// traces recorded against one LINSTOR controller compare equal to
+// the blockstor REST response on replay. Volatile values that vary
 // run-to-run (UUIDs, timestamps, real worker IPs, kernel-version
 // strings) get replaced with stable placeholder tokens; operator-
 // managed dynamic props get stripped entirely.
 //
-// The function is idempotent — `Normalize(Normalize(x)) == Normalize(x)` —
+// The function is idempotent — `NormalizeWith(NormalizeWith(x, o), o) == NormalizeWith(x, o)` —
 // so it's safe to apply at both recording time (so the committed
 // corpus is reproducible) and replay time (so blockstor's response
 // gets the same scrubbing before the diff). Empty / non-JSON input
 // passes through unchanged.
-//
-// Schema:
-//
-//	UUIDs:       any string matching uuidPattern → "<uuid>"
-//	Timestamps:  ISO-8601 / RFC-3339 → "<timestamp>"
-//	IP addrs:    dotted-quad / IPv6 → "<ip>"
-//	hostnames:   strings containing "kubernetes.io/hostname" prop
-//	             values get the worker-name suffix replaced
-//	props map:   operator-managed keys (Aux/piraeus.io/last-applied,
-//	             Aux/piraeus.io/configured-interfaces,
-//	             CurStltConnName, NodeUname) are dropped wholesale
-//	build_time / git_hash on /controller/version: dropped (kept
-//	             rest_api_version + a normalised version stem)
-//	storage_providers ordering: sorted (LINSTOR returns set order)
-func Normalize(body json.RawMessage) (json.RawMessage, error) {
+func NormalizeWith(body json.RawMessage, opts NormalizeOptions) (json.RawMessage, error) {
 	if len(body) == 0 {
 		return body, nil
 	}
@@ -65,7 +77,7 @@ func Normalize(body json.RawMessage) (json.RawMessage, error) {
 		return body, nil //nolint:nilerr // non-JSON passthrough is intentional
 	}
 
-	scrubbed := scrub(decoded)
+	scrubbed := scrubWith(decoded, opts)
 
 	out, err := json.Marshal(scrubbed)
 	if err != nil {
@@ -103,12 +115,12 @@ var volatileTopLevel = map[string]struct{}{ //nolint:gochecknoglobals // table-d
 	"uuid":       {},
 }
 
-func scrub(value any) any {
+func scrubWith(value any, opts NormalizeOptions) any {
 	switch typed := value.(type) {
 	case map[string]any:
-		return scrubMap(typed)
+		return scrubMap(typed, opts)
 	case []any:
-		return scrubSlice(typed)
+		return scrubSlice(typed, opts)
 	case string:
 		return scrubString(typed)
 	default:
@@ -116,7 +128,7 @@ func scrub(value any) any {
 	}
 }
 
-func scrubMap(input map[string]any) map[string]any {
+func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 	out := make(map[string]any, len(input))
 
 	for key, raw := range input {
@@ -140,7 +152,7 @@ func scrubMap(input map[string]any) map[string]any {
 		case "satellite_port":
 			out[key] = raw // ports are stable-ish; keep
 		default:
-			out[key] = scrub(raw)
+			out[key] = scrubWith(raw, opts)
 		}
 	}
 
@@ -166,10 +178,50 @@ func scrubProps(raw any) any {
 	return out
 }
 
-func scrubSlice(input []any) []any {
-	out := make([]any, len(input))
-	for i, value := range input {
-		out[i] = scrub(value)
+func scrubSlice(input []any, opts NormalizeOptions) []any {
+	filtered := filterListByNamePrefix(input, opts.KeepListNamePrefix)
+
+	out := make([]any, len(filtered))
+	for i, value := range filtered {
+		out[i] = scrubWith(value, opts)
+	}
+
+	return out
+}
+
+// filterListByNamePrefix drops entries from an array of objects
+// whose top-level `name` field doesn't start with prefix. Entries
+// without a `name` field are kept as-is so this is safe to apply
+// to lists of scalars / lists of objects with different schemas.
+// An empty prefix means "keep everything" — the zero-value default.
+func filterListByNamePrefix(input []any, prefix string) []any {
+	if prefix == "" {
+		return input
+	}
+
+	out := make([]any, 0, len(input))
+
+	for _, entry := range input {
+		obj, ok := entry.(map[string]any)
+		if !ok {
+			out = append(out, entry)
+
+			continue
+		}
+
+		nameRaw, hasName := obj["name"]
+		if !hasName {
+			out = append(out, entry)
+
+			continue
+		}
+
+		name, ok := nameRaw.(string)
+		if !ok || !strings.HasPrefix(name, prefix) {
+			continue
+		}
+
+		out = append(out, entry)
 	}
 
 	return out
