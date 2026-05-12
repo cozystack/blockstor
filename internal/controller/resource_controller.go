@@ -468,6 +468,13 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 		client.FieldOwner(controllerDRBDIDsFieldOwner),
 		client.ForceOwnership)
 	if err != nil {
+		// SSA Patch on a Resource that was deleted between the Get
+		// above and now returns NotFound. Same race-window as the
+		// Get path — let the next event drive the next attempt.
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+
 		return false, err
 	}
 
