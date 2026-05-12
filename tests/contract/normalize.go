@@ -104,15 +104,34 @@ var dropProps = map[string]struct{}{ //nolint:gochecknoglobals // table-driven c
 	"StltConn/0/Address":                   {},
 	"StltConn/0/Port":                      {},
 	"StltConn/0/EncryptionType":            {},
+	// DrbdCurrentGi is stamped by the oracle when a VolumeDefinition
+	// gets a DRBD layer. blockstor doesn't generate one until the
+	// volume is actually placed on a satellite; for the contract
+	// test (which exercises pure controller state without
+	// placement) it just becomes noise.
+	"DrbdCurrentGi": {},
 }
 
 // volatileTopLevel is the set of top-level response keys that vary
 // per-build of the oracle and would never compare equal to
 // blockstor's own response. Dropped at scrub time.
+//
+// The Node "rich diagnostic" surface lives here: oracle returns
+// resource_layers / storage_providers / unsupported_layers /
+// unsupported_providers / connection_status from `drbdadm` /
+// `lsmod` probes on the satellite; blockstor doesn't track them
+// because cozystack's CSI surface doesn't need them. Dropping the
+// fields wholesale keeps the corpus focused on the wire shape
+// blockstor actually implements.
 var volatileTopLevel = map[string]struct{}{ //nolint:gochecknoglobals // table-driven constant
-	"build_time": {},
-	"git_hash":   {},
-	"uuid":       {},
+	"build_time":            {},
+	"git_hash":              {},
+	"uuid":                  {},
+	"connection_status":     {},
+	"resource_layers":       {},
+	"storage_providers":     {},
+	"unsupported_layers":    {},
+	"unsupported_providers": {},
 }
 
 func scrubWith(value any, opts NormalizeOptions) any {
@@ -146,7 +165,10 @@ func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 		}
 
 		if key == "props" || key == "override_props" {
-			out[key] = scrubProps(raw)
+			scrubbedProps := scrubProps(raw)
+			if !isEmptyValue(scrubbedProps) {
+				out[key] = scrubbedProps
+			}
 
 			continue
 		}
@@ -155,17 +177,46 @@ func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 		// volatile data regardless of the type recorded. Force the
 		// placeholder so a missing field on one side doesn't show
 		// up as a string-vs-null diff.
+		var scrubbedValue any
+
 		switch key {
 		case "address":
-			out[key] = placeholderIP
+			scrubbedValue = placeholderIP
 		case "satellite_port":
-			out[key] = raw // ports are stable-ish; keep
+			scrubbedValue = raw // ports are stable-ish; keep
 		default:
-			out[key] = scrubWith(raw, opts)
+			scrubbedValue = scrubWith(raw, opts)
 		}
+
+		// Drop empty maps and slices. blockstor's encoder uses
+		// `omitempty` for most optional fields; the oracle emits
+		// the key with an empty value. Both produce semantically
+		// "no entries" — collapse to the same wire shape.
+		if isEmptyValue(scrubbedValue) {
+			continue
+		}
+
+		out[key] = scrubbedValue
 	}
 
 	return out
+}
+
+// isEmptyValue reports whether a value should be treated as
+// equivalent to "key absent" for diff purposes. Matches Go's
+// encoding/json `omitempty` semantics on the field types we
+// actually see in LINSTOR responses (maps and slices). Strings
+// pass through — empty strings might be meaningful for some
+// fields (e.g. an empty `message`).
+func isEmptyValue(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		return len(typed) == 0
+	case []any:
+		return len(typed) == 0
+	default:
+		return false
+	}
 }
 
 // scrubAPICallRc reduces a `ret_code`-bearing object (a single
@@ -241,14 +292,14 @@ func scrubSlice(input []any, opts NormalizeOptions) []any {
 }
 
 // collapseAPICallRcArray reduces a `[]ApiCallRc` (every element a
-// map with a numeric `ret_code`) to a single semantic-class entry.
-// Java LINSTOR commonly returns several elements for one mutation
-// — `[ {created, info}, {satellite-not-connected, warn} ]` for
-// node-create against a node with no real satellite, or `[
-// {prop-set, info}, {modified, info} ]` for property+modify.
-// blockstor returns a single info regardless. Both reduce to
-// `[{ret_code_class: <info|warn|error>}]` so the comparison
-// focuses on success/fail semantics, not the per-element envelope.
+// map with a numeric `ret_code`) to a single semantic-class entry
+// reflecting the PRIMARY outcome — the first element. Java LINSTOR
+// commonly returns several elements for one mutation: the first is
+// the primary action's result, the rest are pipeline side-effects
+// (e.g. "satellite-not-connected" warn after a successful node
+// register, or a redundant "modified" info after a prop-set). The
+// blockstor REST shim only emits the primary outcome and skips the
+// follow-ups; both sides agree on the lead element's class.
 //
 // Returns (collapsed, true) when input matches the shape; (nil,
 // false) otherwise so plain arrays fall through to the regular
@@ -269,19 +320,10 @@ func collapseAPICallRcArray(input []any) ([]any, bool) {
 		}
 	}
 
-	worstClass := classInfo
+	primary, _ := input[0].(map[string]any)
+	retCode, _ := primary["ret_code"].(float64)
 
-	for _, entry := range input {
-		obj, _ := entry.(map[string]any)
-		retCode, _ := obj["ret_code"].(float64)
-
-		entryClass := classifyRetCode(retCode)
-		if rank(entryClass) > rank(worstClass) {
-			worstClass = entryClass
-		}
-	}
-
-	return []any{map[string]any{keyClass: worstClass}}, true
+	return []any{map[string]any{keyClass: classifyRetCode(retCode)}}, true
 }
 
 // classifyRetCode maps a numeric LINSTOR ret_code to one of the
@@ -298,19 +340,6 @@ func classifyRetCode(retCode float64) string {
 		return classWarn
 	default:
 		return classInfo
-	}
-}
-
-// rank orders the semantic classes so collapse picks the worst.
-// error > warn > info — any error in the array dominates.
-func rank(class string) int {
-	switch class {
-	case classError:
-		return 2
-	case classWarn:
-		return 1
-	default:
-		return 0
 	}
 }
 
