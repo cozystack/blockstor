@@ -62,8 +62,8 @@ func TestControllerPropertiesSetAndGet(t *testing.T) {
 	resp := httpPost(t, base+"/v1/controller/properties", body)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("PUT status: got %d, want 201", resp.StatusCode)
 	}
 
 	getResp := httpGet(t, base+"/v1/controller/properties")
@@ -105,7 +105,7 @@ func TestControllerPropertiesDelete(t *testing.T) {
 	delResp := httpPost(t, base+"/v1/controller/properties", delBody)
 	_ = delResp.Body.Close()
 
-	if delResp.StatusCode != http.StatusOK {
+	if delResp.StatusCode != http.StatusCreated {
 		t.Fatalf("delete status: got %d", delResp.StatusCode)
 	}
 

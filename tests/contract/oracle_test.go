@@ -33,12 +33,12 @@ import (
 // volume-groups CRUD, resource-definitions + volume-definitions
 // CRUD, error-reports list.
 //
-// The test tolerates divergences for now — it logs each diff via
-// t.Logf instead of t.Errorf — so the baseline can land without
-// hard-failing CI before blockstor's REST shim has been brought
-// up to parity on every endpoint. Flip to t.Errorf once the
-// known divergences have been triaged and either fixed or
-// allow-listed via Normalize.
+// All known divergences have been triaged: either fixed in the
+// REST shim (POST /v1/controller/properties 201, DELETE
+// /v1/controller/properties/{key} route, VolumeDefinitions POST
+// 200) or allow-listed in Normalize (stand-default property keys,
+// piraeus-operator topology / last-applied props, ApiCallRc
+// pipeline noise). Any new diff here means the contract regressed.
 func TestOracleTraceReplay(t *testing.T) {
 	baseURL, stop := resolveTarget(t)
 	defer stop()
@@ -69,11 +69,7 @@ func TestOracleTraceReplay(t *testing.T) {
 
 		diverges++
 
-		// Soft-report: surface the diff but don't fail. The
-		// initial corpus has known stand-side state (e2e6 workers)
-		// that won't reproduce in CI; logging-only lets the corpus
-		// land while we iteratively triage.
-		t.Logf("DIVERGE %s: %s", result.Trace, strings.Join(result.Diffs, "; "))
+		t.Errorf("DIVERGE %s: %s", result.Trace, strings.Join(result.Diffs, "; "))
 	}
 
 	t.Logf("oracle replay: %d match, %d diverge (out of %d total)",

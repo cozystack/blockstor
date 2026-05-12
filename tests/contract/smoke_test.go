@@ -24,6 +24,12 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/rest"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/tests/contract"
@@ -87,7 +93,11 @@ func startServer(t *testing.T) (string, func()) {
 	t.Helper()
 
 	addr := pickFreeAddr(t)
-	srv := &rest.Server{Addr: addr, Store: store.NewInMemory()}
+	srv := &rest.Server{
+		Addr:   addr,
+		Store:  store.NewInMemory(),
+		Client: newFakeClient(t),
+	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -142,4 +152,26 @@ func pickFreeAddr(t *testing.T) string {
 	_ = ln.Close()
 
 	return addr
+}
+
+// newFakeClient builds an in-memory controller-runtime client with
+// the corev1 + blockstor schemes registered. The contract test
+// harness wires this into the REST server so endpoints that touch
+// the apiserver (controller properties, encryption passphrase
+// secrets) don't 503 in-process. Mirrors pkg/rest's
+// newFakeRESTClient — duplicated here because that helper is in a
+// _test.go and not exported.
+func newFakeClient(t *testing.T) client.Client {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1 to scheme: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("blockstor to scheme: %v", err)
+	}
+
+	return fake.NewClientBuilder().WithScheme(scheme).Build()
 }

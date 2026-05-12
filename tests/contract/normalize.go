@@ -94,6 +94,7 @@ func NormalizeWith(body json.RawMessage, opts NormalizeOptions) (json.RawMessage
 // of the prop map round-trips.
 var dropProps = map[string]struct{}{ //nolint:gochecknoglobals // table-driven constant
 	"Aux/piraeus.io/last-applied":          {},
+	"Aux/piraeus.io/managed-by":            {},
 	"Aux/piraeus.io/configured-interfaces": {},
 	"Aux/topology/kubernetes.io/hostname":  {},
 	"Aux/topology/linbit.com/hostname":     {},
@@ -110,6 +111,26 @@ var dropProps = map[string]struct{}{ //nolint:gochecknoglobals // table-driven c
 	// test (which exercises pure controller state without
 	// placement) it just becomes noise.
 	"DrbdCurrentGi": {},
+	// Controller-level stand-defaults that the upstream LINSTOR
+	// bootstrap stamps into /v1/controller/properties (cluster UUID,
+	// SSL connector defaults). blockstor's apiserver-backed
+	// ControllerConfig CRD doesn't seed these — they're not
+	// part of the wire contract any client gates on.
+	"Cluster/LocalID":          {},
+	"defaultDebugSslConnector": {},
+	"defaultPlainConSvc":       {},
+	"defaultSslConSvc":         {},
+}
+
+// dropPropPrefixes lists key prefixes (instead of exact names) that
+// scrubProps strips alongside dropProps. Used for groups of related
+// keys where listing every key would be churn: DrbdOptions/... (DRBD
+// defaults the controller seeds at boot), NetCom/... (TCP connector
+// matrix), Aux/piraeus.io/... (operator-managed slot).
+var dropPropPrefixes = []string{ //nolint:gochecknoglobals // table-driven constant
+	"DrbdOptions/",
+	"NetCom/",
+	"Aux/piraeus.io/",
 }
 
 // volatileTopLevel is the set of top-level response keys that vary
@@ -160,6 +181,17 @@ func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 	// breaking that semantic. Reduce to ret_code_class only.
 	if _, isCallRc := input["ret_code"]; isCallRc {
 		return scrubAPICallRc(input)
+	}
+
+	// A flat string→string map whose keys look like LINSTOR property
+	// paths is a property bag (e.g. the GET /v1/controller/properties
+	// response). Route it through scrubProps so stand-default keys
+	// (DrbdOptions/*, NetCom/*, Cluster/LocalID, ...) get dropped
+	// the same way they would inside a per-node `props` field.
+	if isPropertyBag(input) {
+		bag, _ := scrubProps(input).(map[string]any)
+
+		return bag
 	}
 
 	out := make(map[string]any, len(input))
@@ -271,7 +303,7 @@ func scrubProps(raw any) any {
 	out := make(map[string]any, len(props))
 
 	for key, value := range props {
-		if _, drop := dropProps[key]; drop {
+		if shouldDropProp(key) {
 			continue
 		}
 
@@ -279,6 +311,54 @@ func scrubProps(raw any) any {
 	}
 
 	return out
+}
+
+// isPropertyBag heuristically detects a LINSTOR property-bag
+// response (top-level /v1/controller/properties, or the inner
+// `override_props` payload when posted bare): non-empty, all
+// values are strings, and at least one key looks like a LINSTOR
+// property path (contains '/' or is one of the well-known
+// scalar defaults). Returning true reroutes the map through
+// scrubProps so stand-default keys get filtered.
+func isPropertyBag(input map[string]any) bool {
+	if len(input) == 0 {
+		return false
+	}
+
+	for _, value := range input {
+		if _, ok := value.(string); !ok {
+			return false
+		}
+	}
+
+	for key := range input {
+		if strings.Contains(key, "/") {
+			return true
+		}
+
+		if _, drop := dropProps[key]; drop {
+			return true
+		}
+	}
+
+	return false
+}
+
+// shouldDropProp reports whether a LINSTOR property key matches
+// either the exact-name drop list or one of the prefix-based
+// drop groups (DrbdOptions/..., NetCom/..., Aux/piraeus.io/...).
+func shouldDropProp(key string) bool {
+	if _, drop := dropProps[key]; drop {
+		return true
+	}
+
+	for _, prefix := range dropPropPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func scrubSlice(input []any, opts NormalizeOptions) []any {

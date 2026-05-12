@@ -40,6 +40,12 @@ import (
 func (s *Server) registerControllerProperties(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/controller/properties", s.requireStore(s.handleControllerPropsGet))
 	mux.HandleFunc("POST /v1/controller/properties", s.requireStore(s.handleControllerPropsModify))
+	// LINSTOR property keys embed slashes (e.g. "Aux/trace-recorder-stamp"),
+	// so the per-key DELETE route uses Go 1.22's `{key...}` wildcard
+	// matcher to consume the remaining path. Without `...` the
+	// default `{key}` only matches a single non-slash segment and
+	// every Aux/Foo-style key would 404.
+	mux.HandleFunc("DELETE /v1/controller/properties/{key...}", s.requireStore(s.handleControllerPropDelete))
 }
 
 // handleControllerPropsGet returns ControllerConfig.Spec.ExtraProps
@@ -88,7 +94,81 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Java LINSTOR returns 201 Created for a property-bag mutation
+	// (one ApiCallRc per override key plus one "Controller properties
+	// applied" entry per peer). The contract test collapses that array
+	// to a single semantic class — return one info entry so the
+	// collapsed shape matches.
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "controller properties applied",
+	}})
+}
+
+// handleControllerPropDelete removes one property from
+// ControllerConfig.Spec.ExtraProps. The key is captured by the
+// `{key...}` wildcard so slash-bearing keys like
+// "Aux/trace-recorder-stamp" round-trip intact. Missing CRD /
+// missing key are folded into success: LINSTOR treats
+// "delete a property that wasn't set" as a no-op, not a 404.
+func (s *Server) handleControllerPropDelete(w http.ResponseWriter, r *http.Request) {
+	if s.Client == nil {
+		writeError(w, http.StatusServiceUnavailable, "controller properties require an apiserver client")
+
+		return
+	}
+
+	key := r.PathValue("key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing property key")
+
+		return
+	}
+
+	err := deleteControllerProp(r.Context(), s.Client, key)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "property deleted",
+	}})
+}
+
+// deleteControllerProp removes a single key from ExtraProps. A
+// missing ControllerConfig or absent key returns nil — LINSTOR's
+// `controller drop-property` is idempotent in the same way.
+func deleteControllerProp(ctx context.Context, c client.Client, key string) error {
+	var ctrlConfig blockstoriov1alpha1.ControllerConfig
+
+	err := c.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &ctrlConfig)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return errors.Wrap(err, "get ControllerConfig")
+	}
+
+	if ctrlConfig.Spec.ExtraProps == nil {
+		return nil
+	}
+
+	if _, present := ctrlConfig.Spec.ExtraProps[key]; !present {
+		return nil
+	}
+
+	delete(ctrlConfig.Spec.ExtraProps, key)
+
+	err = c.Update(ctx, &ctrlConfig)
+	if err != nil {
+		return errors.Wrap(err, "update ControllerConfig")
+	}
+
+	return nil
 }
 
 // readControllerProps fetches the singleton ControllerConfig and
