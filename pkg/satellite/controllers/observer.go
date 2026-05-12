@@ -20,8 +20,10 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -335,12 +337,118 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 
 	adm := drbd.NewAdm(o.Exec)
 
+	go o.resyncLoop(ctx)
+
 	for ev := range observationsFrom(events) {
 		obs := ev
 		o.handleObservation(ctx, adm, &obs)
 	}
 
 	return nil
+}
+
+// observerResyncInterval is how often the observer re-applies its
+// cached per-resource state to the apiserver. Belt-and-braces
+// against the race where the first `exists` device frame lands
+// before the controller has created the Resource CRD: the SSA
+// Patch returns NotFound, the event is silenced, and drbd-9
+// never emits a follow-up `change` because the state hasn't
+// moved. Without the periodic re-emit, the Resource lives its
+// whole lifetime with Status.Volumes[i].diskState blank.
+const observerResyncInterval = 5 * time.Second
+
+// resyncLoop ticks every observerResyncInterval and re-applies
+// every cached resource's full snapshot. Cheap — the SSA payload
+// is small, and the apiserver's "same fields, same values" merge
+// is a no-op on the wire.
+func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
+	logger := log.FromContext(ctx).WithName("observer-resync")
+
+	ticker := time.NewTicker(observerResyncInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			o.resyncOnce(ctx, logger)
+		}
+	}
+}
+
+// resyncOnce snapshots both caches and re-applies each known
+// resource. Called by resyncLoop and unit-tested directly.
+func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
+	names := o.cachedResourceNames()
+
+	for _, name := range names {
+		obs := o.snapshotFor(name)
+		if obs.ResourceName == "" {
+			continue
+		}
+
+		err := o.writeStatus(ctx, &obs)
+		if err == nil {
+			continue
+		}
+
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+
+		logger.Error(err, "resync Resource.Status", "resource", name)
+	}
+}
+
+// cachedResourceNames returns the union of resource keys held by
+// the per-volume and per-connection caches. Used by resyncOnce.
+func (o *ObserverRunnable) cachedResourceNames() []string {
+	seen := map[string]struct{}{}
+
+	o.volMu.Lock()
+	for name := range o.volCache {
+		seen[name] = struct{}{}
+	}
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	for name := range o.connCache {
+		seen[name] = struct{}{}
+	}
+	o.connMu.Unlock()
+
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+
+	return out
+}
+
+// snapshotFor returns the full cached observation for one
+// resource: every known volume and every known peer connection.
+// Used by resyncOnce to rebuild the SSA payload from cache.
+func (o *ObserverRunnable) snapshotFor(name string) observation {
+	out := observation{ResourceName: name}
+
+	o.volMu.Lock()
+	if cache, ok := o.volCache[name]; ok {
+		for _, v := range cache {
+			out.Volumes = append(out.Volumes, v)
+		}
+	}
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	if peers, ok := o.connCache[name]; ok {
+		for _, c := range peers {
+			out.Connections = append(out.Connections, c)
+		}
+	}
+	o.connMu.Unlock()
+
+	return out
 }
 
 // handleObservation runs the per-event side-effects: the
@@ -367,9 +475,15 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	o.mergeVolumes(ev)
 
 	err := o.writeStatus(ctx, ev)
-	if err != nil && !apierrors.IsNotFound(err) {
-		logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
+	if err == nil {
+		return
 	}
+
+	if apierrors.IsNotFound(err) {
+		return
+	}
+
+	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
 }
 
 // mergeVolumes folds the per-volume cache so SSA writes carry the
