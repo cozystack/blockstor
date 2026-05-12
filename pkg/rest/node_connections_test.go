@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -24,41 +25,104 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// TestNodeConnectionsReturnEmpty pins the contract: list and per-pair
-// node-connections both 200 with `[]`. golinstor's polling loop logs an
-// error for any non-200, so the empty-but-present shape is what keeps
-// the controller log clean for cozystack's flat-L2 setup where there
-// are no inter-satellite tunnels to report.
-func TestNodeConnectionsReturnEmpty(t *testing.T) {
+// TestNodeConnectionsListReturnsEmpty pins the contract on the
+// matrix-list endpoint: 200 with `[]`. golinstor's polling loop
+// logs an error for any non-200, so the empty-but-present shape
+// keeps the controller log clean in cozystack's flat-L2 setup.
+func TestNodeConnectionsListReturnsEmpty(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
-	for _, path := range []string{
-		"/v1/node-connections",
-		"/v1/node-connections/n1/n2",
-	} {
-		resp := httpGet(t, base+path)
+	resp := httpGet(t, base+"/v1/node-connections")
+	defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode != http.StatusOK {
-			_ = resp.Body.Close()
-			t.Errorf("%s status: got %d, want 200", path, resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
 
-			continue
+	var got []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("body: got %d entries, want 0", len(got))
+	}
+}
+
+// TestNodeConnectionGetReturnsEmptyObject pins the per-pair GET
+// shape: 200 with `{node_a, node_b, properties:{}}`. golinstor
+// expects a NodeConnection object (not a list) here — returning
+// a list would silently mis-decode into an empty zero-value
+// struct without surfacing the wire-shape mismatch.
+func TestNodeConnectionGetReturnsEmptyObject(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/node-connections/n1/n2")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got["node_a"] != "n1" || got["node_b"] != "n2" {
+		t.Errorf("node fields: got %+v", got)
+	}
+
+	props, ok := got["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties not a map: %T %+v", got["properties"], got["properties"])
+	}
+
+	if len(props) != 0 {
+		t.Errorf("properties: got %d entries, want 0", len(props))
+	}
+}
+
+// TestNodeConnectionPutDeleteNoContent pins the write surface:
+// PUT/POST/PATCH/DELETE all accept the request and return 204.
+// Returning 4xx would break `linstor node-connection set-property`
+// even though we don't persist anything — operators experimenting
+// with the CLI command would see an error where Java LINSTOR
+// silently accepts.
+func TestNodeConnectionPutDeleteNoContent(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	client := &http.Client{}
+
+	cases := []struct {
+		method string
+		body   string
+	}{
+		{http.MethodPut, `{"override_props":{"DrbdOptions/Net/ping-timeout":"100"}}`},
+		{http.MethodPost, `{"override_props":{"DrbdOptions/Net/ping-timeout":"100"}}`},
+		{http.MethodPatch, `{"delete_props":["DrbdOptions/Net/ping-timeout"]}`},
+		{http.MethodDelete, ""},
+	}
+
+	for _, tc := range cases {
+		req, err := http.NewRequestWithContext(t.Context(), tc.method,
+			base+"/v1/node-connections/n1/n2", bytes.NewBufferString(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.method, err)
 		}
 
-		var got []map[string]any
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.method, err)
+		}
 
-		err := json.NewDecoder(resp.Body).Decode(&got)
 		_ = resp.Body.Close()
 
-		if err != nil {
-			t.Errorf("%s decode: %v", path, err)
-
-			continue
-		}
-
-		if len(got) != 0 {
-			t.Errorf("%s body: got %d entries, want 0", path, len(got))
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("%s status: got %d, want 204", tc.method, resp.StatusCode)
 		}
 	}
 }
