@@ -110,8 +110,11 @@ func replayOne(ctx context.Context, client *http.Client, baseURL string, trace *
 }
 
 // compare runs the trace's expectations against the captured response.
-// JSON bodies are normalised (key-sorted) before byte compare so we
-// don't false-positive on golang vs Java map iteration order.
+// Both sides go through Normalize so stand-specific volatile values
+// (UUIDs, timestamps, real worker IPs, operator-managed props) don't
+// produce false-positive divergences. The expected body was already
+// normalised at recording time but we re-run for idempotency so a
+// caller can hand-author a trace without thinking about scrubbing.
 func compare(trace *Trace, result *Result) []string {
 	var diffs []string
 
@@ -121,14 +124,14 @@ func compare(trace *Trace, result *Result) []string {
 	}
 
 	if len(trace.ExpectedBody) > 0 {
-		want, err := normaliseJSON(trace.ExpectedBody)
+		want, err := Normalize(trace.ExpectedBody)
 		if err != nil {
 			diffs = append(diffs, "expected body: "+err.Error())
 
 			return diffs
 		}
 
-		got, err := normaliseJSON(result.ActualBody)
+		got, err := Normalize(result.ActualBody)
 		if err != nil {
 			diffs = append(diffs, "actual body: "+err.Error())
 
@@ -141,29 +144,6 @@ func compare(trace *Trace, result *Result) []string {
 	}
 
 	return diffs
-}
-
-// normaliseJSON re-marshals raw JSON with sorted keys so map-iteration
-// order doesn't poison string compare. Returns the original bytes for
-// non-object responses (arrays, scalars).
-func normaliseJSON(raw json.RawMessage) ([]byte, error) {
-	if len(raw) == 0 {
-		return raw, nil
-	}
-
-	var decoded any
-
-	err := json.Unmarshal(raw, &decoded)
-	if err != nil {
-		return nil, errors.Wrap(err, "unmarshal")
-	}
-
-	out, err := json.Marshal(decoded)
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal")
-	}
-
-	return out, nil
 }
 
 // itoa avoids dragging strconv into this file's import set; we only

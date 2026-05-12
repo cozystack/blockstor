@@ -55,6 +55,8 @@ import (
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/cockroachdb/errors"
+
+	"github.com/cozystack/blockstor/tests/contract"
 )
 
 const (
@@ -207,11 +209,11 @@ func (r *recorder) write(method, path string, reqBody []byte, status int, respBo
 	}
 
 	if len(reqBody) > 0 {
-		captured.Body = canonicalJSON(reqBody)
+		captured.Body = normalizeOrCanonical(reqBody)
 	}
 
 	if len(respBody) > 0 {
-		captured.ExpectedBody = canonicalJSON(respBody)
+		captured.ExpectedBody = normalizeOrCanonical(respBody)
 	}
 
 	out, err := json.MarshalIndent(captured, "", "  ")
@@ -234,14 +236,22 @@ func (r *recorder) write(method, path string, reqBody []byte, status int, respBo
 	fmt.Printf("  %s\n", name)
 }
 
-// canonicalJSON rewrites the bytes through encoding/json so the
-// stored trace has stable key ordering. Returns the original bytes
-// if parsing fails (e.g. non-JSON response bodies — rare but the
-// version endpoint sometimes uses a different content-type).
-func canonicalJSON(in []byte) json.RawMessage {
+// normalizeOrCanonical scrubs the body through `tests/contract.Normalize`
+// so stand-specific volatile values (UUIDs, timestamps, real worker
+// IPs, operator-managed props) are replaced with stable placeholders
+// before the trace lands on disk. Falls back to the JSON canonical
+// form (stable key ordering, same as encoding/json's default
+// re-marshal) if normalisation fails — better to commit a slightly
+// noisy trace than to skip the call entirely.
+func normalizeOrCanonical(in []byte) json.RawMessage {
+	scrubbed, err := contract.Normalize(in)
+	if err == nil && len(scrubbed) > 0 {
+		return scrubbed
+	}
+
 	var decoded any
 
-	err := json.Unmarshal(in, &decoded)
+	err = json.Unmarshal(in, &decoded)
 	if err != nil {
 		return json.RawMessage(in)
 	}
