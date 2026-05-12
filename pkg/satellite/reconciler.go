@@ -546,6 +546,13 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 // otherwise create blank. Parses `<srcRD>:<snapName>` for the
 // clone form — matches what the snapshot-restore-resource REST
 // handler stamps onto the target RD's Props.
+//
+// Cross-node fallback: when SourceSnapshot is set but the snapshot
+// doesn't physically exist on THIS node (autoplace landed the new
+// replica on a node that wasn't part of the snapshot set), the
+// clone returns storage.ErrNotFound. Fall back to a blank
+// CreateVolume — DRBD's network resync from a peer that DID clone
+// locally will populate the data. Matches upstream LINSTOR.
 func materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *satellitepb.DesiredVolume) error {
 	target := storage.Volume{
 		ResourceName: rdName,
@@ -563,11 +570,18 @@ func materializeVolume(ctx context.Context, provider storage.Provider, rdName st
 		return errors.Errorf("SourceSnapshot %q must be <srcRD>:<snapName>", src)
 	}
 
-	return provider.RestoreVolumeFromSnapshot(ctx, target, storage.Snapshot{ //nolint:wrapcheck // caller wraps
+	err := provider.RestoreVolumeFromSnapshot(ctx, target, storage.Snapshot{
 		ResourceName: srcRD,
 		SnapshotName: snapName,
 		PoolName:     vol.GetStoragePool(),
 	})
+	if errors.Is(err, storage.ErrNotFound) {
+		// Snapshot absent on this node — let DRBD resync from a
+		// peer that did clone locally.
+		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
+	}
+
+	return err //nolint:wrapcheck // caller wraps
 }
 
 // applyDRBD renders the .res file from dr's metadata and (re)applies
