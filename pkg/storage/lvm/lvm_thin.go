@@ -22,6 +22,8 @@ package lvm
 import (
 	"context"
 	"fmt"
+	"io"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -229,6 +231,107 @@ func (t *Thin) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vol
 			t.cfg.VolumeGroup+"/"+srcName)...)
 	if err != nil {
 		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
+	}
+
+	return nil
+}
+
+// SendSnapshot streams the snapshot LV's raw bytes for a peer
+// satellite to pipe into its own RecvSnapshot. We use `dd
+// if=/dev/<vg>/<snap-lv>` rather than upstream's thin_send/thin_recv
+// pair because the latter needs metadata-aware tooling on both
+// sides (thin-provisioning-tools >= 0.9, root + thin-pool exclusive
+// access). The dd path wastes space relative to the delta format
+// but works across stock kernels and is what the FILE backend
+// already uses; matches semantics, sacrifices throughput on
+// sparsely-allocated thin volumes.
+//
+// Caller follows up the recv with drbdmeta drop-md + create-md to
+// stamp the local DRBD node-id over the source's embedded metadata.
+func (t *Thin) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
+	srcName := snapshotLVName(snap)
+	if !t.lvExists(ctx, srcName) {
+		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot LV %s/%s for send", t.cfg.VolumeGroup, srcName)
+	}
+
+	devPath := "/dev/" + t.cfg.VolumeGroup + "/" + srcName
+
+	cmd := exec.CommandContext(ctx, "dd", "if="+devPath, "bs=1M", "status=none") //nolint:gosec // VG / LV names come from operator-owned StoragePool CRDs
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, errors.Wrapf(err, "stdout pipe %s", devPath)
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, errors.Wrapf(err, "start dd %s", devPath)
+	}
+
+	return &lvmDDReader{cmd: cmd, stdout: stdout}, nil
+}
+
+// lvmDDReader bundles the dd-send process with its stdout pipe so
+// Close terminates both. Mirrors the zfs send-reader pattern.
+type lvmDDReader struct {
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+}
+
+// Read forwards to the underlying stdout pipe.
+func (r *lvmDDReader) Read(p []byte) (int, error) {
+	return r.stdout.Read(p) //nolint:wrapcheck // io contract preserves err shape
+}
+
+// Close kills the running dd process (no-op if it already exited)
+// and reaps it.
+func (r *lvmDDReader) Close() error {
+	_ = r.stdout.Close()
+
+	if r.cmd.Process != nil {
+		_ = r.cmd.Process.Kill()
+	}
+
+	_ = r.cmd.Wait()
+
+	return nil
+}
+
+// RecvSnapshot allocates a fresh thin LV the size of the target and
+// `dd of=/dev/<vg>/<tgt>`-writes the stream into it. Pre-existing
+// target LV → no-op; matches FILE/ZFS resumed-reconcile semantic.
+//
+// The post-recv dance is the same as ZFS: drbdmeta drop-md +
+// drbdadm create-md to stamp the local node-id over the embedded
+// metadata, then drbdadm adjust.
+func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+	tgtName := volumeLVName(target)
+	if t.lvExists(ctx, tgtName) {
+		return nil
+	}
+
+	// Allocate the target LV first so dd has somewhere to write.
+	// CreateVolume's idempotency already handles the "exists"
+	// branch; pass through so the lvcreate flags match what a
+	// regular CreateVolume would have done.
+	err := t.CreateVolume(ctx, target)
+	if err != nil {
+		return errors.Wrapf(err, "pre-create LV %s for recv", tgtName)
+	}
+
+	devPath := "/dev/" + t.cfg.VolumeGroup + "/" + tgtName
+
+	cmd := exec.CommandContext(ctx, "dd", "of="+devPath, "bs=1M", "status=none", "conv=fsync") //nolint:gosec // VG / LV names come from operator-owned StoragePool CRDs
+	cmd.Stdin = src
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Roll back the pre-created LV so the next reconcile re-
+		// streams cleanly. Best-effort lvremove — if it also fails
+		// the operator will see both errors in the surrounding log.
+		_ = t.DeleteVolume(ctx, target)
+
+		return errors.Wrapf(err, "dd recv %s: %s", devPath, strings.TrimSpace(string(out)))
 	}
 
 	return nil

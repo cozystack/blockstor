@@ -22,6 +22,8 @@ package zfs
 import (
 	"context"
 	"fmt"
+	"io"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -221,6 +223,97 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
+	}
+
+	return nil
+}
+
+// SendSnapshot streams `zfs send <pool>/<rd>_00000@<snap>` so a peer
+// satellite can pipe it into its own `zfs recv` and reproduce the
+// dataset byte-for-byte (including the DRBD metadata block embedded
+// in the zvol). The returned ReadCloser wraps the running zfs
+// process's stdout — Close kills the process via the wrapped
+// context cancel, so callers can abort mid-stream.
+//
+// Bypasses storage.Exec because Exec.Run buffers the full output in
+// memory; multi-GB snapshot streams need a pipe. FakeExec tests
+// don't cover this path — the integration test on the stand drives
+// it through a real peer Fetch.
+func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
+	srcDS := p.snapshotDataset(snap)
+	if !p.datasetExists(ctx, srcDS) {
+		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", srcDS)
+	}
+
+	cmd := exec.CommandContext(ctx, "zfs", "send", srcDS)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, errors.Wrapf(err, "stdout pipe %s", srcDS)
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, errors.Wrapf(err, "start zfs send %s", srcDS)
+	}
+
+	return &zfsSendReader{cmd: cmd, stdout: stdout}, nil
+}
+
+// zfsSendReader bundles the zfs-send process with its stdout pipe
+// so Close terminates both. Reading hits EOF when zfs send exits;
+// the caller still has to Close to reap the process.
+type zfsSendReader struct {
+	cmd    *exec.Cmd
+	stdout io.ReadCloser
+}
+
+// Read forwards to the underlying stdout pipe.
+func (r *zfsSendReader) Read(p []byte) (int, error) {
+	return r.stdout.Read(p) //nolint:wrapcheck // io contract preserves err shape
+}
+
+// Close kills the running zfs-send process (no-op if it already
+// exited) and reaps it.
+func (r *zfsSendReader) Close() error {
+	_ = r.stdout.Close()
+
+	if r.cmd.Process != nil {
+		_ = r.cmd.Process.Kill()
+	}
+
+	_ = r.cmd.Wait()
+
+	return nil
+}
+
+// RecvSnapshot reads the stream produced by a peer satellite's
+// SendSnapshot and replays it through `zfs recv <pool>/<rd>_<vol>`.
+// After this call the target dataset exists and is mountable; the
+// embedded DRBD metadata block carries the source's UUIDs, so the
+// caller follows up with drbdmeta drop-md + create-md to stamp the
+// local node-id before drbdadm adjust.
+//
+// Idempotent on a pre-existing target dataset: the recv is skipped
+// and any leftover staging artifacts cleaned up. matches
+// FILE backend's resumed-reconcile semantic.
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+	tgtDS := p.volumeDataset(target)
+	if p.datasetExists(ctx, tgtDS) {
+		return nil
+	}
+
+	cmd := exec.CommandContext(ctx, "zfs", "recv", "-F", tgtDS)
+	cmd.Stdin = src
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// On failure leave nothing behind — `zfs recv -F` may have
+		// partially created the dataset; nuke it so the next
+		// reconcile re-streams cleanly.
+		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
+
+		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
 	}
 
 	return nil
