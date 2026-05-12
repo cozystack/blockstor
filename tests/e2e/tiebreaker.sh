@@ -36,15 +36,17 @@ wait_uptodate "$RD" "$N1" "$N2"
 
 echo ">> wait 60s for ResourceDefinitionReconciler to add tiebreaker"
 deadline=$(( $(date +%s) + 60 ))
+witness_found=false
 while (( $(date +%s) < deadline )); do
     if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
+        witness_found=true
         break
     fi
-    sleep 2
+    sleep 1
 done
 
-if ! kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
-    echo "FAIL: tiebreaker witness not created on $N3"
+if [[ "$witness_found" != "true" ]]; then
+    echo "FAIL: tiebreaker witness not created on $N3 (waited $(( $(date +%s) - (deadline - 60) ))s)"
     kubectl get resources.blockstor.io.blockstor.io --no-headers | awk -v rd="$RD" '$1 ~ rd'
     exit 1
 fi
