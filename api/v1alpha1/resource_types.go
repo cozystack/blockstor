@@ -211,6 +211,19 @@ type ResourceVolumeStatus struct {
 	// budget. Order is newest-first.
 	// +optional
 	HistoryGi []string `json:"historyGi,omitempty"`
+
+	// outOfSyncKib is the worst-case "how many KiB this volume is
+	// behind any peer" reported by `drbdsetup events2 --statistics`
+	// peer-device frames. Combined with RD.Spec.VolumeDefinitions
+	// SizeKib, callers compute a sync-progress percentage:
+	//   progress = (1 - outOfSyncKib / sizeKib) * 100
+	//
+	// 0 means fully in sync; sizeKib (or close to it) means fresh
+	// resync hasn't started yet. Surfaced via the REST view layer
+	// so `linstor r l` / piraeus dashboards can render a CDI-style
+	// progress bar without polling drbdsetup themselves.
+	// +optional
+	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
 }
 
 // +kubebuilder:object:root=true

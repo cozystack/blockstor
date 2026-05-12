@@ -50,10 +50,19 @@ type observation struct {
 // volumeObservation carries per-volume DiskState + the
 // `current-uuid` value the controller seeds new replicas with
 // to skip the full initial-sync (Phase 8.1).
+//
+// OutOfSyncKib is populated from `peer-device` events (kept
+// separately from DiskState/CurrentUUID which come from `device`
+// kind frames). When only one of the three sources fires, the
+// other fields are left as their zero values — mergeVolumes
+// stitches the per-volume picture together so SSA writes carry
+// the full known state.
 type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
 	CurrentUUID  string
+	OutOfSyncKib int64
+	HasSync      bool // true when this observation carried out-of-sync stats
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -79,37 +88,11 @@ type connectionObservation struct {
 func translateEvent(ev drbd.Event) (observation, bool) {
 	switch ev.Kind {
 	case "resource":
-		name := ev.Fields["name"]
-		if name == "" {
-			return observation{}, false
-		}
-
-		return observation{
-			ResourceName: name,
-			InUse:        ev.Fields["role"] == "Primary",
-		}, true
+		return translateResourceEvent(ev)
 	case "device":
-		name := ev.Fields["name"]
-		if name == "" {
-			return observation{}, false
-		}
-
-		disk := ev.Fields["disk"]
-		out := observation{ResourceName: name, DrbdState: disk}
-
-		volStr, hasVol := ev.Fields["volume"]
-		if hasVol {
-			volNum, err := strconv.Atoi(volStr)
-			if err == nil {
-				out.Volumes = []volumeObservation{{
-					VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
-					DiskState:    disk,
-					CurrentUUID:  ev.Fields["current-uuid"],
-				}}
-			}
-		}
-
-		return out, true
+		return translateDeviceEvent(ev)
+	case eventKindPeerDevice:
+		return translatePeerDeviceEvent(ev)
 	case eventKindConnection:
 		// `drbdsetup events2` emits:
 		//   exists connection name:<rd> peer-node-id:<id> conn-name:<peer> connection:<state> ...
@@ -138,6 +121,89 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 	}
 
 	return observation{}, false
+}
+
+// translateResourceEvent extracts the resource-kind frame: just
+// the role transition (Primary → InUse=true). Helper for
+// translateEvent's switch so the gocyclo budget stays under 15.
+func translateResourceEvent(ev drbd.Event) (observation, bool) {
+	name := ev.Fields["name"]
+	if name == "" {
+		return observation{}, false
+	}
+
+	return observation{
+		ResourceName: name,
+		InUse:        ev.Fields["role"] == "Primary",
+	}, true
+}
+
+// translateDeviceEvent extracts the device-kind frame: per-volume
+// DiskState + the current-uuid the controller seeds from.
+func translateDeviceEvent(ev drbd.Event) (observation, bool) {
+	name := ev.Fields["name"]
+	if name == "" {
+		return observation{}, false
+	}
+
+	disk := ev.Fields["disk"]
+	out := observation{ResourceName: name, DrbdState: disk}
+
+	volStr, hasVol := ev.Fields["volume"]
+	if !hasVol {
+		return out, true
+	}
+
+	volNum, err := strconv.Atoi(volStr)
+	if err != nil {
+		return out, true
+	}
+
+	out.Volumes = []volumeObservation{{
+		VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+		DiskState:    disk,
+		CurrentUUID:  ev.Fields["current-uuid"],
+	}}
+
+	return out, true
+}
+
+// translatePeerDeviceEvent extracts the peer-device frame from
+// `drbdsetup events2 --statistics`:
+//
+//	exists peer-device name:<rd> peer-node-id:<id> volume:<v>
+//	   conn-name:<peer> replication:<state> peer-disk:<state>
+//	   out-of-sync:<kib> ...
+//
+// Only out-of-sync stats are surfaced; UI/CLI derive a sync-%
+// from VolumeDefinition.SizeKib.
+func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
+	name := ev.Fields["name"]
+	volStr, hasVol := ev.Fields["volume"]
+	oosStr, hasOOS := ev.Fields["out-of-sync"]
+
+	if name == "" || !hasVol || !hasOOS {
+		return observation{}, false
+	}
+
+	volNum, err := strconv.Atoi(volStr)
+	if err != nil {
+		return observation{}, false
+	}
+
+	oos, err := strconv.ParseInt(oosStr, 10, 64)
+	if err != nil {
+		return observation{}, false
+	}
+
+	return observation{
+		ResourceName: name,
+		Volumes: []volumeObservation{{
+			VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+			OutOfSyncKib: oos,
+			HasSync:      true,
+		}},
+	}, true
 }
 
 // observationsFrom transforms a stream of events2 lines into a
@@ -170,6 +236,11 @@ const (
 	// eventKindConnection is the events2 `kind` token for peer
 	// connection state-change frames.
 	eventKindConnection = "connection"
+	// eventKindPeerDevice is the events2 `kind` token for per-
+	// (volume, peer) replication-state frames; carries the
+	// `out-of-sync` byte counter the UI/CLI turns into a sync-%
+	// progress bar.
+	eventKindPeerDevice = "peer-device"
 	// drbdStateConnected is the DRBD-9 connection-state token
 	// meaning "handshake complete, replication active". Anything
 	// else (`StandAlone`, `BrokenPipe`, `Connecting`, ...) lands
@@ -205,6 +276,16 @@ type ObserverRunnable struct {
 	// before apply preserves all peers.
 	connMu    sync.Mutex
 	connCache map[string]map[string]connectionObservation
+
+	// volCache holds the latest observed per-volume aggregate keyed
+	// by `<resource>/<volume>`. Same reason as connCache: SSA with
+	// the same FieldOwner replaces the slice's per-key field-claims
+	// each apply. Two events from different kinds (device-kind sets
+	// DiskState; peer-device sets OutOfSyncKib) would otherwise drop
+	// each other's fields between applies. Cache the union and emit
+	// the full per-resource snapshot.
+	volMu    sync.Mutex
+	volCache map[string]map[int32]volumeObservation
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -267,11 +348,94 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// snapshot. Without the merge, Apply N drops Apply N-1's other
 	// peers from this owner's claims and they vanish from Status.
 	o.mergeConnections(ev)
+	o.mergeVolumes(ev)
 
 	err := o.writeStatus(ctx, ev)
 	if err != nil && !apierrors.IsNotFound(err) {
 		logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
 	}
+}
+
+// mergeVolumes folds the per-volume cache so SSA writes carry the
+// full per-volume picture. Without this, two separate event kinds
+// (`device` for DiskState/CurrentGi, `peer-device` for OutOfSyncKib)
+// would each strip the other's field claims when SSA-applying the
+// same listMap key — leaving Status.Volumes[i] alternating between
+// "has disk-state, no sync" and "has sync, no disk-state".
+//
+// Throttle: when the incoming observation is identical to the
+// cached value, mergeVolumes leaves ev.Volumes empty so writeStatus
+// becomes a no-op for that slice. peer-device events fire on every
+// drbdsetup statistics tick (~1Hz per peer); without this filter
+// each idle resource would PATCH the apiserver every second.
+func (o *ObserverRunnable) mergeVolumes(ev *observation) {
+	if ev.ResourceName == "" {
+		return
+	}
+
+	o.volMu.Lock()
+	defer o.volMu.Unlock()
+
+	if o.volCache == nil {
+		o.volCache = map[string]map[int32]volumeObservation{}
+	}
+
+	cache, ok := o.volCache[ev.ResourceName]
+	if !ok {
+		cache = map[int32]volumeObservation{}
+		o.volCache[ev.ResourceName] = cache
+	}
+
+	changed := false
+
+	for _, incoming := range ev.Volumes {
+		if mergeVolumeInto(cache, incoming) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		ev.Volumes = nil
+
+		return
+	}
+
+	snapshot := make([]volumeObservation, 0, len(cache))
+	for _, entry := range cache {
+		snapshot = append(snapshot, entry)
+	}
+
+	ev.Volumes = snapshot
+}
+
+// mergeVolumeInto folds `incoming` into `cache` for its volume key.
+// Returns true if any field actually changed — the caller uses that
+// to decide whether to emit a fresh Status snapshot.
+func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservation) bool {
+	merged := cache[incoming.VolumeNumber]
+	merged.VolumeNumber = incoming.VolumeNumber
+
+	changed := false
+
+	if incoming.DiskState != "" && merged.DiskState != incoming.DiskState {
+		merged.DiskState = incoming.DiskState
+		changed = true
+	}
+
+	if incoming.CurrentUUID != "" && merged.CurrentUUID != incoming.CurrentUUID {
+		merged.CurrentUUID = incoming.CurrentUUID
+		changed = true
+	}
+
+	if incoming.HasSync && (!merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib) {
+		merged.OutOfSyncKib = incoming.OutOfSyncKib
+		merged.HasSync = true
+		changed = true
+	}
+
+	cache[incoming.VolumeNumber] = merged
+
+	return changed
 }
 
 // mergeConnections updates the per-resource peer-state cache from
@@ -380,6 +544,7 @@ func buildObserverVolumeStatus(ev *observation) []blockstoriov1alpha1.ResourceVo
 			VolumeNumber: v.VolumeNumber,
 			DiskState:    v.DiskState,
 			CurrentGi:    v.CurrentUUID,
+			OutOfSyncKib: v.OutOfSyncKib,
 		})
 	}
 
