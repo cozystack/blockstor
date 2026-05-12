@@ -124,6 +124,63 @@ func TestControllerPropertiesDelete(t *testing.T) {
 	}
 }
 
+// TestControllerPropertiesDeleteSingleKey pins the per-key DELETE
+// route added for golinstor's `controller.DeleteProp(...)` call. The
+// route's `{key...}` wildcard must capture slash-bearing keys like
+// `Aux/trace-recorder-stamp` (a plain `{key}` matcher would 404).
+func TestControllerPropertiesDeleteSingleKey(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{
+			"Aux/keep-me":   "1",
+			"Aux/remove-me": "2",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/controller/properties", body)
+	_ = resp.Body.Close()
+
+	delResp := httpDelete(t, base+"/v1/controller/properties/Aux/remove-me")
+	_ = delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", delResp.StatusCode)
+	}
+
+	getResp := httpGet(t, base+"/v1/controller/properties")
+	defer func() { _ = getResp.Body.Close() }()
+
+	var got map[string]string
+	_ = json.NewDecoder(getResp.Body).Decode(&got)
+
+	if _, present := got["Aux/remove-me"]; present {
+		t.Errorf("Aux/remove-me still in props: %v", got)
+	}
+
+	if got["Aux/keep-me"] != "1" {
+		t.Errorf("Aux/keep-me lost: got %v", got)
+	}
+}
+
+// TestControllerPropertiesDeleteMissingKeyIsIdempotent pins the
+// no-op semantic: deleting a key that isn't set is a 200, not a
+// 404. Matches upstream LINSTOR's `controller drop-property` which
+// is intentionally idempotent so a re-run of an operator's
+// teardown script doesn't fail on already-cleaned state.
+func TestControllerPropertiesDeleteMissingKeyIsIdempotent(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/controller/properties/Aux/nonexistent")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestControllerPropertiesModifyBadJSON: malformed body → 400 from
 // the JSON decoder. Pinned because controller-prop sets are how
 // satellites learn about TLS, ports, AutoBlockSize policy etc — a
