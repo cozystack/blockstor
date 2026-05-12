@@ -126,6 +126,42 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 
 	snap.ResourceName = rd
 
+	// Copy the source RD's VolumeDefinitions onto the snapshot so a
+	// later snapshot-restore-resource has the volume layout to
+	// hydrate the target RD with. Without this the cloned RD has
+	// zero volumes and autoplace creates empty Resources that never
+	// converge to UpToDate.
+	srcRD, err := s.Store.ResourceDefinitions().Get(r.Context(), rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if len(snap.VolumeDefinitions) == 0 {
+		// We can't directly read VolumeDefinitions off the wire
+		// shape (it's CRD-inline only), so fetch via the dedicated
+		// store call.
+		vds, vdErr := s.Store.VolumeDefinitions().List(r.Context(), rd)
+		if vdErr != nil {
+			writeStoreError(w, vdErr)
+
+			return
+		}
+
+		snap.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(vds))
+		for _, vd := range vds {
+			snap.VolumeDefinitions = append(snap.VolumeDefinitions, apiv1.SnapshotVolumeDef{
+				VolumeNumber: vd.VolumeNumber,
+				SizeKib:      vd.SizeKib,
+			})
+		}
+	}
+
+	if snap.Props == nil {
+		snap.Props = srcRD.Props
+	}
+
 	err = s.Store.Snapshots().Create(r.Context(), &snap)
 	if err != nil {
 		writeStoreError(w, err)
