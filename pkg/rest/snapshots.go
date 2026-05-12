@@ -17,8 +17,10 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -126,27 +128,47 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 
 	snap.ResourceName = rd
 
-	// Copy the source RD's VolumeDefinitions onto the snapshot so a
-	// later snapshot-restore-resource has the volume layout to
-	// hydrate the target RD with. Without this the cloned RD has
-	// zero volumes and autoplace creates empty Resources that never
-	// converge to UpToDate.
-	srcRD, err := s.Store.ResourceDefinitions().Get(r.Context(), rd)
+	err = s.hydrateSnapshotFromRD(r.Context(), &snap, rd)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	if len(snap.VolumeDefinitions) == 0 {
-		// We can't directly read VolumeDefinitions off the wire
-		// shape (it's CRD-inline only), so fetch via the dedicated
-		// store call.
-		vds, vdErr := s.Store.VolumeDefinitions().List(r.Context(), rd)
-		if vdErr != nil {
-			writeStoreError(w, vdErr)
+	err = s.Store.Snapshots().Create(r.Context(), &snap)
+	if err != nil {
+		writeStoreError(w, err)
 
-			return
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "snapshot created: " + snap.Name,
+	}})
+}
+
+// hydrateSnapshotFromRD fills in the per-snapshot fields the
+// snapshot-restore-resource handler + the autoplace constraint need
+// downstream. Three derivations:
+//
+//   - VolumeDefinitions: copied from the source RD when absent; without
+//     these a restore-target RD comes up with zero volumes.
+//   - Props: inherited from the source RD when absent.
+//   - Nodes: upstream-LINSTOR semantic — empty means "every diskful
+//     replica". The satellite reconciler gates per-snapshot work on
+//     slices.Contains(snap.Spec.Nodes, self), so an empty list would
+//     silently produce a zero-replica snapshot.
+func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot, rd string) error {
+	srcRD, err := s.Store.ResourceDefinitions().Get(ctx, rd)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	if len(snap.VolumeDefinitions) == 0 {
+		vds, vdErr := s.Store.VolumeDefinitions().List(ctx, rd)
+		if vdErr != nil {
+			return vdErr //nolint:wrapcheck // surfaced via writeStoreError
 		}
 
 		snap.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(vds))
@@ -162,17 +184,37 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		snap.Props = srcRD.Props
 	}
 
-	err = s.Store.Snapshots().Create(r.Context(), &snap)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
+	if len(snap.Nodes) == 0 {
+		snap.Nodes, err = listDiskfulNodes(ctx, s, rd)
+		if err != nil {
+			return err
+		}
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "snapshot created: " + snap.Name,
-	}})
+	return nil
+}
+
+// listDiskfulNodes returns the node names that host a diskful
+// (non-DISKLESS) replica of rd. Used to default snap.Nodes when the
+// caller didn't pin a per-node list — matches upstream's
+// "snapshot all diskful replicas" semantic.
+func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, error) {
+	resList, err := s.Store.Resources().ListByDefinition(ctx, rd)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	out := make([]string, 0, len(resList))
+
+	for i := range resList {
+		if slices.Contains(resList[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		out = append(out, resList[i].NodeName)
+	}
+
+	return out, nil
 }
 
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
