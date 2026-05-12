@@ -82,6 +82,24 @@ step "rollout-status (satellite)" "kubectl -n blockstor-system rollout status ds
 step "cleanup leftover" \
     "kubectl delete resource --all --force --grace-period=0 --ignore-not-found 2>&1 | tail -3; kubectl delete resourcedefinition --all --ignore-not-found 2>&1 | tail -3"
 
+# Tear down any DRBD resources the kernel modules still hold on the
+# satellite pods. `kubectl delete --force --grace-period=0` above
+# bypasses the satellite finalizer that would normally run `drbdadm
+# down`, so stale resources keep their DRBD minors (1000+) and the
+# next scenario's create-md hits "Device '1000' is configured".
+# Wipe per-resource .res + .md-created markers too — the satellite
+# wipes /etc/drbd.d on startup but a no-restart iter (controller
+# image unchanged) skips that path.
+step "drbdadm down stale resources on satellites" \
+    "kubectl -n blockstor-system get pod -l app=blockstor-satellite -o name | while read p; do
+        kubectl -n blockstor-system exec \$p -- bash -c '
+            for r in \$(drbdsetup status --json 2>/dev/null | python3 -c \"import json,sys; print(\\\" \\\".join(r[\\\"name\\\"] for r in json.load(sys.stdin)))\" 2>/dev/null); do
+                drbdsetup down \$r 2>&1 || drbdsetup del-resource \$r 2>&1 || true;
+            done;
+            rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true
+        ' 2>&1 | sed \"s|^|\$p: |\";
+    done"
+
 step "e2e:$SCENARIO" "make e2e NAME=$NAME SCENARIO=$SCENARIO"
 rc=$?
 
