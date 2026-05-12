@@ -31,7 +31,7 @@ import (
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
@@ -140,8 +140,8 @@ func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
 //
 // The signature returns an error too, but reserves it for context
 // cancellation — per-resource failures land in the Result entries.
-func (r *Reconciler) Apply(ctx context.Context, res []*satellitepb.DesiredResource) ([]*satellitepb.ResourceApplyResult, error) {
-	results := make([]*satellitepb.ResourceApplyResult, 0, len(res))
+func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) ([]*intent.ResourceApplyResult, error) {
+	results := make([]*intent.ResourceApplyResult, 0, len(res))
 
 	for _, dr := range res {
 		err := ctx.Err()
@@ -159,11 +159,11 @@ func (r *Reconciler) Apply(ctx context.Context, res []*satellitepb.DesiredResour
 // resource (looked up via the resource→pool map populated by Apply).
 // Returns ok=false in the response when the resource is unknown — the
 // satellite never auto-creates snapshots of state it doesn't own.
-func (r *Reconciler) CreateSnapshot(ctx context.Context, req *satellitepb.CreateSnapshotRequest) (*satellitepb.CreateSnapshotResponse, error) {
+func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnapshotRequest) (*intent.CreateSnapshotResponse, error) {
 	provider, err := r.providerForResource(req.GetResourceName())
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &satellitepb.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	err = provider.CreateSnapshot(ctx, storage.Snapshot{
@@ -172,10 +172,10 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *satellitepb.Create
 	})
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &satellitepb.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	return &satellitepb.CreateSnapshotResponse{
+	return &intent.CreateSnapshotResponse{
 		Ok:                  true,
 		CreateTimestampUnix: time.Now().Unix(),
 	}, nil
@@ -183,11 +183,11 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *satellitepb.Create
 
 // DeleteSnapshot mirrors CreateSnapshot. Idempotency lives at the
 // provider layer (lvremove on missing LV is non-fatal there).
-func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.DeleteSnapshotRequest) (*satellitepb.DeleteSnapshotResponse, error) {
+func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnapshotRequest) (*intent.DeleteSnapshotResponse, error) {
 	provider, err := r.providerForResource(req.GetResourceName())
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &satellitepb.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
 	err = provider.DeleteSnapshot(ctx, storage.Snapshot{
@@ -196,10 +196,10 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.Delete
 	})
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &satellitepb.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.DeleteSnapshotResponse{Ok: false, Message: err.Error()}, nil
 	}
 
-	return &satellitepb.DeleteSnapshotResponse{Ok: true}, nil
+	return &intent.DeleteSnapshotResponse{Ok: true}, nil
 }
 
 // DeleteResource tears down a resource: drbdadm down (best-effort —
@@ -208,7 +208,7 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *satellitepb.Delete
 // the .res file. Idempotent on a missing resource. Per-step errors
 // land in the response body so the controller can surface granular
 // status without aborting the rest of the cleanup.
-func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.DeleteResourceRequest) (*satellitepb.DeleteResourceResponse, error) {
+func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
 	var downMsg string
 
 	if r.cfg.Adm != nil {
@@ -243,7 +243,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 				})
 				if err != nil {
 					//nolint:nilerr // surfaced as ok=false; gRPC error reserved for transport faults
-					return &satellitepb.DeleteResourceResponse{
+					return &intent.DeleteResourceResponse{
 						Ok:      false,
 						Message: err.Error(),
 					}, nil
@@ -261,7 +261,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 		for _, suffix := range []string{".res", ".md-created"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
-				return &satellitepb.DeleteResourceResponse{
+				return &intent.DeleteResourceResponse{
 					Ok:      false,
 					Message: err.Error(),
 				}, nil
@@ -271,7 +271,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *satellitepb.Delete
 
 	r.forgetPool(req.GetName())
 
-	return &satellitepb.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
+	return &intent.DeleteResourceResponse{Ok: true, Message: downMsg}, nil
 }
 
 // forgetPool drops the resource from the resource→pool map so a
@@ -288,8 +288,8 @@ func (r *Reconciler) forgetPool(resourceName string) {
 // else routes one CreateVolume per DesiredVolume. When the DRBD half is
 // enabled (cfg.Adm != nil), also renders the `.res` file and runs
 // drbdadm create-md / adjust.
-func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResource) *satellitepb.ResourceApplyResult {
-	res := &satellitepb.ResourceApplyResult{
+func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *intent.ResourceApplyResult {
+	res := &intent.ResourceApplyResult{
 		Name:     dr.GetName(),
 		NodeName: dr.GetNodeName(),
 		Ok:       true,
@@ -344,7 +344,7 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *satellitepb.DesiredResour
 // for diskless replicas — they never open the underlying disk. When
 // the storage layer just grew (resized=true), also runs cryptsetup
 // resize so the mapper picks up the new size before DRBD's resize.
-func (r *Reconciler) maybeLUKS(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized bool) (map[int32]string, error) {
+func (r *Reconciler) maybeLUKS(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string, resized bool) (map[int32]string, error) {
 	if diskless || !needsLUKS(dr.GetLayerStack()) {
 		return devices, nil
 	}
@@ -375,7 +375,7 @@ func needsLUKS(stack []string) bool {
 // controller folds it in from the RD's `DrbdOptions/Encryption/passphrase`
 // prop via the resolver. Empty passphrase fails the apply — explicit
 // rather than silently creating an unencrypted volume.
-func (r *Reconciler) applyLUKS(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, error) {
+func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, error) {
 	if r.cfg.Cryptsetup == nil {
 		return nil, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
 	}
@@ -457,7 +457,7 @@ func needsDRBD(stack []string) bool {
 // Storage + .res file are intentionally untouched — activate later
 // brings the kernel resource back without losing port/node-id or
 // triggering a re-sync.
-func (r *Reconciler) applyInactive(ctx context.Context, dr *satellitepb.DesiredResource, res *satellitepb.ResourceApplyResult) {
+func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResource, res *intent.ResourceApplyResult) {
 	if r.cfg.Adm == nil {
 		return
 	}
@@ -473,7 +473,7 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *satellitepb.DesiredR
 // replicas (they have no backing disk) and routes diskful ones to
 // applyStorage. Pulled out of applyOne to keep the latter under
 // funlen.
-func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
+func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
 	if diskless {
 		return map[int32]string{}, false, false, nil
 	}
@@ -482,7 +482,7 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *satellitepb.
 }
 
 // the pool.
-func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredResource) (map[int32]string, bool, bool, error) {
+func (r *Reconciler) applyStorage(ctx context.Context, dr *intent.DesiredResource) (map[int32]string, bool, bool, error) {
 	devices := map[int32]string{}
 	resized := false
 	cloned := false
@@ -558,7 +558,7 @@ func (r *Reconciler) applyStorage(ctx context.Context, dr *satellitepb.DesiredRe
 // clone returns storage.ErrNotFound. Fall back to a blank
 // CreateVolume — DRBD's network resync from a peer that DID clone
 // locally will populate the data. Matches upstream LINSTOR.
-func materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *satellitepb.DesiredVolume) error {
+func materializeVolume(ctx context.Context, provider storage.Provider, rdName string, vol *intent.DesiredVolume) error {
 	target := storage.Volume{
 		ResourceName: rdName,
 		VolumeNumber: vol.GetVolumeNumber(),
@@ -596,7 +596,7 @@ func materializeVolume(ctx context.Context, provider storage.Provider, rdName st
 // StandAlone forever. del-peer needs the peer's `on <node>` block
 // still in the .res to resolve its node-id, so run it BEFORE
 // overwriting the file.
-func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *satellitepb.DesiredResource, resPath string) error {
+func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string) error {
 	removed := computeRemovedPeers(resPath, dr, r.cfg.NodeName)
 	for _, p := range removed {
 		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), p)
@@ -613,7 +613,7 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *satellitepb.D
 // before but are NOT in the new layout. Empty when the .res file
 // doesn't exist (first apply) or when the read fails — we'd rather
 // skip the del-peer pass than wedge the reconcile.
-func computeRemovedPeers(resPath string, dr *satellitepb.DesiredResource, localNode string) []string {
+func computeRemovedPeers(resPath string, dr *intent.DesiredResource, localNode string) []string {
 	body, err := os.ReadFile(resPath)
 	if err != nil {
 		return nil
@@ -678,7 +678,7 @@ func extractResFilePeers(body string) []string {
 // devices is the volNumber → DevicePath map applyStorage produced.
 // buildResFile uses it as the disk path so a loopfile-backed volume
 // gets `disk /dev/loopN` rather than the LVM-shaped guess.
-func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResource, diskless bool, devices map[int32]string, resized, cloned bool) error {
+func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string, resized, cloned bool) error {
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
@@ -789,7 +789,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 // (which is itself a no-op when SeedFromGi is empty). This makes
 // the marker-file gate safe against accidental deletion / bare
 // satellite restarts that lose the marker.
-func (r *Reconciler) runFirstActivation(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string, mdMarkerPath string) error {
+func (r *Reconciler) runFirstActivation(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string) error {
 	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "dump-md %s", dr.GetName())
@@ -818,7 +818,7 @@ func (r *Reconciler) runFirstActivation(ctx context.Context, dr *satellitepb.Des
 	return nil
 }
 
-func (r *Reconciler) seedInitialGi(ctx context.Context, dr *satellitepb.DesiredResource, devices map[int32]string) error {
+func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	for _, vol := range dr.GetVolumes() {
 		if vol.GetSeedFromGi() == "" {
 			continue
@@ -882,7 +882,7 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // disk path. Empty / missing → fall back to the LVM/ZFS-shaped
 // `/dev/<pool>/<rd>_<vol>` guess, which is what works for those
 // providers.
-func buildResFile(dr *satellitepb.DesiredResource, localNode, localAddr string, devices map[int32]string) (string, error) {
+func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string) (string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -1049,18 +1049,18 @@ func isDiskless(flags []string) bool {
 //     holds after applyStorage + maybeLUKS.
 //   - DISKLESS replicas have no consumer-facing device; we emit
 //     no Volumes entries.
-func buildVolumeResults(dr *satellitepb.DesiredResource, devices map[int32]string, diskless, withDRBD bool) []*satellitepb.ResourceApplyVolumeResult {
+func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, diskless, withDRBD bool) []*intent.ResourceApplyVolumeResult {
 	if diskless {
 		return nil
 	}
 
-	out := make([]*satellitepb.ResourceApplyVolumeResult, 0, len(dr.GetVolumes()))
+	out := make([]*intent.ResourceApplyVolumeResult, 0, len(dr.GetVolumes()))
 
 	if withDRBD {
 		minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
 
 		for _, vol := range dr.GetVolumes() {
-			out = append(out, &satellitepb.ResourceApplyVolumeResult{
+			out = append(out, &intent.ResourceApplyVolumeResult{
 				VolumeNumber: vol.GetVolumeNumber(),
 				DevicePath:   fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
 			})
@@ -1075,7 +1075,7 @@ func buildVolumeResults(dr *satellitepb.DesiredResource, devices map[int32]strin
 			continue
 		}
 
-		out = append(out, &satellitepb.ResourceApplyVolumeResult{
+		out = append(out, &intent.ResourceApplyVolumeResult{
 			VolumeNumber: vol.GetVolumeNumber(),
 			DevicePath:   dev,
 		})

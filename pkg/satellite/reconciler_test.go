@@ -23,7 +23,7 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
@@ -40,11 +40,11 @@ func TestApplyCreatesVolumeViaProvider(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -72,11 +72,11 @@ func TestApplyUnknownPoolFails(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024, StoragePool: "missing"},
 			},
 		},
@@ -103,12 +103,12 @@ func TestApplyDisklessSkipsStorage(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
 			Flags:    []string{"DISKLESS"},
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -142,16 +142,16 @@ func TestApplyHandlesMultipleResources(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name: "pvc-1", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
 		{
 			Name: "pvc-2", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2048 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -191,7 +191,7 @@ func TestApplyCtxCancelBubblesAsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // cancel immediately
 
-	_, err := rec.Apply(ctx, []*satellitepb.DesiredResource{
+	_, err := rec.Apply(ctx, []*intent.DesiredResource{
 		{Name: "pvc-1", NodeName: "n1"},
 	})
 	if err == nil {

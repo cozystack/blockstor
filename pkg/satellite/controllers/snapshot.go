@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
 // SnapshotReconciler watches Snapshot CRDs and acts on those
@@ -105,7 +105,7 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // on an existing snapshot is a no-op (the provider-side
 // `lvcreate --snapshot` already short-circuits on existing LV).
 func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	req := &satellitepb.CreateSnapshotRequest{
+	req := &intent.CreateSnapshotRequest{
 		ResourceName: snap.Spec.ResourceDefinitionName,
 		SnapshotName: snap.Spec.SnapshotName,
 	}
@@ -134,7 +134,7 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 // case. Idempotent — DeleteSnapshot on a missing snapshot is
 // a no-op so a re-run after a satellite restart is safe.
 func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
-	req := &satellitepb.DeleteSnapshotRequest{
+	req := &intent.DeleteSnapshotRequest{
 		ResourceName: snap.Spec.ResourceDefinitionName,
 		SnapshotName: snap.Spec.SnapshotName,
 	}

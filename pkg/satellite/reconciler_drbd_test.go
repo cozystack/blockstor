@@ -28,7 +28,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/satellite"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
@@ -57,11 +57,11 @@ func TestApplyWritesResFile(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			Peers: []string{"n2"},
@@ -119,11 +119,11 @@ func TestApplyInvokesDrbdadmAdjust(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -157,7 +157,7 @@ func TestApplyDisklessNoCreateMD(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-1",
 			NodeName: "n1",
@@ -205,11 +205,11 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	})
 
 	// Desired: 2 GiB.
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-grow",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -250,11 +250,11 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-new",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -295,11 +295,11 @@ func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-rwx",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -346,11 +346,11 @@ func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-noeviction",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -416,11 +416,11 @@ func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-no-drbd",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack:  []string{"STORAGE"},
@@ -470,11 +470,11 @@ func TestApplyLayersLUKS(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-luks",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -522,11 +522,11 @@ func TestApplyLUKSFailsWithoutPassphrase(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-luks-empty",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -574,11 +574,11 @@ func TestApplyLUKSStorageNeverDRBD(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	dr := []*satellitepb.DesiredResource{
+	dr := []*intent.DesiredResource{
 		{
 			Name:     "pvc-luks-only",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -663,11 +663,11 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-stack",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
@@ -741,11 +741,11 @@ func TestApplyDRBDResizeErrorSurfaces(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-resize-fail",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -792,11 +792,11 @@ func TestApplyUnknownStoragePool(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-bad-pool",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "ghost-pool"},
 			},
 			DrbdOptions: map[string]string{
@@ -847,12 +847,12 @@ func TestApplyInactiveOnlyDownsDRBD(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-inactive",
 			NodeName: "n1",
 			Flags:    []string{"INACTIVE"},
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -919,11 +919,11 @@ func TestApplyLUKSWithoutCryptsetupWrapper(t *testing.T) {
 		// Cryptsetup intentionally nil.
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-no-cs",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -981,11 +981,11 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-luks-grow",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -1042,11 +1042,11 @@ func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	dr := []*satellitepb.DesiredResource{
+	dr := []*intent.DesiredResource{
 		{
 			Name:     "pvc-seed",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -1123,7 +1123,7 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	resp, err := rec.DeleteResource(t.Context(), &satellitepb.DeleteResourceRequest{
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
 		Name:          "pvc-luks-del",
 		StoragePool:   "thin1",
 		VolumeNumbers: []int32{0},
@@ -1198,11 +1198,11 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	dr := []*satellitepb.DesiredResource{
+	dr := []*intent.DesiredResource{
 		{
 			Name:     "pvc-abort",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -1311,11 +1311,11 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		Cryptsetup: luks.NewCryptsetup(fx),
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-luks-format",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			LayerStack: []string{"LUKS", "STORAGE"},
@@ -1366,11 +1366,11 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-md-fail",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -1420,11 +1420,11 @@ func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	results, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-seed-fail",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{
@@ -1476,11 +1476,11 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-seed",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{
 					VolumeNumber: 0,
 					SizeKib:      1024 * 1024,
@@ -1548,11 +1548,11 @@ func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
 		NodeName:  "n1",
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-noseed",
 			NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 			DrbdOptions: map[string]string{

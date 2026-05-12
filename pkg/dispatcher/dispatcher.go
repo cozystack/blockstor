@@ -32,7 +32,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
@@ -56,7 +56,7 @@ const boolPropTrue = "true"
 // nodes is consulted for each peer's `SatelliteEndpoint` prop so
 // `peer.<name>.address` carries a real (pod) IP rather than a 0.0.0.0
 // placeholder; drbd-9 won't replicate to 0.0.0.0.
-func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *satellitepb.DesiredResource {
+func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, rd *blockstoriov1alpha1.ResourceDefinition, effectiveProps map[string]string) *intent.DesiredResource {
 	// node-id and port/minor are persisted on Status by the controller
 	// before Apply runs. Falling back to derive*() is a transitional
 	// safety net for the case where the allocator hasn't run yet — it
@@ -122,7 +122,7 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 // assembleDesired packages the per-replica wire payload. Pulled out
 // of BuildDesired so the caller stays under the funlen budget.
-func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, dropped []string, drbdOpts, effectiveProps map[string]string) *satellitepb.DesiredResource {
+func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, dropped []string, drbdOpts, effectiveProps map[string]string) *intent.DesiredResource {
 	_ = peers // peers info already folded into drbdOpts via addPeerEntries
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
@@ -153,7 +153,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		layerStack = rd.Spec.LayerStack
 	}
 
-	return &satellitepb.DesiredResource{
+	return &intent.DesiredResource{
 		Name:        target.Spec.ResourceDefinitionName,
 		NodeName:    target.Spec.NodeName,
 		Flags:       target.Spec.Flags,
@@ -317,7 +317,7 @@ func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 // (LINSTOR-compatible key) with the RD-level fallback. For DISKLESS
 // replicas it stays empty — the .res renderer treats empty as "no
 // disk on this peer".
-func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstoriov1alpha1.Resource) []*satellitepb.DesiredVolume {
+func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstoriov1alpha1.Resource) []*intent.DesiredVolume {
 	if rd == nil {
 		return nil
 	}
@@ -357,10 +357,10 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 		srcSnapshot = rd.Spec.Props[restoreFromKey]
 	}
 
-	out := make([]*satellitepb.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
+	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
-		out = append(out, &satellitepb.DesiredVolume{
+		out = append(out, &intent.DesiredVolume{
 			VolumeNumber:   vd.VolumeNumber,
 			SizeKib:        vd.SizeKib,
 			StoragePool:    pool,

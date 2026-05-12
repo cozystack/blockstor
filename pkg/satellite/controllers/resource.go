@@ -38,7 +38,7 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
 // SatelliteResourceFinalizer is the per-satellite-instance
@@ -238,7 +238,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, err
 	}
 
-	results, err := r.Config.Apply.Apply(ctx, []*satellitepb.DesiredResource{desired})
+	results, err := r.Config.Apply.Apply(ctx, []*intent.DesiredResource{desired})
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
@@ -282,7 +282,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 // observer's DiskState / CurrentGi writes on the same Volume[i]
 // (listMapKey=volumeNumber means the slice is merged by volume
 // number, not replaced wholesale).
-func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, results []*satellitepb.ResourceApplyResult) error {
+func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) error {
 	if len(results) == 0 || len(results[0].GetVolumes()) == 0 {
 		return nil
 	}
@@ -370,7 +370,7 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 // path — the controller-runtime reconciler does exactly the
 // same work the controller's dispatcher did, just on the
 // satellite side. Phase 10.1.
-func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (*satellitepb.DesiredResource, error) {
+func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (*intent.DesiredResource, error) {
 	var resList blockstoriov1alpha1.ResourceList
 
 	err := r.List(ctx, &resList)
@@ -463,7 +463,7 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{}, err
 	}
 
-	req := &satellitepb.DeleteResourceRequest{
+	req := &intent.DeleteResourceRequest{
 		Name:          res.Spec.ResourceDefinitionName,
 		StoragePool:   resolveDeleteStoragePool(res),
 		VolumeNumbers: volumeNumbers,

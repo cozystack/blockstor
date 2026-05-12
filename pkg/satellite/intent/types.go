@@ -14,18 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package satellitepb hosts the in-process wire format for the
-// satellite apply chain. Phase 10.6 retired the gRPC contract; the
-// types here are now plain Go structs the controller-runtime
-// reconcilers, the satellite `Reconciler`, and the
-// `dispatcher.BuildDesired` translator pass between each other.
-// Getter methods (`GetX`) are kept so the migration off the
-// generated-proto shape was a no-op at call sites.
+// Package intent hosts the in-process value objects the controller
+// dispatcher passes to the satellite apply chain. Phase 10.6 retired
+// the gRPC wire that lived under `pkg/satellite/proto`; these types
+// are plain Go structs the controller-runtime reconcilers, the
+// satellite `Reconciler`, and `dispatcher.BuildDesired` exchange
+// in-process.
 //
-// The package name and import path stay as `satellitepb` for
-// historical reasons; a future rename to `pkg/satellite/applyspec`
-// (or similar) is fine — there are no out-of-tree consumers.
-package satellitepb
+// Getter methods (`GetX`) are kept so the migration from the
+// generated-proto shape was a no-op at every call site.
+package intent
 
 // DesiredResource is the satellite-facing apply payload for one
 // per-node Resource: which RD, which node, the flags

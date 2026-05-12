@@ -22,7 +22,7 @@ import (
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
-	satellitepb "github.com/cozystack/blockstor/pkg/satellite/proto"
+	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
@@ -39,10 +39,10 @@ func TestCreateSnapshotDispatchesToProvider(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name: "pvc-1", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -51,7 +51,7 @@ func TestCreateSnapshotDispatchesToProvider(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	resp, err := rec.CreateSnapshot(t.Context(), &satellitepb.CreateSnapshotRequest{
+	resp, err := rec.CreateSnapshot(t.Context(), &intent.CreateSnapshotRequest{
 		ResourceName: "pvc-1",
 		SnapshotName: "snap-1",
 	})
@@ -78,7 +78,7 @@ func TestCreateSnapshotUnknownResource(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	resp, err := rec.CreateSnapshot(t.Context(), &satellitepb.CreateSnapshotRequest{
+	resp, err := rec.CreateSnapshot(t.Context(), &intent.CreateSnapshotRequest{
 		ResourceName: "ghost",
 		SnapshotName: "snap-1",
 	})
@@ -107,10 +107,10 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name: "pvc-1", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -119,7 +119,7 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	resp, err := rec.DeleteSnapshot(t.Context(), &satellitepb.DeleteSnapshotRequest{
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{
 		ResourceName: "pvc-1",
 		SnapshotName: "snap-1",
 	})
@@ -161,10 +161,10 @@ func TestCreateSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name: "pvc-1", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -173,7 +173,7 @@ func TestCreateSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 		t.Fatalf("Apply (seed): %v", err)
 	}
 
-	resp, err := rec.CreateSnapshot(t.Context(), &satellitepb.CreateSnapshotRequest{
+	resp, err := rec.CreateSnapshot(t.Context(), &intent.CreateSnapshotRequest{
 		ResourceName: "pvc-1",
 		SnapshotName: "snap-fail",
 	})
@@ -204,10 +204,10 @@ func TestDeleteSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 		Providers: map[string]storage.Provider{"thin1": thin},
 	})
 
-	_, err := rec.Apply(t.Context(), []*satellitepb.DesiredResource{
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name: "pvc-1", NodeName: "n1",
-			Volumes: []*satellitepb.DesiredVolume{
+			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
 		},
@@ -216,7 +216,7 @@ func TestDeleteSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 		t.Fatalf("Apply (seed): %v", err)
 	}
 
-	resp, err := rec.DeleteSnapshot(t.Context(), &satellitepb.DeleteSnapshotRequest{
+	resp, err := rec.DeleteSnapshot(t.Context(), &intent.DeleteSnapshotRequest{
 		ResourceName: "pvc-1",
 		SnapshotName: "snap-fail",
 	})
