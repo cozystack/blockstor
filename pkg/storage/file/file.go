@@ -30,6 +30,7 @@ package file
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -314,6 +315,85 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	return nil
 }
 
+// SendSnapshot opens the snapshot's .img file as a byte stream. For
+// FILE/FILE_THIN this is the raw file contents — the receiver's
+// RecvSnapshot writes them verbatim into the target.img path. No
+// special framing; suitable for piping through HTTP, ssh, or any
+// transparent transport.
+//
+// Returns storage.ErrNotFound when the snapshot file is missing
+// (e.g. the calling satellite picked a peer that doesn't host this
+// snapshot — caller should pick another peer or fall through to
+// DRBD resync).
+func (p *Provider) SendSnapshot(_ context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
+	path := p.snapshotPath(snap)
+
+	snapshotFile, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s", path)
+		}
+
+		return nil, errors.Wrapf(err, "open %s", path)
+	}
+
+	return snapshotFile, nil
+}
+
+// RecvSnapshot writes the byte stream into target's .img file and
+// attaches a loop device, the same tail CreateVolume runs. Pre-
+// existing target → no-op (idempotent across satellite restarts).
+//
+// The receiver expects raw file bytes — matches SendSnapshot's
+// stream shape. drbdmeta drop-md + create-md follow on the caller
+// side to stamp this node's DRBD node-id over the metadata block
+// embedded in the stream.
+func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
+	dstPath := p.volumePath(target)
+
+	_, statErr := os.Stat(dstPath)
+	if statErr == nil {
+		// Pre-existing target — ensure the loop is up and return.
+		_, err := p.attach(ctx, dstPath)
+		if err != nil {
+			return errors.Wrapf(err, "losetup %s", dstPath)
+		}
+
+		return nil
+	}
+
+	if !os.IsNotExist(statErr) {
+		return errors.Wrapf(statErr, "stat %s", dstPath)
+	}
+
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, volumeFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "create %s", dstPath)
+	}
+
+	_, err = io.Copy(dst, src)
+	cErr := dst.Close()
+
+	if err != nil {
+		_ = os.Remove(dstPath)
+
+		return errors.Wrapf(err, "stream into %s", dstPath)
+	}
+
+	if cErr != nil {
+		_ = os.Remove(dstPath)
+
+		return errors.Wrapf(cErr, "close %s", dstPath)
+	}
+
+	_, err = p.attach(ctx, dstPath)
+	if err != nil {
+		return errors.Wrapf(err, "losetup %s", dstPath)
+	}
+
+	return nil
+}
+
 // snapshotPath is `<dir>/<resource>_<snap>_00000.img`. Matches the
 // LV-side `<rd>_<snap>_00000` naming (volume #0 only — multi-volume
 // snapshots land in Phase 4).
@@ -394,4 +474,7 @@ func (p *Provider) volumePath(vol storage.Volume) string {
 const (
 	stateNotProvisioned = "NOT_PROVISIONED"
 	bytesPerKib         = 1024
+	// volumeFilePerm — owner-only read+write. The FILE storage pool
+	// dir already restricts access; the satellite runs as root.
+	volumeFilePerm = 0o600
 )
