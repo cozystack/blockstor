@@ -343,8 +343,9 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 			AllocatedKib: volStatus.AllocatedKib,
 			UsableKib:    volStatus.UsableKib,
 			State: apiv1.VolumeState{
-				DiskState: volStatus.DiskState,
-				CurrentGi: volStatus.CurrentGi,
+				DiskState:    volStatus.DiskState,
+				CurrentGi:    volStatus.CurrentGi,
+				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
 		})
 	}

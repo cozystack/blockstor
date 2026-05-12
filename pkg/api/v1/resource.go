@@ -89,6 +89,13 @@ type VolumeState struct {
 	// The controller reads it when adding a new replica to skip the
 	// full initial-sync (Phase 8.1).
 	CurrentGi string `json:"current_gi,omitempty"`
+
+	// OutOfSyncKib is the worst-case "how many KiB this replica is
+	// behind any peer" reported by `drbdsetup events2 --statistics`
+	// peer-device frames. UI/CLI compute a sync-progress %:
+	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
+	// 0 means fully in sync.
+	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
 }
 
 // VolumeObservation carries per-volume observed state propagated from
