@@ -1,0 +1,17 @@
+{
+  "name": "DELETE /v1/nodes/trace-n2",
+  "method": "DELETE",
+  "path": "/v1/nodes/trace-n2",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Node 'trace-n2' UUID was: \u003cuuid\u003e",
+      "message": "Node 'trace-n2' deleted.",
+      "obj_refs": {
+        "Node": "trace-n2"
+      },
+      "ret_code": 54263810
+    }
+  ]
+}

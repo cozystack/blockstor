@@ -1,0 +1,17 @@
+{
+  "name": "DELETE /v1/resource-definitions/trace-rd-1",
+  "method": "DELETE",
+  "path": "/v1/resource-definitions/trace-rd-1",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Resource definition 'trace-rd-1' UUID was: \u003cuuid\u003e",
+      "message": "Resource definition 'trace-rd-1' deleted.",
+      "obj_refs": {
+        "RscDfn": "trace-rd-1"
+      },
+      "ret_code": 54001666
+    }
+  ]
+}

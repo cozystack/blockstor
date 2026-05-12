@@ -1,0 +1,31 @@
+{
+  "name": "PUT /v1/nodes/trace-n1",
+  "method": "PUT",
+  "path": "/v1/nodes/trace-n1",
+  "body": {
+    "override_props": {
+      "Aux/recorder-stamp": "yes"
+    }
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "message": "Successfully set property key(s): Aux/recorder-stamp",
+      "obj_refs": {
+        "Node": "trace-n1"
+      },
+      "ret_code": 20709377
+    },
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Node 'trace-n1' UUID is: \u003cuuid\u003e",
+      "message": "Node 'trace-n1' modified.",
+      "obj_refs": {
+        "Node": "trace-n1",
+        "UUID": "\u003cuuid\u003e"
+      },
+      "ret_code": 37486595
+    }
+  ]
+}

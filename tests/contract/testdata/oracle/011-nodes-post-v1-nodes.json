@@ -1,0 +1,39 @@
+{
+  "name": "POST /v1/nodes",
+  "method": "POST",
+  "path": "/v1/nodes",
+  "body": {
+    "name": "trace-n1",
+    "net_interfaces": [
+      {
+        "address": "\u003cip\u003e",
+        "name": "default",
+        "satellite_encryption_type": "PLAIN",
+        "satellite_port": 3366
+      }
+    ],
+    "type": "SATELLITE"
+  },
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Node 'trace-n1' UUID is: \u003cuuid\u003e",
+      "message": "New node 'trace-n1' registered.",
+      "obj_refs": {
+        "Node": "trace-n1",
+        "UUID": "\u003cuuid\u003e"
+      },
+      "ret_code": 20709377
+    },
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "The controller is trying to (re-) establish a connection to the satellite. The controller stored the changes and as soon the satellite is connected, it will receive this update.",
+      "message": "No active connection to satellite 'trace-n1'",
+      "obj_refs": {
+        "Node": "trace-n1"
+      },
+      "ret_code": -9223372036834065000
+    }
+  ]
+}

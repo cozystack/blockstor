@@ -1,0 +1,19 @@
+{
+  "name": "POST /v1/resource-groups/trace-rg-1/volume-groups",
+  "method": "POST",
+  "path": "/v1/resource-groups/trace-rg-1/volume-groups",
+  "body": {},
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "message": "New volume group with number '0' of resource group 'trace-rg-1' created.",
+      "obj_refs": {
+        "RscGrp": "trace-rg-1",
+        "VlmGrp": "trace-rg-1",
+        "VlmNr": "0"
+      },
+      "ret_code": 21495809
+    }
+  ]
+}

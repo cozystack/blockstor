@@ -1,0 +1,13 @@
+{
+  "name": "DELETE /v1/controller/properties/Aux/trace-recorder-stamp",
+  "method": "DELETE",
+  "path": "/v1/controller/properties/Aux/trace-recorder-stamp",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "message": "Successfully deleted property 'Aux/trace-recorder-stamp'",
+      "ret_code": 51380226
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "GET /v1/resource-definitions?",
+  "method": "GET",
+  "path": "/v1/resource-definitions?",
+  "expectedStatus": 200,
+  "expectedBody": []
+}

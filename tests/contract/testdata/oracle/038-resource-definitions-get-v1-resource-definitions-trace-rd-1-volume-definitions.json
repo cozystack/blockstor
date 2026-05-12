@@ -1,0 +1,15 @@
+{
+  "name": "GET /v1/resource-definitions/trace-rd-1/volume-definitions",
+  "method": "GET",
+  "path": "/v1/resource-definitions/trace-rd-1/volume-definitions",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "props": {
+        "DrbdCurrentGi": "EB0EE67EEFD1FDF0"
+      },
+      "size_kib": 65536,
+      "volume_number": 0
+    }
+  ]
+}

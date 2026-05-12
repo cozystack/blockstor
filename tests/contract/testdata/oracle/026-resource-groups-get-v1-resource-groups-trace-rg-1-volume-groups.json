@@ -1,0 +1,11 @@
+{
+  "name": "GET /v1/resource-groups/trace-rg-1/volume-groups",
+  "method": "GET",
+  "path": "/v1/resource-groups/trace-rg-1/volume-groups",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "volume_number": 0
+    }
+  ]
+}

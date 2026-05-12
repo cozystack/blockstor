@@ -1,0 +1,24 @@
+{
+  "name": "POST /v1/resource-groups",
+  "method": "POST",
+  "path": "/v1/resource-groups",
+  "body": {
+    "name": "trace-rg-2",
+    "select_filter": {
+      "place_count": 1
+    }
+  },
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Resource group 'trace-rg-2' UUID is: \u003cuuid\u003e",
+      "message": "New resource group 'trace-rg-2' created.",
+      "obj_refs": {
+        "RscGrp": "trace-rg-2",
+        "UUID": "\u003cuuid\u003e"
+      },
+      "ret_code": 21233665
+    }
+  ]
+}

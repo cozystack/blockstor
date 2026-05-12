@@ -1,0 +1,16 @@
+{
+  "name": "GET /v1/resource-definitions?",
+  "method": "GET",
+  "path": "/v1/resource-definitions?",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "name": "trace-rd-1",
+      "resource_group_name": "DfltRscGrp"
+    },
+    {
+      "name": "trace-rd-2",
+      "resource_group_name": "DfltRscGrp"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "GET /v1/resource-groups/trace-rg-1",
+  "method": "GET",
+  "path": "/v1/resource-groups/trace-rg-1",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "name": "trace-rg-1",
+    "select_filter": {
+      "place_count": 1
+    }
+  }
+}

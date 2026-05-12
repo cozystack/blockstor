@@ -1,0 +1,32 @@
+{
+  "name": "PUT /v1/resource-groups/trace-rg-1",
+  "method": "PUT",
+  "path": "/v1/resource-groups/trace-rg-1",
+  "body": {
+    "override_props": {
+      "Aux/trace-recorder-stamp": "modified"
+    },
+    "select_filter": {}
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "message": "Successfully set property key(s): Aux/trace-recorder-stamp",
+      "obj_refs": {
+        "RscGrp": "trace-rg-1"
+      },
+      "ret_code": 20447233
+    },
+    {
+      "created_at": "\u003ctimestamp\u003e",
+      "details": "Resource group 'trace-rg-1' UUID is: \u003cuuid\u003e",
+      "message": "Resource group 'trace-rg-1' modified.",
+      "obj_refs": {
+        "RscGrp": "trace-rg-1",
+        "UUID": "\u003cuuid\u003e"
+      },
+      "ret_code": 21233667
+    }
+  ]
+}

@@ -1,0 +1,334 @@
+{
+  "name": "GET /v1/nodes",
+  "method": "GET",
+  "path": "/v1/nodes",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "connection_status": "ONLINE",
+      "name": "e2e6-worker-1",
+      "net_interfaces": [
+        {
+          "address": "\u003cip\u003e",
+          "is_active": true,
+          "name": "default-ipv4",
+          "satellite_encryption_type": "PLAIN",
+          "satellite_port": 3366
+        }
+      ],
+      "props": {},
+      "resource_layers": [
+        "DRBD",
+        "LUKS",
+        "STORAGE"
+      ],
+      "storage_providers": [
+        "DISKLESS",
+        "LVM",
+        "LVM_THIN",
+        "ZFS",
+        "ZFS_THIN",
+        "FILE",
+        "FILE_THIN",
+        "REMOTE_SPDK",
+        "EBS_INIT",
+        "EBS_TARGET"
+      ],
+      "type": "SATELLITE",
+      "unsupported_layers": {
+        "BCACHE": [
+          "'modprobe bcache' returned with exit code 1"
+        ],
+        "CACHE": [
+          "'modprobe dm-cache' returned with exit code 1"
+        ],
+        "NVME": [
+          "'modprobe nvmet_rdma' returned with exit code 1",
+          "'modprobe nvme_rdma' returned with exit code 1"
+        ],
+        "WRITECACHE": [
+          "'modprobe dm-writecache' returned with exit code 1"
+        ]
+      },
+      "unsupported_providers": {
+        "SPDK": [
+          "IO exception occured when running 'rpc.py spdk_get_version': Cannot run program \"rpc.py\": error=2, No such file or directory"
+        ],
+        "STORAGE_SPACES": [
+          "This tool does not exist on the Linux platform."
+        ],
+        "STORAGE_SPACES_THIN": [
+          "This tool does not exist on the Linux platform."
+        ]
+      }
+    },
+    {
+      "connection_status": "ONLINE",
+      "name": "e2e6-worker-2",
+      "net_interfaces": [
+        {
+          "address": "\u003cip\u003e",
+          "is_active": true,
+          "name": "default-ipv4",
+          "satellite_encryption_type": "PLAIN",
+          "satellite_port": 3366
+        }
+      ],
+      "props": {},
+      "resource_layers": [
+        "DRBD",
+        "LUKS",
+        "STORAGE"
+      ],
+      "storage_providers": [
+        "DISKLESS",
+        "LVM",
+        "LVM_THIN",
+        "ZFS",
+        "ZFS_THIN",
+        "FILE",
+        "FILE_THIN",
+        "REMOTE_SPDK",
+        "EBS_INIT",
+        "EBS_TARGET"
+      ],
+      "type": "SATELLITE",
+      "unsupported_layers": {
+        "BCACHE": [
+          "'modprobe bcache' returned with exit code 1"
+        ],
+        "CACHE": [
+          "'modprobe dm-cache' returned with exit code 1"
+        ],
+        "NVME": [
+          "'modprobe nvmet_rdma' returned with exit code 1",
+          "'modprobe nvme_rdma' returned with exit code 1"
+        ],
+        "WRITECACHE": [
+          "'modprobe dm-writecache' returned with exit code 1"
+        ]
+      },
+      "unsupported_providers": {
+        "SPDK": [
+          "IO exception occured when running 'rpc.py spdk_get_version': Cannot run program \"rpc.py\": error=2, No such file or directory"
+        ],
+        "STORAGE_SPACES": [
+          "This tool does not exist on the Linux platform."
+        ],
+        "STORAGE_SPACES_THIN": [
+          "This tool does not exist on the Linux platform."
+        ]
+      }
+    },
+    {
+      "connection_status": "ONLINE",
+      "name": "e2e6-worker-3",
+      "net_interfaces": [
+        {
+          "address": "\u003cip\u003e",
+          "is_active": true,
+          "name": "default-ipv4",
+          "satellite_encryption_type": "PLAIN",
+          "satellite_port": 3366
+        }
+      ],
+      "props": {},
+      "resource_layers": [
+        "DRBD",
+        "LUKS",
+        "STORAGE"
+      ],
+      "storage_providers": [
+        "DISKLESS",
+        "LVM",
+        "LVM_THIN",
+        "ZFS",
+        "ZFS_THIN",
+        "FILE",
+        "FILE_THIN",
+        "REMOTE_SPDK",
+        "EBS_INIT",
+        "EBS_TARGET"
+      ],
+      "type": "SATELLITE",
+      "unsupported_layers": {
+        "BCACHE": [
+          "'modprobe bcache' returned with exit code 1"
+        ],
+        "CACHE": [
+          "'modprobe dm-cache' returned with exit code 1"
+        ],
+        "NVME": [
+          "'modprobe nvmet_rdma' returned with exit code 1",
+          "'modprobe nvme_rdma' returned with exit code 1"
+        ],
+        "WRITECACHE": [
+          "'modprobe dm-writecache' returned with exit code 1"
+        ]
+      },
+      "unsupported_providers": {
+        "SPDK": [
+          "IO exception occured when running 'rpc.py spdk_get_version': Cannot run program \"rpc.py\": error=2, No such file or directory"
+        ],
+        "STORAGE_SPACES": [
+          "This tool does not exist on the Linux platform."
+        ],
+        "STORAGE_SPACES_THIN": [
+          "This tool does not exist on the Linux platform."
+        ]
+      }
+    },
+    {
+      "connection_status": "OFFLINE",
+      "name": "trace-n1",
+      "net_interfaces": [
+        {
+          "address": "\u003cip\u003e",
+          "is_active": true,
+          "name": "default",
+          "satellite_encryption_type": "PLAIN",
+          "satellite_port": 3366
+        }
+      ],
+      "props": {},
+      "resource_layers": [
+        "STORAGE"
+      ],
+      "storage_providers": [
+        "DISKLESS",
+        "REMOTE_SPDK",
+        "EBS_INIT",
+        "EBS_TARGET"
+      ],
+      "type": "SATELLITE",
+      "unsupported_layers": {
+        "BCACHE": [
+          "No information from satellite yet"
+        ],
+        "CACHE": [
+          "No information from satellite yet"
+        ],
+        "DRBD": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ],
+        "LUKS": [
+          "No information from satellite yet"
+        ],
+        "NVME": [
+          "No information from satellite yet"
+        ],
+        "WRITECACHE": [
+          "No information from satellite yet"
+        ]
+      },
+      "unsupported_providers": {
+        "FILE": [
+          "No information from satellite yet"
+        ],
+        "FILE_THIN": [
+          "No information from satellite yet"
+        ],
+        "LVM": [
+          "No information from satellite yet"
+        ],
+        "LVM_THIN": [
+          "No information from satellite yet"
+        ],
+        "SPDK": [
+          "No information from satellite yet"
+        ],
+        "STORAGE_SPACES": [
+          "No information from satellite yet"
+        ],
+        "STORAGE_SPACES_THIN": [
+          "No information from satellite yet"
+        ],
+        "ZFS": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ],
+        "ZFS_THIN": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ]
+      }
+    },
+    {
+      "connection_status": "OFFLINE",
+      "name": "trace-n2",
+      "net_interfaces": [
+        {
+          "address": "\u003cip\u003e",
+          "is_active": true,
+          "name": "default",
+          "satellite_encryption_type": "PLAIN",
+          "satellite_port": 3366
+        }
+      ],
+      "props": {},
+      "resource_layers": [
+        "STORAGE"
+      ],
+      "storage_providers": [
+        "DISKLESS",
+        "REMOTE_SPDK",
+        "EBS_INIT",
+        "EBS_TARGET"
+      ],
+      "type": "SATELLITE",
+      "unsupported_layers": {
+        "BCACHE": [
+          "No information from satellite yet"
+        ],
+        "CACHE": [
+          "No information from satellite yet"
+        ],
+        "DRBD": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ],
+        "LUKS": [
+          "No information from satellite yet"
+        ],
+        "NVME": [
+          "No information from satellite yet"
+        ],
+        "WRITECACHE": [
+          "No information from satellite yet"
+        ]
+      },
+      "unsupported_providers": {
+        "FILE": [
+          "No information from satellite yet"
+        ],
+        "FILE_THIN": [
+          "No information from satellite yet"
+        ],
+        "LVM": [
+          "No information from satellite yet"
+        ],
+        "LVM_THIN": [
+          "No information from satellite yet"
+        ],
+        "SPDK": [
+          "No information from satellite yet"
+        ],
+        "STORAGE_SPACES": [
+          "No information from satellite yet"
+        ],
+        "STORAGE_SPACES_THIN": [
+          "No information from satellite yet"
+        ],
+        "ZFS": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ],
+        "ZFS_THIN": [
+          "No information from satellite yet",
+          "No information from satellite yet"
+        ]
+      }
+    }
+  ]
+}
