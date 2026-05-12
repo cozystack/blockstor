@@ -647,13 +647,18 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *satellitepb.DesiredResou
 		}
 	}
 
-	// Force-primary trigger: either the RD-prop `auto-primary` is
-	// set (controller-initiated seed) OR the replica was just
-	// cloned from a snapshot. The clone case promotes-then-demotes
-	// to flush the fresh DRBD metadata's GI into "UpToDate" without
-	// kicking a full initial-sync against the cloned bits.
+	// Force-primary trigger: only when the RD-prop `auto-primary` is
+	// set (controller-initiated seed for fresh replicas).
+	//
+	// Do NOT auto-promote on clone. Local clone (zfs clone / lvcreate
+	// -s / cp --reflink) copies the source's DRBD metadata byte-for-
+	// byte, so every clone replica starts with the same Current UUID.
+	// Running `drbdadm primary --force` on each replica regenerates
+	// the Current UUID independently per node → peers see divergent
+	// UUIDs on first handshake → split-brain (StandAlone).
 	autoPromote := firstActivation && !diskless &&
-		(cloned || dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue)
+		dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue
+	_ = cloned
 
 	if autoPromote {
 		err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
