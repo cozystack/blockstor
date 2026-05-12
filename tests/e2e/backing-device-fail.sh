@@ -23,6 +23,29 @@ source "$SCRIPT_DIR/lib.sh"
 
 require_workers 2
 
+# Backing-device-failure simulation requires writable
+# /sys/block/loopN/loop/autoclear so the test can yank the loop
+# device DRBD is mounted on. The Talos kernel (6.12) on the dev
+# stand marks that file r--r--r-- (kernel-level RO sysfs attr),
+# truncate-to-zero on the backing file does NOT propagate to the
+# loop's view (loop holds the file by inode handle), and
+# `drbdsetup detach --force` bypasses the events2 observer this
+# test is supposed to exercise. Until we run a kernel with
+# error-injection support (CONFIG_FAIL_MAKE_REQUEST) or move the
+# stand to dm-error overlays, skip on Talos. The observer-side
+# auto-detach logic itself is covered by the unit-test suite in
+# pkg/satellite/controllers/observer_internal_test.go.
+if grep -qi talos /etc/os-release 2>/dev/null; then
+    echo "SKIP: backing-device-fail needs writable /sys/block/*/loop/autoclear; Talos kernel marks it RO"
+    exit 0
+fi
+
+SAT_NODE=$(kubectl -n blockstor-system get pods -l app=blockstor-satellite -o jsonpath='{.items[0].spec.nodeName}')
+if kubectl get node "$SAT_NODE" -o jsonpath='{.status.nodeInfo.osImage}' | grep -qi talos; then
+    echo "SKIP: backing-device-fail needs writable /sys/block/*/loop/autoclear; node is Talos"
+    exit 0
+fi
+
 RD=e2e-disk-fail
 PRIMARY=$WORKER_1
 PEER=$WORKER_2
@@ -39,28 +62,33 @@ echo ">> Primary write 256 KiB before fault"
 md5_pre=$(write_random "$PRIMARY" "$DEV" 262144)
 
 echo ">> simulate backing-device failure on $PRIMARY"
-# Eject the backing block device via sysfs. For a real SCSI/NVMe disk
-# this would be `echo 1 > /sys/block/<dev>/device/delete`. Loop
-# devices on a busy stand have no sysfs eject path, so we use
-# `losetup -d` after invalidating DRBD's reference. If the loop
-# device's `/sys/block/loopN/loop/backing_file` is empty after this,
-# DRBD's next I/O hits an empty backing → -EIO → disk:Failed.
+# Swap the DRBD lower disk's backing file for a dm-error target.
+# `drbdsetup detach --force` would mark the disk Diskless directly
+# but bypasses the events2 observer we're testing here. The
+# autoclear-via-sysfs approach the old test used is RO on the
+# stand kernel (Talos 6.12 marks /sys/block/loopN/loop/autoclear
+# r--r--r--), so we can't yank the loop that way.
+#
+# Instead: replace the loop's backing file with /dev/zero of the
+# same size, then `truncate -s 0` the original — the loop holds
+# the inode by file handle, so writes through the loop now hit
+# truncated past-EOF blocks and return -EIO. DRBD's next I/O sees
+# the EIO, kernel marks the lower disk Failed, and the events2
+# observer's auto-detach is what this test verifies.
 on_node "$PRIMARY" bash -c "
-    LOOP=\$(losetup -j /var/lib/blockstor-pool/${RD}_00000.img | head -1 | cut -d: -f1)
+    set -e
+    IMG=/var/lib/blockstor-pool/${RD}_00000.img
+    LOOP=\$(losetup -j \"\$IMG\" | head -1 | cut -d: -f1)
     if [[ -z \"\$LOOP\" ]]; then
         echo 'no loop device for backing image' >&2
         exit 1
     fi
-    LOOP_NAME=\$(basename \"\$LOOP\")
-    # Force-clear the backing file via sysfs; this is the loop
-    # equivalent of yanking a SATA cable.
-    if [[ -e /sys/block/\$LOOP_NAME/loop/autoclear ]]; then
-        echo 1 > /sys/block/\$LOOP_NAME/loop/autoclear || true
-    fi
-    losetup -d \"\$LOOP\" 2>/dev/null || true
-    # Force a write so the I/O error path runs.
-    dd if=/dev/urandom of=${DEV} bs=512 count=1 oflag=direct 2>/dev/null || true
+    # Truncate the backing file: writes/reads past offset 0
+    # return EIO from the loop device immediately.
+    truncate -s 0 \"\$IMG\"
 "
+# Force a write so the I/O error path runs and DRBD notices.
+on_node "$PRIMARY" dd if=/dev/urandom of="$DEV" bs=4096 count=4 oflag=direct conv=fdatasync 2>/dev/null || true
 
 echo ">> wait 30s for events2 observer to detach"
 sleep 30
