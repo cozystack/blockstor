@@ -426,6 +426,16 @@ func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blocksto
 func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader client.Reader, target *blockstoriov1alpha1.Resource) (bool, error) {
 	err := reader.Get(ctx, client.ObjectKey{Name: target.Name}, target)
 	if err != nil {
+		// Resource gone between reconcile dispatch and direct
+		// APIReader read — common race when the parent RD reconciler
+		// just created the witness Resource and the workqueue fired
+		// before the apiserver fully propagated, or when --force
+		// deletion races against an in-flight reconcile. Nothing to
+		// allocate; let the next event drive the allocation.
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+
 		return false, err
 	}
 
