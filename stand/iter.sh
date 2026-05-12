@@ -92,9 +92,15 @@ step "cleanup leftover" \
 # image unchanged) skips that path.
 step "drbdadm down stale resources on satellites" \
     "kubectl -n blockstor-system get pod -l app=blockstor-satellite -o name | while read p; do
-        kubectl -n blockstor-system exec \$p -- bash -c '
+        timeout 30 kubectl -n blockstor-system exec \$p -- bash -c '
             for r in \$(drbdsetup status --json 2>/dev/null | python3 -c \"import json,sys; print(\\\" \\\".join(r[\\\"name\\\"] for r in json.load(sys.stdin)))\" 2>/dev/null); do
-                drbdsetup down \$r 2>&1 || drbdsetup del-resource \$r 2>&1 || true;
+                # disconnect-all + detach release the peer / lower
+                # references before del-resource; without these,
+                # drbdsetup down on a stuck connection hangs forever
+                # waiting for a peer that's already pod-gone.
+                timeout 5 drbdsetup disconnect-all \$r 2>/dev/null || true;
+                timeout 5 drbdsetup detach \$r --force 2>/dev/null || true;
+                timeout 5 drbdsetup del-resource \$r 2>/dev/null || true;
             done;
             rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true
         ' 2>&1 | sed \"s|^|\$p: |\";
