@@ -89,6 +89,22 @@ type DrbdResourceLayer struct {
 	// missing field which the Python CLI interprets as "no DRBD
 	// layer present".
 	Connections map[string]DrbdConnection `json:"connections,omitempty"`
+
+	// DrbdVolumes is the per-volume disk-state surface the Python
+	// CLI reads for the `linstor r l` State column — without this
+	// field populated the CLI falls back to a literal "Created"
+	// regardless of the volumes[i].state.disk_state we'd already
+	// computed. Mirrors upstream LINSTOR's `DrbdRscData.drbdVlmList`.
+	DrbdVolumes []DrbdVolume `json:"drbd_volumes,omitempty"`
+}
+
+// DrbdVolume is one volume's DRBD-layer-specific state. The Python
+// CLI reads `disk_state` here for its State column, falling back to
+// "Created" when the field is missing.
+type DrbdVolume struct {
+	VolumeNumber int32  `json:"volume_number"`
+	DiskState    string `json:"disk_state,omitempty"`
+	DevicePath   string `json:"device_path,omitempty"`
 }
 
 // DrbdConnection is one peer's connection state as reported by

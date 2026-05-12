@@ -404,6 +404,28 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 		hasAny = true
 	}
 
+	// Per-volume DRBD disk-state — Python CLI's `linstor r l` State
+	// column reads this exact path; without it the column shows a
+	// literal "Created" regardless of the observed disk_state in
+	// Status.Volumes[i].DiskState.
+	if len(st.Volumes) > 0 {
+		out.DrbdVolumes = make([]apiv1.DrbdVolume, 0, len(st.Volumes))
+		for i := range st.Volumes {
+			vol := &st.Volumes[i]
+			if vol.DiskState == "" && vol.DevicePath == "" {
+				continue
+			}
+
+			out.DrbdVolumes = append(out.DrbdVolumes, apiv1.DrbdVolume{
+				VolumeNumber: vol.VolumeNumber,
+				DiskState:    vol.DiskState,
+				DevicePath:   vol.DevicePath,
+			})
+
+			hasAny = true
+		}
+	}
+
 	if !hasAny {
 		return nil
 	}
