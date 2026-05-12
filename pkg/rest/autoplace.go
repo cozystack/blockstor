@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -134,6 +135,17 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 
 	filter := mergeAutoplaceFilter(r.Context(), s.Store, &rd, &req.SelectFilter)
 
+	// snapshot-restore-resource stamps BlockstorRestoreFromSnapshot
+	// on the new RD. Without satellite-to-satellite zfs/thin send-recv
+	// (upstream's cross-node clone path), a replica landed on a node
+	// that doesn't have the snapshot locally would have to fall back
+	// to a blank CreateVolume + DRBD initial-sync — and the metadata-
+	// from-clone peer interacts badly with the fresh-create peer,
+	// yielding incorrect data. Until send-recv lands, default the
+	// candidate node list to the snapshot's nodes when the caller
+	// didn't pin one explicitly.
+	constrainAutoplaceToSnapshotNodes(r.Context(), s.Store, &rd, &filter)
+
 	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, &filter)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -157,6 +169,43 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
 	}})
+}
+
+// constrainAutoplaceToSnapshotNodes restricts the filter's
+// NodeNameList to the snapshot's nodes when the RD was created via
+// snapshot-restore-resource and the caller didn't pin nodes
+// explicitly. See the call site for the why — without local
+// satellite-to-satellite send-recv, a clone on a node without the
+// snapshot can't converge to correct data.
+//
+// No-ops when:
+//   - the RD lacks the BlockstorRestoreFromSnapshot prop
+//   - the prop is malformed (missing colon)
+//   - the caller already supplied a NodeNameList (respect explicit intent)
+//   - the snapshot lookup fails (let placer fall back to all nodes)
+func constrainAutoplaceToSnapshotNodes(ctx context.Context, st store.Store, rd *apiv1.ResourceDefinition, filter *apiv1.AutoSelectFilter) {
+	if len(filter.NodeNameList) > 0 {
+		return
+	}
+
+	const restoreFromKey = "BlockstorRestoreFromSnapshot"
+
+	stamp := rd.Props[restoreFromKey]
+	if stamp == "" {
+		return
+	}
+
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return
+	}
+
+	snap, err := st.Snapshots().Get(ctx, srcRD, snapName)
+	if err != nil || len(snap.Nodes) == 0 {
+		return
+	}
+
+	filter.NodeNameList = append([]string(nil), snap.Nodes...)
 }
 
 // apiCallRcInfo is upstream LINSTOR's MASK_INFO bit (0x0040_…).
