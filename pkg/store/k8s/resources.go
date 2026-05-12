@@ -315,8 +315,11 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			InUse:     boolPtr(crd.Status.InUse),
 			DrbdState: crd.Status.DrbdState,
 		},
-		Volumes: volumesFromStatus(crd.Status.Volumes),
-		UUID:    string(crd.UID),
+		Volumes: volumesWithReplicationStates(
+			volumesFromStatus(crd.Status.Volumes),
+			crd.Status.Connections,
+		),
+		UUID: string(crd.UID),
 	}
 }
 
@@ -379,6 +382,44 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 	}
 
 	return out
+}
+
+// volumesWithReplicationStates folds the resource-level per-peer
+// replication state into each volume's state.replication_states
+// map. The Python CLI reads exactly this shape for the Repl column
+// — it cannot infer per-peer replication from
+// `layer_object.drbd.connections[].replication_state`, even though
+// blockstor stores the data there too.
+func volumesWithReplicationStates(
+	vols []apiv1.Volume,
+	conns []crdv1alpha1.ResourceConnectionStatus,
+) []apiv1.Volume {
+	if len(vols) == 0 || len(conns) == 0 {
+		return vols
+	}
+
+	states := make(map[string]apiv1.ReplicationState, len(conns))
+
+	for i := range conns {
+		c := &conns[i]
+		if c.ReplicationState == "" {
+			continue
+		}
+
+		states[c.PeerNodeName] = apiv1.ReplicationState{
+			ReplicationState: c.ReplicationState,
+		}
+	}
+
+	if len(states) == 0 {
+		return vols
+	}
+
+	for i := range vols {
+		vols[i].State.ReplicationStates = states
+	}
+
+	return vols
 }
 
 // volumeLayerDataFromStack mirrors the resource-level layer stack

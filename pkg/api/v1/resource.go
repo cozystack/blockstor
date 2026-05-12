@@ -118,6 +118,31 @@ type VolumeState struct {
 	//   progress = (1 - OutOfSyncKib / VolumeDefinition.SizeKib) * 100
 	// 0 means fully in sync.
 	OutOfSyncKib int64 `json:"out_of_sync_kib,omitempty"`
+
+	// ReplicationStates is the per-peer replication-state map the
+	// Python CLI reads for the `linstor v list` Repl column. Keyed
+	// by peer node name. When every peer is `Established`, the CLI
+	// renders the column as `Established(N)`; non-uniform states
+	// surface per-peer with optional sync-progress percentages.
+	ReplicationStates map[string]ReplicationState `json:"replication_states,omitempty"`
+}
+
+// ReplicationState is one entry of VolumeState.ReplicationStates:
+// the DRBD-9 replication state to a single peer plus an optional
+// sync-progress percentage. Mirrors upstream LINSTOR's
+// `ReplicationState` REST shape.
+type ReplicationState struct {
+	// ReplicationState is the DRBD-9 replication-state token:
+	// `Established`, `SyncSource`, `SyncTarget`, `PausedSync*`,
+	// `VerifyS/T`, `Ahead`, `Behind`, `Off`, `WFBitMap*`, etc.
+	ReplicationState string `json:"replication_state,omitempty"`
+
+	// DonePercentage is a float in [0, 100] giving the syncing
+	// progress for `SyncTarget` / `PausedSync*` / `VerifyT` states.
+	// nil for `Established` (nothing to sync) — the JSON `omitempty`
+	// drops it when 0 too, which is fine: the CLI renders "?" when
+	// the field is absent.
+	DonePercentage *float64 `json:"done_percentage,omitempty"`
 }
 
 // VolumeObservation carries per-volume observed state propagated from
