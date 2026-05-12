@@ -47,16 +47,27 @@ const (
 	// announces for its fake nodes. Real oracle never opens this;
 	// the test just needs a structurally-valid NodeCreate body.
 	loopbackSatellitePort = 3366
+	// Shared constants for NodeCreate payloads — lifted so goconst
+	// stops flagging every NodeCreate site and a future LINSTOR
+	// rename (e.g. SATELLITE → AGENT) lands in one place.
+	nodeTypeSatellite    = "SATELLITE"
+	nodeIfaceDefaultName = "default"
+	nodeEncryptionPlain  = "PLAIN"
 )
 
 func selectPhases(name string) []phase {
 	all := []phase{
 		{"bootstrap", phaseBootstrap},
 		{"controller-props", phaseControllerProps},
+		{"controller-config", phaseStats},
 		{"error-reports", phaseErrorReports},
+		{"remotes", phaseRemotes},
+		{"key-value-store", phaseKeyValueStore},
 		{"nodes", phaseNodes},
+		{"node-ops", phaseNodeOps},
 		{"resource-groups", phaseResourceGroups},
 		{"resource-definitions", phaseResourceDefinitions},
+		{"view-empty", phaseViewEmpty},
 	}
 
 	if name == "all" {
@@ -119,12 +130,12 @@ func phaseNodes(ctx context.Context, c *client.Client) error {
 	for _, name := range []string{traceNode1, traceNode2} {
 		err := c.Nodes.Create(ctx, client.Node{
 			Name: name,
-			Type: "SATELLITE",
+			Type: nodeTypeSatellite,
 			NetInterfaces: []client.NetInterface{{
-				Name:                    "default",
+				Name:                    nodeIfaceDefaultName,
 				Address:                 net.ParseIP("127.0.0.1"),
 				SatellitePort:           loopbackSatellitePort,
-				SatelliteEncryptionType: "PLAIN",
+				SatelliteEncryptionType: nodeEncryptionPlain,
 			}},
 		})
 		if err != nil {
