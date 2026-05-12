@@ -16,4 +16,6 @@
 *.out
 *.test
 *.prof
-linstor-trace-recorder
+# Anchored with leading `/` so the rule matches only the binary
+# at the repo root, not the cmd/linstor-trace-recorder/ source dir.
+/linstor-trace-recorder
