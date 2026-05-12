@@ -150,6 +150,15 @@ if [[ "$s1" != *"disk:UpToDate"* ]]; then
     exit 1
 fi
 
+# Demote $N2 so $N1 can promote and read. With dual-primaries
+# disabled (the default) `drbdadm primary` from within read_md5
+# would fail silently on $N1 while $N2 still holds Primary, and
+# the subsequent `dd` opens the still-suspended block device and
+# trips `No data available` (ENODATA from quorum-on-no-data path).
+echo ">> demote $N2 so $N1 can read"
+on_node "$N2" drbdadm secondary "$RD" || true
+sleep 5
+
 echo ">> read on $N1 after heal — md5 must match $md5_majority"
 md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")
 if [[ "$md5_after" != "$md5_majority" ]]; then
