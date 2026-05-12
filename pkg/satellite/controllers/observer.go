@@ -18,7 +18,9 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cockroachdb/errors"
@@ -563,6 +565,16 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
+	logger := log.FromContext(ctx).WithName("observer")
+	logger.Info("writeStatus pre-patch",
+		"name", name,
+		"vols", len(apply.Status.Volumes),
+		"vols_diskState", volumesDiskStateSummary(apply.Status.Volumes),
+		"conns", len(apply.Status.Connections),
+		"inUse", apply.Status.InUse,
+		"drbdState", apply.Status.DrbdState,
+	)
+
 	err = o.Client.Status().Patch(ctx, apply,
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
 		client.FieldOwner(k8s.SatelliteFieldOwner),
@@ -571,7 +583,24 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
 	}
 
+	logger.Info("writeStatus post-patch ok", "name", name)
+
 	return nil
+}
+
+// volumesDiskStateSummary formats Volumes for the diagnostic log so
+// we can see what disk states are being SSA-claimed at each Patch.
+func volumesDiskStateSummary(vols []blockstoriov1alpha1.ResourceVolumeStatus) string {
+	if len(vols) == 0 {
+		return "[]"
+	}
+
+	parts := make([]string, 0, len(vols))
+	for i := range vols {
+		parts = append(parts, fmt.Sprintf("vol%d=%q", vols[i].VolumeNumber, vols[i].DiskState))
+	}
+
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // buildObserverVolumeStatus packs the per-volume observations
