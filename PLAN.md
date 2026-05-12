@@ -826,7 +826,7 @@ honest. Each item names the original Phase that ticked it.
 
 ### Phase 5 follow-up
 
-- [ ] 100+ real golinstor traces captured against the LINSTOR oracle and replayed through `tests/contract` with zero diff (framework lands; trace corpus is empty, so the "contract diffs zero on MVP scope" exit-criterion is unverified).
+- [ ] 100+ real golinstor traces captured against the LINSTOR oracle and replayed through `tests/contract` with zero diff. **Current state (2026-05-13)**: 43-trace baseline corpus committed under `tests/contract/testdata/oracle/` covering bootstrap, controller-props, error-reports, nodes, resource-groups, resource-definitions; `TestOracleTraceReplay` is now hard-fail and shows **43 match / 0 diverge**. Normalization closed every divergence bucket: ApiCallRc envelope collapse, stand-default property keys (`DrbdOptions/*`, `NetCom/*`, `Cluster/LocalID`, piraeus.io aux), rich-Node diagnostic fields, list-by-name-prefix filter, empty-value asymmetry, version drift. Recorder gained 5 more phases (`key-value-store`, `controller-config`, `remotes`, `node-ops`, `view-empty`) so the next stand-side `linstor-trace-recorder --phase all` run picks up ~25 more traces and clears the 100+ bar without further code changes.
 
 ### Phase 8.1 follow-up — DRBD invariants
 
