@@ -340,55 +340,84 @@ func (p *Provider) SendSnapshot(_ context.Context, snap storage.Snapshot) (io.Re
 	return snapshotFile, nil
 }
 
-// RecvSnapshot writes the byte stream into target's .img file and
-// attaches a loop device, the same tail CreateVolume runs. Pre-
-// existing target → no-op (idempotent across satellite restarts).
+// RecvSnapshot writes the byte stream into target's .img and attaches
+// a loop device, idempotent across satellite restarts and atomic
+// against a mid-transfer crash on either side.
 //
-// The receiver expects raw file bytes — matches SendSnapshot's
-// stream shape. drbdmeta drop-md + create-md follow on the caller
-// side to stamp this node's DRBD node-id over the metadata block
-// embedded in the stream.
+// Resilience: stream into `<target>.partial`, then rename to the final
+// path on success. On the next reconcile:
+//
+//   - final exists, .partial absent → resumed; attach loop, return.
+//   - final absent, .partial present → previous run aborted before
+//     rename; drop the .partial and re-stream from scratch.
+//   - both absent → first run; open .partial, stream, rename.
+//
+// The rename is atomic on Linux ext4/xfs/btrfs/zfs (single-directory,
+// same filesystem) so an interrupted recv never leaves the final
+// path pointing at a truncated copy.
+//
+// drbdmeta drop-md + create-md follow on the caller side to stamp
+// this node's DRBD node-id over the metadata block embedded in the
+// stream.
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
-	dstPath := p.volumePath(target)
+	finalPath := p.volumePath(target)
+	partialPath := finalPath + ".partial"
 
-	_, statErr := os.Stat(dstPath)
+	_, statErr := os.Stat(finalPath)
 	if statErr == nil {
-		// Pre-existing target — ensure the loop is up and return.
-		_, err := p.attach(ctx, dstPath)
+		_, err := p.attach(ctx, finalPath)
 		if err != nil {
-			return errors.Wrapf(err, "losetup %s", dstPath)
+			return errors.Wrapf(err, "losetup %s", finalPath)
 		}
 
 		return nil
 	}
 
 	if !os.IsNotExist(statErr) {
-		return errors.Wrapf(statErr, "stat %s", dstPath)
+		return errors.Wrapf(statErr, "stat %s", finalPath)
 	}
 
-	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, volumeFilePerm)
+	// Either no prior attempt or one that aborted before rename. Drop
+	// the leftover .partial (if any) so OpenFile O_EXCL succeeds and
+	// we re-stream from byte zero — partial bytes from a previous
+	// crash are unsafe to trust.
+	err := os.Remove(partialPath)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove stale %s", partialPath)
+	}
+
+	dst, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, volumeFilePerm)
 	if err != nil {
-		return errors.Wrapf(err, "create %s", dstPath)
+		return errors.Wrapf(err, "create %s", partialPath)
 	}
 
-	_, err = io.Copy(dst, src)
-	cErr := dst.Close()
+	_, copyErr := io.Copy(dst, src)
+	closeErr := dst.Close()
 
+	if copyErr != nil {
+		_ = os.Remove(partialPath)
+
+		return errors.Wrapf(copyErr, "stream into %s", partialPath)
+	}
+
+	if closeErr != nil {
+		_ = os.Remove(partialPath)
+
+		return errors.Wrapf(closeErr, "close %s", partialPath)
+	}
+
+	// Atomic publish: the .partial → final rename is the single point
+	// after which a future reconcile must consider this recv complete.
+	err = os.Rename(partialPath, finalPath)
 	if err != nil {
-		_ = os.Remove(dstPath)
+		_ = os.Remove(partialPath)
 
-		return errors.Wrapf(err, "stream into %s", dstPath)
+		return errors.Wrapf(err, "rename %s → %s", partialPath, finalPath)
 	}
 
-	if cErr != nil {
-		_ = os.Remove(dstPath)
-
-		return errors.Wrapf(cErr, "close %s", dstPath)
-	}
-
-	_, err = p.attach(ctx, dstPath)
+	_, err = p.attach(ctx, finalPath)
 	if err != nil {
-		return errors.Wrapf(err, "losetup %s", dstPath)
+		return errors.Wrapf(err, "losetup %s", finalPath)
 	}
 
 	return nil
