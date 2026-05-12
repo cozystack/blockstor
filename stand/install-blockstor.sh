@@ -40,11 +40,17 @@ kubectl apply -f "$REPO_ROOT/config/crd/bases/" 2>&1 | tail -5
 echo ">> apply controller + RBAC"
 sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5
 
+echo ">> apply apiserver + RBAC"
+sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-apiserver-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5
+
 echo ">> apply satellite DaemonSet"
 sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-satellite-daemonset.yaml" | kubectl apply -f - 2>&1 | tail -5
 
 echo ">> wait for controller Running"
 kubectl -n blockstor-system rollout status deploy/blockstor-controller --timeout=120s
+
+echo ">> wait for apiserver Running"
+kubectl -n blockstor-system rollout status deploy/blockstor-apiserver --timeout=120s
 
 echo ">> wait for satellites (3 workers)"
 deadline=$(( $(date +%s) + 180 ))

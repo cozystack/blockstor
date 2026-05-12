@@ -74,11 +74,17 @@ step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
 step "force-delete controller pod" "kubectl -n blockstor-system delete pod -l app=blockstor-controller --grace-period=0 --force --ignore-not-found 2>&1 | tail -2" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
+step "force-delete apiserver pods" "kubectl -n blockstor-system delete pod -l app=blockstor-apiserver --grace-period=0 --force --ignore-not-found 2>&1 | tail -3" \
+    || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
+
 step "graceful-delete satellite pods" "kubectl -n blockstor-system delete pod -l app=blockstor-satellite --ignore-not-found --timeout=60s 2>&1 | tail -3" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
 step "rollout-status (controller)" "kubectl -n blockstor-system rollout status deploy/blockstor-controller --timeout=120s" \
     || { echo "$NAME rollout-controller FAIL" > "$RESULT"; exit 1; }
+
+step "rollout-status (apiserver)" "kubectl -n blockstor-system rollout status deploy/blockstor-apiserver --timeout=120s" \
+    || { echo "$NAME rollout-apiserver FAIL" > "$RESULT"; exit 1; }
 
 step "rollout-status (satellite)" "kubectl -n blockstor-system rollout status ds/blockstor-satellite --timeout=120s" \
     || { echo "$NAME rollout-satellite FAIL" > "$RESULT"; exit 1; }

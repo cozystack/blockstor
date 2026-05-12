@@ -73,7 +73,9 @@ spec:
           image: __REGISTRY__/blockstor:dev
           imagePullPolicy: Always
           args:
-            - --rest-bind-address=:3370
+            # REST API moved to the separate apiserver Deployment
+            # (cmd/apiserver) — controller now only runs reconcilers.
+            - --enable-rest-api=false
             - --satellite-grpc-bind-address=:7000
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
@@ -81,11 +83,10 @@ spec:
             - --store=k8s
             - --cluster-id=blockstor-stand
           ports:
-            - {name: rest, containerPort: 3370}
             - {name: grpc, containerPort: 7000}
             - {name: health, containerPort: 8081}
           readinessProbe:
-            tcpSocket: {port: 3370}
+            httpGet: {path: /readyz, port: 8081}
             initialDelaySeconds: 5
           livenessProbe:
             httpGet: {path: /healthz, port: 8081}
@@ -106,7 +107,13 @@ metadata:
   name: blockstor-controller
   namespace: blockstor-system
 spec:
-  selector: {app: blockstor-controller}
+  # Selector points at the apiserver pods so existing callers of
+  # `blockstor-controller:3370` (linstor-csi, piraeus-operator, the
+  # `linstor` CLI port-forward in tests/e2e) keep working without
+  # any URL change. The controller Deployment itself no longer
+  # serves :3370. The :7000 grpc port is legacy (Phase 10.6
+  # retired the gRPC contract); kept on the Service for now since
+  # any stale client hitting it gets a clean connection-refused.
+  selector: {app: blockstor-apiserver}
   ports:
     - {name: rest, port: 3370, targetPort: 3370}
-    - {name: grpc, port: 7000, targetPort: 7000}

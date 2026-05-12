@@ -1,0 +1,122 @@
+---
+# Standalone apiserver Deployment — the LINSTOR-compatible REST front
+# end split out of the controller binary. Three replicas behind a
+# Service so linstor-csi / `linstor` CLI / piraeus-operator polling
+# spreads across pods, leaving the single-leader controller binary
+# free of view-API contention.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blockstor-apiserver
+  namespace: blockstor-system
+---
+# RBAC: same Spec.CRDs surface as the controller (the REST handlers
+# call into the same Store interface and need to manipulate every
+# blockstor.io CRD for create / delete / list / view endpoints).
+# Narrowing further is tracked as a follow-up — the REST handlers
+# don't need /finalizers, for instance — but the safe initial cut
+# is identical to the controller's role so the migration doesn't
+# regress any REST path.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: blockstor-apiserver
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*"]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [blockstor.io.blockstor.io]
+    resources: ["*/status", "*/finalizers"]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: blockstor-apiserver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: blockstor-apiserver
+subjects:
+  - kind: ServiceAccount
+    name: blockstor-apiserver
+    namespace: blockstor-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blockstor-apiserver
+  namespace: blockstor-system
+  labels: {app: blockstor-apiserver}
+spec:
+  # Three replicas keeps reads serving on a per-pod restart while
+  # the operator rolls the apiserver image. Reads are stateless;
+  # writes go straight through to apiserver with optimistic
+  # concurrency on resourceVersion, so two replicas can write
+  # concurrently and the apiserver arbitrates.
+  replicas: 3
+  selector: {matchLabels: {app: blockstor-apiserver}}
+  template:
+    metadata: {labels: {app: blockstor-apiserver}}
+    spec:
+      serviceAccountName: blockstor-apiserver
+      # Spread replicas across nodes when possible so a single
+      # node loss doesn't take all apiserver pods at once.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: blockstor-apiserver}
+      containers:
+        - name: apiserver
+          image: __REGISTRY__/blockstor-apiserver:dev
+          imagePullPolicy: Always
+          args:
+            - --rest-bind-address=:3370
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=0
+            - --store=k8s
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: rest, containerPort: 3370}
+            - {name: health, containerPort: 8081}
+          readinessProbe:
+            tcpSocket: {port: 3370}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}
+            initialDelaySeconds: 15
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+---
+# Re-point the existing blockstor-controller Service so callers
+# of the merged REST endpoint (linstor-csi, piraeus-operator, the
+# `linstor` CLI) keep working — they hit the apiserver pods
+# instead of the controller. The :7000 satellite-grpc port stays
+# on the controller (retired in Phase 10.6 but the port name is
+# retained for compatibility).
+apiVersion: v1
+kind: Service
+metadata:
+  name: blockstor-apiserver
+  namespace: blockstor-system
+spec:
+  selector: {app: blockstor-apiserver}
+  ports:
+    - {name: rest, port: 3370, targetPort: 3370}

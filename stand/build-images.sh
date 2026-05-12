@@ -18,11 +18,17 @@ cd "$REPO_ROOT"
 echo ">> docker build $REGISTRY/blockstor:dev (controller stage)"
 docker build --target controller -t "$REGISTRY/blockstor:dev" .
 
+echo ">> docker build $REGISTRY/blockstor-apiserver:dev (apiserver stage)"
+docker build --target apiserver -t "$REGISTRY/blockstor-apiserver:dev" .
+
 echo ">> docker build $REGISTRY/blockstor-satellite:dev (satellite stage)"
 docker build --target satellite  -t "$REGISTRY/blockstor-satellite:dev" .
 
 echo ">> docker push $REGISTRY/blockstor:dev"
 docker push "$REGISTRY/blockstor:dev"
+
+echo ">> docker push $REGISTRY/blockstor-apiserver:dev"
+docker push "$REGISTRY/blockstor-apiserver:dev"
 
 echo ">> docker push $REGISTRY/blockstor-satellite:dev"
 docker push "$REGISTRY/blockstor-satellite:dev"

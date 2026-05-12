@@ -20,6 +20,7 @@ COPY . .
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o controller ./cmd/controller
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o apiserver  ./cmd/apiserver
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o satellite  ./cmd/satellite
 
 # The satellite needs to shell out to drbdadm/lvs/zfs/cryptsetup, none
@@ -32,6 +33,16 @@ WORKDIR /
 COPY --from=builder /workspace/controller .
 USER 65532:65532
 ENTRYPOINT ["/controller"]
+
+# The apiserver is the LINSTOR-compatible REST front-end split out
+# of the controller (Phase 11). It runs N replicas behind a Service
+# and serves linstor-csi / `linstor` CLI / piraeus-operator. Same
+# distroless surface as the controller — no shell-outs.
+FROM gcr.io/distroless/static:nonroot AS apiserver
+WORKDIR /
+COPY --from=builder /workspace/apiserver .
+USER 65532:65532
+ENTRYPOINT ["/apiserver"]
 
 FROM debian:trixie-slim AS satellite
 # zfsutils-linux is in contrib on trixie — enable it so we can pull
