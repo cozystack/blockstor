@@ -60,13 +60,21 @@ step() {
 step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
     || { echo "$NAME apply-crds FAIL" > "$RESULT"; exit 1; }
 
-# Force-delete pods (not just rollout restart) — observed on the
-# 17-stand matrix: a plain rollout-restart with imagePullPolicy:Always
-# still uses the previously-pulled image layer for ~half the stands
-# even after a `--no-cache` rebuild + push. Force-delete makes
-# kubelet do a fresh `containerd images pull` on pod recreate, which
-# resolves the `:dev` tag to the current registry manifest digest.
-step "force-delete pods" "kubectl -n blockstor-system delete pod -l app=blockstor-controller --grace-period=0 --force --ignore-not-found 2>&1 | tail -2; kubectl -n blockstor-system delete pod -l app=blockstor-satellite --grace-period=0 --force --ignore-not-found 2>&1 | tail -3" \
+# Graceful pod delete: controller goes force (no DRBD state to drain),
+# satellites get the full terminationGracePeriodSeconds so the PreStop
+# hook can run `drbdadm down --all` and release every DRBD connection
+# before SIGTERM. Without the graceful drain, the kernel module (which
+# is host-level on the Talos node — shared across pod restarts!) keeps
+# half-open `Connecting` peer states forever, and the next iter's
+# `drbdsetup down` blocks waiting for the gone peer to ack. PreStop is
+# only invoked on normal termination, not on `--force --grace-period=0`.
+#
+# imagePullPolicy: Always on both objects ensures kubelet still
+# resolves :dev to the current digest on pod recreate.
+step "force-delete controller pod" "kubectl -n blockstor-system delete pod -l app=blockstor-controller --grace-period=0 --force --ignore-not-found 2>&1 | tail -2" \
+    || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
+
+step "graceful-delete satellite pods" "kubectl -n blockstor-system delete pod -l app=blockstor-satellite --ignore-not-found --timeout=60s 2>&1 | tail -3" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
 step "rollout-status (controller)" "kubectl -n blockstor-system rollout status deploy/blockstor-controller --timeout=120s" \

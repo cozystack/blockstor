@@ -87,6 +87,8 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
+      # Allow the preStop hook below ~25s to drain DRBD before SIGTERM.
+      terminationGracePeriodSeconds: 30
       containers:
         - name: satellite
           image: __REGISTRY__/blockstor-satellite:dev
@@ -123,6 +125,30 @@ spec:
               protocol: TCP
           securityContext:
             privileged: true
+          # PreStop hook: gracefully release DRBD-9 connections
+          # before SIGTERM. Without this, `kubectl delete pod`
+          # (no --force) leaves drbd kernel state with stuck
+          # `Connecting` peers, and the kernel module is
+          # host-level on the Talos node so it persists across
+          # pod restarts. `drbdadm down --all` walks /etc/drbd.d
+          # in order; the per-resource 5s budget keeps a single
+          # half-hung connection from blocking the whole drain.
+          # Wrapped in `timeout 25` so the overall hook stays
+          # under terminationGracePeriodSeconds (30).
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set +e
+                    timeout 25 sh -c '
+                      for r in $(drbdsetup status --json 2>/dev/null \
+                          | python3 -c "import json,sys; print(\" \".join(r[\"name\"] for r in json.load(sys.stdin)))" 2>/dev/null); do
+                        timeout 5 drbdadm down "$r" 2>/dev/null || true
+                      done
+                    '
           volumeMounts:
             - {name: dev, mountPath: /dev}
             - {name: modules, mountPath: /lib/modules, readOnly: true}
