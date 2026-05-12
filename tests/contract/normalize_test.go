@@ -183,6 +183,72 @@ func TestNormalizeOperatorPropsDropped(t *testing.T) {
 	}
 }
 
+// TestNormalizePropertyBagDropsStandDefaults pins the
+// /v1/controller/properties scrub rule: when the response is a flat
+// LINSTOR property bag, stand-default keys (DrbdOptions/*, NetCom/*,
+// Cluster/LocalID, defaultXxx) and operator-managed Aux/piraeus.io/*
+// entries get stripped so the recorder corpus contains only what the
+// recorder itself sets (Aux/trace-recorder-*).
+func TestNormalizePropertyBagDropsStandDefaults(t *testing.T) {
+	in := []byte(`{
+		"Aux/trace-recorder-stamp":"yes",
+		"Aux/piraeus.io/managed-by":"piraeus-operator",
+		"Cluster/LocalID":"550e8400-e29b-41d4-a716-446655440000",
+		"DrbdOptions/auto-resync-after-disable":"True",
+		"NetCom/PlainConnector/Port":"3376",
+		"defaultPlainConSvc":"PlainConnector"
+	}`)
+
+	out, err := contract.Normalize(in)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, dropped := range []string{
+		"Aux/piraeus.io/managed-by",
+		"Cluster/LocalID",
+		"DrbdOptions/auto-resync-after-disable",
+		"NetCom/PlainConnector/Port",
+		"defaultPlainConSvc",
+	} {
+		if _, present := decoded[dropped]; present {
+			t.Errorf("stand-default key %q should be dropped: %s", dropped, out)
+		}
+	}
+
+	if decoded["Aux/trace-recorder-stamp"] != "yes" {
+		t.Errorf("trace-recorder prop lost: %s", out)
+	}
+}
+
+// TestNormalizePropertyBagLeavesNonBagsAlone pins the heuristic's
+// false-positive guard: a map of strings WITHOUT property-style keys
+// (no slashes, no defaultXxx markers) is NOT a property bag and must
+// not get its keys filtered. Without this guard, e.g. a `{"name":"foo"}`
+// response would lose its `name` field.
+func TestNormalizePropertyBagLeavesNonBagsAlone(t *testing.T) {
+	in := []byte(`{"name":"foo","external_name":"bar"}`)
+
+	out, err := contract.Normalize(in)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(out, &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if decoded["name"] != "foo" || decoded["external_name"] != "bar" {
+		t.Errorf("non-bag map keys corrupted: %s", out)
+	}
+}
+
 // TestNormalizeBuildTimeAndGitHashDropped pins the /controller/version
 // rule. build_time and git_hash vary per binary; only the
 // rest_api_version contract matters across stands.
