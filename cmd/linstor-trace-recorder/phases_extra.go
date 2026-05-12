@@ -105,13 +105,18 @@ func phaseKeyValueStore(ctx context.Context, c *client.Client) error {
 	return nil
 }
 
-// phaseStats captures the single /v1/stats read. Tiny, but it pins
-// the wire shape (object with numeric counters) that monitoring +
-// `linstor controller list` rely on.
-func phaseStats(ctx context.Context, c *client.Client) error {
-	// golinstor doesn't expose /v1/stats — it's blockstor-extension /
-	// piraeus-side telemetry. Reach for it through the raw HTTP
-	// client so the recorder still emits the trace.
+// phaseControllerConfig captures golinstor's
+// Controller.GetConfig() — a single GET /v1/controller/config. The
+// upstream oracle returns a deep ControllerConfig tree (db / http /
+// log / debug / ldap); blockstor returns `{}` since cozystack runs
+// no JVM-style flat-file config. Both shapes normalise away the
+// difference (every field is `omitempty`).
+//
+// golinstor doesn't expose /v1/stats — that's a
+// blockstor-extension / piraeus-side telemetry endpoint, so the
+// "stats" recording lands as a smoke trace in
+// tests/contract/testdata/smoke/04-stats-empty.json instead.
+func phaseControllerConfig(ctx context.Context, c *client.Client) error {
 	_, err := c.Controller.GetConfig(ctx)
 	if err != nil {
 		return errors.Wrap(err, "controller config")

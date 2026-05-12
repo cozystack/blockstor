@@ -59,7 +59,7 @@ func selectPhases(name string) []phase {
 	all := []phase{
 		{"bootstrap", phaseBootstrap},
 		{"controller-props", phaseControllerProps},
-		{"controller-config", phaseStats},
+		{"controller-config", phaseControllerConfig},
 		{"error-reports", phaseErrorReports},
 		{"remotes", phaseRemotes},
 		{"key-value-store", phaseKeyValueStore},
