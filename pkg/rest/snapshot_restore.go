@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -76,19 +77,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Snapshot name precedence: URL path (upstream LINSTOR shape) >
-	// body `from_snapshot` > body `snapshot_name`. Empty after all
-	// three lookups → 400 with a meaningful message instead of the
-	// confusing 404 from a NotFound on Get(ctx, rd, "").
-	snapName := r.PathValue("snap")
-	if snapName == "" {
-		snapName = req.FromSnapshot
-	}
-
-	if snapName == "" {
-		snapName = req.SnapshotName
-	}
-
+	snapName := resolveSnapshotName(r, &req)
 	if snapName == "" {
 		writeError(w, http.StatusBadRequest, "snapshot name required (URL path, from_snapshot, or snapshot_name)")
 
@@ -102,12 +91,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newRD := apiv1.ResourceDefinition{
-		Name:  req.ToResource,
-		Props: snap.Props,
-	}
-
-	err = s.Store.ResourceDefinitions().Create(r.Context(), &newRD)
+	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -116,6 +100,77 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "snapshot restored: " + snapName + " → " + newRD.Name,
+		Message: "snapshot restored: " + snapName + " → " + newRDName,
 	}})
+}
+
+// resolveSnapshotName picks the snapshot name from the three accepted
+// wire dialects (URL path, body from_snapshot, body snapshot_name)
+// in precedence order. Empty result = caller should reject with 400.
+func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
+	if v := r.PathValue("snap"); v != "" {
+		return v
+	}
+
+	if req.FromSnapshot != "" {
+		return req.FromSnapshot
+	}
+
+	return req.SnapshotName
+}
+
+// materializeRestoredRD creates the target RD inheriting the source
+// RD's LayerStack + Props (snapshot Props win when set) and hydrates
+// its VolumeDefinitions from the snapshot's recorded volume layout.
+// Returns the new RD's name on success.
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot) (string, error) {
+	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
+	if err != nil {
+		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	newRD := apiv1.ResourceDefinition{
+		Name:       req.ToResource,
+		Props:      snap.Props,
+		LayerStack: srcRDObj.LayerStack,
+	}
+
+	if newRD.Props == nil {
+		newRD.Props = srcRDObj.Props
+	}
+
+	err = s.Store.ResourceDefinitions().Create(ctx, &newRD)
+	if err != nil {
+		return "", err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	err = hydrateVolumesFromSnapshot(ctx, s, newRD.Name, snap)
+	if err != nil {
+		return "", err
+	}
+
+	return newRD.Name, nil
+}
+
+// hydrateVolumesFromSnapshot copies the snapshot's recorded
+// VolumeDefinitions onto the freshly-created restore-target RD.
+// Without this, the new RD has zero volumes and any subsequent
+// autoplace creates empty Resources that never reach UpToDate.
+// linstor-csi's CreateVolume-from-source path relies on this
+// hydration to surface the cloned PVC's block device.
+func hydrateVolumesFromSnapshot(ctx context.Context, s *Server, rdName string, snap *apiv1.Snapshot) error {
+	for i := range snap.VolumeDefinitions {
+		svd := &snap.VolumeDefinitions[i]
+		vd := apiv1.VolumeDefinition{
+			VolumeNumber: svd.VolumeNumber,
+			SizeKib:      svd.SizeKib,
+		}
+
+		err := s.Store.VolumeDefinitions().Create(ctx, rdName, &vd)
+		if err != nil {
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+	}
+
+	return nil
 }
