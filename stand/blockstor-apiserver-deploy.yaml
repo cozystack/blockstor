@@ -10,30 +10,24 @@ metadata:
   name: blockstor-apiserver
   namespace: blockstor-system
 ---
-# RBAC: same Spec.CRDs surface as the controller (the REST handlers
-# call into the same Store interface and need to manipulate every
-# blockstor.io CRD for create / delete / list / view endpoints).
-# Narrowing further is tracked as a follow-up — the REST handlers
-# don't need /finalizers, for instance — but the safe initial cut
-# is identical to the controller's role so the migration doesn't
-# regress any REST path.
+# RBAC narrowed compared to the controller's role. The REST
+# handlers don't:
+#   - update Status (only reconcilers + satellites do, via the
+#     /status subresource — apiserver's grep -E
+#     '\.(Status\(\)|SetState)' is empty in pkg/rest).
+#   - touch /finalizers (only reconcilers add/strip).
+#   - emit Events (no reconcile-trigger writes from REST).
+#   - need leases (leader election is off — every apiserver
+#     replica serves independently).
+# What's left is plain CRUD on the blockstor.io CRDs themselves.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: blockstor-apiserver
 rules:
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch]
-  - apiGroups: [coordination.k8s.io]
-    resources: [leases]
-    verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [blockstor.io.blockstor.io]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [blockstor.io.blockstor.io]
-    resources: ["*/status", "*/finalizers"]
-    verbs: [get, update, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

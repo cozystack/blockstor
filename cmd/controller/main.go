@@ -65,19 +65,13 @@ func main() {
 	var enableHTTP2 bool
 	var restAddr string
 	var enableRestAPI bool
-	var satelliteGRPCAddr string
-	var clusterID string
 	var storeKind string
 	var controllerNamespace string
 	var tlsOpts []func(*tls.Config)
-	flag.BoolVar(&enableRestAPI, "enable-rest-api", true,
-		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Disable when running the apiserver as a separate Deployment (cmd/apiserver) — keeping reconciler workers from contending with linstor-csi view-API traffic.")
+	flag.BoolVar(&enableRestAPI, "enable-rest-api", false,
+		"Mount the LINSTOR-compatible REST API alongside the reconcilers. Default is OFF — the apiserver runs as a separate Deployment (cmd/apiserver) since Phase 11.x. Set to true only for the legacy single-binary deployment.")
 	flag.StringVar(&restAddr, "rest-bind-address", ":3370",
 		"The address the LINSTOR-compatible REST API binds to (upstream LINSTOR plain-text port is 3370). Ignored when --enable-rest-api=false.")
-	flag.StringVar(&satelliteGRPCAddr, "satellite-grpc-bind-address", ":7000",
-		"The address the satellite-facing gRPC server binds to.")
-	flag.StringVar(&clusterID, "cluster-id", "",
-		"Stable identifier for this cluster, returned to satellites in Hello. Empty disables the check.")
 	flag.StringVar(&storeKind, "store", "k8s",
 		"Persistence backend for the REST API: 'k8s' (CRD-backed, default) or 'memory' (in-process, lost on restart, useful for tests).")
 	flag.StringVar(&controllerNamespace, "controller-namespace", "",

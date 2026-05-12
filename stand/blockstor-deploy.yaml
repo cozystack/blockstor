@@ -76,14 +76,11 @@ spec:
             # REST API moved to the separate apiserver Deployment
             # (cmd/apiserver) — controller now only runs reconcilers.
             - --enable-rest-api=false
-            - --satellite-grpc-bind-address=:7000
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
             - --leader-elect=false
             - --store=k8s
-            - --cluster-id=blockstor-stand
           ports:
-            - {name: grpc, containerPort: 7000}
             - {name: health, containerPort: 8081}
           readinessProbe:
             httpGet: {path: /readyz, port: 8081}
