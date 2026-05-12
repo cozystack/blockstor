@@ -129,6 +129,15 @@ func scrubWith(value any, opts NormalizeOptions) any {
 }
 
 func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
+	// ApiCallRc entries have an entirely different scrub policy
+	// from plain blockstor wire objects — the LINSTOR semantic is
+	// "did the call succeed", and message wording / object-ref
+	// tags / detail strings vary by implementation without
+	// breaking that semantic. Reduce to ret_code_class only.
+	if _, isCallRc := input["ret_code"]; isCallRc {
+		return scrubAPICallRc(input)
+	}
+
 	out := make(map[string]any, len(input))
 
 	for key, raw := range input {
@@ -159,6 +168,44 @@ func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 	return out
 }
 
+// scrubAPICallRc reduces a `ret_code`-bearing object (a single
+// element of LINSTOR's [ApiCallRc] envelope) to its semantic
+// classification. Java oracle and blockstor return different
+// numeric ret_code values, message strings, obj_refs, and details
+// for the same logical outcome — golinstor's
+// `responseToError` only inspects mask bits, never these cosmetic
+// fields. Drop everything but the class.
+//
+// Classification follows upstream's three mask bands:
+//
+//	ret_code < 0      → "<error>"  (MASK_ERROR sets the sign bit)
+//	ret_code & WARN   → "<warn>"   (MASK_WARN, 1<<33)
+//	otherwise         → "<info>"   (MASK_INFO + sub-classes are
+//	                                "the call succeeded")
+//
+// blockstor returns its own constant (1<<32) for every info path;
+// the oracle returns specific (MASK_INFO | object | action) ones.
+// Both reduce to "<info>" here.
+func scrubAPICallRc(input map[string]any) map[string]any {
+	retCode, _ := input["ret_code"].(float64)
+
+	// maskWarn matches upstream LINSTOR's ApiConsts.MASK_WARN = 1<<33.
+	const maskWarn = float64(1 << 33)
+
+	class := classInfo
+
+	switch {
+	case retCode < 0:
+		class = classError
+	case int64(retCode)&int64(maskWarn) != 0:
+		class = classWarn
+	}
+
+	return map[string]any{
+		keyClass: class,
+	}
+}
+
 func scrubProps(raw any) any {
 	props, ok := raw.(map[string]any)
 	if !ok {
@@ -179,6 +226,10 @@ func scrubProps(raw any) any {
 }
 
 func scrubSlice(input []any, opts NormalizeOptions) []any {
+	if collapsed, ok := collapseAPICallRcArray(input); ok {
+		return collapsed
+	}
+
 	filtered := filterListByNamePrefix(input, opts.KeepListNamePrefix)
 
 	out := make([]any, len(filtered))
@@ -187,6 +238,80 @@ func scrubSlice(input []any, opts NormalizeOptions) []any {
 	}
 
 	return out
+}
+
+// collapseAPICallRcArray reduces a `[]ApiCallRc` (every element a
+// map with a numeric `ret_code`) to a single semantic-class entry.
+// Java LINSTOR commonly returns several elements for one mutation
+// — `[ {created, info}, {satellite-not-connected, warn} ]` for
+// node-create against a node with no real satellite, or `[
+// {prop-set, info}, {modified, info} ]` for property+modify.
+// blockstor returns a single info regardless. Both reduce to
+// `[{ret_code_class: <info|warn|error>}]` so the comparison
+// focuses on success/fail semantics, not the per-element envelope.
+//
+// Returns (collapsed, true) when input matches the shape; (nil,
+// false) otherwise so plain arrays fall through to the regular
+// per-element scrubber.
+func collapseAPICallRcArray(input []any) ([]any, bool) {
+	if len(input) == 0 {
+		return nil, false
+	}
+
+	for _, entry := range input {
+		obj, ok := entry.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+
+		if _, hasRetCode := obj["ret_code"]; !hasRetCode {
+			return nil, false
+		}
+	}
+
+	worstClass := classInfo
+
+	for _, entry := range input {
+		obj, _ := entry.(map[string]any)
+		retCode, _ := obj["ret_code"].(float64)
+
+		entryClass := classifyRetCode(retCode)
+		if rank(entryClass) > rank(worstClass) {
+			worstClass = entryClass
+		}
+	}
+
+	return []any{map[string]any{keyClass: worstClass}}, true
+}
+
+// classifyRetCode maps a numeric LINSTOR ret_code to one of the
+// three semantic classes the contract test cares about. Mirrors
+// the per-element logic in scrubAPICallRc; kept separate so the
+// array collapser can pick the worst class across siblings.
+func classifyRetCode(retCode float64) string {
+	const maskWarn = float64(1 << 33)
+
+	switch {
+	case retCode < 0:
+		return classError
+	case int64(retCode)&int64(maskWarn) != 0:
+		return classWarn
+	default:
+		return classInfo
+	}
+}
+
+// rank orders the semantic classes so collapse picks the worst.
+// error > warn > info — any error in the array dominates.
+func rank(class string) int {
+	switch class {
+	case classError:
+		return 2
+	case classWarn:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // filterListByNamePrefix drops entries from an array of objects
@@ -261,4 +386,11 @@ const (
 	placeholderUUID      = "<uuid>"
 	placeholderTimestamp = "<timestamp>"
 	placeholderIP        = "<ip>"
+	// Semantic classes for the ApiCallRc collapse: every mutation
+	// reduces to one of these three regardless of how many
+	// elements the oracle / blockstor produced.
+	classInfo  = "<info>"
+	classWarn  = "<warn>"
+	classError = "<error>"
+	keyClass   = "ret_code_class"
 )
