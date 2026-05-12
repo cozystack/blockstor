@@ -17,6 +17,8 @@ limitations under the License.
 package rest
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -51,6 +53,8 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 
+	vdSizes := vdSizeIndex(r.Context(), s, resList)
+
 	for i := range resList {
 		if !matchAnyFold(nodeFilter, resList[i].NodeName) {
 			continue
@@ -60,19 +64,81 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		annotated := annotateSyncProgress(resList[i].Volumes, vdSizes[resList[i].Name])
+
 		// Resource.Volumes is sourced from CRD Status by
 		// crdToWireResource; ResourceWithVolumes is kept as a
 		// distinct wrapper for backwards-compat with anything
 		// still consuming the embedded shape — its Volumes field
 		// shadows Resource.Volumes via field promotion ordering,
 		// so the JSON output remains a single `volumes` key.
-		out = append(out, apiv1.ResourceWithVolumes{
+		rwv := apiv1.ResourceWithVolumes{
 			Resource: resList[i],
-			Volumes:  resList[i].Volumes,
-		})
+			Volumes:  annotated,
+		}
+		rwv.Resource.Volumes = annotated
+		out = append(out, rwv)
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// vdSizeIndex builds a {rdName → {volumeNumber → sizeKib}} lookup so
+// annotateSyncProgress can compute a sync % without per-volume RD
+// fetches. One ListAll over the store (the RD set is small relative
+// to Resource count) is cheaper than N round-trips.
+func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[string]map[int32]int64 {
+	out := map[string]map[int32]int64{}
+
+	seen := map[string]struct{}{}
+
+	for i := range resList {
+		seen[resList[i].Name] = struct{}{}
+	}
+
+	for rd := range seen {
+		vds, err := s.Store.VolumeDefinitions().List(ctx, rd)
+		if err != nil {
+			continue
+		}
+
+		idx := map[int32]int64{}
+		for j := range vds {
+			idx[vds[j].VolumeNumber] = vds[j].SizeKib
+		}
+
+		out[rd] = idx
+	}
+
+	return out
+}
+
+// annotateSyncProgress decorates each Volume.State.DiskState with a
+// "(N%)" suffix when OutOfSyncKib > 0 and the VD size is known.
+// Matches the CDI/upstream-LINSTOR rendering style — `linstor r list`
+// users see e.g. `Inconsistent(45%)` instead of a stale `Inconsistent`
+// label that gives no progress feedback. UpToDate replicas are left
+// alone since the suffix would just be `(100%)`.
+func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1.Volume {
+	if len(volumes) == 0 {
+		return volumes
+	}
+
+	out := make([]apiv1.Volume, len(volumes))
+	copy(out, volumes)
+
+	for i := range out {
+		size := sizes[out[i].VolumeNumber]
+		if size <= 0 || out[i].State.OutOfSyncKib <= 0 || out[i].State.DiskState == "" {
+			continue
+		}
+
+		percent := max(0, 100-(out[i].State.OutOfSyncKib*100)/size)
+
+		out[i].State.DiskState = fmt.Sprintf("%s(%d%%)", out[i].State.DiskState, percent)
+	}
+
+	return out
 }
 
 // multiValueQuery returns the union of all values for a query
