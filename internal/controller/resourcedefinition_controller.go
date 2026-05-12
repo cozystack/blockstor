@@ -84,7 +84,14 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, req.NamespacedName, &rd)
+	// Use APIReader for the initial fetch when available — the
+	// cached client trails the apiserver by tens to hundreds of ms
+	// after a `kubectl apply`, and a Reconcile fired by an early
+	// watch event would see NotFound through the cache and exit
+	// before the witness gets created. APIReader bypasses the cache.
+	reader := r.directOrCached()
+
+	err := reader.Get(ctx, req.NamespacedName, &rd)
 	if err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -92,6 +99,8 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	if !rd.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
+
+	log.Info("ensureTiebreaker enter", "rd", rd.Name)
 
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
@@ -167,6 +176,17 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	}
 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// directOrCached returns the APIReader-direct reader when available
+// (production path via SetupWithManager) and falls back to the
+// embedded cached client otherwise (unit-test path).
+func (r *ResourceDefinitionReconciler) directOrCached() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+
+	return r.Client
 }
 
 // listReplicasDirect enumerates the Resource children of an RD by
