@@ -663,6 +663,13 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		},
 	}
 
+	log.FromContext(ctx).WithName("observer").V(0).Info("ssa apply",
+		"resource", ev.ResourceName,
+		"inUse", ev.InUse,
+		"drbdState", ev.DrbdState,
+		"vols", len(apply.Status.Volumes),
+		"conns", len(apply.Status.Connections))
+
 	// No ForceOwnership: observer only owns the runtime-state
 	// subfields (diskState / currentGi / connections / inUse /
 	// drbdState / outOfSyncKib / replicationState). The
