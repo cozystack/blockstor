@@ -137,6 +137,15 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		}
 
 		wireProps["LuksPassphrase"] = pass
+
+		// Drop the key from drbdOpts after lifting — splitDRBDOptions
+		// on the satellite side would otherwise render it as a
+		// `passphrase` line in the .res file's options block, and
+		// `drbdadm create-md` rejects unknown options with
+		// `expected: cpu-mask | ... but got 'passphrase'`. The
+		// passphrase reaches the LUKS layer via wireProps, not the
+		// .res file.
+		delete(drbdOpts, drbdEncryptionPassphraseKey)
 	}
 
 	var layerStack []string
