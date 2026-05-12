@@ -84,11 +84,18 @@ step "rollout-status (satellite)" "kubectl -n blockstor-system rollout status ds
     || { echo "$NAME rollout-satellite FAIL" > "$RESULT"; exit 1; }
 
 # Clean any leftover blockstor Resources / RDs from the previous
-# iteration. Force + grace-period=0 because a hung finalizer
-# from a satellite-side bug we're trying to fix shouldn't block
-# the next attempt.
+# iteration. We strip finalizers first because `kubectl delete
+# --force --grace-period=0` only removes the grace period — it
+# leaves finalizers in place. With the satellite already gone
+# (force-deleted above before its PreStop could strip), nothing
+# is going to clear those finalizers, and `kubectl delete` then
+# hangs forever waiting for the apiserver to remove the object.
+# Patching finalizers=[] makes the next delete actually succeed.
 step "cleanup leftover" \
-    "kubectl delete resource --all --force --grace-period=0 --ignore-not-found 2>&1 | tail -3; kubectl delete resourcedefinition --all --ignore-not-found 2>&1 | tail -3"
+    "kubectl get resource -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=merge -p '{\"metadata\":{\"finalizers\":[]}}' >/dev/null 2>&1 || true;
+     kubectl delete resource --all --ignore-not-found --timeout=30s 2>&1 | tail -3;
+     kubectl get resourcedefinitions -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=merge -p '{\"metadata\":{\"finalizers\":[]}}' >/dev/null 2>&1 || true;
+     kubectl delete resourcedefinition --all --ignore-not-found --timeout=30s 2>&1 | tail -3"
 
 # Tear down any DRBD resources the kernel modules still hold on the
 # satellite pods. `kubectl delete --force --grace-period=0` above
