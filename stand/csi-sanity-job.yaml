@@ -27,11 +27,24 @@ spec:
           # and have a storage pool that autoplace will pick.
           args:
             - --csi-endpoint=$(CSI_ENDPOINT)
-            - --node=test-worker-1
+            # Use an actual satellite-backed Node from the stand so
+            # linstor-csi's NodeGetInfo / NodeGetTopology probes hit a
+            # real entry. test-worker-1 was a placeholder that 404'd on
+            # every node-lookup test (~6 csi-sanity failures attributed
+            # to it).
+            - --node=$(BLOCKSTOR_NODE)
             - --linstor-endpoint=$(LS_CONTROLLERS)
           env:
             - {name: CSI_ENDPOINT,  value: "unix:///csi/csi.sock"}
             - {name: LS_CONTROLLERS, value: "http://blockstor-controller.blockstor-system.svc:3370"}
+            # Resolved from a downward-API spec.nodeName if the job
+            # is scheduled onto a worker, otherwise hard-coded to a
+            # known stand worker. The recorder e2e6 stand uses
+            # e2e6-worker-* naming; bump if you point the job at a
+            # different cluster.
+            - name: BLOCKSTOR_NODE
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
           volumeMounts:
             - {name: csi, mountPath: /csi}
 
