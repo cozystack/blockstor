@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -93,39 +94,43 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		return errors.New("nil ResourceDefinition")
 	}
 
-	var existing crdv1alpha1.ResourceDefinition
+	// RetryOnConflict wraps the get-modify-update cycle: the RD
+	// reconciler writes Status / finalizer concurrently with the
+	// REST shim's spec updates (linstor-csi DeleteVolume runs a
+	// finaliser-strip + spec patch under apiserver load). A bare
+	// Update racy-conflicts and surfaces as "the object has been
+	// modified" in csi-sanity's AfterEach cleanup — re-fetch
+	// before retrying is the apiserver-recommended pattern.
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var existing crdv1alpha1.ResourceDefinition
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return errors.Wrapf(store.ErrNotFound, "resource definition %q", in.Name)
+		err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "resource definition %q", in.Name)
+			}
+
+			return errors.Wrapf(err, "get ResourceDefinition %q", in.Name)
 		}
 
-		return errors.Wrapf(err, "get ResourceDefinition %q", in.Name)
-	}
+		// VolumeDefinitions live inline on the CRD spec but have
+		// no counterpart on the wire `ResourceDefinition` shape —
+		// upstream LINSTOR addresses VDs through a separate
+		// `/v1/.../volume-definitions` endpoint family.
+		// `wireToCRDRDSpec` builds a fresh spec from the wire
+		// shape, so a naïve replace would silently wipe the
+		// inline VolumeDefinitions on every RD update (linstor rd
+		// set-property, RG-rebind, etc.). Carry them across
+		// explicitly. Status volumes are on a subresource and
+		// aren't touched by spec writes.
+		prevVDs := existing.Spec.VolumeDefinitions
+		existing.Spec = wireToCRDRDSpec(in)
+		existing.Spec.VolumeDefinitions = prevVDs
 
-	// VolumeDefinitions live inline on the CRD spec but have no
-	// counterpart on the wire `ResourceDefinition` shape — upstream
-	// LINSTOR addresses VDs through a separate `/v1/...
-	// /volume-definitions` endpoint family. `wireToCRDRDSpec` builds
-	// a fresh spec from the wire shape, so a naïve replace would
-	// silently wipe the inline VolumeDefinitions on every RD update
-	// (linstor rd set-property, RG-rebind, etc.). Carry them across
-	// explicitly. Same logic for satellite-observed status volumes
-	// is irrelevant because Status is a subresource and isn't
-	// touched by spec writes.
-	prevVDs := existing.Spec.VolumeDefinitions
-	existing.Spec = wireToCRDRDSpec(in)
-	existing.Spec.VolumeDefinitions = prevVDs
+		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
-	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
-
-	err = s.c.Update(ctx, &existing)
-	if err != nil {
-		return errors.Wrapf(err, "update ResourceDefinition %q", in.Name)
-	}
-
-	return nil
+		return s.c.Update(ctx, &existing)
+	}), "update ResourceDefinition %q", in.Name)
 }
 
 // mergeUserAnnotationsInto applies the wire-side annotation map
