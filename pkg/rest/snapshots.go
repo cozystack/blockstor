@@ -22,7 +22,10 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerSnapshots wires snapshot endpoints. Three different paths land
@@ -265,12 +268,18 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	snapName := r.PathValue("snap")
 
 	err := s.Store.Snapshots().Delete(r.Context(), rd, snapName)
-	if err != nil {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
 
 		return
 	}
 
+	// Idempotent delete: missing snapshot folds into success. CSI
+	// drivers retry DeleteSnapshot until they see success; a 404
+	// breaks the second-delete-after-success path the
+	// csi-sanity "should succeed when an invalid snapshot id"
+	// test exercises. Mirrors upstream LINSTOR's behaviour for
+	// non-existent snapshot drops.
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot deleted: " + snapName,

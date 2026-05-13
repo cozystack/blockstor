@@ -283,8 +283,10 @@ func TestSnapshotsCreateMissingName(t *testing.T) {
 }
 
 // TestSnapshotsDeleteMissing: DELETE on a non-existent (RD, snap)
-// → 404 from writeStoreError. Pins the idempotent-delete contract
-// linstor-csi relies on during VolumeSnapshot deletion.
+// returns 200 + ApiCallRc success. CSI drivers retry DeleteSnapshot
+// until they see success, so a 404 breaks the second-delete path
+// the csi-sanity "should succeed when an invalid snapshot id" test
+// exercises. Mirrors upstream LINSTOR's idempotent drop semantic.
 func TestSnapshotsDeleteMissing(t *testing.T) {
 	t.Parallel()
 
@@ -294,7 +296,7 @@ func TestSnapshotsDeleteMissing(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/resource-definitions/ghost/snapshots/s1")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }
