@@ -186,4 +186,4 @@ func IsTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // AutoTiebreakerSuppressedUntilAnnotation exposes the annotation
 // key for tests so a regression that renamed the key on one side
 // would fail to compile here.
-const AutoTiebreakerSuppressedUntilAnnotation = autoTiebreakerSuppressedUntilKey
+const AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation

@@ -33,21 +33,20 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// AutoTiebreakerSuppressedUntilAnnotation is stamped on an RD when an
-// operator (or an internal cleanup path) deletes a TIE_BREAKER replica.
-// While the annotation timestamp is in the future, the RD-level
-// reconciler skips its auto-witness branch. Without the suppression
-// window, `linstor r d <tiebreaker-node> <rd>` returns success and
-// then the reconciler re-stamps a fresh witness within milliseconds,
-// silently undoing operator intent.
+// AutoTiebreakerSuppressedUntilAnnotation is re-exported from
+// pkg/api/v1 so existing rest-package call sites (and tests that
+// reference `rest.AutoTiebreakerSuppressedUntilAnnotation`) keep
+// compiling. The canonical definition lives in pkg/api/v1 so the
+// REST writer and the internal/controller reader share one constant
+// without either package importing the other.
 //
-// 5 minutes covers a normal operator follow-up (e.g. scale to 3
-// diskful before quorum changes) and naturally expires for the
-// steady-state auto-quorum path. The window is intentionally short
-// so a forgotten suppression doesn't permanently disable the
-// auto-witness invariant.
+// autoTiebreakerSuppressionWindow: 5 minutes covers a normal operator
+// follow-up (e.g. scale to 3 diskful before quorum changes) and
+// naturally expires for the steady-state auto-quorum path. The window
+// is intentionally short so a forgotten suppression doesn't
+// permanently disable the auto-witness invariant.
 const (
-	AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
+	AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation
 	autoTiebreakerSuppressionWindow         = 5 * time.Minute
 )
 

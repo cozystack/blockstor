@@ -211,7 +211,7 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		return false
 	}
 
-	raw, ok := rd.Annotations[autoTiebreakerSuppressedUntilKey]
+	raw, ok := rd.Annotations[apiv1.AutoTiebreakerSuppressedUntilAnnotation]
 	if !ok || raw == "" {
 		return false
 	}
@@ -223,13 +223,6 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 
 	return time.Now().Before(deadline)
 }
-
-// autoTiebreakerSuppressedUntilKey mirrors the REST-side
-// AutoTiebreakerSuppressedUntilAnnotation constant. Keeping it
-// duplicated here (rather than importing from pkg/rest) preserves the
-// internal controller's independence from the REST package — pulling
-// pkg/rest in would create a circular import via the store types.
-const autoTiebreakerSuppressedUntilKey = "blockstor.io/auto-tiebreaker-suppressed-until"
 
 // directOrCached returns the APIReader-direct reader when available
 // (production path via SetupWithManager) and falls back to the
