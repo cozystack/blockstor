@@ -44,6 +44,14 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defensive non-nil: linstor-csi rejects `null` in place of the
+	// empty-list envelope. Pin the invariant at the wire edge so a
+	// future store backend that elides `make()` on the no-rows path
+	// doesn't silently regress to a `null` body.
+	if rgs == nil {
+		rgs = []apiv1.ResourceGroup{}
+	}
+
 	writeJSON(w, http.StatusOK, rgs)
 }
 

@@ -140,6 +140,13 @@ func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defensive non-nil: linstor-csi's VD-list decoder treats a `null`
+	// body as malformed. Both store backends `make()` their result,
+	// but pin the invariant at the wire edge.
+	if vds == nil {
+		vds = []apiv1.VolumeDefinition{}
+	}
+
 	writeJSON(w, http.StatusOK, vds)
 }
 

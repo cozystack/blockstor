@@ -250,6 +250,12 @@ func paginateResources(r *http.Request, in []apiv1.ResourceWithVolumes) []apiv1.
 		out = out[:limit]
 	}
 
+	// Belt + braces: keep the wire envelope as `[]` not `null` even if
+	// a future caller hands in a nil slice (matches paginateSnapshots).
+	if out == nil {
+		return []apiv1.ResourceWithVolumes{}
+	}
+
 	return out
 }
 

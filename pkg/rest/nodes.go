@@ -262,6 +262,13 @@ func (s *Server) handleNodesList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defensive non-nil: linstor-csi rejects `null` in place of the
+	// empty-list envelope. Both store backends `make()` the slice,
+	// but pinning here keeps the invariant local to the wire edge.
+	if nodes == nil {
+		nodes = []apiv1.Node{}
+	}
+
 	writeJSON(w, http.StatusOK, nodes)
 }
 

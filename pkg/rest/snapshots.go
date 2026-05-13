@@ -153,6 +153,18 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defensive: serialise an empty array as `[]`, never `null`.
+	// linstor-csi's ListSnapshots decoder treats a `null` body as
+	// "malformed response" and surfaces it as Internal; csi-sanity's
+	// "empty snapshot list" assertion expects `[]`. The k8s + in-memory
+	// stores both `make()` their result slices, but a partial mock or
+	// future store impl that returns a nil slice on the no-rows path
+	// would silently regress this envelope — pinning it at the handler
+	// edge keeps the invariant local to where it's wire-visible.
+	if snaps == nil {
+		snaps = []apiv1.Snapshot{}
+	}
+
 	writeJSON(w, http.StatusOK, snaps)
 }
 
@@ -265,6 +277,24 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 // Out-of-range offset returns an empty slice (NOT 416) — matches
 // upstream LINSTOR which silently empties the list when paginated
 // past the end.
+//
+// The returned slice is always non-nil so `json.Marshal` yields `[]`
+// rather than `null`. linstor-csi's CSI ListSnapshots loop forwards
+// `max_entries + starting_token` into `?limit + offset`; when the
+// caller paginates past the last item, csi-sanity expects an empty
+// JSON array body, not a null. A null body decodes to a nil slice in
+// the csi-sanity client and the assertion path treats that as a
+// malformed envelope.
+//
+// Exact-fit pagination: when `limit == len(in)-offset` (i.e. the page
+// boundary lines up with the end of the data), the slice for the
+// current page is returned at full length. The CSI client then
+// issues the follow-up call with `offset += limit`, which lands in
+// the `offset >= len(in)` branch above and returns the empty array
+// that signals "no more pages". This two-call dance is the only
+// way a flat-array REST surface can communicate end-of-data without
+// inventing a next_token envelope; csi-sanity tolerates the extra
+// round-trip.
 func paginateSnapshots(r *http.Request, in []apiv1.Snapshot) []apiv1.Snapshot {
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	if offset < 0 {
@@ -280,6 +310,15 @@ func paginateSnapshots(r *http.Request, in []apiv1.Snapshot) []apiv1.Snapshot {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
+	}
+
+	// Belt + braces: `in[offset:]` on a non-nil slice is always
+	// non-nil, but a future caller passing a nil `in` (e.g. a stub
+	// store implementation that elides the make()) would slip through
+	// the offset guard for offset==0 and return nil. Reify so the
+	// JSON envelope is `[]`, not `null`.
+	if out == nil {
+		return []apiv1.Snapshot{}
 	}
 
 	return out

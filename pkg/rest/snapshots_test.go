@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -560,4 +561,149 @@ func TestSnapshotsDeleteExistingReturnsEnvelopeAndDrops(t *testing.T) {
 	if _, err := st.Snapshots().Get(t.Context(), "pvc-1", "s1"); err == nil {
 		t.Errorf("snapshot still in store after delete")
 	}
+}
+
+// TestSnapshotsViewEmptyRendersBracketsNotNull pins the empty-store
+// wire envelope: GET /v1/view/snapshots on an empty cluster must
+// serialise as the literal byte sequence `[]`, never `null`.
+// linstor-csi's ListSnapshots decoder treats a `null` body as
+// malformed and surfaces it as `Internal` — csi-sanity's
+// "should return empty when the specified snapshot id does not
+// exist" assertion fires on the malformed-envelope path, not on
+// the snapshot-id mismatch. The fix lives at the wire edge in
+// `handleSnapshotsView`/`paginateSnapshots`, but the contract worth
+// pinning here is the byte-level shape, not just the decoded-slice
+// emptiness — a future regression that flips back to nil-slice
+// would deserialise to len==0 in the helper but emit `null` on the
+// wire, which is the actual failure mode.
+func TestSnapshotsViewEmptyRendersBracketsNotNull(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/snapshots")
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	got := strings.TrimSpace(string(body))
+	if got != "[]" {
+		t.Errorf("body: got %q, want literal `[]` (not `null`)", got)
+	}
+}
+
+// TestSnapshotsViewPaginationMaxEntriesPartial pins csi-sanity's
+// "should return snapshots when given a max entries" contract for
+// the four-of-two case: 4 snapshots in the store, max_entries=2
+// (→ ?limit=2). First page returns 2 entries; CSI then issues the
+// next call with starting_token=2 (→ ?offset=2&limit=2), which
+// must return the remaining 2 entries; a follow-up at offset=4
+// must return `[]` (the wire signal for "no more pages" — there is
+// no next_token envelope on this REST surface, the CSI client
+// keys end-of-data off the empty array).
+func TestSnapshotsViewPaginationMaxEntriesPartial(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, name := range []string{"s1", "s2", "s3", "s4"} {
+		if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+			Name: name, ResourceName: "pvc-1",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Page 1: offset=0, limit=2 → 2 entries, more remain.
+	page1 := decodeSnapshotPage(t, base+"/v1/view/snapshots?limit=2")
+	if len(page1) != 2 {
+		t.Fatalf("page 1 len: got %d, want 2 (%+v)", len(page1), page1)
+	}
+
+	// Page 2: offset=2, limit=2 → 2 entries, exact-fit end.
+	page2 := decodeSnapshotPage(t, base+"/v1/view/snapshots?offset=2&limit=2")
+	if len(page2) != 2 {
+		t.Fatalf("page 2 len: got %d, want 2 (%+v)", len(page2), page2)
+	}
+
+	// Page 3 (the "no more pages" probe CSI emits after exact-fit):
+	// offset=4 → `[]` literal, signalling end-of-data.
+	resp := httpGet(t, base+"/v1/view/snapshots?offset=4&limit=2")
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if got := strings.TrimSpace(string(body)); got != "[]" {
+		t.Errorf("page 3 body: got %q, want literal `[]`", got)
+	}
+}
+
+// TestSnapshotsViewPaginationMaxEntriesExactFit pins the
+// "max_entries exactly equals the store size" edge — csi-sanity's
+// pagination-edge test. 2 snapshots in the store, max_entries=2
+// (→ ?limit=2): the response carries both entries, and the CSI
+// client's follow-up call at starting_token=2 (→ ?offset=2)
+// must return `[]` so the sidecar sees the empty wire envelope
+// as "no next page". Before this fix, paginateSnapshots could
+// silently emit `null` on that follow-up, which linstor-csi
+// rejects as a malformed body.
+func TestSnapshotsViewPaginationMaxEntriesExactFit(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, name := range []string{"s1", "s2"} {
+		if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+			Name: name, ResourceName: "pvc-1",
+		}); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	page1 := decodeSnapshotPage(t, base+"/v1/view/snapshots?limit=2")
+	if len(page1) != 2 {
+		t.Fatalf("page 1 len: got %d, want 2 (%+v)", len(page1), page1)
+	}
+
+	// Follow-up at offset=2 must serialise as `[]`, never `null`.
+	resp := httpGet(t, base+"/v1/view/snapshots?offset=2&limit=2")
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if got := strings.TrimSpace(string(body)); got != "[]" {
+		t.Errorf("end-of-data body: got %q, want literal `[]`", got)
+	}
+}
+
+// decodeSnapshotPage is a tiny helper used by the pagination tests
+// to keep the page-decode boilerplate out of the assertion sites.
+func decodeSnapshotPage(t *testing.T, url string) []apiv1.Snapshot {
+	t.Helper()
+
+	resp := httpGet(t, url)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %s: got %d, want 200", url, resp.StatusCode)
+	}
+
+	var got []apiv1.Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
+	}
+
+	return got
 }

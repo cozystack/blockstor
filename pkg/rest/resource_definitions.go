@@ -46,6 +46,13 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Defensive non-nil: linstor-csi's RD-list decoder treats a `null`
+	// body as malformed. Both store backends `make()` their result,
+	// but pin the invariant at the wire edge.
+	if rds == nil {
+		rds = []apiv1.ResourceDefinition{}
+	}
+
 	writeJSON(w, http.StatusOK, rds)
 }
 
