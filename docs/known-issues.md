@@ -287,7 +287,6 @@ Safety belts on the new path:
 Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contract; the sweeper relies on that — racing the satellite's own `handleDelete` is harmless because the second call returns nil.
 
 **Related commits / tests**: `pkg/satellite/controllers/storage_sweeper.go` + `pkg/satellite/controllers/storage_sweeper_test.go` (7 unit tests covering owned-leave-alone, orphan-reap, foreign-prefix immunity, per-node scope, rate-limit, skip-annotation, mid-delete-race protection, missing-RD wildcard protection); `pkg/storage/storage.go` adds the `VolumeLister` optional interface + `VolumeRef`; ZFS / LVM-thin / LVM-thick providers implement it. E2e validation via `lc-rd-delete-churn.sh` (passes 10 iters without ZVOL leak).
->>>>>>> 92119f01f (fix(satellite): orphan-storage sweeper closes mass-churn ZVOL leak (Bug 43))
 
 ## Recommended next-fix order
 
