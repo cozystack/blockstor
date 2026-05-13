@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -92,25 +93,27 @@ func (s *resourceGroups) Update(ctx context.Context, in *apiv1.ResourceGroup) er
 		return errors.New("nil ResourceGroup")
 	}
 
-	var existing crdv1alpha1.ResourceGroup
+	// RetryOnConflict mirrors the RD store: the RG reconciler
+	// writes Status concurrently with REST `linstor rg modify` /
+	// linstor-csi's `sc-XXX` provisioning patch, which racy-conflicts
+	// with "the object has been modified". Same Get-modify-Update
+	// pattern, re-fetched on each retry.
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var existing crdv1alpha1.ResourceGroup
 
-	err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return errors.Wrapf(store.ErrNotFound, "resource group %q", in.Name)
+		err := s.c.Get(ctx, types.NamespacedName{Name: Name(in.Name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "resource group %q", in.Name)
+			}
+
+			return errors.Wrapf(err, "get ResourceGroup %q", in.Name)
 		}
 
-		return errors.Wrapf(err, "get ResourceGroup %q", in.Name)
-	}
+		existing.Spec = wireToCRDRGSpec(in)
 
-	existing.Spec = wireToCRDRGSpec(in)
-
-	err = s.c.Update(ctx, &existing)
-	if err != nil {
-		return errors.Wrapf(err, "update ResourceGroup %q", in.Name)
-	}
-
-	return nil
+		return s.c.Update(ctx, &existing)
+	}), "update ResourceGroup %q", in.Name)
 }
 
 func (s *resourceGroups) Delete(ctx context.Context, name string) error {
