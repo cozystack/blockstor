@@ -117,6 +117,22 @@ type ResourceStore interface {
 	// moved from Spec.Props onto Status; the legacy drbdProps map
 	// parameter is gone.
 	SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, volumes []apiv1.VolumeObservation) error
+
+	// ClearDRBDPort drops the persisted DRBD TCP port allocation on
+	// the named replica. The controller's allocator (resource_controller.go
+	// allocateDRBDFields) gates on `Status.DRBDPort == nil` and will
+	// pick a fresh free port on its next reconcile. The activate REST
+	// handler invokes this when the operator passes
+	// `?reallocate-port=true` to recover from a port collision via
+	// the deactivate + activate recipe — without it the original port
+	// is preserved verbatim, making the recipe ineffective (Bug 46).
+	//
+	// Status.DRBDMinor and Status.DRBDNodeID are intentionally left
+	// alone — neither participates in TCP-port collisions, and the
+	// minor in particular is baked into device-mapper paths that
+	// in-flight I/O is wired to. Returns ErrNotFound when the named
+	// replica doesn't exist.
+	ClearDRBDPort(ctx context.Context, rdName, node string) error
 }
 
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite

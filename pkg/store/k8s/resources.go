@@ -258,6 +258,61 @@ func (s *resources) SetState(ctx context.Context, rdName, node string, state api
 	return nil
 }
 
+// ClearDRBDPort drops Status.DRBDPort on the named Resource so the
+// controller's allocator (resource_controller.allocateDRBDFields)
+// re-picks a fresh free port on its next reconcile. The activate
+// REST handler invokes this when the operator passes
+// `?reallocate-port=true` to recover from a port collision via the
+// deactivate + activate recipe (Bug 46).
+//
+// Implementation: JSON merge patch with `{"status":{"drbdPort":null}}`
+// on the Status subresource. SSA can't naturally express "clear
+// this single field" without re-Applying as the original field
+// owner (`ControllerFieldOwner`) which would also touch DRBDNodeID
+// and DRBDMinor — both of which we want to preserve. A merge patch
+// is field-surgical: only `drbdPort` is removed; DRBDMinor /
+// DRBDNodeID / observer-claimed Volumes survive.
+func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) error {
+	name := resourceCRDName(rdName, node)
+
+	// Verify the Resource exists first. Without this, an apiserver
+	// merge-patch on a missing object returns a 404 we'd have to
+	// translate downstream; surfacing ErrNotFound up-front keeps the
+	// store contract uniform with the rest of the methods.
+	var existing crdv1alpha1.Resource
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+		}
+
+		return errors.Wrapf(err, "get Resource %s/%s", rdName, node)
+	}
+
+	// Fast-path: nothing to clear. Avoids a no-op apiserver round
+	// trip for the common case where the operator hits activate
+	// without `?reallocate-port=true` on a freshly-Created Resource
+	// the controller hasn't allocated yet.
+	if existing.Status.DRBDPort == nil {
+		return nil
+	}
+
+	patch := ctrlclient.RawPatch(types.MergePatchType,
+		[]byte(`{"status":{"drbdPort":null}}`))
+
+	err = s.c.Status().Patch(ctx, &existing, patch)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+		}
+
+		return errors.Wrapf(err, "clear Status.DRBDPort on Resource %s/%s", rdName, node)
+	}
+
+	return nil
+}
+
 // buildVolumeStatusForApply turns a slice of per-volume
 // observations into the SSA-shaped Status.Volumes payload. Only
 // non-empty fields land in the apply object so SSA doesn't claim

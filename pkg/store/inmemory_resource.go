@@ -180,6 +180,32 @@ func (s *inMemoryResources) SetState(_ context.Context, rdName, node string, sta
 	return nil
 }
 
+// ClearDRBDPort drops the recorded DRBD TCP port allocation on the
+// named replica. Wire-shape Resource has no Status.DRBDPort field —
+// the port surfaces via LayerObject.Drbd.TCPPorts (the k8s store
+// projects Status.DRBDPort onto that slice). Clearing TCPPorts keeps
+// the in-memory store behaviourally equivalent to the k8s store for
+// REST handlers and tests that round-trip through both backends.
+func (s *inMemoryResources) ClearDRBDPort(_ context.Context, rdName, node string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := rKey{rdName, node}
+
+	existing, ok := s.m[key]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
+	}
+
+	if existing.LayerObject != nil && existing.LayerObject.Drbd != nil {
+		existing.LayerObject.Drbd.TCPPorts = nil
+	}
+
+	s.m[key] = existing
+
+	return nil
+}
+
 // VolumeStateForTest exposes per-volume state for the in-memory store
 // to the shared storetest suite. Production callers read per-volume
 // state via the K8s store's `Resource.Status.Volumes[i]` (CRD Status

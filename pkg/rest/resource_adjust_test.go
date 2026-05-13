@@ -229,3 +229,121 @@ func TestResourceActivateUnknown(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// resourceWithPort builds an apiv1.Resource whose layer object carries
+// a single TCPPort entry. The in-memory store doesn't have a separate
+// Status.DRBDPort field — the port surfaces verbatim through
+// LayerObject.Drbd.TCPPorts (the k8s store projects Status.DRBDPort
+// onto that slice), so seeding it this way is the InMemory analogue
+// of "Status.DRBDPort is allocated to <port>" and is exactly what
+// ClearDRBDPort drops on this store.
+func resourceWithPort(rd, node string, port int32) *apiv1.Resource {
+	return &apiv1.Resource{
+		Name:     rd,
+		NodeName: node,
+		LayerObject: &apiv1.ResourceLayer{
+			Type: apiv1.LayerKindDRBD,
+			Drbd: &apiv1.DrbdResourceLayer{
+				TCPPorts: []int32{port},
+			},
+		},
+	}
+}
+
+// tcpPortsOf is the read-side mirror of resourceWithPort: it pulls
+// the per-replica TCPPorts slice out of a wire Resource without
+// re-asserting the nil-chain at every callsite.
+func tcpPortsOf(res apiv1.Resource) []int32 {
+	if res.LayerObject == nil || res.LayerObject.Drbd == nil {
+		return nil
+	}
+
+	return res.LayerObject.Drbd.TCPPorts
+}
+
+// TestResourceActivatePreservesPort pins the default deact + act
+// behaviour: bare activate must NOT reshuffle the TCP port. The
+// documented operator workflow (piraeus-operator node-maintenance)
+// relies on the resource coming back at the same DRBD addr:port so
+// in-flight peer reconnects don't churn through a fresh handshake.
+// The port-collision fix preserves this invariant by gating the
+// reallocation on an explicit `?reallocate-port=true` query
+// parameter (regression guard for the issue tracked as item 46).
+func TestResourceActivatePreservesPort(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, resourceWithPort("pvc-1", "n1", 7042)); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n1/activate", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("activate status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	ports := tcpPortsOf(got)
+	if len(ports) != 1 || ports[0] != 7042 {
+		t.Errorf("TCPPorts: got %v, want [7042] (bare activate must preserve port)", ports)
+	}
+}
+
+// TestResourceActivateReallocatePortClears pins the port-collision
+// recovery path (issue 46): `?reallocate-port=true` drops the
+// persisted port allocation so the controller's allocator
+// (resource_controller.allocateDRBDFields) gates on
+// `Status.DRBDPort == nil` and re-runs to pick a fresh free port
+// on the next reconcile.
+//
+// The in-memory store has no Status.DRBDPort field — clearing
+// LayerObject.Drbd.TCPPorts is the wire-level equivalent the k8s
+// store materialises from Status.DRBDPort. Asserting the slice is
+// empty is the same invariant the controller's allocator gates on
+// once the merge-patch lands.
+func TestResourceActivateReallocatePortClears(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, resourceWithPort("pvc-1", "n1", 7042)); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-1/resources/n1/activate?reallocate-port=true",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("activate status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if ports := tcpPortsOf(got); len(ports) != 0 {
+		t.Errorf("TCPPorts: got %v, want [] (reallocate-port=true must clear)", ports)
+	}
+}
