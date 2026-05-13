@@ -445,6 +445,18 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 		}
 	}
 
+	// External-metadata pool (scenario 6.18, UG9
+	// §"Using external DRBD metadata"). Resolves the
+	// `StorPoolNameDrbdMeta` prop in the upstream-LINSTOR precedence
+	// order — most-specific scope wins, terminated as soon as a
+	// non-empty value is found. Diskless replicas don't carry a
+	// backing disk and therefore have no metadata to route, so we
+	// leave the field empty in that case.
+	metaPool := ""
+	if !diskless {
+		metaPool = resolveMetaPool(target, rd)
+	}
+
 	// Optional clone source — set by the snapshot-restore-resource
 	// REST handler on the target RD's Props. Format `<srcRD>:<snap>`.
 	// When present, satellite materialises each volume via
@@ -467,10 +479,46 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			StoragePool:    pool,
 			SeedFromGi:     seedFromGi(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
+			MetaPool:       metaPool,
 		})
 	}
 
 	return out
+}
+
+// StorPoolNameDrbdMetaKey is the upstream-LINSTOR prop key that
+// routes DRBD activity-log + bitmap + generation-id state to a
+// separate storage pool. Set by operators with e.g.
+// `linstor rd set-property <rd> StorPoolNameDrbdMeta ssd-meta`.
+//
+// Exposed for the satellite-side reconciler which keys its meta
+// volume naming on the same well-known string.
+const StorPoolNameDrbdMetaKey = "StorPoolNameDrbdMeta"
+
+// resolveMetaPool walks the upstream-LINSTOR scope precedence for
+// StorPoolNameDrbdMeta — Resource → RD — returning the first non-
+// empty value found. The full UG9 hierarchy (Node → RG → RD →
+// Resource → VG → VD, most-specific wins) lives in
+// pkg/effectiveprops; we only need the two scopes the dispatcher
+// has direct objects for, because effectiveProps (already
+// resolved upstream of this call) covers the Controller / RG /
+// Node / VG / VD scopes via a merged map. We re-walk Resource and
+// RD here because effectiveProps strips non-DrbdOptions/... keys
+// into wireProps and isn't plumbed into buildVolumes today — a
+// follow-up pass can unify the two readers once buildVolumes
+// takes effectiveProps directly.
+func resolveMetaPool(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) string {
+	if v := target.Spec.Props[StorPoolNameDrbdMetaKey]; v != "" {
+		return v
+	}
+
+	if rd != nil {
+		if v := rd.Spec.Props[StorPoolNameDrbdMetaKey]; v != "" {
+			return v
+		}
+	}
+
+	return ""
 }
 
 // seedFromGi looks up the controller-allocated SeedFromGi for the

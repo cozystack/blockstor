@@ -120,6 +120,22 @@ type Volume struct {
 	// assigns these globally on the node, so it is the controller's
 	// job to allocate one and pin it here.
 	Minor int
+
+	// MetaDisk, when non-empty, routes DRBD activity-log + bitmap +
+	// generation-id state to a SEPARATE backing block device — the
+	// upstream LINSTOR `StorPoolNameDrbdMeta` feature (UG9
+	// §"Using external DRBD metadata"). The renderer emits
+	// `meta-disk <MetaDisk>;` for the local diskful host instead of
+	// the default `meta-disk internal;` line. Empty value → internal
+	// metadata (the default, where metadata lives at the tail of the
+	// data device).
+	//
+	// Peer hosts still get `meta-disk internal;` rendered — drbd
+	// never reads the peer-side meta-disk path, and emitting a real
+	// path here would tie every peer's .res to this satellite's
+	// local meta-pool layout, breaking the deterministic render
+	// across peers.
+	MetaDisk string
 }
 
 // Build renders r into a drbd-9 `.res` file body. The output is
@@ -215,7 +231,7 @@ func writeOnBlock(b *strings.Builder, host *Host, vols []Volume) {
 		fmt.Fprintf(b, "    volume %d {\n", vol.Number)
 		fmt.Fprintf(b, "      device %s minor %d;\n", vol.Device, vol.Minor)
 		fmt.Fprintf(b, "      disk %s;\n", diskField(host, vol))
-		b.WriteString("      meta-disk internal;\n")
+		fmt.Fprintf(b, "      meta-disk %s;\n", metaField(host, vol))
 		b.WriteString("    }\n")
 	}
 
@@ -233,6 +249,25 @@ func diskField(host *Host, vol Volume) string {
 	default:
 		return peerDiskPlaceholder
 	}
+}
+
+// metaField picks the `meta-disk` value to render. For the local
+// diskful host with a non-empty Volume.MetaDisk we emit the external
+// path (scenario 6.18 — `StorPoolNameDrbdMeta`); for everyone else
+// (diskless, peers, local with empty MetaDisk) we emit `internal`.
+//
+// Note: drbd's `meta-disk` accepts `internal`, `<device>`, or
+// `<device> [<index>]`. We render only the `internal` and bare-
+// device forms — indexed external metadata isn't on the surface yet
+// and upstream LINSTOR's StorPoolNameDrbdMeta path always carves a
+// per-volume LV/zvol rather than packing multiple replicas into one
+// metadata device.
+func metaField(host *Host, vol Volume) string {
+	if host.IsLocal && !host.Diskless && vol.MetaDisk != "" {
+		return vol.MetaDisk
+	}
+
+	return "internal"
 }
 
 // writeConnectionMesh emits one `connection { … }` block per (i, j)

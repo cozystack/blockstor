@@ -2149,3 +2149,113 @@ func TestReconcilerRespectsOperatorDisconnect(t *testing.T) {
 		t.Errorf("expected at least one drbdadm adjust across 5 passes; got %v", allLines)
 	}
 }
+
+// TestApplyRendersExternalMetaDiskPath: scenario 6.18 spec — when the
+// dispatcher stamps DesiredVolume.MetaPool, the .res file the
+// reconciler writes carries the matching `meta-disk <path>;` line
+// for the local diskful host. Path shape follows the existing
+// LVM/ZFS `/dev/<pool>/<rd>_<vol5digits>_meta` convention so a
+// follow-up provisioner can drop the LV in place without further
+// renaming.
+//
+// This test ONLY asserts the .res render path is wired up; the
+// matching satellite-side provisioning of the meta volume is
+// covered by TestApplyProvisionsBothDataAndMeta below (currently
+// t.Skip — see that test's comment).
+func TestApplyRendersExternalMetaDiskPath(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-meta-0_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-meta-0",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{
+					VolumeNumber: 0,
+					SizeKib:      1024 * 1024,
+					StoragePool:  "thin1",
+					// External-metadata routing — the dispatcher
+					// would stamp this from a Resource/RD prop
+					// `StorPoolNameDrbdMeta=ssd-meta`.
+					MetaPool: "ssd-meta",
+				},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-meta-0.res"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got := string(body)
+
+	// Local diskful host gets the external path verbatim. The path
+	// shape (`/dev/<metaPool>/<rd>_<vol5digits>_meta`) is the same
+	// /dev/<pool>/<lv> shape the LVM/ZFS providers use for the data
+	// volume — keeps the satellite reconciler from having to thread
+	// a second devices map.
+	wantMeta := "meta-disk /dev/ssd-meta/pvc-meta-0_00000_meta;"
+	if !strings.Contains(got, wantMeta) {
+		t.Errorf("missing %q in:\n%s", wantMeta, got)
+	}
+
+	// Peer host keeps `internal` — drbd never reads peer-side
+	// meta-disk and pinning a path here would couple every peer's
+	// .res to this satellite's local layout.
+	if !strings.Contains(got, "on n2 {") {
+		t.Fatalf("missing peer block in:\n%s", got)
+	}
+
+	// Expect exactly one `meta-disk internal;` (the peer's) and
+	// one external `meta-disk /dev/...;` (the local).
+	internal := strings.Count(got, "meta-disk internal;")
+	if internal != 1 {
+		t.Errorf("want exactly 1 'meta-disk internal;' (peer only); got %d in:\n%s", internal, got)
+	}
+}
+
+// TestApplyProvisionsBothDataAndMeta: scenario 6.18 satellite-side
+// follow-up. When DesiredVolume.MetaPool is set the reconciler must
+// carve TWO backing volumes — `<rd>_<vol5digits>` on the data pool
+// and `<rd>_<vol5digits>_meta` on the meta pool — before drbdadm
+// create-md runs against the assembled .res.
+//
+// Currently t.Skip'd: the data + meta carve requires either:
+//
+//  1. a new Provider method (CreateMetaVolume) so the satellite can
+//     issue the sibling create with a `_meta` LV-name suffix without
+//     bending storage.Volume's naming contract; or
+//  2. a Volume.NameSuffix-style field that all providers honour.
+//
+// Both are non-trivial: each provider (LVM thin, LVM thick, ZFS,
+// FILE_THIN) carries its own volumeLVName / volumeFSPath helper, so
+// the meta-suffix has to thread through every backend. Tracked
+// against the same 6.18 backlog entry as `MetaPool` itself.
+func TestApplyProvisionsBothDataAndMeta(t *testing.T) {
+	t.Skip("6.18 satellite-side wiring follow-up — see test godoc for the open Provider-API design point")
+}

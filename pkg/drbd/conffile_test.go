@@ -208,6 +208,94 @@ func TestBuildPeerDisks(t *testing.T) {
 	}
 }
 
+// TestRenderExternalMetadata: scenario 6.18 — when Volume.MetaDisk is
+// non-empty, the .res renderer emits `meta-disk <path>;` for the
+// local diskful host instead of the default `meta-disk internal;`.
+// Peer hosts and diskless local hosts still get `meta-disk internal;`
+// — drbd never reads the peer-side meta-disk and the local diskless
+// case has no meta to point at.
+func TestRenderExternalMetadata(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{ProtocolC: true},
+		Hosts: []drbd.Host{
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+			{NodeName: "n3", Address: "10.0.0.3", Port: 7000, NodeID: 2, Diskless: true},
+		},
+		Volumes: []drbd.Volume{
+			{
+				Number:   0,
+				Device:   "/dev/drbd1000",
+				Disk:     "/dev/data-vg/pvc-1_00000",
+				MetaDisk: "/dev/meta-vg/pvc-1_meta",
+				Minor:    1000,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	cases := []struct {
+		needle string
+		why    string
+	}{
+		{
+			// Local diskful gets the external meta-disk path verbatim.
+			needle: "  on n1 {\n    address 10.0.0.1:7000;\n    node-id 0;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk /dev/data-vg/pvc-1_00000;\n      meta-disk /dev/meta-vg/pvc-1_meta;\n",
+			why:    "local diskful → external meta path",
+		},
+		{
+			// Peer diskful keeps `internal` — see Volume.MetaDisk
+			// godoc for the rationale (peer side isn't read by drbd
+			// and pinning a local path here breaks deterministic
+			// render across peers).
+			needle: "  on n2 {\n    address 10.0.0.2:7000;\n    node-id 1;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk /dev/drbd/this/is/not/used;\n      meta-disk internal;\n",
+			why:    "peer diskful → internal",
+		},
+		{
+			// Diskless local/peer always gets `internal`.
+			needle: "  on n3 {\n    address 10.0.0.3:7000;\n    node-id 2;\n    volume 0 {\n      device /dev/drbd1000 minor 1000;\n      disk none;\n      meta-disk internal;\n",
+			why:    "diskless peer → internal",
+		},
+	}
+
+	for _, c := range cases {
+		if !strings.Contains(got, c.needle) {
+			t.Errorf("%s: missing block\n  want substring %q\n  in:\n%s", c.why, c.needle, got)
+		}
+	}
+}
+
+// TestRenderInternalMetadataDefault pins the default: when
+// Volume.MetaDisk is empty, every host's volume block keeps the
+// pre-6.18 `meta-disk internal;` line. Guards against accidental
+// regression of the default path from the metaField switch.
+func TestRenderInternalMetadataDefault(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{ProtocolC: true},
+		Hosts: []drbd.Host{
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+		},
+		Volumes: []drbd.Volume{
+			{Number: 0, Device: "/dev/drbd1000", Disk: "/dev/vg/pvc-1_00000", Minor: 1000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// Both `on` blocks must carry `meta-disk internal;` — assert by
+	// counting occurrences (one per peer × one volume = 2).
+	const want = "meta-disk internal;"
+	if n := strings.Count(got, want); n != 2 {
+		t.Errorf("expected %q to appear twice (one per host), got %d\n%s", want, n, got)
+	}
+}
+
 // TestBuildDeterministic: same input → same output, twice in a row. Map
 // iteration order would otherwise leak into the .res file and trigger
 // spurious drbdadm reloads on every reconcile.

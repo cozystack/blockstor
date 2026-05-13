@@ -1015,20 +1015,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		})
 	}
 
-	vols := make([]drbd.Volume, 0, len(dr.GetVolumes()))
-	for _, vol := range dr.GetVolumes() {
-		disk := devices[vol.GetVolumeNumber()]
-		if disk == "" {
-			disk = fmt.Sprintf("/dev/%s/%s_%05d", vol.GetStoragePool(), dr.GetName(), vol.GetVolumeNumber())
-		}
-
-		vols = append(vols, drbd.Volume{
-			Number: int(vol.GetVolumeNumber()),
-			Device: fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
-			Disk:   disk,
-			Minor:  minor + int(vol.GetVolumeNumber()),
-		})
-	}
+	vols := buildResVolumes(dr, devices, minor)
 
 	netOpts, resOpts := splitDRBDOptions(opts)
 
@@ -1044,6 +1031,52 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 	}
 
 	return out, nil
+}
+
+// buildResVolumes turns the per-RD DesiredVolumes into the
+// drbd.Volume slice the .res renderer consumes. Pulled out of
+// buildResFile to keep that function under the funlen budget.
+//
+// `minor` is the base /dev/drbd<N> minor for the resource; each
+// volume offsets from it (volumeNumber 0 → minor, vol 1 → minor+1,
+// …). The disk path follows applyStorage's devices map when set
+// (the kernel actually opens that path); empty falls through to
+// the LVM/ZFS-shaped `/dev/<pool>/<rd>_<vol5digits>` guess so
+// providers that don't surface a devicePath still get a working
+// .res. The meta-disk path is the scenario 6.18
+// `StorPoolNameDrbdMeta` carve — see Volume.MetaPool godoc.
+func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor int) []drbd.Volume {
+	vols := make([]drbd.Volume, 0, len(dr.GetVolumes()))
+
+	for _, vol := range dr.GetVolumes() {
+		disk := devices[vol.GetVolumeNumber()]
+		if disk == "" {
+			disk = fmt.Sprintf("/dev/%s/%s_%05d", vol.GetStoragePool(), dr.GetName(), vol.GetVolumeNumber())
+		}
+
+		// External-metadata path (scenario 6.18). When MetaPool is set
+		// we emit `meta-disk <path>;` against a sibling LV named
+		// `<rd>_<vol5digits>_meta` on that pool. Path shape matches
+		// the data volume's LVM/ZFS guess — `/dev/<pool>/<lv>` — so
+		// the renderer doesn't need a second devices-map round trip.
+		// applyStorage carves the LV (or its provider equivalent)
+		// before this renders, so the file is always rendered with a
+		// path that resolves on disk; create-md fails fast otherwise.
+		metaDisk := ""
+		if mp := vol.GetMetaPool(); mp != "" {
+			metaDisk = fmt.Sprintf("/dev/%s/%s_%05d_meta", mp, dr.GetName(), vol.GetVolumeNumber())
+		}
+
+		vols = append(vols, drbd.Volume{
+			Number:   int(vol.GetVolumeNumber()),
+			Device:   fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
+			Disk:     disk,
+			MetaDisk: metaDisk,
+			Minor:    minor + int(vol.GetVolumeNumber()),
+		})
+	}
+
+	return vols
 }
 
 // splitDRBDOptions partitions the satellite-received drbd_options bag

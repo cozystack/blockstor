@@ -133,6 +133,20 @@ type DesiredVolume struct {
 	// the satellite splits before issuing the storage call. Used by
 	// the CSI clone + snapshot-restore-resource paths.
 	SourceSnapshot string
+
+	// MetaPool, when non-empty, names the storage pool the satellite
+	// must provision a SECOND backing volume on to hold this DRBD
+	// volume's activity-log + bitmap + GI state. Set by the
+	// dispatcher when the resolved props carry
+	// `StorPoolNameDrbdMeta` (UG9 §"Using external DRBD metadata",
+	// scenario 6.18). Empty == internal metadata (default).
+	//
+	// The satellite carves a sibling volume named
+	// `<rd>_<vol>_meta` on this pool BEFORE the data volume's
+	// drbdadm create-md so the `meta-disk <path>;` line in the .res
+	// file points at an already-existing block device. The path is
+	// then propagated via the .res renderer's Volume.MetaDisk field.
+	MetaPool string
 }
 
 // GetVolumeNumber returns the per-RD volume index.
@@ -180,6 +194,17 @@ func (x *DesiredVolume) GetSourceSnapshot() string {
 	}
 
 	return x.SourceSnapshot
+}
+
+// GetMetaPool returns the external-metadata pool name (scenario
+// 6.18 / StorPoolNameDrbdMeta), or "" when this volume should use
+// internal metadata.
+func (x *DesiredVolume) GetMetaPool() string {
+	if x == nil {
+		return ""
+	}
+
+	return x.MetaPool
 }
 
 // ResourceApplyResult is the per-resource outcome of one
