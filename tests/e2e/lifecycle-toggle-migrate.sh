@@ -124,10 +124,15 @@ if kubectl get resource "$RD.$WORKER_3" >/dev/null 2>&1; then
 fi
 
 # Background invariant watcher: poll every 0.5s; record minimum
-# observed diskful count. Migration must never drop diskful < 2
-# while waiting for $WORKER_3 to sync; it can drop to 2 only after
-# $WORKER_2's deletion completes (i.e. when the new $WORKER_3 copy
-# is already UpToDate so the count stays at 2 the whole time).
+# observed diskful count. Under Option B (strict add-before-drop),
+# the REST handler stamps BlockstorMigratingFrom on the dst and
+# RETURNS — src lives until the ResourceMigrationReconciler
+# observes dst.Status.Volumes[].DiskState=UpToDate, at which point
+# it deletes src and clears the prop. The diskful count therefore
+# climbs from 2 (orig) to 3 (orig + new dst) while sync runs, then
+# settles back to 2 once src is pruned. It MUST NEVER drop below
+# the original 2 — that's the UG9 "no redundancy loss" promise
+# Option B exists to deliver. Strict bar enforced below.
 WATCH_LOG=/tmp/migrate-diskful-watch.log
 : >"$WATCH_LOG"
 (
@@ -220,11 +225,12 @@ case "$final_role" in
 esac
 
 # Redundancy invariant: minimum diskful count observed in the
-# watcher log must be >= 2 (we never dropped a copy before the
-# new one was UpToDate). Tolerance: 1 brief sample equal to 1 is
-# acceptable only if it coincides with the deletion tail — but
-# upstream LINSTOR semantics promise add-before-drop, so we hold
-# the strict bar.
+# watcher log must be >= 2 for EVERY sample. UG9 promises strict
+# add-before-drop; Option B's reconciler holds src alive until dst
+# is observed UpToDate, so there is no legitimate sample with
+# count < 2. A single sub-2 sample is a regression — it means the
+# REST handler raced ahead of the reconciler, or Option A
+# semantics crept back in. No tolerance.
 min_diskful=$(awk '{print $2}' "$WATCH_LOG" | grep -E '^[0-9]+$' | sort -n | head -1)
 echo ">> watcher: $(wc -l <"$WATCH_LOG") samples, min diskful = $min_diskful"
 if [[ -z "$min_diskful" || "$min_diskful" -lt 2 ]]; then

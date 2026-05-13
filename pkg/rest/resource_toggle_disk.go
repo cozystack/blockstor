@@ -163,26 +163,37 @@ func stampStoragePool(res *apiv1.Resource, pool string) {
 	res.Props["StorPoolName"] = pool
 }
 
+// MigratingFromProp is the per-Resource property the REST migrate-
+// disk handler stamps on the destination replica when starting a
+// strict add-before-drop migration (Option B). The companion
+// ResourceMigrationReconciler watches Resources carrying this prop,
+// waits for the destination's volumes to reach DiskState=UpToDate,
+// then deletes the named source replica's Resource CRD and clears
+// the prop on the destination. UG9 §"Migrating a resource to
+// another node" promises the redundancy invariant holds across the
+// entire migration — Option B preserves it strictly by deferring
+// the source teardown until the new copy is durable.
+const MigratingFromProp = "BlockstorMigratingFrom"
+
 // handleResourceMigrateDisk implements upstream LINSTOR's
 // `linstor r td --migrate-from <src>` semantics (UG9 §"Migrating a
-// resource to another node"). The flow upstream is:
+// resource to another node") under Option B (strict add-before-drop):
 //
 //  1. Validate: rd exists, src has a diskful replica, dst is either
 //     missing or already diskless. If src is Primary InUse, refuse
 //     with 409 — upstream UG9 requires an explicit demote first
 //     before a Primary replica can be migrated.
-//  2. Ensure dst exists. If absent, create a fresh DISKLESS replica
-//     so the satellite wires it into the DRBD resource first.
-//  3. Stamp StorPoolName=<pool> on dst and drop the DISKLESS flag so
-//     the satellite reconciler's auto-diskful path attaches storage
-//     and starts syncing from src.
-//  4. Option A (this wire): immediately Delete src — the operator
-//     gets atomic "move" semantics at the REST layer; the satellite
-//     reconcilers handle the actual add-before-drop on the wire.
-//     Option B (TODO follow-up): stamp Spec.Props["BlockstorMigratingFrom"]
-//     and let a resource-side reconciler watch for dst UpToDate
-//     before pruning src — preserves the upstream redundancy
-//     invariant strictly under all timings.
+//  2. Ensure dst exists with the requested storage pool stamped and
+//     DISKLESS cleared so the satellite attaches storage and starts
+//     syncing from src.
+//  3. Stamp dst's Spec.Props["BlockstorMigratingFrom"]=<src-node>.
+//     This is the trigger the ResourceMigrationReconciler watches —
+//     once dst's Status.Volumes[].DiskState all reach UpToDate, the
+//     reconciler deletes src's Resource CRD and clears the prop.
+//  4. Return 200 immediately. The operation is async-pending: the
+//     redundancy invariant (diskful count never drops below the
+//     original) is preserved because src lives until the reconciler
+//     observes UpToDate on dst.
 //
 // Returns 200 with an APICallRc envelope on success, 404 on unknown
 // RD or missing src diskful replica, 409 when src is Primary InUse.
@@ -203,26 +214,20 @@ func (s *Server) handleResourceMigrateDisk(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if !s.promoteMigrateDst(w, r, rdName, dst, pool) {
+	if !s.promoteMigrateDst(w, r, rdName, dst, pool, src) {
 		return
 	}
 
-	// Option A: immediately delete the source replica. The
-	// satellite tears down via the standard delete path. Trades
-	// strict add-before-drop redundancy for atomic REST semantics;
-	// Option B (BlockstorMigratingFrom prop + reconciler) is the
-	// follow-up that preserves the invariant under all timings.
-	err = s.Store.Resources().Delete(r.Context(), rdName, src)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
+	// Option B: src lives. ResourceMigrationReconciler observes
+	// the BlockstorMigratingFrom prop stamped in promoteMigrateDst,
+	// waits for dst Volumes to reach UpToDate, then deletes src and
+	// clears the prop. Operation is "pending" at REST layer; caller
+	// must observe Status (or poll the resources list) to confirm
+	// completion.
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource '" + rdName + "' migrating from '" + src + "' to '" + dst +
-			"' on pool '" + pool + "'",
+			"' on pool '" + pool + "' (pending; src will be removed once dst is UpToDate)",
 	}})
 }
 
@@ -265,16 +270,22 @@ func (s *Server) validateMigrateSrc(w http.ResponseWriter, r *http.Request, rdNa
 }
 
 // promoteMigrateDst ensures dst has a Resource entry stamped with
-// the target pool and DISKLESS cleared. Creates a fresh diskful
-// replica when dst was absent, or flips an existing diskless one
-// to diskful in place. Returns false (after writing an HTTP error)
-// when dst already holds a diskful replica or store ops fail.
-func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdName, dst, pool string) bool {
+// the target pool, DISKLESS cleared, and the BlockstorMigratingFrom
+// prop set to the src node name. Creates a fresh diskful replica
+// when dst was absent, or flips an existing diskless one to diskful
+// in place. Returns false (after writing an HTTP error) when dst
+// already holds a diskful replica or store ops fail.
+//
+// The migrating-from stamp is the trigger the migration reconciler
+// watches; without it the controller has no way to know which src
+// to prune once dst reaches UpToDate.
+func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdName, dst, pool, src string) bool {
 	dstRes, err := s.Store.Resources().Get(r.Context(), rdName, dst)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		dstRes = apiv1.Resource{Name: rdName, NodeName: dst}
 		stampStoragePool(&dstRes, pool)
+		stampMigratingFrom(&dstRes, src)
 
 		err = s.Store.Resources().Create(r.Context(), &dstRes)
 		if err != nil {
@@ -299,6 +310,7 @@ func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdNam
 	}
 
 	stampStoragePool(&dstRes, pool)
+	stampMigratingFrom(&dstRes, src)
 	dstRes.Flags = applyFlagMutation(dstRes.Flags, apiv1.ResourceFlagDiskless, false)
 
 	err = s.Store.Resources().Update(r.Context(), &dstRes)
@@ -309,4 +321,16 @@ func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdNam
 	}
 
 	return true
+}
+
+// stampMigratingFrom records the source node name on the destination
+// Resource's prop map. The migration reconciler reads this to find
+// the corresponding src Resource to prune once the destination
+// volumes reach UpToDate.
+func stampMigratingFrom(res *apiv1.Resource, src string) {
+	if res.Props == nil {
+		res.Props = map[string]string{}
+	}
+
+	res.Props[MigratingFromProp] = src
 }

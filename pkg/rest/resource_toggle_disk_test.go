@@ -156,12 +156,17 @@ func TestToggleDiskUnknownReplica(t *testing.T) {
 }
 
 // TestMigrateDiskBasicFlow: src has a diskful replica, dst has no
-// replica yet. PUT migrate-disk should:
+// replica yet. PUT migrate-disk under Option B (strict
+// add-before-drop) should:
 //   - create dst diskful with StorPoolName stamped
-//   - delete src
+//   - stamp BlockstorMigratingFrom=<src-node> on dst
+//   - LEAVE src in place — the ResourceMigrationReconciler will
+//     prune it asynchronously once dst's Status.Volumes report
+//     UpToDate
 //
-// Pins the Option-A wire (atomic REST semantics; satellite handles
-// actual add-before-drop on the DRBD layer).
+// Pins the redundancy invariant: at no point during this REST call
+// does the diskful count drop below the original. The src lives
+// until the destination is observed durable on the wire.
 func TestMigrateDiskBasicFlow(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-mig"}); err != nil {
@@ -188,7 +193,7 @@ func TestMigrateDiskBasicFlow(t *testing.T) {
 		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	// dst exists, diskful, pool stamped.
+	// dst exists, diskful, pool stamped, migrating-from prop set.
 	got, err := st.Resources().Get(t.Context(), "pvc-mig", "dst-node")
 	if err != nil {
 		t.Fatalf("Get dst: %v", err)
@@ -202,16 +207,30 @@ func TestMigrateDiskBasicFlow(t *testing.T) {
 		t.Errorf("dst StorPoolName: got %q, want zfs-thin", got.Props["StorPoolName"])
 	}
 
-	// src removed.
-	if _, err := st.Resources().Get(t.Context(), "pvc-mig", "src-node"); err == nil {
-		t.Errorf("src Resource still present after migrate-disk")
+	if got.Props[MigratingFromProp] != "src-node" {
+		t.Errorf("dst %s: got %q, want src-node",
+			MigratingFromProp, got.Props[MigratingFromProp])
+	}
+
+	// src MUST still be present — Option B defers the prune to the
+	// reconciler. Deleting it here would re-introduce the redundancy
+	// regression Option B exists to fix.
+	srcRes, err := st.Resources().Get(t.Context(), "pvc-mig", "src-node")
+	if err != nil {
+		t.Fatalf("src Resource pruned by REST handler (Option A regression): %v", err)
+	}
+
+	if slices.Contains(srcRes.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("src unexpectedly flagged DISKLESS by migrate handler: %v", srcRes.Flags)
 	}
 }
 
 // TestMigrateDiskWithExistingDiskless: dst already declared diskless
 // (the typical two-step upstream flow: `linstor r c <dst> <rd>
 // --drbd-diskless` then `linstor r td -s <pool> --migrate-from
-// <src>`). Migrate flips dst diskful and prunes src.
+// <src>`). Migrate flips dst diskful, stamps migrating-from, and
+// leaves src untouched (the reconciler prunes it once dst is
+// UpToDate — strict add-before-drop, Option B).
 func TestMigrateDiskWithExistingDiskless(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-mig2"}); err != nil {
@@ -256,8 +275,14 @@ func TestMigrateDiskWithExistingDiskless(t *testing.T) {
 		t.Errorf("dst StorPoolName: got %q, want zfs-thin", got.Props["StorPoolName"])
 	}
 
-	if _, err := st.Resources().Get(t.Context(), "pvc-mig2", "src-node"); err == nil {
-		t.Errorf("src Resource still present after migrate-disk")
+	if got.Props[MigratingFromProp] != "src-node" {
+		t.Errorf("dst %s: got %q, want src-node",
+			MigratingFromProp, got.Props[MigratingFromProp])
+	}
+
+	// src MUST live until the reconciler observes dst UpToDate.
+	if _, err := st.Resources().Get(t.Context(), "pvc-mig2", "src-node"); err != nil {
+		t.Errorf("src Resource pruned synchronously by REST handler: %v", err)
 	}
 }
 
