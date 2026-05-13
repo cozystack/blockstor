@@ -24,8 +24,35 @@ DURATION=${2:-86400}
 
 export KUBECONFIG="$WORK_DIR/kubeconfig"
 
-PRIMARY=test-worker-1
-PEER=test-worker-2
+# PRIMARY / PEER auto-discover when not pinned: pick two worker nodes
+# (those WITHOUT the control-plane role label). Falls back to first two
+# ready nodes if no role label is present. Overridable via env.
+discover_workers() {
+    local out
+    out=$(kubectl get nodes \
+        -l '!node-role.kubernetes.io/control-plane' \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+        2>/dev/null | head -2)
+    if [[ -z "$out" ]]; then
+        out=$(kubectl get nodes \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+            2>/dev/null | head -2)
+    fi
+    echo "$out"
+}
+
+if [[ -z "${PRIMARY:-}" || -z "${PEER:-}" ]]; then
+    mapfile -t _WORKERS < <(discover_workers)
+    PRIMARY=${PRIMARY:-${_WORKERS[0]:-}}
+    PEER=${PEER:-${_WORKERS[1]:-}}
+fi
+
+if [[ -z "$PRIMARY" || -z "$PEER" || "$PRIMARY" == "$PEER" ]]; then
+    echo "burnin: failed to discover two distinct worker nodes (PRIMARY=$PRIMARY PEER=$PEER); set them via env" >&2
+    exit 2
+fi
+
+echo "burnin: PRIMARY=$PRIMARY PEER=$PEER"
 NS=blockstor-system
 SIZE_KIB=65536  # 64 MiB
 DEADLINE=$(( $(date +%s) + DURATION ))
