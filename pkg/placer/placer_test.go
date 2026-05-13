@@ -796,5 +796,134 @@ func TestPlacePlaceCountIgnoresDisklessWitness(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnDifferentExcludeMode pins UG9's "key=value" form
+// of replicas_on_different: nodes carrying that exact Aux/<key>=<value>
+// pair are considered LAST resort, NOT hard-excluded. With 3 healthy
+// nodes (n3 carrying Aux/no-csi-volumes=true), a place_count=2 call
+// must land on n1+n2 even though n3 has the largest free capacity —
+// because the value-form excludes n3 from normal selection.
+//
+// A regression that treated the value-form as a no-op would happily
+// pick n3 (biggest free) over n2 and break tenant placement intent.
+func TestPlaceReplicasOnDifferentExcludeMode(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name string, free int64, props map[string]string) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite, Props: props,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// n3 has the LARGEST free capacity AND the excluded label —
+	// largest-first sort alone would pick it. The filter must keep
+	// it out of the preferred bucket.
+	mk("n1", 100, nil)
+	mk("n2", 200, nil)
+	mk("n3", 999, map[string]string{"Aux/no-csi-volumes": "true"})
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          2,
+		ReplicasOnDifferent: []string{"no-csi-volumes=true"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["n3"] {
+		t.Errorf("excluded node n3 picked while preferred candidates still available; resources=%+v", got)
+	}
+
+	if !on["n1"] || !on["n2"] {
+		t.Errorf("expected placement on n1+n2 (preferred), got %+v", on)
+	}
+}
+
+// TestPlaceReplicasOnDifferentFallsBackToExcludedNode pins the
+// last-resort fallback half of the contract: the value-form is a
+// preference, NOT a hard rule. With only 3 nodes available and
+// place_count=3, the placer MUST tap n3 (the excluded node) after
+// the preferred bucket is drained, otherwise a 3-replica RG over a
+// 3-node cluster would be permanently under-placed.
+//
+// A regression that hard-excluded the value-form node would leave
+// placed=2/want=3 and the operator would have no way to recover.
+func TestPlaceReplicasOnDifferentFallsBackToExcludedNode(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name string, free int64, props map[string]string) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite, Props: props,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("n1", 100, nil)
+	mk("n2", 200, nil)
+	mk("n3", 999, map[string]string{"Aux/no-csi-volumes": "true"})
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          3,
+		ReplicasOnDifferent: []string{"no-csi-volumes=true"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (last-resort fallback must engage)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if !on["n1"] || !on["n2"] || !on["n3"] {
+		t.Errorf("expected placement on all 3 nodes (n3 as last-resort), got %+v", on)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background

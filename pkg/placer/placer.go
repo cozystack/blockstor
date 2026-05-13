@@ -95,7 +95,19 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	placed := countDiskfulReplicas(existing, disabled)
 	want := int(filter.PlaceCount)
 
-	placed, err = p.placeDiskful(ctx, rdName, state, candidates, placed, want)
+	// replicas_on_different in "key=value" form is a soft-exclusion:
+	// nodes carrying that exact pair are considered LAST. Split the
+	// candidate set into preferred (no excluded pair) and last-resort
+	// (excluded pair present) so we exhaust preferred before touching
+	// the excluded bucket — see UG9 §replicasOnDifferent.
+	preferred, lastResort := partitionByExclusion(candidates, nodes, filter.ReplicasOnDifferent)
+
+	placed, err = p.placeDiskful(ctx, rdName, state, preferred, placed, want)
+	if err != nil {
+		return placed, want, err
+	}
+
+	placed, err = p.placeDiskful(ctx, rdName, state, lastResort, placed, want)
 	if err != nil {
 		return placed, want, err
 	}
@@ -281,7 +293,12 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		s.sameTuple = lookupKeys(nodeProps, s.filter.ReplicasOnSame)
 	}
 
-	for _, k := range s.filter.ReplicasOnDifferent {
+	for _, spec := range s.filter.ReplicasOnDifferent {
+		if _, _, hasValue := parseDiffSpec(spec); hasValue {
+			continue
+		}
+
+		k := spec
 		s.diffSeen[k+"="+nodeProps[auxKey(k)]] = struct{}{}
 	}
 
@@ -417,7 +434,16 @@ func topologyTuple(existing []apiv1.Resource, nodes map[string]map[string]string
 func topologySeen(existing []apiv1.Resource, nodes map[string]map[string]string, keys []string) map[string]struct{} {
 	out := map[string]struct{}{}
 
-	for _, k := range keys {
+	for _, spec := range keys {
+		// "key=value" form is a soft-exclusion, not anti-affinity —
+		// don't pre-seed it into the diff seen-set. Such entries are
+		// handled by partitionByExclusion + the two-pass place loop.
+		if _, _, hasValue := parseDiffSpec(spec); hasValue {
+			continue
+		}
+
+		k := spec
+
 		for i := range existing {
 			value := nodes[existing[i].NodeName][auxKey(k)]
 			out[k+"="+value] = struct{}{}
@@ -442,7 +468,16 @@ func matchesTuple(nodeProps map[string]string, keys []string, want map[string]st
 }
 
 func collidesWithDiff(nodeProps map[string]string, keys []string, seen map[string]struct{}) bool {
-	for _, k := range keys {
+	for _, spec := range keys {
+		// Value-form entries don't participate in anti-affinity; they
+		// are soft-exclusions handled at the candidate-partitioning
+		// layer. Skip them so a key="zone=us-east" filter doesn't
+		// accidentally collide with itself.
+		if _, _, hasValue := parseDiffSpec(spec); hasValue {
+			continue
+		}
+
+		k := spec
 		if _, dup := seen[k+"="+nodeProps[auxKey(k)]]; dup {
 			return true
 		}
@@ -467,6 +502,86 @@ func auxKey(key string) string {
 	}
 
 	return prefix + key
+}
+
+// parseDiffSpec splits a replicas_on_different entry into its key and
+// optional value half. Per UG9, a bare "key" means "spread replicas
+// across distinct values of key" (anti-affinity); a "key=value" form
+// means "nodes carrying that exact pair are LAST resort" (soft
+// exclusion). The third return tells the caller which mode this spec
+// is in.
+func parseDiffSpec(spec string) (string, string, bool) {
+	k, v, ok := strings.Cut(spec, "=")
+	if !ok {
+		return spec, "", false
+	}
+
+	return k, v, true
+}
+
+// partitionByExclusion separates the candidate pool list into a
+// "preferred" bucket (nodes that don't carry any of the soft-exclusion
+// `key=value` pairs from replicas_on_different) and a "last-resort"
+// bucket (nodes that carry at least one). The placer drains preferred
+// first; only when preferred is exhausted does it touch last-resort,
+// matching the UG9 contract: value-form excludes those nodes from
+// normal selection but does not hard-forbid them.
+//
+// When the filter carries no value-form entries, every candidate ends
+// up in preferred — the function is a no-op for the common case.
+func partitionByExclusion(candidates []apiv1.StoragePool, nodes map[string]map[string]string, keys []string) ([]apiv1.StoragePool, []apiv1.StoragePool) {
+	// Fast path: no value-form entries → everything is preferred.
+	hasAnyValueForm := false
+
+	for _, spec := range keys {
+		if _, _, hv := parseDiffSpec(spec); hv {
+			hasAnyValueForm = true
+
+			break
+		}
+	}
+
+	if !hasAnyValueForm {
+		return candidates, nil
+	}
+
+	var (
+		preferred  []apiv1.StoragePool
+		lastResort []apiv1.StoragePool
+	)
+
+	for i := range candidates {
+		pool := candidates[i]
+		nodeProps := nodes[pool.NodeName]
+
+		if matchesAnyExcludedPair(nodeProps, keys) {
+			lastResort = append(lastResort, pool)
+
+			continue
+		}
+
+		preferred = append(preferred, pool)
+	}
+
+	return preferred, lastResort
+}
+
+// matchesAnyExcludedPair returns true when at least one value-form
+// entry in keys matches the node's Aux/<key> property. This is the
+// per-node test that drives partitionByExclusion's bucketing.
+func matchesAnyExcludedPair(nodeProps map[string]string, keys []string) bool {
+	for _, spec := range keys {
+		k, v, hasValue := parseDiffSpec(spec)
+		if !hasValue {
+			continue
+		}
+
+		if nodeProps[auxKey(k)] == v {
+			return true
+		}
+	}
+
+	return false
 }
 
 // pickSameGroup partitions candidates by their `replicas_on_same`
