@@ -32,6 +32,9 @@ rules:
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
@@ -79,7 +82,6 @@ spec:
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
             - --leader-elect=false
-            - --store=k8s
           ports:
             - {name: health, containerPort: 8081}
           readinessProbe:
