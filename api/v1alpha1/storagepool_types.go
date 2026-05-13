@@ -77,6 +77,13 @@ type StoragePoolStatus struct {
 	// +optional
 	StaticTraits map[string]string `json:"staticTraits,omitempty"`
 
+	// poolMissing indicates the satellite's last PoolStatus probe failed —
+	// typically the backing pool (zpool / VG / FILE_THIN dir) was destroyed
+	// out-of-band. While true, the placer skips this pool and the REST
+	// wire view emits state="Faulty" instead of "Ok".
+	// +optional
+	PoolMissing bool `json:"poolMissing,omitempty"`
+
 	// conditions represent the current state of the StoragePool resource.
 	// +listType=map
 	// +listMapKey=type

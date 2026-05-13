@@ -152,6 +152,14 @@ func (r *StoragePoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // transient PoolStatus / apiserver error logs + the next
 // Reconcile retries. A nil provider (DISKLESS) is a no-op since
 // there's nothing to query.
+//
+// When the provider's PoolStatus probe fails — the typical cause
+// is operator-driven destruction of the backing pool (`zpool
+// destroy`, `vgremove`, deleting the FILE_THIN dir) — we stamp
+// `Status.PoolMissing=true` and zero out the capacity numbers so
+// the placer skips the pool and the REST wire view flips to
+// state="Faulty". The next successful probe clears PoolMissing
+// back to false. Bug 50.
 func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockstoriov1alpha1.StoragePool, provider storage.Provider) {
 	logger := log.FromContext(ctx).WithValues("storagepool", pool.Name)
 
@@ -161,12 +169,32 @@ func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockst
 
 	status, err := provider.PoolStatus(ctx)
 	if err != nil {
-		logger.Info("PoolStatus failed", "err", err)
+		// Operator-initiated destroy is a legitimate state — Info,
+		// not Error. The next successful probe clears PoolMissing.
+		logger.Info("pool disappeared", "err", err)
+
+		if pool.Status.PoolMissing &&
+			pool.Status.FreeCapacity == 0 &&
+			pool.Status.TotalCapacity == 0 {
+			// Already marked missing with zeroed capacity — skip
+			// the apiserver round-trip on repeated failures.
+			return
+		}
+
+		pool.Status.PoolMissing = true
+		pool.Status.FreeCapacity = 0
+		pool.Status.TotalCapacity = 0
+
+		updateErr := r.Status().Update(ctx, pool)
+		if updateErr != nil {
+			logger.Info("Status.Update for PoolMissing", "err", updateErr)
+		}
 
 		return
 	}
 
-	if pool.Status.FreeCapacity == status.FreeCapacityKib &&
+	if !pool.Status.PoolMissing &&
+		pool.Status.FreeCapacity == status.FreeCapacityKib &&
 		pool.Status.TotalCapacity == status.TotalCapacityKib &&
 		pool.Status.SupportsSnapshots == status.SupportsSnapshots {
 		// No-op write: nothing changed since the last Reconcile.
@@ -178,6 +206,7 @@ func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockst
 	pool.Status.FreeCapacity = status.FreeCapacityKib
 	pool.Status.TotalCapacity = status.TotalCapacityKib
 	pool.Status.SupportsSnapshots = status.SupportsSnapshots
+	pool.Status.PoolMissing = false
 
 	err = r.Status().Update(ctx, pool)
 	if err != nil {

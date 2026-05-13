@@ -266,14 +266,19 @@ func TestStoragePoolDriveReplacement6_19(t *testing.T) {
 
 	t.Run("capacity zeroed or marked stale on missing pool", func(t *testing.T) {
 		t.Parallel()
-		t.Skip("scenario 6.19 not implemented — see feature gap 4 in storagepool_replacement_test.go header. " +
-			"FreeCapacity/TotalCapacity are left at last-known values; the autoplacer will keep treating " +
-			"the dead pool as a placement target.")
 
-		// EXPECTED once implemented (option A — zero out):
+		// writeCapacity zeroes FreeCapacity/TotalCapacity and
+		// flips PoolMissing=true on a PoolStatus error. The full
+		// PoolMissing-bool lifecycle is pinned by
+		// TestStoragePoolReconcilePoolMissingLifecycle; this assertion
+		// just confirms the capacity half of the same write landed.
 		if afterFailure.Status.FreeCapacity != 0 {
 			t.Errorf("Pass 2: Status.FreeCapacity = %d, want 0 (pool is missing)",
 				afterFailure.Status.FreeCapacity)
+		}
+
+		if !afterFailure.Status.PoolMissing {
+			t.Errorf("Pass 2: Status.PoolMissing = false, want true (pool is missing)")
 		}
 	})
 

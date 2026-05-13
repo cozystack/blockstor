@@ -44,7 +44,10 @@ func (s *inMemoryStoragePools) List(_ context.Context) ([]apiv1.StoragePool, err
 
 	out := make([]apiv1.StoragePool, 0, len(s.m))
 	for k := range s.m {
-		out = append(out, s.m[k])
+		sp := s.m[k]
+		withDerivedState(&sp)
+
+		out = append(out, sp)
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -67,7 +70,10 @@ func (s *inMemoryStoragePools) ListByNode(_ context.Context, node string) ([]api
 
 	for k := range s.m {
 		if s.m[k].NodeName == node {
-			out = append(out, s.m[k])
+			sp := s.m[k]
+			withDerivedState(&sp)
+
+			out = append(out, sp)
 		}
 	}
 
@@ -88,7 +94,26 @@ func (s *inMemoryStoragePools) Get(_ context.Context, node, pool string) (apiv1.
 		return apiv1.StoragePool{}, errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
 	}
 
+	withDerivedState(&sp)
+
 	return sp, nil
+}
+
+// withDerivedState fills the wire `state` field from the in-memory
+// PoolMissing carrier. Mirrors the k8s store's crdToWireStoragePool —
+// keeping the two backends in lockstep so the rest tests that use
+// the in-memory store still see "Ok" / "Faulty" the same way real
+// clusters do.
+func withDerivedState(sp *apiv1.StoragePool) {
+	if sp.State != "" {
+		return
+	}
+
+	if sp.PoolMissing {
+		sp.State = "Faulty"
+	} else {
+		sp.State = "Ok"
+	}
 }
 
 // Create inserts a new pool. Conflict on (node, name).

@@ -1925,6 +1925,122 @@ func TestPlaceWeightedScoringMinRscCount(t *testing.T) {
 	}
 }
 
+// TestPlaceSkipsPoolMissing pins Bug 50 placer behaviour: a pool
+// the satellite has flagged with PoolMissing=true MUST NOT receive
+// a replica. With 3 nodes — one of them flagged as missing —
+// place_count=2 lands on the two healthy peers; the missing pool
+// is dropped from the candidate set by matchesPoolFilter, same as
+// EVICTED / LOST nodes.
+//
+// Without this gate the placer would happily stamp a Resource on
+// the dead pool, the satellite would fail the ZVOL create, but
+// the DRBD slot would still come up on the healthy peers — leaving
+// resync stalled at 1% because there's nothing on the dead peer to
+// catch up.
+func TestPlaceSkipsPoolMissing(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, name := range []string{"n1", "n2", "n3-missing"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        n,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    1000,
+			TotalCapacity:   1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n3-missing",
+		StoragePoolName: "pool",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    0,
+		TotalCapacity:   0,
+		PoolMissing:     true,
+	}); err != nil {
+		t.Fatalf("seed missing pool: %v", err)
+	}
+
+	placed, want, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 2})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	for _, r := range got {
+		if r.NodeName == "n3-missing" {
+			t.Errorf("missing-pool node received a replica: %+v", r)
+		}
+	}
+}
+
+// TestPlacePoolMissingNoCandidates pins the singular-missing-pool
+// edge: when the ONLY candidate is PoolMissing, the placer must
+// fail rather than land a replica on the dead pool. We expect the
+// placer to return placed=0 with no error (or a CapacityShortfallError
+// surface when a non-zero RD size enters the picture).
+func TestPlacePoolMissingNoCandidates(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "pool",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    0,
+		TotalCapacity:   0,
+		PoolMissing:     true,
+	}); err != nil {
+		t.Fatalf("seed missing pool: %v", err)
+	}
+
+	placed, want, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		// CapacityShortfallError or a generic-shortfall envelope is
+		// acceptable — both surface to the operator as "no candidate".
+		// The hard requirement is placed=0 on the dead-pool path.
+		if !strings.Contains(err.Error(), "free capacity") &&
+			!errors.As(err, new(*placer.CapacityShortfallError)) {
+			t.Logf("Place error (acceptable): %v", err)
+		}
+	}
+
+	if placed != 0 {
+		t.Errorf("placed: got %d, want 0 (only pool is missing)", placed)
+	}
+
+	if want != 1 {
+		t.Errorf("want: got %d, want 1", want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 0 {
+		t.Errorf("resources created on dead-pool path: %+v", got)
+	}
+}
 
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background

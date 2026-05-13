@@ -37,6 +37,21 @@ type StoragePool struct {
 	SupportsSnapshot bool        `json:"supports_snapshots,omitempty"`
 	ExternalLocking  bool        `json:"external_locking,omitempty"`
 	UUID             string      `json:"uuid,omitempty"`
+
+	// State is the per-pool health string upstream LINSTOR exposes on
+	// the wire (`Ok` / `Faulty` / `Error`). The Python CLI's
+	// `storpool_cmds.py:472` reads it as `state_str`. We emit "Faulty"
+	// when the satellite has marked the pool missing (Status.PoolMissing
+	// on the CRD); otherwise "Ok". Bug 50: without this field, the CLI
+	// rendered every pool as Ok even after `zpool destroy`, so the
+	// operator had no signal that the backing pool was gone.
+	State string `json:"state,omitempty"`
+
+	// PoolMissing is an internal carrier so the placer can drop pools
+	// whose backing storage has disappeared on the satellite. Not on
+	// the upstream wire; we tag it `json:"-"` to keep responses byte-
+	// compatible. Mirrors the CRD's Status.PoolMissing.
+	PoolMissing bool `json:"-"`
 }
 
 // APICallRc is the upstream `ApiCallRc` envelope. We define a minimal subset

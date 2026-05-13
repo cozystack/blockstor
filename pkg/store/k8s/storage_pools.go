@@ -194,6 +194,14 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		fsmName = crd.Spec.SharedSpaceID
 	}
 
+	// Surface the satellite's PoolMissing signal as the wire `state`
+	// field. Upstream LINSTOR uses "Ok" / "Faulty" / "Error" — we map
+	// PoolMissing=true → "Faulty", everything else → "Ok".
+	state := "Ok"
+	if crd.Status.PoolMissing {
+		state = "Faulty"
+	}
+
 	return apiv1.StoragePool{
 		StoragePoolName:  poolName,
 		NodeName:         crd.Spec.NodeName,
@@ -206,6 +214,8 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		StaticTraits:     crd.Status.StaticTraits,
 		FreeSpaceMgrName: fsmName,
 		UUID:             string(crd.UID),
+		State:            state,
+		PoolMissing:      crd.Status.PoolMissing,
 	}
 }
 

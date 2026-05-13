@@ -771,6 +771,15 @@ func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, 
 		return false
 	}
 
+	// Drop pools whose satellite has marked them as missing
+	// (backing zpool / VG / FILE_THIN dir was destroyed out-of-band).
+	// Without this gate the placer would happily land a replica on a
+	// pool whose ZVOL create is guaranteed to fail, leaving DRBD slot
+	// up on the healthy peer and resync stuck at 1%.
+	if pool.PoolMissing {
+		return false
+	}
+
 	if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
 		return false
 	}

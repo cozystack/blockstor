@@ -121,6 +121,125 @@ func TestStoragePoolReconcileStampsFinalizer(t *testing.T) {
 	}
 }
 
+// TestStoragePoolReconcilePoolMissingLifecycle pins the Bug 50
+// semantic: when the satellite's PoolStatus probe fails (operator
+// did `zpool destroy` / `vgremove` out-of-band) the reconciler
+// MUST stamp `Status.PoolMissing=true` + zero the capacity, and
+// the next successful probe MUST clear PoolMissing back to false.
+//
+// Three reconcile passes, each driving one transition:
+//
+//  1. healthy probe → PoolMissing stays false, capacity stamped.
+//  2. PoolStatus fails (`lvs` returns empty stdout, lvm-thin treats
+//     it as "thin pool not found") → PoolMissing=true, capacity=0.
+//  3. healthy probe again → PoolMissing flips back to false, fresh
+//     capacity stamped.
+//
+// Implementation note: the test reuses the LVM-thin `lvs` command
+// shape from `storagepool_replacement_test.go::drvReplacementLvsCmd`
+// so a single FakeExec stub drives both the healthy and the missing
+// passes.
+func TestStoragePoolReconcilePoolMissingLifecycle(t *testing.T) {
+	t.Parallel()
+
+	const initialFreeKib int64 = 50 * 1024 * 1024 // 50 GiB
+
+	scheme := newStoragePoolScheme(t)
+
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       drvReplacementVG + "-n1",
+			Finalizers: []string{controllers.StoragePoolFinalizer},
+		},
+		Spec: blockstoriov1alpha1.StoragePoolSpec{
+			NodeName:     "n1",
+			PoolName:     drvReplacementVG,
+			ProviderKind: "LVM_THIN",
+			Props: map[string]string{
+				"StorDriver/LvmVg":    drvReplacementVG,
+				"StorDriver/ThinPool": drvReplacementThin,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pool).
+		WithStatusSubresource(&blockstoriov1alpha1.StoragePool{}).
+		Build()
+
+	// --- Pass 1: healthy probe — PoolMissing stays false. ---
+
+	fx := storage.NewFakeExec()
+	expectLvsOutput(fx, initialFreeKib)
+	_ = reconcileDrvReplacement(t, cli, fx)
+
+	var afterHealthy blockstoriov1alpha1.StoragePool
+
+	err := cli.Get(context.Background(), client.ObjectKey{Name: drvReplacementVG + "-n1"}, &afterHealthy)
+	if err != nil {
+		t.Fatalf("Get after healthy reconcile: %v", err)
+	}
+
+	if afterHealthy.Status.PoolMissing {
+		t.Errorf("Pass 1: PoolMissing=true on healthy probe, want false")
+	}
+
+	if afterHealthy.Status.FreeCapacity != initialFreeKib {
+		t.Errorf("Pass 1: Status.FreeCapacity = %d, want %d (healthy probe)",
+			afterHealthy.Status.FreeCapacity, initialFreeKib)
+	}
+
+	// --- Pass 2: PoolStatus fails — empty `lvs` stdout makes
+	// lvm.Thin.PoolStatus surface a "thin pool not found" error. ---
+
+	fx = storage.NewFakeExec() // empty Responses => empty stdout
+	_ = reconcileDrvReplacement(t, cli, fx)
+
+	var afterMissing blockstoriov1alpha1.StoragePool
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: drvReplacementVG + "-n1"}, &afterMissing)
+	if err != nil {
+		t.Fatalf("Get after pool-missing reconcile: %v", err)
+	}
+
+	if !afterMissing.Status.PoolMissing {
+		t.Errorf("Pass 2: PoolMissing=false after PoolStatus error, want true")
+	}
+
+	if afterMissing.Status.FreeCapacity != 0 {
+		t.Errorf("Pass 2: Status.FreeCapacity = %d, want 0 (pool missing)",
+			afterMissing.Status.FreeCapacity)
+	}
+
+	if afterMissing.Status.TotalCapacity != 0 {
+		t.Errorf("Pass 2: Status.TotalCapacity = %d, want 0 (pool missing)",
+			afterMissing.Status.TotalCapacity)
+	}
+
+	// --- Pass 3: healthy probe again — PoolMissing clears. ---
+
+	fx = storage.NewFakeExec()
+	expectLvsOutput(fx, initialFreeKib)
+	_ = reconcileDrvReplacement(t, cli, fx)
+
+	var afterRecovery blockstoriov1alpha1.StoragePool
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: drvReplacementVG + "-n1"}, &afterRecovery)
+	if err != nil {
+		t.Fatalf("Get after recovery reconcile: %v", err)
+	}
+
+	if afterRecovery.Status.PoolMissing {
+		t.Errorf("Pass 3: PoolMissing=true after recovery, want false")
+	}
+
+	if afterRecovery.Status.FreeCapacity != initialFreeKib {
+		t.Errorf("Pass 3: Status.FreeCapacity = %d, want %d (recovered)",
+			afterRecovery.Status.FreeCapacity, initialFreeKib)
+	}
+}
+
 // TestStoragePoolReconcileDeleteIsDeregisterOnly pins the
 // safety contract: deleting a StoragePool CRD MUST NOT touch
 // the backend (no `vgremove`, no `zpool destroy`). The
