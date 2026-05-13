@@ -183,13 +183,32 @@ func crdToWireSnapshot(crd *crdv1alpha1.Snapshot) apiv1.Snapshot {
 		}
 	}
 
-	if len(crd.Status.NodeStatus) > 0 {
+	switch {
+	case len(crd.Status.NodeStatus) > 0:
 		out.Snapshots = make([]apiv1.SnapshotPerNode, 0, len(crd.Status.NodeStatus))
 		for i := range crd.Status.NodeStatus {
 			out.Snapshots = append(out.Snapshots, apiv1.SnapshotPerNode{
 				SnapshotName:    crd.Spec.SnapshotName,
 				NodeName:        crd.Status.NodeStatus[i].NodeName,
 				CreateTimestamp: crd.Status.NodeStatus[i].CreateTimestamp,
+			})
+		}
+	case len(crd.Spec.Nodes) > 0:
+		// Status.NodeStatus is satellite-reported and lands after the
+		// satellite reconciler picks up the new Snapshot CRD. The
+		// REST shim's view of "where the snapshot landed" needs to
+		// be visible immediately after CreateSnapshot — linstor-csi
+		// hard-fails ListSnapshots with "missing snapshots" when
+		// the per-node Snapshots[] is empty. Synthesise one
+		// SnapshotPerNode entry per Spec.Nodes target so the wire
+		// shape matches upstream LINSTOR's "all replicas have a
+		// SnapshotNode entry once the controller commits the
+		// definition" semantic.
+		out.Snapshots = make([]apiv1.SnapshotPerNode, 0, len(crd.Spec.Nodes))
+		for _, node := range crd.Spec.Nodes {
+			out.Snapshots = append(out.Snapshots, apiv1.SnapshotPerNode{
+				SnapshotName: crd.Spec.SnapshotName,
+				NodeName:     node,
 			})
 		}
 	}

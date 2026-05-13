@@ -135,6 +135,16 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Materialise the per-node `Snapshots[]` array so reads see one
+	// SnapshotNode per diskful peer. linstor-csi's CreateSnapshot
+	// flow lists snapshots immediately after create and treats an
+	// empty `snapshots[]` array as "the satellite never took it" —
+	// surfaced as "failed to create snapshot: missing snapshots".
+	// blockstor's actual snapshot is taken by the satellite during
+	// reconcile, but the REST shim's view of "where it landed"
+	// derives deterministically from Spec.Nodes.
+	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes)
+
 	err = s.Store.Snapshots().Create(r.Context(), &snap)
 	if err != nil {
 		writeStoreError(w, err)
@@ -146,6 +156,22 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
 	}})
+}
+
+// makeSnapshotPerNode builds the `Snapshots[]` per-node materialisation
+// from the slice of node names a Snapshot targets. Used at create time
+// so subsequent GETs surface one SnapshotNode entry per diskful peer —
+// linstor-csi's "did the satellite actually take it?" probe.
+func makeSnapshotPerNode(name string, nodes []string) []apiv1.SnapshotPerNode {
+	out := make([]apiv1.SnapshotPerNode, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, apiv1.SnapshotPerNode{
+			SnapshotName: name,
+			NodeName:     node,
+		})
+	}
+
+	return out
 }
 
 // hydrateSnapshotFromRD fills in the per-snapshot fields the
