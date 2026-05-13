@@ -22,13 +22,33 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
+)
+
+// AutoTiebreakerSuppressedUntilAnnotation is stamped on an RD when an
+// operator (or an internal cleanup path) deletes a TIE_BREAKER replica.
+// While the annotation timestamp is in the future, the RD-level
+// reconciler skips its auto-witness branch. Without the suppression
+// window, `linstor r d <tiebreaker-node> <rd>` returns success and
+// then the reconciler re-stamps a fresh witness within milliseconds,
+// silently undoing operator intent.
+//
+// 5 minutes covers a normal operator follow-up (e.g. scale to 3
+// diskful before quorum changes) and naturally expires for the
+// steady-state auto-quorum path. The window is intentionally short
+// so a forgotten suppression doesn't permanently disable the
+// auto-witness invariant.
+const (
+	AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
+	autoTiebreakerSuppressionWindow         = 5 * time.Minute
 )
 
 // registerAutoplace wires `POST /v1/resource-definitions/{rd}/autoplace` and
@@ -146,17 +166,19 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 	// didn't pin one explicitly.
 	constrainAutoplaceToSnapshotNodes(r.Context(), s.Store, &rd, &filter)
 
-	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, &filter)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
+	// Clones from snapshots must land on pools whose ProviderKind
+	// matches the source's. zfs send/recv and dd/lvm payloads are
+	// not interchangeable; a ZFS_THIN→LVM_THIN clone fails opaquely
+	// at satellite SendSnapshot/RecvSnapshot time. Pin the
+	// provider-kind filter to the source's so the placer drops
+	// mismatched candidates and 409s fail-fast with an operator-
+	// actionable error instead.
+	srcKind := resolveCloneSourceProviderKind(r.Context(), s.Store, &rd)
+	if srcKind != "" {
+		filter.ProviderList = []string{srcKind}
 	}
 
-	if placed < want {
-		writeError(w, http.StatusConflict,
-			"not enough candidate storage pools for the requested placement")
-
+	if !s.runPlaceAndReport(w, r, rdName, &filter, srcKind) {
 		return
 	}
 
@@ -169,6 +191,99 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
 	}})
+}
+
+// runPlaceAndReport drives the placer and writes the appropriate
+// HTTP error on shortfall. Returns true on success (caller writes
+// the success body), false on any error path (caller returns).
+// Pulled out of handleAutoplace to keep that function under the
+// cyclomatic / funlen budget once the snapshot-clone provider-kind
+// constraint was added.
+func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
+	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	if placed < want {
+		if srcKind != "" {
+			writeError(w, http.StatusConflict,
+				"cannot place: snapshot is on "+srcKind+
+					" but no "+srcKind+" pool found on any candidate node")
+
+			return false
+		}
+
+		writeError(w, http.StatusConflict,
+			"not enough candidate storage pools for the requested placement")
+
+		return false
+	}
+
+	return true
+}
+
+// resolveCloneSourceProviderKind returns the ProviderKind of the
+// pool backing the source RD when `rd` was born from a snapshot
+// (BlockstorRestoreFromSnapshot prop). Returns "" when the RD is
+// not a clone, when the prop is malformed, or when the source has
+// no diskful replica we can read a StorPoolName off of.
+//
+// Used by handleAutoplace to constrain candidate pools to a
+// matching ProviderKind — zfs send and dd/lvm payloads are not
+// interchangeable, so a cross-provider clone would fail opaquely
+// at satellite SendSnapshot/RecvSnapshot time.
+//
+// Lookup path: BlockstorRestoreFromSnapshot → source RD name →
+// first non-Diskless Resource on source RD → its StorPoolName +
+// NodeName → StoragePool.ProviderKind. We walk Resources rather
+// than trusting a hypothetical Snapshot.ProviderKind field because
+// the snapshot CRD doesn't stamp it today (potential future
+// optimisation — see the report).
+func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *apiv1.ResourceDefinition) string {
+	const restoreFromKey = "BlockstorRestoreFromSnapshot"
+
+	stamp := rd.Props[restoreFromKey]
+	if stamp == "" {
+		return ""
+	}
+
+	srcRD, _, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" {
+		return ""
+	}
+
+	resList, err := st.Resources().ListByDefinition(ctx, srcRD)
+	if err != nil {
+		return ""
+	}
+
+	for i := range resList {
+		res := &resList[i]
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		stor := res.Props["StorPoolName"]
+		if stor == "" {
+			continue
+		}
+
+		pool, err := st.StoragePools().Get(ctx, res.NodeName, stor)
+		if err != nil {
+			continue
+		}
+
+		if pool.ProviderKind == "" || pool.ProviderKind == apiv1.StoragePoolKindDiskless {
+			continue
+		}
+
+		return pool.ProviderKind
+	}
+
+	return ""
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's
@@ -468,9 +583,29 @@ func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 // 200/204. Returning a bare `204 No Content` makes the CLI emit
 // "Unable to parse REST json data: Expecting value", so we mirror
 // the upstream shape: HTTP 200 + `MASK_INFO | RC_RSC_DELETED` entry.
+//
+// Special case: when the replica being deleted is a TIE_BREAKER, the
+// parent RD gets an auto-tiebreaker-suppression annotation so the
+// RD-level reconciler doesn't immediately re-stamp a fresh witness
+// the next time `ensureTiebreaker` fires. Looked up BEFORE the
+// Delete so a concurrent reconcile observes "Resource gone +
+// annotation present" rather than "Resource gone + no annotation"
+// (which would race the witness back in).
 func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
+
+	// Look up flags before delete so we know whether to stamp the
+	// suppression annotation. A NotFound at this stage is fine —
+	// the Delete call below will surface the right 404.
+	existing, getErr := s.Store.Resources().Get(r.Context(), rdName, node)
+	if getErr == nil && slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+		// Best-effort. Failure to stamp must not block the
+		// operator-requested delete; the worst case without
+		// the annotation is "auto-witness comes back in 5
+		// seconds" — annoying, but not data-loss.
+		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
+	}
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
@@ -483,4 +618,34 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "Resource '" + rdName + "' on node '" + node + "' deleted",
 	}})
+}
+
+// stampTiebreakerSuppression writes the
+// AutoTiebreakerSuppressedUntilAnnotation onto the parent RD with a
+// `now + autoTiebreakerSuppressionWindow` deadline. The RD-side
+// reconciler reads the annotation in `isTiebreakerSuppressed` and
+// skips its auto-witness branch while the window is active.
+//
+// Idempotent: a fresh stamp always wins (later operator intent
+// overrides earlier). NotFound on the parent RD is swallowed — a
+// concurrent RD-delete cascade is the most common reason and the
+// caller doesn't care.
+func (s *Server) stampTiebreakerSuppression(ctx context.Context, rdName string) error {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return err //nolint:wrapcheck // best-effort, caller swallows
+	}
+
+	if rd.Annotations == nil {
+		rd.Annotations = map[string]string{}
+	}
+
+	deadline := time.Now().Add(autoTiebreakerSuppressionWindow).UTC().Format(time.RFC3339)
+	rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation] = deadline
+
+	return s.Store.ResourceDefinitions().Update(ctx, &rd) //nolint:wrapcheck // best-effort
 }

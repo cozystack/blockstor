@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"slices"
 	"testing"
+	"time"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -1048,5 +1049,99 @@ func TestAutoplaceBadJSON(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestResourceDeleteTieBreakerStampsSuppression: deleting a
+// TIE_BREAKER-flagged replica writes the auto-tiebreaker
+// suppression annotation on the parent RD with a future RFC3339
+// deadline. The RD-side reconciler honours that annotation to
+// avoid immediately re-stamping a fresh witness — without this,
+// `linstor r d <tiebreaker-node> <rd>` would silently get undone
+// within milliseconds by the next reconcile.
+//
+// Regression guard for Bug 4.
+func TestResourceDeleteTieBreakerStampsSuppression(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-tb"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-tb",
+		NodeName: "n3",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-tb/resources/n3")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-tb")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	raw, ok := rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation]
+	if !ok || raw == "" {
+		t.Fatalf("suppression annotation missing; annotations=%v", rd.Annotations)
+	}
+
+	deadline, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("annotation value %q is not RFC3339: %v", raw, err)
+	}
+
+	if !deadline.After(time.Now()) {
+		t.Errorf("annotation deadline %v is not in the future", deadline)
+	}
+}
+
+// TestResourceDeleteRegularReplicaSkipsSuppression: deleting a
+// regular diskful replica must NOT stamp the suppression
+// annotation. Only TIE_BREAKER deletes carry operator intent that
+// should pause the auto-witness loop — otherwise every `linstor r
+// d` would silently disable the invariant for 5 minutes.
+func TestResourceDeleteRegularReplicaSkipsSuppression(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-reg"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-reg", NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-reg/resources/n1")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-reg")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if _, ok := rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation]; ok {
+		t.Errorf("suppression annotation must not appear on a regular-replica delete; got %v", rd.Annotations)
 	}
 }

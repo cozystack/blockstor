@@ -17,8 +17,11 @@ limitations under the License.
 package rest
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -75,7 +78,54 @@ func (s *Server) handleNodeReconnect(w http.ResponseWriter, r *http.Request) {
 // handleNodeEvacuate adds the EVICTED flag — a soft "drain me" hint
 // the autoplacer respects (won't pick this node for new replicas) and
 // the migration reconciler watches for.
+//
+// Per UG9 §"Evacuating a node": refuse when any resource on the node
+// has observed state.in_use=true (Primary, with a consumer mounting
+// it). Stamping EVICTED silently would let the autoplacer/migrator
+// strand an actively-mounted volume — a data-availability hazard the
+// operator must consciously accept.
+//
+// `state.in_use == nil` is "satellite hasn't reported yet" and is
+// NOT a refusal — the operator may legitimately evacuate a node
+// before any satellite observation has landed.
+//
+// ?force=true bypasses the check, matching the precedent set by
+// handleRGDelete (mirrors upstream LINSTOR's `--force`).
 func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("node")
+
+	if r.URL.Query().Get("force") != "true" {
+		resources, err := s.Store.Resources().List(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+
+			return
+		}
+
+		var inUse []string
+
+		for i := range resources {
+			res := &resources[i]
+			if res.NodeName != name {
+				continue
+			}
+
+			if res.State.InUse != nil && *res.State.InUse {
+				inUse = append(inUse, res.Name)
+			}
+		}
+
+		if len(inUse) > 0 {
+			sort.Strings(inUse)
+			writeError(w, http.StatusConflict, fmt.Sprintf(
+				"cannot evacuate: %d resource(s) on node %s are in use; "+
+					"demote or stop the consumer(s) first: %s",
+				len(inUse), name, strings.Join(inUse, ", ")))
+
+			return
+		}
+	}
+
 	updateNodeFlags(w, r, s, addFlag("EVICTED"))
 }
 
