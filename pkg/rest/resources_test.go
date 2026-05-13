@@ -145,6 +145,113 @@ func TestResourcesViewRDFilter(t *testing.T) {
 	}
 }
 
+// TestFaultyFilterPrioritizesZeroUpToDate exercises the recovery-
+// copilot ranking: `?faulty=true` excludes fully-healthy RDs and
+// orders the remainder so the RDs with ZERO UpToDate copies come
+// first (operators have to intervene there — DRBD has no good
+// replica to seed from), followed by RDs that still have at least
+// one UpToDate replica.
+//
+// Seed:
+//   - rd-1: 3 replicas, all Inconsistent  → 0 UpToDate, faulty (FIRST)
+//   - rd-2: 1 UpToDate + 1 StandAlone     → 1 UpToDate, faulty (SECOND)
+//   - rd-3: 3 replicas, all UpToDate      → 3 UpToDate, healthy (EXCLUDED)
+func TestFaultyFilterPrioritizesZeroUpToDate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seed := []apiv1.Resource{
+		// rd-1 — all replicas Inconsistent: 0 UpToDate, must come first.
+		{Name: "rd-1", NodeName: "n1", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "Inconsistent"},
+		}}},
+		{Name: "rd-1", NodeName: "n2", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "Inconsistent"},
+		}}},
+		{Name: "rd-1", NodeName: "n3", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "Inconsistent"},
+		}}},
+		// rd-2 — one UpToDate replica + one StandAlone peer: 1 UpToDate.
+		{Name: "rd-2", NodeName: "n1", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "UpToDate"},
+		}}},
+		{Name: "rd-2", NodeName: "n2", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "StandAlone"},
+		}}},
+		// rd-3 — fully healthy: must be filtered out entirely.
+		{Name: "rd-3", NodeName: "n1", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "UpToDate"},
+		}}},
+		{Name: "rd-3", NodeName: "n2", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "UpToDate"},
+		}}},
+		{Name: "rd-3", NodeName: "n3", Volumes: []apiv1.Volume{{
+			VolumeNumber: 0,
+			State:        apiv1.VolumeState{DiskState: "UpToDate"},
+		}}},
+	}
+
+	for i := range seed {
+		if err := st.Resources().Create(ctx, &seed[i]); err != nil {
+			t.Fatalf("seed %s/%s: %v", seed[i].Name, seed[i].NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources?faulty=true")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// rd-3 (3 replicas, all UpToDate) must be excluded; only rd-1
+	// (3 replicas) + rd-2 (2 replicas) survive = 5 entries.
+	if len(got) != 5 {
+		t.Fatalf("len: got %d, want 5; entries=%v", len(got), got)
+	}
+
+	// rd-3 must not appear anywhere — defence in depth against
+	// regressions where the filter weakens to "any non-empty
+	// disk_state" or similar.
+	for i := range got {
+		if got[i].Name == "rd-3" {
+			t.Errorf("rd-3 (all UpToDate) leaked into faulty view at index %d", i)
+		}
+	}
+
+	// First three entries belong to rd-1 (0 UpToDate); next two to
+	// rd-2 (1 UpToDate). Bucket boundary is the load-bearing
+	// invariant — within each bucket the deterministic Name+NodeName
+	// tiebreak keeps order stable for pagination.
+	for i := range 3 {
+		if got[i].Name != "rd-1" {
+			t.Errorf("position %d: got %q, want rd-1 (0 UpToDate first)", i, got[i].Name)
+		}
+	}
+
+	for i := 3; i < 5; i++ {
+		if got[i].Name != "rd-2" {
+			t.Errorf("position %d: got %q, want rd-2 (1 UpToDate second)", i, got[i].Name)
+		}
+	}
+}
+
 // TestResourcesViewWithoutStore: 503 when store is nil.
 func TestResourcesViewWithoutStore(t *testing.T) {
 	base, stop := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: nil})

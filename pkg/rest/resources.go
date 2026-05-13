@@ -52,6 +52,15 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	// poll returns a non-empty list when the answer is yes.
 	nodeFilter := multiValueQuery(r, "nodes")
 	rdFilter := multiValueQuery(r, "resources")
+	faultyOnly := boolQuery(r, "faulty")
+
+	// Per-RD UpToDate tally — drives the `?faulty=true` filter and
+	// the recovery-copilot's "broken first" ranking. Recovery
+	// playbooks key on "zero healthy copies" because that's the
+	// failure mode that can't self-heal: a single UpToDate replica
+	// is enough for DRBD to seed from, so RDs with 0 UpToDate need
+	// operator attention first.
+	rdStats := aggregateRDStats(resList)
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 
@@ -63,6 +72,10 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !matchAnyFold(rdFilter, resList[i].Name) {
+			continue
+		}
+
+		if faultyOnly && !rdStats[resList[i].Name].faulty {
 			continue
 		}
 
@@ -82,18 +95,139 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		out = append(out, rwv)
 	}
 
-	// Stable order so CSI ListVolumes pagination (offset+limit
-	// query params forwarded from max_entries + starting_token)
-	// is deterministic across calls.
-	slices.SortFunc(out, func(a, b apiv1.ResourceWithVolumes) int {
-		if a.Name != b.Name {
-			return strings.Compare(a.Name, b.Name)
+	// Stable order. Default keys on Name+NodeName so CSI ListVolumes
+	// pagination (offset+limit forwarded from max_entries +
+	// starting_token) is deterministic across calls. When
+	// `?faulty=true` is set, the recovery-copilot wants the
+	// worst-off RDs first, so prepend an UpToDate-count primary key:
+	// RDs with 0 UpToDate copies come before RDs with 1+.
+	slices.SortFunc(out, func(left, right apiv1.ResourceWithVolumes) int {
+		if faultyOnly {
+			if c := compareResourceFaulty(rdStats, &left, &right); c != 0 {
+				return c
+			}
 		}
 
-		return strings.Compare(a.NodeName, b.NodeName)
+		if left.Name != right.Name {
+			return strings.Compare(left.Name, right.Name)
+		}
+
+		return strings.Compare(left.NodeName, right.NodeName)
 	})
 
 	writeJSON(w, http.StatusOK, paginateResources(r, out))
+}
+
+// rdFaultyStats summarises the per-RD aggregate state used by the
+// `?faulty=true` filter + sort: how many replicas of this RD report
+// the UpToDate disk_state, and whether at least one replica looks
+// broken (i.e. needs operator attention).
+type rdFaultyStats struct {
+	upToDate int
+	faulty   bool
+}
+
+// diskStateUpToDate is the canonical DRBD-9 "this replica is fully
+// caught up" disk_state. Hoisted to a constant because both the
+// faulty-flag computation and the UpToDate-tally hot path key off
+// it — without one source of truth, a typo would silently desync
+// the two halves of `?faulty=true`.
+const diskStateUpToDate = "UpToDate"
+
+// aggregateRDStats walks the flat per-replica resource list and
+// folds each entry into its parent-RD bucket. The Python CLI's
+// `--faulty` semantics work at RD granularity — "is this resource
+// healthy?" is answered by looking at every replica's disk_state,
+// not just one — so the REST surface mirrors that: a single
+// non-UpToDate replica taints the whole RD as faulty in this view.
+func aggregateRDStats(resList []apiv1.Resource) map[string]rdFaultyStats {
+	out := map[string]rdFaultyStats{}
+
+	for i := range resList {
+		stats := out[resList[i].Name]
+
+		for j := range resList[i].Volumes {
+			disk := resList[i].Volumes[j].State.DiskState
+			if disk == "" {
+				continue
+			}
+
+			if isUpToDateDiskState(disk) {
+				stats.upToDate++
+			}
+		}
+
+		if isResourceFaulty(&resList[i]) {
+			stats.faulty = true
+		}
+
+		out[resList[i].Name] = stats
+	}
+
+	return out
+}
+
+// isResourceFaulty reports whether THIS single replica looks broken
+// (any non-empty volume disk_state that isn't UpToDate). The
+// RD-level aggregation in aggregateRDStats folds these per-replica
+// verdicts into a single per-RD faulty flag — one bad replica is
+// enough to mark the whole RD as needing operator attention.
+func isResourceFaulty(r *apiv1.Resource) bool {
+	for i := range r.Volumes {
+		disk := r.Volumes[i].State.DiskState
+		if disk == "" {
+			continue
+		}
+
+		if !isUpToDateDiskState(disk) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isUpToDateDiskState matches "UpToDate" plus the sync-progress-
+// annotated variant "UpToDate(NN%)" emitted by annotateSyncProgress.
+// We never want a fully-synced replica that happens to carry a
+// progress suffix to count as faulty.
+func isUpToDateDiskState(disk string) bool {
+	return disk == diskStateUpToDate || strings.HasPrefix(disk, diskStateUpToDate+"(")
+}
+
+// compareResourceFaulty is the recovery-copilot's "rank by
+// faultyness" primary sort key. RDs with zero UpToDate copies are
+// the ones that can't self-heal (DRBD needs one good replica to
+// seed from), so they go first; RDs with 1+ UpToDate copies follow.
+// Returns 0 when both belong to RDs with identical UpToDate counts —
+// the caller falls back to the deterministic Name+NodeName tiebreak.
+func compareResourceFaulty(stats map[string]rdFaultyStats, a, b *apiv1.ResourceWithVolumes) int {
+	au := stats[a.Name].upToDate
+	bu := stats[b.Name].upToDate
+
+	if au != bu {
+		return au - bu
+	}
+
+	return 0
+}
+
+// boolQuery parses a `?key=true|1|yes|on` query param. Mirrors
+// strconv.ParseBool's accepted forms plus the python-linstor CLI's
+// `yes` / `on` shorthands, since both wire dialects are observed.
+// Empty / unparseable / explicit-false returns false.
+func boolQuery(r *http.Request, key string) bool {
+	v := strings.TrimSpace(r.URL.Query().Get(key))
+	if v == "" {
+		return false
+	}
+
+	switch strings.ToLower(v) {
+	case "1", "t", "true", "y", "yes", "on":
+		return true
+	}
+
+	return false
 }
 
 // paginateResources applies golinstor's ListOpts.{Offset,Limit}
