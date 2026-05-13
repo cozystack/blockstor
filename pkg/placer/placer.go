@@ -24,6 +24,7 @@ package placer
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -211,6 +212,18 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 	allPools, err := p.store.StoragePools().List(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "list storage pools")
+	}
+
+	// do-not-place-with anti-affinity (scenarios 2.10 / 2.11): exclude
+	// every candidate pool whose node already hosts a replica of an RD
+	// named in NotPlaceWithRsc (verbatim) or matching
+	// NotPlaceWithRscRegex (compiled pattern). Resources of the RD
+	// being placed are ignored — otherwise the very first replica
+	// locks out the rest of the cluster. Invalid regex is a silent
+	// no-op so operator typos don't strand placement.
+	candidates, err = p.applyNotPlaceWith(ctx, rdName, filter, candidates)
+	if err != nil {
+		return nil, err
 	}
 
 	state := newState(filter, existing, nodes, allPools)
@@ -438,6 +451,73 @@ func poolsByKey(pools []apiv1.StoragePool) map[string]apiv1.StoragePool {
 	}
 
 	return out
+}
+
+// applyNotPlaceWith drops every candidate pool whose node already hosts
+// a replica of an RD named verbatim in filter.NotPlaceWithRsc OR matching
+// filter.NotPlaceWithRscRegex (scenarios 2.10 / 2.11). Replicas of the RD
+// being placed are skipped so the first replica doesn't lock the placer
+// out of the cluster. An invalid regex is a silent no-op — operator typos
+// must not strand placement.
+//
+// Returns the filtered candidates slice. When neither field is set the
+// input is returned unchanged (zero allocations on the common path).
+func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool) ([]apiv1.StoragePool, error) {
+	if len(filter.NotPlaceWithRsc) == 0 && filter.NotPlaceWithRscRegex == "" {
+		return candidates, nil
+	}
+
+	var pattern *regexp.Regexp
+
+	if filter.NotPlaceWithRscRegex != "" {
+		// Compile-error is a silent no-op per spec: an operator typo
+		// must never strand placement. The verbatim list still applies.
+		re, compileErr := regexp.Compile(filter.NotPlaceWithRscRegex)
+		if compileErr == nil {
+			pattern = re
+		}
+	}
+
+	all, err := p.store.Resources().List(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "list resources for not-place-with filter")
+	}
+
+	excluded := make(map[string]struct{})
+
+	for i := range all {
+		// Skip resources of the RD being placed — otherwise the first
+		// replica we land locks every subsequent placement out.
+		if all[i].Name == rdName {
+			continue
+		}
+
+		if slices.Contains(filter.NotPlaceWithRsc, all[i].Name) {
+			excluded[all[i].NodeName] = struct{}{}
+
+			continue
+		}
+
+		if pattern != nil && pattern.MatchString(all[i].Name) {
+			excluded[all[i].NodeName] = struct{}{}
+		}
+	}
+
+	if len(excluded) == 0 {
+		return candidates, nil
+	}
+
+	out := candidates[:0:0]
+
+	for i := range candidates {
+		if _, blocked := excluded[candidates[i].NodeName]; blocked {
+			continue
+		}
+
+		out = append(out, candidates[i])
+	}
+
+	return out, nil
 }
 
 // candidatePools returns the pool set eligible for a placement, after

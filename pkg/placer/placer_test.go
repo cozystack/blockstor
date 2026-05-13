@@ -1673,5 +1673,88 @@ func TestPlaceCapacityGateIntegratesWithOversubRatio(t *testing.T) {
 	}
 }
 
+// TestPlaceNotPlaceWithRscRegexExcludesMatchingHosts pins scenario 2.11:
+// when `NotPlaceWithRscRegex` matches the name of an existing RD, every
+// node hosting a replica of that RD becomes ineligible. Cluster has 3
+// nodes; rd-prod-a sits on n1, rd-prod-b on n2; spawning rd-new with
+// PlaceCount=1 and regex `rd-prod-.*` must land on n3 — the only host
+// not running anything matching the pattern.
+func TestPlaceNotPlaceWithRscRegexExcludesMatchingHosts(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "rd-prod-a", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed rd-prod-a: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "rd-prod-b", NodeName: "n2",
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed rd-prod-b: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "rd-new", &apiv1.AutoSelectFilter{
+		PlaceCount:           1,
+		NotPlaceWithRscRegex: "rd-prod-.*",
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 || want != 1 {
+		t.Fatalf("placed/want: got %d/%d, want 1/1", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "rd-new")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1; %+v", len(got), got)
+	}
+
+	if got[0].NodeName != "n3" {
+		t.Errorf("node: got %q, want %q (n1/n2 host rd-prod-* and must be excluded)",
+			got[0].NodeName, "n3")
+	}
+}
+
+// TestPlaceNotPlaceWithRscRegexInvalidIsNoOp pins the "invalid regex is
+// silent" contract: a bracket-only pattern fails to compile, but the
+// placer must NOT error out — operator typos must not strand placement.
+// With no other constraints and 3 healthy nodes, PlaceCount=2 still
+// succeeds end-to-end on the two largest-free pools.
+func TestPlaceNotPlaceWithRscRegexInvalidIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(t.Context(), "rd-new", &apiv1.AutoSelectFilter{
+		PlaceCount:           2,
+		NotPlaceWithRscRegex: "[", // invalid: unterminated character class
+	})
+	if err != nil {
+		t.Fatalf("Place: invalid regex must be silent, got %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
