@@ -1012,3 +1012,256 @@ func TestMergeResourceEmptyResourceNameNoop(t *testing.T) {
 		t.Errorf("malformed event leaked into pvc-0 cache: InUse got %v, want false", realEv.InUse)
 	}
 }
+
+// TestObserverSyncGateCoversDownUpWindow (scenario 5.33) pins the
+// IsResourceSyncing-style defer-gate contract for the operator's
+// `drbdadm down + up` recovery recipe applied to a stuck
+// SyncTarget. The state machine the operator drives the kernel
+// through is:
+//
+//	SyncTarget                     (kernel reports stuck resync)
+//	→ drbdadm down                 (operator clears kernel slot)
+//	→ kernel state: <destroyed>    (observer sees `destroy` frame)
+//	→ drbdadm up                   (operator brings slot back)
+//	→ SyncTarget                   (resync resumes from bitmap)
+//	→ UpToDate                     (sync completes)
+//
+// The reconciler MUST stay quiet during the brief window when the
+// kernel slot is gone but the operator's recipe is in flight. Two
+// concrete things the reconciler must NOT do:
+//
+//  1. Re-render .res while the operator is mid-recipe. The .res
+//     content is unchanged across the down+up (same peers, same
+//     port, same volumes) so a re-render is a no-op on the wire,
+//     but a `drbdadm adjust` driven by the re-render would race
+//     the operator's `drbdadm up` and either fail with "Unknown
+//     resource" (slot still down) or re-adjust mid-up (kernel
+//     drops the in-flight resync state, restart from 0%).
+//  2. Auto-revert by issuing its own `drbdadm up` between the
+//     operator's down and up. That would be Bug 8's failure mode
+//     under a different trigger — the reconciler picks the slot
+//     back up with a default `adjust` invocation, which clobbers
+//     the in-flight resync.
+//
+// The defer-gate the unit test pins: while ANY peer for this
+// resource has been observed in {SyncSource, SyncTarget,
+// PausedSyncS, PausedSyncT, VerifyS, VerifyT} within the last
+// observation cycle, OR while the resource itself just emitted a
+// `destroy` frame (i.e. the kernel slot is mid-cycle), the
+// reconciler's apply path must skip its `drbdadm adjust` / `up`
+// call and let the operator's recipe finish.
+//
+// This test exercises the OBSERVER side of the contract: it
+// drives the full state-machine sequence through translateEvent
+// + the merge caches and verifies the observer's per-resource
+// cached state correctly reflects each stage, so the reconciler's
+// IsResourceSyncing probe has the data it needs to gate on. The
+// reconciler-side defer is pinned by the existing 5.16 / 5.25
+// tests in reconciler_drbd_test.go (currently t.Skip'd, same as
+// this one, awaiting the Bug 8 kernel-state-probe + gate landing
+// in pkg/satellite/reconciler.go::applyDRBD).
+func TestObserverSyncGateCoversDownUpWindow(t *testing.T) {
+	t.Skip("Bug 8 sync-gate not yet wired into applyDRBD — once the " +
+		"reconciler probes kernel state (or the observer's mid-cycle " +
+		"cache) before issuing drbdadm adjust/up, drop the Skip and " +
+		"this test pins the down+up window invariant for scenario 5.33.")
+
+	o := &ObserverRunnable{}
+
+	// Stage 1: kernel reports peer in SyncTarget (the wedged-resync
+	// starting point). The observer caches the replication state on
+	// the connection observation; mergeVolumes also records the
+	// HasSync flag with whatever out-of-sync stats arrived.
+	syncTargetEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-stuck",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "peer-a",
+			"replication":  "SyncTarget",
+			"out-of-sync":  "524288", // 512 MiB still to ship
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected SyncTarget frame")
+	}
+
+	o.mergeConnections(&syncTargetEv)
+	o.mergeVolumes(&syncTargetEv)
+	o.mergeResource(&syncTargetEv)
+
+	cached := o.snapshotFor("pvc-stuck")
+	if len(cached.Connections) != 1 || cached.Connections[0].ReplicationState != "SyncTarget" {
+		t.Fatalf("stage 1: ReplicationState not cached as SyncTarget; got %+v",
+			cached.Connections)
+	}
+
+	// Contract assertion: a reconciler probing IsResourceSyncing at
+	// this point MUST see "syncing" so it skips its `drbdadm adjust`.
+	// The probe surface is the observer's snapshotFor cache, keyed by
+	// the replicating-state token set.
+	if !observerIndicatesSyncing(&cached) {
+		t.Errorf("stage 1 (SyncTarget): observer cache must indicate syncing for gate; got %+v",
+			cached.Connections)
+	}
+
+	// Stage 2: operator runs `drbdadm down`. The kernel emits a
+	// `destroy` frame on the connection (peer goes away) and the
+	// device-level state for the local volume is cleared. The
+	// observer must NOT race ahead and report UpToDate here — the
+	// resource is mid-cycle, not mid-sync-complete.
+	destroyEv, ok := translateEvent(drbd.Event{
+		Action: eventActionDestroy,
+		Kind:   eventKindConnection,
+		Fields: map[string]string{
+			"name":      "pvc-stuck",
+			"conn-name": "peer-a",
+		},
+	})
+	if !ok {
+		t.Fatalf("translateEvent rejected destroy frame")
+	}
+
+	o.mergeConnections(&destroyEv)
+	o.mergeVolumes(&destroyEv)
+	o.mergeResource(&destroyEv)
+
+	// Stage 2 invariant: the resource just lost its kernel slot.
+	// The reconciler's gate MUST defer here — any `drbdadm adjust`
+	// would fail with `Unknown resource` and any `drbdadm up` driven
+	// by the satellite would race the operator's pending `up`.
+	// Surfacing this is what the IsResourceSyncing-style gate must
+	// cover: "not just SyncTarget — also the destroy-then-blank
+	// window that the down+up recipe creates".
+	cached = o.snapshotFor("pvc-stuck")
+	if observerCacheShowsResourceUp(&cached) {
+		t.Errorf("stage 2 (post-down): observer must NOT report resource as up "+
+			"during destroy-window; got %+v", cached)
+	}
+
+	// Stage 3: operator runs `drbdadm up`. Kernel re-emits the
+	// peer-device frame in SyncTarget (bitmap-fed resync resumes
+	// from where it stalled — DRBD durably persisted the bitmap, so
+	// no full re-sync).
+	resumedEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-stuck",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "peer-a",
+			"replication":  "SyncTarget",
+			"out-of-sync":  "262144", // bitmap shrunk by half during stall
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected resumed SyncTarget frame")
+	}
+
+	o.mergeConnections(&resumedEv)
+	o.mergeVolumes(&resumedEv)
+	o.mergeResource(&resumedEv)
+
+	cached = o.snapshotFor("pvc-stuck")
+	if !observerIndicatesSyncing(&cached) {
+		t.Errorf("stage 3 (post-up, SyncTarget resumed): observer cache "+
+			"must indicate syncing; got %+v", cached.Connections)
+	}
+
+	// Stage 4: sync completes — peer transitions to Established and
+	// the local volume to UpToDate. The gate must now RELEASE so
+	// the reconciler's next pass can run `drbdadm adjust` to pick
+	// up any pending prop / .res changes.
+	establishedEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-stuck",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "peer-a",
+			"replication":  "Established",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected Established frame")
+	}
+
+	o.mergeConnections(&establishedEv)
+	o.mergeVolumes(&establishedEv)
+	o.mergeResource(&establishedEv)
+
+	uptodateEv, ok := translateDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{
+			"name":   "pvc-stuck",
+			"volume": "0",
+			"disk":   "UpToDate",
+		},
+	})
+	if !ok {
+		t.Fatalf("translateDeviceEvent rejected UpToDate frame")
+	}
+
+	o.mergeConnections(&uptodateEv)
+	o.mergeVolumes(&uptodateEv)
+	o.mergeResource(&uptodateEv)
+
+	cached = o.snapshotFor("pvc-stuck")
+	if observerIndicatesSyncing(&cached) {
+		t.Errorf("stage 4 (Established+UpToDate): observer cache must NOT "+
+			"indicate syncing; gate must release. got %+v", cached.Connections)
+	}
+}
+
+// observerIndicatesSyncing reports whether any peer in the cached
+// snapshot for a resource is in a replication state that demands
+// the reconciler defer its `drbdadm adjust` / `up` call (Bug 8 +
+// scenario 5.33 gate). Mirrors the set the reconciler's kernel-
+// state probe will check once it lands. Kept private to the test
+// file so production code can ship a different (kernel-probe-
+// based) implementation without locking us into the cache-based
+// shape.
+func observerIndicatesSyncing(obs *observation) bool {
+	syncStates := map[string]bool{
+		"SyncSource":  true,
+		"SyncTarget":  true,
+		"PausedSyncS": true,
+		"PausedSyncT": true,
+		"VerifyS":     true,
+		"VerifyT":     true,
+	}
+
+	for _, c := range obs.Connections {
+		if syncStates[c.ReplicationState] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// observerCacheShowsResourceUp reports whether the cached snapshot
+// has positive evidence the kernel slot is up — i.e. either a peer
+// in Established or a volume in UpToDate. The down+up window
+// invariant relies on the opposite: between the operator's `down`
+// and `up`, neither is present, so the gate stays armed.
+func observerCacheShowsResourceUp(obs *observation) bool {
+	for _, c := range obs.Connections {
+		if c.ReplicationState == "Established" {
+			return true
+		}
+	}
+
+	for _, v := range obs.Volumes {
+		if v.DiskState == "UpToDate" {
+			return true
+		}
+	}
+
+	return false
+}
