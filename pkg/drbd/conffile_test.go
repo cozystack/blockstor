@@ -296,6 +296,67 @@ func TestRenderInternalMetadataDefault(t *testing.T) {
 	}
 }
 
+// TestMultiPathDefaultPathCoexistence pins scenario 3.8 (UG9 §"How
+// adding a new DRBD path affects the default path", lines 2233-2255):
+// when a resource-connection carries one or more explicit `path { … }`
+// blocks, the implicit "default" path derived from each host's
+// `address` field MUST NOT be re-rendered inside the connection block.
+// Operators who want the default address to keep moving traffic must
+// add it back as an explicit path (e.g. as `path3` alongside path1 +
+// path2).
+//
+// Why this matters: the user-visible symptom is "I added a backup
+// repl path and now my primary NIC went quiet". The driver of that
+// behaviour is drbd-9 — as soon as ANY explicit path appears inside a
+// connection, drbd ignores the connection-level `host … address …;`
+// pair entirely. The renderer must mirror that, otherwise we ship
+// .res files that disagree with what `drbdadm adjust` produces and
+// trigger phantom reloads on every reconcile.
+//
+// SPEC PENDING IMPLEMENTATION (scenario 3.7):
+//   - `pkg/drbd.Resource` has no `Connections` / `ResourcePaths`
+//     field yet — multi-path is feature-flagged "T" in
+//     tests/scenarios/03-networking.md §3.7. Implementation will add:
+//     REST endpoint
+//     `POST /v1/resource-definitions/{rd}/resource-connections/{a}/{b}/paths`,
+//     a Resource-level slice of (NodeA, NodeB, []Path{Name, AddrA,
+//     AddrB}) connection overrides, and ConfFileBuilder emitting
+//     multiple `path { host A address X; host B address Y; }` blocks
+//     inside each `connection { … }` block.
+//   - Until 3.7 lands, t.Skip with a pointer to this test so we don't
+//     forget to flip it on once the wiring exists.
+//
+// Contract this test will assert once unblocked:
+//
+//	Given a Resource with two diskful peers (n1, n2) and an explicit
+//	ResourceConnection between (n1, n2) carrying path1 (10.1.0.0/24)
+//	+ path2 (10.2.0.0/24):
+//
+//	  - The rendered `connection { … }` block contains TWO `path { … }`
+//	    sub-blocks, one per explicit path.
+//	  - The block does NOT contain the connection-level
+//	    `host n1 address 10.0.0.1:7000;` /
+//	    `host n2 address 10.0.0.2:7000;` lines (those are the implicit
+//	    "default" path derived from the `on` blocks; drbd-9 drops them
+//	    when explicit paths are present).
+//	  - The `on n1 { address 10.0.0.1:7000; … }` / `on n2 { … }`
+//	    blocks themselves still carry the default address — drbd needs
+//	    them for the listen socket. Only the connection-level
+//	    duplication is suppressed.
+//
+//	Given the same Resource but with a third explicit path "default"
+//	whose addresses match the `on` block addresses (10.0.0.1 /
+//	10.0.0.2):
+//
+//	  - The connection block now contains THREE `path { … }` blocks,
+//	    including the default one. Operator opted back in to the
+//	    default path being used as transport.
+func TestMultiPathDefaultPathCoexistence(t *testing.T) {
+	t.Skip("scenario 3.8 — pending 3.7 (multi-path) implementation; " +
+		"Resource.Connections / ResourcePath design described in " +
+		"tests/scenarios/03-networking.md §3.7 and in this test's godoc")
+}
+
 // TestBuildDeterministic: same input → same output, twice in a row. Map
 // iteration order would otherwise leak into the .res file and trigger
 // spurious drbdadm reloads on every reconcile.
