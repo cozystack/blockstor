@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -83,10 +84,67 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream LINSTOR's `linstor rg spawn` autoplaces according to
+	// the RG's SelectFilter — that's the operator-visible contract:
+	// spawn = create RD + VDs + place replicas. Without this step,
+	// `r l` would be empty after spawn until the operator runs a
+	// separate `r c --auto-place=N`. The CSI flow follows the same
+	// contract (linstor-csi calls /spawn, then expects to find
+	// resources in /v1/view/resources on the next reconcile).
+	placeErr := spawnAutoplace(r.Context(), s, rd.Name, &rg, &req)
+	if placeErr != nil {
+		log.FromContext(r.Context()).WithName("rest").
+			Error(placeErr, "spawn autoplace", "rd", rd.Name)
+
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition spawned, autoplace deferred: " + rd.Name + ": " + placeErr.Error(),
+		}})
+
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition spawned: " + rd.Name,
 	}})
+}
+
+// spawnAutoplace runs the same placer/select-filter merge that
+// /v1/resource-definitions/{rd}/autoplace does, but inline as part
+// of the spawn call. Mirrors upstream LINSTOR's "spawn = create +
+// place" semantic. PartialPlaceCount=0 (no RG constraint) skips
+// placement entirely so plain-CRD spawns without a SelectFilter
+// stay definition-only.
+func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) error {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return errors.Wrap(err, "get spawned RD")
+	}
+
+	// Merge spawn-time PartialFilter overrides on top of the RG's
+	// SelectFilter — same precedence as upstream's spawn.
+	filter := mergeAutoplaceFilter(ctx, s.Store, &rd, &req.SelectFilter)
+
+	// Default to RG's PlaceCount when caller didn't override.
+	if filter.PlaceCount == 0 {
+		filter.PlaceCount = rg.SelectFilter.PlaceCount
+	}
+
+	if filter.PlaceCount == 0 {
+		return nil
+	}
+
+	placed, want, err := placer.New(s.Store).Place(ctx, rdName, &filter)
+	if err != nil {
+		return errors.Wrap(err, "autoplace")
+	}
+
+	if placed < want {
+		return errors.Errorf("not enough candidate storage pools: placed %d of %d", placed, want)
+	}
+
+	return nil
 }
 
 func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.ResourceGroup) apiv1.ResourceDefinition {
