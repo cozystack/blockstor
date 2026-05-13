@@ -19,6 +19,8 @@ package dispatcher_test
 import (
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 )
@@ -171,5 +173,134 @@ func TestMetaPoolDefaultsToInternal(t *testing.T) {
 
 	if vol := got.Volumes[0]; vol.MetaPool != "" {
 		t.Errorf("MetaPool=%q want \"\" (internal default)", vol.MetaPool)
+	}
+}
+
+// TestPeerAddressPrefersKubeInternalNIC: Bug 48 — when a peer's Node
+// CRD advertises both a pod-CIDR NetInterface in slot [0] (the
+// piraeus-operator-with-externalController-url pathology, where
+// satellite-pod IP rather than host IP gets written) and a named
+// "k8s-internal" NetInterface carrying the routable corev1.Node
+// InternalIP, the dispatcher must pick the InternalIP for the peer
+// `address=` line. Otherwise DRBD-9 hands a pod-CIDR address to the
+// peer satellite, which can't route to it cross-node, and the RD
+// flaps in `Connecting`.
+//
+// Negative case: a single pod-CIDR NetInterface with no "k8s-
+// internal" alongside must NOT abort — the dispatcher carries the
+// pod-CIDR address through, on the theory that single-NIC
+// satellite-pod-IP clusters (host networking / hostNetwork:true)
+// are still legitimate.
+func TestPeerAddressPrefersKubeInternalNIC(t *testing.T) {
+	rdName := "pvc-1"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	cases := []struct {
+		name        string
+		peerIfaces  []blockstoriov1alpha1.NodeNetInterface
+		wantPeerAdr string
+		comment     string
+	}{
+		{
+			name: "k8s-internal-wins-over-positional-pod-cidr",
+			peerIfaces: []blockstoriov1alpha1.NodeNetInterface{
+				// piraeus rewrote [0] with the satellite pod IP.
+				{Name: "default", Address: "10.244.0.5"},
+				// register / label-sync published the host
+				// InternalIP under the well-known name.
+				{Name: "k8s-internal", Address: "10.51.0.3"},
+			},
+			wantPeerAdr: "10.51.0.3",
+			comment:     "k8s-internal must override pod-CIDR positional[0]",
+		},
+		{
+			name: "single-pod-cidr-interface-falls-through",
+			peerIfaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "default", Address: "10.244.0.5"},
+			},
+			wantPeerAdr: "10.244.0.5",
+			comment:     "single NIC carries through; no abort, no rewrite",
+		},
+		{
+			name: "k8s-internal-only",
+			peerIfaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "k8s-internal", Address: "10.51.0.3"},
+			},
+			wantPeerAdr: "10.51.0.3",
+			comment:     "k8s-internal alone is used directly",
+		},
+		{
+			name: "default-named-preferred-over-unnamed",
+			peerIfaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "drbd-net", Address: "10.244.0.5"},
+				{Name: "default", Address: "10.51.0.3"},
+			},
+			wantPeerAdr: "10.51.0.3",
+			comment:     "explicit default wins over arbitrary other names",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			peerID := int32(1)
+			targetID := int32(0)
+
+			target := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+					StoragePool:            "data-hdd",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+			}
+
+			peer := blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n2",
+					StoragePool:            "data-hdd",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
+			}
+
+			nodes := []blockstoriov1alpha1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type: "Satellite",
+						NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+							{Name: "default", Address: "10.51.0.2"},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: tc.peerIfaces,
+					},
+				},
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			gotAddr := got.DrbdOptions["peer.n2.address"]
+			if gotAddr != tc.wantPeerAdr {
+				t.Errorf("%s: peer.n2.address=%q want %q (drbdOpts=%v)",
+					tc.comment, gotAddr, tc.wantPeerAdr, got.DrbdOptions)
+			}
+		})
 	}
 }

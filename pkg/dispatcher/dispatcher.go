@@ -536,15 +536,39 @@ func seedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32) string
 	return ""
 }
 
+// kubeInternalNICName is the well-known NetInterface name carrying the
+// corev1.Node InternalIP (a host-routable address). Populated by the
+// register / label-sync path when blockstor knows the kube view of a
+// node; preferred over arbitrarily-ordered NetInterfaces so we don't
+// trip over piraeus-operator's habit of overwriting
+// `Spec.NetInterfaces[0].Address` with the satellite **pod** IP (a
+// pod-CIDR address that's only routable inside the CNI — DRBD peer
+// connect fails). See Bug 48.
+const kubeInternalNICName = "k8s-internal"
+
+// defaultNICName is the upstream-LINSTOR convention for "the
+// satellite endpoint" when nodes carry multiple NetInterfaces. We
+// prefer it over a positional [0] read so manifest reordering doesn't
+// silently flip which address gets stamped into peer blocks.
+const defaultNICName = "default"
+
 // lookupEndpoint reads the satellite endpoint from the matching Node CRD.
 // Precedence:
 //
 //  1. typed `Spec.SatelliteEndpoint` (Phase 10.3 native field)
 //  2. legacy `Spec.Props["SatelliteEndpoint"]` (partially-migrated clusters)
-//  3. `Spec.NetInterfaces[0].Address` (first advertised interface — the
-//     upstream-LINSTOR convention is "first interface is the satellite
-//     endpoint"; piraeus-operator and operator-supplied manifests
-//     populate this field)
+//  3. `Spec.NetInterfaces` by name: "k8s-internal" → "default" → first
+//     non-empty entry. The named lookups exist because piraeus-operator
+//     installed alongside blockstor (LinstorCluster.spec.externalController.url
+//     pointing at blockstor's apiserver) overwrites
+//     `Spec.NetInterfaces[0].Address` with the satellite pod IP — a
+//     pod-CIDR address that isn't routable peer-to-peer. The
+//     register / label-sync layer publishes the routable
+//     corev1.Node InternalIP under the "k8s-internal" name so the
+//     dispatcher can prefer it without doing CIDR detection here.
+//     When no named interface is present we fall through to the
+//     legacy "first non-empty" behaviour so single-NIC clusters keep
+//     working unchanged. (Bug 48)
 //
 // Match is on the original LINSTOR name (annotation when slugified,
 // else metadata.Name) so non-RFC1123 LINSTOR names still resolve.
@@ -562,11 +586,32 @@ func lookupEndpoint(nodeName string, nodes []blockstoriov1alpha1.Node) string {
 			return ep
 		}
 
-		if len(nodes[i].Spec.NetInterfaces) > 0 && nodes[i].Spec.NetInterfaces[0].Address != "" {
-			return nodes[i].Spec.NetInterfaces[0].Address
-		}
+		return preferredNetInterfaceAddress(nodes[i].Spec.NetInterfaces)
+	}
 
-		return ""
+	return ""
+}
+
+// preferredNetInterfaceAddress walks a node's NetInterfaces in the
+// dispatcher's name-preference order — "k8s-internal" first (the
+// host-routable corev1 InternalIP), then "default" (the upstream-
+// LINSTOR convention), then the first non-empty entry as a final
+// fallback for single-NIC clusters. Empty when no NetInterface
+// carries an address; the caller treats that as "node not ready"
+// and emits the drbdAddrAny placeholder.
+func preferredNetInterfaceAddress(ifaces []blockstoriov1alpha1.NodeNetInterface) string {
+	for _, name := range []string{kubeInternalNICName, defaultNICName} {
+		for j := range ifaces {
+			if ifaces[j].Name == name && ifaces[j].Address != "" {
+				return ifaces[j].Address
+			}
+		}
+	}
+
+	for j := range ifaces {
+		if ifaces[j].Address != "" {
+			return ifaces[j].Address
+		}
 	}
 
 	return ""
