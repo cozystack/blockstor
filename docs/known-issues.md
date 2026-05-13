@@ -226,6 +226,37 @@ Severity legend:
 
 **Related commits / tests**: scenario 10 §10.1 reproducer; no fix yet.
 
+## Bug 49: satellite ignores runtime NetInterface changes (deferred from scenario 3.10)
+
+**Status**: open (deferred — design gap, not a defect)
+**Severity**: P2
+**Scenario reference**: tests/scenarios/03-networking.md §3.10
+**Surfaced by**: scenario audit (UG9 §"Managing network interface cards", lines 2167-2169)
+**Reproduction steps**:
+
+1. `kubectl edit node.blockstor.io/<worker>` and re-order the entries under `spec.netInterfaces` (or change the first entry's `address`).
+2. Observe the running satellite Pod on that worker — it does not re-dial anything, does not re-render its DRBD `on <node>` block, and continues talking to the kube-apiserver via the same Service VIP.
+3. Restart the satellite Pod (`kubectl delete pod -l app=blockstor-satellite,kubernetes.io/hostname=<worker>`) — only on restart does the new `Spec.NetInterfaces[0].Address` flow into `LocalAddress` (via `$POD_IP`) and from there into the next reconcile-rendered .res file.
+
+**Expected behaviour (upstream LINSTOR contract)**: `linstor node interface modify ... --active` flips `StltConn/0/Active=true` and the satellite re-dials the controller via the freshly-active NIC without a process restart.
+
+**Actual behaviour (blockstor)**: No re-dial happens, and there is no field to flip. Two architectural reasons:
+
+1. Phase 10.6 retired the satellite→controller gRPC wire entirely. The satellite now talks to the kube-apiserver via the standard in-cluster config (`ctrl.GetConfig()` → `kubernetes.default.svc` Service VIP). There is no LINSTOR-style "controller endpoint" left to re-target.
+2. `api/v1alpha1.NodeNetInterface` has no `Active` field. The `IsActive` flag on the REST wire is synthesised at conversion time (`i == 0` in `pkg/store/k8s/nodes.go`) — pure presentation, no behaviour. The only satellite code that reads peer NetInterfaces at runtime is `pkg/satellite/controllers/snapshot_fetcher.go` (peer-to-peer snapshot transport), and it picks by `Name == "default"` or first non-empty `Address`, not by an Active flag.
+
+**Recommended fix**: Deferred. Implementing Outcome A (live NIC switch) would require:
+
+- Adding an `Active` field to `NodeNetInterface` and a controller-runtime watch in the satellite that triggers reconciliation when `Spec.NetInterfaces[].Active` changes.
+- A redirect plane that the satellite actually re-routes through — but the satellite's only outbound wire is the kube-apiserver REST/watch, which is owned by client-go and routes via the cluster Service VIP rather than this node's NIC selection.
+- For the satellite→satellite snapshot stream the change would be marginal (peer-side already picks Address dynamically per Fetch call).
+
+Net: implementing the upstream contract requires either resurrecting a custom controller-bind wire (rejected by the Phase 10.6 design) or accepting that "active interface" is now a pure presentation field that operators must not rely on for connection re-targeting.
+
+The spec is pinned by `TestSatelliteFlagsLackControllerBindAddress` and `TestNodeCRDHasNoActiveField` in `pkg/satellite/stream/redial_spec_test.go`. If a future change implements Outcome A, both tests will fail and force the reviewer to replace them with a positive re-dial assertion.
+
+**Related commits / tests**: `pkg/satellite/stream/redial_spec_test.go`; tests/scenarios/03-networking.md §3.10.
+
 ## Recommended next-fix order
 
 1. **Bug 35** (P0, placer FreeCapacity) — only P0; blocks placer 1.0 and risks ENOSPC at create time.

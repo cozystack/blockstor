@@ -120,6 +120,8 @@ When you add an explicit path, the implicit `default` path is no longer used **u
 
 After `node interface modify ... --active`, satellite re-dials the controller via the new IP. Today blockstor's satellite reads the controller endpoint from a CLI flag at startup — doesn't honour runtime changes. Document the gap; test asserts the satellite re-dials on Spec change.
 
+**Status (Outcome B — deferred):** Phase 10.6 retired the satellite→controller gRPC wire entirely; the satellite now talks only to the kube-apiserver via `ctrl.GetConfig()`. There is no `--controller-bind-address` flag and `NodeNetInterface` has no `Active` field — `IsActive` on the REST wire is synthesised as `i == 0` (pure presentation). Implementing live re-dial (Outcome A) would require resurrecting a custom controller wire that the Phase 10.6 design intentionally removed. Pinned by `pkg/satellite/stream/redial_spec_test.go` (`TestSatelliteFlagsLackControllerBindAddress`, `TestNodeCRDHasNoActiveField`) — both fail if anyone starts implementing Outcome A, forcing a positive re-dial test to replace them. Tracked as Bug 49 in `docs/known-issues.md`.
+
 ---
 
 ## End-to-end on dedicated replication network
