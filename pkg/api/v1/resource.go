@@ -34,6 +34,14 @@ type Resource struct {
 	UUID        string            `json:"uuid,omitempty"`
 	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
 
+	// ToggleDiskCancel mirrors CRD `Spec.ToggleDiskCancel`. Set by
+	// the REST shim when the operator issues `linstor r td --cancel`
+	// (upstream LINSTOR shape) — the satellite reconciler observes
+	// it and unwinds an in-flight diskless→diskful conversion.
+	// Bug 40. The CSI driver never sets this; only the REST surface
+	// flips it.
+	ToggleDiskCancel bool `json:"toggle_disk_cancel,omitempty"`
+
 	// Volumes is the per-replica volume slice — sourced from
 	// Resource.Status.Volumes which the satellite observer writes.
 	// Upstream LINSTOR's `Resource` carries volumes inline; the
@@ -69,6 +77,14 @@ type ResourceState struct {
 	// concurrent Spec mutation (auto-diskful, resize) can't clobber
 	// it and vice-versa.
 	DrbdState string `json:"drbd_state,omitempty"`
+
+	// ToggleDiskRetries is the satellite-incremented retry counter
+	// for the in-flight diskless→diskful conversion on this replica.
+	// Surfaces upstream LINSTOR's `Resource.toggle_disk_retries`
+	// shape so `linstor r l` users can spot a permanently-stuck
+	// toggle. 0 means either no conversion in flight or the last
+	// conversion completed. Bug 39.
+	ToggleDiskRetries int32 `json:"toggle_disk_retries,omitempty"`
 }
 
 // ResourceWithVolumes is the shape `/v1/view/resources` returns — Resource

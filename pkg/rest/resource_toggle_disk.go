@@ -86,6 +86,33 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Bug 40: `linstor r td --cancel` aborts an in-flight conversion.
+	// Upstream LINSTOR uses an explicit cancel verb; we accept the
+	// same intent on the existing toggle-disk endpoint via a
+	// `?cancel=true` query param. The satellite reconciler reads
+	// Spec.ToggleDiskCancel and unwinds the partial state. The Flags
+	// path below is skipped: cancel must NOT also flip DISKLESS —
+	// the reconciler does that itself as the last step of the
+	// rollback so an external observer sees DISKLESS reappear only
+	// AFTER drbdadm down + storage Delete succeed.
+	if r.URL.Query().Get("cancel") == "true" {
+		res.ToggleDiskCancel = true
+
+		err = s.Store.Resources().Update(r.Context(), &res)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource '" + rdName + "' on '" + node + "' toggle-disk cancel requested",
+		}})
+
+		return
+	}
+
 	wasDiskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
 
 	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, !wasDiskless)

@@ -323,6 +323,57 @@ func TestMigrateDiskRefusesPrimaryInUse(t *testing.T) {
 	}
 }
 
+// TestToggleDiskCancelQuerySetsSpecField pins the Bug 40 cancel
+// surface: PUT toggle-disk?cancel=true on a diskful (or in-flight
+// converting) replica MUST set Spec.ToggleDiskCancel=true on the
+// stored Resource without flipping the DISKLESS flag. The flag flip
+// is the reconciler's job once it has torn down storage + DRBD —
+// REST only writes the intent.
+func TestToggleDiskCancelQuerySetsSpecField(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-c"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-c",
+		NodeName: "n-cancel",
+		// no DISKLESS flag — Resource is mid-conversion or already
+		// diskful; either way, REST handler stamps the cancel
+		// intent without touching Flags.
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-c/resources/n-cancel/toggle-disk?cancel=true", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-c", "n-cancel")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !got.ToggleDiskCancel {
+		t.Errorf("ToggleDiskCancel false after cancel=true: got %+v", got)
+	}
+
+	// Crucial: REST must NOT flip DISKLESS itself — the reconciler
+	// is the one that re-stamps DISKLESS after the rollback runs.
+	// A pre-emptive flag flip would make consumers see the Resource
+	// as connection-mesh-only before the storage + drbdadm cleanup
+	// finished, racing the satellite's tear-down path.
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("cancel handler unexpectedly flipped DISKLESS: %v", got.Flags)
+	}
+}
+
 // TestMigrateDiskUnknownRD: missing ResourceDefinition surfaces as
 // 404, not as a follow-on 500 from a later lookup.
 func TestMigrateDiskUnknownRD(t *testing.T) {

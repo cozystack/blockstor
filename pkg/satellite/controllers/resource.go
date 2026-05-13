@@ -110,6 +110,15 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
 	}
 
+	// Bug 40: REST shim sets Spec.ToggleDiskCancel when the operator
+	// passes `?cancel=true` to PUT toggle-disk. Honour it before
+	// the normal apply path so a cancel issued mid-conversion
+	// unwinds partial state instead of racing the same apply that
+	// caused the cancel.
+	if res.Spec.ToggleDiskCancel {
+		return r.handleToggleDiskCancel(ctx, &res, logger)
+	}
+
 	return r.runApply(ctx, &res, logger)
 }
 
@@ -261,6 +270,15 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	err = r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
 		logger.Error(err, "stamp Status.Volumes")
+	}
+
+	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
+	// per-resource result. The helper is a no-op when the Resource
+	// isn't mid diskless→diskful conversion, so it's safe to call
+	// unconditionally on every apply pass.
+	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
+	if err != nil {
+		logger.Error(err, "record toggle-disk outcome")
 	}
 
 	// Apply chain surfaces per-resource errors via results (e.g.

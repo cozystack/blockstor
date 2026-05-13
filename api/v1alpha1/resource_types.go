@@ -72,6 +72,30 @@ type ResourceSpec struct {
 	// +listMapKey=volumeNumber
 	// +optional
 	Volumes []ResourceVolumeSpec `json:"volumes,omitempty"`
+
+	// toggleDiskCancel asks the satellite reconciler to abort an
+	// in-flight diskless→diskful conversion and roll back to the
+	// pre-toggle Diskless state. Set by the REST shim when the
+	// operator passes `?cancel=true` to PUT toggle-disk (upstream
+	// LINSTOR's `linstor r td --cancel` shape). Bug 40.
+	//
+	// The reconciler observes this flag in conjunction with a
+	// "partial diskful" state (storage carved, DRBD not yet Up or
+	// not yet UpToDate) and unwinds by:
+	//
+	//   1. drbdadm down (idempotent if the kernel resource is
+	//      already gone),
+	//   2. DeleteVolume on the storage provider,
+	//   3. re-stamping the DISKLESS flag on Spec.Flags,
+	//   4. clearing this flag and Status.ToggleDiskRetries.
+	//
+	// Once cleared the satellite resumes normal reconcile loops
+	// against the (now diskless) Spec. A cancel issued against a
+	// Resource that's already past the partial-state window (DRBD
+	// is Up and Volumes report UpToDate) is a no-op — the operator
+	// must issue a fresh toggle-disk to demote.
+	// +optional
+	ToggleDiskCancel bool `json:"toggleDiskCancel,omitempty"`
 }
 
 // ResourceVolumeSpec is one volume's per-replica configuration knobs.
@@ -158,6 +182,23 @@ type ResourceStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// toggleDiskRetries counts how many times the satellite
+	// reconciler has failed mid-conversion while running the
+	// diskless→diskful chain (storage carve → drbdmeta create-md
+	// → drbdadm up → initial-sync). Upstream LINSTOR exposes the
+	// same counter under `Resource.toggle_disk_retries` so
+	// operators can spot a permanently-stuck conversion via
+	// `linstor r l`. Bug 39.
+	//
+	// Reset to 0 when the conversion succeeds (Resource reaches
+	// the diskful steady-state) or when a cancel completes via
+	// `Spec.ToggleDiskCancel`. The reconciler does NOT impose a
+	// hard cap — the bound is policy that lives in the controller
+	// layer (today the legacy backoff cap of 10 attempts) and is
+	// surfaced via a `ToggleDiskFailed` condition once exceeded.
+	// +optional
+	ToggleDiskRetries int32 `json:"toggleDiskRetries,omitempty"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection

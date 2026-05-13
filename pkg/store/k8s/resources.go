@@ -367,9 +367,11 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		// at apply time, not by this read-only echo.
 		LayerObject: layerObjectFromCRD(crd),
 		State: apiv1.ResourceState{
-			InUse:     boolPtr(crd.Status.InUse),
-			DrbdState: crd.Status.DrbdState,
+			InUse:             boolPtr(crd.Status.InUse),
+			DrbdState:         crd.Status.DrbdState,
+			ToggleDiskRetries: crd.Status.ToggleDiskRetries,
 		},
+		ToggleDiskCancel: crd.Spec.ToggleDiskCancel,
 		Volumes: volumesWithReplicationStates(
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,
@@ -661,5 +663,9 @@ func wireToCRDResourceSpec(in *apiv1.Resource) crdv1alpha1.ResourceSpec {
 		// non-DRBD, so stripDRBDProps left it alone) for forward-
 		// compat — readers still consulting Props will see it.
 		StoragePool: in.Props["StorPoolName"],
+		// Bug 40: the REST cancel verb writes this through the
+		// wire shape on PUT toggle-disk?cancel=true. The satellite
+		// reconciler watches it and unwinds a partial conversion.
+		ToggleDiskCancel: in.ToggleDiskCancel,
 	}
 }
