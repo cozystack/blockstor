@@ -51,3 +51,26 @@ const maskWarn = int64(0x0002_0000_0000)
 // Sub-code 1024 sits one past upstream's WARN_VLMDFN_RESIZE_SAME_SIZE
 // (1023) — clusters tailing both servers can disambiguate the two.
 const warnVlmDfnResizeShrink = maskWarn | int64(1024)
+
+// warnRscNotFound is the (warn | rsc | del | code) composite used by
+// `DELETE /v1/resource-definitions/{rd}/resources/{node}` when the
+// (rd, node) pair doesn't exist. CSI spec § DeleteVolume mandates
+// idempotence: the driver retries until it sees success, so a 404 on
+// the second-delete-after-success path breaks the retry loop.
+// Upstream LINSTOR returns 200 + `WARNING: Node: …, Resource: … not
+// found.` exit 0 on the same input (cli-parity-audit row #42); the
+// WARN bit lets python-linstor's print loop surface the "already
+// absent" line as an advisory rather than a fatal error.
+//
+// Sub-code 2048 sits in the warn band reserved for "delete-of-missing"
+// advisories — kept distinct from warnVlmDfnResizeShrink's 1024 so
+// audit-log greppers can tell the two apart.
+const warnRscNotFound = maskWarn | int64(2048)
+
+// warnRDNotFound mirrors warnRscNotFound for the parent
+// `DELETE /v1/resource-definitions/{rd}` route. The same CSI
+// idempotence reasoning applies: a re-issued DeleteVolume on an RD
+// that has already been dropped must succeed, not 404. Sub-code 2049
+// sits one past warnRscNotFound so log filtering can distinguish the
+// two no-op replays.
+const warnRDNotFound = maskWarn | int64(2049)

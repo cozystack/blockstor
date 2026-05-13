@@ -350,6 +350,14 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// handleRDDelete drops an RD plus cascades the per-replica teardown.
+//
+// Idempotent on NotFound (Bug 56 sibling): CSI spec § DeleteVolume
+// mandates idempotence at the volume layer, and an RD whose last
+// child finished its finalizer drain may already be gone by the time
+// a retry arrives. Folding the missing RD into a 200 + warn-mask
+// envelope keeps the retry loop short and matches the same upstream
+// "WARNING: … not found." exit 0 shape applied to resource delete.
 func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rd")
 
@@ -379,6 +387,15 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.ResourceDefinitions().Delete(r.Context(), name)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnRDNotFound,
+				Message: "resource definition already absent: " + name,
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return

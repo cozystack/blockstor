@@ -275,18 +275,21 @@ func TestResourceDefinitionsUpdateMissingRD(t *testing.T) {
 }
 
 // TestResourceDefinitionsDeleteMissingRD: DELETE on missing RD →
-// 404 surface from writeStoreError (idempotent delete is the
-// store's job, not the handler's, but the handler must surface
-// the not-found cleanly).
+// 200 + warn-mask `resource definition already absent` envelope, NOT
+// 404. CSI § DeleteVolume is idempotent, so a re-issued delete on an
+// RD that the previous request already cleared must succeed —
+// otherwise linstor-csi loops on its retry path. Mirrors upstream
+// LINSTOR's `linstor rd d` on a missing RD (200 + WARNING exit 0)
+// and the Bug 56 fix for the per-resource DELETE.
 func TestResourceDefinitionsDeleteMissingRD(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
 	resp := httpDelete(t, base+"/v1/resource-definitions/ghost")
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }
 

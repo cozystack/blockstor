@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -559,5 +560,156 @@ func TestViewResourcesDistinguishesDisklessFromTiebreaker(t *testing.T) {
 	if disklessState == tiebreakerState {
 		t.Fatalf("CLI State collision: both render as %q — operator cannot distinguish "+
 			"explicit diskless from autoplacer witness", disklessState)
+	}
+}
+
+// TestResourceDeleteUnknownRDReturns200Warning pins half of the CSI
+// idempotence contract for Bug 56: DELETE on a {rd} path segment that
+// never existed returns 200 + an ApiCallRc envelope carrying the
+// WARN bit and an "already absent" message, NOT 404 / 500.
+// linstor-csi's DeleteVolume retries until it sees success; the
+// previous 404 broke the second-delete-after-success path and
+// surfaced as a divergence against upstream LINSTOR (cli-parity-audit
+// row #42: upstream → 200 WARN, blockstor → 500 ERROR).
+func TestResourceDeleteUnknownRDReturns200Warning(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/ghost-rd/resources/any-node")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	// WARN bit (maskWarn = 0x0002_0000_0000) MUST be set so python-
+	// linstor surfaces the advisory line in `linstor r d` output.
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+}
+
+// TestResourceDeleteUnknownNodeReturns200Warning pins the other half
+// of the Bug 56 idempotence contract: with the RD present but no
+// replica on the requested node, the handler must STILL fold the
+// per-replica NotFound into the 200 + WARN envelope rather than
+// 404 / 500. Upstream LINSTOR returns `WARNING: Node: X, Resource: Y
+// not found.` exit 0 on this exact input.
+func TestResourceDeleteUnknownNodeReturns200Warning(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-real"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-real/resources/ghost-node")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "pvc-real") || !strings.Contains(rc[0].Message, "ghost-node") {
+		t.Errorf("message: got %q, want it to name both pvc-real and ghost-node", rc[0].Message)
+	}
+}
+
+// TestResourceDeleteSuccessUsesInfoMaskNotWarn pins the success-path
+// distinction: a DELETE that actually drops a real replica must
+// reply with the MASK_INFO + RC_RSC_DELETED entry (NO warn bit), so
+// operators reading API logs can tell a real drop from a no-op
+// replay. Without this guard, a regression that always tagged the
+// envelope with WARN would silently make every successful delete
+// look like an idempotent re-try in audit logs.
+func TestResourceDeleteSuccessUsesInfoMaskNotWarn(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-live"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-live", NodeName: "n1"}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-live/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	// Success path: MASK_INFO bit set, MASK_WARN bit NOT set.
+	if rc[0].RetCode&apiCallRcInfo == 0 {
+		t.Errorf("ret_code: got %#x, want MASK_INFO (%#x) set", rc[0].RetCode, apiCallRcInfo)
+	}
+
+	if rc[0].RetCode&maskWarn != 0 {
+		t.Errorf("ret_code: got %#x, MASK_WARN (%#x) must NOT be set on a real drop",
+			rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "resource deleted") {
+		t.Errorf("message: got %q, want 'resource deleted' marker", rc[0].Message)
+	}
+
+	// Belt + braces: the row really left the store, not just the
+	// envelope. Without this, a buggy handler that always emitted
+	// the success envelope without calling Delete would pass the
+	// status/mask checks while leaking entries on every CSI retry.
+	_, err := st.Resources().Get(ctx, "pvc-live", "n1")
+	if err == nil {
+		t.Errorf("replica still present after DELETE; want it gone")
 	}
 }

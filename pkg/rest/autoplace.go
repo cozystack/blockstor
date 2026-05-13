@@ -862,6 +862,17 @@ func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 // "Unable to parse REST json data: Expecting value", so we mirror
 // the upstream shape: HTTP 200 + `MASK_INFO | RC_RSC_DELETED` entry.
 //
+// Idempotent on NotFound (Bug 56): CSI spec § DeleteVolume mandates
+// idempotence — the driver retries until it sees success, so a 404
+// on either an unknown {rd} or an unknown {node} segment breaks the
+// second-delete-after-success retry path. Both branches fold to a
+// 200 + ApiCallRc envelope carrying the warn-mask `warnRscNotFound`
+// ret_code and an "already absent" message, distinct from the
+// MASK_INFO-only "deleted" reply so operators reading API logs can
+// tell a real drop from a no-op replay. Mirrors upstream LINSTOR's
+// behaviour (`linstor r d` on a missing pair returns
+// `WARNING: … not found.` exit 0).
+//
 // Special case: when the replica being deleted is a TIE_BREAKER, the
 // parent RD gets an auto-tiebreaker-suppression annotation so the
 // RD-level reconciler doesn't immediately re-stamp a fresh witness
@@ -875,7 +886,8 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 
 	// Look up flags before delete so we know whether to stamp the
 	// suppression annotation. A NotFound at this stage is fine —
-	// the Delete call below will surface the right 404.
+	// the Delete call below folds the missing replica into the
+	// idempotent 200 + warn envelope.
 	existing, getErr := s.Store.Resources().Get(r.Context(), rdName, node)
 	if getErr == nil && slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
 		// Best-effort. Failure to stamp must not block the
@@ -887,6 +899,15 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnRscNotFound,
+				Message: "resource already absent: " + rdName + " on " + node,
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
@@ -894,7 +915,7 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
-		Message: "Resource '" + rdName + "' on node '" + node + "' deleted",
+		Message: "resource deleted: " + rdName + " on " + node,
 	}})
 }
 

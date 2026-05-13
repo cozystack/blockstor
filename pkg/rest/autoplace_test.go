@@ -1059,18 +1059,21 @@ func TestResourceCreateRejectsNonCanonicalName(t *testing.T) {
 }
 
 // TestResourceDeleteMissing: DELETE on a non-existent (RD, node) →
-// 404. Pinned because linstor-csi performs idempotent replica
-// removal during volume teardown; the 404 must surface cleanly so
-// csi treats it as "already gone" rather than retrying forever.
+// 200 + warn-mask `resource already absent` envelope, NOT 404.
+// Regression guard for Bug 56: linstor-csi's DeleteVolume is required
+// by the CSI spec to be idempotent, so a re-issued delete on a pair
+// that was already cleaned up must succeed. Upstream LINSTOR returns
+// the same shape (`WARNING: Node: …, Resource: … not found.` exit 0
+// — cli-parity-audit row #42).
 func TestResourceDeleteMissing(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
 	resp := httpDelete(t, base+"/v1/resource-definitions/ghost/resources/n1")
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }
 
