@@ -279,3 +279,243 @@ func TestSpawnBadJSON(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestSpawnRejectsExceedingFreeCapacityRatio is the spawn-side gate:
+// requesting a volume bigger than free × MaxFreeCapacityOversubscriptionRatio
+// returns 409 with an actionable message naming the prop to raise.
+//
+// Setup: ZFS_THIN pool with 1024 KiB free, ratio=2 → cap = 2048 KiB.
+// Requesting 3 MiB (3072 KiB) exceeds the cap, so the spawn is
+// rejected and no RD lands in the store. Without this gate,
+// linstor-csi would happily create a definition the cluster
+// physically can't host and only fail at autoplace time.
+func TestSpawnRejectsExceedingFreeCapacityRatio(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-cap",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		Props: map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio":  "2",
+			"MaxTotalCapacityOversubscriptionRatio": "2",
+		},
+		FreeCapacity:  1024, // KiB
+		TotalCapacity: 4096, // KiB — big enough that the total gate doesn't clamp first
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-too-big",
+		VolumeSizes:            []int64{3 * 1024 * 1024}, // 3 MiB = 3072 KiB > 2048 cap
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-cap/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	// Decode error envelope; verify the message names at least one
+	// of the props the operator can raise. Pinned because the
+	// actionable message is the operator's only signal to know
+	// which knob fixes the rejection — a regression to a generic
+	// "too big" would silently break the ops runbook.
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].Message == "" {
+		t.Fatalf("empty error envelope: %+v", rc)
+	}
+
+	msg := rc[0].Message
+	if !containsAll(msg, "over-subscription", "MaxFreeCapacityOversubscriptionRatio") {
+		t.Errorf("message must name the gate + a knob: %q", msg)
+	}
+
+	// The half-built RD must NOT exist — gate runs before any
+	// store mutation.
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-too-big"); err == nil {
+		t.Errorf("RD leaked past the gate")
+	}
+}
+
+// TestSpawnRejectsExceedingTotalCapacityRatio pins the
+// MaxTotalCapacityOversubscriptionRatio gate end-to-end via spawn.
+// The free-capacity gate is generous (ratio=100), but the total-
+// capacity gate is tight (ratio=2) — the smaller wins.
+//
+// Pool: total=10 KiB, free=10 KiB. Free × 100 = 1000 KiB but
+// Total × 2 = 20 KiB → cap=20. Requesting 24 KiB → 409.
+func TestSpawnRejectsExceedingTotalCapacityRatio(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-total",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio":  "100",
+			"MaxTotalCapacityOversubscriptionRatio": "2",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 10,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-total-gate",
+		VolumeSizes:            []int64{24 * 1024}, // 24 KiB > cap=20
+	})
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-total/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (total-capacity gate)", resp.StatusCode)
+	}
+}
+
+// TestSpawnRejectsExceedingOversubscriptionRatio pins the
+// umbrella MaxOversubscriptionRatio fallback at the spawn layer.
+// No per-axis ratio set; only the umbrella value, so both axes
+// inherit it. Free=10 × 3 = 30 cap; request 40 → 409.
+func TestSpawnRejectsExceedingOversubscriptionRatio(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-umb",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"MaxOversubscriptionRatio": "3",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 1000, // wide so the total gate doesn't bite
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-umb",
+		VolumeSizes:            []int64{40 * 1024}, // 40 KiB > 30 cap
+	})
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-umb/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (umbrella ratio)", resp.StatusCode)
+	}
+}
+
+// TestSpawnAcceptsWithinOversubscriptionGate pins the happy path:
+// a request that fits inside the gate (free × ratio) passes
+// straight through. We don't fully autoplace (no nodes/replica
+// fixtures), but the call gets past the gate — exit status 201
+// (autoplace deferred) is the acceptable success on this fixture.
+func TestSpawnAcceptsWithinOversubscriptionGate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-ok",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.Nodes().Create(ctx, &apiv1.Node{Name: "n1"})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		Props: map[string]string{
+			"MaxOversubscriptionRatio": "5",
+		},
+		FreeCapacity:  10, // KiB
+		TotalCapacity: 100,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-fits",
+		VolumeSizes:            []int64{40 * 1024}, // 40 KiB ≤ 50 cap
+	})
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-ok/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("status: got %d, want 201 (gate must allow)", resp.StatusCode)
+	}
+}
+
+// containsAll asserts every needle is a substring of haystack.
+// Inlined here (vs `strings.Contains` loops in the assertion) so
+// the test's expectation reads as one assertion line.
+func containsAll(haystack string, needles ...string) bool {
+	for _, n := range needles {
+		found := false
+
+		for i := 0; i+len(n) <= len(haystack); i++ {
+			if haystack[i:i+len(n)] == n {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			return false
+		}
+	}
+
+	return true
+}

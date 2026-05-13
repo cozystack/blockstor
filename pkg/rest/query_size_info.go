@@ -89,6 +89,12 @@ func (s *Server) handleQueryAllSizeInfo(w http.ResponseWriter, r *http.Request) 
 // resource-create will be able to spawn at PlaceCount replicas
 // without running anyone out of room — the cap that golinstor's
 // capacity guard uses.
+//
+// MaxVlmSizeInKib honours the controller-level / per-pool
+// over-subscription gates (MaxFreeCapacity..., MaxTotalCapacity...,
+// MaxOversubscriptionRatio) — see `poolMaxVolumeKib` for the exact
+// formula. Thin pools therefore advertise more capacity than they
+// physically have; thick pools collapse to FreeCapacity.
 func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFilter) (querySizeInfoResponse, error) {
 	pools, err := s.Store.StoragePools().List(ctx)
 	if err != nil {
@@ -99,6 +105,8 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 	if err != nil {
 		return querySizeInfoResponse{}, err
 	}
+
+	ctrlProps := s.readCtrlPropsOrEmpty(ctx)
 
 	var (
 		totalCapacity int64
@@ -141,7 +149,7 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 		availableSum += pool.FreeCapacity
 	}
 
-	maxVolKib := worstFreeOfTopN(dedupShared(candidates), replicaCount(filter))
+	maxVolKib := worstMaxVolOfTopN(dedupShared(candidates), replicaCount(filter), ctrlProps)
 
 	return querySizeInfoResponse{
 		SpaceInfo: querySizeInfoSpaceInfo{
@@ -176,29 +184,34 @@ func dedupShared(pools []apiv1.StoragePool) []apiv1.StoragePool {
 	return out
 }
 
-// worstFreeOfTopN sorts pools by FreeCapacity desc and returns the
-// FreeCapacity of the n-th — i.e. the cap that all `n` replicas can
-// actually fit. Fewer than n candidates → 0 (the request can't be
-// satisfied at this placement count).
-func worstFreeOfTopN(pools []apiv1.StoragePool, n int) int64 {
+// worstMaxVolOfTopN sorts pools by their per-pool MaxVolumeSize
+// (free × MaxFreeCapacityOversubscriptionRatio capped by
+// total × MaxTotalCapacityOversubscriptionRatio) descending and
+// returns the cap of the n-th. That's the largest volume size all
+// `n` replicas can fit honouring the over-subscription gates.
+//
+// Fewer than n candidates → 0 (request can't be satisfied at this
+// placement count). For thick (non-thin) pools the ratios collapse
+// to 1.0 and the result reduces to the legacy FreeCapacity-based cap.
+func worstMaxVolOfTopN(pools []apiv1.StoragePool, n int, ctrlProps map[string]string) int64 {
 	if n <= 0 || len(pools) < n {
 		return 0
 	}
 
-	sortedFree := make([]int64, 0, len(pools))
+	sortedMax := make([]int64, 0, len(pools))
 	for i := range pools {
-		sortedFree = append(sortedFree, pools[i].FreeCapacity)
+		sortedMax = append(sortedMax, poolMaxVolumeKib(&pools[i], ctrlProps))
 	}
 
 	// insertion-sort descending — pools count is in single digits
 	// in practice, no need for the heavier sort package import.
-	for i := 1; i < len(sortedFree); i++ {
-		for j := i; j > 0 && sortedFree[j] > sortedFree[j-1]; j-- {
-			sortedFree[j], sortedFree[j-1] = sortedFree[j-1], sortedFree[j]
+	for i := 1; i < len(sortedMax); i++ {
+		for j := i; j > 0 && sortedMax[j] > sortedMax[j-1]; j-- {
+			sortedMax[j], sortedMax[j-1] = sortedMax[j-1], sortedMax[j]
 		}
 	}
 
-	return sortedFree[n-1]
+	return sortedMax[n-1]
 }
 
 // replicaCount extracts the desired replica count from the filter,

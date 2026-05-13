@@ -48,7 +48,7 @@ func TestQuerySizeInfo(t *testing.T) {
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        nodeName,
-			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			ProviderKind:    apiv1.StoragePoolKindLVM,
 			FreeCapacity:    free,
 			TotalCapacity:   free * 2,
 		}); err != nil {
@@ -103,7 +103,7 @@ func TestQuerySizeInfo_Insufficient(t *testing.T) {
 	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 		StoragePoolName: "pool",
 		NodeName:        "n1",
-		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		ProviderKind:    apiv1.StoragePoolKindLVM,
 		FreeCapacity:    1024,
 	})
 
@@ -142,7 +142,7 @@ func TestQueryAllSizeInfo(t *testing.T) {
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,
-			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			ProviderKind:    apiv1.StoragePoolKindLVM,
 			FreeCapacity:    1024,
 		})
 	}
@@ -194,9 +194,9 @@ func TestQuerySizeInfoSharedLUN(t *testing.T) {
 
 	// Two pools sharing the same LUN, plus a third independent pool.
 	pools := []apiv1.StoragePool{
-		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
-		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
-		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 700, TotalCapacity: 1400},
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVM, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVM, SharedSpaceID: "lun-1", FreeCapacity: 1000, TotalCapacity: 2000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVM, FreeCapacity: 700, TotalCapacity: 1400},
 	}
 	for i := range pools {
 		_ = st.StoragePools().Create(ctx, &pools[i])
@@ -364,5 +364,373 @@ func TestQueryAllSizeInfoEmpty(t *testing.T) {
 
 	if got.Result == nil {
 		t.Errorf("Result: got nil map; want empty map (golinstor expects a JSON object, not null)")
+	}
+}
+
+// TestQuerySizeInfoFreeCapacityRatioGate pins the
+// `MaxFreeCapacityOversubscriptionRatio` gate: ZFS_THIN pool with
+// 10 KiB free, ratio=2 → MaxVolumeSize=20 KiB (free × ratio).
+//
+// The pool prop overrides the controller default — that's the
+// precedence upstream LINSTOR uses in PriorityProps. Without this,
+// a 10 KiB ZFS_THIN pool would (a) silently advertise 200 KiB at the
+// upstream default ratio of 20, and (b) ignore an operator's pool-
+// scoped override entirely. Both are P1 capacity-guard failures.
+func TestQuerySizeInfoFreeCapacityRatioGate(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-thin",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		Props: map[string]string{
+			// Pool-level override of the free-capacity gate. Set the
+			// total-capacity ratio too so it doesn't squash the free
+			// gate (totalCap=20 × 2 = 40 > 20, so min(20, 40) = 20).
+			"MaxFreeCapacityOversubscriptionRatio":  "2",
+			"MaxTotalCapacityOversubscriptionRatio": "2",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 20,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-thin/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 20 {
+		t.Errorf("max vol: got %d KiB, want 20 (free=10 × ratio=2)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoTotalCapacityRatioGate pins the
+// `MaxTotalCapacityOversubscriptionRatio` clamp: a generous
+// free-capacity ratio is overridden by a tighter total-capacity
+// cap. Pool: total=100, free=80, ratios (free=10, total=2) →
+// freeCap = 800, totalCap = 200 → min = 200.
+//
+// Without this clamp, a near-empty pool with a high free ratio
+// would advertise wildly more than the underlying device can
+// physically hold, and the gate would devolve to "free * ratio"
+// alone.
+func TestQuerySizeInfoTotalCapacityRatioGate(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-total",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio":  "10",
+			"MaxTotalCapacityOversubscriptionRatio": "2",
+		},
+		FreeCapacity:  80,
+		TotalCapacity: 100,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-total/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 200 {
+		t.Errorf("max vol: got %d KiB, want 200 (min(80×10, 100×2))",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoOverallRatioFallback pins the
+// `MaxOversubscriptionRatio` umbrella fallback: when neither
+// MaxFreeCapacity... nor MaxTotalCapacity... is set, both fall
+// back to the umbrella ratio. ratio=3 + free=10, total=100 →
+// min(30, 300) = 30.
+//
+// This is the operator's single-knob "tune the whole cluster"
+// path — without the fallback, setting just MaxOversubscriptionRatio
+// would silently do nothing and operators would (rightly) declare
+// the gate broken.
+func TestQuerySizeInfoOverallRatioFallback(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-overall",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"MaxOversubscriptionRatio": "3",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 100,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-overall/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 30 {
+		t.Errorf("max vol: got %d KiB, want 30 (10 × MaxOversubscriptionRatio=3)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoThickProviderIgnoresRatios pins that raw LVM /
+// ZFS pools never oversubscribe — even if an operator (mistakenly)
+// sets the ratio props, MaxVolumeSize stays at FreeCapacity.
+// Storage backends that allocate physically can't honour the gate,
+// so applying it would advertise space that doesn't exist.
+func TestQuerySizeInfoThickProviderIgnoresRatios(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-thick",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindZFS, // thick
+		Props: map[string]string{
+			"MaxOversubscriptionRatio": "20",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 20,
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-thick/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 10 {
+		t.Errorf("max vol: got %d KiB, want 10 (thick pool: ratio ignored)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoThinPoolDefaultRatio pins the implicit default
+// of 20 (LINSTOR's documented default in `properties.json`). Free=5,
+// no overrides → cap = 5 × 20 = 100. This is what a fresh cluster
+// will report; any operator-visible regression here means the
+// gate has lost its default and would be the de-facto "free space"
+// behaviour again.
+func TestQuerySizeInfoThinPoolDefaultRatio(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-default",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		FreeCapacity:    5,
+		TotalCapacity:   1000, // big enough that the total gate doesn't clamp
+	})
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-default/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 100 {
+		t.Errorf("max vol: got %d KiB, want 100 (default ratio 20 × free 5)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoControllerRatioFallback: pool-level prop is
+// absent, controller prop carries the gate, the pool should
+// inherit it. Pins the precedence path (pool > controller >
+// default) on the controller-side branch — the missing piece for
+// "set it once cluster-wide" operator workflow.
+func TestQuerySizeInfoControllerRatioFallback(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-ctrl",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    10,
+		TotalCapacity:   1000,
+	})
+
+	srv := &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	}
+	// Seed a controller-level MaxFreeCapacityOversubscriptionRatio.
+	if err := applyControllerProps(ctx, srv.Client, &apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio": "4",
+		},
+	}); err != nil {
+		t.Fatalf("seed ctrl props: %v", err)
+	}
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-ctrl/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 40 {
+		t.Errorf("max vol: got %d KiB, want 40 (controller ratio 4 × free 10)",
+			got.SpaceInfo.MaxVlmSizeInKib)
+	}
+}
+
+// TestQuerySizeInfoPoolPropOverridesController pins the precedence
+// rule — when both layers carry the same key, the pool-level value
+// wins. Same shape as upstream's PriorityProps walk.
+func TestQuerySizeInfoPoolPropOverridesController(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-prec",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+
+	_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio": "5",
+		},
+		FreeCapacity:  10,
+		TotalCapacity: 1000,
+	})
+
+	srv := &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	}
+	if err := applyControllerProps(ctx, srv.Client, &apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{
+			// Controller says 100; pool says 5. Pool wins → cap 50.
+			"MaxFreeCapacityOversubscriptionRatio": "100",
+		},
+	}); err != nil {
+		t.Fatalf("seed ctrl props: %v", err)
+	}
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-prec/query-size-info", []byte(`{}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	var got querySizeInfoResponse
+
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+
+	if got.SpaceInfo.MaxVlmSizeInKib != 50 {
+		t.Errorf("max vol: got %d KiB, want 50 (pool ratio 5 wins over controller 100)",
+			got.SpaceInfo.MaxVlmSizeInKib)
 	}
 }

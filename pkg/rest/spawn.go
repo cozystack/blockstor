@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,16 +68,35 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rd := buildSpawnedRD(&req, rgName, &rg)
+	// Over-subscription gate (Scenarios 7.19/7.20/7.21). The cap is
+	// computed against the RG's effective SelectFilter (merged with
+	// spawn-time overrides) so the operator's `not_place_with_rsc` /
+	// pool-restriction overrides take effect before we look at sizes.
+	// `definitions_only` spawns still go through the gate — defining
+	// a 1 TiB VD on a 10 GiB cluster is just as much an operator
+	// error as actually trying to place it.
+	if rejected := s.rejectIfExceedsOversubGate(r.Context(), w, &rg, &req); rejected {
+		return
+	}
 
-	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
+	s.spawnCreate(w, r, rgName, &rg, &req)
+}
+
+// spawnCreate runs the mutation half of handleSpawn — build RD,
+// create VDs, run autoplace. Extracted so handleSpawn stays under
+// the funlen budget; the split also matches the natural
+// "validate → mutate" boundary in the request lifecycle.
+func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) {
+	rd := buildSpawnedRD(req, rgName, rg)
+
+	err := s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	err = s.spawnVolumeDefinitions(r.Context(), rd.Name, &rg, req.VolumeSizes)
+	err = s.spawnVolumeDefinitions(r.Context(), rd.Name, rg, req.VolumeSizes)
 	if err != nil {
 		rollbackSpawn(r.Context(), s.Store, rd.Name)
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -91,7 +111,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	// separate `r c --auto-place=N`. The CSI flow follows the same
 	// contract (linstor-csi calls /spawn, then expects to find
 	// resources in /v1/view/resources on the next reconcile).
-	placeErr := spawnAutoplace(r.Context(), s, rd.Name, &rg, &req)
+	placeErr := spawnAutoplace(r.Context(), s, rd.Name, rg, req)
 	if placeErr != nil {
 		log.FromContext(r.Context()).WithName("rest").
 			Error(placeErr, "spawn autoplace", "rd", rd.Name)
@@ -219,3 +239,90 @@ func rollbackSpawn(ctx context.Context, st store.Store, rdName string) {
 			Error(err, "rollback spawn: delete RD", "rd", rdName)
 	}
 }
+
+// rejectIfExceedsOversubGate computes the cluster's effective
+// MaxVolumeSize for the spawn's pool selection and rejects any
+// requested volume size that exceeds it. Returns true when the
+// caller should bail out (a response has already been written).
+//
+// The gate is honoured BEFORE we touch the store so a 409 path
+// doesn't leave a half-built RD behind — no rollback needed.
+//
+// Empty / zero VolumeSizes (e.g. definitions_only spawns that
+// list no volumes yet) skip the check; there's nothing to gate.
+func (s *Server) rejectIfExceedsOversubGate(ctx context.Context, w http.ResponseWriter, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) bool {
+	if len(req.VolumeSizes) == 0 {
+		return false
+	}
+
+	filter := effectiveSpawnFilter(rg, req)
+
+	info, err := s.computeSizeInfo(ctx, &filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return true
+	}
+
+	capKib := info.SpaceInfo.MaxVlmSizeInKib
+	if capKib <= 0 {
+		// No candidate pools at the requested placement — let the
+		// downstream autoplace step surface the failure with its
+		// own error (it has richer context: per-pool exclusion
+		// reasons). The gate is specifically about
+		// "size > available"; "no available pools at all" is a
+		// different failure mode handled elsewhere.
+		return false
+	}
+
+	for i, sizeBytes := range req.VolumeSizes {
+		sizeKib := sizeBytes / bytesPerKib
+		if sizeKib > capKib {
+			writeError(w, http.StatusConflict,
+				"over-subscription gate: volume "+
+					strconvI(i)+
+					" size "+strconvI64(sizeKib)+
+					" KiB exceeds MaxVolumeSize "+strconvI64(capKib)+
+					" KiB (raise MaxFreeCapacityOversubscriptionRatio / "+
+					"MaxTotalCapacityOversubscriptionRatio / MaxOversubscriptionRatio "+
+					"on the storage pool or controller, or shrink the request)")
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// effectiveSpawnFilter merges the spawn-time SelectFilter overrides
+// onto the RG's SelectFilter — the same precedence the autoplacer
+// uses post-spawn (`spawnAutoplace`). Returns the merged copy so the
+// caller can safely pass a pointer without mutating the RG.
+func effectiveSpawnFilter(rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) apiv1.AutoSelectFilter {
+	filter := rg.SelectFilter
+
+	if req.SelectFilter.PlaceCount != 0 {
+		filter.PlaceCount = req.SelectFilter.PlaceCount
+	}
+
+	if req.SelectFilter.StoragePool != "" {
+		filter.StoragePool = req.SelectFilter.StoragePool
+	}
+
+	if len(req.SelectFilter.StoragePoolList) > 0 {
+		filter.StoragePoolList = req.SelectFilter.StoragePoolList
+	}
+
+	if len(req.SelectFilter.NodeNameList) > 0 {
+		filter.NodeNameList = req.SelectFilter.NodeNameList
+	}
+
+	return filter
+}
+
+// strconvI and strconvI64 are tiny inline integer-to-string
+// helpers so the gate error message stays a single expression
+// without dragging fmt + its allocations onto a path the CSI
+// driver hits on every CreateVolume.
+func strconvI(v int) string     { return strconv.Itoa(v) }
+func strconvI64(v int64) string { return strconv.FormatInt(v, 10) }
