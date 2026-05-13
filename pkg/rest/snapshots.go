@@ -145,6 +145,23 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	// derives deterministically from Spec.Nodes.
 	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes)
 
+	// Idempotent create: a CSI driver retries CreateSnapshot for the
+	// same (rd, snap_name) until success, so a re-request must
+	// return 200 + ApiCallRc rather than 409. Mirrors upstream
+	// LINSTOR's behaviour for snapshot name collisions on the same
+	// RD. Different-source name collision is detected at the
+	// linstor-csi layer (it maps CSI snapshot ids to LINSTOR
+	// (rd, snap_name) tuples).
+	existing, getErr := s.Store.Snapshots().Get(r.Context(), rd, snap.Name)
+	if getErr == nil {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "snapshot already exists: " + existing.Name,
+		}})
+
+		return
+	}
+
 	err = s.Store.Snapshots().Create(r.Context(), &snap)
 	if err != nil {
 		writeStoreError(w, err)
