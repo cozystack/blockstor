@@ -608,6 +608,26 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
+	// Cross-cluster ship guard (scenario 4.17). Upstream LINSTOR's
+	// `BackupShip` payload references a remote-cluster snapshot via
+	// `<remote_name>:<srcRD>:<snap>` (three colon-separated parts).
+	// Cozystack's satellite knows only the local CrossNodeFetcher
+	// pipeline — there is no wire shape for fetching a snapshot
+	// from a different cluster's controller. Reject the 3-part form
+	// up-front with an actionable error so it surfaces on the
+	// resource's Status.Conditions instead of being silently mis-
+	// parsed as a malformed 2-part srcRD that happens to contain
+	// a colon.
+	if remotePrefix, rest, hasRemote := strings.Cut(src, ":"); hasRemote {
+		if _, _, hasSnap := strings.Cut(rest, ":"); hasSnap && remotePrefix != "" {
+			return errors.Errorf(
+				"SourceSnapshot %q references a cross-cluster remote (%q); "+
+					"cluster-to-cluster ship via LINSTOR remote is not "+
+					"implemented; use snapshot-restore-resource for "+
+					"in-cluster ship", src, remotePrefix)
+		}
+	}
+
 	srcRD, snapName, ok := strings.Cut(src, ":")
 	if !ok || srcRD == "" || snapName == "" {
 		return errors.Errorf("SourceSnapshot %q must be <srcRD>:<snapName>", src)

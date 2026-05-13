@@ -18,9 +18,12 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -91,5 +94,259 @@ func TestRemotesTypedEndpointsBareArray(t *testing.T) {
 				t.Errorf("got nil; want []")
 			}
 		})
+	}
+}
+
+// TestLinstorRemoteCRUD pins the REST surface for scenario 4.17:
+// POST /v1/remotes/linstor with the envelope `{remote_name, url,
+// passphrase}` accepts and stores the entry; GET /v1/remotes/linstor
+// surfaces it as a single-element array; DELETE /v1/remotes
+// ?remote_name=... removes it; the follow-up GET goes back to `[]`.
+//
+// The body wire-shape matches upstream LINSTOR's `LinstorRemote`
+// (see pkg/api/openapi/types.gen.go) so golinstor's typed client can
+// drive this surface without bespoke decoders. We assert the exact
+// JSON keys, not Go field names, because the persistence layer is
+// what tooling sees.
+func TestLinstorRemoteCRUD(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	const (
+		remoteName = "peer-cluster-east"
+		remoteURL  = "http://controller.peer.east.example:3370"
+		remotePass = "shared-test-passphrase"
+	)
+
+	// --- POST: create the remote ---
+	body, err := json.Marshal(map[string]string{
+		"remote_name": remoteName,
+		"url":         remoteURL,
+		"passphrase":  remotePass,
+	})
+	if err != nil {
+		t.Fatalf("marshal create body: %v", err)
+	}
+
+	createResp := httpPost(t, base+"/v1/remotes/linstor", body)
+	defer func() { _ = createResp.Body.Close() }()
+
+	if createResp.StatusCode != http.StatusCreated {
+		gotBody, _ := io.ReadAll(createResp.Body)
+		t.Fatalf("POST status: got %d, want 201; body=%s", createResp.StatusCode, gotBody)
+	}
+
+	var created map[string]string
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	if created["remote_name"] != remoteName {
+		t.Errorf("created remote_name: got %q, want %q", created["remote_name"], remoteName)
+	}
+
+	// --- GET /v1/remotes/linstor: typed-array list ---
+	listResp := httpGet(t, base+"/v1/remotes/linstor")
+	defer func() { _ = listResp.Body.Close() }()
+
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET typed status: got %d, want 200", listResp.StatusCode)
+	}
+
+	var list []map[string]string
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+
+	if len(list) != 1 {
+		t.Fatalf("typed list len: got %d, want 1; entries=%+v", len(list), list)
+	}
+
+	if list[0]["remote_name"] != remoteName {
+		t.Errorf("list[0].remote_name: got %q, want %q", list[0]["remote_name"], remoteName)
+	}
+
+	if list[0]["url"] != remoteURL {
+		t.Errorf("list[0].url: got %q, want %q", list[0]["url"], remoteURL)
+	}
+
+	// passphrase round-trips on the typed-array view (the operator
+	// posted it, the operator can read it back). A future hardening
+	// pass may redact it; pin the current behaviour so the change is
+	// intentional.
+	if list[0]["passphrase"] != remotePass {
+		t.Errorf("list[0].passphrase: got %q, want %q", list[0]["passphrase"], remotePass)
+	}
+
+	// --- GET /v1/remotes: envelope view also sees the entry ---
+	envResp := httpGet(t, base+"/v1/remotes")
+	defer func() { _ = envResp.Body.Close() }()
+
+	var env remoteListEnvelope
+	if err := json.NewDecoder(envResp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(env.LinstorRemotes) != 1 || env.LinstorRemotes[0].RemoteName != remoteName {
+		t.Errorf("envelope linstor_remotes: got %+v, want one entry named %q",
+			env.LinstorRemotes, remoteName)
+	}
+
+	// --- DELETE: remove via query param ---
+	delResp := httpDelete(t, base+"/v1/remotes?remote_name="+remoteName)
+	defer func() { _ = delResp.Body.Close() }()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status: got %d, want 200", delResp.StatusCode)
+	}
+
+	// --- Final GET: list empty again ---
+	finalResp := httpGet(t, base+"/v1/remotes/linstor")
+	defer func() { _ = finalResp.Body.Close() }()
+
+	var finalList []map[string]string
+	if err := json.NewDecoder(finalResp.Body).Decode(&finalList); err != nil {
+		t.Fatalf("decode final list: %v", err)
+	}
+
+	if len(finalList) != 0 {
+		t.Errorf("post-delete list: got %+v, want []", finalList)
+	}
+}
+
+// TestLinstorRemoteCreateValidatesRequiredFields: POSTing a body
+// missing `remote_name` or `url` produces 400 with an
+// upstream-shaped ApiCallRc message — pinned so a future refactor
+// that drops the validation doesn't slip a half-formed entry past
+// the JSON decoder onto the registry.
+func TestLinstorRemoteCreateValidatesRequiredFields(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	for _, tc := range []struct {
+		name     string
+		body     map[string]string
+		wantMsg  string
+		wantCode int
+	}{
+		{
+			name:     "missing remote_name",
+			body:     map[string]string{"url": "http://x"},
+			wantMsg:  "remote_name is required",
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "missing url",
+			body:     map[string]string{"remote_name": "r1"},
+			wantMsg:  "url is required",
+			wantCode: http.StatusBadRequest,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(tc.body)
+
+			resp := httpPost(t, base+"/v1/remotes/linstor", body)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tc.wantCode {
+				t.Fatalf("status: got %d, want %d", resp.StatusCode, tc.wantCode)
+			}
+
+			var rcs []apiv1.APICallRc
+			if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+				t.Fatalf("decode ApiCallRc: %v", err)
+			}
+
+			if len(rcs) != 1 {
+				t.Fatalf("ApiCallRc len: got %d, want 1", len(rcs))
+			}
+
+			if !strings.Contains(rcs[0].Message, tc.wantMsg) {
+				t.Errorf("message: got %q, want substring %q", rcs[0].Message, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestLinstorRemoteDeleteMissingReturns404 pins the wire shape for
+// "delete unknown remote": 404 + ApiCallRc with the operator-facing
+// message. Catches a regression that would mask the failure as 200
+// (silent no-op) and let downstream code keep referencing a
+// remote that doesn't exist.
+func TestLinstorRemoteDeleteMissingReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/remotes?remote_name=ghost")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestLinstorRemoteShipReturns501WithText is the core spec pin for
+// scenario 4.17: POST /v1/remotes/{remote}/backups/ship MUST return
+// 501 (Not Implemented) with a body that names the supported
+// in-cluster alternative (`snapshot-restore-resource`). golinstor
+// turns 501 into `ApiCallError` and surfaces the `message` field
+// verbatim — that's what the operator sees on the CLI.
+//
+// The text MUST mention "snapshot-restore-resource" so an operator
+// searching for the fallback can find it without grep-ing source.
+// Without this pin a future refactor returning a bare 501 would
+// drop the actionable hint and force the operator into the bug
+// tracker.
+func TestLinstorRemoteShipReturns501WithText(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	// Pre-create a remote so the URL is plausibly addressable. The
+	// 501 must fire regardless of whether the remote exists — the
+	// feature is missing on the satellite side, not on the routing
+	// layer — but exercising the realistic call path catches a
+	// future regression where someone wires the registry check
+	// before the not-implemented return and accidentally turns the
+	// 501 into a 404.
+	createBody, _ := json.Marshal(map[string]string{
+		"remote_name": "peer-east",
+		"url":         "http://peer.example:3370",
+	})
+	createResp := httpPost(t, base+"/v1/remotes/linstor", createBody)
+	_ = createResp.Body.Close()
+
+	shipBody, _ := json.Marshal(map[string]any{
+		"src_rsc_name":  "pvc-source",
+		"dst_rsc_name":  "pvc-target",
+		"src_snap_name": "snap-1",
+	})
+
+	resp := httpPost(t, base+"/v1/remotes/peer-east/backups/ship", shipBody)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want 501", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode ApiCallRc: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("ApiCallRc len: got %d, want 1; got=%+v", len(rcs), rcs)
+	}
+
+	// Hard-pinned substrings — change here means the operator-facing
+	// hint changed. That's intentional; require an explicit test
+	// edit when it does.
+	for _, want := range []string{
+		"linstor-remote ship not implemented",
+		"snapshot-restore-resource",
+	} {
+		if !strings.Contains(rcs[0].Message, want) {
+			t.Errorf("ship 501 message %q is missing required substring %q",
+				rcs[0].Message, want)
+		}
 	}
 }

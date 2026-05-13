@@ -51,6 +51,12 @@ type Server struct {
 	Store     store.Store
 	Client    client.Client // controller-runtime client for native-object endpoints
 	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
+
+	// linstorRemotes is the in-memory registry for LINSTOR remotes —
+	// see pkg/rest/remotes.go. Lazy-initialised on the first call to
+	// registerRemotes so a zero-value Server keeps working in tests
+	// that build the mux without going through the full constructor.
+	linstorRemotes *linstorRemoteRegistry
 }
 
 // NeedLeaderElection reports whether the server requires leader election.
