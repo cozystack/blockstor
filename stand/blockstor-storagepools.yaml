@@ -96,9 +96,11 @@ spec:
     StorDriver/ThinPool: thin
 ---
 # ZFS pool — install-pools.sh creates blockstor-zfs as a zpool
-# on each worker. `StorDriver/ZPool` is what the satellite's
-# factory.go reads; provider kind ZFS_THIN matches the legacy
-# `--zfs-thin=true` flag default.
+# on each worker. `StorDriver/ZPoolThin` is the upstream-LINSTOR
+# property key for ZFS_THIN (Python CLI reads this verbatim for
+# the `sp l` PoolName column). The satellite's factory.go accepts
+# both ZPoolThin (canonical, used here) and the legacy ZPool name
+# for backwards-compat with stands deployed before the rename.
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
@@ -108,7 +110,7 @@ spec:
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:
-    StorDriver/ZPool: blockstor-zfs
+    StorDriver/ZPoolThin: blockstor-zfs
 ---
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
@@ -119,7 +121,7 @@ spec:
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:
-    StorDriver/ZPool: blockstor-zfs
+    StorDriver/ZPoolThin: blockstor-zfs
 ---
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
@@ -130,4 +132,4 @@ spec:
   poolName: zfs-thin
   providerKind: ZFS_THIN
   props:
-    StorDriver/ZPool: blockstor-zfs
+    StorDriver/ZPoolThin: blockstor-zfs

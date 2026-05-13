@@ -42,10 +42,11 @@ const (
 // kind. Mirrored verbatim so existing operators / piraeus-operator
 // manifests round-trip.
 const (
-	propLvmVG    = "StorDriver/LvmVg"
-	propThinPool = "StorDriver/ThinPool"
-	propZPool    = "StorDriver/ZPool"
-	propFileDir  = "StorDriver/FileDir"
+	propLvmVG     = "StorDriver/LvmVg"
+	propThinPool  = "StorDriver/ThinPool"
+	propZPool     = "StorDriver/ZPool"
+	propZPoolThin = "StorDriver/ZPoolThin"
+	propFileDir   = "StorDriver/FileDir"
 )
 
 // NewProviderFromKind instantiates the matching `storage.Provider`
@@ -107,14 +108,31 @@ func newLVMThin(props map[string]string, exec storage.Exec) (storage.Provider, e
 }
 
 func newZFS(props map[string]string, exec storage.Exec, thin bool) (storage.Provider, error) {
-	pool := props[propZPool]
+	// Upstream LINSTOR uses distinct prop keys per provider kind:
+	// `StorDriver/ZPool` for ZFS and `StorDriver/ZPoolThin` for
+	// ZFS_THIN. The python-linstor-client `sp l` PoolName column
+	// renders from the kind-specific key — if a ZFS_THIN pool only
+	// carries `ZPool`, the column stays blank. We accept both for
+	// each kind (kind-specific key wins) to keep CRDs that were
+	// written before the rename and operators who copy-paste from
+	// LVM examples both working.
+	primary, secondary := propZPool, propZPoolThin
+	if thin {
+		primary, secondary = propZPoolThin, propZPool
+	}
+
+	pool := props[primary]
+	if pool == "" {
+		pool = props[secondary]
+	}
+
 	if pool == "" {
 		kind := ProviderKindZFS
 		if thin {
 			kind = ProviderKindZFSThin
 		}
 
-		return nil, errors.Errorf("%s provider requires %q in props", kind, propZPool)
+		return nil, errors.Errorf("%s provider requires %q in props", kind, primary)
 	}
 
 	return zfs.NewProvider(zfs.Config{Pool: pool, Thin: thin}, exec), nil
