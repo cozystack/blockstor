@@ -1145,3 +1145,290 @@ func TestResourceDeleteRegularReplicaSkipsSuppression(t *testing.T) {
 		t.Errorf("suppression annotation must not appear on a regular-replica delete; got %v", rd.Annotations)
 	}
 }
+
+// TestMakeAvailablePromotesTiebreakerWitness pins the CSI
+// ControllerPublishVolume happy path: linstor-csi calls
+// `POST .../resources/{node}/make-available` with `{diskful:false}`
+// against a node that already carries a [DISKLESS, TIE_BREAKER]
+// witness. The witness must lose TIE_BREAKER (and keep DISKLESS) so
+// the satellite reconciler exposes a real DRBD device — without
+// this the Pod stays in ContainerCreating with "could not determine
+// device path".
+func TestMakeAvailablePromotesTiebreakerWitness(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	witness := &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n3",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}
+	if err := st.Resources().Create(ctx, witness); err != nil {
+		t.Fatalf("seed tiebreaker witness: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: false})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n3/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n3")
+	if err != nil {
+		t.Fatalf("get promoted: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag missing after promote: %v", got.Flags)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("TIE_BREAKER must be stripped after CSI attach: %v", got.Flags)
+	}
+}
+
+// TestMakeAvailableCreatesDisklessOnEmptyNode covers the second
+// half of the CSI promote semantics — when no replica exists on the
+// target node, make-available creates a plain DISKLESS one. Without
+// this the manual fallback path in linstor-csi's Attach has to fire
+// a second REST call and racily collide with the controller's
+// tiebreaker placer.
+func TestMakeAvailableCreatesDisklessOnEmptyNode(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: false})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n2/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n2")
+	if err != nil {
+		t.Fatalf("get created: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag missing on freshly-created replica: %v", got.Flags)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("freshly-created CSI replica must not carry TIE_BREAKER: %v", got.Flags)
+	}
+}
+
+// TestMakeAvailableMissingRDReturns404: linstor-csi treats 404 here
+// as "no such volume → fail attach"; any other status code would
+// loop the csi retry path. Match upstream LINSTOR exactly.
+func TestMakeAvailableMissingRDReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: false})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/ghost/resources/n1/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestMakeAvailableDiskfulPromotesWitnessToDiskful exercises the
+// less-common `{diskful:true}` branch — the witness loses both
+// DISKLESS and TIE_BREAKER so the reconciler attaches storage on
+// that node. Mirrors the upstream `linstor resource toggle-disk
+// --diskful` semantics.
+func TestMakeAvailableDiskfulPromotesWitnessToDiskful(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	witness := &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n3",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}
+	if err := st.Resources().Create(ctx, witness); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: true})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n3/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n3")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) ||
+		slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("diskful promote should strip both DISKLESS and TIE_BREAKER, got %v", got.Flags)
+	}
+}
+
+// TestMakeAvailableDiskfulReplicaIsNoOp: calling make-available on a
+// node that already has a diskful replica returns 200 with no flag
+// mutation. Idempotent by design — csi may issue the call on every
+// ControllerPublishVolume retry.
+func TestMakeAvailableDiskfulReplicaIsNoOp(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	diskful := &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n1",
+		Props:    map[string]string{"StorPoolName": "pool"},
+	}
+	if err := st.Resources().Create(ctx, diskful); err != nil {
+		t.Fatalf("seed diskful: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{Diskful: false})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n1/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if len(got.Flags) != 0 {
+		t.Errorf("no-op make-available must not add flags to a diskful replica, got %v", got.Flags)
+	}
+}
+
+// TestMakeAvailablePersistsLayerListOntoRD: linstor-csi may smuggle a
+// layer_list on the make-available call (matches the
+// `autoplace`/`resources` POST behaviour). Persist onto RD.LayerStack
+// only when the RD doesn't already carry one — operator-set wins.
+func TestMakeAvailablePersistsLayerListOntoRD(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceMakeAvailable{
+		LayerList: []string{apiv1.LayerKindDRBD, apiv1.LayerKindStorage},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources/n1/make-available", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := []string{apiv1.LayerKindDRBD, apiv1.LayerKindStorage}
+	if !slices.Equal(rd.LayerStack, want) {
+		t.Errorf("LayerStack: got %v, want %v", rd.LayerStack, want)
+	}
+}
+
+// TestResourceCreatePromotesTiebreakerWithDisklessFlag covers the
+// linstor-csi fallback path: after make-available returns 404 the
+// client retries with `POST .../resources` carrying
+// `Flags: [DISKLESS]` and NO StorPoolName. The promote branch must
+// fire on that bare-diskless envelope too, otherwise the second
+// call collides with the existing TIE_BREAKER witness.
+func TestResourceCreatePromotesTiebreakerWithDisklessFlag(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	witness := &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n3",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}
+	if err := st.Resources().Create(ctx, witness); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{
+			NodeName: "n3",
+			Flags:    []string{apiv1.ResourceFlagDiskless},
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n3")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS must remain: %v", got.Flags)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("TIE_BREAKER must be stripped: %v", got.Flags)
+	}
+}

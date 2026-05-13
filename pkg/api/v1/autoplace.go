@@ -33,3 +33,15 @@ type ResourceCreate struct {
 	DrbdNodeID   *int32   `json:"drbd_node_id,omitempty"`
 	NetInterface string   `json:"net_interface,omitempty"`
 }
+
+// ResourceMakeAvailable is the body upstream LINSTOR uses on
+// `POST /v1/resource-definitions/{rd}/resources/{node}/make-available`.
+// linstor-csi's `Attach` (ControllerPublishVolume) posts
+// `{diskful:false}` here to either promote an existing
+// TIE_BREAKER/DISKLESS witness on the target node, or create a fresh
+// DISKLESS replica. Diskful=true forces a regular diskful replica
+// even when a diskless one would otherwise satisfy the request.
+type ResourceMakeAvailable struct {
+	LayerList []string `json:"layer_list,omitempty"`
+	Diskful   bool     `json:"diskful,omitempty"`
+}

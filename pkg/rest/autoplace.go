@@ -53,6 +53,15 @@ const (
 
 // registerAutoplace wires `POST /v1/resource-definitions/{rd}/autoplace` and
 // the per-resource list/POST/DELETE used by linstor-csi for explicit placement.
+//
+// The `make-available` route mirrors upstream LINSTOR's
+// `POST /v1/resource-definitions/{rd}/resources/{node}/make-available`
+// — linstor-csi v0.21+ calls it from `Attach` (the
+// ControllerPublishVolume implementation) to promote a TIE_BREAKER
+// witness into a real DISKLESS replica, or create one on demand.
+// Without it the call hits 404, csi falls back to a manual diskless
+// `POST .../resources` create, which collides with the existing
+// witness and the replica never reaches a usable state.
 func (s *Server) registerAutoplace(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/autoplace",
 		s.requireStore(s.handleAutoplace))
@@ -62,6 +71,8 @@ func (s *Server) registerAutoplace(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceGet))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources",
 		s.requireStore(s.handleResourceCreate))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/make-available",
+		s.requireStore(s.handleResourceMakeAvailable))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resources/{node}",
 		s.requireStore(s.handleResourceDelete))
 }
@@ -481,7 +492,16 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 	// TIE_BREAKER replica converts it to diskful (effectively an
 	// implicit toggle-disk-to-diskful). Mirror that here when
 	// the only thing in the way is the diskless/tiebreaker flag.
-	if errors.Is(err, store.ErrAlreadyExists) && res.Props["StorPoolName"] != "" {
+	//
+	// The same promote-instead-of-error path covers the linstor-csi
+	// fallback after a make-available 404: csi posts a bare
+	// `Flags: [DISKLESS]` create against a node that may already
+	// carry a TIE_BREAKER witness, and the witness must be stripped
+	// to its plain-DISKLESS form so the reconciler exposes a
+	// usable DRBD device.
+	wantsPromote := res.Props["StorPoolName"] != "" ||
+		containsResourceFlag(res.Flags, apiv1.ResourceFlagDiskless)
+	if errors.Is(err, store.ErrAlreadyExists) && wantsPromote {
 		promoted, promErr := s.promoteDisklessReplica(r.Context(), res)
 		if promErr != nil {
 			writeStoreError(w, promErr)
@@ -498,33 +518,55 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 }
 
 // promoteDisklessReplica takes a Resource the caller just tried to
-// create-as-diskful, looks up the existing one on the same (node, RD),
-// and if it's a DISKLESS / TIE_BREAKER replica converts it to diskful
-// by dropping those flags and stamping the new StorPoolName onto
-// Spec.Props. The satellite reconciler picks the Resource change up
-// via its watch and runs the normal storage-attach chain.
+// create, looks up the existing one on the same (node, RD), and if
+// it's a DISKLESS / TIE_BREAKER replica converts it to match the
+// requested shape:
 //
-// Returns the updated Resource on success, or wraps ErrAlreadyExists
-// when the existing replica is NOT a diskless witness (i.e. a real
-// conflict the caller should surface as 409).
+//   - target carries a StorPoolName → promote to diskful: drop both
+//     DISKLESS and TIE_BREAKER and stamp the new StorPoolName onto
+//     Spec.Props (the upstream `linstor resource create --storage-pool`
+//     toggle-disk semantics).
+//   - target carries `Flags:[DISKLESS]` without a StorPoolName (the
+//     linstor-csi fallback after make-available 404) → drop only
+//     TIE_BREAKER and leave DISKLESS in place.
+//
+// The satellite reconciler picks the Resource change up via its
+// watch and runs the normal storage-attach chain. Returns the updated
+// Resource on success, or wraps ErrAlreadyExists when the existing
+// replica is NOT a diskless witness (i.e. a real conflict the caller
+// should surface as 409).
 func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resource) (*apiv1.Resource, error) {
 	existing, err := s.Store.Resources().Get(ctx, target.Name, target.NodeName)
 	if err != nil {
 		return nil, errors.Wrapf(err, "lookup existing replica %s.%s", target.Name, target.NodeName)
 	}
 
+	wantDiskful := target.Props["StorPoolName"] != "" &&
+		!containsResourceFlag(target.Flags, apiv1.ResourceFlagDiskless)
+
 	wasDiskless := false
 
 	keep := existing.Flags[:0]
 
 	for _, flag := range existing.Flags {
-		if flag == apiv1.ResourceFlagDiskless || flag == apiv1.ResourceFlagTieBreaker {
+		switch flag {
+		case apiv1.ResourceFlagTieBreaker:
+			// Always strip the witness marker on any
+			// caller-driven promote — the replica is now
+			// owned by an operator/CSI request, not the
+			// auto-placer.
+			wasDiskless = true
+		case apiv1.ResourceFlagDiskless:
 			wasDiskless = true
 
-			continue
-		}
+			if wantDiskful {
+				continue
+			}
 
-		keep = append(keep, flag)
+			keep = append(keep, flag)
+		default:
+			keep = append(keep, flag)
+		}
 	}
 
 	if !wasDiskless {
@@ -535,11 +577,13 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 
 	existing.Flags = keep
 
-	if existing.Props == nil {
-		existing.Props = map[string]string{}
-	}
+	if wantDiskful {
+		if existing.Props == nil {
+			existing.Props = map[string]string{}
+		}
 
-	existing.Props["StorPoolName"] = target.Props["StorPoolName"]
+		existing.Props["StorPoolName"] = target.Props["StorPoolName"]
+	}
 
 	err = s.Store.Resources().Update(ctx, &existing)
 	if err != nil {
@@ -547,6 +591,196 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 	}
 
 	return &existing, nil
+}
+
+// containsResourceFlag is a small helper so the create/promote
+// branching reads at the call site without an inline loop.
+func containsResourceFlag(flags []string, want string) bool {
+	return slices.Contains(flags, want)
+}
+
+// handleResourceMakeAvailable answers
+// `POST /v1/resource-definitions/{rd}/resources/{node}/make-available`,
+// the route linstor-csi v0.21+ uses from its `Attach`
+// (ControllerPublishVolume) path. The upstream LINSTOR semantics:
+//
+//   - If no replica exists on the node: create one. Body's
+//     `diskful=false` (the typical CSI case) means a DISKLESS
+//     replica; `diskful=true` means a regular diskful one and
+//     the body MAY include a `layer_list` carried over from the
+//     request shape, which we persist onto the RD just like the
+//     other create paths.
+//   - If a DISKLESS / TIE_BREAKER witness already lives on the
+//     node: promote it. For the CSI case (diskful=false) that means
+//     strip TIE_BREAKER but keep DISKLESS so the satellite reconciler
+//     brings up a real diskless DRBD device. For diskful=true the
+//     existing promoteDisklessReplica path drops both flags and
+//     stamps the new StorPoolName.
+//   - If a diskful replica already lives on the node: no-op
+//     (already available).
+//
+// Always responds with the upstream `[]ApiCallRc` envelope — golinstor
+// discards the body but the Python CLI and `linstor` operator UI
+// surface the message.
+func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+
+	req, ok := decodeMakeAvailableBody(w, r)
+	if !ok {
+		return
+	}
+
+	// The RD MUST exist — matches upstream behaviour and lets
+	// linstor-csi distinguish "no such volume" (404 → fail Attach)
+	// from "make-available not wired" (which would also be 404 here
+	// but is now impossible since the route is registered).
+	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	// Pass-through for CSI-supplied layer_list, identical to the
+	// autoplace / explicit-create flows. RD-level LayerStack wins.
+	if len(req.LayerList) > 0 && len(rd.LayerStack) == 0 {
+		rd.LayerStack = append([]string(nil), req.LayerList...)
+
+		err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
+
+	ok = s.applyMakeAvailable(w, r, rdName, node, &req)
+	if !ok {
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "Resource '" + rdName + "' on node '" + node + "' made available",
+	}})
+}
+
+// decodeMakeAvailableBody parses the optional JSON body. Upstream
+// LINSTOR accepts an empty body as `{diskful:false}` — golinstor's
+// MakeAvailable always posts the struct, but the python CLI / curl
+// callers may omit it entirely.
+func decodeMakeAvailableBody(w http.ResponseWriter, r *http.Request) (apiv1.ResourceMakeAvailable, bool) {
+	var req apiv1.ResourceMakeAvailable
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return req, false
+	}
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		return req, true
+	}
+
+	err = json.Unmarshal(body, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return req, false
+	}
+
+	return req, true
+}
+
+// applyMakeAvailable dispatches to update-or-create depending on
+// whether a Resource already lives on the target node. Writes the
+// HTTP error response on failure and returns false.
+func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdName, node string, req *apiv1.ResourceMakeAvailable) bool {
+	existing, err := s.Store.Resources().Get(r.Context(), rdName, node)
+
+	switch {
+	case err == nil:
+		err = s.makeAvailableUpdate(r.Context(), &existing, req)
+	case errors.Is(err, store.ErrNotFound):
+		err = s.makeAvailableCreate(r.Context(), rdName, node, req)
+	}
+
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	return true
+}
+
+// makeAvailableUpdate mutates an existing replica to match the
+// make-available intent. TIE_BREAKER is always stripped (the witness
+// is being "consumed" by an attach); DISKLESS is stripped only when
+// the caller asked for diskful. Diskful replicas with no flag changes
+// are a no-op (already available).
+func (s *Server) makeAvailableUpdate(ctx context.Context, existing *apiv1.Resource, req *apiv1.ResourceMakeAvailable) error {
+	changed := false
+
+	keep := existing.Flags[:0]
+
+	for _, flag := range existing.Flags {
+		switch flag {
+		case apiv1.ResourceFlagTieBreaker:
+			// Tiebreaker witnesses always shed the marker on
+			// make-available — the controller's tiebreaker
+			// cleanup hands ownership to the consumer.
+			changed = true
+		case apiv1.ResourceFlagDiskless:
+			if req.Diskful {
+				// Promoting to diskful: drop DISKLESS too.
+				changed = true
+
+				continue
+			}
+
+			keep = append(keep, flag)
+		default:
+			keep = append(keep, flag)
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+
+	existing.Flags = keep
+
+	err := s.Store.Resources().Update(ctx, existing)
+	if err != nil {
+		return errors.Wrapf(err, "make-available update %s.%s", existing.Name, existing.NodeName)
+	}
+
+	return nil
+}
+
+// makeAvailableCreate creates a fresh replica when no existing one
+// lives on the target node. Defaults to DISKLESS unless the caller
+// asked for diskful (in which case the placer's regular path would
+// be more appropriate, but we honour the explicit request).
+func (s *Server) makeAvailableCreate(ctx context.Context, rdName, node string, req *apiv1.ResourceMakeAvailable) error {
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: node,
+	}
+
+	if !req.Diskful {
+		res.Flags = []string{apiv1.ResourceFlagDiskless}
+	}
+
+	err := s.Store.Resources().Create(ctx, &res)
+	if err != nil {
+		return errors.Wrapf(err, "make-available create %s.%s", rdName, node)
+	}
+
+	return nil
 }
 
 // decodeResourceCreateBody accepts either the upstream-LINSTOR
