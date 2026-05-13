@@ -925,5 +925,286 @@ func TestPlaceReplicasOnDifferentFallsBackToExcludedNode(t *testing.T) {
 	}
 }
 
+// TestPlaceMixedProviderPools pins UG9 §"Mixing storage pools of
+// different storage providers" / scenario 6.8: a RG that lists pools
+// with DIFFERENT ProviderKinds in StoragePoolList must autoplace
+// freely across them. With:
+//
+//   - n1: only `zfs-thin` (ZFS_THIN, big free)
+//   - n2: only `lvm-thin` (LVM_THIN, medium free)
+//   - n3: both pools (small free)
+//
+// and StoragePoolList = ["zfs-thin","lvm-thin"], place_count=2 must
+// land replicas on n1 + n2 (biggest-free preferred), yielding a
+// MIXED-provider RD where one replica is on ZFS_THIN and the other
+// on LVM_THIN. Each replica's Props["StorPoolName"] reflects the
+// pool that hosts it — the dispatcher uses this downstream to drive
+// the satellite's provider-specific create path.
+//
+// The reverse-direction guard (Bug 15) is exercised in a sub-test:
+// once such a mixed-provider RD exists, a snapshot-restore clone from
+// it must NOT be free to land cross-provider. We simulate the REST
+// handler's behaviour by setting filter.ProviderList to the source's
+// ProviderKind — the placer's candidatePools must then drop all
+// pools whose ProviderKind doesn't match, leaving only same-kind
+// pools as placement targets.
+func TestPlaceMixedProviderPools(t *testing.T) {
+	t.Parallel()
+
+	t.Run("autoplace_mixes_providers", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n1", "n2", "n3"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", n, err)
+			}
+		}
+
+		// FreeCapacity is tuned so the biggest-first sort picks
+		// n1.zfs-thin then n2.lvm-thin BEFORE either of n3's pools.
+		// That puts one ZFS_THIN replica and one LVM_THIN replica on
+		// two DIFFERENT nodes — the canonical "mixed-provider RG" shape.
+		pools := []apiv1.StoragePool{
+			{NodeName: "n1", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000},
+			{NodeName: "n2", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 900},
+			{NodeName: "n3", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 200},
+			{NodeName: "n3", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+		}
+		for i := range pools {
+			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+				t.Fatalf("seed pool %s/%s: %v", pools[i].NodeName, pools[i].StoragePoolName, err)
+			}
+		}
+
+		p := placer.New(st)
+
+		placed, want, err := p.Place(ctx, "pvc-mixed", &apiv1.AutoSelectFilter{
+			PlaceCount:      2,
+			StoragePoolList: []string{"zfs-thin", "lvm-thin"},
+		})
+		if err != nil {
+			t.Fatalf("Place: %v", err)
+		}
+
+		if placed != 2 || want != 2 {
+			t.Fatalf("placed/want: got %d/%d, want 2/2", placed, want)
+		}
+
+		got, err := st.Resources().ListByDefinition(ctx, "pvc-mixed")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+
+		if len(got) != 2 {
+			t.Fatalf("len: got %d, want 2; %+v", len(got), got)
+		}
+
+		// Each replica's StorPoolName + the looked-up ProviderKind
+		// must reflect the pool that hosts it. Walk the placed
+		// Resources, look up the pool, and bucket by ProviderKind.
+		kinds := map[string]string{} // node -> ProviderKind
+		nodes := map[string]bool{}
+
+		for _, r := range got {
+			nodes[r.NodeName] = true
+
+			stor := r.Props["StorPoolName"]
+			if stor == "" {
+				t.Errorf("replica on %s missing StorPoolName prop: %+v", r.NodeName, r)
+
+				continue
+			}
+
+			pool, err := st.StoragePools().Get(ctx, r.NodeName, stor)
+			if err != nil {
+				t.Fatalf("get pool %s/%s: %v", r.NodeName, stor, err)
+			}
+
+			kinds[r.NodeName] = pool.ProviderKind
+		}
+
+		// Biggest-free pair → n1 + n2 (not n3).
+		if !nodes["n1"] || !nodes["n2"] {
+			t.Errorf("expected placement on n1+n2 (largest-free across providers); got %+v", nodes)
+		}
+
+		if nodes["n3"] {
+			t.Errorf("n3 picked despite n1/n2 having larger free; got %+v", nodes)
+		}
+
+		// Mixed providers: one ZFS_THIN, one LVM_THIN.
+		var seenZFS, seenLVM bool
+		for _, k := range kinds {
+			switch k {
+			case apiv1.StoragePoolKindZFSThin:
+				seenZFS = true
+			case apiv1.StoragePoolKindLVMThin:
+				seenLVM = true
+			}
+		}
+
+		if !seenZFS || !seenLVM {
+			t.Errorf("expected mixed providers (ZFS_THIN + LVM_THIN); kinds=%+v", kinds)
+		}
+
+		// Sanity: replica on n1 is ZFS_THIN, replica on n2 is LVM_THIN.
+		if kinds["n1"] != apiv1.StoragePoolKindZFSThin {
+			t.Errorf("n1 replica: got ProviderKind=%q, want %q",
+				kinds["n1"], apiv1.StoragePoolKindZFSThin)
+		}
+
+		if kinds["n2"] != apiv1.StoragePoolKindLVMThin {
+			t.Errorf("n2 replica: got ProviderKind=%q, want %q",
+				kinds["n2"], apiv1.StoragePoolKindLVMThin)
+		}
+	})
+
+	t.Run("bug15_clone_refuses_cross_provider", func(t *testing.T) {
+		t.Parallel()
+
+		// Same topology as above, but now we simulate the REST
+		// snapshot-restore path: source RD is on ZFS_THIN, so the
+		// caller pins filter.ProviderList = [ZFS_THIN]. The placer
+		// must drop every LVM_THIN candidate — even though the
+		// StoragePoolList still allows both pool *names*. With only
+		// 2 ZFS_THIN-bearing nodes (n1, n3) the placer can place 2
+		// replicas, but NOT on n2 (LVM_THIN only).
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n1", "n2", "n3"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", n, err)
+			}
+		}
+
+		pools := []apiv1.StoragePool{
+			{NodeName: "n1", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000},
+			{NodeName: "n2", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 900},
+			{NodeName: "n3", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 200},
+			{NodeName: "n3", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100},
+		}
+		for i := range pools {
+			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+				t.Fatalf("seed pool: %v", err)
+			}
+		}
+
+		p := placer.New(st)
+
+		// Caller asks for both pool names AND restricts ProviderKind
+		// to ZFS_THIN (simulating handleAutoplace's Bug 15 stamp).
+		placed, want, err := p.Place(ctx, "pvc-clone", &apiv1.AutoSelectFilter{
+			PlaceCount:      2,
+			StoragePoolList: []string{"zfs-thin", "lvm-thin"},
+			ProviderList:    []string{apiv1.StoragePoolKindZFSThin},
+		})
+		if err != nil {
+			t.Fatalf("Place: %v", err)
+		}
+
+		if placed != 2 || want != 2 {
+			t.Fatalf("placed/want: got %d/%d, want 2/2 (n1+n3 ZFS_THIN); placed should still satisfy via same-provider", placed, want)
+		}
+
+		got, _ := st.Resources().ListByDefinition(ctx, "pvc-clone")
+
+		for _, r := range got {
+			stor := r.Props["StorPoolName"]
+
+			pool, err := st.StoragePools().Get(ctx, r.NodeName, stor)
+			if err != nil {
+				t.Fatalf("get pool %s/%s: %v", r.NodeName, stor, err)
+			}
+
+			if pool.ProviderKind != apiv1.StoragePoolKindZFSThin {
+				t.Errorf("cross-provider leak: replica on %s used %s pool (kind=%s); ProviderList guard failed; resource=%+v",
+					r.NodeName, stor, pool.ProviderKind, r)
+			}
+
+			if r.NodeName == "n2" {
+				t.Errorf("n2 (LVM_THIN only) selected despite ProviderList=[ZFS_THIN]; resource=%+v", r)
+			}
+		}
+
+		// Sanity: the two replicas live on the two ZFS_THIN-bearing
+		// nodes (n1 + n3). Either pool name from the allow-list is
+		// fine as long as ProviderKind is ZFS_THIN.
+		nodes := map[string]bool{}
+		for _, r := range got {
+			nodes[r.NodeName] = true
+		}
+
+		if !nodes["n1"] || !nodes["n3"] {
+			t.Errorf("expected ZFS_THIN replicas on n1+n3; got %+v", nodes)
+		}
+	})
+
+	t.Run("bug15_clone_underplaces_when_only_one_zfs_node", func(t *testing.T) {
+		t.Parallel()
+
+		// Tightens the guard: when the cluster can't satisfy
+		// place_count with same-provider pools, the placer must
+		// 409-shortfall (placed<want), NOT silently fall back to
+		// the other provider and corrupt the clone payload.
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n1", "n2", "n3"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", n, err)
+			}
+		}
+
+		// Only n1 carries a ZFS_THIN pool; n2+n3 are LVM_THIN.
+		pools := []apiv1.StoragePool{
+			{NodeName: "n1", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000},
+			{NodeName: "n2", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 900},
+			{NodeName: "n3", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 800},
+		}
+		for i := range pools {
+			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+				t.Fatalf("seed pool: %v", err)
+			}
+		}
+
+		p := placer.New(st)
+
+		placed, want, err := p.Place(ctx, "pvc-clone-2", &apiv1.AutoSelectFilter{
+			PlaceCount:      2,
+			StoragePoolList: []string{"zfs-thin", "lvm-thin"},
+			ProviderList:    []string{apiv1.StoragePoolKindZFSThin},
+		})
+		if err != nil {
+			t.Fatalf("Place: %v", err)
+		}
+
+		if placed != 1 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 1/2 (only n1 satisfies ProviderList=[ZFS_THIN])", placed, want)
+		}
+
+		got, _ := st.Resources().ListByDefinition(ctx, "pvc-clone-2")
+		for _, r := range got {
+			if r.NodeName == "n2" || r.NodeName == "n3" {
+				t.Errorf("Bug 15 violation: clone allowed onto LVM_THIN node %s; resource=%+v", r.NodeName, r)
+			}
+		}
+
+		// And the (unused) slices import stays load-bearing in the file.
+		if len(got) > 0 && !slices.Contains([]string{"n1"}, got[0].NodeName) {
+			t.Errorf("expected single replica on n1; got %+v", got)
+		}
+	})
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
