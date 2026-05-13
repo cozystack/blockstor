@@ -30,11 +30,13 @@ import (
 // Pass-through names are not annotated.
 const AnnotationLinstorName = "blockstor.io/linstor-name"
 
-// SetOriginalName tags meta with the original LINSTOR name when it
-// disagrees with meta.Name (i.e. the slugifier rewrote it). No-op when
-// they match — keeps the annotation map empty for the common case.
+// SetOriginalName tags meta with the original LINSTOR name when the
+// slugifier rewrote it (non-rfc1123 input). Case-only differences
+// (e.g. `DfltRscGrp` → `dfltrscgrp`) are NOT preserved — LINSTOR is
+// case-insensitive and the user prefers the short normalised form
+// over a "stash the original case" round-trip.
 func SetOriginalName(meta *metav1.ObjectMeta, original string) {
-	if meta.Name == original {
+	if strings.EqualFold(meta.Name, original) {
 		return
 	}
 
@@ -58,19 +60,25 @@ func OriginalName(meta *metav1.ObjectMeta) string {
 
 // Name turns a LINSTOR-shaped name (which Java accepts in mixed case
 // and with characters k8s rejects) into something the API server will
-// store without complaining. If the input already conforms it passes
-// through unchanged; otherwise we lowercase, replace non-allowed runs
-// with '-', and append a short SHA-256 prefix so distinct LINSTOR
-// names never collide on the same k8s name.
+// store without complaining. LINSTOR identifiers are case-insensitive
+// (`DfltRscGrp` and `dfltrscgrp` address the same object), so we
+// lowercase first — if the lowercased form is rfc1123-valid, return
+// it unchanged. Otherwise we replace non-allowed runs with '-' and
+// append a short SHA-256 prefix so distinct LINSTOR names never
+// collide on the same k8s name.
 //
 // linstor-csi names PVCs like `vol-<uuid>` (already lowercase) but
-// csi-sanity uses `DeleteSnapshot-volume-1-…` style — both must work.
+// upstream LINSTOR's `DfltRscGrp` and csi-sanity's `DeleteSnapshot-
+// volume-1-…` need normalisation. Lowercasing in this function is
+// the single normalization point: every store Get/Update/Delete
+// routes through Name(), so the same input lands on the same CRD
+// regardless of case.
 func Name(in string) string {
-	if in != "" && len(in) <= maxK8sName && rfc1123.MatchString(in) {
-		return in
-	}
-
 	lower := strings.ToLower(in)
+
+	if lower != "" && len(lower) <= maxK8sName && rfc1123.MatchString(lower) {
+		return lower
+	}
 
 	var builder strings.Builder
 

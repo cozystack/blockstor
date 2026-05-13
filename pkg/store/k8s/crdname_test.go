@@ -90,15 +90,46 @@ func TestK8sName_DeterministicForSameInput(t *testing.T) {
 	}
 }
 
+// TestSetAndOriginalName_RoundTrip pins the slugify-fallback case:
+// when the input has characters rfc1123 rejects (here a slash),
+// Name() builds a hashed slug and SetOriginalName preserves the
+// original through the annotation so OriginalName can recover it.
+// Case-only differences (e.g. `DfltRscGrp` → `dfltrscgrp`) are
+// NOT preserved — see TestSetOriginalName_CaseOnlyDifference.
 func TestSetAndOriginalName_RoundTrip(t *testing.T) {
 	t.Parallel()
 
-	original := "DeleteSnapshot-volume-1-target"
+	original := "needs/slugify"
 	meta := metav1.ObjectMeta{Name: k8s.Name(original)}
 	k8s.SetOriginalName(&meta, original)
 
 	if got := k8s.OriginalName(&meta); got != original {
 		t.Errorf("OriginalName = %q, want %q", got, original)
+	}
+}
+
+// TestSetOriginalName_CaseOnlyDifference pins that mixed-case input
+// that lowercases to a valid rfc1123 name (the upstream LINSTOR
+// `DfltRscGrp` case) does NOT round-trip through the annotation —
+// the API shows the short normalised form. LINSTOR is
+// case-insensitive so this is a behavioural choice, not a data loss.
+func TestSetOriginalName_CaseOnlyDifference(t *testing.T) {
+	t.Parallel()
+
+	original := "DfltRscGrp"
+	meta := metav1.ObjectMeta{Name: k8s.Name(original)}
+	k8s.SetOriginalName(&meta, original)
+
+	if meta.Name != "dfltrscgrp" {
+		t.Errorf("Name() = %q, want %q", meta.Name, "dfltrscgrp")
+	}
+
+	if _, ok := meta.Annotations[k8s.AnnotationLinstorName]; ok {
+		t.Errorf("case-only difference should not set annotation: %v", meta.Annotations)
+	}
+
+	if got := k8s.OriginalName(&meta); got != "dfltrscgrp" {
+		t.Errorf("OriginalName = %q, want %q (lowercased form)", got, "dfltrscgrp")
 	}
 }
 
