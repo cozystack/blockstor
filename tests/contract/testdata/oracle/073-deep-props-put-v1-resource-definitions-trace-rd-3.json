@@ -1,0 +1,18 @@
+{
+  "name": "PUT /v1/resource-definitions/trace-rd-3",
+  "method": "PUT",
+  "path": "/v1/resource-definitions/trace-rd-3",
+  "body": {
+    "override_props": {
+      "Aux/trace-deep-a": "a-1",
+      "Aux/trace-deep-b": "b-1",
+      "Aux/trace-deep-c": "c-1"
+    }
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

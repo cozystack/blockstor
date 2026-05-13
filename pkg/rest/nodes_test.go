@@ -193,10 +193,10 @@ func TestNodesUpdate(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	body, _ := json.Marshal(apiv1.Node{
-		// Body's Name intentionally empty — path's "n1" must win.
-		Type:  apiv1.NodeTypeSatellite,
-		Props: map[string]string{"Aux/zone": "us-east-1a"},
+	body, _ := json.Marshal(apiv1.NodeModify{
+		GenericPropsModify: apiv1.GenericPropsModify{
+			OverrideProps: map[string]string{"Aux/zone": "us-east-1a"},
+		},
 	})
 
 	resp := httpPut(t, base+"/v1/nodes/n1", body)
@@ -213,6 +213,13 @@ func TestNodesUpdate(t *testing.T) {
 
 	if got.Props["Aux/zone"] != "us-east-1a" {
 		t.Errorf("Props after PUT: got %v, want Aux/zone=us-east-1a", got.Props)
+	}
+
+	// Existing Type field must survive — the PUT body didn't
+	// specify it (node_type omitted), so the handler must NOT
+	// reset it to "".
+	if got.Type != apiv1.NodeTypeSatellite {
+		t.Errorf("Type clobbered: got %q, want SATELLITE", got.Type)
 	}
 }
 

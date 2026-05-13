@@ -11,29 +11,7 @@
   "expectedStatus": 201,
   "expectedBody": [
     {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "Successfully set property 'Aux/trace-recorder-stamp' to value 'yes'",
-      "ret_code": 17825793
-    },
-    {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "Successfully set property 'Aux/trace-recorder-purpose' to value 'contract-recording'",
-      "ret_code": 17825793
-    },
-    {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "(e2e6-worker-3) Controller properties applied",
-      "ret_code": 4611686018461991000
-    },
-    {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "(e2e6-worker-1) Controller properties applied",
-      "ret_code": 4611686018461991000
-    },
-    {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "(e2e6-worker-2) Controller properties applied",
-      "ret_code": 4611686018461991000
+      "ret_code_class": "\u003cinfo\u003e"
     }
   ]
 }

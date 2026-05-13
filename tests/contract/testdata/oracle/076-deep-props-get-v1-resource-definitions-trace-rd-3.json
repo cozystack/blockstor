@@ -1,0 +1,14 @@
+{
+  "name": "GET /v1/resource-definitions/trace-rd-3",
+  "method": "GET",
+  "path": "/v1/resource-definitions/trace-rd-3",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "name": "trace-rd-3",
+    "props": {
+      "Aux/trace-deep-a": "a-2",
+      "Aux/trace-deep-b": "b-1"
+    },
+    "resource_group_name": "DfltRscGrp"
+  }
+}

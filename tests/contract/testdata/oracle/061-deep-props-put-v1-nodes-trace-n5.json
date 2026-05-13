@@ -1,0 +1,18 @@
+{
+  "name": "PUT /v1/nodes/trace-n5",
+  "method": "PUT",
+  "path": "/v1/nodes/trace-n5",
+  "body": {
+    "override_props": {
+      "Aux/trace-deep-a": "a-1",
+      "Aux/trace-deep-b": "b-1",
+      "Aux/trace-deep-c": "c-1"
+    }
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

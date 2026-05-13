@@ -1,0 +1,16 @@
+{
+  "name": "GET /v1/resource-groups/trace-rg-3",
+  "method": "GET",
+  "path": "/v1/resource-groups/trace-rg-3",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "name": "trace-rg-3",
+    "props": {
+      "Aux/trace-deep-a": "a-2",
+      "Aux/trace-deep-b": "b-1"
+    },
+    "select_filter": {
+      "place_count": 1
+    }
+  }
+}

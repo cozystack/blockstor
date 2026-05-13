@@ -77,7 +77,26 @@ func NormalizeWith(body json.RawMessage, opts NormalizeOptions) (json.RawMessage
 		return body, nil //nolint:nilerr // non-JSON passthrough is intentional
 	}
 
-	scrubbed := scrubWith(decoded, opts)
+	// Apply KeepListNamePrefix only to the response-body top-level
+	// array — that's what the recorder needs to drop pre-existing
+	// oracle state (e2e6-worker-* nodes, DfltRscGrp, etc.) from
+	// list responses. Nested arrays inside an object (e.g.
+	// NetInterfaces[] inside a Node body) are explicit attributes
+	// of the parent fixture, NOT pre-existing state; filtering
+	// them would silently strip the "default" interface and break
+	// every per-node list trace.
+	if topArray, isArray := decoded.([]any); isArray && opts.KeepListNamePrefix != "" {
+		decoded = filterListByNamePrefix(topArray, opts.KeepListNamePrefix)
+	}
+
+	// Recursive scrub uses the same opts EXCEPT the list filter,
+	// which is already done above. This keeps nested NetInterfaces
+	// / VolumeDefinitions / props intact while still letting the
+	// per-element scrubber strip UUIDs, timestamps, etc.
+	deepOpts := opts
+	deepOpts.KeepListNamePrefix = ""
+
+	scrubbed := scrubWith(decoded, deepOpts)
 
 	out, err := json.Marshal(scrubbed)
 	if err != nil {
@@ -158,6 +177,13 @@ var volatileTopLevel = map[string]struct{}{ //nolint:gochecknoglobals // table-d
 	// linstor-csi / piraeus-operator don't gate on either.
 	"version":          {},
 	"rest_api_version": {},
+	// `is_active` is the satellite-connection state oracle stamps
+	// on each NetInterface (true for the currently-active address,
+	// false for the standby ones). blockstor doesn't run a
+	// persistent satellite TCP — it has nothing meaningful to put
+	// here. Drop both sides; the wire-shape contract is fine
+	// without it.
+	"is_active": {},
 }
 
 func scrubWith(value any, opts NormalizeOptions) any {

@@ -5,9 +5,7 @@
   "expectedStatus": 200,
   "expectedBody": [
     {
-      "created_at": "\u003ctimestamp\u003e",
-      "message": "Successfully deleted property 'Aux/trace-recorder-purpose'",
-      "ret_code": 51380226
+      "ret_code_class": "\u003cinfo\u003e"
     }
   ]
 }

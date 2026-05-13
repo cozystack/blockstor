@@ -31,6 +31,16 @@ type Node struct {
 	ConnectionStatus string            `json:"connection_status,omitempty"`
 }
 
+// NodeModify is the upstream payload for `linstor n set-property` /
+// `linstor n modify`. golinstor's NodeService.Modify sends this
+// envelope; treating it like a full Node body wipes net_interfaces
+// + type on every prop-only mutation.
+type NodeModify struct {
+	GenericPropsModify
+
+	NodeType string `json:"node_type,omitempty"`
+}
+
 // NetInterface mirrors `NetInterface` from upstream.
 type NetInterface struct {
 	Name                    string `json:"name"`

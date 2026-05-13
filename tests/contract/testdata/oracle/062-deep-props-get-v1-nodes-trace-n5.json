@@ -1,0 +1,23 @@
+{
+  "name": "GET /v1/nodes/trace-n5",
+  "method": "GET",
+  "path": "/v1/nodes/trace-n5",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "name": "trace-n5",
+    "net_interfaces": [
+      {
+        "address": "\u003cip\u003e",
+        "name": "default",
+        "satellite_encryption_type": "PLAIN",
+        "satellite_port": 3366
+      }
+    ],
+    "props": {
+      "Aux/trace-deep-a": "a-1",
+      "Aux/trace-deep-b": "b-1",
+      "Aux/trace-deep-c": "c-1"
+    },
+    "type": "SATELLITE"
+  }
+}

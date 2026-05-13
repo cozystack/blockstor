@@ -1,0 +1,19 @@
+{
+  "name": "PUT /v1/resource-groups/trace-rg-3",
+  "method": "PUT",
+  "path": "/v1/resource-groups/trace-rg-3",
+  "body": {
+    "delete_props": [
+      "Aux/trace-deep-c"
+    ],
+    "override_props": {
+      "Aux/trace-deep-a": "a-2"
+    }
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

@@ -52,8 +52,10 @@ func TestNetInterfaceCreateAppendsToNode(t *testing.T) {
 	resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", body)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	// Upstream LINSTOR returns 201 for the per-interface POST + an
+	// ApiCallRc envelope body. blockstor matches that wire shape.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
 	}
 
 	got, err := st.Nodes().Get(ctx, "n1")

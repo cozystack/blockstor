@@ -1,0 +1,18 @@
+{
+  "name": "GET /v1/nodes/trace-n1",
+  "method": "GET",
+  "path": "/v1/nodes/trace-n1",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "name": "trace-n1",
+    "net_interfaces": [
+      {
+        "address": "\u003cip\u003e",
+        "name": "default",
+        "satellite_encryption_type": "PLAIN",
+        "satellite_port": 3366
+      }
+    ],
+    "type": "SATELLITE"
+  }
+}

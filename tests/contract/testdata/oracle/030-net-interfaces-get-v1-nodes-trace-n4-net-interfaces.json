@@ -1,0 +1,20 @@
+{
+  "name": "GET /v1/nodes/trace-n4/net-interfaces",
+  "method": "GET",
+  "path": "/v1/nodes/trace-n4/net-interfaces",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "address": "\u003cip\u003e",
+      "name": "default",
+      "satellite_encryption_type": "PLAIN",
+      "satellite_port": 3366
+    },
+    {
+      "address": "\u003cip\u003e",
+      "name": "repl-net",
+      "satellite_encryption_type": "PLAIN",
+      "satellite_port": 3367
+    }
+  ]
+}

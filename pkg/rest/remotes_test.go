@@ -24,23 +24,51 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// TestRemotesEnvelopeShape pins the empty-RemoteList response: the
-// body must be a JSON object with three named empty arrays
-// (s3_remotes, linstor_remotes, ebs_remotes), NOT a bare `[]`.
-//
-// Why this matters: golinstor's client.RemoteList is decoded
-// unconditionally on every snapshot-list call. A bare-array response
-// errors with "cannot unmarshal array into Go value of type
-// client.RemoteList" — a regression that would break every
-// linstor-csi DeleteSnapshot flow because the CSI driver surfaces
-// the upstream snapshot-list error verbatim.
+// TestRemotesEnvelopeShape pins the /v1/remotes (no type suffix)
+// response: a JSON object with three named empty arrays
+// (s3_remotes, linstor_remotes, ebs_remotes). golinstor's
+// client.RemoteList decodes into this shape — a bare `[]` errors
+// with "cannot unmarshal array into Go value of type
+// client.RemoteList" and would break every linstor-csi
+// DeleteSnapshot flow.
 func TestRemotesEnvelopeShape(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
-	// All four registered paths must surface the same envelope.
+	resp := httpGet(t, base+"/v1/remotes")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got emptyRemoteList
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v (response is bare array, not RemoteList object)", err)
+	}
+
+	if got.S3Remotes == nil {
+		t.Errorf("s3_remotes: nil, want []")
+	}
+
+	if got.LinstorRemotes == nil {
+		t.Errorf("linstor_remotes: nil, want []")
+	}
+
+	if got.EbsRemotes == nil {
+		t.Errorf("ebs_remotes: nil, want []")
+	}
+}
+
+// TestRemotesTypedEndpointsBareArray pins the /v1/remotes/{type}
+// shape: a flat array of that type, NOT the envelope. golinstor's
+// GetAllLinstor / GetAllS3 / GetAllEbs decode into `[]Type{...}` —
+// the envelope shape breaks their decoder.
+func TestRemotesTypedEndpointsBareArray(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
 	for _, path := range []string{
-		"/v1/remotes",
 		"/v1/remotes/s3",
 		"/v1/remotes/linstor",
 		"/v1/remotes/ebs",
@@ -53,23 +81,14 @@ func TestRemotesEnvelopeShape(t *testing.T) {
 				t.Fatalf("status: got %d, want 200", resp.StatusCode)
 			}
 
-			// Decode into golinstor's expected shape, not into
-			// `[]any` — that's the actual contract.
-			var got emptyRemoteList
+			var got []map[string]any
+
 			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-				t.Fatalf("decode: %v (response is bare array, not RemoteList object)", err)
+				t.Fatalf("decode: %v (response is envelope object, not bare array)", err)
 			}
 
-			if got.S3Remotes == nil {
-				t.Errorf("s3_remotes: nil, want []")
-			}
-
-			if got.LinstorRemotes == nil {
-				t.Errorf("linstor_remotes: nil, want []")
-			}
-
-			if got.EbsRemotes == nil {
-				t.Errorf("ebs_remotes: nil, want []")
+			if got == nil {
+				t.Errorf("got nil; want []")
 			}
 		})
 	}

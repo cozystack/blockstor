@@ -27,10 +27,17 @@ import (
 // `[]` surfaces as `cannot unmarshal array into Go value of type
 // client.RemoteList` on every snapshot-list call.
 func (s *Server) registerRemotes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/remotes", handleEmptyRemotes)
-	mux.HandleFunc("GET /v1/remotes/s3", handleEmptyRemotes)
-	mux.HandleFunc("GET /v1/remotes/linstor", handleEmptyRemotes)
-	mux.HandleFunc("GET /v1/remotes/ebs", handleEmptyRemotes)
+	// `/v1/remotes` (no type suffix) returns the typed envelope —
+	// golinstor's `RemoteService.GetAll()` decodes into RemoteList.
+	mux.HandleFunc("GET /v1/remotes", handleRemoteEnvelope)
+	// `/v1/remotes/{type}` returns a flat array of that type —
+	// golinstor's GetAllLinstor / GetAllS3 / GetAllEbs decode into
+	// `[]LinstorRemote` / `[]S3Remote` / `[]EbsRemote`. Returning
+	// the envelope here breaks the decoder ("cannot unmarshal
+	// object into Go slice").
+	mux.HandleFunc("GET /v1/remotes/s3", handleEmptyRemoteArray)
+	mux.HandleFunc("GET /v1/remotes/linstor", handleEmptyRemoteArray)
+	mux.HandleFunc("GET /v1/remotes/ebs", handleEmptyRemoteArray)
 }
 
 // emptyRemoteList is upstream LINSTOR's `RemoteList` zero-value: an
@@ -42,10 +49,17 @@ type emptyRemoteList struct {
 	EbsRemotes     []map[string]string `json:"ebs_remotes"`
 }
 
-func handleEmptyRemotes(w http.ResponseWriter, _ *http.Request) {
+func handleRemoteEnvelope(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, emptyRemoteList{
 		S3Remotes:      []map[string]string{},
 		LinstorRemotes: []map[string]string{},
 		EbsRemotes:     []map[string]string{},
 	})
+}
+
+// handleEmptyRemoteArray returns a bare `[]` for the type-specific
+// endpoints. Cozystack doesn't use cross-cluster shipping so there
+// are never any remotes configured.
+func handleEmptyRemoteArray(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, []map[string]string{})
 }

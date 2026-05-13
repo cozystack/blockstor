@@ -1,0 +1,17 @@
+{
+  "name": "PUT /v1/nodes/trace-n4/net-interfaces/repl-net",
+  "method": "PUT",
+  "path": "/v1/nodes/trace-n4/net-interfaces/repl-net",
+  "body": {
+    "address": "\u003cip\u003e",
+    "name": "repl-net",
+    "satellite_encryption_type": "PLAIN",
+    "satellite_port": 3368
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

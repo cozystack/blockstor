@@ -1,0 +1,23 @@
+{
+  "name": "POST /v1/nodes",
+  "method": "POST",
+  "path": "/v1/nodes",
+  "body": {
+    "name": "trace-n5",
+    "net_interfaces": [
+      {
+        "address": "\u003cip\u003e",
+        "name": "default",
+        "satellite_encryption_type": "PLAIN",
+        "satellite_port": 3366
+      }
+    ],
+    "type": "SATELLITE"
+  },
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

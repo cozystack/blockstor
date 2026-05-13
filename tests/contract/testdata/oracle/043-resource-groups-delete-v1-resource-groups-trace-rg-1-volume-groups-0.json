@@ -1,0 +1,11 @@
+{
+  "name": "DELETE /v1/resource-groups/trace-rg-1/volume-groups/0",
+  "method": "DELETE",
+  "path": "/v1/resource-groups/trace-rg-1/volume-groups/0",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

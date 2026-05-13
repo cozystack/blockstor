@@ -19,6 +19,8 @@ package rest
 import (
 	"net/http"
 	"slices"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // registerNodeLifecycle wires the eviction / restore / lost endpoints.
@@ -29,8 +31,42 @@ func (s *Server) registerNodeLifecycle(mux *http.ServeMux) {
 		s.requireStore(s.handleNodeEvacuate))
 	mux.HandleFunc("POST /v1/nodes/{node}/restore",
 		s.requireStore(s.handleNodeRestore))
+	// Upstream LINSTOR uses DELETE here (golinstor's NodeService.Lost
+	// does `doDELETE`); the legacy POST form is kept alongside for
+	// shell scripts that hit it directly via curl without honouring
+	// the OpenAPI spec.
 	mux.HandleFunc("POST /v1/nodes/{node}/lost",
 		s.requireStore(s.handleNodeLost))
+	mux.HandleFunc("DELETE /v1/nodes/{node}/lost",
+		s.requireStore(s.handleNodeLost))
+	// Reconnect is golinstor's `NodeService.Reconnect` — PUT with
+	// no body. It tells the controller to drop and re-establish the
+	// satellite TCP. blockstor doesn't run a persistent satellite
+	// TCP so this is a no-op that just acknowledges the request.
+	mux.HandleFunc("PUT /v1/nodes/{node}/reconnect",
+		s.requireStore(s.handleNodeReconnect))
+}
+
+// handleNodeReconnect acknowledges a satellite-reconnect request.
+// blockstor's satellite-as-controller-runtime (Phase 10) uses k8s
+// API watches, not TCP keepalives, so there's no socket to bounce —
+// returning success matches the operator's mental model that the
+// request was accepted.
+func (s *Server) handleNodeReconnect(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("node")
+
+	// Verify the node exists so a typo doesn't silently succeed.
+	_, err := s.Store.Nodes().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node " + name + " reconnect requested",
+	}})
 }
 
 // handleNodeEvacuate adds the EVICTED flag — a soft "drain me" hint
@@ -77,7 +113,10 @@ func updateNodeFlags(w http.ResponseWriter, r *http.Request, s *Server, mutators
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node " + name + " flags updated",
+	}})
 }
 
 // addFlag returns a mutator that adds flag if it's not already there.

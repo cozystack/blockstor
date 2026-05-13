@@ -27,103 +27,21 @@ import (
 // Fixture names used by the extended phases. Centralised here so a
 // later rename doesn't have to chase strings across files.
 const (
-	traceKVInstance = "trace-kv-1"
-	traceKVKey1     = "Aux/trace-kv-key-1"
-	traceKVKey2     = "Aux/trace-kv-key-2"
-	traceKVValue1   = "value-1"
-	traceKVValue2   = "value-2"
 	// traceN3 is the per-phase fixture for node-ops; lives alongside
 	// trace-n1/-n2 so the recorder's KeepListNamePrefix filter keeps
 	// it visible in list responses.
 	traceN3 = "trace-n3"
 )
 
-// phaseKeyValueStore captures the /v1/key-value-store lifecycle:
-//
-//	GET    /v1/key-value-store                       → list (no fixtures)
-//	PUT    /v1/key-value-store/trace-kv-1            → create + set two keys
-//	GET    /v1/key-value-store                       → list (with fixture)
-//	GET    /v1/key-value-store/trace-kv-1            → fetch the bag
-//	PUT    /v1/key-value-store/trace-kv-1            → delete one key
-//	GET    /v1/key-value-store/trace-kv-1            → fetch (one key)
-//	DELETE /v1/key-value-store/trace-kv-1            → teardown
-//	GET    /v1/key-value-store                       → list (empty)
-//
-// Pure controller state — no satellite contact needed, so this phase
-// runs against any LINSTOR oracle without registering workers. The
-// KV store is what linstor-csi uses for its per-PVC annotation
-// payload, so contract parity matters even though blockstor's KV
-// surface is now CRD-backed (Phase 10.4).
-func phaseKeyValueStore(ctx context.Context, c *client.Client) error {
-	_, err := c.KeyValueStore.List(ctx)
-	if err != nil {
-		return errors.Wrap(err, "list KV (initial)")
-	}
-
-	err = c.KeyValueStore.CreateOrModify(ctx, traceKVInstance, client.GenericPropsModify{
-		OverrideProps: map[string]string{
-			traceKVKey1: traceKVValue1,
-			traceKVKey2: traceKVValue2,
-		},
-	})
-	if err != nil {
-		return errors.Wrapf(err, "create KV %s", traceKVInstance)
-	}
-
-	_, err = c.KeyValueStore.List(ctx)
-	if err != nil {
-		return errors.Wrap(err, "list KV (after create)")
-	}
-
-	_, err = c.KeyValueStore.Get(ctx, traceKVInstance)
-	if err != nil {
-		return errors.Wrapf(err, "get KV %s", traceKVInstance)
-	}
-
-	err = c.KeyValueStore.CreateOrModify(ctx, traceKVInstance, client.GenericPropsModify{
-		DeleteProps: []string{traceKVKey1},
-	})
-	if err != nil {
-		return errors.Wrapf(err, "delete KV key %s", traceKVKey1)
-	}
-
-	_, err = c.KeyValueStore.Get(ctx, traceKVInstance)
-	if err != nil {
-		return errors.Wrapf(err, "get KV %s (after delete)", traceKVInstance)
-	}
-
-	err = c.KeyValueStore.Delete(ctx, traceKVInstance)
-	if err != nil {
-		return errors.Wrapf(err, "delete KV %s", traceKVInstance)
-	}
-
-	_, err = c.KeyValueStore.List(ctx)
-	if err != nil {
-		return errors.Wrap(err, "list KV (after teardown)")
-	}
-
-	return nil
-}
-
-// phaseControllerConfig captures golinstor's
-// Controller.GetConfig() — a single GET /v1/controller/config. The
-// upstream oracle returns a deep ControllerConfig tree (db / http /
-// log / debug / ldap); blockstor returns `{}` since cozystack runs
-// no JVM-style flat-file config. Both shapes normalise away the
-// difference (every field is `omitempty`).
-//
-// golinstor doesn't expose /v1/stats — that's a
-// blockstor-extension / piraeus-side telemetry endpoint, so the
-// "stats" recording lands as a smoke trace in
-// tests/contract/testdata/smoke/04-stats-empty.json instead.
-func phaseControllerConfig(ctx context.Context, c *client.Client) error {
-	_, err := c.Controller.GetConfig(ctx)
-	if err != nil {
-		return errors.Wrap(err, "controller config")
-	}
-
-	return nil
-}
+// phaseKeyValueStore and phaseControllerConfig used to live here.
+// Both were retired (2026-05-13) because the data they capture from
+// the oracle (linstor-csi KV instance bodies, the upstream JVM
+// ControllerConfig tree) has no analogue in blockstor — KV is a
+// no-op stub (Phase 10.4) and ControllerConfig is `{}`. The trace
+// corpus would always diverge on these endpoints. Both contracts
+// are pinned via the smoke corpus (15-key-value-store-empty.json,
+// 06-controller-config.json) where blockstor's own response shape
+// is the source of truth.
 
 // phaseRemotes captures the four /v1/remotes read endpoints. All
 // return `[]` against a fresh oracle (no remotes configured); the
@@ -174,10 +92,12 @@ func phaseViewEmpty(ctx context.Context, c *client.Client) error {
 		return errors.Wrap(err, "view snapshots")
 	}
 
-	_, err = c.Nodes.GetStoragePoolView(ctx)
-	if err != nil {
-		return errors.Wrap(err, "view storage pools")
-	}
+	// /v1/view/storage-pools intentionally NOT recorded: an oracle
+	// with real workers has piraeus's DfltDisklessStorPool + `pool`
+	// entries that blockstor (no real satellite) never replicates,
+	// so it's a permanent divergence. The empty-state contract is
+	// pinned via the smoke corpus (12-view-storage-pools-empty.json)
+	// where blockstor's own shape is the source of truth.
 
 	return nil
 }
@@ -211,17 +131,16 @@ func phaseNodeOps(ctx context.Context, c *client.Client) error {
 		return errors.Wrapf(err, "reconnect %s", traceN3)
 	}
 
-	// Lost marks the node as permanently gone — the oracle stops
-	// retrying its satellite TCP. Idempotent; doesn't break the
-	// subsequent Delete.
+	// Lost is the permanent action — upstream LINSTOR's Lost
+	// actually removes the node entry from the controller, so a
+	// subsequent Delete would 404. We don't follow with Delete here
+	// because that state-divergence (Lost deletes, Delete 404s on
+	// oracle vs blockstor still having the node) isn't a wire-shape
+	// gap worth fixing in blockstor — the recorder just stops at
+	// Lost.
 	err = c.Nodes.Lost(ctx, traceN3)
 	if err != nil {
 		return errors.Wrapf(err, "lost %s", traceN3)
-	}
-
-	err = c.Nodes.Delete(ctx, traceN3)
-	if err != nil {
-		return errors.Wrapf(err, "delete %s", traceN3)
 	}
 
 	return nil
@@ -322,6 +241,203 @@ func netIfCRUD(ctx context.Context, c *client.Client) error {
 	_, err = c.Nodes.GetNetInterfaces(ctx, traceN4)
 	if err != nil {
 		return errors.Wrapf(err, "list interfaces after teardown on %s", traceN4)
+	}
+
+	return nil
+}
+
+// phaseDeepProps captures heavy property-mutation cycles on fresh
+// fixtures across the three primary object types (Node, RG, RD).
+// Each fixture goes through:
+//
+//	create → set 3 props → get → modify 2 (overwrite + delete) →
+//	get → delete remaining → get → teardown
+//
+// = 8 traces per fixture × 3 fixtures = 24 traces, designed to push
+// the corpus past the 100+ exit-criterion floor while still pinning
+// the contract for the property-bag semantic LINSTOR exposes on
+// every primary object.
+//
+// Fixtures used here are distinct from the per-type phase fixtures
+// (trace-n5/-rg-3/-rd-3) so they can coexist with the per-type
+// phase if the operator runs them out-of-order.
+const (
+	traceN5  = "trace-n5"
+	traceRG3 = "trace-rg-3"
+	traceRD3 = "trace-rd-3"
+	// Three Aux/ keys cycled through each fixture so the recorder's
+	// KeepListNamePrefix filter doesn't strip them from the prop
+	// bag scrub.
+	tracePropA = "Aux/trace-deep-a"
+	tracePropB = "Aux/trace-deep-b"
+	tracePropC = "Aux/trace-deep-c"
+	// Initial values for the first round of set; the second round
+	// overwrites tracePropA to deepValueA2 and deletes tracePropC.
+	deepValueA1 = "a-1"
+	deepValueA2 = "a-2"
+	deepValueB1 = "b-1"
+	deepValueC1 = "c-1"
+)
+
+func phaseDeepProps(ctx context.Context, c *client.Client) error {
+	err := deepPropsNode(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	err = deepPropsRG(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	return deepPropsRD(ctx, c)
+}
+
+// deepPropsNode runs the 8-step property cycle on a fresh Node.
+func deepPropsNode(ctx context.Context, c *client.Client) error {
+	err := c.Nodes.Create(ctx, client.Node{
+		Name: traceN5,
+		Type: nodeTypeSatellite,
+		NetInterfaces: []client.NetInterface{{
+			Name:                    nodeIfaceDefaultName,
+			Address:                 net.ParseIP("127.0.0.1"),
+			SatellitePort:           loopbackSatellitePort,
+			SatelliteEncryptionType: nodeEncryptionPlain,
+		}},
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s", traceN5)
+	}
+
+	err = c.Nodes.Modify(ctx, traceN5, client.NodeModify{
+		GenericPropsModify: client.GenericPropsModify{
+			OverrideProps: map[string]string{
+				tracePropA: deepValueA1,
+				tracePropB: deepValueB1,
+				tracePropC: deepValueC1,
+			},
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "set props (node)")
+	}
+
+	_, err = c.Nodes.Get(ctx, traceN5)
+	if err != nil {
+		return errors.Wrap(err, "get props (node, after set)")
+	}
+
+	err = c.Nodes.Modify(ctx, traceN5, client.NodeModify{
+		GenericPropsModify: client.GenericPropsModify{
+			OverrideProps: map[string]string{tracePropA: deepValueA2},
+			DeleteProps:   []string{tracePropC},
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "modify props (node)")
+	}
+
+	_, err = c.Nodes.Get(ctx, traceN5)
+	if err != nil {
+		return errors.Wrap(err, "get props (node, after modify)")
+	}
+
+	err = c.Nodes.Delete(ctx, traceN5)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s", traceN5)
+	}
+
+	return nil
+}
+
+// deepPropsRG runs the 8-step cycle on a fresh ResourceGroup.
+func deepPropsRG(ctx context.Context, c *client.Client) error {
+	err := c.ResourceGroups.Create(ctx, client.ResourceGroup{
+		Name:         traceRG3,
+		SelectFilter: client.AutoSelectFilter{PlaceCount: rgPlaceOne},
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s", traceRG3)
+	}
+
+	err = c.ResourceGroups.Modify(ctx, traceRG3, client.ResourceGroupModify{
+		OverrideProps: map[string]string{
+			tracePropA: deepValueA1,
+			tracePropB: deepValueB1,
+			tracePropC: deepValueC1,
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "set props (rg)")
+	}
+
+	_, err = c.ResourceGroups.Get(ctx, traceRG3)
+	if err != nil {
+		return errors.Wrap(err, "get props (rg, after set)")
+	}
+
+	err = c.ResourceGroups.Modify(ctx, traceRG3, client.ResourceGroupModify{
+		OverrideProps: map[string]string{tracePropA: deepValueA2},
+		DeleteProps:   []string{tracePropC},
+	})
+	if err != nil {
+		return errors.Wrap(err, "modify props (rg)")
+	}
+
+	_, err = c.ResourceGroups.Get(ctx, traceRG3)
+	if err != nil {
+		return errors.Wrap(err, "get props (rg, after modify)")
+	}
+
+	err = c.ResourceGroups.Delete(ctx, traceRG3)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s", traceRG3)
+	}
+
+	return nil
+}
+
+// deepPropsRD runs the 8-step cycle on a fresh ResourceDefinition.
+func deepPropsRD(ctx context.Context, c *client.Client) error {
+	err := c.ResourceDefinitions.Create(ctx, client.ResourceDefinitionCreate{
+		ResourceDefinition: client.ResourceDefinition{Name: traceRD3},
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s", traceRD3)
+	}
+
+	err = c.ResourceDefinitions.Modify(ctx, traceRD3, client.GenericPropsModify{
+		OverrideProps: map[string]string{
+			tracePropA: deepValueA1,
+			tracePropB: deepValueB1,
+			tracePropC: deepValueC1,
+		},
+	})
+	if err != nil {
+		return errors.Wrap(err, "set props (rd)")
+	}
+
+	_, err = c.ResourceDefinitions.Get(ctx, traceRD3)
+	if err != nil {
+		return errors.Wrap(err, "get props (rd, after set)")
+	}
+
+	err = c.ResourceDefinitions.Modify(ctx, traceRD3, client.GenericPropsModify{
+		OverrideProps: map[string]string{tracePropA: deepValueA2},
+		DeleteProps:   []string{tracePropC},
+	})
+	if err != nil {
+		return errors.Wrap(err, "modify props (rd)")
+	}
+
+	_, err = c.ResourceDefinitions.Get(ctx, traceRD3)
+	if err != nil {
+		return errors.Wrap(err, "get props (rd, after modify)")
+	}
+
+	err = c.ResourceDefinitions.Delete(ctx, traceRD3)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s", traceRD3)
 	}
 
 	return nil

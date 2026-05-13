@@ -18,7 +18,9 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
+	"reflect"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -95,18 +97,43 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
-	var rg apiv1.ResourceGroup
+	var patch apiv1.ResourceGroup
 
-	err := json.NewDecoder(r.Body).Decode(&rg)
+	err := json.NewDecoder(r.Body).Decode(&patch)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	rg.Name = name
+	// golinstor's RG Modify sends a `ResourceGroupModify` body —
+	// override_props / delete_props on top of the existing
+	// SelectFilter. Load existing and merge instead of clobbering
+	// (the old replace-whole-object semantic nuked select_filter
+	// + props on every prop-only PUT).
+	existing, err := s.Store.ResourceGroups().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
 
-	err = s.Store.ResourceGroups().Update(r.Context(), &rg)
+		return
+	}
+
+	mergeRGProps(&existing, &patch)
+
+	// SelectFilter only overwrites when the client sent a non-zero
+	// envelope. Zero-value `select_filter:{}` from a prop-only patch
+	// must NOT wipe the existing placement filter. reflect-equal
+	// against the zero value catches all leaf fields (PlaceCount,
+	// NodeNameList, …) without listing them by hand.
+	if !reflect.DeepEqual(patch.SelectFilter, apiv1.AutoSelectFilter{}) {
+		existing.SelectFilter = patch.SelectFilter
+	}
+
+	if patch.Description != "" {
+		existing.Description = patch.Description
+	}
+
+	err = s.Store.ResourceGroups().Update(r.Context(), &existing)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -115,8 +142,23 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "resource group modified: " + rg.Name,
+		Message: "resource group modified: " + name,
 	}})
+}
+
+// mergeRGProps applies the OverrideProps / DeleteProps merge
+// semantic LINSTOR uses for any property-bag-bearing object:
+// override entries land first, then delete entries strip their keys.
+func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
+	if existing.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
+		existing.Props = map[string]string{}
+	}
+
+	maps.Copy(existing.Props, patch.OverrideProps)
+
+	for _, k := range patch.DeleteProps {
+		delete(existing.Props, k)
+	}
 }
 
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {

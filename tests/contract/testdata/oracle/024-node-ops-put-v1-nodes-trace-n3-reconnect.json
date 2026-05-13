@@ -1,0 +1,11 @@
+{
+  "name": "PUT /v1/nodes/trace-n3/reconnect",
+  "method": "PUT",
+  "path": "/v1/nodes/trace-n3/reconnect",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

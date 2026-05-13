@@ -1,0 +1,16 @@
+{
+  "name": "POST /v1/resource-definitions",
+  "method": "POST",
+  "path": "/v1/resource-definitions",
+  "body": {
+    "resource_definition": {
+      "name": "trace-rd-2"
+    }
+  },
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

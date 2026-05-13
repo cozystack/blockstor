@@ -1,0 +1,17 @@
+{
+  "name": "POST /v1/resource-groups",
+  "method": "POST",
+  "path": "/v1/resource-groups",
+  "body": {
+    "name": "trace-rg-1",
+    "select_filter": {
+      "place_count": 1
+    }
+  },
+  "expectedStatus": 201,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

@@ -51,6 +51,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/LINBIT/golinstor/client"
@@ -216,12 +217,19 @@ func (r *recorder) write(method, path string, reqBody []byte, status int, respBo
 		ExpectedStatus: status,
 	}
 
+	// Request bodies are recorder-authored fixtures — never pre-existing
+	// oracle state — so the list-name filter doesn't apply.
 	if len(reqBody) > 0 {
-		captured.Body = normalizeOrCanonical(reqBody)
+		captured.Body = normalizeOrCanonical(reqBody, false)
 	}
 
+	// Response bodies get the list-filter only on fixture-list endpoints
+	// (top-level /v1/nodes, /v1/resource-groups, …). Per-fixture detail
+	// endpoints like /v1/nodes/{n}/net-interfaces return arrays of the
+	// fixture's own children; filtering by name would strip the
+	// recorder-created "default" interface and break the trace.
 	if len(respBody) > 0 {
-		captured.ExpectedBody = normalizeOrCanonical(respBody)
+		captured.ExpectedBody = normalizeOrCanonical(respBody, isFixtureListPath(path))
 	}
 
 	out, err := json.MarshalIndent(captured, "", "  ")
@@ -265,8 +273,13 @@ var recorderNormalizeOpts contract.NormalizeOptions
 // back to the JSON canonical form (stable key ordering, same as
 // encoding/json's default re-marshal) if normalisation fails —
 // better to commit a slightly noisy trace than to skip the call.
-func normalizeOrCanonical(in []byte) json.RawMessage {
-	scrubbed, err := contract.NormalizeWith(in, recorderNormalizeOpts)
+func normalizeOrCanonical(in []byte, allowListFilter bool) json.RawMessage {
+	opts := recorderNormalizeOpts
+	if !allowListFilter {
+		opts.KeepListNamePrefix = ""
+	}
+
+	scrubbed, err := contract.NormalizeWith(in, opts)
 	if err == nil && len(scrubbed) > 0 {
 		return scrubbed
 	}
@@ -284,6 +297,56 @@ func normalizeOrCanonical(in []byte) json.RawMessage {
 	}
 
 	return out
+}
+
+// isFixtureListPath reports whether a URL path returns a top-level
+// array of "primary fixtures" — Nodes, RGs, RDs, or view aggregates.
+// The recorder's KeepListNamePrefix filter only makes sense on these
+// paths: it drops pre-existing oracle state from the committed
+// corpus. Per-fixture detail endpoints (e.g.
+// `/v1/nodes/{n}/net-interfaces` returns []NetInterface owned by the
+// node we just created) must NOT get filtered or recorder-created
+// children would silently disappear.
+//
+// Match by path *prefix* with the per-fixture sub-paths excluded —
+// `/v1/resource-definitions` is fixture-list, but
+// `/v1/resource-definitions/foo/volume-definitions` is per-fixture
+// detail and slips out.
+func isFixtureListPath(path string) bool {
+	// Per-fixture detail paths (the leaf is a child of a named
+	// fixture) — explicitly NOT filterable.
+	excludePrefixes := []string{
+		"/v1/nodes/",
+		"/v1/resource-groups/",
+		"/v1/resource-definitions/",
+		"/v1/key-value-store/",
+	}
+
+	for _, prefix := range excludePrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return false
+		}
+	}
+
+	// Trim any querystring before matching — `?` shows up on RD
+	// list calls with no opts.
+	trimmed := path
+	if idx := strings.Index(trimmed, "?"); idx >= 0 {
+		trimmed = trimmed[:idx]
+	}
+
+	// Fixture-list / view paths: the response is a top-level array
+	// of objects whose `name` field is the fixture name.
+	return slices.Contains([]string{
+		"/v1/nodes",
+		"/v1/resource-groups",
+		"/v1/resource-definitions",
+		"/v1/key-value-store",
+		"/v1/view/resources",
+		"/v1/view/snapshots",
+		"/v1/view/storage-pools",
+		"/v1/view/volume-definitions",
+	}, trimmed)
 }
 
 // sanitisePath turns an HTTP method + path into a filename-safe

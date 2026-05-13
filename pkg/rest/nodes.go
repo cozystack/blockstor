@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
@@ -222,7 +223,20 @@ func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutat
 		return
 	}
 
-	writeJSON(w, http.StatusOK, node)
+	// Upstream LINSTOR returns an ApiCallRc envelope for the
+	// per-interface POST / PUT — golinstor decodes the response as
+	// `[]ApiCallRc` and surfaces ret_code errors. Returning the full
+	// Node body instead breaks its decoder ("cannot unmarshal object
+	// into Go value of type []client.ApiCallRc").
+	status := http.StatusOK
+	if r.Method == http.MethodPost {
+		status = http.StatusCreated
+	}
+
+	writeJSON(w, status, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "net-interface " + r.Method + " " + iface.Name,
+	}})
 }
 
 // requireStore guards endpoints that need persistence; it returns 503 if the
@@ -296,19 +310,43 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 
-	var n apiv1.Node
+	// golinstor's Nodes.Modify(...) sends a NodeModify body — a
+	// GenericPropsModify (override_props / delete_props) wrapped
+	// with optional `node_type`. Decoding into apiv1.Node would
+	// silently nuke the Node's net_interfaces + type because they
+	// aren't in the request. Load the existing Node, merge the
+	// patch on top.
+	var patch apiv1.NodeModify
 
-	err := json.NewDecoder(r.Body).Decode(&n)
+	err := json.NewDecoder(r.Body).Decode(&patch)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	// The path name wins over any body name, so callers can omit it.
-	n.Name = name
+	existing, err := s.Store.Nodes().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
 
-	err = s.Store.Nodes().Update(r.Context(), &n)
+		return
+	}
+
+	if patch.NodeType != "" {
+		existing.Type = patch.NodeType
+	}
+
+	if existing.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
+		existing.Props = map[string]string{}
+	}
+
+	maps.Copy(existing.Props, patch.OverrideProps)
+
+	for _, k := range patch.DeleteProps {
+		delete(existing.Props, k)
+	}
+
+	err = s.Store.Nodes().Update(r.Context(), &existing)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -317,7 +355,7 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "node modified: " + n.Name,
+		Message: "node modified: " + name,
 	}})
 }
 

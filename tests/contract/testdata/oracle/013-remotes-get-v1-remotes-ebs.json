@@ -1,0 +1,7 @@
+{
+  "name": "GET /v1/remotes/ebs",
+  "method": "GET",
+  "path": "/v1/remotes/ebs",
+  "expectedStatus": 200,
+  "expectedBody": []
+}
