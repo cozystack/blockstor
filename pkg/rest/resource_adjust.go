@@ -85,7 +85,27 @@ func (s *Server) registerResourceLifecycle(mux *http.ServeMux) {
 // handleResourceActivate clears the INACTIVE flag on the named replica.
 // Idempotent: removing an already-absent flag is a no-op. The satellite
 // brings the kernel resource back up on its next reconcile.
+//
+// Optional query parameter `?reallocate-port=true` additionally clears
+// Status.DRBDPort so the controller's allocator picks a fresh free
+// port on the next reconcile. This is the supported recovery for a
+// TCP-port collision (Bug 46): the documented deact + act recipe
+// preserves port + node-id by default, which makes it ineffective
+// against a collision. Operators opt in only when they actively want
+// the port to be reshuffled.
 func (s *Server) handleResourceActivate(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("reallocate-port") == "true" {
+		rdName := r.PathValue("rd")
+		node := r.PathValue("node")
+
+		err := s.Store.Resources().ClearDRBDPort(r.Context(), rdName, node)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
+
 	mutateResourceFlag(w, r, s, "INACTIVE", false, "resource activated")
 }
 

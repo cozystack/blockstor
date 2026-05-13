@@ -356,21 +356,123 @@ func TestSnapshotRollbackUnknownSnap404(t *testing.T) {
 	}
 }
 
-// TestSnapshotsDeleteMissing: DELETE on a non-existent (RD, snap)
-// returns 200 + ApiCallRc success. CSI drivers retry DeleteSnapshot
-// until they see success, so a 404 breaks the second-delete path
-// the csi-sanity "should succeed when an invalid snapshot id" test
-// exercises. Mirrors upstream LINSTOR's idempotent drop semantic.
-func TestSnapshotsDeleteMissing(t *testing.T) {
+// TestSnapshotsDeleteUnknownRD pins one half of the CSI idempotence
+// contract: DELETE on an unknown {rd} path segment returns 200 +
+// ApiCallRc("snapshot already absent: ..."), NOT 404. csi-sanity's
+// "DeleteSnapshot should succeed when an invalid snapshot id is used"
+// feeds in a (volume-id, snap-id) pair that decomposes to (rd, snap)
+// where the rd never existed; a 404 on that path breaks both the
+// spec contract and the second-delete-after-success retry loop the
+// CSI driver runs. The "already absent" message lets operators
+// distinguish a real drop from a no-op replay in API logs.
+func TestSnapshotsDeleteUnknownRD(t *testing.T) {
 	t.Parallel()
 
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
 	resp := httpDelete(t, base+"/v1/resource-definitions/ghost/snapshots/s1")
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status: got %d, want 200", resp.StatusCode)
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode <= 0 {
+		t.Errorf("ApiCallRc envelope: got %+v, want non-empty with positive ret_code", rc)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+}
+
+// TestSnapshotsDeleteKnownRDUnknownSnap pins the other half of the
+// idempotence contract: once the RD exists the handler must still
+// fold a missing per-snap row into success rather than 404,
+// otherwise the CSI retry loop after a partial DeleteSnapshot
+// success stalls. Same "already absent" message as the unknown-RD
+// branch so operators reading the API log get one consistent
+// no-op marker.
+func TestSnapshotsDeleteKnownRDUnknownSnap(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/snapshots/ghost-snap")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode <= 0 {
+		t.Errorf("ApiCallRc envelope: got %+v, want non-empty with positive ret_code", rc)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "ghost-snap") {
+		t.Errorf("message: got %q, want it to name the missing snapshot", rc[0].Message)
+	}
+}
+
+// TestSnapshotsDeleteExistingReturnsEnvelopeAndDrops pins the happy
+// path: DELETE on a really-present snapshot returns 200 +
+// ApiCallRc("snapshot deleted: ...") AND the row actually leaves the
+// store. Without the storage probe a 200 envelope that quietly left
+// the snapshot in place would silently leak entries on every CSI
+// retry.
+func TestSnapshotsDeleteExistingReturnsEnvelopeAndDrops(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	if err := st.Snapshots().Create(t.Context(), &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode <= 0 {
+		t.Errorf("ApiCallRc envelope: got %+v, want non-empty with positive ret_code", rc)
+	}
+
+	if !strings.Contains(rc[0].Message, "snapshot deleted") || !strings.Contains(rc[0].Message, "s1") {
+		t.Errorf("message: got %q, want 'snapshot deleted: s1'", rc[0].Message)
+	}
+
+	if _, err := st.Snapshots().Get(t.Context(), "pvc-1", "s1"); err == nil {
+		t.Errorf("snapshot still in store after delete")
 	}
 }

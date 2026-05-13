@@ -349,23 +349,38 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 	return out, nil
 }
 
+// handleSnapshotDelete answers `DELETE /v1/resource-definitions/{rd}/snapshots/{snap}`
+// with an idempotent 200 + ApiCallRc envelope. CSI spec §DeleteSnapshot
+// mandates idempotence: the driver retries until it sees success, so
+// a 404 on either an unknown RD or an unknown snapshot breaks the
+// second-delete-after-success retry path that csi-sanity's "should
+// succeed when an invalid snapshot id is used" check exercises.
+//
+// Both "unknown RD" and "unknown snapshot on known RD" fold to a
+// success envelope with an "already absent" message — distinct from
+// "snapshot deleted" so operators reading API logs can tell a real
+// drop from a no-op replay. Mirrors upstream LINSTOR's behaviour for
+// non-existent snapshot drops.
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
 
 	err := s.Store.Snapshots().Delete(r.Context(), rd, snapName)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "snapshot already absent: " + snapName,
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
 	}
 
-	// Idempotent delete: missing snapshot folds into success. CSI
-	// drivers retry DeleteSnapshot until they see success; a 404
-	// breaks the second-delete-after-success path the
-	// csi-sanity "should succeed when an invalid snapshot id"
-	// test exercises. Mirrors upstream LINSTOR's behaviour for
-	// non-existent snapshot drops.
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot deleted: " + snapName,
