@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"strconv"
@@ -240,6 +241,11 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture the pre-merge size so we can detect an explicit shrink
+	// after the patch has been applied. Done before mergeVolumeDefinitionPatch
+	// so we compare against the stored spec, not the in-place mutated one.
+	previousSizeKib := existing.SizeKib
+
 	mergeVolumeDefinitionPatch(&existing, &patch)
 
 	// Path-derived VolumeNumber wins — never trust the body's vol_num.
@@ -252,10 +258,38 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition modified",
-	}})
+	}}
+
+	// Shrink advisory (docs/known-issues.md #38). Upstream LINSTOR rejects
+	// shrink-after-deploy at the API; blockstor accepts it (the satellite reconciler's
+	// grow branch is `vol.GetSizeKib() > status.UsableKib`, so a shrink
+	// in the spec never reaches `lvextend`/`zfs set volsize` and never
+	// truncates the backing device). Still, the operator should see a
+	// warning entry so the data-loss risk surfaces in the audit log —
+	// shrinking the spec without also shrinking the FS will eventually
+	// corrupt data if the FS later writes past the new size.
+	//
+	// Emit the warning as a SECOND envelope entry (success first, then
+	// advisory) — matches upstream's order in ApiCallRcImpl where the
+	// "operation succeeded" entry leads and per-resource warnings tail.
+	if patch.SizeKib != nil && *patch.SizeKib < previousSizeKib {
+		envelope = append(envelope, apiv1.APICallRc{
+			RetCode: warnVlmDfnResizeShrink,
+			Message: fmt.Sprintf(
+				"shrinking volume %d from %d KiB to %d KiB (DATA LOSS RISK — caller intent assumed)",
+				vn, previousSizeKib, *patch.SizeKib,
+			),
+			ObjRefs: map[string]string{
+				"RscDfn": rd,
+				"VlmNr":  strconv.FormatInt(int64(vn), 10),
+			},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, envelope)
 }
 
 // mergeVolumeDefinitionPatch overlays the modify delta onto an existing

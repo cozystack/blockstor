@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -797,5 +798,206 @@ func TestVolumeDefinitionsUpdateDeletePropsRemovesKey(t *testing.T) {
 
 	if got.Props["keep-me"] != "stay" {
 		t.Errorf("delete_props collateral damage: got Props=%v, want keep-me=stay", got.Props)
+	}
+}
+
+// TestVDUpdateShrinkEmitsSTATEInfoWarning pins Bug 38's fix: a
+// VD-modify that reduces SizeKib must surface a warning ApiCallRc
+// entry alongside the success entry, so `linstor vd set-size`
+// operators see the data-loss-risk advisory in the audit log.
+// Pre-fix, blockstor silently accepted the shrink and returned a
+// single info entry — the operator had no indication that the
+// backing FS would need to be shrunk out-of-band.
+//
+// Wire contract: HTTP 200, two-entry `[]ApiCallRc`. Entry 0 is the
+// success line (preserves the existing CLI behaviour where modify
+// returns one "volume definition modified" line). Entry 1 carries
+// the warn-mask bit, the from/to KiB values, and the literal token
+// "shrinking" so the Python CLI's message-print loop emits it.
+func TestVDUpdateShrinkEmitsSTATEInfoWarning(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-shrink-warn"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 10240
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-shrink-warn",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const shrunkKib = 5120
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: shrunkKib})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-shrink-warn/volume-definitions/0", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 2 {
+		t.Fatalf("envelope entries: got %d, want 2 (success + shrink warning); got=%+v", len(rcs), rcs)
+	}
+
+	// Entry 0: the canonical success line. golinstor and the Python
+	// CLI both dereference replies[0]; flipping the order would break
+	// every existing caller.
+	if rcs[0].RetCode&maskInfo == 0 {
+		t.Errorf("entry 0 ret_code = %x, want maskInfo bit set", rcs[0].RetCode)
+	}
+
+	// Entry 1: the shrink advisory. Must carry the warn-mask bit so
+	// the contract normalizer classifies it into the <warn> bucket
+	// and so the Python CLI prints it as a warning, not as plain info.
+	if rcs[1].RetCode&maskWarn == 0 {
+		t.Errorf("entry 1 ret_code = %x, want warn-mask bit set", rcs[1].RetCode)
+	}
+
+	// Message must mention "shrinking" so an operator grepping the
+	// API audit log can find shrink events without decoding ret_code.
+	if !strings.Contains(rcs[1].Message, "shrinking") {
+		t.Errorf("entry 1 message missing 'shrinking': %q", rcs[1].Message)
+	}
+
+	// Both the source and target KiB values must appear so the
+	// operator can sanity-check the magnitude of the shrink.
+	if !strings.Contains(rcs[1].Message, "10240") {
+		t.Errorf("entry 1 message missing source size 10240 KiB: %q", rcs[1].Message)
+	}
+
+	if !strings.Contains(rcs[1].Message, "5120") {
+		t.Errorf("entry 1 message missing target size 5120 KiB: %q", rcs[1].Message)
+	}
+}
+
+// TestVDUpdateGrowNoWarning pins the negative case: a SizeKib that
+// grows (or equals) the current size must NOT trigger the shrink
+// advisory. CSI-resizer's ControllerExpandVolume drives thousands
+// of these per hour in a busy cluster; emitting a spurious warning
+// would flood the audit log and train operators to ignore the entry.
+func TestVDUpdateGrowNoWarning(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-grow-warn"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 10240
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-grow-warn",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const grownKib = 20480
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: grownKib})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-grow-warn/volume-definitions/0", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries on grow: got %d, want 1 (success only); got=%+v", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&maskWarn != 0 {
+		t.Errorf("grow path leaked warn-mask bit: ret_code=%x", rcs[0].RetCode)
+	}
+}
+
+// TestVDUpdateNoSizeChangeNoWarning pins the "size-omitted" and
+// "same-size" cases: a props-only modify, or a no-op resize that
+// re-applies the current SizeKib (csi-resizer retry path), must
+// NOT emit the shrink advisory. Same-size is upstream's
+// WARN_VLMDFN_RESIZE_SAME_SIZE territory — explicitly NOT a shrink
+// warning. Without this guard, csi-resizer's idempotent retry on
+// every reconcile pass would synthesise a stream of spurious shrink
+// warnings whenever a resize raced a controller restart.
+func TestVDUpdateNoSizeChangeNoWarning(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-nosize"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 10240
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-nosize",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Case A: size_kib omitted entirely (props-only modify).
+	respA := httpPut(t,
+		base+"/v1/resource-definitions/pvc-nosize/volume-definitions/0",
+		[]byte(`{}`))
+
+	if respA.StatusCode != http.StatusOK {
+		_ = respA.Body.Close()
+		t.Fatalf("case A status: got %d, want 200", respA.StatusCode)
+	}
+
+	var rcsA []apiv1.APICallRc
+	if err := json.NewDecoder(respA.Body).Decode(&rcsA); err != nil {
+		_ = respA.Body.Close()
+		t.Fatalf("case A decode envelope: %v", err)
+	}
+
+	_ = respA.Body.Close()
+
+	if len(rcsA) != 1 {
+		t.Fatalf("case A: omitted size_kib produced %d entries, want 1; got=%+v", len(rcsA), rcsA)
+	}
+
+	// Case B: size_kib equal to the current value (csi-resizer retry).
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: initialKib})
+
+	respB := httpPut(t, base+"/v1/resource-definitions/pvc-nosize/volume-definitions/0", body)
+	if respB.StatusCode != http.StatusOK {
+		_ = respB.Body.Close()
+		t.Fatalf("case B status: got %d, want 200", respB.StatusCode)
+	}
+
+	var rcsB []apiv1.APICallRc
+	if err := json.NewDecoder(respB.Body).Decode(&rcsB); err != nil {
+		_ = respB.Body.Close()
+		t.Fatalf("case B decode envelope: %v", err)
+	}
+
+	_ = respB.Body.Close()
+
+	if len(rcsB) != 1 {
+		t.Fatalf("case B: same-size size_kib produced %d entries, want 1; got=%+v", len(rcsB), rcsB)
+	}
+
+	if rcsB[0].RetCode&maskWarn != 0 {
+		t.Errorf("case B leaked warn-mask bit on no-op: ret_code=%x", rcsB[0].RetCode)
 	}
 }
