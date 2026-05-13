@@ -257,10 +257,14 @@ func TestSnapshotsCreateBadJSON(t *testing.T) {
 	}
 }
 
-// TestSnapshotsCreateMissingName: empty snap name → 400. linstor-csi
-// derives the snap name from a VolumeSnapshot UID — a regression
-// that allowed nameless snapshots would orphan rows that no later
-// reconcile can address.
+// TestSnapshotsCreateMissingName: empty snap name → 400 + body marker.
+// linstor-csi derives the snap name from a VolumeSnapshot UID — a
+// regression that allowed nameless snapshots would orphan rows that
+// no later reconcile can address. csi-sanity's "CreateSnapshot should
+// fail when the name field is missing" feeds in an empty CSI
+// snapshot-name; linstor-csi forwards that as `{"name": ""}` and the
+// handler must surface the marker text in the response so the driver
+// can echo it into the CSI gRPC error.
 func TestSnapshotsCreateMissingName(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
@@ -276,10 +280,91 @@ func TestSnapshotsCreateMissingName(t *testing.T) {
 	}
 
 	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status: got %d, want 400", resp.StatusCode)
+		t.Fatalf("status: got %d, want 400", resp.StatusCode)
+	}
+
+	bodyBytes := make([]byte, 1024)
+	n, _ := resp.Body.Read(bodyBytes)
+	got := string(bodyBytes[:n])
+
+	if !strings.Contains(got, "snapshot name is required") {
+		t.Errorf("body: got %q, want it to contain 'snapshot name is required'", got)
+	}
+}
+
+// TestSnapshotsCreateWhitespaceOnlyName pins TrimSpace on snap.Name.
+// A `"   "` payload previously slipped past the bare `== ""` guard
+// and persisted an unaddressable snapshot row — zfs barfs on the
+// whitespace snap name later in the satellite reconcile, but
+// linstor-csi has already seen the 201 response and never retries.
+// csi-sanity's "CreateSnapshot empty-name" parametrisation includes
+// the whitespace shape, so this nails the (c) wire-shape gap end-to-end.
+func TestSnapshotsCreateWhitespaceOnlyName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "   ", Nodes: []string{"n1"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400", resp.StatusCode)
+	}
+
+	bodyBytes := make([]byte, 1024)
+	n, _ := resp.Body.Read(bodyBytes)
+	got := string(bodyBytes[:n])
+
+	if !strings.Contains(got, "snapshot name is required") {
+		t.Errorf("body: got %q, want it to contain 'snapshot name is required'", got)
+	}
+}
+
+// TestSnapshotsCreateValidNameReturns201 pins the happy path after
+// the empty-name guard: a well-formed payload still gets 201 +
+// ApiCallRc envelope. Without this, an over-zealous trim regression
+// (e.g. trimming the JSON-decoded name in-place and emptying valid
+// content) would slip through CI silently.
+func TestSnapshotsCreateValidNameReturns201(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "foo", Nodes: []string{"n1"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode <= 0 {
+		t.Errorf("ApiCallRc envelope: got %+v, want non-empty with positive ret_code", rc)
 	}
 }
 

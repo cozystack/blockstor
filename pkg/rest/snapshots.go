@@ -173,6 +173,21 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
+	// Reject whitespace-only RD names before the JSON decode: csi-sanity's
+	// "CreateSnapshot should fail when the source volume is not specified"
+	// path forwards an empty source-volume-id into linstor-csi which
+	// concatenates it into the path. Without an explicit trim, a `%20`
+	// or pure-empty {rd} segment slugs into a real-looking row that no
+	// subsequent reconcile can address (the satellite scans by RD name
+	// and never matches a blank one). Distinct message from the snap
+	// validation below so the CSI driver's error surface tells the
+	// operator which field was wrong.
+	if strings.TrimSpace(rd) == "" {
+		writeError(w, http.StatusBadRequest, "resource definition name is required")
+
+		return
+	}
+
 	var snap apiv1.Snapshot
 
 	err := json.NewDecoder(r.Body).Decode(&snap)
@@ -182,7 +197,13 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if snap.Name == "" {
+	// TrimSpace guards the "silent slug-of-empty" bug class csi-sanity
+	// surfaces with "CreateSnapshot should fail when the name field is
+	// missing"/"empty". A bare `""` already 400'd here, but a
+	// whitespace-only `"   "` previously slipped through and persisted
+	// an unaddressable snapshot row (zfs barfs on the snap name later;
+	// linstor-csi sees a "created" response and never retries).
+	if strings.TrimSpace(snap.Name) == "" {
 		writeError(w, http.StatusBadRequest, "snapshot name is required")
 
 		return
