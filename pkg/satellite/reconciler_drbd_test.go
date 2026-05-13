@@ -1582,3 +1582,147 @@ func indexOfPrefix(lines []string, prefix string) int {
 
 	return -1
 }
+
+// TestReconcilerDoesNotPropagateDiscardMyData (scenario 5.31) pins the
+// safety property that drives operator-misuse defence:
+//
+//	Setup: 2-replica RD pvc-discard. This satellite (n1) holds the
+//	ONLY UpToDate copy; peer n2 is Inconsistent / already-discarded
+//	(e.g. the operator just ran `drbdadm connect --discard-my-data`
+//	on n2 against the rules, or n2 came back from a failed resync).
+//
+//	Expectation: when the satellite drives a reconcile pass over a
+//	steady DesiredResource (no growth, no flag change, no peer
+//	churn) it MUST NOT auto-replicate the discard back onto its
+//	own UpToDate replica. Concretely:
+//	  - no `drbdadm connect --discard-my-data` on n1
+//	  - no `drbdadm disconnect` on the surviving UpToDate peer
+//	  - no `drbdadm down` / `drbdadm up` on the surviving replica
+//	The reconciler treats the on-the-wire state of the peer as
+//	observed-state (not desired-state) and converges by writing
+//	the .res file + `drbdadm adjust`; DRBD then negotiates with
+//	the peer using the normal handshake, which will refuse a
+//	discard-my-data offered against a current-uuid the local node
+//	doesn't recognise.
+//
+// The test drives two Apply passes: first activation (writes .res +
+// runs create-md + adjust) and a steady-state second pass with the
+// LV already present. The assertions span BOTH passes — proving
+// the property holds across the bring-up boundary, since the
+// scenario can fire either way in production (operator misuse can
+// happen the moment a brand-new replica joins, or long after the
+// resource has been live).
+func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// First-pass storage probe: LV absent, lvcreate will run.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-discard_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// 2-replica RD: this satellite (n1) is the UpToDate copy, n2 is
+	// the peer the operator just ran `drbdadm connect
+	// --discard-my-data` against. The DesiredResource shape the
+	// satellite sees from the controller is identical to a healthy
+	// 2-replica RD — peer disk-state lives in the observer, NOT in
+	// the apply payload, so the reconciler cannot use it to make a
+	// "discard" decision. That's exactly the property under test.
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-discard",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (first activation): %v", err)
+	}
+
+	first := fx.CommandLines()
+
+	// Steady-state second pass: LV already present, .res + md-marker
+	// linger from the first pass → firstActivation=false. This is
+	// the path that fires repeatedly while the operator-misuse
+	// state persists on n2. Reconciler must remain inert toward
+	// connect/disconnect/down/up regardless of how many times it
+	// re-runs.
+	fx.Reset()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-discard_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-discard_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-discard_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-discard_00000|1048576\n")})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (steady-state): %v", err)
+	}
+
+	second := fx.CommandLines()
+
+	// Forbidden commands. Every one of these, if issued by the
+	// reconciler on the surviving UpToDate replica, would either
+	// propagate the operator's discard (`connect
+	// --discard-my-data`), pre-quiesce the connection so DRBD's
+	// handshake never gets to refuse the discard (`disconnect`),
+	// or drop the kernel state entirely so the next `up` re-reads
+	// metadata and re-handshakes from scratch (`down`/`up`) —
+	// undoing the protection DRBD's own handshake gives us.
+	forbidden := []string{
+		"drbdadm connect --discard-my-data",
+		"connect --discard-my-data",
+		"drbdadm disconnect pvc-discard",
+		"drbdadm down pvc-discard",
+		"drbdadm up pvc-discard",
+	}
+
+	for _, phase := range []struct {
+		label string
+		lines []string
+	}{
+		{"first-activation", first},
+		{"steady-state", second},
+	} {
+		for _, bad := range forbidden {
+			for _, line := range phase.lines {
+				if strings.Contains(line, bad) {
+					t.Errorf("%s phase: reconciler issued forbidden %q on surviving UpToDate replica: %s\nall calls: %v",
+						phase.label, bad, line, phase.lines)
+				}
+			}
+		}
+	}
+
+	// Positive control: the reconciler MUST still run `drbdadm
+	// adjust` — that's its sole convergence verb for live state.
+	// Without it the test would degenerate to "reconciler did
+	// nothing", which would pass the forbidden-command checks
+	// trivially.
+	if !slices.Contains(first, "drbdadm adjust pvc-discard") {
+		t.Errorf("first-activation phase: expected drbdadm adjust to fire; got %v", first)
+	}
+
+	if !slices.Contains(second, "drbdadm adjust pvc-discard") {
+		t.Errorf("steady-state phase: expected drbdadm adjust to fire; got %v", second)
+	}
+}
