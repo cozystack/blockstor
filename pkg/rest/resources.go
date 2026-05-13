@@ -79,19 +79,13 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		annotated := annotateSyncProgress(resList[i].Volumes, vdSizes[resList[i].Name])
+		rwv, buildErr := s.buildResourceView(r.Context(), &resList[i], vdSizes[resList[i].Name])
+		if buildErr != nil {
+			writeError(w, http.StatusInternalServerError, buildErr.Error())
 
-		// Resource.Volumes is sourced from CRD Status by
-		// crdToWireResource; ResourceWithVolumes is kept as a
-		// distinct wrapper for backwards-compat with anything
-		// still consuming the embedded shape — its Volumes field
-		// shadows Resource.Volumes via field promotion ordering,
-		// so the JSON output remains a single `volumes` key.
-		rwv := apiv1.ResourceWithVolumes{
-			Resource: resList[i],
-			Volumes:  annotated,
+			return
 		}
-		rwv.Resource.Volumes = annotated
+
 		out = append(out, rwv)
 	}
 
@@ -116,6 +110,38 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, paginateResources(r, out))
+}
+
+// buildResourceView annotates one replica with sync progress and
+// resolves its effective-prop bag. Extracted from
+// handleResourcesView to keep that handler under the funlen budget;
+// the parent fetch (Controller / RG / RD) is soft-fail so a partial
+// hierarchy returns a usable response.
+func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
+	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
+
+	eff, err := effectivePropsForResource(ctx, s.Client, s.Store, rsc)
+	if err != nil {
+		return apiv1.ResourceWithVolumes{}, err
+	}
+
+	// Resource.Volumes is sourced from CRD Status by
+	// crdToWireResource; ResourceWithVolumes is kept as a
+	// distinct wrapper for backwards-compat with anything
+	// still consuming the embedded shape — its Volumes field
+	// shadows Resource.Volumes via field promotion ordering,
+	// so the JSON output remains a single `volumes` key.
+	rwv := apiv1.ResourceWithVolumes{
+		Resource: *rsc,
+		Volumes:  annotated,
+	}
+	rwv.Volumes = annotated
+
+	if len(eff) > 0 {
+		rwv.EffectiveProps = eff
+	}
+
+	return rwv, nil
 }
 
 // rdFaultyStats summarises the per-RD aggregate state used by the

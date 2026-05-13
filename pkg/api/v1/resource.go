@@ -43,6 +43,13 @@ type Resource struct {
 	// present. Without Volumes, every resource appears as "Unknown"
 	// and Conns silently hides peer-connection state.
 	Volumes []Volume `json:"volumes,omitempty"`
+
+	// EffectiveProps is the merged Controller→RG→RD→Resource view
+	// of the property bag for this replica. Populated on the
+	// `/v1/view/resources` aggregate GET path; ignored on writes.
+	// Drives the `(R)` inherited-property marker in
+	// `linstor r lp <rd> <node>`.
+	EffectiveProps EffectiveProperties `json:"effective_props,omitempty"`
 }
 
 // ResourceState is the runtime state surface of a Resource.

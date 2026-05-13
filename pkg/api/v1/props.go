@@ -73,3 +73,34 @@ const (
 // pseudo-object that owns the `Autoplacer/Weights/*` knobs and any
 // future cluster-wide tunables.
 const ControllerPropsName = "default"
+
+// Effective-prop scope identifiers. Match the upstream LINSTOR
+// `(R)` marker hierarchy that python-linstor-client's
+// `linstor rd lp --effective` walks — Controller → ResourceGroup →
+// ResourceDefinition → Resource. The Python CLI compares the
+// `scope` of each entry with the object the user asked about and
+// prints `(R)` when the value was inherited from a parent.
+const (
+	EffectivePropScopeController         = "CTRL"
+	EffectivePropScopeResourceGroup      = "RG"
+	EffectivePropScopeResourceDefinition = "RD"
+	EffectivePropScopeResource           = "RSC"
+)
+
+// EffectivePropEntry is one row of the merged-property bag exposed
+// alongside the raw `props` map on RG / RD / Resource GET handlers.
+// Value is the wire-effective value at the queried scope; Scope is
+// the highest-precedence origin contributing that value (the parent
+// the key was inherited from, or the queried scope itself when set
+// locally). Python-linstor-client's `--effective` mode reads `scope`
+// to decide whether to print the `(R)` inheritance marker next to
+// the value.
+type EffectivePropEntry struct {
+	Value string `json:"value"`
+	Scope string `json:"scope"`
+}
+
+// EffectiveProperties maps property key → resolved entry. Sibling
+// to `props` on RG / RD / Resource responses — the raw map carries
+// LOCAL settings, this map carries the merged-from-parents view.
+type EffectiveProperties map[string]EffectivePropEntry
