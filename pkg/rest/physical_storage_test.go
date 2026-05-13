@@ -44,6 +44,136 @@ func TestPhysicalStorageList(t *testing.T) {
 	}
 }
 
+// TestPSListAggregatesAcrossNodes pins the Bug 51 wire pipe: the
+// satellite-side discovery runnable publishes one PhysicalDevice
+// CRD per free disk on its own node; `GET /v1/physical-storage`
+// MUST aggregate the per-node CRDs into the cluster-wide bucketed
+// envelope upstream LINSTOR's `linstor ps l` parses.
+//
+// Without this aggregation `linstor ps l` returns an empty list
+// even when each satellite has correctly populated its local
+// PhysicalDevice store — the exact failure mode bug 51 documents.
+// Three nodes here cover the "more than one node per bucket"
+// merge path (size-+-rotational equivalence) and the
+// "single-node bucket" path simultaneously.
+func TestPSListAggregatesAcrossNodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	rotational := false
+
+	// Two SSDs on n1 + n2 land in the same (size, rotational)
+	// bucket; n3's HDD goes to its own bucket.
+	seeds := []*apiv1.PhysicalDevice{
+		{
+			Name:       "n1.wwn-a",
+			NodeName:   "n1",
+			StableID:   "wwn-a",
+			DevicePath: "/dev/disk/by-id/wwn-a",
+			SizeBytes:  1_000_000_000_000,
+			Model:      "SSD-A",
+			Serial:     "SN-A",
+			Rotational: &rotational,
+			Phase:      "Available",
+		},
+		{
+			Name:       "n2.wwn-b",
+			NodeName:   "n2",
+			StableID:   "wwn-b",
+			DevicePath: "/dev/disk/by-id/wwn-b",
+			SizeBytes:  1_000_000_000_000,
+			Model:      "SSD-B",
+			Serial:     "SN-B",
+			Rotational: &rotational,
+			Phase:      "Available",
+		},
+		{
+			Name:       "n3.wwn-c",
+			NodeName:   "n3",
+			StableID:   "wwn-c",
+			DevicePath: "/dev/disk/by-id/wwn-c",
+			SizeBytes:  2_000_000_000_000, // different size → different bucket
+			Model:      "HDD-C",
+			Serial:     "SN-C",
+			// Rotational nil = bucket has rotational=nil
+			Phase: "Available",
+		},
+	}
+
+	for _, d := range seeds {
+		if err := st.PhysicalDevices().Create(ctx, d); err != nil {
+			t.Fatalf("seed %s: %v", d.Name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/physical-storage")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var entries []physicalStorageEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// One bucket for the two SSDs (size+rotational match) + one
+	// for the HDD → 2 buckets total.
+	if len(entries) != 2 {
+		t.Fatalf("buckets: got %d, want 2 (SSD-bucket merging n1+n2 plus HDD-bucket)", len(entries))
+	}
+
+	// Locate the SSD bucket and verify both nodes are present.
+	var ssdBucket *physicalStorageEntry
+
+	for i := range entries {
+		if entries[i].Size == 1_000_000_000_000 {
+			ssdBucket = &entries[i]
+
+			break
+		}
+	}
+
+	if ssdBucket == nil {
+		t.Fatalf("SSD bucket missing from %+v", entries)
+	}
+
+	if len(ssdBucket.Nodes) != 2 {
+		t.Errorf("SSD bucket nodes: got %d, want 2 (n1+n2)", len(ssdBucket.Nodes))
+	}
+
+	if devs := ssdBucket.Nodes["n1"]; len(devs) != 1 || devs[0].WWN != "wwn-a" {
+		t.Errorf("n1 entry: got %+v, want one wwn-a", devs)
+	}
+
+	if devs := ssdBucket.Nodes["n2"]; len(devs) != 1 || devs[0].WWN != "wwn-b" {
+		t.Errorf("n2 entry: got %+v, want one wwn-b", devs)
+	}
+
+	// HDD bucket must carry only n3.
+	var hddBucket *physicalStorageEntry
+
+	for i := range entries {
+		if entries[i].Size == 2_000_000_000_000 {
+			hddBucket = &entries[i]
+
+			break
+		}
+	}
+
+	if hddBucket == nil {
+		t.Fatalf("HDD bucket missing from %+v", entries)
+	}
+
+	if len(hddBucket.Nodes) != 1 || len(hddBucket.Nodes["n3"]) != 1 {
+		t.Errorf("HDD bucket: got %+v, want exactly n3->[wwn-c]", hddBucket.Nodes)
+	}
+}
+
 // TestPhysicalStorageListWithDevices pins the Phase 10.7 wire
 // shape: GET /v1/physical-storage groups Available devices by
 // (size, rotational); GET /v1/nodes/{node}/physical-storage

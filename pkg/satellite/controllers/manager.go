@@ -158,6 +158,15 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		return errors.Wrap(err, "register StorageOrphanSweeperRunnable")
 	}
 
+	err = (&PhysicalDeviceDiscoveryRunnable{
+		Client:   mgr.GetClient(),
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "register PhysicalDeviceDiscoveryRunnable")
+	}
+
 	return nil
 }
 
