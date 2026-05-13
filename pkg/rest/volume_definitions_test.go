@@ -394,3 +394,297 @@ func TestVolumeDefinitionsUpdateBadJSON(t *testing.T) {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestVolumeDefinitionsUpdateGolinstorWireShape pins the exact wire
+// payload that golinstor's `VolumeDefinitionService.ModifyVolumeDefinition`
+// emits — a bare envelope with `size_kib` at the top level (no
+// `volume_definition` wrapper). This is the CSI ControllerExpandVolume
+// hot path: linstor-csi → golinstor → blockstor REST. If the server
+// ever required the wrapper-envelope, every grow from kubernetes would
+// silently no-op.
+//
+// Wire format reference (golinstor v0.58+):
+//
+//	type VolumeDefinitionModify struct {
+//	    SizeKib uint64 `json:"size_kib,omitempty"`
+//	    GenericPropsModify
+//	    Flags []string `json:"flags,omitempty"`
+//	}
+func TestVolumeDefinitionsUpdateGolinstorWireShape(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-csi"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-csi",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Raw JSON — bypass any apiv1 envelope to mirror what golinstor
+	// puts on the wire. snake_case keys per the OpenAPI spec.
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-csi/volume-definitions/0",
+		[]byte(`{"size_kib":4194304}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-csi", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != 4194304 {
+		t.Errorf("SizeKib after CSI-shape PUT: got %d, want %d", got.SizeKib, 4194304)
+	}
+}
+
+// TestVolumeDefinitionsUpdateNoOp pins that a PUT with the same
+// size as already stored round-trips with 200 and leaves the VD
+// unchanged. csi-resizer occasionally re-applies the same target
+// size (controller-resize retry after a transient error); a strict
+// "size must change" guard would loop the resize controller.
+func TestVolumeDefinitionsUpdateNoOp(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-noop"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const sizeKib = 2 * 1024 * 1024
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-noop",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: sizeKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: sizeKib})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-noop/volume-definitions/0", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-noop", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != sizeKib {
+		t.Errorf("no-op PUT changed SizeKib: got %d, want %d", got.SizeKib, sizeKib)
+	}
+}
+
+// TestVolumeDefinitionsUpdateShrinkAccepted pins that the REST
+// surface accepts a smaller `size_kib` than the current VD size
+// without rejecting at the API layer. Data-loss prevention lives at
+// the satellite (`reconciler.go`: `if vol.GetSizeKib() > status.UsableKib`
+// — the grow branch is the only one that calls `ResizeVolume`, so a
+// shrink in the spec never reaches `lvextend`/`zfs set volsize` and
+// never truncates the backing device). Upstream LINSTOR's UG9
+// chapter 1.20.5 warns operators about this but doesn't reject at
+// the API either. If we ever start rejecting shrinks at REST, the
+// invariant "controller and satellite agree on the spec" breaks
+// because csi-resizer doesn't issue shrinks but admins doing
+// `linstor vd set-size` might.
+func TestVolumeDefinitionsUpdateShrinkAccepted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-shrink"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 4 * 1024 * 1024
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-shrink",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Halve the size — explicit shrink.
+	const shrunkKib = initialKib / 2
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: shrunkKib})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-shrink/volume-definitions/0", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("shrink status: got %d, want 200 (REST accepts shrinks; satellite is data-safe)", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-shrink", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != shrunkKib {
+		t.Errorf("SizeKib after shrink: got %d, want %d", got.SizeKib, shrunkKib)
+	}
+}
+
+// TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip pins that
+// petabyte-scale `size_kib` values survive the JSON round-trip
+// without truncation. The wire field is int64 on our side and uint64
+// in golinstor; a regression that decoded into int32 would clamp
+// anything above ~2 TiB. 2^40 KiB = 1 PiB — covers the largest
+// volumes any sane cluster would carve.
+func TestVolumeDefinitionsUpdateLargeSizeKibRoundTrip(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-pib"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-pib",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const oneEiB = int64(1) << 40 // 1 PiB in KiB
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: oneEiB})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-pib/volume-definitions/0", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-pib", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != oneEiB {
+		t.Errorf("SizeKib after large PUT: got %d, want %d (truncation?)", got.SizeKib, oneEiB)
+	}
+}
+
+// TestVolumeDefinitionsUpdateGetRoundTrip exercises the
+// CSI-after-grow flow: a PUT that bumps SizeKib must be readable
+// through GET in the same wire shape (`size_kib` snake_case at the
+// top level, not wrapped). golinstor's `GetVolumeDefinition` decodes
+// a bare `VolumeDefinition`; a refactor that wrapped the response
+// envelope would break the controller's post-grow refresh.
+func TestVolumeDefinitionsUpdateGetRoundTrip(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-rt"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-rt",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const grownKib = 8 * 1024 * 1024
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: grownKib})
+
+	putResp := httpPut(t, base+"/v1/resource-definitions/pvc-rt/volume-definitions/0", body)
+	_ = putResp.Body.Close()
+
+	if putResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", putResp.StatusCode)
+	}
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-rt/volume-definitions/0")
+	defer func() { _ = getResp.Body.Close() }()
+
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status: got %d, want 200", getResp.StatusCode)
+	}
+
+	var got apiv1.VolumeDefinition
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+
+	if got.SizeKib != grownKib {
+		t.Errorf("GET after PUT saw stale size: got %d, want %d", got.SizeKib, grownKib)
+	}
+
+	if got.VolumeNumber != 0 {
+		t.Errorf("VolumeNumber drifted across round-trip: got %d, want 0", got.VolumeNumber)
+	}
+}
+
+// TestVolumeDefinitionsUpdateEmptyBodyZeroesSizeKib documents the
+// CURRENT wholesale-replace semantics of the PUT handler: a body
+// without `size_kib` (e.g. a props-only modify from an older
+// golinstor or a `linstor vd set-property`-only call) collapses
+// SizeKib to 0. The satellite reconciler's grow branch is
+// `vol.GetSizeKib() > status.UsableKib`, so 0 can't trigger an
+// `lvextend`/`drbdadm resize` — the on-disk volume stays intact.
+// But `linstor vd l` would then report 0 KiB and the NEXT
+// legitimate grow would be a no-op (UsableKib > 0 ≥ new SizeKib).
+//
+// This test pins the property so a future change to merge-semantics
+// (decode → fetch current → overlay only set fields → update) is a
+// conscious move with a test churn, not an accidental behavior flip.
+// Tracked separately as an open issue — see 4.6 audit report.
+func TestVolumeDefinitionsUpdateEmptyBodyZeroesSizeKib(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-wipe"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-wipe",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Empty JSON object — golinstor's props-only modify would look
+	// like this if SizeKib were unset (it has `omitempty`).
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-wipe/volume-definitions/0", []byte(`{}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-wipe", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// CURRENT BEHAVIOR — wholesale replace. If this test starts
+	// failing because SizeKib stays at 1 MiB, the handler grew
+	// merge-semantics; update the assertion (and revisit the
+	// audit-4.6 open issues).
+	if got.SizeKib != 0 {
+		t.Errorf("SizeKib after `{}` PUT: got %d, want 0 (current wholesale-replace semantics)", got.SizeKib)
+	}
+}
