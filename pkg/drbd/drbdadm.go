@@ -286,6 +286,45 @@ func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
+// IsLoaded reports whether the kernel currently owns a DRBD slot
+// for the named resource. Used to detect the post-`drbdadm down`
+// state where the on-disk .res + `.md-created` marker still
+// describe a resource but the kernel slot is gone — running
+// `drbdadm adjust` in that state fails with `(158) Unknown
+// resource` because adjust only reconciles already-loaded
+// kernel state, it doesn't bootstrap missing resources. The
+// reconciler consults this probe and falls back to `drbdadm up`
+// (which performs new-resource + new-path + attach + connect)
+// to revive the slot, then proceeds with adjust as normal.
+//
+// Convention:
+//   - zero exit + non-empty stdout → loaded (true)
+//   - non-zero exit OR empty stdout → not loaded (false)
+//   - error-text / stdout containing "No currently configured
+//     DRBD found" is folded into the not-loaded case too — that's
+//     drbdsetup's verbatim message when the kernel module is
+//     present but the named resource isn't.
+//
+// Returning false + nil error is the dominant "absent" signal so
+// callers don't need to branch on the error type; a true error
+// surfaces only for genuinely-unexpected failures (binary
+// missing, exec/IO error) that the caller should bubble up.
+func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource)
+	if err != nil {
+		// Any non-zero exit is treated as "absent": the dominant
+		// failure mode is `drbdsetup status` returning exit 10 +
+		// "No currently configured DRBD found", but other non-zero
+		// codes (e.g. transient netlink hiccups) also indicate the
+		// kernel doesn't have a usable view of the slot, which is
+		// the trigger for the `drbdadm up` recovery path. Surface
+		// false + nil so the caller doesn't need to branch.
+		return false, nil //nolint:nilerr // non-zero exit is the "kernel slot absent" signal, not a bubble-up error
+	}
+
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {

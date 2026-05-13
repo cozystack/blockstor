@@ -34,10 +34,11 @@ import (
 )
 
 var (
-	errNotALUKSDevice    = errors.New("not a luks device")
-	errLUKSOpenAlready   = errors.New("device pvc-luks-only-0-luks already exists")
-	errDrbdadmAdjustFail = errors.New("drbdadm: simulated mid-Apply abort")
-	errDrbdadmResizeFail = errors.New("drbdadm: resize failed (peer disconnected)")
+	errNotALUKSDevice      = errors.New("not a luks device")
+	errLUKSOpenAlready     = errors.New("device pvc-luks-only-0-luks already exists")
+	errDrbdadmAdjustFail   = errors.New("drbdadm: simulated mid-Apply abort")
+	errDrbdadmResizeFail   = errors.New("drbdadm: resize failed (peer disconnected)")
+	errDrbdsetupNoResource = errors.New("drbdsetup: exit status 10")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -1250,6 +1251,14 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("pvc-abort_00000\n")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-abort_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-abort_00000|1048576\n")})
+	// Steady-state kernel probe (Bug 47 / scenario 5.32): the first
+	// pass succeeded in loading the kernel slot via the original
+	// `drbdadm adjust`; the second pass uses `drbdsetup status` to
+	// detect it's already loaded and emits a fresh `adjust`. Stage
+	// a non-empty status output so the probe reads as "loaded".
+	fx.Expect("drbdsetup status pvc-abort", storage.FakeResponse{
+		Stdout: []byte("pvc-abort role:Secondary\n  volume:0 disk:UpToDate\n"),
+	})
 	// Overwrite the previously-failing drbdadm response with a clean
 	// success — the simulated SIGKILL window has passed.
 	fx.Expect("drbdadm adjust pvc-abort", storage.FakeResponse{})
@@ -1939,6 +1948,17 @@ func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("pvc-discard_00000\n")})
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-discard_00000",
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-discard_00000|1048576\n")})
+	// Steady-state kernel probe (Bug 47 / scenario 5.32): the
+	// reconciler now consults `drbdsetup status <rd>` before
+	// choosing between `drbdadm adjust` (kernel slot present) and
+	// `drbdadm up` (kernel slot absent). Stage the UpToDate kernel
+	// view this test asserts — without it the FakeExec returns
+	// empty stdout, the probe reads as "not loaded", and the
+	// reconciler emits `drbdadm up` instead of the `adjust` the
+	// test pins.
+	fx.Expect("drbdsetup status pvc-discard", storage.FakeResponse{
+		Stdout: []byte("pvc-discard role:Secondary\n  volume:0 disk:UpToDate\n"),
+	})
 
 	_, err = rec.Apply(t.Context(), dr)
 	if err != nil {

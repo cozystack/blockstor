@@ -839,7 +839,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	err = r.runAdjust(ctx, dr)
+	err = r.runApplyDRBDVerb(ctx, dr, firstActivation)
 	if err != nil {
 		return err
 	}
@@ -885,19 +885,70 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	return nil
 }
 
+// runApplyDRBDVerb is the per-reconcile dispatch between the two
+// bring-up branches. First activation falls through to the SkipDisk-
+// aware `drbdadm adjust` (or `adjust --skip-disk`): the .res +
+// freshly-created metadata are the canonical bring-up path on master
+// and existing tests pin that behaviour. The kernel-state probe +
+// `drbdadm up` fallback (Bug 47 / scenario 5.32) only matters on
+// steady-state passes where an operator may have torn the kernel
+// slot down out-of-band — adjust on an absent slot fails with
+// `(158) Unknown resource` and the resource stays down forever.
+//
+// Split out of applyDRBD so the orchestration function stays under
+// the gocyclo budget.
+func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredResource, firstActivation bool) error {
+	if firstActivation {
+		return r.runAdjust(ctx, dr)
+	}
+
+	return r.runBringUpOrAdjust(ctx, dr)
+}
+
+// runBringUpOrAdjust probes the kernel for the resource's slot via
+// `drbdsetup status <rsc>` and chooses the right drbdadm verb:
+//
+//   - kernel slot present → `drbdadm adjust` (or `adjust --skip-disk`
+//     when SkipDisk is enabled, scenario 5.11).
+//   - kernel slot absent  → `drbdadm up`, which performs
+//     new-resource + new-path + attach + connect in one go and is
+//     the only verb that bootstraps a missing slot from a valid
+//     .res + on-disk metadata. `drbdadm adjust` on an absent slot
+//     fails with `Failure: (158) Unknown resource` because adjust
+//     only reconciles already-loaded kernel state.
+//
+// Why this matters (Bug 47 / scenario 5.32): an operator's
+// `drbdadm down <rsc>` removes the kernel slot but leaves the
+// satellite's `.md-created` marker on disk. Without this probe,
+// every subsequent reconcile retries `drbdadm adjust` →
+// `drbdsetup new-path` → `(158) Unknown resource` forever, and
+// the resource stays down until the satellite pod restarts.
+//
+// IsLoaded's "genuine" error path (unexpected exec failure, not
+// the resource-absent signal) is bubbled up: we'd rather surface
+// a satellite-side failure than guess wrong and run the wrong
+// verb against half-known kernel state.
+func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredResource) error {
+	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "probe kernel state for %s", dr.GetName())
+	}
+
+	if !loaded {
+		err = r.cfg.Adm.Up(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
+		}
+
+		return nil
+	}
+
+	return r.runAdjust(ctx, dr)
+}
+
 // runAdjust dispatches to the plain `drbdadm adjust` or the
 // `--skip-disk` variant based on the `DrbdOptions/SkipDisk` prop
-// (scenario 5.11). Pulled out of applyDRBD so the orchestration
-// function stays under the gocyclo budget.
-//
-// When the observer stamped `DrbdOptions/SkipDisk=True` onto
-// Resource.Spec.Props (in response to a kernel `disk:Failed`
-// frame), append `--skip-disk` so drbdadm leaves the failed lower
-// disk alone and only reconciles network/peer state. A plain
-// `drbdadm adjust` on a Failed/Diskless replica would re-attempt
-// disk attachment and fail. The operator unset path
-// (`r sp <n> <r> DrbdOptions/SkipDisk` with no value) drops the
-// prop and the next reconcile falls through to the plain Adjust.
+// (scenario 5.11).
 func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) error {
 	var err error
 

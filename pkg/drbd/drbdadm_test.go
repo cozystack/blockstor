@@ -291,3 +291,76 @@ func TestAdmStatusResourcesEmptyKernel(t *testing.T) {
 		t.Errorf("StatusResources empty: got %v, want []", names)
 	}
 }
+
+// TestAdmIsLoadedTrue pins the kernel-loaded case: `drbdsetup status
+// <rd>` exits zero with a real status block → IsLoaded returns true.
+// Used by the reconciler's Bug-47 fix to decide between `drbdadm
+// adjust` (loaded → reconcile diff) and `drbdadm up` (absent →
+// bootstrap from .res + metadata).
+func TestAdmIsLoadedTrue(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1", storage.FakeResponse{Stdout: []byte(`pvc-1 role:Primary
+  volume:0 disk:UpToDate
+  worker-2 role:Secondary
+    volume:0 peer-disk:UpToDate
+`)})
+
+	adm := drbd.NewAdm(fx)
+
+	loaded, err := adm.IsLoaded(t.Context(), "pvc-1")
+	if err != nil {
+		t.Fatalf("IsLoaded: unexpected error %v", err)
+	}
+
+	if !loaded {
+		t.Errorf("IsLoaded(loaded resource): got false, want true")
+	}
+}
+
+// TestAdmIsLoadedFalseNoResource pins the post-`drbdadm down` case:
+// `drbdsetup status <rd>` returns non-zero with the verbatim "No
+// currently configured DRBD found" message → IsLoaded must report
+// false + nil error. The reconciler keys its `drbdadm up` fallback
+// off this exact "absent but not broken" signal; a bubbled error
+// here would surface as a misleading "satellite probe failed" in
+// the reconcile loop instead of "kernel slot is just gone".
+func TestAdmIsLoadedFalseNoResource(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-down", storage.FakeResponse{
+		Stdout: []byte("No currently configured DRBD found.\n"),
+		Err:    errFakeFailure,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	loaded, err := adm.IsLoaded(t.Context(), "pvc-down")
+	if err != nil {
+		t.Fatalf("IsLoaded(absent): unexpected error %v", err)
+	}
+
+	if loaded {
+		t.Errorf("IsLoaded(absent): got true, want false")
+	}
+}
+
+// TestAdmIsLoadedFalseEmptyStdout pins the defensive empty-output
+// case: a zero-exit `drbdsetup status` with no payload is treated
+// as "not loaded" even though real drbdsetup never produces that
+// — fake exec in unit tests can, and we'd rather err on "absent
+// → reconciler will call up" than mis-report as loaded and adjust
+// against a slot the kernel doesn't know.
+func TestAdmIsLoadedFalseEmptyStdout(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// No Expect → FakeExec returns nil stdout + nil error.
+
+	adm := drbd.NewAdm(fx)
+
+	loaded, err := adm.IsLoaded(t.Context(), "pvc-empty")
+	if err != nil {
+		t.Fatalf("IsLoaded(empty): unexpected error %v", err)
+	}
+
+	if loaded {
+		t.Errorf("IsLoaded(empty stdout): got true, want false")
+	}
+}
