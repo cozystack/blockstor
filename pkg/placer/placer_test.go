@@ -709,5 +709,92 @@ func TestPlacerDeficitExcludesDisklessAndTiebreaker(t *testing.T) {
 	}
 }
 
+// TestPlacePlaceCountIgnoresDisklessWitness pins Bug 28: PlaceCount
+// counts DISKFUL replicas only — a DISKLESS / TIE_BREAKER witness
+// pre-seeded by the RD reconciler's ensureTiebreaker race must NOT
+// be counted as one of the PlaceCount diskful replicas.
+//
+// Scenario: 3 healthy worker nodes, an RD reconciler already stamped
+// a DISKLESS+TIE_BREAKER witness on n1 (the witness racing the
+// REST autoplace call). Caller now requests PlaceCount=2. Expected:
+// 2 fresh diskful replicas on the OTHER two nodes (n2 + n3 — the
+// largest-free ones), with the witness on n1 left in place.
+//
+// Pre-fix behaviour (the bug): the placer's "existing counts toward
+// PlaceCount" loop counts the witness as one slot — only 1 diskful
+// gets created, the cluster ends up with 1 diskful + 1 witness,
+// quorum is impossible.
+func TestPlacePlaceCountIgnoresDisklessWitness(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	// Pre-seed the witness on n1 (the smallest-free node). This
+	// mirrors what the RD controller's ensureTiebreaker stamps when
+	// it fires before the placer has finished. n1 is deliberately
+	// chosen so largest-free placement (n3 → n2) would skip it for
+	// diskful — proving the placer doesn't accidentally promote it
+	// either.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n1",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: 2})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2 (witness must not count)", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	diskful := 0
+	witness := 0
+
+	for _, r := range got {
+		isDiskless := false
+		isTieBreaker := false
+
+		for _, f := range r.Flags {
+			if f == apiv1.ResourceFlagDiskless {
+				isDiskless = true
+			}
+
+			if f == apiv1.ResourceFlagTieBreaker {
+				isTieBreaker = true
+			}
+		}
+
+		switch {
+		case isTieBreaker:
+			witness++
+		case !isDiskless:
+			diskful++
+		}
+	}
+
+	if diskful != 2 {
+		t.Errorf("diskful count: got %d, want 2; resources=%+v", diskful, got)
+	}
+
+	if witness != 1 {
+		t.Errorf("witness count: got %d, want 1 (left in place); resources=%+v", witness, got)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
