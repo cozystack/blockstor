@@ -18,21 +18,26 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerStoragePools wires endpoints serving golinstor's StoragePool calls.
 //
 // linstor-csi calls /v1/view/storage-pools in its node-registration loop and
-// /v1/nodes/{node}/storage-pools[/{pool}] for per-node operations. We start
-// with the read-only paths; create/delete land alongside Phase 2 reconcile.
+// /v1/nodes/{node}/storage-pools[/{pool}] for per-node operations. The POST
+// path on /v1/nodes/{node}/storage-pools is hit by satellite Hello/heartbeat
+// loops (and piraeus's operator) to register a pool — without it the
+// satellite retry loop spins forever against a 405 (Bug 31).
 func (s *Server) registerStoragePools(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/view/storage-pools", s.requireStore(s.handleStoragePoolsView))
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolsList))
+	mux.HandleFunc("POST /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolCreate))
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolGet))
 }
 
@@ -125,4 +130,161 @@ func (s *Server) handleNodeStoragePoolGet(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, sp)
+}
+
+// isKnownStoragePoolKind mirrors the set of apiv1.StoragePoolKind*
+// constants we support on the satellite side, minus the two upstream
+// kinds (OPENFLEX_TARGET, REMOTE_SPDK) we deliberately stub as
+// out-of-scope. Validating here gives the satellite an immediate 400
+// instead of letting a garbage CRD land in the store and surface as
+// a downstream NPE.
+func isKnownStoragePoolKind(kind string) bool {
+	switch kind {
+	case apiv1.StoragePoolKindLVM,
+		apiv1.StoragePoolKindLVMThin,
+		apiv1.StoragePoolKindZFS,
+		apiv1.StoragePoolKindZFSThin,
+		apiv1.StoragePoolKindFile,
+		apiv1.StoragePoolKindFileThin,
+		apiv1.StoragePoolKindDiskless:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleNodeStoragePoolCreate serves POST /v1/nodes/{node}/storage-pools.
+//
+// Body shape mirrors upstream's `JsonGenTypes.StoragePool` (the same struct
+// GET emits). The path's {node} wins over any node_name in the body so we
+// can't end up creating a pool on a different node than the URL claims —
+// piraeus assumes that invariant when it iterates over per-node SPs in
+// its reconcile loop.
+//
+// Idempotency: re-POSTing the same (node, pool) is a no-op success rather
+// than 409 Conflict. Piraeus's satellite Hello/heartbeat reposts the same
+// pool on every registration tick; treating it as upsert keeps the retry
+// loop quiet and matches the operator's expectation that "re-announce"
+// is safe. Upstream LINSTOR returns an error on duplicate-create, but
+// piraeus retries through that error indefinitely, so the practical
+// outcome is the same — we just skip the retry storm.
+func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+
+	body, ok := decodeStoragePoolCreate(w, r, node)
+	if !ok {
+		return
+	}
+
+	// Reject pools on ghost nodes with a clean 404. Without this the
+	// store-level create would succeed (the StoragePoolStore key is
+	// (node, pool) and doesn't FK to NodeStore) and the satellite
+	// would learn about a pool on a node the controller doesn't
+	// know — a permanent orphan from the controller's POV.
+	_, nodeErr := s.Store.Nodes().Get(r.Context(), node)
+	if nodeErr != nil {
+		if errors.Is(nodeErr, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "node not found: "+node)
+
+			return
+		}
+
+		writeError(w, http.StatusInternalServerError, nodeErr.Error())
+
+		return
+	}
+
+	createErr := s.Store.StoragePools().Create(r.Context(), &body)
+	if createErr == nil {
+		writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "storage pool created: " + body.StoragePoolName + " on " + node,
+		}})
+
+		return
+	}
+
+	if errors.Is(createErr, store.ErrAlreadyExists) {
+		s.upsertStoragePool(w, r, &body, node)
+
+		return
+	}
+
+	writeStoreError(w, createErr)
+}
+
+// decodeStoragePoolCreate parses the POST body, normalises NodeName
+// from the URL path, and validates the mandatory fields. Writes the
+// 400 response itself and returns ok=false if anything is off.
+func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string) (apiv1.StoragePool, bool) {
+	var body apiv1.StoragePool
+
+	err := json.NewDecoder(r.Body).Decode(&body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return apiv1.StoragePool{}, false
+	}
+
+	body.NodeName = node
+
+	if body.StoragePoolName == "" {
+		writeError(w, http.StatusBadRequest, "storage_pool_name is required")
+
+		return apiv1.StoragePool{}, false
+	}
+
+	if body.ProviderKind == "" {
+		writeError(w, http.StatusBadRequest, "provider_kind is required")
+
+		return apiv1.StoragePool{}, false
+	}
+
+	if !isKnownStoragePoolKind(body.ProviderKind) {
+		writeError(w, http.StatusBadRequest, "unknown provider_kind: "+body.ProviderKind)
+
+		return apiv1.StoragePool{}, false
+	}
+
+	return body, true
+}
+
+// upsertStoragePool merges the POST body's Spec fields onto the
+// existing row when a pool with the same (node, pool) already exists.
+// Capacity / status fields stay where SetCapacity put them. Returns
+// 201 + envelope on success.
+func (s *Server) upsertStoragePool(w http.ResponseWriter, r *http.Request, body *apiv1.StoragePool, node string) {
+	existing, getErr := s.Store.StoragePools().Get(r.Context(), node, body.StoragePoolName)
+	if getErr != nil {
+		writeStoreError(w, getErr)
+
+		return
+	}
+
+	existing.ProviderKind = body.ProviderKind
+	if body.Props != nil {
+		existing.Props = body.Props
+	}
+
+	if body.FreeSpaceMgrName != "" {
+		existing.FreeSpaceMgrName = body.FreeSpaceMgrName
+	}
+
+	if body.SharedSpaceID != "" {
+		existing.SharedSpaceID = body.SharedSpaceID
+	}
+
+	existing.ExternalLocking = body.ExternalLocking
+
+	updateErr := s.Store.StoragePools().Update(r.Context(), &existing)
+	if updateErr != nil {
+		writeStoreError(w, updateErr)
+
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "storage pool already present, updated in place: " + body.StoragePoolName + " on " + node,
+	}})
 }

@@ -423,4 +423,207 @@ func TestStoragePoolEndpointsWithoutStore(t *testing.T) {
 			t.Errorf("%s: got %d, want 503", path, resp.StatusCode)
 		}
 	}
+
+	// POST /v1/nodes/{n}/storage-pools must also gate on the store —
+	// without it the requireStore middleware should short-circuit
+	// before the handler validates the body.
+	postResp := httpPost(t, base+"/v1/nodes/n1/storage-pools",
+		[]byte(`{"storage_pool_name":"p1","provider_kind":"LVM_THIN"}`))
+	_ = postResp.Body.Close()
+
+	if postResp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("POST without store: got %d, want 503", postResp.StatusCode)
+	}
+}
+
+// TestPerNodeStoragePoolPostCreatesPool pins Bug 31: the satellite
+// Hello/heartbeat loop registers each local pool with POST
+// /v1/nodes/{node}/storage-pools. Before the handler was wired the
+// route returned 405 and the satellite spun retrying forever; this
+// test pins the happy path returning 201 with the upstream-shaped
+// `[]ApiCallRc` envelope and the new pool landing in the store.
+func TestPerNodeStoragePoolPostCreatesPool(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg1", "StorDriver/ThinPool": "thin"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var env []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(env) == 0 {
+		t.Fatalf("envelope: got empty, want at least one ApiCallRc")
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "p1")
+	if err != nil {
+		t.Fatalf("store Get after POST: %v", err)
+	}
+
+	if got.NodeName != "n1" || got.StoragePoolName != "p1" ||
+		got.ProviderKind != apiv1.StoragePoolKindLVMThin {
+		t.Errorf("stored pool: got %+v, want n1/p1 LVM_THIN", got)
+	}
+
+	if got.Props["StorDriver/LvmVg"] != "vg1" {
+		t.Errorf("stored props lost: got %v", got.Props)
+	}
+}
+
+// TestPerNodeStoragePoolPostIdempotent pins the upsert semantics: a
+// satellite that re-announces the same (node, pool) every heartbeat
+// must not see 409/error — the registration loop relies on
+// re-POST being a no-op-success. We also assert that an updated
+// ProviderKind / Props on the second POST overwrites the stored row,
+// so operator-driven `linstor storage-pool create` re-runs with
+// corrected config actually take effect.
+func TestPerNodeStoragePoolPostIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg1"},
+	})
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+
+	resp1 := httpPost(t, base+"/v1/nodes/n1/storage-pools", first)
+	_ = resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("first POST: got %d, want 201", resp1.StatusCode)
+	}
+
+	// Re-POST same (node, name) with a different ProviderKind/Props.
+	// Must succeed, must overwrite Spec fields, must NOT 409.
+	second, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		Props:           map[string]string{"StorDriver/ZPool": "zp1"},
+	})
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+
+	resp2 := httpPost(t, base+"/v1/nodes/n1/storage-pools", second)
+	defer func() { _ = resp2.Body.Close() }()
+
+	if resp2.StatusCode == http.StatusConflict {
+		t.Fatalf("idempotency broken: got 409 on re-POST")
+	}
+
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("second POST: got %d, want 201", resp2.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "p1")
+	if err != nil {
+		t.Fatalf("store Get after second POST: %v", err)
+	}
+
+	if got.ProviderKind != apiv1.StoragePoolKindZFSThin {
+		t.Errorf("provider_kind not updated: got %q, want ZFS_THIN", got.ProviderKind)
+	}
+
+	if got.Props["StorDriver/ZPool"] != "zp1" || got.Props["StorDriver/LvmVg"] != "" {
+		t.Errorf("props not replaced: got %v, want only StorDriver/ZPool=zp1", got.Props)
+	}
+}
+
+// TestPerNodeStoragePoolPostNodeUnknown pins that POSTing a pool on a
+// node the controller doesn't know returns a clean 404 (not 500).
+// Letting the store-level create succeed without a parent Node would
+// leave the controller with an orphan pool the satellite can never
+// own.
+func TestPerNodeStoragePoolPostNodeUnknown(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/ghost/storage-pools", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestPerNodeStoragePoolPostMissingFields pins that an empty / partial
+// body is a clean 400 — not a 5xx and not a silent create with zero
+// fields. The validation has to fire on the REST side because the
+// underlying store accepts whatever you hand it (Bug 31 follow-up).
+func TestPerNodeStoragePoolPostMissingFields(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{name: "empty object", body: []byte(`{}`)},
+		{name: "missing provider_kind", body: []byte(`{"storage_pool_name":"p1"}`)},
+		{name: "missing pool name", body: []byte(`{"provider_kind":"LVM_THIN"}`)},
+		{name: "unknown provider_kind", body: []byte(`{"storage_pool_name":"p1","provider_kind":"BOGUS"}`)},
+		{name: "garbage json", body: []byte(`not-json`)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", tc.body)
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status: got %d, want 400", resp.StatusCode)
+			}
+		})
+	}
 }
