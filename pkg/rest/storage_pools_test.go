@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -625,5 +626,99 @@ func TestPerNodeStoragePoolPostMissingFields(t *testing.T) {
 				t.Errorf("status: got %d, want 400", resp.StatusCode)
 			}
 		})
+	}
+}
+
+// TestPoolCreateRejectsNonCanonicalName pins that a POST body whose
+// storage_pool_name carries a '.' (which would shift the
+// `<pool>.<node>` boundary the CRD's CEL rule enforces) returns a
+// 400 with the convention message — not a 5xx or a silent create
+// that the apiserver would later reject with a hard-to-trace 422.
+//
+// The wire body has no `metadata.name` field (the REST server sets
+// the CRD name via `crdName(node, pool)`), so the only failure mode
+// is a pool name that breaks the canonical encoding. We test that
+// path explicitly so a future convention drift doesn't go unnoticed.
+func TestPoolCreateRejectsNonCanonicalName(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "thin.evil", // contains '.', would corrupt <pool>.<node>
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400", resp.StatusCode)
+	}
+
+	bodyBuf := make([]byte, 1<<10)
+
+	n, _ := resp.Body.Read(bodyBuf)
+	if !strings.Contains(string(bodyBuf[:n]), "metadata.name must equal") {
+		t.Errorf("body: got %q, want substring \"metadata.name must equal\"", string(bodyBuf[:n]))
+	}
+}
+
+// TestPoolCreateProducesCanonicalCRDName pins that a normal POST
+// stores a pool the (node, pool) key resolves and the round-trip
+// preserves both halves of the canonical name. The InMemory store
+// keys on the wire tuple directly, so this test would still pass
+// against a regression in the k8s store's `crdName`; the CEL test
+// in `pkg/store/k8s` covers that path. Together they pin both
+// sides of the encoding.
+func TestPoolCreateProducesCanonicalCRDName(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "w1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "zfs-thin",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/w1/storage-pools", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "w1", "zfs-thin")
+	if err != nil {
+		t.Fatalf("store Get: %v", err)
+	}
+
+	// Round-trip on (node, pool) — the k8s store maps this to
+	// `metadata.name = <pool>.<node>` via `crdName`. The InMemory
+	// store keys on the wire tuple directly; either way both fields
+	// must come back populated for the canonical name to be derivable
+	// downstream.
+	if got.NodeName != "w1" || got.StoragePoolName != "zfs-thin" {
+		t.Errorf("round-trip: got (node=%q, pool=%q), want (w1, zfs-thin)",
+			got.NodeName, got.StoragePoolName)
 	}
 }

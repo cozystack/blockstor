@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -275,6 +276,20 @@ func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string
 
 	if body.StoragePoolName == "" {
 		writeError(w, http.StatusBadRequest, "storage_pool_name is required")
+
+		return apiv1.StoragePool{}, false
+	}
+
+	// Enforce the cluster-wide naming convention up front: the CRD
+	// metadata.name will be `<pool>.<node>`, so a pool name carrying a
+	// '.' would silently shift the boundary and either collide with
+	// another (pool, node) pair or stage a CRD the CEL rule on the
+	// type would later reject with a 422. Catch it here with a
+	// friendly 400 so callers don't have to parse the k8s Invalid
+	// envelope to figure out what went wrong.
+	if strings.Contains(body.StoragePoolName, ".") {
+		writeError(w, http.StatusBadRequest,
+			"storage_pool_name must not contain '.': metadata.name must equal <pool>.<node>")
 
 		return apiv1.StoragePool{}, false
 	}

@@ -476,6 +476,26 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 			return nil, false
 		}
 
+		// Enforce the cluster-wide naming convention up front: the CRD
+		// metadata.name will be `<rd>.<node>`, so an embedded '.' in
+		// either side would shift the boundary and either collide with
+		// another (rd, node) pair or stage a CRD the CEL rule on the
+		// type would later reject with a 422. Catch it here with a
+		// friendly 400.
+		if strings.Contains(res.NodeName, ".") {
+			writeError(w, http.StatusBadRequest,
+				"node_name must not contain '.': metadata.name must equal <rd>.<node>")
+
+			return nil, false
+		}
+
+		if strings.Contains(rdName, ".") {
+			writeError(w, http.StatusBadRequest,
+				"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
+
+			return nil, false
+		}
+
 		// Same CSI pass-through as handleAutoplace: linstor-csi may set
 		// layer_list on the explicit-placement call rather than on RD create.
 		// Persist onto rd.LayerStack if not already set so the satellite

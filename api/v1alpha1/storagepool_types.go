@@ -31,10 +31,11 @@ type StoragePoolSpec struct {
 	// +required
 	NodeName string `json:"nodeName"`
 
-	// poolName is the LINSTOR pool name (LVM VG, ZFS dataset, etc.). When
-	// empty, defaults to metadata.name.
-	// +optional
-	PoolName string `json:"poolName,omitempty"`
+	// poolName is the LINSTOR pool name (LVM VG, ZFS dataset, etc.). The
+	// CRD-level CEL rule pins `metadata.name == poolName + "." + nodeName`,
+	// so this field is required — without it the rule cannot evaluate.
+	// +required
+	PoolName string `json:"poolName"`
 
 	// providerKind is the storage backend.
 	// +kubebuilder:validation:Enum=LVM;LVM_THIN;ZFS;ZFS_THIN;FILE;FILE_THIN;DISKLESS
@@ -94,8 +95,18 @@ type StoragePoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == self.spec.poolName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.poolName>.<spec.nodeName>"
 
-// StoragePool is the Schema for the storagepools API
+// StoragePool is the Schema for the storagepools API.
+//
+// The CEL rule above enforces the cluster-wide naming convention every
+// node-bound CRD in the project follows: `metadata.name == <pool>.<node>`.
+// Keeping the composite key encoded in the name lets operators grep for
+// `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
+// resource bound to one satellite at once. The rule fires on both Create
+// and Update; the REST layer (`pkg/rest/storage_pools.go`) also rejects
+// non-canonical bodies with a friendlier 400 message so callers don't
+// have to parse the k8s 422 Invalid envelope.
 type StoragePool struct {
 	metav1.TypeMeta `json:",inline"`
 

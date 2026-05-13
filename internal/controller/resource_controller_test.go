@@ -32,7 +32,13 @@ import (
 
 var _ = Describe("Resource Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+		// metadata.name follows the cluster-wide `<rd>.<node>`
+		// convention enforced by the CRD's CEL rule.
+		const (
+			rdName       = "test-rd"
+			nodeName     = "test-node"
+			resourceName = rdName + "." + nodeName
+		)
 
 		ctx := context.Background()
 
@@ -51,7 +57,10 @@ var _ = Describe("Resource Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: blockstoriov1alpha1.ResourceSpec{
+						ResourceDefinitionName: rdName,
+						NodeName:               nodeName,
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

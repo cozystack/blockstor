@@ -17,7 +17,14 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Resource is the Schema for the resources API
+        description: |-
+          Resource is the Schema for the resources API.
+
+          The CEL rule above enforces the cluster-wide naming convention every
+          node-bound CRD in the project follows: `metadata.name == <rd>.<node>`.
+          Keeping the composite key encoded in the name lets operators grep for
+          `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
+          resource bound to one satellite at once.
         properties:
           apiVersion:
             description: |-
@@ -508,6 +515,9 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName>
+          rule: self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.nodeName
     served: true
     storage: true
     subresources:

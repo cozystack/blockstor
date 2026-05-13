@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // TestCrdToWireStoragePoolEmptyPoolNameFallback: when a CRD has an
@@ -38,7 +39,7 @@ func TestCrdToWireStoragePoolEmptyPoolNameFallback(t *testing.T) {
 
 	crd := &crdv1alpha1.StoragePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "n1.thin",
+			Name: "thin.n1",
 			Labels: map[string]string{
 				LabelPoolName: "thin",
 				LabelNodeName: "n1",
@@ -66,7 +67,7 @@ func TestCrdToWireStoragePoolEmptyPoolNameNoLabel(t *testing.T) {
 	t.Parallel()
 
 	crd := &crdv1alpha1.StoragePool{
-		ObjectMeta: metav1.ObjectMeta{Name: "n1.thin"},
+		ObjectMeta: metav1.ObjectMeta{Name: "thin.n1"},
 		Spec:       crdv1alpha1.StoragePoolSpec{NodeName: "n1"},
 	}
 
@@ -78,5 +79,56 @@ func TestCrdToWireStoragePoolEmptyPoolNameNoLabel(t *testing.T) {
 
 	if got.NodeName != "n1" {
 		t.Errorf("NodeName: got %q, want n1", got.NodeName)
+	}
+}
+
+// TestCRDNameUsesPoolDotNodeOrder pins the canonical name encoding:
+// `<pool>.<node>`. Matches the CRD-level CEL rule on the StoragePool
+// type (`metadata.name == spec.poolName + '.' + spec.nodeName`) and
+// the cluster-wide naming convention every other node-bound CRD in
+// the project follows. Flipping the order silently breaks the CEL
+// rule on Create — k8s rejects the write with a 422 and the wire-
+// side error is hard to trace back to the wrong helper.
+func TestCRDNameUsesPoolDotNodeOrder(t *testing.T) {
+	t.Parallel()
+
+	got := crdName("w1", "zfs-thin")
+	want := "zfs-thin.w1"
+
+	if got != want {
+		t.Errorf("crdName(\"w1\", \"zfs-thin\"): got %q, want %q (must be <pool>.<node>)",
+			got, want)
+	}
+}
+
+// TestWireToCRDStoragePoolProducesCanonicalName pins the wire→CRD
+// converter to the canonical `<pool>.<node>` shape — same rule the
+// apiserver CEL validation enforces. Without this test a regression
+// in `crdName` ordering would only surface against a real cluster
+// (the InMemory store keys on the wire tuple and would still work).
+func TestWireToCRDStoragePoolProducesCanonicalName(t *testing.T) {
+	t.Parallel()
+
+	in := &apiv1.StoragePool{NodeName: "w1", StoragePoolName: "zfs-thin"}
+	crd := wireToCRDStoragePool(in)
+
+	want := "zfs-thin.w1"
+	if crd.Name != want {
+		t.Errorf("CRD metadata.name: got %q, want %q", crd.Name, want)
+	}
+
+	if crd.Spec.PoolName != "zfs-thin" || crd.Spec.NodeName != "w1" {
+		t.Errorf("spec: got (pool=%q, node=%q), want (zfs-thin, w1)",
+			crd.Spec.PoolName, crd.Spec.NodeName)
+	}
+
+	// CEL pin: the rule on the CRD is `self.metadata.name ==
+	// self.spec.poolName + '.' + self.spec.nodeName`. Replicate it
+	// here so a future converter rewrite that drifts from the rule
+	// fails this test rather than a much-harder-to-trace apiserver
+	// 422 on Create.
+	if crd.Name != crd.Spec.PoolName+"."+crd.Spec.NodeName {
+		t.Errorf("CEL invariant broken: name=%q, expected %q",
+			crd.Name, crd.Spec.PoolName+"."+crd.Spec.NodeName)
 	}
 }

@@ -268,3 +268,48 @@ func equalStrSlice(a, b []string) bool {
 
 	return true
 }
+
+// TestResourceCRDNameUsesRDDotNodeOrder pins the canonical Resource
+// name encoding: `<rd>.<node>`. Matches the CRD-level CEL rule on
+// the Resource type and the cluster-wide naming convention every
+// other node-bound CRD in the project follows. Flipping the order
+// silently breaks the CEL rule on Create — k8s rejects the write
+// with a 422 and the wire-side error is hard to trace back to the
+// wrong helper.
+func TestResourceCRDNameUsesRDDotNodeOrder(t *testing.T) {
+	t.Parallel()
+
+	got := resourceCRDName("pvc-1", "w1")
+	want := "pvc-1.w1"
+
+	if got != want {
+		t.Errorf("resourceCRDName: got %q, want %q (must be <rd>.<node>)",
+			got, want)
+	}
+}
+
+// TestWireToCRDResourceProducesCanonicalName pins the wire→CRD
+// converter for Resource to the canonical `<rd>.<node>` shape that
+// the CRD's CEL rule enforces. The store's `wireToCRDResource`
+// builds the metadata.Name from (Name, NodeName); a regression here
+// would only surface against a real cluster (apiserver 422 from
+// CEL), this test catches it pre-flight.
+func TestWireToCRDResourceProducesCanonicalName(t *testing.T) {
+	t.Parallel()
+
+	in := apiv1.Resource{Name: "pvc-x", NodeName: "w1"}
+	crd := wireToCRDResource(&in)
+
+	want := "pvc-x.w1"
+	if crd.Name != want {
+		t.Errorf("CRD metadata.name: got %q, want %q", crd.Name, want)
+	}
+
+	// Replicate the CEL invariant so a future converter rewrite that
+	// drifts from the rule fails this test rather than a much-harder
+	// -to-trace apiserver 422 on Create.
+	if crd.Name != crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName {
+		t.Errorf("CEL invariant broken: name=%q, expected %q",
+			crd.Name, crd.Spec.ResourceDefinitionName+"."+crd.Spec.NodeName)
+	}
+}

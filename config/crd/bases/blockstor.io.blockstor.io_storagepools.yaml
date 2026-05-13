@@ -17,7 +17,17 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: StoragePool is the Schema for the storagepools API
+        description: |-
+          StoragePool is the Schema for the storagepools API.
+
+          The CEL rule above enforces the cluster-wide naming convention every
+          node-bound CRD in the project follows: `metadata.name == <pool>.<node>`.
+          Keeping the composite key encoded in the name lets operators grep for
+          `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
+          resource bound to one satellite at once. The rule fires on both Create
+          and Update; the REST layer (`pkg/rest/storage_pools.go`) also rejects
+          non-canonical bodies with a friendlier 400 message so callers don't
+          have to parse the k8s 422 Invalid envelope.
         properties:
           apiVersion:
             description: |-
@@ -46,8 +56,9 @@ spec:
                 type: string
               poolName:
                 description: |-
-                  poolName is the LINSTOR pool name (LVM VG, ZFS dataset, etc.). When
-                  empty, defaults to metadata.name.
+                  poolName is the LINSTOR pool name (LVM VG, ZFS dataset, etc.). The
+                  CRD-level CEL rule pins `metadata.name == poolName + "." + nodeName`,
+                  so this field is required — without it the rule cannot evaluate.
                 type: string
               props:
                 additionalProperties:
@@ -77,6 +88,7 @@ spec:
                 type: string
             required:
             - nodeName
+            - poolName
             - providerKind
             type: object
           status:
@@ -177,6 +189,9 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: metadata.name must equal <spec.poolName>.<spec.nodeName>
+          rule: self.metadata.name == self.spec.poolName + '.' + self.spec.nodeName
     served: true
     storage: true
     subresources:

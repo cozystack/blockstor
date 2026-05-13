@@ -32,7 +32,13 @@ import (
 
 var _ = Describe("StoragePool Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+		// metadata.name follows the cluster-wide `<pool>.<node>`
+		// convention enforced by the CRD's CEL rule.
+		const (
+			poolName     = "test-pool"
+			nodeName     = "test-node"
+			resourceName = poolName + "." + nodeName
+		)
 
 		ctx := context.Background()
 
@@ -52,7 +58,8 @@ var _ = Describe("StoragePool Controller", func() {
 						Namespace: "default",
 					},
 					Spec: blockstoriov1alpha1.StoragePoolSpec{
-						NodeName:     "test-node",
+						NodeName:     nodeName,
+						PoolName:     poolName,
 						ProviderKind: "LVM_THIN",
 					},
 				}

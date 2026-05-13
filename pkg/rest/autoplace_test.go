@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1017,6 +1018,43 @@ func TestResourceCreateMissingNodeName(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400 (missing node_name)", resp.StatusCode)
+	}
+}
+
+// TestResourceCreateRejectsNonCanonicalName pins that a Resource
+// create whose node_name carries a '.' (which would shift the
+// `<rd>.<node>` boundary the CRD's CEL rule enforces) returns a
+// 400 with the convention message — not a 5xx or a silent create
+// that the apiserver would later reject with a hard-to-trace 422.
+func TestResourceCreateRejectsNonCanonicalName(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{NodeName: "bad.node"}, // contains '.'
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", body)
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400", resp.StatusCode)
+	}
+
+	bodyBuf := make([]byte, 1<<10)
+
+	n, _ := resp.Body.Read(bodyBuf)
+	if !strings.Contains(string(bodyBuf[:n]), "metadata.name must equal") {
+		t.Errorf("body: got %q, want substring \"metadata.name must equal\"", string(bodyBuf[:n]))
 	}
 }
 

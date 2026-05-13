@@ -36,20 +36,26 @@ type storagePools struct {
 	c ctrlclient.Client
 }
 
-// crdName encodes the (node, pool) composite key into a single CRD name.
-// LINSTOR accepts mixed-case names that k8s would reject, so the result
+// crdName encodes the (pool, node) composite key into a single CRD name.
+// LINSTOR accepts mixed-case names that k8s would rejected, so the result
 // is run through Name() to slugify when needed.
 //
-// IMPORTANT: blockstor's StoragePool CRDs may carry an operator-chosen
-// metadata.name (e.g. piraeus's "zfs-thin-w3" produced via `kubectl
-// apply -f`) that does NOT follow this convention. The (node, pool)
-// identity is anchored in Spec.NodeName + Spec.PoolName, not the
-// CRD name. crdName() is still authoritative for OUR own Create path
-// (so newly-created pools land predictably), but per-key reads/writes
-// (Get/Delete/Update/SetCapacity) must resolve through resolveCRDName()
-// to honour operator-managed CRDs. See Bug 55.
+// The order is `<pool>.<node>` — matches Resource (`<rd>.<node>`) and
+// the CRD-level CEL rule `self.metadata.name == self.spec.poolName +
+// '.' + self.spec.nodeName`. Any helper or test that builds the name
+// by hand must use the same order; mismatched orders will be rejected
+// by the apiserver on Create with a CEL validation error.
+//
+// IMPORTANT: blockstor's StoragePool CRDs may still carry an operator-
+// chosen metadata.name (e.g. piraeus's "zfs-thin-w3" produced via
+// `kubectl apply -f`) that does NOT follow this convention. The (node,
+// pool) identity is anchored in Spec.NodeName + Spec.PoolName, not the
+// CRD name. crdName() is authoritative for OUR own Create path (so
+// newly-created pools land predictably AND satisfy CEL), but per-key
+// reads/writes (Get/Delete/Update/SetCapacity) must resolve through
+// resolveCRDName() to honour operator-managed CRDs. See Bug 55.
 func crdName(node, pool string) string {
-	return Name(node + "." + pool)
+	return Name(pool + "." + node)
 }
 
 // List returns every StoragePool CRD as a wire-shape value, sorted by

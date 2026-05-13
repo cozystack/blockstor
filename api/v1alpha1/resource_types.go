@@ -279,8 +279,15 @@ type ResourceVolumeStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName>"
 
-// Resource is the Schema for the resources API
+// Resource is the Schema for the resources API.
+//
+// The CEL rule above enforces the cluster-wide naming convention every
+// node-bound CRD in the project follows: `metadata.name == <rd>.<node>`.
+// Keeping the composite key encoded in the name lets operators grep for
+// `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
+// resource bound to one satellite at once.
 type Resource struct {
 	metav1.TypeMeta `json:",inline"`
 

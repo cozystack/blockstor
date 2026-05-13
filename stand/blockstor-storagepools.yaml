@@ -16,6 +16,12 @@
 # different node is a different CRD (the satellite's predicate
 # filters by `Spec.NodeName`). Apply with `kubectl apply -f`
 # OR templated per-node via cozystack's StoragePool generator.
+#
+# Naming convention: every node-bound CRD in the project uses
+# `<resource>.<node>` for metadata.name (enforced by the CRD-
+# level CEL rule on StoragePool). install-pools.sh substitutes
+# __WORKER_N__ placeholders in-place, so the rendered names
+# are e.g. `stand.talos-w1`, `lvm-thin.talos-w1`, etc.
 
 # Sparse-file + losetup pool. Default fallback when an extra
 # disk isn't available — every Talos worker mounts
@@ -24,7 +30,7 @@
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: stand-w1
+  name: stand.__WORKER_1__
 spec:
   nodeName: __WORKER_1__
   poolName: stand
@@ -35,7 +41,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: stand-w2
+  name: stand.__WORKER_2__
 spec:
   nodeName: __WORKER_2__
   poolName: stand
@@ -46,7 +52,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: stand-w3
+  name: stand.__WORKER_3__
 spec:
   nodeName: __WORKER_3__
   poolName: stand
@@ -62,7 +68,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: lvm-thin-w1
+  name: lvm-thin.__WORKER_1__
 spec:
   nodeName: __WORKER_1__
   poolName: lvm-thin
@@ -74,7 +80,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: lvm-thin-w2
+  name: lvm-thin.__WORKER_2__
 spec:
   nodeName: __WORKER_2__
   poolName: lvm-thin
@@ -86,7 +92,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: lvm-thin-w3
+  name: lvm-thin.__WORKER_3__
 spec:
   nodeName: __WORKER_3__
   poolName: lvm-thin
@@ -104,7 +110,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: zfs-thin-w1
+  name: zfs-thin.__WORKER_1__
 spec:
   nodeName: __WORKER_1__
   poolName: zfs-thin
@@ -115,7 +121,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: zfs-thin-w2
+  name: zfs-thin.__WORKER_2__
 spec:
   nodeName: __WORKER_2__
   poolName: zfs-thin
@@ -126,7 +132,7 @@ spec:
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: StoragePool
 metadata:
-  name: zfs-thin-w3
+  name: zfs-thin.__WORKER_3__
 spec:
   nodeName: __WORKER_3__
   poolName: zfs-thin
