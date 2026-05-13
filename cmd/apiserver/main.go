@@ -72,7 +72,6 @@ type apiserverFlags struct {
 	restAddr            string
 	metricsAddr         string
 	probeAddr           string
-	storeKind           string
 	controllerNamespace string
 }
 
@@ -85,8 +84,6 @@ func parseFlags() *apiserverFlags {
 		"The address the metrics endpoint binds to. 0 disables.")
 	flag.StringVar(&flags.probeAddr, "health-probe-bind-address", ":8081",
 		"The address the probe endpoint binds to.")
-	flag.StringVar(&flags.storeKind, "store", "k8s",
-		"Persistence backend: 'k8s' (CRD-backed) or 'memory' (in-process).")
 	flag.StringVar(&flags.controllerNamespace, "controller-namespace", "",
 		"Namespace for the apiserver's own Secrets/ConfigMaps (default $POD_NAMESPACE then blockstor-system).")
 
@@ -148,22 +145,6 @@ func resolveNamespace(flagValue string) string {
 	return "blockstor-system"
 }
 
-// buildStore picks the persistence backend. Same selector the
-// controller binary uses so misconfiguration looks identical
-// across the two deployments.
-func buildStore(kind string, mgr manager.Manager, log func(string)) (store.Store, error) {
-	switch kind {
-	case "k8s":
-		return storek8s.New(mgr.GetClient()), nil
-	case "memory":
-		log("Using in-memory store; data lost on restart")
-
-		return store.NewInMemory(), nil
-	default:
-		return nil, errors.Errorf("unknown --store value %q (want k8s or memory)", kind)
-	}
-}
-
 func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserverFlags, namespace string) error {
 	err := mgr.AddHealthzCheck("healthz", healthz.Ping)
 	if err != nil {
@@ -200,11 +181,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := buildStore(flags.storeKind, mgr, func(msg string) { setupLog.Info(msg) })
-	if err != nil {
-		setupLog.Error(err, "store init", "store", flags.storeKind)
-		os.Exit(1)
-	}
+	// CRD-backed store is the only supported persistence layer
+	// post-Phase-11 — the apiserver/controller split made
+	// in-process state pointless across replicas.
+	st := storek8s.New(mgr.GetClient())
 
 	err = registerProbesAndREST(mgr, st, flags, namespace)
 	if err != nil {
