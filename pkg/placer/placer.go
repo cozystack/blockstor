@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -572,15 +573,186 @@ func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		out = append(out, pool)
 	}
 
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].FreeCapacity != out[j].FreeCapacity {
-			return out[i].FreeCapacity > out[j].FreeCapacity
-		}
+	weights, err := p.loadWeights(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
 
-		return out[i].NodeName < out[j].NodeName
-	})
+	rscPerNode, err := p.resourcesPerNode(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	rankCandidates(out, weights, rscPerNode)
 
 	return out, maxFreeBelow, nil
+}
+
+// weights bundles the four `Autoplacer/Weights/*` controller-scope
+// multipliers consumed by the scoring path. Default (unset) is 1.0 for
+// every weight so a cluster that never touches the knobs gets "all four
+// strategies equally weighted", which is the UG9 default.
+type weights struct {
+	maxFreeSpace     float64
+	minReservedSpace float64
+	minRscCount      float64
+	maxThroughput    float64
+}
+
+// loadWeights reads the controller-scope props bag and decodes the four
+// scoring weights. Missing or unparseable keys default to 1.0 so the
+// composite score remains well-defined for fresh clusters. A negative
+// weight is clamped to 0 — operators that fat-finger a "-1" shouldn't
+// invert the strategy.
+func (p *Placer) loadWeights(ctx context.Context) (weights, error) {
+	props, err := p.store.ControllerProps().Get(ctx)
+	if err != nil {
+		return weights{}, errors.Wrap(err, "get controller props")
+	}
+
+	return weights{
+		maxFreeSpace:     parseWeight(props[apiv1.PropAutoplacerWeightMaxFreeSpace]),
+		minReservedSpace: parseWeight(props[apiv1.PropAutoplacerWeightMinReservedSpace]),
+		minRscCount:      parseWeight(props[apiv1.PropAutoplacerWeightMinRscCount]),
+		maxThroughput:    parseWeight(props[apiv1.PropAutoplacerWeightMaxThroughput]),
+	}, nil
+}
+
+// parseWeight returns the float value of raw, defaulting to 1.0 for the
+// empty string and clamping negative values to 0. Unparseable inputs
+// fall back to the default to keep a typo from breaking placement.
+func parseWeight(raw string) float64 {
+	if raw == "" {
+		return 1.0
+	}
+
+	weight, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 1.0
+	}
+
+	if weight < 0 {
+		return 0
+	}
+
+	return weight
+}
+
+// resourcesPerNode counts every Resource the cluster is hosting,
+// grouped by NodeName. Feeds the MinRscCount strategy's per-pool score
+// of 1/(1+numResourcesOnNode).
+func (p *Placer) resourcesPerNode(ctx context.Context) (map[string]int, error) {
+	all, err := p.store.Resources().List(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "list resources")
+	}
+
+	out := make(map[string]int, len(all))
+	for i := range all {
+		out[all[i].NodeName]++
+	}
+
+	return out, nil
+}
+
+// rankCandidates sorts pools in place by descending composite score,
+// breaking ties on NodeName (stable, matches the legacy sort's
+// secondary key so downstream tests pinning specific node orders stay
+// green). The composite score is sum(weight_i * score_i) with each
+// strategy scored as:
+//   - MaxFreeSpace:     FreeCapacity / TotalCapacity, or 0 when total=0
+//   - MinReservedSpace: 1 - reservedKib/totalKib (reserved from
+//     pool.Props[Aux/blockstor.io/reserved-kib], 0 if absent)
+//   - MinRscCount:      1 / (1 + numResourcesOnNode(pool.NodeName))
+//   - MaxThroughput:    throughput / maxThroughputInSet (0 when nobody
+//     advertises a hint, or when this pool's hint is 0)
+func rankCandidates(pools []apiv1.StoragePool, w weights, rscPerNode map[string]int) {
+	if len(pools) < 2 {
+		return
+	}
+
+	maxThroughput := 0.0
+
+	for i := range pools {
+		t := throughputHint(&pools[i])
+		if t > maxThroughput {
+			maxThroughput = t
+		}
+	}
+
+	scores := make([]float64, len(pools))
+	for i := range pools {
+		scores[i] = composite(&pools[i], w, rscPerNode, maxThroughput)
+	}
+
+	sort.SliceStable(pools, func(i, j int) bool {
+		if scores[i] != scores[j] {
+			return scores[i] > scores[j]
+		}
+
+		return pools[i].NodeName < pools[j].NodeName
+	})
+}
+
+// composite is the single-pool weighted score. Each per-strategy score
+// is in [0..1] (so the four weights are commensurable); the function
+// short-circuits when a strategy has weight 0 to avoid e.g. a divide-
+// by-zero in the throughput path when no pool advertises a hint.
+func composite(pool *apiv1.StoragePool, w weights, rscPerNode map[string]int, maxThroughput float64) float64 {
+	score := 0.0
+
+	if w.maxFreeSpace > 0 && pool.TotalCapacity > 0 {
+		score += w.maxFreeSpace * (float64(pool.FreeCapacity) / float64(pool.TotalCapacity))
+	}
+
+	if w.minReservedSpace > 0 && pool.TotalCapacity > 0 {
+		reserved := min(reservedKib(pool), pool.TotalCapacity)
+		score += w.minReservedSpace * (1.0 - float64(reserved)/float64(pool.TotalCapacity))
+	}
+
+	if w.minRscCount > 0 {
+		score += w.minRscCount * (1.0 / float64(1+rscPerNode[pool.NodeName]))
+	}
+
+	if w.maxThroughput > 0 && maxThroughput > 0 {
+		score += w.maxThroughput * (throughputHint(pool) / maxThroughput)
+	}
+
+	return score
+}
+
+// reservedKib reads the optional `Aux/blockstor.io/reserved-kib` pool
+// prop. Missing/unparseable values score 0 — the MinReservedSpace
+// strategy degrades to "no reservation reported", same as a literal 0.
+func reservedKib(pool *apiv1.StoragePool) int64 {
+	raw := pool.Props[apiv1.PropAuxPoolReservedKib]
+	if raw == "" {
+		return 0
+	}
+
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+
+	return v
+}
+
+// throughputHint reads the optional `Aux/throughput-mbps` pool prop.
+// Missing/unparseable returns 0 — the MaxThroughput strategy treats it
+// as "unknown" and the pool contributes 0 to that strategy.
+func throughputHint(pool *apiv1.StoragePool) float64 {
+	raw := pool.Props[apiv1.PropAuxPoolThroughputMBps]
+	if raw == "" {
+		return 0
+	}
+
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+
+	return v
 }
 
 // matchesPoolFilter is the AutoSelectFilter eligibility check for a

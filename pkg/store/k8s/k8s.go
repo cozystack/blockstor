@@ -22,6 +22,10 @@ limitations under the License.
 package k8s
 
 import (
+	"context"
+	"maps"
+	"sync"
+
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/cozystack/blockstor/pkg/store"
@@ -47,6 +51,7 @@ type Store struct {
 	volumeDefinitions   *volumeDefinitions
 	snapshots           *snapshots
 	physicalDevices     *physicalDevices
+	controllerProps     *controllerProps
 }
 
 // New wraps a controller-runtime client and returns a store.Store.
@@ -60,8 +65,46 @@ func New(c ctrlclient.Client) *Store {
 	s.volumeDefinitions = &volumeDefinitions{c: c}
 	s.snapshots = &snapshots{c: c}
 	s.physicalDevices = &physicalDevices{c: c}
+	s.controllerProps = &controllerProps{props: map[string]string{}}
 
 	return s
+}
+
+// controllerProps is a process-local stand-in for the singleton
+// controller-scope props bag. A future iteration will swap this for a
+// dedicated CRD (or a ConfigMap-backed shim) so the value survives
+// controller restarts; until then the autoplacer's weights revert to
+// defaults across restarts, which is acceptable because the four
+// `Autoplacer/Weights/*` knobs are pure scoring multipliers — no
+// persisted state depends on them and operators that set them today
+// can re-set after a restart with no data risk.
+type controllerProps struct {
+	mu    sync.RWMutex
+	props map[string]string
+}
+
+// Get returns a defensive copy (never nil).
+func (s *controllerProps) Get(_ context.Context) (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]string, len(s.props))
+	maps.Copy(out, s.props)
+
+	return out, nil
+}
+
+// Set replaces the props map atomically.
+func (s *controllerProps) Set(_ context.Context, props map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := make(map[string]string, len(props))
+	maps.Copy(next, props)
+
+	s.props = next
+
+	return nil
 }
 
 // Nodes returns the NodeStore view of this store.
@@ -87,3 +130,6 @@ func (s *Store) Snapshots() store.SnapshotStore { return s.snapshots }
 
 // PhysicalDevices returns the PhysicalDeviceStore view.
 func (s *Store) PhysicalDevices() store.PhysicalDeviceStore { return s.physicalDevices }
+
+// ControllerProps returns the singleton controller-scope props bag.
+func (s *Store) ControllerProps() store.ControllerPropsStore { return s.controllerProps }

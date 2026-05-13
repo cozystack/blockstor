@@ -31,3 +31,45 @@ type KV struct {
 	Name  string            `json:"name"`
 	Props map[string]string `json:"props,omitempty"`
 }
+
+// Autoplacer scoring-weight controller-scope property keys. Each one
+// scales a [0..1] per-pool score the placer computes in
+// candidatePools; the composite is the weighted sum. UG9 §"Storage
+// pool placement" (lines 933-993) ships these as the operator-visible
+// tuning knobs. Default (unset) value is 1.0 for every weight, so the
+// composite degenerates to "all four strategies equally weighted" — a
+// stable behaviour for clusters that never touch the knobs.
+const (
+	// PropAutoplacerWeightMaxFreeSpace scales the "FreeCapacity /
+	// TotalCapacity" score (bigger ratio is better).
+	PropAutoplacerWeightMaxFreeSpace = "Autoplacer/Weights/MaxFreeSpace"
+	// PropAutoplacerWeightMinReservedSpace scales the
+	// "1 - reservedKib/totalKib" score (less reserved is better).
+	// Reserved is read from the pool's
+	// `Aux/blockstor.io/reserved-kib` prop; missing = 0.
+	PropAutoplacerWeightMinReservedSpace = "Autoplacer/Weights/MinReservedSpace"
+	// PropAutoplacerWeightMinRscCount scales the
+	// "1 / (1 + numResourcesOnNode)" score — pools on busier nodes
+	// rank lower.
+	PropAutoplacerWeightMinRscCount = "Autoplacer/Weights/MinRscCount"
+	// PropAutoplacerWeightMaxThroughput scales the per-pool
+	// `Aux/throughput-mbps` advertised hint, normalised across the
+	// candidate set. Pools without the hint contribute 0 to this
+	// strategy.
+	PropAutoplacerWeightMaxThroughput = "Autoplacer/Weights/MaxThroughput"
+
+	// PropAuxPoolReservedKib is the optional pool-scope hint for
+	// reserved (non-Free) capacity in KiB. Used by the
+	// MinReservedSpace strategy when present.
+	PropAuxPoolReservedKib = "Aux/blockstor.io/reserved-kib"
+	// PropAuxPoolThroughputMBps is the optional pool-scope advertised
+	// throughput hint in MB/s. Used by the MaxThroughput strategy
+	// when present.
+	PropAuxPoolThroughputMBps = "Aux/throughput-mbps"
+)
+
+// ControllerPropsName is the singleton row key for the controller-
+// scope properties bag. Mirrors upstream LINSTOR's "Controller"
+// pseudo-object that owns the `Autoplacer/Weights/*` knobs and any
+// future cluster-wide tunables.
+const ControllerPropsName = "default"

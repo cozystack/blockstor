@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"maps"
 	"sort"
 	"sync"
 
@@ -37,6 +38,7 @@ type InMemory struct {
 	volumeDefinitions   *inMemoryVolumeDefinitions
 	snapshots           *inMemorySnapshots
 	physicalDevices     *inMemoryPhysicalDevices
+	controllerProps     *inMemoryControllerProps
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
@@ -50,6 +52,7 @@ func NewInMemory() *InMemory {
 		volumeDefinitions:   &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
 		snapshots:           &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
 		physicalDevices:     &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},
+		controllerProps:     &inMemoryControllerProps{props: map[string]string{}},
 	}
 }
 
@@ -76,6 +79,43 @@ func (s *InMemory) Snapshots() SnapshotStore { return s.snapshots }
 
 // PhysicalDevices returns the PhysicalDeviceStore view.
 func (s *InMemory) PhysicalDevices() PhysicalDeviceStore { return s.physicalDevices }
+
+// ControllerProps returns the singleton controller-scope props bag.
+func (s *InMemory) ControllerProps() ControllerPropsStore { return s.controllerProps }
+
+// inMemoryControllerProps is a single-row bag protected by an RWMutex.
+// The k8s store will back the same shape with a singleton CRD; here we
+// hold the map straight so unit tests can prime weights without touching
+// any k8s plumbing.
+type inMemoryControllerProps struct {
+	mu    sync.RWMutex
+	props map[string]string
+}
+
+// Get returns a defensive copy of the props map (never nil — callers
+// can do `m[key]` directly).
+func (s *inMemoryControllerProps) Get(_ context.Context) (map[string]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]string, len(s.props))
+	maps.Copy(out, s.props)
+
+	return out, nil
+}
+
+// Set replaces the props map atomically. A nil input clears the bag.
+func (s *inMemoryControllerProps) Set(_ context.Context, props map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := make(map[string]string, len(props))
+	maps.Copy(next, props)
+
+	s.props = next
+
+	return nil
+}
 
 type inMemoryNodes struct {
 	mu sync.RWMutex

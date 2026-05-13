@@ -181,10 +181,14 @@ func TestAutoplacePrefersFreestPool(t *testing.T) {
 		t.Fatalf("seed RD: %v", err)
 	}
 
+	// TotalCapacity is uniform across pools so the weighted scorer's
+	// MaxFreeSpace strategy (Free/Total ratio) ends up driven by Free
+	// alone, preserving the legacy "biggest-free-first" ordering this
+	// test was written for under the new scenario 2.17 scorer.
 	pools := []apiv1.StoragePool{
-		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000},
-		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 5000},
-		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 3000},
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000, TotalCapacity: 10000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 5000, TotalCapacity: 10000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 3000, TotalCapacity: 10000},
 	}
 
 	for i := range pools {

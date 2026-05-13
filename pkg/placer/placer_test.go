@@ -47,6 +47,11 @@ func seedStore(t *testing.T, st store.Store, names []string) {
 			StoragePoolName: "pool",
 			ProviderKind:    apiv1.StoragePoolKindLVMThin,
 			FreeCapacity:    int64(i+1) * 100,
+			// TotalCapacity uniform 1000 — scenario 2.17's MaxFreeSpace
+			// ratio (Free/Total) discriminates n3 > n2 > n1, preserving
+			// the legacy flat-sort biggest-free-first ordering under
+			// the weighted scorer.
+			TotalCapacity: 1000,
 		}); err != nil {
 			t.Fatalf("seed pool %s: %v", name, err)
 		}
@@ -1755,6 +1760,171 @@ func TestPlaceNotPlaceWithRscRegexInvalidIsNoOp(t *testing.T) {
 		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
 	}
 }
+
+// TestPlaceWeightedScoringMaxFreeSpace pins scenario 2.17 case 1:
+// three pools with FreeCapacity 100 / 500 / 1000 (and a uniform Total
+// so the Free/Total ratio is monotone in Free), Weights/MaxFreeSpace=10
+// with the other three weights left at their default 1.0 → the
+// MaxFreeSpace strategy dominates and the placer picks the 1000-Free
+// pool first. A regression that dropped the weight multiplier or
+// swapped the comparator would silently fill the 100-Free pool first.
+func TestPlaceWeightedScoringMaxFreeSpace(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	frees := []int64{100, 500, 1000}
+	names := []string{"n1", "n2", "n3"}
+
+	for i, name := range names {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    frees[i],
+			TotalCapacity:   1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// Boost MaxFreeSpace heavily over the defaults so its 0.1 / 0.5 /
+	// 1.0 raw scores are the dominant signal. (Other strategies default
+	// to weight 1.0 each — MinRscCount alone contributes 1.0 to every
+	// pool when no resources exist, so the picker needs MaxFreeSpace's
+	// per-pool variance multiplied up to win.)
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxFreeSpace: "10",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 1 || got[0].NodeName != "n3" {
+		t.Errorf("expected single replica on n3 (most free); got %+v", got)
+	}
+}
+
+// TestPlaceWeightedScoringMinRscCount pins scenario 2.17 case 2:
+// MaxFreeSpace=0 disables the capacity-ratio strategy, MinRscCount=10
+// dominates. One node already hosts 2 existing RDs, the other two host
+// 0 each. The placer must pick a 0-RDs node even when it carries the
+// smallest pool, proving the rsc-count score wins over the implicit
+// MinReservedSpace=1.0 default tie.
+func TestPlaceWeightedScoringMinRscCount(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// n-c-busy carries 1000 of Free + 2 pre-existing Resources on
+	// unrelated RDs. n-a-small has the smallest Free (100); n-b-mid
+	// sits in the middle (500). MinRscCount=10 should beat the tied
+	// MinReservedSpace=1.0 default contribution and put a 0-RDs node
+	// ahead of n-c-busy even though n-c-busy has 10x more Free.
+	type fixture struct {
+		name  string
+		free  int64
+		busy  bool
+		total int64
+	}
+
+	// Names ordered alphabetically: n-a-small < n-b-mid < n-c-busy. The
+	// scoring tiebreaker is NodeName ASC, so when two pools end up with
+	// identical composite scores the alphabetically-first wins — picking
+	// distinct alphabetic prefixes makes the expected winner unambiguous.
+	fixtures := []fixture{
+		{"n-c-busy", 1000, true, 1000},
+		{"n-a-small", 100, false, 1000},
+		{"n-b-mid", 500, false, 1000},
+	}
+
+	for _, f := range fixtures {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: f.name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", f.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        f.name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    f.free,
+			TotalCapacity:   f.total,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", f.name, err)
+		}
+
+		if !f.busy {
+			continue
+		}
+
+		// Two pre-existing Resources for unrelated RDs on n-c-busy. The
+		// MinRscCount strategy counts every Resource on the node, not
+		// just same-RD replicas, so these contribute to the score
+		// regardless of name.
+		for j, rdName := range []string{"other-rd-1", "other-rd-2"} {
+			if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName}); err != nil && j == 0 {
+				// First create may collide if a previous fixture seeded
+				// it — only the first iteration's failure matters.
+				t.Logf("seed RD %s: %v (ok if duplicate)", rdName, err)
+			}
+
+			if err := st.Resources().Create(ctx, &apiv1.Resource{
+				Name:     rdName,
+				NodeName: f.name,
+				Props:    map[string]string{"StorPoolName": "pool"},
+			}); err != nil {
+				t.Fatalf("seed existing resource on %s: %v", f.name, err)
+			}
+		}
+	}
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxFreeSpace: "0",
+		apiv1.PropAutoplacerWeightMinRscCount:  "10",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1; %+v", len(got), got)
+	}
+
+	// n-c-busy hosts 2 → MinRscCount score 1/3. n-a-small + n-b-mid
+	// host 0 → score 1/1. n-a-small wins the tie among the two
+	// zero-resource nodes on NodeName ASC (the deterministic
+	// tiebreaker).
+	if got[0].NodeName != "n-a-small" {
+		t.Errorf("expected n-a-small (0 resources, smallest Free) to win on MinRscCount weight; got %s", got[0].NodeName)
+	}
+}
+
 
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background

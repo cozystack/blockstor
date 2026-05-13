@@ -177,6 +177,25 @@ type PhysicalDeviceStore interface {
 	Delete(ctx context.Context, name string) error
 }
 
+// ControllerPropsStore persists the singleton controller-scope props
+// bag (keyed by apiv1.ControllerPropsName, "default"). Upstream LINSTOR
+// stores `Autoplacer/Weights/*` and other cluster-wide tunables on the
+// Controller pseudo-object; we mirror that with a single-row store so
+// the autoplacer (and any future cluster-tunable consumer) can read /
+// write the knobs through one well-typed surface. Missing keys are
+// returned as empty strings — the placer treats that as "use default".
+type ControllerPropsStore interface {
+	// Get returns the current props map. An empty map (not nil) is
+	// returned when no value has been written yet, so callers can do
+	// `props[key]` lookups without nil-checks.
+	Get(ctx context.Context) (map[string]string, error)
+	// Set replaces the entire props map atomically. Callers that want
+	// merge semantics must Get → mutate → Set; the store does no
+	// per-key merging on the assumption that the operator-visible
+	// patch surface (REST) is the right place for partial updates.
+	Set(ctx context.Context, props map[string]string) error
+}
+
 // Store aggregates per-resource stores.
 type Store interface {
 	Nodes() NodeStore
@@ -187,4 +206,5 @@ type Store interface {
 	VolumeDefinitions() VolumeDefinitionStore
 	Snapshots() SnapshotStore
 	PhysicalDevices() PhysicalDeviceStore
+	ControllerProps() ControllerPropsStore
 }
