@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -80,7 +82,41 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		out = append(out, rwv)
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	// Stable order so CSI ListVolumes pagination (offset+limit
+	// query params forwarded from max_entries + starting_token)
+	// is deterministic across calls.
+	slices.SortFunc(out, func(a, b apiv1.ResourceWithVolumes) int {
+		if a.Name != b.Name {
+			return strings.Compare(a.Name, b.Name)
+		}
+
+		return strings.Compare(a.NodeName, b.NodeName)
+	})
+
+	writeJSON(w, http.StatusOK, paginateResources(r, out))
+}
+
+// paginateResources applies golinstor's ListOpts.{Offset,Limit}
+// query params. Mirrors paginateSnapshots — same semantics, same
+// "silent empty past the end" behaviour.
+func paginateResources(r *http.Request, in []apiv1.ResourceWithVolumes) []apiv1.ResourceWithVolumes {
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+
+	if offset >= len(in) {
+		return []apiv1.ResourceWithVolumes{}
+	}
+
+	out := in[offset:]
+
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+
+	return out
 }
 
 // vdSizeIndex builds a {rdName → {volumeNumber → sizeKib}} lookup so
