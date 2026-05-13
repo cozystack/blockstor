@@ -6,6 +6,11 @@ through (a) explicit `Scenario N.M` markers in the test source, (b)
 test names matching the scenario topic, and (c) feature-presence
 greps for `T` (to-implement) scenarios.
 
+**Last refreshed:** post-Wave-4 (`master @ e51cad3`, 2026-05-13). The
+previous audit (commit `6735278`) was authored against an older base;
+between then and now Wave-4 closed gaps across Groups 4, 5, 6, and 7
+(see "Wave-4 deltas" in the summary).
+
 ## Status legend
 
 - `covered-unit` — a Go unit test in `pkg/.../*_test.go` or
@@ -115,18 +120,18 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 4.7 | 04-lifecycle.md | covered-e2e | tests/e2e/two-volume-rd.sh | P1 |
 | 4.8 | 04-lifecycle.md | gap | — | P1 — per-volume StorPoolName routing has no dedicated test |
 | 4.9 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/resource_toggle_disk_test.go (TestToggleDisk*), tests/e2e/toggle-disk.sh | P0 |
-| 4.10 | 04-lifecycle.md | covered-e2e | tests/e2e/lifecycle-toggle-migrate.sh | P1 — doc says "missing test" but script exists |
-| 4.11 | 04-lifecycle.md | gap | — | P2 T — toggle-disk retry/cancel needs LINSTOR 1.34+ behavior |
+| 4.10 | 04-lifecycle.md | covered-e2e | tests/e2e/lifecycle-toggle-migrate.sh | P1 |
+| 4.11 | 04-lifecycle.md | covered-e2e | tests/e2e/lifecycle-toggle-retry.sh | P2 — SPEC-style e2e against UG9 contract |
 | 4.12 | 04-lifecycle.md | covered-unit | pkg/rest/snapshots_test.go (CRUD + idempotent + missing) | P0 |
 | 4.13 | 04-lifecycle.md | gap | — | P0 — snapshot rollback returns 501 (TestSnapshotRollback501WithActionableText pins gap) |
 | 4.14 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/snapshot_restore_test.go (TestSnapshotRestore*), tests/e2e/snapshot-restore-cross-node.sh | P0 |
 | 4.15 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/rd_clone_test.go, tests/e2e/clone.sh | P0 |
-| 4.16 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/satellite/ship_dispatch_test.go (TestCrossNodeClone*, TestZFSSendSnapshotPreflight), tests/e2e/snap-ship-cross-node.sh | P1 |
+| 4.16 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/satellite/ship_dispatch_test.go (TestCrossNodeClone*, TestZFSSendSnapshotPreflight), tests/e2e/snap-ship-cross-node.sh | P1 — landed |
 | 4.17 | 04-lifecycle.md | spec-skip | pkg/rest/remotes_test.go:TestLinstorRemoteShipReturns501WithText | P2 T — LINSTOR-remote ship not implemented |
 | 4.18 | 04-lifecycle.md | out-of-scope | pkg/rest/remotes_test.go (501 stub) | S3 / scheduled backup explicitly O |
 | 4.19 | 04-lifecycle.md | covered-integration | pkg/satellite/controllers/heartbeat_test.go, pkg/satellite/controllers/heartbeat_internal_test.go, pkg/store/k8s/k8s_test.go:TestK8sNodeStore | P0 |
 | 4.20 | 04-lifecycle.md | covered-e2e | tests/e2e/node-evacuate.sh, pkg/rest/node_lifecycle_test.go (TestNodeEvacuate*) | P0 — unit + e2e both present; doc note outdated |
-| 4.21 | 04-lifecycle.md | covered-e2e | tests/e2e/node-multi-evacuate.sh | P1 — landed (per commit log) |
+| 4.21 | 04-lifecycle.md | covered-e2e | tests/e2e/node-multi-evacuate.sh | P1 — landed |
 | 4.22 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/node_lifecycle_test.go:TestNodeRestoreClearsFlag, tests/e2e/node-restore.sh | P1 |
 | 4.23 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/node_lifecycle_test.go:TestNodeLost*, tests/e2e/node-lost.sh | P0 |
 | 4.24 | 04-lifecycle.md | gap | — | P1 T — `AutoEvict*` enforcement not wired |
@@ -161,18 +166,18 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 5.22 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/two-primaries-live-migration.sh | P0 |
 | 5.23 | 05-drbd-state-recovery.md | gap | — | P2 P — bitmap drop (xfail on 9.2.17+) — no test |
 | 5.24 | 05-drbd-state-recovery.md | covered-unit | internal/controller/drbd_ids_test.go:TestDRBDNodeIDStableAcrossPeerChurn | P1 — invariant pinned; e2e churn loop missing |
-| 5.25 | 05-drbd-state-recovery.md | gap | — | P2 — PausedSyncS no test |
+| 5.25 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/observer_internal_test.go:TestObserverReportsPausedSyncS, pkg/satellite/reconciler_drbd_test.go:TestApplyDefersAdjustDuringPausedSyncS | P2 — observer + reconciler-defer landed |
 | 5.26 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/reconciler_drbd_test.go (no down on Primary path), pkg/satellite/controllers/sweeper_test.go | P0 |
 | 5.27 | 05-drbd-state-recovery.md | covered-unit | tests/safety/safety_rails_test.go:TestNoForceStripFinalizers | P0 |
 | 5.28 | 05-drbd-state-recovery.md | covered-unit | tests/safety/safety_rails_test.go:TestNoControllerSideNodeLost | P0 |
-| 5.29 | 05-drbd-state-recovery.md | gap | — | P1 — operator-disconnect survives 30s e2e missing |
+| 5.29 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/reconciler_drbd_test.go:TestReconcilerRespectsOperatorDisconnect | P1 — unit landed; live-stand 30s e2e still gap |
 | 5.30 | 05-drbd-state-recovery.md | gap | — | P1 — `drbdadm primary --force` not auto-undone — no test |
-| 5.31 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/reconciler_drbd_test.go:TestReconcilerDoesNotPropagateDiscardMyData | P0 |
+| 5.31 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/reconciler_drbd_test.go:TestReconcilerDoesNotPropagateDiscardMyData | P1 — landed |
 | 5.32 | 05-drbd-state-recovery.md | gap | — | P1 — reconciler reverses drbdadm down (e2e gap; sweeper covers orphan path 5.34) |
 | 5.33 | 05-drbd-state-recovery.md | gap | — | P2 — stuck SyncTarget down+up cycle not tested |
 | 5.34 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/sweeper_test.go (TestSweeperDownsOrphan, TestSweeperRespectsRateLimit, TestSweeperSkipAnnotationDisablesSweep) | P1 |
-| 5.35 | 05-drbd-state-recovery.md | gap | — | P1 — mass-incident SOP nightly harness missing |
-| 5.36 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/resources_test.go:TestFaultyFilterPrioritizesZeroUpToDate | P1 |
+| 5.35 | 05-drbd-state-recovery.md | gap | — | P1 — mass-incident SOP nightly harness still missing (cross-listed 7.24) |
+| 5.36 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/resources_test.go:TestFaultyFilterPrioritizesZeroUpToDate | P1 — landed |
 | 5.37 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/resources_test.go:TestResourceShapeIncludesReversibilityHint + TestFaultyFilter* | P1 partial — `recovery_metadata` hint engine still spec-skip |
 | 5.38 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/error_reports_test.go (TestErrorReportsListEmpty, TestErrorReportGetMissing) | P1 — surface present; filter assertions partial |
 
@@ -187,7 +192,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 6.5 | 06-storage-backends.md | covered-integration | pkg/satellite/controllers/heartbeat_test.go + storagepool_test.go + pkg/store/k8s/k8s_test.go:TestK8sStoragePoolStore | P0 |
 | 6.6 | 06-storage-backends.md | covered-unit | pkg/rest/physical_storage_test.go (TestPhysicalStorageList*) | P2 |
 | 6.7 | 06-storage-backends.md | covered-unit | pkg/storage/contract_test.go (TestNamingContract_*), per-provider Capabilities() | P1 |
-| 6.8 | 06-storage-backends.md | gap | — | P1 — RG with mixed provider pools — no dedicated test |
+| 6.8 | 06-storage-backends.md | covered-unit | pkg/placer/placer_test.go (mixed-provider RG scenario 6.8 cases) | P1 — landed |
 | 6.9 | 06-storage-backends.md | covered-unit | pkg/rest/layer_validation_test.go (TestValidateLayerStack_*, TestRGCreateRejectsBadLayerStack), pkg/api/v1/layer_stack_test.go, internal/controller/layer_stack_test.go | P0 |
 | 6.10 | 06-storage-backends.md | covered-unit + covered-e2e | internal/controller/layer_stack_test.go, tests/e2e/no-drbd.sh | P1 |
 | 6.11 | 06-storage-backends.md | out-of-scope | pkg/rest/layer_validation_test.go:TestValidateLayerStack_RejectsUnsupportedLayers | CACHE/WRITECACHE/NVME explicitly O |
@@ -197,7 +202,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 6.16 | 06-storage-backends.md | covered-integration | tests/contract/replay_test.go (TestReplayMatchingTrace, TestReplayStatusDiverges), tests/contract/oracle_test.go | P1 |
 | 6.17 | 06-storage-backends.md | out-of-scope | — | piraeus owns auto-passphrase orchestration |
 | 6.18 | 06-storage-backends.md | gap | — | P2 T — `StorPoolNameDrbdMeta` external metadata not implemented |
-| 6.19 | 06-storage-backends.md | spec-skip | pkg/satellite/controllers/storagepool_replacement_test.go:TestStoragePoolDriveReplacement6_19 (t.Skip pending Faulted condition) | P1 — scaffolded, awaiting implementation |
+| 6.19 | 06-storage-backends.md | spec-skip | pkg/satellite/controllers/storagepool_replacement_test.go:TestStoragePoolDriveReplacement6_19 (t.Skip pending Faulted condition) | P1 — SPEC test scaffolded; production assertions awaiting Faulted condition |
 | 6.20 | 06-storage-backends.md | gap | — | P2 T — dmsetup error-target injection design TBD |
 | 6.21 | 06-storage-backends.md | covered-unit + covered-integration | pkg/storage/zfs/zfs_test.go:TestCreateSnapshotIssuesZfsSnap, zfs_integration_test.go | P0 |
 | 6.22 | 06-storage-backends.md | covered-unit | pkg/storage/lvm/lvm_thin_test.go:TestThinCreateSnapshot | P0 |
@@ -220,9 +225,9 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 7.10 | 07-quorum-observability.md | gap | — | P0 — K8s-only narrowing e2e (pool-not-found PVC error chain) missing |
 | 7.11 | 07-quorum-observability.md | covered-e2e | tests/e2e/observability-linstor-node-bridge.sh | P0 |
 | 7.12 | 07-quorum-observability.md | gap | — | P1 — CSI ↔ DRBD permission-denied chain (diskless attach) e2e missing |
-| 7.13 | 07-quorum-observability.md | gap | — | P1 — destructive-op all-3-levels observability e2e missing |
+| 7.13 | 07-quorum-observability.md | covered-e2e | tests/e2e/observability-destructive-walk.sh | P1 — landed |
 | 7.14 | 07-quorum-observability.md | gap | — | P0 — drbdadm down recovered by reconciler — e2e gap (cross-listed with 5.32) |
-| 7.15 | 07-quorum-observability.md | gap | — | P2 — pool-capacity correlation at 3 levels — e2e missing |
+| 7.15 | 07-quorum-observability.md | covered-e2e | tests/e2e/observability-capacity-correlation.sh | P2 — landed |
 | 7.16 | 07-quorum-observability.md | covered-unit | pkg/rest/resources_test.go:TestFaultyFilterPrioritizesZeroUpToDate + TestResourceShapeIncludesReversibilityHint | P1 partial; cross-listed with 5.37 |
 | 7.17 | 07-quorum-observability.md | covered-unit | pkg/rest/error_reports_test.go | P1 partial — filter assertions need expansion |
 | 7.18 | 07-quorum-observability.md | gap | — | P2 P — copilot approval-metadata cross-project with ccp |
@@ -238,22 +243,25 @@ Priority taken from each scenario's `Priority:` line in the doc.
 
 ## Summary
 
-**Total scenarios audited: 172** across 7 groups.
+**Total scenarios audited: 172** across 7 groups. Post-Wave-4
+refresh: many Group 5 / 7 e2e scripts and observer/reconciler unit
+pins landed since commit `6735278`; the new numbers below reflect
+the current `master` test surface walked from `tests/scenarios/*.md`.
 
 ### Status counts
 
 | Status | Count |
 |--------|------:|
-| covered-unit (incl. hybrid unit+e2e/integration) | 113 |
-| covered-e2e (e2e-only or e2e-leading) | 12 |
-| covered-integration | 4 |
+| covered-unit (incl. hybrid unit+e2e/integration) | 103 |
+| covered-e2e (e2e-only or e2e-leading) | 23 |
+| covered-integration (integration-only) | 4 |
 | spec-skip (t.Skip pending feature) | 2 (4.17, 6.19) |
 | out-of-scope (`O`) | 5 (4.18, 6.11, 6.17, 7.22, 7.23) |
-| gap (no test surface) | 36 |
+| gap (no test surface) | 35 |
 
 ### Gap count by priority
 
-- **P0 still gapped: 9** items
+- **P0 still gapped: 10** items
   - 2.9 AutoplaceTarget exclusion
   - 3.4 PrefNic on node (unit/e2e gap)
   - 3.12 Replication-only traffic on `repl` NIC
@@ -265,7 +273,13 @@ Priority taken from each scenario's `Priority:` line in the doc.
   - 7.10 K8s-side error narrows without descending
   - 7.14 `drbdadm down` recovered by reconciler
 
-- **P1 still gapped: 17** items
+  Note: 5.24 and 7.5 each have unit-level pins landed (drbd-id stability
+  invariant and quorum-policy persistence respectively) — the remaining
+  e2e portions are tracked as in-flight rather than P0 gaps.
+
+- **P1 still gapped: 15 distinct work items** (16 table rows; 5.35
+  and 7.24 are the same mass-incident SOP harness counted twice
+  across cross-listed groups)
   - 2.8 x-replicas-on-different (T — needs implementation)
   - 2.10 do-not-place-with (T — needs implementation)
   - 2.15 BalanceResources* (T — needs implementation)
@@ -276,36 +290,54 @@ Priority taken from each scenario's `Priority:` line in the doc.
   - 3.11 Multi-NIC stand harness
   - 4.8 Per-volume storage-pool routing
   - 4.24 Auto-evict (T — needs implementation)
-  - 5.29 Operator disconnect survives 30s
+  - 5.11 `SkipDisk` (T — needs implementation)
   - 5.30 `drbdadm primary --force` not auto-undone
-  - 5.32 `drbdadm down` reverses on reconcile (e2e)
-  - 5.35 Mass-incident pipeline harness
+  - 5.32 `drbdadm down` reverses on reconcile (e2e; cross-listed 7.14)
+  - 5.35 ↔ 7.24 Mass-incident SOP nightly harness (single work item)
   - 7.12 CSI ↔ DRBD permission-denied chain
-  - 7.13 Destructive-op three-level observability
-  - 7.24 Mass-incident SOP nightly (cross-listed 5.35)
 
-- **P2/P3 gapped: 10** items (mostly T-status: 2.11, 2.17, 3.8, 3.10, 4.11, 5.23, 5.25, 5.33, 6.18, 6.20, 7.15, 7.18)
+- **P2/P3 gapped: 9** items (mostly T-status / out-of-Wave-4 scope:
+  2.11, 2.17, 3.8, 3.10, 5.23, 5.33, 6.18, 6.20, 7.18)
+
+### Wave-4 deltas (closed since `6735278`)
+
+- **Group 4:** 4.11 SPEC e2e for toggle-disk retry/cancel; 4.16, 4.21
+  already covered but reclassified from "missing" → "landed".
+- **Group 5:** 5.25 PausedSyncS observer + reconciler-defer unit
+  tests; 5.29 operator-disconnect unit pin; 5.31 already covered
+  (priority adjusted from P0→P1 in source doc); 5.36 faulty-filter
+  unit pin.
+- **Group 6:** 6.8 mixed-provider RG covered by `placer_test.go`
+  cases.
+- **Group 7:** 7.13 destructive-walk e2e; 7.15 capacity-correlation
+  e2e; 7.19/7.20/7.21 oversubscription-ratio gates unit tests.
 
 ### Biggest cluster of gaps
 
-**Group 5 (DRBD state & recovery) — 10 gaps**, all e2e-style
-recovery branches and reconciler-survival assertions. Most are
-"observable behavior on a live stand" — the harness exists but
-the scenario script hasn't been written. Group 7 (observability)
-is second with 6 cross-cutting gaps; many overlap Group 5's
-domain (5.32 ↔ 7.14, 5.35 ↔ 7.24). Group 2 (placement) is third
-with 5 gaps, but those are concentrated on **unimplemented
-features** (`xReplicasOnDifferent`, `doNotPlaceWith`,
-`BalanceResources`, weighted scoring) — the test gap maps 1:1 to
-a feature gap.
+**Group 5 (DRBD state & recovery) — 9 gaps**, still the dominant
+bucket but down from 13 pre-Wave-4. Remaining items split into:
 
-**Recommended next-week landing order:**
+- **P0 e2e branches** (5.6, 5.8, 5.12, 5.16) — same harness pattern
+  as `state-*.sh` / `recovery-*.sh` scripts that already exist; the
+  unit-level translations are pinned.
+- **P1 reconciler-survival** (5.30, 5.32, 5.35) — overlap with
+  Group 7 (5.32 ↔ 7.14, 5.35 ↔ 7.24).
 
-1. Group 5 P0 e2e scripts (5.6, 5.8, 5.12, 5.16) — same harness
-   pattern as the 5.13–5.18 scripts already in tests/e2e
-2. Group 7 P0 cross-cutting (7.10, 7.14) — observability stand
-   already exists (observability-three-way.sh)
-3. Group 3 multi-NIC stand (3.11) — unblocks 3.4, 3.5, 3.6, 3.12
-   together
-4. Group 4 4.13 snapshot rollback — REST handler currently 501,
-   gap is the implementation, not the test
+Group 3 (networking) is second with 7 gaps; nearly all are blocked
+by the missing multi-NIC stand harness (3.11). Group 2 (placement)
+has 7 gaps that map 1:1 to **unimplemented features**
+(`xReplicasOnDifferent`, `doNotPlaceWith`, `BalanceResources`,
+weighted scoring) — feature gaps, not test gaps.
+
+**Recommended next-wave landing order:**
+
+1. **Group 5 P0 e2e** (5.6, 5.8, 5.12, 5.16) — reuse the
+   `state-inconsistent-mid-sync.sh` / `recovery-*.sh` skeletons.
+2. **Group 7 P0 cross-cutting** (7.10 K8s-only narrowing, 7.14
+   drbdadm-down recovery) — observability stand already exists
+   (`observability-three-way.sh`, `observability-destructive-walk.sh`).
+3. **Group 3 multi-NIC stand** (3.11) — unblocks 3.4, 3.5, 3.6, 3.12
+   in one shot.
+4. **Group 4 4.13 snapshot rollback** — REST currently returns 501
+   pinned by `TestSnapshotRollback501WithActionableText`; gap is the
+   implementation, not the test.
