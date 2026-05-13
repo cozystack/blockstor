@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -124,28 +125,29 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		return errors.New("nil Snapshot")
 	}
 
-	var existing crdv1alpha1.Snapshot
+	// RetryOnConflict mirrors the RD/RG store fixes (ee2f4af, bfa98f5):
+	// the satellite reconciler stamps `Status.NodeStatus` concurrently
+	// with REST snapshot-prop patches, which racy-conflict with "the
+	// object has been modified". Re-fetch + retry handles it.
+	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var existing crdv1alpha1.Snapshot
 
-	key := types.NamespacedName{Name: snapshotCRDName(in.ResourceName, in.Name)}
+		key := types.NamespacedName{Name: snapshotCRDName(in.ResourceName, in.Name)}
 
-	err := s.c.Get(ctx, key, &existing)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return errors.Wrapf(store.ErrNotFound, "snapshot %q on RD %q", in.Name, in.ResourceName)
+		err := s.c.Get(ctx, key, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "snapshot %q on RD %q", in.Name, in.ResourceName)
+			}
+
+			return errors.Wrapf(err, "get Snapshot %s/%s", in.ResourceName, in.Name)
 		}
 
-		return errors.Wrapf(err, "get Snapshot %s/%s", in.ResourceName, in.Name)
-	}
+		existing.Spec = wireToCRDSnapshotSpec(in)
+		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
-	existing.Spec = wireToCRDSnapshotSpec(in)
-	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
-
-	err = s.c.Update(ctx, &existing)
-	if err != nil {
-		return errors.Wrapf(err, "update Snapshot %s/%s", in.ResourceName, in.Name)
-	}
-
-	return nil
+		return s.c.Update(ctx, &existing)
+	}), "update Snapshot %s/%s", in.ResourceName, in.Name)
 }
 
 func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
