@@ -454,6 +454,161 @@ func TestPlaceReplicasOnSamePicksLargestGroup(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnSameBug44 pins Bug 44: when an RG passes
+// `replicas-on-same Aux/topology.kubernetes.io/zone` (the full
+// Aux-prefixed key used by the NodeLabelSyncReconciler), spawning
+// with place-count=2 across 3 nodes (zone-a: 2 nodes, zone-b: 1
+// node) MUST land both replicas in zone-a — never on the zone-b
+// singleton.
+//
+// Mirrors tests/e2e/placement-label-sync.sh (scenario 2.13) at the
+// placer layer. The e2e setup gives worker-3 the largest FreeCapacity
+// to defeat the biggest-first sort — without the replicas-on-same
+// constraint the placer would pick worker-3 first. Both the bare-key
+// and the Aux-prefixed-key forms must work because the upstream CLI
+// passes the key verbatim through the wire and operators write
+// either shape (`auxKey()` normalises).
+func TestPlaceReplicasOnSameBug44(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/topology.kubernetes.io/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "stand",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// worker-3 has the LARGEST free capacity AND is the singleton in
+	// zone-b — without the replicas-on-same constraint the placer
+	// would pick it first by the biggest-first sort. The constraint
+	// must keep it out entirely.
+	mk("worker-1", "zone-a", 200)
+	mk("worker-2", "zone-a", 100)
+	mk("worker-3", "zone-b", 999)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		StoragePool:    "stand",
+		ReplicasOnSame: []string{"Aux/topology.kubernetes.io/zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2; %+v", len(got), got)
+	}
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["worker-3"] {
+		t.Errorf("worker-3 (zone-b) placed despite replicas_on_same=Aux/topology.kubernetes.io/zone; got %+v", got)
+	}
+
+	if !on["worker-1"] || !on["worker-2"] {
+		t.Errorf("expected placement on worker-1+worker-2 (zone-a pair); got %+v", on)
+	}
+}
+
+// TestPlaceReplicasOnSameCountsUniqueNodes pins the unique-nodes
+// sizing in pickSameGroup (Bug 44 hardening): a group with one node
+// exposing N pools cannot satisfy place_count=2 even when the pool
+// count looks like 2. The placer must skip such pseudo-groups so a
+// multi-pool-per-node setup doesn't trick the partitioner into
+// returning a too-small group as the winner.
+//
+// Scenario: zone-a has ONE node with TWO pools (lvm-thin + zfs-thin);
+// zone-b has TWO nodes with one pool each. place_count=2 must pick
+// the zone-b pair — zone-a only has one unique node so the placer
+// cannot land 2 distinct replicas there.
+func TestPlaceReplicasOnSameCountsUniqueNodes(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mkNode := func(name, zone string) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+	}
+
+	mkPool := func(node, pool string, free int64) {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: node, StoragePoolName: pool,
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s/%s: %v", node, pool, err)
+		}
+	}
+
+	mkNode("a1", "zone-a")
+	mkPool("a1", "fast", 500)
+	mkPool("a1", "slow", 500) // single zone-a node, but 2 pools — looks like 2 candidates
+
+	mkNode("b1", "zone-b")
+	mkNode("b2", "zone-b")
+	mkPool("b1", "fast", 100)
+	mkPool("b2", "fast", 100)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		ReplicasOnSame: []string{"zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["a1"] {
+		t.Errorf("a1 (zone-a singleton with 2 pools) picked despite needing 2 unique nodes; got %+v", got)
+	}
+
+	if !on["b1"] || !on["b2"] {
+		t.Errorf("expected zone-b pair (b1+b2); got %+v", on)
+	}
+}
+
 // TestPlaceExistingReplicaWithStaleStorPool pins the newState
 // resilience to a Resource that references a StoragePool by name
 // in its Props but that pool no longer exists in the StoragePools

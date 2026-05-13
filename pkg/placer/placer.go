@@ -774,11 +774,19 @@ func matchesAnyExcludedPair(nodeProps map[string]string, keys []string) bool {
 // only those candidates plus the locked-in tuple. When no group is
 // large enough we return the candidates unchanged — the placer will
 // then fail the conflict check honestly.
+//
+// Group sizing counts UNIQUE nodes, not pools (Bug 44). A node with
+// two pools still hosts at most one replica per RD, so a group
+// holding `pools=[n1.fast, n1.slow]` can satisfy `want=2` only on
+// paper. Counting unique nodes is what matches the placer's per-node
+// taken-set semantic and keeps cross-zone leaks from sneaking in via
+// multi-pool nodes.
 func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]string, keys []string, want int) ([]apiv1.StoragePool, map[string]string) {
 	type group struct {
 		tuple map[string]string
 		key   string
 		pools []apiv1.StoragePool
+		seen  map[string]struct{}
 		free  int64
 	}
 
@@ -791,17 +799,18 @@ func pickSameGroup(candidates []apiv1.StoragePool, nodes map[string]map[string]s
 
 		grp, ok := byKey[key]
 		if !ok {
-			grp = &group{tuple: tuple, key: key}
+			grp = &group{tuple: tuple, key: key, seen: map[string]struct{}{}}
 			byKey[key] = grp
 		}
 
 		grp.pools = append(grp.pools, pool)
+		grp.seen[pool.NodeName] = struct{}{}
 		grp.free += pool.FreeCapacity
 	}
 
 	groups := make([]*group, 0, len(byKey))
 	for _, grp := range byKey {
-		if len(grp.pools) >= want {
+		if len(grp.seen) >= want {
 			groups = append(groups, grp)
 		}
 	}
