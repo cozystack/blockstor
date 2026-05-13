@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // scheme carries the runtime types this manager understands —
@@ -109,23 +110,46 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
 	}
 
-	err = mgr.Add(&ObserverRunnable{
-		Client:   mgr.GetClient(),
-		Exec:     cfg.Exec,
-		NodeName: cfg.NodeName,
-	})
+	err = addBackgroundRunnables(mgr, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "add ObserverRunnable")
-	}
-
-	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
-	if err != nil {
-		return nil, errors.Wrap(err, "register HeartbeatRunnable")
+		return nil, err
 	}
 
 	wireCrossNodeFetcher(mgr, cfg)
 
 	return mgr, nil
+}
+
+// addBackgroundRunnables wires the per-pod background loops
+// (events2 observer, heartbeat, orphan sweeper) into the manager.
+// Pulled out of NewManager to keep that function under the funlen
+// budget — Scenario 5.34 added the third runnable and the
+// inline chain tipped over the limit.
+func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
+	err := mgr.Add(&ObserverRunnable{
+		Client:   mgr.GetClient(),
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+	})
+	if err != nil {
+		return errors.Wrap(err, "add ObserverRunnable")
+	}
+
+	err = (&HeartbeatRunnable{Client: mgr.GetClient(), NodeName: cfg.NodeName}).RegisterWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "register HeartbeatRunnable")
+	}
+
+	err = (&OrphanSweeperRunnable{
+		Client:   mgr.GetClient(),
+		Adm:      drbd.NewAdm(cfg.Exec),
+		NodeName: cfg.NodeName,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "register OrphanSweeperRunnable")
+	}
+
+	return nil
 }
 
 // wireCrossNodeFetcher injects the SnapshotFetcher into the Apply

@@ -231,3 +231,63 @@ func TestAdmResizeInvokesDrbdadm(t *testing.T) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
 }
+
+// TestAdmStatusResourcesParsesNames pins the kernel-state listing
+// the orphan sweeper (Scenario 5.34) relies on. `drbdsetup status`
+// puts every resource name at column 0 followed by `role:<role>`;
+// per-volume / per-peer lines are indented. The parser must:
+//   - pull the resource name from column-0 lines,
+//   - skip indented continuation lines,
+//   - skip blank separators between resource blocks.
+//
+// A regression that returned indented tokens (volume / peer-node
+// names) would feed the sweeper false orphans and trigger
+// drbdadm-down on healthy volumes.
+func TestAdmStatusResourcesParsesNames(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status", storage.FakeResponse{Stdout: []byte(`pvc-aaa role:Primary
+  volume:0 disk:UpToDate
+  worker-2 role:Secondary
+    volume:0 peer-disk:UpToDate
+
+pvc-bbb role:Secondary
+  volume:0 disk:Diskless
+`)})
+
+	adm := drbd.NewAdm(fx)
+
+	names, err := adm.StatusResources(t.Context())
+	if err != nil {
+		t.Fatalf("StatusResources: %v", err)
+	}
+
+	want := []string{"pvc-aaa", "pvc-bbb"}
+	if !slices.Equal(names, want) {
+		t.Errorf("StatusResources: got %v, want %v", names, want)
+	}
+}
+
+// TestAdmStatusResourcesEmptyKernel pins the no-resources path:
+// drbdsetup exits non-zero with `No currently configured DRBD found.`
+// when the kernel module is loaded but holds nothing. The sweeper
+// must treat this as "empty kernel, no orphans" — not an error.
+// Otherwise every sweep on a freshly-rebooted node would log a
+// failure.
+func TestAdmStatusResourcesEmptyKernel(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status", storage.FakeResponse{
+		Stdout: []byte("No currently configured DRBD found.\n"),
+		Err:    errFakeFailure,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	names, err := adm.StatusResources(t.Context())
+	if err != nil {
+		t.Fatalf("StatusResources empty: unexpected error %v", err)
+	}
+
+	if len(names) != 0 {
+		t.Errorf("StatusResources empty: got %v, want []", names)
+	}
+}

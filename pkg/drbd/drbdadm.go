@@ -217,6 +217,57 @@ func (a *Adm) DelPeer(ctx context.Context, resource, peerNode string) error {
 	return errors.Wrapf(err, "drbdadm del-peer %s", target)
 }
 
+// StatusResources runs `drbdsetup status` and returns the names of
+// every resource the local kernel currently owns. Used by the
+// orphan-diskless sweeper (Scenario 5.34) to cross-reference
+// kernel-resident resources against Resource CRDs placed on this
+// node; anything in the kernel but missing from the CRD set is a
+// candidate for `drbdadm down` cleanup.
+//
+// drbdsetup status output convention: every resource starts at
+// column 0 with `<name> role:<role> [...]`; per-volume / per-peer
+// lines are indented. We parse the first non-empty whitespace-token
+// of every column-0 line — robust against drbdsetup format additions
+// (new tail fields don't affect the resource-name slot).
+//
+// A non-zero exit from drbdsetup with the typical "no resources
+// defined" message returns an empty slice + nil error: a kernel
+// with no DRBD resources is a valid steady state, not a failure.
+func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status")
+	if err != nil {
+		// `No currently configured DRBD found.` (kernel module loaded
+		// but zero resources) and friends all bubble up non-zero. Treat
+		// as "empty kernel" so the sweeper just runs a no-op cycle.
+		if strings.Contains(string(out), "No currently configured DRBD") ||
+			strings.Contains(err.Error(), "No currently configured DRBD") {
+			return nil, nil
+		}
+
+		return nil, errors.Wrap(err, "drbdsetup status")
+	}
+
+	var names []string
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		// Indented lines describe connections / volumes inside a
+		// resource block — skip. Blank lines separate resources.
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+
+		// First whitespace-token is the resource name.
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		names = append(names, fields[0])
+	}
+
+	return names, nil
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {
