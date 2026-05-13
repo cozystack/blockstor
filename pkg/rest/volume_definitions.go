@@ -42,12 +42,15 @@ func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
 }
 
 // handleVDView is the cluster-wide aggregate for
-// `linstor vd l` / golinstor's VolumeDefinitions.GetAll(). Iterates
-// over every RD and flattens each (rd, volume_definition) pair onto
-// the response, embedding the parent RD name so consumers can group.
-// Matches upstream LINSTOR's `/v1/view/volume-definitions` shape:
-// each entry wraps the VolumeDefinition plus `resource_name` so the
-// Python CLI's table renderer has the column it expects.
+// `linstor vd l` / golinstor's VolumeDefinitions.GetAll(). Returns
+// upstream LINSTOR's shape: an array of ResourceDefinitionWithVolumeDefinition
+// (each RD wrapping its inline volume_definitions array). The Python
+// linstor CLI iterates `lstmsg.resource_definitions` → for each rd:
+// `rsc_dfn.volume_definitions` — a flat per-VD entry would render
+// the table empty because the attribute path doesn't match.
+//
+// Empty-VD RDs are dropped from the response so the CLI's
+// per-row groupby doesn't show RDs without any defined volumes.
 func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 	rds, err := s.Store.ResourceDefinitions().List(r.Context())
 	if err != nil {
@@ -56,13 +59,16 @@ func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type entry struct {
-		apiv1.VolumeDefinition
-
-		ResourceName string `json:"resource_name"`
+	type rdWithVDs struct {
+		Name              string                   `json:"name"`
+		ExternalName      string                   `json:"external_name,omitempty"`
+		ResourceGroupName string                   `json:"resource_group_name,omitempty"`
+		Flags             []string                 `json:"flags,omitempty"`
+		Props             map[string]string        `json:"props,omitempty"`
+		VolumeDefinitions []apiv1.VolumeDefinition `json:"volume_definitions"`
 	}
 
-	out := make([]entry, 0)
+	out := make([]rdWithVDs, 0, len(rds))
 
 	for i := range rds {
 		vds, listErr := s.Store.VolumeDefinitions().List(r.Context(), rds[i].Name)
@@ -72,12 +78,18 @@ func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		for j := range vds {
-			out = append(out, entry{
-				VolumeDefinition: vds[j],
-				ResourceName:     rds[i].Name,
-			})
+		if len(vds) == 0 {
+			continue
 		}
+
+		out = append(out, rdWithVDs{
+			Name:              rds[i].Name,
+			ExternalName:      rds[i].ExternalName,
+			ResourceGroupName: rds[i].ResourceGroupName,
+			Flags:             rds[i].Flags,
+			Props:             rds[i].Props,
+			VolumeDefinitions: vds,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, out)

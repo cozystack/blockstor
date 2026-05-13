@@ -78,11 +78,21 @@ type volumeObservation struct {
 // Maps directly onto `ResourceStatus.Connections[i]` — the wire-side
 // `linstor r list --faulty` reads `Connected` to color disconnected
 // peers red.
+//
+// `Removed` is an internal marker set by translateEvent for
+// `destroy connection` frames (drbdsetup emits one after
+// `drbdadm del-peer` resolves) so mergeConnections can prune the
+// stale entry from the per-resource cache. Without it, a deleted
+// peer's last-known state (typically StandAlone) lingers in
+// view/resources forever — `linstor r l` keeps showing the dead
+// peer as disconnected.
 type connectionObservation struct {
 	PeerNodeName     string
 	Connected        bool
 	Message          string
 	ReplicationState string
+
+	Removed bool
 }
 
 // translateEvent maps one parsed events2 frame into the
@@ -107,16 +117,34 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 		// `drbdsetup events2` emits:
 		//   exists connection name:<rd> peer-node-id:<id> conn-name:<peer> connection:<state> ...
 		//   change connection name:<rd> peer-node-id:<id> connection:<state> ...
+		//   destroy connection name:<rd> peer-node-id:<id> conn-name:<peer>
 		// `conn-name` is the LINSTOR peer node name; `connection` is
 		// the DRBD-9 state (`Connected`, `StandAlone`, `BrokenPipe`,
 		// `Connecting`, `NetworkFailure`, `Timeout`, ...). The Python
 		// CLI's `--faulty` filter goes red on anything other than
-		// `Connected`.
+		// `Connected`. `destroy` arrives after `drbdadm del-peer`
+		// resolves — surface it as a removal so mergeConnections can
+		// prune the cache, otherwise `view/resources` keeps reporting
+		// the deleted peer as StandAlone forever.
 		name := ev.Fields["name"]
 		peer := ev.Fields["conn-name"]
 		state := ev.Fields[eventKindConnection]
 
-		if name == "" || peer == "" || state == "" {
+		if name == "" || peer == "" {
+			return observation{}, false
+		}
+
+		if ev.Action == eventActionDestroy {
+			return observation{
+				ResourceName: name,
+				Connections: []connectionObservation{{
+					PeerNodeName: peer,
+					Removed:      true,
+				}},
+			}, true
+		}
+
+		if state == "" {
 			return observation{}, false
 		}
 
@@ -281,6 +309,11 @@ const (
 	// drbdRolePrimary is the DRBD-9 role token meaning the
 	// replica is open for write. Maps to ResourceStatus.InUse.
 	drbdRolePrimary = "Primary"
+	// eventActionDestroy is the events2 verb emitted after a peer
+	// is removed via `drbdadm del-peer`. The observer uses this
+	// to prune the connection cache so stale StandAlone entries
+	// don't linger on view/resources after a replica delete.
+	eventActionDestroy = "destroy"
 )
 
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
@@ -691,8 +724,16 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 
 	// Field-wise merge so the two event-kinds (connection-kind sets
 	// Connected/Message; peer-device-kind sets ReplicationState)
-	// don't clobber each other's contributions.
+	// don't clobber each other's contributions. `Removed`
+	// (from `destroy connection`) drops the peer entirely so a
+	// deleted replica stops appearing in view/resources.
 	for _, c := range ev.Connections {
+		if c.Removed {
+			delete(peers, c.PeerNodeName)
+
+			continue
+		}
+
 		merged := peers[c.PeerNodeName]
 		merged.PeerNodeName = c.PeerNodeName
 
