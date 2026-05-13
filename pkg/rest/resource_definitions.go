@@ -215,9 +215,13 @@ func (s *Server) ensureDefaultRGAssignment(ctx context.Context, rd *apiv1.Resour
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
+	// Description left empty to match upstream LINSTOR's auto-created
+	// `DfltRscGrp` verbatim (Bug 57). Upstream's `linstor rg l` shows an
+	// empty Description column for this RG; tools and runbooks compare
+	// the full row byte-for-byte, so any "helpful" prose here diverges
+	// from canonical wire output.
 	defaultRG := apiv1.ResourceGroup{
-		Name:        DefaultResourceGroupName,
-		Description: "Default LINSTOR resource group — autoplace catch-all for RDs without an explicit RG.",
+		Name: DefaultResourceGroupName,
 	}
 
 	err = s.Store.ResourceGroups().Create(ctx, &defaultRG)

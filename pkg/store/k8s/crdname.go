@@ -31,12 +31,24 @@ import (
 const AnnotationLinstorName = "blockstor.io/linstor-name"
 
 // SetOriginalName tags meta with the original LINSTOR name when the
-// slugifier rewrote it (non-rfc1123 input). Case-only differences
-// (e.g. `DfltRscGrp` → `dfltrscgrp`) are NOT preserved — LINSTOR is
-// case-insensitive and the user prefers the short normalised form
-// over a "stash the original case" round-trip.
+// slugifier rewrote it in any way — including case-only differences
+// like `DfltRscGrp` → `dfltrscgrp`.
+//
+// The case-only round-trip matters because LINSTOR identifiers ARE
+// case-insensitive on the wire, but a handful of well-known names
+// have a canonical CamelCase spelling (notably `DfltRscGrp`) that
+// callers grep for verbatim — linstor-csi's `defaultResourceGroup`
+// constant, the upstream `linstor rg l` table header sort order, and
+// operator runbooks that copy-paste the name.
+// Returning the lowercased `dfltrscgrp` looks "fine" to a Java client
+// but breaks string-equality comparisons in downstream code.
+//
+// So: bytewise-different originals are always annotated. meta.Name
+// remains the lowercased k8s-addressable slug (so `kubectl get
+// resourcegroup dfltrscgrp` keeps working); OriginalName() returns
+// the canonical CamelCase spelling for wire output.
 func SetOriginalName(meta *metav1.ObjectMeta, original string) {
-	if strings.EqualFold(meta.Name, original) {
+	if meta.Name == original {
 		return
 	}
 
@@ -72,7 +84,9 @@ func OriginalName(meta *metav1.ObjectMeta) string {
 // volume-1-…` need normalisation. Lowercasing in this function is
 // the single normalization point: every store Get/Update/Delete
 // routes through Name(), so the same input lands on the same CRD
-// regardless of case.
+// regardless of case. The canonical CamelCase spelling (when the
+// caller supplied one) round-trips via the `blockstor.io/linstor-name`
+// annotation — see SetOriginalName / OriginalName.
 func Name(in string) string {
 	lower := strings.ToLower(in)
 
