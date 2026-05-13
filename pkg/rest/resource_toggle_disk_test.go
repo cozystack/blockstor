@@ -154,3 +154,162 @@ func TestToggleDiskUnknownReplica(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestMigrateDiskBasicFlow: src has a diskful replica, dst has no
+// replica yet. PUT migrate-disk should:
+//   - create dst diskful with StorPoolName stamped
+//   - delete src
+//
+// Pins the Option-A wire (atomic REST semantics; satellite handles
+// actual add-before-drop on the DRBD layer).
+func TestMigrateDiskBasicFlow(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-mig"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-mig",
+		NodeName: "src-node",
+		// No DISKLESS flag — diskful.
+	}); err != nil {
+		t.Fatalf("seed src Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-mig/resources/dst-node/migrate-disk/src-node/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	// dst exists, diskful, pool stamped.
+	got, err := st.Resources().Get(t.Context(), "pvc-mig", "dst-node")
+	if err != nil {
+		t.Fatalf("Get dst: %v", err)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("dst DISKLESS flag still set: %v", got.Flags)
+	}
+
+	if got.Props["StorPoolName"] != "zfs-thin" {
+		t.Errorf("dst StorPoolName: got %q, want zfs-thin", got.Props["StorPoolName"])
+	}
+
+	// src removed.
+	if _, err := st.Resources().Get(t.Context(), "pvc-mig", "src-node"); err == nil {
+		t.Errorf("src Resource still present after migrate-disk")
+	}
+}
+
+// TestMigrateDiskWithExistingDiskless: dst already declared diskless
+// (the typical two-step upstream flow: `linstor r c <dst> <rd>
+// --drbd-diskless` then `linstor r td -s <pool> --migrate-from
+// <src>`). Migrate flips dst diskful and prunes src.
+func TestMigrateDiskWithExistingDiskless(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-mig2"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name: "pvc-mig2", NodeName: "src-node",
+	}); err != nil {
+		t.Fatalf("seed src Resource: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name: "pvc-mig2", NodeName: "dst-node",
+		Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed dst Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-mig2/resources/dst-node/migrate-disk/src-node/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-mig2", "dst-node")
+	if err != nil {
+		t.Fatalf("Get dst: %v", err)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("dst DISKLESS not cleared: %v", got.Flags)
+	}
+
+	if got.Props["StorPoolName"] != "zfs-thin" {
+		t.Errorf("dst StorPoolName: got %q, want zfs-thin", got.Props["StorPoolName"])
+	}
+
+	if _, err := st.Resources().Get(t.Context(), "pvc-mig2", "src-node"); err == nil {
+		t.Errorf("src Resource still present after migrate-disk")
+	}
+}
+
+// TestMigrateDiskRefusesPrimaryInUse: an active Primary replica
+// can't be migrated implicitly — UG9 requires the operator to
+// demote the consumer first. 409 Conflict per writeError.
+func TestMigrateDiskRefusesPrimaryInUse(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-busy"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	primary := true
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-busy",
+		NodeName: "src-node",
+		State:    apiv1.ResourceState{InUse: &primary},
+	}); err != nil {
+		t.Fatalf("seed src Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-busy/resources/dst-node/migrate-disk/src-node/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	// src must be untouched.
+	if _, err := st.Resources().Get(t.Context(), "pvc-busy", "src-node"); err != nil {
+		t.Errorf("src removed despite 409: %v", err)
+	}
+}
+
+// TestMigrateDiskUnknownRD: missing ResourceDefinition surfaces as
+// 404, not as a follow-on 500 from a later lookup.
+func TestMigrateDiskUnknownRD(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/ghost-rd/resources/dst/migrate-disk/src/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}

@@ -67,25 +67,40 @@ done
 # python-linstor constructs:
 #   PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}
 #
-# We hit it against a non-existent RD/node triple so we can observe
-# only the routing layer's response (404 = unrouted, 501 = stubbed,
-# 4xx with a structured ApiCallRc = endpoint exists and rejected
-# our bogus args). Anything else means it's wired.
+# We hit it against a non-existent RD/node triple. Three outcomes:
+#   - HTTP 405/501          → route not implemented at all
+#   - HTTP 404 + plain text  → mux 404 ("404 page not found") — no route registered
+#   - HTTP 404 + ApiCallRc[] → endpoint live, RD not found (the new wire)
+# Anything else also means it's wired.
 echo ">> probe PUT /v1/resource-definitions/.../migrate-disk/... routing"
 PROBE_CODE=$(curl -sS -o /tmp/migrate-probe.json -w "%{http_code}" \
     -X PUT "http://localhost:$PF_PORT/v1/resource-definitions/__probe__/resources/__probe__/migrate-disk/__probe__/__probe__" || echo "000")
-echo "   probe HTTP=$PROBE_CODE  body=$(head -c 160 /tmp/migrate-probe.json 2>/dev/null)"
+PROBE_BODY=$(head -c 200 /tmp/migrate-probe.json 2>/dev/null)
+echo "   probe HTTP=$PROBE_CODE  body=$PROBE_BODY"
 
+# A bare-mux 404 returns the literal text "404 page not found"; a wired
+# endpoint returns a JSON ApiCallRc array (`[{...}]`). Use that to
+# distinguish "unrouted" from "routed but RD missing".
+SPEC_MODE=no
 case "$PROBE_CODE" in
-    404|405|501)
-        echo ">> SPEC: --migrate-from endpoint not implemented in REST (HTTP $PROBE_CODE)"
-        echo "   upstream URL: PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}"
-        echo "   pin: pkg/rest/resource_toggle_disk.go currently registers /toggle-disk shapes only."
-        echo "   gap is consistent with scenario doc tests/scenarios/04-lifecycle.md §4.10 ('missing test')."
-        echo ">> LIFECYCLE-TOGGLE-MIGRATE SPEC ($WORKER_1 -> $WORKER_3 via $WORKER_2)"
-        exit 0
+    405|501)
+        SPEC_MODE=yes
+        ;;
+    404)
+        if [[ "$PROBE_BODY" != *"["* || "$PROBE_BODY" == *"page not found"* ]]; then
+            SPEC_MODE=yes
+        fi
         ;;
 esac
+
+if [[ "$SPEC_MODE" == "yes" ]]; then
+    echo ">> SPEC: --migrate-from endpoint not implemented in REST (HTTP $PROBE_CODE)"
+    echo "   upstream URL: PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}"
+    echo "   pin: pkg/rest/resource_toggle_disk.go currently registers /toggle-disk shapes only."
+    echo "   gap is consistent with scenario doc tests/scenarios/04-lifecycle.md §4.10 ('missing test')."
+    echo ">> LIFECYCLE-TOGGLE-MIGRATE SPEC ($WORKER_1 -> $WORKER_3 via $WORKER_2)"
+    exit 0
+fi
 
 # ---------- Endpoint is live: run the full migration drill ----------
 

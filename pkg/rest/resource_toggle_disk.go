@@ -20,7 +20,10 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerResourceToggleDisk wires the upstream LINSTOR
@@ -50,6 +53,16 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceToggleDisk))
 	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless",
 		s.requireStore(s.handleResourceToggleDiskToDiskless))
+	// Upstream LINSTOR's `linstor r td --migrate-from <src>` shape:
+	// move a replica between nodes without dropping below the original
+	// diskful count. Path-param order matches python-linstor's URL
+	// construction (UG9 §"Migrating a resource to another node"):
+	//   PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}
+	// — {dst} is the receiving node (gets a diskful replica), {src}
+	// is the source node we drain from, {pool} is the storage-pool
+	// the new diskful copy lands in on {dst}.
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}",
+		s.requireStore(s.handleResourceMigrateDisk))
 }
 
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
@@ -148,4 +161,152 @@ func stampStoragePool(res *apiv1.Resource, pool string) {
 	}
 
 	res.Props["StorPoolName"] = pool
+}
+
+// handleResourceMigrateDisk implements upstream LINSTOR's
+// `linstor r td --migrate-from <src>` semantics (UG9 §"Migrating a
+// resource to another node"). The flow upstream is:
+//
+//  1. Validate: rd exists, src has a diskful replica, dst is either
+//     missing or already diskless. If src is Primary InUse, refuse
+//     with 409 — upstream UG9 requires an explicit demote first
+//     before a Primary replica can be migrated.
+//  2. Ensure dst exists. If absent, create a fresh DISKLESS replica
+//     so the satellite wires it into the DRBD resource first.
+//  3. Stamp StorPoolName=<pool> on dst and drop the DISKLESS flag so
+//     the satellite reconciler's auto-diskful path attaches storage
+//     and starts syncing from src.
+//  4. Option A (this wire): immediately Delete src — the operator
+//     gets atomic "move" semantics at the REST layer; the satellite
+//     reconcilers handle the actual add-before-drop on the wire.
+//     Option B (TODO follow-up): stamp Spec.Props["BlockstorMigratingFrom"]
+//     and let a resource-side reconciler watch for dst UpToDate
+//     before pruning src — preserves the upstream redundancy
+//     invariant strictly under all timings.
+//
+// Returns 200 with an APICallRc envelope on success, 404 on unknown
+// RD or missing src diskful replica, 409 when src is Primary InUse.
+func (s *Server) handleResourceMigrateDisk(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	dst := r.PathValue("dst")
+	src := r.PathValue("src")
+	pool := r.PathValue("pool")
+
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if !s.validateMigrateSrc(w, r, rdName, src) {
+		return
+	}
+
+	if !s.promoteMigrateDst(w, r, rdName, dst, pool) {
+		return
+	}
+
+	// Option A: immediately delete the source replica. The
+	// satellite tears down via the standard delete path. Trades
+	// strict add-before-drop redundancy for atomic REST semantics;
+	// Option B (BlockstorMigratingFrom prop + reconciler) is the
+	// follow-up that preserves the invariant under all timings.
+	err = s.Store.Resources().Delete(r.Context(), rdName, src)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' migrating from '" + src + "' to '" + dst +
+			"' on pool '" + pool + "'",
+	}})
+}
+
+// validateMigrateSrc enforces the migrate-disk preconditions on the
+// source replica: it must exist, be diskful, and not currently
+// Primary InUse. Writes the matching HTTP error to w and returns
+// false if any check fails.
+func (s *Server) validateMigrateSrc(w http.ResponseWriter, r *http.Request, rdName, src string) bool {
+	srcRes, err := s.Store.Resources().Get(r.Context(), rdName, src)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				"migrate-disk: source replica '"+rdName+"' on '"+src+"' not found")
+
+			return false
+		}
+
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if slices.Contains(srcRes.Flags, apiv1.ResourceFlagDiskless) {
+		writeError(w, http.StatusConflict,
+			"migrate-disk: source replica '"+rdName+"' on '"+src+
+				"' has no diskful storage to migrate (DISKLESS)")
+
+		return false
+	}
+
+	if srcRes.State.InUse != nil && *srcRes.State.InUse {
+		writeError(w, http.StatusConflict,
+			"migrate-disk: source replica '"+rdName+"' on '"+src+
+				"' is Primary InUse; demote the consumer before migrating")
+
+		return false
+	}
+
+	return true
+}
+
+// promoteMigrateDst ensures dst has a Resource entry stamped with
+// the target pool and DISKLESS cleared. Creates a fresh diskful
+// replica when dst was absent, or flips an existing diskless one
+// to diskful in place. Returns false (after writing an HTTP error)
+// when dst already holds a diskful replica or store ops fail.
+func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdName, dst, pool string) bool {
+	dstRes, err := s.Store.Resources().Get(r.Context(), rdName, dst)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		dstRes = apiv1.Resource{Name: rdName, NodeName: dst}
+		stampStoragePool(&dstRes, pool)
+
+		err = s.Store.Resources().Create(r.Context(), &dstRes)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return false
+		}
+
+		return true
+	case err != nil:
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if !slices.Contains(dstRes.Flags, apiv1.ResourceFlagDiskless) {
+		writeError(w, http.StatusConflict,
+			"migrate-disk: destination replica '"+rdName+"' on '"+dst+
+				"' is already diskful; cannot migrate onto it")
+
+		return false
+	}
+
+	stampStoragePool(&dstRes, pool)
+	dstRes.Flags = applyFlagMutation(dstRes.Flags, apiv1.ResourceFlagDiskless, false)
+
+	err = s.Store.Resources().Update(r.Context(), &dstRes)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	return true
 }
