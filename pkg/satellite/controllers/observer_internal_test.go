@@ -489,6 +489,236 @@ func TestMergeResourceIsolatesResources(t *testing.T) {
 	}
 }
 
+// TestObserverReportsPausedSyncS (scenario 5.25) pins the peer-device
+// translation path for `replication:PausedSyncS`. DRBD-9 emits this
+// token when a SyncTarget has been paused — typically because the
+// resync was suspended via `resync-suspended:dependency` (another
+// peer holds the only UpToDate copy of a region we need, and DRBD
+// blocks the resync until that peer comes back). Operators recover
+// from this by `drbdadm disconnect <r>:<peer>` + `drbdadm connect
+// <r>:<peer>` to force a fresh handshake to the Primary; the
+// reconciler MUST NOT auto-resume by doing `drbdadm adjust` (that
+// re-renders connection-config and the kernel restarts the resync
+// from 0, which is exactly Bug 8's failure mode).
+//
+// This test exercises only the observer side: the events2
+// `peer-device` frame carrying `replication:PausedSyncS` must
+// surface intact on the observation so the satellite SSA patch
+// projects it onto Resource.Status.Connections[*].replicationState
+// — that's how the controller (and the operator running
+// `linstor v l`) sees the paused state and decides to apply the
+// recipe.
+//
+// Variants:
+//   - Bare PausedSyncS frame (DRBD-9 abbreviated form).
+//   - PausedSyncS together with out-of-sync stats (the long form
+//     drbdsetup emits when `--statistics` is on; covers the path
+//     where a single event carries both volume and connection
+//     observations).
+//   - Surrounding states the operator can also observe during a
+//     dependency pause (`PausedSyncT`, `Behind`) — same translation
+//     contract, recorded here so a future refactor of the
+//     replication-state passthrough doesn't accidentally
+//     special-case PausedSyncS while dropping its cousins.
+func TestObserverReportsPausedSyncS(t *testing.T) {
+	cases := []struct {
+		name     string
+		fields   map[string]string
+		wantRepl string
+		wantOos  int64
+		wantHas  bool
+	}{
+		{
+			name: "bare PausedSyncS frame",
+			fields: map[string]string{
+				"name":         "pvc-1",
+				"peer-node-id": "1",
+				"volume":       "0",
+				"conn-name":    "node-b",
+				"replication":  "PausedSyncS",
+			},
+			wantRepl: "PausedSyncS",
+		},
+		{
+			name: "PausedSyncS with out-of-sync stats",
+			fields: map[string]string{
+				"name":         "pvc-1",
+				"peer-node-id": "1",
+				"volume":       "0",
+				"conn-name":    "node-b",
+				"replication":  "PausedSyncS",
+				"out-of-sync":  "524288", // 512 MiB still to ship
+			},
+			wantRepl: "PausedSyncS",
+			wantOos:  524288,
+			wantHas:  true,
+		},
+		{
+			name: "PausedSyncT (peer-side paused) — same translation contract",
+			fields: map[string]string{
+				"name":         "pvc-1",
+				"peer-node-id": "1",
+				"volume":       "0",
+				"conn-name":    "node-b",
+				"replication":  "PausedSyncT",
+			},
+			wantRepl: "PausedSyncT",
+		},
+		{
+			name: "Behind (dependency-pause sibling) — pass through",
+			fields: map[string]string{
+				"name":         "pvc-1",
+				"peer-node-id": "1",
+				"volume":       "0",
+				"conn-name":    "node-b",
+				"replication":  "Behind",
+			},
+			wantRepl: "Behind",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, ok := translatePeerDeviceEvent(drbd.Event{
+				Action: "change",
+				Kind:   "peer-device",
+				Fields: tc.fields,
+			})
+
+			if !ok {
+				t.Fatalf("translatePeerDeviceEvent rejected %+v", tc.fields)
+			}
+
+			if obs.ResourceName != "pvc-1" {
+				t.Errorf("ResourceName = %q, want pvc-1", obs.ResourceName)
+			}
+
+			if len(obs.Connections) != 1 {
+				t.Fatalf("Connections len = %d, want 1: %+v", len(obs.Connections), obs.Connections)
+			}
+
+			c := obs.Connections[0]
+			if c.PeerNodeName != "node-b" {
+				t.Errorf("PeerNodeName = %q, want node-b", c.PeerNodeName)
+			}
+
+			if c.ReplicationState != tc.wantRepl {
+				t.Errorf("ReplicationState = %q, want %q", c.ReplicationState, tc.wantRepl)
+			}
+
+			// Connected/Message belong to the connection-kind path; the
+			// peer-device translator must not synthesize them — only the
+			// kernel's `connection:<state>` frame is authoritative for
+			// connection liveness. A PausedSyncS resync runs on top of a
+			// Connected link, so claiming Connected=true here would
+			// double-write the per-peer status entry and clobber the
+			// real connection-kind frame's claim under SSA.
+			if c.Connected {
+				t.Errorf("Connected = true, want false (peer-device must not set Connected)")
+			}
+
+			if c.Message != "" {
+				t.Errorf("Message = %q, want empty (peer-device must not set Message)", c.Message)
+			}
+
+			// Out-of-sync passthrough: when the frame carries
+			// `out-of-sync:<kib>`, the same observation must also surface
+			// the per-volume Volumes entry. Without it, the operator
+			// can't see resync-progress alongside the PausedSyncS state
+			// — both flow from the same event under --statistics.
+			if tc.wantHas {
+				if len(obs.Volumes) != 1 {
+					t.Fatalf("Volumes len = %d, want 1: %+v", len(obs.Volumes), obs.Volumes)
+				}
+
+				if obs.Volumes[0].OutOfSyncKib != tc.wantOos {
+					t.Errorf("OutOfSyncKib = %d, want %d", obs.Volumes[0].OutOfSyncKib, tc.wantOos)
+				}
+
+				if !obs.Volumes[0].HasSync {
+					t.Errorf("HasSync = false, want true (out-of-sync was present)")
+				}
+			} else if len(obs.Volumes) != 0 {
+				t.Errorf("Volumes populated without out-of-sync: %+v", obs.Volumes)
+			}
+		})
+	}
+}
+
+// TestMergeConnectionsPreservesPausedSyncS pins the cache-merge half
+// of the PausedSyncS path. The peer-device-kind event sets only
+// `ReplicationState`; the connection-kind event sets
+// `Connected`/`Message` independently. Both must coexist on the
+// merged per-peer entry — without this, an interleaved
+// `connection:Connected` frame would zero the just-recorded
+// `replication:PausedSyncS` (or vice-versa), and the operator's
+// `linstor v l` Repl column would flicker.
+//
+// Mirrors the SSA contract documented on writeStatus: connection-
+// kind frames own f:connected/f:message; peer-device-kind frames
+// own f:replicationState. Both apply under the same FieldOwner so
+// the merge logic — not SSA — has to keep both contributions live
+// across event arrival order.
+func TestMergeConnectionsPreservesPausedSyncS(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// 1. peer-device frame arrives first: replication:PausedSyncS.
+	pd := &observation{
+		ResourceName: "pvc-1",
+		Connections: []connectionObservation{
+			{PeerNodeName: "node-b", ReplicationState: "PausedSyncS"},
+		},
+	}
+	o.mergeConnections(pd)
+
+	got := connByPeer(pd.Connections)
+	if got["node-b"].ReplicationState != "PausedSyncS" {
+		t.Fatalf("first apply: ReplicationState = %q, want PausedSyncS",
+			got["node-b"].ReplicationState)
+	}
+
+	// 2. connection-kind frame arrives next: connection:Connected.
+	//    Must NOT erase the PausedSyncS already in cache.
+	conn := &observation{
+		ResourceName: "pvc-1",
+		Connections: []connectionObservation{
+			{PeerNodeName: "node-b", Connected: true, Message: "Connected"},
+		},
+	}
+	o.mergeConnections(conn)
+
+	got = connByPeer(conn.Connections)
+	if got["node-b"].ReplicationState != "PausedSyncS" {
+		t.Errorf("Connected event erased PausedSyncS: ReplicationState = %q",
+			got["node-b"].ReplicationState)
+	}
+
+	if !got["node-b"].Connected || got["node-b"].Message != "Connected" {
+		t.Errorf("Connected/Message dropped: %+v", got["node-b"])
+	}
+
+	// 3. peer-device frame transitions to Established (resync
+	//    resumed, dependency cleared). The cache must replace
+	//    PausedSyncS but keep Connected/Message intact.
+	resumed := &observation{
+		ResourceName: "pvc-1",
+		Connections: []connectionObservation{
+			{PeerNodeName: "node-b", ReplicationState: "Established"},
+		},
+	}
+	o.mergeConnections(resumed)
+
+	got = connByPeer(resumed.Connections)
+	if got["node-b"].ReplicationState != "Established" {
+		t.Errorf("post-resume: ReplicationState = %q, want Established",
+			got["node-b"].ReplicationState)
+	}
+
+	if !got["node-b"].Connected || got["node-b"].Message != "Connected" {
+		t.Errorf("post-resume: Connected/Message lost: %+v", got["node-b"])
+	}
+}
+
 // TestMergeResourceEmptyResourceNameNoop guards the early return.
 // Events without a resource name must NOT populate the cache —
 // otherwise a malformed event would corrupt the per-resource

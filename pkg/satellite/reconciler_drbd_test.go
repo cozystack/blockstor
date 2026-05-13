@@ -1571,6 +1571,273 @@ func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
 	}
 }
 
+// TestApplyDefersAdjustDuringSyncTarget (scenario 5.16, Bug 8 unit
+// pin) encodes the satellite-side invariant the e2e test
+// `tests/e2e/recovery-synctarget-defer.sh` exercises end-to-end:
+//
+//	`drbdadm adjust` re-renders the kernel's connection config from
+//	the .res file. DRBD-9 treats `adjust` against a peer that is
+//	currently SyncSource / SyncTarget as a connection-config touch
+//	and disconnects, dropping the in-flight bitmap progress and
+//	restarting the resync from 0%. On multi-hundred-GiB volumes
+//	this loops forever as new prop / spec changes keep landing.
+//
+// The fix: on a steady-state Apply (not first activation), the
+// reconciler MUST consult kernel state for the resource and skip
+// the `drbdadm adjust` call when any peer is mid-resync
+// (`replication:SyncTarget` or `replication:SyncSource`). The
+// .res file rewrite is still safe — DRBD doesn't re-read it
+// without an `adjust`. The deferred adjust runs on the next
+// reconcile pass once the peer reaches `replication:Established`.
+//
+// FIRST ACTIVATION IS EXEMPT: a fresh `drbdadm adjust` is what
+// actually brings the resource up — there's no in-flight resync
+// to clobber, the kernel slot doesn't even exist yet. This test
+// gates on the *steady-state* Apply (second pass with .res +
+// md-marker persisting); the first-pass adjust is verified by
+// the existing TestApplyInvokesDrbdadmAdjust.
+//
+// PROBE: the natural mechanism is `drbdsetup status <rd>` —
+// drbd-utils already lists replication:<state> per peer there.
+// The reconciler shells out, parses the replication tokens, and
+// gates the adjust on the absence of {SyncSource, SyncTarget,
+// PausedSyncS, PausedSyncT, VerifyS, VerifyT}.
+//
+// Currently t.Skip()'d: the reconciler does NOT yet probe
+// kernel state on Apply (see applyDRBD in pkg/satellite/reconciler.go
+// — the `r.cfg.Adm.Adjust(ctx, dr.GetName())` call is
+// unconditional). Once the probe + gate land, drop the t.Skip
+// and the test pins the invariant for regression catches.
+func TestApplyDefersAdjustDuringSyncTarget(t *testing.T) {
+	t.Skip("Bug 8 fix not yet implemented in pkg/satellite/reconciler.go applyDRBD — " +
+		"the reconciler calls drbdadm adjust unconditionally. Once kernel-state probing " +
+		"+ defer gate lands (per scenario 5.16 e2e test), drop the Skip and this test " +
+		"pins the SyncTarget defer invariant.")
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// First-pass storage probe: LV absent, lvcreate will run.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-synctgt_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-synctgt",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	}
+
+	// First Apply: brings the resource up, adjust MUST fire. This
+	// pass also writes the .res + md-marker the second pass keys off
+	// of for firstActivation=false.
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (first activation): %v", err)
+	}
+
+	if !slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-synctgt") {
+		t.Fatalf("first-activation Apply must adjust to bring the resource up; got %v",
+			fx.CommandLines())
+	}
+
+	// Second Apply: steady-state. .res + md-marker persist →
+	// firstActivation=false. Stage `drbdsetup status` to show n2 in
+	// SyncTarget — the kernel probe the post-fix reconciler will
+	// consult. The exact wire format mirrors what drbdsetup emits
+	// on a live mid-sync resource.
+	fx.Reset()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-synctgt_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-synctgt_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-synctgt_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-synctgt_00000|2097152\n")})
+	fx.Expect("drbdsetup status pvc-synctgt",
+		storage.FakeResponse{Stdout: []byte(`pvc-synctgt role:Primary
+  volume:0 disk:UpToDate
+  n2 role:Secondary
+    volume:0 replication:SyncTarget peer-disk:Inconsistent done:42.50
+`)})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (steady-state mid-sync): %v", err)
+	}
+
+	if slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-synctgt") {
+		t.Errorf("steady-state Apply during SyncTarget MUST defer adjust (Bug 8): got %v",
+			fx.CommandLines())
+	}
+}
+
+// TestApplyDefersAdjustDuringPausedSyncS (scenario 5.25) extends the
+// 5.16 SyncTarget defer to the PausedSyncS variant. DRBD-9 emits
+// `replication:PausedSyncS` when the SyncSource side has paused the
+// resync — typically because of `resync-suspended:dependency`: the
+// kernel detected another peer holds the only UpToDate copy of a
+// region the SyncTarget needs, and dropped the resync until that
+// dependency clears (the operator runs `drbdadm disconnect <r>:<peer>`
+// + `drbdadm connect <r>:<peer>` against the Primary to force a
+// fresh handshake, exactly as in the drbd-recovery skill).
+//
+// The reconciler MUST treat PausedSyncS the same as SyncTarget /
+// SyncSource: a `drbdadm adjust` mid-pause would re-render
+// connection config, the kernel would drop the (still-armed)
+// resync state, and the operator's manual recovery recipe would
+// race against the reconciler's adjust on every reconcile pass.
+//
+// PausedSyncT mirror is asserted in a subtest below — same
+// invariant, peer-side perspective. VerifyS / VerifyT have the
+// same kernel-level "connection-config-touch tears down state"
+// failure mode and are exercised inline so a future regression
+// that special-cases PausedSync* but drops Verify* surfaces.
+//
+// Currently t.Skip()'d: same reason as TestApplyDefersAdjustDuringSyncTarget
+// — kernel-state probe + defer gate are not yet wired into applyDRBD.
+func TestApplyDefersAdjustDuringPausedSyncS(t *testing.T) {
+	cases := []struct {
+		name        string
+		replication string
+		peerDisk    string
+	}{
+		{
+			name:        "PausedSyncS (resync-suspended:dependency)",
+			replication: "PausedSyncS",
+			peerDisk:    "Inconsistent",
+		},
+		{
+			name:        "PausedSyncT (peer-side paused, same invariant)",
+			replication: "PausedSyncT",
+			peerDisk:    "Inconsistent",
+		},
+		{
+			name:        "VerifyS (online verify in progress)",
+			replication: "VerifyS",
+			peerDisk:    "UpToDate",
+		},
+		{
+			name:        "VerifyT (peer-side verify)",
+			replication: "VerifyT",
+			peerDisk:    "UpToDate",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Skip("Bug 8 fix not yet implemented — reconciler calls drbdadm adjust " +
+				"unconditionally; PausedSyncS/PausedSyncT/VerifyS/VerifyT defer " +
+				"invariant will activate once the kernel-state probe + gate land.")
+
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-paused_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+
+			thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{"thin1": thin},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			dr := []*intent.DesiredResource{
+				{
+					Name:     "pvc-paused",
+					NodeName: "n1",
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+					},
+					Peers: []string{"n2"},
+					DrbdOptions: map[string]string{
+						"port":            "7000",
+						"node-id":         "0",
+						"address":         "10.0.0.1",
+						"minor":           "1000",
+						"peer.n2.address": "10.0.0.2",
+						"peer.n2.node-id": "1",
+						"peer.n2.port":    "7000",
+					},
+				},
+			}
+
+			// First activation: adjust must fire (no in-flight resync
+			// to clobber, kernel slot doesn't exist yet).
+			_, err := rec.Apply(t.Context(), dr)
+			if err != nil {
+				t.Fatalf("Apply (first activation): %v", err)
+			}
+
+			if !slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-paused") {
+				t.Fatalf("first-activation Apply must adjust; got %v", fx.CommandLines())
+			}
+
+			// Steady-state with kernel mid-pause: stage drbdsetup status
+			// to report the paused/verify replication state. The
+			// reconciler's gate must pick this up and skip adjust.
+			//
+			// IMPORTANT: the .res + md-marker linger from the first
+			// pass, so firstActivation=false on the second pass. The
+			// defer only applies on the firstActivation=false branch
+			// — see the test rationale on TestApplyDefersAdjustDuringSyncTarget.
+			fx.Reset()
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-paused_00000",
+				storage.FakeResponse{Stdout: []byte("pvc-paused_00000\n")})
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-paused_00000",
+				storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-paused_00000|2097152\n")})
+			fx.Expect("drbdsetup status pvc-paused",
+				storage.FakeResponse{Stdout: []byte(fmt.Sprintf(`pvc-paused role:Primary
+  volume:0 disk:UpToDate
+  n2 role:Secondary
+    volume:0 replication:%s peer-disk:%s done:33.00
+`, tc.replication, tc.peerDisk))})
+
+			_, err = rec.Apply(t.Context(), dr)
+			if err != nil {
+				t.Fatalf("Apply (steady-state %s): %v", tc.replication, err)
+			}
+
+			if slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-paused") {
+				t.Errorf("steady-state Apply during %s MUST defer adjust "+
+					"(operator runs disconnect+connect to recover; reconciler must NOT race that): got %v",
+					tc.replication, fx.CommandLines())
+			}
+
+			// Positive control: .res file MUST still be rewritten —
+			// it's the durable record of desired state, the kernel
+			// just doesn't re-read it without an `adjust`. Skipping
+			// the .res write would lose any prop/peer change the
+			// controller pushed while the resync was paused.
+			resPath := filepath.Join(dir, "pvc-paused.res")
+			if _, statErr := os.Stat(resPath); statErr != nil {
+				t.Errorf("steady-state Apply during %s must still rewrite .res "+
+					"(adjust is deferred, .res-write is not): %v",
+					tc.replication, statErr)
+			}
+		})
+	}
+}
+
 // indexOfPrefix returns the index of the first call line that
 // begins with the given prefix, or -1.
 func indexOfPrefix(lines []string, prefix string) int {
