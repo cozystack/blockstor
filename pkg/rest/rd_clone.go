@@ -83,8 +83,32 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "resource definition cloned: " + clone.Name,
-	}})
+	// golinstor's ResourceDefinitionService.Clone decodes into
+	// `ResourceDefinitionCloneStarted` (an object), NOT
+	// `[]ApiCallRc`. Returning the bare ApiCallRc array breaks the
+	// decoder with "cannot unmarshal array into Go value of type
+	// client.ResourceDefinitionCloneStarted" — surfaced as a
+	// CSI CreateVolume-from-source failure in csi-sanity. Emit the
+	// envelope shape upstream specifies.
+	writeJSON(w, http.StatusCreated, cloneStartedResponse{
+		Location:   "/v1/resource-definitions/" + clone.Name + "/clone-status",
+		SourceName: srcName,
+		CloneName:  clone.Name,
+		Messages: &[]apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition cloned: " + clone.Name,
+		}},
+	})
+}
+
+// cloneStartedResponse mirrors upstream LINSTOR's
+// `ResourceDefinitionCloneStarted` — the JSON object golinstor's
+// Clone(...) decodes into. Defined here (not in pkg/api/v1) since
+// it's an output-only response envelope; no client-side caller
+// constructs it.
+type cloneStartedResponse struct {
+	Location   string             `json:"location"`
+	SourceName string             `json:"source_name"`
+	CloneName  string             `json:"clone_name"`
+	Messages   *[]apiv1.APICallRc `json:"messages,omitempty"`
 }
