@@ -51,6 +51,22 @@ func (s *Server) registerStoragePools(mux *http.ServeMux) {
 // trips its `xml.etree` parser and crashes the CLI. Returning a
 // proper ApiCallRc envelope on every code path keeps both
 // golinstor and the Python CLI happy.
+//
+// Semantics: this is REGISTRY-ONLY. The store-level Delete deregisters
+// the StoragePool CRD from blockstor's pool map (and the satellite
+// finalizer in pkg/satellite/controllers/storagepool.go releases the
+// in-memory provider). The underlying disk-level pool (LVM VG, ZFS
+// zpool, file directory) stays intact — on-disk teardown is an
+// out-of-band operator concern. blockstor refuses to `vgremove` /
+// `zpool destroy` to avoid surprising data loss.
+//
+// Per-key (node, pool) resolution goes through the store's
+// Spec-based resolver (Bug 55), so operator-managed CRDs whose
+// metadata.name doesn't follow blockstor's canonical "<node>.<pool>"
+// shape (e.g. piraeus's `zfs-thin-w3` created via `kubectl apply -f`)
+// are still deletable through this endpoint. Without the resolver,
+// `linstor sp d` would optimistically report "already absent" while
+// the CRD lived on and List() kept showing the pool.
 func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
