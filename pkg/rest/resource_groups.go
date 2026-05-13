@@ -50,7 +50,11 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), name)
+	// CreateVolume hot path: linstor-csi follows `POST /resource-groups`
+	// with `GET /resource-groups/{rg}` that may land on a sibling
+	// apiserver replica whose informer cache still trails the write.
+	// Retry on NotFound to absorb the lag — see pkg/rest/cache_retry.go.
+	rg, err := getRGWithCacheRetry(r.Context(), s.Store, name)
 	if err != nil {
 		writeStoreError(w, err)
 

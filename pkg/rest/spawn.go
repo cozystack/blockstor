@@ -55,7 +55,10 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// CreateVolume hot path — the just-created RG may not yet be visible
+	// on this apiserver replica's informer cache; retry on NotFound.
+	// See pkg/rest/cache_retry.go.
+	rg, err := getRGWithCacheRetry(r.Context(), s.Store, rgName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -137,7 +140,12 @@ func (s *Server) spawnCreate(w http.ResponseWriter, r *http.Request, rgName stri
 // placement entirely so plain-CRD spawns without a SelectFilter
 // stay definition-only.
 func spawnAutoplace(ctx context.Context, s *Server, rdName string, rg *apiv1.ResourceGroup, req *apiv1.ResourceGroupSpawn) error {
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	// CreateVolume hot path — the RD we just wrote on `s.Store` may not
+	// be visible yet on a sibling apiserver replica's informer cache if
+	// the Spawn POST was load-balanced across pods mid-request. The
+	// CRD write went through the apiserver-direct path; the immediate
+	// read goes through the informer cache. Retry on NotFound.
+	rd, err := getRDWithCacheRetry(ctx, s.Store, rdName)
 	if err != nil {
 		return errors.Wrap(err, "get spawned RD")
 	}

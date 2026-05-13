@@ -52,7 +52,11 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRDGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rd")
 
-	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), name)
+	// CreateVolume hot path: a `GET /resource-definitions/{rd}` after a
+	// fresh spawn / RD-create may land on a sibling apiserver replica
+	// whose informer cache trails the write. Retry on NotFound to
+	// absorb the cache lag — see pkg/rest/cache_retry.go.
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, name)
 	if err != nil {
 		writeStoreError(w, err)
 

@@ -83,7 +83,11 @@ func (s *Server) registerAutoplace(mux *http.ServeMux) {
 func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	// CreateVolume hot path — linstor-csi polls this endpoint during
+	// ControllerPublishVolume right after the spawn; a sibling
+	// apiserver replica's cache may still trail the spawn write.
+	// See pkg/rest/cache_retry.go.
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -139,7 +143,10 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	// CreateVolume hot path — RD may have been written via a sibling
+	// apiserver replica seconds ago; cache trail surfaces as 404.
+	// See pkg/rest/cache_retry.go.
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -358,7 +365,12 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 	out := apiv1.AutoSelectFilter{}
 
 	if rd.ResourceGroupName != "" {
-		rg, err := st.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+		// CreateVolume hot path — RG may have been created on a sibling
+		// apiserver replica milliseconds ago. Retry on NotFound to
+		// absorb cache lag rather than silently falling back to the
+		// empty SelectFilter (which would mis-place replicas).
+		// See pkg/rest/cache_retry.go.
+		rg, err := getRGWithCacheRetry(ctx, st, rd.ResourceGroupName)
 		if err == nil {
 			out = rg.SelectFilter
 		}
@@ -644,7 +656,10 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 	// linstor-csi distinguish "no such volume" (404 → fail Attach)
 	// from "make-available not wired" (which would also be 404 here
 	// but is now impossible since the route is registered).
-	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	//
+	// CreateVolume hot path: retry on NotFound to absorb sibling
+	// apiserver replica cache lag — see pkg/rest/cache_retry.go.
+	rd, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		writeStoreError(w, err)
 
