@@ -822,7 +822,7 @@ honest. Each item names the original Phase that ticked it.
 
 ### Phase 4 follow-up
 
-- [ ] csi-sanity remaining 21 failures resolved (the `volume not present in storage backend` and node-specific lookups that need a live satellite on the csi-sanity test node — currently 53/74 specs pass).
+- [ ] csi-sanity remaining 21 failures resolved (the `volume not present in storage backend` and node-specific lookups that need a live satellite on the csi-sanity test node — currently **55/74 specs pass** after closing two wire-shape gaps: KV bag `/v1/key-value-store/{instance}` returns single-element `[]KV` (was bare object — linstor-csi's snapshot lookup `Get` decoded into `[]client.KV`), and PUT/POST/DELETE on KV instances persist into a process-local mutex-guarded bag (was no-op). Plus `stand/csi-sanity-job.yaml` now resolves `--node` via `spec.nodeName` so NodeGetInfo hits a real satellite-backed Node CRD instead of 404-ing on a placeholder. Remaining 19 failures cluster around Node Service tests that need the csi-sanity test pod to be a real CSI Node mount point (mount/unmount real filesystems) and snapshot-data-plane tests (CreateSnapshot/ListSnapshots/clone) that need an actual DRBD volume backing — both deeper than wire-shape and tracked as the architectural gap in the original PLAN line).
 
 ### Phase 5 follow-up
 
