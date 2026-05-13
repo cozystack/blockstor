@@ -18,7 +18,9 @@ package placer_test
 
 import (
 	"context"
+	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -1204,6 +1206,316 @@ func TestPlaceMixedProviderPools(t *testing.T) {
 			t.Errorf("expected single replica on n1; got %+v", got)
 		}
 	})
+}
+
+// TestPlaceRejectsBelowMinFreeCapacity pins Bug 35: the placer must
+// drop pools whose FreeCapacity is below the largest VolumeDefinition
+// on the RD. 7.15 e2e showed autoplace returning 200 even when every
+// candidate pool reported FreeCapacity=0 — the satellite then failed
+// opaquely at volume-create. The fix is the FreeCapacity floor at the
+// placer layer.
+//
+// Setup mirrors the bug report: 3 pools with FreeCapacity 100, 200,
+// 50 MiB; one VolumeDefinition asking for 150 MiB. Only the 200-MiB
+// pool clears the floor.
+//
+// Sub-test "single_replica_fits": PlaceCount=1 → the 200-MiB pool
+// hosts the replica; the 100- and 50-MiB pools are silently dropped.
+//
+// Sub-test "three_replicas_short": PlaceCount=3 → only one pool can
+// satisfy, so placed=1/want=3 AND the placer returns a
+// CapacityShortfallError carrying RequiredKib and the largest
+// FreeCapacity among the rejected pools (the 100-MiB one). REST
+// converts this into a 409 with the actionable text from
+// CapacityShortfallError.Error().
+func TestPlaceRejectsBelowMinFreeCapacity(t *testing.T) {
+	t.Parallel()
+
+	const mib = int64(1024)
+
+	mkCluster := func(t *testing.T) store.Store {
+		t.Helper()
+
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		type seed struct {
+			node string
+			free int64 // KiB
+		}
+
+		for _, s := range []seed{
+			{"n-small", 50 * mib},
+			{"n-mid", 100 * mib},
+			{"n-big", 200 * mib},
+		} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: s.node, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", s.node, err)
+			}
+
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName: s.node, StoragePoolName: "pool",
+				ProviderKind: apiv1.StoragePoolKindLVMThin,
+				FreeCapacity: s.free,
+			}); err != nil {
+				t.Fatalf("seed pool %s: %v", s.node, err)
+			}
+		}
+
+		// RD + VD asking for 150 MiB — the floor against which the
+		// placer's capacity gate filters candidate pools.
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-1",
+		}); err != nil {
+			t.Fatalf("seed RD: %v", err)
+		}
+
+		if err := st.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{
+			VolumeNumber: 0,
+			SizeKib:      150 * mib,
+		}); err != nil {
+			t.Fatalf("seed VD: %v", err)
+		}
+
+		return st
+	}
+
+	t.Run("single_replica_fits", func(t *testing.T) {
+		t.Parallel()
+
+		st := mkCluster(t)
+		ctx := t.Context()
+
+		placed, want, err := placer.New(st).Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+			PlaceCount: 1,
+		})
+		if err != nil {
+			t.Fatalf("Place: %v", err)
+		}
+
+		if placed != 1 || want != 1 {
+			t.Errorf("placed/want: got %d/%d, want 1/1", placed, want)
+		}
+
+		got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+		if len(got) != 1 {
+			t.Fatalf("resource count: got %d, want 1; %+v", len(got), got)
+		}
+
+		// The only pool with enough FreeCapacity (200 MiB > 150 MiB)
+		// is on n-big; n-mid (100 MiB) and n-small (50 MiB) must be
+		// silently dropped by the capacity filter.
+		if got[0].NodeName != "n-big" {
+			t.Errorf("placed on %q, want n-big (only pool ≥ 150 MiB); resources=%+v",
+				got[0].NodeName, got)
+		}
+	})
+
+	t.Run("three_replicas_short_surfaces_capacity_error", func(t *testing.T) {
+		t.Parallel()
+
+		st := mkCluster(t)
+		ctx := t.Context()
+
+		placed, want, err := placer.New(st).Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+			PlaceCount: 3,
+		})
+
+		// With only 1 pool clearing the floor, placement is partial.
+		if placed != 1 || want != 3 {
+			t.Errorf("placed/want: got %d/%d, want 1/3 (only n-big satisfies)", placed, want)
+		}
+
+		// And the placer must surface the actionable capacity error
+		// — REST converts to 409 with the rendered text.
+		var capErr *placer.CapacityShortfallError
+		if !errors.As(err, &capErr) {
+			t.Fatalf("err: got %v, want *CapacityShortfallError", err)
+		}
+
+		if capErr.RequiredKib != 150*mib {
+			t.Errorf("RequiredKib: got %d, want %d", capErr.RequiredKib, 150*mib)
+		}
+
+		// Largest FreeCapacity among rejected pools is the 100-MiB one.
+		if capErr.MaxFreeKib != 100*mib {
+			t.Errorf("MaxFreeKib: got %d, want %d (largest rejected)",
+				capErr.MaxFreeKib, 100*mib)
+		}
+
+		// Sanity: rendered message carries both numbers verbatim — the
+		// REST 409 surface that operators see.
+		msg := capErr.Error()
+		if !strings.Contains(msg, "required 153600 KiB") {
+			t.Errorf("error text missing required KiB: %q", msg)
+		}
+
+		if !strings.Contains(msg, "max free 102400 KiB") {
+			t.Errorf("error text missing max free KiB: %q", msg)
+		}
+	})
+
+	t.Run("no_candidate_clears_floor", func(t *testing.T) {
+		t.Parallel()
+
+		// Tightens the all-rejected branch: when ZERO pools clear the
+		// FreeCapacity floor, the placer must early-return the
+		// shortfall error without creating any Resource — even on a
+		// single-replica request. This is the literal 7.15 e2e shape:
+		// every candidate reports 0-KiB free.
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n1", "n2"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node: %v", err)
+			}
+
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName: n, StoragePoolName: "pool",
+				ProviderKind: apiv1.StoragePoolKindLVMThin,
+				FreeCapacity: 10 * mib, // way under the 150-MiB ask
+			}); err != nil {
+				t.Fatalf("seed pool: %v", err)
+			}
+		}
+
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-empty",
+		}); err != nil {
+			t.Fatalf("seed RD: %v", err)
+		}
+
+		if err := st.VolumeDefinitions().Create(ctx, "pvc-empty", &apiv1.VolumeDefinition{
+			VolumeNumber: 0, SizeKib: 150 * mib,
+		}); err != nil {
+			t.Fatalf("seed VD: %v", err)
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "pvc-empty",
+			&apiv1.AutoSelectFilter{PlaceCount: 1})
+
+		if placed != 0 || want != 1 {
+			t.Errorf("placed/want: got %d/%d, want 0/1", placed, want)
+		}
+
+		var capErr *placer.CapacityShortfallError
+		if !errors.As(err, &capErr) {
+			t.Fatalf("err: got %v, want *CapacityShortfallError", err)
+		}
+
+		// The largest FreeCapacity among the rejected pools is 10 MiB.
+		if capErr.MaxFreeKib != 10*mib {
+			t.Errorf("MaxFreeKib: got %d, want %d", capErr.MaxFreeKib, 10*mib)
+		}
+
+		got, _ := st.Resources().ListByDefinition(ctx, "pvc-empty")
+		if len(got) != 0 {
+			t.Errorf("no replica must be created on all-rejected fail-fast; got %+v", got)
+		}
+	})
+}
+
+// TestPlaceCapacityGateIntegratesWithOversubRatio pins that the
+// placer's hard FreeCapacity floor (Bug 35) and the spawn-layer
+// over-subscription gate (Bug 7.19, see
+// pkg/rest/oversubscription.go:poolMaxVolumeKib) are independent
+// gates: even on a thin pool where the oversub ratio would let the
+// logical sum exceed FreeCapacity, the PHYSICAL FreeCapacity floor
+// still drops pools that can't host the requested volume at create
+// time.
+//
+// Why this matters: the oversub gate is a logical-budget check
+// applied at spawn time across the cluster; the placer-level capacity
+// gate is the per-pool physical floor. Without Bug 35 the placer
+// would happily pick a pool whose FreeCapacity is below the volume
+// size, trusting the oversub gate to have already vetted "logical
+// sum". But the oversub gate runs on a stale snapshot and ALWAYS
+// trusts the in-store FreeCapacity from the satellite's last push —
+// it doesn't protect against a pool that has since filled up. The
+// placer's hard floor is the synchronisation point that catches that.
+//
+// Setup: 2 LVM_THIN pools (both thin → ratio=20 by default would
+// allow logical up to 20×FreeCapacity), each reporting FreeCapacity=
+// 10 MiB, TotalCapacity=1 GiB. The RD's VD asks for 100 MiB — well
+// above the per-pool FreeCapacity (which Bug 35 gates) but well
+// inside what a naive ratio×FreeCapacity computation would let pass.
+// The placer must reject BOTH pools and surface the capacity error,
+// independent of the oversub ratio.
+func TestPlaceCapacityGateIntegratesWithOversubRatio(t *testing.T) {
+	t.Parallel()
+
+	const mib = int64(1024)
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node: %v", err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: n, StoragePoolName: "thin",
+			ProviderKind:  apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:  10 * mib,   // physical floor
+			TotalCapacity: 1024 * mib, // ratio gate would allow much more
+			// Explicitly set the umbrella ratio prop to the upstream
+			// default (20) so the bug-7.19 logical budget is in scope.
+			// The placer must IGNORE this and gate on FreeCapacity only.
+			Props: map[string]string{"MaxOversubscriptionRatio": "20"},
+		}); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-oversub",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Request 100 MiB — fits inside 20×10MiB logical budget but
+	// overshoots the 10-MiB physical floor on every pool.
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-oversub", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      100 * mib,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	placed, want, err := placer.New(st).Place(ctx, "pvc-oversub",
+		&apiv1.AutoSelectFilter{PlaceCount: 2})
+
+	if placed != 0 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 0/2 (oversub must not bypass physical floor)",
+			placed, want)
+	}
+
+	var capErr *placer.CapacityShortfallError
+	if !errors.As(err, &capErr) {
+		t.Fatalf("err: got %v, want *CapacityShortfallError", err)
+	}
+
+	if capErr.RequiredKib != 100*mib {
+		t.Errorf("RequiredKib: got %d, want %d", capErr.RequiredKib, 100*mib)
+	}
+
+	if capErr.MaxFreeKib != 10*mib {
+		t.Errorf("MaxFreeKib: got %d, want %d (the physical floor, NOT ratio×free)",
+			capErr.MaxFreeKib, 10*mib)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-oversub")
+	if len(got) != 0 {
+		t.Errorf("no Resource must be created when capacity gate trips; got %+v", got)
+	}
 }
 
 // Keep go-vet happy on unused symbols in the import set.

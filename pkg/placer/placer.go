@@ -23,6 +23,7 @@ package placer
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -32,6 +33,31 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// CapacityShortfallError reports that no candidate pool has enough
+// FreeCapacity to host the RD's largest volume. Surfaced by Place
+// when the post-capacity-filter candidate set is empty AND the RD
+// carries a non-zero required size. REST handlers translate this
+// into a 409 with operator-actionable text.
+//
+// Origin (Bug 35 / 7.15 e2e): without this gate, autoplace returned
+// 200 even when every candidate pool reported FreeCapacity=0 — the
+// satellite then failed opaquely on volume create. The placer must
+// fail-fast at the controller before any Resource is stamped.
+type CapacityShortfallError struct {
+	RequiredKib int64
+	MaxFreeKib  int64
+}
+
+// Error formats the actionable shortfall message. Format is stable:
+// "not enough free capacity on candidate pools: required N KiB, max free M KiB".
+// Operators grep for the prefix; tools surface the numbers verbatim.
+func (e *CapacityShortfallError) Error() string {
+	return fmt.Sprintf(
+		"not enough free capacity on candidate pools: required %d KiB, max free %d KiB",
+		e.RequiredKib, e.MaxFreeKib,
+	)
+}
 
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
@@ -60,29 +86,131 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
-	candidates, err := p.candidatePools(ctx, filter)
+	plan, err := p.buildPlan(ctx, rdName, filter)
 	if err != nil {
 		return 0, 0, err
 	}
 
+	if plan.capacityShortfall {
+		// Fail-fast: no pool can host the largest volume. Surface the
+		// actionable error so REST returns 409 instead of 200 + a
+		// downstream satellite failure (Bug 35 / 7.15 e2e).
+		return 0, int(filter.PlaceCount), &CapacityShortfallError{
+			RequiredKib: plan.requiredKib,
+			MaxFreeKib:  plan.maxFreeKib,
+		}
+	}
+
+	placed := countDiskfulReplicas(plan.existing, plan.disabled)
+	want := int(filter.PlaceCount)
+
+	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.preferred, placed, want)
+	if err != nil {
+		return placed, want, err
+	}
+
+	placed, err = p.placeDiskful(ctx, rdName, plan.state, plan.lastResort, placed, want)
+	if err != nil {
+		return placed, want, err
+	}
+
+	if filter.DisklessOnRemaining && placed >= want {
+		err = p.placeDisklessOnRemaining(ctx, rdName, plan.state)
+		if err != nil {
+			return placed, want, err
+		}
+	}
+
+	// Partial-shortfall path (Bug 35): the diskful loop ran out of
+	// candidates because the capacity gate dropped pools that would
+	// otherwise have qualified. Surface the actionable error so the
+	// REST 409 names the missing capacity. We only fire when capacity
+	// was actually the rejecter (maxFreeKib > 0); a shortfall caused
+	// purely by topology/anti-affinity still falls through to the
+	// generic "not enough candidate storage pools" path.
+	if placed < want && plan.requiredKib > 0 && plan.maxFreeKib > 0 {
+		return placed, want, &CapacityShortfallError{
+			RequiredKib: plan.requiredKib,
+			MaxFreeKib:  plan.maxFreeKib,
+		}
+	}
+
+	return placed, want, nil
+}
+
+// placePlan bundles everything Place needs after the read-side
+// store lookups complete. Pulled into a struct so the main Place
+// function stays under the gocyclo budget once the Bug 35 capacity
+// gate added two more branches.
+//
+// capacityShortfall=true means buildPlan has already determined that
+// no pool can host the largest volume and the rest of placement
+// must be skipped; requiredKib + maxFreeKib then carry the numbers
+// for the actionable CapacityShortfallError envelope.
+type placePlan struct {
+	state             *state
+	preferred         []apiv1.StoragePool
+	lastResort        []apiv1.StoragePool
+	existing          []apiv1.Resource
+	disabled          map[string]struct{}
+	requiredKib       int64
+	maxFreeKib        int64
+	capacityShortfall bool
+}
+
+// buildPlan does the read-side legwork: load VDs, candidate pools,
+// existing resources, disabled / node-prop maps, and the topology-
+// partitioned candidate buckets. When the capacity gate has already
+// rejected every pool it returns a plan with capacityShortfall=true
+// and only the shortfall numbers populated — the caller fail-fasts
+// with CapacityShortfallError without touching the unset fields.
+func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (*placePlan, error) {
+	// Capacity-gate sizing (Bug 35): every volume of an RD provisions
+	// against the same pool, so any candidate pool must accommodate
+	// the biggest of them. requiredKib==0 (no VDs yet, e.g. a
+	// definitions-only spawn) leaves the capacity filter a no-op.
+	requiredKib, err := p.requiredKib(ctx, rdName)
+	if err != nil {
+		return nil, err
+	}
+
+	candidates, maxFreeKib, err := p.candidatePools(ctx, filter, requiredKib)
+	if err != nil {
+		return nil, err
+	}
+
+	if requiredKib > 0 && len(candidates) == 0 {
+		return &placePlan{
+			requiredKib:       requiredKib,
+			maxFreeKib:        maxFreeKib,
+			capacityShortfall: true,
+		}, nil
+	}
+
+	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, maxFreeKib)
+}
+
+// assemblePlan finishes off buildPlan once the capacity gate has
+// passed. Split out so buildPlan stays under the gocyclo budget.
+func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool, requiredKib, maxFreeKib int64) (*placePlan, error) {
 	existing, err := p.store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
-		return 0, 0, errors.Wrap(err, "list resources by definition")
+		return nil, errors.Wrap(err, "list resources by definition")
 	}
 
 	disabled, err := p.disabledNodes(ctx)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 
 	nodes, err := p.nodesByName(ctx)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 
 	allPools, err := p.store.StoragePools().List(ctx)
 	if err != nil {
-		return 0, 0, errors.Wrap(err, "list storage pools")
+		return nil, errors.Wrap(err, "list storage pools")
 	}
 
 	state := newState(filter, existing, nodes, allPools)
@@ -92,9 +220,6 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 			filter.ReplicasOnSame, int(filter.PlaceCount))
 	}
 
-	placed := countDiskfulReplicas(existing, disabled)
-	want := int(filter.PlaceCount)
-
 	// replicas_on_different in "key=value" form is a soft-exclusion:
 	// nodes carrying that exact pair are considered LAST. Split the
 	// candidate set into preferred (no excluded pair) and last-resort
@@ -102,24 +227,15 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	// the excluded bucket — see UG9 §replicasOnDifferent.
 	preferred, lastResort := partitionByExclusion(candidates, nodes, filter.ReplicasOnDifferent)
 
-	placed, err = p.placeDiskful(ctx, rdName, state, preferred, placed, want)
-	if err != nil {
-		return placed, want, err
-	}
-
-	placed, err = p.placeDiskful(ctx, rdName, state, lastResort, placed, want)
-	if err != nil {
-		return placed, want, err
-	}
-
-	if filter.DisklessOnRemaining && placed >= want {
-		err := p.placeDisklessOnRemaining(ctx, rdName, state)
-		if err != nil {
-			return placed, want, err
-		}
-	}
-
-	return placed, want, nil
+	return &placePlan{
+		state:       state,
+		preferred:   preferred,
+		lastResort:  lastResort,
+		existing:    existing,
+		disabled:    disabled,
+		requiredKib: requiredKib,
+		maxFreeKib:  maxFreeKib,
+	}, nil
 }
 
 // countDiskfulReplicas returns the number of existing replicas that
@@ -324,49 +440,52 @@ func poolsByKey(pools []apiv1.StoragePool) map[string]apiv1.StoragePool {
 	return out
 }
 
-func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter) ([]apiv1.StoragePool, error) {
+// candidatePools returns the pool set eligible for a placement, after
+// applying all filter constraints (kind, node list, pool list, provider
+// list) and — Bug 35 — dropping pools whose FreeCapacity is below the
+// volume the placer is about to land. Returns the second value as the
+// largest FreeCapacity among pools that PASSED every non-capacity gate
+// but FAILED the capacity one; callers use it to build the actionable
+// "max free M KiB" 409 message.
+//
+// minFreeKib==0 disables the capacity filter (definitions-only or test
+// paths with no VDs).
+func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter, minFreeKib int64) ([]apiv1.StoragePool, int64, error) {
 	all, err := p.store.StoragePools().List(ctx)
 	if err != nil {
-		return nil, errors.Wrap(err, "list storage pools")
+		return nil, 0, errors.Wrap(err, "list storage pools")
 	}
 
 	disabled, err := p.disabledNodes(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	out := make([]apiv1.StoragePool, 0, len(all))
 
+	var maxFreeBelow int64
+
 	for i := range all {
 		pool := all[i]
 
-		if pool.ProviderKind == apiv1.StoragePoolKindDiskless {
+		if !matchesPoolFilter(&pool, filter, disabled) {
 			continue
 		}
 
-		if _, off := disabled[pool.NodeName]; off {
-			continue
-		}
+		// Capacity gate (Bug 35): drop pools that physically can't
+		// host the largest volume of this RD. Track the largest
+		// FreeCapacity among rejected pools so the caller can render
+		// the actionable 409 ("required N KiB, max free M KiB").
+		// The gate is FreeCapacity-only — over-subscription is the
+		// spawn-time gate's job (see pkg/rest/spawn.go's
+		// rejectIfExceedsOversubGate); this layer is the hard floor
+		// that protects against the 0-KiB-free pool race seen in
+		// 7.15 e2e.
+		if minFreeKib > 0 && pool.FreeCapacity < minFreeKib {
+			if pool.FreeCapacity > maxFreeBelow {
+				maxFreeBelow = pool.FreeCapacity
+			}
 
-		if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
-			continue
-		}
-
-		if len(filter.StoragePoolList) > 0 && !slices.Contains(filter.StoragePoolList, pool.StoragePoolName) {
-			continue
-		}
-
-		if len(filter.NodeNameList) > 0 && !slices.Contains(filter.NodeNameList, pool.NodeName) {
-			continue
-		}
-
-		// Provider-kind filter (Bug 15 / snapshot-restore-resource):
-		// `zfs send` and `dd`/`lvm` payloads are not interchangeable,
-		// so cloning from a snapshot on a ZFS_THIN pool onto an
-		// LVM_THIN target fails opaquely at satellite send/recv time.
-		// Fail-fast at the placer layer by dropping pools whose
-		// ProviderKind isn't in the caller's allow-list.
-		if len(filter.ProviderList) > 0 && !slices.Contains(filter.ProviderList, pool.ProviderKind) {
 			continue
 		}
 
@@ -381,7 +500,73 @@ func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		return out[i].NodeName < out[j].NodeName
 	})
 
-	return out, nil
+	return out, maxFreeBelow, nil
+}
+
+// matchesPoolFilter is the AutoSelectFilter eligibility check for a
+// single pool: drops the DISKLESS provider kind, drops pools on
+// EVICTED / LOST nodes, and enforces every name-list / provider-list
+// constraint on the filter. Returns true when the pool clears every
+// non-capacity gate; the capacity gate stays in candidatePools so it
+// can also track the largest rejected FreeCapacity for the error
+// envelope. Split out to keep candidatePools under the gocyclo budget.
+func matchesPoolFilter(pool *apiv1.StoragePool, filter *apiv1.AutoSelectFilter, disabled map[string]struct{}) bool {
+	if pool.ProviderKind == apiv1.StoragePoolKindDiskless {
+		return false
+	}
+
+	if _, off := disabled[pool.NodeName]; off {
+		return false
+	}
+
+	if filter.StoragePool != "" && pool.StoragePoolName != filter.StoragePool {
+		return false
+	}
+
+	if len(filter.StoragePoolList) > 0 && !slices.Contains(filter.StoragePoolList, pool.StoragePoolName) {
+		return false
+	}
+
+	if len(filter.NodeNameList) > 0 && !slices.Contains(filter.NodeNameList, pool.NodeName) {
+		return false
+	}
+
+	// Provider-kind filter (Bug 15 / snapshot-restore-resource):
+	// `zfs send` and `dd`/`lvm` payloads are not interchangeable,
+	// so cloning from a snapshot on a ZFS_THIN pool onto an
+	// LVM_THIN target fails opaquely at satellite send/recv time.
+	// Fail-fast at the placer layer by dropping pools whose
+	// ProviderKind isn't in the caller's allow-list.
+	if len(filter.ProviderList) > 0 && !slices.Contains(filter.ProviderList, pool.ProviderKind) {
+		return false
+	}
+
+	return true
+}
+
+// requiredKib returns the SizeKib of the largest VolumeDefinition on
+// the named RD. Every volume of an RD provisions against the same pool
+// (upstream LINSTOR contract), so the per-pool capacity gate must clear
+// the biggest of them. Returns 0 — no filter — when the RD has no VDs
+// yet (e.g. definitions-only spawn path where the autoplacer races
+// ahead of spawnVolumeDefinitions, or a bare-RD autoplace before any
+// resize). A storage backend reporting an empty VD list is the
+// idempotent "nothing to gate" case, not an error.
+func (p *Placer) requiredKib(ctx context.Context, rdName string) (int64, error) {
+	vds, err := p.store.VolumeDefinitions().List(ctx, rdName)
+	if err != nil {
+		return 0, errors.Wrap(err, "list volume definitions")
+	}
+
+	var maxKib int64
+
+	for i := range vds {
+		if vds[i].SizeKib > maxKib {
+			maxKib = vds[i].SizeKib
+		}
+	}
+
+	return maxKib, nil
 }
 
 // disabledNodes is the union of EVICTED + LOST flagged nodes. Autoplace

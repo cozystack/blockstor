@@ -212,6 +212,16 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
 	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
 	if err != nil {
+		// Capacity-shortfall (Bug 35) is operator-actionable, not a
+		// 500. Convert to 409 with the placer's actionable text
+		// instead of surfacing a generic InternalServerError.
+		var capErr *placer.CapacityShortfallError
+		if errors.As(err, &capErr) {
+			writeError(w, http.StatusConflict, capErr.Error())
+
+			return false
+		}
+
 		writeError(w, http.StatusInternalServerError, err.Error())
 
 		return false
