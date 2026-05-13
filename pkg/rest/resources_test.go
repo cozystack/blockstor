@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -392,5 +393,171 @@ func TestResourceShapeIncludesReversibilityHint(t *testing.T) {
 		default:
 			t.Errorf("actionable_commands[%d].reversibility_class: got %q, want one of read-only|interrupts-io|destroys-data", i, rev)
 		}
+	}
+}
+
+// cliStateFromFlags models the upstream linstor Python CLI's `State`
+// column rendering for `linstor r list`. The CLI's rsc_state derivation
+// keys off Resource.Flags membership:
+//
+//   - DISKLESS + TIE_BREAKER → "TieBreaker" (autoplacer-stamped witness)
+//   - DISKLESS (only)        → "Diskless"   (operator-placed diskless)
+//   - neither                → "" (caller falls back to per-volume
+//     disk_state, e.g. "UpToDate" / "Inconsistent")
+//
+// The order matters: TIE_BREAKER always implies DISKLESS, so the
+// TieBreaker branch must be checked first. Without that ordering the
+// witness would render as "Diskless" and the operator-placed diskless
+// would be indistinguishable from a tiebreaker — which is the exact
+// regression scenario 5.7 guards against.
+func cliStateFromFlags(flags []string) string {
+	hasDiskless := slices.Contains(flags, apiv1.ResourceFlagDiskless)
+	hasTieBreaker := slices.Contains(flags, apiv1.ResourceFlagTieBreaker)
+
+	switch {
+	case hasDiskless && hasTieBreaker:
+		return "TieBreaker"
+	case hasDiskless:
+		return "Diskless"
+	default:
+		return ""
+	}
+}
+
+// TestViewResourcesDistinguishesDisklessFromTiebreaker is the scenario
+// 5.7 regression guard for the TIE_BREAKER vs DISKLESS wire shape.
+//
+// Two Resources can both carry the DISKLESS flag but mean very different
+// things to the operator:
+//
+//  1. Operator-placed diskless — `linstor r c <node> <rd> --diskless`
+//     plants `Flags: [DISKLESS]`. The Python CLI renders this as
+//     `State=Diskless` in `linstor r list`.
+//  2. Autoplacer-stamped tiebreaker — when place_count < peers the
+//     RD reconciler (and the placer) drop a witness with
+//     `Flags: [DISKLESS, TIE_BREAKER]`. The CLI renders this as
+//     `State=TieBreaker`.
+//
+// The two MUST be distinguishable across:
+//   - the REST `flags` array (raw, exact membership round-trip), and
+//   - the derived CLI `State` column the Python client computes from
+//     those flags.
+//
+// If TIE_BREAKER ever gets dropped on the way through the store / wire,
+// the operator can no longer tell an explicit diskless from an
+// auto-cleanup-eligible witness — and the autoplace.go
+// promoteOrCreateReplica path uses that distinction to decide whether
+// to strip the flag (witness) or preserve it (operator intent).
+func TestViewResourcesDistinguishesDisklessFromTiebreaker(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// pvc-1/n1: operator-placed diskless. Flags = [DISKLESS] only.
+	// pvc-1/n2: autoplacer tiebreaker. Flags = [DISKLESS, TIE_BREAKER].
+	seed := []apiv1.Resource{
+		{
+			Name:     "pvc-1",
+			NodeName: "n1",
+			Flags:    []string{apiv1.ResourceFlagDiskless},
+		},
+		{
+			Name:     "pvc-1",
+			NodeName: "n2",
+			Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		},
+	}
+
+	for i := range seed {
+		if err := st.Resources().Create(ctx, &seed[i]); err != nil {
+			t.Fatalf("seed %s/%s: %v", seed[i].Name, seed[i].NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2; entries=%v", len(got), got)
+	}
+
+	// Index by node so the test is independent of sort order — the
+	// default sort is Name+NodeName so n1 comes before n2, but
+	// asserting via map lookup keeps the contract on the wire-shape,
+	// not on sort order (a separate test guards sort stability).
+	byNode := map[string]apiv1.ResourceWithVolumes{}
+
+	for i := range got {
+		byNode[got[i].NodeName] = got[i]
+	}
+
+	diskless, ok := byNode["n1"]
+	if !ok {
+		t.Fatalf("missing pvc-1/n1 (operator-placed diskless) in view: %v", got)
+	}
+
+	tiebreaker, ok := byNode["n2"]
+	if !ok {
+		t.Fatalf("missing pvc-1/n2 (autoplacer tiebreaker) in view: %v", got)
+	}
+
+	// --- Flags round-trip --------------------------------------------------
+	//
+	// Operator-placed diskless: exactly [DISKLESS] — no TIE_BREAKER
+	// leakage. If TIE_BREAKER ever appears here, the autoplace.go
+	// cleanup heuristics would mis-classify an operator-intentional
+	// diskless as a stale witness and strip it.
+	if !slices.Contains(diskless.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("operator-placed diskless: DISKLESS missing from flags=%v", diskless.Flags)
+	}
+
+	if slices.Contains(diskless.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("operator-placed diskless: TIE_BREAKER leaked into flags=%v", diskless.Flags)
+	}
+
+	// Autoplacer tiebreaker: BOTH DISKLESS and TIE_BREAKER must
+	// survive the wire round-trip. Dropping TIE_BREAKER here is the
+	// exact regression that turns a cleanup-eligible witness into
+	// what looks like operator intent.
+	if !slices.Contains(tiebreaker.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("autoplacer tiebreaker: DISKLESS missing from flags=%v", tiebreaker.Flags)
+	}
+
+	if !slices.Contains(tiebreaker.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("autoplacer tiebreaker: TIE_BREAKER missing from flags=%v", tiebreaker.Flags)
+	}
+
+	// --- CLI State rendering -----------------------------------------------
+	//
+	// The two MUST collapse to different `State` strings under the
+	// Python CLI's rsc_state derivation. If both render as the same
+	// label, an operator running `linstor r list` cannot tell them
+	// apart at the only place they look — the State column.
+	disklessState := cliStateFromFlags(diskless.Flags)
+	tiebreakerState := cliStateFromFlags(tiebreaker.Flags)
+
+	if disklessState != "Diskless" {
+		t.Errorf("operator-placed diskless: State=%q, want %q", disklessState, "Diskless")
+	}
+
+	if tiebreakerState != "TieBreaker" {
+		t.Errorf("autoplacer tiebreaker: State=%q, want %q", tiebreakerState, "TieBreaker")
+	}
+
+	if disklessState == tiebreakerState {
+		t.Fatalf("CLI State collision: both render as %q — operator cannot distinguish "+
+			"explicit diskless from autoplacer witness", disklessState)
 	}
 }
