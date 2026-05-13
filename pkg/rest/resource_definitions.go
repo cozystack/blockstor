@@ -135,6 +135,23 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Sticky LayerStack inheritance from the parent RG (Bug 54).
+	// `linstor rd c <rd> --resource-group <rg>` does NOT carry layer_stack
+	// on the wire — the upstream CLI relies on the controller to walk
+	// rd → rg and stamp the RG's SelectFilter.LayerStack onto the RD at
+	// create time. Without this stamp, RD.LayerStack stays empty, the
+	// dispatcher's `rd.Spec.LayerStack` read at pkg/dispatcher/dispatcher.go
+	// surfaces nil, and the satellite's `needsDRBD(layers []string)` legacy
+	// default treats empty == DRBD+STORAGE — so an `STORAGE`-only RG ends
+	// up spawning DRBD-stacked Resources, contradicting the operator's
+	// SelectFilter.
+	err = s.inheritLayerStackFromRG(r.Context(), &rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
@@ -186,6 +203,46 @@ func (s *Server) ensureDefaultRGAssignment(ctx context.Context, rd *apiv1.Resour
 	if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
+
+	return nil
+}
+
+// inheritLayerStackFromRG copies the parent RG's SelectFilter.LayerStack
+// onto the RD when the RD itself didn't carry one. Caller-supplied
+// rd.LayerStack wins (explicit > inherited), matching the same precedence
+// rule v1.ResolveLayerStack applies at the dispatch read-side. The result
+// is stamped onto the stored RD so a later `linstor rg modify` that flips
+// the parent's LayerStack does NOT retroactively re-layer existing RDs —
+// "sticky at create time", just like upstream LINSTOR's behaviour.
+//
+// NotFound on the parent RG is swallowed: the lazily-created DfltRscGrp
+// in ensureDefaultRGAssignment may race with this lookup on a sibling
+// apiserver replica, and the default RG carries no SelectFilter anyway,
+// so silently falling through leaves rd.LayerStack empty (= the legacy
+// DRBD+STORAGE default, applied downstream).
+func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.ResourceDefinition) error {
+	if len(rd.LayerStack) > 0 {
+		return nil
+	}
+
+	if rd.ResourceGroupName == "" {
+		return nil
+	}
+
+	rg, err := s.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	if len(rg.SelectFilter.LayerStack) == 0 {
+		return nil
+	}
+
+	rd.LayerStack = append([]string(nil), rg.SelectFilter.LayerStack...)
 
 	return nil
 }

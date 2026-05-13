@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
@@ -372,5 +373,155 @@ func TestResourceDefinitionsDeleteCascadeMissingChildIsIdempotent(t *testing.T) 
 
 	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-empty"); err == nil {
 		t.Errorf("RD still present after delete")
+	}
+}
+
+// TestRDCreateInheritsLayerStackFromRG pins Bug 54: when the caller POSTs
+// an RD with empty layer_stack and a resource_group_name that points at an
+// RG whose SelectFilter pins a LayerStack, the stored RD must carry that
+// stack. Without this stamp, the dispatcher reads rd.Spec.LayerStack == nil
+// and the satellite's legacy needsDRBD default re-stacks DRBD onto an
+// STORAGE-only RG (reproducer: `linstor rg c test`, set LayerStack=STORAGE,
+// `linstor rd c test --resource-group test` → Resources show DRBD,STORAGE).
+func TestRDCreateInheritsLayerStackFromRG(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "test-rg",
+		SelectFilter: apiv1.AutoSelectFilter{
+			LayerStack: []string{apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{
+			Name:              "rd-inherit",
+			ResourceGroupName: "test-rg",
+			// LayerStack intentionally empty — exercise the inheritance path.
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "rd-inherit")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := []string{apiv1.LayerKindStorage}
+	if !slices.Equal(got.LayerStack, want) {
+		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
+	}
+}
+
+// TestRDCreateExplicitLayerStackWinsOverRG pins the precedence rule:
+// when the caller supplies a non-empty layer_stack on the RD, the parent
+// RG's SelectFilter.LayerStack does NOT override it. Caller > RG, mirrors
+// v1.ResolveLayerStack's RD-wins ordering at the dispatch read-side and
+// keeps operator-supplied compositions sticky against a later RG retune.
+func TestRDCreateExplicitLayerStackWinsOverRG(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "test-rg",
+		SelectFilter: apiv1.AutoSelectFilter{
+			LayerStack: []string{apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	explicit := []string{apiv1.LayerKindDRBD, apiv1.LayerKindStorage}
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{
+			Name:              "rd-explicit",
+			ResourceGroupName: "test-rg",
+			LayerStack:        explicit,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "rd-explicit")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if !slices.Equal(got.LayerStack, explicit) {
+		t.Errorf("LayerStack: got %v, want explicit %v", got.LayerStack, explicit)
+	}
+}
+
+// TestRDCreateNoInheritWhenRGHasNoLayerStack regression-guards the new
+// inheritance code: when the parent RG has no SelectFilter LayerStack,
+// the RD's LayerStack must stay empty (the legacy "empty == default
+// DRBD+STORAGE" downstream path takes over via dispatcher / needsDRBD).
+// Otherwise the inheritance pass would stamp a hard default that
+// future SelectFilter-mediated overrides could no longer relax.
+func TestRDCreateNoInheritWhenRGHasNoLayerStack(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "silent-rg",
+		// SelectFilter intentionally zero — no LayerStack pin.
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{
+			Name:              "rd-silent",
+			ResourceGroupName: "silent-rg",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "rd-silent")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if len(got.LayerStack) != 0 {
+		t.Errorf("LayerStack: got %v, want empty (defer to legacy default)", got.LayerStack)
 	}
 }

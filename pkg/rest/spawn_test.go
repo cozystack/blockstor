@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -518,4 +519,54 @@ func containsAll(haystack string, needles ...string) bool {
 	}
 
 	return true
+}
+
+// TestSpawnInheritsLayerStackFromRG mirrors Bug 54 on the
+// `linstor rg spawn` path: the RD spawned from an RG whose SelectFilter
+// pins LayerStack must carry that stack so the dispatcher / satellite
+// chain spawns Resources at the right composition. Without this stamp
+// in buildSpawnedRD, every linstor-csi CreateVolume on an STORAGE-only
+// RG would still emit DRBD-stacked replicas via the legacy needsDRBD
+// default — silently contradicting the operator's SelectFilter.
+func TestSpawnInheritsLayerStackFromRG(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-storage-only",
+		SelectFilter: apiv1.AutoSelectFilter{
+			LayerStack: []string{apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-spawn",
+		// definitions_only: skip placement; we only assert the RD shape.
+		DefinitionsOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-storage-only/spawn", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-spawn")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := []string{apiv1.LayerKindStorage}
+	if !slices.Equal(got.LayerStack, want) {
+		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
+	}
 }

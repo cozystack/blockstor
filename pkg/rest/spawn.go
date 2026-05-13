@@ -187,6 +187,16 @@ func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.Reso
 		maps.Copy(rd.Props, rg.Props)
 	}
 
+	// Sticky LayerStack inheritance (Bug 54). Mirrors handleRDCreate's
+	// inheritLayerStackFromRG: when the operator pinned a SelectFilter
+	// LayerStack on the RG, the spawned RD must carry it so the
+	// dispatcher's RD.LayerStack read produces the right composition
+	// for satellite reconcile (otherwise the legacy needsDRBD default
+	// re-stacks DRBD on an STORAGE-only RG).
+	if len(rg.SelectFilter.LayerStack) > 0 {
+		rd.LayerStack = append([]string(nil), rg.SelectFilter.LayerStack...)
+	}
+
 	return rd
 }
 
