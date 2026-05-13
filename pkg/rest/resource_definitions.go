@@ -46,6 +46,27 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional filter the upstream LINSTOR CLI sends on
+	// `linstor rd l --resource-definitions <name>...`: the Python
+	// CLI urlencodes the names as `?resource_definitions=a&resource_definitions=b`,
+	// golinstor as the comma-joined `?resource_definitions=a,b` form.
+	// Without honouring this, `rd l --resource-definitions X` returns
+	// the full RD list and the CLI renders ALL RDs — Bug 61.
+	// Semantics mirror upstream: case-insensitive name match,
+	// unknown names => empty list (NOT 404); missing param => no filter.
+	nameFilter := multiValueQuery(r, "resource_definitions")
+	if len(nameFilter) > 0 {
+		filtered := rds[:0]
+
+		for i := range rds {
+			if matchAnyFold(nameFilter, rds[i].Name) {
+				filtered = append(filtered, rds[i])
+			}
+		}
+
+		rds = filtered
+	}
+
 	// Defensive non-nil: linstor-csi's RD-list decoder treats a `null`
 	// body as malformed. Both store backends `make()` their result,
 	// but pin the invariant at the wire edge.

@@ -44,6 +44,24 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Optional filter the upstream LINSTOR CLI sends on
+	// `linstor rg l --resource-groups <name>...` — mirrors the
+	// `resource_definitions` filter on `rd l` (Bug 61) for the RG
+	// list endpoint. Same semantics: case-insensitive name match,
+	// unknown names => empty list, missing param => no filter.
+	nameFilter := multiValueQuery(r, "resource_groups")
+	if len(nameFilter) > 0 {
+		filtered := rgs[:0]
+
+		for i := range rgs {
+			if matchAnyFold(nameFilter, rgs[i].Name) {
+				filtered = append(filtered, rgs[i])
+			}
+		}
+
+		rgs = filtered
+	}
+
 	// Defensive non-nil: linstor-csi rejects `null` in place of the
 	// empty-list envelope. Pin the invariant at the wire edge so a
 	// future store backend that elides `make()` on the no-rows path

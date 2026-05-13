@@ -525,3 +525,135 @@ func TestRDCreateNoInheritWhenRGHasNoLayerStack(t *testing.T) {
 		t.Errorf("LayerStack: got %v, want empty (defer to legacy default)", got.LayerStack)
 	}
 }
+
+// seedRDs is a small helper for the filter-test family: inserts the
+// named RDs into the in-memory store and returns the wired server.
+func seedRDsForFilterTests(t *testing.T, names ...string) (string, func()) {
+	t.Helper()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, name := range names {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: name}); err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+	}
+
+	return startServerWithStore(t, st)
+}
+
+// getRDListWith fires GET /v1/resource-definitions{query} and decodes
+// the response into the canonical wire shape so filter tests stay
+// close to a real client. The body is closed before returning so the
+// caller doesn't have to (and bodyclose stays happy with a single
+// helper covering both the request and the resource cleanup).
+func getRDListWith(t *testing.T, base, query string) []apiv1.ResourceDefinition {
+	t.Helper()
+
+	resp := httpGet(t, base+"/v1/resource-definitions"+query)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rds []apiv1.ResourceDefinition
+
+	if err := json.NewDecoder(resp.Body).Decode(&rds); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	return rds
+}
+
+func rdNames(rds []apiv1.ResourceDefinition) []string {
+	out := make([]string, 0, len(rds))
+	for i := range rds {
+		out = append(out, rds[i].Name)
+	}
+
+	return out
+}
+
+// TestRDListFiltersByNameQuery pins Bug 61: the upstream LINSTOR CLI
+// sends `?resource_definitions=<name>` on `linstor rd l
+// --resource-definitions <name>`. Before the fix, the param was
+// ignored and ALL RDs came back.
+func TestRDListFiltersByNameQuery(t *testing.T) {
+	base, stop := seedRDsForFilterTests(t, "alpha", "beta", "gamma")
+	defer stop()
+
+	rds := getRDListWith(t, base, "?resource_definitions=beta")
+
+	if got := rdNames(rds); len(got) != 1 || got[0] != "beta" {
+		t.Errorf("filter=beta: got %v, want [beta]", got)
+	}
+}
+
+// TestRDListFiltersAcceptsMultipleNames pins the multi-value wire
+// shape python-linstor's urlencode(doseq=True) sends:
+// `?resource_definitions=a&resource_definitions=b`.
+func TestRDListFiltersAcceptsMultipleNames(t *testing.T) {
+	base, stop := seedRDsForFilterTests(t, "alpha", "beta", "gamma")
+	defer stop()
+
+	rds := getRDListWith(t, base, "?resource_definitions=alpha&resource_definitions=gamma")
+
+	got := rdNames(rds)
+	slices.Sort(got)
+
+	want := []string{"alpha", "gamma"}
+	if !slices.Equal(got, want) {
+		t.Errorf("multi-name filter: got %v, want %v", got, want)
+	}
+}
+
+// TestRDListFiltersCaseInsensitive pins upstream LINSTOR's
+// case-insensitive RD-name matching: the controller normalises names
+// when filtering, so `?resource_definitions=ALPHA` must match the
+// stored `alpha`.
+func TestRDListFiltersCaseInsensitive(t *testing.T) {
+	base, stop := seedRDsForFilterTests(t, "alpha", "beta", "gamma")
+	defer stop()
+
+	rds := getRDListWith(t, base, "?resource_definitions=ALPHA")
+
+	if got := rdNames(rds); len(got) != 1 || got[0] != "alpha" {
+		t.Errorf("case-insensitive filter: got %v, want [alpha]", got)
+	}
+}
+
+// TestRDListFilterUnknownNameReturnsEmpty pins the upstream
+// "filter — not lookup" semantic: an unknown RD name in the filter
+// yields an empty 200 body, NOT a 404. (404 is reserved for the
+// per-RD GET /v1/resource-definitions/{rd} path.)
+func TestRDListFilterUnknownNameReturnsEmpty(t *testing.T) {
+	base, stop := seedRDsForFilterTests(t, "alpha", "beta", "gamma")
+	defer stop()
+
+	rds := getRDListWith(t, base, "?resource_definitions=ghost")
+
+	if len(rds) != 0 {
+		t.Errorf("filter=ghost: got %v, want []", rdNames(rds))
+	}
+}
+
+// TestRDListNoFilterReturnsAll pins backward compat: callers that
+// don't send the `resource_definitions` query param see the full
+// list (golinstor's plain `ResourceDefinitions.GetAll`, csi-linstor's
+// existing call sites).
+func TestRDListNoFilterReturnsAll(t *testing.T) {
+	base, stop := seedRDsForFilterTests(t, "alpha", "beta", "gamma")
+	defer stop()
+
+	rds := getRDListWith(t, base, "")
+
+	got := rdNames(rds)
+	slices.Sort(got)
+
+	want := []string{"alpha", "beta", "gamma"}
+	if !slices.Equal(got, want) {
+		t.Errorf("no-filter: got %v, want %v", got, want)
+	}
+}
