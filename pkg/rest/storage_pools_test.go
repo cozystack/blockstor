@@ -244,6 +244,168 @@ func TestNodeStoragePoolGet(t *testing.T) {
 	}
 }
 
+// TestStoragePoolsPerNodeListReturnsPools pins the per-node listing against
+// the regression linstor-csi hit in Bug 24: pools were visible on
+// /v1/view/storage-pools (so the controller knew about them) but
+// /v1/nodes/{n}/storage-pools returned []. linstor-csi's CreateVolume
+// probes each node via /v1/nodes/{n}/storage-pools, so an empty per-node
+// response caused autoplace to fail with ResourceExhausted and PVCs
+// stayed Pending forever. The per-node count must equal the view's
+// per-node-filtered count.
+func TestStoragePoolsPerNodeListReturnsPools(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seed := []apiv1.StoragePool{
+		{StoragePoolName: "pa", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "pb", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindZFSThin},
+		{StoragePoolName: "pc", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindFileThin},
+		{StoragePoolName: "pa", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "pd", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindZFSThin},
+	}
+
+	for i := range seed {
+		if err := st.StoragePools().Create(ctx, &seed[i]); err != nil {
+			t.Fatalf("seed[%d]: %v", i, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1/storage-pools")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3 (n1 has pa+pb+pc); entries=%v", len(got), got)
+	}
+
+	for _, sp := range got {
+		if sp.NodeName != "n1" {
+			t.Errorf("returned pool from wrong node %q (want n1)", sp.NodeName)
+		}
+	}
+}
+
+// TestStoragePoolsPerNodeListEmptyOnUnknownNode: an unknown node yields
+// an empty 200 body, mirroring upstream LINSTOR (NOT 404). linstor-csi
+// treats 404 on this path as a hard transport error; an empty list is
+// the expected "this node has no pools" signal.
+func TestStoragePoolsPerNodeListEmptyOnUnknownNode(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed a pool on a different node so the store isn't empty (rules
+	// out the trivial "empty store returns empty body" case).
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "p1",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/ghost/storage-pools")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (LINSTOR returns empty list, not 404, for unknown nodes)", resp.StatusCode)
+	}
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got == nil {
+		t.Errorf("body: got nil, want empty (non-nil) slice — linstor-csi rejects null JSON")
+	}
+
+	if len(got) != 0 {
+		t.Errorf("body: got %v, want empty", got)
+	}
+}
+
+// TestStoragePoolsPerNodeListMatchesViewFiltering pins the parity
+// invariant: GET /v1/nodes/{n}/storage-pools must return exactly what
+// GET /v1/view/storage-pools?nodes={n} returns. Bug 24 was a drift —
+// the two endpoints went through different store methods and the
+// per-node path returned [] while the view returned the full set.
+// This test prevents the two from diverging again.
+func TestStoragePoolsPerNodeListMatchesViewFiltering(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, sp := range []apiv1.StoragePool{
+		{StoragePoolName: "p1", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "p2", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindZFSThin},
+		{StoragePoolName: "p1", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin},
+		{StoragePoolName: "p3", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindFileThin},
+	} {
+		if err := st.StoragePools().Create(ctx, &sp); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, node := range []string{"n1", "n2", "n3", "ghost"} {
+		perNodeResp := httpGet(t, base+"/v1/nodes/"+node+"/storage-pools")
+
+		var perNode []apiv1.StoragePool
+
+		if err := json.NewDecoder(perNodeResp.Body).Decode(&perNode); err != nil {
+			_ = perNodeResp.Body.Close()
+			t.Fatalf("per-node decode for %q: %v", node, err)
+		}
+
+		_ = perNodeResp.Body.Close()
+
+		viewResp := httpGet(t, base+"/v1/view/storage-pools?nodes="+node)
+
+		var viewFiltered []apiv1.StoragePool
+
+		if err := json.NewDecoder(viewResp.Body).Decode(&viewFiltered); err != nil {
+			_ = viewResp.Body.Close()
+			t.Fatalf("view decode for %q: %v", node, err)
+		}
+
+		_ = viewResp.Body.Close()
+
+		if len(perNode) != len(viewFiltered) {
+			t.Errorf("drift on node %q: per-node len=%d, view-filtered len=%d", node, len(perNode), len(viewFiltered))
+
+			continue
+		}
+
+		// Same elements in same order — both endpoints sort the
+		// underlying slice consistently (List sorts by (node,pool)
+		// and matchAnyFold preserves order).
+		for i := range perNode {
+			if perNode[i].NodeName != viewFiltered[i].NodeName ||
+				perNode[i].StoragePoolName != viewFiltered[i].StoragePoolName {
+				t.Errorf("drift on node %q index %d: per-node=%s/%s, view=%s/%s",
+					node, i,
+					perNode[i].NodeName, perNode[i].StoragePoolName,
+					viewFiltered[i].NodeName, viewFiltered[i].StoragePoolName)
+			}
+		}
+	}
+}
+
 // Without a Store, pool endpoints also return 503.
 func TestStoragePoolEndpointsWithoutStore(t *testing.T) {
 	base, stop := startServerCustom(t, &Server{Addr: pickFreeAddr(t), Store: nil})
