@@ -17,12 +17,69 @@ limitations under the License.
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// TestActivateDeactivateAPICallRcEnvelope pins the wire shape of the
+// activate/deactivate handlers (Bug 45). golinstor's response parser
+// calls json.Unmarshal against `[]ApiCallRc` unconditionally and fails
+// with "Unable to parse REST json data: Expecting value" if the body
+// is empty — which is what the old `w.WriteHeader(200)` path produced.
+// The Python CLI further dereferences `replies[0].ret_code`, so the
+// array must be non-empty too.
+func TestActivateDeactivateAPICallRcEnvelope(t *testing.T) {
+	for _, action := range []string{"deactivate", "activate"} {
+		t.Run(action, func(t *testing.T) {
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			if err := st.ResourceDefinitions().Create(ctx,
+				&apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+				t.Fatalf("seed RD: %v", err)
+			}
+
+			if err := st.Resources().Create(ctx,
+				&apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+				t.Fatalf("seed Resource: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := httpPost(t,
+				base+"/v1/resource-definitions/pvc-1/resources/n1/"+action, nil)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status: got %d, want 200", resp.StatusCode)
+			}
+
+			var rc []apiv1.APICallRc
+
+			err := json.NewDecoder(resp.Body).Decode(&rc)
+			if err != nil {
+				t.Fatalf("decode envelope: %v", err)
+			}
+
+			if len(rc) == 0 {
+				t.Fatalf("empty envelope — golinstor and Python CLI both crash here")
+			}
+
+			if rc[0].RetCode < 0 {
+				t.Errorf("ret_code = %d, want >=0 (MASK_INFO success marker)", rc[0].RetCode)
+			}
+
+			if rc[0].Message == "" {
+				t.Errorf("empty message — operator log will be unreadable")
+			}
+		})
+	}
+}
 
 // TestAdjustAllOnExistingRD: posting to /v1/resource-definitions/{rd}/adjust
 // returns 200 — the controller's job is to mark the RD for resync; the

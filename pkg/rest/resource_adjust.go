@@ -18,6 +18,8 @@ package rest
 
 import (
 	"net/http"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // registerAdjust wires the adjust nudges. Both endpoints are
@@ -84,20 +86,27 @@ func (s *Server) registerResourceLifecycle(mux *http.ServeMux) {
 // Idempotent: removing an already-absent flag is a no-op. The satellite
 // brings the kernel resource back up on its next reconcile.
 func (s *Server) handleResourceActivate(w http.ResponseWriter, r *http.Request) {
-	mutateResourceFlag(w, r, s, "INACTIVE", false)
+	mutateResourceFlag(w, r, s, "INACTIVE", false, "resource activated")
 }
 
 // handleResourceDeactivate sets the INACTIVE flag. Storage stays;
 // drbdadm down runs on the satellite. The Resource CRD is intact so
 // activate flips it back without losing port/node-id allocations.
 func (s *Server) handleResourceDeactivate(w http.ResponseWriter, r *http.Request) {
-	mutateResourceFlag(w, r, s, "INACTIVE", true)
+	mutateResourceFlag(w, r, s, "INACTIVE", true, "resource deactivated")
 }
 
 // mutateResourceFlag is the shared add/remove path for activate +
 // deactivate. set=true adds the flag; set=false removes every
 // occurrence. Idempotent.
-func mutateResourceFlag(w http.ResponseWriter, r *http.Request, s *Server, flag string, set bool) {
+//
+// Responds with an `[]ApiCallRc` envelope (Bug 45): golinstor's
+// response parser calls `json.Unmarshal` against this shape
+// unconditionally and fails with "Unable to parse REST json data:
+// Expecting value" on empty 200 bodies. The Python CLI also
+// dereferences `replies[0].ret_code` the same way every other write
+// endpoint does — see the comment on handleRGCreate.
+func mutateResourceFlag(w http.ResponseWriter, r *http.Request, s *Server, flag string, set bool, action string) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
@@ -117,7 +126,10 @@ func mutateResourceFlag(w http.ResponseWriter, r *http.Request, s *Server, flag 
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: action + ": " + rdName + " on " + node,
+	}})
 }
 
 // applyFlagMutation adds or removes flag depending on set. Used by the
