@@ -207,6 +207,13 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "node-heartbeat")
 		os.Exit(1)
 	}
+	if err := (&controller.NodeLabelSyncReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "node-label-sync")
+		os.Exit(1)
+	}
 	if err := (&controller.StoragePoolReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

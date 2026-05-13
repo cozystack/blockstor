@@ -201,7 +201,7 @@ func (r *NodeHeartbeatReconciler) applyState(
 
 	apply := &blockstoriov1alpha1.Node{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "Node",
+			Kind:       nodeKind,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: node.Name},

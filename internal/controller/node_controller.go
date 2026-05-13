@@ -38,6 +38,22 @@ import (
 // see progress within a couple of pings.
 const evictionRequeue = 30 * time.Second
 
+// AnnotationMigrationBlocked is stamped onto the parent
+// ResourceDefinition CRD when an eviction-driven migration cannot run
+// — e.g. the RD has no ResourceGroup attached, so the placer has no
+// SelectFilter to derive a topology / place_count from. Operators
+// grep this annotation to find RDs that need manual intervention
+// (attach an RG, then re-trigger the node eviction) rather than
+// silently leaving replicas pinned to a draining node.
+const AnnotationMigrationBlocked = "blockstor.io/migration-blocked"
+
+// MigrationBlockedReasonNoRG is the value the NodeReconciler writes to
+// AnnotationMigrationBlocked when the parent RD has no
+// ResourceGroupName. Distinct constant so future reasons (e.g.
+// insufficient candidates) get their own value rather than overloading
+// a free-form string.
+const MigrationBlockedReasonNoRG = "no-rg"
+
 // NodeReconciler watches Node CRDs and drives replica migration when
 // EVICTED / LOST flags appear. EVICTED is the soft "drain me" hint
 // (operator initiated); LOST is the permanent "node is gone" mark.
@@ -139,13 +155,22 @@ func (r *NodeReconciler) migrateResource(ctx context.Context, victim *apiv1.Reso
 		return err
 	}
 
+	// No RG → no SelectFilter → no topology/place_count to migrate
+	// against. The previous fallback of PlaceCount=1 silently
+	// half-migrated: with 1, the placer treats "1 valid replica
+	// elsewhere" as sufficient, so even when the EVICTED node hosts
+	// the only diskful replica the gap-fill never fires. Fail-safe:
+	// refuse the migration and stamp the RD so an operator sees the
+	// gap. They can attach an RG and re-trigger the eviction.
+	if rd.ResourceGroupName == "" {
+		return r.annotateMigrationBlocked(ctx, rdName, MigrationBlockedReasonNoRG)
+	}
+
 	filter := apiv1.AutoSelectFilter{}
 
-	if rd.ResourceGroupName != "" {
-		rg, err := r.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
-		if err == nil {
-			filter = rg.SelectFilter
-		}
+	rg, err := r.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+	if err == nil {
+		filter = rg.SelectFilter
 	}
 
 	if filter.PlaceCount == 0 {
@@ -179,6 +204,30 @@ func (r *NodeReconciler) migrateResource(ctx context.Context, victim *apiv1.Reso
 // `<rd>.<node>` is the documented composite key.
 func resourceCRDName(rd, node string) string {
 	return rd + "." + node
+}
+
+// annotateMigrationBlocked stamps the parent RD with the
+// `blockstor.io/migration-blocked` annotation and the given reason so
+// an operator (`kubectl get rd -o ...`) can surface every RD whose
+// eviction migration refused to run. Idempotent: re-stamping with the
+// same reason is a no-op write.
+func (r *NodeReconciler) annotateMigrationBlocked(ctx context.Context, rdName, reason string) error {
+	rd, err := r.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return err
+	}
+
+	if rd.Annotations[AnnotationMigrationBlocked] == reason {
+		return nil
+	}
+
+	if rd.Annotations == nil {
+		rd.Annotations = map[string]string{}
+	}
+
+	rd.Annotations[AnnotationMigrationBlocked] = reason
+
+	return r.Store.ResourceDefinitions().Update(ctx, &rd)
 }
 
 // SetupWithManager sets up the controller with the Manager.

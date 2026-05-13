@@ -9,9 +9,14 @@
 #
 # Steps:
 #   1. apply CRDs from config/crd/bases/
-#   2. apply blockstor-deploy.yaml (controller + RBAC + namespace)
-#   3. apply blockstor-satellite-daemonset.yaml
-#   4. wait for controller + satellites Running
+#   2. apply blockstor Node CRs from k8s worker nodes (depends only
+#      on the Node CRD definition from step 1 — done before the
+#      Deployments so a broken controller/apiserver image cannot
+#      gate Node-CR bootstrap)
+#   3. apply blockstor-deploy.yaml (controller + RBAC + namespace)
+#   4. apply blockstor-apiserver-deploy.yaml
+#   5. apply blockstor-satellite-daemonset.yaml
+#   6. wait for controller + apiserver + satellites Running
 #
 # Assumes the host registry is reachable from the cluster on the
 # bridge gateway (.1 of this cluster's NET_CIDR). Talos config-patch
@@ -36,6 +41,32 @@ echo ">> using host registry at $REGISTRY"
 
 echo ">> apply CRDs"
 kubectl apply -f "$REPO_ROOT/config/crd/bases/" 2>&1 | tail -5
+
+# Bootstrap blockstor Node CRDs from k8s worker nodes so the
+# satellite reconciler's peer-resolution path has an address per
+# node — otherwise multi-replica .res files render a 0.0.0.0
+# placeholder for any peer this satellite hasn't directly seen.
+# Cluster-scoped CRD; metadata.name == k8s node name.
+#
+# Done BEFORE the Deployments so a broken controller/apiserver
+# image (crashloop on bad flag, missing env, etc.) does not gate
+# Node-CRD installation. The Node CRs only depend on the Node CRD
+# definition itself, which was just applied above. Re-running this
+# script after the operator patches a broken Deployment is still
+# safe — `kubectl apply` is idempotent.
+echo ">> register blockstor Node CRDs from k8s workers"
+for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}'); do
+    ip=$(kubectl get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+    cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: Node
+metadata: {name: $node}
+spec:
+  type: SATELLITE
+  netInterfaces:
+    - {name: default, address: $ip}
+EOF
+done
 
 echo ">> apply controller + RBAC"
 sed "s|__REGISTRY__|$REGISTRY|g" "$REPO_ROOT/stand/blockstor-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5
@@ -68,24 +99,5 @@ if [[ "$ready" != "3" ]]; then
     kubectl -n blockstor-system get pods -l app=blockstor-satellite
     exit 1
 fi
-
-# Bootstrap blockstor Node CRDs from k8s worker nodes so the
-# satellite reconciler's peer-resolution path has an address per
-# node — otherwise multi-replica .res files render a 0.0.0.0
-# placeholder for any peer this satellite hasn't directly seen.
-# Cluster-scoped CRD; metadata.name == k8s node name.
-echo ">> register blockstor Node CRDs from k8s workers"
-for node in $(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}'); do
-    ip=$(kubectl get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
-    cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
-kind: Node
-metadata: {name: $node}
-spec:
-  type: SATELLITE
-  netInterfaces:
-    - {name: default, address: $ip}
-EOF
-done
 
 echo ">> blockstor stack ready on $(basename "$WORK_DIR")"

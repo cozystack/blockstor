@@ -187,7 +187,18 @@ func TestNodeReconciler_LostDeletesSourceResource(t *testing.T) {
 		Type:  apiv1.NodeTypeSatellite,
 		Flags: []string{apiv1.NodeFlagEvicted, apiv1.NodeFlagLost},
 	})
-	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"})
+	// RG with place_count=1 so the migration loop has a topology to
+	// operate against. Without an RG the NodeReconciler refuses the
+	// migration entirely (Bug 19.1 fail-safe) — that path is covered
+	// in TestMigrateResourceWithoutRGAnnotatesBlocked.
+	_ = st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  1,
+			StoragePool: "pool",
+		},
+	})
+	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1", ResourceGroupName: "rg"})
 	_ = st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"})
 
 	rec := &controllerpkg.NodeReconciler{Client: cli, Scheme: scheme, Store: st}
@@ -204,5 +215,104 @@ func TestNodeReconciler_LostDeletesSourceResource(t *testing.T) {
 	err = cli.Get(ctx, types.NamespacedName{Name: "pvc-1.n1"}, got)
 	if err == nil && got.DeletionTimestamp.IsZero() {
 		t.Errorf("expected Resource on LOST node to be deleted; still present: %v", got)
+	}
+}
+
+// TestMigrateResourceWithoutRGAnnotatesBlocked pins Bug 19.1: when an
+// RD has no ResourceGroupName, the NodeReconciler's migration path
+// must NOT silently fall back to PlaceCount=1 (which would treat any
+// surviving replica as "enough" and skip the gap-fill). Instead it
+// refuses the migration and stamps the RD with
+// `blockstor.io/migration-blocked=no-rg` so an operator can spot the
+// gap via `kubectl get rd -o ...` and decide whether to attach an RG
+// and re-trigger the eviction.
+//
+// Setup: 2 healthy nodes, place_count irrelevant (no RG to derive it
+// from), 1 replica on EVICTED n1. After Reconcile: no new replica
+// placed, no source-replica deletion, RD annotated.
+func TestMigrateResourceWithoutRGAnnotatesBlocked(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	st := store.NewInMemory()
+
+	for _, name := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node: %v", err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        name,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	// RD with NO ResourceGroupName — the bug-19.1 trigger.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-orphan"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-orphan", NodeName: "n1"}); err != nil {
+		t.Fatalf("seed resource: %v", err)
+	}
+
+	if err := st.Nodes().Update(ctx, &apiv1.Node{
+		Name:  "n1",
+		Type:  apiv1.NodeTypeSatellite,
+		Flags: []string{apiv1.NodeFlagEvicted},
+	}); err != nil {
+		t.Fatalf("flag n1 evicted: %v", err)
+	}
+
+	if err := cli.Create(ctx, &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+		Spec: blockstoriov1alpha1.NodeSpec{
+			Type:  apiv1.NodeTypeSatellite,
+			Flags: []string{apiv1.NodeFlagEvicted},
+		},
+	}); err != nil {
+		t.Fatalf("create n1 CRD: %v", err)
+	}
+
+	rec := &controllerpkg.NodeReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	_, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "n1"}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// No new replica must have been placed — the fail-safe refuses
+	// the migration entirely so the operator can attach an RG and
+	// re-trigger eviction.
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-orphan")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("replica count: got %d, want 1 (refuse migration when no RG); entries=%v", len(got), got)
+	}
+
+	if got[0].NodeName != "n1" {
+		t.Errorf("only the original replica should remain: got %+v", got)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-orphan")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if rd.Annotations[controllerpkg.AnnotationMigrationBlocked] != controllerpkg.MigrationBlockedReasonNoRG {
+		t.Errorf("RD annotation: got %q=%q, want %q=%q",
+			controllerpkg.AnnotationMigrationBlocked,
+			rd.Annotations[controllerpkg.AnnotationMigrationBlocked],
+			controllerpkg.AnnotationMigrationBlocked,
+			controllerpkg.MigrationBlockedReasonNoRG)
 	}
 }

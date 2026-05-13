@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -279,6 +280,79 @@ func TestSnapshotsCreateMissingName(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestSnapshotRollback501WithActionableText pins the deliberate 501
+// response for `POST .../snapshots/{snap}/rollback`. blockstor refuses
+// to expose `zfs rollback` (which destroys every snapshot newer than
+// the rollback target — silent data loss), so the route exists only
+// to return a structured ApiCallRc error pointing the operator at the
+// non-destructive `snapshot-restore-resource` path. A regression to
+// 404 would make upstream `linstor snapshot rollback` print
+// "unable to parse server response" and confuse the operator into
+// thinking the controller crashed.
+func TestSnapshotRollback501WithActionableText(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1/rollback", []byte("{}"))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want 501", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("empty ApiCallRc envelope")
+	}
+
+	// Hard error, NOT maskInfo — `linstor` CLI prints the message
+	// verbatim and treats this as failure. A non-negative ret_code
+	// would have it cheerfully report "success" for a no-op.
+	if rc[0].RetCode >= 0 {
+		t.Errorf("ret_code: got %#x, want negative (error)", rc[0].RetCode)
+	}
+
+	if !strings.Contains(rc[0].Message, "snapshot-restore-resource") {
+		t.Errorf("message missing actionable pointer to snapshot-restore-resource: %q", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "non-destructive") {
+		t.Errorf("message missing 'non-destructive' rationale: %q", rc[0].Message)
+	}
+}
+
+// TestSnapshotRollbackUnknownSnap404 pins the input-validation order:
+// an unknown (rd, snap) returns 404 (not 501) so the operator learns
+// about the typo BEFORE they learn rollback isn't supported. Mirrors
+// upstream LINSTOR's "validate the snapshot reference first, then run
+// the strategy" sequencing.
+func TestSnapshotRollbackUnknownSnap404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/ghost/snapshots/nope/rollback", []byte("{}"))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
 

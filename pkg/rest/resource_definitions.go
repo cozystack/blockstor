@@ -86,6 +86,13 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = validateLayerStack(rd.LayerStack)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
 	// Upstream LINSTOR parity: every RD belongs to an RG. The
 	// well-known DfltRscGrp serves as the catch-all for clients that
 	// don't specify one (linstor-csi, the legacy CSI shipper, manual
@@ -235,7 +242,31 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rd")
 
-	err := s.Store.ResourceDefinitions().Delete(r.Context(), name)
+	// Cascade the delete to all child Resource replicas BEFORE
+	// dropping the RD itself. Without this, child Resources are
+	// orphaned: no DeletionTimestamp is ever stamped on them, the
+	// satellite reconciler's finalizer chain never fires, and
+	// `drbdadm down` never runs — leaving DRBD kernel state
+	// (minors, ports, peer entries) live on every satellite. The
+	// next RD-create with the same name then collides with a
+	// stale port (.res) or sees a half-configured peer.
+	//
+	// Upstream LINSTOR does this server-side too: deleting an RD
+	// flags the RD with DELETE, then walks Resources and stamps
+	// DELETE on each. The satellite drives the teardown from
+	// there. Our equivalent is: per-child Resources().Delete()
+	// stamps DeletionTimestamp on the CRD; the satellite's
+	// existing `blockstor.io.blockstor.io/satellite-resource`
+	// finalizer then drains DRBD before the apiserver removes
+	// the object.
+	err := s.cascadeDeleteResources(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = s.Store.ResourceDefinitions().Delete(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -246,4 +277,37 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}})
+}
+
+// cascadeDeleteResources enumerates every Resource replica under the
+// named RD and deletes them so the satellite's finalizer can drain
+// DRBD state per-node. ErrNotFound from a per-child Delete is
+// swallowed — a Resource that already vanished (race with another
+// controller, or a previous partial cascade) shouldn't fail the
+// whole RD-delete.
+//
+// Returns the first non-NotFound error so the caller can surface it
+// via writeStoreError. A NotFound from the parent RD lookup is
+// treated as "no children to cascade" (idempotent: re-running an
+// RD-delete that already cleared its replicas must still let the
+// final Store.ResourceDefinitions().Delete see its own NotFound and
+// produce the right HTTP code).
+func (s *Server) cascadeDeleteResources(ctx context.Context, rdName string) error {
+	children, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	for i := range children {
+		err = s.Store.Resources().Delete(ctx, rdName, children[i].NodeName)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+	}
+
+	return nil
 }

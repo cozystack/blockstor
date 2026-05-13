@@ -43,6 +43,47 @@ func (s *Server) registerSnapshots(mux *http.ServeMux) {
 		s.requireStore(s.handleSnapshotGet))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/snapshots/{snap}",
 		s.requireStore(s.handleSnapshotDelete))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshots/{snap}/rollback",
+		s.requireStore(s.handleSnapshotRollback))
+}
+
+// handleSnapshotRollback answers the upstream `linstor snapshot rollback`
+// endpoint with a deliberate 501. blockstor does NOT expose `zfs rollback`:
+// it destroys every snapshot newer than the rollback target, which is a
+// hard data-loss footgun we refuse to make reachable over REST. The
+// operator-facing message points at `snapshot-restore-resource` — the
+// safe, non-destructive path that materialises the snapshot into a new
+// resource-definition via `zfs clone` (pkg/storage/zfs/zfs.go:257).
+//
+// The route exists (rather than 404'ing) so the upstream CLI surfaces a
+// structured ApiCallRc error the operator can act on, instead of the
+// `linstor: unable to parse server response` 404 path that confuses
+// people into thinking the controller crashed.
+//
+// Wrong-input shapes still take priority: an unknown (rd, snap) returns
+// 404 from the existence probe so the operator learns about the typo
+// before they learn rollback isn't supported.
+func (s *Server) handleSnapshotRollback(w http.ResponseWriter, r *http.Request) {
+	rd := r.PathValue("rd")
+	snapName := r.PathValue("snap")
+
+	// Probe (rd, snap) first so typos/unknown inputs surface as 404
+	// rather than getting swallowed by the blanket 501. Mirrors
+	// upstream LINSTOR which validates the snapshot reference before
+	// kicking off the rollback strategy.
+	_, err := s.Store.Snapshots().Get(r.Context(), rd, snapName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeError(w, http.StatusNotImplemented,
+		"snapshot rollback not implemented; use POST "+
+			"/v1/resource-definitions/"+rd+"/snapshot-restore-resource "+
+			"to materialise this snapshot into a new resource-definition "+
+			"(safe, non-destructive). Direct zfs/lvm rollback would destroy "+
+			"intervening snapshots and is deliberately not exposed.")
 }
 
 func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {

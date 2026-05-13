@@ -100,8 +100,6 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	log.Info("ensureTiebreaker enter", "rd", rd.Name)
-
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
 		log.Error(err, "ensure tiebreaker", "rd", rd.Name)
@@ -154,8 +152,6 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
-	logf.FromContext(ctx).Info("ensureTiebreaker", "rd", rd.Name, "replicas", len(replicas))
-
 	diskful, diskless := splitByDiskless(replicas)
 	witness := filterTieBreaker(diskless)
 	nonWitnessDiskless := len(diskless) - len(witness)
@@ -167,8 +163,30 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	// cluster-wide via ControllerProps; vanilla blockstor leaves it
 	// off so explicit DISKLESS replicas don't race with the auto
 	// reconciler.
+	//
+	// Suppression: if an operator (or the REST per-resource-delete
+	// handler) recently dropped a TIE_BREAKER replica, the RD
+	// carries a short-lived annotation telling us "don't re-stamp
+	// the witness right now". Without this, `linstor r d
+	// <tiebreaker> <rd>` returns success only to have the next
+	// reconcile bring the witness right back milliseconds later.
 	wantWitness := isAutoTieBreakerEnabled(rd) &&
+		!isTiebreakerSuppressed(rd) &&
 		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
+
+	willCreate := wantWitness && len(witness) == 0
+	willRemove := !wantWitness && len(witness) > 0
+
+	if willCreate || willRemove {
+		logf.FromContext(ctx).Info("ensureTiebreaker",
+			"rd", rd.Name,
+			"replicas", len(replicas),
+			"diskful", len(diskful),
+			"witness", len(witness),
+			"willCreate", willCreate,
+			"willRemove", willRemove,
+		)
+	}
 
 	disklessAfter, err := r.applyWitnessDecision(ctx, rd, replicas, diskless, witness, wantWitness)
 	if err != nil {
@@ -177,6 +195,41 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
 }
+
+// isTiebreakerSuppressed reports whether the operator recently
+// dropped a TIE_BREAKER replica via the REST per-resource-delete
+// handler. The handler stamps an RFC3339 deadline onto the RD; this
+// helper returns true while the deadline is in the future.
+//
+// Bad / unparseable values are treated as "not suppressed" so a
+// hand-edited annotation can't accidentally freeze the auto-witness
+// invariant forever. An expired stamp also returns false — the
+// auto-quorum invariant resumes its normal behaviour without any
+// manual cleanup.
+func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if rd.Annotations == nil {
+		return false
+	}
+
+	raw, ok := rd.Annotations[autoTiebreakerSuppressedUntilKey]
+	if !ok || raw == "" {
+		return false
+	}
+
+	deadline, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+
+	return time.Now().Before(deadline)
+}
+
+// autoTiebreakerSuppressedUntilKey mirrors the REST-side
+// AutoTiebreakerSuppressedUntilAnnotation constant. Keeping it
+// duplicated here (rather than importing from pkg/rest) preserves the
+// internal controller's independence from the REST package — pulling
+// pkg/rest in would create a circular import via the store types.
+const autoTiebreakerSuppressedUntilKey = "blockstor.io/auto-tiebreaker-suppressed-until"
 
 // directOrCached returns the APIReader-direct reader when available
 // (production path via SetupWithManager) and falls back to the

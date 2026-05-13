@@ -76,6 +76,13 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	err = validateLayerStack(rg.SelectFilter.LayerStack)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
 		writeStoreError(w, err)

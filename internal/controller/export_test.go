@@ -174,3 +174,16 @@ func (r *ResourceDefinitionReconciler) ApplyWitnessDecision(
 func (r *ResourceDefinitionReconciler) EnsureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
 	return r.ensureTiebreaker(ctx, rd)
 }
+
+// IsTiebreakerSuppressed exposes the suppression-window helper for
+// tests. The reconciler honours the stamped deadline so a recent
+// `linstor r d <tiebreaker>` doesn't get immediately undone by the
+// next reconcile.
+func IsTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return isTiebreakerSuppressed(rd)
+}
+
+// AutoTiebreakerSuppressedUntilAnnotation exposes the annotation
+// key for tests so a regression that renamed the key on one side
+// would fail to compile here.
+const AutoTiebreakerSuppressedUntilAnnotation = autoTiebreakerSuppressedUntilKey

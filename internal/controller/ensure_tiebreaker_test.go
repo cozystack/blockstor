@@ -19,6 +19,7 @@ package controller_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -168,5 +169,176 @@ func TestEnsureTiebreakerOffOnSingleReplica(t *testing.T) {
 		if _, err := st.Resources().Get(ctx, "pvc-solo", n); err == nil {
 			t.Errorf("unexpected witness on %s for 1-replica RD", n)
 		}
+	}
+}
+
+// TestEnsureTiebreakerHonoursSuppressionAnnotation pins Bug 4:
+// when the RD carries a fresh
+// `blockstor.io/auto-tiebreaker-suppressed-until` annotation, the
+// reconciler must NOT auto-stamp a witness. Models the operator
+// workflow `linstor r d <tiebreaker-node> <rd>`: the REST handler
+// stamps the annotation BEFORE deleting the replica; the next
+// reconcile reads it and skips the auto-witness branch.
+//
+// Without this gate, the witness comes back within milliseconds of
+// the operator's delete and the cluster ignores explicit intent.
+func TestEnsureTiebreakerHonoursSuppressionAnnotation(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-suppressed", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	// Fresh suppression: deadline 5 minutes in the future.
+	deadline := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-suppressed",
+			Annotations: map[string]string{
+				controllerpkg.AutoTiebreakerSuppressedUntilAnnotation: deadline,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// No witness must have landed on n3.
+	if _, err := st.Resources().Get(ctx, "pvc-suppressed", "n3"); err == nil {
+		t.Errorf("witness was created on n3 despite suppression annotation")
+	}
+
+	// The suppression-aware helper must agree.
+	if !controllerpkg.IsTiebreakerSuppressed(rd) {
+		t.Errorf("IsTiebreakerSuppressed returned false for a fresh annotation")
+	}
+}
+
+// TestEnsureTiebreakerExpiredSuppressionResumesAutoWitness: once
+// the suppression deadline passes, normal auto-witness behaviour
+// resumes without any manual cleanup. A bad / hand-typed annotation
+// must also not freeze the invariant forever — the helper treats
+// unparseable values as "not suppressed".
+func TestEnsureTiebreakerExpiredSuppressionResumesAutoWitness(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-expired", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	// Expired: deadline 5 minutes in the past.
+	expired := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-expired",
+			Annotations: map[string]string{
+				controllerpkg.AutoTiebreakerSuppressedUntilAnnotation: expired,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// Witness must have been auto-created on n3 — the expired
+	// annotation does not block the normal path.
+	got, err := st.Resources().Get(ctx, "pvc-expired", "n3")
+	if err != nil {
+		t.Fatalf("witness not created on n3 despite expired suppression: %v", err)
+	}
+
+	hasTB := false
+
+	for _, f := range got.Flags {
+		if f == apiv1.ResourceFlagTieBreaker {
+			hasTB = true
+
+			break
+		}
+	}
+
+	if !hasTB {
+		t.Errorf("witness on n3 lacks TIE_BREAKER flag; got %v", got.Flags)
+	}
+
+	if controllerpkg.IsTiebreakerSuppressed(rd) {
+		t.Errorf("IsTiebreakerSuppressed returned true for an expired annotation")
+	}
+
+	// Hand-typed garbage must also not freeze the invariant.
+	rdGarbage := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-junk",
+			Annotations: map[string]string{
+				controllerpkg.AutoTiebreakerSuppressedUntilAnnotation: "definitely not a timestamp",
+			},
+		},
+	}
+
+	// Use Get on final RD spec to confirm.
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-expired"}, final); err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	if final.Spec.Props["DrbdOptions/Resource/quorum"] != "majority" {
+		t.Errorf("quorum prop: got %q, want majority (witness was created)",
+			final.Spec.Props["DrbdOptions/Resource/quorum"])
+	}
+
+	if controllerpkg.IsTiebreakerSuppressed(rdGarbage) {
+		t.Errorf("IsTiebreakerSuppressed returned true for unparseable annotation")
 	}
 }

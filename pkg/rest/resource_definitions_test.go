@@ -288,3 +288,89 @@ func TestResourceDefinitionsDeleteMissingRD(t *testing.T) {
 		t.Errorf("status: got %d, want 404", resp.StatusCode)
 	}
 }
+
+// TestResourceDefinitionsDeleteCascadesChildren pins the RD-delete
+// cascade: every child Resource must be deleted before the RD
+// itself goes. Without the cascade, child Resource CRDs never
+// receive a DeletionTimestamp, the satellite's
+// `blockstor.io.blockstor.io/satellite-resource` finalizer never
+// fires, and DRBD kernel state (minor numbers, TCP ports, peer
+// entries) lingers on every node — the next RD-create with the
+// same name then collides on a stale port or sees half-configured
+// peers.
+//
+// Regression guard for Bug 1: the trivial handler that only called
+// Store.ResourceDefinitions().Delete left orphan replicas.
+func TestResourceDefinitionsDeleteCascadesChildren(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-cascade"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-cascade", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-cascade")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	// All children gone.
+	left, err := st.Resources().ListByDefinition(ctx, "pvc-cascade")
+	if err != nil {
+		t.Fatalf("list children: %v", err)
+	}
+
+	if len(left) != 0 {
+		t.Errorf("children left after cascade: %d (%v)", len(left), left)
+	}
+
+	// RD itself gone.
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-cascade"); err == nil {
+		t.Errorf("RD still present after delete")
+	}
+}
+
+// TestResourceDefinitionsDeleteCascadeMissingChildIsIdempotent: the
+// cascade swallows ErrNotFound on a per-child Delete. Models the
+// race where another controller (or a previous, partial cascade)
+// already removed the child between the ListByDefinition and the
+// per-child Delete. The whole RD-delete must still succeed —
+// otherwise concurrent reconciles never converge.
+func TestResourceDefinitionsDeleteCascadeMissingChildIsIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed an RD with no children. The cascade has nothing to
+	// drop, but the handler must still succeed: this models the
+	// "every child already gone" tail of the race window.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-empty"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-empty")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200 (cascade with no children is OK)", resp.StatusCode)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-empty"); err == nil {
+		t.Errorf("RD still present after delete")
+	}
+}

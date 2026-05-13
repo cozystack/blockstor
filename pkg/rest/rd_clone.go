@@ -21,6 +21,7 @@ import (
 	"maps"
 	"net/http"
 
+	"github.com/cozystack/blockstor/pkg/api/openapi"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
@@ -31,10 +32,18 @@ type rdCloneRequest struct {
 	Name string `json:"name"`
 }
 
-// registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoint.
+// registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoints.
+//
+// The GET path mirrors upstream LINSTOR exactly:
+// `/v1/resource-definitions/{src}/clone/{target}` — that's what
+// golinstor's `ResourceDefinitionService.CloneStatus` issues, and what
+// linstor-csi polls in a loop until `status == "COMPLETE"`. A 404 here
+// makes CSI clone-from-source fail with "clone status: not found".
 func (s *Server) registerRDClone(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/clone",
 		s.requireStore(s.handleRDClone))
+	mux.HandleFunc("GET /v1/resource-definitions/{rd}/clone/{target}",
+		s.requireStore(s.handleRDCloneStatus))
 }
 
 // handleRDClone duplicates the source RD's metadata (props, RG ref)
@@ -91,13 +100,42 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	// CSI CreateVolume-from-source failure in csi-sanity. Emit the
 	// envelope shape upstream specifies.
 	writeJSON(w, http.StatusCreated, cloneStartedResponse{
-		Location:   "/v1/resource-definitions/" + clone.Name + "/clone-status",
+		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + clone.Name,
 		SourceName: srcName,
 		CloneName:  clone.Name,
 		Messages: &[]apiv1.APICallRc{{
 			RetCode: maskInfo,
 			Message: "resource definition cloned: " + clone.Name,
 		}},
+	})
+}
+
+// handleRDCloneStatus answers golinstor's `CloneStatus` poll. Today
+// blockstor's clone is synchronous w.r.t. RD creation — by the time
+// POST .../clone returns the new RD is durably persisted — so we
+// always answer COMPLETE if the target RD exists. If a future
+// implementation makes cloning truly async (e.g. waits for the
+// satellite to finish a zfs-send/recv), this handler is the
+// place to surface CLONING/FAILED.
+//
+// Path: GET /v1/resource-definitions/{src}/clone/{target}.
+// The {src} path segment is required by the upstream contract but
+// unused here: we only need to confirm the target RD survived the
+// POST. A 404 on the target signals "clone failed mid-way" — which
+// gives linstor-csi an actionable error rather than an infinite
+// poll loop.
+func (s *Server) handleRDCloneStatus(w http.ResponseWriter, r *http.Request) {
+	targetName := r.PathValue("target")
+
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), targetName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, openapi.ResourceDefinitionCloneStatus{
+		Status: openapi.COMPLETE,
 	})
 }
 

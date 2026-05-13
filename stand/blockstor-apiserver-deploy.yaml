@@ -76,7 +76,6 @@ spec:
             - --rest-bind-address=:3370
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
-            - --store=k8s
           env:
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
