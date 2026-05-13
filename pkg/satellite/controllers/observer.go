@@ -26,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -314,6 +315,13 @@ const (
 	// to prune the connection cache so stale StandAlone entries
 	// don't linger on view/resources after a replica delete.
 	eventActionDestroy = "destroy"
+	// drbdDiskStateFailed is the DRBD-9 device disk_state token
+	// the kernel emits when the backing block device (LV / zvol /
+	// loopfile / disk hardware) starts returning I/O errors. Two
+	// auto-recovery actions key off this state: drbdadm detach to
+	// stop bashing the dead device, and the SkipDisk prop write
+	// to pin the next adjust onto `--skip-disk` (scenario 5.11).
+	drbdDiskStateFailed = "Failed"
 )
 
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
@@ -582,16 +590,51 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 
 // handleObservation runs the per-event side-effects: the
 // backing-device-failure auto-detach (kernel-reported disk:Failed
-// → drbdadm detach) and the Resource.Status SSA write.
+// → drbdadm detach) plus the SkipDisk prop write that pins the
+// next reconcile onto `drbdadm adjust --skip-disk`, and the
+// Resource.Status SSA write.
+//
+// Scenario 5.11 (UG9 §4428-4460): kernel reports `change device
+// disk:Failed` when the backing block device starts returning I/O
+// errors (LV missing / zvol destroyed / disk physically gone).
+// Two side-effects must converge before the resource is usable
+// again on this node:
+//
+//  1. Detach the failed lower disk so the kernel stops bashing
+//     dead I/O — this transitions the volume to Diskless (the
+//     resource keeps serving I/O via DRBD's network path to
+//     UpToDate peers).
+//  2. Stamp `DrbdOptions/SkipDisk=True` onto Resource.Spec.Props
+//     so the next `drbdadm adjust` call skips disk-level
+//     reconfiguration (which would try to re-attach the dead
+//     disk). The reconciler reads the prop and appends
+//     `--skip-disk` to its Adjust invocation.
+//
+// Operator clears the prop with
+// `linstor r sp <node> <rsc> DrbdOptions/SkipDisk` (no value);
+// the existing prop-management path drops the key and the next
+// reconcile resumes normal `drbdadm adjust` (which then tries to
+// re-attach the disk if the underlying block device is back).
 func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm, ev *observation) {
 	logger := log.FromContext(ctx).WithName("observer")
 
-	if ev.DrbdState == "Failed" {
+	if ev.DrbdState == drbdDiskStateFailed {
 		err := adm.Detach(ctx, ev.ResourceName)
 		if err != nil {
 			logger.Error(err, "auto-detach on Failed", "resource", ev.ResourceName)
 		} else {
 			logger.Info("auto-detached failed replica", "resource", ev.ResourceName)
+		}
+
+		err = o.writeSkipDiskProp(ctx, ev.ResourceName)
+		switch {
+		case err == nil:
+			logger.Info("set DrbdOptions/SkipDisk on failed replica", "resource", ev.ResourceName)
+		case apierrors.IsNotFound(err):
+			// Resource CRD not yet created — convergence-pending; same
+			// silence policy as writeStatus.
+		default:
+			logger.Error(err, "set SkipDisk prop on Failed", "resource", ev.ResourceName)
 		}
 	}
 
@@ -813,6 +856,114 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		client.FieldOwner(k8s.SatelliteFieldOwner))
 	if err != nil {
 		return errors.Wrapf(err, "ssa apply Resource.Status %s", name)
+	}
+
+	return nil
+}
+
+// skipDiskPropKey is the LINSTOR-compatible property path
+// upstream's DrbdAdm.adjust consults. Matches
+// `ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_SKIP_DISK`
+// from upstream's StateSequenceDetector (which auto-stamps the
+// prop on the same Failed→Diskless transition path we trigger off
+// here). The value is upstream's `ApiConsts.VAL_TRUE = "True"` —
+// match the literal so a same-cluster heterogeneous upgrade
+// (some controllers still on upstream) reads consistent state.
+const skipDiskPropKey = "DrbdOptions/SkipDisk"
+
+// skipDiskPropValue is the literal upstream uses for the SkipDisk
+// flag. Case-sensitive on write; upstream reads it
+// case-insensitively (`VAL_TRUE.equalsIgnoreCase`) so the
+// satellite's reconciler matches either spelling, but on write we
+// pin the canonical form.
+const skipDiskPropValue = "True"
+
+// observerSkipDiskFieldOwner is the distinct SSA field-manager
+// the observer uses for SkipDisk prop writes. Distinct from
+// SatelliteFieldOwner (which owns Status fields) so a SkipDisk
+// claim never collides with the reconciler's other Spec.Props
+// writes — the reconciler is a different field-owner and SSA's
+// per-key merge on the map keeps both alive. Operator clearing the
+// prop via `r sp <n> <r> DrbdOptions/SkipDisk` (no value) is
+// expected to use the controller's FieldOwner; without a distinct
+// observer owner the apiserver would either reject the clear (key
+// owned elsewhere) or silently re-apply on the next observer tick.
+const observerSkipDiskFieldOwner = "blockstor-satellite-skipdisk"
+
+// writeSkipDiskProp SSA-applies `Spec.Props["DrbdOptions/SkipDisk"]
+// = "True"` onto the matching Resource CRD. Uses a distinct
+// FieldOwner so the prop can be cleared by the operator's
+// controller-side prop-management path (which uses
+// ControllerFieldOwner) without an observer re-broadcast
+// resurrecting the key.
+//
+// SSA on Spec.Props (a map) merges per-key — the apply object
+// carries ONLY the SkipDisk key, so other Spec.Props entries
+// owned by the controller-side reconciler stay untouched. The
+// apiserver's NotFound on a not-yet-created Resource is surfaced
+// to the caller; handleObservation silences it the same way
+// writeStatus does.
+func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName string) error {
+	if resourceName == "" {
+		return nil
+	}
+
+	name := k8s.Name(resourceName + "." + o.NodeName)
+
+	// Read the existing Resource so the SSA apply object can carry
+	// the immutable required scalars (`resourceDefinitionName`,
+	// `nodeName`) without claiming a new value for them — the
+	// reconciler upstream of us authored those fields and SSA
+	// validation will reject an apply that doesn't include them
+	// (kubebuilder marks both `+required`, no `omitempty`).
+	// Mirrors the pattern node_label_sync_controller.go uses when
+	// SSA-applying Aux props onto Node.Spec.
+	//
+	// NotFound here is the convergence-pending case — Resource CRD
+	// not yet created. Bubble up so handleObservation's
+	// IsNotFound branch silences the event.
+	var existing blockstoriov1alpha1.Resource
+
+	err := o.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
+	if err != nil {
+		return errors.Wrapf(err, "get Resource %s", name)
+	}
+
+	// Unstructured (not the typed Resource) so the serialised SSA
+	// apply object carries ONLY the SkipDisk key under
+	// `spec.props` PLUS the immutable required scalars. Building
+	// from the typed struct without omitempty on
+	// resourceDefinitionName/nodeName would force claims even when
+	// fields are omitted; unstructured gives us per-field shape
+	// control.
+	apply := &unstructured.Unstructured{}
+	apply.SetGroupVersionKind(blockstoriov1alpha1.GroupVersion.WithKind(resourceKind))
+	apply.SetName(name)
+	apply.Object["spec"] = map[string]any{
+		"resourceDefinitionName": existing.Spec.ResourceDefinitionName,
+		"nodeName":               existing.Spec.NodeName,
+		"props": map[string]any{
+			skipDiskPropKey: skipDiskPropValue,
+		},
+	}
+
+	// ForceOwnership: the SkipDisk key conflicts with the
+	// controller-side FieldOwner ("blockstor-controller") which
+	// authored Spec.Props from the dispatcher's resolve pass. The
+	// SkipDisk gate is the satellite's auto-action on a kernel
+	// disk-failure event — it MUST win against the resolved bag
+	// the controller installed seconds before, otherwise the prop
+	// flips back on the next dispatcher cycle and the SkipDisk
+	// auto-recovery never takes hold. The required scalars stay
+	// owned by their original writer because we don't change
+	// their value (SSA's "value didn't change" merge leaves
+	// ownership untouched).
+	err = o.Client.Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
+		client.FieldOwner(observerSkipDiskFieldOwner),
+		client.ForceOwnership)
+	if err != nil {
+		return errors.Wrapf(err, "ssa apply Resource.Spec.Props SkipDisk %s", name)
 	}
 
 	return nil

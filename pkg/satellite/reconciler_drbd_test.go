@@ -2259,3 +2259,143 @@ func TestApplyRendersExternalMetaDiskPath(t *testing.T) {
 func TestApplyProvisionsBothDataAndMeta(t *testing.T) {
 	t.Skip("6.18 satellite-side wiring follow-up — see test godoc for the open Provider-API design point")
 }
+
+// TestReconcilerPassesSkipDiskFlag (scenario 5.11) pins the
+// SkipDisk gate: when the observer (or an operator) stamps
+// `DrbdOptions/SkipDisk=True` onto Resource.Spec.Props, the
+// reconciler MUST invoke `drbdadm adjust --skip-disk <rsc>` rather
+// than the bare `drbdadm adjust <rsc>`. Without the flag, drbdadm
+// would re-attempt disk attachment on a Failed/Diskless replica
+// and bail; with it, only network/peer state reconciles (UG9
+// §4428-4460 + upstream's DrbdAdm.adjust skipDisk branch at
+// satellite/.../DrbdAdm.java:124).
+//
+// Two shapes exercised to match the prop's lifecycle:
+//
+//  1. Prop on the wire-side `Props` map. Mirrors the observer's
+//     SSA write onto Resource.Spec.Props verbatim — when the
+//     dispatcher hasn't yet split DrbdOptions/... keys out of the
+//     props bag, the reconciler must still see the gate.
+//  2. Prop folded into DrbdOptions by the dispatcher. The
+//     production path runs every `DrbdOptions/...` key through
+//     `mergeEffectiveProps` which moves it from Props → DrbdOptions
+//     before Apply sees the DesiredResource; the gate must survive
+//     that hop.
+//
+// Negative-control case: no prop, plain `drbdadm adjust` lands —
+// guards against the regression where someone always appends the
+// flag regardless of state.
+//
+// Case-insensitive matches "True"/"true"/"TRUE" because upstream
+// reads VAL_TRUE via `equalsIgnoreCase` (DrbdRscData:584) so an
+// operator who sets the prop via `r sp` with lower-case `true`
+// gets the same effect.
+func TestReconcilerPassesSkipDiskFlag(t *testing.T) {
+	cases := []struct {
+		name        string
+		props       map[string]string
+		drbdOpts    map[string]string
+		wantCommand string
+	}{
+		{
+			name:        "no SkipDisk prop -> bare adjust",
+			wantCommand: "drbdadm adjust pvc-skipdisk",
+		},
+		{
+			name:        "SkipDisk in Props -> adjust --skip-disk",
+			props:       map[string]string{"DrbdOptions/SkipDisk": "True"},
+			wantCommand: "drbdadm adjust --skip-disk pvc-skipdisk",
+		},
+		{
+			name:        "SkipDisk in DrbdOptions (dispatcher landing) -> adjust --skip-disk",
+			drbdOpts:    map[string]string{"DrbdOptions/SkipDisk": "True"},
+			wantCommand: "drbdadm adjust --skip-disk pvc-skipdisk",
+		},
+		{
+			name:        "SkipDisk lowercase 'true' -> adjust --skip-disk (case-insensitive)",
+			props:       map[string]string{"DrbdOptions/SkipDisk": "true"},
+			wantCommand: "drbdadm adjust --skip-disk pvc-skipdisk",
+		},
+		{
+			name:        "SkipDisk empty value -> bare adjust (operator unset path)",
+			props:       map[string]string{"DrbdOptions/SkipDisk": ""},
+			wantCommand: "drbdadm adjust pvc-skipdisk",
+		},
+		{
+			name:        "SkipDisk 'False' -> bare adjust",
+			props:       map[string]string{"DrbdOptions/SkipDisk": "False"},
+			wantCommand: "drbdadm adjust pvc-skipdisk",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-skipdisk_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+
+			thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{"thin1": thin},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			drbdOpts := map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			}
+
+			for k, v := range tc.drbdOpts {
+				drbdOpts[k] = v
+			}
+
+			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-skipdisk",
+					NodeName: "n1",
+					Props:    tc.props,
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+					},
+					DrbdOptions: drbdOpts,
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			cmds := fx.CommandLines()
+
+			if !slices.Contains(cmds, tc.wantCommand) {
+				t.Errorf("expected command %q; got %v", tc.wantCommand, cmds)
+			}
+
+			// Cross-guard: when --skip-disk is expected, the bare
+			// `drbdadm adjust pvc-skipdisk` MUST NOT also appear —
+			// otherwise we'd be re-attempting disk attachment alongside
+			// the skip-disk pass, which defeats the whole point of the
+			// gate. (And the reverse: bare adjust must not coexist with
+			// the flagged form.)
+			forbidden := "drbdadm adjust pvc-skipdisk"
+			if tc.wantCommand == "drbdadm adjust --skip-disk pvc-skipdisk" {
+				for _, line := range cmds {
+					if line == forbidden {
+						t.Errorf("got both bare adjust and --skip-disk: %v", cmds)
+					}
+				}
+			} else {
+				skipDiskCmd := "drbdadm adjust --skip-disk pvc-skipdisk"
+				for _, line := range cmds {
+					if line == skipDiskCmd {
+						t.Errorf("unexpected --skip-disk without prop set: %v", cmds)
+					}
+				}
+			}
+		})
+	}
+}

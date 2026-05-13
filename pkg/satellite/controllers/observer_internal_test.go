@@ -17,10 +17,18 @@ limitations under the License.
 package controllers
 
 import (
+	"context"
 	"sort"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // TestTranslateEventConnection pins the events2 → connectionObservation
@@ -717,6 +725,272 @@ func TestMergeConnectionsPreservesPausedSyncS(t *testing.T) {
 	if !got["node-b"].Connected || got["node-b"].Message != "Connected" {
 		t.Errorf("post-resume: Connected/Message lost: %+v", got["node-b"])
 	}
+}
+
+// TestObserverWritesSkipDiskOnFailed (scenario 5.11) pins the
+// observer's response to `change device disk:Failed` from
+// drbdsetup events2: alongside the auto-detach (which transitions
+// the volume to Diskless so the kernel stops issuing I/O at the
+// dead lower disk), the observer MUST stamp
+// `DrbdOptions/SkipDisk=True` onto the matching Resource's
+// Spec.Props. Without that prop, the next `drbdadm adjust` would
+// re-attempt disk attachment and fail.
+//
+// Mirrors upstream linstor's StateSequenceDetector which auto-
+// stamps the same prop on Failed→Diskless (controller/.../event/
+// handler/StateSequenceDetector.java:67) — implementing it in the
+// satellite (not controller) here because our event observer
+// runs on the satellite and we'd rather not synthesise the
+// transition on the controller from the SSA Status update.
+//
+// Verifies:
+//   - The Resource.Spec.Props["DrbdOptions/SkipDisk"] key lands
+//     with value "True" (case-sensitive on write; upstream reads
+//     case-insensitively).
+//   - Pre-existing Spec.Props entries are preserved — SSA's
+//     per-key map merge must not collapse the bag down to just
+//     SkipDisk.
+//   - The required Spec scalars (resourceDefinitionName,
+//     nodeName) survive unchanged.
+//   - `drbdadm detach --force <rsc>` still ran. The two side-
+//     effects are independent and both must converge.
+//   - NotFound on the Get is silenced (convergence-pending case
+//     where the Resource CRD hasn't been created yet — same
+//     contract writeStatus already honours).
+func TestObserverWritesSkipDiskOnFailed(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			Props: map[string]string{
+				// Pre-existing entry the dispatcher landed: the SkipDisk
+				// SSA must NOT clobber it. SSA's per-key merge on the
+				// map keeps both keys alive when the new owner only
+				// claims SkipDisk.
+				"StorPoolName": "thin1",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	adm := drbd.NewAdm(fx)
+
+	// The events2 frame: `change device name:pvc-1 disk:Failed`.
+	// Drives both side-effects — detach + SkipDisk prop write.
+	ev := &observation{
+		ResourceName: "pvc-1",
+		DrbdState:    drbdDiskStateFailed,
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: drbdDiskStateFailed},
+		},
+	}
+
+	o.handleObservation(context.Background(), adm, ev)
+
+	// 1. drbdadm detach --force ran (the auto-detach branch).
+	wantDetach := "drbdadm detach --force pvc-1"
+
+	var sawDetach bool
+
+	for _, line := range fx.CommandLines() {
+		if line == wantDetach {
+			sawDetach = true
+
+			break
+		}
+	}
+
+	if !sawDetach {
+		t.Errorf("expected %q in commands; got %v", wantDetach, fx.CommandLines())
+	}
+
+	// 2. SkipDisk prop landed on Resource.Spec.Props with the
+	//    canonical "True" value.
+	var got blockstoriov1alpha1.Resource
+
+	err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.n1"}, &got)
+	if err != nil {
+		t.Fatalf("get Resource: %v", err)
+	}
+
+	if got.Spec.Props[skipDiskPropKey] != skipDiskPropValue {
+		t.Errorf("Spec.Props[%q] = %q, want %q",
+			skipDiskPropKey, got.Spec.Props[skipDiskPropKey], skipDiskPropValue)
+	}
+
+	// 3. Pre-existing prop preserved — SSA's per-key merge must
+	//    not collapse the map.
+	if got.Spec.Props["StorPoolName"] != "thin1" {
+		t.Errorf("pre-existing StorPoolName lost: got %q, want thin1",
+			got.Spec.Props["StorPoolName"])
+	}
+
+	// 4. Required scalars unchanged. ForceOwnership on a value-
+	//    unchanged field is a no-op for ownership tracking; the
+	//    fields must survive intact.
+	if got.Spec.ResourceDefinitionName != "pvc-1" {
+		t.Errorf("ResourceDefinitionName: got %q, want pvc-1",
+			got.Spec.ResourceDefinitionName)
+	}
+
+	if got.Spec.NodeName != "n1" {
+		t.Errorf("NodeName: got %q, want n1", got.Spec.NodeName)
+	}
+}
+
+// TestObserverSkipDiskNoopOnNonFailedState guards against false
+// positives: the SkipDisk write MUST NOT fire for healthy
+// DiskState values. A bug here would auto-set SkipDisk on every
+// UpToDate/Inconsistent/Outdated transition, wedging the cluster
+// into perpetual `--skip-disk` mode and blocking all real recovery
+// paths.
+func TestObserverSkipDiskNoopOnNonFailedState(t *testing.T) {
+	t.Parallel()
+
+	for _, diskState := range []string{
+		"UpToDate", "Inconsistent", "Outdated", "Attaching",
+		"Diskless", "Negotiating", "", // omitted disk field
+	} {
+		t.Run(diskState, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := runtime.NewScheme()
+			_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+			existing := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: "pvc-1",
+					NodeName:               "n1",
+				},
+			}
+
+			cli := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(existing).
+				Build()
+
+			fx := storage.NewFakeExec()
+
+			o := &ObserverRunnable{
+				Client:   cli,
+				Exec:     fx,
+				NodeName: "n1",
+			}
+
+			adm := drbd.NewAdm(fx)
+
+			o.handleObservation(context.Background(), adm, &observation{
+				ResourceName: "pvc-1",
+				DrbdState:    diskState,
+				Volumes: []volumeObservation{
+					{VolumeNumber: 0, DiskState: diskState},
+				},
+			})
+
+			var got blockstoriov1alpha1.Resource
+
+			err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.n1"}, &got)
+			if err != nil {
+				t.Fatalf("get Resource: %v", err)
+			}
+
+			if v := got.Spec.Props[skipDiskPropKey]; v != "" {
+				t.Errorf("DiskState=%q triggered SkipDisk write: got %q, want empty",
+					diskState, v)
+			}
+
+			// Sibling guard: detach must also not fire for non-Failed
+			// states (it's the same `DrbdState == "Failed"` branch).
+			for _, line := range fx.CommandLines() {
+				if line == "drbdadm detach --force pvc-1" {
+					t.Errorf("DiskState=%q triggered detach: cmds=%v",
+						diskState, fx.CommandLines())
+				}
+			}
+		})
+	}
+}
+
+// TestObserverSkipDiskSilencesNotFound pins the convergence-pending
+// contract: when handleObservation fires for a Resource CRD that
+// doesn't exist yet (the satellite's events2 observer can race
+// the controller's CRD creation), the SkipDisk write must surface
+// NotFound but NOT bubble it as a fatal error. handleObservation
+// silences NotFound the same way writeStatus does so a fresh
+// Resource's first observed event doesn't spam the logs.
+func TestObserverSkipDiskSilencesNotFound(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	// Empty client — no Resource CRD for pvc-1.n1.
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		NodeName: "n1",
+	}
+
+	err := o.writeSkipDiskProp(context.Background(), "pvc-1")
+	if err == nil {
+		t.Fatalf("expected NotFound, got nil")
+	}
+
+	// Defer to the caller (handleObservation) to silence the
+	// NotFound — this method MUST return it so the caller can
+	// distinguish "Resource not yet created" from "apiserver
+	// rejected the write".
+	if !isNotFoundErr(err) {
+		t.Errorf("expected NotFound; got %v", err)
+	}
+}
+
+func isNotFoundErr(err error) bool {
+	type notFound interface{ Status() metav1.Status }
+
+	var nf notFound
+
+	for unwrapErr := err; unwrapErr != nil; {
+		if asNF, ok := unwrapErr.(notFound); ok {
+			nf = asNF
+
+			break
+		}
+
+		// errors.Unwrap chain
+		un, ok := unwrapErr.(interface{ Unwrap() error })
+		if !ok {
+			break
+		}
+
+		unwrapErr = un.Unwrap()
+	}
+
+	if nf == nil {
+		return false
+	}
+
+	return nf.Status().Reason == metav1.StatusReasonNotFound
 }
 
 // TestMergeResourceEmptyResourceNameNoop guards the early return.

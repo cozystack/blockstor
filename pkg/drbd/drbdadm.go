@@ -58,6 +58,24 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
 }
 
+// AdjustSkipDisk is the Failed-replica variant of Adjust that
+// appends drbd-utils' `--skip-disk` flag. Used after the observer
+// detected `disk:Failed` and stamped `DrbdOptions/SkipDisk=True`
+// on the Resource: a plain `drbdadm adjust` on a Failed/Diskless
+// replica would try to re-attach the dead lower disk and fail; the
+// `--skip-disk` flag tells drbdadm to leave the disk attachment
+// alone and only reconcile network/peer state. Mirrors upstream
+// linstor's `DrbdAdm.adjust` behaviour when its `skipDisk` flag is
+// set (satellite/.../DrbdAdm.java:124).
+//
+// Operator clears the SkipDisk prop with
+// `linstor r sp <node> <rsc> DrbdOptions/SkipDisk` (no value);
+// next reconcile falls back to plain Adjust and re-attaches when
+// the lower disk is back.
+func (a *Adm) AdjustSkipDisk(ctx context.Context, resource string) error {
+	return a.run(ctx, "adjust", "--skip-disk", resource)
+}
+
 // CreateMD initialises on-disk metadata for the resource. We always use
 // --force: a freshly-allocated LV may carry leftover signature bytes
 // from its previous tenant, and DRBD bails without --force.

@@ -819,9 +819,9 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	err = r.cfg.Adm.Adjust(ctx, dr.GetName())
+	err = r.runAdjust(ctx, dr)
 	if err != nil {
-		return errors.Wrapf(err, "adjust %s", dr.GetName())
+		return err
 	}
 
 	// Pickup-time resize: the storage layer was just grown, drbdadm
@@ -860,6 +860,35 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		if err != nil {
 			return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
 		}
+	}
+
+	return nil
+}
+
+// runAdjust dispatches to the plain `drbdadm adjust` or the
+// `--skip-disk` variant based on the `DrbdOptions/SkipDisk` prop
+// (scenario 5.11). Pulled out of applyDRBD so the orchestration
+// function stays under the gocyclo budget.
+//
+// When the observer stamped `DrbdOptions/SkipDisk=True` onto
+// Resource.Spec.Props (in response to a kernel `disk:Failed`
+// frame), append `--skip-disk` so drbdadm leaves the failed lower
+// disk alone and only reconciles network/peer state. A plain
+// `drbdadm adjust` on a Failed/Diskless replica would re-attempt
+// disk attachment and fail. The operator unset path
+// (`r sp <n> <r> DrbdOptions/SkipDisk` with no value) drops the
+// prop and the next reconcile falls through to the plain Adjust.
+func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) error {
+	var err error
+
+	if isSkipDiskEnabled(dr) {
+		err = r.cfg.Adm.AdjustSkipDisk(ctx, dr.GetName())
+	} else {
+		err = r.cfg.Adm.Adjust(ctx, dr.GetName())
+	}
+
+	if err != nil {
+		return errors.Wrapf(err, "adjust %s", dr.GetName())
 	}
 
 	return nil
@@ -1140,6 +1169,47 @@ const drbdAddrPlaceholder = "0.0.0.0"
 // inline rather than re-export to keep `pkg/satellite` from
 // importing `pkg/dispatcher` just for one constant.
 const drbdBoolPropTrue = "true"
+
+// skipDiskPropKey and skipDiskPropValue mirror upstream linstor's
+// `ApiConsts.NAMESPC_DRBD_OPTIONS + "/" + ApiConsts.KEY_DRBD_SKIP_DISK`
+// and `ApiConsts.VAL_TRUE` constants. Scenario 5.11: the
+// satellite-side observer stamps `DrbdOptions/SkipDisk=True` onto
+// Resource.Spec.Props when the kernel reports `disk:Failed`; this
+// reconciler reads the prop and gates `drbdadm adjust --skip-disk`
+// onto its presence. Constants kept here (rather than re-exported
+// from `pkg/satellite/controllers`) so the reconciler's gate
+// doesn't pick up a controllers-package import cycle.
+const (
+	skipDiskPropKey   = "DrbdOptions/SkipDisk"
+	skipDiskPropValue = "True"
+)
+
+// isSkipDiskEnabled reports whether the observer (or an operator
+// via `linstor r sp <n> <r> DrbdOptions/SkipDisk True`) has marked
+// this replica's lower disk as failed. The check covers both
+// landing spots:
+//
+//   - `dr.DrbdOptions`: the dispatcher pulls every `DrbdOptions/...`
+//     key out of `Spec.Props` and folds it into the per-replica
+//     DrbdOptions bag before calling Apply. The production path
+//     therefore reads the prop from here.
+//   - `dr.Props`: the satellite reconciler unit tests build
+//     DesiredResource directly without running through the
+//     dispatcher's split; tests that pin the SkipDisk gate need
+//     a shape that doesn't require re-implementing dispatcher
+//     internals.
+//
+// Case-insensitive compare to mirror upstream's
+// `VAL_TRUE.equalsIgnoreCase` so operators who set the prop
+// manually with lower-case "true" get the same behaviour the
+// observer's canonical "True" produces.
+func isSkipDiskEnabled(dr *intent.DesiredResource) bool {
+	if strings.EqualFold(dr.GetDrbdOptions()[skipDiskPropKey], skipDiskPropValue) {
+		return true
+	}
+
+	return strings.EqualFold(dr.GetProps()[skipDiskPropKey], skipDiskPropValue)
+}
 
 // resolveAddr substitutes the satellite's own IP whenever the
 // controller-supplied address is the placeholder (which it is until

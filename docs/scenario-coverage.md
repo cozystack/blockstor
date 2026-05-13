@@ -152,7 +152,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 5.8 | 05-drbd-state-recovery.md | gap | — | P0 — drain/uncordon e2e (UpToDate↔Outdated) missing |
 | 5.9 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/state-inconsistent-mid-sync.sh | P0 |
 | 5.10 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/state-standalone-partition.sh, network-partition.sh | P0 |
-| 5.11 | 05-drbd-state-recovery.md | gap | — | P1 T — `SkipDisk` not implemented (grep clean) |
+| 5.11 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/observer_internal_test.go:TestObserverWritesSkipDiskOnFailed, pkg/satellite/reconciler_drbd_test.go:TestReconcilerPassesSkipDiskFlag | P1 — observer auto-sets `DrbdOptions/SkipDisk=True` on `disk:Failed`; reconciler gates `drbdadm adjust --skip-disk`. CLI render `Skip-Disk (R)` not surfaced — needs effective-props REST + python-linstor-client (out of repo). |
 | 5.12 | 05-drbd-state-recovery.md | gap | — | P0 — Unknown-branch full e2e walkthrough missing; partial via 5.5 |
 | 5.13 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/recovery-deleting-convert.sh | P0 |
 | 5.14 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/recovery-discard-my-data.sh | P0 |
