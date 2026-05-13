@@ -409,6 +409,141 @@ func TestCreateSnapshotErrorWraps(t *testing.T) {
 	}
 }
 
+// TestZFSThickCreateOmitsSparseFlag pins the THICK-only behavior:
+// `Thin: false` must NOT pass `-s` to `zfs create`, because the
+// thick mode reserves the full volsize up front via ZFS
+// `refreservation`. A regression that leaked `-s` into the thick
+// path would silently degrade capacity guarantees — operators
+// who picked the `ZFS` provider kind for hard reservations would
+// suddenly oversubscribe the pool.
+func TestZFSThickCreateOmitsSparseFlag(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: false}, fx)
+
+	err := p.CreateVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	var createCmd string
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "zfs create ") {
+			createCmd = line
+
+			break
+		}
+	}
+
+	if createCmd == "" {
+		t.Fatalf("no zfs create call recorded; got %v", fx.CommandLines())
+	}
+
+	// The line must contain `-V <size>M <dataset>` and must NOT
+	// contain ` -s ` (sparse) — the THICK invariant.
+	if !strings.Contains(createCmd, " -V 1024M tank/pvc-1_00000") {
+		t.Errorf("create cmd missing `-V 1024M tank/pvc-1_00000`: %q", createCmd)
+	}
+
+	if strings.Contains(createCmd, " -s ") || strings.HasSuffix(createCmd, " -s") {
+		t.Errorf("THICK CreateVolume must NOT include `-s` (sparse) flag; got %q", createCmd)
+	}
+}
+
+// TestZFSThinCreateIncludesSparseFlag is the inverse-pair of
+// TestZFSThickCreateOmitsSparseFlag — it pins that ZFS_THIN
+// always passes `-s` so the zvol is sparse and contributes nothing
+// to pool reservation accounting. Without this an accidental flip
+// of the `thin` bool would still parse but break ZFS_THIN's
+// oversubscription semantics.
+func TestZFSThinCreateIncludesSparseFlag(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, fx)
+
+	err := p.CreateVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	var createCmd string
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "zfs create ") {
+			createCmd = line
+
+			break
+		}
+	}
+
+	if createCmd == "" {
+		t.Fatalf("no zfs create call recorded; got %v", fx.CommandLines())
+	}
+
+	// Both `-s` and `-V <size>M <dataset>` must be present.
+	if !strings.Contains(createCmd, " -s ") {
+		t.Errorf("THIN CreateVolume must include `-s` (sparse) flag; got %q", createCmd)
+	}
+
+	if !strings.Contains(createCmd, " -V 1024M tank/pvc-1_00000") {
+		t.Errorf("create cmd missing `-V 1024M tank/pvc-1_00000`: %q", createCmd)
+	}
+}
+
+// TestZFSThickPoolStatusMatchesZpoolFree pins the THICK
+// PoolStatus arithmetic: even though thick reservations affect
+// capacity SEMANTICS (no oversubscription), the math itself is
+// identical to thin — `zpool list -H -p -o size,free` reports
+// `free` already net of reservations from sibling thick zvols, so
+// we surface `free/1024` as FreeCapacityKib and `size/1024` as
+// TotalCapacityKib unchanged. The test exists to lock the
+// invariant in case someone "fixes" the thick path to subtract
+// allocated bytes manually (which would double-count).
+func TestZFSThickPoolStatusMatchesZpoolFree(t *testing.T) {
+	const (
+		sizeBytes = int64(107374182400) // 100 GiB
+		freeBytes = int64(80530636800)  // 75 GiB
+		wantTotal = sizeBytes / 1024
+		wantFree  = freeBytes / 1024
+	)
+
+	fx := storage.NewFakeExec()
+	fx.Expect("zpool list -H -p -o size,free tank",
+		storage.FakeResponse{Stdout: []byte("107374182400\t80530636800\n")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: false}, fx)
+
+	got, err := p.PoolStatus(t.Context())
+	if err != nil {
+		t.Fatalf("PoolStatus: %v", err)
+	}
+
+	if got.TotalCapacityKib != wantTotal {
+		t.Errorf("TotalCapacityKib (thick): got %d, want %d", got.TotalCapacityKib, wantTotal)
+	}
+
+	if got.FreeCapacityKib != wantFree {
+		t.Errorf("FreeCapacityKib (thick): got %d, want %d", got.FreeCapacityKib, wantFree)
+	}
+
+	if !got.SupportsSnapshots {
+		t.Errorf("SupportsSnapshots: got false, want true (ZFS always supports snapshots)")
+	}
+}
+
 // TestDeleteSnapshotErrorWraps mirrors CreateSnapshot: a `zfs destroy
 // <snap>` failure must surface with the "zfs destroy" wrap keyword.
 func TestDeleteSnapshotErrorWraps(t *testing.T) {
