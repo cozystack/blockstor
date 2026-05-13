@@ -1726,3 +1726,159 @@ func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
 		t.Errorf("steady-state phase: expected drbdadm adjust to fire; got %v", second)
 	}
 }
+
+// TestReconcilerRespectsOperatorDisconnect (scenario 5.29) pins the
+// safety property that an operator-initiated `drbdadm disconnect`
+// from the satellite shell must survive ≥30s of reconciler activity
+// without auto-reconnect. The 30s window is the documented manual
+// recovery budget — long enough for the operator to inspect peer
+// state, run `drbdcheck`, decide whether to `drbdadm connect` or
+// `drbdadm primary --force`, etc. — without the reconciler racing
+// them by re-establishing the connection.
+//
+// Design choice: Option B (rely on structural reconciler behaviour),
+// NOT Option A (per-resource `Aux/operator-managed=true` gate).
+//
+// Why B: at the time of writing, the satellite-side `drbd.Adm`
+// wrapper exposes Up / Down / Adjust / CreateMD / Primary /
+// PrimaryForce / Secondary / Detach / Resize / SetGi / DelPeer —
+// notably NO `Connect` verb. The reconciler's sole live-state
+// convergence call is `drbdadm adjust`, which re-reads the .res
+// file and reconfigures peers, but in DRBD 9 does NOT force a
+// connection on a peer the operator has manually disconnected
+// (a disconnected peer stays StandAlone / Disconnecting until
+// `drbdadm connect` is run). So "operator disconnect survives
+// reconciliation" is enforced by absence-of-verb, not by a prop
+// gate.
+//
+// That makes this test a regression pin: if someone later adds an
+// `(*Adm).Connect` and wires it into the apply path (e.g. trying
+// to be helpful and auto-reconnect StandAlone peers based on
+// observer state), this test will fail and force the author to
+// either gate the new code on `Aux/operator-managed=false` or
+// justify the change against scenario 5.29.
+//
+// The test drives 5 reconcile passes (the count chosen to model
+// roughly one pass per ~6s of the 30s window — reconcile is event-
+// driven not interval-driven, but 5 passes covers the worst-case
+// burst from peer-state flapping + heartbeat retries inside the
+// window) over a steady DesiredResource and asserts the FakeExec
+// transcript contains ZERO `drbdadm connect` lines for the whole
+// run.
+//
+// Open issue tracked separately: if/when the scenarios doc settles
+// on requiring an explicit `Aux/operator-managed=true` prop (the
+// 5.29 doc still calls it an "open design question"), this test
+// should grow a sibling that drives the prop-gated branch.
+func TestReconcilerRespectsOperatorDisconnect(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// First-pass storage probe: LV absent, lvcreate will run.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-opdisc_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// 2-replica RD. The observer (out-of-band, not modelled here)
+	// reports peer n2 as Disconnecting/StandAlone after the
+	// operator ran `drbdadm disconnect pvc-opdisc` on the
+	// satellite shell. The DesiredResource shape the controller
+	// hands the satellite is unchanged — peer connection-state is
+	// observer-only, NOT part of the apply payload. That's the
+	// point: the reconciler has no signal that would tempt it to
+	// "fix" a manually-disconnected peer, and no verb in its
+	// toolbox to do so even if it tried.
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-opdisc",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7100",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1100",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7100",
+			},
+		},
+	}
+
+	// Pass 1: first activation — writes .res, runs create-md +
+	// adjust. From pass 2 onward we're in steady state with the
+	// LV present, the .res file linger, and create-md already
+	// marked done.
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply pass 1 (first activation): %v", err)
+	}
+
+	allLines := []string{}
+	allLines = append(allLines, fx.CommandLines()...)
+
+	// Passes 2–5: steady-state reconciles. This is the loop a
+	// satellite runs while the operator is still inside their
+	// 30s window — DesiredResource hasn't changed, observer
+	// keeps reporting peer StandAlone, reconciler keeps firing.
+	for pass := 2; pass <= 5; pass++ {
+		fx.Reset()
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-opdisc_00000",
+			storage.FakeResponse{Stdout: []byte("pvc-opdisc_00000\n")})
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-opdisc_00000",
+			storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-opdisc_00000|1048576\n")})
+
+		if _, err := rec.Apply(t.Context(), dr); err != nil {
+			t.Fatalf("Apply pass %d (steady-state): %v", pass, err)
+		}
+
+		allLines = append(allLines, fx.CommandLines()...)
+	}
+
+	// Core assertion: ZERO `drbdadm connect` calls anywhere in
+	// the 5-pass window. `disconnect` is also forbidden — the
+	// reconciler should never preemptively quiesce a connection
+	// either, that's purely the operator's call here.
+	forbidden := []string{
+		"drbdadm connect",
+		"drbdadm disconnect",
+	}
+
+	for _, bad := range forbidden {
+		for _, line := range allLines {
+			if strings.Contains(line, bad) {
+				t.Errorf("reconciler issued forbidden %q during operator-disconnect window: %s\nall calls: %v",
+					bad, line, allLines)
+			}
+		}
+	}
+
+	// Positive control: `drbdadm adjust` must still fire at
+	// least once across the 5 passes — without it the test
+	// degenerates to "reconciler did nothing", which would pass
+	// the forbidden-verb check trivially. Adjust is the verb
+	// that proves the reconciler IS running, just not touching
+	// the connection state.
+	sawAdjust := false
+
+	for _, line := range allLines {
+		if strings.Contains(line, "drbdadm adjust pvc-opdisc") {
+			sawAdjust = true
+
+			break
+		}
+	}
+
+	if !sawAdjust {
+		t.Errorf("expected at least one drbdadm adjust across 5 passes; got %v", allLines)
+	}
+}
