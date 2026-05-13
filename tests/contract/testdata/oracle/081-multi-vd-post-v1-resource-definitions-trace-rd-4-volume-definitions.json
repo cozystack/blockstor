@@ -1,0 +1,17 @@
+{
+  "name": "POST /v1/resource-definitions/trace-rd-4/volume-definitions",
+  "method": "POST",
+  "path": "/v1/resource-definitions/trace-rd-4/volume-definitions",
+  "body": {
+    "volume_definition": {
+      "size_kib": 262144,
+      "volume_number": 2
+    }
+  },
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

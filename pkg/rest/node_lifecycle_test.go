@@ -85,9 +85,14 @@ func TestNodeRestoreClearsFlag(t *testing.T) {
 	}
 }
 
-// TestNodeLostMarksFlag: POST /v1/nodes/{node}/lost adds LOST and
-// EVICTED — `lost` is a permanent action.
-func TestNodeLostMarksFlag(t *testing.T) {
+// TestNodeLostDeletesNode pins the upstream-LINSTOR semantic:
+// `controller drop-node` removes the Node entry entirely (not
+// "mark with LOST/EVICTED flags"). Orphan Resources are re-placed
+// by the reconciler on the next cycle (Phase 6 work). The
+// recorder-corpus comparison against the oracle relied on this —
+// keeping the old "mark flags" behaviour made the post-Lost
+// /v1/nodes list diverge from upstream.
+func TestNodeLostDeletesNode(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -103,15 +108,9 @@ func TestNodeLostMarksFlag(t *testing.T) {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	got, err := st.Nodes().Get(t.Context(), "n1")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-
-	for _, want := range []string{"LOST", "EVICTED"} {
-		if !slices.Contains(got.Flags, want) {
-			t.Errorf("expected %s flag; got %v", want, got.Flags)
-		}
+	_, err := st.Nodes().Get(t.Context(), "n1")
+	if err == nil {
+		t.Errorf("expected node to be deleted, but Get succeeded")
 	}
 }
 
@@ -184,15 +183,18 @@ func TestNodeRestoreUnknown(t *testing.T) {
 	}
 }
 
-// TestNodeLostUnknown: ditto for /lost.
-func TestNodeLostUnknown(t *testing.T) {
+// TestNodeLostUnknownIsIdempotent: `lost` on a non-existent node is
+// folded into success — matches upstream LINSTOR's "drop-node is
+// idempotent" semantic so re-running an operator teardown script
+// doesn't fail on an already-cleaned node.
+func TestNodeLostUnknownIsIdempotent(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
 	resp := httpPost(t, base+"/v1/nodes/ghost/lost", nil)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }

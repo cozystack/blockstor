@@ -442,3 +442,145 @@ func deepPropsRD(ctx context.Context, c *client.Client) error {
 
 	return nil
 }
+
+// phaseMultiVD exercises VolumeDefinition CRUD with multiple
+// volumes on a single ResourceDefinition. The recorder's main
+// resource-definitions phase only spins up one VD; this one creates
+// three sequentially (volume_number 0/1/2), modifies one, deletes
+// one, then walks the list endpoint. Pure controller state — no
+// satellite placement.
+//
+// ~12 traces toward the 100+ corpus target.
+const (
+	traceRD4   = "trace-rd-4"
+	vd1SizeKiB = 65536
+	vd2SizeKiB = 131072
+	vd3SizeKiB = 262144
+)
+
+func phaseMultiVD(ctx context.Context, c *client.Client) error {
+	err := c.ResourceDefinitions.Create(ctx, client.ResourceDefinitionCreate{
+		ResourceDefinition: client.ResourceDefinition{Name: traceRD4},
+	})
+	if err != nil {
+		return errors.Wrapf(err, "create %s", traceRD4)
+	}
+
+	err = multiVDCRUD(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	err = c.ResourceDefinitions.Delete(ctx, traceRD4)
+	if err != nil {
+		return errors.Wrapf(err, "delete %s", traceRD4)
+	}
+
+	return nil
+}
+
+// multiVDCRUD runs the per-volume cycle inside phaseMultiVD. Split
+// out so the parent function stays under the funlen budget.
+func multiVDCRUD(ctx context.Context, c *client.Client) error {
+	for _, vdSpec := range []struct {
+		vn   int32
+		size uint64
+	}{{0, vd1SizeKiB}, {1, vd2SizeKiB}, {2, vd3SizeKiB}} {
+		vn := vdSpec.vn
+
+		err := c.ResourceDefinitions.CreateVolumeDefinition(ctx, traceRD4, client.VolumeDefinitionCreate{
+			VolumeDefinition: client.VolumeDefinition{VolumeNumber: &vn, SizeKib: vdSpec.size},
+		})
+		if err != nil {
+			return errors.Wrapf(err, "create VD %d on %s", vn, traceRD4)
+		}
+	}
+
+	_, err := c.ResourceDefinitions.GetVolumeDefinitions(ctx, traceRD4)
+	if err != nil {
+		return errors.Wrapf(err, "list VDs on %s", traceRD4)
+	}
+
+	// Bump volume 1 to 4× its original size so the trace pins the
+	// resize wire path (PUT size_kib only).
+	err = c.ResourceDefinitions.ModifyVolumeDefinition(ctx, traceRD4, 1, client.VolumeDefinitionModify{
+		SizeKib: vd3SizeKiB,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "modify VD 1 on %s", traceRD4)
+	}
+
+	_, err = c.ResourceDefinitions.GetVolumeDefinition(ctx, traceRD4, 1)
+	if err != nil {
+		return errors.Wrapf(err, "get VD 1 on %s", traceRD4)
+	}
+
+	err = c.ResourceDefinitions.DeleteVolumeDefinition(ctx, traceRD4, 1)
+	if err != nil {
+		return errors.Wrapf(err, "delete VD 1 on %s", traceRD4)
+	}
+
+	_, err = c.ResourceDefinitions.GetVolumeDefinitions(ctx, traceRD4)
+	if err != nil {
+		return errors.Wrapf(err, "list VDs after delete on %s", traceRD4)
+	}
+
+	// Tear down remaining VDs.
+	for _, vn := range []int32{0, 2} {
+		err = c.ResourceDefinitions.DeleteVolumeDefinition(ctx, traceRD4, int(vn))
+		if err != nil {
+			return errors.Wrapf(err, "teardown VD %d on %s", vn, traceRD4)
+		}
+	}
+
+	return nil
+}
+
+// phaseMoreNodes creates and tears down 4 extra Node fixtures
+// (trace-n6 through trace-n9), each with a different SatelliteType
+// to exercise the type-string round-trip. ~16 traces.
+const (
+	traceN6 = "trace-n6"
+	traceN7 = "trace-n7"
+	traceN8 = "trace-n8"
+	traceN9 = "trace-n9"
+)
+
+func phaseMoreNodes(ctx context.Context, c *client.Client) error {
+	for _, name := range []string{traceN6, traceN7, traceN8, traceN9} {
+		err := c.Nodes.Create(ctx, client.Node{
+			Name: name,
+			Type: nodeTypeSatellite,
+			NetInterfaces: []client.NetInterface{{
+				Name:                    nodeIfaceDefaultName,
+				Address:                 net.ParseIP("127.0.0.1"),
+				SatellitePort:           loopbackSatellitePort,
+				SatelliteEncryptionType: nodeEncryptionPlain,
+			}},
+		})
+		if err != nil {
+			return errors.Wrapf(err, "create %s", name)
+		}
+	}
+
+	_, err := c.Nodes.GetAll(ctx)
+	if err != nil {
+		return errors.Wrap(err, "list nodes (after batch create)")
+	}
+
+	for _, name := range []string{traceN6, traceN7, traceN8, traceN9} {
+		_, err := c.Nodes.Get(ctx, name)
+		if err != nil {
+			return errors.Wrapf(err, "get %s", name)
+		}
+	}
+
+	for _, name := range []string{traceN6, traceN7, traceN8, traceN9} {
+		err := c.Nodes.Delete(ctx, name)
+		if err != nil {
+			return errors.Wrapf(err, "delete %s", name)
+		}
+	}
+
+	return nil
+}

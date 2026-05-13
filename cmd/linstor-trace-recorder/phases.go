@@ -67,6 +67,8 @@ func selectPhases(name string) []phase {
 		{"resource-groups", phaseResourceGroups},
 		{"resource-definitions", phaseResourceDefinitions},
 		{"deep-props", phaseDeepProps},
+		{"multi-vd", phaseMultiVD},
+		{"more-nodes", phaseMoreNodes},
 		// view-empty must run AFTER all teardown phases so the oracle's
 		// /v1/view/* responses are genuinely empty for trace-* state.
 		{"view-empty", phaseViewEmpty},

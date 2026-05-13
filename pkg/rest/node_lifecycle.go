@@ -20,7 +20,10 @@ import (
 	"net/http"
 	"slices"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerNodeLifecycle wires the eviction / restore / lost endpoints.
@@ -83,10 +86,27 @@ func (s *Server) handleNodeRestore(w http.ResponseWriter, r *http.Request) {
 	updateNodeFlags(w, r, s, removeFlag("EVICTED"))
 }
 
-// handleNodeLost is the permanent action — node is gone, replicas
-// must be re-created elsewhere even without local cooperation.
+// handleNodeLost is the permanent action — upstream LINSTOR's
+// `controller drop-node` removes the Node from the controller
+// entirely; orphan Resources are re-placed on the next reconcile
+// (Phase 6 work). blockstor mirrors that: delete the Node CRD, not
+// just stamp flags. Missing-node is folded into success so a
+// re-run of an operator teardown script doesn't fail on
+// already-cleaned state.
 func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
-	updateNodeFlags(w, r, s, addFlag("LOST"), addFlag("EVICTED"))
+	name := r.PathValue("node")
+
+	err := s.Store.Nodes().Delete(r.Context(), name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node lost: " + name,
+	}})
 }
 
 // updateNodeFlags loads the Node, applies each mutator, and persists.

@@ -1,0 +1,11 @@
+{
+  "name": "DELETE /v1/nodes/trace-n6",
+  "method": "DELETE",
+  "path": "/v1/nodes/trace-n6",
+  "expectedStatus": 200,
+  "expectedBody": [
+    {
+      "ret_code_class": "\u003cinfo\u003e"
+    }
+  ]
+}

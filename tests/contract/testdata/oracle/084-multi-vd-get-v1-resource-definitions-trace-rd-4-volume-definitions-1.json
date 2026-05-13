@@ -1,0 +1,10 @@
+{
+  "name": "GET /v1/resource-definitions/trace-rd-4/volume-definitions/1",
+  "method": "GET",
+  "path": "/v1/resource-definitions/trace-rd-4/volume-definitions/1",
+  "expectedStatus": 200,
+  "expectedBody": {
+    "size_kib": 262144,
+    "volume_number": 1
+  }
+}
