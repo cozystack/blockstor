@@ -39,6 +39,35 @@ func (s *Server) registerStoragePools(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolsList))
 	mux.HandleFunc("POST /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolCreate))
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolGet))
+	mux.HandleFunc("DELETE /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolDelete))
+}
+
+// handleNodeStoragePoolDelete serves DELETE /v1/nodes/{node}/storage-pools/{pool}.
+//
+// Idempotent: removing a pool that's already absent folds into a 200
+// success envelope. Python linstor-client's `_handle_response_error`
+// path tries JSON then XML to decode error responses; a bare 405 from
+// Go's default mux (the previous shape with no handler registered)
+// trips its `xml.etree` parser and crashes the CLI. Returning a
+// proper ApiCallRc envelope on every code path keeps both
+// golinstor and the Python CLI happy.
+func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+	pool := r.PathValue("pool")
+
+	err := s.Store.StoragePools().Delete(r.Context(), node, pool)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	msg := "storage pool deleted: " + pool + " on " + node
+	if err != nil {
+		msg = "storage pool already absent: " + pool + " on " + node
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: msg}})
 }
 
 func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) {
