@@ -53,6 +53,24 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		rds = []apiv1.ResourceDefinition{}
 	}
 
+	// `?with_volume_definitions=true` is the upstream LINSTOR query
+	// the Python CLI sends on `linstor vd l` — it expects RDs with
+	// their VDs inlined under `volume_definitions`. Without this
+	// handling, `vd l` renders an empty table even when VDs exist
+	// (the Python CLI never falls back to per-RD GETs).
+	if r.URL.Query().Get("with_volume_definitions") == "true" {
+		for i := range rds {
+			vds, vdErr := s.Store.VolumeDefinitions().List(r.Context(), rds[i].Name)
+			if vdErr != nil {
+				writeError(w, http.StatusInternalServerError, vdErr.Error())
+
+				return
+			}
+
+			rds[i].VolumeDefinitions = vds
+		}
+	}
+
 	writeJSON(w, http.StatusOK, rds)
 }
 

@@ -37,6 +37,13 @@ type ResourceDefinition struct {
 	// Wire field name matches upstream LINSTOR (`resource_definition.layer_stack`).
 	LayerStack []string `json:"layer_stack,omitempty"`
 	UUID       string   `json:"uuid,omitempty"`
+	// VolumeDefinitions is the inline VD list emitted when the caller
+	// asks for `GET /v1/resource-definitions?with_volume_definitions=true`.
+	// Upstream LINSTOR returns RD + its VDs in a single round-trip on
+	// this query; python-linstor-client's `vd l` reads from here
+	// (linstorapi.py::resource_dfn_list). Omitted by default so the
+	// plain `rd l` view stays compact.
+	VolumeDefinitions []VolumeDefinition `json:"volume_definitions,omitempty"`
 }
 
 // Layer kind constants — the strings LINSTOR uses on the wire.
