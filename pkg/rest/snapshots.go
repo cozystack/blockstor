@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -59,7 +61,7 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	rdFilter := multiValueQuery(r, "resources")
 	nameFilter := multiValueQuery(r, "snapshots")
 
-	out := make([]apiv1.Snapshot, 0, len(snaps))
+	filtered := make([]apiv1.Snapshot, 0, len(snaps))
 
 	for i := range snaps {
 		if !matchAnyFold(rdFilter, snaps[i].ResourceName) {
@@ -70,10 +72,26 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		out = append(out, snaps[i])
+		filtered = append(filtered, snaps[i])
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	// Pagination: golinstor's ListOpts.{Offset,Limit} surface as
+	// `?offset=N&limit=M`. linstor-csi forwards csi-sanity's
+	// max_entries + starting_token into these, and CSI's
+	// ListSnapshots "next token" path expects to see the next
+	// batch on subsequent calls. Sort to make pagination
+	// deterministic across calls — without a stable order,
+	// offset slicing into a map-backed list returns inconsistent
+	// pages.
+	slices.SortFunc(filtered, func(a, b apiv1.Snapshot) int {
+		if a.ResourceName != b.ResourceName {
+			return strings.Compare(a.ResourceName, b.ResourceName)
+		}
+
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	writeJSON(w, http.StatusOK, paginateSnapshots(r, filtered))
 }
 
 func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +194,33 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
 	}})
+}
+
+// paginateSnapshots applies golinstor's ListOpts.{Offset,Limit}
+// query params to the filtered slice. CSI's ListSnapshots
+// max_entries + starting_token forward into these. A zero/missing
+// `limit` returns everything; a negative `offset` clamps to zero.
+// Out-of-range offset returns an empty slice (NOT 416) — matches
+// upstream LINSTOR which silently empties the list when paginated
+// past the end.
+func paginateSnapshots(r *http.Request, in []apiv1.Snapshot) []apiv1.Snapshot {
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+
+	if offset >= len(in) {
+		return []apiv1.Snapshot{}
+	}
+
+	out := in[offset:]
+
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+
+	return out
 }
 
 // makeSnapshotPerNode builds the `Snapshots[]` per-node materialisation
