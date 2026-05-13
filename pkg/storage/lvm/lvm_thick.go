@@ -110,6 +110,13 @@ func (t *Thick) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.V
 	return volumeStatusViaLVS(ctx, t.exec, t.cfg.VolumeGroup+"/"+volumeLVName(vol))
 }
 
+// ListVolumeNames enumerates every LV in the configured VG that
+// matches blockstor's `<resource>_<vol5digits>` naming. Used by the
+// orphan-storage sweeper (Bug 43) — see Thin.ListVolumeNames doc.
+func (t *Thick) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
+	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
+}
+
 // PoolStatus reports the VG's free/total capacity.
 func (t *Thick) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	out, err := t.exec.Run(ctx, "vgs",

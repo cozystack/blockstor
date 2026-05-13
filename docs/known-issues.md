@@ -24,9 +24,9 @@ Severity legend:
 
 **Actual behaviour**: A short window exists where the CR is gone but the ZVOL still resides on disk because the satellite finalizer was bypassed. The next reconcile or operator restart eventually GCs it, but for a few seconds the storage pool reports phantom capacity.
 
-**Recommended fix**: No code change required. Document the window and rely on Bug 5.34 sweeper (see Bug 33) to handle the residual cleanup deterministically. Consider extending the sweeper to also enumerate orphan ZVOLs whose parent RD no longer exists.
+**Recommended fix**: No code change required. Document the window and rely on Bug 33 (DRBD orphan sweeper) plus Bug 43 (storage orphan sweeper) to handle the residual cleanup deterministically.
 
-**Related commits / tests**: see Bug 33 sweeper.
+**Related commits / tests**: see Bug 33 (DRBD sweeper) and Bug 43 (storage sweeper).
 
 ## Bug 33: orphan kernel DRBD-Diskless after force-strip
 
@@ -256,6 +256,38 @@ Net: implementing the upstream contract requires either resurrecting a custom co
 The spec is pinned by `TestSatelliteFlagsLackControllerBindAddress` and `TestNodeCRDHasNoActiveField` in `pkg/satellite/stream/redial_spec_test.go`. If a future change implements Outcome A, both tests will fail and force the reviewer to replace them with a positive re-dial assertion.
 
 **Related commits / tests**: `pkg/satellite/stream/redial_spec_test.go`; tests/scenarios/03-networking.md §3.10.
+
+## Bug 43: mass-churn ZVOL leak on force-stripped finalizers
+
+**Status**: closed (by storage-orphan sweeper)
+**Severity**: P0
+**Scenario reference**: tests/e2e/lc-rd-delete-churn.sh (scenario 5.4 extended — 10 RD rapid create/delete on one node)
+**Surfaced by**: e2e test
+
+**Reproduction steps**:
+
+1. Run `lc-rd-delete-churn.sh` with `ITERS=10` against a 2-node stand.
+2. Inject a satellite stall (e.g. SIGSTOP on the satellite pod) for the iteration's DRBD-down phase so the REST controller times out the per-iter delete and force-strips the Resource CRD finalizer.
+3. After the loop, `zfs list -t volume` on each node.
+
+**Expected behaviour**: All 10 ZVOLs are destroyed in lock-step with the Resource CRD deletion; the final `zfs list -t volume` shows no `churn-N_NNNNN` datasets.
+
+**Actual behaviour** (pre-fix): 9 of 10 ZVOLs leak. The REST controller stamps `DeletionTimestamp` on the per-node Resource CRD; the satellite finalizer is mid-`drbdsetup down` so doesn't release the finalizer in time; the controller force-strips the finalizer; the satellite's `handleDelete` (which would have called `provider.DeleteVolume`) never runs; the ZVOL survives indefinitely. Bug 32 documents the short-window variant; Bug 43 is the deterministic mass-churn variant where the satellite genuinely cannot keep up and force-strip becomes the steady-state path.
+
+**Recommended fix (landed)**: New `StorageOrphanSweeperRunnable` in `pkg/satellite/controllers/storage_sweeper.go` periodically (every 5 minutes, same cadence as the DRBD orphan sweeper for Bug 33) walks every registered `storage.Provider` that implements the new `storage.VolumeLister` capability, diffs the on-disk volume list against the Resource CRDs scheduled to this node, and calls `provider.DeleteVolume` on each volume whose owning CRD has fully vanished (force-strip aftermath).
+
+Safety belts on the new path:
+
+- Wildcard-owned protection: a Resource CRD whose RD has been cascade-deleted out of order still counts as "owned" (volume number wildcard) so the sweeper never races `handleDelete`.
+- Per-cycle delete bound (`StorageSweeperMaxDeletePerCycle = 3`) so a pathological upstream producer of orphans surfaces in logs without being silently cleaned in one tick.
+- Storage-resource prefix allowlist (`pvc-`, `bs-`) so operator-created datasets that happen to share the pool are immune to the sweep.
+- Per-Node opt-out annotation `blockstor.io/skip-orphan-storage-sweeper` for forensic-mode operators.
+- `ListVolumeNames` skips ZFS deferred-delete markers (`__DELETED__`) and LVM snapshot LVs via the lv_attr column so the sweeper never confuses cleanup artefacts for orphans.
+
+Idempotency of `provider.DeleteVolume` was already guaranteed by Bug 33's contract; the sweeper relies on that — racing the satellite's own `handleDelete` is harmless because the second call returns nil.
+
+**Related commits / tests**: `pkg/satellite/controllers/storage_sweeper.go` + `pkg/satellite/controllers/storage_sweeper_test.go` (7 unit tests covering owned-leave-alone, orphan-reap, foreign-prefix immunity, per-node scope, rate-limit, skip-annotation, mid-delete-race protection, missing-RD wildcard protection); `pkg/storage/storage.go` adds the `VolumeLister` optional interface + `VolumeRef`; ZFS / LVM-thin / LVM-thick providers implement it. E2e validation via `lc-rd-delete-churn.sh` (passes 10 iters without ZVOL leak).
+>>>>>>> 92119f01f (fix(satellite): orphan-storage sweeper closes mass-churn ZVOL leak (Bug 43))
 
 ## Recommended next-fix order
 

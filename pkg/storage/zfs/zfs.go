@@ -364,6 +364,99 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	return nil
 }
 
+// ListVolumeNames enumerates every zvol in the configured pool that
+// matches the blockstor naming convention `<pool>/<resource>_<vol5digits>`.
+// Used by the orphan-storage sweeper (Bug 43) to find zvols whose
+// owning Resource CRD has been force-deleted without the satellite's
+// DeleteVolume ever running.
+//
+// Skips:
+//   - Datasets outside the configured pool (defensive — `zfs list -r`
+//     with `-d 1` should only return direct children, but the parse
+//     guards anyway).
+//   - Deferred-delete markers (names containing `__DELETED__`) — those
+//     are upstream LINSTOR's "clone still references this snapshot"
+//     gravestones, NOT user volumes; the sweep MUST NOT GC them.
+//   - Datasets whose suffix isn't a 5-digit volume number — we don't
+//     manage hand-created datasets in the pool and silently leaving
+//     them alone is the right call (operator may have placed them
+//     there intentionally).
+func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
+	out, err := p.exec.Run(ctx, "zfs",
+		"list", "-H", "-r", "-d", "1",
+		"-o", "name", "-t", "volume",
+		p.cfg.Pool)
+	if err != nil {
+		return nil, errors.Wrapf(err, "zfs list pool %s", p.cfg.Pool)
+	}
+
+	refs := make([]storage.VolumeRef, 0)
+
+	prefix := p.cfg.Pool + "/"
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+
+		// Skip deferred-delete markers — they look like
+		// `<pool>/<rsc>_00000@<snap>__DELETED__<ts>` and aren't
+		// even zvols (they're tagged volumes by `-t volume` only
+		// because the origin dataset is one). Defensive belt-and-
+		// braces — the filter substring catches the rename pattern
+		// even if upstream's naming shifts a character.
+		if strings.Contains(line, "__DELETED__") {
+			continue
+		}
+
+		base := strings.TrimPrefix(line, prefix)
+
+		resource, vol, ok := parseVolumeName(base)
+		if !ok {
+			continue
+		}
+
+		refs = append(refs, storage.VolumeRef{
+			ResourceName: resource,
+			VolumeNumber: vol,
+		})
+	}
+
+	return refs, nil
+}
+
+// parseVolumeName splits "<resource>_<vol5digits>" into its parts.
+// Returns ok=false when the suffix isn't a 5-digit decimal number;
+// the orphan sweeper relies on that to skip operator-created
+// datasets that happen to share the pool.
+func parseVolumeName(name string) (string, int32, bool) {
+	idx := strings.LastIndex(name, "_")
+	if idx == -1 {
+		return "", 0, false
+	}
+
+	suffix := name[idx+1:]
+	if len(suffix) != volNumberDigits {
+		return "", 0, false
+	}
+
+	n, err := strconv.Atoi(suffix)
+	if err != nil {
+		return "", 0, false
+	}
+
+	return name[:idx], int32(n), true
+}
+
+// volNumberDigits is the fixed-width digit count blockstor uses for
+// the per-RD volume index in dataset / LV names. Keep in sync with
+// volumeDataset / volumeLVName.
+const volNumberDigits = 5
+
 // volumeOrigin reads the zvol's `origin` property — the snapshot
 // dataset name when this volume was created via `zfs clone`, or
 // `-` for a standalone dataset. Returns "" on either case + on any

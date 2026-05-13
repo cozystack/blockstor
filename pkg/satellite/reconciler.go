@@ -158,6 +158,26 @@ func (r *Reconciler) RegisterProvider(pool string, provider storage.Provider) {
 	r.cfg.Providers[pool] = provider
 }
 
+// SnapshotProviders returns a snapshot of the pool→provider map the
+// reconciler currently holds. Used by the orphan-storage sweeper (Bug
+// 43) which walks every registered provider for VolumeLister-capable
+// backends. The map is copied under the same lock RegisterProvider
+// takes so a concurrent registration can't tear the snapshot.
+//
+// Callers must treat the returned map as read-only — modifying it
+// races every subsequent RegisterProvider call.
+func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make(map[string]storage.Provider, len(r.cfg.Providers))
+	for k, v := range r.cfg.Providers {
+		out[k] = v
+	}
+
+	return out
+}
+
 // SetCrossNodeFetcher injects the cross-node fetcher post-construction.
 // Called by the agent after the controller-runtime manager is built —
 // the fetcher needs the manager's cached client to look up Snapshot +

@@ -127,6 +127,56 @@ type Provider interface {
 	RestoreVolumeFromSnapshot(ctx context.Context, target Volume, sourceSnapshot Snapshot) error
 }
 
+// VolumeLister is the optional "enumerate every volume this provider
+// currently holds on disk" capability. The orphan-storage sweeper
+// (see pkg/satellite/controllers/storage_sweeper.go) uses it to
+// diff on-disk volumes against the Resource CRDs scheduled to this
+// satellite and reap any volume whose owning CRD vanished without
+// the satellite's finalizer running its DeleteVolume — the failure
+// mode Bug 43 documents (controller force-strips the finalizer
+// after a hung satellite, the satellite-side DeleteResource never
+// fires, the ZVOL / LV survives).
+//
+// Pulled out of Provider for the same interfacebloat reason as
+// SnapshotShipper — most call sites don't need to enumerate, and a
+// provider that genuinely cannot enumerate (e.g. an opaque
+// network-backed kind) keeps working without implementing this.
+type VolumeLister interface {
+	// ListVolumeNames returns one entry per on-disk volume this
+	// provider owns. ResourceName + VolumeNumber are parsed out of
+	// the backend-specific path naming `<resource>_<vol5digits>`;
+	// PoolName is filled by the caller (the sweeper, which knows
+	// which pool it's iterating). Implementations skip artefacts
+	// they don't recognise (e.g. ZFS deferred-delete markers
+	// containing `__DELETED__`) so the sweeper never tries to GC
+	// a name that doesn't match the CRD-owned convention.
+	ListVolumeNames(ctx context.Context) ([]VolumeRef, error)
+}
+
+// VolumeRef is the lightweight identifier the sweeper consumes —
+// just enough to call DeleteVolume on the matching provider when an
+// orphan is detected. Distinct from Volume (which carries size and
+// other materialise-time fields) so the listing path doesn't have
+// to fabricate stub values that would later confuse the caller.
+type VolumeRef struct {
+	// PoolName is filled by the sweeper from the storage-pool the
+	// provider is registered under, NOT parsed from the backend.
+	// Two providers backed by the same ZFS pool would be the same
+	// physical storage but a different logical pool from blockstor's
+	// PoV; the registry name is the source of truth.
+	PoolName string
+
+	// ResourceName matches the RD name (e.g. "pvc-aaa"). The
+	// satellite-side DeleteResource takes the RD name, not the
+	// per-node CRD name `<rd>.<node>`.
+	ResourceName string
+
+	// VolumeNumber is the per-RD volume index (0-based). RDs
+	// today have at most one volume; the field exists so the
+	// sweeper stays correct when multi-volume RDs land.
+	VolumeNumber int32
+}
+
 // SnapshotShipper is the optional cross-node-clone capability — a
 // provider that implements it can stream a snapshot to a peer
 // satellite and reconstitute it on the receiving side. ZFS / LVM

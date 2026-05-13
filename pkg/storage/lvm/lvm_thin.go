@@ -337,6 +337,104 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 	return nil
 }
 
+// ListVolumeNames enumerates every LV in the configured VG that
+// matches blockstor's `<resource>_<vol5digits>` naming. Used by the
+// orphan-storage sweeper (Bug 43) to GC LVs whose owning Resource
+// CRD has been force-deleted without the satellite's DeleteVolume
+// running.
+//
+// Snapshot LVs (named `<rd>_<snap>_00000` — see snapshotLVName) live
+// in the same VG; we filter them out via the lv_attr column. Volume
+// LVs have type '-' (thick) or 'V' (thin virtual); snapshot LVs use
+// 's' (regular) or carry origin metadata differentiable through
+// lv_attr.
+func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
+	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
+}
+
+// listLVMVolumes is the shared LV-enumeration helper used by both
+// Thin and Thick providers. Both backends use the same per-VG `lvs`
+// invocation; only the VG name differs.
+func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.VolumeRef, error) {
+	out, err := ex.Run(ctx, "lvs",
+		Args("--noheadings",
+			"-o", "lv_name,lv_attr",
+			"--separator", "\t",
+			vg)...)
+	if err != nil {
+		return nil, errors.Wrapf(err, "lvs %s", vg)
+	}
+
+	refs := make([]storage.VolumeRef, 0)
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+
+		name := strings.TrimSpace(parts[0])
+		attr := strings.TrimSpace(parts[1])
+
+		// First lv_attr char is the volume type. Snapshot LVs
+		// (origin 's' or thin-snapshot variants) live in the
+		// same VG; we don't manage them through DeleteVolume
+		// so the sweeper skips them. Volume LVs have type '-'
+		// (thick) or 'V' (thin virtual).
+		if len(attr) == 0 {
+			continue
+		}
+
+		volType := attr[0]
+		if volType != '-' && volType != 'V' {
+			continue
+		}
+
+		resource, vol, ok := parseLVName(name)
+		if !ok {
+			continue
+		}
+
+		refs = append(refs, storage.VolumeRef{
+			ResourceName: resource,
+			VolumeNumber: vol,
+		})
+	}
+
+	return refs, nil
+}
+
+// parseLVName splits `<resource>_<vol5digits>` into (resource, vol).
+// Mirrors zfs.parseVolumeName; kept package-local so each backend
+// owns its naming convention.
+func parseLVName(name string) (string, int32, bool) {
+	idx := strings.LastIndex(name, "_")
+	if idx == -1 {
+		return "", 0, false
+	}
+
+	suffix := name[idx+1:]
+	if len(suffix) != lvNumberDigits {
+		return "", 0, false
+	}
+
+	n, err := strconv.Atoi(suffix)
+	if err != nil {
+		return "", 0, false
+	}
+
+	return name[:idx], int32(n), true
+}
+
+// lvNumberDigits is the fixed-width volume-number suffix length —
+// matches the zero-padding in volumeLVName.
+const lvNumberDigits = 5
+
 // lvExists is the idempotency primitive used by Create/Delete. Errors
 // from `lvs` are folded into "missing": we can't distinguish "lv not
 // found" from "vg locked" via stdout, and the caller's subsequent op
