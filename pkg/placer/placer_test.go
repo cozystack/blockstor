@@ -18,6 +18,7 @@ package placer_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -620,6 +621,91 @@ func TestPlaceCandidatePoolsFiltersByStoragePoolList(t *testing.T) {
 			t.Errorf("expected StoragePool=fast, got %q on %s",
 				r.Props["StorPoolName"], r.NodeName)
 		}
+	}
+}
+
+// TestPlacerDeficitExcludesDisklessAndTiebreaker pins Bug 19.2: the
+// place_count deficit calculation must NOT count DISKLESS replicas
+// (including auto-tiebreaker witnesses, which carry DISKLESS +
+// TIE_BREAKER) toward the diskful target. A 3-replica RG sitting at
+// 2 diskful + 1 diskless witness must still be 1-short so the placer
+// fills the gap rather than declaring satisfaction.
+//
+// Setup: place_count=3, 4 healthy nodes. Pre-seed 2 diskful replicas
+// (n1+n2) and one tiebreaker witness (n3, DISKLESS+TIE_BREAKER). The
+// placer must add a 3rd diskful replica on n4 — NOT treat the witness
+// as the 3rd replica and exit early.
+func TestPlacerDeficitExcludesDisklessAndTiebreaker(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2", "n3", "n4"})
+
+	// Two diskful replicas on n1 + n2.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: n,
+			Props: map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	// Auto-tiebreaker witness on n3: DISKLESS + TIE_BREAKER. Without
+	// the deficit fix the placer counts n3 as a "replica present"
+	// and stops at 2 diskful + 1 witness instead of going to 3 diskful.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-1", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: 3})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (witness must not count)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	diskful := 0
+	witness := 0
+
+	for _, r := range got {
+		if slices.Contains(r.Flags, apiv1.ResourceFlagDiskless) {
+			witness++
+
+			continue
+		}
+
+		diskful++
+	}
+
+	if diskful != 3 {
+		t.Errorf("diskful count: got %d, want 3 (gap-fill must run); resources=%+v", diskful, got)
+	}
+
+	if witness != 1 {
+		t.Errorf("witness count: got %d, want 1 (existing witness left untouched); resources=%+v", witness, got)
+	}
+
+	// The new diskful replica must land on n4 — the only remaining
+	// healthy node that wasn't already taken by an existing replica.
+	gotNodes := map[string]bool{}
+	for _, r := range got {
+		gotNodes[r.NodeName] = true
+	}
+
+	if !gotNodes["n4"] {
+		t.Errorf("expected new diskful replica on n4; got %+v", gotNodes)
 	}
 }
 

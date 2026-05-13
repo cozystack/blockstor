@@ -92,14 +92,7 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 			filter.ReplicasOnSame, int(filter.PlaceCount))
 	}
 
-	placed := 0
-
-	for i := range existing {
-		if _, off := disabled[existing[i].NodeName]; !off {
-			placed++
-		}
-	}
-
+	placed := countDiskfulReplicas(existing, disabled)
 	want := int(filter.PlaceCount)
 
 	placed, err = p.placeDiskful(ctx, rdName, state, candidates, placed, want)
@@ -115,6 +108,33 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 	}
 
 	return placed, want, nil
+}
+
+// countDiskfulReplicas returns the number of existing replicas that
+// satisfy place_count: diskful (no DISKLESS flag) and not on an
+// EVICTED/LOST node.
+//
+// DISKLESS replicas — including auto-tiebreaker witnesses, which carry
+// both DISKLESS and TIE_BREAKER — do NOT count. place_count is the
+// diskful-replica target. A 3-replica RG sitting at 2 diskful + 1
+// diskless witness must be treated as 1-short so the placer fills the
+// gap rather than declaring satisfaction.
+func countDiskfulReplicas(existing []apiv1.Resource, disabled map[string]struct{}) int {
+	count := 0
+
+	for i := range existing {
+		if _, off := disabled[existing[i].NodeName]; off {
+			continue
+		}
+
+		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		count++
+	}
+
+	return count
 }
 
 // placeDiskful is the inner loop of Place — tries each candidate pool
@@ -320,6 +340,16 @@ func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		}
 
 		if len(filter.NodeNameList) > 0 && !slices.Contains(filter.NodeNameList, pool.NodeName) {
+			continue
+		}
+
+		// Provider-kind filter (Bug 15 / snapshot-restore-resource):
+		// `zfs send` and `dd`/`lvm` payloads are not interchangeable,
+		// so cloning from a snapshot on a ZFS_THIN pool onto an
+		// LVM_THIN target fails opaquely at satellite send/recv time.
+		// Fail-fast at the placer layer by dropping pools whose
+		// ProviderKind isn't in the caller's allow-list.
+		if len(filter.ProviderList) > 0 && !slices.Contains(filter.ProviderList, pool.ProviderKind) {
 			continue
 		}
 
