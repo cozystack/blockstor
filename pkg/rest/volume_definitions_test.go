@@ -636,30 +636,31 @@ func TestVolumeDefinitionsUpdateGetRoundTrip(t *testing.T) {
 	}
 }
 
-// TestVolumeDefinitionsUpdateEmptyBodyZeroesSizeKib documents the
-// CURRENT wholesale-replace semantics of the PUT handler: a body
-// without `size_kib` (e.g. a props-only modify from an older
-// golinstor or a `linstor vd set-property`-only call) collapses
-// SizeKib to 0. The satellite reconciler's grow branch is
-// `vol.GetSizeKib() > status.UsableKib`, so 0 can't trigger an
-// `lvextend`/`drbdadm resize` — the on-disk volume stays intact.
-// But `linstor vd l` would then report 0 KiB and the NEXT
-// legitimate grow would be a no-op (UsableKib > 0 ≥ new SizeKib).
+// TestVolumeDefinitionsUpdateMergeSemanticsPreservesSizeKib pins the
+// audit-4.6 fix for the VD-PUT merge regression: a PUT body without
+// `size_kib` (e.g. a props-only modify from `linstor vd set-property`,
+// or an older golinstor that only sends override_props) must NOT
+// silently zero the stored SizeKib. The satellite reconciler's grow branch is
+// `vol.GetSizeKib() > status.UsableKib`, so the immediate on-disk
+// volume stays intact either way — but a zeroed SizeKib makes
+// `linstor vd l` report 0 KiB and the NEXT legitimate grow becomes
+// a no-op (UsableKib > 0 ≥ new SizeKib).
 //
-// This test pins the property so a future change to merge-semantics
-// (decode → fetch current → overlay only set fields → update) is a
-// conscious move with a test churn, not an accidental behavior flip.
-// Tracked separately as an open issue — see 4.6 audit report.
-func TestVolumeDefinitionsUpdateEmptyBodyZeroesSizeKib(t *testing.T) {
+// Previously the handler did a wholesale Decode(&apiv1.VolumeDefinition)
+// + Update, which collapsed SizeKib to 0 whenever the body omitted
+// the field. Fixed by switching to a modify envelope with optional
+// SizeKib pointer and merging into the fetched existing VD.
+func TestVolumeDefinitionsUpdateMergeSemanticsPreservesSizeKib(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-wipe"}); err != nil {
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-keep"}); err != nil {
 		t.Fatalf("seed RD: %v", err)
 	}
 
-	if err := st.VolumeDefinitions().Create(ctx, "pvc-wipe",
-		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+	const initialKib = 1024 * 1024
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-keep",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
 		t.Fatalf("seed VD: %v", err)
 	}
 
@@ -668,23 +669,133 @@ func TestVolumeDefinitionsUpdateEmptyBodyZeroesSizeKib(t *testing.T) {
 
 	// Empty JSON object — golinstor's props-only modify would look
 	// like this if SizeKib were unset (it has `omitempty`).
-	resp := httpPut(t, base+"/v1/resource-definitions/pvc-wipe/volume-definitions/0", []byte(`{}`))
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-keep/volume-definitions/0", []byte(`{}`))
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	got, err := st.VolumeDefinitions().Get(ctx, "pvc-wipe", 0)
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-keep", 0)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 
-	// CURRENT BEHAVIOR — wholesale replace. If this test starts
-	// failing because SizeKib stays at 1 MiB, the handler grew
-	// merge-semantics; update the assertion (and revisit the
-	// audit-4.6 open issues).
-	if got.SizeKib != 0 {
-		t.Errorf("SizeKib after `{}` PUT: got %d, want 0 (current wholesale-replace semantics)", got.SizeKib)
+	if got.SizeKib != initialKib {
+		t.Errorf("SizeKib after empty-body PUT: got %d, want %d (merge must preserve)", got.SizeKib, initialKib)
+	}
+}
+
+// TestVolumeDefinitionsUpdateOverridePropsMergesWithExisting pins
+// the props-merge half of Bug-36's fix: an `override_props` map in
+// the PUT body must overlay onto the existing Props (preserving
+// untouched keys), not replace the whole map. Upstream LINSTOR's
+// `linstor vd set-property foo=bar` issues a modify with
+// override_props={foo:bar} and expects every other key to survive.
+func TestVolumeDefinitionsUpdateOverridePropsMergesWithExisting(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-props"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-props", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+		Props: map[string]string{
+			"DrbdOptions/Net/protocol": "C",
+			"existing-key":             "existing-value",
+		},
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Send only override_props — no size_kib, no flags.
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-props/volume-definitions/0",
+		[]byte(`{"override_props":{"new-key":"new-value","existing-key":"updated-value"}}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-props", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != 1024*1024 {
+		t.Errorf("SizeKib drifted across props-only PUT: got %d, want %d", got.SizeKib, 1024*1024)
+	}
+
+	if got.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("untouched prop lost: got %q, want %q", got.Props["DrbdOptions/Net/protocol"], "C")
+	}
+
+	if got.Props["existing-key"] != "updated-value" {
+		t.Errorf("override prop not applied: got %q, want %q", got.Props["existing-key"], "updated-value")
+	}
+
+	if got.Props["new-key"] != "new-value" {
+		t.Errorf("new prop missing: got %q, want %q", got.Props["new-key"], "new-value")
+	}
+}
+
+// TestVolumeDefinitionsUpdateDeletePropsRemovesKey pins the
+// delete-side of the props-merge: a `delete_props` list in the body
+// drops the named keys from the existing Props map without
+// touching others. Driven by `linstor vd set-property foo=` (empty
+// value), which golinstor translates into delete_props=[foo].
+func TestVolumeDefinitionsUpdateDeletePropsRemovesKey(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-del"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-del", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      1024 * 1024,
+		Props: map[string]string{
+			"keep-me":   "stay",
+			"remove-me": "go",
+		},
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-del/volume-definitions/0",
+		[]byte(`{"delete_props":["remove-me"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-del", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != 1024*1024 {
+		t.Errorf("SizeKib drifted across delete-props PUT: got %d, want %d", got.SizeKib, 1024*1024)
+	}
+
+	if _, found := got.Props["remove-me"]; found {
+		t.Errorf("delete_props did not drop key: Props=%v", got.Props)
+	}
+
+	if got.Props["keep-me"] != "stay" {
+		t.Errorf("delete_props collateral damage: got Props=%v, want keep-me=stay", got.Props)
 	}
 }

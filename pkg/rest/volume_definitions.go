@@ -18,11 +18,37 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strconv"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
+
+// volumeDefinitionModifyBody is the shape upstream golinstor sends on
+// `PUT /v1/resource-definitions/{rd}/volume-definitions/{vn}` — driven
+// by `linstor vd set-size`, `linstor vd set-property`, and the CSI
+// ControllerExpandVolume path. Top-level fields are a modify delta,
+// not the full VD spec.
+//
+// SizeKib is a pointer so we can distinguish "client omitted size_kib"
+// (preserve existing) from "client sent size_kib=0" (explicit zero).
+// Wholesale Decode(&VolumeDefinition) would conflate the two and the
+// satellite reconciler's `vol.GetSizeKib() > status.UsableKib` grow
+// branch would never fire after a no-op props-only modify because
+// SizeKib was silently zeroed. See Bug 36 (4.6 audit).
+type volumeDefinitionModifyBody struct {
+	OverrideProps    map[string]string `json:"override_props,omitempty"`
+	DeleteProps      []string          `json:"delete_props,omitempty"`
+	DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
+	SizeKib          *int64            `json:"size_kib,omitempty"`
+	Flags            []string          `json:"flags,omitempty"`
+
+	// Props mirrors the legacy callers that PUT the full VolumeDefinition
+	// shape (matches the read-side wire field). Treated as an override
+	// overlay on the existing Props map — equivalent to OverrideProps.
+	Props map[string]string `json:"props,omitempty"`
+}
 
 // registerVolumeDefinitions wires
 // /v1/resource-definitions/{rd}/volume-definitions[/{vn}] CRUD.
@@ -174,6 +200,13 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// handleVDUpdate applies a modify delta to an existing VolumeDefinition.
+// PUT semantics for upstream LINSTOR's `vd set-size` / `vd set-property`
+// are MERGE, not REPLACE — golinstor sends only the fields that changed
+// (size_kib alone for CSI grow, override_props/delete_props alone for
+// property modifies) and expects the rest of the VD spec to be
+// preserved. A naive Decode(&fullVD) + Update silently zeroes SizeKib
+// whenever the body omits it (see audit-4.6 finding). Fetch + merge.
 func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
@@ -184,18 +217,28 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var vd apiv1.VolumeDefinition
+	var patch volumeDefinitionModifyBody
 
-	err = json.NewDecoder(r.Body).Decode(&vd)
+	err = json.NewDecoder(r.Body).Decode(&patch)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	vd.VolumeNumber = vn
+	existing, err := s.Store.VolumeDefinitions().Get(r.Context(), rd, vn)
+	if err != nil {
+		writeStoreError(w, err)
 
-	err = s.Store.VolumeDefinitions().Update(r.Context(), rd, &vd)
+		return
+	}
+
+	mergeVolumeDefinitionPatch(&existing, &patch)
+
+	// Path-derived VolumeNumber wins — never trust the body's vol_num.
+	existing.VolumeNumber = vn
+
+	err = s.Store.VolumeDefinitions().Update(r.Context(), rd, &existing)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -206,6 +249,41 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "volume definition modified",
 	}})
+}
+
+// mergeVolumeDefinitionPatch overlays the modify delta onto an existing
+// VolumeDefinition in place. Split out of handleVDUpdate to keep the
+// HTTP handler under the gocyclo budget; the merge rules are unit-
+// tested through the handler.
+func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeDefinitionModifyBody) {
+	if patch.SizeKib != nil {
+		existing.SizeKib = *patch.SizeKib
+	}
+
+	// Props: overlay override_props (and the legacy `props` field —
+	// some callers PUT the full VD shape) on top of existing, then
+	// drop anything in delete_props. delete_namespaces is the upstream
+	// "delete every key under prefix" knob.
+	if len(patch.OverrideProps) > 0 || len(patch.Props) > 0 {
+		if existing.Props == nil {
+			existing.Props = map[string]string{}
+		}
+
+		maps.Copy(existing.Props, patch.OverrideProps)
+		maps.Copy(existing.Props, patch.Props)
+	}
+
+	for _, k := range patch.DeleteProps {
+		delete(existing.Props, k)
+	}
+
+	for _, ns := range patch.DeleteNamespaces {
+		for k := range existing.Props {
+			if k == ns || (len(k) > len(ns) && k[:len(ns)] == ns && k[len(ns)] == '/') {
+				delete(existing.Props, k)
+			}
+		}
+	}
 }
 
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
