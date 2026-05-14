@@ -124,8 +124,8 @@ func TestReconcilerPublishesFreeDisks(t *testing.T) {
 		t.Fatalf("missing CRD for one of sda/sdb/sdc: %+v", got)
 	}
 
-	if got["sda"].Status.DevicePath != "/dev/disk/by-id/wwn-0x5000c500a3b1c2d1" {
-		t.Errorf("sda DevicePath: got %q, want /dev/disk/by-id/wwn-0x5000c500a3b1c2d1",
+	if got["sda"].Status.DevicePath != "/dev/sda" {
+		t.Errorf("sda DevicePath: got %q, want /dev/sda (kernel name; Bug 69)",
 			got["sda"].Status.DevicePath)
 	}
 

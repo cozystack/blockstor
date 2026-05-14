@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"regexp"
 	"sort"
 	"time"
 
@@ -34,6 +35,21 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
+
+// zvolKNamePattern matches ZFS volume devices' kernel names
+// (zd0, zd16, zd32, …). They surface as TYPE=disk in lsblk
+// output but are not pool candidates — they're the block-device
+// face of an existing zvol on this node and excluding them keeps
+// `linstor ps l` showing only real free disks. Bug 70.
+var zvolKNamePattern = regexp.MustCompile(`^zd\d+$`)
+
+// isZVOLKName reports whether the kernel name belongs to a ZFS
+// volume device. Used by publishDevice to skip zvols before the
+// signature-probe fan-out so they never produce a PhysicalDevice
+// CRD. Bug 70.
+func isZVOLKName(kname string) bool {
+	return zvolKNamePattern.MatchString(kname)
+}
 
 // PhysicalDeviceDiscoveryPeriod is the cadence at which the
 // satellite re-scans `lsblk` and publishes PhysicalDevice CRDs
@@ -210,6 +226,20 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 // REST shim / operator is preserved (we never touch Spec here;
 // discovery owns Status only).
 func (p *PhysicalDeviceDiscoveryRunnable) publishDevice(ctx context.Context, logger logr.Logger, row *satellite.LsblkDevice, free bool) (string, bool) {
+	// Bug 70: ZFS zvols (KName like zd0, zd16, …) come from an
+	// existing zpool — they're already in use as block devices for
+	// blockstor's own DRBD volumes (or operator-managed zvols).
+	// They MUST NOT appear in `linstor ps l` as candidates for new
+	// pools; the operator would otherwise see a list dominated by
+	// zvol entries instead of the few real disks they can pool.
+	// Upstream LINSTOR doesn't filter them explicitly but their
+	// `lsblk --paths` typically renders zvols differently or
+	// excludes them through fstype detection — we exclude by kname
+	// prefix to avoid wiring up MAJ:MIN parsing.
+	if isZVOLKName(row.KName) {
+		return "", false
+	}
+
 	stableID := satellite.PickStableID(row)
 	if stableID == "" {
 		// No stable signal at all — virtio without serial /
@@ -221,7 +251,15 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDevice(ctx context.Context, log
 	}
 
 	name := k8s.Name(p.NodeName + "." + stableID)
-	devicePath := "/dev/disk/by-id/" + stableID
+	// Bug 69: operators type `linstor ps cdp ... /dev/vda` and
+	// match by kernel-name path. The `/dev/disk/by-id/<stableID>`
+	// path is stable across reboots but useless to humans — and
+	// for virtio devices without WWN/serial the stableID is the
+	// fallback `by-path-<kname>`, producing the nonsensical
+	// `/dev/disk/by-id/by-path-vda`. Surface the kernel name as
+	// the primary DevicePath; the stable form lives in
+	// Status.StableID for CRD-name determinism only.
+	devicePath := "/dev/" + row.KName
 	currentDevPath := "/dev/" + row.KName
 
 	rotational := row.Rotational
