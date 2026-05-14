@@ -20,11 +20,21 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/storage"
 )
+
+// DownForceTimeout caps how long DownForce waits for the happy-path
+// `drbdadm down <res>` before falling back to the kernel-direct
+// teardown sequence. 15s is the budget the satellite daemonset's
+// terminationGracePeriod (30s) and per-resource preStop budget can
+// both afford — long enough for a healthy peer to ack the
+// disconnect, short enough that a suspended-quorum slot can't stall
+// the deletion path indefinitely (Bug 82).
+const DownForceTimeout = 15 * time.Second
 
 // Adm is a thin wrapper around the `drbdadm` CLI. It exists so the
 // satellite reconciler can be unit-tested without a real DRBD kernel
@@ -49,6 +59,75 @@ func (a *Adm) Up(ctx context.Context, resource string) error {
 // Down deactivates the resource: `drbdadm down <res>`. Counterpart to Up.
 func (a *Adm) Down(ctx context.Context, resource string) error {
 	return a.run(ctx, "down", resource)
+}
+
+// DownForce tears the resource down with a bounded timeout, falling
+// back to the kernel-direct sequence when the happy-path
+// `drbdadm down <res>` doesn't return in time (Bug 82).
+//
+// Why the happy-path can hang: when DRBD loses quorum
+// (`suspended:quorum`) mid-delete, `drbdadm down` blocks waiting
+// for the resource to leave the suspended state, which only
+// resolves if a peer comes back. Operators see this as
+// `kubectl delete pod` hanging Terminating for many minutes and
+// only unblocking under `--force`, leaving a stale
+// `/dev/drbd<minor>` slot that breaks the next resource allocated
+// the same port→minor pair (Bug 82 dev-stand observation).
+//
+// Flow:
+//
+//  1. Run `drbdadm down <res>` under a child context with deadline =
+//     DownForceTimeout. If it returns within the budget (success or
+//     a non-hang error), we're done — the kernel slot is gone.
+//  2. On timeout / error: for each volume, force-detach the lower
+//     disk via `drbdsetup detach --force <res>/<vol>`. detach does
+//     NOT wait for quorum, so this returns even when the resource
+//     is suspended.
+//  3. Finalise with `drbdsetup down <res>` (kernel-direct slot
+//     release, bypasses drbdadm's quorum-aware wait). Returns nil
+//     on a "missing slot" exit — the goal state (slot absent) is
+//     the same.
+//
+// volumeNumbers is the set of DRBD volume slots to force-detach;
+// callers source it from VolumeDefinitions. An empty slice skips
+// the per-volume detach and relies on `drbdsetup down` alone —
+// belt-and-braces for kernels where `down` won't proceed past a
+// transient disk-attached state.
+//
+// Returns nil on success. Returns a wrapped error only when BOTH
+// the bounded `drbdadm down` AND the kernel-direct `drbdsetup
+// down` failed.
+func (a *Adm) DownForce(ctx context.Context, resource string, volumeNumbers []int32) error {
+	downCtx, cancel := context.WithTimeout(ctx, DownForceTimeout)
+	defer cancel()
+
+	err := a.run(downCtx, "down", resource)
+	if err == nil {
+		return nil
+	}
+
+	// Fallback path: force-detach every volume (no quorum wait),
+	// then kernel-direct `drbdsetup down`. Use the parent ctx so a
+	// tighter caller deadline still applies.
+	for _, vol := range volumeNumbers {
+		target := fmt.Sprintf("%s/%d", resource, vol)
+		_, _ = a.exec.Run(ctx, "drbdsetup", "detach", "--force", target)
+	}
+
+	_, downErr := a.exec.Run(ctx, "drbdsetup", "down", resource)
+	if downErr == nil {
+		return nil
+	}
+
+	// `drbdsetup down` on a missing slot exits non-zero with
+	// "No such resource" / "Unknown resource" — same goal state.
+	if strings.Contains(downErr.Error(), "No such resource") ||
+		strings.Contains(downErr.Error(), "No currently configured DRBD") ||
+		strings.Contains(downErr.Error(), "Unknown resource") {
+		return nil
+	}
+
+	return errors.Wrapf(downErr, "drbdsetup down %s after drbdadm down failed (%v)", resource, err)
 }
 
 // Adjust reconciles kernel state to the on-disk .res file. Called after

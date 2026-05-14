@@ -278,24 +278,39 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnaps
 	return &intent.DeleteSnapshotResponse{Ok: true}, nil
 }
 
-// DeleteResource tears down a resource: drbdadm down (best-effort —
-// the kernel handles a missing one fine), DeleteVolume on every
-// requested volume_number through the named Provider, then remove
-// the .res file. Idempotent on a missing resource. Per-step errors
-// land in the response body so the controller can surface granular
-// status without aborting the rest of the cleanup.
+// DeleteResource tears down a resource: bounded drbdadm down with a
+// kernel-direct `drbdsetup detach`+`drbdsetup down` fallback when the
+// happy path is wedged by suspended-quorum (Bug 82), DeleteVolume on
+// every requested volume_number through the named Provider, then
+// remove the .res file. Idempotent on a missing resource. Per-step
+// errors land in the response body so the controller can surface
+// granular status without aborting the rest of the cleanup.
+//
+// Bug 82: the previous `Adm.Down` call had no timeout, so deleting an
+// RD whose kernel slot was `suspended:quorum` would block the entire
+// handleDelete → satellite finalizer-strip path indefinitely. With
+// the satellite finalizer stuck, operators force-stripped it and the
+// kernel slot survived as a `/dev/drbd<minor>` orphan that prevented
+// the next port→minor allocation from creating its metadata. The
+// bounded `DownForce` path collapses both failure modes: happy path
+// returns within DownForceTimeout; quorum-stuck path falls back to
+// `drbdsetup detach --force` per volume + `drbdsetup down` (neither
+// command waits for quorum). Either way the kernel slot is gone
+// before we return, and finalizer-strip becomes safe again.
 func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResourceRequest) (*intent.DeleteResourceResponse, error) {
 	var downMsg string
 
 	if r.cfg.Adm != nil {
-		err := r.cfg.Adm.Down(ctx, req.GetName())
+		err := r.cfg.Adm.DownForce(ctx, req.GetName(), req.GetVolumeNumbers())
 		if err != nil {
-			// Best-effort: a "not configured" error is fine here
-			// (resource was already torn down on a prior pass), but we
-			// still want to surface the message back to the controller
-			// so it shows up in the gRPC response. Don't fail — DRBD
-			// down errors shouldn't block the storage cleanup.
-			downMsg = "drbdadm down: " + err.Error()
+			// Best-effort: a "not configured" / "no such resource"
+			// error here is fine (resource was already torn down on a
+			// prior pass), but we still want to surface the message
+			// back to the controller so it shows up in the response.
+			// Don't fail — even a fully-failed DownForce shouldn't
+			// block storage cleanup; the storage sweeper is the
+			// wider-scope backstop.
+			downMsg = "drbdadm down (force): " + err.Error()
 		}
 	}
 

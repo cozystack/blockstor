@@ -40,6 +40,7 @@ var (
 	errDrbdadmAdjustFail   = errors.New("drbdadm: simulated mid-Apply abort")
 	errDrbdadmResizeFail   = errors.New("drbdadm: resize failed (peer disconnected)")
 	errDrbdsetupNoResource = errors.New("drbdsetup: exit status 10")
+	errDrbdadmDownStuck    = errors.New("drbdadm down: suspended:quorum")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -1370,6 +1371,76 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 	if closeIdx >= 0 && removeIdx >= 0 && closeIdx > removeIdx {
 		t.Errorf("luksClose must run BEFORE lvremove (mapper would dangle on a missing LV); got close@%d remove@%d in %v",
 			closeIdx, removeIdx, calls)
+	}
+}
+
+// TestDeleteResourceForceTeardownOnSuspendedQuorum pins the Bug 82
+// fix: when `drbdadm down` fails (surrogate for the production hang
+// on suspended:quorum), DeleteResource must follow up with
+// `drbdsetup detach --force <res>/<vol>` for every volume and
+// `drbdsetup down <res>`. The DRBD kernel slot survives the original
+// `drbdadm down` hang otherwise, and the next port→minor allocation
+// runs into `Device '<minor>' is configured! exit 20`. The response
+// stays Ok=true because the kernel slot is released via the
+// fallback path; storage cleanup proceeds; the satellite finalizer
+// gets released by handleDelete unconditionally.
+func TestDeleteResourceForceTeardownOnSuspendedQuorum(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Wedge `drbdadm down` so DownForce flips to the kernel-direct
+	// fallback. In production this manifests as an indefinite hang
+	// that DownForce's context deadline turns into an error; the
+	// FakeExec surrogate just produces an immediate error, which the
+	// wrapper handles via the same fallback branch.
+	fx.Expect("drbdadm down pvc-stuck", storage.FakeResponse{Err: errDrbdadmDownStuck})
+
+	// Storage probe so DeleteVolume is a clean no-op (resource has
+	// no thin provider attached in this scenario — keep the test
+	// focused on the DRBD teardown path).
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
+		Name:          "pvc-stuck",
+		VolumeNumbers: []int32{0, 1},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	// Ok=true even though drbdadm down failed — DownForce's
+	// fallback released the kernel slot, and storage cleanup is
+	// allowed to proceed.
+	if !resp.GetOk() {
+		t.Fatalf("DeleteResource Ok=false: %s", resp.GetMessage())
+	}
+
+	calls := fx.CommandLines()
+
+	want := []string{
+		"drbdadm down pvc-stuck",
+		"drbdsetup detach --force pvc-stuck/0",
+		"drbdsetup detach --force pvc-stuck/1",
+		"drbdsetup down pvc-stuck",
+	}
+	for _, w := range want {
+		if !slices.Contains(calls, w) {
+			t.Errorf("missing %q in fallback sequence: %v", w, calls)
+		}
+	}
+
+	// Every per-volume detach must precede the final drbdsetup down
+	// — bringing the slot down before the lower disks are released
+	// keeps the suspended-state path re-triggerable.
+	downIdx := slices.Index(calls, "drbdsetup down pvc-stuck")
+	for _, vol := range []string{"pvc-stuck/0", "pvc-stuck/1"} {
+		detachIdx := slices.Index(calls, "drbdsetup detach --force "+vol)
+		if detachIdx < 0 || downIdx < 0 || detachIdx > downIdx {
+			t.Errorf("detach %s must precede drbdsetup down; got %v", vol, calls)
+		}
 	}
 }
 

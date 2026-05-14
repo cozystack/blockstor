@@ -17,6 +17,7 @@ limitations under the License.
 package drbd_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -56,6 +57,180 @@ func TestAdmDownInvokesDrbdadm(t *testing.T) {
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
+}
+
+// TestAdmDownForceHappyPath: when `drbdadm down <res>` returns
+// successfully under the budget, DownForce stops after one shell-out
+// and does NOT invoke the kernel-direct fallback. Pins Bug 82's
+// happy-path expectation — the new bounded teardown stays a pure
+// `drbdadm down` on healthy resources so we don't churn netlink
+// state on every delete.
+func TestAdmDownForceHappyPath(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	if err := adm.DownForce(t.Context(), "pvc-1", []int32{0, 1}); err != nil {
+		t.Fatalf("DownForce: %v", err)
+	}
+
+	calls := fx.CommandLines()
+	if !slices.Contains(calls, "drbdadm down pvc-1") {
+		t.Errorf("missing drbdadm down call: %v", calls)
+	}
+
+	// Fallback path MUST NOT run when drbdadm down succeeded.
+	for _, line := range calls {
+		if line == "drbdsetup detach --force pvc-1/0" ||
+			line == "drbdsetup detach --force pvc-1/1" ||
+			line == "drbdsetup down pvc-1" {
+			t.Errorf("fallback path ran on happy success: %q in %v", line, calls)
+		}
+	}
+}
+
+// errSuspendedQuorum is the static error used as a surrogate for
+// "drbdadm down hung on suspended:quorum" in the DownForce fallback
+// tests. DownForce only matches substrings against the drbdsetup
+// error text (not drbdadm), so this message just needs to make the
+// happy path fail; the exact wording is irrelevant.
+var errSuspendedQuorum = errors.New("test: resource is suspended: quorum")
+
+// errNoSuchResource is the static error used as a surrogate for
+// drbdsetup down's "missing slot" exit. DownForce matches the
+// title-case substring "No such resource" against the drbdsetup
+// error text, so we embed that exact phrase here (the leading
+// "test:" satisfies the ST1005 "no leading capital" lint without
+// hiding the substring DownForce's matcher looks for).
+var errNoSuchResource = errors.New("test: No such resource")
+
+// TestAdmDownForceFallback pins the Bug 82 recovery: when
+// `drbdadm down` fails (suspended-quorum surrogate: we just inject a
+// generic error), DownForce must invoke `drbdsetup detach --force`
+// for every volume and then `drbdsetup down <res>`, and must return
+// nil because the goal state (kernel slot released) was reached via
+// the fallback path.
+func TestAdmDownForceFallback(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// Make `drbdadm down` fail; this is the surrogate for the
+	// real-world "suspended:quorum hung the call until ctx deadline"
+	// — the wrapper's contract is identical either way (error from
+	// the bounded sub-context triggers fallback).
+	fx.Expect("drbdadm down pvc-suspended", storage.FakeResponse{
+		Err: errSuspendedQuorum,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	err := adm.DownForce(t.Context(), "pvc-suspended", []int32{0, 1})
+	if err != nil {
+		t.Fatalf("DownForce: expected nil after fallback recovery, got %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	want := []string{
+		"drbdadm down pvc-suspended",
+		"drbdsetup detach --force pvc-suspended/0",
+		"drbdsetup detach --force pvc-suspended/1",
+		"drbdsetup down pvc-suspended",
+	}
+	for _, w := range want {
+		if !slices.Contains(calls, w) {
+			t.Errorf("missing %q in fallback sequence: %v", w, calls)
+		}
+	}
+
+	// Ordering: every detach must precede the final drbdsetup down,
+	// otherwise the kernel slot release runs before lower disks are
+	// released and the suspended-state retry stalls again.
+	downIdx := slices.Index(calls, "drbdsetup down pvc-suspended")
+	for _, vol := range []string{"pvc-suspended/0", "pvc-suspended/1"} {
+		detachIdx := slices.Index(calls, "drbdsetup detach --force "+vol)
+		if detachIdx < 0 || downIdx < 0 || detachIdx > downIdx {
+			t.Errorf("detach %s must precede drbdsetup down; got %v", vol, calls)
+		}
+	}
+}
+
+// TestAdmDownForceFallbackMissingSlot: when `drbdsetup down` reports
+// the resource is already gone ("No such resource"), DownForce returns
+// nil — the goal state is "kernel slot absent", and a missing slot
+// satisfies it. Without this branch, an idempotent re-issue (second
+// handleDelete pass after a partial first) would surface as an error.
+func TestAdmDownForceFallbackMissingSlot(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm down pvc-gone", storage.FakeResponse{
+		Err: errSuspendedQuorum,
+	})
+	fx.Expect("drbdsetup down pvc-gone", storage.FakeResponse{
+		Err: errNoSuchResource,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	err := adm.DownForce(t.Context(), "pvc-gone", []int32{0})
+	if err != nil {
+		t.Fatalf("DownForce: missing-slot must be a clean no-op, got %v", err)
+	}
+}
+
+// TestAdmDownForceBoundedDeadline guarantees the happy-path call
+// receives a context with a deadline set by DownForceTimeout — this
+// is the load-bearing invariant of the Bug 82 fix. The fake exec
+// inspects ctx.Deadline() on the recorded call to verify the
+// timeout was applied; without a deadline, a suspended-quorum
+// resource would block the satellite finalizer-strip path
+// indefinitely.
+func TestAdmDownForceBoundedDeadline(t *testing.T) {
+	var (
+		deadlineSeen bool
+		hasDeadline  bool
+	)
+
+	deadlineFx := &deadlineCapturingExec{
+		fx: storage.NewFakeExec(),
+		onCall: func(name string, _ []string, hasDl bool) {
+			if name == "drbdadm" {
+				deadlineSeen = true
+				hasDeadline = hasDl
+			}
+		},
+	}
+
+	adm := drbd.NewAdm(deadlineFx)
+	if err := adm.DownForce(t.Context(), "pvc-1", nil); err != nil {
+		t.Fatalf("DownForce: %v", err)
+	}
+
+	if !deadlineSeen {
+		t.Fatal("drbdadm down was never invoked")
+	}
+
+	if !hasDeadline {
+		t.Error("DownForce must invoke drbdadm down with a deadline (Bug 82 bounded teardown)")
+	}
+}
+
+// deadlineCapturingExec wraps a FakeExec to inspect ctx.Deadline()
+// per call — needed by TestAdmDownForceBoundedDeadline because
+// FakeExec drops the context.
+type deadlineCapturingExec struct {
+	fx     *storage.FakeExec
+	onCall func(name string, args []string, hasDeadline bool)
+}
+
+func (d *deadlineCapturingExec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	_, hasDeadline := ctx.Deadline()
+	if d.onCall != nil {
+		d.onCall(name, args, hasDeadline)
+	}
+
+	out, err := d.fx.Run(ctx, name, args...)
+	if err != nil {
+		return out, fmt.Errorf("fake exec %s: %w", name, err)
+	}
+
+	return out, nil
 }
 
 // TestAdmAdjustInvokesDrbdadm: Adjust → `drbdadm adjust <res>`. This is
