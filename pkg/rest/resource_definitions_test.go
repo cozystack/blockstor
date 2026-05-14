@@ -19,6 +19,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"slices"
@@ -521,6 +522,138 @@ func TestResourceDefinitionsDeleteCascadesChildren(t *testing.T) {
 	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-cascade"); err == nil {
 		t.Errorf("RD still present after delete")
 	}
+}
+
+// TestResourceDefinitionsDeleteReleasesPortsAndAllowsRecreate pins
+// wave2 scenario 4.W10 (tests/scenarios/wave2-04-lifecycle.md): a
+// DELETE on /v1/resource-definitions/{rd} cascades to N replicas,
+// every replica's DRBD TCP port returns to the controller's free
+// pool, and a subsequent rd create on the same name works without
+// colliding on a leftover port.
+//
+// Failure mode pinned: if RD delete only stamps the RD record but
+// leaves child Resources (and their LayerObject.Drbd.TCPPorts)
+// behind, the next `LowestFreePort` call sees those ports as still
+// taken — the operator gets "no free port" or, worse, the next
+// `r c` re-picks the same minor/port and DRBD on the satellite
+// refuses to start with "address already in use".
+//
+// N=5 replicas (wave1 4.1 covers N=3) exercises a wider port range
+// and confirms the cascade is not bounded by a low replica count.
+func TestResourceDefinitionsDeleteReleasesPortsAndAllowsRecreate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const rdName = "pvc-portpool"
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Seed N replicas across N distinct nodes, each holding a
+	// distinct DRBD TCP port. Cascade must drop every entry —
+	// otherwise `takenPortsOnNode` (the controller's allocator
+	// input) keeps reporting these as in use after the RD is gone.
+	replicas := []struct {
+		node string
+		port int32
+	}{
+		{"n1", 7000},
+		{"n2", 7001},
+		{"n3", 7002},
+		{"n4", 7003},
+		{"n5", 7004},
+	}
+
+	for _, rep := range replicas {
+		if err := st.Resources().Create(ctx, resourceWithPort(rdName, rep.node, rep.port)); err != nil {
+			t.Fatalf("seed replica %s:%d: %v", rep.node, rep.port, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rdName)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Cascade pin: every child Resource record (and the TCPPorts
+	// it pinned) is gone — the controller's allocator now sees
+	// 7000..7004 back in the free pool.
+	left, err := st.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		t.Fatalf("list children: %v", err)
+	}
+
+	if len(left) != 0 {
+		t.Errorf("children left after cascade: %d (%v) — ports stay allocated", len(left), left)
+	}
+
+	// Port-pool release pin: explicitly recompute the per-port
+	// "taken" set the way the controller's allocator would. After
+	// the cascade, none of the previously-held ports should remain
+	// in any node's taken set.
+	for _, rep := range replicas {
+		taken, listErr := allReplicaPortsOnNode(ctx, st, rep.node)
+		if listErr != nil {
+			t.Fatalf("list replicas on %s: %v", rep.node, listErr)
+		}
+
+		if slices.Contains(taken, rep.port) {
+			t.Errorf("node %s still reports port %d as taken after RD delete (taken=%v)",
+				rep.node, rep.port, taken)
+		}
+	}
+
+	// RD itself gone — `Terminating` would mean a finalizer was
+	// never cleared; an in-memory store has no finalizer state, so
+	// the post-cascade Get must surface plain NotFound.
+	if _, err := st.ResourceDefinitions().Get(ctx, rdName); err == nil {
+		t.Errorf("RD still present after delete (stuck Terminating-equivalent)")
+	}
+
+	// Same-name re-create must succeed: with the cascade done,
+	// the name and every previously-held port are free again.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName}); err != nil {
+		t.Fatalf("re-create RD on same name: %v (cascade left a record behind?)", err)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(ctx, rdName); err != nil {
+		t.Errorf("re-created RD missing: %v", err)
+	}
+}
+
+// allReplicaPortsOnNode mirrors ResourceReconciler.takenPortsOnNode
+// over the REST-side store interface: it reads every Resource on the
+// given node and returns the DRBD TCP ports each one pins via
+// LayerObject.Drbd.TCPPorts. The wave2 4.W10 cascade test uses this
+// to assert "ports back in the free pool" without dragging the k8s
+// controller cache into a pure-REST in-memory test.
+func allReplicaPortsOnNode(ctx context.Context, st store.Store, node string) ([]int32, error) {
+	all, err := st.Resources().List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list resources: %w", err)
+	}
+
+	var out []int32
+
+	for i := range all {
+		if all[i].NodeName != node {
+			continue
+		}
+
+		if all[i].LayerObject == nil || all[i].LayerObject.Drbd == nil {
+			continue
+		}
+
+		out = append(out, all[i].LayerObject.Drbd.TCPPorts...)
+	}
+
+	return out, nil
 }
 
 // TestResourceDefinitionsDeleteCascadeMissingChildIsIdempotent: the
