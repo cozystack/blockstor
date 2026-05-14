@@ -305,6 +305,167 @@ func TestPeerAddressPrefersKubeInternalNIC(t *testing.T) {
 	}
 }
 
+// TestHostNetworkSatelliteUsesNodeIPNotPodIP: scenario 3.W06.
+//
+// LinstorSatelliteConfiguration with `hostNetwork: true` restarts
+// satellite pods sharing the host network namespace. Under that
+// configuration, the satellite pod IP equals the host's InternalIP,
+// and LINSTOR must reconfigure each `.res` so `peer.<peer>.address`
+// resolves to the host IP — not to a stale pod-CIDR address piraeus-
+// operator wrote into `Spec.NetInterfaces[0]` before the switch
+// (Bug 48: piraeus rewrites the positional [0] NetInterface with the
+// satellite pod IP, which under CNI networking is a pod-CIDR address
+// that doesn't route cross-node).
+//
+// Three cases pin the contract on the dispatcher side:
+//
+//   - hostNetwork true, host IP published under `k8s-internal`:
+//     dispatcher picks the host IP regardless of any leftover
+//     pod-CIDR sitting in `default` from the pre-switch state.
+//   - hostNetwork true with only the host-IP `default` NIC (clean
+//     install, no `k8s-internal` published yet): host IP carries
+//     through — single-NIC clusters keep working.
+//   - hostNetwork false (CNI networking, pre-switch baseline):
+//     `default` holds the pod-CIDR satellite-pod IP and no
+//     `k8s-internal` is registered; the dispatcher carries the
+//     pod-CIDR address through unchanged. The test pins that
+//     pre-switch behaviour so a regression in either direction —
+//     stamping host IP when none was published, OR failing to pick
+//     `k8s-internal` post-switch — fails the suite.
+//
+// The W06 e2e scenario verifies `.res` carries host IPs on a live
+// stand; this unit test pins the dispatcher's IP selection in
+// isolation so we catch the failure mode without spinning the stand.
+func TestHostNetworkSatelliteUsesNodeIPNotPodIP(t *testing.T) {
+	rdName := "pvc-1"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	// Routable host InternalIPs and pod-CIDR addresses for the two
+	// satellite nodes. The dispatcher must always prefer the host
+	// IP when both are visible on the Node CRD.
+	const (
+		n1HostIP = "10.51.0.2"
+		n1PodIP  = "10.244.0.5"
+		n2HostIP = "10.51.0.3"
+		n2PodIP  = "10.244.0.6"
+	)
+
+	cases := []struct {
+		name        string
+		n2Ifaces    []blockstoriov1alpha1.NodeNetInterface
+		wantPeerAdr string
+		comment     string
+	}{
+		{
+			name: "host-network-with-k8s-internal-overrides-stale-pod-cidr",
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				// Stale entry: piraeus wrote the pod IP into
+				// positional [0] before the hostNetwork switch.
+				{Name: "default", Address: n2PodIP},
+				// register / label-sync published the host
+				// InternalIP under the well-known name.
+				{Name: "k8s-internal", Address: n2HostIP},
+			},
+			wantPeerAdr: n2HostIP,
+			comment:     "post-W06: k8s-internal host IP wins over leftover pod-CIDR in default[0]",
+		},
+		{
+			name: "host-network-host-ip-in-default-single-nic",
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				// Clean install with hostNetwork=true from the
+				// start: satellite pod IP == host IP, so the only
+				// advertised NIC carries the host address.
+				{Name: "default", Address: n2HostIP},
+			},
+			wantPeerAdr: n2HostIP,
+			comment:     "single-NIC hostNetwork clusters carry the host IP through default",
+		},
+		{
+			name: "container-network-pre-switch-baseline",
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				// Pre-W06 state: CNI networking, pod-CIDR is all
+				// we have — dispatcher must not invent a host IP
+				// out of thin air.
+				{Name: "default", Address: n2PodIP},
+			},
+			wantPeerAdr: n2PodIP,
+			comment:     "pre-switch (container network) carries pod-CIDR through",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetID := int32(0)
+			peerID := int32(1)
+
+			target := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+					StoragePool:            "data-hdd",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+			}
+
+			peer := blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n2",
+					StoragePool:            "data-hdd",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
+			}
+
+			nodes := []blockstoriov1alpha1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type: "Satellite",
+						NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+							{Name: "default", Address: n1HostIP},
+							{Name: "k8s-internal", Address: n1HostIP},
+						},
+						// Pin the local replica's address to a known
+						// value via PrefNic so any regression in the
+						// peer-side lookup doesn't bleed in through
+						// the target-side branch.
+						Props: map[string]string{"PrefNic": "default"},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: tc.n2Ifaces,
+					},
+				},
+			}
+
+			_ = n1PodIP // referenced for symmetry / future cases
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			gotAddr := got.DrbdOptions["peer.n2.address"]
+			if gotAddr != tc.wantPeerAdr {
+				t.Errorf("%s: peer.n2.address=%q want %q (drbdOpts=%v)",
+					tc.comment, gotAddr, tc.wantPeerAdr, got.DrbdOptions)
+			}
+		})
+	}
+}
+
 // TestPrefNicSteersDRBDAddress: scenario 3.W03.
 //
 // `linstor node set-property <node> PrefNic <nic>` (or the equivalent
