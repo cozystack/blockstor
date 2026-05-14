@@ -31,6 +31,16 @@ import (
 // the discovery filter path. Phase 10.7.
 const LsblkTypeDisk = "disk"
 
+// MajorDRBD is the Linux kernel major number allocated to DRBD
+// devices (drivers/block/drbd/, allocation 147 in
+// Documentation/admin-guide/devices.txt). DRBD volumes surface as
+// TYPE=disk in lsblk with no FSType on the device itself (the FS
+// lives inside the replicated volume), so they pass the
+// Type=disk + empty-FSType + no-mountpoint gates and need a
+// major-based exclusion. Mirrors upstream LINSTOR's
+// LsBlkUtils.MAJOR_DRBD_NR. Bug 72.
+const MajorDRBD = 147
+
 // LsblkDevice is one row of `lsblk -P` output, parsed and typed.
 // Mirrors the subset of fields the PhysicalDevice discovery loop
 // consumes — name, kernel name, size in bytes, filesystem type,
@@ -50,6 +60,11 @@ type LsblkDevice struct {
 	Serial     string
 	Rotational bool
 	Transport  string
+	// Major is the Linux kernel major number for this device,
+	// parsed from lsblk's `MAJ:MIN` column. Used to filter out
+	// DRBD devices (major 147) from the PhysicalDevice discovery
+	// loop — see MajorDRBD. Bug 72.
+	Major int
 }
 
 // IsFreeBlockDevice reports whether this device is a candidate for
@@ -77,14 +92,25 @@ func (d *LsblkDevice) IsFreeBlockDevice() bool {
 		return false
 	}
 
+	// Bug 72: DRBD devices are TYPE=disk with no FSType visible on
+	// the device itself, so they pass the earlier gates. Exclude by
+	// kernel major number (147) — same approach as upstream
+	// LINSTOR's LsBlkUtils.filterDeviceCandidates.
+	if d.Major == MajorDRBD {
+		return false
+	}
+
 	return true
 }
 
-// Lsblk runs `lsblk -Pb -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,
-// WWN,MODEL,SERIAL,ROTA,TRAN` and parses the output into a slice
-// of `LsblkDevice`. The `-P` flag emits key=value pairs; `-b`
-// switches SIZE to raw bytes so callers don't have to parse
-// human-readable suffixes. Phase 10.7.
+// Lsblk runs `lsblk -Pb -o NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,
+// MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN` and parses the output
+// into a slice of `LsblkDevice`. The `-P` flag emits key=value
+// pairs; `-b` switches SIZE to raw bytes so callers don't have
+// to parse human-readable suffixes. Phase 10.7.
+//
+// MAJ:MIN is included so callers can filter out DRBD devices
+// (major 147) — see MajorDRBD / Bug 72.
 //
 // Returns the unfiltered list — callers run `IsFreeBlockDevice` on
 // each row + the cross-checks (pvs, zpool, drbdmeta) before
@@ -92,7 +118,7 @@ func (d *LsblkDevice) IsFreeBlockDevice() bool {
 func Lsblk(ctx context.Context, exec storage.Exec) ([]LsblkDevice, error) {
 	out, err := exec.Run(ctx, "lsblk",
 		"-Pb",
-		"-o", "NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN")
+		"-o", "NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN")
 	if err != nil {
 		return nil, errors.Wrap(err, "lsblk")
 	}
@@ -133,6 +159,14 @@ func parseLsblkPairs(raw string) []LsblkDevice {
 
 		if rota := fields["ROTA"]; rota == "1" {
 			dev.Rotational = true
+		}
+
+		majmin := fields["MAJ:MIN"]
+		if i := strings.IndexByte(majmin, ':'); i > 0 {
+			maj, err := strconv.Atoi(majmin[:i])
+			if err == nil {
+				dev.Major = maj
+			}
 		}
 
 		devices = append(devices, dev)

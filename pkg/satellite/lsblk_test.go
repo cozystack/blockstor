@@ -56,6 +56,37 @@ NAME="sdc1" KNAME="sdc1" SIZE="1000204886015" FSTYPE="" TYPE="part" MOUNTPOINT="
 	}
 }
 
+// TestParseLsblkPairsMajorField pins the MAJ:MIN parser. Bug 72:
+// without parsing the major number, the discovery loop has no way
+// to filter out DRBD devices (major 147) — they pass the
+// Type=disk + empty-FSType + no-mountpoint gates and would be
+// stamped as "free" for wipe, destroying an active replica.
+func TestParseLsblkPairsMajorField(t *testing.T) {
+	t.Parallel()
+
+	raw := `NAME="sda" KNAME="sda" MAJ:MIN="8:0" SIZE="1000204886016" FSTYPE="" TYPE="disk" MOUNTPOINT="" WWN="" MODEL="" SERIAL="" ROTA="0" TRAN=""
+NAME="drbd1000" KNAME="drbd1000" MAJ:MIN="147:1000" SIZE="10737418240" FSTYPE="" TYPE="disk" MOUNTPOINT="" WWN="" MODEL="" SERIAL="" ROTA="0" TRAN=""
+NAME="zd0" KNAME="zd0" MAJ:MIN="230:0" SIZE="10737418240" FSTYPE="" TYPE="disk" MOUNTPOINT="" WWN="" MODEL="" SERIAL="" ROTA="0" TRAN=""`
+
+	devs := parseLsblkPairs(raw)
+
+	if len(devs) != 3 {
+		t.Fatalf("got %d devices, want 3", len(devs))
+	}
+
+	if devs[0].Major != 8 {
+		t.Errorf("sda Major: got %d, want 8", devs[0].Major)
+	}
+
+	if devs[1].Major != 147 {
+		t.Errorf("drbd1000 Major: got %d, want 147 (DRBD)", devs[1].Major)
+	}
+
+	if devs[2].Major != 230 {
+		t.Errorf("zd0 Major: got %d, want 230 (zvol)", devs[2].Major)
+	}
+}
+
 // TestIsFreeBlockDeviceFiltersCorrectly pins the four-way filter
 // the discovery loop runs over each lsblk row before publishing a
 // PhysicalDevice CRD. A regression in any of these would silently
@@ -103,6 +134,21 @@ func TestIsFreeBlockDeviceFiltersCorrectly(t *testing.T) {
 			name: "disk with both fs and mount",
 			dev:  LsblkDevice{Name: "sdd", Type: "disk", FSType: "xfs", Mountpoint: "/srv"},
 			want: false,
+		},
+		{
+			// Bug 72: a DRBD device is a top-level TYPE=disk row with
+			// no FS visible on the device itself (the FS lives inside
+			// the DRBD volume). Without the MAJOR=147 filter it would
+			// pass and end up flagged as "free" for wipe, even though
+			// it's an active replica of a blockstor resource.
+			name: "drbd device with major=147",
+			dev:  LsblkDevice{Name: "drbd1000", Type: "disk", Major: 147},
+			want: false,
+		},
+		{
+			name: "regular disk explicit major",
+			dev:  LsblkDevice{Name: "sda", Type: "disk", Major: 8},
+			want: true,
 		},
 	}
 

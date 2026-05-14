@@ -41,7 +41,7 @@ var errNoDRBDMeta = errors.New("drbdmeta: no metadata")
 // for `satellite.Lsblk`. Centralised here so a change to Lsblk's
 // arg list (e.g. adding a column) trips one match-string to update
 // instead of one per test.
-const lsblkCmdLine = "lsblk -Pb -o NAME,KNAME,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN"
+const lsblkCmdLine = "lsblk -Pb -o NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN"
 
 // pvsCmdLine matches the LVM signature probe key. The flag-string
 // is built by `lvm.Args(...)` — pinning the literal here keeps the
@@ -551,5 +551,76 @@ func TestPublishDeviceFiltersZFSZvols(t *testing.T) {
 	if got["sdb"] == nil || got["vdb"] == nil {
 		t.Errorf("Bug 70 regression: real disks dropped along with zvols (sdb=%v vdb=%v)",
 			got["sdb"] != nil, got["vdb"] != nil)
+	}
+}
+
+// TestScanOnceFiltersDRBDDevices pins Bug 72. DRBD volumes
+// surface as TYPE=disk with no FSType (the FS lives inside the
+// replicated volume), so they pass the Type=disk + empty-FSType
+// + signature-probe gates and would be published as "free
+// for wipe" — operator running `linstor ps cdp` against them
+// would destroy an active replica. Filter by kernel major
+// number 147 in scanOnce, mirroring upstream LINSTOR's
+// LsBlkUtils.filterDeviceCandidates.
+func TestScanOnceFiltersDRBDDevices(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	// lsblk row with explicit MAJ:MIN. sdb is a real disk (major 8);
+	// drbd1000 is a DRBD volume (major 147) that must be filtered
+	// out before signature probing. If the filter regresses and DRBD
+	// rows slip through, FakeExec returns "unexpected command" for
+	// the missing drbdmeta probe — that surfaces clearly.
+	row := func(name, kname, majmin, size, typ string) string {
+		return `NAME="` + name + `" KNAME="` + kname + `" MAJ:MIN="` + majmin +
+			`" SIZE="` + size + `" FSTYPE="" TYPE="` + typ +
+			`" MOUNTPOINT="" WWN="" MODEL="" SERIAL="" ROTA="0" TRAN=""`
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{
+		Stdout: []byte(
+			row("sdb", "sdb", "8:16", "2000398934016", "disk") + "\n" +
+				row("drbd1000", "drbd1000", "147:1000", "10737418240", "disk") + "\n"),
+	})
+
+	// Signature probes only fire for sdb; drbd1000 should be filtered
+	// out at the Major==147 gate before they're consulted.
+	fx.Expect("drbdmeta 0 v09 /dev/sdb internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+	fx.Expect("wipefs -n /dev/sdb", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+
+	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
+	if err != nil {
+		t.Fatalf("scanOnce: %v", err)
+	}
+
+	var list blockstoriov1alpha1.PhysicalDeviceList
+	if err := cli.List(t.Context(), &list,
+		client.MatchingLabels{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"}); err != nil {
+		t.Fatalf("list PhysicalDevices: %v", err)
+	}
+
+	got := indexByKName(list.Items)
+
+	if got["drbd1000"] != nil {
+		t.Errorf("Bug 72: DRBD device (major=147) leaked into PhysicalDevice list; must be filtered out before signature probing")
+	}
+
+	if got["sdb"] == nil {
+		t.Errorf("Bug 72 regression: real disk dropped along with DRBD")
 	}
 }

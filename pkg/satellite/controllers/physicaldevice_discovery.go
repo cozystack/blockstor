@@ -195,6 +195,15 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 			continue
 		}
 
+		// Bug 72: DRBD devices (kernel major 147) are TYPE=disk
+		// with no FSType on the device itself — they pass the
+		// signature probes and would be surfaced as "free" for
+		// wipe. Exclude them here, mirroring upstream LINSTOR's
+		// LsBlkUtils.filterDeviceCandidates.
+		if row.Major == satellite.MajorDRBD {
+			continue
+		}
+
 		free, signatureErr := satellite.IsDeviceFree(ctx, p.Exec, &row)
 		if signatureErr != nil {
 			// One device's probe failing shouldn't sink the whole
