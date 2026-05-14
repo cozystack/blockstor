@@ -61,6 +61,69 @@ func (e *CapacityShortfallError) Error() string {
 	)
 }
 
+// OversubRatioKind names which over-subscription cap a pool tripped on.
+// Used by OversubscriptionShortfallError so operators can see the exact
+// property to tune.
+//   - OversubRatioFree:   MaxFreeCapacityOversubscriptionRatio  (7.W09 / 7.19)
+//   - OversubRatioTotal:  MaxTotalCapacityOversubscriptionRatio (7.W10 / 7.20)
+//   - OversubRatioMaster: MaxOversubscriptionRatio              (7.W11 / 7.21)
+//     The master backstop is only reported when the specific Free/Total
+//     property is unset and the umbrella fell through to it; otherwise
+//     the specific kind is named even if its effective value came from
+//     the umbrella fallback chain.
+type OversubRatioKind string
+
+const (
+	OversubRatioFree   OversubRatioKind = "MaxFreeCapacityOversubscriptionRatio"
+	OversubRatioTotal  OversubRatioKind = "MaxTotalCapacityOversubscriptionRatio"
+	OversubRatioMaster OversubRatioKind = "MaxOversubscriptionRatio"
+)
+
+// OversubscriptionShortfallError reports that every candidate pool's
+// effective over-subscription cap (the lesser of free×freeRatio and
+// total×totalRatio, with the umbrella MaxOversubscriptionRatio as the
+// final backstop) is below the volume the placer must land. Surfaced
+// by Place when the FreeCapacity floor cleared but no pool can host
+// the request once the ratio caps are applied — the placer's mirror
+// of the spawn-layer 409 gate (pkg/rest/spawn.go's
+// rejectIfExceedsOversubGate), needed because autoplace and spawn are
+// independent code paths.
+//
+// Origin (scenarios 7.W10 / 7.W11): without this gate the placer
+// would accept a pool whose FreeCapacity covers the request but whose
+// `MaxTotalCapacityOversubscriptionRatio` (or the master backstop)
+// already caps the per-pool logical budget below the ask — leading
+// to a successful Resource create followed by an opaque satellite
+// failure when the next ZVOL extend trips the same ratio cap.
+//
+// The error names the pool that was CLOSEST to satisfying the ask
+// (largest EffectiveCapKib among rejected pools) plus the specific
+// ratio kind the operator must tune. REST handlers translate this
+// into a 409 with operator-actionable text.
+type OversubscriptionShortfallError struct {
+	RequiredKib     int64
+	PoolName        string
+	NodeName        string
+	Ratio           OversubRatioKind
+	RatioValue      float64
+	EffectiveCapKib int64
+}
+
+// Error formats the actionable shortfall message. Format is stable:
+// "over-subscription cap on pool <pool>@<node>: required N KiB exceeds
+// MaxVolumeSize M KiB (raise <Ratio> currently V on the storage pool
+// or controller, or shrink the request)".
+// Operators grep for the prefix; tools surface the numbers verbatim.
+func (e *OversubscriptionShortfallError) Error() string {
+	return fmt.Sprintf(
+		"over-subscription cap on pool %s@%s: required %d KiB exceeds MaxVolumeSize %d KiB "+
+			"(raise %s currently %g on the storage pool or controller, or shrink the request)",
+		e.PoolName, e.NodeName,
+		e.RequiredKib, e.EffectiveCapKib,
+		e.Ratio, e.RatioValue,
+	)
+}
+
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
 type Placer struct {
@@ -97,6 +160,18 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		// Fail-fast: no pool can host the largest volume. Surface the
 		// actionable error so REST returns 409 instead of 200 + a
 		// downstream satellite failure (Bug 35 / 7.15 e2e).
+		//
+		// Precedence: the physical FreeCapacity floor (Bug 35) is the
+		// more fundamental gate, so a non-zero maxFreeKib wins over an
+		// oversub witness — operators see the hard floor first. Only
+		// when the floor was clean (every rejected pool tripped a ratio
+		// cap, not the floor) do we surface the OversubscriptionShortfall
+		// envelope so the relevant ratio (Free / Total / Master) is
+		// named in the 409 (scenarios 7.W10 / 7.W11).
+		if plan.maxFreeKib == 0 && plan.oversubShortfall != nil {
+			return 0, int(filter.PlaceCount), plan.oversubShortfall
+		}
+
 		return 0, int(filter.PlaceCount), &CapacityShortfallError{
 			RequiredKib: plan.requiredKib,
 			MaxFreeKib:  plan.maxFreeKib,
@@ -123,17 +198,27 @@ func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSel
 		}
 	}
 
-	// Partial-shortfall path (Bug 35): the diskful loop ran out of
-	// candidates because the capacity gate dropped pools that would
-	// otherwise have qualified. Surface the actionable error so the
-	// REST 409 names the missing capacity. We only fire when capacity
-	// was actually the rejecter (maxFreeKib > 0); a shortfall caused
-	// purely by topology/anti-affinity still falls through to the
-	// generic "not enough candidate storage pools" path.
-	if placed < want && plan.requiredKib > 0 && plan.maxFreeKib > 0 {
-		return placed, want, &CapacityShortfallError{
-			RequiredKib: plan.requiredKib,
-			MaxFreeKib:  plan.maxFreeKib,
+	// Partial-shortfall path (Bug 35 + scenarios 7.W10 / 7.W11): the
+	// diskful loop ran out of candidates because the capacity or
+	// over-subscription gate dropped pools that would otherwise have
+	// qualified. Surface the actionable error so the REST 409 names
+	// the missing capacity OR the over-subscription cap. We only fire
+	// when one of those gates was actually the rejecter; a shortfall
+	// caused purely by topology/anti-affinity still falls through to
+	// the generic "not enough candidate storage pools" path.
+	//
+	// Precedence: physical floor (maxFreeKib > 0) wins over oversub —
+	// see the capacityShortfall branch above for the rationale.
+	if placed < want && plan.requiredKib > 0 {
+		if plan.maxFreeKib > 0 {
+			return placed, want, &CapacityShortfallError{
+				RequiredKib: plan.requiredKib,
+				MaxFreeKib:  plan.maxFreeKib,
+			}
+		}
+
+		if plan.oversubShortfall != nil {
+			return placed, want, plan.oversubShortfall
 		}
 	}
 
@@ -158,6 +243,13 @@ type placePlan struct {
 	requiredKib       int64
 	maxFreeKib        int64
 	capacityShortfall bool
+	// oversubShortfall carries the closest-miss over-subscription
+	// rejection from candidatePools. Surfaced by Place when no pool
+	// survived the ratio gates (scenarios 7.W09 / 7.W10 / 7.W11) and
+	// the FreeCapacity floor did NOT also trip — the two errors are
+	// mutually exclusive so REST can render a single 409 naming the
+	// exact ratio the operator needs to tune.
+	oversubShortfall *OversubscriptionShortfallError
 }
 
 // buildPlan does the read-side legwork: load VDs, candidate pools,
@@ -176,7 +268,7 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 		return nil, err
 	}
 
-	candidates, maxFreeKib, err := p.candidatePools(ctx, filter, requiredKib)
+	candidates, gates, err := p.candidatePools(ctx, filter, requiredKib)
 	if err != nil {
 		return nil, err
 	}
@@ -184,17 +276,18 @@ func (p *Placer) buildPlan(ctx context.Context, rdName string, filter *apiv1.Aut
 	if requiredKib > 0 && len(candidates) == 0 {
 		return &placePlan{
 			requiredKib:       requiredKib,
-			maxFreeKib:        maxFreeKib,
+			maxFreeKib:        gates.maxFreeBelow,
 			capacityShortfall: true,
+			oversubShortfall:  gates.oversubBest,
 		}, nil
 	}
 
-	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, maxFreeKib)
+	return p.assemblePlan(ctx, rdName, filter, candidates, requiredKib, gates)
 }
 
 // assemblePlan finishes off buildPlan once the capacity gate has
 // passed. Split out so buildPlan stays under the gocyclo budget.
-func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool, requiredKib, maxFreeKib int64) (*placePlan, error) {
+func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter, candidates []apiv1.StoragePool, requiredKib int64, gates candidateGates) (*placePlan, error) {
 	existing, err := p.store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
 		return nil, errors.Wrap(err, "list resources by definition")
@@ -242,13 +335,14 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 	preferred, lastResort := partitionByExclusion(candidates, nodes, filter.ReplicasOnDifferent)
 
 	return &placePlan{
-		state:       state,
-		preferred:   preferred,
-		lastResort:  lastResort,
-		existing:    existing,
-		disabled:    disabled,
-		requiredKib: requiredKib,
-		maxFreeKib:  maxFreeKib,
+		state:            state,
+		preferred:        preferred,
+		lastResort:       lastResort,
+		existing:         existing,
+		disabled:         disabled,
+		requiredKib:      requiredKib,
+		maxFreeKib:       gates.maxFreeBelow,
+		oversubShortfall: gates.oversubBest,
 	}, nil
 }
 
@@ -567,30 +661,76 @@ func (p *Placer) applyNotPlaceWith(ctx context.Context, rdName string, filter *a
 	return out, nil
 }
 
+// candidateGates bundles the rejection metadata produced by
+// candidatePools alongside the surviving pool set. Pulled into a
+// struct so candidatePools can report BOTH the FreeCapacity-floor
+// witness (Bug 35) and the over-subscription cap witness (scenarios
+// 7.W10 / 7.W11) without growing a four-return signature.
+//
+// maxFreeBelow: largest FreeCapacity among pools rejected by the
+// physical floor. Zero when no pool tripped that gate.
+//
+// oversubBest: the over-subscription rejection with the LARGEST
+// effective cap (i.e. the pool that came CLOSEST to satisfying the
+// request after applying the ratio gates). Nil when no pool tripped
+// the oversub gate. The caller surfaces this in
+// OversubscriptionShortfallError so operators see the most relevant
+// ratio to tune.
+type candidateGates struct {
+	maxFreeBelow int64
+	oversubBest  *OversubscriptionShortfallError
+}
+
 // candidatePools returns the pool set eligible for a placement, after
 // applying all filter constraints (kind, node list, pool list, provider
-// list) and — Bug 35 — dropping pools whose FreeCapacity is below the
-// volume the placer is about to land. Returns the second value as the
-// largest FreeCapacity among pools that PASSED every non-capacity gate
-// but FAILED the capacity one; callers use it to build the actionable
-// "max free M KiB" 409 message.
+// list), the FreeCapacity floor (Bug 35) and the three over-subscription
+// ratio caps (scenarios 7.W09 / 7.W10 / 7.W11). The returned
+// candidateGates carries the witnesses needed to render an actionable
+// 409 when placement ultimately falls short.
 //
-// minFreeKib==0 disables the capacity filter (definitions-only or test
-// paths with no VDs).
-func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter, minFreeKib int64) ([]apiv1.StoragePool, int64, error) {
+// minFreeKib==0 disables both gates (definitions-only or test paths
+// with no VDs).
+func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFilter, minFreeKib int64) ([]apiv1.StoragePool, candidateGates, error) {
 	all, err := p.store.StoragePools().List(ctx)
 	if err != nil {
-		return nil, 0, errors.Wrap(err, "list storage pools")
+		return nil, candidateGates{}, errors.Wrap(err, "list storage pools")
 	}
 
 	disabled, err := p.disabledNodes(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, candidateGates{}, err
 	}
 
-	out := make([]apiv1.StoragePool, 0, len(all))
+	ctrlProps, err := p.store.ControllerProps().Get(ctx)
+	if err != nil {
+		return nil, candidateGates{}, errors.Wrap(err, "get controller props")
+	}
 
-	var maxFreeBelow int64
+	out, gates := applyCapacityAndOversubGates(all, filter, disabled, ctrlProps, minFreeKib)
+
+	weights, err := p.loadWeights(ctx)
+	if err != nil {
+		return nil, candidateGates{}, err
+	}
+
+	rscPerNode, err := p.resourcesPerNode(ctx)
+	if err != nil {
+		return nil, candidateGates{}, err
+	}
+
+	rankCandidates(out, weights, rscPerNode)
+
+	return out, gates, nil
+}
+
+// applyCapacityAndOversubGates is the gate-loop core split out of
+// candidatePools so the latter stays under the funlen budget. Returns
+// the surviving pool slice plus the closest-miss witnesses for the
+// FreeCapacity floor (Bug 35) and the three over-subscription ratio
+// caps (scenarios 7.W09 / 7.W10 / 7.W11).
+func applyCapacityAndOversubGates(all []apiv1.StoragePool, filter *apiv1.AutoSelectFilter, disabled map[string]struct{}, ctrlProps map[string]string, minFreeKib int64) ([]apiv1.StoragePool, candidateGates) {
+	out := make([]apiv1.StoragePool, 0, len(all))
+	gates := candidateGates{}
 
 	for i := range all {
 		pool := all[i]
@@ -603,35 +743,58 @@ func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		// host the largest volume of this RD. Track the largest
 		// FreeCapacity among rejected pools so the caller can render
 		// the actionable 409 ("required N KiB, max free M KiB").
-		// The gate is FreeCapacity-only — over-subscription is the
-		// spawn-time gate's job (see pkg/rest/spawn.go's
-		// rejectIfExceedsOversubGate); this layer is the hard floor
-		// that protects against the 0-KiB-free pool race seen in
-		// 7.15 e2e.
+		// This is the hard floor that protects against the 0-KiB-free
+		// pool race seen in 7.15 e2e.
 		if minFreeKib > 0 && pool.FreeCapacity < minFreeKib {
-			if pool.FreeCapacity > maxFreeBelow {
-				maxFreeBelow = pool.FreeCapacity
+			if pool.FreeCapacity > gates.maxFreeBelow {
+				gates.maxFreeBelow = pool.FreeCapacity
 			}
 
+			continue
+		}
+
+		// Over-subscription gate (scenarios 7.W09 / 7.W10 / 7.W11):
+		// even if the physical floor passes, the per-pool logical
+		// budget set by MaxFreeCapacityOversubscriptionRatio /
+		// MaxTotalCapacityOversubscriptionRatio / MaxOversubscriptionRatio
+		// can be below the request — accepting such a pool would
+		// produce a successful Resource create followed by an opaque
+		// satellite failure when the volume is sized.
+		if minFreeKib > 0 && oversubRejects(&pool, ctrlProps, minFreeKib, &gates) {
 			continue
 		}
 
 		out = append(out, pool)
 	}
 
-	weights, err := p.loadWeights(ctx)
-	if err != nil {
-		return nil, 0, err
+	return out, gates
+}
+
+// oversubRejects evaluates the over-subscription gate for a single
+// pool and, on rejection, updates the closest-miss witness on gates.
+// Returns true to signal the caller to drop the pool.
+//
+// "Closest miss" = the pool with the LARGEST effective cap among
+// rejections — that's the one operators are closest to unlocking by
+// raising the named ratio.
+func oversubRejects(pool *apiv1.StoragePool, ctrlProps map[string]string, minFreeKib int64, gates *candidateGates) bool {
+	capKib, kind, ratioValue := effectiveOversubCaps(pool, ctrlProps)
+	if capKib >= minFreeKib {
+		return false
 	}
 
-	rscPerNode, err := p.resourcesPerNode(ctx)
-	if err != nil {
-		return nil, 0, err
+	if gates.oversubBest == nil || capKib > gates.oversubBest.EffectiveCapKib {
+		gates.oversubBest = &OversubscriptionShortfallError{
+			RequiredKib:     minFreeKib,
+			PoolName:        pool.StoragePoolName,
+			NodeName:        pool.NodeName,
+			Ratio:           kind,
+			RatioValue:      ratioValue,
+			EffectiveCapKib: capKib,
+		}
 	}
 
-	rankCandidates(out, weights, rscPerNode)
-
-	return out, maxFreeBelow, nil
+	return true
 }
 
 // weights bundles the four `Autoplacer/Weights/*` controller-scope
