@@ -18,6 +18,7 @@ package rest
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -95,6 +96,14 @@ func (s *Server) handleQueryAllSizeInfo(w http.ResponseWriter, r *http.Request) 
 // MaxOversubscriptionRatio) — see `poolMaxVolumeKib` for the exact
 // formula. Thin pools therefore advertise more capacity than they
 // physically have; thick pools collapse to FreeCapacity.
+//
+// NextSpawnResult mirrors upstream's `next_spawn_result`: the N
+// pool-on-node tuples the placer would pick for the next spawn,
+// sorted by per-pool MaxVolumeSize descending. When the filter
+// can't be satisfied (fewer than N candidates) the slot is empty
+// and Reports carries an info-band ApiCallRc explaining why so
+// `linstor rg query-size-info` shows the operator the actual gate
+// that rejected placement instead of a silent zero.
 func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFilter) (querySizeInfoResponse, error) {
 	pools, err := s.Store.StoragePools().List(ctx)
 	if err != nil {
@@ -106,20 +115,50 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 		return querySizeInfoResponse{}, err
 	}
 
+	candidates, totalCapacity, availableSum := collectCandidates(pools, disabled, filter)
+
+	replicas := replicaCount(filter)
+	deduped := dedupShared(candidates)
 	ctrlProps := s.readCtrlPropsOrEmpty(ctx)
+	maxVolKib := worstMaxVolOfTopN(deduped, replicas, ctrlProps)
+	spawn := nextSpawnResult(deduped, replicas, ctrlProps)
+
+	resp := querySizeInfoResponse{
+		SpaceInfo: querySizeInfoSpaceInfo{
+			MaxVlmSizeInKib:    maxVolKib,
+			CapacityInKib:      totalCapacity,
+			AvailableSizeInKib: availableSum,
+			NextSpawnResult:    spawn,
+		},
+	}
+
+	if reason := unsatisfiableReason(filter, deduped, replicas); reason != "" {
+		resp.Reports = []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: reason,
+		}}
+	}
+
+	return resp, nil
+}
+
+// collectCandidates filters the cluster's storage pools down to the
+// set that's eligible for the next spawn under `filter`, returning
+// the candidate slice plus the (TotalCapacity, FreeCapacity) rollup
+// with shared-LUN dedup applied so a SAN/EXOS slice attached to N
+// satellites contributes its capacity once, not N times.
+//
+// Extracted from computeSizeInfo to keep that handler within the
+// linter funlen budget; the candidate set is what feeds both the
+// max-volume cap and the next_spawn_result preview.
+func collectCandidates(pools []apiv1.StoragePool, disabled map[string]struct{}, filter *apiv1.AutoSelectFilter) ([]apiv1.StoragePool, int64, int64) {
+	candidates := make([]apiv1.StoragePool, 0, len(pools))
+	sharedSeen := map[string]struct{}{}
 
 	var (
 		totalCapacity int64
 		availableSum  int64
 	)
-
-	candidates := make([]apiv1.StoragePool, 0, len(pools))
-	// sharedSeen collapses pools that share a backing LUN: a SAN /
-	// EXOS / Ceph-RBD-as-shared-disk slice attached to multiple
-	// satellites must only contribute its capacity once to cluster
-	// totals. Without this, two pools each "seeing" 100 GiB of the
-	// same LUN would report 200 GiB free.
-	sharedSeen := map[string]struct{}{}
 
 	for i := range pools {
 		pool := pools[i]
@@ -149,15 +188,94 @@ func (s *Server) computeSizeInfo(ctx context.Context, filter *apiv1.AutoSelectFi
 		availableSum += pool.FreeCapacity
 	}
 
-	maxVolKib := worstMaxVolOfTopN(dedupShared(candidates), replicaCount(filter), ctrlProps)
+	return candidates, totalCapacity, availableSum
+}
 
-	return querySizeInfoResponse{
-		SpaceInfo: querySizeInfoSpaceInfo{
-			MaxVlmSizeInKib:    maxVolKib,
-			CapacityInKib:      totalCapacity,
-			AvailableSizeInKib: availableSum,
-		},
-	}, nil
+// nextSpawnResult returns the top-N pool/node tuples the placer
+// would pick for the next spawn, sorted by per-pool MaxVolumeSize
+// descending. Returns nil when fewer than N candidates exist —
+// the operator-facing UI then renders an empty preview, which
+// matches upstream's behaviour for an unsatisfiable RG.
+//
+// The ratios are populated only for thin pools — thick pools
+// collapse to 1.0 (see effectiveOversubRatios) and omitting them
+// keeps golinstor's JSON parser from surfacing meaningless 1.0
+// ratios on every preview row.
+func nextSpawnResult(pools []apiv1.StoragePool, n int, ctrlProps map[string]string) []querySizeInfoSpawnResult {
+	if n <= 0 || len(pools) < n {
+		return nil
+	}
+
+	type capped struct {
+		pool   apiv1.StoragePool
+		maxVol int64
+	}
+
+	ranked := make([]capped, 0, len(pools))
+	for i := range pools {
+		ranked = append(ranked, capped{pool: pools[i], maxVol: poolMaxVolumeKib(&pools[i], ctrlProps)})
+	}
+
+	for i := 1; i < len(ranked); i++ {
+		for j := i; j > 0 && ranked[j].maxVol > ranked[j-1].maxVol; j-- {
+			ranked[j], ranked[j-1] = ranked[j-1], ranked[j]
+		}
+	}
+
+	out := make([]querySizeInfoSpawnResult, 0, n)
+
+	for i := range n {
+		pool := ranked[i].pool
+
+		row := querySizeInfoSpawnResult{
+			NodeName:     pool.NodeName,
+			StorPoolName: pool.StoragePoolName,
+		}
+
+		if isThinProvider(pool.ProviderKind) {
+			freeRatio, totalRatio := effectiveOversubRatios(&pool, ctrlProps)
+
+			overall := freeRatio
+			if totalRatio < overall {
+				overall = totalRatio
+			}
+
+			row.StorPoolOversubscriptionRatio = overall
+			row.StorPoolFreeCapacityOversubscriptionRatio = freeRatio
+			row.StorPoolTotalCapacityOversubscriptionRatio = totalRatio
+		}
+
+		out = append(out, row)
+	}
+
+	return out
+}
+
+// unsatisfiableReason returns a one-line explanation when the
+// requested RG can't be honoured, or "" when placement preview
+// succeeded. golinstor surfaces this as the "Next Spawn Result"
+// reason line so the operator sees *why* a spawn would fail
+// (filter too restrictive, no eligible pools, etc) before they
+// actually attempt the spawn.
+func unsatisfiableReason(filter *apiv1.AutoSelectFilter, pools []apiv1.StoragePool, replicas int) string {
+	if replicas <= 0 {
+		return "place-count is 0; nothing to spawn"
+	}
+
+	if len(pools) == 0 {
+		if filter != nil && filter.StoragePool != "" {
+			return fmt.Sprintf("no eligible storage pools match filter %q", filter.StoragePool)
+		}
+
+		return "no eligible storage pools in cluster (all DISKLESS / EVICTED / LOST)"
+	}
+
+	if len(pools) < replicas {
+		return fmt.Sprintf("only %d eligible pool(s); place-count=%d cannot be satisfied",
+			len(pools), replicas)
+	}
+
+	return ""
 }
 
 // dedupShared collapses pools that share a backing LUN to a single
@@ -249,17 +367,38 @@ func (s *Server) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 }
 
 // querySizeInfoResponse mirrors the upstream JSON shape (subset).
-// We deliberately don't include the oversubscription ratios — DRBD
-// volumes don't oversubscribe, the values would always be 1.0, and
-// golinstor's parser treats absence as "default".
+// We deliberately don't include the cluster-level oversubscription
+// ratio summary fields — thick pools never oversubscribe, and the
+// thin-pool numbers are surfaced per-pool in NextSpawnResult so
+// the operator can see them where they actually apply.
+//
+// Reports carries the ApiCallRc envelope upstream uses for warning /
+// info lines on `linstor rg query-size-info`. Populated only when
+// the RG is constraint-impossible (e.g. place-count > eligible
+// pools); empty otherwise so the wire shape stays compact.
 type querySizeInfoResponse struct {
 	SpaceInfo querySizeInfoSpaceInfo `json:"space_info"`
+	Reports   []apiv1.APICallRc      `json:"reports,omitempty"`
 }
 
 type querySizeInfoSpaceInfo struct {
-	MaxVlmSizeInKib    int64 `json:"max_vlm_size_in_kib"`
-	CapacityInKib      int64 `json:"capacity_in_kib,omitempty"`
-	AvailableSizeInKib int64 `json:"available_size_in_kib,omitempty"`
+	MaxVlmSizeInKib    int64                      `json:"max_vlm_size_in_kib"`
+	CapacityInKib      int64                      `json:"capacity_in_kib,omitempty"`
+	AvailableSizeInKib int64                      `json:"available_size_in_kib,omitempty"`
+	NextSpawnResult    []querySizeInfoSpawnResult `json:"next_spawn_result,omitempty"`
+}
+
+// querySizeInfoSpawnResult is one preview row — `{node, pool}`
+// the next spawn would land on. Matches upstream's
+// `QuerySizeInfoSpawnResult` model: node_name and stor_pool_name
+// are required (the placer always has a target); the ratio fields
+// are emitted only for thin pools where they're meaningful.
+type querySizeInfoSpawnResult struct {
+	NodeName                                   string  `json:"node_name"`
+	StorPoolName                               string  `json:"stor_pool_name"`
+	StorPoolOversubscriptionRatio              float64 `json:"stor_pool_oversubscription_ratio,omitempty"`
+	StorPoolFreeCapacityOversubscriptionRatio  float64 `json:"stor_pool_free_capacity_oversubscription_ratio,omitempty"`
+	StorPoolTotalCapacityOversubscriptionRatio float64 `json:"stor_pool_total_capacity_oversubscription_ratio,omitempty"`
 }
 
 type queryAllSizeInfoResponse struct {
