@@ -637,6 +637,208 @@ func TestResourceGroupListPropertiesUnknownRGReturns404(t *testing.T) {
 	}
 }
 
+// TestRGDeleteRefusedWhenRDsExist pins scenario 9.W02 (P1, unit;
+// cross-listed with wave1 4.5 + Bug 11). `DELETE /v1/resource-groups/
+// {rg}` MUST refuse the drop with 409 + FAIL_EXISTS_RSC_DFN when at
+// least one ResourceDefinition still references the named RG.
+// Mirrors upstream LINSTOR's CtrlRscGrpApiCallHandler.deleteResourceGroup
+// `rscGrpData.hasResourceDefinitions(apiCtx)` guard — operator must
+// clear or reassign the child RDs first; there is no `--force`. The
+// refusal message includes the count substring `N resource-definitions
+// exist` so operators can grep the audit log for the failure cause
+// without re-listing the RG's children by hand.
+func TestRGDeleteRefusedWhenRDsExist(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-busy"}); err != nil {
+		t.Fatalf("seed rg: %v", err)
+	}
+
+	// Two child RDs pointing at rg-busy plus one unrelated RD
+	// attached to a different RG (must NOT inflate the count or
+	// block the refusal). Mirrors the TestRGModifyResponseIncludesRebalanceCount
+	// seeding pattern so a future refactor that swaps countChildRDs
+	// in either place stays consistent.
+	for _, n := range []string{"pvc-a", "pvc-b"} {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              n,
+			ResourceGroupName: "rg-busy",
+		}); err != nil {
+			t.Fatalf("seed rd %q: %v", n, err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-elsewhere",
+		ResourceGroupName: "other-rg",
+	}); err != nil {
+		t.Fatalf("seed unrelated rd: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-groups/rg-busy")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) != 1 {
+		t.Fatalf("envelope count: got %d, want 1; rc=%+v", len(rc), rc)
+	}
+
+	// Sub-code must carry FAIL_EXISTS_RSC_DFN OR'd with the
+	// MASK_ERROR wrapper — same shape the snapshot-dfn refusal on
+	// `DELETE /v1/resource-definitions/{rd}` emits.
+	wantCode := apiCallRcError | apiCallRcFailExistsRscDfn
+	if rc[0].RetCode != wantCode {
+		t.Errorf("ret_code: got %#x, want %#x (apiCallRcError|FAIL_EXISTS_RSC_DFN)", rc[0].RetCode, wantCode)
+	}
+
+	// Both substrings must be present:
+	//   - upstream-wire text "because it has existing resource definitions."
+	//   - blockstor-extension count "2 resource-definitions exist"
+	for _, want := range []string{
+		"resource group 'rg-busy'",
+		"because it has existing resource definitions.",
+		"cannot delete: 2 resource-definitions exist",
+	} {
+		if !strings.Contains(rc[0].Message, want) {
+			t.Errorf("message: got %q, want substring %q", rc[0].Message, want)
+		}
+	}
+
+	if rc[0].ObjRefs[objRefRscGrp] != "rg-busy" {
+		t.Errorf("ObjRefs[%q]: got %q, want %q", objRefRscGrp, rc[0].ObjRefs[objRefRscGrp], "rg-busy")
+	}
+
+	// The RG must STILL be in the store — the refusal cannot leave
+	// a half-torn-down state (RG dropped but RDs still pointing at
+	// it). Asserts ordering: refuse BEFORE Delete().
+	if _, err := st.ResourceGroups().Get(ctx, "rg-busy"); err != nil {
+		t.Errorf("rg-busy must survive the refused delete; Get err=%v", err)
+	}
+}
+
+// TestRGDeleteAllowedAfterChildRDsCleared pins the post-condition of
+// 9.W02: once every child RD is gone, the same DELETE call succeeds
+// with the normal 200 + maskInfo envelope. Without this, a regression
+// that latched the refusal (e.g. cached the count) would silently
+// brick `linstor rg d` for the lifetime of the controller.
+func TestRGDeleteAllowedAfterChildRDsCleared(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-drain"}); err != nil {
+		t.Fatalf("seed rg: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-going",
+		ResourceGroupName: "rg-drain",
+	}); err != nil {
+		t.Fatalf("seed rd: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// First pass: refused.
+	resp := httpDelete(t, base+"/v1/resource-groups/rg-drain")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("pre-drain delete: got %d, want 409", resp.StatusCode)
+	}
+
+	// Drain the child RD; second pass must succeed.
+	if err := st.ResourceDefinitions().Delete(ctx, "pvc-going"); err != nil {
+		t.Fatalf("drain rd: %v", err)
+	}
+
+	resp = httpDelete(t, base+"/v1/resource-groups/rg-drain")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("post-drain delete: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) != 1 || rc[0].RetCode != maskInfo {
+		t.Errorf("post-drain envelope: got %+v, want single maskInfo entry", rc)
+	}
+
+	// And the RG is genuinely gone.
+	if _, err := st.ResourceGroups().Get(ctx, "rg-drain"); err == nil {
+		t.Errorf("rg-drain must be gone after successful delete")
+	}
+}
+
+// TestRGDeleteIdempotentOnAbsentPostRefusal cross-checks the Bug 66
+// idempotence guarantee against scenario 9.W02: a DELETE on a
+// never-created RG still returns 200 + warnRGNotFound, regardless of
+// whether unrelated RDs (pointing at OTHER groups) exist in the store.
+// Pins that the child-RD check is scoped by RG name — not a global
+// "any RD exists, refuse all RG deletes" filter.
+func TestRGDeleteIdempotentOnAbsentPostRefusal(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Unrelated RD attached to a different RG. Must NOT block the
+	// idempotent no-op on `ghost-rg`.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-elsewhere",
+		ResourceGroupName: "other-rg",
+	}); err != nil {
+		t.Fatalf("seed unrelated rd: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-groups/ghost-rg")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+}
+
 // TestResourceGroupListPropertiesEmptyDecodes pins the "empty scope
 // returns empty map (not nil)" clause: an RG with no Props decodes
 // without panic. golinstor ranges over the (possibly nil) map; the

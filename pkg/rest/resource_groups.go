@@ -329,8 +329,36 @@ func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 // "already absent" condition. Folding NotFound into a 200 + warn-mask
 // envelope keeps `linstor rg d` exit-0 on the second call (matches the
 // CSI idempotence guarantee Bug 56 established for resources / RDs).
+//
+// Scenario 9.W02 (cross-listed with wave1 4.5 + Bug 11): the delete is
+// REFUSED with 409 + FAIL_EXISTS_RSC_DFN when any ResourceDefinition
+// still references this RG. Mirrors upstream LINSTOR's
+// CtrlRscGrpApiCallHandler.deleteResourceGroup
+// `rscGrpData.hasResourceDefinitions(apiCtx)` guard — operator must
+// clear or reassign the RDs first; there's no `--force`. The refuse
+// runs BEFORE the store Delete so a half-torn-down state (RG dropped
+// but RDs still pointing at it) can never arise.
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
+
+	// Refuse the delete if any child RD still references this RG.
+	// The count is best-effort: a -1 sentinel from countChildRDs
+	// signals the list-side hiccup. We surface the refusal anyway
+	// (the RG is presumed unsafe to drop) but degrade the message
+	// to omit the unknown count rather than print "-1 resource-
+	// definitions".
+	childCount := countChildRDs(r.Context(), s.Store, name)
+	if childCount != 0 {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+			Message: rgDeleteRefusedMessage(name, childCount),
+			ObjRefs: map[string]string{
+				objRefRscGrp: name,
+			},
+		}})
+
+		return
+	}
 
 	err := s.Store.ResourceGroups().Delete(r.Context(), name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -352,4 +380,24 @@ func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource group deleted: " + name,
 	}})
+}
+
+// rgDeleteRefusedMessage formats the FAIL_EXISTS_RSC_DFN refusal text.
+// Two flavours:
+//   - happy path (count > 0): includes the upstream-wire text PLUS the
+//     blockstor-extension "cannot delete: N resource-definitions exist"
+//     so operators see the failing count without having to `rd l` the
+//     parent RG (matches the scenario 9.W02 / wave1 4.5 substring).
+//   - degraded (count < 0): the list-side lookup failed; omit the
+//     count but keep the upstream-wire refusal text so the operator
+//     still gets a clear "won't delete" signal.
+func rgDeleteRefusedMessage(name string, count int) string {
+	upstream := "Cannot delete resource group '" + name +
+		"' because it has existing resource definitions."
+
+	if count < 0 {
+		return upstream
+	}
+
+	return fmt.Sprintf("%s cannot delete: %d resource-definitions exist", upstream, count)
 }

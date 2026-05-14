@@ -166,24 +166,25 @@ const warnNoSatelliteConnection = maskWarn | int64(2057)
 // a separate rule.
 const apiCallRcFailExistsSnapshotDfn int64 = 514
 
-// apiCallRcFailInUse mirrors upstream LINSTOR's `ApiConsts.FAIL_IN_USE`
-// (`997 | MASK_ERROR`). Emitted by
-// `DELETE /v1/nodes/{node}/storage-pools/{pool}` when at least one
-// Resource replica on `(node, pool)` still references the pool
-// (wave2 scenario 6.W06 / UG9 §"Creating storage pools by using the
-// physical storage command" note). Upstream's `CtrlStorPoolApiCallHandler`
-// raises this with the literal text
-// `"The specified storage pool '<pool>' on node '<node>' can not be
-// deleted as volumes / snapshot-volumes are still using it."` and asks
-// the operator to drop the referencing volumes first; blockstor matches
-// the wire shape so the Python CLI's existing error-message renderer
-// surfaces the line verbatim.
+// apiCallRcFailExistsRscDfn mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_RSC_DFN` (`501 | MASK_ERROR`). Emitted by
+// `DELETE /v1/resource-groups/{rg}` when the RG still has at least one
+// child ResourceDefinition (wave2 scenario 9.W02 cross-listed with
+// wave1 4.5 / UG9 §"Deleting a resource group"). Upstream's
+// CtrlRscGrpApiCallHandler.deleteResourceGroup checks
+// `rscGrpData.hasResourceDefinitions(apiCtx)` and raises this code
+// with the literal text "Cannot delete <rg name> because it has
+// existing resource definitions." — the operator must clear or
+// reassign the RDs first; there's no `--force`. The MASK_ERROR bit is
+// OR'd in by the `apiCallRcError` envelope wrapper at the call site;
+// the bare 501 sub-code here keeps the wire shape byte-identical to
+// upstream's `linstor rg d <name>` reply on the same input.
 //
-// Sub-code 997 is shared across many "still-referenced" refusal paths
-// in upstream LINSTOR (resource delete, snapshot restore, vlm-dfn modify
-// etc.); reusing the same number here lets audit-log greppers catch
-// blockstor's variant without a separate rule.
-const apiCallRcFailInUse int64 = 997
+// Choosing 501 (rather than a fresh sub-code in our 996+ range) lets
+// audit-log greppers that already classify upstream's
+// FAIL_EXISTS_RSC_DFN traffic catch blockstor's equivalent without a
+// separate rule.
+const apiCallRcFailExistsRscDfn int64 = 501
 
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
@@ -192,6 +193,7 @@ const apiCallRcFailInUse int64 = 997
 const (
 	objRefNode        = "Node"
 	objRefRscDfn      = "RscDfn"
+	objRefRscGrp      = "RscGrp"
 	objRefSnapshotDfn = "SnapshotDfn"
 	objRefStorPool    = "StorPool"
 )
