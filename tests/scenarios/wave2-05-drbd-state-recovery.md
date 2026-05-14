@@ -113,6 +113,8 @@ Requires 5.W05 first. Adds `drbdadm invalidate` step (WARNING: run only on side 
 
 Cross-listed with wave1 5.14. Recipe: on VICTIM `disconnect → secondary → connect --discard-my-data`; on SURVIVOR (if also StandAlone) `disconnect → connect`. **Reconciler-survival:** blockstor must NOT re-render `.res` mid-recipe and break side selection.
 
+**E2E:** `tests/e2e/split-brain-recovery.sh` pins the recipe contract — runs both VICTIM and SURVIVOR commands verbatim against a reconciler-managed RD; asserts both peers converge to Established + UpToDate within 30 s, `.res` sha256 unchanged on both sides across the recipe window, and the original Primary never loses Primary-ship. Distinct from wave1 5.14's `tests/e2e/recovery-discard-my-data.sh` (data-marker md5 round-trip) — 5.W12 is the command-contract guard, no operator-driven REST endpoint exposed.
+
 ### 5.W13 Quorum-loss recovery (suspend-io → force secondary) — S
 
 - **Priority:** P0  **Target:** e2e  **Complexity:** M
