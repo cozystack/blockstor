@@ -155,24 +155,23 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// linstor-csi (and piraeus-operator's
-	// LinstorSatelliteConfiguration.spec.storageClasses[*].layerList) sets
-	// `layer_list` on the autoplace call rather than on RD create. Persist
-	// it onto rd.LayerStack here so the dispatcher → satellite chain sees
-	// the right composition. RD-level LayerStack wins if already set
-	// (operator-supplied via REST POST or CRD create).
-	if len(req.LayerList) > 0 && len(rd.LayerStack) == 0 {
-		rd.LayerStack = append([]string(nil), req.LayerList...)
-
-		err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
-		if err != nil {
-			writeStoreError(w, err)
-
-			return
-		}
+	if !s.persistAutoplaceLayerList(w, r, &rd, req.LayerList) {
+		return
 	}
 
 	filter := mergeAutoplaceFilter(r.Context(), s.Store, &rd, &req.SelectFilter)
+
+	// Scenario 4.W17 (`r c --auto-place +1 <rd>`): see
+	// resolveAdditionalPlaceCount doc — the Python CLI's `+1` shorthand
+	// posts `additional_place_count`, and we fold it into the effective
+	// PlaceCount so the placer's target-driven loop adds exactly N
+	// replicas on top of the current diskful count.
+	err = s.resolveAdditionalPlaceCount(r.Context(), rdName, &filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
 
 	// snapshot-restore-resource stamps BlockstorRestoreFromSnapshot
 	// on the new RD. Without satellite-to-satellite zfs/thin send-recv
@@ -210,6 +209,35 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
 	}})
+}
+
+// persistAutoplaceLayerList writes a CSI-supplied layer_list onto the
+// RD's LayerStack so the dispatcher → satellite chain sees the right
+// composition. Pulled out of handleAutoplace to keep that function under
+// the funlen budget once W17's additional_place_count branch was added.
+//
+// linstor-csi (and piraeus-operator's
+// LinstorSatelliteConfiguration.spec.storageClasses[*].layerList) sets
+// layer_list on the autoplace call rather than on RD create.
+// RD-level LayerStack wins if already set (operator-supplied via REST
+// POST or CRD create) — we never overwrite an existing stack. Returns
+// false on write error (HTTP response already emitted), true on success
+// or no-op.
+func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Request, rd *apiv1.ResourceDefinition, layerList []string) bool {
+	if len(layerList) == 0 || len(rd.LayerStack) > 0 {
+		return true
+	}
+
+	rd.LayerStack = append([]string(nil), layerList...)
+
+	err := s.Store.ResourceDefinitions().Update(r.Context(), rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	return true
 }
 
 // runPlaceAndReport drives the placer and writes the appropriate
@@ -253,6 +281,56 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 	}
 
 	return true
+}
+
+// resolveAdditionalPlaceCount implements the W17 `--auto-place +N`
+// semantic: when the caller set `additional_place_count`, the effective
+// PlaceCount becomes `count(existing diskful, non-evicted) + additional`
+// and the regular placer loop drives the rest. When additional is unset
+// or zero, this is a no-op and the placer behaves as a pure target.
+//
+// Counting matches the placer's own `countDiskfulReplicas` (diskful only,
+// non-disabled nodes only) so a tiebreaker witness or an evicted-node
+// replica doesn't suppress the increment. The increment is computed
+// after every other filter merge so an operator who supplies BOTH a
+// `place_count: 5` AND `additional_place_count: 1` ends up with
+// `existing + 1` (upstream semantic — additional overrides target).
+func (s *Server) resolveAdditionalPlaceCount(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) error {
+	if filter.AdditionalPlaceCount <= 0 {
+		return nil
+	}
+
+	existing, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return errors.Wrap(err, "list resources for additional_place_count")
+	}
+
+	disabled, err := s.disabledNodes(ctx)
+	if err != nil {
+		return err
+	}
+
+	diskful := 0
+
+	for i := range existing {
+		if _, off := disabled[existing[i].NodeName]; off {
+			continue
+		}
+
+		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		diskful++
+	}
+
+	filter.PlaceCount = apiv1.LaxInt32(diskful) + filter.AdditionalPlaceCount
+	// Once consumed, drop the delta so it doesn't leak into the
+	// shortfall envelope's "Additional replica count: N" line — the
+	// effective PlaceCount is what callers reason about post-merge.
+	filter.AdditionalPlaceCount = 0
+
+	return nil
 }
 
 // writeAutoplaceShortfall renders the upstream-shaped ApiCallRc
@@ -560,6 +638,16 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 
 	if req.PlaceCount > 0 {
 		out.PlaceCount = req.PlaceCount
+	}
+
+	// Scenario 4.W17: `--auto-place +1` posts AdditionalPlaceCount
+	// instead of PlaceCount; carry the request-side value forward so
+	// resolveAdditionalPlaceCount can fold it into the effective
+	// place_count. Unlike PlaceCount the RG never stores an
+	// "additional" knob (it's a per-call delta intent, not a target),
+	// so we only ever take the request's value here.
+	if req.AdditionalPlaceCount > 0 {
+		out.AdditionalPlaceCount = req.AdditionalPlaceCount
 	}
 
 	if req.StoragePool != "" {

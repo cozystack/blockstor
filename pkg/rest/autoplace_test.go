@@ -2127,3 +2127,367 @@ func TestResourceCreateDrbdDisklessPermanentClient(t *testing.T) {
 			rd.Props["DrbdOptions/AutoAddQuorumTiebreaker"])
 	}
 }
+
+// TestAutoplaceAdditionalPlusOneAddsOneReplica pins scenario 4.W17:
+// `linstor r c --auto-place +1 <rd>` posts
+// `additional_place_count: 1` on top of the existing-replica list and
+// expects exactly ONE new replica to land. The pre-existing replicas
+// must not be disturbed: same node names, same pool prop, same flags.
+//
+// Setup: RD already has two diskful replicas on n1, n2 on the LVM_THIN
+// pool "fast". Three more candidate pools live on n3, n4, n5 — the
+// placer must pick one (n3 wins the deterministic tie-break: lowest
+// node name), promote it to a diskful replica, and leave the other two
+// candidates untouched.
+//
+// Same-kind constraint (Bug 76) is verified by seeding n5 with an
+// LVM (not LVM_THIN) pool: even though it's a healthy candidate it must
+// be skipped because the RD's first replica is LVM_THIN and
+// IsProviderKindMixingAllowed(LVM_THIN, LVM) returns false. The placer
+// must pick n3 (LVM_THIN) over n5 (LVM).
+func TestAutoplaceAdditionalPlusOneAddsOneReplica(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Pools on every node. n5 uses a different ProviderKind so the
+	// Bug 76 same-kind gate fires.
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "fast", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n4", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n5", ProviderKind: "LVM", FreeCapacity: 10000, TotalCapacity: 100000},
+	}
+
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool %s: %v", pools[i].NodeName, err)
+		}
+	}
+
+	// Seed the two existing replicas. The placer's countDiskfulReplicas
+	// will return 2; with additional_place_count=1 the effective
+	// PlaceCount becomes 3 and the placer adds exactly one more.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-1",
+			NodeName: n,
+			Props:    map[string]string{"StorPoolName": "fast"},
+		}); err != nil {
+			t.Fatalf("seed existing replica %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `--auto-place +1` posts additional_place_count instead of
+	// place_count — see CtrlRscAutoPlaceApiCallHandler upstream.
+	body, err := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			AdditionalPlaceCount: 1,
+			StoragePool:          "fast",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// Existing 2 + exactly 1 new = 3 replicas total.
+	if len(got) != 3 {
+		t.Fatalf("replica count: got %d, want 3 (existing 2 + add 1)", len(got))
+	}
+
+	nodes := map[string]struct{}{}
+	for i := range got {
+		nodes[got[i].NodeName] = struct{}{}
+	}
+
+	// Existing replicas untouched.
+	for _, n := range []string{"n1", "n2"} {
+		if _, ok := nodes[n]; !ok {
+			t.Errorf("existing replica on %s was disturbed; nodes=%v", n, nodes)
+		}
+	}
+
+	// Bug 76: same-kind constraint must skip n5 (LVM, not LVM_THIN).
+	if _, picked := nodes["n5"]; picked {
+		t.Errorf("Bug 76: cross-kind replica placed on n5 despite first replica on LVM_THIN; nodes=%v", nodes)
+	}
+
+	// The third replica MUST sit on one of the LVM_THIN candidates n3/n4.
+	thirdNode := ""
+
+	for n := range nodes {
+		if n == "n1" || n == "n2" {
+			continue
+		}
+
+		thirdNode = n
+	}
+
+	if thirdNode != "n3" && thirdNode != "n4" {
+		t.Errorf("third replica on unexpected node %q; want n3 or n4", thirdNode)
+	}
+
+	// New replica must carry the right StorPoolName so the satellite
+	// reconciler hits the LVM_THIN provider, not a fresh empty Props
+	// map (which would yield a misleading "missing pool" satellite
+	// error later in the lifecycle).
+	third, err := st.Resources().Get(ctx, "pvc-1", thirdNode)
+	if err != nil {
+		t.Fatalf("get third replica: %v", err)
+	}
+
+	if third.Props["StorPoolName"] != "fast" {
+		t.Errorf("third replica StorPoolName: got %q, want %q", third.Props["StorPoolName"], "fast")
+	}
+
+	// Diskless flag must NOT be set — `+1` adds a diskful replica.
+	if slices.Contains(third.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("third replica unexpectedly carries DISKLESS; flags=%v", third.Flags)
+	}
+}
+
+// TestAutoplaceAdditionalPlusOneNoCandidatesReturnsConflict pins the
+// "Not enough available nodes" envelope on the W17 incremental path:
+// when the RD already has all same-kind candidates filled, a `+1` must
+// fail with 409 — not silently no-op the way a target-driven
+// `place_count: 2` (== existing) would.
+//
+// Setup: 2 diskful replicas already on the two LVM_THIN pools. The
+// third candidate (n3) is LVM (different ProviderKind), so the Bug 76
+// gate rejects it. The shortfall path must fire: requested 3 (= 2 +
+// 1), placed 2, partial.
+func TestAutoplaceAdditionalPlusOneNoCandidatesReturnsConflict(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Only n1/n2 are LVM_THIN; n3 is LVM. Bug 76 rejects n3 once the
+	// first replica is on LVM_THIN.
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "fast", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 10000, TotalCapacity: 100000},
+		{StoragePoolName: "fast", NodeName: "n3", ProviderKind: "LVM", FreeCapacity: 10000, TotalCapacity: 100000},
+	}
+
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool %s: %v", pools[i].NodeName, err)
+		}
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-1",
+			NodeName: n,
+			Props:    map[string]string{"StorPoolName": "fast"},
+		}); err != nil {
+			t.Fatalf("seed existing replica %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			AdditionalPlaceCount: 1,
+			StoragePool:          "fast",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (no same-kind candidate for +1)", resp.StatusCode)
+	}
+
+	// Existing replicas must still be intact — a shortfall on +1 is
+	// fail-fast, not a partial rollback.
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list after shortfall: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("replica count after shortfall: got %d, want 2 (existing untouched)", len(got))
+	}
+}
+
+// TestAutoplaceAdditionalPlusOneOverridesPlaceCount pins the upstream
+// "additional overrides target" rule: when BOTH place_count and
+// additional_place_count are set, additional wins. This matters because
+// piraeus-operator's `r c --auto-place +1` posts both fields on RGs
+// that already carried a place_count — without override semantics the
+// behaviour would diverge from the Java controller.
+//
+// Setup: 1 existing replica. Request carries place_count=99 AND
+// additional_place_count=1. The expected outcome is 2 total replicas
+// (existing + 1), NOT 99 (or as many as candidate pools allow).
+func TestAutoplaceAdditionalPlusOneOverridesPlaceCount(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "fast",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    10000,
+			TotalCapacity:   100000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n1",
+		Props:    map[string]string{"StorPoolName": "fast"},
+	}); err != nil {
+		t.Fatalf("seed existing replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:           99,
+			AdditionalPlaceCount: 1,
+			StoragePool:          "fast",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Errorf("replica count: got %d, want 2 (additional=1 overrides place_count=99)", len(got))
+	}
+}
+
+// TestAutoplaceAdditionalPlusOneIgnoresDisklessExisting pins that
+// DISKLESS / tiebreaker witnesses do NOT count toward the existing
+// diskful tally on the W17 path. A `+1` against a 2-diskful + 1-witness
+// RD must add ONE diskful replica (total 4: 3 diskful + 1 witness),
+// not zero (which is what a naive `len(existing)` count would yield).
+//
+// This mirrors placer.countDiskfulReplicas, which the W17 handler
+// reuses by counting non-disabled non-DISKLESS replicas only. Without
+// this gate a tiebreaker would suppress every operator-driven +1.
+func TestAutoplaceAdditionalPlusOneIgnoresDisklessExisting(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "fast",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    10000,
+			TotalCapacity:   100000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	// 2 diskful + 1 DISKLESS tiebreaker. The W17 count must yield 2,
+	// not 3.
+	diskful := []string{"n1", "n2"}
+	for _, n := range diskful {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-1",
+			NodeName: n,
+			Props:    map[string]string{"StorPoolName": "fast"},
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n3",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed tiebreaker: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			AdditionalPlaceCount: 1,
+			StoragePool:          "fast",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// 2 diskful + 1 tiebreaker (witness) + 1 new diskful = 4 total.
+	if len(got) != 4 {
+		t.Fatalf("replica count: got %d, want 4 (2 diskful + 1 witness + 1 new)", len(got))
+	}
+
+	diskfulCount := 0
+
+	for i := range got {
+		if !slices.Contains(got[i].Flags, apiv1.ResourceFlagDiskless) {
+			diskfulCount++
+		}
+	}
+
+	if diskfulCount != 3 {
+		t.Errorf("diskful count: got %d, want 3 (existing 2 + new 1; witness must not be promoted)", diskfulCount)
+	}
+}
