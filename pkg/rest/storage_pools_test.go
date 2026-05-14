@@ -966,6 +966,158 @@ func TestSPCreateNoNormalizationNeeded(t *testing.T) {
 	}
 }
 
+// TestSPCreateDisklessNoProps pins scenario 6.W05: `sp create diskless
+// <node> <pool>` must succeed without any `StorDriver/*` props. DISKLESS
+// pools own no underlying storage — they exist purely as allocator
+// targets for the autoplacer's `DisklessOnRemaining` path and the
+// `AutoAddQuorumTiebreaker` reconciler. The contract this test pins:
+//
+//  1. POST /v1/nodes/{node}/storage-pools with
+//     `{"storage_pool_name":"<p>","provider_kind":"DISKLESS"}` and NO
+//     Props returns 201 — the kind validator must accept DISKLESS, and
+//     the expand-StorPoolName-alias normaliser must not trip on the
+//     missing-Props bag (Bug 63 path is a no-op for DISKLESS by design).
+//  2. The stored CRD has `FreeCapacity == 0` and `TotalCapacity == 0`.
+//     DISKLESS pools report zero capacity to the placer (the in-memory
+//     replica consumes no local space); a non-zero default would skew
+//     the MaxFreeSpace scoring. The fields are int64 with omitempty so
+//     "absent in body" must round-trip as zero, not as "preserve previous".
+//  3. The pool surfaces on the aggregate /v1/view/storage-pools call —
+//     that's the path linstor-csi and the autoplacer use to enumerate
+//     diskless targets for the DisklessOnRemaining path. End-to-end the
+//     satellite's NewProviderFromKind returns (nil, nil) for DISKLESS
+//     and the StoragePoolReconciler's `RegisterProvider(nil)` path is
+//     a no-op deregister — a regression that required Props would fail
+//     this REST-level test first.
+//
+// Cross-listed with wave1 6.5 (auto-creation at Node Hello time): the
+// existing `TestNodeCreateAutoCreatesDfltDisklessStorPool` pins the
+// auto-create variant; this test pins the explicit-create path the
+// operator uses to add extra diskless pools beyond `DfltDisklessStorPool`.
+func TestSPCreateDisklessNoProps(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Wire body: no Props, no FreeCapacity, no TotalCapacity. The
+	// CLI's `linstor sp c diskless <node> <pool>` emits exactly this
+	// — DISKLESS has no backing-storage knob to fill in.
+	body, err := json.Marshal(apiv1.StoragePool{
+		StoragePoolName: "diskless-extra",
+		ProviderKind:    apiv1.StoragePoolKindDiskless,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (DISKLESS must not require Props)", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "diskless-extra")
+	if err != nil {
+		t.Fatalf("store Get after POST: %v", err)
+	}
+
+	if got.ProviderKind != apiv1.StoragePoolKindDiskless {
+		t.Errorf("ProviderKind: got %q, want %q",
+			got.ProviderKind, apiv1.StoragePoolKindDiskless)
+	}
+
+	if got.FreeCapacity != 0 {
+		t.Errorf("FreeCapacity: got %d, want 0 (DISKLESS has no backing storage)", got.FreeCapacity)
+	}
+
+	if got.TotalCapacity != 0 {
+		t.Errorf("TotalCapacity: got %d, want 0 (DISKLESS has no backing storage)", got.TotalCapacity)
+	}
+
+	// Props bag must remain absent / empty — the expand-alias path
+	// must not synthesise spurious keys when no StorPoolName alias is
+	// present and the kind has no canonical prop key.
+	for k, v := range got.Props {
+		t.Errorf("DISKLESS pool gained spurious prop %q=%q (Props must stay empty)", k, v)
+	}
+
+	// And the pool must surface on the aggregate view — that's the
+	// call linstor-csi and the autoplacer make to enumerate diskless
+	// targets for the DisklessOnRemaining path.
+	viewResp := httpGet(t, base+"/v1/view/storage-pools?nodes=n1")
+	defer func() { _ = viewResp.Body.Close() }()
+
+	if viewResp.StatusCode != http.StatusOK {
+		t.Fatalf("view status: got %d, want 200", viewResp.StatusCode)
+	}
+
+	var pools []apiv1.StoragePool
+	if err := json.NewDecoder(viewResp.Body).Decode(&pools); err != nil {
+		t.Fatalf("decode view: %v", err)
+	}
+
+	var found bool
+
+	for i := range pools {
+		if pools[i].NodeName == "n1" &&
+			pools[i].StoragePoolName == "diskless-extra" &&
+			pools[i].ProviderKind == apiv1.StoragePoolKindDiskless {
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("created DISKLESS pool not visible in /v1/view/storage-pools; got pools=%+v", pools)
+	}
+}
+
+// TestSPCreateDisklessIgnoresStorPoolNameAlias pins that the Bug 63
+// expand-StorPoolName-alias normaliser is a no-op for DISKLESS. A
+// caller that copy-pastes `StorDriver/StorPoolName=foo` from an LVM
+// example onto a DISKLESS create must NOT gain spurious kind-specific
+// keys (LvmVg, ZPool, FileDir, …). Without the no-op, a misconfigured
+// alias would land in the props bag and trip the satellite's
+// per-kind config validator the next time the operator switched the
+// kind to LVM with a real VG.
+func TestSPCreateDisklessIgnoresStorPoolNameAlias(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindDiskless,
+		Props:           map[string]string{"StorDriver/StorPoolName": "stray-alias"},
+	})
+
+	// StorPoolName is retained for CLI-display parity (matches the
+	// "explicit alias retained" semantics of the other expand tests).
+	if got.Props["StorDriver/StorPoolName"] != "stray-alias" {
+		t.Errorf("StorPoolName retained: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "stray-alias")
+	}
+
+	// But no kind-specific keys may be synthesised — DISKLESS has
+	// no backing-storage knob and the satellite's NewProviderFromKind
+	// short-circuits to (nil, nil) without reading Props at all.
+	for _, k := range []string{
+		"StorDriver/LvmVg",
+		"StorDriver/ThinPool",
+		"StorDriver/ZPool",
+		"StorDriver/ZPoolThin",
+		"StorDriver/FileDir",
+	} {
+		if got.Props[k] != "" {
+			t.Errorf("DISKLESS gained spurious kind-specific prop %q=%q", k, got.Props[k])
+		}
+	}
+}
+
 // TestSPDeleteUnknownUsesWarnMaskNotInfo is the Bug 66 alignment
 // guard for `DELETE /v1/nodes/{node}/storage-pools/{pool}`. The
 // handler pre-existed Bug 66 (Bug 52, 93d104163) and already folded
