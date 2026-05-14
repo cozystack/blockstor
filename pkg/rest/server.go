@@ -61,11 +61,10 @@ type Server struct {
 	// that build the mux without going through the full constructor.
 	linstorRemotes *linstorRemoteRegistry
 
-	// resourceConnections is the in-memory registry for per-(rd, a, b)
-	// DRBD tuning props — scenario 5.W04. Lazy-initialised on first
-	// call to registerResourceConnections; see
-	// pkg/rest/resource_connections.go for the doc rationale.
-	resourceConnections *resourceConnectionRegistry
+	// (resourceConnections registry from 5.W04 dropped on cherry-pick
+	// conflict with wave1 3.7's RD-prop-backed storage of paths —
+	// pkg/rest/resource_connections.go stores per-(rd, a, b) state
+	// directly on RD.Spec.Props now; no separate registry needed.)
 
 	// errorReports is the in-memory ring buffer that backs
 	// `linstor err l` / `GET /v1/error-reports`. Reconcilers and

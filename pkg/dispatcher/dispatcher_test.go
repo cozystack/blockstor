@@ -17,16 +17,12 @@ limitations under the License.
 package dispatcher_test
 
 import (
-	"reflect"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
-	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // TestExternalMetadataRouting: scenario 6.18 (StorPoolNameDrbdMeta).

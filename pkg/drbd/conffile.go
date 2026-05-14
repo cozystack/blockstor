@@ -408,36 +408,11 @@ func writePathBlocks(b *strings.Builder, hostA, hostB *Host, paths []ResourcePat
 	}
 }
 
-// lookupConnection returns the NetOptions for the (a, b) pair from
-// conns, matching unordered (HostA / HostB may be in either slot).
-// Nil result when no matching entry exists.
-func lookupConnection(conns []Connection, a, b string) map[string]string {
-	for i := range conns {
-		if (conns[i].HostA == a && conns[i].HostB == b) ||
-			(conns[i].HostA == b && conns[i].HostB == a) {
-			return conns[i].NetOptions
-		}
-	}
-
-	return nil
-}
-
-// writeConnectionNet emits the nested `net { … }` block of a
-// connection. Empty map → no block at all (drbd accepts but logs an
-// empty net block; we keep the rendered .res tight).
-func writeConnectionNet(b *strings.Builder, opts map[string]string) {
-	if len(opts) == 0 {
-		return
-	}
-
-	b.WriteString("    net {\n")
-
-	for _, k := range sortedKeys(opts) {
-		fmt.Fprintf(b, "      %s %s;\n", k, opts[k])
-	}
-
-	b.WriteString("    }\n")
-}
+// (lookupConnection + writeConnectionNet from 5.W04 dropped on
+// cherry-pick conflict with wave1 3.7's ResourceConnection type —
+// per-pair NetOptions can be reintroduced by extending
+// ResourceConnection.NetOptions in a follow-up; both 5.W04 and wave1
+// 3.7 tests still pass without these helpers.)
 
 // sortedKeys returns the keys of m in deterministic order. We don't
 // bother with a heap or anything fancy — option maps are tiny (a

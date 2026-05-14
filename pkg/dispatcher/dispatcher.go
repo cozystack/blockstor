@@ -27,7 +27,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -37,142 +36,14 @@ import (
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
-// ResourceConnectionProps is a per-(HostA, HostB) DRBD tuning bag
-// the REST layer collected on `linstor resource-connection
-// drbd-peer-options <rd> <a> <b> --max-buffers 8192` — scenario
-// 5.W04. The dispatcher folds these props into per-connection
-// `drbd.Connection` entries so the satellite renderer drops the
-// matching `net { … }` sub-block inside the `.res` file's
-// connection mesh.
-//
-// The Props map keys are upstream LINSTOR-compatible:
-//   - `DrbdOptions/PeerDevice/max-buffers` → emits as `max-buffers
-//     <value>;` inside the connection's `net { }` block (DRBD's
-//     `max-buffers` option lives on the `net` section even though
-//     the LINSTOR prop key namespace puts it under `PeerDevice/`).
-//   - `DrbdOptions/Net/<name>` → emits as `<name> <value>;` inside
-//     `net { }` directly.
-//
-// Operators who patch a non-DRBD prop on the resource connection
-// will see it silently dropped here — only `DrbdOptions/...` keys
-// are routable into the .res file. Same convention as
-// `splitDRBDOptions` on the satellite reconciler.
-type ResourceConnectionProps struct {
-	HostA string
-	HostB string
-	Props map[string]string
-}
-
-// BuildResourceConnections turns a slice of per-pair Props bags
-// into the slice of `drbd.Connection` entries the .res renderer
-// consumes. Order of input is preserved on output; the renderer
-// matches connection entries to the mesh's (i, j) pair unordered, so
-// callers don't have to canonicalise HostA / HostB.
-//
-// Empty Props maps are dropped — emitting an empty `net { }` sub-
-// block on a connection that doesn't actually carry a tuning
-// override would force a noisy `drbdadm adjust` on every reconcile.
-// Connections whose `DrbdOptions/...` keys all route to unknown
-// destinations (i.e. not Net / PeerDevice) emit no NetOptions and
-// are likewise dropped.
-func BuildResourceConnections(in []ResourceConnectionProps) []drbd.Connection {
-	out := make([]drbd.Connection, 0, len(in))
-
-	for i := range in {
-		net := splitConnectionNetOptions(in[i].Props)
-		if len(net) == 0 {
-			continue
-		}
-
-		out = append(out, drbd.Connection{
-			HostA:      in[i].HostA,
-			HostB:      in[i].HostB,
-			NetOptions: net,
-		})
-	}
-
-	// Deterministic order so the .res renderer output stays stable
-	// across reconciles — same key argument as `sortedKeys`. We sort
-	// by the canonical (min, max) pair so (n1, n2) and (n2, n1)
-	// don't reorder the output across reconciles.
-	sort.SliceStable(out, func(i, j int) bool {
-		lowI, highI := canonicalPair(out[i].HostA, out[i].HostB)
-		lowJ, highJ := canonicalPair(out[j].HostA, out[j].HostB)
-
-		if lowI != lowJ {
-			return lowI < lowJ
-		}
-
-		return highI < highJ
-	})
-
-	return out
-}
-
-// canonicalPair returns the (min, max) of two host names so a
-// later sort.Stable orders the output deterministically irrespective
-// of the input order operators happened to PATCH the (a, b) tuple in.
-func canonicalPair(a, b string) (string, string) {
-	if a <= b {
-		return a, b
-	}
-
-	return b, a
-}
-
-// splitConnectionNetOptions partitions a ResourceConnection props
-// bag into the `net { }` sub-block emission map. Keys under
-// `DrbdOptions/Net/<name>` and `DrbdOptions/PeerDevice/<name>` both
-// land here — DRBD treats the connection-scope `max-buffers` /
-// `ping-timeout` / `c-max-rate` knobs as net-block options, even
-// though LINSTOR's `resource-connection drbd-peer-options` writes
-// them under the PeerDevice/ prop namespace (upstream LINSTOR makes
-// the same routing decision in ConfFileBuilder).
-//
-// Section names not on the allow-list are dropped — emitting them
-// inside `connection { net { ... } }` would produce a syntactically
-// wrong .res file (drbdadm would complain about `disk` or
-// `handlers` keys in a `net` block).
-func splitConnectionNetOptions(props map[string]string) map[string]string {
-	if len(props) == 0 {
-		return nil
-	}
-
-	out := map[string]string{}
-
-	for key, value := range props {
-		rest, ok := strings.CutPrefix(key, drbd.PropPrefix)
-		if !ok {
-			continue
-		}
-
-		section, rawKey, hasSection := strings.Cut(rest, "/")
-		if !hasSection {
-			continue
-		}
-
-		switch strings.ToLower(section) {
-		case "net", "peerdevice", "peer-device":
-			out[rawKey] = value
-		default:
-			// disk / handlers / options on a connection scope would
-			// produce invalid .res output — drop them.
-			continue
-		}
-	}
-
-	return out
-}
-
-// drbdAddrAny is the placeholder address we put into the .res file at
-// dispatch time. The satellite rewrites it to its actual pod IP when
-// it renders the file (drbd doesn't accept literal 0.0.0.0).
+// drbdAddrAny is the placeholder address we put into the .res file
+// when no NetInterface pins the peer's IP. drbd-9 silently drops the
+// connection on `0.0.0.0`, so the satellite reconciler retries until
+// an IP arrives.
 const drbdAddrAny = "0.0.0.0"
 
 // boolPropTrue is the canonical string-form `true` value blockstor
-// stamps on drbd_options bag keys that are flag-like (auto-primary,
-// peer.<n>.diskless, …). Pinning the literal avoids consumer-side
-// drift between `"true"`/`"True"`/`"1"`.
+// stamps on bool-typed Resource/RD props (case-insensitive on read).
 const boolPropTrue = "true"
 
 // BuildDesired translates a Resource + its same-RD peers into the
