@@ -279,7 +279,7 @@ type ResourceVolumeStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:validation:XValidation:rule="self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName>"
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.nodeName>",optionalOldSelf=true
 
 // Resource is the Schema for the resources API.
 //

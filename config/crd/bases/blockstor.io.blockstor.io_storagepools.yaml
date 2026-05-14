@@ -191,7 +191,9 @@ spec:
         type: object
         x-kubernetes-validations:
         - message: metadata.name must equal <spec.poolName>.<spec.nodeName>
-          rule: self.metadata.name == self.spec.poolName + '.' + self.spec.nodeName
+          optionalOldSelf: true
+          rule: oldSelf.hasValue() || self.metadata.name == self.spec.poolName + '.'
+            + self.spec.nodeName
     served: true
     storage: true
     subresources:

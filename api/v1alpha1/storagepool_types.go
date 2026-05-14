@@ -95,7 +95,7 @@ type StoragePoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:validation:XValidation:rule="self.metadata.name == self.spec.poolName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.poolName>.<spec.nodeName>"
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name == self.spec.poolName + '.' + self.spec.nodeName",message="metadata.name must equal <spec.poolName>.<spec.nodeName>",optionalOldSelf=true
 
 // StoragePool is the Schema for the storagepools API.
 //
