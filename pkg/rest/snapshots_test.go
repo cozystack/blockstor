@@ -1072,3 +1072,328 @@ func TestSnapshotListEmptyResourceDoesntPanic(t *testing.T) {
 		}
 	}
 }
+
+// TestSnapshotCreateFansOutToAllDiskfulReplicas pins scenario 8.W01
+// (cross-listed with wave1 4.12): `snapshot create <rd> <snap>` —
+// DRBD-coordinated, consistent point-in-time on EVERY diskful
+// replica of the RD. The wire contract: a POST to
+// `/v1/resource-definitions/{rd}/snapshots` with an OMITTED `nodes`
+// field MUST default to the union of the RD's diskful replica
+// nodes — never an empty list (would silently produce a
+// zero-replica snapshot, no satellite would ever pick it up),
+// never including DISKLESS witness peers (their backing pool is
+// `DfltDisklessStorPool`, no on-disk bytes to snapshot).
+//
+// Without auto-fan-out, the operator-facing `linstor s c <rd>
+// <snap>` (which forwards an empty Nodes list) would behave
+// differently from upstream LINSTOR's "snapshot all diskful peers"
+// semantic, and CSI snapshot lifecycle would lose its
+// DRBD-coordination guarantee — different replicas would commit
+// the snapshot at different in-flight write checkpoints.
+func TestSnapshotCreateFansOutToAllDiskfulReplicas(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Three replicas: n1 + n2 diskful, n3 diskless witness. The
+	// fan-out must include n1 + n2 only.
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-1", NodeName: "n1"},
+		{Name: "pvc-1", NodeName: "n2"},
+		{Name: "pvc-1", NodeName: "n3", Flags: []string{apiv1.ResourceFlagDiskless}},
+	} {
+		if err := st.Resources().Create(ctx, &r); err != nil {
+			t.Fatalf("seed resource %s: %v", r.NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Payload omits the `nodes` field entirely (matches the
+	// upstream `linstor snapshot create <rd> <snap>` invocation,
+	// which leaves the per-node list empty and lets the
+	// controller derive "every diskful peer").
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Snapshots().Get(ctx, "pvc-1", "snap-1")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	// Spec.Nodes MUST resolve to the exact diskful set.
+	wantNodes := map[string]bool{"n1": true, "n2": true}
+
+	if len(got.Nodes) != 2 {
+		t.Fatalf("Nodes: got %v (len=%d), want exactly [n1 n2]", got.Nodes, len(got.Nodes))
+	}
+
+	for _, n := range got.Nodes {
+		if !wantNodes[n] {
+			t.Errorf("Nodes: unexpected entry %q (witness leak?)", n)
+		}
+
+		delete(wantNodes, n)
+	}
+
+	for n := range wantNodes {
+		t.Errorf("Nodes: missing diskful peer %q", n)
+	}
+
+	// The per-node materialisation must mirror the diskful set —
+	// linstor-csi's CreateSnapshot poll loop hard-fails with
+	// "missing snapshots" if `snapshots[]` is empty or sparse.
+	if len(got.Snapshots) != 2 {
+		t.Fatalf("Snapshots[]: got %d entries, want 2 (one per diskful peer); got=%+v",
+			len(got.Snapshots), got.Snapshots)
+	}
+
+	seen := make(map[string]bool, 2)
+	for _, sn := range got.Snapshots {
+		seen[sn.NodeName] = true
+
+		if sn.SnapshotName != "snap-1" {
+			t.Errorf("SnapshotPerNode[%s].SnapshotName: got %q, want snap-1",
+				sn.NodeName, sn.SnapshotName)
+		}
+	}
+
+	if !seen["n1"] || !seen["n2"] {
+		t.Errorf("Snapshots[]: did not cover {n1,n2}; got %v", seen)
+	}
+
+	if seen["n3"] {
+		t.Errorf("Snapshots[]: witness n3 included in per-node materialisation: %+v", got.Snapshots)
+	}
+}
+
+// TestSnapshotCreateAllDisklessRDLeavesNodesEmpty pins the
+// degenerate-fan-out edge: an RD whose ONLY replicas are diskless
+// (no diskful peers — e.g. a witness-only intermediate state during
+// a node migration) MUST return an empty `Nodes` list rather than
+// silently picking witness peers. The satellite reconciler's
+// node-membership predicate then fires on nobody, the Snapshot CRD
+// stays in "Incomplete" state, and the operator can correct the
+// preconditions (add a diskful peer, retry).
+//
+// The alternative — silently include diskless peers — would have
+// the satellite issue `lvcreate -s` / `zfs snapshot` against
+// `DfltDisklessStorPool`, which has no backing volume. That
+// surfaces as a terminal `lvremove: command not found` style
+// failure stamped on Status.Flags=FAILED, with no path to
+// recovery without snapshot delete+recreate.
+func TestSnapshotCreateAllDisklessRDLeavesNodesEmpty(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-2"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// One witness-only replica — the degenerate state above.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-2", NodeName: "n3", Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-degenerate"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-2/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Snapshots().Get(ctx, "pvc-2", "snap-degenerate")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	if len(got.Nodes) != 0 {
+		t.Errorf("Nodes: got %v, want empty (witness-only RD must NOT fan out)", got.Nodes)
+	}
+
+	// No per-node materialisation either — the wire surface stays
+	// "Incomplete" until the operator adds a diskful peer.
+	if len(got.Snapshots) != 0 {
+		t.Errorf("Snapshots[]: got %d entries, want 0 (no diskful peers); got=%+v",
+			len(got.Snapshots), got.Snapshots)
+	}
+}
+
+// TestSnapshotCreateRespectsCallerNodesList pins the explicit-pin
+// path: a POST that DOES carry a `nodes` array bypasses the
+// auto-fan-out path and uses the caller's list verbatim. Used by
+// the `linstor snapshot create <rd> <snap> --node n1 --node n2`
+// CLI form when the operator wants a partial snapshot (e.g. avoid
+// a flaky peer mid-recovery). Must NOT silently widen to "all
+// diskful" — the operator opted out of the default.
+func TestSnapshotCreateRespectsCallerNodesList(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-3"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Three diskful peers; the caller asks for only one of them.
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-3", NodeName: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-pin", Nodes: []string{"n2"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-3/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Snapshots().Get(ctx, "pvc-3", "snap-pin")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	if len(got.Nodes) != 1 || got.Nodes[0] != "n2" {
+		t.Errorf("Nodes: got %v, want [n2] verbatim (no widening)", got.Nodes)
+	}
+
+	if len(got.Snapshots) != 1 || got.Snapshots[0].NodeName != "n2" {
+		t.Errorf("Snapshots[]: got %+v, want one entry on n2", got.Snapshots)
+	}
+}
+
+// TestSnapshotViewSurfacesSatelliteReadyStatus pins the
+// satellite-feedback half of scenario 8.W01: once each satellite
+// has run its backend snapshot (`zfs snapshot`, `lvcreate -s`,
+// XFS/btrfs reflink) and stamped its `Status.NodeStatus[i]` entry
+// with Ready=true + CreateTimestamp, the REST view MUST surface
+// one `Snapshots[]` entry per satellite-reported row, carrying the
+// CreateTimestamp from the satellite's stamp — NOT the
+// synthesised "best-effort from Spec.Nodes" fallback.
+//
+// The Ready=true flip from the satellite is the wire-visible
+// "Successful" signal the scenario lists. linstor-csi's
+// CreateSnapshot poll loop reads `snapshots[*].create_timestamp`
+// non-zero as the success-completion signal. A regression that
+// dropped Status.NodeStatus on the view path would leave the CSI
+// driver polling forever after the satellite had actually
+// completed.
+//
+// CRD-backed store (not in-memory) because Status.NodeStatus is a
+// CRD-only field — the in-memory store doesn't model the Status
+// subresource.
+func TestSnapshotViewSurfacesSatelliteReadyStatus(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("blockstor: %v", err)
+	}
+
+	// Seed a Snapshot whose Status mirrors what the satellite
+	// reconciler stamps after a successful CreateSnapshot:
+	// per-node CreateTimestamp + Ready=true.
+	crd := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.snap-1"},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1", "n2"},
+		},
+		Status: blockstoriov1alpha1.SnapshotStatus{
+			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
+				{NodeName: "n1", CreateTimestamp: 1714000000, Ready: true},
+				{NodeName: "n2", CreateTimestamp: 1714000050, Ready: true},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(crd).
+		WithStatusSubresource(crd).
+		Build()
+
+	st := k8sstore.New(cli)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1; %+v", len(got), got)
+	}
+
+	if len(got[0].Snapshots) != 2 {
+		t.Fatalf("Snapshots[]: got %d, want 2; %+v", len(got[0].Snapshots), got[0].Snapshots)
+	}
+
+	want := map[string]int64{"n1": 1714000000, "n2": 1714000050}
+
+	for _, sn := range got[0].Snapshots {
+		if sn.CreateTimestamp == 0 {
+			t.Errorf("Snapshots[%s].CreateTimestamp: zero — looks like the synthesised "+
+				"Spec.Nodes fallback, not the satellite-reported Status.NodeStatus row",
+				sn.NodeName)
+		}
+
+		if sn.CreateTimestamp != want[sn.NodeName] {
+			t.Errorf("Snapshots[%s].CreateTimestamp: got %d, want %d",
+				sn.NodeName, sn.CreateTimestamp, want[sn.NodeName])
+		}
+
+		// FAILED must NOT be on a Ready=true row — defensive
+		// guard against a future flag-leak regression that would
+		// have linstor-csi see "Failed" on a successful snapshot.
+		if slices.Contains(sn.Flags, "FAILED") {
+			t.Errorf("Snapshots[%s].Flags: leaked FAILED on a Ready=true row: %v",
+				sn.NodeName, sn.Flags)
+		}
+	}
+
+	// Top-level Flags must NOT contain FAILED either — the
+	// SnapshotDefinition-level state is also "Successful" here.
+	if slices.Contains(got[0].Flags, "FAILED") {
+		t.Errorf("Flags: leaked FAILED on a Successful snapshot: %v", got[0].Flags)
+	}
+}
