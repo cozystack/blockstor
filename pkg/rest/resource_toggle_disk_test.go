@@ -750,6 +750,122 @@ func TestToggleDiskCancelQuerySetsSpecField(t *testing.T) {
 	}
 }
 
+// TestToggleDiskCancelStuckAddDiskScenario4W24 pins scenario 4.W24
+// (wave2-04 lifecycle, cross-listed with wave1 4.11 + Bug 40): when an
+// `r td <node> <rd> --storage-pool <pool>` add-disk operation has gone
+// stuck (broken pool, peer disconnect, drbdadm hangs in SyncTarget,
+// etc.), the operator calls `linstor r td <node> <rd> --cancel` which
+// the python-linstor client POSTs as `?cancel=true` against the same
+// toggle-disk endpoint. The REST shim MUST:
+//
+//  1. Set Spec.ToggleDiskCancel=true on the half-attached Resource so
+//     the satellite reconciler's handleToggleDiskCancel path runs the
+//     unwind (DeleteResource → drbdadm down + storage Delete →
+//     re-stamp DISKLESS) on the next pass.
+//  2. NOT flip the DISKLESS flag itself. The satellite owns that flip
+//     — it must run only after drbdadm + storage cleanup completes so
+//     external observers (`linstor r l`) never see DISKLESS reappear
+//     while the kernel still has a half-attached backing device.
+//  3. Preserve Props["StorPoolName"] across the cancel write. The
+//     operator may want to retry the add-disk later with the same pool,
+//     and erasing it here would force them to re-pass `--storage-pool`
+//     on the retry. (Upstream UG9 §"Recovering stuck resources" notes
+//     the root cause must be fixed first; retry only succeeds once the
+//     backend is healthy again.)
+//  4. Be idempotent: a repeated cancel (operator runs `r td --cancel`
+//     twice while waiting for the unwind to drain) returns 200 each
+//     time and leaves Spec.ToggleDiskCancel=true. The reconciler clears
+//     the flag itself once unwind completes; until then, repeated
+//     cancels are harmless re-writes.
+//
+// Mirrors wave1 4.11 E2E (broken pool → stuck → `--diskless` cancels
+// cleanly, no orphan ZVOL); the REST-level invariant tested here is
+// the spec-write contract the satellite reconciler depends on.
+func TestToggleDiskCancelStuckAddDiskScenario4W24(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-4w24"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Stuck mid-conversion: DISKLESS already cleared by an earlier
+	// `r td --storage-pool pool_ssd`, StorPoolName stamped, but the
+	// satellite-side carve / drbdadm adjust never finished (pool
+	// degraded, peer flapped, etc.).
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-4w24",
+		NodeName: "worker-2",
+		Props:    map[string]string{"StorPoolName": "pool_ssd"},
+		// No DISKLESS flag — mid-conversion to diskful.
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// First cancel: stamps the intent, leaves flags + pool untouched.
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-4w24/resources/worker-2/toggle-disk?cancel=true", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("first cancel: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-4w24", "worker-2")
+	if err != nil {
+		t.Fatalf("Get after first cancel: %v", err)
+	}
+
+	// (1) cancel intent stamped.
+	if !got.ToggleDiskCancel {
+		t.Errorf("ToggleDiskCancel false after first cancel: %+v", got)
+	}
+
+	// (2) REST must not flip DISKLESS — that's the satellite's job
+	// after the unwind. A pre-emptive flip would lie to `linstor r l`
+	// while the kernel still holds the half-attached backing device.
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("cancel handler flipped DISKLESS pre-emptively: %v", got.Flags)
+	}
+
+	// (3) Historical pool preserved so a retry doesn't need
+	// `--storage-pool` re-passed.
+	if got.Props["StorPoolName"] != "pool_ssd" {
+		t.Errorf("StorPoolName erased on cancel: got %q, want pool_ssd",
+			got.Props["StorPoolName"])
+	}
+
+	// (4) Idempotency: re-issuing the same cancel while the
+	// reconciler is still draining the unwind returns 200 and leaves
+	// the spec untouched. Mirrors UG9's "re-issuing same command
+	// retries" semantics for the cancel verb (the cancel is the
+	// "command" being retried until the satellite clears the flag).
+	resp2 := httpPut(t, base+"/v1/resource-definitions/pvc-4w24/resources/worker-2/toggle-disk?cancel=true", nil)
+	_ = resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("second cancel: got %d, want 200", resp2.StatusCode)
+	}
+
+	got2, err := st.Resources().Get(t.Context(), "pvc-4w24", "worker-2")
+	if err != nil {
+		t.Fatalf("Get after second cancel: %v", err)
+	}
+
+	if !got2.ToggleDiskCancel {
+		t.Errorf("ToggleDiskCancel cleared by second cancel: %+v", got2)
+	}
+
+	if slices.Contains(got2.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flipped by second cancel: %v", got2.Flags)
+	}
+
+	if got2.Props["StorPoolName"] != "pool_ssd" {
+		t.Errorf("StorPoolName erased by second cancel: got %q, want pool_ssd",
+			got2.Props["StorPoolName"])
+	}
+}
+
 // TestMigrateDiskUnknownRD: missing ResourceDefinition surfaces as
 // 404, not as a follow-on 500 from a later lookup.
 func TestMigrateDiskUnknownRD(t *testing.T) {

@@ -2711,6 +2711,141 @@ func TestApplyRendersExternalMetaDiskPath(t *testing.T) {
 	}
 }
 
+// TestApplyRoutesMetaToSeparatePoolScenario5W05 pins scenario 5.W05
+// (wave2-05 external metadata pool, cross-listed with wave1 6.18): the
+// `StorPoolNameDrbdMeta=<otherpool>` Resource-level prop must make the
+// satellite emit the meta-disk on a pool DIFFERENT from the data pool.
+// This is the load-bearing invariant of W05 — without it, the prop
+// would still resolve to "internal" or to the same pool as data,
+// negating the I/O-isolation purpose UG9 §"Using external DRBD
+// metadata" calls out (small random meta-disk writes shouldn't share
+// the data pool's spindle/SSD wear pattern).
+//
+// The dispatcher already resolves the prop into DesiredVolume.MetaPool
+// (see TestExternalMetadataRouting in pkg/dispatcher); this test pins
+// the satellite-side rendering: given a DesiredResource where
+// StoragePool=<data> and MetaPool=<meta>, the .res file MUST carry
+//
+//   - `disk /dev/<data-pool>/<rd>_<vol5digits>;` and
+//   - `meta-disk /dev/<meta-pool>/<rd>_<vol5digits>_meta;`
+//
+// against the local diskful host, with `<data-pool> != <meta-pool>`.
+// Peer hosts keep `meta-disk internal;` (DRBD never reads peer-side
+// metadata; pinning a path here would couple every peer .res to this
+// satellite's local layout).
+func TestApplyRoutesMetaToSeparatePoolScenario5W05(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Only the data pool is queried for existing LVs; the meta carve
+	// is the open follow-up (see TestApplyProvisionsBothDataAndMeta).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name data-vg/pvc-5w05-0_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	data := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "data-vg", ThinPool: "data-tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"data-thin": data},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	const (
+		dataPool = "data-thin"
+		metaPool = "nvme-meta"
+	)
+
+	if dataPool == metaPool {
+		t.Fatalf("test setup: data and meta pools must differ to exercise 5.W05")
+	}
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-5w05-0",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{
+					VolumeNumber: 0,
+					SizeKib:      1024 * 1024,
+					// The dispatcher would have routed these via the
+					// `StorPoolName=data-thin` data-pool selection +
+					// `StorPoolNameDrbdMeta=nvme-meta` Resource-level
+					// prop (most-specific scope wins — see
+					// dispatcher.resolveMetaPool, exercised by
+					// TestExternalMetadataRouting `resource-overrides-rd`).
+					StoragePool: dataPool,
+					MetaPool:    metaPool,
+				},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-5w05-0.res"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got := string(body)
+
+	// Local diskful host: data path on the data pool, meta path on
+	// the meta pool. Two different `/dev/<pool>/...` prefixes — the
+	// W05 invariant.
+	wantData := "disk /dev/data-thin/pvc-5w05-0_00000;"
+	if !strings.Contains(got, wantData) {
+		t.Errorf("missing data line %q in:\n%s", wantData, got)
+	}
+
+	wantMeta := "meta-disk /dev/nvme-meta/pvc-5w05-0_00000_meta;"
+	if !strings.Contains(got, wantMeta) {
+		t.Errorf("missing meta line %q in:\n%s", wantMeta, got)
+	}
+
+	// Anti-regression: the meta line MUST NOT collide with the data
+	// pool path. A prior dispatcher bug (effectiveProps strip-through)
+	// could quietly fall back to data-pool routing; this check pins
+	// the separation.
+	collision := "meta-disk /dev/data-thin/"
+	if strings.Contains(got, collision) {
+		t.Errorf("meta-disk landed on data pool (%q); W05 isolation broken:\n%s",
+			collision, got)
+	}
+
+	// Peer host n2 keeps `meta-disk internal;` — DRBD never reads
+	// peer-side meta-disk, and pinning a path here would couple every
+	// peer .res to this satellite's local pool naming.
+	if !strings.Contains(got, "on n2 {") {
+		t.Fatalf("missing peer block in:\n%s", got)
+	}
+
+	internal := strings.Count(got, "meta-disk internal;")
+	if internal != 1 {
+		t.Errorf("want exactly 1 'meta-disk internal;' (peer only); got %d in:\n%s",
+			internal, got)
+	}
+
+	// Exactly one external meta-disk line — the local diskful host's.
+	// More would indicate the renderer mistakenly stamped the path on
+	// peers; fewer would mean the dispatcher's MetaPool stamp got
+	// dropped on the floor.
+	external := strings.Count(got, "meta-disk /dev/nvme-meta/")
+	if external != 1 {
+		t.Errorf("want exactly 1 external 'meta-disk /dev/nvme-meta/' line; got %d in:\n%s",
+			external, got)
+	}
+}
+
 // TestApplyProvisionsBothDataAndMeta: scenario 6.18 satellite-side
 // follow-up. When DesiredVolume.MetaPool is set the reconciler must
 // carve TWO backing volumes — `<rd>_<vol5digits>` on the data pool
