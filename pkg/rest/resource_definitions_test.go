@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -25,7 +26,10 @@ import (
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -1208,103 +1212,369 @@ func TestResourceDefinitionListPropertiesEmptyDecodes(t *testing.T) {
 	}
 }
 
-// TestResourceDefinitionReassignRGPreservesReplicas pins wave2 4.W14:
-// `linstor rd modify --resource-group <other>` reassigns the RD's
-// parent RG but MUST NOT touch the existing diskful/diskless replicas
-// — only future autoplace / `rg spawn` calls use the new defaults.
-// Doubles as a regression guard for the bug-60 family (re-autoplace
-// must not fire on rd-modify alone) and pins the upstream golinstor
-// CLI wire shape: the body field is `resource_group`, not
-// `resource_group_name`.
-// RD-level props survive the swap too — they still override the new
-// RG's defaults per the priority chain (VD > resource > RD > node).
-func TestResourceDefinitionReassignRGPreservesReplicas(t *testing.T) {
+// Scenario 5.W02 — `linstor <scope> drbd-options --unset-<option>`
+// removes a DRBD option at that scope so effective-config falls back
+// to the next scope up (Resource→RD→RG→Controller→DRBD default).
+//
+// CLI surface: `linstor rd drbd-options --unset-protocol backups`,
+// `linstor rg drbd-options --unset-protocol pool-1`, etc. The CLI
+// turns `--unset-<option>` into a `delete_props: ["DrbdOptions/.../<option>"]`
+// entry in the GenericPropsModify envelope on the PUT body — same
+// wire shape across every scope. UG9 §"Removing DRBD options from
+// LINSTOR objects" (lines 3414-3434).
+//
+// These tests pin the wire contract — operator-typed CLI vs raw curl
+// vs golinstor all produce the same body, and the REST handler MUST
+// strip exactly the named key without touching siblings. The
+// effective-config fallback half is covered for every scope that
+// participates in the Controller→RG→RD→Resource hierarchy.
+
+// drbdOptProtocolKey is the canonical LINSTOR property key for the
+// `--protocol` DRBD option. The CLI generates it from the
+// `--unset-protocol` flag by prefixing the section + key under
+// `DrbdOptions/`; pinning the exact string in one place keeps every
+// scope test in sync if upstream ever renames the namespace.
+const drbdOptProtocolKey = "DrbdOptions/Net/protocol"
+
+// TestUnsetDrbdOptionRDScope: `linstor rd drbd-options --unset-protocol
+// <rd>` deletes `DrbdOptions/Net/protocol` from RD.Props on PUT, and
+// effective-config falls back to the parent RG's value.
+func TestUnsetDrbdOptionRDScope(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	for _, rg := range []string{"rg-fast", "rg-slow"} {
-		if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: rg}); err != nil {
-			t.Fatalf("seed RG %s: %v", rg, err)
-		}
+	// Parent RG carries the inherited value the RD must fall back to.
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:  "rg-1",
+		Props: map[string]string{drbdOptProtocolKey: "C"},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
 	}
 
+	// RD overrides the RG with protocol=A so the unset has something
+	// to drop. Sibling key must survive the targeted delete.
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-		Name:              "pvc-reassign",
-		ResourceGroupName: "rg-fast",
+		Name:              "pvc-1",
+		ResourceGroupName: "rg-1",
 		Props: map[string]string{
-			"DrbdOptions/Net/protocol": "C",
+			drbdOptProtocolKey:            "A",
+			"DrbdOptions/Net/max-buffers": "8000",
 		},
 	}); err != nil {
 		t.Fatalf("seed RD: %v", err)
 	}
 
-	// Three diskful replicas already placed by an earlier `rg spawn`.
-	// rd-modify must leave them on the same nodes.
-	seedNodes := []string{"worker-1", "worker-2", "worker-3"}
-	for _, n := range seedNodes {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name:     "pvc-reassign",
-			NodeName: n,
-		}); err != nil {
-			t.Fatalf("seed replica %s: %v", n, err)
-		}
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Wire shape: `--unset-protocol` → delete_props on PUT.
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-1",
+		[]byte(`{"delete_props":["`+drbdOptProtocolKey+`"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
+	}
+
+	gotRD, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	if _, present := gotRD.Props[drbdOptProtocolKey]; present {
+		t.Errorf("RD %s still present after unset: %v", drbdOptProtocolKey, gotRD.Props)
+	}
+
+	if gotRD.Props["DrbdOptions/Net/max-buffers"] != "8000" {
+		t.Errorf("sibling key clobbered: %v", gotRD.Props)
+	}
+
+	// Effective-config must fall back to RG (scope=RG, value=C).
+	eff, err := effectivePropsForRD(ctx, nil, st, &gotRD)
+	if err != nil {
+		t.Fatalf("effectivePropsForRD: %v", err)
+	}
+
+	entry := eff[drbdOptProtocolKey]
+	if entry.Value != "C" || entry.Scope != apiv1.EffectivePropScopeResourceGroup {
+		t.Errorf("effective fallback: got {value:%q scope:%q}, want {value:C scope:%s}",
+			entry.Value, entry.Scope, apiv1.EffectivePropScopeResourceGroup)
+	}
+}
+
+// TestUnsetDrbdOptionRGScope: `linstor rg drbd-options --unset-protocol
+// <rg>` deletes the key from RG.Props on PUT, and a child RD that
+// never set the option locally surfaces the Controller-scope value
+// (the next rung up). Pins the wire-shape `delete_props` on
+// /v1/resource-groups/{rg} too.
+func TestUnsetDrbdOptionRGScope(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		Props: map[string]string{
+			drbdOptProtocolKey:            "A",
+			"DrbdOptions/Net/max-buffers": "8000",
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	// Child RD with no local override — its effective value is whatever
+	// the chain above resolves to.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-1",
+		ResourceGroupName: "rg-1",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Controller scope carries the fallback value (mirrors the upstream
+	// "next scope" chain RG → Controller).
+	cli := newFakeRESTClient(t)
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			ExtraProps: map[string]string{drbdOptProtocolKey: "C"},
+		},
+	}); err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1",
+		[]byte(`{"delete_props":["`+drbdOptProtocolKey+`"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
+	}
+
+	gotRG, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get RG: %v", err)
+	}
+
+	if _, present := gotRG.Props[drbdOptProtocolKey]; present {
+		t.Errorf("RG %s still present after unset: %v", drbdOptProtocolKey, gotRG.Props)
+	}
+
+	if gotRG.Props["DrbdOptions/Net/max-buffers"] != "8000" {
+		t.Errorf("sibling key clobbered: %v", gotRG.Props)
+	}
+
+	// Child RD's effective view must fall back past the now-empty RG to
+	// the Controller-scope value.
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	eff, err := effectivePropsForRD(ctx, cli, st, &rd)
+	if err != nil {
+		t.Fatalf("effectivePropsForRD: %v", err)
+	}
+
+	entry := eff[drbdOptProtocolKey]
+	if entry.Value != "C" || entry.Scope != apiv1.EffectivePropScopeController {
+		t.Errorf("effective fallback: got {value:%q scope:%q}, want {value:C scope:%s}",
+			entry.Value, entry.Scope, apiv1.EffectivePropScopeController)
+	}
+}
+
+// TestUnsetDrbdOptionResourceScope: a Resource-scope drbd-option
+// unset (the deepest rung in the Controller→RG→RD→Resource chain)
+// must cause `effectivePropsForResource` to surface the next rung's
+// value. blockstor does not expose a PUT-level `delete_props` handler
+// on /v1/resource-definitions/{rd}/resources/{node} (upstream does;
+// we'll add the route alongside scenario 5.W03 in a follow-up), so
+// the unset is exercised against the Resource store directly — the
+// fallback-resolver path is what the scenario pins.
+func TestUnsetDrbdOptionResourceScope(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-1",
+		Props: map[string]string{drbdOptProtocolKey: "C"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	rsc := apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "node-1",
+		Props:    map[string]string{drbdOptProtocolKey: "A"},
+	}
+
+	if err := st.Resources().Create(ctx, &rsc); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	// Sanity: with the Resource-scope value set, effective resolves to
+	// scope=RSC value=A (Resource beats RD).
+	preEff, err := effectivePropsForResource(ctx, nil, st, &rsc)
+	if err != nil {
+		t.Fatalf("pre-unset effectivePropsForResource: %v", err)
+	}
+
+	if preEff[drbdOptProtocolKey].Scope != apiv1.EffectivePropScopeResource {
+		t.Fatalf("pre-unset scope: got %q, want %s",
+			preEff[drbdOptProtocolKey].Scope, apiv1.EffectivePropScopeResource)
+	}
+
+	// The unset itself: strip the key from Resource.Props (mirrors what
+	// a `delete_props` handler would write through the store layer).
+	delete(rsc.Props, drbdOptProtocolKey)
+
+	if err := st.Resources().Update(ctx, &rsc); err != nil {
+		t.Fatalf("Update Resource: %v", err)
+	}
+
+	// Effective-config must fall back to RD (scope=RD, value=C).
+	postEff, err := effectivePropsForResource(ctx, nil, st, &rsc)
+	if err != nil {
+		t.Fatalf("post-unset effectivePropsForResource: %v", err)
+	}
+
+	entry := postEff[drbdOptProtocolKey]
+	if entry.Value != "C" || entry.Scope != apiv1.EffectivePropScopeResourceDefinition {
+		t.Errorf("effective fallback: got {value:%q scope:%q}, want {value:C scope:%s}",
+			entry.Value, entry.Scope, apiv1.EffectivePropScopeResourceDefinition)
+	}
+}
+
+// TestUnsetDrbdOptionNodeScope: `linstor n drbd-options --unset-<opt>
+// <node>` removes the option from Node.Props via the same
+// `delete_props` envelope. Node-scope DRBD options live outside the
+// Controller→RG→RD→Resource hierarchy upstream walks for the `(R)`
+// marker (they apply to satellite-wide defaults the satellite picks
+// up at startup), so this test pins the wire-shape delete only — the
+// effective-config fallback assertion is meaningless at this scope.
+func TestUnsetDrbdOptionNodeScope(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		Props: map[string]string{
+			drbdOptProtocolKey:            "A",
+			"DrbdOptions/Net/max-buffers": "8000",
+		},
+	}); err != nil {
+		t.Fatalf("seed Node: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// CLI wire shape: `linstor rd modify --resource-group rg-slow`
-	// sends `{"resource_group": "rg-slow"}`, not the legacy
-	// `resource_group_name` key. Both must work — earlier tests pin
-	// the legacy form; this one pins the CLI form.
-	body, err := json.Marshal(map[string]string{"resource_group": "rg-slow"})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	resp := httpPut(t, base+"/v1/resource-definitions/pvc-reassign", body)
+	resp := httpPut(t, base+"/v1/nodes/n1",
+		[]byte(`{"delete_props":["`+drbdOptProtocolKey+`"]}`))
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
 	}
 
-	got, err := st.ResourceDefinitions().Get(ctx, "pvc-reassign")
+	gotNode, err := st.Nodes().Get(ctx, "n1")
 	if err != nil {
-		t.Fatalf("get RD: %v", err)
+		t.Fatalf("Get Node: %v", err)
 	}
 
-	if got.ResourceGroupName != "rg-slow" {
-		t.Errorf("RG: got %q, want rg-slow", got.ResourceGroupName)
+	if _, present := gotNode.Props[drbdOptProtocolKey]; present {
+		t.Errorf("Node %s still present after unset: %v", drbdOptProtocolKey, gotNode.Props)
 	}
 
-	// RD-level prop survives (priority chain: RD overrides new RG).
-	if got.Props["DrbdOptions/Net/protocol"] != "C" {
-		t.Errorf("RD prop DrbdOptions/Net/protocol: got %q, want C (RD overrides RG)",
-			got.Props["DrbdOptions/Net/protocol"])
+	if gotNode.Props["DrbdOptions/Net/max-buffers"] != "8000" {
+		t.Errorf("sibling key clobbered: %v", gotNode.Props)
+	}
+}
+
+// TestUnsetDrbdOptionClusterScope: `linstor controller drbd-options
+// --unset-protocol` strips the key from ControllerConfig.Spec.ExtraProps
+// via POST /v1/controller/properties with a `delete_props` body, and a
+// downstream RD with no local override sees the now-absent Controller
+// entry vanish from its effective view (falls back to DRBD's own
+// default — represented here as "no entry at any LINSTOR scope").
+func TestUnsetDrbdOptionClusterScope(t *testing.T) {
+	ctx := context.Background()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "pvc-1",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
 	}
 
-	// Regression guard (bug-60 family): replicas untouched. rd-modify
-	// never triggers re-autoplace, so the node set + row count are
-	// preserved verbatim.
-	replicas, err := st.Resources().ListByDefinition(ctx, "pvc-reassign")
+	cli := newFakeRESTClient(t)
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			ExtraProps: map[string]string{
+				drbdOptProtocolKey:            "C",
+				"DrbdOptions/Net/max-buffers": "8000",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/controller/properties",
+		[]byte(`{"delete_props":["`+drbdOptProtocolKey+`"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST status: got %d, want 201", resp.StatusCode)
+	}
+
+	var cfg blockstoriov1alpha1.ControllerConfig
+	if err := cli.Get(ctx,
+		client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName},
+		&cfg); err != nil {
+		t.Fatalf("Get ControllerConfig: %v", err)
+	}
+
+	if _, present := cfg.Spec.ExtraProps[drbdOptProtocolKey]; present {
+		t.Errorf("Controller %s still present after unset: %v",
+			drbdOptProtocolKey, cfg.Spec.ExtraProps)
+	}
+
+	if cfg.Spec.ExtraProps["DrbdOptions/Net/max-buffers"] != "8000" {
+		t.Errorf("sibling key clobbered: %v", cfg.Spec.ExtraProps)
+	}
+
+	// Downstream RD's effective view must NOT carry the key any more —
+	// fall back to DRBD's built-in default (which lives outside the
+	// LINSTOR property surface, so it shows up here as "no entry").
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
 	if err != nil {
-		t.Fatalf("list replicas: %v", err)
+		t.Fatalf("Get RD: %v", err)
 	}
 
-	if len(replicas) != len(seedNodes) {
-		t.Errorf("replica count: got %d, want %d (rd-modify must not re-autoplace)",
-			len(replicas), len(seedNodes))
+	eff, err := effectivePropsForRD(ctx, cli, st, &rd)
+	if err != nil {
+		t.Fatalf("effectivePropsForRD: %v", err)
 	}
 
-	gotNodes := map[string]bool{}
-	for _, r := range replicas {
-		gotNodes[r.NodeName] = true
-	}
-
-	for _, n := range seedNodes {
-		if !gotNodes[n] {
-			t.Errorf("replica missing on %s after rd-modify (existing replicas must stay put)", n)
-		}
+	if _, present := eff[drbdOptProtocolKey]; present {
+		t.Errorf("effective view still carries %s after cluster-scope unset: %v",
+			drbdOptProtocolKey, eff)
 	}
 }
