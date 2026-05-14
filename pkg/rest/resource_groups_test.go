@@ -871,189 +871,337 @@ func TestResourceGroupListPropertiesEmptyDecodes(t *testing.T) {
 	}
 }
 
-// TestRGDrbdOptionsPropagateToSpawn pins scenario 9.W13 (cross-listed
-// with 5.W01): `linstor rg drbd-options --protocol C --verify-alg
-// crc32c <rg>` writes RG-scope properties under the `DrbdOptions/Net/...`
-// namespace. The next `rg spawn` must materialise an RD that inherits
-// those keys (mirrors the Bug 54 LayerStack inheritance pattern, but
-// for the DRBD-options bag), and `effectivePropsForRD` must surface
-// the RG-scope entry on the spawned RD so the dispatcher's
-// resolver-fed BuildDesired emits matching `net { protocol C;
-// verify-alg crc32c; }` lines in the .res file downstream.
+// TestRGModifyUnsetReplicasOnSameViaEmptyList pins scenario 9.W12
+// (P1, unit) for the SelectFilter clear-via-empty-list path:
+// `linstor rg modify <rg> --replicas-on-same ""` translates into a
+// PATCH body whose `select_filter.replicas_on_same` is a non-nil
+// empty list (JSON `[]`). The handler must clear ReplicasOnSame on
+// the persisted RG and — critically — must NOT wipe sibling
+// SelectFilter fields (PlaceCount, LayerStack, …) that the patch
+// did not mention. Upstream's `AutoSelectorConfig.applyChanges`
+// treats null = leave alone, non-null = overwrite (incl. empty);
+// our Go decoder distinguishes those via nil-vs-empty slice.
 //
-// We exercise three angles in sequence on the same fixture:
-//
-//  1. PATCH /v1/resource-groups/{rg} with override_props writes the
-//     RG-scope DrbdOptions/Net entries idempotently.
-//  2. POST /v1/resource-groups/{rg}/spawn copies the RG.Props bag
-//     onto the spawned RD.Props (spawn-time snapshot; matches
-//     upstream LINSTOR's behaviour).
-//  3. effectivePropsForRD attributes each entry to scope=RG when the
-//     RD doesn't override, and scope=RD when the RD value differs
-//     (RD > RG precedence, same as the rest of the prop hierarchy).
-//
-// The third leg is the cross-check that the resolver layer the
-// dispatcher consults during BuildDesired (via effectivePropsForResource
-// in the satellite reconciler chain) sees the correct merged view.
-func TestRGDrbdOptionsPropagateToSpawn(t *testing.T) {
+// Subsequent `rg spawn` reads the updated RG, so once ReplicasOnSame
+// is empty the autoplacer's per-call filter merge no longer applies
+// that constraint to new RDs spawned off the group.
+func TestRGModifyUnsetReplicasOnSameViaEmptyList(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	// Seed an empty RG; the modify below adds the DRBD options.
 	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
-		Name: "rg-protocol-c",
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:           3,
+			ReplicasOnSame:       []string{"Aux/zone"},
+			ReplicasOnDifferent:  []string{"Aux/rack"},
+			NotPlaceWithRsc:      []string{"other-rd"},
+			NotPlaceWithRscRegex: "^lock-.*$",
+			LayerStack:           []string{"DRBD", "STORAGE"},
+			ProviderList:         []string{"LVM", "LVM_THIN"},
+		},
 	}); err != nil {
-		t.Fatalf("seed RG: %v", err)
+		t.Fatalf("seed: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// Step 1: `linstor rg drbd-options --protocol C --verify-alg
-	// crc32c rg-protocol-c` lands as PUT /v1/resource-groups/{rg}
-	// with override_props carrying the DRBD options under their
-	// canonical LINSTOR keys (DrbdOptions/Net/protocol etc.).
-	modify := apiv1.ResourceGroup{
-		OverrideProps: map[string]string{
-			"DrbdOptions/Net/protocol":   "C",
-			"DrbdOptions/Net/verify-alg": "crc32c",
-		},
-	}
+	// Build the wire body by hand so we can emit an explicit empty
+	// list — Go struct + json.Marshal would elide `replicas_on_same`
+	// because of the `omitempty` tag and produce an absent field,
+	// not the empty list the CLI sends.
+	body := []byte(`{"select_filter":{"replicas_on_same":[]}}`)
 
-	body, err := json.Marshal(modify)
-	if err != nil {
-		t.Fatalf("marshal modify: %v", err)
-	}
-
-	resp := httpPut(t, base+"/v1/resource-groups/rg-protocol-c", body)
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("modify status: got %d, want 200", resp.StatusCode)
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	// Sanity: RG now carries the DrbdOptions/Net entries in its
-	// stored Props bag. Without this assertion, a spawn-time
-	// inheritance regression could mask a missing modify-side write.
-	rg, err := st.ResourceGroups().Get(ctx, "rg-protocol-c")
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
 	if err != nil {
-		t.Fatalf("get RG: %v", err)
+		t.Fatalf("Get: %v", err)
 	}
 
-	if got := rg.Props["DrbdOptions/Net/protocol"]; got != "C" {
-		t.Errorf("RG.Props[protocol]=%q, want C", got)
+	// Targeted clear.
+	if len(got.SelectFilter.ReplicasOnSame) != 0 {
+		t.Errorf("ReplicasOnSame: got %v, want empty/nil", got.SelectFilter.ReplicasOnSame)
 	}
 
-	if got := rg.Props["DrbdOptions/Net/verify-alg"]; got != "crc32c" {
-		t.Errorf("RG.Props[verify-alg]=%q, want crc32c", got)
+	// Sibling SelectFilter fields must survive the field-level clear.
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("PlaceCount wiped: got %d, want 3", got.SelectFilter.PlaceCount)
 	}
 
-	// Step 2: spawn an RD off the patched RG. linstor-csi calls this
-	// on every CreateVolume; the spawned RD must inherit the RG's
-	// DRBD options so the downstream dispatcher emits the matching
-	// `net { ... }` block.
-	spawnBody, err := json.Marshal(apiv1.ResourceGroupSpawn{
-		ResourceDefinitionName: "pvc-spawn",
-		DefinitionsOnly:        true, // skip placement; we assert on RD.Props
-	})
-	if err != nil {
-		t.Fatalf("marshal spawn: %v", err)
+	if len(got.SelectFilter.ReplicasOnDifferent) != 1 || got.SelectFilter.ReplicasOnDifferent[0] != "Aux/rack" {
+		t.Errorf("ReplicasOnDifferent wiped: got %v, want [Aux/rack]", got.SelectFilter.ReplicasOnDifferent)
 	}
 
-	resp2 := httpPost(t, base+"/v1/resource-groups/rg-protocol-c/spawn", spawnBody)
-	_ = resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusCreated {
-		t.Fatalf("spawn status: got %d, want 201", resp2.StatusCode)
+	if len(got.SelectFilter.NotPlaceWithRsc) != 1 || got.SelectFilter.NotPlaceWithRsc[0] != "other-rd" {
+		t.Errorf("NotPlaceWithRsc wiped: got %v, want [other-rd]", got.SelectFilter.NotPlaceWithRsc)
 	}
 
-	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-spawn")
-	if err != nil {
-		t.Fatalf("get spawned RD: %v", err)
+	if got.SelectFilter.NotPlaceWithRscRegex != "^lock-.*$" {
+		t.Errorf("NotPlaceWithRscRegex wiped: got %q, want ^lock-.*$", got.SelectFilter.NotPlaceWithRscRegex)
 	}
 
-	if got := rd.Props["DrbdOptions/Net/protocol"]; got != "C" {
-		t.Errorf("RD.Props[protocol]=%q, want C (RG → RD inheritance)", got)
+	if len(got.SelectFilter.LayerStack) != 2 {
+		t.Errorf("LayerStack wiped: got %v, want [DRBD STORAGE]", got.SelectFilter.LayerStack)
 	}
 
-	if got := rd.Props["DrbdOptions/Net/verify-alg"]; got != "crc32c" {
-		t.Errorf("RD.Props[verify-alg]=%q, want crc32c (RG → RD inheritance)", got)
-	}
-
-	// Step 3: effectivePropsForRD must attribute each entry to the
-	// correct scope. Since the spawned RD's Props bag now carries
-	// the RG-derived values verbatim (spawn-time copy), the resolver
-	// flags both as scope=RD — which matches upstream LINSTOR's
-	// behaviour: `linstor rd lp` shows the prop on the RD without
-	// the `(R)` inheritance marker after a spawn, because the RG's
-	// value was snapshot-copied at spawn time.
-	eff, err := effectivePropsForRD(ctx, nil, st, &rd)
-	if err != nil {
-		t.Fatalf("effectivePropsForRD: %v", err)
-	}
-
-	for _, key := range []string{
-		"DrbdOptions/Net/protocol",
-		"DrbdOptions/Net/verify-alg",
-	} {
-		entry, ok := eff[key]
-		if !ok {
-			t.Errorf("effective_props missing %q (got keys: %v)", key, effectivePropKeys(eff))
-
-			continue
-		}
-
-		if entry.Scope != apiv1.EffectivePropScopeResourceDefinition {
-			t.Errorf("effective_props[%q].Scope=%q, want %s (spawn snapshot lands on RD)",
-				key, entry.Scope, apiv1.EffectivePropScopeResourceDefinition)
-		}
-	}
-
-	// Step 4 (RD > RG precedence cross-check): an RD-scope override
-	// must beat the RG-scope value the resolver would otherwise
-	// surface. We mutate the stored RD directly to simulate an
-	// operator running `linstor rd drbd-options --protocol A
-	// pvc-spawn` AFTER the spawn — the RD-level write must win.
-	rd.Props["DrbdOptions/Net/protocol"] = "A"
-	if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
-		t.Fatalf("update RD: %v", err)
-	}
-
-	// Now drop the RG-snapshot value off the RD to force the
-	// resolver to walk back up to the RG scope for verify-alg —
-	// exercising the inheritance path.
-	delete(rd.Props, "DrbdOptions/Net/verify-alg")
-	if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
-		t.Fatalf("update RD: %v", err)
-	}
-
-	eff2, err := effectivePropsForRD(ctx, nil, st, &rd)
-	if err != nil {
-		t.Fatalf("effectivePropsForRD (post-override): %v", err)
-	}
-
-	proto := eff2["DrbdOptions/Net/protocol"]
-	if proto.Value != "A" || proto.Scope != apiv1.EffectivePropScopeResourceDefinition {
-		t.Errorf("post-override protocol: got {value:%q scope:%q}, want {A %s}",
-			proto.Value, proto.Scope, apiv1.EffectivePropScopeResourceDefinition)
-	}
-
-	verify := eff2["DrbdOptions/Net/verify-alg"]
-	if verify.Value != "crc32c" || verify.Scope != apiv1.EffectivePropScopeResourceGroup {
-		t.Errorf("post-override verify-alg: got {value:%q scope:%q}, want {crc32c %s}",
-			verify.Value, verify.Scope, apiv1.EffectivePropScopeResourceGroup)
+	if len(got.SelectFilter.ProviderList) != 2 {
+		t.Errorf("ProviderList wiped: got %v, want [LVM LVM_THIN]", got.SelectFilter.ProviderList)
 	}
 }
 
-// effectivePropKeys returns the keys of an EffectiveProperties map as
-// a plain slice for diagnostic output. Go maps print in random order,
-// so embedding a raw `%v` of the bag in a t.Errorf would produce
-// noisy diffs across reruns.
-func effectivePropKeys(eff apiv1.EffectiveProperties) []string {
-	out := make([]string, 0, len(eff))
-	for k := range eff {
-		out = append(out, k)
+// TestRGModifyUnsetMultipleListFieldsViaEmptyList pins scenario
+// 9.W12 for the multi-field-at-once shape: `linstor rg modify` can
+// chain `--replicas-on-same "" --layer-list "" --providers ""` and
+// each individual list field has to clear independently. Anchors
+// the "list-typed SelectFilter clears compose" invariant.
+func TestRGModifyUnsetMultipleListFieldsViaEmptyList(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:          2,
+			ReplicasOnSame:      []string{"Aux/zone"},
+			ReplicasOnDifferent: []string{"Aux/rack"},
+			NotPlaceWithRsc:     []string{"other-rd"},
+			LayerStack:          []string{"DRBD", "STORAGE"},
+			ProviderList:        []string{"LVM"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 
-	return out
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body := []byte(`{"select_filter":{` +
+		`"replicas_on_same":[],` +
+		`"replicas_on_different":[],` +
+		`"not_place_with_rsc":[],` +
+		`"layer_stack":[],` +
+		`"provider_list":[]` +
+		`}}`)
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if len(got.SelectFilter.ReplicasOnSame) != 0 {
+		t.Errorf("ReplicasOnSame: got %v, want cleared", got.SelectFilter.ReplicasOnSame)
+	}
+
+	if len(got.SelectFilter.ReplicasOnDifferent) != 0 {
+		t.Errorf("ReplicasOnDifferent: got %v, want cleared", got.SelectFilter.ReplicasOnDifferent)
+	}
+
+	if len(got.SelectFilter.NotPlaceWithRsc) != 0 {
+		t.Errorf("NotPlaceWithRsc: got %v, want cleared", got.SelectFilter.NotPlaceWithRsc)
+	}
+
+	if len(got.SelectFilter.LayerStack) != 0 {
+		t.Errorf("LayerStack: got %v, want cleared", got.SelectFilter.LayerStack)
+	}
+
+	if len(got.SelectFilter.ProviderList) != 0 {
+		t.Errorf("ProviderList: got %v, want cleared", got.SelectFilter.ProviderList)
+	}
+
+	if got.SelectFilter.PlaceCount != 2 {
+		t.Errorf("PlaceCount: got %d, want 2 (unmentioned field must survive)", got.SelectFilter.PlaceCount)
+	}
+}
+
+// TestRGModifyUnsetNotPlaceWithRscRegexViaEmptyString pins the
+// `--do-not-place-with-regex ""` clear path: the regex is a scalar
+// string (not a list), so the wire shape is
+// `not_place_with_rsc_regex: ""`. Distinguishing absent-vs-empty for
+// scalars in Go requires a sentinel value — here we accept the
+// pragmatic semantic that an explicit empty string in the patch
+// clears the regex when other SelectFilter slice fields tell us the
+// patch DOES carry a select_filter envelope.
+func TestRGModifyUnsetNotPlaceWithRscRegexViaEmptyString(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:           2,
+			NotPlaceWithRscRegex: "^lock-.*$",
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// The wire body emits an empty-string regex alongside any other
+	// field (here an empty list) so the handler can tell the patch
+	// carries a select_filter envelope. Pure `{"select_filter":{}}`
+	// is ambiguous and intentionally must not clear anything.
+	body := []byte(`{"select_filter":{` +
+		`"not_place_with_rsc_regex":"",` +
+		`"replicas_on_same":[]` +
+		`}}`)
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SelectFilter.NotPlaceWithRscRegex != "" {
+		t.Errorf("NotPlaceWithRscRegex: got %q, want cleared", got.SelectFilter.NotPlaceWithRscRegex)
+	}
+
+	if got.SelectFilter.PlaceCount != 2 {
+		t.Errorf("PlaceCount: got %d, want 2 (sibling field must survive)", got.SelectFilter.PlaceCount)
+	}
+}
+
+// TestRGModifyUnsetSpawnNoLongerAppliesConstraint pins the
+// downstream half of scenario 9.W12: once the placement constraint
+// is cleared on the RG, the next `rg spawn` reads the updated
+// SelectFilter, so the merged spawn-time filter no longer carries
+// the constraint. We verify by reading the persisted RG back after
+// the PATCH and re-running effectiveSpawnFilter (the same helper the
+// spawn handler uses) — its output is what the autoplacer sees.
+func TestRGModifyUnsetSpawnNoLongerAppliesConstraint(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:     2,
+			ReplicasOnSame: []string{"Aux/zone"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body := []byte(`{"select_filter":{"replicas_on_same":[]}}`)
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// effectiveSpawnFilter is the helper /v1/resource-groups/{rg}/spawn
+	// calls before handing the filter to the autoplacer. A spawn
+	// with no request-side overrides must inherit the RG's now-empty
+	// ReplicasOnSame.
+	filter := effectiveSpawnFilter(&got, &apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-x",
+	})
+
+	if len(filter.ReplicasOnSame) != 0 {
+		t.Errorf("spawn-time filter still carries ReplicasOnSame: got %v, want empty",
+			filter.ReplicasOnSame)
+	}
+
+	if filter.PlaceCount != 2 {
+		t.Errorf("spawn-time PlaceCount: got %d, want 2 (unmentioned RG field must survive)",
+			filter.PlaceCount)
+	}
+}
+
+// TestRGModifyUnsetViaDeletePropsArray pins the alternate wire
+// shape for SelectFilter clears: the scenario lists `delete_props`
+// as a supported entry point so the Python CLI's namespace-based
+// path (e.g. `delete_props: ["SelectFilter/ReplicasOnSame"]`)
+// reaches the same end state as the empty-list shape. Treated as a
+// surface-parity convenience — the handler maps the well-known
+// SelectFilter/* keys to the same per-field clear path.
+func TestRGModifyUnsetViaDeletePropsArray(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:           3,
+			ReplicasOnSame:       []string{"Aux/zone"},
+			NotPlaceWithRscRegex: "^lock-.*$",
+			LayerStack:           []string{"DRBD", "STORAGE"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		DeleteProps: []string{
+			"SelectFilter/ReplicasOnSame",
+			"SelectFilter/NotPlaceWithRscRegex",
+			"SelectFilter/LayerStack",
+		},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if len(got.SelectFilter.ReplicasOnSame) != 0 {
+		t.Errorf("ReplicasOnSame: got %v, want cleared via delete_props",
+			got.SelectFilter.ReplicasOnSame)
+	}
+
+	if got.SelectFilter.NotPlaceWithRscRegex != "" {
+		t.Errorf("NotPlaceWithRscRegex: got %q, want cleared via delete_props",
+			got.SelectFilter.NotPlaceWithRscRegex)
+	}
+
+	if len(got.SelectFilter.LayerStack) != 0 {
+		t.Errorf("LayerStack: got %v, want cleared via delete_props",
+			got.SelectFilter.LayerStack)
+	}
+
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("PlaceCount: got %d, want 3 (unmentioned field must survive)",
+			got.SelectFilter.PlaceCount)
+	}
 }

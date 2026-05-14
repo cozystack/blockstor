@@ -17,12 +17,13 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
-	"reflect"
 	"slices"
 	"time"
 
@@ -141,12 +142,8 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
-	var patch apiv1.ResourceGroup
-
-	err := json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	raw, patch, ok := readRGUpdatePatch(w, r)
+	if !ok {
 		return
 	}
 
@@ -162,25 +159,8 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mergeRGProps(&existing, &patch)
-
-	// Remember the pre-patch placement filter so we can detect whether
-	// this modify call needs to schedule a rebalance pass on the
-	// child RDs (Bug 60).
 	prevFilter := existing.SelectFilter
-
-	// SelectFilter only overwrites when the client sent a non-zero
-	// envelope. Zero-value `select_filter:{}` from a prop-only patch
-	// must NOT wipe the existing placement filter. reflect-equal
-	// against the zero value catches all leaf fields (PlaceCount,
-	// NodeNameList, …) without listing them by hand.
-	if !reflect.DeepEqual(patch.SelectFilter, apiv1.AutoSelectFilter{}) {
-		existing.SelectFilter = patch.SelectFilter
-	}
-
-	if patch.Description != "" {
-		existing.Description = patch.Description
-	}
+	applyRGUpdatePatch(&existing, &patch, raw)
 
 	// Bug 60 (cli-parity-audit row #41): upstream LINSTOR re-runs
 	// autoplace on every child RD when `rg modify` raises PlaceCount
@@ -188,13 +168,9 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// pushed reconcilers into a separate process, so the REST
 	// handler can't walk RDs inline — instead it stamps the
 	// `blockstor.io/rebalance-pending` annotation and the
-	// RGRebalanceReconciler picks it up.
-	//
-	// Scale-DOWN intentionally does NOT trigger anything: upstream's
-	// rebalance is strictly additive (operator must `linstor r d`
-	// manually to shed replicas), so a PlaceCount reduction passes
-	// through without an annotation stamp.
-	rebalanceScheduled := rgNeedsRebalance(prevFilter, existing.SelectFilter)
+	// RGRebalanceReconciler picks it up. Scale-DOWN intentionally
+	// does NOT trigger anything.
+	rebalanceScheduled := rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
 	if rebalanceScheduled {
 		if existing.Annotations == nil {
 			existing.Annotations = map[string]string{}
@@ -218,11 +194,7 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	if rebalanceScheduled {
 		// Append a second envelope so the Python CLI surfaces the
 		// deferred work. golinstor walks the slice and prints every
-		// entry whose message is non-empty, so operators see both
-		// "modified" and "rebalance scheduled for N RDs" on a single
-		// `linstor rg modify` call. The count is best-effort (errors
-		// while listing child RDs degrade to an unsized advisory
-		// rather than failing the modify).
+		// entry whose message is non-empty.
 		reply = append(reply, apiv1.APICallRc{
 			RetCode: maskInfo,
 			Message: rebalanceMessage(countChildRDs(r.Context(), s.Store, name)),
@@ -230,6 +202,61 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, reply)
+}
+
+// readRGUpdatePatch decodes the PATCH body twice: once as the typed
+// struct (for the merge helpers) and once as a raw envelope so the
+// SelectFilter merge can tell which sub-keys the client actually
+// mentioned. Scenario 9.W12: `linstor rg modify --replicas-on-same ""`
+// sends `select_filter: {"replicas_on_same": []}` — distinguishable
+// from "field absent" only at the raw-JSON level for sub-fields whose
+// Go type elides empty values via `omitempty`. Returns (raw, patch,
+// false) on any I/O or decode error after writing the 400 response.
+func readRGUpdatePatch(w http.ResponseWriter, r *http.Request) ([]byte, apiv1.ResourceGroup, bool) {
+	var patch apiv1.ResourceGroup
+
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return nil, patch, false
+	}
+
+	err = json.Unmarshal(raw, &patch)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return nil, patch, false
+	}
+
+	return raw, patch, true
+}
+
+// applyRGUpdatePatch merges the decoded patch onto `existing` in
+// place. Three independent layers run in order: property bag
+// (override + delete), SelectFilter (field-level merge), and the
+// scalar description string. Extracted from handleRGUpdate to keep
+// the handler under the funlen budget; the split tracks the natural
+// "decode → merge → persist" boundary in the request lifecycle.
+func applyRGUpdatePatch(existing, patch *apiv1.ResourceGroup, raw []byte) {
+	mergeRGProps(existing, patch)
+
+	// Merge the SelectFilter envelope field-by-field. Mirrors upstream
+	// LINSTOR's `AutoSelectorConfig.applyChanges`: per-field null =
+	// leave alone, non-null (including the empty list) = overwrite
+	// (Scenario 9.W12).
+	mergeRGSelectFilter(&existing.SelectFilter, &patch.SelectFilter, raw)
+
+	// Scenario 9.W12 / surface-parity convenience: accept the
+	// `delete_props: ["SelectFilter/<Field>"]` shape as an alternate
+	// entry point to the same per-field clear. Upstream LINSTOR
+	// reserves `delete_props` for the property bag, but the scenario
+	// calls out both wire shapes as supported.
+	applyRGSelectFilterDeleteProps(&existing.SelectFilter, patch.DeleteProps)
+
+	if patch.Description != "" {
+		existing.Description = patch.Description
+	}
 }
 
 // countChildRDs returns the number of ResourceDefinitions whose
@@ -281,7 +308,7 @@ func rebalanceMessage(count int) string {
 // Fields that don't affect placement (Description, Props, peer slots,
 // etc.) are deliberately excluded so prop-only `rg modify` calls
 // don't churn the reconciler.
-func rgNeedsRebalance(prev, next apiv1.AutoSelectFilter) bool {
+func rgNeedsRebalance(prev, next *apiv1.AutoSelectFilter) bool {
 	if next.PlaceCount > prev.PlaceCount {
 		return true
 	}
@@ -311,6 +338,190 @@ func rgNeedsRebalance(prev, next apiv1.AutoSelectFilter) bool {
 	}
 
 	return false
+}
+
+// Property-namespace keys for the `delete_props` alternate clear path
+// (Scenario 9.W12). Shared between the delete-props applier and the
+// per-field clear table so a typo on either side breaks compilation.
+const (
+	sfDPPlaceCount              = "SelectFilter/PlaceCount"
+	sfDPAdditionalPlaceCount    = "SelectFilter/AdditionalPlaceCount"
+	sfDPNodeNameList            = "SelectFilter/NodeNameList"
+	sfDPStoragePool             = "SelectFilter/StoragePool"
+	sfDPStoragePoolList         = "SelectFilter/StoragePoolList"
+	sfDPStoragePoolDisklessList = "SelectFilter/StoragePoolDisklessList"
+	sfDPNotPlaceWithRsc         = "SelectFilter/NotPlaceWithRsc"
+	sfDPNotPlaceWithRscRegex    = "SelectFilter/NotPlaceWithRscRegex"
+	sfDPReplicasOnSame          = "SelectFilter/ReplicasOnSame"
+	sfDPReplicasOnDifferent     = "SelectFilter/ReplicasOnDifferent"
+	sfDPXReplicasOnDifferentMap = "SelectFilter/XReplicasOnDifferentMap"
+	sfDPLayerStack              = "SelectFilter/LayerStack"
+	sfDPProviderList            = "SelectFilter/ProviderList"
+	sfDPDisklessOnRemaining     = "SelectFilter/DisklessOnRemaining"
+	sfDPOverrideVlmID           = "SelectFilter/OverrideVlmID"
+)
+
+// mergeRGSelectFilter applies a `linstor rg modify`-style patch onto
+// the existing SelectFilter using the field-by-field semantic upstream
+// LINSTOR uses (`AutoSelectorConfig.applyChanges`): null = leave alone,
+// non-null (including the empty list / empty string) = overwrite.
+//
+// The Go decoder can't distinguish "field absent in JSON" from
+// "field present with zero value" once the body is unmarshalled into
+// a struct with `omitempty` tags, so for list-typed fields we use
+// the nil-vs-empty distinction the json package DOES preserve. For
+// scalar fields (string regex, int counts) we walk the raw JSON
+// envelope to detect whether the client mentioned the key.
+//
+// Scenario 9.W12: `rg modify <rg> --replicas-on-same ""` reaches here
+// with `patch.ReplicasOnSame == []string{}` (non-nil, length 0); the
+// merge clears the existing list without touching sibling fields.
+func mergeRGSelectFilter(existing, patch *apiv1.AutoSelectFilter, raw []byte) {
+	mergeRGSelectFilterLists(existing, patch)
+	mergeRGSelectFilterScalars(existing, patch, rgSelectFilterKeys(raw))
+}
+
+// mergeRGSelectFilterLists overwrites every list-typed sub-field
+// whose patch value is non-nil — nil-vs-empty is the wire-shape
+// signal for "clear" vs "untouched" (Scenario 9.W12).
+func mergeRGSelectFilterLists(existing, patch *apiv1.AutoSelectFilter) {
+	if patch.NodeNameList != nil {
+		existing.NodeNameList = patch.NodeNameList
+	}
+
+	if patch.StoragePoolList != nil {
+		existing.StoragePoolList = patch.StoragePoolList
+	}
+
+	if patch.StoragePoolDisklessList != nil {
+		existing.StoragePoolDisklessList = patch.StoragePoolDisklessList
+	}
+
+	if patch.NotPlaceWithRsc != nil {
+		existing.NotPlaceWithRsc = patch.NotPlaceWithRsc
+	}
+
+	if patch.ReplicasOnSame != nil {
+		existing.ReplicasOnSame = patch.ReplicasOnSame
+	}
+
+	if patch.ReplicasOnDifferent != nil {
+		existing.ReplicasOnDifferent = patch.ReplicasOnDifferent
+	}
+
+	if patch.XReplicasOnDifferentMap != nil {
+		existing.XReplicasOnDifferentMap = patch.XReplicasOnDifferentMap
+	}
+
+	if patch.LayerStack != nil {
+		existing.LayerStack = patch.LayerStack
+	}
+
+	if patch.ProviderList != nil {
+		existing.ProviderList = patch.ProviderList
+	}
+}
+
+// mergeRGSelectFilterScalars overwrites every scalar SelectFilter
+// sub-field the client explicitly mentioned in the raw envelope.
+// Required for scalars where an absent field and an explicit zero
+// value share the same Go representation.
+func mergeRGSelectFilterScalars(existing, patch *apiv1.AutoSelectFilter, mentioned map[string]struct{}) {
+	if _, ok := mentioned["place_count"]; ok {
+		existing.PlaceCount = patch.PlaceCount
+	}
+
+	if _, ok := mentioned["additional_place_count"]; ok {
+		existing.AdditionalPlaceCount = patch.AdditionalPlaceCount
+	}
+
+	if _, ok := mentioned["storage_pool"]; ok {
+		existing.StoragePool = patch.StoragePool
+	}
+
+	if _, ok := mentioned["not_place_with_rsc_regex"]; ok {
+		existing.NotPlaceWithRscRegex = patch.NotPlaceWithRscRegex
+	}
+
+	if _, ok := mentioned["diskless_on_remaining"]; ok {
+		existing.DisklessOnRemaining = patch.DisklessOnRemaining
+	}
+
+	if _, ok := mentioned["override_vlm_id"]; ok {
+		existing.OverrideVlmID = patch.OverrideVlmID
+	}
+}
+
+// rgSelectFilterKeys returns the set of select_filter sub-keys the
+// client explicitly mentioned in the raw PATCH body. Empty map when
+// the envelope is absent / malformed — callers degrade to the
+// "no mutation" path, matching the leave-alone branch of the merge.
+func rgSelectFilterKeys(raw []byte) map[string]struct{} {
+	out := map[string]struct{}{}
+
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return out
+	}
+
+	var envelope struct {
+		SelectFilter map[string]json.RawMessage `json:"select_filter"`
+	}
+
+	err := json.Unmarshal(raw, &envelope)
+	if err != nil {
+		return out
+	}
+
+	for k := range envelope.SelectFilter {
+		out[k] = struct{}{}
+	}
+
+	return out
+}
+
+// applyRGSelectFilterDeleteProps walks the `delete_props` array and
+// clears any well-known `SelectFilter/<Field>` entry. Mirrors the
+// scenario 9.W12 surface-parity hedge: the property-namespace shape
+// the Python CLI sometimes emits for `linstor rg modify --delete
+// <key>` lands the same end state as the empty-list path. Unknown
+// keys pass through (they were already filtered against the Props
+// bag by `mergeRGProps`).
+func applyRGSelectFilterDeleteProps(existing *apiv1.AutoSelectFilter, keys []string) {
+	clearers := rgSelectFilterClearTable()
+
+	for _, k := range keys {
+		clearFn, ok := clearers[k]
+		if !ok {
+			continue
+		}
+
+		clearFn(existing)
+	}
+}
+
+// rgSelectFilterClearTable maps each well-known `SelectFilter/<Field>`
+// delete-props key to the per-field clear action. Pulled out of the
+// per-iteration body so the cyclomatic complexity of the public
+// applier stays under the project budget — and to keep the
+// key-namespace and the Go field it touches paired on one line.
+func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
+	return map[string]func(*apiv1.AutoSelectFilter){
+		sfDPPlaceCount:              func(f *apiv1.AutoSelectFilter) { f.PlaceCount = 0 },
+		sfDPAdditionalPlaceCount:    func(f *apiv1.AutoSelectFilter) { f.AdditionalPlaceCount = 0 },
+		sfDPNodeNameList:            func(f *apiv1.AutoSelectFilter) { f.NodeNameList = nil },
+		sfDPStoragePool:             func(f *apiv1.AutoSelectFilter) { f.StoragePool = "" },
+		sfDPStoragePoolList:         func(f *apiv1.AutoSelectFilter) { f.StoragePoolList = nil },
+		sfDPStoragePoolDisklessList: func(f *apiv1.AutoSelectFilter) { f.StoragePoolDisklessList = nil },
+		sfDPNotPlaceWithRsc:         func(f *apiv1.AutoSelectFilter) { f.NotPlaceWithRsc = nil },
+		sfDPNotPlaceWithRscRegex:    func(f *apiv1.AutoSelectFilter) { f.NotPlaceWithRscRegex = "" },
+		sfDPReplicasOnSame:          func(f *apiv1.AutoSelectFilter) { f.ReplicasOnSame = nil },
+		sfDPReplicasOnDifferent:     func(f *apiv1.AutoSelectFilter) { f.ReplicasOnDifferent = nil },
+		sfDPXReplicasOnDifferentMap: func(f *apiv1.AutoSelectFilter) { f.XReplicasOnDifferentMap = nil },
+		sfDPLayerStack:              func(f *apiv1.AutoSelectFilter) { f.LayerStack = nil },
+		sfDPProviderList:            func(f *apiv1.AutoSelectFilter) { f.ProviderList = nil },
+		sfDPDisklessOnRemaining:     func(f *apiv1.AutoSelectFilter) { f.DisklessOnRemaining = false },
+		sfDPOverrideVlmID:           func(f *apiv1.AutoSelectFilter) { f.OverrideVlmID = "" },
+	}
 }
 
 // mergeRGProps applies the OverrideProps / DeleteProps merge
