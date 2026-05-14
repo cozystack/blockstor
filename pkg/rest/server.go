@@ -61,6 +61,12 @@ type Server struct {
 	// that build the mux without going through the full constructor.
 	linstorRemotes *linstorRemoteRegistry
 
+	// resourceConnections is the in-memory registry for per-(rd, a, b)
+	// DRBD tuning props — scenario 5.W04. Lazy-initialised on first
+	// call to registerResourceConnections; see
+	// pkg/rest/resource_connections.go for the doc rationale.
+	resourceConnections *resourceConnectionRegistry
+
 	// errorReports is the in-memory ring buffer that backs
 	// `linstor err l` / `GET /v1/error-reports`. Reconcilers and
 	// REST handlers call RecordErrorReport to push a structured
@@ -216,6 +222,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerSOSReport(mux)
 	s.registerRemotes(mux)
 	s.registerNodeConnections(mux)
+	s.registerResourceConnections(mux)
 	s.registerSnapshotMulti(mux)
 	s.registerQuerySizeInfo(mux)
 	s.registerAdvise(mux)

@@ -52,6 +52,36 @@ type Resource struct {
 	// keys — e.g. `on-no-quorum`, `quorum`, `auto-promote`. Sorted
 	// before emission for stable output.
 	Options map[string]string
+
+	// Connections carries per-(hostA, hostB) DRBD tuning that lands
+	// inside the matching `connection { ... }` block of the mesh —
+	// scenario 5.W04. Upstream LINSTOR ResourceConnection scope:
+	// `linstor resource-connection drbd-peer-options <rd> <a> <b>
+	// --max-buffers 8192` writes `DrbdOptions/PeerDevice/max-buffers`
+	// on the ResourceConnection, and the .res renderer emits the
+	// option as `max-buffers 8192;` inside `connection { net { ... } }`
+	// for the matching pair only. Empty / unmatched entries leave the
+	// connection block untouched.
+	Connections []Connection
+}
+
+// Connection is a single per-pair DRBD tuning override that lands in
+// the matching `connection { ... }` block of the mesh. The `net { … }`
+// sub-block is the only one we emit today — upstream LINSTOR's
+// `resource-connection drbd-peer-options` keys (max-buffers,
+// ping-timeout, …) all route to the connection's net section, even
+// though the LINSTOR prop namespace puts them under PeerDevice/.
+type Connection struct {
+	// HostA / HostB name the two peers of this connection. Order
+	// doesn't matter — the renderer matches the mesh pair regardless
+	// of which side is HostA.
+	HostA string
+	HostB string
+
+	// NetOptions are arbitrary `connection { net { ... } }` knobs
+	// (max-buffers, ping-timeout, …). Keys are sorted before emission
+	// for stable output. Empty map → no nested `net { }` block.
+	NetOptions map[string]string
 }
 
 // Net mirrors the drbd-9 `net { ... }` section.
@@ -164,7 +194,7 @@ func Build(r Resource) (string, error) {
 		writeOnBlock(&b, &r.Hosts[i], r.Volumes)
 	}
 
-	writeConnectionMesh(&b, r.Hosts)
+	writeConnectionMesh(&b, r.Hosts, r.Connections)
 
 	b.WriteString("}\n")
 
@@ -273,7 +303,17 @@ func metaField(host *Host, vol Volume) string {
 // writeConnectionMesh emits one `connection { … }` block per (i, j)
 // host pair with i < j. drbd-9 requires the mesh to be explicit; with
 // N>2 peers an implicit "everyone talks to everyone" doesn't exist.
-func writeConnectionMesh(b *strings.Builder, hosts []Host) {
+//
+// When `conns` carries a Connection entry matching the (i, j) pair
+// (HostA / HostB unordered), a nested `net { … }` block is emitted
+// inside that connection block carrying the per-pair NetOptions —
+// scenario 5.W04 (`resource-connection drbd-peer-options`).
+// Connection entries that don't match any mesh pair are silently
+// ignored; an unmatched HostA / HostB usually means the operator
+// patched a property on a pair that doesn't exist in this resource's
+// host list yet, and the next reconcile that adds the peer will pick
+// the tuning up.
+func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []Connection) {
 	if len(hosts) < minMeshPeers {
 		return
 	}
@@ -283,9 +323,41 @@ func writeConnectionMesh(b *strings.Builder, hosts []Host) {
 			b.WriteString("  connection {\n")
 			fmt.Fprintf(b, "    host %s address %s:%d;\n", hosts[i].NodeName, hosts[i].Address, hosts[i].Port)
 			fmt.Fprintf(b, "    host %s address %s:%d;\n", hosts[j].NodeName, hosts[j].Address, hosts[j].Port)
+			writeConnectionNet(b, lookupConnection(conns, hosts[i].NodeName, hosts[j].NodeName))
 			b.WriteString("  }\n")
 		}
 	}
+}
+
+// lookupConnection returns the NetOptions for the (a, b) pair from
+// conns, matching unordered (HostA / HostB may be in either slot).
+// Nil result when no matching entry exists.
+func lookupConnection(conns []Connection, a, b string) map[string]string {
+	for i := range conns {
+		if (conns[i].HostA == a && conns[i].HostB == b) ||
+			(conns[i].HostA == b && conns[i].HostB == a) {
+			return conns[i].NetOptions
+		}
+	}
+
+	return nil
+}
+
+// writeConnectionNet emits the nested `net { … }` block of a
+// connection. Empty map → no block at all (drbd accepts but logs an
+// empty net block; we keep the rendered .res tight).
+func writeConnectionNet(b *strings.Builder, opts map[string]string) {
+	if len(opts) == 0 {
+		return
+	}
+
+	b.WriteString("    net {\n")
+
+	for _, k := range sortedKeys(opts) {
+		fmt.Fprintf(b, "      %s %s;\n", k, opts[k])
+	}
+
+	b.WriteString("    }\n")
 }
 
 // sortedKeys returns the keys of m in deterministic order. We don't
