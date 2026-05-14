@@ -105,6 +105,75 @@ func TestToggleDiskWithExplicitPool(t *testing.T) {
 	}
 }
 
+// TestToggleDiskAddDiskScenario4W22 pins scenario 4.W22 (wave2-04
+// lifecycle): `linstor r td <node> <rd> --storage-pool <pool>` promotes
+// a DISKLESS replica to diskful with the named pool. The REST handler
+// MUST:
+//
+//  1. Stamp the typed storage-pool name (Props["StorPoolName"], which
+//     pkg/store/k8s wireToCRDResourceSpec lifts into Spec.StoragePool
+//     for the satellite reconciler's storage-carve path).
+//  2. Drop the DISKLESS flag so the satellite's runApply path takes
+//     the diskful branch (applyStorageIfDiskful provisions the LV/ZVOL
+//     + applyDRBD runs drbdadm adjust, which attaches and syncs from
+//     peers through Inconsistent -> SyncTarget -> UpToDate).
+//  3. NOT stamp the cancel intent — Spec.ToggleDiskCancel must remain
+//     false on a forward add-disk operation. Flipping it here would
+//     race the reconciler's add-disk path with handleToggleDiskCancel
+//     and unwind the very allocation the operator asked for. Cancel
+//     is only ever set via `?cancel=true` (Bug 40).
+//
+// Cross-listed with wave1 4.9 (inverse direction). UG9 §"Toggling a
+// resource between diskful and diskless" (lines 3608-3629).
+func TestToggleDiskAddDiskScenario4W22(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-4w22"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-4w22",
+		NodeName: "worker-3",
+		Flags:    []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-4w22/resources/worker-3/toggle-disk/storage-pool/pool_ssd",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-4w22", "worker-3")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// (1) Typed storage pool stamped.
+	if got.Props["StorPoolName"] != "pool_ssd" {
+		t.Errorf("Props[StorPoolName]: got %q, want pool_ssd", got.Props["StorPoolName"])
+	}
+
+	// (2) DISKLESS dropped so the satellite takes the diskful Apply branch.
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag still present after add-disk: %v", got.Flags)
+	}
+
+	// (3) Cancel intent stays clear — only `?cancel=true` flips it
+	// (Bug 40). A forward add-disk that also stamped cancel would race
+	// the reconciler's unwind path with its own allocation.
+	if got.ToggleDiskCancel {
+		t.Errorf("ToggleDiskCancel unexpectedly true after add-disk: %+v", got)
+	}
+}
+
 // TestToggleDiskDemotesDiskful: PUT on a diskful replica adds the
 // DISKLESS flag — the satellite tears down the LV on its next
 // reconcile via the existing detach hook.
