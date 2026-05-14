@@ -87,6 +87,164 @@ func TestNodeRestoreClearsFlag(t *testing.T) {
 	}
 }
 
+// TestNodeRestorePreservesPropsAndPools pins scenario 4.W07 (UG9
+// §"Restoring an evacuating node"): a `node restore` un-evicts the
+// node WITHOUT touching its other state — storage pools, Props
+// (including any operator-set `AutoplaceTarget`), and replicas that
+// already migrated to peer nodes during the evacuate window MUST
+// stay exactly where they are. The restore endpoint is a flag
+// flip, not a full lifecycle reset; auto-balance-back is
+// explicitly out-of-scope (UG9 lines 2424-2443).
+//
+// Pinned because a naive "rebuild Node from name" path would zero
+// Props on every restore — which would silently drop the
+// AutoplaceTarget override the operator stamped before evacuate
+// (4.W06 sequence: prop-then-evacuate), inviting the next
+// autoplace cycle to repopulate the just-restored node and undo
+// the operator's drain.
+func TestNodeRestorePreservesPropsAndPools(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed: evicted node with operator-set props + a peer node.
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name:  "n1",
+		Flags: []string{"EVICTED"},
+		Props: map[string]string{
+			// Mirrors the 4.W06 sequence: operator pinned this before
+			// evacuate to keep the autoplacer off the node. Must
+			// survive the restore so a follow-up autoplace doesn't
+			// immediately repopulate.
+			"DrbdOptions/AutoplaceTarget": "false",
+			"Aux/operator-note":           "drained-2026-05-14",
+		},
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "peer"}); err != nil {
+		t.Fatalf("seed peer: %v", err)
+	}
+
+	// Pool on the evicted node — must survive the restore. A
+	// rebuild-from-name path would lose this and brick the next
+	// `linstor sp l` against the freshly-restored node.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "pool-ssd",
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	// Replica that migrated to `peer` during the evacuate window.
+	// 4.W07 contract: no auto-balance-back. The replica MUST NOT
+	// move on restore; it stays on `peer`.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "rd-moved", NodeName: "peer",
+	}); err != nil {
+		t.Fatalf("seed migrated replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/n1/restore", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("EVICTED still present after restore: %v", got.Flags)
+	}
+
+	// Props survive verbatim — operator's AutoplaceTarget pin and
+	// any Aux/* annotations are part of the operator's drain
+	// posture, not part of the eviction state machine.
+	if got.Props["DrbdOptions/AutoplaceTarget"] != "false" {
+		t.Errorf("AutoplaceTarget lost on restore: got %q, want %q",
+			got.Props["DrbdOptions/AutoplaceTarget"], "false")
+	}
+
+	if got.Props["Aux/operator-note"] != "drained-2026-05-14" {
+		t.Errorf("Aux annotation lost on restore: %v", got.Props)
+	}
+
+	// Storage pool on the restored node still present.
+	pool, err := st.StoragePools().Get(ctx, "n1", "pool-ssd")
+	if err != nil {
+		t.Errorf("pool dropped by restore: %v", err)
+	} else if pool.StoragePoolName != "pool-ssd" {
+		t.Errorf("pool mutated by restore: %+v", pool)
+	}
+
+	// Migrated replica still on `peer` — restore MUST NOT trigger
+	// an auto-balance-back (UG9 4.W07 explicit contract).
+	moved, err := st.Resources().Get(ctx, "rd-moved", "peer")
+	if err != nil {
+		t.Errorf("migrated replica vanished after restore: %v", err)
+	} else if moved.NodeName != "peer" {
+		t.Errorf("replica auto-balanced back on restore: NodeName=%q", moved.NodeName)
+	}
+
+	// And the inverse: no replica was magically materialised back
+	// on n1 by the restore handler.
+	if _, err := st.Resources().Get(ctx, "rd-moved", "n1"); err == nil {
+		t.Errorf("restore re-seeded replica on n1; expected no-op for replica placement")
+	}
+}
+
+// TestNodeRestoreIdempotent: a second POST to /restore on a node
+// that's already un-evicted MUST succeed without flapping any
+// other flag. addFlag/removeFlag are pure idempotent set
+// operations, but the lifecycle endpoint is the contract the
+// operator sees — pinned so a controller-restart-then-retry loop
+// doesn't 404 or 5xx on the second pass.
+func TestNodeRestoreIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name:  "n1",
+		Flags: []string{"SOME_OTHER_FLAG"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/n1/restore", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (restore on un-evicted node)", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// Pre-existing unrelated flag MUST survive — removeFlag scopes
+	// to EVICTED only. A clobbering implementation would corrupt
+	// neighbouring flags and (e.g.) accidentally drop LOST on a
+	// half-cleaned-up node.
+	if !slices.Contains(got.Flags, "SOME_OTHER_FLAG") {
+		t.Errorf("unrelated flag clobbered by restore: %v", got.Flags)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("EVICTED appeared on restore of un-evicted node: %v", got.Flags)
+	}
+}
+
 // TestNodeLostDeletesNode pins the upstream-LINSTOR semantic:
 // `controller drop-node` removes the Node entry entirely (not
 // "mark with LOST/EVICTED flags"). Orphan Resources are re-placed
