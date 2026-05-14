@@ -17,12 +17,16 @@ limitations under the License.
 package dispatcher_test
 
 import (
+	"context"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/effectiveprops"
 )
 
 // TestExternalMetadataRouting: scenario 6.18 (StorPoolNameDrbdMeta).
@@ -1057,5 +1061,214 @@ func TestDRBDLUKSStorageLayerStackPropagates_W10(t *testing.T) {
 		t.Errorf("LUKS slot must sit between DRBD and STORAGE; got order %v "+
 			"(drbd=%d luks=%d storage=%d)",
 			got.LayerStack, drbdIdx, luksIdx, storageIdx)
+	}
+}
+
+// TestDirectCRDEditOfDrbdOptionsPickedUpByDispatcher pins scenario
+// 11.W07: an operator who bypasses the REST surface and instead runs
+//
+//	kubectl edit resourcedefinition.blockstor.io.blockstor.io/<rd>
+//
+// to mutate `Spec.Props["DrbdOptions/Resource/protocol"]="C"` directly
+// MUST see the change picked up on the next reconcile, identically to
+// the REST path. Cross-listed with 5.W01 (RD drbd-options), 5.W03
+// (node-connection drbd-peer-options), 5.W04 (resource-connection
+// drbd-peer-options) and 9.W13 (RG drbd-options spawn propagation) —
+// 11.W07 is the K8s-flavoured variant that asserts the dispatcher
+// reads from the STORE (the CRD itself, surfaced via the controller-
+// runtime cache + the same `effectiveprops.Resolve` walk the satellite
+// reconciler uses), NOT from a REST-only in-memory cache that would
+// only see writes coming through `apiserver` handlers.
+//
+// The pre-Phase-10 controller kept a parallel REST-side prop bag and
+// the dispatcher consulted that first; a `kubectl edit` against the
+// CRD would silently fail to propagate until the operator hit the
+// REST PATCH endpoint as well. Phase 10.1 retired that path: the
+// satellite-side reconciler resolves props by reading the CRDs
+// directly through `effectiveprops.Resolve` and hands the result to
+// `dispatcher.BuildDesired`. This test pins that single-source-of-
+// truth contract.
+//
+// Two ways an operator can land a DRBD option from K8s:
+//
+//  1. **REST / `kubectl exec`** — `kubectl -n linbit-sds exec
+//     deploy/blockstor-apiserver -- linstor rd drbd-options
+//     --protocol C <rd>`. The apiserver handler PATCHes the same
+//     `Spec.Props` field on the RD CRD. The wire shape after this
+//     path is identical to (2) below — same `Spec.Props` key, same
+//     value — so the dispatcher cannot tell the two paths apart by
+//     construction. We assert it here on the REST-equivalent shape.
+//
+//  2. **Direct CRD edit** — `kubectl edit
+//     resourcedefinition.blockstor.io.blockstor.io/<rd>` and add the
+//     same `DrbdOptions/Resource/protocol: C` entry under
+//     `spec.props`. No REST round-trip. This test seeds a fake
+//     client with the RD already carrying the prop, runs
+//     `effectiveprops.Resolve` against the fake store, hands the
+//     result to `dispatcher.BuildDesired`, and asserts `protocol=C`
+//     reached the wire DrbdOptions bag.
+//
+// A regression that reintroduced a REST-only cache between the CRD
+// and the dispatcher would fail this test: `Resolve` would still
+// return the prop (it reads from the controller-runtime client),
+// but the dispatcher would consult the cache instead of the
+// effectiveProps argument and emit `protocol` empty.
+func TestDirectCRDEditOfDrbdOptionsPickedUpByDispatcher(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rdName       = "pvc-1"
+		protocolKey  = "DrbdOptions/Resource/protocol"
+		protocolWant = "C"
+	)
+
+	// Seed the fake store with an RD whose `Spec.Props` carries
+	// the DRBD option directly — exactly the shape `kubectl edit
+	// resourcedefinition.../pvc-1` produces after the operator
+	// adds the entry under `spec.props`. No apiserver handler ran
+	// to populate this; the CRD itself is the source of truth.
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{
+				protocolKey: protocolWant,
+			},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	// The fake client stands in for the controller-runtime cache
+	// the live satellite reconciler holds. `Resolve` reads RD + RG
+	// + ControllerConfig through this same client interface, so
+	// "direct CRD edit" and "REST PATCH followed by CRD apply"
+	// converge on the same input here — that convergence is the
+	// property under test.
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(rd).
+		Build()
+
+	effective, err := effectiveprops.Resolve(context.Background(), cli, target, rd)
+	if err != nil {
+		t.Fatalf("effectiveprops.Resolve: %v", err)
+	}
+
+	if got := effective[protocolKey]; got != protocolWant {
+		t.Fatalf("Resolve(direct-CRD-edit)[%s]=%q want %q (effective=%v)",
+			protocolKey, got, protocolWant, effective)
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effective)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if v := got.DrbdOptions[protocolKey]; v != protocolWant {
+		t.Errorf("dispatcher dropped the directly-edited prop: "+
+			"DrbdOptions[%s]=%q want %q (drbdOpts=%v)",
+			protocolKey, v, protocolWant, got.DrbdOptions)
+	}
+
+	// Belt-and-braces: the prop must NOT leak into the wire-side
+	// non-DRBD Props bag. mergeEffectiveProps routes `DrbdOptions/...`
+	// keys to drbdOpts so the .res renderer picks them up under the
+	// right section block. A regression that mis-routed the key
+	// would render an unknown line in the global .res scope and
+	// drbdadm would reject the resource.
+	if _, leaked := got.Props[protocolKey]; leaked {
+		t.Errorf("directly-edited DRBD prop leaked into wire Props: %v", got.Props)
+	}
+}
+
+// TestDirectCRDEditOnResourcePropsOverridesRD pins the priority half
+// of scenario 11.W07: when both the RD and the Resource CRDs are
+// edited directly with kubectl (bypassing REST), the Resource-scope
+// value wins — same UG9 prop precedence the REST path honours
+// (Resource > RD > RG > Controller).
+//
+// This guards against a future refactor that special-cases REST
+// writes (e.g. tagging them with provenance) and accidentally
+// inverts the priority for store-only edits — the dispatcher must
+// remain provenance-agnostic.
+func TestDirectCRDEditOnResourcePropsOverridesRD(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rdName      = "pvc-1"
+		protocolKey = "DrbdOptions/Resource/protocol"
+	)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			// Operator first did `kubectl edit rd pvc-1` and set
+			// protocol A. Then changed their mind and used
+			// `kubectl edit resource pvc-1-n1` to override to C
+			// just for this replica's RD scope. Resource-scope
+			// must win.
+			Props: map[string]string{protocolKey: "A"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+			Props: map[string]string{
+				protocolKey: "C",
+			},
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(rd, target).
+		Build()
+
+	effective, err := effectiveprops.Resolve(context.Background(), cli, target, rd)
+	if err != nil {
+		t.Fatalf("effectiveprops.Resolve: %v", err)
+	}
+
+	if got := effective[protocolKey]; got != "C" {
+		t.Fatalf("Resolve precedence: [%s]=%q want %q (effective=%v)",
+			protocolKey, got, "C", effective)
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effective)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if v := got.DrbdOptions[protocolKey]; v != "C" {
+		t.Errorf("dispatcher did not honour Resource-scope CRD edit: "+
+			"DrbdOptions[%s]=%q want %q (drbdOpts=%v)",
+			protocolKey, v, "C", got.DrbdOptions)
 	}
 }
