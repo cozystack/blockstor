@@ -959,3 +959,207 @@ func TestPhysicalStorageCreateRejectsUnknownProviderKind(t *testing.T) {
 		t.Errorf("unknown provider_kind must return 400, got %d", resp.StatusCode)
 	}
 }
+
+// TestPhysicalStorageCreatePropagatesPoolNameToProps pins Bug 88:
+// `linstor ps cdp --pool-name X --storage-pool Y <kind> <node> <dev>`
+// passes `pool_name` at the top level without populating
+// `with_storage_pool.props`. The REST handler MUST derive the
+// kind-specific StorDriver/* key from `pool_name` and stamp it on
+// the auto-created StoragePool CRD's Spec.Props so the satellite
+// provider can instantiate the backend on its next reconcile —
+// otherwise it loops on "<kind> attach requires <Key>" and
+// Status.{FreeCapacity, TotalCapacity, SupportsSnapshots} stay zero.
+//
+// Per-kind dispatch mirrors upstream LINSTOR's
+// `controller/.../api/rest/v1/PhysicalStorage.java::deviceProviderToStorPoolProperty`
+// and the satellite's `pkg/satellite/factory.go::NewProviderFromKind`
+// key set:
+//   - ZFS              → StorDriver/ZPool       = pool_name
+//   - ZFS_THIN         → StorDriver/ZPoolThin   = pool_name
+//   - LVM              → StorDriver/LvmVg       = pool_name
+//   - LVM_THIN (bare)  → StorDriver/LvmVg       = "linstor_"+pool_name,
+//     StorDriver/ThinPool    = pool_name
+//   - LVM_THIN (vg/lv) → StorDriver/LvmVg       = vg,
+//     StorDriver/ThinPool    = lv
+//   - FILE / FILE_THIN → StorDriver/FileDir     = pool_name
+func TestPhysicalStorageCreatePropagatesPoolNameToProps(t *testing.T) {
+	cases := []struct {
+		name         string
+		providerKind string
+		poolName     string
+		// For ZFS_THIN the satellite factory accepts either
+		// `ZPool` or `ZPoolThin` (kind-specific key wins), but the
+		// canonical key MUST be present so `linstor sp l`'s
+		// PoolName column renders. Pin the kind-specific key only.
+		wantProps map[string]string
+	}{
+		{
+			name:         "zfs-thick",
+			providerKind: "ZFS",
+			poolName:     "data",
+			wantProps: map[string]string{
+				"StorDriver/ZPool": "data",
+			},
+		},
+		{
+			name:         "zfs-thin",
+			providerKind: "ZFS_THIN",
+			poolName:     "tank",
+			wantProps: map[string]string{
+				"StorDriver/ZPoolThin": "tank",
+			},
+		},
+		{
+			name:         "lvm-thick",
+			providerKind: "LVM",
+			poolName:     "vg1",
+			wantProps: map[string]string{
+				"StorDriver/LvmVg": "vg1",
+			},
+		},
+		{
+			// Upstream LvmThinDriverKind: bare pool_name → vg
+			// becomes `linstor_<name>`, thin LV becomes
+			// `<name>`. piraeus-operator's CDP request shape.
+			name:         "lvm-thin-bare",
+			providerKind: "LVM_THIN",
+			poolName:     "thin1",
+			wantProps: map[string]string{
+				"StorDriver/LvmVg":    "linstor_thin1",
+				"StorDriver/ThinPool": "thin1",
+			},
+		},
+		{
+			// vg/lv syntax: explicit split.
+			name:         "lvm-thin-explicit",
+			providerKind: "LVM_THIN",
+			poolName:     "vg2/tp2",
+			wantProps: map[string]string{
+				"StorDriver/LvmVg":    "vg2",
+				"StorDriver/ThinPool": "tp2",
+			},
+		},
+		{
+			name:         "file",
+			providerKind: "FILE",
+			poolName:     "/var/lib/blockstor/file",
+			wantProps: map[string]string{
+				"StorDriver/FileDir": "/var/lib/blockstor/file",
+			},
+		},
+		{
+			name:         "file-thin",
+			providerKind: "FILE_THIN",
+			poolName:     "/var/lib/blockstor/file-thin",
+			wantProps: map[string]string{
+				"StorDriver/FileDir": "/var/lib/blockstor/file-thin",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			if err := st.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+				Name:       "n1-vda",
+				NodeName:   "n1",
+				DevicePath: "/dev/vda",
+				Phase:      "Available",
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			// Bug 88 reproducer: the CLI sends `pool_name` at the
+			// top level and `with_storage_pool.name` only — no
+			// `with_storage_pool.props`. The handler MUST infer
+			// the StorDriver/* key from `pool_name`.
+			body := `{
+				"provider_kind": "` + tc.providerKind + `",
+				"pool_name": "` + tc.poolName + `",
+				"device_paths": ["/dev/vda"],
+				"with_storage_pool": {"name": "sp1"}
+			}`
+
+			resp := httpPost(t, base+"/v1/physical-storage/n1", []byte(body))
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status: got %d, want 202", resp.StatusCode)
+			}
+
+			pool, err := st.StoragePools().Get(ctx, "n1", "sp1")
+			if err != nil {
+				t.Fatalf("StoragePool Get: %v", err)
+			}
+
+			if pool.ProviderKind != tc.providerKind {
+				t.Errorf("ProviderKind: got %q, want %q",
+					pool.ProviderKind, tc.providerKind)
+			}
+
+			for key, want := range tc.wantProps {
+				got := pool.Props[key]
+				if got != want {
+					t.Errorf("Bug 88: Spec.Props[%q]: got %q, want %q (pool_name=%q kind=%q produced %+v) — satellite provider would reject with %q attach requires %s",
+						key, got, want, tc.poolName, tc.providerKind, pool.Props, tc.providerKind, key)
+				}
+			}
+		})
+	}
+}
+
+// TestPhysicalStorageCreateExplicitPropsWinOverPoolName pins that
+// when the operator DOES pass `with_storage_pool.props` (the
+// upstream-shaped manifest path), the explicit values win over
+// the Bug 88 pool_name-fallback inference. Keeps GitOps-supplied
+// configs from being silently overwritten by the CLI shorthand.
+func TestPhysicalStorageCreateExplicitPropsWinOverPoolName(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+		Name:       "n1-vda",
+		NodeName:   "n1",
+		DevicePath: "/dev/vda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Operator passes both: explicit StorDriver/ZPool=explicit
+	// MUST win over pool_name=fallback (otherwise the GitOps
+	// manifest's intent gets shadowed by the CLI shorthand).
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "ZFS",
+			"pool_name": "fallback",
+			"device_paths": ["/dev/vda"],
+			"with_storage_pool": {
+				"name": "sp1",
+				"props": {"StorDriver/ZPool": "explicit"}
+			}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	pool, err := st.StoragePools().Get(ctx, "n1", "sp1")
+	if err != nil {
+		t.Fatalf("StoragePool Get: %v", err)
+	}
+
+	if pool.Props["StorDriver/ZPool"] != "explicit" {
+		t.Errorf("explicit Props beat pool_name fallback: got %q, want %q",
+			pool.Props["StorDriver/ZPool"], "explicit")
+	}
+}

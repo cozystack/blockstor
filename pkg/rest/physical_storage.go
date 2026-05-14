@@ -33,6 +33,21 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// Canonical upstream-LINSTOR `DeviceProviderKind` enum values. Mirrors
+// `server/generated-src/com/linbit/linstor/storage/kinds/
+// DeviceProviderKind.java` and the StoragePool CRD's `providerKind`
+// enum. Bug 88 + Bug 73 ride these constants so per-kind dispatch in
+// `fillAttachToFromPoolName` and `normalizeProviderKind` can't drift.
+const (
+	providerKindLVM      = "LVM"
+	providerKindLVMThin  = "LVM_THIN"
+	providerKindZFS      = "ZFS"
+	providerKindZFSThin  = "ZFS_THIN"
+	providerKindFile     = "FILE"
+	providerKindFileThin = "FILE_THIN"
+	providerKindDiskless = "DISKLESS"
+)
+
 // physicalStorageCDPRunbookNotice is the wave2 scenario 6.W09 operator-
 // runbook advisory: the CDP one-shot runs pvcreate + vgcreate + lvcreate
 // --thinpool + LINSTOR pool register, but the OS-level VG / thin LV are
@@ -392,6 +407,12 @@ func ensureStoragePoolForAttach(ctx context.Context, st store.Store, node string
 // provider-specific defaults from `AttachTo` when the operator
 // didn't supply them. The satellite's NewProviderFromKind reads
 // these keys to instantiate the right provider.
+//
+// Bug 88: ZFS_THIN reads from `StorDriver/ZPoolThin` (factory.go
+// `newZFS`); ZFS reads from `StorDriver/ZPool`. We dispatch on
+// `attach.ProviderKind` so the pool_name-fallback inferred in
+// `fillAttachToFromPoolName` lands under the kind-specific key the
+// satellite probe expects, not the cross-kind alias.
 func buildPoolPropsForAttach(attach *apiv1.PhysicalDeviceAttachTo, req *physicalStorageCreateRequest) map[string]string {
 	props := map[string]string{}
 
@@ -399,20 +420,27 @@ func buildPoolPropsForAttach(attach *apiv1.PhysicalDeviceAttachTo, req *physical
 		maps.Copy(props, req.WithStoragePool.Props)
 	}
 
-	if attach.VGName != "" && props["StorDriver/LvmVg"] == "" {
-		props["StorDriver/LvmVg"] = attach.VGName
+	if attach.VGName != "" && props[propLvmVG] == "" {
+		props[propLvmVG] = attach.VGName
 	}
 
-	if attach.ThinPoolName != "" && props["StorDriver/ThinPool"] == "" {
-		props["StorDriver/ThinPool"] = attach.ThinPoolName
+	if attach.ThinPoolName != "" && props[propThinPool] == "" {
+		props[propThinPool] = attach.ThinPoolName
 	}
 
-	if attach.ZPoolName != "" && props["StorDriver/ZPool"] == "" {
-		props["StorDriver/ZPool"] = attach.ZPoolName
+	if attach.ZPoolName != "" {
+		zKey := propZPool
+		if attach.ProviderKind == providerKindZFSThin {
+			zKey = propZPoolThin
+		}
+
+		if props[zKey] == "" {
+			props[zKey] = attach.ZPoolName
+		}
 	}
 
-	if attach.Directory != "" && props["StorDriver/FileDir"] == "" {
-		props["StorDriver/FileDir"] = attach.Directory
+	if attach.Directory != "" && props[propFileDir] == "" {
+		props[propFileDir] = attach.Directory
 	}
 
 	return props
@@ -425,6 +453,20 @@ func buildPoolPropsForAttach(attach *apiv1.PhysicalDeviceAttachTo, req *physical
 // callers that pass it at the top level. Provider-kind-specific
 // fields (`vg_name`, `thin_pool`, `zpool`, `directory`) come from
 // the props bag the operator may have included.
+//
+// Bug 88: when the operator runs `linstor ps cdp --pool-name X`
+// without `with_storage_pool.props`, the python-linstor CLI passes
+// the OS-level pool name as `pool_name` at the top level only — it
+// does NOT auto-populate `with_storage_pool.props[StorDriver/*]`.
+// Without inferring the kind-specific field from `pool_name`, the
+// resulting StoragePool CRD lands with empty Props so the satellite
+// provider rejects every reconcile with `attach requires <key>`
+// (`ZFS attach requires ZPoolName` etc.), and Status.{FreeCapacity,
+// TotalCapacity, SupportsSnapshots} never get probed.
+// Mirrors upstream LINSTOR's `deviceProviderToStorPoolProperty`
+// (`controller/.../api/rest/v1/PhysicalStorage.java`) which builds
+// the same per-kind defaults from `getDevicePoolName(pool_name, ...)`
+// when the operator omits `with_storage_pool.props`.
 func buildAttachTo(req *physicalStorageCreateRequest) *apiv1.PhysicalDeviceAttachTo {
 	out := &apiv1.PhysicalDeviceAttachTo{
 		ProviderKind: req.ProviderKind,
@@ -443,7 +485,61 @@ func buildAttachTo(req *physicalStorageCreateRequest) *apiv1.PhysicalDeviceAttac
 		out.Directory = req.WithStoragePool.Props["StorDriver/FileDir"]
 	}
 
+	// Bug 88: per-kind fallback to req.PoolName when the operator
+	// didn't pre-populate `with_storage_pool.props` (the common case
+	// for `linstor ps cdp --pool-name X` without a manifest). Treat
+	// req.PoolName as the canonical OS-level pool identifier and
+	// derive the provider-specific field from it. LVM_THIN parses
+	// `vg/thin` and `bare` per upstream `LvmThinDriverKind.VGName`
+	// / `LVName` — bare names get a `linstor_` VG prefix.
+	fillAttachToFromPoolName(out, req.ProviderKind, req.PoolName)
+
 	return out
+}
+
+// fillAttachToFromPoolName populates the kind-specific AttachTo
+// fields from the operator-passed `--pool-name` value when
+// `with_storage_pool.props` left them empty. Bug 88.
+func fillAttachToFromPoolName(out *apiv1.PhysicalDeviceAttachTo, kind, poolName string) {
+	if poolName == "" {
+		return
+	}
+
+	switch kind {
+	case providerKindLVM:
+		if out.VGName == "" {
+			out.VGName = poolName
+		}
+	case providerKindLVMThin:
+		vgName, thinLV := splitLvmThinPoolName(poolName)
+		if out.VGName == "" {
+			out.VGName = vgName
+		}
+
+		if out.ThinPoolName == "" {
+			out.ThinPoolName = thinLV
+		}
+	case providerKindZFS, providerKindZFSThin:
+		if out.ZPoolName == "" {
+			out.ZPoolName = poolName
+		}
+	case providerKindFile, providerKindFileThin:
+		if out.Directory == "" {
+			out.Directory = poolName
+		}
+	}
+}
+
+// splitLvmThinPoolName mirrors upstream LINSTOR's
+// `LvmThinDriverKind.VGName` / `LVName`: a `vg/thin`-shaped pool
+// name splits on the slash, a bare name gets the `linstor_` VG
+// prefix and uses the bare name as the thin LV. Bug 88.
+func splitLvmThinPoolName(poolName string) (string, string) {
+	if before, after, ok := strings.Cut(poolName, "/"); ok {
+		return before, after
+	}
+
+	return "linstor_" + poolName, poolName
 }
 
 // physicalStorageEntry is the envelope golinstor expects on
@@ -599,20 +695,20 @@ func groupPhysicalDevices(devs []apiv1.PhysicalDevice) []physicalStorageEntry {
 // DeviceProviderKind.java` and python-linstor's `consts.py`.
 func normalizeProviderKind(raw string) (string, bool) {
 	switch strings.ToUpper(strings.TrimSpace(raw)) {
-	case "LVM":
-		return "LVM", true
-	case "LVMTHIN", "LVM_THIN":
-		return "LVM_THIN", true
-	case "ZFS":
-		return "ZFS", true
-	case "ZFSTHIN", "ZFS_THIN":
-		return "ZFS_THIN", true
-	case "FILE":
-		return "FILE", true
-	case "FILETHIN", "FILE_THIN":
-		return "FILE_THIN", true
-	case "DISKLESS":
-		return "DISKLESS", true
+	case providerKindLVM:
+		return providerKindLVM, true
+	case "LVMTHIN", providerKindLVMThin:
+		return providerKindLVMThin, true
+	case providerKindZFS:
+		return providerKindZFS, true
+	case "ZFSTHIN", providerKindZFSThin:
+		return providerKindZFSThin, true
+	case providerKindFile:
+		return providerKindFile, true
+	case "FILETHIN", providerKindFileThin:
+		return providerKindFileThin, true
+	case providerKindDiskless:
+		return providerKindDiskless, true
 	default:
 		return "", false
 	}

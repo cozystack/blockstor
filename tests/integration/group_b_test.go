@@ -92,6 +92,9 @@ func TestGroupB(t *testing.T) {
 	t.Run("PhysicalStorageCreateDevicePool", func(t *testing.T) {
 		testPhysicalStorageCreateDevicePool(t, stack)
 	})
+	t.Run("PhysicalStorageCDPPropsPerKind", func(t *testing.T) {
+		testPhysicalStorageCDPPropsPerKind(t, stack)
+	})
 
 	// SPPoolMissingReportsFaulty mutates the satellite mock's
 	// SimulatePoolMissing state on (worker-1, lvm-thin). Kept last
@@ -614,4 +617,176 @@ func testPhysicalStorageCreateDevicePool(t *testing.T, stack *harness.Stack) {
 
 		return pool.Spec.ProviderKind == "ZFS"
 	}, "Bug 68: StoragePool CRD never appeared after cdp request")
+
+	// 3. Bug 88: the auto-created StoragePool's Spec.Props must
+	//    carry the kind-specific `StorDriver/ZPool` key with the
+	//    operator-supplied `--pool-name` value. Without this, the
+	//    satellite's `newZFS` factory rejects every reconcile with
+	//    "ZFS provider requires StorDriver/ZPool in props" and the
+	//    pool's Status.{FreeCapacity, TotalCapacity,
+	//    SupportsSnapshots} stay zero — the live-stand failure mode
+	//    the bug reports.
+	var pool blockstoriov1alpha1.StoragePool
+	if err := stack.Env.Client.Get(ctx,
+		types.NamespacedName{Name: spName + ".worker-3"}, &pool); err != nil {
+		t.Fatalf("Bug 88: get StoragePool: %v", err)
+	}
+
+	if got := pool.Spec.Props["StorDriver/ZPool"]; got != "myzpool" {
+		t.Errorf("Bug 88: Spec.Props[StorDriver/ZPool]: got %q, want %q (props=%+v) — satellite would log `ZFS attach requires ZPoolName` every reconcile",
+			got, "myzpool", pool.Spec.Props)
+	}
+}
+
+// testPhysicalStorageCDPPropsPerKind pins Bug 88 across all six
+// provider kinds blockstor supports. The operator-typed `--pool-name`
+// MUST land as the kind-specific `StorDriver/*` prop on the
+// auto-created StoragePool CRD so the satellite's
+// `NewProviderFromKind` can instantiate the backend on its next
+// reconcile.
+//
+// Drives the REST handler directly (POST /v1/physical-storage/<node>)
+// to cover provider kinds the python-linstor CLI binary may reject
+// at parse time (e.g. FILE_THIN) — the wire contract is the source
+// of truth, the CLI is just one client of it.
+func testPhysicalStorageCDPPropsPerKind(t *testing.T, stack *harness.Stack) {
+	t.Helper()
+
+	cases := []struct {
+		name         string
+		providerKind string
+		poolName     string
+		spName       string
+		devSuffix    string
+		wantProps    map[string]string
+	}{
+		{
+			name:         "lvm",
+			providerKind: "LVM",
+			poolName:     "vg-thick",
+			spName:       "cdp-lvm",
+			devSuffix:    "lvm",
+			wantProps:    map[string]string{"StorDriver/LvmVg": "vg-thick"},
+		},
+		{
+			name:         "lvm-thin",
+			providerKind: "LVM_THIN",
+			poolName:     "vg-lt/thin-lt",
+			spName:       "cdp-lvmthin",
+			devSuffix:    "lvmthin",
+			wantProps: map[string]string{
+				"StorDriver/LvmVg":    "vg-lt",
+				"StorDriver/ThinPool": "thin-lt",
+			},
+		},
+		{
+			name:         "zfs-thin",
+			providerKind: "ZFS_THIN",
+			poolName:     "tank-thin",
+			spName:       "cdp-zfsthin",
+			devSuffix:    "zfsthin",
+			wantProps:    map[string]string{"StorDriver/ZPoolThin": "tank-thin"},
+		},
+		{
+			name:         "file",
+			providerKind: "FILE",
+			poolName:     "/var/lib/blockstor/cdp-file",
+			spName:       "cdp-file",
+			devSuffix:    "file",
+			wantProps:    map[string]string{"StorDriver/FileDir": "/var/lib/blockstor/cdp-file"},
+		},
+		{
+			name:         "file-thin",
+			providerKind: "FILE_THIN",
+			poolName:     "/var/lib/blockstor/cdp-filethin",
+			spName:       "cdp-filethin",
+			devSuffix:    "filethin",
+			wantProps:    map[string]string{"StorDriver/FileDir": "/var/lib/blockstor/cdp-filethin"},
+		},
+	}
+
+	ctx := context.Background()
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			devName := "worker-3.cdp-" + tc.devSuffix
+			devPath := "/dev/disk/by-id/scsi-cdp-" + tc.devSuffix
+
+			dev := &blockstoriov1alpha1.PhysicalDevice{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: devName,
+					Labels: map[string]string{
+						blockstoriov1alpha1.PhysicalDeviceLabelNode: "worker-3",
+					},
+				},
+			}
+			if err := stack.Env.Client.Create(ctx, dev); err != nil {
+				t.Fatalf("create PhysicalDevice: %v", err)
+			}
+
+			var got blockstoriov1alpha1.PhysicalDevice
+			if err := stack.Env.Client.Get(ctx,
+				types.NamespacedName{Name: devName}, &got); err != nil {
+				t.Fatalf("get PhysicalDevice: %v", err)
+			}
+
+			got.Status = blockstoriov1alpha1.PhysicalDeviceStatus{
+				NodeName:   "worker-3",
+				StableID:   "scsi-cdp-" + tc.devSuffix,
+				DevicePath: devPath,
+				SizeBytes:  4294967296,
+				Phase:      blockstoriov1alpha1.PhysicalDevicePhaseAvailable,
+			}
+			if err := stack.Env.Client.Status().Update(ctx, &got); err != nil {
+				t.Fatalf("status update: %v", err)
+			}
+
+			// POST directly through the REST API — the Bug 88
+			// regression is in the handler, not the CLI; mirror
+			// the JSON shape python-linstor emits for
+			// `--pool-name X --storage-pool Y`.
+			body := `{
+				"provider_kind": "` + tc.providerKind + `",
+				"pool_name": "` + tc.poolName + `",
+				"device_paths": ["` + devPath + `"],
+				"with_storage_pool": {"name": "` + tc.spName + `"}
+			}`
+
+			resp, err := http.Post(stack.RestURL+"/v1/physical-storage/worker-3",
+				"application/json", strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("POST cdp: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status: got %d, want 202", resp.StatusCode)
+			}
+
+			const waitProps = 10 * time.Second
+
+			poolKey := types.NamespacedName{Name: tc.spName + ".worker-3"}
+
+			harness.Eventually(t, waitProps, func() bool {
+				var pool blockstoriov1alpha1.StoragePool
+				if err := stack.Env.Client.Get(ctx, poolKey, &pool); err != nil {
+					return false
+				}
+
+				return pool.Spec.ProviderKind == tc.providerKind
+			}, "Bug 88: StoragePool CRD never appeared for "+tc.name)
+
+			var pool blockstoriov1alpha1.StoragePool
+			if err := stack.Env.Client.Get(ctx, poolKey, &pool); err != nil {
+				t.Fatalf("Bug 88: get StoragePool %s: %v", poolKey.Name, err)
+			}
+
+			for key, want := range tc.wantProps {
+				if got := pool.Spec.Props[key]; got != want {
+					t.Errorf("Bug 88 %s: Spec.Props[%q]: got %q, want %q (props=%+v)",
+						tc.name, key, got, want, pool.Spec.Props)
+				}
+			}
+		})
+	}
 }
