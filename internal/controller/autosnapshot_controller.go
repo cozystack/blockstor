@@ -60,11 +60,18 @@ const (
 	// (linstor-common/consts.json line 3809).
 	DefaultAutoSnapshotKeep = 10
 
-	// AutoSnapshotPrefix is the snapshot-name prefix — upstream uses
-	// `autoSnap` (InternalApiConsts.DEFAULT_AUTO_SNAPSHOT_PREFIX).
-	// The full snapshot name is `<prefix><id>` with `%05d` padding,
-	// e.g. `autoSnap00001`.
-	AutoSnapshotPrefix = "autoSnap"
+	// AutoSnapshotPrefix is the snapshot-name prefix. Upstream LINSTOR
+	// uses `autoSnap` (InternalApiConsts.DEFAULT_AUTO_SNAPSHOT_PREFIX),
+	// but the Snapshot CRD's `metadata.name` is composed as
+	// `<rd>.<snapName>` and is validated against the RFC1123 subdomain
+	// regex by the kube-apiserver — uppercase letters are rejected
+	// (the camelCase `autoSnap` would become e.g. `pvc-x.autoSnap00001`
+	// and fail with "must consist of lower case alphanumeric
+	// characters, '-' or '.'"). Switch to lowercase-with-hyphens so
+	// the composed CRD name stays RFC1123-clean. Width-5 zero padding
+	// preserves the lexicographic-equals-numeric ordering the prune
+	// step depends on. Bug 84.
+	AutoSnapshotPrefix = "auto-snap-"
 
 	// AnnotationAutoSnapshotLastAt stamps the wall-clock time of the
 	// last auto-snapshot creation onto the parent RD's annotations.
@@ -457,7 +464,7 @@ func parsePositiveDurationMinutes(raw string) (time.Duration, bool) {
 // defaulting to 0 (so the first snapshot allocates id=1). Surfaces
 // parse errors so an operator-corrupted value doesn't silently
 // reset the counter and let the next tick collide with an existing
-// `autoSnap00001`.
+// `auto-snap-00001`.
 func nextAutoSnapshotID(rd *blockstoriov1alpha1.ResourceDefinition) (int64, error) {
 	raw, ok := rd.Spec.Props[PropAutoSnapshotNextID]
 	if !ok || raw == "" {
@@ -476,11 +483,13 @@ func nextAutoSnapshotID(rd *blockstoriov1alpha1.ResourceDefinition) (int64, erro
 	return n, nil
 }
 
-// formatAutoSnapshotName mirrors upstream LINSTOR's
-// `String.format("%s%05d", snapPrefix, id)` —
-// `autoSnap00001`, `autoSnap00002`, ... lexicographic sort matches
-// numeric sort up to 5 digits, which is what the cleanup pass and
-// the `linstor s l` listing both rely on for "oldest first".
+// formatAutoSnapshotName builds the per-tick snapshot name. Mirrors
+// upstream LINSTOR's `String.format("%s%05d", snapPrefix, id)` shape
+// (width-5 zero-padded so lexicographic sort equals numeric sort —
+// the prune step relies on "oldest first" by name), but uses the
+// RFC1123-clean lowercase-hyphen prefix `auto-snap-` so the composed
+// CRD name `<rd>.<snapName>` survives kube-apiserver name validation.
+// Yields `auto-snap-00001`, `auto-snap-00002`, ... Bug 84.
 func formatAutoSnapshotName(id int64) string {
 	return fmt.Sprintf("%s%05d", AutoSnapshotPrefix, id)
 }

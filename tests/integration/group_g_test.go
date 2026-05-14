@@ -795,36 +795,25 @@ func testGroupGSnapDeleteBlockedByLater(t *testing.T, stack *harness.Stack, cli 
 
 // testGroupGAutoSnapshotPeriodicTick pins the upstream LINSTOR
 // `AutoSnapshot/RunEvery` cron semantic: an RD with the prop set
-// must, on the runnable's tick, attempt to materialise a Snapshot
-// CRD labelled with `LabelAutoSnapshot=true`. We drive `Tick`
-// directly (rather than wait the 1-minute production cadence) so
-// the subtest stays under the groupGTimeout budget — the method is
+// must, on the runnable's tick, materialise a Snapshot CRD
+// labelled with `LabelAutoSnapshot=true`. We drive `Tick` directly
+// (rather than wait the 1-minute production cadence) so the
+// subtest stays under the groupGTimeout budget — the method is
 // exported on AutoSnapshotRunnable for exactly this case (the unit
 // suite already uses it).
 //
-// Discovered bug (filed for Phase 2 follow-up): the auto-snapshot
-// naming function `formatAutoSnapshotName` returns CamelCase
-// `autoSnap%05d`, which produces CRD names like
-// `<rd>.autoSnap00001`. Real kube-apiservers reject this because
-// RFC1123 subdomain validation forbids uppercase letters in the
-// metadata.name segment after the `.` — only the production
-// envtest path surfaces this (fake clients skip name validation,
-// which is why the unit suite has never caught it). The CRD
-// creation therefore fails and the per-RD branch of `Tick` logs
-// + swallows the error (the top-level Tick returns nil).
-//
-// For now we assert the controller-side invariants that DO hold:
-//
-//   - `Tick` returns nil (top-level surface is healthy even when
-//     individual RDs fail mid-cycle).
-//   - The runnable correctly detects the prop and runs through
-//     `processRD` (observed via stampRDAfterCreate being attempted —
-//     when the fix lands the RD will carry NextAutoId+last-at).
-//
-// The "snapshot was created with the auto-snapshot label"
-// assertion is gated behind a CamelCase-name guard so it flips on
-// automatically the moment `formatAutoSnapshotName` is fixed to
-// emit RFC1123-clean names — no test edit required.
+// Bug 84 (fixed): `formatAutoSnapshotName` previously returned
+// CamelCase `autoSnap%05d`, which produced CRD names like
+// `<rd>.autoSnap00001` and was rejected by real kube-apiservers
+// because RFC1123 subdomain validation forbids uppercase letters
+// in the metadata.name segment after the `.`. The prefix is now
+// `auto-snap-` so the composed name `<rd>.auto-snap-00001` is
+// RFC1123-clean. This test asserts the strict post-fix behaviour:
+// the per-tick Snapshot CRD must materialise with the auto-snapshot
+// label AND its `Spec.SnapshotName` must match `auto-snap-00001`
+// (the first allocated id, width-5 zero padded). A regression to
+// the camelCase form would fail name validation here and the
+// labelled-Snapshot assertion would time out.
 func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	ctx := context.Background()
 	rdName := seedRDWithVolume(t, stack, "auto-snap")
@@ -848,49 +837,17 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 		t.Fatalf("set AutoSnapshot/RunEvery: %v", err)
 	}
 
-	// Top-level Tick must NOT return an error — per-RD failures
-	// are logged and swallowed. A non-nil error here means a
-	// regression at the runnable loop level itself.
+	// Top-level Tick must NOT return an error.
 	runnable := &controller.AutoSnapshotRunnable{Client: stack.Env.Client}
 	if err := runnable.Tick(ctx); err != nil {
 		t.Fatalf("AutoSnapshot Tick: %v", err)
 	}
 
-	// Determine whether the CamelCase-name bug is fixed by probing
-	// the canonical first-tick snapshot name. If the apiserver
-	// accepts it, the bug is fixed and the rest of the assertions
-	// upgrade to "real cron semantic" mode.
-	camelCaseNameFixed := true
+	// Strict post-fix assertions: a labelled Snapshot must be
+	// visible, its SnapshotName must be the RFC1123-clean
+	// `auto-snap-00001`, and the RD bookkeeping must be stamped.
+	const wantFirstSnapName = "auto-snap-00001"
 
-	probeSnap := &blockstoriov1alpha1.Snapshot{
-		ObjectMeta: metav1.ObjectMeta{Name: "rd-g-auto-snap-probe.autoSnap00001"},
-		Spec: blockstoriov1alpha1.SnapshotSpec{
-			ResourceDefinitionName: rdName,
-			SnapshotName:           "autoSnap00001",
-		},
-	}
-
-	probeErr := stack.Env.Client.Create(ctx, probeSnap)
-	if probeErr != nil && strings.Contains(probeErr.Error(), "lowercase RFC 1123") {
-		camelCaseNameFixed = false
-	}
-
-	if probeErr == nil {
-		_ = stack.Env.Client.Delete(ctx, probeSnap)
-	}
-
-	if !camelCaseNameFixed {
-		// Bug-known mode: assert only that Tick ran. The labelled
-		// Snapshot will appear automatically once the CamelCase
-		// fix lands; this test will then flip to the strict-mode
-		// branch without an edit.
-		t.Logf("AutoSnapshot CamelCase-name bug present: formatAutoSnapshotName returns 'autoSnap%%05d' which fails RFC1123; Tick runs but per-RD create fails")
-
-		return
-	}
-
-	// Strict mode (post-fix): a labelled Snapshot must be visible
-	// and the RD bookkeeping must be stamped.
 	harness.Eventually(t, groupGTimeout, func() bool {
 		var list blockstoriov1alpha1.SnapshotList
 
@@ -904,13 +861,19 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 				continue
 			}
 
-			if list.Items[i].Labels[controller.LabelAutoSnapshot] == "true" {
-				return true
+			if list.Items[i].Labels[controller.LabelAutoSnapshot] != "true" {
+				continue
 			}
+
+			if list.Items[i].Spec.SnapshotName != wantFirstSnapName {
+				continue
+			}
+
+			return true
 		}
 
 		return false
-	}, "AutoSnapshot Tick did not create a labelled Snapshot for "+rdName)
+	}, "AutoSnapshot Tick did not create a labelled Snapshot named "+wantFirstSnapName+" for "+rdName)
 
 	var updated blockstoriov1alpha1.ResourceDefinition
 	if err := stack.Env.Client.Get(ctx,

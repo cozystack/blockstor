@@ -93,7 +93,7 @@ func listAutoSnapshotsByRD(t *testing.T, cli client.Client, rdName string) []blo
 }
 
 // TestAutoSnapshotFirstTickCreatesOne: RunEvery=15, no existing
-// state — the first Tick allocates id=1 and creates `autoSnap00001`.
+// state — the first Tick allocates id=1 and creates `auto-snap-00001`.
 // Pins the cadence semantic the scenario doc spells out ("set
 // RunEvery=15, advance past one interval → one snapshot").
 func TestAutoSnapshotFirstTickCreatesOne(t *testing.T) {
@@ -119,8 +119,8 @@ func TestAutoSnapshotFirstTickCreatesOne(t *testing.T) {
 		t.Fatalf("expected 1 auto-snapshot, got %d", len(snaps))
 	}
 
-	if got := snaps[0].Spec.SnapshotName; got != "autoSnap00001" {
-		t.Errorf("snapshot name = %q, want autoSnap00001", got)
+	if got := snaps[0].Spec.SnapshotName; got != "auto-snap-00001" {
+		t.Errorf("snapshot name = %q, want auto-snap-00001", got)
 	}
 
 	if got := snaps[0].Spec.ResourceDefinitionName; got != "pvc-w05-first" {
@@ -177,7 +177,7 @@ func TestAutoSnapshotFiveIntervalsProduceFiveSnapshots(t *testing.T) {
 	}
 
 	for i, snap := range snaps {
-		want := fmt.Sprintf("autoSnap%05d", i+1)
+		want := fmt.Sprintf("auto-snap-%05d", i+1)
 		if snap.Spec.SnapshotName != want {
 			t.Errorf("snap[%d].name = %q, want %q", i, snap.Spec.SnapshotName, want)
 		}
@@ -250,7 +250,7 @@ func TestAutoSnapshotKeepPrunesOldestBeyondBudget(t *testing.T) {
 	}
 
 	// Survivors should be the three newest ids: 3, 4, 5.
-	wantNames := []string{"autoSnap00003", "autoSnap00004", "autoSnap00005"}
+	wantNames := []string{"auto-snap-00003", "auto-snap-00004", "auto-snap-00005"}
 
 	gotNames := make([]string, 0, len(snaps))
 	for _, snap := range snaps {
