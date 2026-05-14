@@ -32,9 +32,30 @@ import (
 
 // passphraseRequest is the body upstream linstor expects on the
 // encryption/passphrase endpoints.
+//
+// Two field names accepted on `PATCH /v1/encryption/passphrase`:
+//   - `new_passphrase` — the historical upstream-LINSTOR shape that
+//     `linstor encryption modify` and golinstor's `Passphrase.Enter`
+//     have always posted.
+//   - `passphrase` — the W13 bare-key shape `linstor encryption
+//     enter-passphrase` documents post-Phase-10. Either field is
+//     equivalent on the wire; the handler prefers `passphrase` when
+//     both are set so a typo-defensive caller (sending both for
+//     belt-and-braces) doesn't accidentally use the wrong one.
 type passphraseRequest struct {
-	NewPassphrase string `json:"new_passphrase"`
+	NewPassphrase string `json:"new_passphrase,omitempty"`
 	OldPassphrase string `json:"old_passphrase,omitempty"`
+	Passphrase    string `json:"passphrase,omitempty"`
+}
+
+// proofOfKnowledge returns the operator-supplied passphrase from the
+// PATCH body, honouring the dual-key wire surface above.
+func (r passphraseRequest) proofOfKnowledge() string {
+	if r.Passphrase != "" {
+		return r.Passphrase
+	}
+
+	return r.NewPassphrase
 }
 
 // defaultPassphraseSecretName is the Secret the controller falls
@@ -99,6 +120,13 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 
 	if have != "" {
 		if have == req.NewPassphrase {
+			// Idempotent re-create from a caller that
+			// demonstrably knows the value — flip the
+			// in-memory unlock too so a crash-loop-during-
+			// bootstrap retry leaves the controller in the
+			// same usable state as the original create.
+			s.passphraseUnlocked.Store(true)
+
 			w.WriteHeader(http.StatusOK)
 
 			return
@@ -116,12 +144,34 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Fresh-cluster create-passphrase: the operator just stamped
+	// the value, so they implicitly hold the proof-of-knowledge.
+	// Marking the controller unlocked here saves them an
+	// immediately-following PATCH to start provisioning LUKS.
+	s.passphraseUnlocked.Store(true)
+
 	w.WriteHeader(http.StatusCreated)
 }
 
-// handlePassphraseEnter unlocks the in-memory crypto context for this
-// controller process. We treat the request body's `new_passphrase` as
-// the proof-of-knowledge — matches upstream's PATCH semantics.
+// handlePassphraseEnter unlocks the in-memory crypto context for
+// this controller process. Scenario 6.W13: a controller restart
+// loses the unlock flag, leaving the sealed-Secret passphrase
+// dormant on the apiserver. The operator calls
+// `linstor encryption enter-passphrase`, which PATCHes this endpoint
+// with the master passphrase as proof-of-knowledge:
+//
+//   - missing prior passphrase → 412 (must POST/create first)
+//   - wrong proof → 401 Unauthorized + descriptive error; the unlock
+//     flag MUST stay false, otherwise a single wrong-passphrase
+//     guess would silently grant LUKS provisioning.
+//   - right proof → 200 OK + s.passphraseUnlocked flipped to true,
+//     so the very next /v1/view/resources GET reports every LUKS
+//     replica as Suspended=false (Available).
+//
+// Body shape accepts BOTH `{"new_passphrase":"..."}` (historical,
+// upstream-LINSTOR-compatible) AND `{"passphrase":"..."}` (the W13
+// CLI shape). passphraseRequest.proofOfKnowledge centralises the
+// choice so the rest of the handler is dual-key-agnostic.
 func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
@@ -145,11 +195,13 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if have != req.NewPassphrase {
-		writeError(w, http.StatusForbidden, "passphrase mismatch")
+	if have != req.proofOfKnowledge() {
+		writeError(w, http.StatusUnauthorized, "passphrase mismatch")
 
 		return
 	}
+
+	s.passphraseUnlocked.Store(true)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -191,6 +243,14 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 
 		return
 	}
+
+	// Successful rotation implies the caller knew the old
+	// passphrase and just stamped the new one — they're unlocked
+	// by definition. Without this flip, a post-rotation
+	// /v1/view/resources would still report Suspended on every
+	// LUKS replica until a follow-up PATCH, which surprises any
+	// operator who thought modify-passphrase was enough.
+	s.passphraseUnlocked.Store(true)
 
 	w.WriteHeader(http.StatusOK)
 }

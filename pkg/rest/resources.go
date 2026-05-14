@@ -117,6 +117,11 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 // handleResourcesView to keep that handler under the funlen budget;
 // the parent fetch (Controller / RG / RD) is soft-fail so a partial
 // hierarchy returns a usable response.
+//
+// Scenario 6.W13: a LUKS-stack replica also gets `state.suspended`
+// stamped here — true while the controller is locked (master
+// passphrase not yet entered in this process), false once unlocked.
+// stampSuspendedOnLUKS centralises the layer-walk + flag-read.
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
@@ -141,7 +146,48 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 		rwv.EffectiveProps = eff
 	}
 
+	s.stampSuspendedOnLUKS(&rwv)
+
 	return rwv, nil
+}
+
+// stampSuspendedOnLUKS sets `state.suspended` on a resource that
+// carries a LUKS layer in its LayerObject chain. true while the
+// controller process is locked (no enter-passphrase yet), false
+// once unlocked. Non-LUKS resources are left with state.suspended
+// nil so the field is omitted on the wire — see ResourceState.Suspended
+// for the tri-state contract. Scenario 6.W13.
+func (s *Server) stampSuspendedOnLUKS(rwv *apiv1.ResourceWithVolumes) {
+	if !hasLUKSLayer(rwv.LayerObject) {
+		return
+	}
+
+	suspended := !s.passphraseUnlocked.Load()
+	rwv.State.Suspended = &suspended
+}
+
+// hasLUKSLayer walks the ResourceLayer tree and returns true iff
+// any node in the chain advertises `LayerKindLUKS`. The chain is
+// shallow in practice (DRBD → LUKS → STORAGE), so a recursive walk
+// is cheap and matches the upstream Python CLI's
+// `_walk(layer_data, type==LUKS)` predicate used to pick the State
+// column suffix.
+func hasLUKSLayer(layer *apiv1.ResourceLayer) bool {
+	if layer == nil {
+		return false
+	}
+
+	if layer.Type == apiv1.LayerKindLUKS {
+		return true
+	}
+
+	for i := range layer.Children {
+		if hasLUKSLayer(&layer.Children[i]) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // rdFaultyStats summarises the per-RD aggregate state used by the

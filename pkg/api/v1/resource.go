@@ -97,6 +97,22 @@ type ResourceState struct {
 	// toggle. 0 means either no conversion in flight or the last
 	// conversion completed. Bug 39.
 	ToggleDiskRetries int32 `json:"toggle_disk_retries,omitempty"`
+
+	// Suspended is the per-replica "LUKS-stack blocked on master
+	// passphrase" marker the REST /v1/view/resources view stamps
+	// when the resource carries a LUKS layer but the controller
+	// process has not yet been unlocked (passphrase Secret exists,
+	// but the in-memory unlock flag is false — fresh controller
+	// restart). The CLI surfaces this as Suspended in the State
+	// column; once the operator PATCHes the master passphrase the
+	// view flips to Suspended=false, rendered as Available.
+	// Scenario 6.W13.
+	//
+	// Tri-state semantics on the wire (pointer, omitempty):
+	//   nil   — no LUKS layer in the stack; field never surfaces.
+	//   true  — LUKS layer present, controller still locked.
+	//   false — LUKS layer present, controller unlocked.
+	Suspended *bool `json:"suspended,omitempty"`
 }
 
 // ResourceWithVolumes is the shape `/v1/view/resources` returns — Resource

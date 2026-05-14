@@ -310,9 +310,15 @@ func TestPassphraseModifyWithoutCreate(t *testing.T) {
 }
 
 // TestPassphraseEnterMismatch: PATCH with the wrong passphrase
-// against an established cluster → 403 (forbidden). Pinned because
-// the passphrase is the master key for at-rest LUKS volume keys —
-// a regression that flipped this to 200 would silently grant unlock
+// against an established cluster → 401 (unauthorized). Scenario
+// 6.W13 narrows upstream's historical 403 down to 401 — the
+// request was syntactically allowed but the proof-of-knowledge
+// failed, which is precisely what 401 carries (vs. 403's
+// "authenticated but disallowed"). `linstor encryption
+// enter-passphrase` keys off the status code to print "wrong
+// passphrase" rather than "permission denied". Pinned because the
+// passphrase is the master key for at-rest LUKS volume keys — a
+// regression that flipped this to 200 would silently grant unlock
 // access to any caller, breaking the encryption boundary.
 func TestPassphraseEnterMismatch(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
@@ -331,8 +337,8 @@ func TestPassphraseEnterMismatch(t *testing.T) {
 	resp := httpPatch(t, base+"/v1/encryption/passphrase", wrongBody)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("status: got %d, want 403 (mismatched passphrase)", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401 (mismatched passphrase)", resp.StatusCode)
 	}
 }
 
@@ -518,8 +524,8 @@ func TestPassphraseSecretEnterMatchesSecret(t *testing.T) {
 	noResp := httpPatch(t, base+"/v1/encryption/passphrase", wrongBody)
 	_ = noResp.Body.Close()
 
-	if noResp.StatusCode != http.StatusForbidden {
-		t.Errorf("PATCH with wrong passphrase: got %d, want 403", noResp.StatusCode)
+	if noResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("PATCH with wrong passphrase: got %d, want 401", noResp.StatusCode)
 	}
 }
 
