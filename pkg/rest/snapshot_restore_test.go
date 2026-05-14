@@ -334,6 +334,200 @@ func contains(haystack, needle string) bool {
 	return false
 }
 
+// TestSnapshotRestoreScenario8W03: covers wave2 scenario 8.W03 /
+// wave1 F1 — `snapshot resource restore` against an existing snapshot
+// must build a NEW ResourceDefinition (NOT mutate the source RD,
+// NOT rollback in place). End-to-end contract:
+//
+//  1. POST .../snapshot-restore-resource with `to_resource: <new-rd>`
+//     returns 201 and reports the source-snap → target-rd mapping in
+//     the APICallRc envelope.
+//  2. The target RD exists in the store, separate from the source RD.
+//  3. The target RD carries the `BlockstorRestoreFromSnapshot` prop
+//     (`<srcRD>:<snapName>`) — this is what the dispatcher pipes
+//     through to DesiredVolume.SourceSnapshot so the satellite
+//     materialises the volume via Provider.RestoreVolumeFromSnapshot
+//     (`zfs clone` / `lvcreate -s` / FILE reflink) instead of
+//     CreateVolume. Cross-pool / cross-node clone falls back to
+//     CrossNodeFetcher + SnapshotShipper.RecvSnapshot (zfs send | recv,
+//     dd-piped thin LV stream); that satellite-side wiring lives in
+//     pkg/satellite/reconciler.go.
+//  4. The target RD's VolumeDefinitions mirror the snapshot's recorded
+//     volume layout — same volume_number / size_kib pairs, hydrated
+//     by hydrateVolumesFromSnapshot. Without this, autoplace would
+//     create an RD with zero volumes that never reaches UpToDate.
+//  5. The source RD is untouched — `snapshot resource restore` is the
+//     non-destructive alternative to `snapshot rollback` (8.W04). The
+//     two RDs are independently usable.
+func TestSnapshotRestoreScenario8W03(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed source RD with a non-trivial Props map. The handler copies
+	// snapshot.Props onto the new RD when set, falling back to the
+	// source RD's Props when not — we exercise the fallback path so
+	// the LayerStack / Props inheritance is observable.
+	srcProps := map[string]string{
+		"DrbdOptions/Net/protocol": "C",
+	}
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:       "pvc-src",
+		Props:      srcProps,
+		LayerStack: []string{"DRBD", "STORAGE"},
+	}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	// Two-volume snapshot — proves hydrateVolumesFromSnapshot copies
+	// every VD, not just the first one. Mirrors what a multi-volume
+	// RD (e.g. data + WAL) looks like in production.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		Nodes:        []string{"n1", "n2"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024}, // 1 GiB data
+			{VolumeNumber: 1, SizeKib: 64 * 1024},   // 64 MiB WAL
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-restored",
+		FromSnapshot: "snap-1",
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	// 1) HTTP-level contract.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode APICallRc envelope: %v", err)
+	}
+
+	if len(rcs) != 1 || !contains(rcs[0].Message, "snap-1") || !contains(rcs[0].Message, "pvc-restored") {
+		t.Errorf("envelope message %q must mention both snap-1 and pvc-restored", rcs[0].Message)
+	}
+
+	// 2) New RD exists and is distinct from source.
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("expected pvc-restored to exist: %v", err)
+	}
+
+	if got.Name != "pvc-restored" {
+		t.Errorf("new RD name: got %q, want pvc-restored", got.Name)
+	}
+
+	// LayerStack must be inherited from source so the satellite
+	// builds the same DRBD/STORAGE stack on the new RD.
+	if len(got.LayerStack) != 2 || got.LayerStack[0] != "DRBD" || got.LayerStack[1] != "STORAGE" {
+		t.Errorf("LayerStack: got %v, want [DRBD STORAGE]", got.LayerStack)
+	}
+
+	// 3) BlockstorRestoreFromSnapshot prop drives the satellite to
+	// `zfs clone` / `lvcreate -s` instead of CreateVolume.
+	clone, ok := got.Props["BlockstorRestoreFromSnapshot"]
+	if !ok {
+		t.Fatalf("Props missing BlockstorRestoreFromSnapshot — satellite would CreateVolume blank instead of cloning")
+	}
+
+	if clone != "pvc-src:snap-1" {
+		t.Errorf("clone source prop: got %q, want %q", clone, "pvc-src:snap-1")
+	}
+
+	// 4) VolumeDefinitions hydrated from snapshot.
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list VDs on new RD: %v", err)
+	}
+
+	if len(vds) != 2 {
+		t.Fatalf("hydrated VDs: got %d, want 2 (one per snapshot volume)", len(vds))
+	}
+
+	wantSize := map[int32]int64{0: 1024 * 1024, 1: 64 * 1024}
+	for _, vd := range vds {
+		if got := vd.SizeKib; got != wantSize[vd.VolumeNumber] {
+			t.Errorf("VD %d SizeKib: got %d, want %d", vd.VolumeNumber, got, wantSize[vd.VolumeNumber])
+		}
+	}
+
+	// 5) Source RD untouched — independent usability is the whole
+	// point of restore-into-new-RD vs rollback-in-place.
+	src, err := st.ResourceDefinitions().Get(ctx, "pvc-src")
+	if err != nil {
+		t.Fatalf("source RD must still exist: %v", err)
+	}
+
+	if _, hasClone := src.Props["BlockstorRestoreFromSnapshot"]; hasClone {
+		t.Errorf("source RD must NOT carry the clone-source prop (would mis-route satellite reconcile)")
+	}
+
+	if src.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("source RD Props mutated: got %v", src.Props)
+	}
+}
+
+// TestSnapshotRestoreScenario8W03SnapInPath: same scenario, but the
+// snapshot name arrives via the URL path (`/snapshot-restore-resource/{snap}`)
+// instead of the body — that's the dialect upstream linstor CLI /
+// golinstor emit. Must produce the same target RD with the same
+// clone-source prop so the CLI hits this endpoint without translation.
+func TestSnapshotRestoreScenario8W03SnapInPath(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 2048},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// No `from_snapshot` in body — only `to_resource`. Snapshot name
+	// rides the URL path, matching upstream linstor CLI shape.
+	body, _ := json.Marshal(map[string]string{"to_resource": "pvc-restored"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource/snap-1",
+		body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("new RD: %v", err)
+	}
+
+	if got.Props["BlockstorRestoreFromSnapshot"] != "pvc-src:snap-1" {
+		t.Errorf("clone source prop: got %q, want %q",
+			got.Props["BlockstorRestoreFromSnapshot"], "pvc-src:snap-1")
+	}
+}
+
 // TestSnapshotRestoreConflict: target RD already exists → 409 from
 // writeStoreError surfacing ErrAlreadyExists. Pinned because
 // linstor-csi reconciles VolumeSnapshot → PVC restore by retrying;
