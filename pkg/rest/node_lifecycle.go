@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
@@ -143,10 +144,30 @@ func (s *Server) handleNodeRestore(w http.ResponseWriter, r *http.Request) {
 // just stamp flags. Missing-node is folded into success so a
 // re-run of an operator teardown script doesn't fail on
 // already-cleaned state.
+//
+// Scenario 4.W04 contract: the node is irrecoverable by definition
+// (UG9 §"Auto-evict" warns "aggressive — never run on a recoverable
+// node"). Resource CRDs hosted on this node MUST be cascade-deleted
+// by the REST handler itself, NOT via the satellite finalizer — the
+// satellite that owned `SatelliteResourceFinalizer` is gone with
+// the node, so a plain DeletionTimestamp stamp would hang every
+// orphan Resource forever and brick the next RD-create that
+// recycles the name/port. StoragePool CRDs on the lost node are
+// dropped the same way; they can never be probed again and leaving
+// them pollutes `linstor sp l` and the autoplacer's free-space
+// ranking. Surviving peer replicas are left alone so the
+// TieBreaker reconciler can stamp.
 func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 
-	err := s.Store.Nodes().Delete(r.Context(), name)
+	err := s.cascadeOrphansForLostNode(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = s.Store.Nodes().Delete(r.Context(), name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
 
@@ -157,6 +178,46 @@ func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "node lost: " + name,
 	}})
+}
+
+// cascadeOrphansForLostNode walks Resources + StoragePools and
+// deletes every row whose NodeName matches the lost node. NotFound
+// from a per-child Delete is swallowed (a child that already
+// vanished — race with a parallel cascade or a previous partial
+// teardown — must not fail the whole `node lost` call; the parent
+// handler is itself idempotent for this exact reason). The first
+// non-NotFound error short-circuits the cascade so the operator
+// sees an actionable signal before the Node row vanishes.
+func (s *Server) cascadeOrphansForLostNode(ctx context.Context, name string) error {
+	resources, err := s.Store.Resources().List(ctx)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	for i := range resources {
+		if resources[i].NodeName != name {
+			continue
+		}
+
+		err = s.Store.Resources().Delete(ctx, resources[i].Name, name)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+	}
+
+	pools, err := s.Store.StoragePools().ListByNode(ctx, name)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	for i := range pools {
+		err = s.Store.StoragePools().Delete(ctx, name, pools[i].StoragePoolName)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+	}
+
+	return nil
 }
 
 // updateNodeFlags loads the Node, applies each mutator, and persists.

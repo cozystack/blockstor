@@ -379,3 +379,153 @@ func TestNodeEvacuateUnobservedInUseAccepts(t *testing.T) {
 		t.Errorf("EVICTED not stamped with unobserved InUse: %v", got.Flags)
 	}
 }
+
+// TestNodeLostCascadeDeletesResources pins scenario 4.W04: every
+// Resource CRD with Spec.NodeName == lost MUST be removed by the
+// REST handler itself — NOT by the satellite finalizer.
+//
+// The node is irrecoverable by definition (that's what `node lost`
+// means; UG9 §"Auto-evict" calls it "aggressive — never run on a
+// recoverable node"). The satellite that owns
+// SatelliteResourceFinalizer is gone with the node, so a plain
+// DeletionTimestamp stamp would hang Resources forever and brick
+// the next RD-create that recycles the name/port. The handler
+// drives the cascade through the store directly.
+//
+// Surviving peers on a healthy node are left alone — they're how
+// the TieBreaker reconciler maintains quorum after node loss.
+func TestNodeLostCascadeDeletesResources(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "lost-node"}); err != nil {
+		t.Fatalf("seed lost node: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "peer-node"}); err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+
+	for _, rd := range []string{"rd-a", "rd-b"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: rd, NodeName: "lost-node",
+		}); err != nil {
+			t.Fatalf("seed replica on lost node for %s: %v", rd, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: rd, NodeName: "peer-node",
+		}); err != nil {
+			t.Fatalf("seed replica on peer node for %s: %v", rd, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/lost-node/lost", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	for _, rd := range []string{"rd-a", "rd-b"} {
+		_, err := st.Resources().Get(ctx, rd, "lost-node")
+		if err == nil {
+			t.Errorf("replica %s on lost-node still present; expected cascade delete", rd)
+		}
+	}
+
+	for _, rd := range []string{"rd-a", "rd-b"} {
+		_, err := st.Resources().Get(ctx, rd, "peer-node")
+		if err != nil {
+			t.Errorf("peer replica %s on peer-node missing: %v", rd, err)
+		}
+	}
+}
+
+// TestNodeLostCascadeDeletesStoragePools pins the SP half of
+// scenario 4.W04: every StoragePool with NodeName == lost MUST be
+// dropped from the store. StoragePools on the lost node can never
+// be probed again (no satellite to talk to), so leaving them
+// indefinitely makes `linstor sp l` report stale capacity and
+// pollutes the autoplacer's free-space ranking. SPs on the
+// surviving peer node must NOT be touched.
+func TestNodeLostCascadeDeletesStoragePools(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "lost-node"}); err != nil {
+		t.Fatalf("seed lost node: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "peer-node"}); err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+
+	for _, node := range []string{"lost-node", "peer-node"} {
+		for _, pool := range []string{"pool-ssd", "pool-hdd"} {
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName:        node,
+				StoragePoolName: pool,
+			}); err != nil {
+				t.Fatalf("seed SP %s on %s: %v", pool, node, err)
+			}
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/lost-node/lost", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	for _, pool := range []string{"pool-ssd", "pool-hdd"} {
+		_, err := st.StoragePools().Get(ctx, "lost-node", pool)
+		if err == nil {
+			t.Errorf("SP %s on lost-node still present; expected cascade delete", pool)
+		}
+	}
+
+	for _, pool := range []string{"pool-ssd", "pool-hdd"} {
+		_, err := st.StoragePools().Get(ctx, "peer-node", pool)
+		if err != nil {
+			t.Errorf("peer SP %s on peer-node missing: %v", pool, err)
+		}
+	}
+}
+
+// TestNodeLostCascadeIgnoresMissingChildren pins the idempotency
+// of the cascade: a re-run of `node lost` (or a partial prior
+// teardown) must succeed even when no Resources / StoragePools
+// remain to cascade. Matches the parent handler's
+// already-NotFound-is-success semantic so an operator teardown
+// loop is safe to retry.
+func TestNodeLostCascadeIgnoresMissingChildren(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "lost-node"}); err != nil {
+		t.Fatalf("seed lost node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/lost-node/lost", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (cascade with no children must succeed)", resp.StatusCode)
+	}
+
+	_, err := st.Nodes().Get(ctx, "lost-node")
+	if err == nil {
+		t.Errorf("node still present after lost: expected removal")
+	}
+}
