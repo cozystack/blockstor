@@ -1610,6 +1610,261 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	}
 }
 
+// TestApplyFirstActivationDiskReplaceInternalMetadata (scenario 5.W09)
+// pins the satellite-side ordering for the upstream drbd-troubleshooting
+// "Replacing a failed disk when using internal metadata" recipe.
+//
+// The recipe, applied at the operator-shell level on a satellite, is:
+//
+//	drbdadm detach --force <rd>         # local disk drops to Diskless
+//	# swap underlying LV/zvol/file out of band
+//	drbdmeta --force <rd>/<vol> v09 <dev> internal create-md <peers>
+//	drbdadm attach <rd>                  # kernel re-reads fresh metadata
+//
+// (Cross-listed with wave1 6.18 + 6.19; the e2e walks the operator-shell
+// path end-to-end in tests/e2e/disk-replace-internal-metadata.sh.)
+//
+// This test pins the *satellite-managed equivalent*: when the controller
+// re-creates the Resource CRD (e.g. via `linstor r d <node> <rd>` + `rd
+// ap <rd>`, the LINSTOR-managed shape of the same recipe), the
+// satellite's first activation on the new replica MUST issue create-md
+// BEFORE adjust — the v09 metadata format and the internal-metadata
+// shape both come from the satellite's own `drbdadm create-md
+// --force --max-peers=<N>` call, not from peer or controller state.
+//
+// Pin shape:
+//   - on the fresh replica (no .res, no .md-created marker on disk yet)
+//   - apply runs and emits exec calls in this order:
+//     1. provider create / probe (LV / zvol / file)
+//     2. `drbdadm create-md --force --max-peers=31 <rd>`
+//     (stamps a fresh DRBD-9 v09 metadata block; the `v09` format
+//     is implicit in `drbdadm create-md` for any DRBD-9 build)
+//     3. `drbdadm adjust <rd>`
+//     (the satellite's analog of `drbdadm attach` — adjust
+//     attaches the lower disk + connects peers in one go for
+//     first activation)
+//
+// What this catches: a regression that flips the order (e.g. running
+// adjust before create-md, which would fail with "No valid meta data
+// found"), drops create-md (e.g. mis-treating a re-created Resource
+// as firstActivation=false), or stamps metadata via a different verb
+// (e.g. `drbdmeta create-md` directly — which works at the operator
+// shell but is NOT the satellite's contract; the satellite always
+// goes through `drbdadm create-md` so the wrapper handles --max-peers
+// + activity-log sizing consistently).
+//
+// Cross-listed pin: scenario 5.W09 also asserts a *separate* property
+// — that when the OPERATOR runs `drbdmeta create-md + drbdadm attach`
+// outside LINSTOR, the reconciler must NOT overwrite `.res` mid-recipe.
+// That second property is covered by
+// `TestApplyAdoptsExistingMetadataAfterDiskReplace` below, which pins
+// the `HasMD` adopt-on-existing branch the recipe relies on.
+func TestApplyFirstActivationDiskReplaceInternalMetadata(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// LV absent on first activation — the post-disk-replace shape from
+	// the LINSTOR-managed recovery: the controller just dropped the
+	// stale Resource CRD and re-created it, so the provider does a
+	// fresh lvcreate (LVM-thin) before the DRBD bring-up.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-w09-replace_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-w09-replace",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7900",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1900",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7900",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	// The exact create-md invocation the satellite issues — pins the
+	// v09 metadata format (implicit in `drbdadm create-md`) and the
+	// internal-metadata shape (no `meta-disk <ext-dev>` in .res, which
+	// means `drbdadm create-md` lays down internal metadata in the
+	// trailing bytes of the lower disk). --max-peers is the
+	// 5.W09-critical knob: a fresh replica MUST be sized for the
+	// cluster's eventual peer count, not drbd-utils' default of 7,
+	// or future replicas would fail to attach with
+	// "peer-id out of range".
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-w09-replace", drbd.MaxPeers-1)
+	wantAdjust := "drbdadm adjust pvc-w09-replace"
+
+	createMD := indexOfPrefix(calls, wantCreateMD)
+	adjust := indexOfPrefix(calls, wantAdjust)
+	lvcreate := indexOfPrefix(calls, "lvcreate")
+
+	if lvcreate < 0 {
+		t.Fatalf("missing lvcreate (LV must be carved before DRBD bring-up): %v", calls)
+	}
+
+	if createMD < 0 {
+		t.Fatalf("missing %q in calls: %v", wantCreateMD, calls)
+	}
+
+	if adjust < 0 {
+		t.Fatalf("missing %q in calls: %v", wantAdjust, calls)
+	}
+
+	// Hard ordering: lvcreate (lower-disk carve) → create-md (stamp
+	// metadata) → adjust (kernel attach + peer connect). Any other
+	// order is a regression of the upstream recipe — and adjust before
+	// create-md would fail in production with "No valid meta data
+	// found" on the freshly-allocated lower disk.
+	if !(lvcreate < createMD && createMD < adjust) {
+		t.Errorf("ordering: lvcreate@%d → create-md@%d → adjust@%d (want strictly ascending); calls=%v",
+			lvcreate, createMD, adjust, calls)
+	}
+
+	// .md-created marker must exist on disk after the first activation
+	// — without it, a satellite restart would re-run create-md on the
+	// next reconcile and wipe the freshly-stamped metadata block.
+	if _, statErr := os.Stat(filepath.Join(dir, "pvc-w09-replace.md-created")); statErr != nil {
+		t.Errorf(".md-created marker missing after first activation: %v", statErr)
+	}
+}
+
+// TestApplyAdoptsExistingMetadataAfterDiskReplace (scenario 5.W09,
+// "raw `drbdmeta create-md + attach` outside LINSTOR" assertion)
+// pins the safety guard the reconciler uses when an operator has
+// already laid down a fresh DRBD-9 metadata block by hand (e.g. via
+// the upstream-doc verbatim `drbdmeta --force <rd>/<vol> v09 <dev>
+// internal create-md <peers>` command), but the satellite-side
+// `.md-created` marker is missing — because the operator bypassed
+// blockstor entirely and the controller-side desired state never
+// changed, so no reconciler-driven create-md ever wrote the marker.
+//
+// The safety property: when `drbdadm dump-md <rd>` reports parseable
+// metadata already on the lower disk (`HasMD=true`), the satellite
+// MUST NOT re-run `drbdadm create-md` on this resource. `create-md
+// --force` would wipe the operator's freshly-stamped GI + bitmap
+// state and orphan the local data from the cluster — the exact
+// failure mode the recipe is supposed to recover FROM.
+//
+// Instead, the satellite must:
+//   - adopt the existing metadata (skip create-md)
+//   - write the `.md-created` marker so subsequent reconciles see
+//     `firstActivation=false` and stay on the steady-state branch
+//   - continue to `drbdadm adjust` (the satellite-side analog of
+//     `drbdadm attach`, which is the last step of the upstream
+//     recipe) so the kernel picks up the new metadata block
+//
+// This is the property the e2e `disk-replace-internal-metadata.sh`
+// indirectly exercises end-to-end ("reconciler picks up state within
+// 10s without overwriting `.res`"); this unit test pins the exact
+// satellite-side decision branch so a regression at the satellite
+// layer surfaces in unit tests, not only in slow e2e runs.
+func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// LV present — the LINSTOR-managed teardown didn't run (operator
+	// bypassed blockstor), so the lower disk + its metadata block are
+	// already in place by the time the next reconcile fires.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-w09-adopt_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-w09-adopt_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-w09-adopt_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-w09-adopt_00000|1048576\n")})
+
+	// drbdadm dump-md returns a parseable metadata block — the
+	// operator's `drbdmeta create-md` just stamped a fresh one. The
+	// real drbdadm dump-md prints a multi-line `version`/`la-size`/
+	// `bm-uuid`/... dump; the satellite's HasMD only needs `err == nil
+	// && len(out) > 0`, so a minimal canned response suffices.
+	fx.Expect("drbdadm dump-md pvc-w09-adopt",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-w09-adopt",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7901",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1901",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7901",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	// The forbidden verb: `drbdadm create-md` on a resource whose
+	// metadata is already present would wipe the operator-stamped
+	// GI + bitmap and orphan the local data from the cluster. This
+	// is the W09 invariant that makes the upstream recipe safe.
+	for _, line := range calls {
+		if strings.HasPrefix(line, "drbdadm create-md") {
+			t.Errorf("reconciler re-ran create-md despite HasMD=true (would wipe operator-stamped metadata): %s", line)
+		}
+	}
+
+	// dump-md (HasMD probe) MUST have fired — without it the safety
+	// guard is bypassed and the create-md call above would have run.
+	if indexOfPrefix(calls, "drbdadm dump-md pvc-w09-adopt") < 0 {
+		t.Errorf("HasMD probe (drbdadm dump-md) missing from call sequence: %v", calls)
+	}
+
+	// adjust MUST still fire — adopting metadata is only safe if we
+	// also hand the kernel control of the now-attached state. Without
+	// adjust, the resource stays Diskless on n1 forever despite the
+	// metadata being healthy.
+	if !slices.Contains(calls, "drbdadm adjust pvc-w09-adopt") {
+		t.Errorf("expected drbdadm adjust after adopting existing metadata; got %v", calls)
+	}
+
+	// .md-created marker MUST be written — it gates `firstActivation`
+	// across satellite restarts. Without the marker, the next reconcile
+	// would re-enter the firstActivation=true branch, hit the dump-md
+	// probe again (still ok), but more importantly betray the adopt
+	// path's "this is a one-shot fixup" intent.
+	if _, statErr := os.Stat(filepath.Join(dir, "pvc-w09-adopt.md-created")); statErr != nil {
+		t.Errorf(".md-created marker not written after adopting existing metadata: %v", statErr)
+	}
+}
+
 // TestApplyFirstActivationNoSkipOnLVMThick (Bug 77 negative case)
 // pins that on a fresh RD with no peer to seed from AND a backing
 // provider that does NOT guarantee zeroes on read (thick LVM hands
