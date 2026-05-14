@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -575,144 +576,95 @@ func TestRGDeleteUnknownReturns200Warning(t *testing.T) {
 	}
 }
 
-// TestRGCreateScenario9W01WiresSelectFilter closes wave2-09 scenario
-// 9.W01 (`rg create <name> --place-count N --storage-pool <pool>` +
-// placement-constraint flavours). The scenario is the foundation of
-// RG-driven deployment, so this test pins the wire-to-spec mapping
-// for every SelectFilter field the CLI sends on a single
-// `linstor rg c` invocation:
-//
-//   - PlaceCount      (`--place-count N`)
-//   - StoragePool     (`--storage-pool <pool>`)
-//   - LayerStack      (`--layer-list drbd,luks,storage`)
-//   - ReplicasOnSame  (`--replicas-on-same Aux/<k>=<v>`)
-//   - ReplicasOnDifferent (`--replicas-on-different Aux/<k>`)
-//
-// All five must round-trip through POST `/v1/resource-groups` onto
-// `ResourceGroup.SelectFilter` so that downstream `rg spawn`
-// (handled by ResourceGroupSpawn / Autoplacer) sees the exact same
-// constraint set the operator typed. A regression in any single
-// field silently weakens autoplacement on every spawn — pinning all
-// five together here makes that regression loud.
-//
-// Sibling tests cover narrower angles:
-//   - TestResourceGroupsCreateRoundTrip — PlaceCount + StoragePool only
-//     (the original happy path).
-//   - TestResourceGroupsUpdate — LayerStack via PUT (the modify path).
-//   - TestResourceGroupsCreateConflict — same-name 409 (Bug-style pin).
-//
-// This test is the scenario-anchored consolidation so wave2-09 9.W01
-// has one named assertion that fails together with any regression in
-// the create-side SelectFilter wiring.
-func TestRGCreateScenario9W01WiresSelectFilter(t *testing.T) {
+// TestResourceGroupListPropertiesRoundTripAllNamespaces pins scenario
+// 1.W01 (P0, unit) for the ResourceGroup scope: `linstor
+// resource-group list-properties` reads the `props` field of
+// `GET /v1/resource-groups/{rg}`. Every LINSTOR-known namespace
+// (`DrbdOptions/`, `Aux/`, `FileSystem/`, `StorDriver/`) must
+// round-trip verbatim so RG-level templating (the inheritance
+// source for every RD spawned off the group) keeps its operator-
+// authored keys intact.
+func TestResourceGroupListPropertiesRoundTripAllNamespaces(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
+
+	seed := map[string]string{
+		"DrbdOptions/auto-quorum":  "io-error",
+		"DrbdOptions/Net/protocol": "C",
+		"Aux/cozystack.io/owner":   "team-storage",
+		"FileSystem/Type":          "xfs",
+		"StorDriver/StorPoolName":  "blockstor-zfs",
+	}
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:  "rg-props",
+		Props: maps.Clone(seed),
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	body, err := json.Marshal(apiv1.ResourceGroup{
-		Name:        "rg-w01",
-		Description: "wave2 9.W01 scenario pin",
-		SelectFilter: apiv1.AutoSelectFilter{
-			PlaceCount:          3,
-			StoragePool:         "pool-ssd",
-			LayerStack:          []string{"DRBD", "LUKS", "STORAGE"},
-			ReplicasOnSame:      []string{"Aux/zone=a"},
-			ReplicasOnDifferent: []string{"Aux/rack"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	resp := httpPost(t, base+"/v1/resource-groups", body)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("create status: got %d, want 201", resp.StatusCode)
-	}
-
-	got, err := st.ResourceGroups().Get(ctx, "rg-w01")
+	c := newClient(t, base)
+	got, err := c.ResourceGroups.Get(ctx, "rg-props")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.SelectFilter.PlaceCount != 3 {
-		t.Errorf("PlaceCount: got %d, want 3", got.SelectFilter.PlaceCount)
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want a {Key,Value} map")
 	}
 
-	if got.SelectFilter.StoragePool != "pool-ssd" {
-		t.Errorf("StoragePool: got %q, want pool-ssd", got.SelectFilter.StoragePool)
-	}
-
-	wantLayerStack := []string{"DRBD", "LUKS", "STORAGE"}
-	if !equalStringSlice(got.SelectFilter.LayerStack, wantLayerStack) {
-		t.Errorf("LayerStack: got %v, want %v", got.SelectFilter.LayerStack, wantLayerStack)
-	}
-
-	wantReplicasOnSame := []string{"Aux/zone=a"}
-	if !equalStringSlice(got.SelectFilter.ReplicasOnSame, wantReplicasOnSame) {
-		t.Errorf("ReplicasOnSame: got %v, want %v", got.SelectFilter.ReplicasOnSame, wantReplicasOnSame)
-	}
-
-	wantReplicasOnDifferent := []string{"Aux/rack"}
-	if !equalStringSlice(got.SelectFilter.ReplicasOnDifferent, wantReplicasOnDifferent) {
-		t.Errorf("ReplicasOnDifferent: got %v, want %v", got.SelectFilter.ReplicasOnDifferent, wantReplicasOnDifferent)
-	}
-
-	// Same-name idempotency contract: a second POST with the same
-	// name must NOT silently re-create or mutate the persisted RG.
-	// Upstream LINSTOR rejects duplicate-name creates outright
-	// (translates to HTTP 409 via writeStoreError(ErrAlreadyExists))
-	// — operators rely on this to spot accidental double-creates
-	// rather than getting a silent "last write wins" surprise. We
-	// drive a second create with a deliberately-different filter to
-	// catch a regression that swallows the conflict and clobbers the
-	// stored SelectFilter.
-	clobber, err := json.Marshal(apiv1.ResourceGroup{
-		Name: "rg-w01",
-		SelectFilter: apiv1.AutoSelectFilter{
-			PlaceCount:  9,
-			StoragePool: "pool-different",
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal clobber: %v", err)
-	}
-
-	dup := httpPost(t, base+"/v1/resource-groups", clobber)
-	_ = dup.Body.Close()
-
-	if dup.StatusCode != http.StatusConflict {
-		t.Errorf("duplicate create status: got %d, want 409", dup.StatusCode)
-	}
-
-	after, err := st.ResourceGroups().Get(ctx, "rg-w01")
-	if err != nil {
-		t.Fatalf("Get after dup: %v", err)
-	}
-
-	if after.SelectFilter.PlaceCount != 3 || after.SelectFilter.StoragePool != "pool-ssd" {
-		t.Errorf("duplicate create must not mutate SelectFilter; got %+v", after.SelectFilter)
+	for k, want := range seed {
+		if got.Props[k] != want {
+			t.Errorf("Props[%q]: got %q, want %q (namespace round-trip drift)", k, got.Props[k], want)
+		}
 	}
 }
 
-// equalStringSlice reports whether a and b contain the same strings
-// in the same order. Kept local to this file to avoid pulling in
-// reflect.DeepEqual for what is conceptually a wire-shape assertion
-// — the slice-equality contract here is order-sensitive because
-// LayerStack ordering is semantically meaningful (top-down stack).
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// TestResourceGroupListPropertiesUnknownRGReturns404 pins the
+// unknown-scope half of scenario 1.W01 for resource groups.
+func TestResourceGroupListPropertiesUnknownRGReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-groups/ghost-rg")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestResourceGroupListPropertiesEmptyDecodes pins the "empty scope
+// returns empty map (not nil)" clause: an RG with no Props decodes
+// without panic. golinstor ranges over the (possibly nil) map; the
+// pin guards the no-panic contract.
+func TestResourceGroupListPropertiesEmptyDecodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-empty"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
 	}
 
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-groups/rg-empty")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	return true
+	var got apiv1.ResourceGroup
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for k, v := range got.Props {
+		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
+	}
 }

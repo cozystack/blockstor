@@ -19,6 +19,7 @@ package rest
 import (
 	"bytes"
 	"encoding/json"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -1039,6 +1040,92 @@ func TestNodeListPropsNodeUname(t *testing.T) {
 	if got.Props["CurStltConnName"] != "default" {
 		t.Errorf("Props[CurStltConnName]: got %q, want %q",
 			got.Props["CurStltConnName"], "default")
+	}
+}
+
+// TestNodeListPropertiesRoundTripAllNamespaces pins scenario 1.W01
+// (P0, unit) for the Node scope: `linstor node list-properties` is
+// served client-side from the `props` field of `GET /v1/nodes/{node}`,
+// so the REST round-trip must preserve every known LINSTOR namespace
+// (`DrbdOptions/`, `Aux/`, `FileSystem/`, `StorDriver/`) verbatim —
+// no key rewriting, no value re-encoding. A regression that lower-
+// cased keys or stripped namespace prefixes would break golinstor's
+// per-key lookups in the recovery-copilot's diagnostic playbooks.
+func TestNodeListPropertiesRoundTripAllNamespaces(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seed := map[string]string{
+		"DrbdOptions/Net/protocol":     "C",
+		"Aux/rack-id":                  "rack-7",
+		"FileSystem/Type":              "ext4",
+		"StorDriver/StorPoolName":      "blockstor-zfs",
+		"Aux/cozystack.io/tenant-uuid": "9f3c-aabb",
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name:  "worker-1",
+		Type:  apiv1.NodeTypeSatellite,
+		Props: maps.Clone(seed),
+	}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "worker-1")
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want a map (scenario 1.W01: empty scope returns empty map, not nil)")
+	}
+
+	for k, want := range seed {
+		if got.Props[k] != want {
+			t.Errorf("Props[%q]: got %q, want %q (namespace round-trip drift)", k, got.Props[k], want)
+		}
+	}
+}
+
+// TestNodeListPropertiesUnknownNodeReturns404 pins the unknown-scope
+// half of scenario 1.W01: a `list-properties` call against a node
+// that does not exist must surface a 404 (which golinstor's CLI maps
+// to "Node 'ghost' not found"). A 500 here would mask a typo as a
+// transient server error and silently retry forever.
+func TestNodeListPropertiesUnknownNodeReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/ghost")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestNodeListPropertiesEmptySeedNotNil pins the "empty scope returns
+// empty map (not nil)" clause of scenario 1.W01. A satellite-typed
+// node seeded with no Props at all must still emit a usable map
+// after the F2 synthesis: NodeUname + CurStltConnName are stamped
+// unconditionally, so an operator running `linstor n list-properties`
+// on a fresh node never sees a "no properties" CLI panic from an
+// indexed access on a nil map.
+func TestNodeListPropertiesEmptySeedNotNil(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "fresh-node")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "fresh-node")
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want non-nil map (F2 synthesises NodeUname + CurStltConnName)")
+	}
+
+	if len(got.Props) == 0 {
+		t.Errorf("Props: got empty map, want at least NodeUname + CurStltConnName")
 	}
 }
 

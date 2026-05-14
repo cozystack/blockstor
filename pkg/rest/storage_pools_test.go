@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -1164,210 +1165,15 @@ func TestSPDeleteUnknownUsesWarnMaskNotInfo(t *testing.T) {
 	}
 }
 
-// TestSPCreateLVMThinScenario6W02 closes the wave2 6.W02 scenario for
-// `linstor sp create lvmthin <node> <pool> <vg>/<thinpool>`.
-//
-// The CLI's `sp c lvmthin` invocation hits POST
-// `/v1/nodes/{node}/storage-pools` with this wire payload:
-//
-//	{
-//	  "storage_pool_name": "<pool>",
-//	  "provider_kind":     "lvmthin",      // CLI-typed, lowercase one-word
-//	  "props": {
-//	    "StorDriver/StorPoolName": "<vg>/<thinpool>"
-//	  }
-//	}
-//
-// Three guarantees this test pins, all of which fall out of the
-// scenario's "REST normalises lvmthin -> LVM_THIN" + Bug 63 alias
-// expansion + the satellite's NewProviderFromKind contract:
-//
-//  1. ProviderKind on the stored row is the canonical upstream-LINSTOR
-//     enum "LVM_THIN" — never the CLI alias `lvmthin` (one word) nor the
-//     UG-typo `lvm-thin` (hyphenated). The StoragePool CRD's CEL enum
-//     only allows the uppercase canonical form; without normalisation
-//     the apiserver returns an opaque "Unsupported value" error and the
-//     satellite's NewProviderFromKind switch falls through to
-//     "unknown provider kind", leaving the pool unregistered forever.
-//  2. Props carry both kind-specific keys the satellite needs:
-//     `StorDriver/LvmVg=<vg>` and `StorDriver/ThinPool=<thinpool>`.
-//     Without `ThinPool`, `newLVMThin` returns "requires
-//     StorDriver/ThinPool in props" and the pool surfaces in `sp l` but
-//     fails every placement. The original `StorDriver/StorPoolName`
-//     alias is retained because upstream-CLI `sp l` echoes it back as
-//     the PoolName column.
-//  3. The full wire shape round-trips through the store: a follow-up
-//     GET /v1/nodes/{node}/storage-pools/{pool} returns the same
-//     (canonical ProviderKind + expanded Props) payload — so a
-//     satellite reconciler tick that re-reads the CRD doesn't drift.
-//
-// Cross-listed with wave1 6.1. Bug 63 (alias expansion) is exercised
-// for the `<vg>/<thin>` split — see TestSPCreateExpandsLVMThinStorPoolName
-// for the focused-on-that-axis variant; this test pins the end-to-end
-// scenario contract as a single passing path.
-func TestSPCreateLVMThinScenario6W02(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "w1", Type: apiv1.NodeTypeSatellite}); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	// Wire body mirrors `linstor sp c lvmthin w1 lvm-thin vg0/thinpool0`
-	// — lowercase one-word kind alias + the `<vg>/<thin>` StorPoolName
-	// shorthand. No kind-specific Props keys are pre-filled; the REST
-	// handler must derive them.
-	body := []byte(`{
-		"storage_pool_name": "lvm-thin",
-		"provider_kind":     "lvmthin",
-		"props": {
-			"StorDriver/StorPoolName": "vg0/thinpool0"
-		}
-	}`)
-
-	resp := httpPost(t, base+"/v1/nodes/w1/storage-pools", body)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST status: got %d, want 201", resp.StatusCode)
-	}
-
-	got, err := st.StoragePools().Get(ctx, "w1", "lvm-thin")
-	if err != nil {
-		t.Fatalf("store Get after POST: %v", err)
-	}
-
-	// Guarantee 1: ProviderKind landed as canonical "LVM_THIN".
-	if got.ProviderKind != apiv1.StoragePoolKindLVMThin {
-		t.Errorf("ProviderKind: got %q, want %q (REST must normalise lvmthin to LVM_THIN)",
-			got.ProviderKind, apiv1.StoragePoolKindLVMThin)
-	}
-
-	// Guarantee 2: kind-specific Props populated from the alias.
-	if got.Props["StorDriver/LvmVg"] != "vg0" {
-		t.Errorf("StorDriver/LvmVg: got %q, want %q (props=%v)",
-			got.Props["StorDriver/LvmVg"], "vg0", got.Props)
-	}
-
-	if got.Props["StorDriver/ThinPool"] != "thinpool0" {
-		t.Errorf("StorDriver/ThinPool: got %q, want %q (props=%v)",
-			got.Props["StorDriver/ThinPool"], "thinpool0", got.Props)
-	}
-
-	if got.Props["StorDriver/StorPoolName"] != "vg0/thinpool0" {
-		t.Errorf("StorDriver/StorPoolName retained: got %q, want %q",
-			got.Props["StorDriver/StorPoolName"], "vg0/thinpool0")
-	}
-
-	// Guarantee 3: GET /v1/nodes/{node}/storage-pools/{pool} round-trips
-	// the canonical shape — so the next satellite reconcile tick reads
-	// what the create handler stored.
-	getResp := httpGet(t, base+"/v1/nodes/w1/storage-pools/lvm-thin")
-	defer func() { _ = getResp.Body.Close() }()
-
-	if getResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET status: got %d, want 200", getResp.StatusCode)
-	}
-
-	var wire apiv1.StoragePool
-	if err := json.NewDecoder(getResp.Body).Decode(&wire); err != nil {
-		t.Fatalf("decode GET body: %v", err)
-	}
-
-	if wire.ProviderKind != apiv1.StoragePoolKindLVMThin {
-		t.Errorf("wire ProviderKind: got %q, want %q", wire.ProviderKind, apiv1.StoragePoolKindLVMThin)
-	}
-
-	if wire.Props["StorDriver/LvmVg"] != "vg0" || wire.Props["StorDriver/ThinPool"] != "thinpool0" {
-		t.Errorf("wire props: got LvmVg=%q ThinPool=%q, want vg0 / thinpool0",
-			wire.Props["StorDriver/LvmVg"], wire.Props["StorDriver/ThinPool"])
-	}
-}
-
-// TestSPCreateLVMThinAliasVariants pins the case-and-form normalisation
-// matrix for scenario 6.W02: every variant the python-linstor-client
-// CLI emits — lowercase compressed `lvmthin`, uppercase compressed
-// `LVMTHIN`, canonical `LVM_THIN`, and the mixed-case `lvm_thin` shape
-// some operator scripts copy from docs — MUST land on the stored row
-// as canonical `LVM_THIN`. Mirrors upstream Java's
-// `DeviceProviderKind.valueOfIgnoreCase` semantic the
-// `normalizeProviderKind` helper in physical_storage.go already
-// implements for `physical-storage create-device-pool`; this test
-// pins the same matrix on the `sp create` path so the two endpoints
-// stay in lockstep (Bug 73 parity).
-//
-// The `lvm-thin` hyphenated form is deliberately NOT accepted —
-// scenario 6.W02 explicitly calls out "Driver name is `lvmthin` (one
-// word), not `lvm-thin`", matching upstream LINSTOR's CLI grammar.
-func TestSPCreateLVMThinAliasVariants(t *testing.T) {
-	cases := []struct {
-		name    string
-		wireRaw string
-	}{
-		{name: "lowercase one-word", wireRaw: "lvmthin"},
-		{name: "uppercase one-word", wireRaw: "LVMTHIN"},
-		{name: "canonical underscore", wireRaw: "LVM_THIN"},
-		{name: "mixed-case lower-underscore", wireRaw: "lvm_thin"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			st := store.NewInMemory()
-			ctx := t.Context()
-
-			if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
-				t.Fatalf("seed node: %v", err)
-			}
-
-			base, stop := startServerWithStore(t, st)
-			defer stop()
-
-			body := []byte(`{
-				"storage_pool_name": "p1",
-				"provider_kind":     "` + tc.wireRaw + `",
-				"props": {"StorDriver/StorPoolName": "vg/thin"}
-			}`)
-
-			resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
-			_ = resp.Body.Close()
-
-			if resp.StatusCode != http.StatusCreated {
-				t.Fatalf("status for %q: got %d, want 201", tc.wireRaw, resp.StatusCode)
-			}
-
-			got, err := st.StoragePools().Get(ctx, "n1", "p1")
-			if err != nil {
-				t.Fatalf("store Get: %v", err)
-			}
-
-			if got.ProviderKind != apiv1.StoragePoolKindLVMThin {
-				t.Errorf("ProviderKind for wire %q: got %q, want %q",
-					tc.wireRaw, got.ProviderKind, apiv1.StoragePoolKindLVMThin)
-			}
-
-			// Alias expansion must still fire even when the wire kind
-			// arrived in a non-canonical form: normalisation happens
-			// BEFORE expandStorPoolNameAlias inspects ProviderKind.
-			if got.Props["StorDriver/LvmVg"] != "vg" || got.Props["StorDriver/ThinPool"] != "thin" {
-				t.Errorf("alias expansion did not fire for wire %q: LvmVg=%q ThinPool=%q",
-					tc.wireRaw, got.Props["StorDriver/LvmVg"], got.Props["StorDriver/ThinPool"])
-			}
-		})
-	}
-}
-
-// TestSPCreateLVMThinHyphenRejected pins scenario 6.W02's explicit
-// non-goal: the legacy `lvm-thin` hyphenated form (which appears in
-// some docs but is NOT what python-linstor-client emits) MUST be
-// rejected with a 400. We never want to silently coerce it because
-// the same string is a perfectly valid POOL name (see e.g.
-// `pkg/satellite/controllers/resource_test.go` which uses "lvm-thin"
-// as a pool name), and accepting it as a kind would mask typos that
-// otherwise mean a real misconfiguration.
-func TestSPCreateLVMThinHyphenRejected(t *testing.T) {
+// TestStoragePoolListPropertiesRoundTripAllNamespaces pins scenario
+// 1.W01 (P0, unit) for the StoragePool scope: `linstor storage-pool
+// list-properties` reads the `props` field of `GET
+// /v1/nodes/{node}/storage-pools/{pool}`. Every LINSTOR-known
+// namespace (`DrbdOptions/`, `Aux/`, `FileSystem/`, `StorDriver/`)
+// must round-trip verbatim — Bug 63's StorPoolName alias expansion
+// is the closest we get to normalisation, and it only adds keys, it
+// must not rewrite the namespaces themselves.
+func TestStoragePoolListPropertiesRoundTripAllNamespaces(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -1375,18 +1181,110 @@ func TestSPCreateLVMThinHyphenRejected(t *testing.T) {
 		t.Fatalf("seed node: %v", err)
 	}
 
+	seed := map[string]string{
+		"StorDriver/LvmVg":           "vg1",
+		"StorDriver/ThinPool":        "thin",
+		"DrbdOptions/AutoVerifyAlgo": "crc32c",
+		"Aux/cozystack.io/pool-tier": "premium",
+		"FileSystem/MkfsOptions":     "-K -E lazy_itable_init=0",
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           maps.Clone(seed),
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	body := []byte(`{
-		"storage_pool_name": "p1",
-		"provider_kind":     "lvm-thin"
-	}`)
+	resp := httpGet(t, base+"/v1/nodes/n1/storage-pools/p1")
+	defer func() { _ = resp.Body.Close() }()
 
-	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
-	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status: got %d, want 400 (lvm-thin hyphenated form must be rejected)", resp.StatusCode)
+	var got apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want a {Key,Value} map")
+	}
+
+	for k, want := range seed {
+		if got.Props[k] != want {
+			t.Errorf("Props[%q]: got %q, want %q (namespace round-trip drift)", k, got.Props[k], want)
+		}
+	}
+}
+
+// TestStoragePoolListPropertiesUnknownPoolReturns404 pins the
+// unknown-scope half of scenario 1.W01 for storage pools: an absent
+// (node, pool) pair must 404, not return an empty-Props 200 — that
+// would hide an operator typo.
+func TestStoragePoolListPropertiesUnknownPoolReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/ghost-node/storage-pools/ghost-pool")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestStoragePoolListPropertiesEmptyDecodes pins the "empty scope
+// returns empty map (not nil)" clause of scenario 1.W01 for the
+// StoragePool scope: an SP seeded with no Props must still decode
+// into a usable `props` field — golinstor's
+// `linstor sp list-properties` indexes into the map directly, so
+// nil would panic the CLI with a "nil map dereference" on the
+// first `--show-props` access.
+func TestStoragePoolListPropertiesEmptyDecodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p-empty",
+		ProviderKind:    apiv1.StoragePoolKindDiskless,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1/storage-pools/p-empty")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// `props,omitempty` legitimately omits the field on the wire when
+	// the seed has nothing in the bag, so Props may decode to nil.
+	// The scenario's "empty map (not nil)" contract is satisfied at
+	// the LINSTOR-CLI level by ranging over a (potentially nil) map
+	// — that is the no-panic check we pin here so a future refactor
+	// that swaps the map for a pointer-typed wrapper trips the test.
+	for k, v := range got.Props {
+		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }

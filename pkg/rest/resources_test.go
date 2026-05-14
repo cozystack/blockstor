@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -1012,5 +1013,118 @@ func TestDiskfulResourceUnchanged(t *testing.T) {
 
 	if vol.DiskState != "UpToDate" {
 		t.Errorf("diskful: storage_volumes[0].disk_state=%q, want UpToDate", vol.DiskState)
+	}
+}
+
+// TestResourceListPropertiesRoundTripAllNamespaces pins scenario
+// 1.W01 (P0, unit) for the Resource scope: `linstor resource
+// list-properties` reads the `props` field of `GET
+// /v1/resource-definitions/{rd}/resources/{node}`. Every LINSTOR-
+// known namespace (`DrbdOptions/`, `Aux/`, `FileSystem/`,
+// `StorDriver/`) must round-trip verbatim — per-replica overrides
+// only take effect on a specific (rd, node) pair, so any
+// normalisation drift would silently miss the replica it was
+// meant to target.
+func TestResourceListPropertiesRoundTripAllNamespaces(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	seed := map[string]string{
+		"DrbdOptions/Net/protocol": "C",
+		"DrbdOptions/PeerSlots":    "7",
+		"Aux/cozystack.io/replica": "primary",
+		"FileSystem/Type":          "ext4",
+		"StorDriver/StorPoolName":  "blockstor-zfs",
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n1",
+		Props:    maps.Clone(seed),
+	}); err != nil {
+		t.Fatalf("seed resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want a {Key,Value} map")
+	}
+
+	for k, want := range seed {
+		if got.Props[k] != want {
+			t.Errorf("Props[%q]: got %q, want %q (namespace round-trip drift)", k, got.Props[k], want)
+		}
+	}
+}
+
+// TestResourceListPropertiesUnknownReturns404 pins the unknown-scope
+// half of scenario 1.W01 for resources: an absent (rd, node) pair
+// must 404 rather than fold into a 200 with empty Props.
+func TestResourceListPropertiesUnknownReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/ghost-rd/resources/ghost-node")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestResourceListPropertiesEmptyDecodes pins the "empty scope
+// returns empty map (not nil)" clause for the Resource scope: a
+// replica with no Props decodes cleanly so the CLI's range-over-map
+// renders zero rows instead of crashing on a nil dereference.
+func TestResourceListPropertiesEmptyDecodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-empty"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-empty",
+		NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-empty/resources/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for k, v := range got.Props {
+		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }

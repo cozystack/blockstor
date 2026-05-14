@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"slices"
 	"testing"
@@ -936,5 +937,102 @@ func TestRDListNoFilterReturnsAll(t *testing.T) {
 	want := []string{"alpha", "beta", "gamma"}
 	if !slices.Equal(got, want) {
 		t.Errorf("no-filter: got %v, want %v", got, want)
+	}
+}
+
+// TestResourceDefinitionListPropertiesRoundTripAllNamespaces pins
+// scenario 1.W01 (P0, unit) for the ResourceDefinition scope:
+// `linstor resource-definition list-properties` reads the `props`
+// field of `GET /v1/resource-definitions/{rd}`. Every LINSTOR-known
+// namespace (`DrbdOptions/`, `Aux/`, `FileSystem/`, `StorDriver/`)
+// must round-trip verbatim so RD-level overrides (the per-volume
+// inheritance terminus) stay byte-identical with what the operator
+// PUT.
+func TestResourceDefinitionListPropertiesRoundTripAllNamespaces(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seed := map[string]string{
+		"DrbdOptions/auto-quorum":   "io-error",
+		"DrbdOptions/Net/protocol":  "C",
+		"Aux/cozystack.io/pvc-uuid": "abc-123",
+		"FileSystem/Type":           "ext4",
+		"StorDriver/StorPoolName":   "blockstor-zfs",
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-props",
+		Props: maps.Clone(seed),
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-props")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want a {Key,Value} map")
+	}
+
+	for k, want := range seed {
+		if got.Props[k] != want {
+			t.Errorf("Props[%q]: got %q, want %q (namespace round-trip drift)", k, got.Props[k], want)
+		}
+	}
+}
+
+// TestResourceDefinitionListPropertiesUnknownRDReturns404 pins the
+// unknown-scope half of scenario 1.W01 for resource definitions.
+func TestResourceDefinitionListPropertiesUnknownRDReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/ghost-rd")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestResourceDefinitionListPropertiesEmptyDecodes pins the "empty
+// scope returns empty map (not nil)" clause for the RD scope.
+func TestResourceDefinitionListPropertiesEmptyDecodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "rd-empty"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/rd-empty")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for k, v := range got.Props {
+		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }
