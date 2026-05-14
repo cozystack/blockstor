@@ -237,8 +237,10 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	// surfaced as "failed to create snapshot: missing snapshots".
 	// blockstor's actual snapshot is taken by the satellite during
 	// reconcile, but the REST shim's view of "where it landed"
-	// derives deterministically from Spec.Nodes.
-	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes)
+	// derives deterministically from Spec.Nodes. F20: each per-node
+	// entry also carries the `snapshot_volumes[]` slot array so the
+	// CLI's per-node volume table renders the volume_number column.
+	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes, snap.VolumeDefinitions)
 
 	// Idempotent create: a CSI driver retries CreateSnapshot for the
 	// same (rd, snap_name) until success, so a re-request must
@@ -327,14 +329,32 @@ func paginateSnapshots(r *http.Request, in []apiv1.Snapshot) []apiv1.Snapshot {
 // makeSnapshotPerNode builds the `Snapshots[]` per-node materialisation
 // from the slice of node names a Snapshot targets. Used at create time
 // so subsequent GETs surface one SnapshotNode entry per diskful peer —
-// linstor-csi's "did the satellite actually take it?" probe.
-func makeSnapshotPerNode(name string, nodes []string) []apiv1.SnapshotPerNode {
+// linstor-csi's "did the satellite actually take it?" probe. F20:
+// each per-node entry carries one `SnapshotVolume` per VolumeDefinition
+// slot so the upstream `linstor s l` CLI renders the per-node
+// volume_number column without an empty list.
+func makeSnapshotPerNode(name string, nodes []string, vds []apiv1.SnapshotVolumeDef) []apiv1.SnapshotPerNode {
 	out := make([]apiv1.SnapshotPerNode, 0, len(nodes))
+
+	vols := make([]apiv1.SnapshotVolume, 0, len(vds))
+	for i := range vds {
+		vols = append(vols, apiv1.SnapshotVolume{VolumeNumber: vds[i].VolumeNumber})
+	}
+
 	for _, node := range nodes {
-		out = append(out, apiv1.SnapshotPerNode{
+		entry := apiv1.SnapshotPerNode{
 			SnapshotName: name,
 			NodeName:     node,
-		})
+		}
+
+		if len(vols) > 0 {
+			// Defensive copy — per-node entries must not share the
+			// same backing array (a future per-node `State` mutation
+			// would race across SnapshotPerNode siblings otherwise).
+			entry.SnapshotVolumes = append([]apiv1.SnapshotVolume(nil), vols...)
+		}
+
+		out = append(out, entry)
 	}
 
 	return out
@@ -342,33 +362,57 @@ func makeSnapshotPerNode(name string, nodes []string) []apiv1.SnapshotPerNode {
 
 // hydrateSnapshotFromRD fills in the per-snapshot fields the
 // snapshot-restore-resource handler + the autoplace constraint need
-// downstream. Three derivations:
+// downstream. Derivations:
 //
 //   - VolumeDefinitions: copied from the source RD when absent; without
-//     these a restore-target RD comes up with zero volumes.
+//     these a restore-target RD comes up with zero volumes. F20:
+//     each entry also carries the parent VD's `Props` so the
+//     snapshot DTO surfaces `volume_definition_props` to upstream
+//     tooling (`linstor backup`, schedule reconciler).
 //   - Props: inherited from the source RD when absent.
 //   - Nodes: upstream-LINSTOR semantic — empty means "every diskful
 //     replica". The satellite reconciler gates per-snapshot work on
 //     slices.Contains(snap.Spec.Nodes, self), so an empty list would
 //     silently produce a zero-replica snapshot.
+//   - F20 DTO fields: `SnapshotDefinitionProps` (== Snapshot's own
+//     props bag) and `ResourceDefinitionProps` (a snapshot-time copy
+//     of the parent RD's props) — both are surfaced via the wire
+//     DTO so CLI consumers don't need a second round-trip.
 func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot, rd string) error {
 	srcRD, err := s.Store.ResourceDefinitions().Get(ctx, rd)
 	if err != nil {
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
-	if len(snap.VolumeDefinitions) == 0 {
-		vds, vdErr := s.Store.VolumeDefinitions().List(ctx, rd)
-		if vdErr != nil {
-			return vdErr //nolint:wrapcheck // surfaced via writeStoreError
-		}
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rd)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
 
+	vdPropsByNumber := make(map[int32]map[string]string, len(vds))
+	for _, vd := range vds {
+		if len(vd.Props) > 0 {
+			vdPropsByNumber[vd.VolumeNumber] = vd.Props
+		}
+	}
+
+	if len(snap.VolumeDefinitions) == 0 {
 		snap.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(vds))
 		for _, vd := range vds {
 			snap.VolumeDefinitions = append(snap.VolumeDefinitions, apiv1.SnapshotVolumeDef{
-				VolumeNumber: vd.VolumeNumber,
-				SizeKib:      vd.SizeKib,
+				VolumeNumber:          vd.VolumeNumber,
+				SizeKib:               vd.SizeKib,
+				VolumeDefinitionProps: vdPropsByNumber[vd.VolumeNumber],
 			})
+		}
+	} else {
+		// Caller-supplied VDs: still backfill the parent-RD per-VD
+		// props (F20) when the slot doesn't carry its own —
+		// the inherited block is what `linstor backup` reads.
+		for i := range snap.VolumeDefinitions {
+			if snap.VolumeDefinitions[i].VolumeDefinitionProps == nil {
+				snap.VolumeDefinitions[i].VolumeDefinitionProps = vdPropsByNumber[snap.VolumeDefinitions[i].VolumeNumber]
+			}
 		}
 	}
 
@@ -381,6 +425,21 @@ func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot
 		if err != nil {
 			return err
 		}
+	}
+
+	// F20 wire-shape fields. SnapshotDefinitionProps mirrors the
+	// snapshot's own props bag (upstream surfaces both — the
+	// SnapshotDefinition is the cluster-scope object, the Snapshot
+	// is the per-node materialisation, and props live on the
+	// definition). ResourceDefinitionProps is a snapshot-time copy
+	// of the parent RD's props — a later RD-prop mutation does NOT
+	// retroactively change this field.
+	if snap.SnapshotDefinitionProps == nil {
+		snap.SnapshotDefinitionProps = snap.Props
+	}
+
+	if snap.ResourceDefinitionProps == nil && len(srcRD.Props) > 0 {
+		snap.ResourceDefinitionProps = srcRD.Props
 	}
 
 	return nil

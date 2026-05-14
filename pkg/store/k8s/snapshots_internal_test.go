@@ -52,7 +52,7 @@ func TestCrdToWireSnapshotStatusNodeStatus(t *testing.T) {
 		},
 	}
 
-	got := crdToWireSnapshot(crd)
+	got := crdToWireSnapshot(crd, nil)
 
 	if len(got.Snapshots) != 2 {
 		t.Fatalf("Snapshots: got %d, want 2", len(got.Snapshots))

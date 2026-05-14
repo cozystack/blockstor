@@ -780,3 +780,206 @@ func decodeSnapshotPage(t *testing.T, url string) []apiv1.Snapshot {
 
 	return got
 }
+
+// TestSnapshotListIncludesSnapshotVolumes pins F20's CLI-parity DTO
+// shape: every per-node `snapshots[]` entry must carry one
+// `snapshot_volumes[]` slot per VolumeDefinition the snapshot
+// captured. `linstor backup` and the snapshot-shipping tooling read
+// `vlm_nr` from this list to address per-volume satellite RPCs;
+// without it the CLI's per-node table loses the volume column.
+func TestSnapshotListIncludesSnapshotVolumes(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-1",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 1024 * 1024}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1", Nodes: []string{"n1"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Snapshots().Get(ctx, "pvc-1", "snap-1")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	if len(got.Snapshots) != 1 {
+		t.Fatalf("Snapshots[] len: got %d, want 1; %+v", len(got.Snapshots), got.Snapshots)
+	}
+
+	if len(got.Snapshots[0].SnapshotVolumes) != 1 {
+		t.Fatalf("snapshot_volumes[] len: got %d, want 1; %+v",
+			len(got.Snapshots[0].SnapshotVolumes), got.Snapshots[0].SnapshotVolumes)
+	}
+
+	if got.Snapshots[0].SnapshotVolumes[0].VolumeNumber != 0 {
+		t.Errorf("snapshot_volumes[0].vlm_nr: got %d, want 0",
+			got.Snapshots[0].SnapshotVolumes[0].VolumeNumber)
+	}
+}
+
+// TestSnapshotListIncludesVolumeDefinitionProps pins F20: each
+// `volume_definitions[]` slot on the snapshot DTO carries the parent
+// RD's per-volume props bag (`volume_definition_props`). The upstream
+// CLI reads inherited keys (e.g. `Aux/PvcName`) through the snapshot
+// view rather than re-fetching the parent RD per-snapshot.
+func TestSnapshotListIncludesVolumeDefinitionProps(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-1",
+		&apiv1.VolumeDefinition{
+			VolumeNumber: 0,
+			SizeKib:      1024 * 1024,
+			Props:        map[string]string{"Aux/source": "pvc-orig"},
+		}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1", Nodes: []string{"n1"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", resp.StatusCode)
+	}
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if len(got[0].VolumeDefinitions) != 1 {
+		t.Fatalf("volume_definitions len: got %d, want 1; %+v",
+			len(got[0].VolumeDefinitions), got[0].VolumeDefinitions)
+	}
+
+	if got[0].VolumeDefinitions[0].VolumeDefinitionProps["Aux/source"] != "pvc-orig" {
+		t.Errorf("volume_definition_props: got %v, want Aux/source=pvc-orig",
+			got[0].VolumeDefinitions[0].VolumeDefinitionProps)
+	}
+}
+
+// TestSnapshotListIncludesRDProps pins F20: the snapshot DTO carries
+// a snapshot-time copy of the parent RD's `props` bag as
+// `resource_definition_props`. `linstor backup` reads inherited keys
+// (e.g. `DrbdOptions/auto-resync-after`) through the snapshot view —
+// re-fetching the RD per-snapshot would be racy if the RD's props
+// mutate between snapshot-take and the read.
+func TestSnapshotListIncludesRDProps(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "pvc-1",
+		Props: map[string]string{"Aux/owner": "team-a"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1", Nodes: []string{"n1"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", resp.StatusCode)
+	}
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if got[0].ResourceDefinitionProps["Aux/owner"] != "team-a" {
+		t.Errorf("resource_definition_props: got %v, want Aux/owner=team-a",
+			got[0].ResourceDefinitionProps)
+	}
+}
+
+// TestSnapshotListEmptyResourceDoesntPanic pins the orphan-snapshot
+// path: a Snapshot row whose parent RD has been deleted out from
+// under it (e.g. an in-flight delete reordering) must still render
+// via the view endpoint without nil-dereferencing on the missing
+// parent. The new F20 derived fields (`resource_definition_props`,
+// per-VD `volume_definition_props`) gracefully degrade to empty
+// when the parent is gone.
+func TestSnapshotListEmptyResourceDoesntPanic(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed a snapshot WITHOUT seeding the parent RD — simulates the
+	// orphan path. The in-memory store accepts a snapshot whose
+	// resource_name does not resolve to an RD; the view layer must
+	// handle the dangling reference rather than panicking.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-orphan",
+		ResourceName: "ghost-rd",
+	}); err != nil {
+		t.Fatalf("seed orphan snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1; %+v", len(got), got)
+	}
+
+	// New F20 derived fields must be empty (zero map / nil slice),
+	// never carry stale values from a previous render.
+	if len(got[0].ResourceDefinitionProps) != 0 {
+		t.Errorf("ResourceDefinitionProps on orphan: got %v, want empty",
+			got[0].ResourceDefinitionProps)
+	}
+
+	for i, vd := range got[0].VolumeDefinitions {
+		if len(vd.VolumeDefinitionProps) != 0 {
+			t.Errorf("VolumeDefinitions[%d].VolumeDefinitionProps on orphan: got %v, want empty",
+				i, vd.VolumeDefinitionProps)
+		}
+	}
+}

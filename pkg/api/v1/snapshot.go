@@ -26,28 +26,64 @@ package v1
 // without going through the deprecated KVEntry CRD. Not part of
 // upstream LINSTOR's wire shape — golinstor ignores unknown JSON
 // fields, so the new key flows through transparently.
+//
+// F20 (CLI-parity): the per-snapshot view also carries the
+// `snapshot_definition_props` and `resource_definition_props` maps
+// upstream surfaces — `linstor backup` and the schedule tooling
+// read inherited RD props through the snapshot DTO rather than
+// re-fetching the parent RD. ResourceDefinitionProps is a
+// *snapshot-time* copy of the parent RD's props, so a later RD
+// prop mutation does not retroactively change what `linstor s l`
+// reports for already-taken snapshots.
 type Snapshot struct {
-	Name              string              `json:"name"`
-	ResourceName      string              `json:"resource_name"`
-	Nodes             []string            `json:"nodes,omitempty"`
-	Props             map[string]string   `json:"props,omitempty"`
-	Annotations       map[string]string   `json:"annotations,omitempty"`
-	Flags             []string            `json:"flags,omitempty"`
-	VolumeDefinitions []SnapshotVolumeDef `json:"volume_definitions,omitempty"`
-	Snapshots         []SnapshotPerNode   `json:"snapshots,omitempty"`
-	UUID              string              `json:"uuid,omitempty"`
+	Name                    string              `json:"name"`
+	ResourceName            string              `json:"resource_name"`
+	Nodes                   []string            `json:"nodes,omitempty"`
+	Props                   map[string]string   `json:"props,omitempty"`
+	Annotations             map[string]string   `json:"annotations,omitempty"`
+	Flags                   []string            `json:"flags,omitempty"`
+	VolumeDefinitions       []SnapshotVolumeDef `json:"volume_definitions,omitempty"`
+	Snapshots               []SnapshotPerNode   `json:"snapshots,omitempty"`
+	SnapshotDefinitionProps map[string]string   `json:"snapshot_definition_props,omitempty"`
+	ResourceDefinitionProps map[string]string   `json:"resource_definition_props,omitempty"`
+	UUID                    string              `json:"uuid,omitempty"`
 }
 
-// SnapshotVolumeDef is one volume slot inside a Snapshot.
+// SnapshotVolumeDef is one volume slot inside a Snapshot. F20:
+// `VolumeDefinitionProps` is the snapshot-time copy of the parent
+// RD's per-volume props — exposed via the snapshot DTO so the
+// CLI doesn't need a second round-trip to the RD endpoint.
 type SnapshotVolumeDef struct {
-	VolumeNumber int32 `json:"volume_number"`
-	SizeKib      int64 `json:"size_kib"`
+	VolumeNumber          int32             `json:"volume_number"`
+	SizeKib               int64             `json:"size_kib"`
+	VolumeDefinitionProps map[string]string `json:"volume_definition_props,omitempty"`
 }
 
 // SnapshotPerNode is the per-node materialisation of a Snapshot.
+// F20: `Flags` carries the upstream LINSTOR per-node snapshot
+// flags (FAILED_DEPLOYMENT, FAILED_DISCONNECT, ...); blockstor
+// does not yet derive these from satellite state, so the field is
+// a passthrough today (callers may set, GET surfaces). `SnapshotVolumes`
+// carries one entry per volume the snapshot captured on this
+// node — `linstor backup` and the snapshot-shipping tooling
+// inspect the per-volume `state` to decide which volume to ship.
 type SnapshotPerNode struct {
-	SnapshotName    string `json:"snapshot_name"`
-	NodeName        string `json:"node_name"`
-	CreateTimestamp int64  `json:"create_timestamp,omitempty"`
-	UUID            string `json:"uuid,omitempty"`
+	SnapshotName    string           `json:"snapshot_name"`
+	NodeName        string           `json:"node_name"`
+	CreateTimestamp int64            `json:"create_timestamp,omitempty"`
+	Flags           []string         `json:"flags,omitempty"`
+	SnapshotVolumes []SnapshotVolume `json:"snapshot_volumes,omitempty"`
+	UUID            string           `json:"uuid,omitempty"`
+}
+
+// SnapshotVolume is one per-node, per-volume slot inside a
+// SnapshotPerNode entry. Mirrors upstream's `SnapshotVolumeNode`
+// (vlm_nr + state); `linstor backup` reads `state` to surface the
+// satellite-reported snapshot status. blockstor leaves `State`
+// blank today — the CRD does not yet track per-volume per-node
+// snapshot state — but the slot is still emitted so the CLI
+// table renders the volume_number column.
+type SnapshotVolume struct {
+	VolumeNumber int32  `json:"vlm_nr"`
+	State        string `json:"state,omitempty"`
 }

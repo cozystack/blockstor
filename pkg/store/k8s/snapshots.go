@@ -51,9 +51,14 @@ func (s *snapshots) List(ctx context.Context) ([]apiv1.Snapshot, error) {
 		return nil, errors.Wrap(err, "list Snapshot CRDs")
 	}
 
+	parents, err := s.collectParentRDs(ctx, crdList.Items)
+	if err != nil {
+		return nil, err
+	}
+
 	out := make([]apiv1.Snapshot, 0, len(crdList.Items))
 	for i := range crdList.Items {
-		out = append(out, crdToWireSnapshot(&crdList.Items[i]))
+		out = append(out, crdToWireSnapshot(&crdList.Items[i], parents[crdList.Items[i].Spec.ResourceDefinitionName]))
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -76,9 +81,11 @@ func (s *snapshots) ListByDefinition(ctx context.Context, rdName string) ([]apiv
 		return nil, errors.Wrapf(err, "list Snapshot CRDs for RD %q", rdName)
 	}
 
+	parent, _ := s.getParentRD(ctx, rdName)
+
 	out := make([]apiv1.Snapshot, 0, len(crdList.Items))
 	for i := range crdList.Items {
-		out = append(out, crdToWireSnapshot(&crdList.Items[i]))
+		out = append(out, crdToWireSnapshot(&crdList.Items[i], parent))
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -98,7 +105,60 @@ func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Sna
 		return apiv1.Snapshot{}, errors.Wrapf(err, "get Snapshot %s/%s", rdName, snapName)
 	}
 
-	return crdToWireSnapshot(&crd), nil
+	parent, _ := s.getParentRD(ctx, crd.Spec.ResourceDefinitionName)
+
+	return crdToWireSnapshot(&crd, parent), nil
+}
+
+// getParentRD fetches the parent ResourceDefinition for a Snapshot,
+// returning nil + the not-found error when the parent has already
+// been deleted (orphan Snapshot — the view layer still has to render
+// the snapshot row without panicking on nil-deref).
+func (s *snapshots) getParentRD(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
+	if rdName == "" {
+		return nil, nil //nolint:nilnil // empty name == no parent to look up
+	}
+
+	var rd crdv1alpha1.ResourceDefinition
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil //nolint:nilnil // orphan snapshot — no parent
+		}
+
+		return nil, errors.Wrapf(err, "get parent RD %q for Snapshot", rdName)
+	}
+
+	return &rd, nil
+}
+
+// collectParentRDs batches the parent-RD lookups for a List call so
+// the view of 50 snapshots-on-the-same-RD doesn't trigger 50 separate
+// API server GETs. Missing parents (orphan Snapshots) silently
+// produce a nil entry in the map — the wire-shape conversion folds
+// nil into empty maps.
+func (s *snapshots) collectParentRDs(
+	ctx context.Context, snaps []crdv1alpha1.Snapshot,
+) (map[string]*crdv1alpha1.ResourceDefinition, error) {
+	out := make(map[string]*crdv1alpha1.ResourceDefinition, len(snaps))
+
+	for i := range snaps {
+		rdName := snaps[i].Spec.ResourceDefinitionName
+
+		if _, seen := out[rdName]; seen {
+			continue
+		}
+
+		rd, err := s.getParentRD(ctx, rdName)
+		if err != nil {
+			return nil, err
+		}
+
+		out[rdName] = rd
+	}
+
+	return out, nil
 }
 
 func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
@@ -165,22 +225,47 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	return nil
 }
 
-func crdToWireSnapshot(crd *crdv1alpha1.Snapshot) apiv1.Snapshot {
+// crdToWireSnapshot converts the Snapshot CRD into the wire DTO.
+// `parent` is the parent ResourceDefinition CRD at conversion time —
+// nil when the parent has been deleted (orphan Snapshot). The parent
+// supplies the `resource_definition_props` map and per-volume
+// `volume_definition_props` blocks F20 added to the snapshot DTO.
+func crdToWireSnapshot(
+	crd *crdv1alpha1.Snapshot, parent *crdv1alpha1.ResourceDefinition,
+) apiv1.Snapshot {
 	out := apiv1.Snapshot{
-		Name:         crd.Spec.SnapshotName,
-		ResourceName: crd.Spec.ResourceDefinitionName,
-		Nodes:        crd.Spec.Nodes,
-		Props:        crd.Spec.Props,
-		Annotations:  userAnnotations(crd.Annotations),
-		UUID:         string(crd.UID),
+		Name:                    crd.Spec.SnapshotName,
+		ResourceName:            crd.Spec.ResourceDefinitionName,
+		Nodes:                   crd.Spec.Nodes,
+		Props:                   crd.Spec.Props,
+		Annotations:             userAnnotations(crd.Annotations),
+		UUID:                    string(crd.UID),
+		SnapshotDefinitionProps: crd.Spec.Props,
+	}
+
+	// Parent-RD-derived fields — guarded by nil-check so an orphan
+	// Snapshot whose RD has already been deleted still renders.
+	var vdPropsByNumber map[int32]map[string]string
+
+	if parent != nil {
+		out.ResourceDefinitionProps = parent.Spec.Props
+
+		vdPropsByNumber = make(map[int32]map[string]string, len(parent.Spec.VolumeDefinitions))
+		for i := range parent.Spec.VolumeDefinitions {
+			vd := &parent.Spec.VolumeDefinitions[i]
+			if len(vd.Props) > 0 {
+				vdPropsByNumber[vd.VolumeNumber] = vd.Props
+			}
+		}
 	}
 
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(crd.Spec.VolumeDefinitions))
 		for i := range crd.Spec.VolumeDefinitions {
 			out.VolumeDefinitions = append(out.VolumeDefinitions, apiv1.SnapshotVolumeDef{
-				VolumeNumber: crd.Spec.VolumeDefinitions[i].VolumeNumber,
-				SizeKib:      crd.Spec.VolumeDefinitions[i].SizeKib,
+				VolumeNumber:          crd.Spec.VolumeDefinitions[i].VolumeNumber,
+				SizeKib:               crd.Spec.VolumeDefinitions[i].SizeKib,
+				VolumeDefinitionProps: vdPropsByNumber[crd.Spec.VolumeDefinitions[i].VolumeNumber],
 			})
 		}
 	}
@@ -193,6 +278,7 @@ func crdToWireSnapshot(crd *crdv1alpha1.Snapshot) apiv1.Snapshot {
 				SnapshotName:    crd.Spec.SnapshotName,
 				NodeName:        crd.Status.NodeStatus[i].NodeName,
 				CreateTimestamp: crd.Status.NodeStatus[i].CreateTimestamp,
+				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
 			})
 		}
 	case len(crd.Spec.Nodes) > 0:
@@ -209,10 +295,33 @@ func crdToWireSnapshot(crd *crdv1alpha1.Snapshot) apiv1.Snapshot {
 		out.Snapshots = make([]apiv1.SnapshotPerNode, 0, len(crd.Spec.Nodes))
 		for _, node := range crd.Spec.Nodes {
 			out.Snapshots = append(out.Snapshots, apiv1.SnapshotPerNode{
-				SnapshotName: crd.Spec.SnapshotName,
-				NodeName:     node,
+				SnapshotName:    crd.Spec.SnapshotName,
+				NodeName:        node,
+				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
 			})
 		}
+	}
+
+	return out
+}
+
+// snapshotVolumesFromVDs derives the per-node `snapshot_volumes[]`
+// array from the snapshot's volume definitions. Each VD slot
+// surfaces as one SnapshotVolume entry — upstream's CLI reads the
+// `vlm_nr` column from this. `state` is left blank: blockstor does
+// not yet track per-volume per-node snapshot state, but the slot
+// is still emitted so the CLI table renders the volume_number
+// column without an empty list.
+func snapshotVolumesFromVDs(vds []crdv1alpha1.SnapshotVolumeRef) []apiv1.SnapshotVolume {
+	if len(vds) == 0 {
+		return nil
+	}
+
+	out := make([]apiv1.SnapshotVolume, 0, len(vds))
+	for i := range vds {
+		out = append(out, apiv1.SnapshotVolume{
+			VolumeNumber: vds[i].VolumeNumber,
+		})
 	}
 
 	return out
