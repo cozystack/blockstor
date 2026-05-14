@@ -302,6 +302,168 @@ func TestResourceActivatePreservesPort(t *testing.T) {
 	}
 }
 
+// TestResourceDeactivateActivateSnapshotShipTargetPreservesState pins
+// scenario 4.W20 (cross-listed with wave1 5.19 and Bug 45): a DRBD-
+// layered resource that serves as a snapshot-ship destination becomes
+// **permanent-deactivated** after `r deactivate` — the kernel resource
+// is brought down (INACTIVE flag set), but every piece of allocated
+// state survives: layer stack, TCP port, props (the wire-level surface
+// of the per-replica node-id), storage-pool routing. `r activate`
+// re-enables by clearing the INACTIVE flag while leaving the same
+// state in place; in particular, bare activate does NOT reshuffle the
+// port (regression guard for the snapshot-ship "no replication, but
+// state preserved" contract documented in UG9 §"Shipping a snapshot
+// in the same cluster"). Idempotency is also pinned: a second
+// deactivate / activate is a no-op.
+//
+// This is the unit-side companion to day2-resource-deactivate.md.
+// Upstream LINSTOR returns the same INACTIVE flag with a WARNING
+// envelope about the operation being permanent for DRBD-layered
+// resources; the envelope shape is pinned by
+// TestActivateDeactivateAPICallRcEnvelope, so this test focuses on
+// the store-side state-preservation invariant.
+func TestResourceDeactivateActivateSnapshotShipTargetPreservesState(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	rd := &apiv1.ResourceDefinition{
+		Name:       "ship-target",
+		LayerStack: apiv1.DefaultLayerStack(),
+	}
+	if err := st.ResourceDefinitions().Create(ctx, rd); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const (
+		port      = int32(7042)
+		nodeIDKey = "DrbdOptions/NodeId"
+		nodeIDVal = "3"
+		poolKey   = "StorPoolName"
+		poolVal   = "pool_ssd"
+	)
+
+	seed := resourceWithPort("ship-target", "n1", port)
+	seed.Props = map[string]string{
+		nodeIDKey: nodeIDVal,
+		poolKey:   poolVal,
+	}
+
+	if err := st.Resources().Create(ctx, seed); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Deactivate twice — the second call must be a no-op, not a
+	// duplicate INACTIVE flag (idempotency contract from the existing
+	// TestResourceDeactivate).
+	for range 2 {
+		resp := httpPost(t,
+			base+"/v1/resource-definitions/ship-target/resources/n1/deactivate", nil)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("deactivate status: got %d, want 200", resp.StatusCode)
+		}
+	}
+
+	got, err := st.Resources().Get(ctx, "ship-target", "n1")
+	if err != nil {
+		t.Fatalf("get after deactivate: %v", err)
+	}
+
+	if c := countFlag(got.Flags, "INACTIVE"); c != 1 {
+		t.Errorf("INACTIVE count after 2x deactivate: got %d, want 1 (idempotent); flags=%v",
+			c, got.Flags)
+	}
+
+	if ports := tcpPortsOf(got); len(ports) != 1 || ports[0] != port {
+		t.Errorf("TCPPorts after deactivate: got %v, want [%d] (port must survive — snapshot-ship reuses it on activate)",
+			ports, port)
+	}
+
+	if v := got.Props[nodeIDKey]; v != nodeIDVal {
+		t.Errorf("%s after deactivate: got %q, want %q (node-id must survive — DRBD peers expect a stable id)",
+			nodeIDKey, v, nodeIDVal)
+	}
+
+	if v := got.Props[poolKey]; v != poolVal {
+		t.Errorf("%s after deactivate: got %q, want %q (storage-pool routing must survive)",
+			poolKey, v, poolVal)
+	}
+
+	rdGot, err := st.ResourceDefinitions().Get(ctx, "ship-target")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if !containsString(rdGot.LayerStack, apiv1.LayerKindDRBD) {
+		t.Errorf("LayerStack after deactivate: got %v, want DRBD present (permanent-deactivated keeps the layer composition)",
+			rdGot.LayerStack)
+	}
+
+	// Now re-activate; do it twice to pin the idempotent clear.
+	for range 2 {
+		resp := httpPost(t,
+			base+"/v1/resource-definitions/ship-target/resources/n1/activate", nil)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("activate status: got %d, want 200", resp.StatusCode)
+		}
+	}
+
+	got, err = st.Resources().Get(ctx, "ship-target", "n1")
+	if err != nil {
+		t.Fatalf("get after activate: %v", err)
+	}
+
+	if c := countFlag(got.Flags, "INACTIVE"); c != 0 {
+		t.Errorf("INACTIVE after activate: got %d occurrences, want 0; flags=%v",
+			c, got.Flags)
+	}
+
+	if ports := tcpPortsOf(got); len(ports) != 1 || ports[0] != port {
+		t.Errorf("TCPPorts after activate: got %v, want [%d] (bare activate must NOT reshuffle — same listen addr on re-up)",
+			ports, port)
+	}
+
+	if v := got.Props[nodeIDKey]; v != nodeIDVal {
+		t.Errorf("%s after activate: got %q, want %q (node-id round-trips through deact+act)",
+			nodeIDKey, v, nodeIDVal)
+	}
+}
+
+// countFlag returns the number of occurrences of target in flags. The
+// duplicate-flag invariant is the wire-level expression of LINSTOR's
+// idempotency contract for activate / deactivate — a second deactivate
+// must NOT append a second INACTIVE entry.
+func countFlag(flags []string, target string) int {
+	n := 0
+
+	for _, f := range flags {
+		if f == target {
+			n++
+		}
+	}
+
+	return n
+}
+
+// containsString is the test-local equivalent of slices.Contains, kept
+// here so the test doesn't pull in a fresh stdlib import just for one
+// membership check.
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+
+	return false
+}
+
 // TestResourceActivateReallocatePortClears pins the port-collision
 // recovery path (issue 46): `?reallocate-port=true` drops the
 // persisted port allocation so the controller's allocator
