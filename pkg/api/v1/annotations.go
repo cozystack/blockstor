@@ -89,3 +89,25 @@ const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 // so the controller-runtime watch fires. The annotation is harmless to
 // the dispatcher / Python CLI (they ignore unknown keys).
 const PeerChangedAnnotation = "blockstor.io/peer-changed"
+
+// RDSpawnShortfallAnnotation is stamped on a ResourceDefinition when
+// `rg spawn` placed strictly fewer replicas than the parent RG's
+// PlaceCount asked for — i.e. the partial-fail path where 2 of 3
+// nodes accepted a replica and the 3rd hit a transient pool error.
+// The value is the RFC3339 wall-clock timestamp of the spawn event so
+// the rebalance reconciler can age the marker against the configured
+// GracePeriod before retrying.
+//
+// Scenario 2.20 (UG9 §"Automatically maintaining resource group
+// placement count"): the rebalance reconciler scans for this marker on
+// every periodic tick and, once GracePeriod has elapsed since the
+// stamp, re-runs the additive placer for that RD. On success the
+// annotation is stripped so the next scheduled tick is a clean no-op;
+// on continued failure the marker survives and a later tick retries.
+//
+// Defined here (rather than in pkg/rest or internal/controller) so the
+// REST writer (the spawn handler in 9.W05's partial-fail path) and the
+// controller reader (RGRebalanceReconciler) share a single source of
+// truth without either package importing the other — pkg/api/v1 is
+// the neutral, dependency-free shared layer both already import.
+const RDSpawnShortfallAnnotation = "blockstor.io/spawn-shortfall"

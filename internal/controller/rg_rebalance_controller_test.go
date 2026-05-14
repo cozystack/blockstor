@@ -253,8 +253,6 @@ func TestRGRebalanceReconcilerIgnoresNonFalseValues(t *testing.T) {
 	t.Parallel()
 
 	for _, val := range []string{"", "true", "True", "0", "FALSE", "no"} {
-		val := val
-
 		t.Run("value="+val, func(t *testing.T) {
 			t.Parallel()
 
@@ -287,12 +285,15 @@ func TestRGRebalanceReconcilerIgnoresNonFalseValues(t *testing.T) {
 	}
 }
 
-// TestRGRebalanceReconcilerSkipsWithoutAnnotation: an RG CRD event
-// that fires without the rebalance-pending marker is a fast no-op.
-// Pins the annotation gate — otherwise every prop write would
-// re-run the placer and we'd duplicate work the existing
-// ResourceGroupReconciler already does on every spec change.
-func TestRGRebalanceReconcilerSkipsWithoutAnnotation(t *testing.T) {
+// TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick:
+// scenario 2.15 broadened the no-annotation contract — the scheduled
+// tick now ALWAYS refills a place-count deficit cluster-wide, so an
+// RG event arriving without the rebalance-pending marker still acts
+// when there is genuine work to do. The placer's idempotent
+// already-placed accounting keeps a clean cluster a no-op; this test
+// pins the deficit-fill side. A subsequent test (TestRebalanceHonours
+// Disabled) pins the kill-switch suppression path.
+func TestRGRebalanceReconcilerNoAnnotationStillFiresScheduledTick(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -301,7 +302,11 @@ func TestRGRebalanceReconcilerSkipsWithoutAnnotation(t *testing.T) {
 	st := store.NewInMemory()
 
 	for _, n := range []string{"n1", "n2", "n3"} {
-		_ = st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite})
+		_ = st.Nodes().Create(ctx, &apiv1.Node{
+			Name:             n,
+			Type:             apiv1.NodeTypeSatellite,
+			ConnectionStatus: apiv1.NodeTypeOnline,
+		})
 		_ = st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: "pool",
 			NodeName:        n,
@@ -315,7 +320,7 @@ func TestRGRebalanceReconcilerSkipsWithoutAnnotation(t *testing.T) {
 			PlaceCount:  3,
 			StoragePool: "pool",
 		},
-		// No Annotations — should be a no-op.
+		// No Annotations — scheduled tick fires anyway under 2.15.
 	})
 	_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 		Name:              "pvc-no-annot",
@@ -329,7 +334,7 @@ func TestRGRebalanceReconcilerSkipsWithoutAnnotation(t *testing.T) {
 	}
 
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-no-annot")
-	if len(got) != 0 {
-		t.Errorf("reconciler must skip RGs without the rebalance marker; got %d replicas", len(got))
+	if len(got) != 3 {
+		t.Errorf("scheduled tick must refill deficit even without annotation; got %d replicas, want 3", len(got))
 	}
 }
