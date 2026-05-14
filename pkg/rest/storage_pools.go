@@ -79,12 +79,26 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	msg := "storage pool deleted: " + pool + " on " + node
+	// Promote the "already absent" path to the warn band (Bug 66
+	// alignment): the original Bug 52 fix used maskInfo for both
+	// outcomes, hiding the no-op replay from audit-log greppers.
+	// All other delete handlers fold NotFound into the warn band
+	// (warnRGNotFound, warnVDNotFound, warnVGNotFound, …); keeping
+	// this one in step makes `grep WARN` reliably surface every
+	// no-op replay across the entire delete surface.
 	if err != nil {
-		msg = "storage pool already absent: " + pool + " on " + node
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnStoragePoolNotFound,
+			Message: "storage pool already absent: " + pool + " on " + node,
+		}})
+
+		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{RetCode: maskInfo, Message: msg}})
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "storage pool deleted: " + pool + " on " + node,
+	}})
 }
 
 func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) {

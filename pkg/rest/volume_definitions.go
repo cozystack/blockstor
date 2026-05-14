@@ -23,7 +23,10 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // volumeDefinitionModifyBody is the shape upstream golinstor sends on
@@ -327,6 +330,13 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 	}
 }
 
+// handleVDDelete drops a VolumeDefinition under an RD.
+//
+// Idempotent on NotFound (Bug 66): both NotFound shapes — the parent
+// RD missing AND the (rd, vn) pair missing inside an extant RD — fold
+// into a 200 + warn-mask envelope. linstor-csi's ControllerExpand /
+// shrink paths re-issue `vd d` on retry; the bare 404 used to crash
+// the Python CLI on its XML decoder fallback (see Bug 56 commentary).
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
@@ -338,15 +348,24 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.Store.VolumeDefinitions().Delete(r.Context(), rd, vn)
-	if err != nil {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnVDNotFound,
+			Message: fmt.Sprintf("volume definition already absent: %s/%d", rd, vn),
+		}})
 
 		return
 	}
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "volume definition deleted",
+		Message: fmt.Sprintf("volume definition deleted: %s/%d", rd, vn),
 	}})
 }
 

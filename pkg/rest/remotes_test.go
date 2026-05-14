@@ -268,20 +268,40 @@ func TestLinstorRemoteCreateValidatesRequiredFields(t *testing.T) {
 	}
 }
 
-// TestLinstorRemoteDeleteMissingReturns404 pins the wire shape for
-// "delete unknown remote": 404 + ApiCallRc with the operator-facing
-// message. Catches a regression that would mask the failure as 200
-// (silent no-op) and let downstream code keep referencing a
-// remote that doesn't exist.
-func TestLinstorRemoteDeleteMissingReturns404(t *testing.T) {
+// TestLinstorRemoteDeleteMissingReturns200Warning pins the wire shape
+// for "delete unknown remote" (Bug 66): 200 + ApiCallRc envelope with
+// the warn-mask bit set. Previously asserted 404, but the in-memory
+// remote registry is wiped on every controller restart, so retries
+// against a fresh controller would crash the python CLI's XML decoder
+// fallback. The warn-mask distinguishes the no-op replay from a real
+// drop so downstream tooling can still detect the dangling reference
+// if it wants — but the HTTP layer stays exit-0.
+func TestLinstorRemoteDeleteMissingReturns200Warning(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
 	resp := httpDelete(t, base+"/v1/remotes?remote_name=ghost")
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") || !strings.Contains(rc[0].Message, "ghost") {
+		t.Errorf("message: got %q, want 'already absent' + 'ghost'", rc[0].Message)
 	}
 }
 

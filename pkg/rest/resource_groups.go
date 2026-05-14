@@ -22,7 +22,10 @@ import (
 	"net/http"
 	"reflect"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerResourceGroups wires the /v1/resource-groups CRUD endpoints.
@@ -198,12 +201,30 @@ func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 	}
 }
 
+// handleRGDelete drops a ResourceGroup.
+//
+// Idempotent on NotFound (Bug 66): the Python linstor CLI feeds the
+// response body to `xml.etree.ElementTree.fromstring` whenever the
+// HTTP layer reports non-2xx, so a bare 404 on a delete-of-missing
+// crashes the CLI with a ParseError before it can surface the
+// "already absent" condition. Folding NotFound into a 200 + warn-mask
+// envelope keeps `linstor rg d` exit-0 on the second call (matches the
+// CSI idempotence guarantee Bug 56 established for resources / RDs).
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
 	err := s.Store.ResourceGroups().Delete(r.Context(), name)
-	if err != nil {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnRGNotFound,
+			Message: "resource group already absent: " + name,
+		}})
 
 		return
 	}

@@ -19,11 +19,15 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerResourceGroupExtras wires the secondary ResourceGroup
@@ -246,6 +250,13 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// handleVGDelete drops a VolumeGroup entry from its parent RG.
+//
+// Idempotent on NotFound (Bug 66): both NotFound shapes — parent RG
+// missing OR vlmNr absent inside an extant RG — fold into 200 + warn-
+// mask. A bare 404 crashed the Python CLI's XML decoder fallback;
+// switching to the ApiCallRc envelope keeps `linstor rg vg d` exit-0
+// on the no-op replay and matches the pattern Bug 56 set for RDs.
 func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
@@ -256,6 +267,15 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 
 	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnVGNotFound,
+				Message: fmt.Sprintf("volume group already absent: %s/%d", rgName, vlmNr),
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
@@ -275,7 +295,10 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !found {
-		writeError(w, http.StatusNotFound, "volume group not found")
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnVGNotFound,
+			Message: fmt.Sprintf("volume group already absent: %s/%d", rgName, vlmNr),
+		}})
 
 		return
 	}
@@ -295,7 +318,7 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 	// even on success.
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "volume group deleted",
+		Message: fmt.Sprintf("volume group deleted: %s/%d", rgName, vlmNr),
 	}})
 }
 

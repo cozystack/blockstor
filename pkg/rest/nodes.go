@@ -400,12 +400,29 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	}})
 }
 
+// handleNodeDelete drops a Node from the cluster.
+//
+// Idempotent on NotFound (Bug 66): Cozystack's node-evacuation
+// playbook calls `linstor n d <node>` in a retry loop, so a 404 on
+// the second pass crashed the python CLI's XML decoder fallback and
+// surfaced as a fatal `ParseError` instead of the intended no-op.
+// Folding NotFound into a 200 + warn-mask envelope keeps the retry
+// loop exit-0 on the second call.
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 
 	err := s.Store.Nodes().Delete(r.Context(), name)
-	if err != nil {
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnNodeNotFound,
+			Message: "node already absent: " + name,
+		}})
 
 		return
 	}

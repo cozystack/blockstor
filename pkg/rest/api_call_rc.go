@@ -74,3 +74,52 @@ const warnRscNotFound = maskWarn | int64(2048)
 // sits one past warnRscNotFound so log filtering can distinguish the
 // two no-op replays.
 const warnRDNotFound = maskWarn | int64(2049)
+
+// warnRGNotFound flags a delete-of-missing on
+// `DELETE /v1/resource-groups/{rg}`. Bug 66: the Python linstor CLI
+// pipes the response body through its XML parser when the HTTP layer
+// returns a non-2xx, so a bare 404 on a no-op replay crashes the CLI
+// before it can surface the "already absent" reality. Folding into a
+// 200 + WARN envelope keeps `linstor rg d` exit-0 on the second call
+// (matches the Bug 56 pattern in warnRscNotFound).
+const warnRGNotFound = maskWarn | int64(2050)
+
+// warnVDNotFound flags a delete-of-missing on
+// `DELETE /v1/resource-definitions/{rd}/volume-definitions/{vn}`.
+// Sub-code 2051. The two NotFound shapes (RD absent, VD absent
+// inside an extant RD) both fold here — the message disambiguates
+// them. Required for `linstor vd d` retries from csi-driver-side
+// expand/shrink replay paths.
+const warnVDNotFound = maskWarn | int64(2051)
+
+// warnVGNotFound flags a delete-of-missing on
+// `DELETE /v1/resource-groups/{rg}/volume-groups/{vlmNr}`.
+// Sub-code 2052. Folds two NotFound shapes (RG itself absent, or
+// VG-by-number absent inside an extant RG) into 200 + WARN.
+const warnVGNotFound = maskWarn | int64(2052)
+
+// warnNodeNotFound flags a delete-of-missing on
+// `DELETE /v1/nodes/{node}`. Sub-code 2053. Cozystack
+// node-evacuation playbooks re-issue `linstor n d` per node on
+// every retry — a 404 on the second pass tripped the python CLI's
+// XML decoder and surfaced as `xml.etree.ElementTree.ParseError`
+// instead of the intended idempotent success.
+const warnNodeNotFound = maskWarn | int64(2053)
+
+// warnRemoteNotFound flags a delete-of-missing on
+// `DELETE /v1/remotes?remote_name=…`. Sub-code 2054. The linstor
+// remote registry is process-local (in-memory), so a controller
+// restart loses every entry — operators (and `linstor remote d`
+// scripts) frequently retry against a fresh controller and would
+// otherwise see a 404 crash in the Python CLI.
+const warnRemoteNotFound = maskWarn | int64(2054)
+
+// warnStoragePoolNotFound flags a delete-of-missing on
+// `DELETE /v1/nodes/{node}/storage-pools/{pool}`. Sub-code 2055.
+// The handler pre-existed Bug 66 (added in Bug 52, 93d104163) and
+// already folded NotFound into 200, but tagged it as `maskInfo`
+// — making the "already absent" reply indistinguishable from a
+// real drop. Bug 66 promotes it to the warn band so audit-log
+// greppers can tell the two outcomes apart, in line with all
+// other delete handlers.
+const warnStoragePoolNotFound = maskWarn | int64(2055)

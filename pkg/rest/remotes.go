@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // linstorRemoteRegistry holds Linstor remote definitions in memory.
@@ -170,9 +172,13 @@ func (s *Server) handleCreateLinstorRemote(w http.ResponseWriter, r *http.Reques
 // because the same handler removes S3 / EBS / Linstor remotes —
 // the type is inferred from the registry's contents.
 //
-// 404 when the remote is unknown: pin this so a future CRD-backed
-// implementation returning 404 from the apiserver doesn't get
-// rewritten as 204 (delete-of-missing) by mistake.
+// Idempotent on unknown remote (Bug 66): the remote registry is
+// process-local (in-memory; see linstorRemoteRegistry's doc), so a
+// controller restart wipes every entry — `linstor remote d` retries
+// then crashed the python CLI's XML decoder fallback on the bare 404.
+// Folding the "already absent" path into 200 + warn-mask keeps the
+// CLI exit-0 and stays consistent with the rest of the delete-of-
+// missing handlers in this package.
 func (s *Server) handleDeleteRemote(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("remote_name")
 	if name == "" {
@@ -182,12 +188,18 @@ func (s *Server) handleDeleteRemote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.linstorRemotes.delete(name) {
-		writeError(w, http.StatusNotFound, "remote not found: "+name)
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnRemoteNotFound,
+			Message: "remote already absent: " + name,
+		}})
 
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "remote deleted: " + name,
+	}})
 }
 
 // handleLinstorRemoteShipNotImplemented surfaces 501 + an

@@ -333,9 +333,9 @@ func TestVolumeDefinitionsDeleteBadVolumeNumber(t *testing.T) {
 }
 
 // TestVolumeDefinitionsDeleteMissingVD: DELETE on a non-existent
-// vol_num → 404 from writeStoreError. Pinned because linstor-csi
-// performs idempotent VD-delete on volume removal; the 404 must
-// surface cleanly so csi can treat it as "already gone".
+// vol_num folds into 200 + warn-mask ApiCallRc envelope (Bug 66).
+// linstor-csi's ControllerExpand path re-issues vd-delete on retry;
+// the previous 404 crashed the python CLI's XML decoder fallback.
 func TestVolumeDefinitionsDeleteMissingVD(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
@@ -348,8 +348,8 @@ func TestVolumeDefinitionsDeleteMissingVD(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/volume-definitions/42")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }
 
@@ -999,5 +999,78 @@ func TestVDUpdateNoSizeChangeNoWarning(t *testing.T) {
 
 	if rcsB[0].RetCode&maskWarn != 0 {
 		t.Errorf("case B leaked warn-mask bit on no-op: ret_code=%x", rcsB[0].RetCode)
+	}
+}
+
+// TestVDDeleteUnknownReturns200Warning pins the Bug 66 idempotence
+// contract for `DELETE /v1/resource-definitions/{rd}/volume-
+// definitions/{vn}`. Two NotFound shapes are covered:
+//
+//   - sub-test "missing-vd": parent RD exists, vlmNr is absent
+//   - sub-test "missing-rd": parent RD itself is absent
+//
+// Both must fold into the same 200 + WARN + "already absent" envelope
+// so linstor-csi's expand/shrink retry loops stay exit-0 on no-op
+// replays and the python CLI's XML decoder fallback isn't tripped.
+func TestVDDeleteUnknownReturns200Warning(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		seed func(t *testing.T, st store.Store)
+		path string
+	}{
+		{
+			name: "missing-vd",
+			seed: func(t *testing.T, st store.Store) {
+				t.Helper()
+
+				if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-vd"}); err != nil {
+					t.Fatalf("seed RD: %v", err)
+				}
+			},
+			path: "/v1/resource-definitions/pvc-vd/volume-definitions/42",
+		},
+		{
+			name: "missing-rd",
+			seed: func(_ *testing.T, _ store.Store) {},
+			path: "/v1/resource-definitions/ghost-rd/volume-definitions/0",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewInMemory()
+			tc.seed(t, st)
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := httpDelete(t, base+tc.path)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status: got %d, want 200", resp.StatusCode)
+			}
+
+			var rc []apiv1.APICallRc
+			if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+				t.Fatalf("decode ApiCallRc envelope: %v", err)
+			}
+
+			if len(rc) == 0 {
+				t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+			}
+
+			if rc[0].RetCode&maskWarn == 0 {
+				t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+			}
+
+			if !strings.Contains(rc[0].Message, "already absent") {
+				t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+			}
+		})
 	}
 }

@@ -965,3 +965,49 @@ func TestSPCreateNoNormalizationNeeded(t *testing.T) {
 		}
 	}
 }
+
+// TestSPDeleteUnknownUsesWarnMaskNotInfo is the Bug 66 alignment
+// guard for `DELETE /v1/nodes/{node}/storage-pools/{pool}`. The
+// handler pre-existed Bug 66 (Bug 52, 93d104163) and already folded
+// NotFound into a 200, but tagged it with maskInfo — making the
+// "already absent" reply indistinguishable from a real drop in audit
+// logs. Bug 66 promotes the no-op path into the warn band so the
+// envelope shape matches every other delete handler in this package.
+//
+// A regression that reverted to maskInfo (silent) would still pass
+// existing 200-status assertions, so this test pins the WARN bit
+// itself.
+func TestSPDeleteUnknownUsesWarnMaskNotInfo(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/ghost-node/storage-pools/ghost-pool")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set on no-op replay", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "ghost-pool") || !strings.Contains(rc[0].Message, "ghost-node") {
+		t.Errorf("message: got %q, want it to name both ghost-pool and ghost-node", rc[0].Message)
+	}
+}

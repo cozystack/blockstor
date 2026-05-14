@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
@@ -163,7 +164,10 @@ func TestNodesCreateBadJSON(t *testing.T) {
 	}
 }
 
-// TestNodesDeleteMissing: 404 on DELETE of an absent node.
+// TestNodesDeleteMissing: DELETE of an absent node folds into 200 +
+// warn-mask ApiCallRc envelope (Bug 66). Cozystack's evacuation
+// playbook retries `linstor n d` per node; the previous 404 crashed
+// the python CLI's XML decoder fallback on the second pass.
 func TestNodesDeleteMissing(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
@@ -171,8 +175,8 @@ func TestNodesDeleteMissing(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/nodes/ghost")
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
 	}
 }
 
@@ -507,4 +511,46 @@ func httpPut(t *testing.T, addr string, body []byte) *http.Response {
 	}
 
 	return resp
+}
+
+// TestNodeDeleteUnknownReturns200Warning pins the Bug 66 idempotence
+// contract for `DELETE /v1/nodes/{node}`. Cozystack's node-evacuation
+// playbook calls `linstor n d` in a retry loop after a node finishes
+// draining; a 404 on the second pass crashed the python CLI's XML
+// decoder fallback. The handler must fold NotFound into 200 + an
+// ApiCallRc with the WARN bit and an "already absent" message that
+// names the node.
+func TestNodeDeleteUnknownReturns200Warning(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/ghost-node")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "ghost-node") {
+		t.Errorf("message: got %q, want it to name ghost-node", rc[0].Message)
+	}
 }

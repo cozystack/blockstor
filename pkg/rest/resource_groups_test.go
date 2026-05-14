@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
@@ -265,7 +266,11 @@ func TestResourceGroupsUpdateBadJSON(t *testing.T) {
 	}
 }
 
-// TestResourceGroupsDeleteMissingRG: DELETE on missing RG → 404.
+// TestResourceGroupsDeleteMissingRG: DELETE on missing RG folds into
+// 200 + warn-mask ApiCallRc envelope (Bug 66). Previously asserted 404;
+// the python linstor CLI parses non-2xx responses via xml.etree and
+// crashes on the JSON body, so the bare 404 made `linstor rg d` exit
+// non-zero with a ParseError instead of the no-op the operator wanted.
 func TestResourceGroupsDeleteMissingRG(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
@@ -273,7 +278,49 @@ func TestResourceGroupsDeleteMissingRG(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/resource-groups/ghost")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRGDeleteUnknownReturns200Warning pins the Bug 66 idempotence
+// contract for `DELETE /v1/resource-groups/{rg}`: the response is 200
+// + ApiCallRc envelope with the WARN bit set and an "already absent"
+// message that names the RG. Catches a regression that would either
+// fall back to a 404 (crashes python CLI on its XML decoder) or drop
+// the WARN bit (audit-log can no longer tell a real drop from a
+// no-op replay).
+func TestRGDeleteUnknownReturns200Warning(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-groups/ghost-rg")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("ApiCallRc envelope: got empty, want one entry")
+	}
+
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code: got %#x, want WARN bit (%#x) set", rc[0].RetCode, maskWarn)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "ghost-rg") {
+		t.Errorf("message: got %q, want it to name ghost-rg", rc[0].Message)
 	}
 }
