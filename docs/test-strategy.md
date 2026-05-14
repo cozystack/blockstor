@@ -9,7 +9,7 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 | Phase | Group | Tests | Status | Branch / PR |
 |---|---|---|---|---|
 | 0 | Harness scaffold + smoke | 1 | pending | — |
-| 1 | A — Node | 10 | pending | — |
+| 1 | A — Node | 10 | done | feat/integration-group-a-node |
 | 1 | B — Storage Pool | 9 | pending | — |
 | 1 | C — Resource Group | 7 | pending | — |
 | 1 | D — Resource Definition | 9 | pending | — |
