@@ -48,11 +48,11 @@ func (s *Server) registerSnapshots(mux *http.ServeMux) {
 }
 
 // handleSnapshotRollback answers the upstream `linstor snapshot rollback`
-// endpoint with a deliberate 501. blockstor does NOT expose `zfs rollback`:
-// it destroys every snapshot newer than the rollback target, which is a
-// hard data-loss footgun we refuse to make reachable over REST. The
-// operator-facing message points at `snapshot-restore-resource` — the
-// safe, non-destructive path that materialises the snapshot into a new
+// endpoint. blockstor does NOT expose `zfs rollback`: it destroys every
+// snapshot newer than the rollback target, which is a hard data-loss
+// footgun we refuse to make reachable over REST. The operator-facing 501
+// message points at `snapshot-restore-resource` — the safe,
+// non-destructive path that materialises the snapshot into a new
 // resource-definition via `zfs clone` (pkg/storage/zfs/zfs.go:257).
 //
 // The route exists (rather than 404'ing) so the upstream CLI surfaces a
@@ -60,9 +60,19 @@ func (s *Server) registerSnapshots(mux *http.ServeMux) {
 // `linstor: unable to parse server response` 404 path that confuses
 // people into thinking the controller crashed.
 //
-// Wrong-input shapes still take priority: an unknown (rd, snap) returns
-// 404 from the existence probe so the operator learns about the typo
-// before they learn rollback isn't supported.
+// Validation cascade (matches upstream LINSTOR's "typos > preconditions
+// > strategy" ordering, scenario 8.W04 / wave1 4.13 / Bug 21):
+//
+//  1. Unknown (rd, snap) → 404 from the existence probe so the operator
+//     learns about the typo first.
+//  2. Any replica `InUse` (Primary, consumer attached) → 409. `zfs
+//     rollback` or `lvconvert --merge` underneath a live consumer's
+//     filesystem cache silently corrupts data — refuse rather than risk
+//     it. Tri-state semantic on `*InUse`: only an explicit `true`
+//     refuses; `nil` (un-observed) and `false` fall through, matching
+//     handleNodeEvacuate / validateMigrateSrc.
+//  3. Everything else → 501 + actionable text pointing at
+//     snapshot-restore-resource.
 func (s *Server) handleSnapshotRollback(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
@@ -74,6 +84,43 @@ func (s *Server) handleSnapshotRollback(w http.ResponseWriter, r *http.Request) 
 	_, err := s.Store.Snapshots().Get(r.Context(), rd, snapName)
 	if err != nil {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	// Scenario 8.W04: refuse if ANY replica is InUse. The check
+	// scopes to resources of the target RD only — sibling RDs'
+	// Primary state is irrelevant. The backend rollback operation
+	// (`zfs rollback` / `lvconvert --merge`) is per-replica, so any
+	// one offending node taints the cluster-wide rollback.
+	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	inUseNodes := make([]string, 0, len(resList))
+
+	for i := range resList {
+		// Tri-state: nil ("un-observed") and *false ("Secondary")
+		// are NOT refusals. Only an explicit *true ("Primary,
+		// consumer attached") triggers the 409. A precautionary
+		// refusal on un-observed state would lock out every
+		// rollback on a fresh-spawned RD before the satellite has
+		// reported its first state heartbeat.
+		if resList[i].State.InUse != nil && *resList[i].State.InUse {
+			inUseNodes = append(inUseNodes, resList[i].NodeName)
+		}
+	}
+
+	if len(inUseNodes) > 0 {
+		slices.Sort(inUseNodes)
+		writeError(w, http.StatusConflict,
+			"snapshot rollback refused: resource '"+rd+
+				"' is InUse on node(s) "+strings.Join(inUseNodes, ", ")+
+				"; demote/unmount the consumer(s) before retrying "+
+				"(rollback would corrupt a live filesystem)")
 
 		return
 	}

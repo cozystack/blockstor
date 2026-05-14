@@ -450,6 +450,148 @@ func TestSnapshotRollbackUnknownSnap404(t *testing.T) {
 	}
 }
 
+// TestSnapshotRollbackRefusesInUse pins scenario 8.W04 (cross-listed with
+// wave1 4.13 and Bug 21): an in-place `snapshot rollback <rd> <snap>`
+// MUST refuse when ANY replica of the target RD is currently `InUse`
+// (Primary). The backend operation — `zfs rollback` for ZFS_THIN or
+// `lvconvert --merge` / "reactivate from snap" for LVM_THIN — would
+// otherwise replay snapshot bytes underneath a live consumer's filesystem
+// cache, producing silent corruption that surfaces hours later as
+// unmount-time fsck damage.
+//
+// Wire shape: 409 + structured ApiCallRc envelope naming every offending
+// (node, resource) pair so the operator knows where to demote BEFORE
+// retrying. The check sits AFTER the (rd, snap) existence probe — an
+// unknown snapshot still yields 404 (TestSnapshotRollbackUnknownSnap404)
+// — and BEFORE the 501 not-implemented surface
+// (TestSnapshotRollback501WithActionableText). That ordering matches
+// upstream LINSTOR's validation cascade: typos > preconditions > strategy.
+//
+// `*InUse == nil` MUST NOT refuse: the satellite hasn't reported yet,
+// and a precautionary 409 on un-observed state would lock out every
+// rollback on a fresh-spawned RD. Only an explicit `*InUse == true`
+// reading is treated as "consumer attached" — same tri-state semantic
+// as TestNodeEvacuateUnobservedInUseAccepts.
+func TestSnapshotRollbackRefusesInUse(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	// Two diskful replicas; one is Primary InUse on n1, the other is
+	// Secondary (not InUse) on n2. A single offending replica is enough
+	// for refusal — `zfs rollback` on any one node corrupts the DRBD
+	// peer's bitmap regardless of which node holds the consumer.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-1", NodeName: "n1",
+		State: apiv1.ResourceState{InUse: boolPtr(true)},
+	}); err != nil {
+		t.Fatalf("seed res n1: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-1", NodeName: "n2",
+		State: apiv1.ResourceState{InUse: boolPtr(false)},
+	}); err != nil {
+		t.Fatalf("seed res n2: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1/rollback", []byte("{}"))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (InUse refusal)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("empty ApiCallRc envelope")
+	}
+
+	// Negative ret_code — `linstor` CLI's "is this a fatal error?"
+	// check is `ret_code < 0`. Without the sign bit the CLI treats
+	// this as a success and operators retry without demoting.
+	if rc[0].RetCode >= 0 {
+		t.Errorf("ret_code: got %#x, want negative (error)", rc[0].RetCode)
+	}
+
+	// Message must name the offending node so the operator knows
+	// WHERE to demote. Without the node name they have to grep the
+	// `linstor r l` output by hand to find the Primary.
+	if !strings.Contains(rc[0].Message, "n1") {
+		t.Errorf("message missing offending node 'n1': %q", rc[0].Message)
+	}
+
+	// Must NOT name the non-InUse peer — listing Secondary nodes in
+	// the refusal message sends operators chasing the wrong consumer.
+	if strings.Contains(rc[0].Message, "n2") {
+		t.Errorf("message names non-InUse peer 'n2': %q", rc[0].Message)
+	}
+
+	// Operator-actionable text: tell them what to do. The message
+	// must mention the InUse precondition so the human knows the
+	// path to retry isn't "try harder" but "release the consumer".
+	if !strings.Contains(rc[0].Message, "InUse") {
+		t.Errorf("message missing 'InUse' marker: %q", rc[0].Message)
+	}
+}
+
+// TestSnapshotRollbackAllReplicasSecondaryReaches501 pins the precondition
+// ordering: when every replica is Secondary (no InUse refusal triggers)
+// the handler falls through to the deliberate 501 not-implemented
+// response — NOT a 200 success or a 5xx from a half-wired storage path.
+// Without this pin a future regression that flipped the InUse check to
+// "always refuse" would silently mask the 501 contract, hiding the
+// "use snapshot-restore-resource instead" guidance from operators who
+// CAN legitimately attempt rollback (Secondary everywhere).
+func TestSnapshotRollbackAllReplicasSecondaryReaches501(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{Name: "s1", ResourceName: "pvc-1"}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	// Both replicas Secondary — *InUse explicitly false on each so the
+	// tri-state check (nil != refuse, false != refuse, true == refuse)
+	// is exercised on the "observed-not-in-use" branch.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: n,
+			State: apiv1.ResourceState{InUse: boolPtr(false)},
+		}); err != nil {
+			t.Fatalf("seed res %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1/rollback", []byte("{}"))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want 501 (Secondary everywhere → falls through)", resp.StatusCode)
+	}
+}
+
 // TestSnapshotsDeleteUnknownRD pins one half of the CSI idempotence
 // contract: DELETE on an unknown {rd} path segment returns 200 +
 // ApiCallRc("snapshot already absent: ..."), NOT 404. csi-sanity's
