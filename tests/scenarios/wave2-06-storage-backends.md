@@ -19,7 +19,9 @@ scenarios.
 - **Priority:** P0  **Target:** unit + integration  **Complexity:** L
 - **Source:** UG9 §"Creating storage pools" (lines 610-651) via tests/scenarios/day2-storage-pool-create-lvm.md
 
-Thick LVM. **Critical pre-req:** `/etc/lvm/lvm.conf` `global_filter` must skip `/dev/drbd*` and `/dev/mapper/[lL]instor*` — without this, LVM commands hang on DRBD hosts. Test asserts the filter check before creating the pool.
+Thick LVM. Create path: REST `POST /v1/nodes/{node}/storage-pools` with `provider_kind=LVM` + `StorDriver/LvmVg=<vg>` lands a StoragePool CRD; on the target satellite, `StoragePoolReconciler` reads the CRD, calls `satellite.NewProviderFromKind("LVM", props, exec)` → `lvm.NewThick{VolumeGroup: <vg>}`, and the next `PoolStatus` tick (`vgs --units k` over the configured VG, equivalent to UG9's `vgdisplay` validation) populates `Status.FreeCapacity` / `TotalCapacity`. The python-CLI `--pool-name <vg>` alias arrives as `StorDriver/StorPoolName` and is normalised into `StorDriver/LvmVg` by `expandStorPoolNameAlias` (Bug 63) so the satellite factory's required-key check (`LVM provider requires "StorDriver/LvmVg" in props`) never trips on CLI-shaped payloads. Unit pin: `TestSPCreateLVMThickRoundTrip` in `pkg/rest/storage_pools_test.go`.
+
+**Host-level reminder (NOT enforced by tests):** `/etc/lvm/lvm.conf` `global_filter` MUST skip `/dev/drbd*` and `/dev/mapper/[lL]instor*` on every DRBD host — without it `lvs` / `vgs` hang on a DRBD-backed PV and the satellite's `PoolStatus` probe blocks forever. blockstor's own LVM CLI shell-outs already pass `--config ConfigFilter` (see `pkg/storage/lvm/lvm_common.go`), but that only protects blockstor's own invocations; host-level / piraeus / kubelet LVM tooling still reads `lvm.conf`. This is a host-config invariant the operator owns — REST validation of the host's filter is out of scope.
 
 ### 6.W02 `sp create lvmthin <node> <pool> <vg>/<thinpool>` — S
 
