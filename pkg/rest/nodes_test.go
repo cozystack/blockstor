@@ -1657,6 +1657,102 @@ func TestNodeCreateDNSFailureReturns400(t *testing.T) {
 	}
 }
 
+// TestNodeCreateArbitraryNameVsKernelHostname pins scenario 4.W02
+// (wave2-04-lifecycle.md): the LINSTOR node name is decoupled from
+// the kernel hostname reported by `uname --nodename`. UG9 §"Naming
+// LINSTOR nodes" explicitly allows the operator to register a
+// satellite under an arbitrary identifier (e.g. `worker-fra-az1`)
+// while the underlying host's hostname stays at its DNS / cloud-init
+// default (`ip-10-0-0-7.eu-central-1.compute.internal`). The REST
+// handler MUST accept the mismatch: a Node body where `Name` differs
+// from `Props["NodeUname"]` (the canonical LINSTOR carrier of the
+// kernel hostname) goes through Create unchanged and round-trips on
+// the read side.
+//
+// The DRBD `.res` `on <host> { ... }` block uses the kernel hostname
+// (the satellite's `cfg.NodeName`, sourced from $NODE_NAME / downward
+// API) — pinned separately in pkg/satellite's reconciler tests. This
+// test owns the REST half: the handler does NOT collapse the two
+// names into one, and a regression that started rejecting the
+// mismatch (or silently overwriting `Props["NodeUname"]` with
+// `Name`) would surface here.
+func TestNodeCreateArbitraryNameVsKernelHostname(t *testing.T) {
+	const (
+		linstorName    = "worker-fra-az1"
+		kernelHostname = "ip-10-0-0-7.eu-central-1.compute.internal"
+	)
+
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Node{
+		Name: linstorName,
+		Type: apiv1.NodeTypeSatellite,
+		// Props["NodeUname"] is the LINSTOR-canonical carrier of the
+		// kernel hostname — golinstor / piraeus-operator stamp this
+		// from `uname -n` at satellite register time. The handler
+		// MUST persist it verbatim (no rewrite to Name, no strip).
+		Props: map[string]string{
+			"NodeUname": kernelHostname,
+		},
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.7"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (mismatch must NOT be rejected)", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(t.Context(), linstorName)
+	if err != nil {
+		t.Fatalf("Get %q: %v", linstorName, err)
+	}
+
+	if got.Name != linstorName {
+		t.Errorf("Name: got %q, want %q (LINSTOR name preserved verbatim)",
+			got.Name, linstorName)
+	}
+
+	if got.Props["NodeUname"] != kernelHostname {
+		t.Errorf("Props[NodeUname]: got %q, want %q (kernel hostname preserved verbatim — no collapse to Name)",
+			got.Props["NodeUname"], kernelHostname)
+	}
+
+	if got.Name == got.Props["NodeUname"] {
+		t.Errorf("Name == Props[NodeUname] (%q): handler must keep the two names independent",
+			got.Name)
+	}
+
+	// REST read-side: GET /v1/nodes/{node} echoes the same shape.
+	// Synthesis (SynthesizeNodeCapabilities) must NOT overwrite the
+	// caller-supplied NodeUname with Name — the `if _, exists` guard
+	// in pkg/api/v1/node.go pins this.
+	c := newClient(t, base)
+
+	wireNode, err := c.Nodes.Get(t.Context(), linstorName)
+	if err != nil {
+		t.Fatalf("REST Get: %v", err)
+	}
+
+	if wireNode.Name != linstorName {
+		t.Errorf("wire Name: got %q, want %q", wireNode.Name, linstorName)
+	}
+
+	if wireNode.Props["NodeUname"] != kernelHostname {
+		t.Errorf("wire Props[NodeUname]: got %q, want %q (read-side synthesis preserves caller value)",
+			wireNode.Props["NodeUname"], kernelHostname)
+	}
+}
+
 // for the F2 tests so a regression shows up as `got keys=[...]`
 // rather than as a Go map literal's randomised order.
 func mapKeys(m map[string][]string) []string {

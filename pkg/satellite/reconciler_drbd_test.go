@@ -4162,3 +4162,112 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyResFileUsesKernelHostnameNotLINSTORName pins scenario 4.W02
+// (wave2-04-lifecycle.md): when the LINSTOR node name decouples from
+// the host's kernel hostname (UG9 §"Naming LINSTOR nodes" — operators
+// may register a satellite under any identifier while the OS-level
+// `uname -n` stays at the cloud-init / DNS default), the rendered
+// `.res` file MUST use the KERNEL hostname in the `on <host> { ... }`
+// block, NOT the LINSTOR name.
+//
+// Contract:
+//
+//   - `cfg.NodeName` on the satellite is the kernel hostname, sourced
+//     from $NODE_NAME (DaemonSet downward API: `spec.nodeName` ==
+//     kubelet hostname == kernel `uname -n`). Stays constant for the
+//     life of the pod.
+//   - `DesiredResource.NodeName` is the LINSTOR identifier the
+//     controller filtered Resource CRDs against; arbitrary, set by
+//     the operator via `linstor node create <name>`.
+//   - When the two differ, `buildResFile` MUST emit
+//     `on <kernel-hostname> {` (matches what drbd-9 / drbdadm see on
+//     this host) — `drbdadm adjust` resolves the local `on { }` block
+//     by matching against the kernel hostname, NOT the controller's
+//     symbolic name.
+//
+// The REST half of the same scenario (handler accepting the
+// mismatch, Props["NodeUname"] preserved verbatim) lives in
+// pkg/rest/nodes_test.go::TestNodeCreateArbitraryNameVsKernelHostname.
+func TestApplyResFileUsesKernelHostnameNotLINSTORName(t *testing.T) {
+	const (
+		// LINSTOR-side identifier the operator typed into
+		// `linstor node create <name>` — symbolic, controller-only.
+		linstorName = "worker-fra-az1"
+		// Kernel `uname -n` value — what drbdadm sees on the host.
+		// Notably different shape from linstorName so a regression
+		// that conflated the two surfaces an obvious mismatch.
+		kernelHostname = "ip-10-0-0-7.eu-central-1.compute.internal"
+		peerLinstor    = "worker-fra-az2"
+	)
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		// cfg.NodeName == kernel hostname (downward-API contract).
+		// LINSTOR name lives ONLY in the DesiredResource below.
+		NodeName: kernelHostname,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name: "pvc-1",
+			// LINSTOR-side identifier — what the controller selected
+			// this satellite by. Intentionally != kernelHostname.
+			NodeName: linstorName,
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{peerLinstor},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.7",
+				"minor":   "1000",
+				// Peer wire payload also uses LINSTOR-side names —
+				// they're symbolic on the peer's host too. The peer's
+				// `on { }` block is rendered on the PEER satellite
+				// with its own kernel hostname; here we only assert
+				// the LOCAL `on { }` line.
+				"peer." + peerLinstor + ".address": "10.0.0.8",
+				"peer." + peerLinstor + ".node-id": "1",
+				"peer." + peerLinstor + ".port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	resPath := filepath.Join(dir, "pvc-1.res")
+
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got := string(body)
+
+	// Positive: kernel hostname appears as the local `on { }` host.
+	wantOn := "on " + kernelHostname + " {"
+	if !strings.Contains(got, wantOn) {
+		t.Errorf("missing local %q in:\n%s", wantOn, got)
+	}
+
+	// Negative: LINSTOR name MUST NOT leak into a local `on { }`
+	// header. (Matching `on <name> {` exactly rather than the bare
+	// name avoids false positives — `linstorName` could conceivably
+	// appear in a comment header or a connection-block path.)
+	badOn := "on " + linstorName + " {"
+	if strings.Contains(got, badOn) {
+		t.Errorf("LINSTOR name leaked into local `on { }` header (%q); .res must use kernel hostname:\n%s",
+			badOn, got)
+	}
+}
