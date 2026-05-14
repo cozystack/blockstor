@@ -306,10 +306,21 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 		return nil
 	}
 
+	// Source of truth for StoragePool is `Resource.Spec.StoragePool` —
+	// authored by the controller-side dispatcher before the satellite
+	// took over the reconcile. Carry it onto every per-volume Status
+	// entry so the REST view layer's `volumesFromStatus()` projection
+	// surfaces a real pool name in `linstor v l` instead of `None`
+	// (Bug 75). Empty Spec.StoragePool is fine — DISKLESS replicas
+	// legitimately have no pool and the field is `omitempty` so SSA
+	// won't claim ownership of an empty string.
+	pool := res.Spec.StoragePool
+
 	vols := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(results[0].GetVolumes()))
 	for _, v := range results[0].GetVolumes() {
 		vols = append(vols, blockstoriov1alpha1.ResourceVolumeStatus{
 			VolumeNumber: v.GetVolumeNumber(),
+			StoragePool:  pool,
 			DevicePath:   v.GetDevicePath(),
 		})
 	}

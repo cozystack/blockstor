@@ -824,22 +824,37 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 
 	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
 
-	// No prior Get: SSA Patch is the existence check. The cached
-	// client's local cache trails the apiserver during the first
-	// seconds of a fresh Resource's life; a Get round-trip through
-	// the cache returned NotFound, the satellite silenced it, and
-	// the apply for the UpToDate device-kind frame never reached
-	// the apiserver — leaving Status.Volumes[i].diskState blank for
-	// the rest of the lifetime. SSA Patch on a not-yet-existing
-	// Resource returns NotFound which we silence the same way the
-	// Get used to.
+	// Best-effort lookup for `Spec.StoragePool` so the observer's
+	// per-volume Status entries carry the pool name on every tick
+	// (Bug 75). NotFound / lookup error → leave the pool empty; the
+	// SSA apply payload's `omitempty` keeps the observer from racing
+	// the satellite-stamp owner on the same listMap entry. The
+	// satellite-stamp path remains the primary writer.
+	var storagePool string
+
+	var lookup blockstoriov1alpha1.Resource
+
+	lookupErr := o.Client.Get(ctx, client.ObjectKey{Name: name}, &lookup)
+	if lookupErr == nil {
+		storagePool = lookup.Spec.StoragePool
+	}
+
+	// No prior Get on the apply payload itself: SSA Patch is the
+	// existence check. The cached client's local cache trails the
+	// apiserver during the first seconds of a fresh Resource's
+	// life; a Get round-trip through the cache returned NotFound,
+	// the satellite silenced it, and the apply for the UpToDate
+	// device-kind frame never reached the apiserver — leaving
+	// Status.Volumes[i].diskState blank for the rest of the
+	// lifetime. SSA Patch on a not-yet-existing Resource returns
+	// NotFound which we silence the same way the Get used to.
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta:   metav1.TypeMeta{Kind: resourceKind, APIVersion: blockstoriov1alpha1.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: blockstoriov1alpha1.ResourceStatus{
 			InUse:       ev.InUse,
 			DrbdState:   ev.DrbdState,
-			Volumes:     buildObserverVolumeStatus(ev),
+			Volumes:     buildObserverVolumeStatus(ev, storagePool),
 			Connections: buildObserverConnectionStatus(ev),
 		},
 	}
@@ -974,7 +989,15 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 // non-empty fields propagate so the apply object stays narrow
 // — broader claims would steal field ownership from other
 // writers (controller-side seed allocator, etc.).
-func buildObserverVolumeStatus(ev *observation) []blockstoriov1alpha1.ResourceVolumeStatus {
+//
+// `storagePool` carries `Resource.Spec.StoragePool` so the
+// observer's listMap entries don't blank out the pool name the
+// satellite-stamp owner authored on the same `volumeNumber` key
+// (Bug 75). An empty `storagePool` (e.g. parent Resource not yet
+// resolvable) is intentionally not claimed — the `omitempty` on
+// the wire field keeps SSA from staking a claim on `""`, which
+// would race the satellite-stamp owner.
+func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstoriov1alpha1.ResourceVolumeStatus {
 	if len(ev.Volumes) == 0 {
 		return nil
 	}
@@ -984,6 +1007,7 @@ func buildObserverVolumeStatus(ev *observation) []blockstoriov1alpha1.ResourceVo
 	for _, v := range ev.Volumes {
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
 			VolumeNumber: v.VolumeNumber,
+			StoragePool:  storagePool,
 			DiskState:    v.DiskState,
 			CurrentGi:    v.CurrentUUID,
 			OutOfSyncKib: v.OutOfSyncKib,
