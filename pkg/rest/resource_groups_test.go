@@ -402,11 +402,128 @@ func TestRGModifyNoAnnotationOnNoOp(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
 // TestResourceGroupsDeleteMissingRG: DELETE on missing RG folds into
 // 200 + warn-mask ApiCallRc envelope (Bug 66). Previously asserted 404;
 // the python linstor CLI parses non-2xx responses via xml.etree and
 // crashes on the JSON body, so the bare 404 made `linstor rg d` exit
 // non-zero with a ParseError instead of the no-op the operator wanted.
+=======
+// TestRGModifyResponseIncludesRebalanceCount: Bug 60. When the
+// modify call schedules a rebalance, the REST handler appends a
+// second APICallRc envelope with the count of child RDs that the
+// reconciler will process. golinstor walks the slice and the
+// Python CLI prints both entries, so the operator sees the
+// deferred work surface at the original call site rather than
+// silently in the controller log.
+func TestRGModifyResponseIncludesRebalanceCount(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+	}); err != nil {
+		t.Fatalf("seed rg: %v", err)
+	}
+
+	// Two child RDs that should be counted.
+	for _, n := range []string{"pvc-a", "pvc-b"} {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              n,
+			ResourceGroupName: "rg-1",
+		}); err != nil {
+			t.Fatalf("seed rd %q: %v", n, err)
+		}
+	}
+
+	// Unrelated RD attached to a different RG — must not be counted.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-elsewhere",
+		ResourceGroupName: "other-rg",
+	}); err != nil {
+		t.Fatalf("seed unrelated rd: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var reply []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		t.Fatalf("decode reply: %v", err)
+	}
+
+	if len(reply) != 2 {
+		t.Fatalf("reply envelope count: got %d, want 2; reply=%+v", len(reply), reply)
+	}
+
+	if reply[0].Message != "resource group modified: rg-1" {
+		t.Errorf("first envelope: got %q", reply[0].Message)
+	}
+
+	wantSecond := "rebalance scheduled for 2 RDs"
+	if reply[1].Message != wantSecond {
+		t.Errorf("second envelope: got %q, want %q", reply[1].Message, wantSecond)
+	}
+
+	if reply[1].RetCode != reply[0].RetCode {
+		t.Errorf("second envelope ret_code: got %#x, want %#x (maskInfo)", reply[1].RetCode, reply[0].RetCode)
+	}
+}
+
+// TestRGModifyResponseSingleEnvelopeWhenNoRebalance: prop-only
+// modify keeps the response a single APICallRc — no rebalance
+// advisory line. Pins the inverse of TestRGModifyResponseIncludesRebalanceCount
+// so a future change that always appends the advisory regresses
+// loudly.
+func TestRGModifyResponseSingleEnvelopeWhenNoRebalance(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		OverrideProps: map[string]string{"DrbdOptions/auto-quorum": "io-error"},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var reply []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
+		t.Fatalf("decode reply: %v", err)
+	}
+
+	if len(reply) != 1 {
+		t.Errorf("no-op modify must return a single envelope; got %+v", reply)
+	}
+}
+
+// TestResourceGroupsDeleteMissingRG: DELETE on missing RG → 404.
+>>>>>>> 0ebeef41b (feat(rest): surface rebalance-scheduled count on rg modify reply (Bug 60))
 func TestResourceGroupsDeleteMissingRG(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()

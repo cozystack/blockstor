@@ -17,7 +17,9 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net/http"
 	"reflect"
@@ -192,7 +194,8 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// rebalance is strictly additive (operator must `linstor r d`
 	// manually to shed replicas), so a PlaceCount reduction passes
 	// through without an annotation stamp.
-	if rgNeedsRebalance(prevFilter, existing.SelectFilter) {
+	rebalanceScheduled := rgNeedsRebalance(prevFilter, existing.SelectFilter)
+	if rebalanceScheduled {
 		if existing.Annotations == nil {
 			existing.Annotations = map[string]string{}
 		}
@@ -207,10 +210,59 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+	reply := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource group modified: " + name,
-	}})
+	}}
+
+	if rebalanceScheduled {
+		// Append a second envelope so the Python CLI surfaces the
+		// deferred work. golinstor walks the slice and prints every
+		// entry whose message is non-empty, so operators see both
+		// "modified" and "rebalance scheduled for N RDs" on a single
+		// `linstor rg modify` call. The count is best-effort (errors
+		// while listing child RDs degrade to an unsized advisory
+		// rather than failing the modify).
+		reply = append(reply, apiv1.APICallRc{
+			RetCode: maskInfo,
+			Message: rebalanceMessage(countChildRDs(r.Context(), s.Store, name)),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, reply)
+}
+
+// countChildRDs returns the number of ResourceDefinitions whose
+// ResourceGroupName equals the named RG. The lookup is best-effort:
+// any error from the store is folded into a -1 sentinel so the
+// caller can fall back to an unsized "rebalance scheduled" advisory
+// rather than failing the parent `rg modify` over a list-side hiccup.
+func countChildRDs(ctx context.Context, st store.Store, rgName string) int {
+	rds, err := st.ResourceDefinitions().List(ctx)
+	if err != nil {
+		return -1
+	}
+
+	n := 0
+
+	for i := range rds {
+		if rds[i].ResourceGroupName == rgName {
+			n++
+		}
+	}
+
+	return n
+}
+
+// rebalanceMessage formats the deferred-work APICallRc message. A
+// negative count means the child-RD lookup failed; we still surface
+// the advisory line so the operator knows a rebalance is queued.
+func rebalanceMessage(count int) string {
+	if count < 0 {
+		return "rebalance scheduled (child RD count unavailable)"
+	}
+
+	return fmt.Sprintf("rebalance scheduled for %d RDs", count)
 }
 
 // rgNeedsRebalance reports whether the placement-affecting subset of
