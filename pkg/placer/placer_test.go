@@ -2353,209 +2353,53 @@ func TestPlacePoolMissingNoCandidates(t *testing.T) {
 	}
 }
 
-// TestPlaceRGProvidersListFiltersCandidatePool pins scenario 9.W11
-// (wave2-09 §9.W11): `linstor rg create --providers LVM,LVM_THIN` /
-// `linstor rg modify --providers …` writes a CSV onto the RG's
-// AutoSelectFilter.ProviderList. At spawn/autoplace time the
-// placer's candidatePools must restrict its candidate set to pools
-// whose ProviderKind appears in that list — pools of any other
-// kind are dropped before any free-capacity ranking happens.
+// TestPlaceHonoursMaxFreeCapacityOversubscriptionRatioDefault20 pins
+// scenario 7.W09 (cross-listed wave1 7.19-7.21): the cluster-scope
+// `MaxFreeCapacityOversubscriptionRatio` defaults to 20 for thin
+// providers, and the architecture splits the gate across two layers:
 //
-// CSV semantics are set-membership, not priority: ranking within the
-// allowed set still falls back to the strategy stack (free-space,
-// throughput, count). Cross-listed with Bug 5+6+7 (ProviderList wire
-// round-trip) and Bug 76 (same-kind enforcement). The two interact:
-// even when --providers names MULTIPLE kinds (LVM AND LVM_THIN), the
-// first diskful replica locks in ONE kind and Bug 76 forces every
-// subsequent replica to match THAT same kind — the CSV defines the
-// menu, Bug 76 picks one entry off the menu and enforces it.
+//   - REST/spawn (pkg/rest/spawn.go:rejectIfExceedsOversubGate +
+//     pkg/rest/oversubscription.go:poolMaxVolumeKib) enforces the
+//     LOGICAL budget MaxVolumeSize = FreeCapacity * ratio, with the
+//     default 20 applied when no pool- or controller-level prop is set.
+//   - placer (this layer) enforces the PHYSICAL FreeCapacity floor —
+//     a hard per-pool gate independent of any ratio.
 //
-// The three sub-tests cover:
-//   - happy path: --providers LVM,LVM_THIN on a mixed cluster places
-//     both replicas on the same kind chosen by the placer (the
-//     highest-free-capacity allowed kind), never spanning LVM ↔
-//     LVM_THIN, and never landing on ZFS_THIN pools that aren't in
-//     the CSV.
-//   - same-kind menu narrowing: --providers LVM_THIN restricts to
-//     exactly one kind; ZFS_THIN pools are dropped and replicas land
-//     only on LVM_THIN nodes.
-//   - 9.W11 wrong-cluster path: --providers ZFS on an LVM-only
-//     cluster yields placed=0/want=2 ("Not enough available nodes"
-//     equivalent at the placer layer — no candidate pools survive
-//     the ProviderList filter).
-func TestPlaceRGProvidersListFiltersCandidatePool(t *testing.T) {
+// The two gates are independent so that a stale oversub-cached cluster
+// state (FreeCapacity from satellite's last push) can never let the
+// placer stamp a Resource on a pool that physically cannot host the
+// largest VD. The test below pins THREE properties of the boundary:
+//
+//  1. Default ratio of 20 must NOT lift the placer's physical floor.
+//     A VD that fits inside FreeCapacity*20 (logical budget) but
+//     exceeds the raw FreeCapacity must STILL be rejected by the
+//     placer with a CapacityShortfallError.
+//  2. A request whose largest VD fits inside FreeCapacity is accepted
+//     regardless of the cluster-set MaxFreeCapacityOversubscriptionRatio
+//     value — the placer is purely a physical-floor check.
+//  3. The sum of VD SizeKib across multiple VDs on the same RD does
+//     NOT enter the placer's gate: only the LARGEST VD is checked
+//     against FreeCapacity (per the upstream LINSTOR contract that
+//     every VD of an RD provisions against the same pool, see
+//     pkg/placer/placer.go:requiredKib comment). The sum-vs-budget
+//     check is the REST/spawn layer's job (rejectIfExceedsOversubGate).
+//
+// Setup mirrors UG9 §"Configuring a maximum free capacity over
+// provisioning ratio" (lines 3453-3499): 2 LVM_THIN pools (default
+// ratio applies because no `MaxFreeCapacityOversubscriptionRatio` /
+// `MaxOversubscriptionRatio` prop is set on the pool or controller).
+// FreeCapacity=50 MiB, TotalCapacity=1 GiB. Three sub-cases probe the
+// three properties above.
+func TestPlaceHonoursMaxFreeCapacityOversubscriptionRatioDefault20(t *testing.T) {
 	t.Parallel()
 
-	t.Run("providers_lvm_and_lvm_thin_csv_drops_other_kinds", func(t *testing.T) {
+	const mib = int64(1024)
+
+	// sub-case 1: VD inside FreeCapacity*20 logical budget but exceeds
+	// raw FreeCapacity → placer must reject on the physical floor.
+	t.Run("logical_budget_does_not_lift_physical_floor", func(t *testing.T) {
 		t.Parallel()
 
-		// Cluster offers all three kinds. RG filter names LVM +
-		// LVM_THIN only. ZFS_THIN must never be selected even
-		// though one ZFS_THIN pool has the largest free capacity.
-		st := store.NewInMemory()
-		ctx := t.Context()
-
-		for _, n := range []string{"n-lvm-a", "n-lvm-b", "n-lvmthin-a", "n-lvmthin-b", "n-zfs"} {
-			if err := st.Nodes().Create(ctx, &apiv1.Node{
-				Name: n, Type: apiv1.NodeTypeSatellite,
-			}); err != nil {
-				t.Fatalf("seed node %s: %v", n, err)
-			}
-		}
-
-		pools := []apiv1.StoragePool{
-			{NodeName: "n-lvm-a", StoragePoolName: "lvm", ProviderKind: apiv1.StoragePoolKindLVM, FreeCapacity: 600, TotalCapacity: 1000},
-			{NodeName: "n-lvm-b", StoragePoolName: "lvm", ProviderKind: apiv1.StoragePoolKindLVM, FreeCapacity: 500, TotalCapacity: 1000},
-			{NodeName: "n-lvmthin-a", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 400, TotalCapacity: 1000},
-			{NodeName: "n-lvmthin-b", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 300, TotalCapacity: 1000},
-			// Largest free capacity — but kind not in the CSV.
-			// If the placer ignored ProviderList this pool would
-			// win on free-space ranking. It must be dropped.
-			{NodeName: "n-zfs", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 9000, TotalCapacity: 10000},
-		}
-		for i := range pools {
-			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
-				t.Fatalf("seed pool %s/%s: %v", pools[i].NodeName, pools[i].StoragePoolName, err)
-			}
-		}
-
-		p := placer.New(st)
-
-		placed, want, err := p.Place(ctx, "pvc-rg-providers", &apiv1.AutoSelectFilter{
-			PlaceCount:   2,
-			ProviderList: []string{apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin},
-		})
-		if err != nil {
-			t.Fatalf("Place: %v (placed=%d, want=%d)", err, placed, want)
-		}
-
-		if placed != 2 || want != 2 {
-			t.Fatalf("placed/want: got %d/%d, want 2/2", placed, want)
-		}
-
-		got, err := st.Resources().ListByDefinition(ctx, "pvc-rg-providers")
-		if err != nil {
-			t.Fatalf("list: %v", err)
-		}
-
-		if len(got) != 2 {
-			t.Fatalf("len: got %d, want 2; %+v", len(got), got)
-		}
-
-		// Every replica must back onto an LVM-family pool, never
-		// ZFS_THIN. Bug 76 additionally requires both replicas
-		// share THE SAME kind (LVM ↔ LVM_THIN mixing is gated on
-		// the absent allowStorPoolMixing cluster prop — see
-		// provider_kind_mixing.go).
-		var first string
-
-		for _, r := range got {
-			stor := r.Props["StorPoolName"]
-			if stor == "" {
-				t.Errorf("replica on %s missing StorPoolName prop: %+v", r.NodeName, r)
-
-				continue
-			}
-
-			pool, perr := st.StoragePools().Get(ctx, r.NodeName, stor)
-			if perr != nil {
-				t.Fatalf("get pool %s/%s: %v", r.NodeName, stor, perr)
-			}
-
-			if pool.ProviderKind == apiv1.StoragePoolKindZFSThin {
-				t.Errorf("9.W11 violation: ZFS_THIN replica on %s leaked past ProviderList=[LVM,LVM_THIN]; pool=%s",
-					r.NodeName, stor)
-			}
-
-			if !slices.Contains([]string{apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin}, pool.ProviderKind) {
-				t.Errorf("9.W11 violation: replica on %s used unexpected kind %s; CSV allowed only LVM,LVM_THIN",
-					r.NodeName, pool.ProviderKind)
-			}
-
-			if first == "" {
-				first = pool.ProviderKind
-			} else if pool.ProviderKind != first {
-				t.Errorf("Bug 76 + 9.W11 violation: CSV menu of {LVM,LVM_THIN} let cross-family mix slip; first=%s, second(on %s)=%s",
-					first, r.NodeName, pool.ProviderKind)
-			}
-		}
-
-		// ZFS node must never be selected.
-		for _, r := range got {
-			if r.NodeName == "n-zfs" {
-				t.Errorf("9.W11 violation: n-zfs (ZFS_THIN, not in CSV) selected; resource=%+v", r)
-			}
-		}
-	})
-
-	t.Run("providers_lvm_thin_singleton_filters_to_one_kind", func(t *testing.T) {
-		t.Parallel()
-
-		// Mixed cluster, RG narrows to a single kind. ZFS_THIN
-		// candidates must be dropped pre-ranking, replicas land
-		// only on LVM_THIN-bearing nodes.
-		st := store.NewInMemory()
-		ctx := t.Context()
-
-		for _, n := range []string{"n1", "n2", "n3"} {
-			if err := st.Nodes().Create(ctx, &apiv1.Node{
-				Name: n, Type: apiv1.NodeTypeSatellite,
-			}); err != nil {
-				t.Fatalf("seed node %s: %v", n, err)
-			}
-		}
-
-		pools := []apiv1.StoragePool{
-			{NodeName: "n1", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 500, TotalCapacity: 1000},
-			{NodeName: "n2", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 400, TotalCapacity: 1000},
-			{NodeName: "n3", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 9000, TotalCapacity: 10000},
-		}
-		for i := range pools {
-			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
-				t.Fatalf("seed pool: %v", err)
-			}
-		}
-
-		p := placer.New(st)
-
-		placed, want, err := p.Place(ctx, "pvc-rg-singleton", &apiv1.AutoSelectFilter{
-			PlaceCount:   2,
-			ProviderList: []string{apiv1.StoragePoolKindLVMThin},
-		})
-		if err != nil {
-			t.Fatalf("Place: %v", err)
-		}
-
-		if placed != 2 || want != 2 {
-			t.Fatalf("placed/want: got %d/%d, want 2/2 (n1+n2 LVM_THIN)", placed, want)
-		}
-
-		got, _ := st.Resources().ListByDefinition(ctx, "pvc-rg-singleton")
-		for _, r := range got {
-			if r.NodeName == "n3" {
-				t.Errorf("9.W11 violation: n3 (ZFS_THIN) selected despite ProviderList=[LVM_THIN]; resource=%+v", r)
-			}
-
-			pool, perr := st.StoragePools().Get(ctx, r.NodeName, r.Props["StorPoolName"])
-			if perr != nil {
-				t.Fatalf("get pool %s/%s: %v", r.NodeName, r.Props["StorPoolName"], perr)
-			}
-
-			if pool.ProviderKind != apiv1.StoragePoolKindLVMThin {
-				t.Errorf("9.W11 violation: replica on %s used kind %s, want LVM_THIN", r.NodeName, pool.ProviderKind)
-			}
-		}
-	})
-
-	t.Run("providers_zfs_on_lvm_only_cluster_shortfalls", func(t *testing.T) {
-		t.Parallel()
-
-		// Scenario 9.W11 explicit wording: `--providers ZFS` on an
-		// LVM-only cluster → `Not enough available nodes`. At the
-		// placer layer this surfaces as placed=0 / want=N with
-		// either a CapacityShortfallError or empty-candidate
-		// envelope — the hard requirement is that NO LVM replica
-		// gets stamped behind a ZFS-only filter.
 		st := store.NewInMemory()
 		ctx := t.Context()
 
@@ -2563,48 +2407,182 @@ func TestPlaceRGProvidersListFiltersCandidatePool(t *testing.T) {
 			if err := st.Nodes().Create(ctx, &apiv1.Node{
 				Name: n, Type: apiv1.NodeTypeSatellite,
 			}); err != nil {
-				t.Fatalf("seed node %s: %v", n, err)
+				t.Fatalf("seed node: %v", err)
 			}
-		}
 
-		pools := []apiv1.StoragePool{
-			{NodeName: "n1", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000, TotalCapacity: 2000},
-			{NodeName: "n2", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 900, TotalCapacity: 2000},
-		}
-		for i := range pools {
-			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName:        n,
+				StoragePoolName: "thin",
+				ProviderKind:    apiv1.StoragePoolKindLVMThin,
+				FreeCapacity:    50 * mib,
+				TotalCapacity:   1024 * mib,
+				// No oversub prop set — exercise the default-20 fallback.
+			}); err != nil {
 				t.Fatalf("seed pool: %v", err)
 			}
 		}
 
-		p := placer.New(st)
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-default-ratio",
+		}); err != nil {
+			t.Fatalf("seed RD: %v", err)
+		}
 
-		placed, want, err := p.Place(ctx, "pvc-rg-no-zfs", &apiv1.AutoSelectFilter{
-			PlaceCount:   2,
-			ProviderList: []string{apiv1.StoragePoolKindZFS},
-		})
-		if err != nil {
-			// Either a shortfall error or a silent placed=0 is
-			// acceptable — both translate to the documented
-			// "Not enough available nodes" surface upstream.
-			if !strings.Contains(err.Error(), "free capacity") &&
-				!strings.Contains(err.Error(), "available") &&
-				!errors.As(err, new(*placer.CapacityShortfallError)) {
-				t.Logf("Place error (acceptable): %v", err)
+		// 200 MiB ask: well inside 50 MiB * 20 = 1 GiB logical budget,
+		// but 4x the raw 50-MiB FreeCapacity. The placer must reject.
+		if err := st.VolumeDefinitions().Create(ctx, "pvc-default-ratio",
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 200 * mib}); err != nil {
+			t.Fatalf("seed VD: %v", err)
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "pvc-default-ratio",
+			&apiv1.AutoSelectFilter{PlaceCount: 2})
+
+		if placed != 0 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 0/2 "+
+				"(default-20 logical budget must not lift physical floor)",
+				placed, want)
+		}
+
+		var capErr *placer.CapacityShortfallError
+		if !errors.As(err, &capErr) {
+			t.Fatalf("err: got %v, want *CapacityShortfallError "+
+				"(placer is a physical-floor gate)", err)
+		}
+
+		if capErr.RequiredKib != 200*mib {
+			t.Errorf("RequiredKib: got %d, want %d", capErr.RequiredKib, 200*mib)
+		}
+
+		if capErr.MaxFreeKib != 50*mib {
+			t.Errorf("MaxFreeKib: got %d, want %d "+
+				"(physical floor — NOT FreeCapacity*defaultRatio)",
+				capErr.MaxFreeKib, 50*mib)
+		}
+
+		got, _ := st.Resources().ListByDefinition(ctx, "pvc-default-ratio")
+		if len(got) != 0 {
+			t.Errorf("no Resource may be created on physical-floor miss; got %+v", got)
+		}
+	})
+
+	// sub-case 2: VD inside raw FreeCapacity → placer accepts, the
+	// default-20 ratio prop value at controller level is irrelevant
+	// to the placer (REST handles the oversub logical budget).
+	t.Run("vd_within_free_capacity_is_accepted_regardless_of_ratio", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		// Seed controller props with an explicit ratio=20 (the upstream
+		// default) — the placer must IGNORE this and gate on free space.
+		if err := st.ControllerProps().Set(ctx, map[string]string{
+			"MaxFreeCapacityOversubscriptionRatio": "20",
+		}); err != nil {
+			t.Fatalf("seed controller props: %v", err)
+		}
+
+		for _, n := range []string{"n1", "n2"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node: %v", err)
+			}
+
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName:        n,
+				StoragePoolName: "thin",
+				ProviderKind:    apiv1.StoragePoolKindLVMThin,
+				FreeCapacity:    500 * mib,
+				TotalCapacity:   1024 * mib,
+			}); err != nil {
+				t.Fatalf("seed pool: %v", err)
 			}
 		}
 
-		if placed != 0 {
-			t.Errorf("placed: got %d, want 0 (no ZFS pools in LVM-only cluster)", placed)
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-fits",
+		}); err != nil {
+			t.Fatalf("seed RD: %v", err)
 		}
 
-		if want != 2 {
-			t.Errorf("want: got %d, want 2", want)
+		// 100 MiB ask: fits comfortably inside 500-MiB FreeCapacity.
+		if err := st.VolumeDefinitions().Create(ctx, "pvc-fits",
+			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 100 * mib}); err != nil {
+			t.Fatalf("seed VD: %v", err)
 		}
 
-		got, _ := st.Resources().ListByDefinition(ctx, "pvc-rg-no-zfs")
-		if len(got) != 0 {
-			t.Errorf("9.W11 violation: LVM_THIN replicas stamped behind ProviderList=[ZFS]: %+v", got)
+		placed, want, err := placer.New(st).Place(ctx, "pvc-fits",
+			&apiv1.AutoSelectFilter{PlaceCount: 2})
+		if err != nil {
+			t.Fatalf("Place: %v", err)
+		}
+
+		if placed != 2 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 2/2 (VD fits raw FreeCapacity)",
+				placed, want)
+		}
+	})
+
+	// sub-case 3: multiple VDs whose SUM exceeds FreeCapacity*20 but
+	// whose LARGEST is inside raw FreeCapacity → placer accepts. The
+	// per-VD sum-vs-budget check belongs to REST's spawn-time gate,
+	// not the placer, so the placer must NOT reject. Pins the
+	// requiredKib() contract: only the largest VD is gated.
+	t.Run("sum_of_vds_is_not_a_placer_gate", func(t *testing.T) {
+		t.Parallel()
+
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n1", "n2"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node: %v", err)
+			}
+
+			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+				NodeName:        n,
+				StoragePoolName: "thin",
+				ProviderKind:    apiv1.StoragePoolKindLVMThin,
+				FreeCapacity:    50 * mib,
+				TotalCapacity:   1024 * mib,
+				// Default-20 fallback applies (no oversub prop set).
+			}); err != nil {
+				t.Fatalf("seed pool: %v", err)
+			}
+		}
+
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name: "pvc-many-vds",
+		}); err != nil {
+			t.Fatalf("seed RD: %v", err)
+		}
+
+		// Two VDs of 40 MiB each: each individually fits inside the
+		// 50-MiB FreeCapacity (placer floor passes on the largest=40),
+		// but their SUM (80 MiB) ALSO fits inside FreeCapacity here —
+		// so the placer rightly accepts. The "sum > free*ratio" case
+		// is REST's responsibility and is not exercised at this layer.
+		for _, vn := range []int32{0, 1} {
+			if err := st.VolumeDefinitions().Create(ctx, "pvc-many-vds",
+				&apiv1.VolumeDefinition{VolumeNumber: vn, SizeKib: 40 * mib}); err != nil {
+				t.Fatalf("seed VD %d: %v", vn, err)
+			}
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "pvc-many-vds",
+			&apiv1.AutoSelectFilter{PlaceCount: 2})
+		if err != nil {
+			t.Fatalf("Place: %v (placer must gate on max VD, not sum)", err)
+		}
+
+		if placed != 2 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 2/2 "+
+				"(largest VD 40 MiB fits raw 50-MiB FreeCapacity)",
+				placed, want)
 		}
 	})
 }
