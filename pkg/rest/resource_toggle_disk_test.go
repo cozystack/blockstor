@@ -142,6 +142,136 @@ func TestToggleDiskDemotesDiskful(t *testing.T) {
 	}
 }
 
+// TestToggleDiskForceDisklessOnDiskful pins scenario 4.W23 (P0):
+// `linstor r td <node> <rd> --diskless` on a currently-diskful
+// replica POSTs to the explicit `/toggle-disk/diskless` suffix.
+// REST adds the DISKLESS flag on Spec; the satellite reconciler
+// picks the demote up from there — drbdadm detach on the local
+// volume frees the backing LV/dataset, the DRBD peer survives as
+// a connection-mesh-only (diskless) replica that still serves I/O
+// through its UpToDate peers. The historical StorPoolName stays
+// stamped so a follow-on `r td` (without `--diskless`) can promote
+// the same replica back to diskful without re-passing the pool.
+func TestToggleDiskForceDisklessOnDiskful(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-w23"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-w23",
+		NodeName: "n-demote",
+		// No DISKLESS flag — currently diskful with a backing LV.
+		Props: map[string]string{"StorPoolName": "zfs-thin"},
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-w23/resources/n-demote/toggle-disk/diskless", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-w23", "n-demote")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// REST flag flip: DISKLESS must be present after the demote. The
+	// satellite reconciler reads this on the next pass and routes
+	// applyStorageIfDiskful's diskless branch (skip storage) plus
+	// drbdadm detach on the (now-removed) local backing device.
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag missing after `r td --diskless`: %v", got.Flags)
+	}
+
+	// Pool intact: demote keeps the historical pool stamped so a
+	// later toggle-back to diskful re-uses the same backing pool
+	// without the operator having to re-pass it on the next
+	// `r td <node> <rd> --storage-pool <pool>` call.
+	if got.Props["StorPoolName"] != "zfs-thin" {
+		t.Errorf("Props[StorPoolName] dropped on demote: got %q, want zfs-thin",
+			got.Props["StorPoolName"])
+	}
+}
+
+// TestToggleDiskForceDisklessIdempotent pins idempotency of the
+// `/toggle-disk/diskless` suffix: re-issuing the same call against
+// an already-diskless replica is a no-op flag-wise (DISKLESS stays
+// set, no duplicate entry) and still returns 200. Matches upstream
+// LINSTOR's behaviour: `linstor r td --diskless` against a diskless
+// replica reports success without churning storage state.
+func TestToggleDiskForceDisklessIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-w23i"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-w23i",
+		NodeName: "n-already",
+		Flags:    []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-w23i/resources/n-already/toggle-disk/diskless", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(t.Context(), "pvc-w23i", "n-already")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag missing after idempotent re-demote: %v", got.Flags)
+	}
+
+	// applyFlagMutation must not double-stamp the flag: a duplicate
+	// would surface in `linstor r l` as "DISKLESS,DISKLESS" and trip
+	// downstream callers that slice the Flags list by exact match.
+	var disklessCount int
+
+	for _, f := range got.Flags {
+		if f == apiv1.ResourceFlagDiskless {
+			disklessCount++
+		}
+	}
+
+	if disklessCount != 1 {
+		t.Errorf("DISKLESS flag count: got %d, want 1 (no duplicate); flags=%v",
+			disklessCount, got.Flags)
+	}
+}
+
+// TestToggleDiskForceDisklessUnknownReplica: explicit `--diskless`
+// suffix against a missing (rd, node) pair surfaces 404, not a
+// silent create. Pins the suffix handler shares the same
+// not-found semantics as the un-suffixed toggle-disk endpoint.
+func TestToggleDiskForceDisklessUnknownReplica(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPut(t, base+"/v1/resource-definitions/ghost/resources/n9/toggle-disk/diskless", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // TestToggleDiskUnknownReplica: 404 on a missing (rd, node) pair.
 func TestToggleDiskUnknownReplica(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
