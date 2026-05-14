@@ -131,6 +131,16 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 // log.
 const applyFailureRequeue = 5 * time.Second
 
+// peerAllocationRequeue is the short backoff applied when the
+// controller-side allocator is still trailing on one of this RD's
+// diskful peers (peer Resource exists but its Status.DRBDNodeID is
+// nil). The cache-trail typically clears within hundreds of
+// milliseconds — the controller-side reconciler stamps Status as
+// part of its very next pass — so a 2s requeue is comfortably
+// faster than the user-visible auto-place latency budget while
+// still giving the apiserver time to commit the Status patch.
+const peerAllocationRequeue = 2 * time.Second
+
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
 // typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
@@ -232,18 +242,29 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "get parent RD")
 	}
 
+	// Read peer Resources fresh via APIReader (uncached). The c-r
+	// informer cache trails the apiserver by hundreds of milliseconds,
+	// and the auto-primary election downstream needs every diskful
+	// peer's Status.DRBDNodeID to make a deterministic choice — a
+	// partial peer set rolls the dice and can elect two primaries
+	// (see Bug 80 in CHANGELOG / lowestDiskfulID comment).
+	peers, err := r.listPeerResources(ctx, res)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "list peer Resources")
+	}
+
 	// The DRBD-ID allocation gate only matters when the RD actually
 	// uses DRBD. A LayerStack=["STORAGE"] (or ["LUKS","STORAGE"]) RD
 	// renders no .res and the kernel never sees a node-id, so waiting
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
 	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.waitForControllerAllocation(res, logger); !waitOK {
+		if waitResult, waitOK := r.waitForControllerAllocation(res, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
 
-	desired, err := r.buildDesiredFromCRD(ctx, res, &rd)
+	desired, err := r.buildDesiredFromCRD(ctx, res, &rd, peers)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -396,34 +417,23 @@ func (r *ResourceReconciler) enqueueLocalSiblings(ctx context.Context, obj clien
 
 // buildDesiredFromCRD packages a Resource CRD into the
 // satellite-facing DesiredResource by walking the apiserver
-// for parent RD + same-RD peers + Node list, then resolving
-// effective DRBD options via the shared
-// `pkg/effectiveprops` package and finally handing everything
-// to `dispatcher.BuildDesired`.
+// for the Node + StoragePool lists, resolving effective DRBD
+// options via the shared `pkg/effectiveprops` package, and
+// handing everything to `dispatcher.BuildDesired`.
+//
+// Peer Resources are supplied by the caller (already read
+// uncached via APIReader in `runApply`) so the auto-primary
+// election sees every diskful peer's allocated NodeID rather
+// than racing the c-r informer cache.
 //
 // This is the load-bearing replacement for the gRPC dispatch
 // path — the controller-runtime reconciler does exactly the
 // same work the controller's dispatcher did, just on the
 // satellite side. Phase 10.1.
-func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (*intent.DesiredResource, error) {
-	var resList blockstoriov1alpha1.ResourceList
-
-	err := r.List(ctx, &resList)
-	if err != nil {
-		return nil, errors.Wrap(err, "list Resources for peer set")
-	}
-
-	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
-
-	for i := range resList.Items {
-		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
-			peers = append(peers, resList.Items[i])
-		}
-	}
-
+func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, peers []blockstoriov1alpha1.Resource) (*intent.DesiredResource, error) {
 	var nodeList blockstoriov1alpha1.NodeList
 
-	err = r.List(ctx, &nodeList)
+	err := r.List(ctx, &nodeList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Nodes")
 	}
@@ -443,6 +453,47 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	return dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps), nil
 }
 
+// listPeerResources lists every Resource that belongs to the same
+// ResourceDefinition as target, including target itself. Reads from
+// the APIReader (uncached, direct apiserver) when one is wired so
+// the cache-trail race on Status.DRBDNodeID can't elect two
+// auto-primaries during a fresh auto-place: the informer cache may
+// not yet have observed the controller-side allocator's Status patch
+// on the peer Resource, and acting on that stale view is exactly
+// what produces Bug 80's stuck-Inconsistent outcome. Falls back to
+// the cached client when APIReader is nil (unit-test path).
+func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]blockstoriov1alpha1.Resource, error) {
+	reader := r.peerReader()
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err := reader.List(ctx, &resList)
+	if err != nil {
+		return nil, errors.Wrap(err, "list Resources for peer set")
+	}
+
+	peers := make([]blockstoriov1alpha1.Resource, 0, len(resList.Items))
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+			peers = append(peers, resList.Items[i])
+		}
+	}
+
+	return peers, nil
+}
+
+// peerReader returns the APIReader (uncached) when the manager
+// wired one in, falling back to the cached client for unit tests
+// that construct the reconciler directly. Mirrors `deleteReader`.
+func (r *ResourceReconciler) peerReader() client.Reader {
+	if r.Config.APIReader != nil {
+		return r.Config.APIReader
+	}
+
+	return r.Client
+}
+
 // rdNeedsDRBD mirrors pkg/satellite/reconciler.go's needsDRBD but
 // over the RD CRD: empty LayerStack defaults to ["DRBD","STORAGE"]
 // (legacy semantics), any explicit stack must list "DRBD".
@@ -457,17 +508,36 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 
 // waitForControllerAllocation gates the apply path on the
 // controller-side allocator having stamped Status.DRBDNodeID /
-// DRBDPort / DRBDMinor. Without this, dispatcher.BuildDesired
-// silently defaults the missing fields to 0 / "0.0.0.0" / minor 0
-// and we'd render a .res claiming the local node is `node-id 0`.
-// drbdsetup new-resource burns that into kernel state at first
-// adjust, and the next reconcile (after the controller writes the
-// real allocation) hits `peer node id cannot be my own node id`
-// forever because the kernel's recorded my-id never moves.
+// DRBDPort / DRBDMinor — for THIS replica AND for every diskful
+// peer of the same RD. Without the peer-side check, a fresh
+// `linstor r c --auto-place=2` lands two Resources at the
+// satellites before the controller's allocator finishes patching
+// Status on both: each satellite sees its own NodeID but not the
+// peer's, the auto-primary election in `dispatcher.BuildDesired`
+// degenerates to "I'm the lowest because I'm the only one with an
+// id", and BOTH replicas run `drbdadm primary --force` on first
+// activation. Result: divergent UUIDs, split-brain or both stuck
+// Inconsistent forever. The target-only check that used to live
+// here was sufficient before per-replica allocation, but the
+// allocator now races the satellite's cache for peer Status —
+// hence the broadened gate.
 //
-// Returns ok=true when allocation is fresh; ok=false with a
-// short-backoff requeue Result when one of the IDs is still nil.
-func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
+// Without the target-only check, dispatcher.BuildDesired silently
+// defaults the missing fields to 0 / "0.0.0.0" / minor 0 and we'd
+// render a .res claiming the local node is `node-id 0`. drbdsetup
+// new-resource burns that into kernel state at first adjust, and
+// the next reconcile (after the controller writes the real
+// allocation) hits `peer node id cannot be my own node id` forever
+// because the kernel's recorded my-id never moves.
+//
+// Returns ok=true when allocation is fresh on every diskful
+// replica; ok=false with a short-backoff requeue Result when any
+// of the IDs is still nil. The peer-side check uses the shorter
+// `peerAllocationRequeue` because the controller-side allocator
+// typically completes within hundreds of milliseconds — no point
+// waiting the full apply-failure backoff for a write that's
+// already in flight.
+func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
 	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
 		logger.Info("waiting for controller-side DRBD-ID allocation",
 			"nodeID", res.Status.DRBDNodeID,
@@ -477,7 +547,40 @@ func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, false
 	}
 
+	if !dispatcher.DiskfulPeersAllocated(res, peers) {
+		logger.Info("waiting for peer Status.DRBDNodeID allocation",
+			"missingPeers", peersMissingNodeID(res, peers))
+
+		return ctrl.Result{RequeueAfter: peerAllocationRequeue}, false
+	}
+
 	return ctrl.Result{}, true
+}
+
+// peersMissingNodeID collects the names of diskful peer Resources
+// whose Status.DRBDNodeID is still nil. Pure cosmetics — surfaces
+// the laggard names in the wait log so operators don't have to
+// kubectl-walk every peer to figure out which Status the controller
+// hasn't stamped yet.
+func peersMissingNodeID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) []string {
+	missing := []string{}
+
+	for i := range peers {
+		peer := &peers[i]
+		if peer.Spec.NodeName == target.Spec.NodeName {
+			continue
+		}
+
+		if slices.Contains(peer.Spec.Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		if peer.Status.DRBDNodeID == nil {
+			missing = append(missing, peer.Spec.NodeName)
+		}
+	}
+
+	return missing
 }
 
 // handleDelete runs the satellite-side teardown when a Resource

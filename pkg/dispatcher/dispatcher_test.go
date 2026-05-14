@@ -1152,3 +1152,143 @@ func TestMultiPathConnectionRendersTwoPaths(t *testing.T) {
 		t.Errorf("RD with no connection prop produced Connections=%+v, want empty", plain.GetConnections())
 	}
 }
+
+// TestAutoPrimaryGatedOnAllPeerNodeIDs pins the Bug-80 invariant:
+// `dispatcher.BuildDesired` MUST NOT stamp `auto-primary=true` on
+// any replica until every diskful peer in the RD has an allocated
+// Status.DRBDNodeID. Without the gate, a fresh
+// `linstor r c <rd> --auto-place=2` lands two Resources at the
+// satellites before the controller-side allocator finishes
+// patching Status. Each satellite then sees its own NodeID but not
+// the peer's (informer cache trails), the auto-primary election
+// degenerates to "I'm the lowest because I'm the only one with an
+// id", and BOTH replicas end up running `drbdadm primary --force`
+// on first activation. Result: divergent UUIDs, split-brain or
+// both replicas stuck Inconsistent forever.
+//
+// The test models the two-pass cache-trail scenario directly:
+//
+//  1. First pass — target on n1 has NodeID=0, peer on n2 still has
+//     NodeID=nil (allocator hasn't caught up). BuildDesired on
+//     EITHER replica's perspective must omit `auto-primary` — the
+//     dispatcher cannot tell yet which id will be lowest.
+//
+//  2. Second pass — allocator has now stamped peer's NodeID=1.
+//     BuildDesired must stamp `auto-primary=true` on exactly the
+//     lowest-id replica (n1) and leave it off the other (n2).
+//
+// Diskless peers are deliberately skipped from the gate (they
+// never participate in the primary election anyway); a separate
+// sub-test pins that contract so a future refactor doesn't
+// over-broaden the gate and stall single-diskful + diskless
+// witness clusters.
+func TestAutoPrimaryGatedOnAllPeerNodeIDs(t *testing.T) {
+	t.Parallel()
+
+	const rdName = "pvc-auto-place"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	id := func(v int32) *int32 { return &v }
+
+	t.Run("first-pass-peer-id-missing-suppresses-auto-primary", func(t *testing.T) {
+		t.Parallel()
+
+		// Target n1 has its own id; peer n2 hasn't been allocated yet.
+		// Either satellite running its first reconcile must NOT stamp
+		// auto-primary.
+		n1 := newDiskfulResource(rdName, "n1", id(0))
+		n2NoID := newDiskfulResource(rdName, "n2", nil)
+
+		fromN1 := dispatcher.BuildDesired(n1, []blockstoriov1alpha1.Resource{*n2NoID}, nil, nil, rd, nil)
+		if got, ok := fromN1.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("n1 stamped auto-primary=%q while peer n2 has no NodeID — Bug 80 regression", got)
+		}
+
+		fromN2 := dispatcher.BuildDesired(n2NoID, []blockstoriov1alpha1.Resource{*n1}, nil, nil, rd, nil)
+		if got, ok := fromN2.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("n2 stamped auto-primary=%q while its own NodeID is nil — Bug 80 regression", got)
+		}
+	})
+
+	t.Run("second-pass-all-ids-present-only-lowest-stamps", func(t *testing.T) {
+		t.Parallel()
+
+		// Allocator caught up. Both replicas have allocated NodeIDs.
+		// The lowest (n1, id=0) must stamp auto-primary; the other
+		// (n2, id=1) must not.
+		n1 := newDiskfulResource(rdName, "n1", id(0))
+		n2 := newDiskfulResource(rdName, "n2", id(1))
+
+		fromN1 := dispatcher.BuildDesired(n1, []blockstoriov1alpha1.Resource{*n2}, nil, nil, rd, nil)
+		if got := fromN1.DrbdOptions["auto-primary"]; got != "true" {
+			t.Errorf("lowest-id n1 must stamp auto-primary=true, got %q", got)
+		}
+
+		fromN2 := dispatcher.BuildDesired(n2, []blockstoriov1alpha1.Resource{*n1}, nil, nil, rd, nil)
+		if got, ok := fromN2.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("non-lowest n2 must not stamp auto-primary, got %q", got)
+		}
+	})
+
+	t.Run("diskless-peer-missing-id-does-not-block-election", func(t *testing.T) {
+		t.Parallel()
+
+		// 1 diskful (n1, id=0) + 1 diskless witness (n3, id=nil).
+		// Diskless replicas legitimately keep nil NodeIDs until much
+		// later in their lifecycle — the gate must skip them and let
+		// the sole diskful replica stamp auto-primary on its own.
+		n1 := newDiskfulResource(rdName, "n1", id(0))
+		n3 := newDisklessResource(rdName, "n3", nil)
+
+		fromN1 := dispatcher.BuildDesired(n1, []blockstoriov1alpha1.Resource{*n3}, nil, nil, rd, nil)
+		if got := fromN1.DrbdOptions["auto-primary"]; got != "true" {
+			t.Errorf("sole diskful n1 must stamp auto-primary=true regardless of diskless witness id, got %q", got)
+		}
+	})
+}
+
+// newDiskfulResource is a one-shot Resource builder for the Bug-80
+// regression test. Kept local to dispatcher_test.go so the rest of
+// the suite can stay on its existing inline literals.
+func newDiskfulResource(rdName, node string, nodeID *int32) *blockstoriov1alpha1.Resource {
+	r := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               node,
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	r.Status.DRBDNodeID = nodeID
+
+	// Port + minor populated so dispatcher.BuildDesired doesn't fall
+	// back to the derive*() safety net (which would otherwise mask
+	// the auto-primary gate's behaviour by burning placeholder ids
+	// into the drbdOpts map).
+	port := int32(7000)
+	minor := int32(1000)
+	r.Status.DRBDPort = &port
+	r.Status.DRBDMinor = &minor
+
+	return r
+}
+
+// newDisklessResource mirrors newDiskfulResource for the diskless
+// witness case. Diskless replicas never participate in the
+// auto-primary election so their NodeID is intentionally allowed
+// to stay nil.
+func newDisklessResource(rdName, node string, nodeID *int32) *blockstoriov1alpha1.Resource {
+	r := newDiskfulResource(rdName, node, nodeID)
+	r.Spec.Flags = []string{"DISKLESS"}
+	r.Spec.StoragePool = ""
+
+	return r
+}

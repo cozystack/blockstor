@@ -396,8 +396,25 @@ func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1
 // lowestDiskfulID picks the smallest allocated node-id among the
 // diskful replicas of the RD. Used to deterministically choose which
 // replica seeds the initial Primary on first activation.
+//
+// When ANY diskful peer is missing Status.DRBDNodeID the allocator
+// hasn't finished yet — returning the sentinel here forces the
+// auto-primary election to wait for the next reconcile. Without
+// this guard each satellite sees only its own id (cache-trail race
+// at first activation: peer's Resource is observed by the satellite
+// before the controller-allocator stamps Status.DRBDNodeID on it),
+// computes lowest==self, both stamp auto-primary=true, both run
+// `drbdadm primary --force`, and the cluster lands in split-brain
+// or both replicas stay Inconsistent. The satellite layer (see
+// `waitForControllerAllocation`) is the primary defence; this is the
+// dispatcher-level backstop for callers that pass an incomplete peer
+// slice for reasons other than the c-r cache trail.
 func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) int32 {
 	const sentinel int32 = 1 << 30
+
+	if !diskfulPeersAllocated(target, peers) {
+		return sentinel
+	}
 
 	low := sentinel
 
@@ -423,6 +440,48 @@ func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return low
+}
+
+// diskfulPeersAllocated reports whether every diskful replica (target
+// + peers) carries an allocated Status.DRBDNodeID. Returns false the
+// instant one diskful replica has a nil id — the caller must treat
+// the auto-primary election as "not ready this pass" and let the
+// next reconcile rerun once the controller-side allocator catches
+// up. Diskless replicas are skipped: they never participate in the
+// primary election (a diskless replica cannot host the initial
+// SyncSource), and the allocator legitimately leaves their id nil
+// during the brief window between Resource creation and the
+// allocator stamping their Status.
+func diskfulPeersAllocated(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	check := func(r *blockstoriov1alpha1.Resource) bool {
+		if slices.Contains(r.Spec.Flags, "DISKLESS") {
+			return true
+		}
+
+		return nodeIDOf(r) >= 0
+	}
+
+	if !check(target) {
+		return false
+	}
+
+	for i := range peers {
+		if !check(&peers[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// DiskfulPeersAllocated is the exported façade over
+// `diskfulPeersAllocated`. The satellite reconciler calls it from
+// `waitForControllerAllocation` (Bug 80) to gate the apply pass
+// before any .res rendering — without an exported entry point the
+// gate would have to re-implement the diskful filter, drifting from
+// the dispatcher's own definition of "ready".
+func DiskfulPeersAllocated(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) bool {
+	return diskfulPeersAllocated(target, peers)
 }
 
 // buildVolumes turns the parent ResourceDefinition's VolumeDefinitions
