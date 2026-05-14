@@ -1,0 +1,60 @@
+name: Contract tests
+
+# Tier 3 of the test strategy (docs/test-strategy.md). Runs the
+# drbd-utils contract suite — a thin docker container running real
+# drbdmeta / drbdadm binaries against loopback files — to pin the
+# byte-shape of every wrapper in pkg/drbd against the actual CLI.
+#
+# Catches the Bug-81 class: unit tests pass because FakeExec accepts
+# any string, but the real drbdmeta rejects the flag combo. Runs on
+# every PR; target wall-clock < 1 minute including image build.
+#
+# Linux-only — the harness skips on other GOOS values.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  contract:
+    permissions:
+      contents: read
+    name: Contract (drbd-utils in docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Clone
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # The harness builds the image lazily on first test via
+      # sync.Once. We pre-build it here so the build step's logs are
+      # separated from test logs, which makes triage easier when the
+      # image build itself breaks (e.g. alpine moved drbd-utils to a
+      # different repo).
+      - name: Build contract image
+        run: |
+          docker build -t blockstor-drbd-contract:local \
+            -f tests/contract/Dockerfile tests/contract/
+          docker images blockstor-drbd-contract:local
+
+      - name: Contract tests
+        run: |
+          go test -tags=contract -count=1 -timeout=5m -v ./tests/contract/... \
+            | tee contract.log
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: contract-logs
+          path: contract.log
