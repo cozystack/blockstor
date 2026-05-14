@@ -522,6 +522,183 @@ func TestMigrateDiskRefusesPrimaryInUse(t *testing.T) {
 	}
 }
 
+// TestMigrateDiskAddBeforeDropOrdering pins the Bug 34 Option B
+// ordering contract for scenario 4.W21 / wave1 4.10: the REST
+// migrate-disk handler must add the destination diskful replica
+// BEFORE anything happens to the source. The diskful replica count
+// must monotonically rise across the REST call (N → N+1) and only
+// the asynchronous ResourceMigrationReconciler — running after dst
+// reaches UpToDate on the wire — is allowed to drop it back to N by
+// pruning src.
+//
+// Concretely the test seeds a 3-diskful-replica RD, calls PUT
+// migrate-disk with a fourth node as the destination, and asserts:
+//
+//  1. The handler returns 200 (Option B is an async-pending success,
+//     not 202).
+//  2. ListByDefinition immediately afterwards returns FOUR diskful
+//     Resources for the RD — the three originals plus dst — proving
+//     the add happened before any drop.
+//  3. The src Resource is still byte-for-byte diskful: no DISKLESS
+//     flag, no ToggleDiskCancel, no MigratingFrom prop on it (the
+//     prop belongs on dst, not src).
+//  4. The handler stamped MigratingFromProp on dst BEFORE clearing
+//     DISKLESS on src — verified indirectly: src has no spec mutation
+//     at all, while dst carries both the pool stamp and the prop.
+//
+// The test then simulates the reconciler completing (delete src,
+// strip prop on dst) and asserts the final count is back to three
+// diskful — i.e. the full lifecycle is N → N+1 → N, never N → N-1
+// → N as the Option A regression would produce.
+func TestMigrateDiskAddBeforeDropOrdering(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-order"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, node := range []string{"alpha", "bravo", "charlie"} {
+		if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+			Name:     "pvc-order",
+			NodeName: node,
+			// No DISKLESS flag — diskful.
+		}); err != nil {
+			t.Fatalf("seed %s: %v", node, err)
+		}
+	}
+
+	// Pre-condition: exactly 3 diskful replicas, 0 diskless.
+	pre, err := st.Resources().ListByDefinition(t.Context(), "pvc-order")
+	if err != nil {
+		t.Fatalf("pre ListByDefinition: %v", err)
+	}
+
+	if diskfulCount(pre) != 3 {
+		t.Fatalf("pre: diskful count got %d, want 3 (%v)", diskfulCount(pre), pre)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Migrate alpha → delta. Under Option B the handler must
+	// raise the diskful count to 4 (add dst) and leave alpha
+	// alone (deferred drop). Failure mode under Option A: handler
+	// deletes alpha synchronously, count goes 3 → 2 → 3 with a
+	// transient window of 2 visible to any concurrent ListResources.
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-order/resources/delta/migrate-disk/alpha/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Post-condition immediately after REST returns: 4 diskful
+	// replicas exist for the RD. This is the add-before-drop
+	// pin — any handler that pruned src synchronously would land
+	// here with 3 (and only later swing back to 4 once a separate
+	// reconcile re-stamped dst, which is the broken Option A flow).
+	post, err := st.Resources().ListByDefinition(t.Context(), "pvc-order")
+	if err != nil {
+		t.Fatalf("post ListByDefinition: %v", err)
+	}
+
+	if got := diskfulCount(post); got != 4 {
+		t.Errorf("post-REST diskful count: got %d, want 4 (add-before-drop violated): %v",
+			got, post)
+	}
+
+	// src (alpha) must be present and untouched.
+	alpha, err := st.Resources().Get(t.Context(), "pvc-order", "alpha")
+	if err != nil {
+		t.Fatalf("src alpha pruned by REST handler (Option A regression): %v", err)
+	}
+
+	if slices.Contains(alpha.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("src alpha flipped DISKLESS at REST layer: %v", alpha.Flags)
+	}
+
+	if alpha.Props[MigratingFromProp] != "" {
+		t.Errorf("src alpha carries MigratingFrom prop (belongs on dst): %q",
+			alpha.Props[MigratingFromProp])
+	}
+
+	if alpha.ToggleDiskCancel {
+		t.Errorf("src alpha unexpectedly carries ToggleDiskCancel")
+	}
+
+	// dst (delta) must be the new diskful with both the pool stamp
+	// and the migrating-from trigger set in the same REST round-trip.
+	// The reconciler only fires when BOTH conditions are observed
+	// together; a half-stamped dst would deadlock the migration.
+	delta, err := st.Resources().Get(t.Context(), "pvc-order", "delta")
+	if err != nil {
+		t.Fatalf("dst delta missing after REST: %v", err)
+	}
+
+	if slices.Contains(delta.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("dst delta still DISKLESS: %v", delta.Flags)
+	}
+
+	if delta.Props["StorPoolName"] != "zfs-thin" {
+		t.Errorf("dst delta StorPoolName: got %q, want zfs-thin",
+			delta.Props["StorPoolName"])
+	}
+
+	if delta.Props[MigratingFromProp] != "alpha" {
+		t.Errorf("dst delta MigratingFrom: got %q, want alpha",
+			delta.Props[MigratingFromProp])
+	}
+
+	// Simulate the ResourceMigrationReconciler completing the second
+	// half of Option B: it observes dst UpToDate, deletes src, strips
+	// the prop on dst. The final state must be exactly three diskful
+	// replicas (alpha pruned, bravo/charlie/delta diskful) and the
+	// migrating-from prop cleared on dst — proving the full N → N+1
+	// → N lifecycle and that no other state mutation is needed past
+	// what the REST handler stamped.
+	if err := st.Resources().Delete(t.Context(), "pvc-order", "alpha"); err != nil {
+		t.Fatalf("simulate reconciler prune of src: %v", err)
+	}
+
+	delta.Props = map[string]string{"StorPoolName": "zfs-thin"} // prop stripped by reconciler.
+	if err := st.Resources().Update(t.Context(), &delta); err != nil {
+		t.Fatalf("simulate reconciler clear of prop: %v", err)
+	}
+
+	final, err := st.Resources().ListByDefinition(t.Context(), "pvc-order")
+	if err != nil {
+		t.Fatalf("final ListByDefinition: %v", err)
+	}
+
+	if got := diskfulCount(final); got != 3 {
+		t.Errorf("final diskful count: got %d, want 3 (%v)", got, final)
+	}
+
+	for _, res := range final {
+		if res.Props[MigratingFromProp] != "" {
+			t.Errorf("MigratingFrom prop leaked on %s after reconciler clear: %q",
+				res.NodeName, res.Props[MigratingFromProp])
+		}
+	}
+}
+
+// diskfulCount returns the number of diskful replicas in the slice —
+// i.e. replicas without the DISKLESS flag set. Used by the
+// add-before-drop ordering test to assert the redundancy invariant
+// across each phase of an Option B migration.
+func diskfulCount(rs []apiv1.Resource) int {
+	n := 0
+
+	for i := range rs {
+		if !slices.Contains(rs[i].Flags, apiv1.ResourceFlagDiskless) {
+			n++
+		}
+	}
+
+	return n
+}
+
 // TestToggleDiskCancelQuerySetsSpecField pins the Bug 40 cancel
 // surface: PUT toggle-disk?cancel=true on a diskful (or in-flight
 // converting) replica MUST set Spec.ToggleDiskCancel=true on the
