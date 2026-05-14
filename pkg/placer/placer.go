@@ -344,6 +344,14 @@ type state struct {
 	sharedSeen map[string]struct{} // sharedSpaceIDs already used by an existing replica
 	pools      map[string]apiv1.StoragePool
 	filter     *apiv1.AutoSelectFilter
+	// firstKind is the ProviderKind of the first diskful replica
+	// either already on the RD (seeded from `existing`) or placed
+	// during this Place call. Subsequent diskful candidates are
+	// rejected unless IsProviderKindMixingAllowed(firstKind, pool)
+	// returns true (Bug 76: mirror upstream LINSTOR's same-kind
+	// constraint). Empty string means "no diskful replica yet, no
+	// constraint" — the first replica is free to pick any kind.
+	firstKind string
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool) *state {
@@ -376,9 +384,35 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		if pool.SharedSpaceID != "" {
 			s.sharedSeen[pool.SharedSpaceID] = struct{}{}
 		}
+
+		// Pre-seed Bug 76 same-kind constraint from the first
+		// diskful replica already on the RD. DISKLESS replicas
+		// don't claim a backing pool so they're skipped — see
+		// IsProviderKindMixingAllowed for the rationale.
+		if s.firstKind == "" && !slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			s.firstKind = pool.ProviderKind
+		}
 	}
 
 	return s
+}
+
+// allowsKindMix is the Bug 76 same-kind gate. Once the RD has one
+// diskful replica, every subsequent diskful replica must land on a
+// pool whose ProviderKind is compatible with the first one. This
+// mirrors upstream LINSTOR's DeviceProviderKind.isMixingAllowed
+// and prevents `r c test --auto-place 2` from spreading replicas
+// across e.g. FILE_THIN + LVM_THIN — the symptom Bug 76 reports.
+//
+// Returns true when no diskful replica has been pinned yet
+// (firstKind is the empty string) — the first replica is free to
+// pick any kind.
+func (s *state) allowsKindMix(kind string) bool {
+	if s.firstKind == "" {
+		return true
+	}
+
+	return IsProviderKindMixingAllowed(s.firstKind, kind)
 }
 
 func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
@@ -404,6 +438,11 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		if _, dup := s.sharedSeen[pool.SharedSpaceID]; dup {
 			return false, nil
 		}
+	}
+
+	// ProviderKind mixing gate (Bug 76): see allowsKindMix doc.
+	if !s.allowsKindMix(pool.ProviderKind) {
+		return false, nil
 	}
 
 	res := apiv1.Resource{
@@ -434,6 +473,13 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 
 	if pool.SharedSpaceID != "" {
 		s.sharedSeen[pool.SharedSpaceID] = struct{}{}
+	}
+
+	// Lock in the RD's ProviderKind from the first diskful replica
+	// (Bug 76). Subsequent tryPlace calls compare against this
+	// captured value via IsProviderKindMixingAllowed.
+	if s.firstKind == "" {
+		s.firstKind = pool.ProviderKind
 	}
 
 	return true, nil
