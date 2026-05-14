@@ -227,6 +227,14 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 		out.NetInterfaces = apiv1.DefaultNetInterfaceFields(out.Name, out.NetInterfaces)
 	}
 
+	// Synthesise upstream-LINSTOR capability fields (UUID,
+	// resource_layers, storage_providers, unsupported_*,
+	// props.NodeUname, props.CurStltConnName) — these aren't
+	// persisted on the CRD because they're derivable from the
+	// satellite binary's own capabilities. Audit row F2 called out
+	// their absence as a `linstor n l` wire-shape gap.
+	apiv1.SynthesizeNodeCapabilities(&out)
+
 	return out
 }
 

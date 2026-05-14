@@ -129,12 +129,9 @@ func (s *inMemoryNodes) List(_ context.Context) ([]apiv1.Node, error) {
 	defer s.mu.RUnlock()
 
 	out := make([]apiv1.Node, 0, len(s.m))
-	for _, n := range s.m {
-		if len(n.NetInterfaces) > 0 {
-			n.NetInterfaces = apiv1.DefaultNetInterfaceFields(n.Name, append([]apiv1.NetInterface(nil), n.NetInterfaces...))
-		}
-
-		out = append(out, n)
+	for k := range s.m {
+		n := s.m[k]
+		out = append(out, decorateInMemoryNode(&n))
 	}
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -143,10 +140,12 @@ func (s *inMemoryNodes) List(_ context.Context) ([]apiv1.Node, error) {
 }
 
 // Get returns the named node or ErrNotFound. NetInterface defaults
-// are applied on read so the in-memory store mirrors the K8s
-// backend's wire shape — both surfaces emit `satellite_port=3366` /
-// `satellite_encryption_type=PLAIN` when the caller omitted them at
-// Create time.
+// + upstream-LINSTOR capability fields are applied on read so the
+// in-memory store mirrors the K8s backend's wire shape — both
+// surfaces emit `satellite_port=3366` / `satellite_encryption_type=PLAIN`
+// when the caller omitted them at Create time, plus the UUID /
+// resource_layers / storage_providers / unsupported_* parity fields
+// the CLI audit (row F2) required.
 func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -156,11 +155,25 @@ func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) 
 		return apiv1.Node{}, errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
+	return decorateInMemoryNode(&n), nil
+}
+
+// decorateInMemoryNode applies the wire-shape decoration both Get and
+// List run on every read: NetInterface upstream defaults
+// (port=3366 / type=PLAIN / first-iface IsActive=true) plus the F2
+// capability synthesis (UUID, resource_layers, storage_providers,
+// unsupported_*, props.NodeUname, props.CurStltConnName). Takes a
+// pointer so the 184-byte Node struct isn't copied on the call;
+// callers pass `&n` from a loop-local copy so the stored map value
+// stays unmodified.
+func decorateInMemoryNode(n *apiv1.Node) apiv1.Node {
 	if len(n.NetInterfaces) > 0 {
 		n.NetInterfaces = apiv1.DefaultNetInterfaceFields(n.Name, append([]apiv1.NetInterface(nil), n.NetInterfaces...))
 	}
 
-	return n, nil
+	apiv1.SynthesizeNodeCapabilities(n)
+
+	return *n
 }
 
 // Create inserts a new node. Returns ErrAlreadyExists if the name is taken.

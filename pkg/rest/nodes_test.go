@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"testing"
 
@@ -816,4 +817,242 @@ func TestNodeDeleteUnknownReturns200Warning(t *testing.T) {
 	if !strings.Contains(rc[0].Message, "ghost-node") {
 		t.Errorf("message: got %q, want it to name ghost-node", rc[0].Message)
 	}
+}
+
+// seedNodeForF2 is a tiny helper used by the F2 capability-synthesis
+// tests below. They all need the same shape (one Satellite-typed node
+// with no props/layers/UUID at seed time) so the assertion focuses
+// on what the read-path adds.
+func seedNodeForF2(t *testing.T, st store.Store, name string) {
+	t.Helper()
+
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name: name,
+		Type: apiv1.NodeTypeSatellite,
+	}); err != nil {
+		t.Fatalf("seed node %q: %v", name, err)
+	}
+}
+
+// fetchNodeForF2 GETs a node through the REST surface and returns
+// the decoded wire-shape value. Centralises the boilerplate the F2
+// tests share.
+func fetchNodeForF2(t *testing.T, base, name string) apiv1.Node {
+	t.Helper()
+
+	resp := httpGet(t, base+"/v1/nodes/"+name)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/nodes/%s status: got %d, want 200", name, resp.StatusCode)
+	}
+
+	var got apiv1.Node
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode node %q: %v", name, err)
+	}
+
+	return got
+}
+
+// TestNodeListIncludesUUIDStable pins F2/audit row #1: upstream
+// LINSTOR's Node DTO carries a top-level `uuid` field, and operators
+// script `linstor n l --pastable` against it. The UUID MUST be
+// non-empty AND stable across separate reads (same name → same UUID
+// on every GET, every controller restart, every replica of the
+// apiserver). Re-derive in the test via the same helper to also pin
+// the namespace constant so a future refactor doesn't silently
+// re-roll every operator's cached UUID.
+func TestNodeListIncludesUUIDStable(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "n1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first := fetchNodeForF2(t, base, "n1")
+	if first.UUID == "" {
+		t.Fatalf("UUID: got empty, want non-empty UUID v5")
+	}
+
+	want := apiv1.StableNodeUUID("n1")
+	if first.UUID != want {
+		t.Errorf("UUID: got %q, want %q (deterministic SHA1 namespace)", first.UUID, want)
+	}
+
+	// Stability across reads — re-GET and confirm the same value
+	// comes back. If it didn't, operators' tooling that caches UUID
+	// would break on every reconcile.
+	second := fetchNodeForF2(t, base, "n1")
+	if first.UUID != second.UUID {
+		t.Errorf("UUID not stable across reads: got %q then %q", first.UUID, second.UUID)
+	}
+}
+
+// TestNodeListSurfacesSupportedLayers pins F2/audit row #1:
+// upstream's `Node.resource_layers` array advertises which LINSTOR
+// layer types this satellite implements. `linstor advise` and the
+// CLI's layer-stack picker read this list. Blockstor's satellite
+// implements DRBD, STORAGE, and LUKS — the response MUST surface
+// them in upstream-name form.
+func TestNodeListSurfacesSupportedLayers(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "n1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "n1")
+
+	wantLayers := []string{"DRBD", "STORAGE", "LUKS"}
+	for _, want := range wantLayers {
+		var found bool
+
+		for _, have := range got.ResourceLayers {
+			if have == want {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("ResourceLayers missing %q; got %v", want, got.ResourceLayers)
+		}
+	}
+}
+
+// TestNodeListSurfacesSupportedProviders pins F2/audit row #1:
+// upstream's `Node.storage_providers` advertises which provider
+// kinds `linstor sp c` will accept on this node. The list MUST
+// match what `pkg/satellite/factory.go::NewProviderFromKind`
+// actually instantiates — operators rely on it to validate
+// StorageClass `linstor.csi.linbit.com/storagePool` references.
+func TestNodeListSurfacesSupportedProviders(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "n1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "n1")
+
+	// LVM_THIN / ZFS_THIN / FILE_THIN / DISKLESS are the four that
+	// linstor-csi exercises most heavily in piraeus-operator
+	// deployments — pin them explicitly so a future trim doesn't
+	// silently break CSI provisioning.
+	wantProviders := []string{"LVM_THIN", "ZFS_THIN", "FILE_THIN", "DISKLESS"}
+	for _, want := range wantProviders {
+		var found bool
+
+		for _, have := range got.StorageProviders {
+			if have == want {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("StorageProviders missing %q; got %v", want, got.StorageProviders)
+		}
+	}
+}
+
+// TestNodeListExposesUnsupportedSets pins F2/audit row #1:
+// upstream's `Node.unsupported_layers` and `unsupported_providers`
+// are `map[string][]string` where the key names the
+// missing-layer/provider and the value carries one-or-more reason
+// strings. The CLI surfaces these in `linstor n l --pastable`'s
+// SupportInfo column. Blockstor explicitly scopes out CACHE /
+// WRITECACHE / NVME layers and the OPENFLEX_TARGET / REMOTE_SPDK /
+// SPDK / STORAGE_SPACES{,_THIN} / EBS_TARGET / EBS_INIT providers
+// — the wire MUST advertise this so `linstor advise` doesn't
+// suggest unreachable configurations.
+func TestNodeListExposesUnsupportedSets(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "n1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "n1")
+
+	wantLayers := []string{"CACHE", "WRITECACHE", "NVME"}
+	for _, want := range wantLayers {
+		reasons, ok := got.UnsupportedLayers[want]
+		if !ok {
+			t.Errorf("UnsupportedLayers missing %q; got keys=%v", want, mapKeys(got.UnsupportedLayers))
+
+			continue
+		}
+
+		if len(reasons) == 0 {
+			t.Errorf("UnsupportedLayers[%q]: got empty reason list, want at least one", want)
+		}
+	}
+
+	wantProviders := []string{
+		"OPENFLEX_TARGET", "REMOTE_SPDK", "SPDK",
+		"STORAGE_SPACES", "STORAGE_SPACES_THIN",
+		"EBS_TARGET", "EBS_INIT",
+	}
+	for _, want := range wantProviders {
+		reasons, ok := got.UnsupportedProviders[want]
+		if !ok {
+			t.Errorf("UnsupportedProviders missing %q; got keys=%v", want, mapKeys(got.UnsupportedProviders))
+
+			continue
+		}
+
+		if len(reasons) == 0 {
+			t.Errorf("UnsupportedProviders[%q]: got empty reason list, want at least one", want)
+		}
+	}
+}
+
+// TestNodeListPropsNodeUname pins F2/audit row #1: upstream LINSTOR
+// stamps `props.NodeUname` (the value `uname -n` would have returned
+// on the satellite host) and `props.CurStltConnName` ("default" for
+// single-connection deployments). Both surface in `linstor n l
+// --show-props NodeUname,CurStltConnName`. Blockstor synthesises
+// NodeUname from the node name (Piraeus convention) and pins
+// CurStltConnName=default since there's exactly one connection per
+// node in this architecture.
+func TestNodeListPropsNodeUname(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "worker-1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := fetchNodeForF2(t, base, "worker-1")
+
+	if got.Props == nil {
+		t.Fatalf("Props: got nil, want NodeUname/CurStltConnName populated")
+	}
+
+	if got.Props["NodeUname"] != "worker-1" {
+		t.Errorf("Props[NodeUname]: got %q, want %q", got.Props["NodeUname"], "worker-1")
+	}
+
+	if got.Props["CurStltConnName"] != "default" {
+		t.Errorf("Props[CurStltConnName]: got %q, want %q",
+			got.Props["CurStltConnName"], "default")
+	}
+}
+
+// mapKeys is a tiny helper that returns the keys of a
+// `map[string][]string` as a sorted slice — used in failure messages
+// for the F2 tests so a regression shows up as `got keys=[...]`
+// rather than as a Go map literal's randomised order.
+func mapKeys(m map[string][]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+
+	sort.Strings(out)
+
+	return out
 }
