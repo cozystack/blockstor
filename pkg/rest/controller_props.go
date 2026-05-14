@@ -110,6 +110,13 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Scenario 7.W06: `controller set-log-level DEBUG` lands as a
+	// LogLevel property write on the controller. Apply the runtime
+	// flip AFTER the CRD write so a persistence failure doesn't
+	// silently change the slog level — operators expect the
+	// list-properties output and the live log stream to agree.
+	applyRuntimeLogLevel(&modify)
+
 	// Java LINSTOR returns 201 Created for a property-bag mutation
 	// (one ApiCallRc per override key plus one "Controller properties
 	// applied" entry per peer). The contract test collapses that array

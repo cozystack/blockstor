@@ -43,6 +43,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"log/slog"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -92,6 +93,16 @@ func parseFlags() *apiserverFlags {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Bind slog.Default to the REST package's runtime LevelVar so
+	// `controller set-log-level DEBUG` (scenario 7.W06) flips the
+	// effective level of every slog.* call without a pod restart.
+	// The controller-runtime zap logger keeps its own level for
+	// historical reasons; new code paths emitting via slog (e.g.
+	// satellite reconcile fan-out) honour this var.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: rest.RuntimeLogLevel(),
+	})))
 
 	return flags
 }
