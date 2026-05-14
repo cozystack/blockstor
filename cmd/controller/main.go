@@ -229,6 +229,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "resourcegroup")
 		os.Exit(1)
 	}
+	if err := (&controller.RGRebalanceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Store:  st,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "rg-rebalance")
+		os.Exit(1)
+	}
 	if err := (&controller.ResourceDefinitionReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
