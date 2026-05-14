@@ -2307,6 +2307,249 @@ func TestReconcilerRespectsOperatorDisconnect(t *testing.T) {
 	}
 }
 
+// TestOperatorDisconnectSurvives30sWindow (scenario 5.W14, cross-listed
+// with wave1 5.29) pins the wave2 P1 regression budget on the operator-
+// disconnect window. Where the sibling TestReconcilerRespectsOperator
+// Disconnect drives 5 passes as a quick-burst guard, this test stretches
+// to a 10-pass steady-state loop — long enough to cover the documented
+// ≥30s manual-recovery budget at one-pass-per-~3s plus a comfortable
+// margin for reconcile back-pressure / observer-driven re-enqueues
+// during the window.
+//
+// What's pinned beyond the 5.29 baseline:
+//
+//  1. A broader forbidden-verb set. 5.29 forbids `drbdadm connect` /
+//     `drbdadm disconnect` outright. 5.W14 extends to the lower-level
+//     `drbdsetup connect` / `drbdsetup disconnect` and the bring-up
+//     short-circuit `drbdsetup new-peer ... --connect` that a future
+//     "be helpful and re-handshake StandAlone peers" patch might reach
+//     for. If any of those forms ever lands on the apply path without
+//     a corresponding Aux/operator-managed=false gate, this test fails
+//     and forces the author to justify the change against 5.W14's
+//     scenario doc + the open design question on Aux/operator-managed.
+//
+//  2. Per-pass liveness positive control. 5.29 asserts adjust fires
+//     "at least once" across the whole 5-pass window. 5.W14 asserts
+//     `drbdadm adjust` fires on EVERY steady-state pass (2 through 10):
+//     a future regression that silently skipped reconcile passes when
+//     it observed a StandAlone peer would still pass 5.29's "at least
+//     one" gate but fail this one. The reconciler's contract is "keep
+//     converging the convergeable layers (.res render, adjust) even
+//     when the peer is operator-quiesced" — adjust on a peer in
+//     StandAlone is a no-op for the peer's connection state in DRBD 9
+//     and is what makes that contract safe.
+//
+//  3. Doc-pin for the design choice. The 5.W14 scenarios doc still
+//     calls Aux/operator-managed=true an "open design question". This
+//     test implicitly pins Option B (rely on the absence of any
+//     reconnect verb in `drbd.Adm`) by NOT stamping any operator-
+//     managed prop on the DesiredResource. If the project later flips
+//     to Option A (explicit prop gate), this test's DesiredResource
+//     shape becomes the negative-control baseline (no prop → still no
+//     reconnect because the gate defaults closed) and a sibling test
+//     should drive the prop-set case.
+//
+// The test does NOT model wall-clock time directly — the reconciler is
+// event-driven, not interval-driven, so wall-clock isn't a meaningful
+// invariant to assert against in unit scope. The pass count is the
+// chosen proxy: 10 passes models the worst-case burst the satellite
+// could fire during a 30s window if every event-source (controller
+// push, observer state change, heartbeat retry) flapped concurrently.
+func TestOperatorDisconnectSurvives30sWindow(t *testing.T) {
+	const (
+		// passCount models the ≥30s recovery budget. At the worst-case
+		// reconcile burst observed in production (~one pass per 3s
+		// under observer flap), 10 passes covers the full window with
+		// a 3s margin.
+		passCount = 10
+		// steadyStartPass is the first pass that's in steady-state
+		// (LV present, .res lingering, create-md marker dropped).
+		// Pass 1 is the first-activation bring-up.
+		steadyStartPass = 2
+	)
+
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Pass 1: first activation — LV absent, lvcreate fires.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-opdisc30s_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// 2-replica RD. Observer (out-of-band, not modelled) reports peer
+	// n2 StandAlone after operator's `drbdadm disconnect pvc-opdisc30s`
+	// — but the DesiredResource the controller pushes to the satellite
+	// is unchanged, because peer connection-state is observer-only and
+	// not part of the apply payload. That's the property under test:
+	// the reconciler has no signal that would tempt it to "fix" a
+	// manually-disconnected peer.
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-opdisc30s",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7200",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1200",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7200",
+			},
+		},
+	}
+
+	// Pass 1: first activation. create-md + adjust + bring-up land
+	// here; the forbidden-verb scan still applies, but the per-pass
+	// adjust-liveness check starts from steadyStartPass.
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply pass 1 (first activation): %v", err)
+	}
+
+	type passCommands struct {
+		pass  int
+		lines []string
+	}
+
+	transcript := []passCommands{{pass: 1, lines: append([]string{}, fx.CommandLines()...)}}
+
+	// Passes 2..passCount: steady-state. .res file + md-marker linger
+	// from pass 1, LV reports present. This is the loop the satellite
+	// actually runs while the operator is inside their 30s window.
+	//
+	// Per-pass FakeExec staging:
+	//
+	//   - `lvs` (twice): the storage layer's existence + path/size
+	//     probe. Reports the LV present at the requested size, so the
+	//     storage path is a no-op and only the DRBD path runs.
+	//   - `drbdsetup status <rd>`: the kernel-state probe gating
+	//     `drbdadm up` vs `drbdadm adjust` (Bug 47 / scenario 5.32).
+	//     Stage a non-empty role/disk line so IsLoaded reads "loaded"
+	//     and the reconciler picks adjust. Without this, the probe
+	//     fails → reconciler falls back to `drbdadm up`, and the
+	//     per-pass adjust-liveness check below would fire spuriously
+	//     even though the steady-state path is structurally correct.
+	//     The status payload deliberately reports peer n2 in
+	//     `connection:StandAlone` to mirror what the kernel would
+	//     actually expose mid-operator-disconnect — a future
+	//     reconciler that grew StandAlone-aware behaviour would
+	//     trip the forbidden-verb scan above.
+	for pass := steadyStartPass; pass <= passCount; pass++ {
+		fx.Reset()
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-opdisc30s_00000",
+			storage.FakeResponse{Stdout: []byte("pvc-opdisc30s_00000\n")})
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-opdisc30s_00000",
+			storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-opdisc30s_00000|1048576\n")})
+		fx.Expect("drbdsetup status pvc-opdisc30s",
+			storage.FakeResponse{Stdout: []byte(
+				"pvc-opdisc30s role:Secondary\n" +
+					"  volume:0 disk:UpToDate\n" +
+					"  n2 connection:StandAlone\n")})
+
+		if _, err := rec.Apply(t.Context(), dr); err != nil {
+			t.Fatalf("Apply pass %d (steady-state): %v", pass, err)
+		}
+
+		transcript = append(transcript, passCommands{pass: pass, lines: append([]string{}, fx.CommandLines()...)})
+	}
+
+	// Forbidden-verb scan: zero connect/disconnect commands of any
+	// shape across the full 10-pass window. Each substring is a
+	// distinct verb form a future regression might reach for — the
+	// list is deliberately broader than 5.29's two-entry set.
+	forbidden := []string{
+		"drbdadm connect",
+		"drbdadm disconnect",
+		"drbdsetup connect",
+		"drbdsetup disconnect",
+		// Bring-up short-circuit: `drbdadm up` is allowed (it's how
+		// the resource enters the kernel on pass 1), but the explicit
+		// `drbdsetup new-peer ... --connect` shape some patches inline
+		// to force a handshake is not.
+		"new-peer --connect",
+		// Equivalent shape with the flag in a different position.
+		"--connect new-peer",
+	}
+
+	for _, entry := range transcript {
+		for _, line := range entry.lines {
+			for _, bad := range forbidden {
+				if strings.Contains(line, bad) {
+					t.Errorf("scenario 5.W14: pass %d issued forbidden %q during operator-disconnect window: %s",
+						entry.pass, bad, line)
+				}
+			}
+		}
+	}
+
+	// Per-pass liveness check: every steady-state pass MUST fire
+	// `drbdadm adjust`. Adjust is the reconciler's sole convergence
+	// verb and is a no-op for connection state on a StandAlone peer
+	// in DRBD 9 — so it stays safe to fire while keeping the rest of
+	// the reconcile loop honest. A regression that silently skipped
+	// adjust on observed StandAlone peers would fail here even though
+	// 5.29's coarser "at least one adjust across all passes" check
+	// would still pass.
+	for _, entry := range transcript {
+		if entry.pass < steadyStartPass {
+			continue
+		}
+
+		sawAdjust := false
+
+		for _, line := range entry.lines {
+			if strings.Contains(line, "drbdadm adjust pvc-opdisc30s") {
+				sawAdjust = true
+
+				break
+			}
+		}
+
+		if !sawAdjust {
+			t.Errorf("scenario 5.W14: pass %d (steady-state) did not fire `drbdadm adjust` — reconciler appears to have skipped this pass; got %v",
+				entry.pass, entry.lines)
+		}
+	}
+
+	// Final guard against the lazy-pass regression: at least one
+	// `drbdadm adjust` must appear in the LAST pass specifically.
+	// This catches the failure mode where a future change defers
+	// adjust on the first few StandAlone observations and never
+	// re-runs it — a pattern that could read as "fine, eventually
+	// consistent" in code review but in fact silently drops the
+	// reconciler's convergence contract for the rest of the window.
+	lastPass := transcript[len(transcript)-1]
+	if lastPass.pass != passCount {
+		t.Fatalf("transcript bookkeeping error: last pass = %d, want %d", lastPass.pass, passCount)
+	}
+
+	sawAdjustLast := false
+
+	for _, line := range lastPass.lines {
+		if strings.Contains(line, "drbdadm adjust pvc-opdisc30s") {
+			sawAdjustLast = true
+
+			break
+		}
+	}
+
+	if !sawAdjustLast {
+		t.Errorf("scenario 5.W14: final pass (%d) did not fire `drbdadm adjust` — reconciler stopped converging mid-window; got %v",
+			passCount, lastPass.lines)
+	}
+}
+
 // TestApplyRendersExternalMetaDiskPath: scenario 6.18 spec — when the
 // dispatcher stamps DesiredVolume.MetaPool, the .res file the
 // reconciler writes carries the matching `meta-disk <path>;` line
