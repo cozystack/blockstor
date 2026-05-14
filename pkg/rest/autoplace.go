@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
@@ -344,7 +345,9 @@ func autoplaceFilterPoolNames(filter *apiv1.AutoSelectFilter) []string {
 // that mirrors upstream LINSTOR's
 // `AutoSelectFilterApi.asHelpString("   ")` — only fields the caller
 // actually set get a line, so a bare call doesn't drown the operator
-// in empty rows.
+// in empty rows. Split into writeAutoplacePools / writeAutoplaceTopology
+// to stay under the gocyclo budget; each helper covers a logically
+// related slice of the filter.
 func writeAutoplaceConfig(buf *strings.Builder, filter *apiv1.AutoSelectFilter) {
 	const indent = "   "
 
@@ -360,6 +363,18 @@ func writeAutoplaceConfig(buf *strings.Builder, filter *apiv1.AutoSelectFilter) 
 		fmt.Fprintf(buf, "%sAdditional replica count: %d\n", indent, filter.AdditionalPlaceCount)
 	}
 
+	writeAutoplacePools(buf, filter, indent)
+	writeAutoplaceTopology(buf, filter, indent)
+
+	if filter.DisklessOnRemaining {
+		fmt.Fprintf(buf, "%sDiskless on remaining: true\n", indent)
+	}
+}
+
+// writeAutoplacePools renders the pool / node-list slice of the
+// filter (StoragePool, NodeNameList, NotPlaceWith, LayerStack,
+// ProviderList). Split off from writeAutoplaceConfig for gocyclo.
+func writeAutoplacePools(buf *strings.Builder, filter *apiv1.AutoSelectFilter, indent string) {
 	if len(filter.NodeNameList) > 0 {
 		fmt.Fprintf(buf, "%sNode name: %v\n", indent, filter.NodeNameList)
 	}
@@ -384,6 +399,18 @@ func writeAutoplaceConfig(buf *strings.Builder, filter *apiv1.AutoSelectFilter) 
 		fmt.Fprintf(buf, "%sDo not place with resource (regex): %s\n", indent, filter.NotPlaceWithRscRegex)
 	}
 
+	if len(filter.LayerStack) > 0 {
+		fmt.Fprintf(buf, "%sLayer stack: %v\n", indent, filter.LayerStack)
+	}
+
+	if len(filter.ProviderList) > 0 {
+		fmt.Fprintf(buf, "%sAllowed Provider: %v\n", indent, filter.ProviderList)
+	}
+}
+
+// writeAutoplaceTopology renders the topology slice of the filter
+// (replicas_on_same / _on_different / x_replicas_on_different_map).
+func writeAutoplaceTopology(buf *strings.Builder, filter *apiv1.AutoSelectFilter, indent string) {
 	if len(filter.ReplicasOnSame) > 0 {
 		fmt.Fprintf(buf, "%sReplicas on nodes with same properties: %v\n", indent, filter.ReplicasOnSame)
 	}
@@ -392,16 +419,8 @@ func writeAutoplaceConfig(buf *strings.Builder, filter *apiv1.AutoSelectFilter) 
 		fmt.Fprintf(buf, "%sReplicas on nodes with different properties: %v\n", indent, filter.ReplicasOnDifferent)
 	}
 
-	if len(filter.LayerStack) > 0 {
-		fmt.Fprintf(buf, "%sLayer stack: %v\n", indent, filter.LayerStack)
-	}
-
-	if len(filter.ProviderList) > 0 {
-		fmt.Fprintf(buf, "%sAllowed Provider: %v\n", indent, filter.ProviderList)
-	}
-
-	if filter.DisklessOnRemaining {
-		fmt.Fprintf(buf, "%sDiskless on remaining: true\n", indent)
+	if len(filter.XReplicasOnDifferentMap) > 0 {
+		fmt.Fprintf(buf, "%sX-replicas on different properties (per-key cap): %v\n", indent, filter.XReplicasOnDifferentMap)
 	}
 }
 
@@ -565,6 +584,14 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 
 	if len(req.ReplicasOnDifferent) > 0 {
 		out.ReplicasOnDifferent = req.ReplicasOnDifferent
+	}
+
+	if len(req.XReplicasOnDifferentMap) > 0 {
+		// Scenario 9.W08: bucket-cap form of replicas_on_different.
+		// Copy so a later mutation on the request body can't reach
+		// into the merged filter (the RG-level map is reference-
+		// shared with the parent ResourceGroup).
+		out.XReplicasOnDifferentMap = maps.Clone(req.XReplicasOnDifferentMap)
 	}
 
 	if req.DisklessOnRemaining {

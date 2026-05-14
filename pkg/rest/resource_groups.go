@@ -302,6 +302,14 @@ func rgNeedsRebalance(prev, next apiv1.AutoSelectFilter) bool {
 		return true
 	}
 
+	// Scenario 9.W08: XReplicasOnDifferentMap is a placement-affecting
+	// SelectFilter field. A modify that changes the per-key cap
+	// (e.g. relaxing "site 1" to "site 2") must re-run the placer on
+	// every child RD so existing under-placed RDs get caught up.
+	if !maps.Equal(prev.XReplicasOnDifferentMap, next.XReplicasOnDifferentMap) {
+		return true
+	}
+
 	return false
 }
 

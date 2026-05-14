@@ -446,6 +446,15 @@ type state struct {
 	// constraint). Empty string means "no diskful replica yet, no
 	// constraint" — the first replica is free to pick any kind.
 	firstKind string
+	// xBuckets enforces XReplicasOnDifferentMap (scenario 9.W08 /
+	// wave1 2.8). Per <key,N> entry the placer caps the number of
+	// replicas that share the same Aux/<key> value at N. Keys here
+	// are "<key>=<value>"; counts include both pre-existing replicas
+	// (seeded in newState) and replicas placed in the current call.
+	// A node whose property is unset still occupies the empty-value
+	// bucket "<key>=", matching upstream LINSTOR's behaviour where
+	// "missing property" is just another value of that key.
+	xBuckets map[string]int
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool) *state {
@@ -457,10 +466,23 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		sharedSeen: make(map[string]struct{}),
 		pools:      poolsByKey(pools),
 		filter:     filter,
+		xBuckets:   make(map[string]int, len(filter.XReplicasOnDifferentMap)),
 	}
 
 	for i := range existing {
 		s.taken[existing[i].NodeName] = struct{}{}
+
+		// Seed XReplicasOnDifferentMap buckets from any existing
+		// diskful replica. DISKLESS witnesses don't occupy a
+		// topology bucket — they're network-only attachments and
+		// upstream LINSTOR doesn't count them toward x-replicas
+		// either (mirrors place_count's diskful-only semantic).
+		if !slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			nodeProps := nodes[existing[i].NodeName]
+			for key := range filter.XReplicasOnDifferentMap {
+				s.xBuckets[xBucketKey(key, nodeProps)]++
+			}
+		}
 
 		// Pre-seed shared-space anti-affinity: if an existing replica
 		// already lives on a shared-LUN pool, no new replica may land
@@ -491,6 +513,93 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 	return s
 }
 
+// candidateNodeProps returns the node props for pool.NodeName when
+// every per-candidate constraint passes, plus an ok flag. Pulled out
+// of tryPlace to keep that function under the gocyclo budget: each
+// constraint is a short-circuit branch that adds to the count and
+// the list grew long enough (taken / replicas_on_same / _different /
+// x_replicas / shared-LUN / provider-kind-mix) to need its own frame.
+// Returns (nil, false) on rejection so the caller stays a single
+// if-not-ok-return.
+func (s *state) candidateNodeProps(pool *apiv1.StoragePool) (map[string]string, bool) {
+	if _, busy := s.taken[pool.NodeName]; busy {
+		return nil, false
+	}
+
+	nodeProps := s.nodes[pool.NodeName]
+
+	if !matchesTuple(nodeProps, s.filter.ReplicasOnSame, s.sameTuple) {
+		return nil, false
+	}
+
+	if collidesWithDiff(nodeProps, s.filter.ReplicasOnDifferent, s.diffSeen) {
+		return nil, false
+	}
+
+	// X-replicas-on-different bucket cap (scenario 9.W08): for each
+	// <key, N> entry, reject the candidate when its bucket is full.
+	// `--x-replicas-on-different site 1` becomes a hard "all-different"
+	// rule; N=2 lets two replicas share a value (e.g. two per rack)
+	// while still spreading the remaining replicas across other values.
+	if s.exceedsXBucket(nodeProps) {
+		return nil, false
+	}
+
+	// Shared-LUN anti-affinity: pools sharing a backing LUN identifier
+	// cannot host two replicas of the same RD — at the physical layer
+	// they are the same disk, so a 2-replica placement onto the same
+	// SharedSpaceID would offer zero redundancy.
+	if pool.SharedSpaceID != "" {
+		if _, dup := s.sharedSeen[pool.SharedSpaceID]; dup {
+			return nil, false
+		}
+	}
+
+	// ProviderKind mixing gate (Bug 76): see allowsKindMix doc.
+	if !s.allowsKindMix(pool.ProviderKind) {
+		return nil, false
+	}
+
+	return nodeProps, true
+}
+
+// exceedsXBucket reports whether placing a replica on the candidate
+// node would push any XReplicasOnDifferentMap bucket past its cap.
+// Scenario 9.W08: a bare `--replicas-on-different <key>` says "all
+// replicas on different values"; `--x-replicas-on-different <key> N`
+// loosens that to "at most N replicas per value of <key>", supporting
+// stretched-DR layouts like 2 replicas per site × 2 sites.
+//
+// Nodes without the Aux property hash into the empty-value bucket,
+// matching upstream LINSTOR — missing-property nodes are not special-
+// cased the way bare `--replicas-on-different` treats them (see
+// scenario 9.W07's "different from any value" gotcha).
+func (s *state) exceedsXBucket(nodeProps map[string]string) bool {
+	for key, maxPerBucket := range s.filter.XReplicasOnDifferentMap {
+		if maxPerBucket <= 0 {
+			// Defensive: a non-positive cap would silently lock the
+			// cluster out of every node. Treat it as "no constraint"
+			// so an operator's typo (`--x-replicas-on-different a 0`)
+			// degrades gracefully instead of breaking placement.
+			continue
+		}
+
+		if s.xBuckets[xBucketKey(key, nodeProps)] >= int(maxPerBucket) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// xBucketKey returns the bucket-counter key for a node's value of
+// the given X-replicas property. Format mirrors topologySeen's
+// "<key>=<value>" so a future debug dump can render both maps with
+// the same legend.
+func xBucketKey(key string, nodeProps map[string]string) string {
+	return key + "=" + nodeProps[auxKey(key)]
+}
+
 // allowsKindMix is the Bug 76 same-kind gate. Once the RD has one
 // diskful replica, every subsequent diskful replica must land on a
 // pool whose ProviderKind is compatible with the first one. This
@@ -510,32 +619,8 @@ func (s *state) allowsKindMix(kind string) bool {
 }
 
 func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
-	if _, busy := s.taken[pool.NodeName]; busy {
-		return false, nil
-	}
-
-	nodeProps := s.nodes[pool.NodeName]
-
-	if !matchesTuple(nodeProps, s.filter.ReplicasOnSame, s.sameTuple) {
-		return false, nil
-	}
-
-	if collidesWithDiff(nodeProps, s.filter.ReplicasOnDifferent, s.diffSeen) {
-		return false, nil
-	}
-
-	// Shared-LUN anti-affinity: pools sharing a backing LUN identifier
-	// cannot host two replicas of the same RD — at the physical layer
-	// they are the same disk, so a 2-replica placement onto the same
-	// SharedSpaceID would offer zero redundancy.
-	if pool.SharedSpaceID != "" {
-		if _, dup := s.sharedSeen[pool.SharedSpaceID]; dup {
-			return false, nil
-		}
-	}
-
-	// ProviderKind mixing gate (Bug 76): see allowsKindMix doc.
-	if !s.allowsKindMix(pool.ProviderKind) {
+	nodeProps, ok := s.candidateNodeProps(pool)
+	if !ok {
 		return false, nil
 	}
 
@@ -563,6 +648,12 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 
 		k := spec
 		s.diffSeen[k+"="+nodeProps[auxKey(k)]] = struct{}{}
+	}
+
+	// Increment the X-replicas buckets after a successful placement
+	// so subsequent candidates see the updated counts.
+	for key := range s.filter.XReplicasOnDifferentMap {
+		s.xBuckets[xBucketKey(key, nodeProps)]++
 	}
 
 	if pool.SharedSpaceID != "" {

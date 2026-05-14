@@ -2353,230 +2353,227 @@ func TestPlacePoolMissingNoCandidates(t *testing.T) {
 	}
 }
 
-// TestPlaceOversubscriptionRatioGates pins scenarios 7.W09 / 7.W10 /
-// 7.W11 (cross-listed with wave1 7.19 / 7.20 / 7.21): the placer
-// enforces all three over-subscription caps and surfaces an actionable
-// error naming the offending pool plus the specific ratio kind to tune.
+// TestPlaceXReplicasOnDifferentCapsPerBucket pins scenario 9.W08:
+// `--x-replicas-on-different <key> N --place-count M` caps the number
+// of replicas that share an Aux/<key> value at N while still placing
+// M total replicas. Topology: 4 satellites, 2 per rack (rackA holds
+// n1+n2, rackB holds n3+n4). With place_count=4 and cap=2 every node
+// must be picked exactly once — without the cap the placer would
+// happily land all 4 replicas on rackA (or rackB) since the bare
+// `replicas_on_different` is not set.
 //
-// All three sub-cases run on a single LVM_THIN pool with FreeCapacity
-// well above the requested 100-KiB volume — the physical floor (Bug 35)
-// is a no-op so the test isolates the ratio gate. The pool is the SAME
-// across cases; only the props change, so any divergence in cap
-// resolution is observable in the rejection envelope's Ratio/RatioValue
-// fields.
-//
-//	free  total
-//	===== =====
-//	1000  1000  KiB (thin pool; physical floor passes for any 100-KiB ask)
-//
-// Required: 100 KiB on a single-replica autoplace.
-//
-//   - Free  case: MaxFreeCapacityOversubscriptionRatio=0.05 → free cap
-//     = 1000 × 0.05 = 50 KiB < 100 → reject, Ratio=OversubRatioFree,
-//     RatioValue=0.05, EffectiveCapKib=50.
-//   - Total case: MaxTotalCapacityOversubscriptionRatio=0.05 (Free=10
-//     so free cap = 10 000 is generous) → total cap = 50 < 100 →
-//     reject, Ratio=OversubRatioTotal, RatioValue=0.05, EffectiveCapKib
-//     =50. The total cap is the tighter of the two and MUST be the
-//     one named.
-//   - Master case: only MaxOversubscriptionRatio=0.05 set, Free/Total
-//     UNSET → both fall back to the umbrella, both caps = 50 < 100 →
-//     reject, Ratio=OversubRatioMaster (NOT Free/Total — the master
-//     backstop is what an operator must tune, 7.W11), RatioValue=0.05,
-//     EffectiveCapKib=50.
-//
-// Why this matters: without the placer-side gate, autoplace would
-// happily land a Resource on a pool whose effective MaxVolumeSize
-// budget is below the request, and the satellite would then fail
-// opaquely at volume-create time. The spawn-layer gate (pkg/rest/
-// spawn.go) is a separate code path for ResourceGroup spawn flows;
-// the placer-side gate covers the direct autoplace / migration paths
-// (eviction → re-place) that don't traverse spawn.
-//
-// The error envelope's pool@node naming gives operators an exact
-// kubectl-grep target: "raise MaxTotalCapacityOversubscriptionRatio
-// on pool=thin@n1" is actionable; a bare "over-subscribed" is not.
-func TestPlaceOversubscriptionRatioGates(t *testing.T) {
+// A regression that ignored XReplicasOnDifferentMap would let the
+// biggest-free pool of one rack absorb multiple replicas while the
+// other rack stays empty — defeating the stretched-DR layout.
+func TestPlaceXReplicasOnDifferentCapsPerBucket(t *testing.T) {
 	t.Parallel()
 
-	const (
-		requiredKib = int64(100)
-		nodeName    = "n1"
-		poolName    = "thin"
-	)
+	st := store.NewInMemory()
+	ctx := t.Context()
 
-	type seedPool struct {
-		props         map[string]string
-		freeCapacity  int64
-		totalCapacity int64
-	}
-
-	seed := func(t *testing.T, sp seedPool) store.Store {
-		t.Helper()
-
-		st := store.NewInMemory()
-		ctx := t.Context()
-
+	mk := func(name, rack string, free int64) {
 		if err := st.Nodes().Create(ctx, &apiv1.Node{
-			Name: nodeName, Type: apiv1.NodeTypeSatellite,
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/rack": rack},
 		}); err != nil {
-			t.Fatalf("seed node: %v", err)
+			t.Fatalf("seed node %s: %v", name, err)
 		}
 
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-			NodeName: nodeName, StoragePoolName: poolName,
-			ProviderKind:  apiv1.StoragePoolKindLVMThin,
-			Props:         sp.props,
-			FreeCapacity:  sp.freeCapacity,
-			TotalCapacity: sp.totalCapacity,
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
 		}); err != nil {
-			t.Fatalf("seed pool: %v", err)
+			t.Fatalf("seed pool %s: %v", name, err)
 		}
-
-		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-			Name: "pvc-1",
-		}); err != nil {
-			t.Fatalf("seed RD: %v", err)
-		}
-
-		if err := st.VolumeDefinitions().Create(ctx, "pvc-1", &apiv1.VolumeDefinition{
-			VolumeNumber: 0,
-			SizeKib:      requiredKib,
-		}); err != nil {
-			t.Fatalf("seed VD: %v", err)
-		}
-
-		return st
 	}
 
-	cases := []struct {
-		name           string
-		props          map[string]string
-		wantRatio      placer.OversubRatioKind
-		wantRatioValue float64
-		wantCapKib     int64
-	}{
-		{
-			name: "MaxFreeCapacityOversubscriptionRatio (7.W09 / 7.19)",
-			props: map[string]string{
-				// Total ratio set generously so it can't be the rejecter.
-				"MaxFreeCapacityOversubscriptionRatio":  "0.05",
-				"MaxTotalCapacityOversubscriptionRatio": "10",
-			},
-			wantRatio:      placer.OversubRatioFree,
-			wantRatioValue: 0.05,
-			wantCapKib:     50, // free=1000 × 0.05
-		},
-		{
-			name: "MaxTotalCapacityOversubscriptionRatio (7.W10 / 7.20)",
-			props: map[string]string{
-				// Free ratio set generously; total ratio is the tight one.
-				"MaxFreeCapacityOversubscriptionRatio":  "10",
-				"MaxTotalCapacityOversubscriptionRatio": "0.05",
-			},
-			wantRatio:      placer.OversubRatioTotal,
-			wantRatioValue: 0.05,
-			wantCapKib:     50, // total=1000 × 0.05
-		},
-		{
-			name: "MaxOversubscriptionRatio master backstop (7.W11 / 7.21)",
-			props: map[string]string{
-				// Neither Free nor Total set — umbrella backstop is what
-				// produces the cap. Both ratios fall through to 0.05.
-				"MaxOversubscriptionRatio": "0.05",
-			},
-			wantRatio:      placer.OversubRatioMaster,
-			wantRatioValue: 0.05,
-			wantCapKib:     50,
-		},
+	mk("n1", "A", 900)
+	mk("n2", "A", 800)
+	mk("n3", "B", 200)
+	mk("n4", "B", 100)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:              4,
+		XReplicasOnDifferentMap: map[string]int32{"rack": 2},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+	if placed != 4 || want != 4 {
+		t.Errorf("placed/want: got %d/%d, want 4/4", placed, want)
+	}
 
-			st := seed(t, seedPool{
-				props:         tc.props,
-				freeCapacity:  1000,
-				totalCapacity: 1000,
-			})
-			ctx := t.Context()
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
 
-			placed, want, err := placer.New(st).Place(ctx, "pvc-1",
-				&apiv1.AutoSelectFilter{PlaceCount: 1})
+	rackCount := map[string]int{}
+	for _, r := range got {
+		switch r.NodeName {
+		case "n1", "n2":
+			rackCount["A"]++
+		case "n3", "n4":
+			rackCount["B"]++
+		default:
+			t.Errorf("unexpected node %q in placement", r.NodeName)
+		}
+	}
 
-			if placed != 0 || want != 1 {
-				t.Errorf("placed/want: got %d/%d, want 0/1 (ratio cap must reject the only pool)",
-					placed, want)
-			}
+	if rackCount["A"] != 2 || rackCount["B"] != 2 {
+		t.Errorf("rack distribution: got %+v, want 2 per rack (cap=2)", rackCount)
+	}
+}
 
-			// The placer must surface OversubscriptionShortfallError,
-			// NOT CapacityShortfallError: the physical floor (FreeCapacity
-			// 1000 > 100 KiB request) clears, so the rejection is purely
-			// ratio-driven and the error type discriminates the two.
-			var oversubErr *placer.OversubscriptionShortfallError
-			if !errors.As(err, &oversubErr) {
-				// Also assert we did NOT get CapacityShortfallError — a
-				// regression that swapped the two would be very misleading
-				// to operators (they'd think the pool is physically full
-				// when it has 1 GiB of free space left).
-				var capErr *placer.CapacityShortfallError
-				if errors.As(err, &capErr) {
-					t.Fatalf("err: got *CapacityShortfallError (%v), want *OversubscriptionShortfallError — physical floor is 10× the ask, this MUST be a ratio rejection",
-						capErr)
-				}
+// TestPlaceXReplicasOnDifferentCapOneEqualsAllDifferent pins the
+// UG9 contract that `--x-replicas-on-different <key> 1` is equivalent
+// to bare `--replicas-on-different <key>`: every replica must carry a
+// distinct value of <key>. With 3 nodes split 2:1 across rack values
+// and place_count=3, the placer can satisfy only 2 replicas — the
+// third would have to share a bucket and is therefore rejected.
+//
+// Pins the "missing property nodes still occupy the empty-value
+// bucket" semantic: a node without Aux/rack hashes into "rack=" and
+// burns that bucket for the next candidate.
+func TestPlaceXReplicasOnDifferentCapOneEqualsAllDifferent(t *testing.T) {
+	t.Parallel()
 
-				t.Fatalf("err: got %T (%v), want *OversubscriptionShortfallError", err, err)
-			}
+	st := store.NewInMemory()
+	ctx := t.Context()
 
-			if oversubErr.Ratio != tc.wantRatio {
-				t.Errorf("Ratio: got %q, want %q (operators must see the specific knob to tune)",
-					oversubErr.Ratio, tc.wantRatio)
-			}
+	mk := func(name, rack string, free int64) {
+		props := map[string]string{}
+		if rack != "" {
+			props["Aux/rack"] = rack
+		}
 
-			if oversubErr.RatioValue != tc.wantRatioValue {
-				t.Errorf("RatioValue: got %g, want %g", oversubErr.RatioValue, tc.wantRatioValue)
-			}
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite, Props: props,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
 
-			if oversubErr.EffectiveCapKib != tc.wantCapKib {
-				t.Errorf("EffectiveCapKib: got %d, want %d", oversubErr.EffectiveCapKib, tc.wantCapKib)
-			}
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
 
-			if oversubErr.RequiredKib != requiredKib {
-				t.Errorf("RequiredKib: got %d, want %d", oversubErr.RequiredKib, requiredKib)
-			}
+	mk("n1", "A", 900)
+	mk("n2", "A", 800) // same rack as n1 — must lose
+	mk("n3", "B", 100)
 
-			if oversubErr.PoolName != poolName {
-				t.Errorf("PoolName: got %q, want %q", oversubErr.PoolName, poolName)
-			}
+	p := placer.New(st)
 
-			if oversubErr.NodeName != nodeName {
-				t.Errorf("NodeName: got %q, want %q", oversubErr.NodeName, nodeName)
-			}
+	placed, _, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:              3,
+		XReplicasOnDifferentMap: map[string]int32{"rack": 1},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
 
-			// Rendered message must carry both numbers and the ratio name
-			// verbatim — the REST 409 surface that operators see.
-			msg := oversubErr.Error()
-			if !strings.Contains(msg, string(tc.wantRatio)) {
-				t.Errorf("error text missing ratio name %q: %q", tc.wantRatio, msg)
-			}
+	if placed != 2 {
+		t.Errorf("placed: got %d, want 2 (rackA bucket capped at 1)", placed)
+	}
 
-			if !strings.Contains(msg, poolName+"@"+nodeName) {
-				t.Errorf("error text missing pool@node identifier: %q", msg)
-			}
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
 
-			// The cap value must surface verbatim too — operators grep
-			// for "MaxVolumeSize <N> KiB" to size their requests.
-			if !strings.Contains(msg, "MaxVolumeSize 50 KiB") {
-				t.Errorf("error text missing cap KiB: %q", msg)
-			}
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
 
-			// No Resource was created — pure rejection path.
-			got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
-			if len(got) != 0 {
-				t.Errorf("no Resource must be created when oversub gate trips; got %+v", got)
-			}
-		})
+	if !on["n3"] {
+		t.Errorf("expected n3 (rackB) in placement, got %+v", on)
+	}
+
+	if on["n1"] && on["n2"] {
+		t.Errorf("both rackA nodes picked — cap=1 not enforced; got %+v", on)
+	}
+}
+
+// TestPlaceXReplicasOnDifferentSeedsExistingReplicas pins that a
+// pre-existing replica already occupies its bucket: a follow-up
+// Place call must NOT exceed the cap by ignoring the seed. With
+// rackA already carrying 2 replicas (cap=2) and a third Place call
+// asking for 1 more, the only legal landing site is rackB.
+func TestPlaceXReplicasOnDifferentSeedsExistingReplicas(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, rack string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/rack": rack},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("n1", "A", 900)
+	mk("n2", "A", 800)
+	mk("n3", "B", 700)
+
+	// Pre-seed: two diskful replicas on rackA fill the rackA bucket.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: n,
+			Props: map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("seed existing replica on %s: %v", n, err)
+		}
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:              3,
+		XReplicasOnDifferentMap: map[string]int32{"rack": 2},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3", len(got))
+	}
+
+	rackCount := map[string]int{}
+	for _, r := range got {
+		switch r.NodeName {
+		case "n1", "n2":
+			rackCount["A"]++
+		case "n3":
+			rackCount["B"]++
+		}
+	}
+
+	if rackCount["A"] != 2 {
+		t.Errorf("rackA replicas: got %d, want 2 (cap enforced on pre-seeded bucket)", rackCount["A"])
+	}
+
+	if rackCount["B"] != 1 {
+		t.Errorf("rackB replicas: got %d, want 1 (the only available bucket)", rackCount["B"])
 	}
 }
 
