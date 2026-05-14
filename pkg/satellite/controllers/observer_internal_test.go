@@ -1265,3 +1265,290 @@ func observerCacheShowsResourceUp(obs *observation) bool {
 
 	return false
 }
+
+// TestObserverSkipDiskFullTransitionSequence (scenario 5.W06) pins
+// the full UG9 §4427-4460 + drbd-troubleshooting "Dealing with hard
+// disk failure" recovery flow as it drives the satellite-side
+// observer. The wave1 5.11 cross-listing covers the single-frame
+// case; wave2 5.W06 adds the multi-frame transition sequence the
+// kernel actually emits when a backing block device starts
+// returning I/O errors:
+//
+//	UpToDate           (steady state — healthy lower disk)
+//	→ Failed           (kernel detects I/O error on lower disk)
+//	→ Diskless         (post-`drbdadm detach` — kernel released disk)
+//	→ UpToDate (stale) (events2 may repost prior frames on
+//	                    statistics ticks — the observer MUST NOT
+//	                    clear SkipDisk on its own)
+//
+// Invariants:
+//
+//  1. The auto-detach + SkipDisk prop write fires ONCE on the
+//     UpToDate→Failed transition. The trailing Diskless frame must
+//     NOT re-issue `drbdadm detach` (Detach on already-diskless
+//     replicas is a kernel no-op but each call still spawns
+//     drbdadm and spams the satellite log).
+//  2. Spec.Props["DrbdOptions/SkipDisk"]="True" lands once and
+//     survives across the trailing frames. SSA's per-key merge
+//     with the same FieldOwner is naturally idempotent, but we
+//     pin it so a future refactor that swaps SSA for Patch
+//     doesn't regress the contract.
+//  3. The Resource.Spec scalars (ResourceDefinitionName, NodeName,
+//     pre-existing Props keys) survive the multi-frame sequence.
+//     A subtle bug would be a second SSA apply collapsing the
+//     props map because the field-manager's claim narrowed.
+//  4. The observer never owns the "clear SkipDisk" path — only
+//     the operator clears it via
+//     `linstor r sp <n> <r> DrbdOptions/SkipDisk` (no value),
+//     which is scenario 5.W08. If the observer cleared SkipDisk
+//     on a passing UpToDate frame, an operator's pending repair
+//     would silently flip into auto-attach and re-failure-loop.
+func TestObserverSkipDiskFullTransitionSequence(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-w06.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-w06",
+			NodeName:               "n1",
+			Props: map[string]string{
+				// Pre-existing prop the dispatcher landed — the
+				// observer's SSA SkipDisk apply (field-manager
+				// "blockstor-satellite-skipdisk") MUST NOT collapse
+				// the bag down to just SkipDisk; SSA's per-key merge
+				// keeps both alive when each owner only claims its
+				// own keys.
+				"StorPoolName": "thin1",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+	adm := drbd.NewAdm(fx)
+
+	// Frame 1: UpToDate (steady-state baseline — no side-effects).
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-w06",
+		DrbdState:    "UpToDate",
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: "UpToDate"},
+		},
+	})
+
+	for _, line := range fx.CommandLines() {
+		if line == "drbdadm detach --force pvc-w06" {
+			t.Errorf("baseline UpToDate frame triggered detach: %v", fx.CommandLines())
+		}
+	}
+
+	var afterBaseline blockstoriov1alpha1.Resource
+
+	err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-w06.n1"}, &afterBaseline)
+	if err != nil {
+		t.Fatalf("get Resource after baseline: %v", err)
+	}
+
+	if v := afterBaseline.Spec.Props[skipDiskPropKey]; v != "" {
+		t.Errorf("baseline UpToDate stamped SkipDisk: got %q, want empty", v)
+	}
+
+	// Frame 2: Failed — auto-detach + SkipDisk prop write fire.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-w06",
+		DrbdState:    drbdDiskStateFailed,
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: drbdDiskStateFailed},
+		},
+	})
+
+	detachAfterFailed := countCommand(fx.CommandLines(), "drbdadm detach --force pvc-w06")
+	if detachAfterFailed == 0 {
+		t.Errorf("expected `drbdadm detach --force pvc-w06` after Failed frame; got %v",
+			fx.CommandLines())
+	}
+
+	var afterFailed blockstoriov1alpha1.Resource
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-w06.n1"}, &afterFailed)
+	if err != nil {
+		t.Fatalf("get Resource after Failed: %v", err)
+	}
+
+	if afterFailed.Spec.Props[skipDiskPropKey] != skipDiskPropValue {
+		t.Errorf("Failed frame did not stamp SkipDisk: Props[%q]=%q, want %q",
+			skipDiskPropKey, afterFailed.Spec.Props[skipDiskPropKey], skipDiskPropValue)
+	}
+
+	if afterFailed.Spec.Props["StorPoolName"] != "thin1" {
+		t.Errorf("Failed-stamp clobbered pre-existing StorPoolName: got %q, want thin1",
+			afterFailed.Spec.Props["StorPoolName"])
+	}
+
+	if afterFailed.Spec.ResourceDefinitionName != "pvc-w06" {
+		t.Errorf("ResourceDefinitionName: got %q, want pvc-w06",
+			afterFailed.Spec.ResourceDefinitionName)
+	}
+
+	if afterFailed.Spec.NodeName != "n1" {
+		t.Errorf("NodeName: got %q, want n1", afterFailed.Spec.NodeName)
+	}
+
+	// Frame 3: Diskless (post-detach) — must NOT re-issue detach.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-w06",
+		DrbdState:    "Diskless",
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: "Diskless"},
+		},
+	})
+
+	detachAfterDiskless := countCommand(fx.CommandLines(), "drbdadm detach --force pvc-w06")
+	if detachAfterDiskless != detachAfterFailed {
+		t.Errorf("Diskless frame re-issued detach: count went %d → %d",
+			detachAfterFailed, detachAfterDiskless)
+	}
+
+	// Frame 4: spurious UpToDate frame from a stale events2 buffer
+	// (or operator triggered an unrelated state change). The
+	// observer must NEVER clear SkipDisk on its own — only the
+	// operator (scenario 5.W08) clears it.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-w06",
+		DrbdState:    "UpToDate",
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: "UpToDate"},
+		},
+	})
+
+	var afterRecovery blockstoriov1alpha1.Resource
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-w06.n1"}, &afterRecovery)
+	if err != nil {
+		t.Fatalf("get Resource after recovery frame: %v", err)
+	}
+
+	if afterRecovery.Spec.Props[skipDiskPropKey] != skipDiskPropValue {
+		t.Errorf("UpToDate after Failed cleared SkipDisk: Props[%q]=%q, want %q (only the operator clears, scenario 5.W08)",
+			skipDiskPropKey, afterRecovery.Spec.Props[skipDiskPropKey], skipDiskPropValue)
+	}
+
+	if afterRecovery.Spec.Props["StorPoolName"] != "thin1" {
+		t.Errorf("recovery frame clobbered pre-existing StorPoolName: got %q, want thin1",
+			afterRecovery.Spec.Props["StorPoolName"])
+	}
+}
+
+// TestObserverSkipDiskIdempotentOnRepeatedFailedFrames (scenario
+// 5.W06) pins the apiserver-load bound: when events2 emits the
+// same `device disk:Failed` frame N times (drbd-9 can repost on
+// statistics ticks while the kernel's state engine settles), the
+// observer's SSA SkipDisk apply must converge — every apply lands
+// the same Spec.Props value and the post-state equals the
+// post-first-apply state. SSA's "same FieldOwner + same value =
+// no-op managedFields update" is the guarantee; pinning it here so
+// a future refactor that bypasses Apply (e.g. a Patch-on-diff
+// optimisation) doesn't drop the convergence property.
+//
+// Detach is NOT gated on a count here — `drbdadm detach --force`
+// on an already-diskless replica is a kernel no-op, and the
+// satellite has no trustworthy "I already detached" signal short
+// of round-tripping through events2 again. Rate-limiting detach
+// at the observer is its own scenario.
+func TestObserverSkipDiskIdempotentOnRepeatedFailedFrames(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-rep.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-rep",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+	adm := drbd.NewAdm(fx)
+
+	// Five repeated Failed frames — a worst-case events2 burst
+	// where the kernel's state engine keeps emitting the same
+	// frame while detach is still propagating.
+	const repeats = 5
+
+	for range repeats {
+		// Each handleObservation mutates ev (mergeResource re-emits
+		// cached InUse/DrbdState onto the same struct), so feed a
+		// fresh copy each time to mimic the events2 → translate
+		// path producing N independent observations.
+		ev := &observation{
+			ResourceName: "pvc-rep",
+			DrbdState:    drbdDiskStateFailed,
+			Volumes: []volumeObservation{
+				{VolumeNumber: 0, DiskState: drbdDiskStateFailed},
+			},
+		}
+		o.handleObservation(context.Background(), adm, ev)
+	}
+
+	var got blockstoriov1alpha1.Resource
+
+	err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-rep.n1"}, &got)
+	if err != nil {
+		t.Fatalf("get Resource after %d Failed frames: %v", repeats, err)
+	}
+
+	if got.Spec.Props[skipDiskPropKey] != skipDiskPropValue {
+		t.Errorf("after %d repeats: Props[%q]=%q, want %q",
+			repeats, skipDiskPropKey, got.Spec.Props[skipDiskPropKey], skipDiskPropValue)
+	}
+
+	if got.Spec.ResourceDefinitionName != "pvc-rep" {
+		t.Errorf("after %d repeats: ResourceDefinitionName=%q, want pvc-rep",
+			repeats, got.Spec.ResourceDefinitionName)
+	}
+
+	if got.Spec.NodeName != "n1" {
+		t.Errorf("after %d repeats: NodeName=%q, want n1", repeats, got.Spec.NodeName)
+	}
+}
+
+// countCommand returns the number of times line appears in cmds.
+// Helper for the SkipDisk transition tests where the assertion is
+// "this command count did not grow across frames".
+func countCommand(cmds []string, line string) int {
+	n := 0
+
+	for _, c := range cmds {
+		if c == line {
+			n++
+		}
+	}
+
+	return n
+}
