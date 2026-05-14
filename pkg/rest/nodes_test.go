@@ -406,6 +406,99 @@ func TestNodeCreateAutoCreatesDfltDisklessStorPool(t *testing.T) {
 	}
 }
 
+// TestNodeCreateReturnsConnectionWarning pins cli-parity-audit row #40:
+// upstream LINSTOR's `n c` returns a 2-entry ApiCallRc envelope on
+// the wire — a SUCCESS for the controller-side record, then a WARNING
+// "No active connection to satellite '<name>'" so the operator knows
+// the satellite daemon still needs to come up.
+func TestNodeCreateReturnsConnectionWarning(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		Name: "parity-fake",
+		Type: apiv1.NodeTypeSatellite,
+	})
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 2 {
+		t.Fatalf("envelope entries: got %d, want 2 (success + connection warning); got=%+v", len(rcs), rcs)
+	}
+
+	// Entry 0: the canonical success line. Python CLI and golinstor
+	// both dereference replies[0]; flipping the order would break
+	// every existing caller.
+	if rcs[0].RetCode&maskInfo == 0 {
+		t.Errorf("entry 0 ret_code = %x, want maskInfo bit set", rcs[0].RetCode)
+	}
+
+	if rcs[0].RetCode&maskWarn != 0 {
+		t.Errorf("entry 0 ret_code = %x, leaked warn-mask bit onto success", rcs[0].RetCode)
+	}
+
+	// Entry 1: the connection advisory. Must carry the warn-mask bit
+	// so the contract normalizer bins it into the <warn> bucket and so
+	// the Python CLI prints it as WARNING, not as plain info.
+	if rcs[1].RetCode&maskWarn == 0 {
+		t.Errorf("entry 1 ret_code = %x, want warn-mask bit set", rcs[1].RetCode)
+	}
+
+	// Message must contain the exact upstream phrasing so log greppers
+	// and operator runbooks already built against upstream don't have
+	// to learn a second pattern.
+	wantSubstring := "No active connection to satellite 'parity-fake'"
+	if rcs[1].Message != wantSubstring {
+		t.Errorf("entry 1 message: got %q, want %q", rcs[1].Message, wantSubstring)
+	}
+}
+
+// TestNodeCreateNoWarningWhenSatelliteAlreadyConnected pins the
+// negative case: a node POSTed with ConnectionStatus="ONLINE" — the
+// "adopt an already-running satellite" path — must NOT emit the
+// no-connection warning. The mask flip would otherwise look like a
+// permanent regression on every reconcile-time re-POST.
+func TestNodeCreateNoWarningWhenSatelliteAlreadyConnected(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		Name:             "already-up",
+		Type:             apiv1.NodeTypeSatellite,
+		ConnectionStatus: apiv1.NodeTypeOnline,
+	})
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries on pre-connected node: got %d, want 1 (success only); got=%+v", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&maskWarn != 0 {
+		t.Errorf("success entry leaked warn-mask bit on pre-connected path: ret_code=%x", rcs[0].RetCode)
+	}
+}
+
 // TestNodesEndpointsWithoutStore: when Store is nil, every endpoint that
 // needs persistence returns 503 Service Unavailable. The version endpoint
 // continues to work.

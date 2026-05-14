@@ -402,13 +402,11 @@ func TestRGModifyNoAnnotationOnNoOp(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
 // TestResourceGroupsDeleteMissingRG: DELETE on missing RG folds into
 // 200 + warn-mask ApiCallRc envelope (Bug 66). Previously asserted 404;
 // the python linstor CLI parses non-2xx responses via xml.etree and
 // crashes on the JSON body, so the bare 404 made `linstor rg d` exit
 // non-zero with a ParseError instead of the no-op the operator wanted.
-=======
 // TestRGModifyResponseIncludesRebalanceCount: Bug 60. When the
 // modify call schedules a rebalance, the REST handler appends a
 // second APICallRc envelope with the count of child RDs that the
@@ -523,7 +521,6 @@ func TestRGModifyResponseSingleEnvelopeWhenNoRebalance(t *testing.T) {
 }
 
 // TestResourceGroupsDeleteMissingRG: DELETE on missing RG → 404.
->>>>>>> 0ebeef41b (feat(rest): surface rebalance-scheduled count on rg modify reply (Bug 60))
 func TestResourceGroupsDeleteMissingRG(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()

@@ -57,6 +57,14 @@ type Server struct {
 	// registerRemotes so a zero-value Server keeps working in tests
 	// that build the mux without going through the full constructor.
 	linstorRemotes *linstorRemoteRegistry
+
+	// errorReports is the in-memory ring buffer that backs
+	// `linstor err l` / `GET /v1/error-reports`. Reconcilers and
+	// REST handlers call RecordErrorReport to push a structured
+	// entry; the LIST handler returns the buffered slice in
+	// reverse-chronological order. Lazy-initialised on first push
+	// so a zero-value Server keeps working in tests.
+	errorReports *errorReportRing
 }
 
 // NeedLeaderElection reports whether the server requires leader election.

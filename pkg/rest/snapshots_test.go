@@ -521,6 +521,79 @@ func TestSnapshotsDeleteKnownRDUnknownSnap(t *testing.T) {
 	}
 }
 
+// TestSnapshotDeleteUsesWarnMaskOnAbsent pins cli-parity-audit row #33
+// (also alignment with the Bug 56/66 family for resource/RD delete on
+// missing objects): the "snapshot already absent" envelope must carry
+// the warn-mask bit so it normalises to the <warn> bucket, not <info>.
+//
+// Upstream LINSTOR emits `WARNING: Snapshot definition <snap> of
+// resource <rd> not found.` exit 0 on this input. blockstor was
+// returning the right idempotent-200 (CSI is happy) but with maskInfo
+// — so tools that classify replies by mask put a no-op replay into
+// the SUCCESS bucket. Tooling like the contract normaliser at
+// tests/contract/normalize.go then misclassified the row vs upstream,
+// surfacing as a parity miss in the wire-shape audit.
+//
+// The earlier maskInfo-on-absent fix is preserved here as a regression
+// guard — flipping the mask back would surface both a maskInfo-bit
+// drop and a maskWarn-bit miss in this assertion pair.
+func TestSnapshotDeleteUsesWarnMaskOnAbsent(t *testing.T) {
+	t.Parallel()
+
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/ghost-rd/snapshots/ghost-snap")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (idempotent)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1; got=%+v", len(rc), rc)
+	}
+
+	// WARN bit MUST be set. Without it, the contract normaliser
+	// (tests/contract/normalize.go) classifies the row as <info>
+	// instead of <warn> and the parity audit re-opens.
+	if rc[0].RetCode&maskWarn == 0 {
+		t.Errorf("ret_code = %#x, want maskWarn (%#x) bit set", rc[0].RetCode, maskWarn)
+	}
+
+	// ret_code must still be non-negative — golinstor's "is this a
+	// fatal error?" check is `ret_code < 0` (MASK_ERROR sign bit).
+	// Flipping the sign would turn idempotent "already absent" into
+	// a hard CSI failure.
+	if rc[0].RetCode < 0 {
+		t.Errorf("ret_code = %#x, leaked sign bit (became error)", rc[0].RetCode)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("message: got %q, want 'already absent' marker", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Message, "ghost-snap") {
+		t.Errorf("message: got %q, want it to name the missing snapshot", rc[0].Message)
+	}
+
+	// ObjRefs should carry the RD and Snapshot definition names —
+	// tooling that does cross-correlation against `linstor err l`
+	// uses these to link an ApiCallRc reply to the affected object.
+	if rc[0].ObjRefs["RscDfn"] != "ghost-rd" {
+		t.Errorf("ObjRefs[RscDfn]: got %q, want 'ghost-rd'", rc[0].ObjRefs["RscDfn"])
+	}
+
+	if rc[0].ObjRefs["SnapshotDfn"] != "ghost-snap" {
+		t.Errorf("ObjRefs[SnapshotDfn]: got %q, want 'ghost-snap'", rc[0].ObjRefs["SnapshotDfn"])
+	}
+}
+
 // TestSnapshotsDeleteExistingReturnsEnvelopeAndDrops pins the happy
 // path: DELETE on a really-present snapshot returns 200 +
 // ApiCallRc("snapshot deleted: ...") AND the row actually leaves the

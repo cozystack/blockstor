@@ -123,3 +123,40 @@ const warnRemoteNotFound = maskWarn | int64(2054)
 // greppers can tell the two outcomes apart, in line with all
 // other delete handlers.
 const warnStoragePoolNotFound = maskWarn | int64(2055)
+
+// warnSnapshotNotFound is emitted by `DELETE /v1/resource-definitions/
+// {rd}/snapshots/{snap}` when the snapshot (and/or its parent RD)
+// doesn't exist. CSI spec § DeleteSnapshot mandates idempotence — the
+// driver retries until success — so a 404 on the second-delete path
+// breaks the retry loop. Upstream LINSTOR's behaviour for the same
+// input is `200 + WARNING: Snapshot definition <snap> of resource <rd>
+// not found.` exit 0 (cli-parity-audit row #33); flipping the mask
+// from maskInfo to maskWarn lets python-linstor surface the line as a
+// "WARNING" rather than misclassifying a no-op replay as a real drop.
+//
+// Sub-code 2050 sits one past warnRDNotFound in the warn band; the
+// numbering keeps the "delete-of-missing" family contiguous so log
+// filters can match the whole class with `(ret_code & 0xFFFE) >= 2048`.
+const warnSnapshotNotFound = maskWarn | int64(2056)
+
+// warnNoSatelliteConnection is emitted as a SECOND envelope entry on
+// `POST /v1/nodes` when the node was created in the controller's view
+// of the cluster but no satellite has registered itself for the named
+// node yet. Upstream LINSTOR returns the same 200 envelope (cli-parity-
+// audit row #40): a SUCCESS line first, then a WARNING with the literal
+// text "No active connection to satellite '<name>'" so operators learn
+// they still need to start `linstor-satellite` (or its DaemonSet pod)
+// before the node can host resources. Sub-code 2051 keeps the warn-band
+// numbering monotonic alongside warnRscNotFound / warnRDNotFound /
+// warnSnapshotNotFound.
+const warnNoSatelliteConnection = maskWarn | int64(2057)
+
+// ObjRefs key constants — the wire-side identifiers upstream LINSTOR
+// uses to tag ApiCallRc entries with the object(s) the message refers
+// to. The strings are case-sensitive (the Python CLI matches on the
+// exact case); constifying them here keeps the wire-shape uniform.
+const (
+	objRefNode        = "Node"
+	objRefRscDfn      = "RscDfn"
+	objRefSnapshotDfn = "SnapshotDfn"
+)

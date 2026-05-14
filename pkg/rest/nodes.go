@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -309,35 +310,48 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Upstream LINSTOR auto-provisions a `DfltDisklessStorPool`
-	// per satellite at node-register time so the autoplacer (and
-	// `linstor advise`) can place diskless replicas without an
-	// explicit pool spec. The CLI parity audit row #3 flagged this
-	// as a behavioural gap: `linstor sp l` on blockstor was missing
-	// the diskless rows upstream shows. Synthesising the SP here
-	// keeps the autoplacer's "DisklessOnRemaining" path working out
-	// of the box for any newly-registered node. A pre-existing
-	// pool with the same name (e.g. operator-managed via piraeus)
-	// is left alone — the StoragePoolStore.Create returns
-	// ErrAlreadyExists and we ignore it.
-	disklessPool := &apiv1.StoragePool{
+	// per satellite at node-register time. CLI parity audit row #3.
+	// Pre-existing pool of the same name is left alone (ErrAlreadyExists
+	// is the no-op signal); any other error must NOT fail Node Create.
+	_ = s.Store.StoragePools().Create(r.Context(), &apiv1.StoragePool{
 		StoragePoolName: DfltDisklessStorPoolName,
 		NodeName:        n.Name,
 		ProviderKind:    apiv1.StoragePoolKindDiskless,
-	}
-	if poolErr := s.Store.StoragePools().Create(r.Context(), disklessPool); poolErr != nil &&
-		!errors.Is(poolErr, store.ErrAlreadyExists) {
-		// Don't fail the Node Create over an auxiliary
-		// synthesis error — the node is registered and useful
-		// without the diskless pool; the operator can re-issue
-		// `linstor sp c <node> DfltDisklessStorPool diskless` by
-		// hand if the synthesis race keeps tripping.
-		_ = poolErr
-	}
+	})
 
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "node created: " + n.Name,
-	}})
+		ObjRefs: map[string]string{objRefNode: n.Name},
+	}}
+
+	// Append the "no active connection" warning when the satellite
+	// hasn't checked in yet. cli-parity-audit row #40: upstream
+	// LINSTOR's `CtrlNodeApiCallHandler.createNode` returns two
+	// ApiCallRc entries on the wire — a SUCCESS for the controller-
+	// side record creation, then a WARNING with the exact text
+	// "No active connection to satellite '<name>'" so the operator
+	// learns the daemon still needs to come up. blockstor's REST shim
+	// was collapsing to a single SUCCESS entry; tooling that parses
+	// `replies[].ret_code` by mask (the contract normaliser at
+	// tests/contract/normalize.go, the Python CLI's print loop) then
+	// missed the deployment-incomplete signal.
+	//
+	// We treat `ConnectionStatus == "ONLINE"` as "the operator pre-seeded
+	// a connected node" — used by tests and by clusters that adopt an
+	// already-running satellite. Any other value (including the empty
+	// default) emits the warning. Upstream LINSTOR's wire vocabulary
+	// here is {"ONLINE","OFFLINE","CONNECTING",…}; matching on ONLINE
+	// is the strictest interpretation of "active connection".
+	if !strings.EqualFold(n.ConnectionStatus, apiv1.NodeTypeOnline) {
+		envelope = append(envelope, apiv1.APICallRc{
+			RetCode: warnNoSatelliteConnection,
+			Message: "No active connection to satellite '" + n.Name + "'",
+			ObjRefs: map[string]string{objRefNode: n.Name},
+		})
+	}
+
+	writeJSON(w, http.StatusCreated, envelope)
 }
 
 // DfltDisklessStorPoolName matches upstream LINSTOR's canonical

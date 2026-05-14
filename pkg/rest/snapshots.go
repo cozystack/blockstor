@@ -416,11 +416,17 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 // second-delete-after-success retry path that csi-sanity's "should
 // succeed when an invalid snapshot id is used" check exercises.
 //
-// Both "unknown RD" and "unknown snapshot on known RD" fold to a
-// success envelope with an "already absent" message — distinct from
-// "snapshot deleted" so operators reading API logs can tell a real
-// drop from a no-op replay. Mirrors upstream LINSTOR's behaviour for
-// non-existent snapshot drops.
+// Both "unknown RD" and "unknown snapshot on known RD" fold to a 200
+// + WARN-mask envelope. The mask flip from maskInfo to warnSnapshotNotFound
+// is the cli-parity-audit #33 fix: upstream LINSTOR returns a
+// `WARNING: Snapshot definition <snap> of resource <rd> not found.`
+// entry on the same input (RC mask `0x4000_0000`), not a SUCCESS line.
+// Tools that classify ret_code by mask (the contract-normaliser at
+// tests/contract/normalize.go, python-linstor's print loop) were
+// putting our no-op replay into the <info> bucket instead of <warn>.
+// CSI doesn't read the mask so it still got its idempotent success;
+// operators tailing the API log now see the same "no-op" annotation
+// upstream emits.
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
@@ -429,8 +435,12 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-				RetCode: maskInfo,
+				RetCode: warnSnapshotNotFound,
 				Message: "snapshot already absent: " + snapName,
+				ObjRefs: map[string]string{
+					objRefRscDfn:      rd,
+					objRefSnapshotDfn: snapName,
+				},
 			}})
 
 			return
