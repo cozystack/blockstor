@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -174,6 +176,19 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/controller/version", handleVersion)
 	mux.HandleFunc("GET /v1/healthz", handleHealth)
+	// /metrics exposes Prometheus exposition-format text on the same
+	// listener as the LINSTOR REST API. Scenario 7.W08 (wave2 K8s
+	// monitoring stack): a ServiceMonitor targeting the apiserver
+	// Service:3370 scrapes this endpoint, picking up the default
+	// process_*/go_* collectors registered by client_golang plus any
+	// blockstor-specific counters added later. Mounting it on 3370
+	// (instead of controller-runtime's separate metrics port) matches
+	// upstream LINSTOR's "single REST port" contract — operators don't
+	// have to teach Prometheus a second endpoint per replica.
+	mux.Handle("GET /metrics", promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{},
+	))
 	s.registerNodes(mux)
 	s.registerStoragePools(mux)
 	s.registerResourceGroups(mux)

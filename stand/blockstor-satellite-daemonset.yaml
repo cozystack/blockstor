@@ -158,6 +158,35 @@ spec:
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: 500m, memory: 256Mi}
+        # drbd-reactor: TODO (scenario 7.W08).
+        #
+        # Upstream LINSTOR's monitoring guide (linstor-kubernetes.adoc
+        # §"Configuring monitoring with Prometheus in Operator v2
+        # deployments") asks for a per-satellite drbd-reactor container
+        # so its `prometheus` plugin can expose per-resource DRBD metrics
+        # (replication state, connection state, quorum). PodMonitor +
+        # PrometheusRule on the LINBIT side scrape that endpoint.
+        #
+        # In Cozystack's Talos deployment, drbd-reactor lives in the
+        # siderolabs/drbd Talos system extension on the host, not as a
+        # sidecar (see PLAN.md "HA failover layer" + "RWX volumes via
+        # Ganesha"). That model is required because:
+        #   1. drbd-reactor must subscribe to `drbdsetup events2` on the
+        #      host kernel module, the same module the satellite uses;
+        #   2. it stamps node taints (`drbd.linbit.com/lost-quorum`)
+        #      which piraeus-ha-controller consumes — host-scoped
+        #      semantics, not pod-scoped.
+        # Running it as a sidecar would still work (hostPID is already
+        # on) but duplicates state with the host-side extension.
+        #
+        # For wave2 we pin the contract here: when the Cozystack-side
+        # Talos extension is the one shipping drbd-reactor, this
+        # DaemonSet stays sidecar-less and the PodMonitor targets the
+        # host port that the extension's reactor binds. If/when a
+        # downstream chooses the in-pod model instead, drop a
+        # `- name: drbd-reactor` container alongside `satellite` with
+        # the upstream image + a /etc/drbd-reactor.d ConfigMap mount;
+        # no other DaemonSet plumbing change is needed.
       volumes:
         - {name: dev, hostPath: {path: /dev}}
         - {name: modules, hostPath: {path: /lib/modules}}
