@@ -1611,6 +1611,104 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 
 var errCreateMDFailed = errors.New("drbdadm: create-md kernel module missing")
 
+// TestApplyDRBDLateVDDoesNotPinDiskless pins Bug 79: an operator
+// who creates an RD and Resources before adding any VolumeDefinition
+// must not get stuck in "Unintentional Diskless" once the VD lands.
+//
+// The empty-volume first pass MUST NOT write the .md-created marker
+// (or run create-md, since there is nothing to create metadata on).
+// Otherwise the second pass — after the VD is added — sees the
+// marker, treats it as a non-first activation, skips create-md, and
+// `drbdadm adjust` finds no on-disk metadata for the newly-present
+// volume. The kernel then reports disk:Diskless even though
+// Spec.Flags lacks DISKLESS — exactly the "Unintentional Diskless"
+// runtime drift that surprised the operator on the production
+// cluster.
+//
+// The contract pinned here: Apply with Volumes=nil is a no-op
+// reconcile; a follow-up Apply with one volume triggers a full
+// firstActivation (create-md + marker write + adjust).
+func TestApplyDRBDLateVDDoesNotPinDiskless(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// Second pass (with a volume) expectations: lvs probe + create-md
+	// + drbdadm adjust. No drbdadm calls at all on the first pass.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-vd_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-vd", drbd.MaxPeers-1),
+		storage.FakeResponse{})
+	fx.Expect("drbdadm adjust pvc-late-vd", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// First pass: RD + Resource exist but no VolumeDefinition yet.
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-late-vd",
+			NodeName: "n1",
+			Volumes:  nil, // ← Bug 79 repro: empty volumes on first apply
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply (empty-volume pass): transport error %v", err)
+	}
+
+	if !results[0].GetOk() {
+		t.Fatalf("Apply (empty-volume pass): Ok=false, message=%q", results[0].GetMessage())
+	}
+
+	// The marker MUST NOT exist after the empty-volume pass. If it
+	// does, the second pass will skip create-md and the kernel
+	// reports the new volume as Diskless.
+	markerPath := dir + "/pvc-late-vd.md-created"
+	if _, err := os.Stat(markerPath); err == nil {
+		t.Fatalf("md-created marker written on empty-volume pass — would pin late VD to Diskless on next reconcile")
+	}
+
+	// .res should also not be present yet — we have nothing to
+	// render. Even if a partial render slipped through, the kernel
+	// has no use for a 0-volume .res file.
+	if _, err := os.Stat(dir + "/pvc-late-vd.res"); err == nil {
+		t.Fatalf("written .res on empty-volume pass; expected satellite to leave the resource un-rendered until a VD arrives")
+	}
+
+	// Second pass: VD has been added, the volume now appears in the
+	// desired state. firstActivation must fire (create-md + marker).
+	results, err = rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-late-vd",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply (VD-added pass): transport error %v", err)
+	}
+
+	if !results[0].GetOk() {
+		t.Fatalf("Apply (VD-added pass): Ok=false, message=%q", results[0].GetMessage())
+	}
+
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("md-created marker missing after VD-added pass: %v — late VD should run firstActivation", err)
+	}
+}
+
 // TestApplyAutoPrimaryForceErrorWraps pins the auto-primary force
 // error-wrap branch of applyDRBD: when the seed step
 // `drbdadm primary --force` fails on first activation, applyOne

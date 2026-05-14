@@ -824,6 +824,22 @@ func extractResFilePeers(body string) []string {
 // buildResFile uses it as the disk path so a loopfile-backed volume
 // gets `disk /dev/loopN` rather than the LVM-shaped guess.
 func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string, resized, cloned bool) error {
+	// Bug 79: when the RD has no VolumeDefinitions yet (operator created
+	// the RD and Resources before adding any VD), there is no backing
+	// volume to bring DRBD up on. Returning early here keeps the
+	// .md-created marker absent so a later VD-add reconcile sees
+	// firstActivation=true and runs create-md against the now-present
+	// backing storage. Without this guard, the empty-volume pass would
+	// write the marker (runFirstActivation always writes it, even when
+	// CreateMD is a no-op on zero volumes), pin firstActivation=false
+	// for the lifetime of the resource, and the late VD would come up
+	// with no DRBD metadata — the kernel then reports disk:Diskless
+	// while Spec.Flags lacks DISKLESS, surfacing as "Unintentional
+	// Diskless" in `linstor r l`.
+	if len(dr.GetVolumes()) == 0 {
+		return nil
+	}
+
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
