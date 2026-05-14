@@ -2,6 +2,31 @@
 
 A 3-tier test architecture that closes the gap between unit-level `go test ./...` (which keeps shipping bugs to operator hands) and slow real-cluster e2e (which is too expensive to gate every PR on). Drafted after the 2026-05-14 hand-found bug spree (Bugs 78–83) — every one of them passed unit tests and was caught in seconds the moment a real `linstor` CLI hit the apiserver.
 
+## Execution tracker
+
+See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending`, `in_progress`, `done`. Each row owned by exactly one agent at a time.
+
+| Phase | Group | Tests | Status | Branch / PR |
+|---|---|---|---|---|
+| 0 | Harness scaffold + smoke | 1 | pending | — |
+| 1 | A — Node | 10 | pending | — |
+| 1 | B — Storage Pool | 9 | pending | — |
+| 1 | C — Resource Group | 7 | pending | — |
+| 1 | D — Resource Definition | 9 | pending | — |
+| 1 | E — Volume Definition | 7 | pending | — |
+| 1 | F — Resource | 14 | pending | — |
+| 1 | G — Snapshot | 10 | pending | — |
+| 1 | H — Controller / Error Reports / KV | 6 | pending | — |
+| 1 | I — Node/Resource connections | 6 | pending | — |
+| 1 | J — CSI | 12 | pending | — |
+| 1 | K — Workflows | 12 | pending | — |
+| 1 | L — Concurrency / cache trail | 6 | pending | — |
+| 2 | Tier 3 — drbd-utils contract | 5 | pending | — |
+| 2 | CI wiring (`.github/workflows/integration.yml`) | — | done | committed with this doc |
+| 2 | E2E cleanup — drop duplicates folded into Tier 2 | — | pending | — |
+
+Total Tier 2 tests: 108. Tier 3: 5. Tier 4 retained: 8 scripts.
+
 ## Tier architecture
 
 ```

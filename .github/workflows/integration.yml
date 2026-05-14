@@ -1,0 +1,70 @@
+name: Integration tests
+
+# Tier 2 of the test strategy (docs/test-strategy.md). Boots envtest
+# (in-process apiserver + etcd), the full controller-runtime manager
+# with every reconciler, the REST server, and an in-process satellite
+# mock, then drives them with the native `linstor` CLI from
+# linstor-client. Catches the class of bugs unit tests miss because
+# unit tests don't parse python-linstor responses or trigger
+# multi-reconciler races.
+#
+# Runs on every PR. Target wall-clock < 5 minutes for the whole suite.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  integration:
+    permissions:
+      contents: read
+    name: Integration (envtest + linstor CLI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Clone
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install linstor-client (python-linstor)
+        # The harness shells out to the upstream linstor CLI to exercise
+        # wire-shape compatibility — exactly what unit tests cannot do.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linstor-client python3-linstor
+
+      - name: Install envtest binaries
+        # controller-runtime's envtest needs kube-apiserver + etcd
+        # binaries. setup-envtest pins the version matching our
+        # controller-runtime release.
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          echo "KUBEBUILDER_ASSETS=$(setup-envtest use --print path 1.34.x)" >> "$GITHUB_ENV"
+
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: Build (ensures harness compiles)
+        run: go build ./...
+
+      - name: Integration tests
+        run: |
+          go test -tags=integration -count=1 -timeout=15m ./tests/integration/... | tee integration.log
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-logs
+          path: |
+            integration.log
+            /tmp/envtest-*.log
