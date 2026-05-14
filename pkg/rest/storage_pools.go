@@ -222,6 +222,19 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Bug 63: linstor-client's `sp c <node> <pool> --pool-name <name>`
+	// emits the provider-kind-agnostic `StorDriver/StorPoolName` key
+	// rather than the kind-specific `StorDriver/LvmVg` / `ZPool` /
+	// `ZPoolThin` / `FileDir` keys the satellite's NewProviderFromKind
+	// reads. Without normalization the CRD lands in the store but
+	// the satellite refuses to register the provider on its next
+	// ApplyStoragePools tick — the pool shows up in `sp l` yet every
+	// volume placement against it fails with `requires "StorDriver/..."
+	// in props`. Expand the alias here so CLI-created pools are
+	// usable end-to-end; the original key is retained because some
+	// upstream clients read it back from `sp l` output.
+	expandStorPoolNameAlias(&body)
+
 	// Reject pools on ghost nodes with a clean 404. Without this the
 	// store-level create would succeed (the StoragePoolStore key is
 	// (node, pool) and doesn't FK to NodeStore) and the satellite
@@ -347,4 +360,100 @@ func (s *Server) upsertStoragePool(w http.ResponseWriter, r *http.Request, body 
 		RetCode: maskInfo,
 		Message: "storage pool already present, updated in place: " + body.StoragePoolName + " on " + node,
 	}})
+}
+
+// Upstream-LINSTOR property keys used to configure each provider
+// kind. Duplicated from pkg/satellite/factory.go (the canonical
+// declarations) to avoid an import cycle — the satellite package
+// already depends on pkg/rest types indirectly through pkg/store.
+// If the satellite list changes, this list must follow.
+const (
+	propStorPoolName = "StorDriver/StorPoolName"
+	propLvmVG        = "StorDriver/LvmVg"
+	propThinPool     = "StorDriver/ThinPool"
+	propZPool        = "StorDriver/ZPool"
+	propZPoolThin    = "StorDriver/ZPoolThin"
+	propFileDir      = "StorDriver/FileDir"
+)
+
+// expandStorPoolNameAlias normalises a pool's Spec.Props for Bug 63.
+//
+// Python linstor-client's `sp c <node> <pool> --pool-name <vg-or-zpool>`
+// writes the provider-kind-agnostic `StorDriver/StorPoolName` prop and
+// does NOT set the kind-specific key the satellite's NewProviderFromKind
+// reads (`StorDriver/LvmVg`, `ZPool`, `ZPoolThin`, `FileDir`, plus
+// `ThinPool` for LVM_THIN). The result was a pool that registered in
+// the CRD store but failed every provider lookup on the satellite,
+// with a misleading `requires "StorDriver/<key>" in props` error.
+//
+// Behaviour:
+//
+//   - If the kind-specific key for the body's ProviderKind is already
+//     set, the explicit value wins and the alias is ignored (matches
+//     upstream LINSTOR's "explicit > implicit" precedence).
+//   - If only StorPoolName is set, copy its value into the canonical
+//     kind-specific key(s). For LVM_THIN the alias is parsed as
+//     `<vg>/<thin>` (the format `linstor sp c lvmthin ...` emits) and
+//     each half lands in `LvmVg` / `ThinPool` respectively. A bare
+//     value with no slash for LVM_THIN copies into `LvmVg` only and
+//     leaves `ThinPool` empty — the satellite will surface a clear
+//     "requires ThinPool" error rather than silently using the wrong
+//     volume.
+//   - The original `StorDriver/StorPoolName` is retained because
+//     `linstor sp l` echoes it back and some operator tooling
+//     compares against it.
+//   - DISKLESS / unknown kinds are no-ops — DISKLESS has no underlying
+//     storage and unknown kinds already 400 in decodeStoragePoolCreate.
+func expandStorPoolNameAlias(body *apiv1.StoragePool) {
+	if body.Props == nil {
+		return
+	}
+
+	alias := body.Props[propStorPoolName]
+	if alias == "" {
+		return
+	}
+
+	switch body.ProviderKind {
+	case apiv1.StoragePoolKindLVM:
+		setPropIfEmpty(body.Props, propLvmVG, alias)
+	case apiv1.StoragePoolKindLVMThin:
+		expandLVMThinAlias(body.Props, alias)
+	case apiv1.StoragePoolKindZFS:
+		setPropIfEmpty(body.Props, propZPool, alias)
+	case apiv1.StoragePoolKindZFSThin:
+		setPropIfEmpty(body.Props, propZPoolThin, alias)
+	case apiv1.StoragePoolKindFile, apiv1.StoragePoolKindFileThin:
+		setPropIfEmpty(body.Props, propFileDir, alias)
+	}
+}
+
+// setPropIfEmpty writes value at key only when key is currently empty.
+// Mirrors the "explicit > implicit" precedence: a pre-set kind-specific
+// key beats any alias we'd derive from StorPoolName.
+func setPropIfEmpty(props map[string]string, key, value string) {
+	if props[key] == "" {
+		props[key] = value
+	}
+}
+
+// expandLVMThinAlias splits the linstor-client LVM_THIN alias into its
+// (VG, ThinPool) halves and writes whichever halves are still empty.
+//
+// linstor-client emits `<vg>/<thin>` for LVM_THIN aliases. Split on
+// the first '/' so VG names containing additional slashes (unusual
+// but legal in some lvm.conf setups) round-trip into LvmVg unmodified;
+// the thin pool half is whatever remains. A bare alias with no slash
+// lands in LvmVg only — ThinPool stays empty and the satellite will
+// surface a clear "requires ThinPool" error on registration.
+func expandLVMThinAlias(props map[string]string, alias string) {
+	vg, thin, hasSlash := strings.Cut(alias, "/")
+	if hasSlash {
+		setPropIfEmpty(props, propLvmVG, vg)
+		setPropIfEmpty(props, propThinPool, thin)
+
+		return
+	}
+
+	setPropIfEmpty(props, propLvmVG, alias)
 }

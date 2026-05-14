@@ -722,3 +722,175 @@ func TestPoolCreateProducesCanonicalCRDName(t *testing.T) {
 			got.NodeName, got.StoragePoolName)
 	}
 }
+
+// postPoolForExpandTest is a small helper that wires up a node, posts
+// the given pool body, and returns the stored row. Bug 63's expand-alias
+// tests all follow the same shape — extracted to keep each test focused
+// on its props-table expectation rather than HTTP plumbing.
+func postPoolForExpandTest(t *testing.T, body apiv1.StoragePool) apiv1.StoragePool {
+	t.Helper()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", raw)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", body.StoragePoolName)
+	if err != nil {
+		t.Fatalf("store Get: %v", err)
+	}
+
+	return got
+}
+
+// TestSPCreateExpandsLVMThinStorPoolName pins Bug 63 for LVM_THIN: the
+// linstor-client CLI's `--pool-name <vg>/<thin>` payload arrives as
+// `StorDriver/StorPoolName="vg/thin"` with no kind-specific keys. The
+// REST handler must split the alias into `StorDriver/LvmVg=vg` plus
+// `StorDriver/ThinPool=thin` so the satellite's NewProviderFromKind
+// can register the pool; the original StorPoolName is retained for
+// upstream-CLI display parity.
+func TestSPCreateExpandsLVMThinStorPoolName(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/StorPoolName": "vg/thin"},
+	})
+
+	if got.Props["StorDriver/LvmVg"] != "vg" {
+		t.Errorf("LvmVg: got %q, want %q (props=%v)", got.Props["StorDriver/LvmVg"], "vg", got.Props)
+	}
+
+	if got.Props["StorDriver/ThinPool"] != "thin" {
+		t.Errorf("ThinPool: got %q, want %q (props=%v)", got.Props["StorDriver/ThinPool"], "thin", got.Props)
+	}
+
+	if got.Props["StorDriver/StorPoolName"] != "vg/thin" {
+		t.Errorf("StorPoolName retained: got %q, want %q", got.Props["StorDriver/StorPoolName"], "vg/thin")
+	}
+}
+
+// TestSPCreateExpandsZFSThinStorPoolName: same Bug 63 path for ZFS_THIN.
+// The CLI emits `--pool-name <zpool>`; the REST handler must mirror it
+// into `StorDriver/ZPoolThin` (NOT `StorDriver/ZPool`, which is the
+// thick-only key the satellite's newZFS reads for non-thin pools).
+func TestSPCreateExpandsZFSThinStorPoolName(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		Props:           map[string]string{"StorDriver/StorPoolName": "blockstor-zfs"},
+	})
+
+	if got.Props["StorDriver/ZPoolThin"] != "blockstor-zfs" {
+		t.Errorf("ZPoolThin: got %q, want %q (props=%v)",
+			got.Props["StorDriver/ZPoolThin"], "blockstor-zfs", got.Props)
+	}
+
+	if got.Props["StorDriver/ZPool"] != "" {
+		t.Errorf("ZPool must stay empty for ZFS_THIN: got %q", got.Props["StorDriver/ZPool"])
+	}
+
+	if got.Props["StorDriver/StorPoolName"] != "blockstor-zfs" {
+		t.Errorf("StorPoolName retained: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "blockstor-zfs")
+	}
+}
+
+// TestSPCreateExpandsFileThinStorPoolName: FILE_THIN's kind-specific
+// key is `StorDriver/FileDir` (same as FILE — thinness only changes
+// allocation policy, not the on-disk layout). Bug 63 expansion must
+// populate FileDir so the satellite's newFile can resolve the
+// backing directory.
+func TestSPCreateExpandsFileThinStorPoolName(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindFileThin,
+		Props:           map[string]string{"StorDriver/StorPoolName": "/var/lib/blockstor/file1"},
+	})
+
+	if got.Props["StorDriver/FileDir"] != "/var/lib/blockstor/file1" {
+		t.Errorf("FileDir: got %q, want %q (props=%v)",
+			got.Props["StorDriver/FileDir"], "/var/lib/blockstor/file1", got.Props)
+	}
+
+	if got.Props["StorDriver/StorPoolName"] != "/var/lib/blockstor/file1" {
+		t.Errorf("StorPoolName retained: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "/var/lib/blockstor/file1")
+	}
+}
+
+// TestSPCreateExplicitKeyTakesPrecedence pins the "explicit > implicit"
+// precedence Bug 63's normalization promises: when both StorPoolName
+// and the kind-specific key are supplied, the explicit kind-specific
+// value wins and the alias does NOT overwrite it. This matters for
+// operator-managed pools that pre-fill `LvmVg` and tack on a stale
+// StorPoolName from an older CLI invocation — the alias must not
+// silently rewrite the volume group.
+func TestSPCreateExplicitKeyTakesPrecedence(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVM,
+		Props: map[string]string{
+			"StorDriver/StorPoolName": "alias-vg",
+			"StorDriver/LvmVg":        "explicit-vg",
+		},
+	})
+
+	if got.Props["StorDriver/LvmVg"] != "explicit-vg" {
+		t.Errorf("LvmVg: got %q, want %q (alias overwrote explicit value)",
+			got.Props["StorDriver/LvmVg"], "explicit-vg")
+	}
+
+	if got.Props["StorDriver/StorPoolName"] != "alias-vg" {
+		t.Errorf("StorPoolName retained: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "alias-vg")
+	}
+}
+
+// TestSPCreateNoNormalizationNeeded pins the pass-through path: a
+// payload that already carries the kind-specific key and no alias
+// must not gain spurious props from the expansion logic. Piraeus
+// emits this shape on every heartbeat; a noisy diff here would
+// trigger the controller's Update path on every reconcile.
+func TestSPCreateNoNormalizationNeeded(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindZFS,
+		Props:           map[string]string{"StorDriver/ZPool": "tank"},
+	})
+
+	if got.Props["StorDriver/ZPool"] != "tank" {
+		t.Errorf("ZPool: got %q, want %q", got.Props["StorDriver/ZPool"], "tank")
+	}
+
+	// Spurious keys would indicate the expansion logic wrote to a
+	// kind-specific slot it shouldn't touch when no alias is set.
+	for _, k := range []string{
+		"StorDriver/StorPoolName",
+		"StorDriver/LvmVg",
+		"StorDriver/ThinPool",
+		"StorDriver/ZPoolThin",
+		"StorDriver/FileDir",
+	} {
+		if got.Props[k] != "" {
+			t.Errorf("unexpected key %q populated: got %q", k, got.Props[k])
+		}
+	}
+}
