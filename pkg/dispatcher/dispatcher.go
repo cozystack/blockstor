@@ -292,16 +292,12 @@ func targetPoolName(r *blockstoriov1alpha1.Resource) string {
 }
 
 // prefNicAddress resolves the node's NetInterface address named by
-// the storage pool's PrefNic prop, falling back to drbdAddrAny when
-// the pool / interface / prop isn't set. drbdAddrAny is the empty-
+// the effective PrefNic prop (pool scope > node scope), falling back
+// to drbdAddrAny when nothing pins an interface. drbdAddrAny is the
 // placeholder the satellite swaps for its own pod IP at .res render
 // time.
 func prefNicAddress(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
-	if poolName == "" {
-		return drbdAddrAny
-	}
-
-	prefNic := lookupPrefNic(nodeName, poolName, pools)
+	prefNic := lookupPrefNic(nodeName, poolName, nodes, pools)
 	if prefNic == "" {
 		return drbdAddrAny
 	}
@@ -315,37 +311,61 @@ func prefNicAddress(nodeName, poolName string, nodes []blockstoriov1alpha1.Node,
 }
 
 // peerAddressWithPrefNic returns the peer node's DRBD address with
-// the PrefNic override on top: when the peer's storage pool has a
-// PrefNic prop, the matching NetInterface address wins over the
-// generic SatelliteEndpoint discovery. Falls back to peerAddress()
-// when nothing pins it (typical single-NIC clusters).
+// the PrefNic override on top: when the peer's storage pool (or the
+// peer's Node CRD) carries a PrefNic prop, the matching NetInterface
+// address wins over the generic SatelliteEndpoint discovery. Falls
+// back to peerAddress() when nothing pins it (typical single-NIC
+// clusters).
 func peerAddressWithPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
-	if poolName != "" {
-		prefNic := lookupPrefNic(nodeName, poolName, pools)
-		if prefNic != "" {
-			if addr := lookupNetInterfaceAddress(nodeName, prefNic, nodes); addr != "" {
-				return addr
-			}
+	prefNic := lookupPrefNic(nodeName, poolName, nodes, pools)
+	if prefNic != "" {
+		if addr := lookupNetInterfaceAddress(nodeName, prefNic, nodes); addr != "" {
+			return addr
 		}
 	}
 
 	return peerAddress(nodeName, nodes)
 }
 
-// lookupPrefNic reads spec.Props["PrefNic"] off the StoragePool that
-// hosts (nodeName, poolName). Returns "" when the pool isn't in the
-// passed slice or the prop isn't set.
-func lookupPrefNic(nodeName, poolName string, pools []blockstoriov1alpha1.StoragePool) string {
-	for i := range pools {
-		if pools[i].Spec.NodeName != nodeName {
+// lookupPrefNic returns the PrefNic name DRBD must bind to on
+// nodeName, honouring UG9's prop-scope precedence:
+//
+//  1. StoragePool.Spec.Props["PrefNic"] on the (nodeName, poolName)
+//     pool — most-specific scope wins, matches `linstor
+//     storage-pool set-property <node> <pool> PrefNic <nic>`.
+//  2. Node.Spec.Props["PrefNic"] on the node — applies to every
+//     storage pool on the node, including the diskless pool. Matches
+//     `linstor node set-property <node> PrefNic <nic>` per
+//     scenario 3.W03.
+//
+// Returns "" when neither scope sets the prop; the caller treats the
+// empty result as "no override" and falls through to the next address
+// source (peerAddress / drbdAddrAny).
+func lookupPrefNic(nodeName, poolName string, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool) string {
+	if poolName != "" {
+		for i := range pools {
+			if pools[i].Spec.NodeName != nodeName {
+				continue
+			}
+
+			if pools[i].Spec.PoolName != poolName {
+				continue
+			}
+
+			if v := pools[i].Spec.Props["PrefNic"]; v != "" {
+				return v
+			}
+
+			break
+		}
+	}
+
+	for i := range nodes {
+		if k8s.OriginalName(&nodes[i].ObjectMeta) != nodeName {
 			continue
 		}
 
-		if pools[i].Spec.PoolName != poolName {
-			continue
-		}
-
-		return pools[i].Spec.Props["PrefNic"]
+		return nodes[i].Spec.Props["PrefNic"]
 	}
 
 	return ""

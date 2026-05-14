@@ -304,3 +304,178 @@ func TestPeerAddressPrefersKubeInternalNIC(t *testing.T) {
 		})
 	}
 }
+
+// TestPrefNicSteersDRBDAddress: scenario 3.W03.
+//
+// `linstor node set-property <node> PrefNic <nic>` (or the equivalent
+// pool-scope `linstor storage-pool set-property <node> <pool>
+// PrefNic <nic>`) must steer DRBD replication to the named
+// NetInterface: the target's own `address` (rendered into `.res` as
+// `on <node> { address ... }`) AND every `peer.<peer>.address` must
+// resolve to the chosen interface's IP — not the default endpoint,
+// not the 0.0.0.0 placeholder.
+//
+// Cases:
+//
+//   - pool-level PrefNic on each node's pool: both target and peer
+//     addresses follow that pool's PrefNic.
+//   - node-level PrefNic via `Node.Spec.Props["PrefNic"]`: applies
+//     to every StoragePool on that node (UG9: safer than pool-level
+//     — includes the diskless pool too).
+//   - pool-level overrides node-level on the same node (most-specific
+//     scope wins, per UG9 prop precedence).
+//
+// We exercise both target (`address`) and peer (`peer.n2.address`)
+// so a regression that only fixes one side still fails the test.
+func TestPrefNicSteersDRBDAddress(t *testing.T) {
+	rdName := "pvc-1"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	// Two nodes, each with two NICs: a "default" (pod-CIDR-ish) and
+	// a "nic_10G" the operator wants DRBD to use.
+	const (
+		n1Default = "10.244.0.2"
+		n1Fast    = "192.168.43.231"
+		n2Default = "10.244.0.5"
+		n2Fast    = "192.168.43.232"
+		poolName  = "data-hdd"
+	)
+
+	makeNodes := func(n1Props, n2Props map[string]string) []blockstoriov1alpha1.Node {
+		return []blockstoriov1alpha1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+				Spec: blockstoriov1alpha1.NodeSpec{
+					Type:  "Satellite",
+					Props: n1Props,
+					NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+						{Name: "default", Address: n1Default},
+						{Name: "nic_10G", Address: n1Fast},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+				Spec: blockstoriov1alpha1.NodeSpec{
+					Type:  "Satellite",
+					Props: n2Props,
+					NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+						{Name: "default", Address: n2Default},
+						{Name: "nic_10G", Address: n2Fast},
+					},
+				},
+			},
+		}
+	}
+
+	makePool := func(node string, props map[string]string) blockstoriov1alpha1.StoragePool {
+		return blockstoriov1alpha1.StoragePool{
+			ObjectMeta: metav1.ObjectMeta{Name: node + "-" + poolName},
+			Spec: blockstoriov1alpha1.StoragePoolSpec{
+				NodeName: node,
+				PoolName: poolName,
+				Props:    props,
+			},
+		}
+	}
+
+	cases := []struct {
+		name           string
+		nodes          []blockstoriov1alpha1.Node
+		pools          []blockstoriov1alpha1.StoragePool
+		wantTargetAddr string
+		wantPeerAddr   string
+		comment        string
+	}{
+		{
+			name:  "pool-level-prefnic-steers-both-sides",
+			nodes: makeNodes(nil, nil),
+			pools: []blockstoriov1alpha1.StoragePool{
+				makePool("n1", map[string]string{"PrefNic": "nic_10G"}),
+				makePool("n2", map[string]string{"PrefNic": "nic_10G"}),
+			},
+			wantTargetAddr: n1Fast,
+			wantPeerAddr:   n2Fast,
+			comment:        "pool PrefNic on each node selects the fast NIC for both endpoints",
+		},
+		{
+			name: "node-level-prefnic-steers-both-sides",
+			nodes: makeNodes(
+				map[string]string{"PrefNic": "nic_10G"},
+				map[string]string{"PrefNic": "nic_10G"},
+			),
+			pools: []blockstoriov1alpha1.StoragePool{
+				// no pool-level PrefNic — node-level must take effect
+				makePool("n1", nil),
+				makePool("n2", nil),
+			},
+			wantTargetAddr: n1Fast,
+			wantPeerAddr:   n2Fast,
+			comment:        "Node.Spec.Props[PrefNic] applies cluster-wide on that node",
+		},
+		{
+			name: "pool-level-overrides-node-level",
+			nodes: makeNodes(
+				// node says "default" but pool pins "nic_10G" → pool wins
+				map[string]string{"PrefNic": "default"},
+				map[string]string{"PrefNic": "default"},
+			),
+			pools: []blockstoriov1alpha1.StoragePool{
+				makePool("n1", map[string]string{"PrefNic": "nic_10G"}),
+				makePool("n2", map[string]string{"PrefNic": "nic_10G"}),
+			},
+			wantTargetAddr: n1Fast,
+			wantPeerAddr:   n2Fast,
+			comment:        "most-specific scope wins per UG9 prop precedence",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetID := int32(0)
+			peerID := int32(1)
+
+			target := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+					StoragePool:            poolName,
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+			}
+
+			peer := blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n2",
+					StoragePool:            poolName,
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, tc.nodes, tc.pools, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			if gotAddr := got.DrbdOptions["address"]; gotAddr != tc.wantTargetAddr {
+				t.Errorf("%s: target address=%q want %q (drbdOpts=%v)",
+					tc.comment, gotAddr, tc.wantTargetAddr, got.DrbdOptions)
+			}
+
+			if gotAddr := got.DrbdOptions["peer.n2.address"]; gotAddr != tc.wantPeerAddr {
+				t.Errorf("%s: peer.n2.address=%q want %q (drbdOpts=%v)",
+					tc.comment, gotAddr, tc.wantPeerAddr, got.DrbdOptions)
+			}
+		})
+	}
+}
