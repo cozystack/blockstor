@@ -1051,3 +1051,131 @@ func TestNodeLostCascadeIgnoresMissingChildren(t *testing.T) {
 		t.Errorf("node still present after lost: expected removal")
 	}
 }
+
+// TestNodeEvacuateSingleInUseWireCompatibleWithMulti pins scenario
+// 4.W05 (cross-listed wave1 4.18 + Bug 18, paired with 4.W06 already
+// closed): the single-node form `POST /v1/nodes/{node}/evacuate` MUST
+// produce the same on-the-wire refusal shape as the multi-node form
+// `POST /v1/nodes/evacuate` for the InUse guard — same HTTP status
+// (409), same `APICallRc` envelope (negative RetCode = MASK_ERROR
+// bit, non-empty Message), same atomic non-stamp on refusal.
+//
+// Both forms route through the same UG9 §"Evacuating a node" intent;
+// the variadic form just folds a set into one call. An operator
+// script that pattern-matches the refusal body (or status code +
+// envelope) for one form MUST work identically against the other,
+// so the controller-side rolling-drain orchestrator can swap between
+// per-node loops and batched calls without rewriting its error
+// handling. If the two paths diverge — different status, different
+// envelope, partial stamping — clients have to special-case which
+// form they hit and the abstraction leaks back into the operator.
+//
+// Pinned because the single-node guard lives in handleNodeEvacuate
+// (inline) while the multi-node guard lives in checkEvacuateInUse
+// (extracted helper); a refactor that drifts one without the other
+// would silently break wire-compat with no other test catching it.
+func TestNodeEvacuateSingleInUseWireCompatibleWithMulti(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Two-node cluster so the multi-form's no-candidate guard is
+	// satisfied: evacuating n1 leaves n2 as a candidate target.
+	// Both forms must reach the InUse guard, not bail earlier.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	// rd-busy Primary on n1 — must trigger the InUse refusal for
+	// either form.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "rd-busy",
+		NodeName: "n1",
+		State:    apiv1.ResourceState{InUse: boolPtr(true)},
+	}); err != nil {
+		t.Fatalf("seed busy: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Fire the single-node form.
+	singleResp := httpPost(t, base+"/v1/nodes/n1/evacuate", nil)
+	defer func() { _ = singleResp.Body.Close() }()
+
+	singleBody, _ := io.ReadAll(singleResp.Body)
+
+	// Fire the multi-node form with the same {n1} set.
+	multiResp := postEvacuateMulti(t, base, []string{"n1"})
+	defer func() { _ = multiResp.Body.Close() }()
+
+	multiBody, _ := io.ReadAll(multiResp.Body)
+
+	// Wire-compat #1: identical HTTP status.
+	if singleResp.StatusCode != multiResp.StatusCode {
+		t.Errorf("status divergence: single=%d, multi=%d (both must be 409)",
+			singleResp.StatusCode, multiResp.StatusCode)
+	}
+
+	if singleResp.StatusCode != http.StatusConflict {
+		t.Errorf("single status: got %d, want 409", singleResp.StatusCode)
+	}
+
+	// Wire-compat #2: identical APICallRc envelope shape — both
+	// MUST decode as []APICallRc with RetCode carrying MASK_ERROR
+	// (negative) and a non-empty Message. golinstor's
+	// client.ApiCallError discriminates on RetCode sign; a single-
+	// form 409 that lacks the negative RetCode would surface as
+	// "unexpected end of JSON input" in the client.
+	var singleEnv, multiEnv []apiv1.APICallRc
+
+	if err := json.Unmarshal(singleBody, &singleEnv); err != nil {
+		t.Fatalf("single body not []APICallRc: %v; body=%q", err, string(singleBody))
+	}
+
+	if err := json.Unmarshal(multiBody, &multiEnv); err != nil {
+		t.Fatalf("multi body not []APICallRc: %v; body=%q", err, string(multiBody))
+	}
+
+	if len(singleEnv) == 0 || len(multiEnv) == 0 {
+		t.Fatalf("empty envelopes: single=%d, multi=%d", len(singleEnv), len(multiEnv))
+	}
+
+	if (singleEnv[0].RetCode < 0) != (multiEnv[0].RetCode < 0) {
+		t.Errorf("RetCode sign divergence: single=%#x, multi=%#x (both must be MASK_ERROR negative)",
+			singleEnv[0].RetCode, multiEnv[0].RetCode)
+	}
+
+	if singleEnv[0].RetCode >= 0 {
+		t.Errorf("single RetCode not negative (MASK_ERROR missing): %#x", singleEnv[0].RetCode)
+	}
+
+	if singleEnv[0].Message == "" {
+		t.Errorf("single Message empty; operator gets no actionable text")
+	}
+
+	// Wire-compat #3: both refusals MUST name the offending
+	// resource so an operator script parsing either form can target
+	// the same consumer to demote.
+	if !strings.Contains(singleEnv[0].Message, "rd-busy") {
+		t.Errorf("single message missing 'rd-busy': %q", singleEnv[0].Message)
+	}
+
+	if !strings.Contains(multiEnv[0].Message, "rd-busy") {
+		t.Errorf("multi message missing 'rd-busy': %q", multiEnv[0].Message)
+	}
+
+	// Wire-compat #4: atomic non-stamp — neither refusal half-
+	// applies EVICTED. A divergence here (one stamps, the other
+	// doesn't) is the worst kind of leak: same wire shape, different
+	// side effects.
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get n1: %v", err)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("n1 stamped EVICTED despite refusal from both forms: %v", got.Flags)
+	}
+}
