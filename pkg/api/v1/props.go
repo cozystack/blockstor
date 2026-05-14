@@ -173,6 +173,14 @@ const PropBalanceResourcesInterval = "BalanceResourcesInterval"
 // additional GracePeriod before churning anything).
 const PropBalanceResourcesGracePeriod = "BalanceResourcesGracePeriod"
 
+// PropAllowMixingStoragePoolDriver is the cluster-scope override that
+// opens the LVM_THIN ↔ ZFS_THIN cell in the same-provider-kind
+// enforcement (Bug 76). Mirrors upstream LINSTOR's
+// `linstor-common/consts.json` KEY_RSC_ALLOW_MIXING_DEVICE_KIND.
+// Other cross-family pairs stay forbidden regardless of this flag.
+// Preconditions: DRBD ≥ 9.2.7, LINSTOR ≥ 1.27.0. Wave2 scenario 6.W07.
+const PropAllowMixingStoragePoolDriver = "AllowMixingStoragePoolDriver"
+
 // DefaultBalanceResourcesIntervalMinutes is the fallback when no
 // `BalanceResourcesInterval` prop is set at any scope. 5 minutes
 // matches upstream LINSTOR's `Controller/Scheduler/Rebalance/Interval`
