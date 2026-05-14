@@ -136,6 +136,19 @@ Cross-listed with wave1 5.29. Operator runs `drbdadm disconnect` from satellite 
 
 Cross-listed with wave1 5.8 / 5.15. Surviving primary records changes in dirty bitmap; recovered secondary auto-syncs from bitmap on reconnect. Test: power-off worker-2 mid-write → power-on after 60s → SyncTarget → UpToDate without manual intervention.
 
+## Regression guards
+
+### 5.W17 Late VolumeDefinition → Unintentional Diskless (Bug 79) — ✓ (Tier 2 + Tier 4)
+
+- **Priority:** P0  **Target:** integration + e2e  **Complexity:** L
+- **Source:** Production session 2026-05-14, operator repro pinned in `tests/e2e/client-compat.sh` §B.1 docstring.
+
+Operator sequence `rd c <name>` → `r c <w1> <name> --storage-pool <sp>` → `r c <w2> <name> --storage-pool <sp>` → (settle) → `vd c <name> <size>`. Pre-fix: the satellite reconciler stamped the `.md-created` marker on the empty-volume first pass, pinning `firstActivation=false`; the late VD then came up with no DRBD metadata and the kernel reported `disk:Diskless`, surfaced as `Unintentional Diskless` in `linstor r l`. Both replicas silently demoted despite Spec.Flags lacking DISKLESS — a "200 OK + broken kernel state" failure mode.
+
+**Tier 2** (`tests/integration/group_e_test.go::TestGroupEVDLateAddTriggersReconcile`, `tests/integration/group_k_test.go::TestGroupKWFLateVD`): pins the CRD-/controller-shape half — no DISKLESS flag stamped on Spec, Status.DrbdState=UpToDate after the late VD.
+
+**Tier 4** (`tests/e2e/recovery-late-vd-real-drbd.sh`): real-kernel guard — runs the verbatim production repro against a real Talos+DRBD stand, asserts (a) both replicas reach `disk_state="UpToDate"` within 60s, (b) `linstor r l` never reports "Unintentional Diskless", (c) `drbdsetup status` on each satellite confirms the resource has real metadata (disk line is not `Diskless`/`Unattached`/`Negotiating`). Pairs with `tests/e2e/client-compat.sh` §B.1 (CLI wire-shape smoke); 5.W17 is the kernel-truth check.
+
 ## Observability smoke
 
 ### 5.W16 Prometheus alertmanager smoke: drbd-disconnect → alert fires — O
@@ -151,7 +164,7 @@ Cross-listed with wave1 5.8 / 5.15. Surviving primary records changes in dirty b
 
 | Tag | Count |
 |-----|------:|
-| P0 e2e | 3 |
+| P0 e2e | 4 |
 | P1 unit | 2 |
 | P1 e2e | 6 |
 | P2 unit | 2 |
