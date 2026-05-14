@@ -570,3 +570,302 @@ func TestSpawnInheritsLayerStackFromRG(t *testing.T) {
 		t.Errorf("LayerStack: got %v, want %v", got.LayerStack, want)
 	}
 }
+
+// TestSpawnAutoplacesFromRGSelectFilter pins scenario 9.W04 (P0):
+// `rg spawn <rg> <rd> <size>` materialises an RD + VDs AND places
+// replicas according to the RG's SelectFilter (PlaceCount +
+// StoragePool). Without the autoplace step inside spawn, linstor-csi
+// would observe an empty `r l` after CreateVolume returns and loop on
+// retries; the operator-visible contract is that `linstor rg spawn`
+// is a single shot that yields fully-placed resources, mirroring
+// upstream LINSTOR.
+//
+// Fixture: RG carries SelectFilter{PlaceCount:2, StoragePool:"pool"};
+// three same-kind LVM_THIN pools across n1/n2/n3 with skewed free
+// capacity so the weighted scorer's preference is deterministic.
+// The test asserts:
+//
+//  1. HTTP 201 (spawned + placed)
+//  2. RD + VD landed in the store with the RG-derived LayerStack
+//     (Bug 54 cross-check — even with placement enabled)
+//  3. Exactly PlaceCount=2 Resources placed, on the two freest nodes
+//     (n1 + n2), each tagged with the RG's StoragePool name
+func TestSpawnAutoplacesFromRGSelectFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-place",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  2,
+			StoragePool: "pool",
+			LayerStack:  []string{apiv1.LayerKindStorage},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	// Three same-kind pools (Bug 76 happy path — homogeneous cluster).
+	// FreeCapacity skew makes the placer's biggest-free-first sort
+	// pick n1 + n2 deterministically, leaving n3 unplaced.
+	// Capacities in KiB; numbers chosen so a 64 KiB VD fits comfortably.
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "pool", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1_000_000, TotalCapacity: 10_000_000},
+		{StoragePoolName: "pool", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 800_000, TotalCapacity: 10_000_000},
+		{StoragePoolName: "pool", NodeName: "n3", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100_000, TotalCapacity: 10_000_000},
+	}
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-spawn",
+		VolumeSizes:            []int64{4 * 1024 * 1024}, // 4 MiB
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-place/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	// The spawn envelope must announce success — not a deferred
+	// autoplace. A regression where RG.SelectFilter is ignored
+	// (e.g. PlaceCount=0 path triggered) surfaces here as a
+	// "spawned, autoplace deferred" message.
+	var rc []apiv1.APICallRc
+
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || containsAll(rc[0].Message, "autoplace deferred") {
+		t.Errorf("envelope must announce success: %+v", rc)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-spawn")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if rd.ResourceGroupName != "rg-place" {
+		t.Errorf("ResourceGroupName: got %q, want rg-place", rd.ResourceGroupName)
+	}
+
+	// LayerStack must still inherit even when autoplace runs
+	// (cross-check on Bug 54: the RD passes through buildSpawnedRD).
+	if !slices.Equal(rd.LayerStack, []string{apiv1.LayerKindStorage}) {
+		t.Errorf("LayerStack: got %v, want [%s]", rd.LayerStack, apiv1.LayerKindStorage)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-spawn")
+	if err != nil {
+		t.Fatalf("list VDs: %v", err)
+	}
+
+	if len(vds) != 1 || vds[0].SizeKib != 4096 {
+		t.Errorf("VDs: got %+v, want 1 VD of 4096 KiB", vds)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-spawn")
+	if err != nil {
+		t.Fatalf("list resources: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("placed: got %d, want 2 (RG.SelectFilter.PlaceCount)", len(got))
+	}
+
+	// Pin the deterministic biggest-free-first picks: n1 + n2,
+	// never n3. This guards against a regression that ignores
+	// RG.SelectFilter.StoragePool (would place on any pool) or
+	// silently truncates PlaceCount.
+	nodes := map[string]bool{}
+	for _, r := range got {
+		nodes[r.NodeName] = true
+
+		if r.Props["StorPoolName"] != "pool" {
+			t.Errorf("replica on %s: StorPoolName=%q, want %q (from RG.SelectFilter)",
+				r.NodeName, r.Props["StorPoolName"], "pool")
+		}
+	}
+
+	if !nodes["n1"] || !nodes["n2"] || nodes["n3"] {
+		t.Errorf("placement nodes: got %v, want {n1, n2} (biggest-free)", nodes)
+	}
+}
+
+// TestSpawnAutoplaceRejectsCrossKindFromRG pins scenario 9.W04 + Bug 76
+// at the spawn boundary: when the RG's StoragePoolList enumerates
+// pools whose ProviderKinds differ across the cluster, the placer's
+// same-kind gate must still apply during spawn so a single RD never
+// ends up with cross-provider replicas. Without this guard a single
+// `rg spawn` could materialise an RD whose two replicas live on
+// FILE_THIN + LVM_THIN — the exact symptom Bug 76 reports.
+//
+// Fixture: n1 has only ZFS_THIN, n2 has only LVM_THIN; RG lists both
+// pools and asks for PlaceCount=2. The placer's same-kind constraint
+// finds no peer for either kind, so it short-places. The spawn
+// handler surfaces the shortfall via the "autoplace deferred"
+// envelope (HTTP 201, but body names the failure) — the operator's
+// signal that the cluster shape can't satisfy the RG today.
+func TestSpawnAutoplaceRejectsCrossKindFromRG(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-mixed",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:      2,
+			StoragePoolList: []string{"zfs-thin", "lvm-thin"},
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	pools := []apiv1.StoragePool{
+		{StoragePoolName: "zfs-thin", NodeName: "n1", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000, TotalCapacity: 10000},
+		{StoragePoolName: "lvm-thin", NodeName: "n2", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000, TotalCapacity: 10000},
+	}
+	for i := range pools {
+		if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+			t.Fatalf("seed pool: %v", err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-mixed",
+		VolumeSizes:            []int64{1024 * 1024},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-mixed/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	// The RD definition is materialised regardless (the contract is
+	// "definitions land, placement may defer"); the deferral message
+	// is the operator's signal that Bug 76 fired.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].Message == "" {
+		t.Fatalf("empty envelope: %+v", rc)
+	}
+
+	if !containsAll(rc[0].Message, "autoplace deferred") {
+		t.Errorf("message must flag the deferral: %q", rc[0].Message)
+	}
+
+	// Same-kind sanity (Bug 76): at most ONE replica may land —
+	// never a cross-kind pair. (Placement of 0 is also acceptable
+	// on a future hardening of the placer; 2 cross-kind replicas
+	// is the regression signal.)
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-mixed")
+	if err != nil {
+		t.Fatalf("list resources: %v", err)
+	}
+
+	if len(got) > 1 {
+		kinds := map[string]bool{}
+		for _, r := range got {
+			pool, _ := st.StoragePools().Get(ctx, r.NodeName, r.Props["StorPoolName"])
+			kinds[pool.ProviderKind] = true
+		}
+
+		if len(kinds) > 1 {
+			t.Errorf("Bug 76: cross-kind replicas placed via spawn: %v", got)
+		}
+	}
+}
+
+// TestSpawnPartialFlagAllowsShortPlacement pins scenario 9.W04's
+// `--partial` clause: when the operator opts into partial placement
+// the spawn handler MUST still return HTTP 201 even if the placer
+// short-places (placed < want). Mirrors upstream LINSTOR's
+// "definitions land, placement is best-effort" contract on the
+// partial path. The PartialFlag is parsed on the request but the
+// current implementation always tolerates shortfall (deferred
+// envelope) regardless — this test pins that behaviour so a future
+// tightening that demands placed==want on PartialFlag=false doesn't
+// silently regress the partial path.
+//
+// Fixture: RG asks for 3 replicas on "pool" but only 1 same-kind
+// pool exists, forcing a shortfall. With PartialFlag=true the
+// response is HTTP 201 + deferred envelope and the RD is preserved.
+func TestSpawnPartialFlagAllowsShortPlacement(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-partial",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  3,
+			StoragePool: "pool",
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    1000, TotalCapacity: 10000,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-partial",
+		VolumeSizes:            []int64{1024 * 1024},
+		PartialFlag:            true,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-partial/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (partial tolerated)", resp.StatusCode)
+	}
+
+	// RD must survive even under shortfall — operators rely on the
+	// definition existing so a later autoplace can add replicas
+	// once the cluster grows. A regression that rolls back the RD
+	// on shortfall would break the partial-recovery flow.
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-partial"); err != nil {
+		t.Errorf("RD must survive partial placement: %v", err)
+	}
+
+	// Only the single available pool is placed on; never more
+	// than 1 (no cross-kind synthesis, no over-placement).
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-partial")
+	if len(got) > 1 {
+		t.Errorf("placed: got %d, want ≤1 (only n1 has a pool)", len(got))
+	}
+}
