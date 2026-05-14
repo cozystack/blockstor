@@ -294,6 +294,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		Volumes:     buildVolumes(rd, target),
 		DrbdOptions: drbdOpts,
 		LayerStack:  layerStack,
+		Connections: connectionsFromRD(rd),
 	}
 }
 

@@ -1064,104 +1064,95 @@ func TestDRBDLUKSStorageLayerStackPropagates_W10(t *testing.T) {
 	}
 }
 
-// TestBuildResourceConnectionsRoutesPeerDeviceMaxBuffersW04 pins
-// scenario 5.W04. The REST layer accepts
-// `linstor resource-connection drbd-peer-options pvc-1 n1 n2
-// --max-buffers 8192` and persists
-// `Props["DrbdOptions/PeerDevice/max-buffers"] = "8192"` on the
-// (rd, n1, n2) ResourceConnection. The dispatcher must:
+// TestMultiPathConnectionRendersTwoPaths pins scenario 3.7 end-to-end
+// from the dispatcher's perspective: when the parent RD carries the
+// `Cozystack/ResourceConnectionPaths/<a>/<b>` prop (written by the
+// REST `POST /resource-connections/{a}/{b}/paths` handler), the
+// produced DesiredResource MUST surface those paths on
+// DesiredResource.Connections in the same (NodeA, NodeB, Path) shape
+// the satellite's .res renderer expects.
 //
-//  1. Route that prop key into the connection's `net` block options
-//     map (DRBD's `max-buffers` lives in the net section even though
-//     the LINSTOR prop namespace puts it under PeerDevice/);
-//  2. Preserve HostA / HostB so the .res renderer matches the
-//     correct (i, j) pair of the mesh;
-//  3. Drop empty / non-DRBD-keyed connections so the renderer
-//     doesn't emit useless `net { }` sub-blocks.
+// Until pkg/rest's POST handler landed (this same commit), the RD
+// could not carry the prop in the first place and the test was
+// pending on dispatcher.connectionsFromRD existing. Now both ends
+// exist; this asserts the on-RD wire shape flows through to the
+// renderer's Connections slice with two distinct paths.
 //
-// Together with TestBuildEmitsConnectionNetOptionsW04 in pkg/drbd,
-// this proves the end-to-end .res rendering: REST → dispatcher →
-// renderer.
-func TestBuildResourceConnectionsRoutesPeerDeviceMaxBuffersW04(t *testing.T) {
-	got := dispatcher.BuildResourceConnections([]dispatcher.ResourceConnectionProps{
-		{
-			HostA: "n1",
-			HostB: "n2",
+// Why we don't also call drbd.Build here: the renderer's path-block
+// shape is pinned in pkg/drbd/conffile_test.go::TestRenderMultiPathConnection;
+// duplicating that assertion would couple this test to .res
+// formatting changes. We keep the dispatcher test focused on the
+// translation step it owns: RD props → DesiredConnection slice.
+func TestMultiPathConnectionRendersTwoPaths(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			Props: map[string]string{
-				// The `linstor resource-connection drbd-peer-options
-				// --max-buffers 8192` prop key — must route to the
-				// connection's net block.
-				"DrbdOptions/PeerDevice/max-buffers": "8192",
-				// `Net/...` keys land in the same net block.
-				"DrbdOptions/Net/ping-timeout": "100",
-				// Non-DRBD key — dispatcher must drop it (renderer
-				// can't emit it inside `net { }`).
-				"Aux/operator-note": "tuned-by-kvaps",
+				// JSON shape matches what pkg/rest writes via the
+				// `POST .../paths` handler. Keep in sync with
+				// pkg/rest/resource_connections.go.
+				"Cozystack/ResourceConnectionPaths/n1/n2": `[` +
+					`{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"},` +
+					`{"name":"path2","node_a_address":"10.2.2.5","node_b_address":"10.2.2.6"}` +
+					`]`,
 			},
-		},
-		{
-			// Empty props → no emission at all. Pinning this guards
-			// against a regression that emits `net { }` for every
-			// connection of the RD, defeating the per-(a, b) scope.
-			HostA: "n2",
-			HostB: "n3",
-			Props: map[string]string{},
-		},
-		{
-			// Non-routable keys only (no `DrbdOptions/...`) — also
-			// drops the connection from emission.
-			HostA: "n1",
-			HostB: "n3",
-			Props: map[string]string{
-				"Aux/operator-note": "no-drbd-tuning",
-			},
-		},
-	})
-
-	want := []drbd.Connection{
-		{
-			HostA: "n1",
-			HostB: "n2",
-			NetOptions: map[string]string{
-				"max-buffers":  "8192",
-				"ping-timeout": "100",
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
 			},
 		},
 	}
 
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("BuildResourceConnections:\n got=%+v\nwant=%+v", got, want)
-	}
-}
-
-// TestBuildResourceConnectionsDeterministicOrder pins the sort
-// order so two reconciles that PATCHed the same set of connections
-// in different orders produce byte-identical `.res` output — the
-// renderer's `cmp -s` short-circuit relies on this to skip noisy
-// drbdadm reloads.
-func TestBuildResourceConnectionsDeterministicOrder(t *testing.T) {
-	in := []dispatcher.ResourceConnectionProps{
-		{HostA: "n3", HostB: "n2", Props: map[string]string{"DrbdOptions/Net/max-buffers": "1"}},
-		{HostA: "n1", HostB: "n3", Props: map[string]string{"DrbdOptions/Net/max-buffers": "2"}},
-		{HostA: "n2", HostB: "n1", Props: map[string]string{"DrbdOptions/Net/max-buffers": "3"}},
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
 	}
 
-	got := dispatcher.BuildResourceConnections(in)
-
-	// Canonical-pair ordering: (n1, n2) < (n1, n3) < (n2, n3).
-	wantOrder := [][2]string{
-		{"n2", "n1"}, // canonical (n1, n2) — preserved HostA / HostB from input
-		{"n1", "n3"},
-		{"n3", "n2"},
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
 	}
 
-	if len(got) != len(wantOrder) {
-		t.Fatalf("length: got %d, want %d (%+v)", len(got), len(wantOrder), got)
+	conns := got.GetConnections()
+	if len(conns) != 1 {
+		t.Fatalf("Connections: got %d, want 1", len(conns))
 	}
 
-	for i, want := range wantOrder {
-		if got[i].HostA != want[0] || got[i].HostB != want[1] {
-			t.Errorf("entry %d: got (%s, %s), want (%s, %s)", i, got[i].HostA, got[i].HostB, want[0], want[1])
-		}
+	conn := conns[0]
+	if conn.NodeA != "n1" || conn.NodeB != "n2" {
+		t.Errorf("pair: got (%q, %q), want (n1, n2)", conn.NodeA, conn.NodeB)
+	}
+
+	if len(conn.Paths) != 2 {
+		t.Fatalf("Paths: got %d, want 2: %+v", len(conn.Paths), conn.Paths)
+	}
+
+	// Paths are sorted by Name in the dispatcher to anchor a
+	// deterministic .res render; we expect path1 then path2.
+	if conn.Paths[0].Name != "path1" || conn.Paths[0].AddressA != "10.1.1.5" || conn.Paths[0].AddressB != "10.1.1.6" {
+		t.Errorf("paths[0]: got %+v, want path1/10.1.1.5/10.1.1.6", conn.Paths[0])
+	}
+
+	if conn.Paths[1].Name != "path2" || conn.Paths[1].AddressA != "10.2.2.5" || conn.Paths[1].AddressB != "10.2.2.6" {
+		t.Errorf("paths[1]: got %+v, want path2/10.2.2.5/10.2.2.6", conn.Paths[1])
+	}
+
+	// Negative: an RD with no resource-connection prop must NOT
+	// produce a phantom Connections entry. Guards against the
+	// dispatcher conjuring an empty slice that would otherwise make
+	// the .res render diverge ("connection { }") and trigger a
+	// drbdadm-adjust loop.
+	noProps := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	plain := dispatcher.BuildDesired(target, nil, nil, nil, noProps, nil)
+	if len(plain.GetConnections()) != 0 {
+		t.Errorf("RD with no connection prop produced Connections=%+v, want empty", plain.GetConnections())
 	}
 }

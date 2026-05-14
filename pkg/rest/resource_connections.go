@@ -17,258 +17,322 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
-	"maps"
 	"net/http"
-	"sync"
+
+	"github.com/cockroachdb/errors"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
-// Wire-shape keys used in JSON responses on the resource-connection
-// endpoints. Extracted as constants because goconst flags every
-// duplicate and because the upstream LINSTOR
-// `ResourceConnection` schema is the authoritative source — keep
-// the literals in one spot so a schema change is one edit.
-const (
-	keyResourceConnectionNodeA = "node_a"
-	keyResourceConnectionNodeB = "node_b"
-	keyResourceConnectionProps = "props"
-)
-
-// resourceConnectionRegistry holds per-(rd, nodeA, nodeB) DRBD tuning
-// props in memory — scenario 5.W04 (`linstor resource-connection
-// drbd-peer-options <rd> <a> <b> --max-buffers 8192`).
+// registerResourceConnections wires the resource-connection / paths
+// surface from scenario 3.7 (UG9 §"Creating multiple DRBD paths with
+// LINSTOR"). Paths are stored as a JSON-encoded string under a
+// dedicated RD prop — see resourceConnectionPathsPropKey — so the
+// storage layer (kube/inmemory) doesn't need a new CRD just to hold
+// what is effectively an N-slot list per peer pair.
 //
-// Scope: distinct from node-connection (per-(a, b), every RD —
-// scenario 5.W03), distinct from RD/resource scope (every connection
-// of the RD — 5.W01). Keying on the (rd, sorted-pair) tuple keeps
-// the operator-set tuning bound to exactly one connection block of
-// one resource's mesh.
-//
-// Storage is process-local rather than CRD-backed because the
-// dispatcher path that consumes these props for ResourceConnection
-// scope is still being wired (the satellite renderer is the
-// authoritative consumer); persisting in the apiserver process keeps
-// the REST surface honest without implying CRD ownership we don't
-// have yet. Restarting the apiserver loses the tuning — same
-// behaviour as `linstorRemoteRegistry`, and `linstor
-// resource-connection list` will surface an empty Props map until
-// the operator re-PATCHes.
-type resourceConnectionRegistry struct {
-	mu sync.RWMutex
-	// entries[rd][pairKey] = props map (DrbdOptions/PeerDevice/...,
-	// DrbdOptions/Net/...). pairKey is the sorted (a, b) tuple
-	// joined by NUL — so a PATCH on `n1 n2` and a PATCH on `n2 n1`
-	// reach the same map.
-	entries map[string]map[string]map[string]string
+// The endpoint is logically symmetric in (nodeA, nodeB); writes under
+// one order are readable under the swapped order with A/B addresses
+// flipped accordingly. Operators expect this because drbd-9 has no
+// notion of a "primary" endpoint within a connection.
+func (s *Server) registerResourceConnections(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resource-connections/{nodeA}/{nodeB}/paths",
+		s.requireStore(s.handleResourceConnectionPathsList))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resource-connections/{nodeA}/{nodeB}/paths",
+		s.requireStore(s.handleResourceConnectionPathCreate))
+	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resource-connections/{nodeA}/{nodeB}/paths/{name}",
+		s.requireStore(s.handleResourceConnectionPathDelete))
 }
 
-// resourceConnectionPairSeparator joins the sorted (nodeA, nodeB)
-// names into a single map key. NUL is reserved in LINSTOR node names
-// (they're RFC1123-ish), so we can't collide with an actual name.
-const resourceConnectionPairSeparator = "\x00"
+// resourceConnectionPathsPropKey is the RD-prop namespace under which
+// the JSON-encoded path list lives. The (a, b) tuple is normalised
+// (lexicographically sorted) so a store lookup under either order
+// finds the same entry — see canonicalConnectionKey.
+const resourceConnectionPathsPropKey = "Cozystack/ResourceConnectionPaths/"
 
-func newResourceConnectionRegistry() *resourceConnectionRegistry {
-	return &resourceConnectionRegistry{
-		entries: map[string]map[string]map[string]string{},
+// resourceConnectionPath is the wire shape POST/GET use. node_*_address
+// fields match the snake_case golinstor uses on the upstream
+// `/v1/resource-connections` surface.
+type resourceConnectionPath struct {
+	Name         string `json:"name"`
+	NodeAAddress string `json:"node_a_address"`
+	NodeBAddress string `json:"node_b_address"`
+}
+
+// canonicalConnectionKey returns (sortedA, sortedB, swap) where
+// sortedA <= sortedB lexicographically. swap is true when the caller
+// passed the pair in reverse order; the handler uses that to flip
+// A/B addresses on the way in/out so the stored entry always lives
+// under the canonical order.
+func canonicalConnectionKey(a, b string) (string, string, bool) {
+	if a <= b {
+		return a, b, false
+	}
+
+	return b, a, true
+}
+
+// propKey is the full RD-prop key for a (nodeA, nodeB) pair. The pair
+// is canonicalised before joining so the key is identical whether
+// the operator posted under (a, b) or (b, a).
+func propKey(nodeA, nodeB string) string {
+	sortedA, sortedB, _ := canonicalConnectionKey(nodeA, nodeB)
+
+	return resourceConnectionPathsPropKey + sortedA + "/" + sortedB
+}
+
+// loadPaths reads + decodes the stored path list for the (nodeA,
+// nodeB) pair on rd. Returns (paths, swap, error); `swap` mirrors
+// canonicalConnectionKey's third return so callers know whether to
+// flip A/B before encoding the response.
+func loadPaths(rd *apiv1.ResourceDefinition, nodeA, nodeB string) ([]resourceConnectionPath, bool, error) {
+	_, _, swap := canonicalConnectionKey(nodeA, nodeB)
+
+	raw, ok := rd.Props[propKey(nodeA, nodeB)]
+	if !ok || raw == "" {
+		return nil, swap, nil
+	}
+
+	var paths []resourceConnectionPath
+
+	err := json.Unmarshal([]byte(raw), &paths)
+	if err != nil {
+		return nil, swap, errors.Wrap(err, "decode resource-connection paths")
+	}
+
+	return paths, swap, nil
+}
+
+// storePaths encodes + persists the path list onto rd. Pass an empty
+// slice to delete the prop key entirely (so an emptied connection
+// doesn't leak as a zombie `[]` value in storage).
+func storePaths(rd *apiv1.ResourceDefinition, nodeA, nodeB string, paths []resourceConnectionPath) error {
+	key := propKey(nodeA, nodeB)
+
+	if len(paths) == 0 {
+		delete(rd.Props, key)
+
+		return nil
+	}
+
+	if rd.Props == nil {
+		rd.Props = map[string]string{}
+	}
+
+	encoded, err := json.Marshal(paths)
+	if err != nil {
+		return errors.Wrap(err, "encode resource-connection paths")
+	}
+
+	rd.Props[key] = string(encoded)
+
+	return nil
+}
+
+// swapPathAB returns p with A/B fields flipped. Used by the request
+// edge to translate operator-facing (nodeA, nodeB) order into the
+// canonical storage order, and again on the way out.
+func swapPathAB(p resourceConnectionPath) resourceConnectionPath {
+	return resourceConnectionPath{
+		Name:         p.Name,
+		NodeAAddress: p.NodeBAddress,
+		NodeBAddress: p.NodeAAddress,
 	}
 }
 
-// pairKey returns the canonical map key for the (a, b) pair. Sorted
-// lexicographically so `n1 n2` and `n2 n1` are the same connection.
-func pairKey(nodeA, nodeB string) string {
-	if nodeA <= nodeB {
-		return nodeA + resourceConnectionPairSeparator + nodeB
+// swapAll flips A/B on every entry. Cheap (per-path tuple).
+func swapAll(paths []resourceConnectionPath) []resourceConnectionPath {
+	out := make([]resourceConnectionPath, len(paths))
+	for i := range paths {
+		out[i] = swapPathAB(paths[i])
 	}
-
-	return nodeB + resourceConnectionPairSeparator + nodeA
-}
-
-// get returns a snapshot of the props map for (rd, a, b) — never the
-// underlying map, so callers can't mutate registry state. Empty map
-// when the pair has never been PATCHed.
-func (r *resourceConnectionRegistry) get(rd, nodeA, nodeB string) map[string]string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	props, ok := r.entries[rd][pairKey(nodeA, nodeB)]
-	if !ok {
-		return map[string]string{}
-	}
-
-	out := make(map[string]string, len(props))
-	maps.Copy(out, props)
 
 	return out
 }
 
-// merge applies the override / delete delta to (rd, a, b). Matches
-// upstream LINSTOR's `override_props` + `delete_props` envelope
-// shape — a PATCH carrying both fields applies override first, then
-// delete (consistent with the RD-scope handler).
-func (r *resourceConnectionRegistry) merge(rd, nodeA, nodeB string, override map[string]string, del []string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+// handleResourceConnectionPathsList answers GET. Always returns a
+// JSON array (possibly empty) — golinstor decodes a `null` body as
+// a malformed response, so the empty-but-present invariant matters.
+func (s *Server) handleResourceConnectionPathsList(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	nodeA := r.PathValue("nodeA")
+	nodeB := r.PathValue("nodeB")
 
-	if r.entries[rd] == nil {
-		r.entries[rd] = map[string]map[string]string{}
+	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
 	}
 
-	key := pairKey(nodeA, nodeB)
-	if r.entries[rd][key] == nil {
-		r.entries[rd][key] = map[string]string{}
+	paths, swap, err := loadPaths(&rd, nodeA, nodeB)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
 	}
 
-	maps.Copy(r.entries[rd][key], override)
-
-	for _, k := range del {
-		delete(r.entries[rd][key], k)
-	}
-}
-
-// registerResourceConnections wires the LINSTOR `resource-connection`
-// REST surface — scenario 5.W04. Distinct from the no-op
-// `node-connection` family (scenario 5.W03 / pkg/rest/
-// node_connections.go) because the scope is per-(rd, a, b), not
-// per-(a, b): the same operator-driven tuning would either apply to
-// every RD in the cluster (node-connection) or to one resource's
-// connection block (resource-connection). Operators tune
-// max-buffers / ping-timeout differently across RDs (a hot snapshot
-// RD wants different replication tuning than a sleepy backup RD),
-// so the resource-connection scope is the one that gets persisted
-// here.
-//
-// We expose every verb so golinstor / `linstor resource-connection`
-// don't 404 on a misguided call. Read and write paths are real —
-// unlike node-connection, the value matters: the satellite renderer
-// will consume these props to stamp `connection { net { ... } }`
-// inside the matching `.res` block.
-func (s *Server) registerResourceConnections(mux *http.ServeMux) {
-	// Lazy-init mirrors `linstorRemotes` — buildMux runs once at
-	// startup, so a pointer field added on the Server is safe to
-	// populate here without a constructor change.
-	if s.resourceConnections == nil {
-		s.resourceConnections = newResourceConnectionRegistry()
+	if swap {
+		paths = swapAll(paths)
 	}
 
-	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resource-connections",
-		s.handleResourceConnectionsList)
-	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resource-connections/{a}/{b}",
-		s.handleResourceConnectionGet)
-	// `drbd-peer-options` PATCH is the canonical operator-driven
-	// write path — `linstor resource-connection drbd-peer-options
-	// <rd> <a> <b> --max-buffers 8192` lands here.
-	mux.HandleFunc("PATCH /v1/resource-definitions/{rd}/resource-connections/{a}/{b}/drbd-peer-options",
-		s.handleResourceConnectionDRBDPeerOptions)
-	// The bare PATCH endpoint accepts the same envelope so callers
-	// that pre-compute the upstream LINSTOR prop key on the client
-	// side don't need a separate subcommand. Same merge semantics.
-	mux.HandleFunc("PATCH /v1/resource-definitions/{rd}/resource-connections/{a}/{b}",
-		s.handleResourceConnectionDRBDPeerOptions)
-	// PUT is reserved on the upstream surface but unused by the CLI;
-	// accept-and-merge keeps tooling happy without diverging the
-	// write path.
-	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resource-connections/{a}/{b}",
-		s.handleResourceConnectionDRBDPeerOptions)
-}
-
-// handleResourceConnectionsList returns every (a, b) pair we've
-// recorded props for under the given RD. Empty array when no
-// operator has PATCHed yet — matches golinstor's expected
-// `[]ResourceConnection` shape on the list endpoint.
-func (s *Server) handleResourceConnectionsList(w http.ResponseWriter, r *http.Request) {
-	rd := r.PathValue("rd")
-
-	s.resourceConnections.mu.RLock()
-	defer s.resourceConnections.mu.RUnlock()
-
-	out := make([]map[string]any, 0, len(s.resourceConnections.entries[rd]))
-
-	for key, props := range s.resourceConnections.entries[rd] {
-		nodeA, nodeB := splitPairKey(key)
-
-		propsCopy := make(map[string]string, len(props))
-		maps.Copy(propsCopy, props)
-
-		out = append(out, map[string]any{
-			keyResourceConnectionNodeA: nodeA,
-			keyResourceConnectionNodeB: nodeB,
-			keyResourceConnectionProps: propsCopy,
-		})
+	if paths == nil {
+		paths = []resourceConnectionPath{}
 	}
 
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, paths)
 }
 
-// splitPairKey is the inverse of pairKey — extracts (a, b) from the
-// stored map key. Returned in sorted order; the caller doesn't see
-// the original PATCH ordering since it was discarded at write time.
-func splitPairKey(key string) (string, string) {
-	for i := range len(key) {
-		if key[i] == 0 { // NUL separator
-			return key[:i], key[i+1:]
-		}
-	}
+// handleResourceConnectionPathCreate answers POST. Idempotent on
+// path.Name — re-posting an existing name replaces its addresses
+// rather than appending a duplicate.
+func (s *Server) handleResourceConnectionPathCreate(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	nodeA := r.PathValue("nodeA")
+	nodeB := r.PathValue("nodeB")
 
-	return key, ""
-}
+	var body resourceConnectionPath
 
-// handleResourceConnectionGet returns the per-pair props bag. Empty
-// `props: {}` when the pair has never been PATCHed — matches the
-// upstream shape so golinstor decodes into a zero-prop struct
-// without erroring.
-func (s *Server) handleResourceConnectionGet(w http.ResponseWriter, r *http.Request) {
-	rd := r.PathValue("rd")
-	nodeA := r.PathValue("a")
-	nodeB := r.PathValue("b")
-
-	props := s.resourceConnections.get(rd, nodeA, nodeB)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		keyResourceConnectionNodeA: nodeA,
-		keyResourceConnectionNodeB: nodeB,
-		keyResourceConnectionProps: props,
-	})
-}
-
-// resourceConnectionModifyBody mirrors upstream LINSTOR's
-// `ResourceConnectionModify` shape — the same `override_props` +
-// `delete_props` envelope every other modify endpoint uses (RD-scope
-// `handleRDUpdate`, NodeConnection, …). Keeping the wire shape
-// uniform lets golinstor reuse its serialiser.
-type resourceConnectionModifyBody struct {
-	OverrideProps    map[string]string `json:"override_props,omitempty"`
-	DeleteProps      []string          `json:"delete_props,omitempty"`
-	DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
-}
-
-// handleResourceConnectionDRBDPeerOptions PATCHes the (rd, a, b)
-// props bag. Scenario 5.W04: `linstor resource-connection
-// drbd-peer-options pvc-1 n1 n2 --max-buffers 8192` lands here with
-// `{"override_props": {"DrbdOptions/PeerDevice/max-buffers": "8192"}}`
-// and the registry persists the prop on the ResourceConnection.
-//
-// `--unset-max-buffers` (scenario 5.W02) lands here too via
-// `delete_props: ["DrbdOptions/PeerDevice/max-buffers"]` — same
-// merge semantics as `handleRDUpdate`.
-func (s *Server) handleResourceConnectionDRBDPeerOptions(w http.ResponseWriter, r *http.Request) {
-	rd := r.PathValue("rd")
-	nodeA := r.PathValue("a")
-	nodeB := r.PathValue("b")
-
-	var patch resourceConnectionModifyBody
-
-	err := json.NewDecoder(r.Body).Decode(&patch)
+	err := json.NewDecoder(r.Body).Decode(&body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	s.resourceConnections.merge(rd, nodeA, nodeB, patch.OverrideProps, patch.DeleteProps)
+	if body.Name == "" {
+		writeError(w, http.StatusBadRequest, "path name is required")
 
-	// 204 mirrors `handleNoContent` — the upstream LINSTOR contract
-	// returns an APICallRc envelope on RD modify (we follow there) but
-	// `resource-connection drbd-peer-options` lands as 204 in the
-	// Java implementation, and golinstor accepts both shapes.
+		return
+	}
+
+	err = s.upsertResourceConnectionPath(r.Context(), rdName, nodeA, nodeB, body)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+// upsertResourceConnectionPath does the RD read-modify-write so the
+// HTTP handler stays under funlen. Stores in canonical order so a
+// later GET under either (a, b) or (b, a) reads the same blob and
+// only needs to flip A/B at the wire edge.
+func (s *Server) upsertResourceConnectionPath(ctx context.Context, rdName, nodeA, nodeB string, incoming resourceConnectionPath) error {
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	paths, swap, err := loadPaths(&rd, nodeA, nodeB)
+	if err != nil {
+		return err
+	}
+
+	// Translate the request's A/B into canonical-order A/B before
+	// merging.
+	canonical := incoming
+	if swap {
+		canonical = swapPathAB(incoming)
+	}
+
+	paths = upsertByName(paths, canonical)
+
+	err = storePaths(&rd, nodeA, nodeB, paths)
+	if err != nil {
+		return err
+	}
+
+	err = s.Store.ResourceDefinitions().Update(ctx, &rd)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	return nil
+}
+
+// upsertByName replaces an existing path with the same Name (in place,
+// preserving order) or appends when no match exists.
+func upsertByName(paths []resourceConnectionPath, incoming resourceConnectionPath) []resourceConnectionPath {
+	for i := range paths {
+		if paths[i].Name == incoming.Name {
+			paths[i] = incoming
+
+			return paths
+		}
+	}
+
+	return append(paths, incoming)
+}
+
+// handleResourceConnectionPathDelete answers DELETE on
+// /paths/{name}. Removing the last path also drops the storage key so
+// GET reverts to the canonical empty list.
+func (s *Server) handleResourceConnectionPathDelete(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	nodeA := r.PathValue("nodeA")
+	nodeB := r.PathValue("nodeB")
+	name := r.PathValue("name")
+
+	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	paths, _, err := loadPaths(&rd, nodeA, nodeB)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	paths = deleteByName(paths, name)
+
+	err = storePaths(&rd, nodeA, nodeB, paths)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// deleteByName drops the entry with matching Name. Order-preserving.
+// Returns the input untouched when no match exists — DELETE on a
+// non-existent path is a no-op on success (mirrors upstream LINSTOR's
+// behaviour on `resource-connection path delete`).
+func deleteByName(paths []resourceConnectionPath, name string) []resourceConnectionPath {
+	out := paths[:0]
+
+	for i := range paths {
+		if paths[i].Name == name {
+			continue
+		}
+
+		out = append(out, paths[i])
+	}
+
+	return out
+}
+
+// The dispatcher reads the same `Cozystack/ResourceConnectionPaths/`
+// prop namespace directly off RD.Spec.Props — see
+// pkg/dispatcher/connections.go::connectionsFromRD. We deliberately
+// don't export a "give me the decoded connections" helper here
+// because pkg/rest would form an import cycle with pkg/dispatcher.
+// The prop key + JSON shape are the contract between the two
+// packages; both sides have a comment pointing at the other.

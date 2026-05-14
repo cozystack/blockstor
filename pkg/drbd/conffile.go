@@ -53,35 +53,53 @@ type Resource struct {
 	// before emission for stable output.
 	Options map[string]string
 
-	// Connections carries per-(hostA, hostB) DRBD tuning that lands
-	// inside the matching `connection { ... }` block of the mesh —
-	// scenario 5.W04. Upstream LINSTOR ResourceConnection scope:
-	// `linstor resource-connection drbd-peer-options <rd> <a> <b>
-	// --max-buffers 8192` writes `DrbdOptions/PeerDevice/max-buffers`
-	// on the ResourceConnection, and the .res renderer emits the
-	// option as `max-buffers 8192;` inside `connection { net { ... } }`
-	// for the matching pair only. Empty / unmatched entries leave the
-	// connection block untouched.
-	Connections []Connection
+	// Connections carries explicit per-peer-pair overrides used by
+	// the multi-path-DRBD feature (scenario 3.7, UG9 §"Creating
+	// multiple DRBD paths with LINSTOR"). For any (NodeA, NodeB)
+	// pair present here with a non-empty Paths slice, the rendered
+	// `connection { … }` block emits one `path { host A address …;
+	// host B address …; }` sub-block per Path INSTEAD of the
+	// default `host A address …; host B address …;` lines derived
+	// from each Host's Address. drbd-9 drops the implicit default
+	// path as soon as any explicit path is present, so the renderer
+	// mirrors that.
+	//
+	// Pairs missing from Connections (or present with no Paths)
+	// keep the default render: a single connection block with the
+	// two implicit host-address lines. Pair ordering inside a
+	// ResourceConnection is logical, not lexicographic — the
+	// renderer always emits the entry whose NodeA matches the
+	// lexicographically-smaller host as `host A` of each path.
+	Connections []ResourceConnection
 }
 
-// Connection is a single per-pair DRBD tuning override that lands in
-// the matching `connection { ... }` block of the mesh. The `net { … }`
-// sub-block is the only one we emit today — upstream LINSTOR's
-// `resource-connection drbd-peer-options` keys (max-buffers,
-// ping-timeout, …) all route to the connection's net section, even
-// though the LINSTOR prop namespace puts them under PeerDevice/.
-type Connection struct {
-	// HostA / HostB name the two peers of this connection. Order
-	// doesn't matter — the renderer matches the mesh pair regardless
-	// of which side is HostA.
-	HostA string
-	HostB string
+// ResourceConnection is one peer-pair override used to render
+// multi-path DRBD connections. See Resource.Connections.
+type ResourceConnection struct {
+	// NodeA, NodeB identify the two endpoints — must match the
+	// NodeName of two entries in Resource.Hosts.
+	NodeA string
+	NodeB string
+	// Paths is the explicit list of replication paths. Empty slice
+	// means "fall back to the default render" (renderer treats it
+	// the same as the connection not being present).
+	Paths []ResourcePath
+}
 
-	// NetOptions are arbitrary `connection { net { ... } }` knobs
-	// (max-buffers, ping-timeout, …). Keys are sorted before emission
-	// for stable output. Empty map → no nested `net { }` block.
-	NetOptions map[string]string
+// ResourcePath is one `path { … }` sub-block inside a multi-path
+// connection.
+type ResourcePath struct {
+	// Name is the operator-facing identifier (path1, path2, …).
+	// drbd-9 does not write it to the .res file — DRBD identifies
+	// paths positionally — but we keep it on the Go struct so the
+	// REST layer can do idempotent UPSERT and per-path DELETE.
+	Name string
+	// AddressA, AddressB are the IPv4/IPv6 host addresses for the
+	// `host <NodeA> address …;` / `host <NodeB> address …;` lines
+	// inside the path block. Port is reused from each Host's Port
+	// — drbd uses one port per connection, not per path.
+	AddressA string
+	AddressB string
 }
 
 // Net mirrors the drbd-9 `net { ... }` section.
@@ -304,28 +322,89 @@ func metaField(host *Host, vol Volume) string {
 // host pair with i < j. drbd-9 requires the mesh to be explicit; with
 // N>2 peers an implicit "everyone talks to everyone" doesn't exist.
 //
-// When `conns` carries a Connection entry matching the (i, j) pair
-// (HostA / HostB unordered), a nested `net { … }` block is emitted
-// inside that connection block carrying the per-pair NetOptions —
-// scenario 5.W04 (`resource-connection drbd-peer-options`).
-// Connection entries that don't match any mesh pair are silently
-// ignored; an unmatched HostA / HostB usually means the operator
-// patched a property on a pair that doesn't exist in this resource's
-// host list yet, and the next reconcile that adds the peer will pick
-// the tuning up.
-func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []Connection) {
+// When `conns` carries an entry whose (NodeA, NodeB) matches the
+// pair (in either order) AND has at least one Path, the connection
+// block emits one `path { host A address …; host B address …; }`
+// sub-block per Path instead of the default inline
+// `host A address …; host B address …;` pair. drbd-9 ignores the
+// implicit default path as soon as any explicit path appears, so we
+// drop the default lines from the connection block in that case —
+// otherwise drbdadm-adjust would silently rewrite our .res and
+// trigger phantom reloads on every reconcile.
+func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConnection) {
 	if len(hosts) < minMeshPeers {
 		return
 	}
 
 	for i := range hosts {
-		for j := i + 1; j < len(hosts); j++ {
-			b.WriteString("  connection {\n")
-			fmt.Fprintf(b, "    host %s address %s:%d;\n", hosts[i].NodeName, hosts[i].Address, hosts[i].Port)
-			fmt.Fprintf(b, "    host %s address %s:%d;\n", hosts[j].NodeName, hosts[j].Address, hosts[j].Port)
-			writeConnectionNet(b, lookupConnection(conns, hosts[i].NodeName, hosts[j].NodeName))
-			b.WriteString("  }\n")
+		for k := i + 1; k < len(hosts); k++ {
+			writeOneConnection(b, &hosts[i], &hosts[k], conns)
 		}
+	}
+}
+
+// writeOneConnection emits a single `connection { … }` block for the
+// (hostA, hostB) pair. Either a multi-path block (when conns has an
+// entry with at least one Path) or the default two-line inline pair.
+func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []ResourceConnection) {
+	b.WriteString("  connection {\n")
+
+	if paths := lookupPaths(conns, hostA.NodeName, hostB.NodeName); len(paths) > 0 {
+		writePathBlocks(b, hostA, hostB, paths)
+	} else {
+		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostA.NodeName, hostA.Address, hostA.Port)
+		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostB.NodeName, hostB.Address, hostB.Port)
+	}
+
+	b.WriteString("  }\n")
+}
+
+// lookupPaths returns the explicit Paths for the (a, b) host pair,
+// matching either (NodeA=a, NodeB=b) or the swapped form. Returns
+// nil when no entry matches or the entry carries no paths. The
+// returned slice is oriented so each Path's AddressA belongs to
+// `a` (the lexicographically-first host of the rendered mesh pair),
+// regardless of which order the operator stored on the
+// ResourceConnection — keeps the rendered `host a address …;`
+// line consistent with the on-block address we'd otherwise emit.
+func lookupPaths(conns []ResourceConnection, a, b string) []ResourcePath {
+	for i := range conns {
+		switch {
+		case conns[i].NodeA == a && conns[i].NodeB == b:
+			return conns[i].Paths
+		case conns[i].NodeA == b && conns[i].NodeB == a:
+			return swapPathSides(conns[i].Paths)
+		}
+	}
+
+	return nil
+}
+
+// swapPathSides returns a copy of paths with AddressA/AddressB
+// flipped on every entry. Used when the operator stored a
+// ResourceConnection as (b, a) but the mesh walks (a, b).
+func swapPathSides(paths []ResourcePath) []ResourcePath {
+	if len(paths) == 0 {
+		return nil
+	}
+
+	out := make([]ResourcePath, len(paths))
+	for i, p := range paths {
+		out[i] = ResourcePath{Name: p.Name, AddressA: p.AddressB, AddressB: p.AddressA}
+	}
+
+	return out
+}
+
+// writePathBlocks emits one `path { host hostA … host hostB … }`
+// sub-block per Path. Port is taken from each Host (drbd uses one
+// port per connection, not per path).
+func writePathBlocks(b *strings.Builder, hostA, hostB *Host, paths []ResourcePath) {
+	for _, p := range paths {
+		b.WriteString("    path {\n")
+		fmt.Fprintf(b, "      host %s address %s:%d;\n", hostA.NodeName, p.AddressA, hostA.Port)
+		fmt.Fprintf(b, "      host %s address %s:%d;\n", hostB.NodeName, p.AddressB, hostB.Port)
+		b.WriteString("    }\n")
 	}
 }
 

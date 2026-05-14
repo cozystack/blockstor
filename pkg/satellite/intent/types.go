@@ -42,6 +42,32 @@ type DesiredResource struct {
 	// = default; ["LUKS","STORAGE"] = no DRBD; ["STORAGE"] =
 	// single-replica local mode). Empty == default.
 	LayerStack []string
+
+	// Connections carries the explicit multi-path entries the
+	// dispatcher decoded off RD.Spec.Props (scenario 3.7,
+	// UG9 §"Creating multiple DRBD paths with LINSTOR"). Empty when
+	// the RD has no explicit per-peer paths — the satellite then
+	// falls back to drbd-9's default single-host-pair render.
+	Connections []DesiredConnection
+}
+
+// DesiredConnection is one (peer-pair, paths) entry on a
+// DesiredResource. The satellite's `.res` renderer turns each entry
+// into one `connection { … }` block carrying one `path { … }`
+// sub-block per Path.
+type DesiredConnection struct {
+	NodeA string
+	NodeB string
+	Paths []DesiredConnectionPath
+}
+
+// DesiredConnectionPath is one path inside a DesiredConnection.
+// Name is operator-facing (path1, path2, …) and not emitted into
+// the .res file — drbd identifies paths positionally.
+type DesiredConnectionPath struct {
+	Name     string
+	AddressA string
+	AddressB string
 }
 
 // GetName returns the RD name. Nil-safe.
@@ -114,6 +140,17 @@ func (x *DesiredResource) GetLayerStack() []string {
 	}
 
 	return x.LayerStack
+}
+
+// GetConnections returns the explicit multi-path connection list.
+// Nil-safe; empty slice == no overrides (satellite falls back to the
+// default single-host-pair render).
+func (x *DesiredResource) GetConnections() []DesiredConnection {
+	if x == nil {
+		return nil
+	}
+
+	return x.Connections
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

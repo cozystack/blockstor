@@ -17,206 +17,219 @@ limitations under the License.
 package rest
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// TestResourceConnectionDRBDPeerOptionsW04 pins scenario 5.W04: a
-// PATCH to
-// `/v1/resource-definitions/{rd}/resource-connections/{a}/{b}/drbd-peer-options`
-// carrying `override_props: {"DrbdOptions/PeerDevice/max-buffers":
-// "8192"}` must persist the prop on the (rd, a, b) ResourceConnection
-// — i.e. a subsequent GET of the same pair returns the prop in
-// `props`, while a GET of a DIFFERENT (rd, a, b) triple (different
-// rd OR different pair) returns an empty `props` map.
-//
-// The differentiation from 5.W03 (node-connection scope) is the
-// reason both pinning directions matter: a stray RD-keyed write
-// landing on every connection of every RD would silently break the
-// `--max-buffers` knob's promised scope.
-func TestResourceConnectionDRBDPeerOptionsW04(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
-	defer stop()
-
-	const (
-		rdHot  = "pvc-hot"
-		rdCold = "pvc-cold"
-		nodeA  = "n1"
-		nodeB  = "n2"
-		nodeC  = "n3"
-
-		maxBuffersKey = "DrbdOptions/PeerDevice/max-buffers"
-		maxBuffersVal = "8192"
-	)
-
-	// PATCH the hot RD's (n1, n2) connection only.
-	patchBody := `{"override_props":{"` + maxBuffersKey + `":"` + maxBuffersVal + `"}}`
-	patchURL := base + "/v1/resource-definitions/" + rdHot +
-		"/resource-connections/" + nodeA + "/" + nodeB + "/drbd-peer-options"
-
-	resp := doRequest(t, http.MethodPatch, patchURL, patchBody)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PATCH status: got %d, want 204", resp.StatusCode)
-	}
-
-	// GET the same pair — must surface the prop.
-	gotProps := getResourceConnectionProps(t, base, rdHot, nodeA, nodeB)
-	if gotProps[maxBuffersKey] != maxBuffersVal {
-		t.Errorf("hot (n1, n2) props[%s]=%q want %q (full props: %+v)",
-			maxBuffersKey, gotProps[maxBuffersKey], maxBuffersVal, gotProps)
-	}
-
-	// Scope-pinning #1: different pair on the SAME rd must stay clean.
-	// `n1<->n2` is patched; `n1<->n3` is not.
-	gotOther := getResourceConnectionProps(t, base, rdHot, nodeA, nodeC)
-	if v, ok := gotOther[maxBuffersKey]; ok {
-		t.Errorf("scope leaked across pairs: (n1, n3) sees %s=%q", maxBuffersKey, v)
-	}
-
-	// Scope-pinning #2: same pair on a DIFFERENT rd must stay clean.
-	// `(rdHot, n1, n2)` is patched; `(rdCold, n1, n2)` is not — the
-	// per-(rd, a, b) scope is the whole point of 5.W04 vs. 5.W03.
-	gotCold := getResourceConnectionProps(t, base, rdCold, nodeA, nodeB)
-	if v, ok := gotCold[maxBuffersKey]; ok {
-		t.Errorf("scope leaked across RDs: (rdCold, n1, n2) sees %s=%q", maxBuffersKey, v)
-	}
-}
-
-// TestResourceConnectionPairOrderIndependent pins that the registry
-// keys on the SORTED pair so `linstor resource-connection ... n1 n2`
-// and `... n2 n1` reach the same connection — operators on the CLI
-// don't reliably remember which side is HostA.
-func TestResourceConnectionPairOrderIndependent(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
-	defer stop()
-
-	const (
-		rd            = "pvc-1"
-		maxBuffersKey = "DrbdOptions/PeerDevice/max-buffers"
-		maxBuffersVal = "8192"
-	)
-
-	// PATCH via (n2, n1) ordering.
-	patchURL := base + "/v1/resource-definitions/" + rd +
-		"/resource-connections/n2/n1/drbd-peer-options"
-	patchBody := `{"override_props":{"` + maxBuffersKey + `":"` + maxBuffersVal + `"}}`
-
-	resp := doRequest(t, http.MethodPatch, patchURL, patchBody)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PATCH status: got %d, want 204", resp.StatusCode)
-	}
-
-	// GET via (n1, n2) ordering — must still see the prop.
-	gotProps := getResourceConnectionProps(t, base, rd, "n1", "n2")
-	if gotProps[maxBuffersKey] != maxBuffersVal {
-		t.Errorf("unordered match failed: (n1, n2) GET sees %+v", gotProps)
-	}
-}
-
-// TestResourceConnectionDeletePropsW02 pins the `--unset-max-buffers`
-// path (scenario 5.W02 syntax, applied to the resource-connection
-// scope): a PATCH with `delete_props` drops the key from the
-// connection props bag without touching unrelated keys.
-func TestResourceConnectionDeletePropsW02(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
-	defer stop()
-
-	const (
-		rd            = "pvc-1"
-		nodeA         = "n1"
-		nodeB         = "n2"
-		maxBuffersKey = "DrbdOptions/PeerDevice/max-buffers"
-		pingKey       = "DrbdOptions/Net/ping-timeout"
-	)
-
-	patchURL := base + "/v1/resource-definitions/" + rd +
-		"/resource-connections/" + nodeA + "/" + nodeB + "/drbd-peer-options"
-
-	// Set both keys.
-	resp := doRequest(t, http.MethodPatch, patchURL,
-		`{"override_props":{"`+maxBuffersKey+`":"8192","`+pingKey+`":"100"}}`)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PATCH (set) status: got %d, want 204", resp.StatusCode)
-	}
-
-	// Now unset only max-buffers.
-	resp = doRequest(t, http.MethodPatch, patchURL,
-		`{"delete_props":["`+maxBuffersKey+`"]}`)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PATCH (unset) status: got %d, want 204", resp.StatusCode)
-	}
-
-	props := getResourceConnectionProps(t, base, rd, nodeA, nodeB)
-	if _, ok := props[maxBuffersKey]; ok {
-		t.Errorf("delete_props did not remove key: %+v", props)
-	}
-
-	if props[pingKey] != "100" {
-		t.Errorf("delete_props clobbered unrelated key: %+v", props)
-	}
-}
-
-// getResourceConnectionProps GETs (rd, a, b) and returns the props
-// sub-map. Empty map when the pair has never been PATCHed.
-func getResourceConnectionProps(t *testing.T, base, rd, nodeA, nodeB string) map[string]string {
+// seedRDForConnections seeds a single RD so the resource-connection
+// path handler has something to attach paths to. The RD-attach is the
+// design choice that keeps multi-path state on the parent RD rather
+// than introducing a fresh ResourceConnection CRD — the operator-
+// visible REST surface still looks identical to upstream LINSTOR.
+func seedRDForConnections(t *testing.T, st store.Store, name string) {
 	t.Helper()
 
-	url := base + "/v1/resource-definitions/" + rd +
-		"/resource-connections/" + nodeA + "/" + nodeB
+	err := st.ResourceDefinitions().Create(context.Background(), &apiv1.ResourceDefinition{
+		Name: name,
+	})
+	if err != nil {
+		t.Fatalf("seed RD %q: %v", name, err)
+	}
+}
 
-	resp := httpGet(t, url)
+// TestResourceConnectionPathPostRoundTrip pins scenario 3.7: two
+// successive POSTs add two distinct paths; the subsequent GET returns
+// both in declaration order.
+func TestResourceConnectionPathPostRoundTrip(t *testing.T) {
+	st := store.NewInMemory()
+	seedRDForConnections(t, st, "pvc-1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, body := range []string{
+		`{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"}`,
+		`{"name":"path2","node_a_address":"10.2.2.5","node_b_address":"10.2.2.6"}`,
+	} {
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths", []byte(body))
+
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST %s: status %d, want 201", body, resp.StatusCode)
+		}
+	}
+
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths")
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET status for (%s, %s, %s): got %d, want 200", rd, nodeA, nodeB, resp.StatusCode)
+		t.Fatalf("GET status: got %d, want 200", resp.StatusCode)
 	}
 
-	var body struct {
-		NodeA string            `json:"node_a"`
-		NodeB string            `json:"node_b"`
-		Props map[string]string `json:"props"`
+	var got []map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET: %v", err)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		t.Fatalf("decode GET (%s, %s, %s): %v", rd, nodeA, nodeB, err)
+	if len(got) != 2 {
+		t.Fatalf("paths: got %d entries, want 2: %+v", len(got), got)
 	}
 
-	if body.Props == nil {
-		return map[string]string{}
+	if got[0]["name"] != "path1" || got[0]["node_a_address"] != "10.1.1.5" || got[0]["node_b_address"] != "10.1.1.6" {
+		t.Errorf("paths[0]: got %+v", got[0])
 	}
 
-	return body.Props
+	if got[1]["name"] != "path2" || got[1]["node_a_address"] != "10.2.2.5" || got[1]["node_b_address"] != "10.2.2.6" {
+		t.Errorf("paths[1]: got %+v", got[1])
+	}
 }
 
-// doRequest is a tiny wrapper to PATCH/PUT/POST with a JSON body —
-// kept local to this test file rather than promoted into a shared
-// helper to keep test deltas isolated.
-func doRequest(t *testing.T, method, url, body string) *http.Response {
-	t.Helper()
+// TestResourceConnectionPathPostIdempotentOnName: re-POSTing the same
+// path-name UPSERTs the addresses without creating a duplicate entry.
+// The CLI / golinstor expect this (Java LINSTOR's REST POST on
+// resource-connection paths is documented as an UPSERT on name).
+func TestResourceConnectionPathPostIdempotentOnName(t *testing.T) {
+	st := store.NewInMemory()
+	seedRDForConnections(t, st, "pvc-1")
 
-	req, err := http.NewRequestWithContext(t.Context(), method, url, bytes.NewBufferString(body))
-	if err != nil {
-		t.Fatalf("new request: %v", err)
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	first := `{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"}`
+	second := `{"name":"path1","node_a_address":"10.9.9.5","node_b_address":"10.9.9.6"}`
+
+	for _, body := range []string{first, second} {
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths", []byte(body))
+
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("POST %s: status %d, want 201", body, resp.StatusCode)
+		}
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	resp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths")
+	defer func() { _ = resp.Body.Close() }()
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
+	var got []map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET: %v", err)
 	}
 
-	return resp
+	if len(got) != 1 {
+		t.Fatalf("paths: got %d entries after re-POST, want 1: %+v", len(got), got)
+	}
+
+	if got[0]["node_a_address"] != "10.9.9.5" || got[0]["node_b_address"] != "10.9.9.6" {
+		t.Errorf("UPSERT failed: got %+v, want addresses replaced", got[0])
+	}
+}
+
+// TestResourceConnectionPathDeleteLeavesOthers: DELETE path1 removes
+// only that path; path2 stays.
+func TestResourceConnectionPathDeleteLeavesOthers(t *testing.T) {
+	st := store.NewInMemory()
+	seedRDForConnections(t, st, "pvc-1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	for _, body := range []string{
+		`{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"}`,
+		`{"name":"path2","node_a_address":"10.2.2.5","node_b_address":"10.2.2.6"}`,
+	} {
+		resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths", []byte(body))
+
+		_ = resp.Body.Close()
+	}
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths/path1")
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE status: got %d, want 204", resp.StatusCode)
+	}
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths")
+	defer func() { _ = getResp.Body.Close() }()
+
+	var got []map[string]string
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode GET: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("paths after DELETE: got %d entries, want 1: %+v", len(got), got)
+	}
+
+	if got[0]["name"] != "path2" {
+		t.Errorf("kept the wrong path: %+v", got[0])
+	}
+}
+
+// TestResourceConnectionPathPostUnknownRD: POSTing to a non-existent
+// RD must surface as 404, not as a silent no-op. golinstor reads the
+// ApiCallRc envelope and surfaces the error to the operator.
+func TestResourceConnectionPathPostUnknownRD(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/ghost/resource-connections/n1/n2/paths",
+		[]byte(`{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestResourceConnectionPathOrderIsSymmetric: paths posted under
+// (n1, n2) are retrievable under (n2, n1) with the A/B addresses
+// swapped. The endpoint is logically symmetric — drbd-9 doesn't
+// distinguish "first" and "second" host within a connection.
+func TestResourceConnectionPathOrderIsSymmetric(t *testing.T) {
+	st := store.NewInMemory()
+	seedRDForConnections(t, st, "pvc-1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths",
+		[]byte(`{"name":"path1","node_a_address":"10.1.1.5","node_b_address":"10.1.1.6"}`))
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed POST: status %d, want 201", resp.StatusCode)
+	}
+
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n2/n1/paths")
+	defer func() { _ = getResp.Body.Close() }()
+
+	var got []map[string]string
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("paths: got %d, want 1: %+v", len(got), got)
+	}
+
+	// When queried with (n2, n1), n2's address must appear as A and
+	// n1's as B — that's the contract operators rely on when the
+	// REST surface is the source of truth for what the satellite
+	// will render.
+	if got[0]["node_a_address"] != "10.1.1.6" || got[0]["node_b_address"] != "10.1.1.5" {
+		t.Errorf("swapped query did not swap addresses: %+v", got[0])
+	}
 }

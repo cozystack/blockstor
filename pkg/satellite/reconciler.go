@@ -1276,17 +1276,52 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 	netOpts, resOpts := splitDRBDOptions(opts)
 
 	out, err := drbd.Build(drbd.Resource{
-		Name:    dr.GetName(),
-		Net:     drbd.Net{ProtocolC: true, Options: netOpts},
-		Hosts:   hosts,
-		Volumes: vols,
-		Options: resOpts,
+		Name:        dr.GetName(),
+		Net:         drbd.Net{ProtocolC: true, Options: netOpts},
+		Hosts:       hosts,
+		Volumes:     vols,
+		Options:     resOpts,
+		Connections: buildResConnections(dr),
 	})
 	if err != nil {
 		return "", errors.Wrap(err, "drbd.Build")
 	}
 
 	return out, nil
+}
+
+// buildResConnections translates the DesiredResource's logical
+// connection overrides (scenario 3.7 multi-path) into the .res
+// renderer's drbd.ResourceConnection shape. Empty input returns nil
+// — the renderer then falls back to the default single-host-pair
+// connection block.
+func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
+	src := dr.GetConnections()
+	if len(src) == 0 {
+		return nil
+	}
+
+	out := make([]drbd.ResourceConnection, 0, len(src))
+
+	for _, conn := range src {
+		paths := make([]drbd.ResourcePath, 0, len(conn.Paths))
+
+		for _, p := range conn.Paths {
+			paths = append(paths, drbd.ResourcePath{
+				Name:     p.Name,
+				AddressA: p.AddressA,
+				AddressB: p.AddressB,
+			})
+		}
+
+		out = append(out, drbd.ResourceConnection{
+			NodeA: conn.NodeA,
+			NodeB: conn.NodeB,
+			Paths: paths,
+		})
+	}
+
+	return out
 }
 
 // buildResVolumes turns the per-RD DesiredVolumes into the

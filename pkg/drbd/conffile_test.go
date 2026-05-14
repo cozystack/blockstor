@@ -296,6 +296,83 @@ func TestRenderInternalMetadataDefault(t *testing.T) {
 	}
 }
 
+// TestRenderMultiPathConnection pins scenario 3.7 (UG9 §"Creating
+// multiple DRBD paths with LINSTOR", lines 2187-2256): when a
+// Resource carries an explicit Connection with two Paths between
+// two peers, the rendered `connection { … }` block contains TWO
+// `path { … }` sub-blocks (one per Path) and NOT the inline
+// `host A address …;` / `host B address …;` lines drbd-9 derives
+// from the `on` block addresses when no explicit paths are set.
+//
+// Why this shape: drbd-9 drops the implicit "default" host-pair from
+// the connection block as soon as any `path { … }` sub-block appears.
+// The renderer must mirror that, otherwise we ship .res files that
+// disagree with what `drbdadm adjust` produces and trigger phantom
+// reloads on every reconcile.
+func TestRenderMultiPathConnection(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net:  drbd.Net{ProtocolC: true},
+		Hosts: []drbd.Host{
+			{NodeName: "n1", Address: "10.0.0.1", Port: 7000, NodeID: 0, IsLocal: true},
+			{NodeName: "n2", Address: "10.0.0.2", Port: 7000, NodeID: 1},
+		},
+		Volumes: []drbd.Volume{
+			{Number: 0, Device: "/dev/drbd1000", Disk: "/dev/vg/pvc-1_00000", Minor: 1000},
+		},
+		Connections: []drbd.ResourceConnection{
+			{
+				NodeA: "n1",
+				NodeB: "n2",
+				Paths: []drbd.ResourcePath{
+					{Name: "path1", AddressA: "10.1.1.5", AddressB: "10.1.1.6"},
+					{Name: "path2", AddressA: "10.2.2.5", AddressB: "10.2.2.6"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// Both path blocks must appear inside the connection block, in
+	// declaration order, each with the correct (hostA, hostB)
+	// address pair.
+	wantBlock := "  connection {\n" +
+		"    path {\n" +
+		"      host n1 address 10.1.1.5:7000;\n" +
+		"      host n2 address 10.1.1.6:7000;\n" +
+		"    }\n" +
+		"    path {\n" +
+		"      host n1 address 10.2.2.5:7000;\n" +
+		"      host n2 address 10.2.2.6:7000;\n" +
+		"    }\n" +
+		"  }\n"
+	if !strings.Contains(got, wantBlock) {
+		t.Errorf("multi-path connection block mismatch\n  want:\n%s\n  in:\n%s", wantBlock, got)
+	}
+
+	// The implicit `host n1 address 10.0.0.1:7000; host n2 address
+	// 10.0.0.2:7000;` pair (from the `on` blocks) MUST NOT appear
+	// inside the connection block — drbd-9 drops it when explicit
+	// paths are present.
+	bad := "  connection {\n    host n1 address 10.0.0.1:7000;"
+	if strings.Contains(got, bad) {
+		t.Errorf("unexpected implicit default-path lines in connection block:\n%s", got)
+	}
+
+	// The `on` blocks themselves still carry the default address —
+	// drbd needs them for the listen socket. Sanity check.
+	for _, want := range []string{
+		"  on n1 {\n    address 10.0.0.1:7000;",
+		"  on n2 {\n    address 10.0.0.2:7000;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("on-block default address missing: %q\nin:\n%s", want, got)
+		}
+	}
+}
+
 // TestMultiPathDefaultPathCoexistence pins scenario 3.8 (UG9 §"How
 // adding a new DRBD path affects the default path", lines 2233-2255):
 // when a resource-connection carries one or more explicit `path { … }`
