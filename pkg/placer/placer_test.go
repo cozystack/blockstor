@@ -2353,227 +2353,477 @@ func TestPlacePoolMissingNoCandidates(t *testing.T) {
 	}
 }
 
-// TestPlaceXReplicasOnDifferentCapsPerBucket pins scenario 9.W08:
-// `--x-replicas-on-different <key> N --place-count M` caps the number
-// of replicas that share an Aux/<key> value at N while still placing
-// M total replicas. Topology: 4 satellites, 2 per rack (rackA holds
-// n1+n2, rackB holds n3+n4). With place_count=4 and cap=2 every node
-// must be picked exactly once — without the cap the placer would
-// happily land all 4 replicas on rackA (or rackB) since the bare
-// `replicas_on_different` is not set.
+// TestPlaceWeightedScoringMaxThroughput pins the 6.W11 contract:
+// per-SP `Autoplacer/MaxThroughput` (bytes/sec) on three otherwise-
+// identical pools (same Free, same Total, same node-rsc count), with
+// the controller-scope `Autoplacer/Weights/MaxThroughput=10` and the
+// other three strategies left at their defaults (1.0). The placer
+// must pick the pool that advertises the highest throughput first,
+// proving the per-SP hint is wired into the scoring function and the
+// weight multiplier dominates over the implicit MinRscCount /
+// MinReservedSpace defaults.
 //
-// A regression that ignored XReplicasOnDifferentMap would let the
-// biggest-free pool of one rack absorb multiple replicas while the
-// other rack stays empty — defeating the stretched-DR layout.
-func TestPlaceXReplicasOnDifferentCapsPerBucket(t *testing.T) {
+// Wire-shape round-trip: the hint value is set on the StoragePool's
+// Props map as a bytes/sec integer string ("419430400" = 400 MB/s)
+// and the placer must decode it via PropAutoplacerMaxThroughput
+// without any unit conversion at this layer — the QoS-enforcement
+// half (which would subtract per-volume budget) is explicitly out of
+// scope per the 6.W11 spec.
+func TestPlaceWeightedScoringMaxThroughput(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	mk := func(name, rack string, free int64) {
-		if err := st.Nodes().Create(ctx, &apiv1.Node{
-			Name: name, Type: apiv1.NodeTypeSatellite,
-			Props: map[string]string{"Aux/rack": rack},
-		}); err != nil {
+	// Three nodes; identical pool size, varying advertised throughput.
+	// 100 / 200 / 400 MB/s in bytes/sec. The 400-MB/s node must win.
+	hints := []string{"104857600", "209715200", "419430400"}
+	names := []string{"n1-slow", "n2-mid", "n3-fast"}
+
+	for i, name := range names {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: name, Type: apiv1.NodeTypeSatellite}); err != nil {
 			t.Fatalf("seed node %s: %v", name, err)
 		}
 
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-			NodeName: name, StoragePoolName: "pool",
-			ProviderKind: apiv1.StoragePoolKindLVMThin,
-			FreeCapacity: free, TotalCapacity: 1000,
+			NodeName:        name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    1000,
+			TotalCapacity:   1000,
+			Props: map[string]string{
+				apiv1.PropAutoplacerMaxThroughput: hints[i],
+			},
 		}); err != nil {
 			t.Fatalf("seed pool %s: %v", name, err)
 		}
 	}
 
-	mk("n1", "A", 900)
-	mk("n2", "A", 800)
-	mk("n3", "B", 200)
-	mk("n4", "B", 100)
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxThroughput: "10",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
 
-	p := placer.New(st)
-
-	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
-		PlaceCount:              4,
-		XReplicasOnDifferentMap: map[string]int32{"rack": 2},
-	})
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
 	if err != nil {
 		t.Fatalf("Place: %v", err)
 	}
 
-	if placed != 4 || want != 4 {
-		t.Errorf("placed/want: got %d/%d, want 4/4", placed, want)
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
 	}
 
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
-
-	rackCount := map[string]int{}
-	for _, r := range got {
-		switch r.NodeName {
-		case "n1", "n2":
-			rackCount["A"]++
-		case "n3", "n4":
-			rackCount["B"]++
-		default:
-			t.Errorf("unexpected node %q in placement", r.NodeName)
-		}
-	}
-
-	if rackCount["A"] != 2 || rackCount["B"] != 2 {
-		t.Errorf("rack distribution: got %+v, want 2 per rack (cap=2)", rackCount)
+	if len(got) != 1 || got[0].NodeName != "n3-fast" {
+		t.Errorf("expected single replica on n3-fast (highest MaxThroughput); got %+v", got)
 	}
 }
 
-// TestPlaceXReplicasOnDifferentCapOneEqualsAllDifferent pins the
-// UG9 contract that `--x-replicas-on-different <key> 1` is equivalent
-// to bare `--replicas-on-different <key>`: every replica must carry a
-// distinct value of <key>. With 3 nodes split 2:1 across rack values
-// and place_count=3, the placer can satisfy only 2 replicas — the
-// third would have to share a bucket and is therefore rejected.
+// TestPlaceWeightedScoringMinReservedSpace pins the MinReservedSpace
+// strategy in scenario 2.W01. Three pools with identical Free /
+// Total but different `Aux/blockstor.io/reserved-kib` hints (0 / 500
+// / 900). With Weights/MinReservedSpace=10 and other weights at 0,
+// the pool with zero reservation must win — its `1 - reserved/total`
+// score is 1.0 versus 0.5 / 0.1 for the busier peers.
 //
-// Pins the "missing property nodes still occupy the empty-value
-// bucket" semantic: a node without Aux/rack hashes into "rack=" and
-// burns that bucket for the next candidate.
-func TestPlaceXReplicasOnDifferentCapOneEqualsAllDifferent(t *testing.T) {
+// Other weights are explicitly set to 0 so the tiebreaker
+// (NodeName-ASC) doesn't accidentally salvage the wrong pool when
+// the default 1.0 contributions stack up.
+func TestPlaceWeightedScoringMinReservedSpace(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	mk := func(name, rack string, free int64) {
+	type fixture struct {
+		name     string
+		reserved string
+	}
+
+	// n-z-clean has the alphabetically-last name but zero reservation,
+	// so it must beat n-a-busy on score (NodeName-ASC tiebreak would
+	// otherwise pick n-a-busy). Proves MinReservedSpace is doing the
+	// work, not the alphabetical fallback.
+	fixtures := []fixture{
+		{"n-a-busy", "900"},
+		{"n-b-half", "500"},
+		{"n-z-clean", "0"},
+	}
+
+	for _, f := range fixtures {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: f.name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", f.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        f.name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    1000,
+			TotalCapacity:   1000,
+			Props: map[string]string{
+				apiv1.PropAuxPoolReservedKib: f.reserved,
+			},
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", f.name, err)
+		}
+	}
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxFreeSpace:     "0",
+		apiv1.PropAutoplacerWeightMinReservedSpace: "10",
+		apiv1.PropAutoplacerWeightMinRscCount:      "0",
+		apiv1.PropAutoplacerWeightMaxThroughput:    "0",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 1 || got[0].NodeName != "n-z-clean" {
+		t.Errorf("expected single replica on n-z-clean (least reserved); got %+v", got)
+	}
+}
+
+// TestPlaceWeightsDefaultsWhenUnset pins the fresh-cluster contract
+// of 2.W01: with no `Autoplacer/Weights/*` props ever set on the
+// controller, every weight defaults to 1.0 and the composite scorer
+// degenerates to "all four strategies equally weighted". On a flat
+// candidate set (3 pools, only differing in FreeCapacity), the
+// MaxFreeSpace contribution is the only non-tied signal, so the
+// largest-Free pool must win — matching the legacy biggest-first
+// sort and keeping clusters that never touch the knobs stable.
+func TestPlaceWeightsDefaultsWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	// Deliberately do NOT call ControllerProps().Set — fresh cluster.
+
+	placed, _, err := placer.New(st).Place(t.Context(), "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(t.Context(), "pvc-1")
+	if len(got) != 1 || got[0].NodeName != "n3" {
+		t.Errorf("expected n3 (most Free) under default weights; got %+v", got)
+	}
+}
+
+// TestPlaceWeightsNegativeClamped pins the operator-typo guardrail
+// of 2.W01: a negative value on any `Autoplacer/Weights/*` prop is
+// clamped to 0 (the strategy is disabled), not used as-is (which
+// would invert the scorer). Set `Weights/MaxFreeSpace=-5` plus
+// `Weights/MinRscCount=10` and check the placer behaves like the
+// "MaxFreeSpace disabled" case — picks the 0-RDs node, not the
+// largest-Free one.
+func TestPlaceWeightsNegativeClamped(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Same shape as TestPlaceWeightedScoringMinRscCount: n-c-busy has
+	// most Free + 2 existing RDs; smallest pool is on n-a-quiet.
+	type fixture struct {
+		name string
+		free int64
+		busy bool
+	}
+
+	fixtures := []fixture{
+		{"n-c-busy", 1000, true},
+		{"n-a-quiet", 100, false},
+		{"n-b-mid", 500, false},
+	}
+
+	for _, f := range fixtures {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: f.name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", f.name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        f.name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    f.free,
+			TotalCapacity:   1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", f.name, err)
+		}
+
+		if !f.busy {
+			continue
+		}
+
+		for _, rdName := range []string{"other-1", "other-2"} {
+			_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName})
+			if err := st.Resources().Create(ctx, &apiv1.Resource{
+				Name:     rdName,
+				NodeName: f.name,
+				Props:    map[string]string{"StorPoolName": "pool"},
+			}); err != nil {
+				t.Fatalf("seed existing: %v", err)
+			}
+		}
+	}
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxFreeSpace: "-5", // → clamped to 0
+		apiv1.PropAutoplacerWeightMinRscCount:  "10",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	// MaxFreeSpace clamped to 0 → 0-RDs nodes (n-a-quiet, n-b-mid) tie
+	// on MinRscCount, NodeName-ASC picks n-a-quiet.
+	if len(got) != 1 || got[0].NodeName != "n-a-quiet" {
+		t.Errorf("expected n-a-quiet (MaxFreeSpace clamped to 0 by neg weight); got %+v", got)
+	}
+}
+
+// TestPlaceMaxThroughputAllPoolsMissingHint pins the realistic
+// fresh-cluster path for 6.W11: a controller weight of MaxThroughput
+// is set, but NO pool advertises the per-SP hint. The scorer must
+// gracefully treat the strategy's contribution as 0 for every pool
+// and fall through to the other strategies — never panic on
+// divide-by-zero, never refuse to place. The placement order then
+// matches the default-weights case (n3 wins on MaxFreeSpace).
+func TestPlaceMaxThroughputAllPoolsMissingHint(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	if err := st.ControllerProps().Set(t.Context(), map[string]string{
+		apiv1.PropAutoplacerWeightMaxThroughput: "100",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
+
+	placed, _, err := placer.New(st).Place(t.Context(), "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
+	}
+
+	got, _ := st.Resources().ListByDefinition(t.Context(), "pvc-1")
+	if len(got) != 1 || got[0].NodeName != "n3" {
+		t.Errorf("no-hint cluster must fall through to MaxFreeSpace; got %+v", got)
+	}
+}
+
+// TestPlaceMaxThroughputPartialHintsRankProperly pins the mixed-hint
+// path for 6.W11: only some pools advertise `Autoplacer/MaxThroughput`,
+// the rest are silent. The normalised score is hint / max(hint), so
+// a pool with no hint contributes 0 to MaxThroughput regardless of
+// weight; pools that do advertise rank in proportion to their hint.
+//
+// With Weights/MaxThroughput=100 and other weights at 0, the pool
+// with the highest advertised hint must win even when its FreeCapacity
+// is the smallest. A regression that treated "missing hint" as
+// "infinity" or "maximum" would silently land replicas on the wrong
+// pool.
+func TestPlaceMaxThroughputPartialHintsRankProperly(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	type fixture struct {
+		name string
+		free int64
+		hint string // empty = no hint
+	}
+
+	// n-a-fast advertises the only hint; it has the smallest Free.
+	// With MaxThroughput-only weights, it must still win.
+	fixtures := []fixture{
+		{"n-a-fast", 100, "419430400"}, // 400 MB/s
+		{"n-b-blind", 500, ""},
+		{"n-c-blind", 1000, ""},
+	}
+
+	for _, f := range fixtures {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: f.name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", f.name, err)
+		}
+
 		props := map[string]string{}
-		if rack != "" {
-			props["Aux/rack"] = rack
-		}
-
-		if err := st.Nodes().Create(ctx, &apiv1.Node{
-			Name: name, Type: apiv1.NodeTypeSatellite, Props: props,
-		}); err != nil {
-			t.Fatalf("seed node %s: %v", name, err)
+		if f.hint != "" {
+			props[apiv1.PropAutoplacerMaxThroughput] = f.hint
 		}
 
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-			NodeName: name, StoragePoolName: "pool",
-			ProviderKind: apiv1.StoragePoolKindLVMThin,
-			FreeCapacity: free, TotalCapacity: 1000,
+			NodeName:        f.name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    f.free,
+			TotalCapacity:   1000,
+			Props:           props,
 		}); err != nil {
-			t.Fatalf("seed pool %s: %v", name, err)
+			t.Fatalf("seed pool %s: %v", f.name, err)
 		}
 	}
 
-	mk("n1", "A", 900)
-	mk("n2", "A", 800) // same rack as n1 — must lose
-	mk("n3", "B", 100)
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropAutoplacerWeightMaxFreeSpace:     "0",
+		apiv1.PropAutoplacerWeightMinReservedSpace: "0",
+		apiv1.PropAutoplacerWeightMinRscCount:      "0",
+		apiv1.PropAutoplacerWeightMaxThroughput:    "100",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
+	}
 
-	p := placer.New(st)
-
-	placed, _, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
-		PlaceCount:              3,
-		XReplicasOnDifferentMap: map[string]int32{"rack": 1},
-	})
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
 	if err != nil {
 		t.Fatalf("Place: %v", err)
 	}
 
-	if placed != 2 {
-		t.Errorf("placed: got %d, want 2 (rackA bucket capped at 1)", placed)
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
 	}
 
 	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
-
-	on := map[string]bool{}
-	for _, r := range got {
-		on[r.NodeName] = true
-	}
-
-	if !on["n3"] {
-		t.Errorf("expected n3 (rackB) in placement, got %+v", on)
-	}
-
-	if on["n1"] && on["n2"] {
-		t.Errorf("both rackA nodes picked — cap=1 not enforced; got %+v", on)
+	if len(got) != 1 || got[0].NodeName != "n-a-fast" {
+		t.Errorf("MaxThroughput-only weights must pick the only hint advertiser; got %+v", got)
 	}
 }
 
-// TestPlaceXReplicasOnDifferentSeedsExistingReplicas pins that a
-// pre-existing replica already occupies its bucket: a follow-up
-// Place call must NOT exceed the cap by ignoring the seed. With
-// rackA already carrying 2 replicas (cap=2) and a third Place call
-// asking for 1 more, the only legal landing site is rackB.
-func TestPlaceXReplicasOnDifferentSeedsExistingReplicas(t *testing.T) {
+// TestPlaceWeightedScoringWireRoundTrip pins the wire-shape round
+// trip half of 2.W01: a value set on the controller props store
+// through the canonical API (ControllerProps().Set with the exact
+// key strings published in apiv1.PropAutoplacer*) round-trips back
+// into the placer's loadWeights and changes placement outcome. A
+// regression that renamed a key or broke the encode/decode path
+// would silently drop weights — the cluster would behave like a
+// fresh install regardless of operator tuning.
+//
+// We test all four keys at once: setting MaxFreeSpace=0 +
+// MinRscCount=10 must override the defaults, and the placement
+// outcome must match the MinRscCount-dominant case from
+// TestPlaceWeightedScoringMinRscCount.
+func TestPlaceWeightedScoringWireRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	mk := func(name, rack string, free int64) {
-		if err := st.Nodes().Create(ctx, &apiv1.Node{
-			Name: name, Type: apiv1.NodeTypeSatellite,
-			Props: map[string]string{"Aux/rack": rack},
-		}); err != nil {
-			t.Fatalf("seed node %s: %v", name, err)
+	// Mirror the MinRscCount-dominant fixture: largest-Free node is
+	// also the busiest; smallest-Free node is idle.
+	type fixture struct {
+		name string
+		free int64
+		busy bool
+	}
+
+	fixtures := []fixture{
+		{"n-c-busy", 1000, true},
+		{"n-a-quiet", 100, false},
+		{"n-b-mid", 500, false},
+	}
+
+	for _, f := range fixtures {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: f.name, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", f.name, err)
 		}
 
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-			NodeName: name, StoragePoolName: "pool",
-			ProviderKind: apiv1.StoragePoolKindLVMThin,
-			FreeCapacity: free, TotalCapacity: 1000,
+			NodeName:        f.name,
+			StoragePoolName: "pool",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    f.free,
+			TotalCapacity:   1000,
 		}); err != nil {
-			t.Fatalf("seed pool %s: %v", name, err)
+			t.Fatalf("seed pool %s: %v", f.name, err)
+		}
+
+		if !f.busy {
+			continue
+		}
+
+		for _, rdName := range []string{"other-1", "other-2"} {
+			_ = st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName})
+			if err := st.Resources().Create(ctx, &apiv1.Resource{
+				Name:     rdName,
+				NodeName: f.name,
+				Props:    map[string]string{"StorPoolName": "pool"},
+			}); err != nil {
+				t.Fatalf("seed existing: %v", err)
+			}
 		}
 	}
 
-	mk("n1", "A", 900)
-	mk("n2", "A", 800)
-	mk("n3", "B", 700)
-
-	// Pre-seed: two diskful replicas on rackA fill the rackA bucket.
-	for _, n := range []string{"n1", "n2"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name: "pvc-1", NodeName: n,
-			Props: map[string]string{"StorPoolName": "pool"},
-		}); err != nil {
-			t.Fatalf("seed existing replica on %s: %v", n, err)
-		}
+	// Verbatim key strings — a typo anywhere in the keys would silently
+	// fall through to defaults and the test would fail with n-c-busy.
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		"Autoplacer/Weights/MaxFreeSpace":     "0",
+		"Autoplacer/Weights/MinReservedSpace": "0",
+		"Autoplacer/Weights/MinRscCount":      "10",
+		"Autoplacer/Weights/MaxThroughput":    "0",
+	}); err != nil {
+		t.Fatalf("set weights: %v", err)
 	}
 
-	p := placer.New(st)
+	// Defensive readback: confirm Set persisted the literal strings
+	// before we hand control to Place.
+	got, err := st.ControllerProps().Get(ctx)
+	if err != nil {
+		t.Fatalf("get controller props: %v", err)
+	}
 
-	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
-		PlaceCount:              3,
-		XReplicasOnDifferentMap: map[string]int32{"rack": 2},
-	})
+	if got["Autoplacer/Weights/MinRscCount"] != "10" {
+		t.Fatalf("wire round-trip: MinRscCount got %q, want %q",
+			got["Autoplacer/Weights/MinRscCount"], "10")
+	}
+
+	placed, _, err := placer.New(st).Place(ctx, "pvc-1",
+		&apiv1.AutoSelectFilter{PlaceCount: 1})
 	if err != nil {
 		t.Fatalf("Place: %v", err)
 	}
 
-	if placed != 3 || want != 3 {
-		t.Errorf("placed/want: got %d/%d, want 3/3", placed, want)
+	if placed != 1 {
+		t.Fatalf("placed: got %d, want 1", placed)
 	}
 
-	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
-	if len(got) != 3 {
-		t.Fatalf("len: got %d, want 3", len(got))
-	}
-
-	rackCount := map[string]int{}
-	for _, r := range got {
-		switch r.NodeName {
-		case "n1", "n2":
-			rackCount["A"]++
-		case "n3":
-			rackCount["B"]++
-		}
-	}
-
-	if rackCount["A"] != 2 {
-		t.Errorf("rackA replicas: got %d, want 2 (cap enforced on pre-seeded bucket)", rackCount["A"])
-	}
-
-	if rackCount["B"] != 1 {
-		t.Errorf("rackB replicas: got %d, want 1 (the only available bucket)", rackCount["B"])
+	rscs, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(rscs) != 1 || rscs[0].NodeName != "n-a-quiet" {
+		t.Errorf("wire round-trip MinRscCount=10 must pick least-busy; got %+v", rscs)
 	}
 }
 

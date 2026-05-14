@@ -1038,11 +1038,18 @@ func reservedKib(pool *apiv1.StoragePool) int64 {
 	return v
 }
 
-// throughputHint reads the optional `Aux/throughput-mbps` pool prop.
-// Missing/unparseable returns 0 — the MaxThroughput strategy treats it
-// as "unknown" and the pool contributes 0 to that strategy.
+// throughputHint reads the optional `Autoplacer/MaxThroughput` pool
+// prop (bytes/sec — scenario 6.W11, mirrors upstream LINSTOR's
+// `Autoplacer/MaxThroughput` long). Missing/unparseable returns 0 —
+// the MaxThroughput strategy treats it as "unknown" and the pool
+// contributes 0 to that strategy.
+//
+// Unit is bytes/sec (integer), but we decode through float64 so the
+// composite scorer can normalise without a second int→float cast.
+// Negative values clamp to 0 — an operator typo must not invert the
+// strategy.
 func throughputHint(pool *apiv1.StoragePool) float64 {
-	raw := pool.Props[apiv1.PropAuxPoolThroughputMBps]
+	raw := pool.Props[apiv1.PropAutoplacerMaxThroughput]
 	if raw == "" {
 		return 0
 	}

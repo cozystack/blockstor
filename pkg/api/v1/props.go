@@ -53,8 +53,8 @@ const (
 	// rank lower.
 	PropAutoplacerWeightMinRscCount = "Autoplacer/Weights/MinRscCount"
 	// PropAutoplacerWeightMaxThroughput scales the per-pool
-	// `Aux/throughput-mbps` advertised hint, normalised across the
-	// candidate set. Pools without the hint contribute 0 to this
+	// `Autoplacer/MaxThroughput` advertised hint, normalised across
+	// the candidate set. Pools without the hint contribute 0 to this
 	// strategy.
 	PropAutoplacerWeightMaxThroughput = "Autoplacer/Weights/MaxThroughput"
 
@@ -62,10 +62,19 @@ const (
 	// reserved (non-Free) capacity in KiB. Used by the
 	// MinReservedSpace strategy when present.
 	PropAuxPoolReservedKib = "Aux/blockstor.io/reserved-kib"
-	// PropAuxPoolThroughputMBps is the optional pool-scope advertised
-	// throughput hint in MB/s. Used by the MaxThroughput strategy
-	// when present.
-	PropAuxPoolThroughputMBps = "Aux/throughput-mbps"
+	// PropAutoplacerMaxThroughput is the per-StoragePool advertised
+	// maximum throughput in bytes/sec (scenario 6.W11, mirrors
+	// upstream LINSTOR's `Autoplacer/MaxThroughput`). Consumed by
+	// the placer's MaxThroughput scoring strategy: the per-pool
+	// score is hint / max(hint_in_candidate_set), so a pool that
+	// advertises 2x the throughput of its peers scores 1.0 against
+	// peers' 0.5.
+	//
+	// 6.W11 explicitly notes that the *enforcement* half — subtract
+	// per-volume IO budget from the pool's running balance — depends
+	// on QoS (wave1 7.22) which is out-of-scope. This key is the
+	// SCORING half only.
+	PropAutoplacerMaxThroughput = "Autoplacer/MaxThroughput"
 )
 
 // ControllerPropsName is the singleton row key for the controller-
