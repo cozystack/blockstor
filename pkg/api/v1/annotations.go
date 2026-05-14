@@ -31,6 +31,40 @@ package v1
 // is the neutral, dependency-free shared layer both already import.
 const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
 
+// AutoDiskfulDeadlineAnnotation is stamped on an RD when the
+// AutoDiskfulReconciler first observes a diskful-replica deficit
+// (count < SelectFilter.PlaceCount) and the effective
+// `DrbdOptions/auto-diskful` prop (minutes) is positive. The value is
+// the RFC3339 wall-clock deadline at which the reconciler will promote
+// a diskless replica to diskful (toggle-disk shape: drop DISKLESS
+// flag, stamp StorPoolName) to refill the deficit.
+//
+// The annotation is stripped on the next reconcile that observes the
+// deficit gone — either the operator added a replica manually, the
+// reconciler promoted one, or the operator dropped place_count. This
+// keeps the "deadline in the past" check from getting stuck firing
+// repeatedly after the cluster is back at full health.
+//
+// Scenario 7.W03 — UG9 §"Auto-diskful and related options" (lines
+// 4349-4425). The prop hierarchy is Controller → RG → RD: lower scope
+// wins. AutoDiskfulPropKey + this annotation are defined here so the
+// REST writer and controller reader share a single source of truth.
+const AutoDiskfulDeadlineAnnotation = "blockstor.io/auto-diskful-deadline"
+
+// AutoDiskfulPropKey is the upstream-LINSTOR property name for the
+// auto-diskful timer (minutes). Set on ControllerProps for cluster-
+// wide default, or on RG / RD props to override per-template /
+// per-RD. A non-positive / unparseable value disables the feature
+// at that scope; the resolver falls back to the next layer.
+const AutoDiskfulPropKey = "DrbdOptions/auto-diskful"
+
+// AutoDiskfulAllowCleanupPropKey gates the post-promotion cleanup of
+// excess Secondary replicas. Default (unset / "true") cleans up;
+// "false" leaves the extra diskless in place. Scenario 7.W03 wires
+// only the promotion half — cleanup is a follow-up, but the key is
+// reserved here so both consumers stay in sync.
+const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
+
 // PeerChangedAnnotation is stamped by the REST `handleResourceDelete`
 // handler on every SURVIVING sibling Resource CRD when one peer of an
 // RD is dropped. The annotation value is an RFC3339Nano timestamp the
