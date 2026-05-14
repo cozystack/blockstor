@@ -171,13 +171,25 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 }
 
 // PoolStatus reads `zpool list -p` for free/total bytes.
+//
+// An empty `zpool list` response (operator ran `zpool destroy` out
+// of band) is surfaced as a `pool %q not found` error so the
+// satellite's writeCapacity loop flips Status.PoolMissing=true and
+// the wire view in `linstor sp l` lands state=Faulty. Without this
+// check, an empty stdout would slip through as success-with-no-data
+// and the pool would silently report state=Ok with zeroed capacity.
 func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 	out, err := p.exec.Run(ctx, "zpool", "list", "-H", "-p", "-o", "size,free", p.cfg.Pool)
 	if err != nil {
 		return storage.PoolStatus{}, errors.Wrapf(err, "zpool list %s", p.cfg.Pool)
 	}
 
-	parts := strings.Split(strings.TrimSpace(string(out)), "\t")
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return storage.PoolStatus{}, errors.Errorf("zpool %s not found", p.cfg.Pool)
+	}
+
+	parts := strings.Split(line, "\t")
 	if len(parts) != zpoolListCols {
 		return storage.PoolStatus{}, errors.Errorf("zpool list: unexpected output %q", out)
 	}

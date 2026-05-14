@@ -392,10 +392,17 @@ func TestFileThinReportsSupportsSnapshotsTrue(t *testing.T) {
 	}
 }
 
-// TestPoolStatusErrorWrapsOnMissingDir pins the statfs-error wrap:
-// when the configured Dir doesn't exist (operator typo, mount race,
-// missing privilege), PoolStatus must surface an error tagged with
-// the "statfs" keyword so operators can grep it.
+// TestPoolStatusErrorWrapsOnMissingDir pins the missing-dir error
+// shape: when the configured Dir doesn't exist (operator typo,
+// mount race, missing privilege, or `rm -rf` of the backing
+// directory), PoolStatus MUST surface an error whose message
+// contains "not found".
+//
+// Issue 74: the satellite's writeCapacity loop reads "not found"
+// from any backend's PoolStatus error as the "pool absent" signal
+// that flips Status.PoolMissing=true so `linstor sp l` lands
+// state=Faulty rather than silently staying state=Ok with zeroed
+// capacity.
 func TestPoolStatusErrorWrapsOnMissingDir(t *testing.T) {
 	t.Parallel()
 
@@ -407,7 +414,8 @@ func TestPoolStatusErrorWrapsOnMissingDir(t *testing.T) {
 		t.Fatalf("PoolStatus on missing dir: got nil, want error")
 	}
 
-	if msg := err.Error(); !strings.Contains(msg, "statfs") {
-		t.Errorf("error wrap: got %q, want substring \"statfs\"", msg)
+	if msg := err.Error(); !strings.Contains(msg, "not found") {
+		t.Errorf("error message should mention %q to mark the pool absent; got %q",
+			"not found", msg)
 	}
 }

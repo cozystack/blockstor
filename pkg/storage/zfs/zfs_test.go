@@ -331,6 +331,32 @@ func TestPoolStatusBadColumns(t *testing.T) {
 	}
 }
 
+// TestPoolStatusMissingZPoolEmptyOutput pins Issue 74: when the
+// operator destroys the ZFS pool out-of-band (`zpool destroy`),
+// `zpool list -H -p -o size,free <pool>` returns empty stdout in
+// some configurations (or exit 0 + empty stdout in tooling chains).
+// `PoolStatus` MUST surface that as an error whose message mentions
+// "not found" so the satellite's writeCapacity loop flips
+// `Status.PoolMissing=true` and the wire view in `linstor sp l`
+// lands state=Faulty rather than silently keeping state=Ok with
+// zeroed capacity.
+func TestPoolStatusMissingZPoolEmptyOutput(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// No Expect — FakeExec returns empty stdout + nil error.
+
+	p := zfs.NewProvider(zfs.Config{Pool: "blockstor-zfs"}, fx)
+
+	_, err := p.PoolStatus(t.Context())
+	if err == nil {
+		t.Fatalf("expected error on empty zpool list output, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error message should mention %q to mark the pool absent; got %q",
+			"not found", err.Error())
+	}
+}
+
 // TestPoolStatusBadNumbers: well-shaped output with non-numeric
 // fields → ParseInt error, no panic.
 func TestPoolStatusBadNumbers(t *testing.T) {

@@ -304,6 +304,10 @@ func TestThinDeleteSnapshot(t *testing.T) {
 // TestThinPoolStatusEmptyOutput: empty `lvs` output → "thin pool not
 // found" error rather than panic. Matches the satellite's expected
 // fail-loud path on a misconfigured pool name.
+//
+// Issue 74 follow-up: the error message MUST contain "not found"
+// because the satellite's writeCapacity loop relies on it as the
+// "pool absent" signal that flips Status.PoolMissing=true.
 func TestThinPoolStatusEmptyOutput(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/missing",
@@ -313,7 +317,12 @@ func TestThinPoolStatusEmptyOutput(t *testing.T) {
 
 	_, err := p.PoolStatus(t.Context())
 	if err == nil {
-		t.Errorf("expected error on empty lvs output")
+		t.Fatalf("expected error on empty lvs output")
+	}
+
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("error message should mention %q to mark the pool absent; got %q",
+			"not found", err.Error())
 	}
 }
 

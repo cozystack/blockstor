@@ -216,6 +216,21 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 // to match upstream and avoid promising a feature the backend can't
 // implement efficiently (fallocate-backed files don't reflink).
 func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
+	// An ENOENT on statfs (operator deleted the backing directory
+	// out of band) is surfaced as a `pool dir %q not found` error
+	// so the satellite's writeCapacity loop flips
+	// Status.PoolMissing=true and the wire view in `linstor sp l`
+	// lands state=Faulty rather than silently staying state=Ok
+	// with zeroed capacity.
+	_, err := os.Stat(p.cfg.Dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return storage.PoolStatus{}, errors.Errorf("pool dir %s not found", p.cfg.Dir)
+		}
+
+		return storage.PoolStatus{}, errors.Wrapf(err, "stat %s", p.cfg.Dir)
+	}
+
 	free, total, err := diskFree(p.cfg.Dir)
 	if err != nil {
 		return storage.PoolStatus{}, errors.Wrapf(err, "statfs %s", p.cfg.Dir)
