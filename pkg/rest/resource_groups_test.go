@@ -266,6 +266,142 @@ func TestResourceGroupsUpdateBadJSON(t *testing.T) {
 	}
 }
 
+// TestRGModifyStampsRebalanceAnnotationOnPlaceCountIncrease: Bug 60.
+// Raising PlaceCount on `linstor rg modify` must stamp the
+// `blockstor.io/rebalance-pending` annotation onto the persisted RG
+// so the controller-side reconciler picks up the deferred autoplace
+// pass. Mirrors upstream LINSTOR's `CtrlRscGrpApiCallHandler.modify`
+// RescheduleAutoPlace hook — see docs/cli-parity-audit-2026-05-14.md
+// row #41.
+func TestRGModifyStampsRebalanceAnnotationOnPlaceCountIncrease(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	stamp, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]
+	if !ok {
+		t.Fatalf("annotation %q not stamped; got annotations=%v",
+			apiv1.AnnotationRGRebalancePending, got.Annotations)
+	}
+
+	if stamp == "" {
+		t.Errorf("rebalance-pending stamp must be a non-empty RFC3339 timestamp; got %q", stamp)
+	}
+}
+
+// TestRGModifyNoAnnotationOnPlaceCountDecrease: scale-DOWN is not a
+// rebalance trigger. Upstream LINSTOR's rebalance is strictly
+// additive — shedding replicas requires explicit `linstor r d`. So a
+// PUT that lowers PlaceCount must NOT stamp the rebalance annotation
+// (no churn of the reconciler, no surprise replica deletions).
+func TestRGModifyNoAnnotationOnPlaceCountDecrease(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 2},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+		t.Errorf("scale-down must not stamp rebalance annotation; got %v", got.Annotations)
+	}
+}
+
+// TestRGModifyNoAnnotationOnNoOp: a PUT that doesn't touch the
+// placement-affecting filter (here: prop-only override) must not
+// stamp the rebalance annotation. The existing reconciler runs on
+// every CRD change anyway, but we keep the explicit trigger narrow
+// so operators can grep for "actual rebalance scheduled" rather than
+// chasing noise from every prop write.
+func TestRGModifyNoAnnotationOnNoOp(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 3},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Prop-only patch: zero-value SelectFilter, just an OverrideProps
+	// entry. The handler must merge the prop, leave SelectFilter
+	// alone, and NOT stamp the rebalance annotation.
+	body, _ := json.Marshal(apiv1.ResourceGroup{
+		OverrideProps: map[string]string{"DrbdOptions/auto-quorum": "io-error"},
+	})
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if _, ok := got.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+		t.Errorf("no-op modify must not stamp rebalance annotation; got %v", got.Annotations)
+	}
+
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("prop-only patch wiped SelectFilter; got %+v", got.SelectFilter)
+	}
+}
+
 // TestResourceGroupsDeleteMissingRG: DELETE on missing RG folds into
 // 200 + warn-mask ApiCallRc envelope (Bug 66). Previously asserted 404;
 // the python linstor CLI parses non-2xx responses via xml.etree and

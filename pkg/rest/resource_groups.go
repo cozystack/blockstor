@@ -21,6 +21,8 @@ import (
 	"maps"
 	"net/http"
 	"reflect"
+	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -160,6 +162,11 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 
 	mergeRGProps(&existing, &patch)
 
+	// Remember the pre-patch placement filter so we can detect whether
+	// this modify call needs to schedule a rebalance pass on the
+	// child RDs (Bug 60).
+	prevFilter := existing.SelectFilter
+
 	// SelectFilter only overwrites when the client sent a non-zero
 	// envelope. Zero-value `select_filter:{}` from a prop-only patch
 	// must NOT wipe the existing placement filter. reflect-equal
@@ -173,6 +180,26 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		existing.Description = patch.Description
 	}
 
+	// Bug 60 (cli-parity-audit row #41): upstream LINSTOR re-runs
+	// autoplace on every child RD when `rg modify` raises PlaceCount
+	// or changes a placement-affecting filter. Phase 11.x split
+	// pushed reconcilers into a separate process, so the REST
+	// handler can't walk RDs inline — instead it stamps the
+	// `blockstor.io/rebalance-pending` annotation and the
+	// RGRebalanceReconciler picks it up.
+	//
+	// Scale-DOWN intentionally does NOT trigger anything: upstream's
+	// rebalance is strictly additive (operator must `linstor r d`
+	// manually to shed replicas), so a PlaceCount reduction passes
+	// through without an annotation stamp.
+	if rgNeedsRebalance(prevFilter, existing.SelectFilter) {
+		if existing.Annotations == nil {
+			existing.Annotations = map[string]string{}
+		}
+
+		existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+
 	err = s.Store.ResourceGroups().Update(r.Context(), &existing)
 	if err != nil {
 		writeStoreError(w, err)
@@ -184,6 +211,46 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource group modified: " + name,
 	}})
+}
+
+// rgNeedsRebalance reports whether the placement-affecting subset of
+// the SelectFilter changed in a way that should re-run autoplace on
+// the RG's child RDs. The decision is additive-only:
+//
+//   - PlaceCount: trigger only when the NEW value strictly exceeds
+//     the old one. Scale-down is a no-op (upstream LINSTOR forces the
+//     operator to remove replicas explicitly via `linstor r d`).
+//   - LayerStack / ReplicasOnSame / NotPlaceWithRsc /
+//     NotPlaceWithRscRegex: trigger on ANY change. The placer's next
+//     pass honours the new constraint; existing replicas that violate
+//     it stay (no auto-shuffle), but missing ones get spawned on
+//     matching nodes.
+//
+// Fields that don't affect placement (Description, Props, peer slots,
+// etc.) are deliberately excluded so prop-only `rg modify` calls
+// don't churn the reconciler.
+func rgNeedsRebalance(prev, next apiv1.AutoSelectFilter) bool {
+	if next.PlaceCount > prev.PlaceCount {
+		return true
+	}
+
+	if !slices.Equal(prev.LayerStack, next.LayerStack) {
+		return true
+	}
+
+	if !slices.Equal(prev.ReplicasOnSame, next.ReplicasOnSame) {
+		return true
+	}
+
+	if !slices.Equal(prev.NotPlaceWithRsc, next.NotPlaceWithRsc) {
+		return true
+	}
+
+	if prev.NotPlaceWithRscRegex != next.NotPlaceWithRscRegex {
+		return true
+	}
+
+	return false
 }
 
 // mergeRGProps applies the OverrideProps / DeleteProps merge

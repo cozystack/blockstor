@@ -16,13 +16,37 @@ limitations under the License.
 
 package v1
 
+// AnnotationRGRebalancePending is stamped onto the parent ResourceGroup
+// CRD when a REST `linstor rg modify` raises PlaceCount or alters a
+// placement-affecting SelectFilter field. The value is the RFC3339
+// timestamp of the trigger — operators can grep for stale entries
+// (annotation not stripped within a reconcile window indicates the
+// reconciler is wedged). RGRebalanceReconciler observes this key,
+// re-runs the additive placer on every child RD, then strips it.
+//
+// Bug 60 (cli-parity-audit row #41): upstream LINSTOR's
+// `CtrlRscGrpApiCallHandler.modify` triggers RescheduleAutoPlace
+// synchronously from the REST call. Phase 11.x split moved
+// reconcilers into a separate process, so the REST handler can't
+// walk RDs inline; the annotation is the cross-process trigger.
+const AnnotationRGRebalancePending = "blockstor.io/rebalance-pending"
+
 // ResourceGroup mirrors `ResourceGroup` from upstream LINSTOR. A resource
 // group is a template — linstor-csi creates one per Kubernetes StorageClass
 // and `Spawn`s individual ResourceDefinitions from it.
+//
+// `Annotations` carries the K8s-native metadata.annotations of the
+// underlying RG CRD. Mirrors the same field on ResourceDefinition —
+// REST handlers stamp orchestration markers (e.g. the Bug 60
+// `blockstor.io/rebalance-pending` flag) here; controller-side
+// reconcilers observe the annotation to schedule deferred work.
+// Not part of upstream LINSTOR's wire shape; golinstor ignores
+// unknown JSON fields so the new key passes through transparently.
 type ResourceGroup struct {
 	Name         string            `json:"name"`
 	Description  string            `json:"description,omitempty"`
 	Props        map[string]string `json:"props,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
 	SelectFilter AutoSelectFilter  `json:"select_filter,omitzero"`
 	VolumeGroups []VolumeGroup     `json:"volume_groups,omitempty"`
 	UUID         string            `json:"uuid,omitempty"`

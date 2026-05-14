@@ -112,6 +112,8 @@ func (s *resourceGroups) Update(ctx context.Context, in *apiv1.ResourceGroup) er
 
 		existing.Spec = wireToCRDRGSpec(in)
 
+		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
+
 		return s.c.Update(ctx, &existing)
 	}), "update ResourceGroup %q", in.Name)
 }
@@ -138,6 +140,7 @@ func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
 		Name:        OriginalName(&crd.ObjectMeta),
 		Description: crd.Spec.Description,
 		Props:       props,
+		Annotations: userAnnotations(crd.Annotations),
 		PeerSlots:   crd.Spec.PeerSlots,
 		UUID:        string(crd.UID),
 	}
@@ -174,8 +177,11 @@ func crdToWireRG(crd *crdv1alpha1.ResourceGroup) apiv1.ResourceGroup {
 
 func wireToCRDRG(in *apiv1.ResourceGroup) *crdv1alpha1.ResourceGroup {
 	crd := &crdv1alpha1.ResourceGroup{
-		ObjectMeta: metav1.ObjectMeta{Name: Name(in.Name)},
-		Spec:       wireToCRDRGSpec(in),
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        Name(in.Name),
+			Annotations: cloneAnnotations(in.Annotations),
+		},
+		Spec: wireToCRDRGSpec(in),
 	}
 	SetOriginalName(&crd.ObjectMeta, in.Name)
 

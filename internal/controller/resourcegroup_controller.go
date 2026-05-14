@@ -30,6 +30,11 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// AnnotationRebalancePending is re-exported here so the in-package
+// reconciler can reference it without an extra import. See
+// apiv1.AnnotationRGRebalancePending for the canonical definition.
+const AnnotationRebalancePending = apiv1.AnnotationRGRebalancePending
+
 // ResourceGroupReconciler watches RG CRDs and propagates spec changes
 // to every spawned ResourceDefinition. The two cases that matter:
 //
