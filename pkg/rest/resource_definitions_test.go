@@ -21,6 +21,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 
 	lapi "github.com/LINBIT/golinstor/client"
@@ -74,6 +75,17 @@ func TestResourceDefinitionsCreateRoundTrip(t *testing.T) {
 }
 
 // TestResourceDefinitionsCreateConflict: 409 on duplicate.
+//
+// Scenario 1.W03 / wave1 4.2 — `POST /v1/resource-definitions` for an RD
+// whose name is already taken MUST return 409 Conflict with an
+// operator-actionable APICallRc envelope: the `already exists` sentinel
+// phrasing plus the offending RD name. Idempotent automation (linstor-csi
+// retries, GitOps reconcile loops) treats a generic 500 as a transient
+// failure and keeps hammering; a typed 409 with the offending name lets
+// the caller decide between "no-op, the prior request landed" and "name
+// collision, pick a new one". MASK_ERROR bit on RetCode is asserted so
+// golinstor's `client.ApiCallError` surfaces the failure rather than
+// silently treating the response as a success envelope.
 func TestResourceDefinitionsCreateConflict(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
@@ -94,7 +106,104 @@ func TestResourceDefinitionsCreateConflict(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("status: got %d, want 409", resp.StatusCode)
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1 (%+v)", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("RetCode missing MASK_ERROR bit: got %#x", rcs[0].RetCode)
+	}
+
+	// Operator-actionable text: `already exists` sentinel + offending
+	// RD name. Both substrings are required — the sentinel lets clients
+	// branch on the error class, the name lets a human (or a controller
+	// reconcile log) identify which object collided without re-fetching.
+	if !strings.Contains(rcs[0].Message, "already exists") {
+		t.Errorf("Message missing %q sentinel: got %q", "already exists", rcs[0].Message)
+	}
+
+	if !strings.Contains(rcs[0].Message, "pvc-1") {
+		t.Errorf("Message missing offending RD name %q: got %q", "pvc-1", rcs[0].Message)
+	}
+}
+
+// TestResourceCreateDuplicateNodeRDPairConflict: scenario 1.W03 also
+// covers the `(node, rd)` pair conflict on `linstor r c <node> <rd>`.
+// Posting a diskful Resource against a (rd, node) tuple that already
+// carries a diskful Resource MUST return 409 Conflict with an
+// operator-actionable envelope — the existing-replica name and node
+// in the message, MASK_ERROR bit on RetCode. The diskless-promote path
+// (`createOrPromoteResource`) is bypassed because the request carries
+// neither a StorPoolName nor a DISKLESS flag, so the pair collision
+// falls through to `writeStoreError(ErrAlreadyExists)`.
+func TestResourceCreateDuplicateNodeRDPairConflict(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Seed a plain diskful replica on n1. No DISKLESS / TIE_BREAKER
+	// flag → the promote path in createOrPromoteResource must not
+	// engage, so a second create for the same (rd, node) pair has to
+	// surface as a real conflict rather than a silent promote.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-1", NodeName: "n1"}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{NodeName: "n1"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1 (%+v)", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("RetCode missing MASK_ERROR bit: got %#x", rcs[0].RetCode)
+	}
+
+	// Same operator-actionable contract as the RD-name path: a
+	// recognisable `already exists` sentinel plus the offending
+	// (rd, node) coordinates so reconcile logs and human operators
+	// can identify the colliding replica without an extra GET.
+	if !strings.Contains(rcs[0].Message, "already exists") {
+		t.Errorf("Message missing %q sentinel: got %q", "already exists", rcs[0].Message)
+	}
+
+	if !strings.Contains(rcs[0].Message, "pvc-1") {
+		t.Errorf("Message missing RD name %q: got %q", "pvc-1", rcs[0].Message)
+	}
+
+	if !strings.Contains(rcs[0].Message, "n1") {
+		t.Errorf("Message missing node name %q: got %q", "n1", rcs[0].Message)
 	}
 }
 
