@@ -18,7 +18,9 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -670,6 +672,262 @@ func TestPhysicalStorageCreateNormalizesProviderKind(t *testing.T) {
 					tc.input, tc.want, pool.ProviderKind)
 			}
 		})
+	}
+}
+
+// TestPhysicalStorageListWireShapeMatchesUpstreamLINSTOR is the
+// wave2 6.W08 pin: GET /v1/physical-storage MUST emit the exact
+// JSON shape upstream LINSTOR's `JsonGenTypes.PhysicalStorage` +
+// `JsonGenTypes.PhysicalStorageDevice` serialise — same field
+// names, same case, same nesting, same `omitempty`/NON_EMPTY
+// semantics. Re-deriving the shape with a typed decoder would only
+// pin the Go-side struct tags and would happily accept a future
+// rename like `device_path` instead of `device`; upstream's CLI +
+// piraeus-operator parse the raw map with hard-coded keys, so a
+// drift here breaks both consumers silently.
+//
+// Cross-listed with wave1 6.6. Source of truth for the field set:
+// linstor-server/controller/src/main/java/com/linbit/linstor/api/
+// rest/v1/serializer/JsonGenTypes.java::PhysicalStorage +
+// PhysicalStorageDevice. The bucket envelope is
+// {size, rotational, nodes{<node>: [{device, model, serial, wwn}]}}
+// — `size` and `rotational` are NON_EMPTY (omitted when zero / nil),
+// each device entry's four fields are also NON_EMPTY.
+//
+// Filter chain pinned upstream (lsblk_test.go +
+// physicaldevice_discovery_test.go): > 1 GiB, no FS, no DRBD
+// signature (major 147), no zvol (major 230). This pin doesn't
+// re-test the filter — it locks the wire shape only.
+func TestPhysicalStorageListWireShapeMatchesUpstreamLINSTOR(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	rotational := false
+	if err := st.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		StableID:   "0x5000c500a1b2c3d4",
+		DevicePath: "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4",
+		SizeBytes:  1_000_204_886_016,
+		Model:      "Samsung SSD 980 PRO",
+		Serial:     "S6BUNS0R123456",
+		Rotational: &rotational,
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/physical-storage")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	// Decode into a generic map so we pin the raw key names, not
+	// the Go struct tags — a rename like `size_bytes` -> `size`
+	// would slip past a typed decoder if the Go field tag also
+	// changed.
+	var raw []map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decode raw: %v (body=%s)", err, body)
+	}
+
+	if len(raw) != 1 {
+		t.Fatalf("buckets: got %d, want 1 (single seed device)", len(raw))
+	}
+
+	bucket := raw[0]
+
+	// Upstream PhysicalStorage shape — three top-level keys.
+	// Other keys MUST NOT appear (golinstor's strict-mode decoder
+	// would reject them on older clients).
+	for _, k := range []string{"size", "rotational", "nodes"} {
+		if _, ok := bucket[k]; !ok {
+			t.Errorf("bucket key %q missing from %v (upstream JsonGenTypes.PhysicalStorage shape)", k, bucket)
+		}
+	}
+
+	for k := range bucket {
+		switch k {
+		case "size", "rotational", "nodes":
+		default:
+			t.Errorf("unexpected top-level key %q (drift from upstream PhysicalStorage shape: only size/rotational/nodes allowed)", k)
+		}
+	}
+
+	// `size` is a JSON number (Long upstream). json.Unmarshal
+	// stores it as float64 unless we used json.Number — verify
+	// the value still round-trips.
+	if size, ok := bucket["size"].(float64); !ok || int64(size) != 1_000_204_886_016 {
+		t.Errorf("size: got %v (%T), want 1000204886016 (float64)", bucket["size"], bucket["size"])
+	}
+
+	if rot, ok := bucket["rotational"].(bool); !ok || rot {
+		t.Errorf("rotational: got %v (%T), want false (bool)", bucket["rotational"], bucket["rotational"])
+	}
+
+	nodes, ok := bucket["nodes"].(map[string]any)
+	if !ok {
+		t.Fatalf("nodes: got %T, want map[string]any", bucket["nodes"])
+	}
+
+	devsRaw, ok := nodes["n1"].([]any)
+	if !ok || len(devsRaw) != 1 {
+		t.Fatalf("nodes.n1: got %v (%T), want one device entry", nodes["n1"], nodes["n1"])
+	}
+
+	dev, ok := devsRaw[0].(map[string]any)
+	if !ok {
+		t.Fatalf("nodes.n1[0]: got %T, want map[string]any", devsRaw[0])
+	}
+
+	// Upstream PhysicalStorageDevice shape — four NON_EMPTY keys.
+	// `device` / `model` / `serial` / `wwn` are exact upstream
+	// names; the python CLI's storpool_cmds.py parses them by
+	// literal key lookup.
+	wantDev := map[string]string{
+		"device": "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4",
+		"model":  "Samsung SSD 980 PRO",
+		"serial": "S6BUNS0R123456",
+		"wwn":    "0x5000c500a1b2c3d4",
+	}
+	for k, want := range wantDev {
+		got, ok := dev[k].(string)
+		if !ok || got != want {
+			t.Errorf("device.%s: got %q (%T), want %q (upstream PhysicalStorageDevice key)", k, dev[k], dev[k], want)
+		}
+	}
+
+	for k := range dev {
+		switch k {
+		case "device", "model", "serial", "wwn":
+		default:
+			t.Errorf("unexpected device key %q (drift from upstream PhysicalStorageDevice shape: only device/model/serial/wwn allowed)", k)
+		}
+	}
+}
+
+// TestPhysicalStorageCreateAdvisesUnmanagedHostState is the wave2
+// 6.W09 pin: a successful CDP one-shot MUST surface the operator-
+// runbook advisory that the OS-level VG / thin LV (or zpool) are
+// NOT managed by LINSTOR after the call — `linstor sp delete`
+// clears only the controller record, never `vgremove` /
+// `zpool destroy` / `wipefs`. Without this advisory, operators who
+// teardown a pool and try to re-`linstor ps cdp` the same device
+// hit a confusing "device busy / signature exists" error from
+// pvcreate, because the previous VG header is still on disk.
+//
+// Cross-listed with Bug 68 (the underlying CDP end-to-end fix).
+// Source of truth: tests/scenarios/wave2-06-storage-backends.md
+// §6.W09 — "WARNING: OS-level VG / thin LV are NOT managed by
+// LINSTOR after — `sp delete` does not clean them up."
+//
+// The wire shape mirrors upstream LINSTOR's `Flux<ApiCallRc>`
+// (PhysicalStorage.java::createDevicePool concats SUCCESS + pool
+// register replies); the python CLI walks the list and prints
+// each entry's `message`. Surfacing the advisory as a maskWarn
+// ApiCallRc lands it under the standard `WARNING:` log line the
+// CLI emits for warn-band entries, so audit-log greppers catch
+// it consistently with the rest of the blockstor warn-band
+// (warnRscNotFound, warnSnapshotNotFound, etc.).
+func TestPhysicalStorageCreateAdvisesUnmanagedHostState(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-vda",
+		NodeName:   "n1",
+		DevicePath: "/dev/vda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "LVM_THIN",
+			"device_paths": ["/dev/vda"],
+			"with_storage_pool": {
+				"name": "thin1",
+				"props": {
+					"StorDriver/LvmVg": "vg",
+					"StorDriver/ThinPool": "tp"
+				}
+			}
+		}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	var entries []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(entries) < 2 {
+		t.Fatalf("entries: got %d, want >= 2 (SUCCESS + WARNING runbook note)", len(entries))
+	}
+
+	// Pin the SUCCESS line first — matches upstream's two-step
+	// (createDevicePool then createStorPool) Flux concat.
+	if entries[0].RetCode == 0 {
+		t.Errorf("entries[0] RetCode: got 0, want maskInfo bit set (SUCCESS line)")
+	}
+
+	if !strings.Contains(entries[0].Message, "physical-storage attach accepted") {
+		t.Errorf("entries[0] Message: got %q, want SUCCESS line", entries[0].Message)
+	}
+
+	// Locate the WARNING entry — the order is fixed today
+	// (SUCCESS at [0], WARNING at [1]), but future code may
+	// interleave per-device records, so scan the slice.
+	var warn *apiv1.APICallRc
+
+	for i := range entries {
+		if strings.HasPrefix(entries[i].Message, "WARNING:") {
+			warn = &entries[i]
+
+			break
+		}
+	}
+
+	if warn == nil {
+		t.Fatalf("WARNING entry missing from %+v — wave2 6.W09 requires the operator-runbook advisory in the response body", entries)
+	}
+
+	// The advisory text must call out the three concrete things
+	// `linstor sp delete` will NOT do, so operators can grep the
+	// audit log for the exact phrases their runbooks reference.
+	// Drift on any of these strings is a wave2 6.W09 regression.
+	for _, want := range []string{
+		"OS-level VG / thin LV are NOT auto-managed",
+		"linstor sp delete",
+		"operator runbook",
+	} {
+		if !strings.Contains(warn.Message, want) {
+			t.Errorf("WARNING message missing %q substring: got %q", want, warn.Message)
+		}
+	}
+
+	// The advisory must ride the warn band, not the info band —
+	// audit-log filters keyed on `(ret_code & maskWarn) != 0`
+	// would miss an info-tagged advisory.
+	const maskWarnBit = int64(0x0002_0000_0000)
+	if warn.RetCode&maskWarnBit == 0 {
+		t.Errorf("WARNING RetCode: got %#x, want maskWarn (0x%x) bit set so python-linstor prints it as WARNING", warn.RetCode, maskWarnBit)
 	}
 }
 

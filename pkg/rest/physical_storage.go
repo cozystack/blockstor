@@ -33,6 +33,21 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// physicalStorageCDPRunbookNotice is the wave2 scenario 6.W09 operator-
+// runbook advisory: the CDP one-shot runs pvcreate + vgcreate + lvcreate
+// --thinpool + LINSTOR pool register, but the OS-level VG / thin LV are
+// NOT managed by LINSTOR afterwards — `linstor sp delete` clears only
+// the controller record. Operators must `vgremove` / `zpool destroy` /
+// `wipefs` on the host themselves before re-using the device. Surfaced
+// as an ApiCallRc warning entry in the 202 response body so the python
+// CLI prints it in the standard "WARNING:" log line alongside the
+// success entry, and so audit-log greppers catch the line under the
+// blockstor-convention warn band.
+const physicalStorageCDPRunbookNotice = "WARNING: OS-level VG / thin LV are NOT auto-managed; " +
+	"`linstor sp delete` will not run vgremove/zpool destroy/wipefs on the host. " +
+	"Operator must clean up the backing device before re-using it. " +
+	"See operator runbook: day2-storage-pool-physical-create-device-pool."
+
 // registerPhysicalStorage wires the `linstor physical-storage`
 // endpoints. Phase 10.7: the GET endpoints now surface
 // PhysicalDevice CRDs from the store; the cluster-wide list groups
@@ -83,41 +98,8 @@ type physicalStorageCreatePoolDetails struct {
 func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
-	var req physicalStorageCreateRequest
-
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
-		return
-	}
-
-	if req.ProviderKind == "" {
-		writeError(w, http.StatusBadRequest, "provider_kind is required")
-
-		return
-	}
-
-	// Bug 73: the python-linstor CLI sends provider names in
-	// lowercase (and in the compressed form `lvmthin` / `zfsthin` /
-	// `filethin`). The StoragePool CRD enum only allows the
-	// upstream-canonical uppercase tokens — pass-through would
-	// surface as an opaque "Unsupported value" error from apiserver.
-	// Normalise here so every CLI variant lands as the canonical
-	// form on the auto-created pool.
-	normalized, ok := normalizeProviderKind(req.ProviderKind)
+	req, ok := decodePhysicalStorageCreateRequest(w, r)
 	if !ok {
-		writeError(w, http.StatusBadRequest,
-			"provider_kind: unknown value "+req.ProviderKind)
-
-		return
-	}
-
-	req.ProviderKind = normalized
-
-	if len(req.DevicePaths) == 0 {
-		writeError(w, http.StatusBadRequest, "device_paths is required")
-
 		return
 	}
 
@@ -175,15 +157,74 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 	// 10.7 cascade-delete contract.
 	_ = setStoragePoolOwnership(r.Context(), s.Client, target.Name, target.AttachTo.StoragePoolName)
 
-	// Upstream-LINSTOR contract for `POST /v1/physical-storage/<node>`
-	// is async: 202 Accepted + Location header pointing back at the
-	// per-node list endpoint. Clients (golinstor, piraeus-operator)
-	// poll `GET /v1/nodes/<node>/physical-storage` and treat the
-	// request as done when the matching PhysicalDevice CRD has
-	// disappeared (success) or reports `Status.Phase=Failed`.
-	// Phase 10.7.
+	writePhysicalStorageCreateAccepted(w, node)
+}
+
+// decodePhysicalStorageCreateRequest pulls the upstream-LINSTOR
+// `PhysicalStorageCreate` envelope off the request, validates the
+// required fields, and normalises `provider_kind` per Bug 73 so every
+// CLI variant (lowercase, compressed `lvmthin` / `zfsthin` / `filethin`)
+// lands as the canonical uppercase token. Writes the appropriate 400
+// response and returns ok=false on the first failure; the caller bails
+// without touching the store.
+func decodePhysicalStorageCreateRequest(w http.ResponseWriter, r *http.Request) (physicalStorageCreateRequest, bool) {
+	var req physicalStorageCreateRequest
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return req, false
+	}
+
+	if req.ProviderKind == "" {
+		writeError(w, http.StatusBadRequest, "provider_kind is required")
+
+		return req, false
+	}
+
+	normalized, ok := normalizeProviderKind(req.ProviderKind)
+	if !ok {
+		writeError(w, http.StatusBadRequest,
+			"provider_kind: unknown value "+req.ProviderKind)
+
+		return req, false
+	}
+
+	req.ProviderKind = normalized
+
+	if len(req.DevicePaths) == 0 {
+		writeError(w, http.StatusBadRequest, "device_paths is required")
+
+		return req, false
+	}
+
+	return req, true
+}
+
+// writePhysicalStorageCreateAccepted writes the 202 Accepted reply for
+// POST /v1/physical-storage/<node>. The body mirrors upstream's
+// `Flux<ApiCallRc>`: a SUCCESS line for the controller-side attach
+// record + a WARNING with the wave2 6.W09 operator-runbook note. The
+// python-linstor CLI walks the list and prints both, so operators see
+// the "OS-level VG / thin LV NOT auto-managed" advisory at the time
+// they run `linstor ps cdp` rather than discovering it during teardown.
+// Location header points back at the per-node list endpoint so clients
+// (golinstor, piraeus-operator) can poll for completion by waiting for
+// the matching PhysicalDevice CRD to disappear (success) or report
+// `Status.Phase=Failed`. Phase 10.7 + wave2 6.W09.
+func writePhysicalStorageCreateAccepted(w http.ResponseWriter, node string) {
 	w.Header().Set("Location", "/v1/nodes/"+node+"/physical-storage")
-	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, http.StatusAccepted, []apiv1.APICallRc{
+		{
+			RetCode: maskInfo,
+			Message: "physical-storage attach accepted on node '" + node + "'",
+		},
+		{
+			RetCode: maskWarn,
+			Message: physicalStorageCDPRunbookNotice,
+		},
+	})
 }
 
 // setStoragePoolOwnership wires a PhysicalDevice CRD as an
