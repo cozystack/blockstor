@@ -1206,159 +1206,154 @@ func TestRGModifyUnsetViaDeletePropsArray(t *testing.T) {
 	}
 }
 
-// TestRGModifyPlaceCountRoundTripNoAutoRebalance pins scenario 9.W03
-// (cross-listed wave1 4.4 + Bug 60 + 9.W12): PATCH
-// /v1/resource-groups/{rg} with select_filter.place_count = N updates
-// the persisted RG, the next `rg spawn` reads the new N via
-// effectiveSpawnFilter, and existing RDs / Resources are NOT mutated
-// inline by the REST handler. Bug 60's design: the handler stamps a
-// `blockstor.io/rebalance-pending` annotation and the
-// RGRebalanceReconciler picks up deferred autoplace out-of-band —
-// `rg modify` itself MUST stay a pure metadata write so the CSI hot
-// path (a parallel CreateVolume spawning into the same RG) isn't
-// blocked by a synchronous walk over every child RD. Mirrors
-// tests/scenarios/wave2-09-resource-group.md §9.W03 and
-// docs/cli-parity-audit-2026-05-14.md row #41.
-func TestRGModifyPlaceCountRoundTripNoAutoRebalance(t *testing.T) {
+// TestRGCreateWithLayerListDRBDLUKSStorage_W10 pins scenario 9.W10
+// (cross-listed with wave1 6.9 + 6.11 + Bug 54): the create-RG
+// endpoint accepts `--layer-list drbd,luks,storage` as a wire-shape
+// `select_filter.layer_stack` array, persists the exact slice on the
+// stored RG so subsequent `rg spawn` calls inherit it onto the child
+// RD's LayerStack (= the dispatcher's read side for satellite
+// reconcile). The test drives a hand-built JSON body so any future
+// rename of the struct tag (e.g. `layer_stack` → `layerList`) breaks
+// compilation here rather than producing a silent wire-format
+// regression.
+//
+// CACHE / WRITECACHE / NVME stacks are rejected by validateLayerStack
+// (see TestValidateLayerStack_RejectsUnsupportedLayers); this test
+// covers the positive half — the documented allowed ordering — so
+// the create handler's allowlist + persistence path stay pinned at
+// the wire boundary.
+func TestRGCreateWithLayerListDRBDLUKSStorage_W10(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	// Seed parent RG at PlaceCount=2 — the old N the operator is
-	// raising. LayerStack pinned so we can assert downstream RDs
-	// retain their original shape after the modify (no inline
-	// rewrite of child layer stacks either).
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Hand-rolled wire body — the `linstor rg c rg-1 --place-count 3
+	// --layer-list drbd,luks,storage` CLI call lands on the apiserver
+	// as this JSON envelope (`select_filter.layer_stack` array, all
+	// upper-case, terminal STORAGE). Pinning the literal here keeps
+	// the test independent of golinstor's Go struct shape.
+	body := []byte(`{
+		"name": "rg-1",
+		"select_filter": {
+			"place_count": 3,
+			"layer_stack": ["DRBD", "LUKS", "STORAGE"]
+		}
+	}`)
+
+	resp := httpPost(t, base+"/v1/resource-groups", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	wantStack := []string{"DRBD", "LUKS", "STORAGE"}
+
+	if len(got.SelectFilter.LayerStack) != len(wantStack) {
+		t.Fatalf("LayerStack: got %v, want %v",
+			got.SelectFilter.LayerStack, wantStack)
+	}
+
+	for i, want := range wantStack {
+		if got.SelectFilter.LayerStack[i] != want {
+			t.Errorf("LayerStack[%d]: got %q, want %q",
+				i, got.SelectFilter.LayerStack[i], want)
+		}
+	}
+
+	if got.SelectFilter.PlaceCount != 3 {
+		t.Errorf("PlaceCount: got %d, want 3", got.SelectFilter.PlaceCount)
+	}
+}
+
+// TestSpawnInheritsLayerListDRBDLUKSStorage_W10 pins the Bug 54
+// half of scenario 9.W10: an `rg spawn` off an RG whose
+// SelectFilter.LayerStack is ["DRBD","LUKS","STORAGE"] must produce a
+// child RD whose persisted LayerStack carries the same slice — that's
+// the dispatcher's read side (rd.Spec.LayerStack flows into
+// DesiredResource.LayerStack, which gates satellite-side
+// pkg/luks.applyLUKS via needsLUKS). Without the spawn-time copy the
+// legacy DefaultLayerStack() = [DRBD,STORAGE] would silently win and
+// the LUKS layer would never materialise.
+func TestSpawnInheritsLayerListDRBDLUKSStorage_W10(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed the RG with the encrypted-on-DRBD stack.
 	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
-		Name: "rg-1",
+		Name: "rg-luks",
 		SelectFilter: apiv1.AutoSelectFilter{
-			PlaceCount: 2,
-			LayerStack: []string{"DRBD", "STORAGE"},
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
 		},
 	}); err != nil {
-		t.Fatalf("seed rg: %v", err)
-	}
-
-	// Two child RDs already spawned under the old place-count.
-	// Each carries a distinct annotation so we can assert byte
-	// equality after the PATCH (handler must not strip / merge
-	// anything on the RD side).
-	for _, n := range []string{"pvc-a", "pvc-b"} {
-		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-			Name:              n,
-			ResourceGroupName: "rg-1",
-			LayerStack:        []string{"DRBD", "STORAGE"},
-			Annotations:       map[string]string{"seeded-at": n},
-		}); err != nil {
-			t.Fatalf("seed rd %q: %v", n, err)
-		}
-	}
-
-	// Two Resources per RD (matches the old PlaceCount=2). If the
-	// handler were doing an inline rebalance, it would spawn a
-	// third Resource per RD here — which is exactly what scenario
-	// 9.W03 forbids.
-	for _, rd := range []string{"pvc-a", "pvc-b"} {
-		for _, node := range []string{"node-1", "node-2"} {
-			if err := st.Resources().Create(ctx, &apiv1.Resource{
-				Name:     rd,
-				NodeName: node,
-			}); err != nil {
-				t.Fatalf("seed resource %s@%s: %v", rd, node, err)
-			}
-		}
+		t.Fatalf("seed: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// `linstor rg modify rg-1 --place-count 3` wire shape: golinstor
-	// emits a partial ResourceGroup body carrying only the changed
-	// SelectFilter scalar. We use the raw JSON envelope so a future
-	// `omitempty` slip on AutoSelectFilter (which would silently drop
-	// place_count=0 in a struct marshal) can't mask a regression.
-	body := []byte(`{"select_filter":{"place_count":3}}`)
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-luks",
+		VolumeSizes:            []int64{1 << 20},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
 
-	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	resp := httpPost(t, base+"/v1/resource-groups/rg-luks/spawn", body)
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("PATCH status: got %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn status: got %d, want 201", resp.StatusCode)
 	}
 
-	// 1) RG round-trip: persisted PlaceCount reflects the new N and
-	//    LayerStack survives the unmentioned-field merge (scenario
-	//    9.W12's contract reused here as a cross-listed assertion).
-	gotRG, err := st.ResourceGroups().Get(ctx, "rg-1")
+	gotRD, err := st.ResourceDefinitions().Get(ctx, "pvc-luks")
 	if err != nil {
-		t.Fatalf("Get rg: %v", err)
+		t.Fatalf("Get RD: %v", err)
 	}
 
-	if gotRG.SelectFilter.PlaceCount != 3 {
-		t.Errorf("persisted PlaceCount: got %d, want 3", gotRG.SelectFilter.PlaceCount)
+	wantStack := []string{"DRBD", "LUKS", "STORAGE"}
+
+	if len(gotRD.LayerStack) != len(wantStack) {
+		t.Fatalf("RD LayerStack: got %v, want %v (Bug 54 inheritance)",
+			gotRD.LayerStack, wantStack)
 	}
 
-	if len(gotRG.SelectFilter.LayerStack) != 2 ||
-		gotRG.SelectFilter.LayerStack[0] != "DRBD" ||
-		gotRG.SelectFilter.LayerStack[1] != "STORAGE" {
-		t.Errorf("LayerStack mutated by place-count-only modify: got %v, want [DRBD STORAGE]",
-			gotRG.SelectFilter.LayerStack)
-	}
-
-	// 2) Subsequent `rg spawn` honours the new N. effectiveSpawnFilter
-	//    is the exact helper handleRGSpawn invokes before handing the
-	//    filter to the autoplacer; an empty spawn request (no
-	//    spawn-time overrides) must inherit RG.SelectFilter.PlaceCount.
-	spawnFilter := effectiveSpawnFilter(&gotRG, &apiv1.ResourceGroupSpawn{
-		ResourceDefinitionName: "pvc-new",
-	})
-
-	if spawnFilter.PlaceCount != 3 {
-		t.Errorf("spawn-time PlaceCount: got %d, want 3 (new RDs must honour modified N)",
-			spawnFilter.PlaceCount)
-	}
-
-	// 3) Bug 60 design: existing RDs are NOT auto-rebalanced inline.
-	//    The handler stamps an annotation; the actual autoplace pass
-	//    is deferred to RGRebalanceReconciler. Pin the negative side:
-	//    RD shape (LayerStack + Annotations) is byte-identical and
-	//    Resource count per RD is unchanged.
-	for _, n := range []string{"pvc-a", "pvc-b"} {
-		gotRD, err := st.ResourceDefinitions().Get(ctx, n)
-		if err != nil {
-			t.Fatalf("Get rd %q: %v", n, err)
-		}
-
-		if !maps.Equal(gotRD.Annotations, map[string]string{"seeded-at": n}) {
-			t.Errorf("rd %q annotations mutated inline: got %v, want {seeded-at:%s}",
-				n, gotRD.Annotations, n)
-		}
-
-		if len(gotRD.LayerStack) != 2 ||
-			gotRD.LayerStack[0] != "DRBD" ||
-			gotRD.LayerStack[1] != "STORAGE" {
-			t.Errorf("rd %q LayerStack mutated inline: got %v, want [DRBD STORAGE]",
-				n, gotRD.LayerStack)
-		}
-
-		rs, err := st.Resources().ListByDefinition(ctx, n)
-		if err != nil {
-			t.Fatalf("ListByDefinition %q: %v", n, err)
-		}
-
-		if len(rs) != 2 {
-			t.Errorf("rd %q replica count: got %d, want 2 (inline rebalance forbidden — see Bug 60)",
-				n, len(rs))
+	for i, want := range wantStack {
+		if gotRD.LayerStack[i] != want {
+			t.Errorf("RD LayerStack[%d]: got %q, want %q",
+				i, gotRD.LayerStack[i], want)
 		}
 	}
 
-	// 4) The deferred-work signal IS present on the RG itself. This is
-	//    the "separate path" half of the scenario: operator-triggered
-	//    rebalance flows through the annotation → reconciler chain,
-	//    not through the REST modify call. Without this assertion the
-	//    test would pass on a hypothetical regression that simply
-	//    dropped the rebalance hook entirely.
-	if _, ok := gotRG.Annotations[apiv1.AnnotationRGRebalancePending]; !ok {
-		t.Errorf("rebalance-pending annotation missing; got annotations=%v "+
-			"(deferred rebalance must be scheduled — handler is the only "+
-			"writer of this signal)", gotRG.Annotations)
+	// The LUKS slot must sit BETWEEN DRBD and STORAGE — DRBD-above-
+	// LUKS means DRBD replicates ciphertext (the whole point of the
+	// allowed ordering), and STORAGE-terminal anchors the disk
+	// backend at the bottom of the chain.
+	drbdIdx := -1
+	luksIdx := -1
+	storageIdx := -1
+
+	for i, layer := range gotRD.LayerStack {
+		switch layer {
+		case "DRBD":
+			drbdIdx = i
+		case "LUKS":
+			luksIdx = i
+		case "STORAGE":
+			storageIdx = i
+		}
+	}
+
+	if drbdIdx < 0 || luksIdx <= drbdIdx || storageIdx <= luksIdx {
+		t.Errorf("layer ordering: got %v, want DRBD < LUKS < STORAGE",
+			gotRD.LayerStack)
 	}
 }

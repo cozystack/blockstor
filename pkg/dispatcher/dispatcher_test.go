@@ -977,3 +977,85 @@ func TestAutoQuorumDisabledPassesManualSettings(t *testing.T) {
 		})
 	}
 }
+
+// TestDRBDLUKSStorageLayerStackPropagates_W10 pins scenario 9.W10's
+// dispatcher-side contract: when an RD carries
+// LayerStack=["DRBD","LUKS","STORAGE"] (the wire shape that
+// `linstor rg c --layer-list drbd,luks,storage` + spawn produces via
+// the cross-listed sticky-inheritance path), `BuildDesired` must
+// propagate the exact slice onto DesiredResource.LayerStack — same
+// length, same order — so the satellite's `needsLUKS` check
+// (pkg/satellite/reconciler.go) lights up `applyLUKS` for the
+// cryptsetup layer between DRBD and the underlying storage.
+//
+// The order matters: DRBD-above-LUKS means DRBD replicates ciphertext
+// (the whole point of the allowed ordering), and STORAGE-terminal
+// anchors the backing disk at the bottom of the chain. A regression
+// that flipped the slot order or dropped LUKS entirely would silently
+// fall back to needsLUKS=false → no encryption layer, which is a
+// data-at-rest leak.
+func TestDRBDLUKSStorageLayerStackPropagates_W10(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-luks"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-luks",
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	wantStack := []string{"DRBD", "LUKS", "STORAGE"}
+
+	if len(got.LayerStack) != len(wantStack) {
+		t.Fatalf("DesiredResource.LayerStack: got %v, want %v",
+			got.LayerStack, wantStack)
+	}
+
+	for i, want := range wantStack {
+		if got.LayerStack[i] != want {
+			t.Errorf("LayerStack[%d]: got %q, want %q",
+				i, got.LayerStack[i], want)
+		}
+	}
+
+	// Verify the LUKS slot lands strictly between DRBD and STORAGE —
+	// the property pkg/satellite/reconciler.applyLUKS depends on
+	// when it composes cryptsetup over the raw storage devices.
+	// A flat assertion on the slice already enforces this, but the
+	// explicit index check pins the semantic intent against a future
+	// refactor that might widen the allowed shape.
+	drbdIdx := -1
+	luksIdx := -1
+	storageIdx := -1
+
+	for i, layer := range got.LayerStack {
+		switch layer {
+		case "DRBD":
+			drbdIdx = i
+		case "LUKS":
+			luksIdx = i
+		case "STORAGE":
+			storageIdx = i
+		}
+	}
+
+	if drbdIdx < 0 || luksIdx <= drbdIdx || storageIdx <= luksIdx {
+		t.Errorf("LUKS slot must sit between DRBD and STORAGE; got order %v "+
+			"(drbd=%d luks=%d storage=%d)",
+			got.LayerStack, drbdIdx, luksIdx, storageIdx)
+	}
+}
