@@ -1087,6 +1087,211 @@ func TestPlaceReplicasOnDifferentFallsBackToExcludedNode(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnDifferentBareKeySpreadsAcrossValues pins scenario
+// 9.W07's bare-key form: `--replicas-on-different Aux/rack` is hard
+// anti-affinity — every replica must land on a node carrying a
+// DISTINCT Aux/rack value. With 3 nodes in 3 distinct racks (a/b/c)
+// and place_count=3, the placer MUST place one replica per rack.
+// A regression that ignored the bare-key form would happily double up
+// on the largest-free node.
+//
+// Cross-listed with wave1 2.6 / wave2 2.W04 (zone variant covered by
+// e2e); this unit pins the placer-level contract for any Aux key.
+func TestPlaceReplicasOnDifferentBareKeySpreadsAcrossValues(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, rack string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/rack": rack},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("n1", "a", 100)
+	mk("n2", "b", 200)
+	mk("n3", "c", 999)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          3,
+		ReplicasOnDifferent: []string{"Aux/rack"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	racks := map[string]int{}
+
+	for _, r := range got {
+		node, err := st.Nodes().Get(ctx, r.NodeName)
+		if err != nil {
+			t.Fatalf("get node %s: %v", r.NodeName, err)
+		}
+
+		racks[node.Props["Aux/rack"]]++
+	}
+
+	if len(racks) != 3 {
+		t.Errorf("expected 3 distinct rack values, got %+v", racks)
+	}
+
+	for v, n := range racks {
+		if n > 1 {
+			t.Errorf("rack=%q hosts %d replicas (>1) — bare-key anti-affinity violated", v, n)
+		}
+	}
+}
+
+// TestPlaceReplicasOnDifferentBareKeyRejectsSameValue pins the rejection
+// half of scenario 9.W07: when two of three nodes share Aux/rack=a and
+// only one node has rack=b, place_count=2 MUST pick exactly one a-node
+// and the b-node — NEVER both a-nodes, even though doing so would be
+// the cheapest sort path. A regression that fell through to a
+// same-rack pair would silently violate operator-declared topology.
+//
+// Pinned for the bare-key form (no "=value" suffix); the key=value
+// soft-exclusion variant is covered by ExcludeMode/FallsBackToExcludedNode.
+func TestPlaceReplicasOnDifferentBareKeyRejectsSameValue(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, rack string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/rack": rack},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// Two largest-free nodes share rack=a; the placer's "biggest first"
+	// sort would normally grab them. The anti-affinity constraint MUST
+	// override that and force a cross-rack pair.
+	mk("a1", "a", 999)
+	mk("a2", "a", 500)
+	mk("b1", "b", 100)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          2,
+		ReplicasOnDifferent: []string{"Aux/rack"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["a1"] && on["a2"] {
+		t.Errorf("both rack=a nodes picked despite replicas_on_different=Aux/rack; got %+v", got)
+	}
+
+	if !on["b1"] {
+		t.Errorf("b1 (only rack=b node) missing — placer skipped the cross-rack pair; got %+v", got)
+	}
+}
+
+// TestPlaceReplicasOnDifferentBareKeyWithoutAuxPrefix pins the bare-key
+// form accepted without the "Aux/" prefix — UG9 lets operators write
+// `--replicas-on-different rack` and the placer normalises it to
+// Aux/rack internally (see auxKey). Without this contract the same
+// CLI invocation would behave differently between forms and create a
+// silent footgun.
+func TestPlaceReplicasOnDifferentBareKeyWithoutAuxPrefix(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, rack string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/rack": rack},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("a1", "a", 999)
+	mk("a2", "a", 500)
+	mk("b1", "b", 100)
+
+	p := placer.New(st)
+
+	// Bare key "rack" — no "Aux/" prefix in the filter. Placer must
+	// still apply anti-affinity over Aux/rack.
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          2,
+		ReplicasOnDifferent: []string{"rack"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["a1"] && on["a2"] {
+		t.Errorf("both rack=a nodes picked despite replicas_on_different=rack (no Aux/ prefix); got %+v", got)
+	}
+}
+
 // TestPlaceMixedProviderPools pins Bug 76: the autoplacer must NOT
 // spread diskful replicas of one RD across MIXED ProviderKinds. The
 // previous version of this test demanded the opposite — UG9 §"Mixing
