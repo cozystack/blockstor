@@ -395,6 +395,78 @@ func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 	}
 }
 
+// TestApplyRendersRDProtocolIntoNetBlock: scenario 5.W01 — an RD-scope
+// `DrbdOptions/Net/protocol=C` set by `linstor rd drbd-options
+// --protocol C <rd>` reaches the satellite as a flat entry in
+// DesiredResource.DrbdOptions and must land verbatim as
+// `protocol C;` inside the rendered `net { }` block. Pinning the
+// `net {` framing (not just the bare `protocol C;` substring) keeps
+// the assertion honest — the renderer also stamps `protocol C;` at
+// the resource-top level via the legacy Net.ProtocolC default, so a
+// regression that drops the prop from splitDRBDOptions would still
+// leave the substring present at the wrong scope.
+func TestApplyRendersRDProtocolIntoNetBlock(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/backups_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "backups",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+
+				// RD-scope prop the controller stamped onto the
+				// effective DRBD options bag after `linstor rd
+				// drbd-options --protocol C backups`.
+				"DrbdOptions/Net/protocol": "C",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "backups.res"))
+	if err != nil {
+		t.Fatalf("read .res: %v", err)
+	}
+
+	got := string(body)
+
+	// Must contain a `net { … protocol C; … }` block — the
+	// scenario's load-bearing assertion against `grep protocol
+	// /var/lib/linstor.d/backups.res`.
+	if !strings.Contains(got, "net {") {
+		t.Errorf(".res missing net{} block; body=%s", got)
+	}
+
+	netStart := strings.Index(got, "net {")
+	netEnd := strings.Index(got[netStart:], "}")
+
+	if netStart < 0 || netEnd < 0 {
+		t.Fatalf("net{} block not delimited; body=%s", got)
+	}
+
+	netBlock := got[netStart : netStart+netEnd]
+	if !strings.Contains(netBlock, "protocol C;") {
+		t.Errorf("net{} block missing `protocol C;`; net-block=%q\nfull=%s", netBlock, got)
+	}
+}
+
 // TestApplySkipsDRBDWhenLayerStackOmits: a Resource with explicit
 // LayerStack=["STORAGE"] must NOT render a .res file or invoke
 // drbdadm. Storage provider still runs (volume is created); the

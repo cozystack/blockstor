@@ -640,3 +640,66 @@ func TestPrefNicSteersDRBDAddress(t *testing.T) {
 		})
 	}
 }
+
+// TestRDDrbdOptionsProtocolFlowsToDesired: scenario 5.W01 — the RD-
+// scope `DrbdOptions/Net/protocol` prop set by `linstor rd
+// drbd-options --protocol C <rd>` must flow through the effective-
+// props resolver into DesiredResource.DrbdOptions, where the
+// satellite's splitDRBDOptions picks it up for the .res `net { }`
+// block. The other half of the round-trip (RD prop → effective
+// props bag) lives in pkg/drbd/resolver_test.go's TestResolveOptions
+// suite; this test pins the dispatcher hop in between.
+//
+// Non-DRBD props in the effective bag must NOT contaminate
+// DrbdOptions — mergeEffectiveProps splits on the DrbdOptions/
+// prefix, and that split is what keeps the .res renderer from
+// emitting a stray `StorPoolName` line which drbdadm refuses.
+func TestRDDrbdOptionsProtocolFlowsToDesired(t *testing.T) {
+	rdName := "backups"
+	targetID := int32(0)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "backups-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+	}
+
+	// The effective-props resolver feeds RD-scope DRBD knobs through
+	// this map. RD > RG > controller precedence has already collapsed
+	// by the time dispatcher.BuildDesired sees it.
+	effective := map[string]string{
+		"DrbdOptions/Net/protocol": "C",
+		// Non-DRBD prop: must land in wireProps, NOT in DrbdOptions.
+		"Aux/owner": "ops",
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effective)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if got.DrbdOptions["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("DrbdOptions[DrbdOptions/Net/protocol]: got %q, want %q (full: %v)",
+			got.DrbdOptions["DrbdOptions/Net/protocol"], "C", got.DrbdOptions)
+	}
+
+	if _, leaked := got.DrbdOptions["Aux/owner"]; leaked {
+		t.Errorf("non-DRBD prop leaked into DrbdOptions: %v", got.DrbdOptions)
+	}
+
+	if got.Props["Aux/owner"] != "ops" {
+		t.Errorf("non-DRBD prop missing from Props: got %q, want %q", got.Props["Aux/owner"], "ops")
+	}
+}

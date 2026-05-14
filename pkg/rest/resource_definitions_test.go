@@ -305,6 +305,68 @@ func TestResourceDefinitionUpdateChangesRG(t *testing.T) {
 	}
 }
 
+// TestResourceDefinitionUpdateDrbdOptionsProtocol: scenario 5.W01 —
+// `linstor rd drbd-options --protocol C <rd>` writes the
+// `DrbdOptions/Net/protocol` property onto the RD. The CLI hits the
+// same PUT envelope as `rd set-property` with
+// `override_props={"DrbdOptions/Net/protocol":"C"}`; the merge path
+// must persist it without disturbing untouched RD spec fields
+// (resource_group, other props). Pin every step of the round-trip so
+// a regression of the PATCH-merge or of `DrbdOptions/Net/...` key
+// passthrough surfaces immediately.
+func TestResourceDefinitionUpdateDrbdOptionsProtocol(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-default"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "backups",
+		ResourceGroupName: "rg-default",
+		Props: map[string]string{
+			// An unrelated prop that must survive the PATCH merge.
+			"Aux/owner": "ops",
+		},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Same envelope upstream golinstor sends on
+	// `linstor rd drbd-options --protocol C backups`.
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/backups",
+		[]byte(`{"override_props":{"DrbdOptions/Net/protocol":"C"}}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "backups")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if got.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("protocol prop: got %q, want %q", got.Props["DrbdOptions/Net/protocol"], "C")
+	}
+
+	if got.Props["Aux/owner"] != "ops" {
+		t.Errorf("unrelated prop dropped on PATCH merge: got %q, want %q",
+			got.Props["Aux/owner"], "ops")
+	}
+
+	if got.ResourceGroupName != "rg-default" {
+		t.Errorf("ResourceGroupName drifted on props-only PATCH: got %q, want rg-default",
+			got.ResourceGroupName)
+	}
+}
+
 // TestResourceDefinitionsCreateBadJSON: malformed body → 400 from
 // the JSON decoder. Pinned because golinstor is the primary client
 // here; a regression that surfaced raw decoder errors as 500 would
