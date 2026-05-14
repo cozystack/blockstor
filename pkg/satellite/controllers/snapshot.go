@@ -132,6 +132,18 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // `Config.Apply.CreateSnapshot` body. Idempotent — re-running
 // on an existing snapshot is a no-op (the provider-side
 // `lvcreate --snapshot` already short-circuits on existing LV).
+//
+// Failure routing — F18 (cli-parity for `linstor s l` State column):
+//   - Apply.CreateSnapshot returned Terminal=true ⇒ stamp
+//     Status.Flags=["FAILED"] on the Snapshot CRD and return without
+//     requeueing. crdToWireSnapshot surfaces that as `flags: ["FAILED"]`
+//     on /v1/view/snapshots, which the Python CLI maps to State="Failed".
+//   - Apply.CreateSnapshot returned Terminal=false (transient) ⇒ log
+//     and return with Requeue=true; controller-runtime's rate limiter
+//     handles back-off. Status stays empty so the wire view stays
+//     "Incomplete".
+//   - Apply.CreateSnapshot returned Ok=true ⇒ no-op, the observer
+//     reconciler stamps Status.NodeStatus on its own cadence.
 func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	req := &intent.CreateSnapshotRequest{
 		ResourceName: snap.Spec.ResourceDefinitionName,
@@ -147,12 +159,38 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return ctrl.Result{}, errors.Wrap(err, "CreateSnapshot")
 	}
 
-	if !resp.GetOk() {
-		// Body-level failure (per-snapshot, not transport). Log
-		// and let the next reconcile retry — controller-runtime's
-		// rate limiter handles back-off.
-		log.FromContext(ctx).Info("CreateSnapshot per-snapshot failure",
-			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+	if resp.GetOk() {
+		return ctrl.Result{}, nil
+	}
+
+	logger := log.FromContext(ctx)
+	logger.Info("CreateSnapshot per-snapshot failure",
+		"snapshot", snap.Spec.SnapshotName,
+		"message", resp.GetMessage(),
+		"terminal", resp.GetTerminal())
+
+	if !resp.GetTerminal() {
+		// Transient — back off and try again. Returning Requeue
+		// (without an explicit backoff) lets controller-runtime's
+		// rate limiter apply its exponential schedule.
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Terminal failure — stamp Status.Flags=["FAILED"] so the
+	// wire surface goes from "Incomplete" to "Failed" and stops
+	// retrying. Idempotent: re-stamping on a Snapshot that
+	// already carries FAILED is a no-op.
+	if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		return ctrl.Result{}, nil
+	}
+
+	snap.Status.Flags = append(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed)
+
+	err = r.Status().Update(ctx, snap)
+	if err != nil {
+		// Could be a conflict against a concurrent NodeStatus
+		// patch — requeue so the next pass retries the stamp.
+		return ctrl.Result{}, errors.Wrap(err, "stamp Status.Flags=FAILED")
 	}
 
 	return ctrl.Result{}, nil

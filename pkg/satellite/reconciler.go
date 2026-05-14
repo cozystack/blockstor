@@ -214,11 +214,22 @@ func (r *Reconciler) Apply(ctx context.Context, res []*intent.DesiredResource) (
 // resource (looked up via the resource→pool map populated by Apply).
 // Returns ok=false in the response when the resource is unknown — the
 // satellite never auto-creates snapshots of state it doesn't own.
+//
+// Terminal classification policy:
+//   - providerForResource fails ⇒ Terminal=true. "Unknown resource"
+//     means the parent volume never got materialised on this node;
+//     a future Apply pass MIGHT change that, but the SnapshotReconciler
+//     can still treat the snapshot as failed and rely on the operator
+//     to delete + recreate once the parent lands. (Retrying forever on
+//     an indefinitely-missing parent leaks Reconcile pressure.)
+//   - provider.CreateSnapshot returns ErrTerminal (or wraps ErrNotFound)
+//     ⇒ Terminal=true. Same logic.
+//   - any other error ⇒ Terminal=false. Transient lvm/zfs noise.
 func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnapshotRequest) (*intent.CreateSnapshotResponse, error) {
 	provider, err := r.providerForResource(req.GetResourceName())
 	if err != nil {
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &intent.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.CreateSnapshotResponse{Ok: false, Terminal: true, Message: err.Error()}, nil
 	}
 
 	err = provider.CreateSnapshot(ctx, storage.Snapshot{
@@ -226,8 +237,9 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 		SnapshotName: req.GetSnapshotName(),
 	})
 	if err != nil {
+		terminal := errors.Is(err, storage.ErrTerminal) || errors.Is(err, storage.ErrNotFound)
 		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
-		return &intent.CreateSnapshotResponse{Ok: false, Message: err.Error()}, nil
+		return &intent.CreateSnapshotResponse{Ok: false, Terminal: terminal, Message: err.Error()}, nil
 	}
 
 	return &intent.CreateSnapshotResponse{

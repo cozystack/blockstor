@@ -20,11 +20,19 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // TestSnapshotsViewEmpty: aggregate is empty until something gets created.
@@ -758,6 +766,87 @@ func TestSnapshotsViewPaginationMaxEntriesExactFit(t *testing.T) {
 
 	if got := strings.TrimSpace(string(body)); got != "[]" {
 		t.Errorf("end-of-data body: got %q, want literal `[]`", got)
+	}
+}
+
+// TestSnapshotListSurfacesFailedFlag pins the F18 cli-parity
+// fix's wire-shape half: a Snapshot CRD whose Status.Flags
+// carries "FAILED" (stamped by the satellite reconciler on a
+// terminal CreateSnapshot error) MUST surface that flag on the
+// /v1/view/snapshots wire response, so the Python CLI's
+// `linstor s l` State column can render "Failed" instead of
+// "Incomplete".
+//
+// A regression that dropped Status.Flags in crdToWireSnapshot
+// would leave the CLI showing "Incomplete" forever for a
+// dead-letter snapshot, which the operator has no way to
+// distinguish from a still-in-progress one — and CSI's
+// CreateSnapshot success-poll loop would never surface the
+// failure either.
+//
+// Uses the CRD-backed store (not the in-memory one) because
+// Status.Flags is a CRD-only field — the in-memory store
+// already carries Flags on the wire shape directly, so it
+// can't exercise the crdToWireSnapshot translation that is
+// the actual subject under test.
+func TestSnapshotListSurfacesFailedFlag(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1: %v", err)
+	}
+
+	if err := blockstoriov1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("blockstor: %v", err)
+	}
+
+	// Seed a CRD directly with Status.Flags=["FAILED"] —
+	// emulates what the satellite reconciler stamps on the
+	// terminal-error path. WithStatusSubresource so the fake
+	// client honours the Status subresource semantic (without
+	// it, the seeded Status.Flags would get dropped on the
+	// initial Create the fake performs internally).
+	crd := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.snap-1"},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1"},
+		},
+		Status: blockstoriov1alpha1.SnapshotStatus{
+			Flags: []string{blockstoriov1alpha1.SnapshotStatusFlagFailed},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(crd).
+		WithStatusSubresource(crd).
+		Build()
+
+	st := k8sstore.New(cli)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/snapshots")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1 (%+v)", len(got), got)
+	}
+
+	if !slices.Contains(got[0].Flags, "FAILED") {
+		t.Errorf("Flags: got %v, want it to contain FAILED", got[0].Flags)
 	}
 }
 

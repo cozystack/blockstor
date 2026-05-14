@@ -259,6 +259,16 @@ func crdToWireSnapshot(
 		}
 	}
 
+	// Surface Status.Flags on the wire so the Python CLI's
+	// State column can render "Failed". Defensive copy: the
+	// CRD's slice header gets reused across List calls, sharing
+	// the backing array would let a downstream mutation reach
+	// back into the informer cache.
+	if len(crd.Status.Flags) > 0 {
+		out.Flags = make([]string, len(crd.Status.Flags))
+		copy(out.Flags, crd.Status.Flags)
+	}
+
 	if len(crd.Spec.VolumeDefinitions) > 0 {
 		out.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(crd.Spec.VolumeDefinitions))
 		for i := range crd.Spec.VolumeDefinitions {

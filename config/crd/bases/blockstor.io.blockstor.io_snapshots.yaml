@@ -140,6 +140,14 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              flags:
+                description: |-
+                  flags carries terminal-state markers. Currently only
+                  "FAILED" is meaningful — stamped by the satellite when
+                  CreateSnapshot returns a non-retryable error class.
+                items:
+                  type: string
+                type: array
               nodeStatus:
                 description: nodeStatus reports per-node readiness from the satellites.
                 items:

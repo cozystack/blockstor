@@ -1274,6 +1274,11 @@ func (in *SnapshotStatus) DeepCopyInto(out *SnapshotStatus) {
 		*out = make([]SnapshotPerNodeStatus, len(*in))
 		copy(*out, *in)
 	}
+	if in.Flags != nil {
+		in, out := &in.Flags, &out.Flags
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

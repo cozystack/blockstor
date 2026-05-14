@@ -21,6 +21,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -212,6 +213,177 @@ func TestSnapshotReconcileDrainsOnDelete(t *testing.T) {
 			got.Finalizers)
 	}
 }
+
+// TestSnapshotReconcileMarksFailedOnTerminalError pins the F18
+// cli-parity fix: when Apply.CreateSnapshot returns a terminal
+// error (Terminal=true — e.g. parent volume not found, unknown
+// resource, provider returned ErrTerminal), the SnapshotReconciler
+// MUST stamp Status.Flags=["FAILED"] on the CRD before returning
+// and MUST NOT requeue. The wire shape's crdToWireSnapshot
+// surfaces this as `flags: ["FAILED"]`, which the Python CLI
+// maps to State="Failed" in `linstor s l`.
+//
+// A regression that left Status.Flags empty would leave the CLI
+// in State="Incomplete" forever, hiding the failure from the
+// operator and from CSI's CreateSnapshot success-polling loop.
+//
+// Setup: no providers registered for the snapshot's RD ⇒
+// providerForResource returns "unknown resource", which the
+// reconciler classifies as Terminal=true.
+func TestSnapshotReconcileMarksFailedOnTerminalError(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-1.snap-1",
+			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-missing",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(snap).
+		Build()
+
+	// Empty providers map ⇒ Apply.CreateSnapshot's
+	// providerForResource lookup fails ⇒ Terminal=true.
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+	})
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    rec,
+			Exec:     storage.NewFakeExec(),
+		},
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Terminal failures MUST NOT requeue — they're dead-letter.
+	if result.Requeue || result.RequeueAfter > 0 {
+		t.Errorf("terminal failure should NOT requeue; got %+v", result)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		t.Errorf("Status.Flags missing FAILED after terminal error: %+v",
+			got.Status.Flags)
+	}
+}
+
+// TestSnapshotReconcileKeepsIncompleteOnTransientError pins the
+// flip side: when Apply.CreateSnapshot returns a transient
+// failure (Terminal=false — lvm temporary lock, exec wrapper
+// noise, busy dataset), the reconciler MUST requeue without
+// stamping Status.Flags. The CRD stays in the "Incomplete" wire
+// state and the controller-runtime rate limiter handles
+// back-off.
+//
+// A regression that prematurely stamped FAILED on a transient
+// failure would dead-letter a snapshot that the next pass
+// would have completed successfully, and force the operator
+// to delete + recreate it for a recoverable hiccup.
+//
+// Setup: provider's lvcreate exits non-zero (the exec wrapper
+// returns a plain error that does NOT wrap ErrTerminal /
+// ErrNotFound) ⇒ Terminal=false.
+func TestSnapshotReconcileKeepsIncompleteOnTransientError(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-1.snap-1",
+			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(snap).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Seed: lvs returns empty so CreateVolume runs.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Snapshot path: lvcreate -s fails with a transient-looking
+	// error. The error is NOT wrapped in ErrTerminal/ErrNotFound,
+	// so the reconciler classifies it as transient.
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Err: errLvmTemporaryLock})
+
+	rec := seedThinResource(t, fx, "pvc-1", "thin1")
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    rec,
+			Exec:     fx,
+		},
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Transient failures MUST requeue so the next pass retries.
+	if !result.Requeue && result.RequeueAfter == 0 {
+		t.Errorf("transient failure should requeue; got %+v", result)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		t.Errorf("Status.Flags should not contain FAILED on transient error; got %+v",
+			got.Status.Flags)
+	}
+}
+
+// errLvmTemporaryLock simulates a transient lvm condition the
+// kernel resolves on its own (e.g. a busy vg lock that lvcreate
+// retries on its next invocation). NOT wrapped in
+// storage.ErrTerminal / storage.ErrNotFound on purpose — the
+// reconciler reads that absence as "transient, retry".
+var errLvmTemporaryLock = errors.New("lvm: Locking type 1 initialisation failed")
 
 // TestSnapshotReconcileNoOpOnUnrelatedNode pins the
 // node-membership filter: a Snapshot whose `Spec.Nodes` does

@@ -400,8 +400,20 @@ func (x *CreateSnapshotRequest) GetVolumeNumbers() []int32 {
 // snapshot-create path. The optional CreateTimestampUnix is
 // stamped on success so callers can surface "snapshot taken at"
 // in upstream-LINSTOR Status responses.
+//
+// Terminal carries the satellite reconciler's verdict on whether
+// a follow-up Reconcile would have any chance of succeeding. True
+// means "do not retry": the failure is a missing parent volume,
+// an unknown resource, or a provider-level ErrTerminal. False on
+// an Ok=false body means "transient — back off and try again"
+// (lvm temporary lock, busy dataset, exec wrapper failure).
+// SnapshotReconciler stamps Status.Flags=["FAILED"] only when
+// Terminal=true; transient failures keep the snapshot in the
+// Incomplete state and rely on controller-runtime's rate limiter
+// for backoff.
 type CreateSnapshotResponse struct {
 	Ok                  bool
+	Terminal            bool
 	Message             string
 	CreateTimestampUnix int64
 }
@@ -413,6 +425,16 @@ func (x *CreateSnapshotResponse) GetOk() bool {
 	}
 
 	return x.Ok
+}
+
+// GetTerminal reports whether the failure is dead-letter (true) or
+// transient (false). Meaningless when Ok=true.
+func (x *CreateSnapshotResponse) GetTerminal() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.Terminal
 }
 
 // GetMessage returns the diagnostic when Ok=false.

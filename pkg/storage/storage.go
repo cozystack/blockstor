@@ -36,6 +36,13 @@ var (
 	ErrNotFound = errors.New("storage object not found")
 	// ErrAlreadyExists — Create called on an object that already exists.
 	ErrAlreadyExists = errors.New("storage object already exists")
+	// ErrTerminal — the provider has determined the operation cannot
+	// succeed on a retry. The satellite snapshot reconciler tests for
+	// this via errors.Is and stamps `Status.Flags=["FAILED"]` on the
+	// Snapshot CRD rather than requeueing indefinitely. Wrap a
+	// transient cause (lvm temporary lock, busy dataset) WITHOUT this
+	// sentinel to keep retry semantics intact.
+	ErrTerminal = errors.New("provider terminal error")
 )
 
 // Volume identifies a block-level volume on a satellite. The triple

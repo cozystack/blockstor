@@ -52,11 +52,30 @@ type SnapshotVolumeRef struct {
 	SizeKib      int64 `json:"sizeKib"`
 }
 
+// SnapshotStatusFlagFailed is stamped on Status.Flags by the
+// satellite reconciler when CreateSnapshot returned a terminal
+// error (e.g. parent volume missing, unknown resource, source
+// pool absent). Surfaces through crdToWireSnapshot as
+// `flags: ["FAILED"]` on the wire, which the Python CLI maps
+// to the `State="Failed"` column in `linstor s l`. Matches
+// upstream LINSTOR's `FAILED_DEPLOYMENT` SnapshotDefinition
+// flag — same semantic ("the satellite tried and gave up"),
+// shorter name. Once stamped, the reconciler does NOT requeue:
+// a terminal failure is a dead-letter that an operator must
+// either delete or recreate.
+const SnapshotStatusFlagFailed = "FAILED"
+
 // SnapshotStatus is the observed state of a Snapshot.
 type SnapshotStatus struct {
 	// nodeStatus reports per-node readiness from the satellites.
 	// +optional
 	NodeStatus []SnapshotPerNodeStatus `json:"nodeStatus,omitempty"`
+
+	// flags carries terminal-state markers. Currently only
+	// "FAILED" is meaningful — stamped by the satellite when
+	// CreateSnapshot returns a non-retryable error class.
+	// +optional
+	Flags []string `json:"flags,omitempty"`
 
 	// conditions represent the current state of the Snapshot.
 	// +listType=map
