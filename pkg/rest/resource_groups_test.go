@@ -668,3 +668,190 @@ func TestResourceGroupListPropertiesEmptyDecodes(t *testing.T) {
 		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }
+
+// TestRGDrbdOptionsPropagateToSpawn pins scenario 9.W13 (cross-listed
+// with 5.W01): `linstor rg drbd-options --protocol C --verify-alg
+// crc32c <rg>` writes RG-scope properties under the `DrbdOptions/Net/...`
+// namespace. The next `rg spawn` must materialise an RD that inherits
+// those keys (mirrors the Bug 54 LayerStack inheritance pattern, but
+// for the DRBD-options bag), and `effectivePropsForRD` must surface
+// the RG-scope entry on the spawned RD so the dispatcher's
+// resolver-fed BuildDesired emits matching `net { protocol C;
+// verify-alg crc32c; }` lines in the .res file downstream.
+//
+// We exercise three angles in sequence on the same fixture:
+//
+//  1. PATCH /v1/resource-groups/{rg} with override_props writes the
+//     RG-scope DrbdOptions/Net entries idempotently.
+//  2. POST /v1/resource-groups/{rg}/spawn copies the RG.Props bag
+//     onto the spawned RD.Props (spawn-time snapshot; matches
+//     upstream LINSTOR's behaviour).
+//  3. effectivePropsForRD attributes each entry to scope=RG when the
+//     RD doesn't override, and scope=RD when the RD value differs
+//     (RD > RG precedence, same as the rest of the prop hierarchy).
+//
+// The third leg is the cross-check that the resolver layer the
+// dispatcher consults during BuildDesired (via effectivePropsForResource
+// in the satellite reconciler chain) sees the correct merged view.
+func TestRGDrbdOptionsPropagateToSpawn(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed an empty RG; the modify below adds the DRBD options.
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-protocol-c",
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Step 1: `linstor rg drbd-options --protocol C --verify-alg
+	// crc32c rg-protocol-c` lands as PUT /v1/resource-groups/{rg}
+	// with override_props carrying the DRBD options under their
+	// canonical LINSTOR keys (DrbdOptions/Net/protocol etc.).
+	modify := apiv1.ResourceGroup{
+		OverrideProps: map[string]string{
+			"DrbdOptions/Net/protocol":   "C",
+			"DrbdOptions/Net/verify-alg": "crc32c",
+		},
+	}
+
+	body, err := json.Marshal(modify)
+	if err != nil {
+		t.Fatalf("marshal modify: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-protocol-c", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("modify status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Sanity: RG now carries the DrbdOptions/Net entries in its
+	// stored Props bag. Without this assertion, a spawn-time
+	// inheritance regression could mask a missing modify-side write.
+	rg, err := st.ResourceGroups().Get(ctx, "rg-protocol-c")
+	if err != nil {
+		t.Fatalf("get RG: %v", err)
+	}
+
+	if got := rg.Props["DrbdOptions/Net/protocol"]; got != "C" {
+		t.Errorf("RG.Props[protocol]=%q, want C", got)
+	}
+
+	if got := rg.Props["DrbdOptions/Net/verify-alg"]; got != "crc32c" {
+		t.Errorf("RG.Props[verify-alg]=%q, want crc32c", got)
+	}
+
+	// Step 2: spawn an RD off the patched RG. linstor-csi calls this
+	// on every CreateVolume; the spawned RD must inherit the RG's
+	// DRBD options so the downstream dispatcher emits the matching
+	// `net { ... }` block.
+	spawnBody, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-spawn",
+		DefinitionsOnly:        true, // skip placement; we assert on RD.Props
+	})
+	if err != nil {
+		t.Fatalf("marshal spawn: %v", err)
+	}
+
+	resp2 := httpPost(t, base+"/v1/resource-groups/rg-protocol-c/spawn", spawnBody)
+	_ = resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("spawn status: got %d, want 201", resp2.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-spawn")
+	if err != nil {
+		t.Fatalf("get spawned RD: %v", err)
+	}
+
+	if got := rd.Props["DrbdOptions/Net/protocol"]; got != "C" {
+		t.Errorf("RD.Props[protocol]=%q, want C (RG → RD inheritance)", got)
+	}
+
+	if got := rd.Props["DrbdOptions/Net/verify-alg"]; got != "crc32c" {
+		t.Errorf("RD.Props[verify-alg]=%q, want crc32c (RG → RD inheritance)", got)
+	}
+
+	// Step 3: effectivePropsForRD must attribute each entry to the
+	// correct scope. Since the spawned RD's Props bag now carries
+	// the RG-derived values verbatim (spawn-time copy), the resolver
+	// flags both as scope=RD — which matches upstream LINSTOR's
+	// behaviour: `linstor rd lp` shows the prop on the RD without
+	// the `(R)` inheritance marker after a spawn, because the RG's
+	// value was snapshot-copied at spawn time.
+	eff, err := effectivePropsForRD(ctx, nil, st, &rd)
+	if err != nil {
+		t.Fatalf("effectivePropsForRD: %v", err)
+	}
+
+	for _, key := range []string{
+		"DrbdOptions/Net/protocol",
+		"DrbdOptions/Net/verify-alg",
+	} {
+		entry, ok := eff[key]
+		if !ok {
+			t.Errorf("effective_props missing %q (got keys: %v)", key, effectivePropKeys(eff))
+
+			continue
+		}
+
+		if entry.Scope != apiv1.EffectivePropScopeResourceDefinition {
+			t.Errorf("effective_props[%q].Scope=%q, want %s (spawn snapshot lands on RD)",
+				key, entry.Scope, apiv1.EffectivePropScopeResourceDefinition)
+		}
+	}
+
+	// Step 4 (RD > RG precedence cross-check): an RD-scope override
+	// must beat the RG-scope value the resolver would otherwise
+	// surface. We mutate the stored RD directly to simulate an
+	// operator running `linstor rd drbd-options --protocol A
+	// pvc-spawn` AFTER the spawn — the RD-level write must win.
+	rd.Props["DrbdOptions/Net/protocol"] = "A"
+	if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
+		t.Fatalf("update RD: %v", err)
+	}
+
+	// Now drop the RG-snapshot value off the RD to force the
+	// resolver to walk back up to the RG scope for verify-alg —
+	// exercising the inheritance path.
+	delete(rd.Props, "DrbdOptions/Net/verify-alg")
+	if err := st.ResourceDefinitions().Update(ctx, &rd); err != nil {
+		t.Fatalf("update RD: %v", err)
+	}
+
+	eff2, err := effectivePropsForRD(ctx, nil, st, &rd)
+	if err != nil {
+		t.Fatalf("effectivePropsForRD (post-override): %v", err)
+	}
+
+	proto := eff2["DrbdOptions/Net/protocol"]
+	if proto.Value != "A" || proto.Scope != apiv1.EffectivePropScopeResourceDefinition {
+		t.Errorf("post-override protocol: got {value:%q scope:%q}, want {A %s}",
+			proto.Value, proto.Scope, apiv1.EffectivePropScopeResourceDefinition)
+	}
+
+	verify := eff2["DrbdOptions/Net/verify-alg"]
+	if verify.Value != "crc32c" || verify.Scope != apiv1.EffectivePropScopeResourceGroup {
+		t.Errorf("post-override verify-alg: got {value:%q scope:%q}, want {crc32c %s}",
+			verify.Value, verify.Scope, apiv1.EffectivePropScopeResourceGroup)
+	}
+}
+
+// effectivePropKeys returns the keys of an EffectiveProperties map as
+// a plain slice for diagnostic output. Go maps print in random order,
+// so embedding a raw `%v` of the bag in a t.Errorf would produce
+// noisy diffs across reruns.
+func effectivePropKeys(eff apiv1.EffectiveProperties) []string {
+	out := make([]string, 0, len(eff))
+	for k := range eff {
+		out = append(out, k)
+	}
+
+	return out
+}
