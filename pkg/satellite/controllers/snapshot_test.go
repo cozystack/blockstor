@@ -450,3 +450,177 @@ func TestSnapshotReconcileNoOpOnUnrelatedNode(t *testing.T) {
 		t.Errorf("finalizer stamped on a Snapshot for another node: %v", got.Finalizers)
 	}
 }
+
+// TestSnapshotDeleteScenarioW02PerReplicaBackendTeardown pins
+// scenario 8.W02 (wave2-08-snapshots.md): `snapshot delete <rd> <snap>`
+// MUST remove the snapshot across all diskful replicas + their backing
+// storage. Concretely, each per-node satellite's Reconcile pass MUST
+// fire the provider's backend teardown (lvremove for LVM-thin / zfs
+// destroy for ZFS) on its own node before stripping the finalizer.
+//
+// The single-node path is covered by TestSnapshotReconcileDrainsOnDelete;
+// this test exercises the multi-replica half — the same Snapshot CRD
+// (Spec.Nodes lists more than one peer) must drive the local
+// DeleteSnapshot dispatch independently on each node. A regression
+// that scoped the teardown to a single node would let the surviving
+// replicas leak orphan thin-pool LVs / ZFS datasets — the exact
+// failure mode Bug 64's finalizer was added to prevent.
+//
+// Each iteration uses a fresh fake client so the per-node assertion
+// stays isolated from the shared-CRD update race that two reconcilers
+// would otherwise have over one client (the controller-runtime
+// production flow has each satellite running against the real
+// apiserver, with optimistic-concurrency retries handling that race).
+func TestSnapshotDeleteScenarioW02PerReplicaBackendTeardown(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+
+	for _, node := range []string{"n1", "n2"} {
+		now := metav1.Now()
+
+		snap := &blockstoriov1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pvc-1.snap-1",
+				Finalizers:        []string{controllers.SatelliteSnapshotFinalizer},
+				DeletionTimestamp: &now,
+			},
+			Spec: blockstoriov1alpha1.SnapshotSpec{
+				ResourceDefinitionName: "pvc-1",
+				SnapshotName:           "snap-1",
+				Nodes:                  []string{"n1", "n2"},
+			},
+		}
+
+		cli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(snap).
+			Build()
+
+		fx := storage.NewFakeExec()
+		// Apply seed for this node: lvs returns empty → CreateVolume
+		// runs and records the pool mapping the snapshot teardown
+		// will key off.
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+			storage.FakeResponse{Stdout: []byte("")})
+
+		rec := seedThinResource(t, fx, "pvc-1", "thin1")
+
+		reconciler := &controllers.SnapshotReconciler{
+			Client: cli,
+			Config: controllers.Config{
+				NodeName: node,
+				Apply:    rec,
+				Exec:     fx,
+			},
+		}
+
+		_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile (%s): %v", node, err)
+		}
+
+		// Per-replica backend teardown MUST have fired on this node.
+		wantCmd := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000"
+		if !slices.Contains(fx.CommandLines(), wantCmd) {
+			t.Errorf("node %s: scenario 8.W02 expects %q; got %v",
+				node, wantCmd, fx.CommandLines())
+		}
+
+		// This node's pass MUST strip the finalizer once the
+		// backend teardown succeeds. In the multi-replica production
+		// flow each satellite stripes the single shared finalizer
+		// optimistically — last write wins, which is safe because
+		// the teardown is idempotent.
+		var got blockstoriov1alpha1.Snapshot
+
+		gErr := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+		if gErr == nil && slices.Contains(got.Finalizers, controllers.SatelliteSnapshotFinalizer) {
+			t.Errorf("node %s: SatelliteSnapshotFinalizer leaked after teardown: %v",
+				node, got.Finalizers)
+		}
+	}
+}
+
+// TestSnapshotDeleteScenarioW02IdempotentOnAbsentFinalizer pins the
+// idempotent half of scenario 8.W02 (Bug 66 envelope analogue at the
+// satellite layer): a Reconcile pass that observes a Snapshot with a
+// DeletionTimestamp but no SatelliteSnapshotFinalizer (already
+// stripped, or never stamped — e.g. Snapshot created before this
+// satellite came up) MUST short-circuit without invoking the
+// provider's DeleteSnapshot. A regression that called DeleteSnapshot
+// on a finalizer-absent Snapshot would re-issue lvremove against an
+// LV that's already gone (lvm: "Failed to find logical volume"), and
+// — worse — risk racing a freshly-created snapshot of the same name
+// if a re-create-after-delete cycle is in flight.
+func TestSnapshotDeleteScenarioW02IdempotentOnAbsentFinalizer(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+	now := metav1.Now()
+
+	// DeletionTimestamp present, our SatelliteSnapshotFinalizer
+	// absent — the post-strip terminal state from this satellite's
+	// point of view (a peer satellite's finalizer or apiserver-default
+	// keeps the CRD alive while we observe it). A stranger-finalizer
+	// stand-in keeps the fake client happy (it refuses to create an
+	// object with DeletionTimestamp and an empty finalizers list) while
+	// preserving the contract under test: our reconciler observes a CRD
+	// whose ours-finalizer is missing and MUST short-circuit.
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-1.snap-1",
+			Finalizers:        []string{"someone-else.example.com/holding"},
+			DeletionTimestamp: &now,
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(snap).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Deliberately no fx.Expect() for any lvremove command — if the
+	// reconciler dispatches the provider's DeleteSnapshot here, the
+	// FakeExec returns an unmatched-command error and the assertion
+	// below fires with a clear message naming the regressed command.
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+	})
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    rec,
+			Exec:     fx,
+		},
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter > 0 {
+		t.Errorf("finalizer-absent delete pass should NOT requeue; got %+v", result)
+	}
+
+	// No provider commands at all — the short-circuit MUST happen
+	// before Apply.DeleteSnapshot dispatches.
+	if len(fx.CommandLines()) != 0 {
+		t.Errorf("scenario 8.W02 idempotent: expected no backend commands; got %v",
+			fx.CommandLines())
+	}
+}
