@@ -151,6 +151,21 @@ const warnSnapshotNotFound = maskWarn | int64(2056)
 // warnSnapshotNotFound.
 const warnNoSatelliteConnection = maskWarn | int64(2057)
 
+// apiCallRcFailExistsSnapshotDfn mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_SNAPSHOT_DFN` (`514 | MASK_ERROR`). Emitted by
+// `DELETE /v1/resource-definitions/{rd}` when the RD still has at
+// least one Snapshot child (wave2 scenario 4.W11 / UG9 §"Deleting a
+// resource definition" WARNING). The MASK_ERROR bit is OR'd in by the
+// `apiCallRcError` envelope wrapper at the call site; the bare 514 sub-
+// code here keeps the wire shape byte-identical to upstream's `linstor
+// rd d <name>` reply on the same input.
+//
+// Choosing 514 (rather than a fresh sub-code in our 996+ range) lets
+// audit-log greppers that already classify upstream's
+// FAIL_EXISTS_SNAPSHOT_DFN traffic catch blockstor's equivalent without
+// a separate rule.
+const apiCallRcFailExistsSnapshotDfn int64 = 514
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the

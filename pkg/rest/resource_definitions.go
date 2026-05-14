@@ -361,6 +361,35 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rd")
 
+	// Scenario 4.W11: refuse the delete if any Snapshot still hangs
+	// off this RD. Upstream LINSTOR's CtrlRscDfnDeleteApiCallHandler.
+	// ensureNoSnapDfns raises FAIL_EXISTS_SNAPSHOT_DFN on the same
+	// input with `"Cannot delete <rd> because it has snapshots."`;
+	// the operator drops the snapshots first, then retries.
+	//
+	// Must run BEFORE cascadeDeleteResources — once the cascade
+	// stamps DeletionTimestamp on every replica, a failed RD-delete
+	// leaves the cluster half-torn-down (children gone, parent
+	// kept, snapshots orphaned) which no retry can reconcile.
+	snaps, err := s.Store.Snapshots().ListByDefinition(r.Context(), name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if len(snaps) > 0 {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
+			Message: "Cannot delete resource definition '" + name + "' because it has snapshots.",
+			ObjRefs: map[string]string{
+				objRefRscDfn: name,
+			},
+		}})
+
+		return
+	}
+
 	// Cascade the delete to all child Resource replicas BEFORE
 	// dropping the RD itself. Without this, child Resources are
 	// orphaned: no DeletionTimestamp is ever stamped on them, the
@@ -378,7 +407,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// existing `blockstor.io.blockstor.io/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
-	err := s.cascadeDeleteResources(r.Context(), name)
+	err = s.cascadeDeleteResources(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 

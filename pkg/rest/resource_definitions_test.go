@@ -379,6 +379,137 @@ func TestResourceDefinitionsDeleteCascadeMissingChildIsIdempotent(t *testing.T) 
 	}
 }
 
+// TestResourceDefinitionsDeleteRefusesWhenSnapshotsExist pins scenario
+// 4.W11 (wave2-04-lifecycle.md): RD delete must refuse while any
+// snapshot still exists on the RD. Upstream LINSTOR's
+// CtrlRscDfnDeleteApiCallHandler.ensureNoSnapDfns raises
+// FAIL_EXISTS_SNAPSHOT_DFN with `"Cannot delete <rd> because it has
+// snapshots."`; the operator deletes the snapshots first, then
+// retries the RD delete.
+//
+// Without this guard the cascade walks Resources and stamps DELETE
+// on every replica, but the Snapshot CRDs and their backing ZFS /
+// LVM-thin snapshots stay behind, orphaned, with no parent RD to
+// hang the satellite's snapshot-finalizer chain off of. The next
+// `rd create <same-name>` then collides with the leftover backing
+// snapshots on the storage pool.
+func TestResourceDefinitionsDeleteRefusesWhenSnapshotsExist(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-snap"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-snap", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	for _, snapName := range []string{"snap-a", "snap-b"} {
+		if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+			Name: snapName, ResourceName: "pvc-snap",
+		}); err != nil {
+			t.Fatalf("seed snapshot %s: %v", snapName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-snap")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 Conflict", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1 (%+v)", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("RetCode missing MASK_ERROR bit: got %#x", rcs[0].RetCode)
+	}
+
+	wantMsg := "Cannot delete resource definition 'pvc-snap' because it has snapshots."
+	if rcs[0].Message != wantMsg {
+		t.Errorf("Message: got %q, want %q", rcs[0].Message, wantMsg)
+	}
+
+	// Critical: the RD AND its replicas must still be present. The
+	// guard must reject the request BEFORE the cascade fires, else a
+	// failed delete leaves a half-torn-down cluster (children gone,
+	// parent kept) that the next retry can't reconcile.
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-snap"); err != nil {
+		t.Errorf("RD missing after rejected delete: %v", err)
+	}
+
+	left, err := st.Resources().ListByDefinition(ctx, "pvc-snap")
+	if err != nil {
+		t.Fatalf("list children: %v", err)
+	}
+
+	if len(left) != 2 {
+		t.Errorf("replicas after rejected delete: got %d, want 2 (cascade fired too early)", len(left))
+	}
+}
+
+// TestResourceDefinitionsDeleteAfterSnapshotsCleared: once the
+// operator drops every snapshot under the RD, the RD delete must
+// succeed on retry. Pins the "drop snapshots first, then RD" recovery
+// flow from UG9 §"Deleting a resource definition" WARNING.
+func TestResourceDefinitionsDeleteAfterSnapshotsCleared(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-clear"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "snap-1", ResourceName: "pvc-clear",
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// First attempt: refused.
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-clear")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("first delete: got %d, want 409", resp.StatusCode)
+	}
+
+	// Operator clears the snapshot.
+	if err := st.Snapshots().Delete(ctx, "pvc-clear", "snap-1"); err != nil {
+		t.Fatalf("drop snapshot: %v", err)
+	}
+
+	// Retry: now succeeds.
+	resp2 := httpDelete(t, base+"/v1/resource-definitions/pvc-clear")
+	_ = resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second delete: got %d, want 200", resp2.StatusCode)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-clear"); err == nil {
+		t.Errorf("RD still present after delete")
+	}
+}
+
 // TestRDCreateInheritsLayerStackFromRG pins Bug 54: when the caller POSTs
 // an RD with empty layer_stack and a resource_group_name that points at an
 // RG whose SelectFilter pins a LayerStack, the stored RD must carry that
