@@ -1860,6 +1860,135 @@ func TestPlaceCapacityGateIntegratesWithOversubRatio(t *testing.T) {
 	}
 }
 
+// TestPlaceNotPlaceWithRscExactExcludesNamedHosts pins scenario 9.W09
+// (cross-listed with wave1 2.10): the exact-RD-list variant of
+// `--do-not-place-with`. The filter carries a verbatim slice of RD
+// names — every node currently hosting a replica of any RD in that
+// slice becomes ineligible. Matching is exact, not a regex: a name in
+// the list must compare byte-for-byte to an existing RD's Name.
+//
+// Cluster has 3 nodes; rd-a sits on n1, rd-b on n2, rd-c on n3.
+// Spawning rd-new with PlaceCount=1 and NotPlaceWithRsc=[rd-a, rd-b]
+// must land on n3 — the only host not running anything in the list.
+// rd-c is not in the list and therefore does not exclude its host.
+//
+// Regression target: a refactor that swapped the exact-match path to
+// regex-only (or dropped slices.Contains) would silently place onto
+// n1/n2 again. The companion 2.11 regex test exercises the pattern
+// path; this one pins the verbatim path independently.
+func TestPlaceNotPlaceWithRscExactExcludesNamedHosts(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2", "n3"})
+
+	seeds := []struct {
+		name string
+		node string
+	}{
+		{"rd-a", "n1"},
+		{"rd-b", "n2"},
+		{"rd-c", "n3"},
+	}
+	for _, s := range seeds {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: s.name, NodeName: s.node,
+			Props: map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("seed %s: %v", s.name, err)
+		}
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "rd-new", &apiv1.AutoSelectFilter{
+		PlaceCount:      1,
+		NotPlaceWithRsc: []string{"rd-a", "rd-b"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 1 || want != 1 {
+		t.Fatalf("placed/want: got %d/%d, want 1/1", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "rd-new")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1; %+v", len(got), got)
+	}
+
+	if got[0].NodeName != "n3" {
+		t.Errorf("node: got %q, want %q (n1 hosts rd-a, n2 hosts rd-b — both excluded)",
+			got[0].NodeName, "n3")
+	}
+}
+
+// TestPlaceNotPlaceWithRscExactIgnoresSelf pins the
+// "the RD being placed never excludes its own host" contract from
+// scenario 9.W09. The placer must skip resources whose Name matches
+// the target RD when computing the excluded-node set; otherwise the
+// very first replica we land would lock every subsequent placement
+// out of the cluster, breaking PlaceCount > 1.
+//
+// Setup: 2 nodes, rd-new already has one replica on n1 (e.g. a prior
+// run), and NotPlaceWithRsc contains rd-new itself plus a no-op name
+// that isn't in the store. The placer must still be able to add a
+// second replica on n2 — n1 stays excluded only because PlaceCount's
+// taken-set bookkeeping skips already-occupied nodes, NOT because of
+// the not-place-with filter.
+func TestPlaceNotPlaceWithRscExactIgnoresSelf(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2"})
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "rd-new", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed rd-new: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "rd-new", &apiv1.AutoSelectFilter{
+		PlaceCount: 2,
+		// rd-new = self → must be ignored; rd-ghost not in store at
+		// all → also a no-op. Together they must NOT block n2.
+		NotPlaceWithRsc: []string{"rd-new", "rd-ghost"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Fatalf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "rd-new")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if !on["n1"] || !on["n2"] {
+		t.Errorf("nodes: got %v, want both n1 and n2 (self-name must not lock placement out)", on)
+	}
+}
+
 // TestPlaceNotPlaceWithRscRegexExcludesMatchingHosts pins scenario 2.11:
 // when `NotPlaceWithRscRegex` matches the name of an existing RD, every
 // node hosting a replica of that RD becomes ineligible. Cluster has 3

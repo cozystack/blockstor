@@ -80,7 +80,7 @@ Cross-listed with wave1 2.8. Up to N replicas per same-value bucket (e.g. 2 per 
 - **Priority:** P1  **Target:** unit  **Complexity:** L (implement first)
 - **Source:** UG9 §"Avoiding colocating resources when automatically placing a resource" (lines 995-1005) via tests/scenarios/day2-rg-do-not-place-with.md
 
-Cross-listed with wave1 2.10. Autoplacer skips nodes already hosting `<rd>`'s replicas. Constraint enforced at PLACEMENT time only — later toggle-disk onto a now-shared node not prevented. Status: not implemented (no `grep DoNotPlaceWith` matches today). `--do-not-place-with-regex` covers the wave1 2.11 variant.
+Cross-listed with wave1 2.10. Autoplacer skips nodes already hosting `<rd>`'s replicas. Constraint enforced at PLACEMENT time only — later toggle-disk onto a now-shared node not prevented. Status: implemented in `pkg/placer/placer.go` via `applyNotPlaceWith` over `AutoSelectFilter.NotPlaceWithRsc` (verbatim slice) — see `TestPlaceNotPlaceWithRscExactExcludesNamedHosts` and `TestPlaceNotPlaceWithRscExactIgnoresSelf`. `--do-not-place-with-regex` covers the wave1 2.11 variant via `NotPlaceWithRscRegex`.
 
 ### 9.W10 `--layer-list drbd,luks,storage` — S
 
