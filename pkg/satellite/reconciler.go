@@ -85,6 +85,15 @@ type ReconcilerConfig struct {
 	// construction via SetCrossNodeFetcher because the implementation
 	// needs the controller-runtime client only the manager owns.
 	CrossNodeFetcher CrossNodeFetcher
+
+	// Exec runs auxiliary shell-outs the reconciler owns directly
+	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
+	// scenario 9.W14). Production wires `storage.RealExec`; tests
+	// inject `storage.FakeExec` and assert the exact command line.
+	// nil disables auto-mkfs entirely — the seed path still promotes
+	// and demotes via Adm, but a configured `FileSystem/Type` prop
+	// becomes a no-op rather than panicking.
+	Exec storage.Exec
 }
 
 // CrossNodeFetcher abstracts the "fetch a snapshot from a peer that
@@ -325,7 +334,7 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// same name see firstActivation=false on its first apply,
 		// skip create-md, and fail drbdadm adjust with
 		// "No valid meta data found".
-		for _, suffix := range []string{".res", ".md-created"} {
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -883,15 +892,110 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	_ = cloned
 
 	if autoPromote {
-		err = r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+		err = r.runAutoPromote(ctx, dr)
 		if err != nil {
-			return errors.Wrapf(err, "auto-primary %s", dr.GetName())
+			return err
 		}
+	}
 
-		err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+	return nil
+}
+
+// runAutoPromote orchestrates the first-activation seed:
+//
+//  1. `drbdadm primary --force` — promote out of Inconsistent so the
+//     kernel accepts writes.
+//  2. RG-driven `mkfs.<type>` (scenario 9.W14) — runs ONLY while we
+//     hold Primary; mkfs on a Secondary deadlocks on EROFS.
+//  3. `drbdadm secondary` — demote so the consumer (CSI / external
+//     mounter) can promote at its own discretion.
+//
+// Pulled out of applyDRBD so the orchestration function stays under
+// the project's gocyclo budget.
+func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
+	err := r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
+	}
+
+	err = r.runAutoMkfs(ctx, dr)
+	if err != nil {
+		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
+	}
+
+	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
+	}
+
+	return nil
+}
+
+// runAutoMkfs handles the RG-driven auto-mkfs path of scenario
+// 9.W14. The controller folds `FileSystem/Type` (and the optional
+// `FileSystem/MkfsParams`) from the RG's effective props into the
+// per-RD wire Props map; the satellite consumes them here on the
+// primary replica's first activation only.
+//
+// Idempotency lives in a per-RD `<rd>.mkfs.done` marker under
+// StateDir, sibling to `.md-created`. The marker is dropped AFTER
+// every volume's mkfs returns success, so a partial failure leaves
+// the resource in a state the next reconcile can retry. The marker
+// is deleted together with `.res` / `.md-created` in DeleteResource
+// so a re-created RD with the same name correctly mkfs-s again.
+//
+// SAFETY: mkfs on a populated filesystem silently destroys data. The
+// marker file is the only thing standing between scenario 9.W14 and
+// data loss on every Apply — losing the marker on a healthy resource
+// (manual `rm`, satellite disk wipe) would re-run mkfs on the second
+// Apply. We treat the marker as authoritative; recovery from a lost
+// marker requires the operator to either delete + recreate the RD or
+// touch the marker manually before the next reconcile.
+func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource) error {
+	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
+	if fsType == "" {
+		return nil
+	}
+
+	if r.cfg.Exec == nil || r.cfg.StateDir == "" {
+		// No exec wrapper or no state dir → can't run mkfs / can't
+		// drop a marker. Skip rather than fail; production always
+		// wires both. The unit test that pins the no-Exec branch
+		// would otherwise need to mock half a Reconciler.
+		return nil
+	}
+
+	markerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".mkfs.done")
+
+	_, statErr := os.Stat(markerPath)
+	if statErr == nil {
+		// Marker present → mkfs already ran on a previous activation.
+		// Re-running would wipe a populated filesystem.
+		return nil
+	}
+
+	minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
+
+	args := []string{}
+
+	if extra := strings.TrimSpace(dr.GetProps()["FileSystem/MkfsParams"]); extra != "" {
+		args = append(args, strings.Fields(extra)...)
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		device := fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber()))
+
+		cmdArgs := append(slices.Clone(args), device)
+
+		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
 		if err != nil {
-			return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
+			return errors.Wrapf(err, "mkfs.%s %s", fsType, device)
 		}
+	}
+
+	err := os.WriteFile(markerPath, nil, resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", markerPath)
 	}
 
 	return nil
