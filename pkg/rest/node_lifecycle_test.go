@@ -247,6 +247,79 @@ func TestNodeRestoreIdempotent(t *testing.T) {
 	}
 }
 
+// TestNodeLifecyclePUTRoutes pins Bug 78: golinstor and python-linstor
+// hit /v1/nodes/{n}/restore, /evacuate, /evict with HTTP PUT (the
+// OpenAPI spec method). Without an explicit PUT route the Go-1.22
+// ServeMux returns 405 Method Not Allowed with an empty body, and
+// python-linstor crashes on `xml.etree.ElementTree.ParseError: syntax
+// error: line 1, column 0` because its error path tries to parse the
+// empty 405 body as an XML APICallRc envelope.
+//
+// Pin every PUT verb the upstream contract guarantees so a vendored
+// client (legacy script, OpenAPI-generated SDK, the official Python
+// CLI) gets a structured JSON response on success rather than a
+// 405-with-empty-body that crashes its response parser.
+func TestNodeLifecyclePUTRoutes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name:  "n1",
+		Flags: []string{"EVICTED"},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// PUT /restore — un-evict.
+	resp := httpPut(t, base+"/v1/nodes/n1/restore", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT restore: got %d, want 200 (route missing → python-linstor crash)", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("PUT restore left EVICTED in place: %v", got.Flags)
+	}
+
+	// PUT /evacuate — re-stamp EVICTED. ?force=true bypasses the
+	// in-use guard (no resources seeded so the guard would pass
+	// anyway, but explicit is safer against future seed changes).
+	resp = httpPut(t, base+"/v1/nodes/n1/evacuate?force=true", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT evacuate: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err = st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get after evacuate: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("PUT evacuate did not stamp EVICTED: %v", got.Flags)
+	}
+
+	// PUT /evict — alias of /evacuate (blockstor folds offline-drain
+	// into the online-drain handler since ?force already covers the
+	// semantic difference upstream LINSTOR splits across two paths).
+	resp = httpPut(t, base+"/v1/nodes/n1/evict?force=true", nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT evict: got %d, want 200 (alias missing breaks golinstor NodeService.Evict)", resp.StatusCode)
+	}
+}
+
 // TestNodeLostDeletesNode pins the upstream-LINSTOR semantic:
 // `controller drop-node` removes the Node entry entirely (not
 // "mark with LOST/EVICTED flags"). Orphan Resources are re-placed

@@ -39,10 +39,29 @@ func (s *Server) registerNodeLifecycle(mux *http.ServeMux) {
 	// Multi-node evacuate (scenario 4.W06, cross-listed wave1 4.21).
 	// Distinct path from the single-node variant so Go 1.22 ServeMux
 	// routes by literal-vs-wildcard specificity without ambiguity.
+	// Upstream LINSTOR uses PUT for evacuate/restore/evict per the
+	// OpenAPI spec (golinstor's NodeService.Evict/Evacuate/Restore all
+	// doPUT, python-linstor's node_evacuate/node_restore both PUT).
+	// Without the PUT route Go-1.22 ServeMux returns 405 with an
+	// empty body, and python-linstor crashes parsing the empty
+	// response as XML (xml.etree.ElementTree.ParseError at column 0).
+	// The legacy POST forms are kept alongside for shell scripts that
+	// hit the endpoints with curl without honouring the spec.
 	mux.HandleFunc("POST /v1/nodes/evacuate",
 		s.requireStore(s.handleNodeEvacuateMulti))
+	mux.HandleFunc("PUT /v1/nodes/{node}/evacuate",
+		s.requireStore(s.handleNodeEvacuate))
 	mux.HandleFunc("POST /v1/nodes/{node}/evacuate",
 		s.requireStore(s.handleNodeEvacuate))
+	// Upstream splits evict (offline drain) from evacuate (online
+	// drain); blockstor's single handler covers both intents since
+	// the in-use check is the only semantic distinction and ?force=true
+	// already lets the operator override it. Wiring evict as an alias
+	// keeps `linstor n evict` working without a second code path.
+	mux.HandleFunc("PUT /v1/nodes/{node}/evict",
+		s.requireStore(s.handleNodeEvacuate))
+	mux.HandleFunc("PUT /v1/nodes/{node}/restore",
+		s.requireStore(s.handleNodeRestore))
 	mux.HandleFunc("POST /v1/nodes/{node}/restore",
 		s.requireStore(s.handleNodeRestore))
 	// Upstream LINSTOR uses DELETE here (golinstor's NodeService.Lost
