@@ -22,9 +22,9 @@ Every sub-agent gets exactly ONE group from `docs/test-strategy.md` (Groups A th
 | Worktree | `isolation: "worktree"` ALWAYS (so the agent's edits never touch `main`) |
 | Files to add | EXACTLY ONE Go file under `tests/integration/<group>_test.go` plus optional helpers under `tests/integration/harness/<group>_helpers.go` |
 | Files NOT to touch | `tests/integration/harness/{envtest,manager,satellite,linstor,csi,fixtures,asserts,concurrent}.go`, ANY file outside `tests/integration/` |
-| PR title | `test(integration): Group <letter> — <description> (<N> tests)` |
-| PR template | "draft" via `gh pr create --draft`, body lists each test name + bug-guard reference from `docs/test-strategy.md` |
-| Definition of done | `go test -tags=integration ./tests/integration/... -run '^TestGroup<letter>' -count=1` passes locally + CI green on the PR + scenario tracker row flipped to `done` in the same PR |
+| Commit message | `test(integration): Group <letter> — <description> (<N> tests)` with `--signoff` and `Co-Authored-By: Claude <noreply@anthropic.com>` |
+| Push | feature branch only — `git push -u origin <branch>`. NO `gh pr create`. The launcher cherry-picks to `main`. |
+| Definition of done | `go test -tags=integration ./tests/integration/... -run '^TestGroup<letter>' -count=1` passes locally + scenario tracker row flipped to `done` in the same commit |
 
 If an agent needs to change the harness, it MUST stop and ask — never speculate.
 
@@ -32,7 +32,8 @@ If an agent needs to change the harness, it MUST stop and ask — never speculat
 
 - One group = one agent. Never dispatch two agents on the same group concurrently.
 - Bug-fix agents (those modifying `pkg/...` for a real code bug) are dispatched **after** the integration test that surfaces the bug exists on `main`. The test asserts the failing behavior first, the fix lands second on a separate branch. This prevents "test passes because the bug it was supposed to catch was silently fixed in the same PR".
-- Never let an agent run `git push --force` or `gh pr merge`. Merges are operator-only.
+- Never let an agent run `git push --force`. The launcher cherry-picks from feature branches into `main` — agents never touch `main` directly.
+- During the dev phase the launcher pushes cherry-picks straight to `origin/main` (no PR review). When the project flips to prod, the playbook switches to draft PRs.
 - Worktree cleanup: if an agent finishes without a PR (it returned mid-edit, hit token cap, etc.), the launcher MUST `git worktree remove` and `git branch -D` to keep the tree tidy.
 
 ## 3. Worktree hygiene
