@@ -327,6 +327,26 @@ func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string
 		return apiv1.StoragePool{}, false
 	}
 
+	// Scenario 6.W02: the python-linstor-client emits provider names
+	// in the lowercase compressed form (`lvmthin`, `zfsthin`, `filethin`)
+	// — exactly what `sp create lvmthin <node> <pool> <vg>/<thinpool>`
+	// puts on the wire. The StoragePool CRD enum and the satellite's
+	// NewProviderFromKind switch only accept the upstream-canonical
+	// uppercase tokens, so we normalise here in one shared place.
+	// Mirrors the same normalisation `physical-storage create-device-pool`
+	// already applies (Bug 73 parity); both endpoints must stay in
+	// lockstep so a CLI-typed name lands canonical regardless of which
+	// path created it. The legacy `lvm-thin` hyphenated form is NOT
+	// accepted — see TestSPCreateLVMThinHyphenRejected for the rationale.
+	normalized, ok := normalizeProviderKind(body.ProviderKind)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unknown provider_kind: "+body.ProviderKind)
+
+		return apiv1.StoragePool{}, false
+	}
+
+	body.ProviderKind = normalized
+
 	if !isKnownStoragePoolKind(body.ProviderKind) {
 		writeError(w, http.StatusBadRequest, "unknown provider_kind: "+body.ProviderKind)
 
