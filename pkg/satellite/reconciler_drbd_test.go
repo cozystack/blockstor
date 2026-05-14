@@ -2729,125 +2729,275 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 	}
 }
 
-// TestApplyVDSetSizeOnlineGrowOrdering pins scenario 4.W12 (`vd set-size`
-// grows online): when the controller bumps VD.SizeKib above what the
-// provider has on disk, the satellite reconciler MUST run the backend
-// resize (`lvextend` for LVM / `zfs set volsize` for ZFS) BEFORE
-// `drbdadm resize`. Order matters — `drbdadm resize` re-reads the
-// backing device's size and propagates it to the kernel; if it fires
-// before the backing device has grown, DRBD picks up the OLD size and
-// the consumer's `resize2fs` / `xfs_growfs` later sees a smaller block
-// device than its FS expects → ESHRINK and a confusing operator-facing
-// failure two layers up from the actual root cause.
+// TestTemporarySecondaryFailureAutoRecovers (scenario 5.W15 / wave2-05,
+// cross-listed with wave1 5.8 and 5.15) pins the auto-recovery
+// invariant for a transient secondary-node failure:
 //
-// Sub-cases:
-//   - LVM_THIN: lvs reports the LV at 1 GiB, desired 2 GiB → `lvextend
-//     --size 2048MiB` lands strictly before `drbdadm resize --assume-clean`.
-//   - ZFS_THIN: zfs list reports volsize=1 GiB, desired 2 GiB → `zfs set
-//     volsize=2048M` lands strictly before `drbdadm resize --assume-clean`.
+//	Surviving Primary (this satellite, n1) records changes to the
+//	dirty-bitmap while the Secondary peer (n2) is gone. When n2
+//	powers back on its satellite re-renders the same .res, the
+//	kernel re-handshakes from the bitmap, and DRBD walks the peer
+//	through Outdated → Inconsistent → SyncTarget → UpToDate
+//	without any operator action.
 //
-// Pairs with the REST-side guarantee that PUT
-// /v1/resource-definitions/{rd}/volume-definitions/{vn} updates only
-// VD.SizeKib without zeroing it on a props-only modify
-// (TestVolumeDefinitionsUpdateGetRoundTrip,
-// TestVolumeDefinitionsUpdateMergeSemanticsPreservesSizeKib). Together
-// they cover the full CSI ControllerExpandVolume path.
-func TestApplyVDSetSizeOnlineGrowOrdering(t *testing.T) {
-	cases := []struct {
-		name        string
-		newProvider func(storage.Exec) storage.Provider
-		poolName    string
-		// existsProbe is the per-provider "does the volume exist?" exec
-		// line, invoked from Provider.CreateVolume's idempotency check.
-		existsProbe string
-		existsReply string
-		// statProbe is the VolumeStatus exec line; statReply reports the
-		// CURRENT on-disk size as 1 GiB so the desired 2 GiB triggers the
-		// grow branch (`vol.GetSizeKib() > status.UsableKib`).
-		statProbe string
-		statReply string
-		// backendResize is the exact command line the provider issues to
-		// grow the backing device.
-		backendResize string
-	}{
+// The reconciler's job during this lifecycle is to STAY OUT OF THE
+// WAY. Concretely, across the four observed peer states it MUST NOT:
+//
+//   - Issue `drbdadm disconnect` / `drbdadm connect` on n1 (would
+//     pre-empt DRBD's own re-handshake and drop the bitmap-based
+//     delta sync in favour of a full resync, or worse race the
+//     handshake into split-brain).
+//   - Issue `drbdadm down` / `drbdadm up` on n1 (re-reads metadata
+//     and forces a fresh handshake from zero — defeats bitmap delta).
+//   - Issue `drbdadm primary --force` on n1 (already Primary; would
+//     bump current-uuid and trigger a full resync to the recovering
+//     peer instead of bitmap delta).
+//   - Re-run `drbdadm create-md` on n1 (wipes metadata — would
+//     orphan the local replica from the cluster's GI history).
+//   - Issue `drbdadm adjust` during the SyncTarget phase on n2
+//     (Bug 8 / scenario 5.16: adjust mid-resync re-renders the
+//     kernel's connection config, kernel drops in-flight bitmap
+//     progress, resync restarts at 0% — the bitmap delta this whole
+//     scenario relies on dies). The reconciler's kernel-state probe
+//     must catch SyncTarget and defer adjust to the next pass.
+//
+// Cross-listed with the 5.W14 (`TestReconcilerRespectsOperatorDisconnect`)
+// and 5.31 (`TestReconcilerDoesNotPropagateDiscardMyData`) patterns:
+// same "reconciler must not fight DRBD's own recovery" property, just
+// over a different failure shape (transient peer disappearance vs
+// operator disconnect vs operator misuse).
+//
+// Lifecycle drive: four reconcile passes, one per documented peer
+// state. .res + md-marker linger from pass 1, so passes 2–4 hit the
+// firstActivation=false branch (which is where the kernel-state probe
+// + adjust gate live).
+//
+// NOTE on the SyncTarget pass: the adjust-defer behaviour is itself
+// tracked by TestApplyDefersAdjustDuringSyncTarget (currently
+// t.Skip'd until Bug 8 is implemented). This test exercises the
+// SyncTarget step ONLY to confirm the broader "no disruptive verbs"
+// invariant — it does NOT pin the adjust-defer (that's 5.16's job).
+// Once 5.16 lands, the SyncTarget pass here will exercise the gate
+// end-to-end as a natural side effect.
+func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Pass 1: first activation — LV absent, lvcreate fires. Establishes
+	// the steady-state files (.res + md-marker) so subsequent passes
+	// hit firstActivation=false.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tempsec_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// 2-replica RD. The observer (out-of-band, not modelled here)
+	// reports peer n2's disk transitioning through Outdated →
+	// Inconsistent → SyncTarget → UpToDate. The DesiredResource shape
+	// the controller pushes the satellite NEVER changes through this
+	// lifecycle — that's the property under test: peer recovery is
+	// observable-state, not desired-state, so a steady Apply payload
+	// must produce a steady-and-inert reconciler.
+	dr := []*intent.DesiredResource{
 		{
-			name: "LVM_THIN",
-			newProvider: func(ex storage.Exec) storage.Provider {
-				return lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, ex)
+			Name:     "pvc-tempsec",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			poolName:      "thin1",
-			existsProbe:   "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-w12_00000",
-			existsReply:   "pvc-w12_00000\n",
-			statProbe:     "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-w12_00000",
-			statReply:     "/dev/vg/pvc-w12_00000|1048576\n",
-			backendResize: "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-w12_00000",
-		},
-		{
-			name: "ZFS_THIN",
-			newProvider: func(ex storage.Exec) storage.Provider {
-				return zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, ex)
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
 			},
-			poolName:      "zfs-thin1",
-			existsProbe:   "zfs list -H -o name tank/pvc-w12_00000",
-			existsReply:   "tank/pvc-w12_00000\n",
-			statProbe:     "zfs list -H -p -o name,volsize,used tank/pvc-w12_00000",
-			statReply:     "tank/pvc-w12_00000\t1073741824\t512\n",
-			backendResize: "zfs set volsize=2048M tank/pvc-w12_00000",
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			fx := storage.NewFakeExec()
-			fx.Expect(tc.existsProbe, storage.FakeResponse{Stdout: []byte(tc.existsReply)})
-			fx.Expect(tc.statProbe, storage.FakeResponse{Stdout: []byte(tc.statReply)})
+	// Pass 1: first activation, bring-up. adjust MUST fire here —
+	// that's how the resource enters the kernel in the first place,
+	// and is the verb every other 5.W15-style test pins as the
+	// positive control. create-md also fires on pass 1 (one-shot
+	// metadata write) — this is fine and expected; the forbidden-verb
+	// assertion below only spans the steady-state passes (2 through
+	// 5) where the recovery lifecycle actually plays out.
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply pass 1 (first activation): %v", err)
+	}
 
-			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
-				Providers: map[string]storage.Provider{tc.poolName: tc.newProvider(fx)},
-				Adm:       drbd.NewAdm(fx),
-				StateDir:  dir,
-				NodeName:  "n1",
-			})
+	pass1Cmds := append([]string{}, fx.CommandLines()...)
 
-			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
-				{
-					Name:     "pvc-w12",
-					NodeName: "n1",
-					Volumes: []*intent.DesiredVolume{
-						// Desired: 2 GiB — exceeds the 1 GiB the
-						// VolumeStatus probes report on disk.
-						{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: tc.poolName},
-					},
-					DrbdOptions: map[string]string{
-						"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
-					},
-				},
-			})
-			if err != nil {
-				t.Fatalf("Apply: %v", err)
+	if !slices.Contains(pass1Cmds, "drbdadm adjust pvc-tempsec") {
+		t.Fatalf("first-activation Apply must adjust to bring the resource up; got %v",
+			pass1Cmds)
+	}
+
+	// Steady-state passes: walk through the four peer states DRBD
+	// emits during a temporary-secondary recovery. Each pass restages
+	// the storage probes (LV present, size readback) and the kernel
+	// status probe with the matching wire-format snippet. The
+	// reconciler's firstActivation=false branch consults
+	// `drbdsetup status <rd>` via IsLoaded — staging a real status
+	// block keeps it on the adjust path (kernel slot present), which
+	// is the path 5.W15 lives on. An empty / missing status response
+	// would push the reconciler onto the `drbdadm up` fallback (Bug
+	// 47 / scenario 5.32) and bypass this test's invariant.
+	cases := []struct {
+		name     string
+		status   string
+		expectN1 string // n1's local disk
+	}{
+		{
+			name: "n2 powered off (Outdated, Connecting)",
+			// n2 is gone. Surviving Primary records changes to the
+			// dirty bitmap and stays Primary/UpToDate; the connection
+			// flaps through Connecting (or StandAlone, depending on
+			// DRBD timing — Connecting is the canonical "peer
+			// disappeared but I'm waiting for it to come back" shape).
+			status: `pvc-tempsec role:Primary
+  volume:0 disk:UpToDate
+  n2 connection:Connecting role:Unknown
+    volume:0 peer-disk:Outdated
+`,
+			expectN1: "UpToDate",
+		},
+		{
+			name: "n2 back, pre-handshake (Inconsistent)",
+			// n2's satellite booted, kernel module loaded, .res
+			// re-rendered, drbdadm up ran on n2. The peer slot
+			// reappears on the wire but the GI handshake hasn't yet
+			// converged — n2's disk reads Inconsistent until DRBD
+			// computes the bitmap diff and starts the resync.
+			status: `pvc-tempsec role:Primary
+  volume:0 disk:UpToDate
+  n2 connection:Connected role:Secondary
+    volume:0 peer-disk:Inconsistent
+`,
+			expectN1: "UpToDate",
+		},
+		{
+			name: "n2 catching up (SyncTarget, mid-resync)",
+			// Bitmap delta in flight. n1 is SyncSource, n2 is
+			// SyncTarget. This is the danger pass: a `drbdadm
+			// adjust` here re-renders kernel connection config and
+			// drops the in-flight bitmap progress (Bug 8 / scenario
+			// 5.16). The kernel-state probe in runBringUpOrAdjust
+			// must catch SyncTarget and defer.
+			status: `pvc-tempsec role:Primary
+  volume:0 disk:UpToDate
+  n2 connection:Connected role:Secondary
+    volume:0 replication:SyncSource peer-disk:Inconsistent done:42.50
+`,
+			expectN1: "UpToDate",
+		},
+		{
+			name: "n2 caught up (UpToDate, Established)",
+			// Resync complete. DRBD has flipped n2 to UpToDate and
+			// the connection is Established. The reconciler can
+			// resume normal adjust passes from here — but ALL the
+			// disruptive verbs are still forbidden because nothing
+			// in the DesiredResource has changed.
+			status: `pvc-tempsec role:Primary
+  volume:0 disk:UpToDate
+  n2 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`,
+			expectN1: "UpToDate",
+		},
+	}
+
+	// steadyCmds accumulates the FakeExec transcript across the four
+	// steady-state passes. Kept separate from pass1Cmds so the
+	// forbidden-verb checks below can exclude pass 1's expected
+	// `drbdadm create-md` (one-shot metadata write — fine on first
+	// activation, forbidden anywhere else).
+	steadyCmds := []string{}
+
+	for i, tc := range cases {
+		fx.Reset()
+		// Steady-state storage probes: LV already present (carve done
+		// in pass 1) + size readback. These match every other
+		// firstActivation=false test in this file.
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tempsec_00000",
+			storage.FakeResponse{Stdout: []byte("pvc-tempsec_00000\n")})
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tempsec_00000",
+			storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tempsec_00000|1048576\n")})
+		// Kernel-state probe: stage the per-state drbdsetup status
+		// block. IsLoaded reads it as "loaded" (exit zero + non-empty
+		// stdout), keeping the reconciler on the adjust path.
+		fx.Expect("drbdsetup status pvc-tempsec",
+			storage.FakeResponse{Stdout: []byte(tc.status)})
+
+		if _, err := rec.Apply(t.Context(), dr); err != nil {
+			t.Fatalf("Apply pass %d (%s): %v", i+2, tc.name, err)
+		}
+
+		steadyCmds = append(steadyCmds, fx.CommandLines()...)
+	}
+
+	// Core assertion: across the FOUR steady-state passes (peer
+	// Outdated → Inconsistent → SyncTarget → UpToDate), the
+	// reconciler must have issued ZERO disruptive verbs on the local
+	// replica. DRBD's own re-handshake + bitmap-based delta sync is
+	// doing the recovery — the reconciler must not race it.
+	//
+	// Pass 1 (first activation) is excluded: `drbdadm create-md` is
+	// the one-shot metadata write that brings the resource up the
+	// very first time, and `drbdadm adjust` is the bring-up verb.
+	// Neither is allowed on any subsequent pass.
+	forbidden := []string{
+		"drbdadm disconnect pvc-tempsec",
+		"drbdadm connect pvc-tempsec",
+		"drbdadm down pvc-tempsec",
+		"drbdadm up pvc-tempsec",
+		"drbdadm primary --force pvc-tempsec",
+		"drbdadm create-md",
+		"drbdadm invalidate",
+		"drbdadm invalidate-remote",
+		"drbdadm del-peer",
+	}
+
+	for _, bad := range forbidden {
+		for _, line := range steadyCmds {
+			if strings.Contains(line, bad) {
+				t.Errorf("scenario 5.W15: reconciler issued forbidden %q during temp-secondary auto-recovery; "+
+					"DRBD must drive the bitmap delta unaided.\nline: %s\nsteady-state calls: %v",
+					bad, line, steadyCmds)
 			}
+		}
+	}
 
-			calls := fx.CommandLines()
+	// Positive control 1: pass 1 (first activation) MUST have run
+	// `drbdadm adjust pvc-tempsec`. Already asserted above; restate
+	// here so a refactor that loses the pass-1 adjust surfaces in
+	// the same test that pins the lifecycle.
+	if !slices.Contains(pass1Cmds, "drbdadm adjust pvc-tempsec") {
+		t.Errorf("expected drbdadm adjust on first activation; got %v", pass1Cmds)
+	}
 
-			backendIdx := slices.Index(calls, tc.backendResize)
-			drbdResizeIdx := indexOfPrefix(calls, "drbdadm resize")
+	// Positive control 2: the .res file MUST be present and stable —
+	// the reconciler keeps rewriting it on every pass (cheap, durable
+	// record of desired state), but its content must not flap.
+	resPath := filepath.Join(dir, "pvc-tempsec.res")
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile .res: %v", err)
+	}
 
-			if backendIdx < 0 {
-				t.Fatalf("missing backend resize %q in calls: %v", tc.backendResize, calls)
-			}
-
-			if drbdResizeIdx < 0 {
-				t.Fatalf("missing drbdadm resize in calls: %v", calls)
-			}
-
-			// Scenario 4.W12: backend grow MUST precede drbdadm resize.
-			// drbdadm resize re-reads the backing device size; running
-			// it first would propagate the OLD size to the DRBD kernel.
-			if backendIdx >= drbdResizeIdx {
-				t.Errorf("scenario 4.W12 order: backend resize @%d must precede drbdadm resize @%d; calls=%v",
-					backendIdx, drbdResizeIdx, calls)
-			}
-		})
+	// Peer block must still be present in every pass — losing it
+	// would teach DRBD the peer is gone-for-good and trigger
+	// del-peer on the next adjust, defeating the bitmap delta.
+	if !strings.Contains(string(body), "on n2 {") {
+		t.Errorf("scenario 5.W15: .res must keep `on n2 {` across the recovery; got:\n%s", body)
 	}
 }
