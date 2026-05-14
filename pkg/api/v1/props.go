@@ -131,3 +131,36 @@ type EffectiveProperties map[string]EffectivePropEntry
 // RD/RG-scope kill-switches land alongside the placer integration in
 // a follow-up.
 const PropBalanceResourcesEnabled = "BalanceResourcesEnabled"
+
+// PropAllowMixingStoragePoolDriver is the cluster-scope override that
+// opens the LVM_THIN ↔ ZFS_THIN cell of the provider-kind mixing table.
+// Mirrors upstream LINSTOR's `AllowMixingStoragePoolDriver` controller
+// property (linstor-common/consts.json KEY_RSC_ALLOW_MIXING_DEVICE_KIND)
+// gated by UG9 §"Mixing storage pools of different storage providers"
+// (lines 2030-2069).
+//
+// Scenario 6.W07 (cross-listed with wave1 6.8 / Bug 76): the placer's
+// default behaviour is to refuse mixed-provider replicas on one RD —
+// `r c test --auto-place 2` will land both replicas on the same kind
+// or fall short. Setting this prop to "true" on the controller singleton
+// opens exactly the LVM_THIN ↔ ZFS_THIN pair so an operator can run a
+// heterogeneous cluster (e.g. LVM_THIN on flash + ZFS_THIN on bulk)
+// without the placer forcing same-kind-only.
+//
+// Prerequisites the operator must satisfy out-of-band before flipping
+// this prop (documented in code comments, not enforced by the placer):
+//
+//   - DRBD ≥ 9.2.7 — earlier kernels mis-handle the heterogeneous
+//     allocator hand-off and corrupt the resync bitmap on size mismatch.
+//   - LINSTOR ≥ 1.27.0 — earlier controllers don't honour the
+//     `AllowMixingStoragePoolDriver` namespace.
+//   - Mixed-provider RDs are treated as THICK by both kernels (the
+//     thin-space savings of either side are forfeit), and some snapshot
+//     paths degrade — operators must accept those trade-offs.
+//
+// Only the LVM_THIN ↔ ZFS_THIN cell is opened by this flag. The wider
+// upstream `isMixingAllowed` matrix (LVM ↔ ZFS, LVM ↔ LVM_THIN, …)
+// stays closed until a future scenario plumbs the matching matrix
+// extensions — opening more cells than what's tested here would
+// silently widen the placer beyond what e2e covers.
+const PropAllowMixingStoragePoolDriver = "AllowMixingStoragePoolDriver"

@@ -1900,6 +1900,217 @@ func TestPlaceAutoPlace2EnforcesSameProviderKind(t *testing.T) {
 	})
 }
 
+// TestPlaceAllowMixingStoragePoolDriver6W07 pins scenario 6.W07: when
+// the operator sets the controller-scope
+// `AllowMixingStoragePoolDriver=true` prop, the placer opens exactly
+// the LVM_THIN ↔ ZFS_THIN cell of the mixing matrix — so a 2-replica
+// autoplace on a cluster that has ONLY a cross-kind LVM_THIN/ZFS_THIN
+// pair available SUCCEEDS instead of short-placing the way Bug 76
+// default behaviour does.
+//
+// We pin three layers of behaviour:
+//
+//   - default (prop unset / "false"): the LVM_THIN + ZFS_THIN cluster
+//     can only land one replica → placed=1, want=2. This is the
+//     unchanged Bug 76 baseline (mirrors
+//     three_distinct_kinds_force_shortfall).
+//   - 6.W07 ON: same cluster, prop = "true" → placed=2, replicas split
+//     across the two kinds.
+//   - narrow-widening: even with the prop ON, a LVM ↔ ZFS_THIN cluster
+//     stays denied (the override is single-cell). placed=1, not 2.
+//
+// Cross-listed: wave1 6.8 / Bug 76 / wave2-06 §6.W07.
+func TestPlaceAllowMixingStoragePoolDriver6W07(t *testing.T) {
+	t.Parallel()
+
+	// seedCluster wires up a 2-node cluster with one LVM_THIN pool on
+	// n-lvm and one ZFS_THIN pool on n-zfs — the minimal cross-kind
+	// topology that demonstrates the 6.W07 override. Both pools have
+	// generous capacity so the capacity / oversub gates never fire.
+	seedCluster := func(t *testing.T) store.Store {
+		t.Helper()
+
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n-lvm", "n-zfs"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", n, err)
+			}
+		}
+
+		pools := []apiv1.StoragePool{
+			{NodeName: "n-lvm", StoragePoolName: "lvm-thin", ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 1000, TotalCapacity: 2000},
+			{NodeName: "n-zfs", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000, TotalCapacity: 2000},
+		}
+		for i := range pools {
+			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+				t.Fatalf("seed pool %s/%s: %v", pools[i].NodeName, pools[i].StoragePoolName, err)
+			}
+		}
+
+		return st
+	}
+
+	t.Run("default_off_shortfalls_on_cross_kind", func(t *testing.T) {
+		t.Parallel()
+
+		st := seedCluster(t)
+		ctx := t.Context()
+
+		// Prop unset → Bug 76 default: same-kind only. The cluster
+		// offers no same-kind pair, so place_count=2 falls to 1.
+		placed, want, err := placer.New(st).Place(ctx, "rd-off", &apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+		})
+		if err != nil {
+			t.Fatalf("Place: %v (placed=%d, want=%d)", err, placed, want)
+		}
+
+		if placed != 1 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 1/2 (default Bug 76 same-kind, prop off)", placed, want)
+		}
+	})
+
+	t.Run("prop_true_opens_lvm_thin_zfs_thin", func(t *testing.T) {
+		t.Parallel()
+
+		st := seedCluster(t)
+		ctx := t.Context()
+
+		// 6.W07 ON: opt the cluster into the LVM_THIN ↔ ZFS_THIN
+		// override and the same place_count=2 must now succeed with
+		// one replica on each kind.
+		if err := st.ControllerProps().Set(ctx, map[string]string{
+			apiv1.PropAllowMixingStoragePoolDriver: "true",
+		}); err != nil {
+			t.Fatalf("set controller prop: %v", err)
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "rd-on", &apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+		})
+		if err != nil {
+			t.Fatalf("Place: %v (placed=%d, want=%d)", err, placed, want)
+		}
+
+		if placed != 2 || want != 2 {
+			t.Fatalf("placed/want: got %d/%d, want 2/2 (6.W07 LVM_THIN↔ZFS_THIN opened)", placed, want)
+		}
+
+		got, err := st.Resources().ListByDefinition(ctx, "rd-on")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+
+		// Sanity: replicas span BOTH kinds — that's the whole point
+		// of the override. A regression that keeps the same-kind
+		// gate even with the prop would put both on one kind, and
+		// since each node has exactly one pool the only way to land
+		// 2 replicas at all is one-each.
+		nodes := map[string]bool{}
+		kinds := map[string]bool{}
+
+		for _, r := range got {
+			nodes[r.NodeName] = true
+			pool, perr := st.StoragePools().Get(ctx, r.NodeName, r.Props["StorPoolName"])
+			if perr != nil {
+				t.Fatalf("get pool %s/%s: %v", r.NodeName, r.Props["StorPoolName"], perr)
+			}
+
+			kinds[pool.ProviderKind] = true
+		}
+
+		if !nodes["n-lvm"] || !nodes["n-zfs"] {
+			t.Errorf("expected replicas on both n-lvm + n-zfs; got %+v", nodes)
+		}
+
+		if !kinds[apiv1.StoragePoolKindLVMThin] || !kinds[apiv1.StoragePoolKindZFSThin] {
+			t.Errorf("expected one LVM_THIN + one ZFS_THIN replica; got %+v", kinds)
+		}
+	})
+
+	t.Run("prop_true_does_not_open_lvm_zfs_thin", func(t *testing.T) {
+		t.Parallel()
+
+		// Narrow-widening guard: even with the flag set, the wider
+		// upstream matrix (LVM ↔ ZFS_THIN, LVM ↔ LVM_THIN, …) stays
+		// closed. We swap the LVM_THIN pool for a LVM (thick) pool
+		// so the cross-kind pair is LVM ↔ ZFS_THIN — that cell is
+		// NOT covered by the 6.W07 override and the placer must
+		// still short-place.
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		for _, n := range []string{"n-lvm", "n-zfs"} {
+			if err := st.Nodes().Create(ctx, &apiv1.Node{
+				Name: n, Type: apiv1.NodeTypeSatellite,
+			}); err != nil {
+				t.Fatalf("seed node %s: %v", n, err)
+			}
+		}
+
+		pools := []apiv1.StoragePool{
+			{NodeName: "n-lvm", StoragePoolName: "lvm-thick", ProviderKind: apiv1.StoragePoolKindLVM, FreeCapacity: 1000, TotalCapacity: 2000},
+			{NodeName: "n-zfs", StoragePoolName: "zfs-thin", ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 1000, TotalCapacity: 2000},
+		}
+		for i := range pools {
+			if err := st.StoragePools().Create(ctx, &pools[i]); err != nil {
+				t.Fatalf("seed pool %s/%s: %v", pools[i].NodeName, pools[i].StoragePoolName, err)
+			}
+		}
+
+		if err := st.ControllerProps().Set(ctx, map[string]string{
+			apiv1.PropAllowMixingStoragePoolDriver: "true",
+		}); err != nil {
+			t.Fatalf("set controller prop: %v", err)
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "rd-narrow", &apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+		})
+		if err != nil {
+			t.Fatalf("Place: %v (placed=%d, want=%d)", err, placed, want)
+		}
+
+		if placed != 1 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 1/2 (6.W07 must NOT open LVM↔ZFS_THIN even with flag)", placed, want)
+		}
+	})
+
+	t.Run("prop_garbage_treated_as_false", func(t *testing.T) {
+		t.Parallel()
+
+		// Defensive: a typo'd prop value ("yes", "1", empty after
+		// trim) must NOT silently open the cell — only literal
+		// case-insensitive "true" flips the gate. Mirrors upstream
+		// LINSTOR Boolean.parseBoolean semantics and stops an
+		// operator who meant to confirm a different prop from
+		// accidentally widening the matrix.
+		st := seedCluster(t)
+		ctx := t.Context()
+
+		if err := st.ControllerProps().Set(ctx, map[string]string{
+			apiv1.PropAllowMixingStoragePoolDriver: "yes",
+		}); err != nil {
+			t.Fatalf("set controller prop: %v", err)
+		}
+
+		placed, want, err := placer.New(st).Place(ctx, "rd-garbage", &apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+		})
+		if err != nil {
+			t.Fatalf("Place: %v (placed=%d, want=%d)", err, placed, want)
+		}
+
+		if placed != 1 || want != 2 {
+			t.Errorf("placed/want: got %d/%d, want 1/2 (prop=\"yes\" must NOT flip the gate)", placed, want)
+		}
+	})
+}
+
 // TestPlaceRejectsBelowMinFreeCapacity pins Bug 35: the placer must
 // drop pools whose FreeCapacity is below the largest VolumeDefinition
 // on the RD. 7.15 e2e showed autoplace returning 200 even when every

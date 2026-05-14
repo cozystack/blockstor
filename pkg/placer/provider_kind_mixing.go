@@ -34,10 +34,12 @@ import (
 //   - Cross-family pairs are forbidden by default. The notable
 //     conditional case in upstream (LVM_THIN ↔ ZFS_THIN, LVM ↔ ZFS,
 //     LVM ↔ LVM_THIN, …) is gated on an explicit cluster property
-//     `allowStorPoolMixing` plus DRBD version ≥ 9.1.18 / 9.2.7. We
-//     don't carry that cluster prop yet, so those cells return false
-//     here. TODO(bug-76-followup): when the cluster prop lands, mirror
-//     `allowedWithRecentEnoughDrbdVersion` for the gated cells.
+//     `AllowMixingStoragePoolDriver` plus DRBD version ≥ 9.1.18 / 9.2.7.
+//     Scenario 6.W07 plumbs the prop through `allowMixing`: when true
+//     ONLY the LVM_THIN ↔ ZFS_THIN cell opens (the cell explicitly
+//     covered by wave2-06 e2e). The wider upstream matrix (LVM ↔ ZFS,
+//     LVM ↔ LVM_THIN, …) stays closed even with the flag set — opening
+//     them would silently widen the placer beyond what's tested.
 //   - FILE/FILE_THIN are interchangeable with each other and DISKLESS.
 //   - SPDK and REMOTE_SPDK are family-internal (no cross-family
 //     allowance even with the cluster prop).
@@ -52,9 +54,18 @@ import (
 // enum names). Unknown kinds are conservatively rejected unless
 // they're literally equal.
 //
-// Order doesn't matter: f(left,right) == f(right,left) per upstream
+// `allowMixing` is the resolved controller-scope
+// `AllowMixingStoragePoolDriver` prop (apiv1.PropAllowMixingStoragePoolDriver).
+// Operators must independently satisfy the upstream prerequisites —
+// DRBD ≥ 9.2.7 and LINSTOR ≥ 1.27.0 (see prop doc on
+// `PropAllowMixingStoragePoolDriver`) — before flipping the flag;
+// the placer takes the prop's value at face value, mirroring upstream
+// LINSTOR's "operator opts in, operator owns the consequences"
 // contract.
-func IsProviderKindMixingAllowed(left, right string) bool {
+//
+// Order doesn't matter: f(a,b,flag) == f(b,a,flag) per upstream
+// contract.
+func IsProviderKindMixingAllowed(left, right string, allowMixing bool) bool {
 	// DISKLESS as either side: no backing pool, nothing to gate.
 	if left == apiv1.StoragePoolKindDiskless || right == apiv1.StoragePoolKindDiskless {
 		return true
@@ -66,16 +77,47 @@ func IsProviderKindMixingAllowed(left, right string) bool {
 		return true
 	}
 
-	return isMixingAllowedDirected(left, right) || isMixingAllowedDirected(right, left)
+	if isMixingAllowedDirected(left, right) || isMixingAllowedDirected(right, left) {
+		return true
+	}
+
+	// 6.W07 override: the operator has opted in via cluster prop
+	// AllowMixingStoragePoolDriver=true, so open the explicitly-tested
+	// LVM_THIN ↔ ZFS_THIN cell. The widening is deliberately narrow —
+	// only the single cell wave2-06 §6.W07 calls out — so opening the
+	// flag never silently exceeds the matrix the e2e suite exercises.
+	if allowMixing && isThinCrossKindPair(left, right) {
+		return true
+	}
+
+	return false
+}
+
+// isThinCrossKindPair reports whether {left, right} is exactly the
+// LVM_THIN ↔ ZFS_THIN pair (in either order). Pulled out of the public
+// helper so the 6.W07 override is one named call instead of an inline
+// conjunction — the symmetric "either order" check makes the inline
+// form noisy.
+func isThinCrossKindPair(left, right string) bool {
+	if left == apiv1.StoragePoolKindLVMThin && right == apiv1.StoragePoolKindZFSThin {
+		return true
+	}
+
+	if left == apiv1.StoragePoolKindZFSThin && right == apiv1.StoragePoolKindLVMThin {
+		return true
+	}
+
+	return false
 }
 
 // isMixingAllowedDirected mirrors the upstream switch in directed
 // form. The public helper symmetrises by trying both orderings.
 //
 // We omit the `allowedWithRecentEnoughDrbdVersion` branches of the
-// upstream table because we don't yet plumb the `allowStorPoolMixing`
-// cluster prop or per-node DRBD versions into the placer; doing so
-// is the explicit follow-up to Bug 76.
+// upstream table because we only model the single LVM_THIN ↔ ZFS_THIN
+// cell behind 6.W07's `AllowMixingStoragePoolDriver` flag; broader
+// upstream cells (LVM ↔ ZFS, LVM ↔ LVM_THIN, …) stay closed until a
+// follow-up scenario plumbs them through e2e too.
 func isMixingAllowedDirected(kind1, kind2 string) bool {
 	switch kind1 {
 	case apiv1.StoragePoolKindFile, apiv1.StoragePoolKindFileThin:
@@ -87,12 +129,14 @@ func isMixingAllowedDirected(kind1, kind2 string) bool {
 		// Upstream's `allowed` table: LVM ↔ LVM only (plus
 		// STORAGE_SPACES family which we don't model yet).
 		// LVM ↔ LVM_THIN/ZFS/ZFS_THIN sits behind
-		// allowStorPoolMixing — see TODO above.
+		// allowStorPoolMixing in upstream; 6.W07 only widens the
+		// LVM_THIN ↔ ZFS_THIN cell, not these.
 		return false
 
 	case apiv1.StoragePoolKindLVMThin:
 		// Symmetric to LVM: same-family already handled in caller;
-		// every cross-cell here is gated.
+		// the LVM_THIN ↔ ZFS_THIN override is applied by the public
+		// helper after this directed lookup returns false.
 		return false
 
 	case apiv1.StoragePoolKindZFS, apiv1.StoragePoolKindZFSThin:

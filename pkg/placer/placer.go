@@ -308,6 +308,17 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 		return nil, errors.Wrap(err, "list storage pools")
 	}
 
+	// Scenario 6.W07: read the controller-scope
+	// `AllowMixingStoragePoolDriver` opt-in once per Place call so
+	// every candidate evaluation in this run sees the same value (a
+	// concurrent operator flip won't tear the placement decision
+	// mid-loop). False (missing / unparseable / not "true") preserves
+	// the Bug 76 same-kind default.
+	allowPoolDriverMixing, err := p.loadAllowPoolDriverMixing(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// do-not-place-with anti-affinity (scenarios 2.10 / 2.11): exclude
 	// every candidate pool whose node already hosts a replica of an RD
 	// named in NotPlaceWithRsc (verbatim) or matching
@@ -327,7 +338,7 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 	// sees nodes the operator declared as the target value bucket.
 	candidates = filterSamePinned(candidates, nodes, filter.ReplicasOnSame)
 
-	state := newState(filter, existing, nodes, allPools)
+	state := newState(filter, existing, nodes, allPools, allowPoolDriverMixing)
 
 	if state.sameTuple == nil && len(filter.ReplicasOnSame) > 0 {
 		candidates, state.sameTuple = pickSameGroup(candidates, nodes,
@@ -448,11 +459,21 @@ type state struct {
 	// firstKind is the ProviderKind of the first diskful replica
 	// either already on the RD (seeded from `existing`) or placed
 	// during this Place call. Subsequent diskful candidates are
-	// rejected unless IsProviderKindMixingAllowed(firstKind, pool)
-	// returns true (Bug 76: mirror upstream LINSTOR's same-kind
-	// constraint). Empty string means "no diskful replica yet, no
-	// constraint" — the first replica is free to pick any kind.
+	// rejected unless IsProviderKindMixingAllowed(firstKind, pool,
+	// allowPoolDriverMixing) returns true (Bug 76: mirror upstream
+	// LINSTOR's same-kind constraint). Empty string means "no diskful
+	// replica yet, no constraint" — the first replica is free to pick
+	// any kind.
 	firstKind string
+	// allowPoolDriverMixing is the resolved controller-scope value of
+	// the AllowMixingStoragePoolDriver prop
+	// (apiv1.PropAllowMixingStoragePoolDriver). When true, the placer
+	// opens the LVM_THIN ↔ ZFS_THIN cell of IsProviderKindMixingAllowed
+	// (scenario 6.W07). Captured into state at newState time so a
+	// single Place call uses one consistent value even if the prop
+	// changes mid-loop. False (the default) preserves the Bug 76
+	// same-kind behaviour.
+	allowPoolDriverMixing bool
 	// xBuckets enforces XReplicasOnDifferentMap (scenario 9.W08 /
 	// wave1 2.8). Per <key,N> entry the placer caps the number of
 	// replicas that share the same Aux/<key> value at N. Keys here
@@ -464,16 +485,17 @@ type state struct {
 	xBuckets map[string]int
 }
 
-func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool) *state {
+func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool, allowPoolDriverMixing bool) *state {
 	s := &state{
-		nodes:      nodes,
-		taken:      make(map[string]struct{}, len(existing)),
-		sameTuple:  topologyTuple(existing, nodes, filter.ReplicasOnSame),
-		diffSeen:   topologySeen(existing, nodes, filter.ReplicasOnDifferent),
-		sharedSeen: make(map[string]struct{}),
-		pools:      poolsByKey(pools),
-		filter:     filter,
-		xBuckets:   make(map[string]int, len(filter.XReplicasOnDifferentMap)),
+		nodes:                 nodes,
+		taken:                 make(map[string]struct{}, len(existing)),
+		sameTuple:             topologyTuple(existing, nodes, filter.ReplicasOnSame),
+		diffSeen:              topologySeen(existing, nodes, filter.ReplicasOnDifferent),
+		sharedSeen:            make(map[string]struct{}),
+		pools:                 poolsByKey(pools),
+		filter:                filter,
+		xBuckets:              make(map[string]int, len(filter.XReplicasOnDifferentMap)),
+		allowPoolDriverMixing: allowPoolDriverMixing,
 	}
 
 	for i := range existing {
@@ -622,7 +644,7 @@ func (s *state) allowsKindMix(kind string) bool {
 		return true
 	}
 
-	return IsProviderKindMixingAllowed(s.firstKind, kind)
+	return IsProviderKindMixingAllowed(s.firstKind, kind, s.allowPoolDriverMixing)
 }
 
 func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) (bool, error) {
@@ -923,6 +945,26 @@ func (p *Placer) loadWeights(ctx context.Context) (weights, error) {
 		minRscCount:      parseWeight(props[apiv1.PropAutoplacerWeightMinRscCount]),
 		maxThroughput:    parseWeight(props[apiv1.PropAutoplacerWeightMaxThroughput]),
 	}, nil
+}
+
+// loadAllowPoolDriverMixing reads the controller-scope
+// `AllowMixingStoragePoolDriver` prop (scenario 6.W07) and returns the
+// resolved boolean. Missing / empty / not-"true" → false, which keeps
+// the placer on the Bug 76 same-kind default. Match is
+// case-insensitive against "true" so an operator typing "True" or
+// "TRUE" via REST still gets the override — mirroring upstream LINSTOR
+// `Boolean.parseBoolean` semantics on this prop.
+//
+// Pulled out of assemblePlan so the read sits next to the existing
+// controller-props consumer (loadWeights) and a future RG/RD-scope
+// override (the natural follow-up cell) can extend the same path.
+func (p *Placer) loadAllowPoolDriverMixing(ctx context.Context) (bool, error) {
+	props, err := p.store.ControllerProps().Get(ctx)
+	if err != nil {
+		return false, errors.Wrap(err, "get controller props")
+	}
+
+	return strings.EqualFold(props[apiv1.PropAllowMixingStoragePoolDriver], "true"), nil
 }
 
 // parseWeight returns the float value of raw, defaulting to 1.0 for the

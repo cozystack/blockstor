@@ -33,10 +33,13 @@ import (
 //   - same-kind pairs always allowed (LVM/LVM, ZFS/ZFS, …)
 //   - DISKLESS combined with anything always allowed (witnesses)
 //   - cross-kind pairs are denied by default. Notably
-//     LVM_THIN↔ZFS_THIN is denied here even though upstream would
-//     allow it conditionally on the cluster-wide `allowStorPoolMixing`
-//     property and DRBD ≥ 9.1.18. We don't model that prop yet (see
-//     follow-up note in provider_kind_mixing.go), so the cell stays false.
+//     LVM_THIN↔ZFS_THIN is denied unless the operator opts in via the
+//     6.W07 cluster prop `AllowMixingStoragePoolDriver=true`
+//     (apiv1.PropAllowMixingStoragePoolDriver). That override is
+//     exercised in TestIsProviderKindMixingAllowedWith6W07Override.
+//
+// This case body runs with allowMixing=false (the default) so it
+// pins the upstream-default table.
 func TestIsProviderKindMixingAllowed(t *testing.T) {
 	t.Parallel()
 
@@ -71,9 +74,9 @@ func TestIsProviderKindMixingAllowed(t *testing.T) {
 		// the on-disk format and `zfs send` payload are compatible.
 		{"zfs_zfs_thin", apiv1.StoragePoolKindZFS, apiv1.StoragePoolKindZFSThin, true},
 
-		// Cross-family pairs: denied. Upstream gates several of these
-		// behind allowStorPoolMixing + DRBD-version; we don't carry
-		// the cluster prop yet, so they stay denied (Bug 76 scope).
+		// Cross-family pairs: denied by default. The 6.W07 override
+		// opens LVM_THIN ↔ ZFS_THIN only — the others stay denied even
+		// with the flag set; see TestIsProviderKindMixingAllowedWith6W07Override.
 		{"lvm_zfs", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindZFS, false},
 		{"lvm_zfs_thin", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindZFSThin, false},
 		{"lvm_lvm_thin", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin, false},
@@ -94,17 +97,93 @@ func TestIsProviderKindMixingAllowed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := placer.IsProviderKindMixingAllowed(tc.a, tc.b)
+			got := placer.IsProviderKindMixingAllowed(tc.a, tc.b, false)
 			if got != tc.want {
-				t.Errorf("IsProviderKindMixingAllowed(%q, %q) = %v; want %v",
+				t.Errorf("IsProviderKindMixingAllowed(%q, %q, false) = %v; want %v",
 					tc.a, tc.b, got, tc.want)
 			}
 
 			// Symmetry contract: swapping the arguments must yield
 			// the same answer.
-			swapped := placer.IsProviderKindMixingAllowed(tc.b, tc.a)
+			swapped := placer.IsProviderKindMixingAllowed(tc.b, tc.a, false)
 			if swapped != tc.want {
-				t.Errorf("IsProviderKindMixingAllowed(%q, %q) [swapped] = %v; want %v",
+				t.Errorf("IsProviderKindMixingAllowed(%q, %q, false) [swapped] = %v; want %v",
+					tc.b, tc.a, swapped, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsProviderKindMixingAllowedWith6W07Override pins the 6.W07
+// override semantic: when the operator sets
+// `AllowMixingStoragePoolDriver=true` on the controller singleton,
+// exactly ONE additional cell of the mixing matrix opens —
+// LVM_THIN ↔ ZFS_THIN. Every other cross-family cell stays closed,
+// matching the deliberately narrow widening documented in
+// provider_kind_mixing.go.
+//
+// We re-assert the unchanged cells (same-kind, DISKLESS, FILE family,
+// ZFS↔ZFS_THIN) so a regression that flips the flag's polarity (e.g.
+// opens too many cells) is caught by the same table.
+//
+// Cross-listed: wave1 6.8 / Bug 76 / wave2-06 §6.W07.
+func TestIsProviderKindMixingAllowedWith6W07Override(t *testing.T) {
+	t.Parallel()
+
+	type row struct {
+		name string
+		a, b string
+		want bool
+	}
+
+	cases := []row{
+		// The 6.W07 cell: opens once the operator opts in.
+		{"lvm_thin_zfs_thin_opens", apiv1.StoragePoolKindLVMThin, apiv1.StoragePoolKindZFSThin, true},
+
+		// Same-kind still allowed (unchanged).
+		{"lvm_thin_lvm_thin_still_ok", apiv1.StoragePoolKindLVMThin, apiv1.StoragePoolKindLVMThin, true},
+		{"zfs_thin_zfs_thin_still_ok", apiv1.StoragePoolKindZFSThin, apiv1.StoragePoolKindZFSThin, true},
+
+		// DISKLESS witnesses still OK (unchanged).
+		{"diskless_lvm_thin_still_ok", apiv1.StoragePoolKindDiskless, apiv1.StoragePoolKindLVMThin, true},
+		{"diskless_zfs_thin_still_ok", apiv1.StoragePoolKindDiskless, apiv1.StoragePoolKindZFSThin, true},
+
+		// FILE family unchanged.
+		{"file_file_thin_still_ok", apiv1.StoragePoolKindFile, apiv1.StoragePoolKindFileThin, true},
+
+		// ZFS ↔ ZFS_THIN unchanged (upstream `allowed` without flag).
+		{"zfs_zfs_thin_still_ok", apiv1.StoragePoolKindZFS, apiv1.StoragePoolKindZFSThin, true},
+
+		// Cells that stay closed despite the flag — the 6.W07
+		// override is intentionally narrow to match the e2e matrix:
+		//   LVM ↔ LVM_THIN, LVM ↔ ZFS, LVM ↔ ZFS_THIN,
+		//   LVM_THIN ↔ ZFS, FILE ↔ LVM/ZFS_THIN.
+		{"lvm_lvm_thin_still_denied", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin, false},
+		{"lvm_zfs_still_denied", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindZFS, false},
+		{"lvm_zfs_thin_still_denied", apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindZFSThin, false},
+		{"lvm_thin_zfs_still_denied", apiv1.StoragePoolKindLVMThin, apiv1.StoragePoolKindZFS, false},
+		{"file_lvm_still_denied", apiv1.StoragePoolKindFile, apiv1.StoragePoolKindLVM, false},
+		{"file_thin_zfs_thin_still_denied", apiv1.StoragePoolKindFileThin, apiv1.StoragePoolKindZFSThin, false},
+
+		// Unknown kinds: flag must not widen them; equal → ok, distinct → rejected.
+		{"unknown_unknown_eq_still_ok", "BANANA", "BANANA", true},
+		{"unknown_unknown_diff_still_denied", "BANANA", "PEAR", false},
+		{"unknown_lvm_thin_still_denied", "BANANA", apiv1.StoragePoolKindLVMThin, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := placer.IsProviderKindMixingAllowed(tc.a, tc.b, true)
+			if got != tc.want {
+				t.Errorf("IsProviderKindMixingAllowed(%q, %q, true) = %v; want %v",
+					tc.a, tc.b, got, tc.want)
+			}
+
+			swapped := placer.IsProviderKindMixingAllowed(tc.b, tc.a, true)
+			if swapped != tc.want {
+				t.Errorf("IsProviderKindMixingAllowed(%q, %q, true) [swapped] = %v; want %v",
 					tc.b, tc.a, swapped, tc.want)
 			}
 		})
