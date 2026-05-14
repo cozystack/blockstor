@@ -342,3 +342,170 @@ func TestEnsureTiebreakerExpiredSuppressionResumesAutoWitness(t *testing.T) {
 		t.Errorf("IsTiebreakerSuppressed returned true for unparseable annotation")
 	}
 }
+
+// TestEnsureTiebreakerHonoursAutoQuorumDisabled: scenario 7.W01
+// (wave2-07-quorum-observability.md §7.W01, UG9 lines 4233-4279).
+//
+// When `DrbdOptions/AutoQuorum=disabled` is stamped on the RD (the
+// REST POST handler folds cluster / RG-scope props onto the RD at
+// create time, so this single check covers all three scopes), the
+// auto-quorum reconciler must NOT overwrite the operator's manual
+// `DrbdOptions/Resource/quorum`. Without this gate, every reconcile
+// would revert the operator's policy to the auto-computed value the
+// moment they tried to opt out.
+//
+// The witness invariant is independent — auto-tiebreaker still runs
+// because it's gated on a separate prop (DrbdOptions/AutoAddQuorumTiebreaker).
+// This test pins the quorum-only opt-out: witness creation is allowed
+// (default), but quorum prop stays at the operator's chosen value.
+func TestEnsureTiebreakerHonoursAutoQuorumDisabled(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-manual-quorum", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	// Operator opted out of auto-quorum and set the per-RD policy
+	// explicitly. `quorum=off` + `on-no-quorum=io-error` is the
+	// "scale-out fast, fail-loud" combo from UG9.
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-manual-quorum"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{
+				"DrbdOptions/AutoQuorum":            "disabled",
+				"DrbdOptions/Resource/quorum":       "off",
+				"DrbdOptions/Resource/on-no-quorum": "io-error",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// Sanity: the gate must agree with the prop.
+	if !controllerpkg.IsAutoQuorumDisabled(rd) {
+		t.Fatalf("IsAutoQuorumDisabled returned false for AutoQuorum=disabled RD")
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-manual-quorum"}, final); err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	// Operator's manual value must survive: the auto reconciler
+	// would otherwise have computed `majority` (2 diskful + witness)
+	// and clobbered the `off`.
+	if got := final.Spec.Props["DrbdOptions/Resource/quorum"]; got != "off" {
+		t.Errorf("quorum prop: got %q, want %q (auto-quorum=disabled must leave manual value)",
+			got, "off")
+	}
+
+	if got := final.Spec.Props["DrbdOptions/Resource/on-no-quorum"]; got != "io-error" {
+		t.Errorf("on-no-quorum prop: got %q, want %q (auto-quorum=disabled must leave manual value)",
+			got, "io-error")
+	}
+
+	// Auto-quorum opt-out marker must survive the round-trip
+	// unchanged — a stamp-and-strip refactor would be a regression.
+	if got := final.Spec.Props["DrbdOptions/AutoQuorum"]; got != "disabled" {
+		t.Errorf("AutoQuorum prop: got %q, want %q (must round-trip verbatim)",
+			got, "disabled")
+	}
+}
+
+// TestIsAutoQuorumDisabled pins the helper across the input shapes
+// the production code can encounter: nil RD, nil Props, missing key,
+// explicit `disabled` (canonical and mixed case), and the two other
+// accepted values (`suspend-io` / `io-error`) which are NOT disable
+// signals — those tell auto-quorum which on-no-quorum to set, not
+// to stop reconciling.
+func TestIsAutoQuorumDisabled(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		rd   *blockstoriov1alpha1.ResourceDefinition
+		want bool
+	}{
+		{"nil RD", nil, false},
+		{"nil props", &blockstoriov1alpha1.ResourceDefinition{}, false},
+		{
+			name: "no AutoQuorum key",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"other": "value"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "disabled (canonical)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/AutoQuorum": "disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Disabled (mixed case from manual paste)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/AutoQuorum": "Disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "suspend-io (auto-set instruction, not disable)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/AutoQuorum": "suspend-io"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "io-error (auto-set instruction, not disable)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/AutoQuorum": "io-error"},
+				},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := controllerpkg.IsAutoQuorumDisabled(tc.rd); got != tc.want {
+				t.Errorf("IsAutoQuorumDisabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

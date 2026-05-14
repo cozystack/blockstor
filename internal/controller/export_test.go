@@ -183,6 +183,13 @@ func IsTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	return isTiebreakerSuppressed(rd)
 }
 
+// IsAutoQuorumDisabled exposes the auto-quorum opt-out gate for
+// tests. Scenario 7.W01 pins both the disabled-and-skip path and
+// the default-enabled passthrough.
+func IsAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return isAutoQuorumDisabled(rd)
+}
+
 // AutoTiebreakerSuppressedUntilAnnotation exposes the annotation
 // key for tests so a regression that renamed the key on one side
 // would fail to compile here.

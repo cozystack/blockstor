@@ -193,7 +193,45 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
+	// Scenario 7.W01 / UG9 §"Auto-quorum policies": when the
+	// effective `DrbdOptions/AutoQuorum` is `disabled`, leave the
+	// per-RD `DrbdOptions/Resource/quorum` prop alone. The operator
+	// owns the policy in that mode and writes `majority` / `off`
+	// (plus the companion `on-no-quorum=suspend-io|io-error`)
+	// explicitly. Overwriting here would silently revert manual
+	// settings on every reconcile, which is the exact failure mode
+	// the scenario calls out.
+	//
+	// We read the RD's Spec.Props directly — the REST POST
+	// /v1/resource-definitions handler folds parent-RG +
+	// ControllerProps onto the RD at create time (see existing
+	// isAutoTieBreakerEnabled comment), so cluster / RG-scope
+	// `auto-quorum=disabled` reaches us here.
+	if isAutoQuorumDisabled(rd) {
+		return nil
+	}
+
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// isAutoQuorumDisabled reports whether the RD opted out of the
+// auto-quorum reconciler. Upstream LINSTOR (UG9 §"Auto-quorum
+// policies", lines 4233-4279) accepts `disabled`, `suspend-io`,
+// `io-error` for `DrbdOptions/auto-quorum`; only `disabled` stops
+// the reconciler — the other two are "auto-set on-no-quorum to this
+// value" instructions that we don't honour yet (P2 — tracked in
+// scenario 7.W01 as a wave-2 follow-up).
+//
+// Case-insensitive match: operators sometimes paste `Disabled` from
+// the manual.
+func isAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if rd == nil || rd.Spec.Props == nil {
+		return false
+	}
+
+	const propKey = "DrbdOptions/AutoQuorum"
+
+	return strings.EqualFold(rd.Spec.Props[propKey], "disabled")
 }
 
 // isTiebreakerSuppressed reports whether the operator recently

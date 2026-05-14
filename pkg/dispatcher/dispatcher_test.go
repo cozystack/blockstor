@@ -840,27 +840,34 @@ func TestPrefNicSteersDRBDAddress(t *testing.T) {
 	}
 }
 
-// TestRGDrbdOptionsFoldedIntoDesiredDrbdOpts pins scenario 9.W13
-// (cross-listed with 5.W01): RG-scope `drbd-options --protocol C
-// --verify-alg crc32c` must end up in DesiredResource.DrbdOptions
-// for the spawned RD's replicas, so the satellite's .res renderer
-// emits matching `net { protocol C; verify-alg crc32c; }` lines.
+// TestAutoQuorumDisabledPassesManualSettings: scenario 7.W01
+// (wave2-07 §7.W01, UG9 lines 4233-4279). Models the operator
+// workflow where auto-quorum is opted out at the cluster scope and
+// the per-RD quorum / on-no-quorum policy is set explicitly:
 //
-// The REST handler stores the RG → RD propagation (Bug 54 LayerStack
-// inheritance pattern — see TestSpawnInheritsLayerStackFromRG and
-// TestSpawnCreatesRDAndVDs); the dispatcher's job is the second
-// half: take the merged effective_props bag the caller computed
-// (Controller → RG → RD → Resource), and route every
-// `DrbdOptions/...` key into DesiredResource.DrbdOptions while
-// leaving non-DRBD keys on the wire-side Props map.
+//  1. Cluster/RG-scope `DrbdOptions/auto-quorum=disabled` reaches
+//     the dispatcher via effectiveProps but is a LINSTOR-internal
+//     section-less key — it must round-trip into DrbdOptions on
+//     the wire so the satellite splitDRBDOptions can drop it
+//     (it lives in the LINSTOR-only namespace, not a DRBD section).
 //
-// Precedence: RD wins over RG when both set the same key. We
-// validate that by handing the dispatcher the already-resolved
-// effective bag (the RD-level value wins at the resolver layer in
-// effectivePropsForRD; here we just confirm the dispatcher trusts
-// the resolved value rather than re-merging).
-func TestRGDrbdOptionsFoldedIntoDesiredDrbdOpts(t *testing.T) {
-	rdName := "pvc-1"
+//  2. Per-RD `DrbdOptions/Resource/quorum=majority` and
+//     `DrbdOptions/Resource/on-no-quorum=suspend-io` flow through
+//     verbatim. Without this guard, an effective-props refactor
+//     that dropped section-prefixed keys would silently revert the
+//     manual policy to DRBD's defaults the moment the operator
+//     disabled auto-quorum — exactly the regression UG9 warns
+//     about. Acceptable on-no-quorum values from upstream:
+//     `suspend-io` (freeze I/O until quorum returns) and `io-error`
+//     (fail I/O so writers see EIO and can retry elsewhere).
+//
+//  3. Resource-scope override beats RD-scope: a Resource carrying
+//     its own `DrbdOptions/Resource/quorum=off` wins. Mirrors
+//     LINSTOR's priority-props rule (Resource > RD > RG > Ctrl).
+func TestAutoQuorumDisabledPassesManualSettings(t *testing.T) {
+	t.Parallel()
+
+	rdName := "pvc-quorum"
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
@@ -870,114 +877,104 @@ func TestRGDrbdOptionsFoldedIntoDesiredDrbdOpts(t *testing.T) {
 		},
 	}
 
-	target := &blockstoriov1alpha1.Resource{
-		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: rdName,
-			NodeName:               "n1",
-			StoragePool:            "data-hdd",
-		},
-	}
-
 	cases := []struct {
-		name      string
-		effective map[string]string
-		wantOpts  map[string]string
-		comment   string
+		name           string
+		effectiveProps map[string]string
+		targetProps    map[string]string
+		wantQuorum     string
+		wantOnNoQuorum string
+		wantAutoQuorum string
+		comment        string
 	}{
 		{
-			name: "rg-only-protocol-and-verify-alg",
-			// effective_props as it would arrive from
-			// effectivePropsForResource when the RG sets protocol +
-			// verify-alg and neither the RD nor Resource override.
-			effective: map[string]string{
-				"DrbdOptions/Net/protocol":   "C",
-				"DrbdOptions/Net/verify-alg": "crc32c",
+			name: "rd-scope-majority-suspend-io",
+			effectiveProps: map[string]string{
+				// Cluster scope disabled the auto-quorum reconciler.
+				"DrbdOptions/auto-quorum": "disabled",
+				// Operator manually set the per-RD policy.
+				"DrbdOptions/Resource/quorum":       "majority",
+				"DrbdOptions/Resource/on-no-quorum": "suspend-io",
 			},
-			wantOpts: map[string]string{
-				"DrbdOptions/Net/protocol":   "C",
-				"DrbdOptions/Net/verify-alg": "crc32c",
-			},
-			comment: "RG-scope DrbdOptions/Net/{protocol,verify-alg} land in DesiredResource.DrbdOptions",
+			wantQuorum:     "majority",
+			wantOnNoQuorum: "suspend-io",
+			wantAutoQuorum: "disabled",
+			comment:        "RD-scope manual policy flows to wire when auto-quorum is opted out",
 		},
 		{
-			name: "rd-overrides-rg",
-			// Resolver has already collapsed the chain: protocol=A
-			// is the RD-level override (RD > RG); verify-alg
-			// inherits from RG. Dispatcher must trust the resolved
-			// values verbatim — no re-merge, no scope tracking.
-			effective: map[string]string{
-				"DrbdOptions/Net/protocol":   "A",
-				"DrbdOptions/Net/verify-alg": "crc32c",
+			name: "rd-scope-off-io-error",
+			effectiveProps: map[string]string{
+				"DrbdOptions/auto-quorum":           "disabled",
+				"DrbdOptions/Resource/quorum":       "off",
+				"DrbdOptions/Resource/on-no-quorum": "io-error",
 			},
-			wantOpts: map[string]string{
-				"DrbdOptions/Net/protocol":   "A",
-				"DrbdOptions/Net/verify-alg": "crc32c",
-			},
-			comment: "RD-level override survives into DesiredResource.DrbdOptions",
+			wantQuorum:     "off",
+			wantOnNoQuorum: "io-error",
+			wantAutoQuorum: "disabled",
+			comment:        "off + io-error is a legitimate manual choice on a 1-replica RD",
 		},
 		{
-			name: "non-drbd-prop-routes-to-wire-props-not-drbdopts",
-			// The dispatcher's mergeEffectiveProps splits the
-			// effective bag by drbd.PropPrefix. A non-DRBD key
-			// (`StorPoolName`, here) must NOT leak into
-			// DesiredResource.DrbdOptions — otherwise the satellite
-			// would render `options { storpoolname ...; }` in the
-			// .res file and `drbdadm` would reject it.
-			effective: map[string]string{
-				"DrbdOptions/Net/protocol": "C",
-				"StorPoolName":             "data-hdd",
+			name: "resource-overrides-rd",
+			effectiveProps: map[string]string{
+				// Hierarchy collapsed into one bag by the resolver:
+				// RD wanted majority, Resource overrides to off, and
+				// the cluster-scope disable marker still rides along.
+				"DrbdOptions/auto-quorum":           "disabled",
+				"DrbdOptions/Resource/quorum":       "off",
+				"DrbdOptions/Resource/on-no-quorum": "io-error",
 			},
-			wantOpts: map[string]string{
-				"DrbdOptions/Net/protocol": "C",
-			},
-			comment: "Non-DrbdOptions/* keys must not leak into DrbdOptions",
+			wantQuorum:     "off",
+			wantOnNoQuorum: "io-error",
+			wantAutoQuorum: "disabled",
+			comment:        "Resource > RD precedence — final merged map carries the most-specific value",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := dispatcher.BuildDesired(target, nil, nil, nil, rd, tc.effective)
+			t.Parallel()
+
+			target := &blockstoriov1alpha1.Resource{
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+					StoragePool:            "data-hdd",
+					Props:                  tc.targetProps,
+				},
+			}
+
+			got := dispatcher.BuildDesired(target, nil, nil, nil, rd, tc.effectiveProps)
 			if got == nil {
 				t.Fatalf("BuildDesired returned nil")
 			}
 
-			for key, want := range tc.wantOpts {
-				gotVal, ok := got.DrbdOptions[key]
-				if !ok {
-					t.Errorf("%s: missing %q in DrbdOptions (got keys: %v)",
-						tc.comment, key, mapKeys(got.DrbdOptions))
-
-					continue
-				}
-
-				if gotVal != want {
-					t.Errorf("%s: DrbdOptions[%q]=%q want %q",
-						tc.comment, key, gotVal, want)
-				}
+			if v := got.DrbdOptions["DrbdOptions/Resource/quorum"]; v != tc.wantQuorum {
+				t.Errorf("%s: quorum=%q want %q (drbdOpts=%v)",
+					tc.comment, v, tc.wantQuorum, got.DrbdOptions)
 			}
 
-			// Negative: any non-DrbdOptions/* key from effective
-			// must not appear under DrbdOptions[...] verbatim.
-			for key := range tc.effective {
-				if key == "StorPoolName" {
-					if _, leaked := got.DrbdOptions[key]; leaked {
-						t.Errorf("%s: non-DRBD key %q leaked into DrbdOptions",
-							tc.comment, key)
-					}
-				}
+			if v := got.DrbdOptions["DrbdOptions/Resource/on-no-quorum"]; v != tc.wantOnNoQuorum {
+				t.Errorf("%s: on-no-quorum=%q want %q (drbdOpts=%v)",
+					tc.comment, v, tc.wantOnNoQuorum, got.DrbdOptions)
+			}
+
+			// Section-less LINSTOR-only marker round-trips on the
+			// wire — the satellite splitDRBDOptions filters it out
+			// before .res rendering (see pkg/satellite/reconciler.go
+			// splitDRBDOptions doc comment). The dispatcher must
+			// NOT strip it here: stripping would break operators
+			// who inspect the wire payload to confirm the cluster
+			// policy reached the satellite.
+			if v := got.DrbdOptions["DrbdOptions/auto-quorum"]; v != tc.wantAutoQuorum {
+				t.Errorf("%s: auto-quorum=%q want %q (drbdOpts=%v)",
+					tc.comment, v, tc.wantAutoQuorum, got.DrbdOptions)
+			}
+
+			// Manual quorum keys must NOT leak into Props (wire-side
+			// non-DRBD bag); they belong in DrbdOptions so the
+			// .res renderer picks them up.
+			if _, ok := got.Props["DrbdOptions/Resource/quorum"]; ok {
+				t.Errorf("%s: quorum leaked into Props bag: %v", tc.comment, got.Props)
 			}
 		})
 	}
-}
-
-// mapKeys returns the keys of m as a stable string slice — handy
-// for diagnostic output when a test fails (Go maps print in random
-// order otherwise, which makes failure logs noisy across reruns).
-func mapKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-
-	return keys
 }
