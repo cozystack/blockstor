@@ -1128,3 +1128,242 @@ func TestResourceListPropertiesEmptyDecodes(t *testing.T) {
 		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }
+
+// TestAffinityControllerContract pins the `/v1/view/resources` wire
+// shape the piraeus `linstor-affinity-controller` polls to keep PV
+// `spec.nodeAffinity` in lock-step with where DRBD actually has data.
+//
+// Scenario 11.W04 (wave2-11-kubernetes.md). Without the affinity
+// controller a PV's nodeAffinity is set ONCE at provisioning and
+// never updated; if LINSTOR later moves a replica (evacuation /
+// auto-rebalance / operator action) the Pod cannot reschedule onto
+// the node that now carries the diskful copy. The affinity controller
+// closes this gap by polling LINSTOR's resource view and rewriting
+// the PV's nodeAffinity to match the current set of nodes that hold
+// a usable replica.
+//
+// blockstor is the LINSTOR-controller drop-in here. The contract the
+// affinity controller relies on, narrowed to fields it actually reads:
+//
+//  1. The view enumerates one entry per replica with `node_name`
+//     populated (so the controller can list the nodes that hold the
+//     resource at all).
+//
+//  2. Per-replica `flags` round-trips intact — DISKLESS / TIE_BREAKER
+//     must be visible because the affinity controller MUST exclude
+//     witness replicas: a pod scheduled onto a tiebreaker-only node
+//     has no local data and would attach over the network, defeating
+//     the locality the affinity controller exists to enforce.
+//
+//  3. Per-volume `state.disk_state` is the diskful-readiness gate.
+//     Only `UpToDate` (or the sync-progress-annotated `UpToDate(NN%)`
+//     variant) means "the replica on this node is safe to mount":
+//     Inconsistent / Outdated / Failed replicas exist on disk but are
+//     not authoritative, and including them in `nodeAffinity` would
+//     let kubelet mount stale data.
+//
+// Three replica shapes therefore must round-trip distinguishably on
+// the wire:
+//
+//   - diskful-UpToDate on n-good   → eligible target
+//   - diskful-Inconsistent on n-bad → NOT eligible (data not authoritative)
+//   - DISKLESS+TIE_BREAKER on n-tb → NOT eligible (no local data)
+//
+// If any of these collapse on the wire — Inconsistent indistinguishable
+// from UpToDate, TIE_BREAKER flag lost, node_name blank — the affinity
+// controller cannot do its job and Pods get stuck Pending after every
+// evacuate / rebalance. This test is the regression guard for the wire
+// shape; the actual controller loop lives in piraeus and is covered by
+// tests/e2e/affinity-controller.sh against a live stand.
+func TestAffinityControllerContract(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Three replicas of the same RD, one per node, each modelling
+	// one of the cases the affinity controller must distinguish.
+	seed := []apiv1.Resource{
+		{
+			Name:     "pvc-affinity",
+			NodeName: "n-good",
+			Flags:    []string{}, // diskful, no DISKLESS
+			Volumes: []apiv1.Volume{{
+				VolumeNumber: 0,
+				State:        apiv1.VolumeState{DiskState: "UpToDate"},
+			}},
+		},
+		{
+			Name:     "pvc-affinity",
+			NodeName: "n-bad",
+			Flags:    []string{}, // diskful but not authoritative
+			Volumes: []apiv1.Volume{{
+				VolumeNumber: 0,
+				State:        apiv1.VolumeState{DiskState: "Inconsistent"},
+			}},
+		},
+		{
+			Name:     "pvc-affinity",
+			NodeName: "n-tb",
+			Flags: []string{
+				apiv1.ResourceFlagDiskless,
+				apiv1.ResourceFlagTieBreaker,
+			},
+			// Witness — no local volume backing, hence no disk_state.
+			Volumes: []apiv1.Volume{{VolumeNumber: 0}},
+		},
+	}
+
+	for i := range seed {
+		if err := st.Resources().Create(ctx, &seed[i]); err != nil {
+			t.Fatalf("seed %s/%s: %v", seed[i].Name, seed[i].NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// The affinity controller filters by RD name in its polling
+	// loop — mirror that here so the test stays scoped even if
+	// other parallel tests bleed Resources into the store.
+	resp := httpGet(t, base+"/v1/view/resources?resources=pvc-affinity")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Contract #1: one entry per replica. Index by node so the
+	// assertions key on the wire shape, not on sort order.
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3 (one entry per replica); entries=%v", len(got), got)
+	}
+
+	byNode := map[string]apiv1.ResourceWithVolumes{}
+
+	for i := range got {
+		if got[i].NodeName == "" {
+			t.Errorf("replica %d: node_name empty — affinity controller cannot map replica to K8s node", i)
+		}
+
+		byNode[got[i].NodeName] = got[i]
+	}
+
+	good, ok := byNode["n-good"]
+	if !ok {
+		t.Fatalf("missing pvc-affinity/n-good (UpToDate diskful) in view: %v", got)
+	}
+
+	bad, ok := byNode["n-bad"]
+	if !ok {
+		t.Fatalf("missing pvc-affinity/n-bad (Inconsistent diskful) in view: %v", got)
+	}
+
+	tb, ok := byNode["n-tb"]
+	if !ok {
+		t.Fatalf("missing pvc-affinity/n-tb (tiebreaker witness) in view: %v", got)
+	}
+
+	// Contract #2: per-volume disk_state must round-trip. The
+	// affinity controller's "is this node eligible?" predicate is
+	// `disk_state == "UpToDate"`; collapsing Inconsistent into
+	// UpToDate would silently expand nodeAffinity to nodes whose
+	// replica is not authoritative.
+	if len(good.Volumes) == 0 || good.Volumes[0].State.DiskState != "UpToDate" {
+		t.Errorf("n-good: volumes[0].state.disk_state=%q, want %q (eligible-replica gate)",
+			volDiskState(good), "UpToDate")
+	}
+
+	if len(bad.Volumes) == 0 || bad.Volumes[0].State.DiskState != "Inconsistent" {
+		t.Errorf("n-bad: volumes[0].state.disk_state=%q, want %q (must NOT collapse to UpToDate)",
+			volDiskState(bad), "Inconsistent")
+	}
+
+	// Contract #3: TIE_BREAKER round-trips, so the affinity
+	// controller can exclude witnesses by flag membership without
+	// having to second-guess from disk_state alone (a witness has
+	// no volume backing, so its disk_state is naturally empty — but
+	// the same empty disk_state appears transiently on a fresh
+	// diskful replica before the satellite observer first reports,
+	// so flag-based exclusion is the load-bearing signal).
+	if !slices.Contains(tb.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("n-tb: DISKLESS missing from flags=%v — witness indistinguishable from diskful", tb.Flags)
+	}
+
+	if !slices.Contains(tb.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("n-tb: TIE_BREAKER missing from flags=%v — controller cannot exclude autoplaced witness", tb.Flags)
+	}
+
+	// And the diskful entries MUST NOT carry DISKLESS — otherwise
+	// the controller's "exclude all DISKLESS" filter eats the very
+	// nodes it should be selecting.
+	if slices.Contains(good.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("n-good: DISKLESS leaked onto a diskful replica flags=%v", good.Flags)
+	}
+
+	if slices.Contains(bad.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("n-bad: DISKLESS leaked onto a diskful replica flags=%v", bad.Flags)
+	}
+
+	// Composite contract: the eligible-node set the affinity
+	// controller derives from this view is exactly {n-good}. Encode
+	// the derivation here so a future regression on ANY of the
+	// individual contracts above still trips this last assertion.
+	eligible := eligibleAffinityNodes(got)
+
+	if len(eligible) != 1 || eligible[0] != "n-good" {
+		t.Errorf("eligible node set: got %v, want [n-good] only "+
+			"(UpToDate diskful is the only mountable-with-locality replica)", eligible)
+	}
+}
+
+// volDiskState is a nil-safe accessor used by the error messages in
+// TestAffinityControllerContract — keeps the assertion site readable
+// even when the volumes slice is empty (which is itself a failure
+// mode the test catches).
+func volDiskState(r apiv1.ResourceWithVolumes) string {
+	if len(r.Volumes) == 0 {
+		return "<no volumes>"
+	}
+
+	return r.Volumes[0].State.DiskState
+}
+
+// eligibleAffinityNodes models the piraeus linstor-affinity-controller's
+// node-selection predicate, in the narrowest form that exercises the
+// blockstor REST contract: a node is eligible iff it carries a replica
+// that is (a) diskful (no DISKLESS flag — excludes both operator
+// diskless and TIE_BREAKER witnesses) and (b) reports UpToDate on
+// every volume. The real controller has additional knobs (storage-pool
+// labels, allow/deny lists) but those layer on top of this predicate.
+func eligibleAffinityNodes(rs []apiv1.ResourceWithVolumes) []string {
+	out := []string{}
+
+	for i := range rs {
+		if slices.Contains(rs[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		allUpToDate := len(rs[i].Volumes) > 0
+		for j := range rs[i].Volumes {
+			if !isUpToDateDiskState(rs[i].Volumes[j].State.DiskState) {
+				allUpToDate = false
+
+				break
+			}
+		}
+
+		if allUpToDate {
+			out = append(out, rs[i].NodeName)
+		}
+	}
+
+	slices.Sort(out)
+
+	return out
+}
