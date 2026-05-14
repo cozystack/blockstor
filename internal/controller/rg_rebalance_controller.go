@@ -86,6 +86,17 @@ func (r *RGRebalanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
+	// Scenario 2.W02 — operator kill-switch. Controller-scope
+	// `BalanceResourcesEnabled=false` disables the periodic rebalance
+	// pass cluster-wide; existing placements are left untouched.
+	// We still strip the annotation so a transient flip doesn't leave
+	// every subsequent RG event re-firing this code path.
+	if balanceResourcesDisabled(ctx, r.Store) {
+		log.Info("rebalance disabled by BalanceResourcesEnabled=false; skipping")
+
+		return ctrl.Result{}, r.stripRebalanceAnnotation(ctx, &rg)
+	}
+
 	count, err := r.rebalanceChildRDs(ctx, &rg)
 	if err != nil {
 		// Surface the error so controller-runtime requeues; we do
@@ -160,6 +171,29 @@ func (r *RGRebalanceReconciler) stripRebalanceAnnotation(ctx context.Context, rg
 	}
 
 	return r.Store.ResourceGroups().Update(ctx, rg)
+}
+
+// balanceResourcesDisabled returns true when the controller-scope
+// `BalanceResourcesEnabled` prop is explicitly set to "false". Any
+// other value (including missing, empty, or a typo) keeps the
+// rebalance reconciler armed — matches upstream LINSTOR's "default
+// = enabled" semantics so an unconfigured cluster behaves the same
+// way it did before scenario 2.W02 landed.
+func balanceResourcesDisabled(ctx context.Context, st store.Store) bool {
+	if st == nil {
+		return false
+	}
+
+	props, err := st.ControllerProps().Get(ctx)
+	if err != nil || props == nil {
+		// A read error must not silently disable the reconciler — we
+		// fail OPEN, the operator still has the annotation gate + the
+		// RG-level CRD as throttling layers. The error itself will be
+		// surfaced on the next placer call when it hits the same row.
+		return false
+	}
+
+	return props[apiv1.PropBalanceResourcesEnabled] == "false"
 }
 
 // SetupWithManager wires the reconciler into the manager. We share

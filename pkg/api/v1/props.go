@@ -104,3 +104,21 @@ type EffectivePropEntry struct {
 // to `props` on RG / RD / Resource responses — the raw map carries
 // LOCAL settings, this map carries the merged-from-parents view.
 type EffectiveProperties map[string]EffectivePropEntry
+
+// PropBalanceResourcesEnabled is the controller / RG / RD-scope
+// kill-switch for the additive rebalance reconciler. Mirrors upstream
+// LINSTOR's `BalanceResourcesEnabled` knob — UG9 §"Automatically
+// maintaining resource group placement count" (lines 885-907).
+//
+// Scenario 2.W02: when this prop resolves to "false" at controller
+// scope, the RGRebalanceReconciler MUST short-circuit even with the
+// `blockstor.io/rebalance-pending` annotation present — operators
+// disable the periodic rescheduling for clusters that prefer manual
+// placement decisions, and a stamped annotation from a stale REST
+// modify shouldn't override that choice.
+//
+// Resolution hierarchy (most-specific wins): RD > RG > controller.
+// The reconciler reads controller scope only for the first cut;
+// RD/RG-scope kill-switches land alongside the placer integration in
+// a follow-up.
+const PropBalanceResourcesEnabled = "BalanceResourcesEnabled"

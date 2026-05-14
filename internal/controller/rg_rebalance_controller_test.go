@@ -189,6 +189,104 @@ func TestRGRebalanceReconcilerIsAdditiveOnly(t *testing.T) {
 	}
 }
 
+// TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled: scenario
+// 2.W02 — operator sets controller-scope
+// `BalanceResourcesEnabled=false` to suppress the periodic rebalance
+// pass cluster-wide. Even with the `rebalance-pending` annotation
+// stamped on the RG, the reconciler MUST NOT spawn additional
+// replicas; existing placements are left untouched. The annotation
+// is stripped so a re-watch on the same event doesn't loop, matching
+// the no-op return contract.
+func TestRGRebalanceReconcilerHonoursBalanceResourcesDisabled(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	// Two existing replicas, RG wants three — without the kill-switch
+	// the reconciler would add a third. The seed annotation simulates
+	// a fresh `linstor rg modify` increasing PlaceCount.
+	seedRebalanceFixture(t, ctx, st, 3, []string{"n1", "n2"})
+
+	// Flip the controller-scope kill-switch BEFORE the reconcile fires.
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropBalanceResourcesEnabled: "false",
+	}); err != nil {
+		t.Fatalf("set BalanceResourcesEnabled=false: %v", err)
+	}
+
+	rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-rebalance")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("BalanceResourcesEnabled=false must short-circuit; got %d replicas, want 2 (entries=%v)", len(got), got)
+	}
+
+	// Annotation must still be stripped — a stale marker that survives
+	// a kill-switched pass would loop forever on the next RG event.
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("Get rg: %v", err)
+	}
+
+	if _, ok := rg.Annotations[apiv1.AnnotationRGRebalancePending]; ok {
+		t.Errorf("annotation must be stripped after a disabled-pass; got %v", rg.Annotations)
+	}
+}
+
+// TestRGRebalanceReconcilerIgnoresNonFalseValues: 2.W02 contract pin
+// — only the explicit string "false" disables the reconciler. Other
+// values (empty, "true", "0", typo) keep it armed, matching upstream
+// LINSTOR's "default = enabled" semantics so an unconfigured cluster
+// behaves the same way it did before the kill-switch landed.
+func TestRGRebalanceReconcilerIgnoresNonFalseValues(t *testing.T) {
+	t.Parallel()
+
+	for _, val := range []string{"", "true", "True", "0", "FALSE", "no"} {
+		val := val
+
+		t.Run("value="+val, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			scheme := newScheme(t)
+			cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+			st := store.NewInMemory()
+
+			seedRebalanceFixture(t, ctx, st, 3, []string{"n1", "n2"})
+
+			if val != "" {
+				if err := st.ControllerProps().Set(ctx, map[string]string{
+					apiv1.PropBalanceResourcesEnabled: val,
+				}); err != nil {
+					t.Fatalf("set prop: %v", err)
+				}
+			}
+
+			rec := &controllerpkg.RGRebalanceReconciler{Client: cli, Scheme: scheme, Store: st}
+
+			if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "rg"}}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+
+			got, _ := st.Resources().ListByDefinition(ctx, "pvc-rebalance")
+			if len(got) != 3 {
+				t.Errorf("BalanceResourcesEnabled=%q must NOT disable rebalance; got %d replicas, want 3", val, len(got))
+			}
+		})
+	}
+}
+
 // TestRGRebalanceReconcilerSkipsWithoutAnnotation: an RG CRD event
 // that fires without the rebalance-pending marker is a fast no-op.
 // Pins the annotation gate — otherwise every prop write would

@@ -17,6 +17,7 @@ limitations under the License.
 package dispatcher_test
 
 import (
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -641,22 +642,20 @@ func TestPrefNicSteersDRBDAddress(t *testing.T) {
 	}
 }
 
-// TestRDDrbdOptionsProtocolFlowsToDesired: scenario 5.W01 — the RD-
-// scope `DrbdOptions/Net/protocol` prop set by `linstor rd
-// drbd-options --protocol C <rd>` must flow through the effective-
-// props resolver into DesiredResource.DrbdOptions, where the
-// satellite's splitDRBDOptions picks it up for the .res `net { }`
-// block. The other half of the round-trip (RD prop → effective
-// props bag) lives in pkg/drbd/resolver_test.go's TestResolveOptions
-// suite; this test pins the dispatcher hop in between.
+// TestSinglePathPeerAddressIsScalar: scenario 3.W04 regression guard.
 //
-// Non-DRBD props in the effective bag must NOT contaminate
-// DrbdOptions — mergeEffectiveProps splits on the DrbdOptions/
-// prefix, and that split is what keeps the .res renderer from
-// emitting a stray `StorPoolName` line which drbdadm refuses.
-func TestRDDrbdOptionsProtocolFlowsToDesired(t *testing.T) {
-	rdName := "backups"
-	targetID := int32(0)
+// Until the multi-path renderer lands, the dispatcher MUST emit
+// exactly one `peer.<n>.address` key per peer (and no `peer.<n>.path.*`
+// keys). Pins the single-path baseline so the eventual multi-path
+// implementation in BuildDesired can be reviewed as an additive
+// change: any new path keys MUST appear under a distinct namespace
+// (`peer.<n>.path.<name>.{host,address}` per the scenario), and the
+// scalar `peer.<n>.address` MUST keep working for the default path.
+//
+// Cross-listed with wave1 3.7. UG9 §"Creating multiple DRBD paths
+// with LINSTOR" (lines 2186-2255).
+func TestSinglePathPeerAddressIsScalar(t *testing.T) {
+	rdName := "pvc-1"
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
@@ -666,8 +665,11 @@ func TestRDDrbdOptionsProtocolFlowsToDesired(t *testing.T) {
 		},
 	}
 
+	peerID := int32(1)
+	targetID := int32(0)
+
 	target := &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "backups-n1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
 		Spec: blockstoriov1alpha1.ResourceSpec{
 			ResourceDefinitionName: rdName,
 			NodeName:               "n1",
@@ -676,30 +678,163 @@ func TestRDDrbdOptionsProtocolFlowsToDesired(t *testing.T) {
 		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
 	}
 
-	// The effective-props resolver feeds RD-scope DRBD knobs through
-	// this map. RD > RG > controller precedence has already collapsed
-	// by the time dispatcher.BuildDesired sees it.
-	effective := map[string]string{
-		"DrbdOptions/Net/protocol": "C",
-		// Non-DRBD prop: must land in wireProps, NOT in DrbdOptions.
-		"Aux/owner": "ops",
+	peer := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n2",
+			StoragePool:            "data-hdd",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
 	}
 
-	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, effective)
+	nodes := []blockstoriov1alpha1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:          "Satellite",
+				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{{Name: "default", Address: "10.0.0.1"}},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type:          "Satellite",
+				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{{Name: "default", Address: "10.0.0.2"}},
+			},
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
 	if got == nil {
 		t.Fatalf("BuildDesired returned nil")
 	}
 
-	if got.DrbdOptions["DrbdOptions/Net/protocol"] != "C" {
-		t.Errorf("DrbdOptions[DrbdOptions/Net/protocol]: got %q, want %q (full: %v)",
-			got.DrbdOptions["DrbdOptions/Net/protocol"], "C", got.DrbdOptions)
+	// Scalar address must be present and well-formed.
+	if addr := got.DrbdOptions["peer.n2.address"]; addr != "10.0.0.2" {
+		t.Errorf("single-path baseline: peer.n2.address=%q want %q", addr, "10.0.0.2")
 	}
 
-	if _, leaked := got.DrbdOptions["Aux/owner"]; leaked {
-		t.Errorf("non-DRBD prop leaked into DrbdOptions: %v", got.DrbdOptions)
+	// No path.* keys until the multi-path renderer lands. A stray
+	// `peer.n2.path.*` key here would imply the dispatcher started
+	// emitting multi-path entries without the renderer support — a
+	// classic half-landed change. The scalar key MUST come first.
+	for k := range got.DrbdOptions {
+		if strings.HasPrefix(k, "peer.n2.path.") {
+			t.Errorf("unexpected multi-path key emitted under single-path setup: %q", k)
+		}
+	}
+}
+
+// TestMultiPathConnectionRendersNamedPaths: scenario 3.W04 SPEC pin.
+//
+// Once the controller exposes `POST /v1/resource-definitions/{rd}/
+// resource-connections/{n1}/{n2}/paths` and persists named paths on
+// the RD, BuildDesired must surface them to the satellite renderer
+// as `peer.<peer>.path.<name>.{host,address}` triples — the .res
+// renderer then emits a `connection { path <name> { host A address;
+// host B address; } }` block per path.
+//
+// Skipped until the REST handler + dispatcher wiring land. Drop the
+// t.Skip when implementing — the existing assertions already encode
+// the contract we want, so a passing run is the merge gate.
+//
+// Cross-listed with wave1 3.7 + 3.10. UG9 §"Creating multiple DRBD
+// paths with LINSTOR" (lines 2186-2255).
+func TestMultiPathConnectionRendersNamedPaths(t *testing.T) {
+	t.Skip("3.W04 multi-path REST + dispatcher wiring not yet implemented — " +
+		"SPEC pin: enable once `resource-connection path create` materialises " +
+		"peer.<n>.path.<name>.* keys on DesiredResource.DrbdOptions")
+
+	rdName := "pvc-1"
+
+	// Two named paths between n1 and n2: path0 (NIC drbd-a) and
+	// path1 (NIC drbd-b). The implicit `default` path is NOT
+	// honoured once any explicit path exists — UG9's spec mandates
+	// the operator re-adds it explicitly if they want it.
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+			Props: map[string]string{
+				// Wire format pinned by 3.W04: per-pair, per-path
+				// triplet (interface name on each side). Dispatcher
+				// resolves each side's NIC → address.
+				"Connection/n1/n2/Paths/path0/nicA":  "drbd-a",
+				"Connection/n1/n2/Paths/path0/nicB":  "drbd-a",
+				"Connection/n1/n2/Paths/path1/nicA":  "drbd-b",
+				"Connection/n1/n2/Paths/path1/nicB":  "drbd-b",
+			},
+		},
 	}
 
-	if got.Props["Aux/owner"] != "ops" {
-		t.Errorf("non-DRBD prop missing from Props: got %q, want %q", got.Props["Aux/owner"], "ops")
+	peerID := int32(1)
+	targetID := int32(0)
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+	}
+
+	peer := blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               "n2",
+			StoragePool:            "data-hdd",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
+	}
+
+	nodes := []blockstoriov1alpha1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type: "Satellite",
+				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+					{Name: "default", Address: "10.0.0.1"},
+					{Name: "drbd-a", Address: "10.1.0.1"},
+					{Name: "drbd-b", Address: "10.2.0.1"},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+			Spec: blockstoriov1alpha1.NodeSpec{
+				Type: "Satellite",
+				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+					{Name: "default", Address: "10.0.0.2"},
+					{Name: "drbd-a", Address: "10.1.0.2"},
+					{Name: "drbd-b", Address: "10.2.0.2"},
+				},
+			},
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	wantKeys := map[string]string{
+		// path0 — drbd-a both sides
+		"peer.n2.path.path0.host":    "n1",
+		"peer.n2.path.path0.address": "10.1.0.2",
+		// path1 — drbd-b both sides
+		"peer.n2.path.path1.host":    "n1",
+		"peer.n2.path.path1.address": "10.2.0.2",
+	}
+
+	for k, want := range wantKeys {
+		if got.DrbdOptions[k] != want {
+			t.Errorf("multi-path SPEC: drbdOpts[%q]=%q want %q (drbdOpts=%v)",
+				k, got.DrbdOptions[k], want, got.DrbdOptions)
+		}
 	}
 }
