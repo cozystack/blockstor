@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -216,15 +217,25 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 // Pulled out of handleAutoplace to keep that function under the
 // cyclomatic / funlen budget once the snapshot-clone provider-kind
 // constraint was added.
+//
+// Shortfall envelopes (F13 / CLI parity): the Python linstor CLI
+// renders `cause` / `correction` / `details` as labelled blocks in
+// `linstor r c --auto-place`. A bare `message`-only error renders as
+// a terse one-liner that hides every actionable criterion. Both the
+// CapacityShortfallError path and the generic "no candidate pools"
+// path now emit the full envelope shape so the CLI surfaces the
+// same diagnostic upstream Java LINSTOR does (criteria bullet list +
+// "Auto-place configuration details" block).
 func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
 	placed, want, err := placer.New(s.Store).Place(r.Context(), rdName, filter)
 	if err != nil {
 		// Capacity-shortfall (Bug 35) is operator-actionable, not a
-		// 500. Convert to 409 with the placer's actionable text
-		// instead of surfacing a generic InternalServerError.
+		// 500. Surface as a structured 409 envelope so the Python
+		// CLI prints the numeric capacity gap alongside the criteria
+		// bullet list.
 		var capErr *placer.CapacityShortfallError
 		if errors.As(err, &capErr) {
-			writeError(w, http.StatusConflict, capErr.Error())
+			writeAutoplaceShortfall(w, filter, srcKind, capErr)
 
 			return false
 		}
@@ -235,21 +246,163 @@ func (s *Server) runPlaceAndReport(w http.ResponseWriter, r *http.Request, rdNam
 	}
 
 	if placed < want {
-		if srcKind != "" {
-			writeError(w, http.StatusConflict,
-				"cannot place: snapshot is on "+srcKind+
-					" but no "+srcKind+" pool found on any candidate node")
-
-			return false
-		}
-
-		writeError(w, http.StatusConflict,
-			"not enough candidate storage pools for the requested placement")
+		writeAutoplaceShortfall(w, filter, srcKind, nil)
 
 		return false
 	}
 
 	return true
+}
+
+// writeAutoplaceShortfall renders the upstream-shaped ApiCallRc
+// envelope for a failed autoplace call: structured cause + details +
+// correction (F13). When capErr is non-nil the Details block also
+// carries the numeric "required N KiB, max free M KiB" line so the
+// operator can size-down or grow a pool without re-running the call
+// to find the gap.
+//
+// The criteria list mirrors upstream
+// `CtrlRscAutoPlaceApiCallHandler.failNotEnoughCandidates`: storage-
+// pool name (when constrained), free-space minimum (when the placer
+// has a required size), access-context, and online-ness. The
+// configuration block mirrors `AutoSelectFilterApi.asHelpString`:
+// only the fields actually set on the filter render, so a bare
+// `place_count=99` call doesn't drown the operator in empty rows.
+func writeAutoplaceShortfall(w http.ResponseWriter, filter *apiv1.AutoSelectFilter, srcKind string, capErr *placer.CapacityShortfallError) {
+	var details strings.Builder
+
+	details.WriteString("Not enough nodes fulfilling the following auto-place criteria:\n")
+
+	poolNames := autoplaceFilterPoolNames(filter)
+	if len(poolNames) > 0 {
+		fmt.Fprintf(&details, " * has a deployed storage pool named %v\n", poolNames)
+	}
+
+	if capErr != nil && capErr.RequiredKib > 0 {
+		fmt.Fprintf(&details,
+			" * the storage pools have to have at least '%d' free space\n",
+			capErr.RequiredKib,
+		)
+	}
+
+	details.WriteString(" * the current access context has enough privileges to use the node and the storage pool\n")
+	details.WriteString(" * the node is online\n")
+	details.WriteString("\n")
+	details.WriteString("Auto-place configuration details:\n")
+	writeAutoplaceConfig(&details, filter)
+
+	if capErr != nil {
+		fmt.Fprintf(&details,
+			"\nCapacity shortfall: required %d KiB, max free %d KiB\n",
+			capErr.RequiredKib, capErr.MaxFreeKib,
+		)
+	}
+
+	cause := "Not enough nodes fulfilling the auto-place criteria for the requested placement"
+
+	correction := "Add more nodes or storage pools, or relax the placement constraints " +
+		"(reduce place_count, drop node/storage-pool/provider filters, " +
+		"or free capacity on existing pools)."
+
+	if srcKind != "" {
+		cause = "snapshot is on " + srcKind +
+			" but no " + srcKind + " pool found on any candidate node"
+		correction = "Add a " + srcKind +
+			" storage pool on a candidate node, or restore the snapshot to a node that already has one."
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailNotEnoughNodes,
+		Message: "Not enough available nodes",
+		Cause:   cause,
+		Details: details.String(),
+		Correc:  correction,
+	}})
+}
+
+// autoplaceFilterPoolNames returns the union of single-pool +
+// pool-list filter fields. Used by the shortfall envelope so the
+// criteria bullet renders the operator's effective pool constraint
+// rather than an empty `[]`.
+func autoplaceFilterPoolNames(filter *apiv1.AutoSelectFilter) []string {
+	if filter == nil {
+		return nil
+	}
+
+	if len(filter.StoragePoolList) > 0 {
+		return filter.StoragePoolList
+	}
+
+	if filter.StoragePool != "" {
+		return []string{filter.StoragePool}
+	}
+
+	return nil
+}
+
+// writeAutoplaceConfig renders the subset of the AutoSelectFilter
+// that mirrors upstream LINSTOR's
+// `AutoSelectFilterApi.asHelpString("   ")` — only fields the caller
+// actually set get a line, so a bare call doesn't drown the operator
+// in empty rows.
+func writeAutoplaceConfig(buf *strings.Builder, filter *apiv1.AutoSelectFilter) {
+	const indent = "   "
+
+	if filter == nil {
+		return
+	}
+
+	if filter.PlaceCount > 0 {
+		fmt.Fprintf(buf, "%sReplica count: %d\n", indent, filter.PlaceCount)
+	}
+
+	if filter.AdditionalPlaceCount > 0 {
+		fmt.Fprintf(buf, "%sAdditional replica count: %d\n", indent, filter.AdditionalPlaceCount)
+	}
+
+	if len(filter.NodeNameList) > 0 {
+		fmt.Fprintf(buf, "%sNode name: %v\n", indent, filter.NodeNameList)
+	}
+
+	if filter.StoragePool != "" {
+		fmt.Fprintf(buf, "%sStorage pool name: %s\n", indent, filter.StoragePool)
+	}
+
+	if len(filter.StoragePoolList) > 0 {
+		fmt.Fprintf(buf, "%sStorage pool names: %v\n", indent, filter.StoragePoolList)
+	}
+
+	if len(filter.StoragePoolDisklessList) > 0 {
+		fmt.Fprintf(buf, "%sStorage pool diskless name: %v\n", indent, filter.StoragePoolDisklessList)
+	}
+
+	if len(filter.NotPlaceWithRsc) > 0 {
+		fmt.Fprintf(buf, "%sDo not place with resource: %v\n", indent, filter.NotPlaceWithRsc)
+	}
+
+	if filter.NotPlaceWithRscRegex != "" {
+		fmt.Fprintf(buf, "%sDo not place with resource (regex): %s\n", indent, filter.NotPlaceWithRscRegex)
+	}
+
+	if len(filter.ReplicasOnSame) > 0 {
+		fmt.Fprintf(buf, "%sReplicas on nodes with same properties: %v\n", indent, filter.ReplicasOnSame)
+	}
+
+	if len(filter.ReplicasOnDifferent) > 0 {
+		fmt.Fprintf(buf, "%sReplicas on nodes with different properties: %v\n", indent, filter.ReplicasOnDifferent)
+	}
+
+	if len(filter.LayerStack) > 0 {
+		fmt.Fprintf(buf, "%sLayer stack: %v\n", indent, filter.LayerStack)
+	}
+
+	if len(filter.ProviderList) > 0 {
+		fmt.Fprintf(buf, "%sAllowed Provider: %v\n", indent, filter.ProviderList)
+	}
+
+	if filter.DisklessOnRemaining {
+		fmt.Fprintf(buf, "%sDiskless on remaining: true\n", indent)
+	}
 }
 
 // resolveCloneSourceProviderKind returns the ProviderKind of the
@@ -358,6 +511,16 @@ const (
 	apiCallRcRDAutoplaceDone int64 = 0x4231 // ApiConsts.RC_RSC_DFN_PLACED
 	apiCallRcRscDeleted      int64 = 0x4200 // ApiConsts.RC_RSC_DELETED
 )
+
+// apiCallRcFailNotEnoughNodes mirrors upstream
+// `ApiConsts.FAIL_NOT_ENOUGH_NODES` (= 996). The shortfall envelope
+// in writeAutoplaceShortfall ORs this with MASK_ERROR
+// (apiCallRcError) so the wire shape matches
+// `CtrlRscAutoPlaceApiCallHandler.failNotEnoughCandidates`. Tools
+// that classify replies by `ret_code` (e.g. cli-parity contract
+// tests) need the same sub-code, not a generic
+// "high-bit set" error.
+const apiCallRcFailNotEnoughNodes int64 = 996
 
 // mergeAutoplaceFilter merges the request's filter on top of the parent
 // ResourceGroup's stored select filter. Request fields win.

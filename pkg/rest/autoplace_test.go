@@ -1477,3 +1477,206 @@ func TestResourceCreatePromotesTiebreakerWithDisklessFlag(t *testing.T) {
 		t.Errorf("TIE_BREAKER must be stripped: %v", got.Flags)
 	}
 }
+
+// TestAutoplaceImpossibleCountSurfacesStructuredError verifies F13
+// CLI parity: when the operator asks for an impossible PlaceCount
+// (more replicas than the cluster has candidate pools), the response
+// MUST carry the structured ApiCallRc envelope upstream Java LINSTOR
+// emits — cause + correction + details all populated, not just
+// `message`. Without those fields the Python CLI prints a terse
+// one-liner ("ERROR: not enough candidate storage pools …") and the
+// operator has no idea WHY placement failed or what to change.
+//
+// Stamps the 409 status + non-empty cause/details/correction; the
+// envelope shape itself is pinned by the broader
+// TestAPICallRcEnvelopeShape but the structured-error fields are
+// specific to this failure mode.
+func TestAutoplaceImpossibleCountSurfacesStructuredError(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-impossible"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// 2 healthy nodes — far short of the requested 99.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 99, StoragePool: "pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-impossible/autoplace", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("envelope: empty array, want at least one ApiCallRc entry")
+	}
+
+	first := rc[0]
+
+	if first.Cause == "" {
+		t.Errorf("cause: empty, want non-empty operator-actionable text")
+	}
+
+	if first.Details == "" {
+		t.Errorf("details: empty, want criteria bullets + config block")
+	}
+
+	if first.Correc == "" {
+		t.Errorf("correction: empty, want operator-actionable hint")
+	}
+}
+
+// TestAutoplaceImpossibleCountListsCriteria verifies the Details
+// block contains the upstream-style bulleted criteria list and the
+// "Replica count: <N>" configuration line. The Python CLI renders
+// Details verbatim, so operators rely on the criteria list to know
+// which constraint to relax (drop pool filter? add nodes? grow
+// access?). The exact pool-name bullet text uses the constrained
+// storage_pool name so a typo'd pool surfaces in the diagnostic.
+func TestAutoplaceImpossibleCountListsCriteria(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-criteria"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "fast-pool",
+			NodeName:        n,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 99, StoragePool: "fast-pool"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-criteria/autoplace", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("envelope: empty array")
+	}
+
+	details := rc[0].Details
+
+	if !strings.Contains(details, "Replica count: 99") {
+		t.Errorf("details missing 'Replica count: 99', got:\n%s", details)
+	}
+
+	if !strings.Contains(details, "fast-pool") {
+		t.Errorf("details missing 'fast-pool' bullet, got:\n%s", details)
+	}
+
+	if !strings.Contains(details, "storage pool named") {
+		t.Errorf("details missing 'storage pool named' criterion bullet, got:\n%s", details)
+	}
+
+	if !strings.Contains(details, "the node is online") {
+		t.Errorf("details missing 'the node is online' criterion bullet, got:\n%s", details)
+	}
+}
+
+// TestAutoplaceCapacityShortfallSurfacesNumericDetails verifies the
+// capacity-shortfall branch (Bug 35) also routes through the F13
+// structured envelope and that the Details block cites both the
+// required size and the largest free capacity. Operators sizing a
+// PVC against a tight pool need the numeric gap visible in the
+// reply — without it they have to ssh to a satellite and read
+// `zfs list` / `vgs` to figure out what to grow.
+func TestAutoplaceCapacityShortfallSurfacesNumericDetails(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-cap"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// VD requires ~1 GiB (1048576 KiB) per replica.
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-cap", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      1048576,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	// Pool with 1 KiB free can't host the 1 GiB volume — capacity
+	// gate fires, returning a CapacityShortfallError that
+	// runPlaceAndReport must route through writeAutoplaceShortfall.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "tiny",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    1,
+		TotalCapacity:   1024,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "tiny"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-cap/autoplace", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("envelope: empty array")
+	}
+
+	details := rc[0].Details
+
+	if !strings.Contains(details, "1048576") {
+		t.Errorf("details missing required '1048576 KiB', got:\n%s", details)
+	}
+
+	if !strings.Contains(details, " 1 KiB") {
+		t.Errorf("details missing max-free '1 KiB', got:\n%s", details)
+	}
+}
