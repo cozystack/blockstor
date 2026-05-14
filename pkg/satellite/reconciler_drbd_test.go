@@ -1806,7 +1806,15 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 			},
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				// Bug 81: set-gi is per-peer in DRBD 9.2+, so the seed
+				// loop only fires when a peer is wired into DrbdOptions.
+				// Single-replica RDs don't need a seed at all (no peer
+				// to handshake with), but every multi-replica RD has at
+				// least one `peer.<name>.node-id` entry — mirror that
+				// shape here so the test exercises the per-peer path.
+				"peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
 			},
+			Peers: []string{"n2"},
 		},
 	})
 	if err != nil {
@@ -1838,7 +1846,10 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 
 	// Pin the exact GI tuple shape so the seed gets the peer's
 	// current_uuid in BOTH current_uuid and bitmap_uuid slots.
-	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	// Bug 81: drbdmeta in DRBD 9.2+ requires --node-id, identifying
+	// which peer-bitmap slot this GI applies to. We stamp peer n2
+	// (node-id=1).
+	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(calls, wantSetGi) {
 		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGi, calls)
 	}
@@ -2233,7 +2244,15 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 					},
 					DrbdOptions: map[string]string{
 						"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+						// Bug 81: per-peer SetGi loop needs a peer wired
+						// in so the day0 skip-init-sync seed actually
+						// fires. Production never sees a 1-replica RD
+						// reach this path (autoplace mandates at least
+						// 1 peer or tiebreaker); test mirrors a 2-replica
+						// shape.
+						"peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
 					},
+					Peers: []string{"n2"},
 				},
 			})
 			if err != nil {
@@ -2269,7 +2288,12 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			// volume number — keep the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi %s:%s:0:0",
+			// Bug 81: per-peer set-gi includes --node-id <peer>.
+			// Day0 is identical across all peers (deterministic from
+			// RD name + volume), so peer n2 (node-id=1) gets the same
+			// day0 in BOTH bitmap-uuid slots — exactly what DRBD needs
+			// for its skip-init-sync handshake.
+			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:%s:0:0",
 				tc.wantDevice, day0, day0)
 			if !slices.Contains(calls, wantSetGi) {
 				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGi, calls)

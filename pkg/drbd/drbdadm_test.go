@@ -190,7 +190,7 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 
 // TestAdmSetGiInvokesDrbdmeta pins the initial-sync skip seeding
 // command shape: `drbdmeta --force <res>/<vol> v09 <device>
-// internal set-gi <peer_gi>:<peer_gi>:0:0`. Phase 8.1.
+// internal set-gi --node-id <peer> <peer_gi>:<peer_gi>:0:0`.
 //
 // The format MUST be peer-gi twice (current_uuid + bitmap_uuid both
 // match the peer's current_uuid), then two zero history slots — a
@@ -198,18 +198,31 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 // bitmap order would silently break the GI-handshake match and
 // re-introduce the full initial-sync this whole pipeline exists to
 // avoid.
+//
+// DRBD 9.2+ requires `--node-id <peer>` since the bitmap-uuid slot
+// is per-peer in modern metadata; dropping it would re-introduce
+// the failure mode where drbdmeta rejects set-gi with
+// "The set-gi command requires the --node-id option".
 func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", "78A0DDDABCDEF000")
+	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", 2, "78A0DDDABCDEF000")
 	if err != nil {
 		t.Fatalf("SetGi: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi --node-id 2 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+
+	// The bare no-node-id form MUST NOT appear — a regression to
+	// the legacy shape would silently disable the day0
+	// skip-initial-sync on DRBD 9.2+ stands.
+	legacy := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	if slices.Contains(fx.CommandLines(), legacy) {
+		t.Errorf("SetGi emitted legacy no-node-id form: %s", legacy)
 	}
 }
 
