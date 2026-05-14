@@ -1165,6 +1165,233 @@ func TestSPDeleteUnknownUsesWarnMaskNotInfo(t *testing.T) {
 	}
 }
 
+// TestSPDeleteRefusesWhenReferencedByResource pins scenario 6.W06
+// (cross-listed with Bug 52): `linstor sp d <node> <pool>` MUST
+// refuse with 409 + FAIL_IN_USE when at least one Resource replica
+// on `(node, pool)` still references the pool via a Volume whose
+// `StoragePool` matches. The pool CRD stays in the store; the
+// operator drops the referencing replicas first, then retries.
+//
+// Without this pin a regression that turned the delete into a
+// cascade (drop referencing replicas under the hood) would silently
+// throw away on-disk data on every `sp d` — upstream LINSTOR refuses
+// for the same reason in `CtrlStorPoolApiCallHandler` and we must
+// match.
+func TestSPDeleteRefusesWhenReferencedByResource(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg1", "StorDriver/ThinPool": "thin"},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-ref"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Replica with a Volume bound to (n1, p1) — the satellite has
+	// already reported the per-volume observation, so the wire-side
+	// view of the Resource carries an unambiguous reference to the
+	// pool we're trying to drop.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-ref",
+		NodeName: "n1",
+		Volumes: []apiv1.Volume{
+			{VolumeNumber: 0, StoragePool: "p1"},
+		},
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/n1/storage-pools/p1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (still-referenced refusal)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("envelope: got empty, want one entry")
+	}
+
+	// FAIL_IN_USE sub-code 997 OR'd with MASK_ERROR (high bit set).
+	// Python CLI matches on the sub-code; the MASK_ERROR makes the
+	// CLI surface the line as an error rather than informational.
+	if rc[0].RetCode&0xFFFF != apiCallRcFailInUse {
+		t.Errorf("ret_code sub-code: got %#x, want FAIL_IN_USE (%d)",
+			rc[0].RetCode&0xFFFF, apiCallRcFailInUse)
+	}
+
+	if rc[0].RetCode >= 0 {
+		t.Errorf("ret_code: got %#x, want MASK_ERROR (negative) bit set", rc[0].RetCode)
+	}
+
+	// Operator-facing message must name both the pool and the node
+	// so `linstor sp d` exit-error tells the operator exactly which
+	// pair is wedged. The referencing replica name belongs in
+	// Details (matches upstream's wire shape — Message stays terse).
+	if !strings.Contains(rc[0].Message, "p1") || !strings.Contains(rc[0].Message, "n1") {
+		t.Errorf("message: got %q, want it to name pool 'p1' and node 'n1'", rc[0].Message)
+	}
+
+	if !strings.Contains(rc[0].Details, "pvc-ref") {
+		t.Errorf("details: got %q, want it to name the referencing replica 'pvc-ref'", rc[0].Details)
+	}
+
+	// CRITICAL: the pool CRD must still exist — a refused delete
+	// that nevertheless dropped the pool would leave the cluster
+	// in a half-deleted state (CRD gone, on-disk VG still there,
+	// replica's StoragePool reference dangling). Without this
+	// assertion a regression that swapped the order of the
+	// refusal-check and the store Delete would silently pass.
+	if _, err := st.StoragePools().Get(ctx, "n1", "p1"); err != nil {
+		t.Errorf("pool removed despite 409 refusal: %v", err)
+	}
+}
+
+// TestSPDeleteIgnoresUnobservedReplica pins the tri-state semantic
+// on the refusal check: a Resource replica that has NOT yet had its
+// Volumes populated by the satellite observer MUST NOT count as
+// "using" the pool. Without this carve-out a fresh `n d`-evacuated
+// node could never have its empty pool dropped — the controller's
+// view of the replicas would carry the old `(node, pool)` pair
+// until the satellite reconciler caught up, and `sp d` would
+// permanently 409.
+//
+// Matches upstream LINSTOR which iterates per-volume provider
+// objects (a replica with no provider object yet is invisible to
+// the refusal walk).
+func TestSPDeleteIgnoresUnobservedReplica(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg1", "StorDriver/ThinPool": "thin"},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-unobs"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Replica without Volumes — satellite hasn't reported yet,
+	// the controller can't prove the pool is referenced.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-unobs",
+		NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/n1/storage-pools/p1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (unobserved replica ignored)", resp.StatusCode)
+	}
+
+	if _, err := st.StoragePools().Get(ctx, "n1", "p1"); err == nil {
+		t.Errorf("pool kept despite no observed reference")
+	}
+}
+
+// TestSPDeleteScopedToNode pins the per-node scope of the refusal:
+// a Resource replica that references the same pool name on a
+// DIFFERENT node MUST NOT block the delete on (node, pool). Pool
+// names are not globally unique in upstream LINSTOR — `(node, pool)`
+// is the composite key, and operators routinely re-use the same
+// pool name across nodes (`DfltStorPool` is the most common case).
+// Without the per-node carve-out, dropping a single node's
+// `DfltStorPool` would refuse forever as long as ANY other node had
+// a replica bound to its own `DfltStorPool`.
+func TestSPDeleteScopedToNode(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n, Type: apiv1.NodeTypeSatellite}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        n,
+			StoragePoolName: "p1",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			Props:           map[string]string{"StorDriver/LvmVg": "vg1", "StorDriver/ThinPool": "thin"},
+		}); err != nil {
+			t.Fatalf("seed pool on %s: %v", n, err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-other"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Replica references (n2, p1) — must NOT block delete of (n1, p1).
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-other",
+		NodeName: "n2",
+		Volumes: []apiv1.Volume{
+			{VolumeNumber: 0, StoragePool: "p1"},
+		},
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/nodes/n1/storage-pools/p1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (other-node reference ignored)", resp.StatusCode)
+	}
+
+	if _, err := st.StoragePools().Get(ctx, "n1", "p1"); err == nil {
+		t.Errorf("(n1, p1) kept despite no on-node reference")
+	}
+
+	// (n2, p1) must still exist — we only deleted (n1, p1).
+	if _, err := st.StoragePools().Get(ctx, "n2", "p1"); err != nil {
+		t.Errorf("(n2, p1) removed by (n1, p1) delete: %v", err)
+	}
+}
+
 // TestStoragePoolListPropertiesRoundTripAllNamespaces pins scenario
 // 1.W01 (P0, unit) for the StoragePool scope: `linstor storage-pool
 // list-properties` reads the `props` field of `GET

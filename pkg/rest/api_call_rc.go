@@ -166,22 +166,24 @@ const warnNoSatelliteConnection = maskWarn | int64(2057)
 // a separate rule.
 const apiCallRcFailExistsSnapshotDfn int64 = 514
 
-// apiCallRcFailInvldVlmSize mirrors upstream LINSTOR's
-// `ApiConsts.FAIL_INVLD_VLM_SIZE` (`206 | MASK_ERROR`). Emitted by
-// `PUT /v1/resource-definitions/{rd}/volume-definitions/{vn}` when
-// the patch reduces SizeKib without the `force=true` escape hatch
-// (wave2 scenario 4.W13 / UG9 §"Creating and deploying resources and
-// volumes" line 851 WARNING). Upstream's
-// CtrlVlmDfnModifyApiCallHandler.ensureShrinkingIsSupported raises
-// the same `206 | MASK_ERROR` on the same input ("Deployed volumes
-// can only grow in size, not shrink"); blockstor matches the wire
-// code so audit-log greppers that already classify upstream's
-// FAIL_INVLD_VLM_SIZE traffic catch blockstor's equivalent without
-// a separate rule. The MASK_ERROR bit is OR'd in by the
-// `apiCallRcError` envelope wrapper at the call site; the bare 206
-// sub-code here keeps the wire shape byte-identical to upstream's
-// `linstor vd set-size <rd> <vn> <smaller>` reply.
-const apiCallRcFailInvldVlmSize int64 = 206
+// apiCallRcFailInUse mirrors upstream LINSTOR's `ApiConsts.FAIL_IN_USE`
+// (`997 | MASK_ERROR`). Emitted by
+// `DELETE /v1/nodes/{node}/storage-pools/{pool}` when at least one
+// Resource replica on `(node, pool)` still references the pool
+// (wave2 scenario 6.W06 / UG9 §"Creating storage pools by using the
+// physical storage command" note). Upstream's `CtrlStorPoolApiCallHandler`
+// raises this with the literal text
+// `"The specified storage pool '<pool>' on node '<node>' can not be
+// deleted as volumes / snapshot-volumes are still using it."` and asks
+// the operator to drop the referencing volumes first; blockstor matches
+// the wire shape so the Python CLI's existing error-message renderer
+// surfaces the line verbatim.
+//
+// Sub-code 997 is shared across many "still-referenced" refusal paths
+// in upstream LINSTOR (resource delete, snapshot restore, vlm-dfn modify
+// etc.); reusing the same number here lets audit-log greppers catch
+// blockstor's variant without a separate rule.
+const apiCallRcFailInUse int64 = 997
 
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
@@ -191,4 +193,5 @@ const (
 	objRefNode        = "Node"
 	objRefRscDfn      = "RscDfn"
 	objRefSnapshotDfn = "SnapshotDfn"
+	objRefStorPool    = "StorPool"
 )

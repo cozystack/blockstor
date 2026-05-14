@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -68,11 +69,50 @@ func (s *Server) registerStoragePools(mux *http.ServeMux) {
 // are still deletable through this endpoint. Without the resolver,
 // `linstor sp d` would optimistically report "already absent" while
 // the CRD lived on and List() kept showing the pool.
+//
+// Scenario 6.W06: refuses with 409 + FAIL_IN_USE if any Resource
+// replica on `(node, pool)` still references the pool (via a Volume
+// whose `StoragePool` matches). The operator must drop the
+// referencing replicas first — blockstor never cascades a pool-delete
+// into replica-deletes, matching upstream LINSTOR's
+// `CtrlStorPoolApiCallHandler` refusal pattern. The check runs BEFORE
+// the store-level Delete so a refused call leaves the pool's CRD in
+// place.
 func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 
-	err := s.Store.StoragePools().Delete(r.Context(), node, pool)
+	// Refuse if any Resource replica on this node still references
+	// the pool. We scan the full Resource list rather than per-RD
+	// because the store has no (pool → resources) reverse index;
+	// the cost is bounded by the cluster-wide replica count, which
+	// is well below the typical Resource-list path latency budget.
+	refs, err := s.referencingResources(r.Context(), node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if len(refs) > 0 {
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailInUse,
+			Message: "The specified storage pool '" + pool +
+				"' on node '" + node + "' can not be deleted as " +
+				"volumes / snapshot-volumes are still using it.",
+			Details: "Volumes that are still using the storage pool: " +
+				strings.Join(refs, ", "),
+			Correc: "Delete the listed volumes first.",
+			ObjRefs: map[string]string{
+				objRefNode:     node,
+				objRefStorPool: pool,
+			},
+		}})
+
+		return
+	}
+
+	err = s.Store.StoragePools().Delete(r.Context(), node, pool)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
 
@@ -99,6 +139,44 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 		RetCode: maskInfo,
 		Message: "storage pool deleted: " + pool + " on " + node,
 	}})
+}
+
+// referencingResources returns the `<rd>/<vol_nr>` keys of every
+// Volume on `node` whose `StoragePool` matches `pool`. Used by the
+// storage-pool delete refusal path (scenario 6.W06).
+//
+// Resources whose satellite hasn't reported Volumes yet (no
+// per-replica observation) intentionally do NOT count as "using" the
+// pool — without a populated Volumes slice we can't prove the
+// replica's storage came from this specific pool, and refusing on a
+// not-yet-observed replica would block legitimate pool removal on a
+// freshly-restored cluster. Matches upstream LINSTOR, which iterates
+// `VlmProviderObject`s on the pool — a replica that has not yet been
+// materialized has no provider objects bound to the pool either.
+func (s *Server) referencingResources(ctx context.Context, node, pool string) ([]string, error) {
+	all, err := s.Store.Resources().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var refs []string
+
+	for i := range all {
+		if all[i].NodeName != node {
+			continue
+		}
+
+		for _, v := range all[i].Volumes {
+			if v.StoragePool == pool {
+				refs = append(refs,
+					all[i].Name+"/"+strconv.FormatInt(int64(v.VolumeNumber), 10))
+
+				break
+			}
+		}
+	}
+
+	return refs, nil
 }
 
 func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) {
