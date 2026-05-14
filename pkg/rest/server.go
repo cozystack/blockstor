@@ -92,6 +92,35 @@ type Server struct {
 	// `enter-passphrase` PATCH (a low-frequency operator action),
 	// so a mutex would be overkill.
 	passphraseUnlocked atomic.Bool
+
+	// resolveHost is the DNS-lookup seam used by handleNodeCreate
+	// (scenario 4.W01) when the POST body omits a NetInterface
+	// address. Tests inject a stub via Server.SetResolveHost to keep
+	// the unit suite hermetic — nil means "use the production
+	// net.DefaultResolver via defaultResolveHost".
+	resolveHost resolveHostFunc
+}
+
+// SetResolveHost overrides the DNS-lookup function used by
+// handleNodeCreate. Returns the previous value so tests can restore
+// it. Production code never calls this; defaultResolveHost is used
+// when the field is nil.
+func (s *Server) SetResolveHost(fn resolveHostFunc) resolveHostFunc {
+	prev := s.resolveHost
+	s.resolveHost = fn
+
+	return prev
+}
+
+// lookupHost dispatches to s.resolveHost if set, else the package
+// default. Hoisted off-handler so the production handler stays
+// readable and the test seam is explicit.
+func (s *Server) lookupHost(ctx context.Context, host string) ([]string, error) {
+	if s.resolveHost != nil {
+		return s.resolveHost(ctx, host)
+	}
+
+	return defaultResolveHost(ctx, host)
 }
 
 // NeedLeaderElection reports whether the server requires leader election.

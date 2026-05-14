@@ -18,7 +18,9 @@ package rest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"maps"
 	"net"
 	"net/http"
@@ -26,6 +28,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 
 	lapi "github.com/LINBIT/golinstor/client"
 
@@ -130,26 +134,57 @@ func TestNodesGetMissing(t *testing.T) {
 	}
 }
 
-// TestNodesCreateConflict: POST with a duplicate name returns 409.
-func TestNodesCreateConflict(t *testing.T) {
+// TestNodesCreateIdempotent: scenario 4.W01 — POST /v1/nodes is an
+// upsert. The CLI's `node create <name> <ip>` is re-issued by
+// cozystack reconcilers on every operator restart; returning 409
+// made the reconciler hot-spin. Second POST MUST update the node
+// rather than fail with conflict.
+func TestNodesCreateIdempotent(t *testing.T) {
 	st := store.NewInMemory()
-	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeAuxiliary,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1"},
+		},
+	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	body, err := json.Marshal(apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite})
+	body, err := json.Marshal(apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.42"},
+		},
+	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 
 	resp := httpPost(t, base+"/v1/nodes", body)
-	defer func() { _ = resp.Body.Close() }()
+	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("status: got %d, want 409", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (idempotent upsert)", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(t.Context(), "n1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Type != apiv1.NodeTypeSatellite {
+		t.Errorf("Type: got %q, want %q (second POST should overwrite)",
+			got.Type, apiv1.NodeTypeSatellite)
+	}
+
+	if len(got.NetInterfaces) != 1 || got.NetInterfaces[0].Address != "10.0.0.42" {
+		t.Errorf("NetInterfaces: got %+v, want default=10.0.0.42",
+			got.NetInterfaces)
 	}
 }
 
@@ -1397,6 +1432,110 @@ func TestNodeListPropertiesEmptySeedNotNil(t *testing.T) {
 
 // mapKeys is a tiny helper that returns the keys of a
 // `map[string][]string` as a sorted slice — used in failure messages
+// TestNodeCreateSynthesizesDefaultNetInterface: scenario 4.W01 —
+// when the operator POSTs a node body without any NetInterface but
+// the name resolves via DNS, the controller MUST synthesize
+// `NetInterface{Name: "default", Address: <resolved>}` so the
+// satellite has a routable address.
+func TestNodeCreateSynthesizesDefaultNetInterface(t *testing.T) {
+	st := store.NewInMemory()
+	srv := &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	}
+	srv.SetResolveHost(func(_ context.Context, host string) ([]string, error) {
+		if host != "alpha" {
+			t.Errorf("lookupHost host: got %q, want alpha", host)
+		}
+
+		return []string{"10.42.0.7"}, nil
+	})
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Node{
+		Name: "alpha",
+		Type: apiv1.NodeTypeSatellite,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Nodes().Get(t.Context(), "alpha")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if len(got.NetInterfaces) != 1 {
+		t.Fatalf("NetInterfaces len: got %d, want 1", len(got.NetInterfaces))
+	}
+
+	if got.NetInterfaces[0].Name != "default" {
+		t.Errorf("NetInterfaces[0].Name: got %q, want default",
+			got.NetInterfaces[0].Name)
+	}
+
+	if got.NetInterfaces[0].Address != "10.42.0.7" {
+		t.Errorf("NetInterfaces[0].Address: got %q, want 10.42.0.7",
+			got.NetInterfaces[0].Address)
+	}
+}
+
+// TestNodeCreateDNSFailureReturns400: scenario 4.W01 — when neither
+// the body nor DNS lookup yields an address, the handler MUST refuse
+// with an actionable 400 instead of silently registering a Node with
+// an empty Address (which then breaks autoplacer connection routing
+// at the first replica placement attempt).
+func TestNodeCreateDNSFailureReturns400(t *testing.T) {
+	st := store.NewInMemory()
+	srv := &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    newFakeRESTClient(t),
+		Namespace: testRESTNamespace,
+	}
+	srv.SetResolveHost(func(_ context.Context, _ string) ([]string, error) {
+		return nil, errors.New("no such host")
+	})
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Node{
+		Name: "ghost",
+		Type: apiv1.NodeTypeSatellite,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400", resp.StatusCode)
+	}
+
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "DNS") {
+		t.Errorf("body: got %q, want DNS-mentioning error", string(raw))
+	}
+
+	if _, err := st.Nodes().Get(t.Context(), "ghost"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get after failed Create: got %v, want ErrNotFound (no partial persist)", err)
+	}
+}
+
 // for the F2 tests so a regression shows up as `got keys=[...]`
 // rather than as a Go map literal's randomised order.
 func mapKeys(m map[string][]string) []string {

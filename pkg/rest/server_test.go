@@ -57,6 +57,19 @@ func pickFreeAddr(t *testing.T) string {
 func startServerCustom(t *testing.T, srv *Server) (string, func()) {
 	t.Helper()
 
+	// Hermetic DNS-lookup stub: handleNodeCreate falls back to DNS
+	// resolution when the POST body omits a NetInterface address
+	// (scenario 4.W01). The default resolver hits the host network,
+	// which fails in CI sandboxes and is non-deterministic on dev
+	// laptops. Tests that need a specific behaviour (e.g. the
+	// scenario's "DNS fails → 400" path) override this via
+	// Server.SetResolveHost before calling startServerCustom.
+	if srv.resolveHost == nil {
+		srv.SetResolveHost(func(_ context.Context, host string) ([]string, error) {
+			return []string{"127.0.0.1"}, nil //nolint:nilerr // hermetic stub
+		})
+	}
+
 	ctx, cancel := context.WithCancel(t.Context())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start(ctx) }()

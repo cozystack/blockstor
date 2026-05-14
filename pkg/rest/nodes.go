@@ -17,8 +17,10 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
+	"net"
 	"net/http"
 	"strings"
 
@@ -27,6 +29,28 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// DefaultNetInterfaceName is the LINSTOR-canonical name for the
+// per-satellite primary network interface. `linstor node create
+// <name> <ip>` synthesizes a `NetInterface{Name: "default",
+// Address: <ip>}` on the controller side; CLI parity audit row #2
+// pins this string — the autoplacer's connection-routing path and
+// `props.CurStltConnName` both default to it.
+const DefaultNetInterfaceName = "default"
+
+// resolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
+// the POST body omits a NetInterface address. Tests swap this for a
+// deterministic stub via Server.lookupHost.
+type resolveHostFunc func(ctx context.Context, host string) ([]string, error)
+
+// defaultResolveHost wraps net.DefaultResolver.LookupHost — the
+// production resolver. Hoisted into a package-level var so tests can
+// override per-Server (see Server.lookupHost).
+//
+//nolint:gochecknoglobals // injectable test seam — see Server.lookupHost
+var defaultResolveHost resolveHostFunc = func(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
 
 // registerNodes wires the /v1/nodes endpoints on mux. It is split out of
 // Server.Start so each resource group lives in its own file.
@@ -302,8 +326,46 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Scenario 4.W01: synthesize the default NetInterface if the
+	// caller passed none. `linstor node create <name> <ip>` is the
+	// canonical CLI form; the client always sends a body with at
+	// least the primary address, but the CLI also allows omitting
+	// the IP entirely — in which case the controller DNS-resolves
+	// the name. We mirror both branches; failure of the DNS resolve
+	// surfaces an actionable 400 to the operator instead of letting
+	// a satellite register with an empty Address (which then breaks
+	// the autoplacer's connection routing later).
+	if len(n.NetInterfaces) == 0 {
+		addr, dnsErr := s.resolveDefaultAddress(r.Context(), &n)
+		if dnsErr != nil {
+			writeError(w, http.StatusBadRequest, dnsErr.Error())
+
+			return
+		}
+
+		n.NetInterfaces = []apiv1.NetInterface{{
+			Name:    DefaultNetInterfaceName,
+			Address: addr,
+		}}
+	}
+
+	// Idempotent upsert (cli-parity-audit row #44): upstream LINSTOR's
+	// `node create` re-issues become no-op updates, not 409s. Cozystack
+	// reconcilers retry node registration on every operator restart;
+	// returning 409 made the loop hot-spin until human intervention.
+	// We try Create first (the common path), and fall through to Update
+	// only when the store reports the name is already taken.
 	err = s.Store.Nodes().Create(r.Context(), &n)
-	if err != nil {
+	switch {
+	case err == nil:
+		// fresh create — normal path
+	case errors.Is(err, store.ErrAlreadyExists):
+		if upErr := s.Store.Nodes().Update(r.Context(), &n); upErr != nil {
+			writeStoreError(w, upErr)
+
+			return
+		}
+	default:
 		writeStoreError(w, err)
 
 		return
@@ -352,6 +414,29 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, envelope)
+}
+
+// resolveDefaultAddress synthesises the address for the default
+// NetInterface when the POST /v1/nodes body omits one. Picks the
+// first NetInterface address if the caller passed any (defensive —
+// the caller should already have populated NetInterfaces, but this
+// covers a single-IP payload with an empty name), otherwise falls
+// back to DNS resolution of the node's name. Returns an actionable
+// error if DNS lookup fails so the operator sees the cause rather
+// than a satellite stuck with an empty Address.
+func (s *Server) resolveDefaultAddress(ctx context.Context, n *apiv1.Node) (string, error) {
+	addrs, err := s.lookupHost(ctx, n.Name)
+	if err != nil {
+		return "", errors.Wrapf(err,
+			"node %q: address omitted and DNS resolution of name failed", n.Name)
+	}
+
+	if len(addrs) == 0 {
+		return "", errors.Errorf(
+			"node %q: address omitted and DNS resolution returned no addresses", n.Name)
+	}
+
+	return addrs[0], nil
 }
 
 // DfltDisklessStorPoolName matches upstream LINSTOR's canonical
