@@ -4,11 +4,11 @@
 #
 # Wire-shape smoke for the production `linstor` CLI (python-linstor)
 # against blockstor's REST API. The reason this script exists, even
-# though tests/e2e/linstor-cli.sh already covers the happy path: the
-# user's day-of-use shell session keeps hitting bugs that unit-level
-# httptest assertions miss because they exercise Go-side `httpPost`
-# helpers, not the actual python-linstor client. Examples surfaced
-# by hand-tested sessions (and now pinned here):
+# though tests/integration/group_*_test.go (Tier 2) already covers
+# the happy path: the user's day-of-use shell session keeps hitting
+# bugs that unit-level httptest assertions miss because they exercise
+# Go-side `httpPost` helpers, not the actual python-linstor client.
+# Examples surfaced by hand-tested sessions (and now pinned here):
 #
 #   - Bug 78: POST /v1/nodes/{n}/restore was the only registered
 #     verb; python-linstor's node_restore() uses PUT and crashes on
@@ -47,7 +47,7 @@ RD_LATE_VD=cc-late-vd
 RD_AUTOPLACE=cc-autoplace
 RD_HAPPY=cc-happy
 
-# port-forward to the apiserver — same dance as linstor-cli.sh.
+# port-forward to the apiserver.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 kubectl -n blockstor-system port-forward svc/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/client-compat-pf.log 2>&1 &

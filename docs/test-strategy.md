@@ -23,9 +23,9 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 | 1 | L — Concurrency / cache trail | 6 | done | landed via cherry-pick |
 | 2 | Tier 3 — drbd-utils contract | 5 | pending | — |
 | 2 | CI wiring (`.github/workflows/integration.yml`) | — | done | committed with this doc |
-| 2 | E2E cleanup — drop duplicates folded into Tier 2 | — | pending | — |
+| 2 | E2E cleanup — drop duplicates folded into Tier 2 | — | done | `chore/e2e-audit-cleanup` (see `docs/e2e-audit.md`) |
 
-Total Tier 2 tests: 108. Tier 3: 5. Tier 4 retained: 8 scripts.
+Total Tier 2 tests: 108. Tier 3: 5. Tier 4 retained: 53 scripts (will reach 57 once the 4 inbound Bug 80–83 real-DRBD regression guards land). See `docs/e2e-audit.md` for the full disposition table; 13 scripts were folded into Tier 2 by this audit.
 
 ## Tier architecture
 
@@ -267,22 +267,29 @@ These tests stitch several groups into realistic sequences.
 
 ## Tier 4: `tests/e2e/` (the parts that physically need a kernel)
 
-**Keep** (audit + cleanup of existing scripts):
+After the 2026-05-14 audit (`docs/e2e-audit.md`), 53 scripts remain. Categorised:
 
-| Script | Why Tier 4 only |
+| Category | Scripts |
 |---|---|
-| `tests/e2e/recovery-standalone.sh` | SplitBrain → StandAlone, discard-my-data |
-| `tests/e2e/recovery-synctarget.sh` | replication:SyncTarget, partial bitmap |
-| `tests/e2e/recovery-suspended-quorum.sh` | **Bug 82** real kernel state |
-| `tests/e2e/recovery-disk-replace.sh` | external metadata |
-| `tests/e2e/csi-with-kubelet.sh` | mount, formatfs, pod restart |
-| `tests/e2e/iptables-partition.sh` | network partition wave1 5.10, 7.11 |
-| `tests/e2e/burnin-zfs-thin.sh` | 24h sustained I/O (task #73) |
-| `tests/e2e/client-compat.sh` | keep as "smoke" against real DRBD |
+| Kernel replication state machine | `recovery-bitmap-drop.sh`, `recovery-discard-my-data.sh`, `recovery-down-reverses.sh`, `recovery-stuck-synctarget.sh`, `recovery-stuck-synctarget-down-up.sh`, `recovery-primary-force.sh`, `recovery-node-id-mismatch.sh`, `recovery-inconsistent-blocking.sh`, `recovery-port-collision.sh`, `recovery-quorum-persistence.sh`, `split-brain-recovery.sh`, `state-standalone-partition.sh`, `state-inconsistent-mid-sync.sh`, `state-auto-resync.sh`, `network-partition.sh`, `quorum-loss-recovery.sh` |
+| Bug 79–83 real-DRBD regression guards | `recovery-late-vd-real-drbd.sh`, `recovery-auto-place-real-drbd.sh`, `recovery-setgi-per-peer.sh`, `recovery-suspended-quorum.sh`, `recovery-poolmissing-real-zfs.sh` (4 inbound) |
+| Disk / metadata replacement | `disk-replace-internal-metadata.sh`, `disk-replace-external-metadata.sh`, `storage-external-drbd-meta.sh`, `backing-device-fail.sh` |
+| Real backing-device behaviour | `storage-error-injection.sh` |
+| Multi-volume / multi-primary kernel features | `two-primaries-live-migration.sh`, `two-volume-rd.sh`, `toggle-disk.sh` |
+| Sync / replica add | `replica-add-no-resync.sh` |
+| Cross-node data-plane | `snap-ship-cross-node.sh`, `snapshot-restore-cross-node.sh` |
+| Resize + mount + checksum | `resize-luks.sh`, `resize-plain.sh`, `resize-pvc.sh`, `resize-no-drbd.sh`, `clone.sh` |
+| Cryptsetup on real device | `drbd-luks-stack.sh`, `luks-layer.sh`, `no-drbd.sh` |
+| Real-Kubernetes observability | `observability-three-way.sh`, `observability-capacity-correlation.sh`, `observability-destructive-walk.sh`, `observability-linstor-node-bridge.sh` |
+| Live-cluster reconciler races | `tiebreaker.sh`, `auto-diskful.sh`, `evacuate.sh`, `affinity-controller.sh`, `state-offline-unknown.sh` |
+| Operator-recipe contracts (simulated satellite death) | `recovery-deleting-convert.sh`, `lc-rd-delete-churn.sh` |
+| Lifecycle on real DRBD | `lifecycle-toggle-migrate.sh`, `lifecycle-toggle-retry.sh` |
+| Operator-runnable utilities | `satellite-utils-smoke.sh`, `client-compat.sh` |
+| Day-1 lifecycle on real cluster | `rwx-ganesha.sh`, `rolling-upgrade.sh`, `node-replace-hardware.sh` |
 
-**Remove after migration to Tier 2**:
+Burn-in (`burnin-zfs-thin.sh`) and `csi-with-kubelet.sh` listed in the original draft do not exist in the repository yet — they remain a TODO outside the scope of this audit.
 
-- Every `tests/e2e/*.sh` that does not actually exercise kernel-state (e.g. `linstor-cli.sh`, `cheat-sheet-cli-*.sh`) — folded into `tests/integration/cli_smoke_test.go`
+The 13 scripts removed in `chore/e2e-audit-cleanup` (CLI/CSI smoke, node-lifecycle CRD flag flips, label sync, RD-delete cascade, wire-shape `r mkavail` probe) are now exclusively covered by Tier 2. See `docs/e2e-audit.md` for the per-script supersession trail.
 
 ---
 

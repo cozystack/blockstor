@@ -36,13 +36,13 @@ Priority taken from each scenario's `Priority:` line in the doc.
 
 | Scenario | Doc location | Status | Test file | Notes |
 |---|---|---|---|---|
-| 1.1 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/nodes_test.go (TestNodes*), tests/e2e/linstor-cli.sh | P0 hybrid |
-| 1.2 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/storage_pools_test.go (TestViewStoragePools*), tests/e2e/linstor-cli.sh | P0 |
+| 1.1 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/nodes_test.go (TestNodes*), tests/integration/group_a_test.go (TestGroupANode*) | P0 hybrid; e2e folded into Tier 2 |
+| 1.2 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/storage_pools_test.go (TestViewStoragePools*), tests/integration/group_b_test.go | P0 |
 | 1.3 | 01-api-contract.md | covered-unit | pkg/rest/resource_definitions_test.go (TestResourceDefinitionsListEmpty, TestResourceDefinitionsCreateRoundTrip) | P0 unit |
-| 1.4 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/volume_definitions_test.go, tests/e2e/linstor-cli.sh | P0 |
-| 1.5 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/resources_test.go (TestResourcesView*), pkg/rest/autoplace_test.go (TestResourceListAndGet), tests/e2e/linstor-cli.sh | P0; connections cleanup verified in 1.17 |
-| 1.6 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/resources_test.go, tests/e2e/linstor-cli.sh | P0 |
-| 1.7 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/resource_groups_test.go (TestResourceGroups*), tests/e2e/linstor-cli.sh | P0 |
+| 1.4 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/volume_definitions_test.go, tests/integration/group_e_test.go (TestGroupEVD*) | P0 |
+| 1.5 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/resources_test.go (TestResourcesView*), pkg/rest/autoplace_test.go (TestResourceListAndGet), tests/integration/group_f_test.go (TestGroupFRCreateExplicit, TestGroupFRListVolumePoolField) | P0; connections cleanup verified in 1.17 |
+| 1.6 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/resources_test.go, tests/integration/group_f_test.go | P0 |
+| 1.7 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/resource_groups_test.go (TestResourceGroups*), tests/integration/group_c_test.go (TestGroupCRG*) | P0 |
 | 1.8 | 01-api-contract.md | covered-unit | pkg/rest/resource_groups_test.go | P1 unit; volume-group surface |
 | 1.9 | 01-api-contract.md | covered-unit | pkg/rest/kv_store_test.go:TestKVGetReturnsSingleElementArray | P0 |
 | 1.10 | 01-api-contract.md | covered-unit | pkg/rest/kv_store_test.go:TestKVPutDeletePersistInProcessLocalBag | P0 |
@@ -52,18 +52,18 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 1.14 | 01-api-contract.md | covered-unit | pkg/rest/snapshots_test.go (TestSnapshotsViewFilters), pkg/rest/resources_test.go | P1 |
 | 1.15 | 01-api-contract.md | covered-unit | pkg/rest/remotes_test.go (TestRemotesTypedEndpointsBareArray) | P1 |
 | 1.16 | 01-api-contract.md | covered-unit | pkg/rest/nodes_test.go:TestNodesUpdate | P0 |
-| 1.17 | 01-api-contract.md | covered-unit + covered-e2e | pkg/satellite/controllers/observer_internal_test.go (TestTranslateEventConnection, TestMergeConnections*), tests/e2e/lc-connection-cleanup.sh | P0 |
+| 1.17 | 01-api-contract.md | covered-unit + covered-integration | pkg/satellite/controllers/observer_internal_test.go (TestTranslateEventConnection, TestMergeConnections*), tests/integration/group_i_test.go (TestGroupI) | P0 |
 | 1.18 | 01-api-contract.md | covered-unit | pkg/store/k8s/crdname_test.go (TestK8sName_*, TestSetOriginalName_CaseOnlyDifference) | P0 |
 | 1.19 | 01-api-contract.md | covered-unit | pkg/store/k8s/crdname_test.go (TestK8sName_SlugifiesInvalidNames, TestSetAndOriginalName_RoundTrip) | P1 |
 | 1.20 | 01-api-contract.md | covered-unit | pkg/rest/api_call_rc_envelope_test.go:TestAPICallRcEnvelopeShape | P0 |
 | 1.21 | 01-api-contract.md | covered-unit | pkg/rest/spawn_test.go (TestCopyVolumeGroupProps + override-props paths) | P0 |
 | 1.22 | 01-api-contract.md | covered-unit | pkg/api/v1/lax_int_test.go (lenient decoder) | P0 |
-| 1.23 | 01-api-contract.md | covered-e2e | tests/e2e/cheat-sheet-csi-level1.sh | P1 e2e |
-| 1.24 | 01-api-contract.md | covered-e2e | tests/e2e/cheat-sheet-cli-level2.sh | P1 e2e |
+| 1.23 | 01-api-contract.md | covered-integration | tests/integration/group_j_test.go (TestGroupJ — CSI gRPC in-process) | P1 |
+| 1.24 | 01-api-contract.md | covered-integration | tests/integration/group_{a,b,d,f,h}_test.go (CLI matrix across groups) | P1 |
 | 1.25 | 01-api-contract.md | covered-e2e | tests/e2e/satellite-utils-smoke.sh | P1 e2e |
-| 1.26 | 01-api-contract.md | covered-e2e | tests/e2e/cheat-sheet-naming-deltas.sh | P2 |
+| 1.26 | 01-api-contract.md | covered-integration | tests/integration/group_h_test.go (TestGroupH — controller wire shape) | P2 |
 | 1.27 | 01-api-contract.md | covered-unit | pkg/rest/resources_test.go + snapshots_test.go (offset/limit boundaries) | P1 |
-| 1.28 | 01-api-contract.md | covered-unit + covered-e2e | pkg/rest/spawn_test.go (TestSpawnCreatesRDAndVDs, TestSpawnRollsBackOnVDFailure), tests/e2e/linstor-cli.sh | P0 |
+| 1.28 | 01-api-contract.md | covered-unit + covered-integration | pkg/rest/spawn_test.go (TestSpawnCreatesRDAndVDs, TestSpawnRollsBackOnVDFailure), tests/integration/group_c_test.go (TestGroupCRGSpawnResources) | P0 |
 
 ## Group 2 — Placement (20 scenarios)
 
@@ -72,7 +72,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 2.1 | 02-placement.md | covered-unit | internal/controller/first_available_pool_test.go, pkg/placer/placer_test.go (TestPlaceCreatesNUpToPlaceCount) | P0 |
 | 2.2 | 02-placement.md | covered-unit | pkg/placer/placer_test.go (TestPlaceCandidatePools*, FreeCapacity ordering) | P0 |
 | 2.3 | 02-placement.md | covered-unit + covered-e2e | pkg/rest/spawn_test.go, cross-listed with 1.28 | P0 |
-| 2.4 | 02-placement.md | covered-e2e | tests/e2e/linstor-cli.sh, linstor-cli-replica-move.sh | P1 |
+| 2.4 | 02-placement.md | covered-integration | tests/integration/group_f_test.go (TestGroupFRMigrateDisk) | P1 |
 | 2.5 | 02-placement.md | covered-unit | pkg/placer/placer_test.go:TestPlaceReplicasOnSamePicksLargestGroup | P0; doc says "missing test" but unit exists |
 | 2.6 | 02-placement.md | covered-unit | pkg/placer/placer_test.go:TestPlaceReplicasOnDifferentFallsBackToExcludedNode, pkg/rest/autoplace_test.go:TestAutoplaceReplicasOnDifferent* | P0; doc says "missing test" — e2e still gap |
 | 2.7 | 02-placement.md | covered-unit | pkg/placer/placer_test.go:TestPlaceReplicasOnDifferentExcludeMode | P1 |
@@ -111,9 +111,9 @@ Priority taken from each scenario's `Priority:` line in the doc.
 
 | Scenario | Doc location | Status | Test file | Notes |
 |---|---|---|---|---|
-| 4.1 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/resource_definitions_test.go:TestResourceDefinitionsDeleteCascadesChildren, tests/e2e/lc-rd-delete-cascade.sh | P0 |
+| 4.1 | 04-lifecycle.md | covered-unit + covered-integration | pkg/rest/resource_definitions_test.go:TestResourceDefinitionsDeleteCascadesChildren, tests/integration/group_d_test.go (TestGroupD — RD delete cascade) | P0 |
 | 4.2 | 04-lifecycle.md | covered-unit | pkg/rest/resource_definitions_test.go:TestResourceDefinitionsCreateConflict | P1 |
-| 4.3 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/autoplace_test.go:TestResourceCreateAndDelete + TestResourceDeleteTieBreakerStampsSuppression, tests/e2e/lc-connection-cleanup.sh | P0 |
+| 4.3 | 04-lifecycle.md | covered-unit + covered-integration | pkg/rest/autoplace_test.go:TestResourceCreateAndDelete + TestResourceDeleteTieBreakerStampsSuppression, tests/integration/group_i_test.go (TestGroupI) | P0 |
 | 4.4 | 04-lifecycle.md | covered-unit | pkg/rest/resource_groups_test.go:TestResourceGroupsUpdate | P1 |
 | 4.5 | 04-lifecycle.md | covered-unit | pkg/rest/resource_groups_test.go:TestResourceGroupsDelete + DeleteMissingRG | P1 |
 | 4.6 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/volume_definitions_test.go:TestVolumeDefinitionsUpdate, tests/e2e/resize-pvc.sh, resize-luks.sh, resize-plain.sh, resize-no-drbd.sh | P0 |
@@ -130,10 +130,10 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 4.17 | 04-lifecycle.md | spec-skip | pkg/rest/remotes_test.go:TestLinstorRemoteShipReturns501WithText | P2 T — LINSTOR-remote ship not implemented |
 | 4.18 | 04-lifecycle.md | out-of-scope | pkg/rest/remotes_test.go (501 stub) | S3 / scheduled backup explicitly O |
 | 4.19 | 04-lifecycle.md | covered-integration | pkg/satellite/controllers/heartbeat_test.go, pkg/satellite/controllers/heartbeat_internal_test.go, pkg/store/k8s/k8s_test.go:TestK8sNodeStore | P0 |
-| 4.20 | 04-lifecycle.md | covered-e2e | tests/e2e/node-evacuate.sh, pkg/rest/node_lifecycle_test.go (TestNodeEvacuate*) | P0 — unit + e2e both present; doc note outdated |
-| 4.21 | 04-lifecycle.md | covered-e2e | tests/e2e/node-multi-evacuate.sh | P1 — landed |
-| 4.22 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/node_lifecycle_test.go:TestNodeRestoreClearsFlag, tests/e2e/node-restore.sh | P1 |
-| 4.23 | 04-lifecycle.md | covered-unit + covered-e2e | pkg/rest/node_lifecycle_test.go:TestNodeLost*, tests/e2e/node-lost.sh | P0 |
+| 4.20 | 04-lifecycle.md | covered-integration | pkg/rest/node_lifecycle_test.go (TestNodeEvacuate*), tests/integration/group_a_test.go (TestGroupANodeEvacuatePUT), group_k_test.go (TestGroupKWFNodeEvacuateReplaceRestore) | P0 |
+| 4.21 | 04-lifecycle.md | covered-integration | tests/integration/group_a_test.go + group_k_test.go (TestGroupKWFNodeEvacuateReplaceRestore — sequential evacuate covers operator intent) | P1 |
+| 4.22 | 04-lifecycle.md | covered-unit + covered-integration | pkg/rest/node_lifecycle_test.go:TestNodeRestoreClearsFlag, tests/integration/group_a_test.go (TestGroupANodeRestorePUT) | P1 |
+| 4.23 | 04-lifecycle.md | covered-unit + covered-integration | pkg/rest/node_lifecycle_test.go:TestNodeLost*, tests/integration/group_a_test.go (TestGroupANodeLostCascadesOrphans), group_k_test.go (TestGroupKWFNodeLostCascade) | P0 |
 | 4.24 | 04-lifecycle.md | gap | — | P1 T — `AutoEvict*` enforcement not wired |
 | 4.25 | 04-lifecycle.md | covered-unit | internal/controller/auto_diskful_test.go (TestAutoDiskless*), tests/e2e/auto-diskful.sh | P1 |
 | 4.26 | 04-lifecycle.md | covered-unit | internal/controller/auto_diskful_test.go (cleanup branch) | P1 |
@@ -145,7 +145,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 5.1 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/observer_internal_test.go:TestTranslateResourceEventHasResource + TestMergeResourceCachesInUseAcrossNonResourceEvents | P0 |
 | 5.2 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/observer_internal_test.go:TestMergeResourceCachesDrbdStateAcrossNonResourceEvents, pkg/drbd/events2_test.go | P0 |
 | 5.3 | 05-drbd-state-recovery.md | covered-unit | pkg/satellite/controllers/observer_internal_test.go:TestTranslateEventConnection, TestBuildObserverConnectionStatus | P0 |
-| 5.4 | 05-drbd-state-recovery.md | covered-unit + covered-e2e | pkg/satellite/controllers/observer_internal_test.go:TestMergeConnectionsSnapshotsAllPeers, tests/e2e/lc-connection-cleanup.sh | P0 |
+| 5.4 | 05-drbd-state-recovery.md | covered-unit + covered-integration | pkg/satellite/controllers/observer_internal_test.go:TestMergeConnectionsSnapshotsAllPeers, tests/integration/group_i_test.go (TestGroupI) | P0 |
 | 5.5 | 05-drbd-state-recovery.md | covered-unit | internal/controller/node_heartbeat_controller_test.go:TestNodeHeartbeat_StaleFlipsToUnknown + node_reconcile_branches_test.go | P0 — unit landed; e2e gap |
 | 5.6 | 05-drbd-state-recovery.md | gap | — | P0 — SyncTarget no-interfere observation pinned in observer test, but e2e "do not adjust mid-sync" assertion missing |
 | 5.7 | 05-drbd-state-recovery.md | covered-unit | internal/controller/disk_class_test.go:TestSplitByDiskless, TestFilterTieBreaker | P0 |
@@ -158,7 +158,7 @@ Priority taken from each scenario's `Priority:` line in the doc.
 | 5.14 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/recovery-discard-my-data.sh | P0 |
 | 5.15 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/state-auto-resync.sh | P0 |
 | 5.16 | 05-drbd-state-recovery.md | gap | — | P0 — cross-listed with 5.6; reconciler-quiet-during-sync e2e missing |
-| 5.17 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/recovery-false-diskless.sh, pkg/rest/autoplace_test.go (TestMakeAvailable*) | P1 — make-available landed |
+| 5.17 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/autoplace_test.go (TestMakeAvailable*) | P1 — make-available unit-covered; Tier 4 stub (recovery-false-diskless.sh) dropped in 2026-05-14 audit, will be re-added once the handler ships and the kernel-state contract is meaningful |
 | 5.18 | 05-drbd-state-recovery.md | covered-e2e | tests/e2e/recovery-inconsistent-blocking.sh | P0 |
 | 5.19 | 05-drbd-state-recovery.md | covered-unit | pkg/rest/resource_adjust_test.go:TestResourceDeactivate, TestResourceActivateUnknown | P1 — unit landed; e2e gap |
 | 5.20 | 05-drbd-state-recovery.md | covered-unit | internal/controller/set_quorum_test.go (persistence + retry), internal/controller/quorum_policy_test.go | P0 — unit landed; e2e gap |
