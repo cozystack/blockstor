@@ -3244,3 +3244,362 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 		t.Errorf("scenario 5.W15: .res must keep `on n2 {` across the recovery; got:\n%s", body)
 	}
 }
+
+// TestManualSkipDiskRoundTrip (scenarios 5.W07 + 5.W08, wave2-05,
+// cross-listed with wave1 5.11) pins the operator-driven SkipDisk
+// set/clear round-trip across two reconcile passes on the same
+// Reconciler. UG9 §"SkipDisk" (lines 4427-4460) documents two
+// operator entry points:
+//
+//	5.W07 (set): `linstor r sp <node> <rd> DrbdOptions/SkipDisk True`
+//	             — schedule maintenance on the lower disk. Next
+//	             reconcile MUST invoke `drbdadm adjust --skip-disk`
+//	             so DRBD leaves the local backing device alone and
+//	             only reconciles network/peer state.
+//
+//	5.W08 (clear): `linstor r sp <node> <rd> DrbdOptions/SkipDisk`
+//	               (no value) — disk repaired, resume normal ops.
+//	               The prop disappears from Resource.Spec.Props on
+//	               the next dispatcher pass; the SUBSEQUENT reconcile
+//	               MUST fall back to plain `drbdadm adjust` so the
+//	               next adjust pass re-attaches the lower disk and
+//	               drives the SyncTarget → UpToDate sequence.
+//
+// The round-trip matters because the SkipDisk gate is stateful in
+// kernel land (a slot left under `--skip-disk` skips disk-state
+// reconfig forever). A bug that latched the flag — e.g. caching
+// "we passed --skip-disk last time" in the reconciler — would
+// stick the replica in Diskless forever, breaking 5.W08's recovery
+// arc. Conversely, a bug that emitted `--skip-disk` unconditionally
+// would defeat both the auto-set (5.W06) and manual (5.W07) gates
+// by skipping the attach step every reconcile.
+//
+// Two scope shapes are pinned because operators can set the prop at
+// either RD-scope (`linstor rd sp <rd> DrbdOptions/SkipDisk True`)
+// or resource-scope (`linstor r sp <node> <rd> DrbdOptions/SkipDisk True`):
+//
+//   - RD-scope arrives in `dr.DrbdOptions` after the dispatcher's
+//     `mergeEffectiveProps` (pkg/dispatcher/dispatcher.go:185)
+//     splits `DrbdOptions/...` keys off the `effectiveProps` bag.
+//   - Resource-scope follows the same merge path because the
+//     effective-prop resolver folds RD → RG → Resource with
+//     precedence increasing, and the resulting map still flows
+//     through the same DrbdOptions/... split. The reconciler's
+//     `dr.Props` shape is the unit-test safety net (TestReconciler-
+//     PassesSkipDiskFlag pins the Props-only landing).
+//
+// Verb-level contract (asserted across both passes):
+//
+//   - Pass 1 (SkipDisk=True manual): exactly one `drbdadm adjust
+//     --skip-disk pvc-skipdisk-rt` AND NO bare `drbdadm adjust
+//     pvc-skipdisk-rt` — co-emission would defeat the gate by
+//     re-attempting attach.
+//   - Pass 2 (prop cleared): exactly one NEW `drbdadm adjust
+//     pvc-skipdisk-rt` (bare) AND NO new `drbdadm adjust
+//     --skip-disk pvc-skipdisk-rt` — a stale flag here would
+//     wedge the replica permanently in skip-disk mode and break
+//     5.W08's repair arc.
+//
+// .res-shape contract: the file MUST be rewritten on both passes
+// (cheap, deterministic record), and the local host block MUST keep
+// the real backing-disk path across the whole round-trip — the
+// reconciler MUST NOT rewrite `disk /dev/...` to `disk none;` on the
+// SkipDisk-True pass. The skip-disk semantics live entirely in the
+// `--skip-disk` flag at adjust time; the .res renderer never sees
+// the prop and the diskful host block stays unchanged. (`disk none;`
+// is reserved for DISKLESS replicas, which is a different state
+// transition driven by the toggle-disk path, not SkipDisk.)
+//
+// If this test FAILS:
+//   - "got both bare adjust and --skip-disk on pass 1" → reconciler
+//     fell through to runBringUpOrAdjust's runAdjust twice; check
+//     isSkipDiskEnabled().
+//   - "pass 2 still emitted --skip-disk after clear" → either the
+//     reconciler caches the gate decision (it must not), or the
+//     dispatcher failed to drop the cleared prop on its second
+//     BuildDesired (out-of-test-scope, but surfaces the regression).
+//   - ".res lost `disk vg/pvc-...` on pass 1" → renderer
+//     incorrectly tied SkipDisk to disk-field rendering.
+func TestManualSkipDiskRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		// setProps and setDrbdOpts mirror the operator's `r sp` /
+		// `rd sp` landing spots after the dispatcher hop: RD-scope
+		// → DrbdOptions, resource-scope-with-dispatcher → also
+		// DrbdOptions, direct unit-shape → Props.
+		setProps    map[string]string
+		setDrbdOpts map[string]string
+	}{
+		{
+			// 5.W07 RD-scope: `linstor rd sp <rd> DrbdOptions/SkipDisk True`
+			// → effectiveProps → dispatcher.mergeEffectiveProps moves
+			// the `DrbdOptions/...` key into the per-replica DrbdOptions
+			// bag the satellite receives. Production landing.
+			name:        "RD-scope set (DrbdOptions landing)",
+			setDrbdOpts: map[string]string{"DrbdOptions/SkipDisk": "True"},
+		},
+		{
+			// 5.W07 resource-scope unit-shape: tests that build the
+			// DesiredResource directly (no dispatcher) drop the prop
+			// into `Props` straight from the wire. Same gate must
+			// fire — isSkipDiskEnabled checks both maps.
+			name:     "resource-scope set (Props landing)",
+			setProps: map[string]string{"DrbdOptions/SkipDisk": "True"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			// Allow both passes to query LVM without pre-registering
+			// matching responses per pass (FakeExec falls back to
+			// empty success when no Expect is set).
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-skipdisk-rt_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+			// Pass 2 routes through runBringUpOrAdjust (the .md-created
+			// marker pass 1 dropped makes firstActivation=false). That
+			// path probes `drbdsetup status` to decide between `adjust`
+			// (slot loaded) and `up` (slot absent). Stub a non-empty
+			// status reply so IsLoaded returns true and we exercise
+			// runAdjust — which is the production path that gates on
+			// the SkipDisk prop. Without this stub, FakeExec's empty
+			// fallback would route pass 2 into `drbdadm up` and we'd
+			// be testing the wrong verb.
+			fx.Expect("drbdsetup status pvc-skipdisk-rt",
+				storage.FakeResponse{Stdout: []byte("pvc-skipdisk-rt role:Secondary\n")})
+
+			thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{"thin1": thin},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			baseDrbdOpts := func() map[string]string {
+				return map[string]string{
+					"port":    "7000",
+					"node-id": "0",
+					"address": "10.0.0.1",
+					"minor":   "1000",
+				}
+			}
+
+			// Pass 1 (5.W07): operator stamped SkipDisk=True.
+			// Reconciler MUST emit `drbdadm adjust --skip-disk`.
+			pass1DrbdOpts := baseDrbdOpts()
+			for k, v := range tc.setDrbdOpts {
+				pass1DrbdOpts[k] = v
+			}
+
+			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-skipdisk-rt",
+					NodeName: "n1",
+					Props:    tc.setProps,
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+					},
+					DrbdOptions: pass1DrbdOpts,
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply pass 1 (SkipDisk=True): %v", err)
+			}
+
+			pass1Cmds := append([]string{}, fx.CommandLines()...)
+
+			skipDiskCmd := "drbdadm adjust --skip-disk pvc-skipdisk-rt"
+			bareAdjustCmd := "drbdadm adjust pvc-skipdisk-rt"
+
+			if !slices.Contains(pass1Cmds, skipDiskCmd) {
+				t.Errorf("scenario 5.W07: pass 1 did not emit %q; got %v",
+					skipDiskCmd, pass1Cmds)
+			}
+
+			// Cross-guard: bare adjust must NOT appear alongside the
+			// flagged form on pass 1 — co-emission would defeat the
+			// maintenance gate by re-attempting attach.
+			for _, line := range pass1Cmds {
+				if line == bareAdjustCmd {
+					t.Errorf("scenario 5.W07: pass 1 emitted both --skip-disk and bare adjust: %v",
+						pass1Cmds)
+				}
+			}
+
+			// .res-shape: the local diskful host block must keep its
+			// real backing-disk path on pass 1. SkipDisk lives in the
+			// adjust verb, NOT the .res renderer; a regression that
+			// flipped the host to `disk none;` would mask a real
+			// detach as a renderer concern.
+			resPath := filepath.Join(dir, "pvc-skipdisk-rt.res")
+
+			pass1Body, err := os.ReadFile(resPath)
+			if err != nil {
+				t.Fatalf("ReadFile pass 1 .res: %v", err)
+			}
+
+			pass1Res := string(pass1Body)
+
+			if !strings.Contains(pass1Res, "on n1 {") {
+				t.Errorf("scenario 5.W07: pass 1 .res missing local host block; got:\n%s",
+					pass1Res)
+			}
+
+			if strings.Contains(pass1Res, "disk none;") {
+				t.Errorf("scenario 5.W07: pass 1 .res rendered `disk none;` on a diskful "+
+					"local host — SkipDisk must NOT touch the disk field, the gate "+
+					"lives in the adjust flag. got:\n%s", pass1Res)
+			}
+
+			// Pass 2 (5.W08): operator unset the prop. Same Reconciler,
+			// same Apply input MINUS the SkipDisk key — the reconciler
+			// MUST fall back to plain `drbdadm adjust` and MUST NOT
+			// re-emit `--skip-disk` from any cached state.
+			_, err = rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-skipdisk-rt",
+					NodeName: "n1",
+					// Props intentionally nil (operator's `r sp ... DrbdOptions/SkipDisk`
+					// with no value drops the key on the next dispatcher pass).
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+					},
+					DrbdOptions: baseDrbdOpts(),
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply pass 2 (SkipDisk cleared): %v", err)
+			}
+
+			pass2Cmds := fx.CommandLines()
+			pass2New := pass2Cmds[len(pass1Cmds):]
+
+			// Pass 2 must run a NEW bare adjust (the reconciler drives
+			// every reconcile through runAdjust).
+			if !slices.Contains(pass2New, bareAdjustCmd) {
+				t.Errorf("scenario 5.W08: pass 2 (clear) did not emit bare %q; new cmds=%v",
+					bareAdjustCmd, pass2New)
+			}
+
+			// Pass 2 must NOT carry the --skip-disk variant. A latching
+			// bug here is exactly the 5.W08 failure mode the scenario
+			// doc warns about ("Reverse failure mode: clearing before
+			// disk repaired → re-detach loop"); we pin the SDK-side
+			// contract that clearing the prop drops the flag.
+			for _, line := range pass2New {
+				if line == skipDiskCmd {
+					t.Errorf("scenario 5.W08: pass 2 still emitted %q after operator unset; new cmds=%v",
+						skipDiskCmd, pass2New)
+				}
+			}
+
+			// .res-shape on pass 2 mirrors pass 1's invariants — the
+			// local host block stays diskful. A renderer regression
+			// that re-introduced `disk none;` post-clear would surface
+			// here.
+			pass2Body, err := os.ReadFile(resPath)
+			if err != nil {
+				t.Fatalf("ReadFile pass 2 .res: %v", err)
+			}
+
+			pass2Res := string(pass2Body)
+
+			if !strings.Contains(pass2Res, "on n1 {") {
+				t.Errorf("scenario 5.W08: pass 2 .res missing local host block; got:\n%s",
+					pass2Res)
+			}
+
+			if strings.Contains(pass2Res, "disk none;") {
+				t.Errorf("scenario 5.W08: pass 2 .res rendered `disk none;` on a diskful "+
+					"local host post-clear; got:\n%s", pass2Res)
+			}
+		})
+	}
+}
+
+// TestManualSkipDiskClearViaFalseAndEmpty (scenarios 5.W07 + 5.W08)
+// pins the two extra prop-value shapes the operator can land on
+// `r sp` / `rd sp` to clear the gate without using the
+// upstream-canonical empty-value-means-delete CLI sugar:
+//
+//  1. Explicit `False` — operator typed `linstor r sp <node> <rd>
+//     DrbdOptions/SkipDisk False`. The prop is still present in
+//     Spec.Props but its value is the negative literal; the
+//     case-insensitive `True` compare in isSkipDiskEnabled must
+//     reject it.
+//  2. Empty string — operator's `--unset` path before the dispatcher
+//     prunes the key on the next pass. Transient shape that surfaces
+//     in the half-cycle between operator action and the controller's
+//     reconcile.
+//
+// Both shapes MUST result in a bare `drbdadm adjust`, no
+// `--skip-disk`. The round-trip with the canonical key-absent shape
+// is covered by TestManualSkipDiskRoundTrip; this guards against a
+// regression where someone tightens isSkipDiskEnabled to "key
+// present in map" instead of "value matches True".
+func TestManualSkipDiskClearViaFalseAndEmpty(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "operator set SkipDisk=False", value: "False"},
+		{name: "operator unset (empty string transient)", value: ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-skipdisk-clear_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+
+			thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{"thin1": thin},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-skipdisk-clear",
+					NodeName: "n1",
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+					},
+					DrbdOptions: map[string]string{
+						"port":                 "7000",
+						"node-id":              "0",
+						"address":              "10.0.0.1",
+						"minor":                "1000",
+						"DrbdOptions/SkipDisk": tc.value,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			cmds := fx.CommandLines()
+
+			bareAdjust := "drbdadm adjust pvc-skipdisk-clear"
+			skipDiskAdjust := "drbdadm adjust --skip-disk pvc-skipdisk-clear"
+
+			if !slices.Contains(cmds, bareAdjust) {
+				t.Errorf("scenario 5.W08: value=%q did not produce bare %q; got %v",
+					tc.value, bareAdjust, cmds)
+			}
+
+			for _, line := range cmds {
+				if line == skipDiskAdjust {
+					t.Errorf("scenario 5.W08: value=%q produced %q — the gate must "+
+						"only fire on case-insensitive True; got %v",
+						tc.value, skipDiskAdjust, cmds)
+				}
+			}
+		})
+	}
+}
