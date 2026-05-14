@@ -1548,6 +1548,114 @@ func TestResourceDeleteBumpsTimestampMonotonic(t *testing.T) {
 	}
 }
 
+// TestResourceDeleteBumpsAllSurvivorsScenario4W19 closes wave2-04
+// scenario 4.W19 (cross-listed wave1 4.3, Bug 67): `linstor r d <node>
+// <rd>` against ONE replica of a multi-replica RD MUST stamp
+// `blockstor.io/peer-changed` on EVERY surviving sibling — not just
+// the next-in-list, not just the lexicographically-first, not just
+// "the kept one" by any other selection rule. The existing 3-node
+// test (TestResourceDeleteBumpsSiblingPeers) is too small to
+// distinguish "first-survivor only" from "all survivors": both
+// survivors would carry the stamp under either implementation.
+//
+// This test runs against a 5-replica RD so a bug that bumped only
+// one survivor (or only k<N-1 survivors) is detectable. It also
+// pins the "single stamp value" sub-invariant: all four survivors
+// receive the SAME timestamp from a single DELETE call, because
+// `bumpPeerChangedOnSiblings` reads `time.Now()` once and reuses
+// the string for every Update. A regression that read the clock
+// per-iteration would surface as four distinct stamps, which still
+// "works" semantically but defeats the audit-tooling premise that
+// "same DELETE = same stamp on all peers".
+//
+// The 4.W19 scenario also notes that dropping below 3 diskful
+// triggers a controller-side unset of `DrbdOptions/Resource/quorum`
+// + INFO; this test stays at N=5→4 so the quorum-side-effect path
+// is NOT entangled with the peer-changed propagation pin.
+func TestResourceDeleteBumpsAllSurvivorsScenario4W19(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-w19"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Five replicas. Picking N=5 means the "deleted" node is neither
+	// the first nor the last in any plausible iteration order, so a
+	// regression that bumped only a prefix/suffix of the survivor
+	// list would skip at least one node detectably.
+	allNodes := []string{"n1", "n2", "n3", "n4", "n5"}
+	for _, n := range allNodes {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-w19", NodeName: n}); err != nil {
+			t.Fatalf("seed replica on %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	before := time.Now().UTC()
+
+	// Drop a middle node (n3). The deleted row must NOT be
+	// re-bumped; ALL four survivors (n1, n2, n4, n5) must be.
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-w19/resources/n3")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	survivors := []string{"n1", "n2", "n4", "n5"}
+	stamps := make(map[string]string, len(survivors))
+
+	for _, n := range survivors {
+		got, err := st.Resources().Get(ctx, "pvc-w19", n)
+		if err != nil {
+			t.Fatalf("get survivor %s: %v", n, err)
+		}
+
+		raw, ok := got.Annotations[apiv1.PeerChangedAnnotation]
+		if !ok || raw == "" {
+			t.Fatalf("survivor %s missing %s annotation; "+
+				"Bug 67 propagation must reach EVERY surviving sibling, not just the kept one; "+
+				"annotations=%v",
+				n, apiv1.PeerChangedAnnotation, got.Annotations)
+		}
+
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t.Fatalf("survivor %s stamp %q is not RFC3339Nano: %v", n, raw, err)
+		}
+
+		if ts.Before(before) {
+			t.Errorf("survivor %s stamp %v predates the DELETE call floor %v", n, ts, before)
+		}
+
+		stamps[n] = raw
+	}
+
+	// All four survivors must carry the SAME stamp value — one
+	// DELETE call = one timestamp string broadcast to every peer.
+	// A per-iteration clock read would surface as distinct stamps
+	// (still functional, but breaks the audit invariant that lets
+	// observers correlate "same wave of peer-changed events" =
+	// "same source DELETE").
+	first := stamps[survivors[0]]
+	for _, n := range survivors[1:] {
+		if stamps[n] != first {
+			t.Errorf("survivors must share one stamp per DELETE; "+
+				"got %s=%q vs %s=%q (per-iteration clock read regression?)",
+				survivors[0], first, n, stamps[n])
+		}
+	}
+
+	// The deleted node itself must be gone — the bump path must
+	// not resurrect it as a stub just to carry the annotation.
+	if _, err := st.Resources().Get(ctx, "pvc-w19", "n3"); err == nil {
+		t.Errorf("deleted replica n3 still present after DELETE")
+	}
+}
+
 // TestMakeAvailablePromotesTiebreakerWitness pins the CSI
 // ControllerPublishVolume happy path: linstor-csi calls
 // `POST .../resources/{node}/make-available` with `{diskful:false}`
