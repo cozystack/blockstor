@@ -434,10 +434,20 @@ func lowestDiskfulID(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 // the satellite is gated by `!diskless` so emitting Volumes here is
 // safe — it only feeds the .res renderer.
 //
-// StoragePool name comes from the Resource's `StorPoolName` prop
-// (LINSTOR-compatible key) with the RD-level fallback. For DISKLESS
-// replicas it stays empty — the .res renderer treats empty as "no
-// disk on this peer".
+// StoragePool name comes from the per-VD `StorPoolName` prop (most
+// specific — scenario 4.W26 / UG9 §"Placing volumes of one resource
+// in different storage pools"), with fallback to the Resource's
+// `StorPoolName` prop (LINSTOR-compatible key) and the RD-level
+// default. For DISKLESS replicas it stays empty — the .res renderer
+// treats empty as "no disk on this peer".
+//
+// The per-VD override (scenario 4.W26) lets `vol 0` land on a fast
+// NVMe pool and `vol 1` on a slow HDD pool ON THE SAME NODE. Bug 76
+// still enforces same-ProviderKind ACROSS REPLICAS of one VD (the
+// placer never sees per-VD pool selection — that's a satellite-side
+// routing decision made AFTER the placer has already picked the
+// node), but the kinds across DIFFERENT VDs of the same RD are
+// orthogonal.
 func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstoriov1alpha1.Resource) []*intent.DesiredVolume {
 	if rd == nil {
 		return nil
@@ -452,16 +462,16 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	// name (it lives on a per-volume VG.Props in
 	// ResourceGroupVolumeGroup; the RD-prop fallback is the legacy
 	// shim).
-	pool := ""
+	rdPool := ""
 
 	if !diskless {
-		pool = target.Spec.StoragePool
-		if pool == "" {
-			pool = target.Spec.Props["StorPoolName"]
+		rdPool = target.Spec.StoragePool
+		if rdPool == "" {
+			rdPool = target.Spec.Props["StorPoolName"]
 		}
 
-		if pool == "" {
-			pool = rd.Spec.Props["StorPoolName"]
+		if rdPool == "" {
+			rdPool = rd.Spec.Props["StorPoolName"]
 		}
 	}
 
@@ -493,6 +503,19 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	out := make([]*intent.DesiredVolume, 0, len(rd.Spec.VolumeDefinitions))
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
+		// Per-VD `StorPoolName` (scenario 4.W26) is the most-specific
+		// scope and overrides the RD/Resource default. Empty value
+		// falls through to the RD-level pool resolved above.
+		// Diskless replicas still ignore per-VD pool — no backing
+		// disk to provision regardless of what the prop says.
+		pool := rdPool
+
+		if !diskless {
+			if v := vd.Props["StorPoolName"]; v != "" {
+				pool = v
+			}
+		}
+
 		out = append(out, &intent.DesiredVolume{
 			VolumeNumber:   vd.VolumeNumber,
 			SizeKib:        vd.SizeKib,

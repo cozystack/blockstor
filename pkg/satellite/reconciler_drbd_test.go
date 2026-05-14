@@ -105,6 +105,142 @@ func TestApplyWritesResFile(t *testing.T) {
 	}
 }
 
+// TestApplyMultiVolumeRDRendersOneResourceWithVolumes pins scenario
+// 4.W25 (wave2-04-lifecycle.md): an RD that carries multiple
+// VolumeDefinitions is ONE DRBD resource = one consistency group.
+// The reconciler must render a SINGLE `resource <name> { ... }`
+// block whose `on <node> { ... }` body has a `volume <N>` sub-block
+// per VolumeNumber, with kernel minors offset from the resource's
+// base minor (vol 0 → minor, vol 1 → minor+1, …).
+//
+// This is the .res-renderer contract that lets DRBD treat the
+// volumes as a write-order-preserving consistency group: snapshots
+// against the resource capture every volume atomically and primary
+// state is shared. The test guards against a regression where the
+// dispatcher / reconciler accidentally fans one RD out into
+// separate single-volume resources, breaking that guarantee.
+//
+// Scenario 4.W26 (per-VD storage pool) is exercised alongside —
+// vol 0 lands on `fast` (NVMe-ish pool) and vol 1 on `slow` (HDD
+// pool) — so the .res shows the per-volume backing-disk routing
+// the dispatcher's per-VD `StorPoolName` override produces.
+func TestApplyMultiVolumeRDRendersOneResourceWithVolumes(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Two distinct pools, two distinct LV names — vol 0 on `fast`,
+	// vol 1 on `slow`. lvs returns empty (fresh create) for both.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name fast/pvc-multi_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name slow/pvc-multi_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	fast := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "fast", ThinPool: "tp"}, fx)
+	slow := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "slow", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"fast": fast, "slow": slow},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-multi",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				// 4.W26: per-VD pool routing — vol 0 fast, vol 1 slow.
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "fast"},
+				{VolumeNumber: 1, SizeKib: 2 * 1024 * 1024, StoragePool: "slow"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-multi.res"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got := string(body)
+
+	// One DRBD resource block — NOT two. If the reconciler fanned
+	// the RD out into per-volume resources, we'd see no
+	// `resource pvc-multi {` (and instead `pvc-multi_0`/`pvc-multi_1`).
+	if c := strings.Count(got, "resource pvc-multi {"); c != 1 {
+		t.Fatalf("want exactly 1 `resource pvc-multi {`, got %d in:\n%s", c, got)
+	}
+
+	// Two `volume <N> {` sub-blocks per `on <node> {}` block, one
+	// each for local and peer = 4 total volume blocks across the
+	// whole resource. This is the consistency-group shape.
+	for _, want := range []string{
+		"volume 0 {",
+		"volume 1 {",
+		// Per-VD pool routing — vol 0 on `fast`, vol 1 on `slow`
+		// (scenario 4.W26). The local diskful host renders the
+		// real backing path; peer renders the placeholder, which
+		// stays the same across pools.
+		"disk /dev/fast/pvc-multi_00000;",
+		"disk /dev/slow/pvc-multi_00001;",
+		// Kernel minors offset from base — vol 0 → minor 1000,
+		// vol 1 → minor 1001. The renderer wires this in lockstep
+		// with /dev/drbd<N> device-node names.
+		"device /dev/drbd1000 minor 1000;",
+		"device /dev/drbd1001 minor 1001;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+
+	// Per `on {}` block: two volume sub-blocks each, one for
+	// local (`on n1`) and one for peer (`on n2`) = 4 occurrences
+	// of `volume ` in the rendered file.
+	if c := strings.Count(got, "    volume "); c != 4 {
+		t.Errorf("want 4 `volume` sub-blocks (2 vols x 2 hosts), got %d in:\n%s", c, got)
+	}
+
+	// `drbdadm create-md <rd>` initialises metadata for ALL volumes
+	// in the resource (DRBD walks the rendered .res and creates AL +
+	// bitmap + GI state per `volume {}` sub-block). The reconciler
+	// therefore issues one create-md against the resource name, not
+	// one per volume number — matches upstream LINSTOR's DrbdAdm.
+	// We just guard that it ran at all; per-volume metadata is
+	// covered by the on-disk `volume {}` sub-blocks asserted above
+	// (DRBD wouldn't initialise vol 1 if its block were missing).
+	var sawCreateMD bool
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm") && strings.Contains(line, "create-md") &&
+			strings.HasSuffix(line, "pvc-multi") {
+			sawCreateMD = true
+			break
+		}
+	}
+
+	if !sawCreateMD {
+		t.Errorf("want one `drbdadm create-md ... pvc-multi`; cmds:\n%v", fx.CommandLines())
+	}
+
+	// adjust runs against the resource name too — DRBD applies the
+	// new .res to every volume in the consistency group atomically.
+	if !slices.Contains(fx.CommandLines(), "drbdadm adjust pvc-multi") {
+		t.Errorf("want `drbdadm adjust pvc-multi`; cmds:\n%v", fx.CommandLines())
+	}
+}
+
 // TestApplyInvokesDrbdadmAdjust: writing the .res isn't enough — DRBD
 // needs `adjust` to pick up changes. Apply must call it.
 func TestApplyInvokesDrbdadmAdjust(t *testing.T) {

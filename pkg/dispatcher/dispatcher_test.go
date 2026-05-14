@@ -177,6 +177,204 @@ func TestMetaPoolDefaultsToInternal(t *testing.T) {
 	}
 }
 
+// TestMultiVolumeRDConsistencyGroup pins scenario 4.W25 (wave2-04-
+// lifecycle.md): an RD with multiple VolumeDefinitions forms ONE DRBD
+// resource that owns ALL of them. The dispatcher must surface every
+// VD as a separate DesiredVolume on the SAME DesiredResource (not as
+// separate resources!), preserving each VD's VolumeNumber + SizeKib.
+// Downstream this turns into one `.res` file with multiple
+// `volume <N> { ... }` sub-blocks under each `on <node> {}` block,
+// i.e. one DRBD consistency group whose snapshots are atomic across
+// all volumes and whose primary state is shared.
+//
+// Negative — multiple SEPARATE RDs would each emit their own
+// DesiredResource (not exercised here; pinning per-DesiredResource
+// shape is enough to fail the dispatcher-side regression that
+// flattens multi-VD RDs into single-volume payloads).
+func TestMultiVolumeRDConsistencyGroup(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{"StorPoolName": "pool_default"},
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				// Two volumes on the same RD: DRBD will allocate
+				// minors base+0 and base+1, the .res renderer
+				// emits two `volume {}` sub-blocks per `on {}`.
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+				{VolumeNumber: 1, SizeKib: 2 * 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-multi",
+			NodeName:               "n1",
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	// One resource, two volumes — the consistency-group shape.
+	// Multiple DesiredResources here would mean the dispatcher
+	// fanned one RD out into separate DRBD resources, breaking
+	// the cross-volume write-order guarantee.
+	if len(got.Volumes) != 2 {
+		t.Fatalf("want 2 volumes on one DesiredResource, got %d", len(got.Volumes))
+	}
+
+	for i, want := range []struct {
+		vn   int32
+		size int64
+	}{
+		{vn: 0, size: 1024 * 1024},
+		{vn: 1, size: 2 * 1024 * 1024},
+	} {
+		v := got.Volumes[i]
+		if v.VolumeNumber != want.vn {
+			t.Errorf("Volumes[%d].VolumeNumber=%d want %d", i, v.VolumeNumber, want.vn)
+		}
+
+		if v.SizeKib != want.size {
+			t.Errorf("Volumes[%d].SizeKib=%d want %d", i, v.SizeKib, want.size)
+		}
+
+		// Both VDs without per-VD override resolve to the RD-
+		// default pool — same backing pool, one consistency group.
+		if v.StoragePool != "pool_default" {
+			t.Errorf("Volumes[%d].StoragePool=%q want %q", i, v.StoragePool, "pool_default")
+		}
+	}
+}
+
+// TestPerVolumeStorPoolOverride pins scenario 4.W26 (wave2-04-
+// lifecycle.md): per-VolumeDefinition `Props["StorPoolName"]`
+// overrides the RD-level default. Different VDs on the same RD can
+// land on different storage pools (e.g. fast NVMe for vol 0, slow
+// HDD for vol 1) on the same satellite — the dispatcher must surface
+// each VD's resolved pool independently on its DesiredVolume.
+//
+// The same-ProviderKind gate (issue 76) is enforced ACROSS REPLICAS
+// of the same VD by the placer (it never sees per-VD pool
+// selection), so per-VD overrides stay orthogonal to that gate at
+// this layer.
+//
+// Cases:
+//
+//  1. vol 0 + vol 1 both have explicit, distinct per-VD overrides —
+//     each independently overrides the RD default.
+//  2. vol 0 overrides; vol 1 has no per-VD prop → falls through to
+//     the RD default. Mixed-mode RDs must work.
+//  3. Diskless replica: per-VD pool prop is ignored (no disk).
+func TestPerVolumeStorPoolOverride(t *testing.T) {
+	rdName := "pvc-multi-pool"
+
+	mkRD := func() *blockstoriov1alpha1.ResourceDefinition {
+		return &blockstoriov1alpha1.ResourceDefinition{
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				Props: map[string]string{"StorPoolName": "pool_default"},
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{
+						VolumeNumber: 0,
+						SizeKib:      1024 * 1024,
+						Props:        map[string]string{"StorPoolName": "pool_nvme"},
+					},
+					{
+						VolumeNumber: 1,
+						SizeKib:      2 * 1024 * 1024,
+						Props:        map[string]string{"StorPoolName": "pool_hdd"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("both-vds-override", func(t *testing.T) {
+		rd := mkRD()
+		target := &blockstoriov1alpha1.Resource{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: rdName,
+				NodeName:               "n1",
+			},
+		}
+
+		got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+		if got == nil || len(got.Volumes) != 2 {
+			t.Fatalf("want 2 volumes; got %+v", got)
+		}
+
+		if got.Volumes[0].StoragePool != "pool_nvme" {
+			t.Errorf("vol 0 pool=%q want pool_nvme (per-VD override)", got.Volumes[0].StoragePool)
+		}
+
+		if got.Volumes[1].StoragePool != "pool_hdd" {
+			t.Errorf("vol 1 pool=%q want pool_hdd (per-VD override)", got.Volumes[1].StoragePool)
+		}
+	})
+
+	t.Run("mixed-only-vol0-overrides", func(t *testing.T) {
+		rd := &blockstoriov1alpha1.ResourceDefinition{
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				Props: map[string]string{"StorPoolName": "pool_default"},
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{
+						VolumeNumber: 0,
+						SizeKib:      1024 * 1024,
+						Props:        map[string]string{"StorPoolName": "pool_nvme"},
+					},
+					// No per-VD prop → falls through to RD default.
+					{VolumeNumber: 1, SizeKib: 1024 * 1024},
+				},
+			},
+		}
+		target := &blockstoriov1alpha1.Resource{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: rdName,
+				NodeName:               "n1",
+			},
+		}
+
+		got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+		if got == nil || len(got.Volumes) != 2 {
+			t.Fatalf("want 2 volumes; got %+v", got)
+		}
+
+		if got.Volumes[0].StoragePool != "pool_nvme" {
+			t.Errorf("vol 0 pool=%q want pool_nvme (per-VD override)", got.Volumes[0].StoragePool)
+		}
+
+		if got.Volumes[1].StoragePool != "pool_default" {
+			t.Errorf("vol 1 pool=%q want pool_default (RD-fallback when no per-VD prop)",
+				got.Volumes[1].StoragePool)
+		}
+	})
+
+	t.Run("diskless-ignores-per-vd-pool", func(t *testing.T) {
+		rd := mkRD()
+		target := &blockstoriov1alpha1.Resource{
+			Spec: blockstoriov1alpha1.ResourceSpec{
+				ResourceDefinitionName: rdName,
+				NodeName:               "n1",
+				Flags:                  []string{"DISKLESS"},
+			},
+		}
+
+		got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+		if got == nil || len(got.Volumes) != 2 {
+			t.Fatalf("want 2 volumes; got %+v", got)
+		}
+
+		for i, v := range got.Volumes {
+			if v.StoragePool != "" {
+				t.Errorf("vol %d pool=%q want \"\" (DISKLESS suppresses per-VD pool routing)",
+					i, v.StoragePool)
+			}
+		}
+	})
+}
+
 // TestPeerAddressPrefersKubeInternalNIC: Bug 48 — when a peer's Node
 // CRD advertises both a pod-CIDR NetInterface in slot [0] (the
 // piraeus-operator-with-externalController-url pathology, where
