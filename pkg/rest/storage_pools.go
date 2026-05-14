@@ -19,6 +19,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,7 +42,80 @@ func (s *Server) registerStoragePools(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolsList))
 	mux.HandleFunc("POST /v1/nodes/{node}/storage-pools", s.requireStore(s.handleNodeStoragePoolCreate))
 	mux.HandleFunc("GET /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolGet))
+	mux.HandleFunc("PUT /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolModify))
 	mux.HandleFunc("DELETE /v1/nodes/{node}/storage-pools/{pool}", s.requireStore(s.handleNodeStoragePoolDelete))
+}
+
+// handleNodeStoragePoolModify serves PUT /v1/nodes/{node}/storage-pools/{pool}.
+//
+// Wire shape mirrors upstream's `StoragePoolDefinitionModify` —
+// `{override_props, delete_props, delete_namespaces}` — the same
+// GenericPropsModify envelope golinstor's StoragePoolService.Modify
+// and python-linstor-client's `linstor sp set-property` send. Without
+// this route the CLI gets a bare 405 from Go's default mux, which
+// trips the python parser's xml.etree fallback (Bug 85).
+//
+// Semantics: load the existing StoragePool, merge override_props on
+// top, drop delete_props / delete_namespaces, persist via the store.
+// Behaviour mirrors handleNodeUpdate's GenericPropsModify path so a
+// CLI typist gets the same wire-shape contract across n/r/rg/rd/sp
+// modify endpoints.
+func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+	pool := r.PathValue("pool")
+
+	var patch apiv1.GenericPropsModify
+
+	err := json.NewDecoder(r.Body).Decode(&patch)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	existing, err := s.Store.StoragePools().Get(r.Context(), node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if existing.Props == nil && (len(patch.OverrideProps) > 0 ||
+		len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0) {
+		existing.Props = map[string]string{}
+	}
+
+	maps.Copy(existing.Props, patch.OverrideProps)
+
+	for _, k := range patch.DeleteProps {
+		delete(existing.Props, k)
+	}
+
+	// DeleteNamespace: drop every key under the given namespace prefix.
+	// Mirrors upstream LINSTOR's `delete_namespaces` behaviour — the
+	// namespace separator is '/' and the prefix is matched literally
+	// (no glob). An entry "Aux" drops every "Aux/..." key.
+	for _, ns := range patch.DeleteNamespace {
+		prefix := ns + "/"
+
+		for k := range existing.Props {
+			if strings.HasPrefix(k, prefix) {
+				delete(existing.Props, k)
+			}
+		}
+	}
+
+	err = s.Store.StoragePools().Update(r.Context(), &existing)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "storage pool modified: " + pool + " on " + node,
+	}})
 }
 
 // handleNodeStoragePoolDelete serves DELETE /v1/nodes/{node}/storage-pools/{pool}.

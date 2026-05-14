@@ -45,11 +45,9 @@ limitations under the License.
 package integration
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -412,42 +410,28 @@ func testSPCapacityFlow(t *testing.T, stack *harness.Stack) {
 
 // testSPSetProperty pins the basic `sp set-property` contract: the
 // CLI invocation must reach the controller and the property must
-// land in the CRD's Spec.Props. The current REST surface does NOT
-// yet wire PUT /v1/nodes/{node}/storage-pools/{pool} (the python
-// CLI's storage_pool_modify endpoint); when that lands Phase 2 will
-// extend this test to assert the round-trip. Until then we skip
-// rather than mask the missing route — t.Skip keeps the test
-// inventory honest and a future Phase 2 fix surfaces here.
+// land in the CRD's Spec.Props. Bug 85 — wires
+// `PUT /v1/nodes/{node}/storage-pools/{pool}` (the python CLI's
+// `storage_pool_modify` endpoint). Before the fix the route was
+// unwired and the CLI exited non-zero with HTTP-Status(405) that
+// tripped the python xml.etree fallback. The test drives the
+// production path end-to-end via the upstream `linstor` CLI binary
+// so the python parser is the final assertion on the wire shape.
 func testSPSetProperty(t *testing.T, stack *harness.Stack) {
 	t.Helper()
 
-	cmd := exec.CommandContext(context.Background(), "linstor",
-		"--controllers", stack.RestURL, "--machine-readable",
-		"storage-pool", "set-property", "worker-3", "lvm-thin",
+	cli := &harness.CLI{URL: stack.RestURL}
+
+	// Exercise the production path: linstor sp set-property → PUT
+	// /v1/nodes/worker-3/storage-pools/lvm-thin with
+	// `{override_props: {PrefNic: default}}`. cli.Run aborts the
+	// test on any python traceback / xml.etree fallback (the
+	// Bug-59-class checks live there).
+	cli.Run(t, "storage-pool", "set-property", "worker-3", "lvm-thin",
 		"PrefNic", "default")
 
-	var stderr bytes.Buffer
-
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
-		// Current state on `main`: the PUT route is unwired, the
-		// CLI exits non-zero with HTTP-Status(405). Pin the
-		// observable shape so a future REST extension reads its
-		// own change-budget here.
-		if !strings.Contains(stderr.String(), "405") {
-			t.Fatalf("sp set-property: unexpected stderr (want 405 on unwired route): %s", stderr.String())
-		}
-
-		t.Skipf("PUT /v1/nodes/{node}/storage-pools/{pool} not yet wired (stderr: %s)", strings.TrimSpace(stderr.String()))
-
-		return
-	}
-
-	// Once the route lands, the CRD's Spec.Props must carry the
-	// new key. Asserted here so the Phase 2 fix that wires the
-	// PUT handler exercises the full round-trip.
+	// Round-trip via the CRD: the new prop must land in
+	// Spec.Props on the canonical `<pool>.<node>` CRD.
 	var pool blockstoriov1alpha1.StoragePool
 
 	gErr := stack.Env.Client.Get(context.Background(),

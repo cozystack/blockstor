@@ -1515,3 +1515,203 @@ func TestStoragePoolListPropertiesEmptyDecodes(t *testing.T) {
 		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }
+
+// TestSPModifyOverridePropsLands pins Bug 85's core wire contract:
+// `PUT /v1/nodes/{node}/storage-pools/{pool}` accepts the python-linstor
+// `storage_pool_modify` body `{override_props: {...}}` and merges the
+// keys onto the StoragePool's Spec.Props. Before the fix the route was
+// unwired and the python CLI's `sp set-property` exited with a bare 405
+// that tripped the xml.etree fallback.
+func TestSPModifyOverridePropsLands(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props:           map[string]string{"StorDriver/LvmVg": "vg1"},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"PrefNic": "default"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/nodes/n1/storage-pools/p1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "p1")
+	if err != nil {
+		t.Fatalf("Get after PUT: %v", err)
+	}
+
+	if got.Props["PrefNic"] != "default" {
+		t.Errorf("Props[PrefNic] = %q, want %q", got.Props["PrefNic"], "default")
+	}
+
+	// Existing keys must NOT be wiped — the patch shape is "merge",
+	// not "replace".
+	if got.Props["StorDriver/LvmVg"] != "vg1" {
+		t.Errorf("Props[StorDriver/LvmVg] = %q, want vg1 (merge must preserve untouched keys)",
+			got.Props["StorDriver/LvmVg"])
+	}
+}
+
+// TestSPModifyDeletePropsDrops pins the `delete_props` half of the
+// GenericPropsModify envelope: keys listed there must be removed from
+// the StoragePool's Spec.Props in the same transaction as the override
+// merge. Mirrors `linstor sp set-property <n> <p> <key> ""` and
+// `linstor sp delete-property` shapes.
+func TestSPModifyDeletePropsDrops(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"PrefNic":          "default",
+			"StorDriver/LvmVg": "vg1",
+		},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.GenericPropsModify{
+		DeleteProps: []string{"PrefNic"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/nodes/n1/storage-pools/p1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "p1")
+	if err != nil {
+		t.Fatalf("Get after PUT: %v", err)
+	}
+
+	if _, ok := got.Props["PrefNic"]; ok {
+		t.Errorf("Props[PrefNic] still present after delete_props: %q", got.Props["PrefNic"])
+	}
+
+	if got.Props["StorDriver/LvmVg"] != "vg1" {
+		t.Errorf("Props[StorDriver/LvmVg] = %q, want vg1 (delete must not touch untouched keys)",
+			got.Props["StorDriver/LvmVg"])
+	}
+}
+
+// TestSPModifyUnknownPoolReturns404 pins the unknown-scope half of
+// the modify contract: a PUT against a (node, pool) pair the store
+// doesn't know must surface a clean 404 rather than silently creating
+// the row. Mirrors the GET handler's 404 behaviour.
+func TestSPModifyUnknownPoolReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.GenericPropsModify{
+		OverrideProps: map[string]string{"PrefNic": "default"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/nodes/ghost/storage-pools/ghost-pool", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestSPModifyDeleteNamespaceDrops pins the `delete_namespaces` half
+// of GenericPropsModify on the SP scope: every key under the given
+// namespace prefix must be dropped in one transaction. Mirrors
+// upstream LINSTOR's `linstor sp delete-namespace`.
+func TestSPModifyDeleteNamespaceDrops(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		NodeName:        "n1",
+		StoragePoolName: "p1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		Props: map[string]string{
+			"Aux/team":         "storage",
+			"Aux/owner":        "ops",
+			"StorDriver/LvmVg": "vg1",
+			"Aux2/keep":        "kept",
+		},
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.GenericPropsModify{
+		DeleteNamespace: []string{"Aux"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/nodes/n1/storage-pools/p1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.StoragePools().Get(ctx, "n1", "p1")
+	if err != nil {
+		t.Fatalf("Get after PUT: %v", err)
+	}
+
+	for _, k := range []string{"Aux/team", "Aux/owner"} {
+		if _, ok := got.Props[k]; ok {
+			t.Errorf("Props[%q] still present after delete_namespaces=Aux", k)
+		}
+	}
+
+	if got.Props["StorDriver/LvmVg"] != "vg1" {
+		t.Errorf("Props[StorDriver/LvmVg] dropped — namespace match must be prefix-with-slash, not substring")
+	}
+
+	if got.Props["Aux2/keep"] != "kept" {
+		t.Errorf("Props[Aux2/keep] dropped — namespace 'Aux' must NOT match 'Aux2/*'")
+	}
+}
