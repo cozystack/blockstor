@@ -131,7 +131,7 @@ func (s *inMemoryNodes) List(_ context.Context) ([]apiv1.Node, error) {
 	out := make([]apiv1.Node, 0, len(s.m))
 	for _, n := range s.m {
 		if len(n.NetInterfaces) > 0 {
-			n.NetInterfaces = apiv1.DefaultNetInterfaceFields(append([]apiv1.NetInterface(nil), n.NetInterfaces...))
+			n.NetInterfaces = apiv1.DefaultNetInterfaceFields(n.Name, append([]apiv1.NetInterface(nil), n.NetInterfaces...))
 		}
 
 		out = append(out, n)
@@ -157,7 +157,7 @@ func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) 
 	}
 
 	if len(n.NetInterfaces) > 0 {
-		n.NetInterfaces = apiv1.DefaultNetInterfaceFields(append([]apiv1.NetInterface(nil), n.NetInterfaces...))
+		n.NetInterfaces = apiv1.DefaultNetInterfaceFields(n.Name, append([]apiv1.NetInterface(nil), n.NetInterfaces...))
 	}
 
 	return n, nil

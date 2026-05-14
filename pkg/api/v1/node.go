@@ -16,6 +16,8 @@ limitations under the License.
 
 package v1
 
+import "github.com/google/uuid"
+
 // Node mirrors `Node` from the upstream LINSTOR OpenAPI spec. We list only
 // the fields that current consumers (linstor-csi, piraeus-operator) read or
 // write; richer fields (KeyVault, etc.) get added as we wire them up.
@@ -41,8 +43,13 @@ type NodeModify struct {
 	NodeType string `json:"node_type,omitempty"`
 }
 
-// NetInterface mirrors `NetInterface` from upstream.
+// NetInterface mirrors `NetInterface` from upstream. UUID is synthesized
+// on read by the store backends (k8s and inmemory) — we don't persist it
+// on the CRD because the wire identity is `(node, ifname)` and a stored
+// UUID would just drift if the CRD got rewritten by an older controller.
+// See `SyntheticNetInterfaceUUID` for the derivation rule.
 type NetInterface struct {
+	UUID                    string `json:"uuid,omitempty"`
 	Name                    string `json:"name"`
 	Address                 string `json:"address"`
 	SatellitePort           int    `json:"satellite_port,omitempty"`
@@ -66,10 +73,11 @@ const (
 
 // DefaultNetInterfaceFields fills upstream-default port + encryption
 // type on every interface that has an Address but missing port/type,
-// and marks the first interface IsActive. Both store backends call
-// this on read so the REST surface emits a consistent wire shape
-// regardless of which backend persists the Node.
-func DefaultNetInterfaceFields(ifaces []NetInterface) []NetInterface {
+// marks the first interface IsActive, and synthesizes a stable UUID
+// per (node, ifname). Both store backends call this on read so the
+// REST surface emits a consistent wire shape regardless of which
+// backend persists the Node.
+func DefaultNetInterfaceFields(nodeName string, ifaces []NetInterface) []NetInterface {
 	for i := range ifaces {
 		if ifaces[i].Address == "" {
 			continue
@@ -84,9 +92,22 @@ func DefaultNetInterfaceFields(ifaces []NetInterface) []NetInterface {
 		}
 
 		ifaces[i].IsActive = i == 0
+
+		if ifaces[i].UUID == "" {
+			ifaces[i].UUID = SyntheticNetInterfaceUUID(nodeName, ifaces[i].Name)
+		}
 	}
 
 	return ifaces
+}
+
+// SyntheticNetInterfaceUUID derives a stable v5 UUID per (node, ifname).
+// Upstream LINSTOR persists a UUID on every NetInterface DTO; some
+// tooling diffs interface state across reconciles by that UUID. We
+// don't persist on the CRD — same input always produces the same
+// output, so a synthesized value is just as stable for diffing.
+func SyntheticNetInterfaceUUID(nodeName, ifaceName string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("blockstor:netif:"+nodeName+":"+ifaceName)).String()
 }
 
 // Node Type constants — these are the strings LINSTOR uses on the wire.

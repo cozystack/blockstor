@@ -224,7 +224,7 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 		// now flows through the apiserver) so 3366 is descriptive
 		// metadata rather than a routable port — but the CLI uses
 		// it purely for display, not dialing.
-		out.NetInterfaces = apiv1.DefaultNetInterfaceFields(out.NetInterfaces)
+		out.NetInterfaces = apiv1.DefaultNetInterfaceFields(out.Name, out.NetInterfaces)
 	}
 
 	return out

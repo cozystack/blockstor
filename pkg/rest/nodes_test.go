@@ -350,6 +350,176 @@ func TestNodeListIncludesNetInterfaceAddressAndPort(t *testing.T) {
 	}
 }
 
+// TestNodeListIncludesNetInterfaceUUID covers CLI parity audit row #1
+// (F1): upstream LINSTOR's NetInterface DTO carries a `uuid` field
+// that some tooling uses to diff interface state across reconciles.
+// Bug 59 plugged port/encryption/is_active; this pins UUID on both
+// Get and List so the wire shape is complete.
+func TestNodeListIncludesNetInterfaceUUID(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.5"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Get path.
+	getResp := httpGet(t, base+"/v1/nodes/n1")
+	defer func() { _ = getResp.Body.Close() }()
+
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("Get status: got %d, want 200", getResp.StatusCode)
+	}
+
+	var got apiv1.Node
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("Get decode: %v", err)
+	}
+
+	if len(got.NetInterfaces) != 1 {
+		t.Fatalf("Get NetInterfaces: got %d, want 1", len(got.NetInterfaces))
+	}
+
+	if got.NetInterfaces[0].UUID == "" {
+		t.Errorf("Get: NetInterface.UUID is empty; upstream LINSTOR always populates this field")
+	}
+
+	// List path — same node should surface the same shape.
+	listResp := httpGet(t, base+"/v1/nodes")
+	defer func() { _ = listResp.Body.Close() }()
+
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("List status: got %d, want 200", listResp.StatusCode)
+	}
+
+	var listed []apiv1.Node
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatalf("List decode: %v", err)
+	}
+
+	if len(listed) != 1 || len(listed[0].NetInterfaces) != 1 {
+		t.Fatalf("List shape: got %#v", listed)
+	}
+
+	if listed[0].NetInterfaces[0].UUID == "" {
+		t.Errorf("List: NetInterface.UUID is empty")
+	}
+}
+
+// TestNodeNetInterfaceUUIDIsStable: two reads of the same (node, ifname)
+// must return the same UUID. Stability across reconciles is the whole
+// point of surfacing a UUID — a value that changes each request would
+// be worse than nothing for diffing tooling.
+func TestNodeNetInterfaceUUIDIsStable(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.5"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	read := func() string {
+		t.Helper()
+
+		resp := httpGet(t, base+"/v1/nodes/n1")
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status: got %d, want 200", resp.StatusCode)
+		}
+
+		var node apiv1.Node
+		if err := json.NewDecoder(resp.Body).Decode(&node); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		if len(node.NetInterfaces) != 1 {
+			t.Fatalf("NetInterfaces: got %d, want 1", len(node.NetInterfaces))
+		}
+
+		return node.NetInterfaces[0].UUID
+	}
+
+	first := read()
+	second := read()
+
+	if first == "" {
+		t.Fatalf("UUID empty on first read")
+	}
+
+	if first != second {
+		t.Errorf("UUID drifted between reads: first=%q second=%q", first, second)
+	}
+}
+
+// TestNodeNetInterfaceUUIDDiffersByInterface: two interfaces on the
+// same node must get distinct UUIDs. Derivation rule is `(node,
+// ifname)` so collisions would silently break diffing whenever a node
+// ran multiple replication paths.
+func TestNodeNetInterfaceUUIDDiffersByInterface(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.5"},
+			{Name: "replication", Address: "10.10.0.5"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.Node
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.NetInterfaces) != 2 {
+		t.Fatalf("NetInterfaces: got %d, want 2", len(got.NetInterfaces))
+	}
+
+	a := got.NetInterfaces[0].UUID
+	b := got.NetInterfaces[1].UUID
+
+	if a == "" || b == "" {
+		t.Fatalf("empty UUID: a=%q b=%q", a, b)
+	}
+
+	if a == b {
+		t.Errorf("UUIDs collide for distinct interfaces: %q", a)
+	}
+}
+
 // TestNodeCreateAutoCreatesDfltDisklessStorPool pins Bug 59 / parity
 // audit row #3: upstream LINSTOR provisions a `DfltDisklessStorPool`
 // per satellite at node-register time so the autoplacer's
