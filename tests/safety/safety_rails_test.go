@@ -56,6 +56,7 @@ func allowedFinalizerStripFiles() map[string]string {
 		"pkg/satellite/controllers/resource.go":       "satellite teardown completion (own finalizer)",
 		"pkg/satellite/controllers/storagepool.go":    "storage-pool deregistration (own finalizer)",
 		"pkg/satellite/controllers/physicaldevice.go": "physical-device attach cleanup (own finalizer)",
+		"pkg/satellite/controllers/snapshot.go":       "snapshot teardown completion (own finalizer, Bug 64)",
 	}
 }
 
