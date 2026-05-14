@@ -15,9 +15,9 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 | 1 | D — Resource Definition | 9 | done | landed via cherry-pick |
 | 1 | E — Volume Definition | 7 | done | landed via cherry-pick |
 | 1 | F — Resource | 14 | done | landed via cherry-pick |
-| 1 | G — Snapshot | 10 | pending | — |
+| 1 | G — Snapshot | 10 | done | landed via cherry-pick |
 | 1 | H — Controller / Error Reports / KV | 6 | done | landed via cherry-pick |
-| 1 | I — Node/Resource connections | 6 | pending | — |
+| 1 | I — Node/Resource connections | 6 | done | landed via cherry-pick |
 | 1 | J — CSI | 12 | done | landed via cherry-pick |
 | 1 | K — Workflows | 12 | done | landed via cherry-pick |
 | 1 | L — Concurrency / cache trail | 6 | done | landed via cherry-pick |
