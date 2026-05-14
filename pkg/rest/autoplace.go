@@ -621,6 +621,19 @@ const apiCallRcFailNotEnoughNodes int64 = 996
 
 // mergeAutoplaceFilter merges the request's filter on top of the parent
 // ResourceGroup's stored select filter. Request fields win.
+//
+// Scenario 4.W15 — StoragePool resolution chain (high → low priority):
+//
+//	request.SelectFilter.StoragePool  (operator typed `--storage-pool`)
+//	rd.Props["StorPoolName"]          (RD-level sticky default, this tier)
+//	rg.SelectFilter.StoragePool       (RG-level default)
+//	none → placer picks any matching pool
+//
+// The RD-prop tier sits between the request and the RG so an operator
+// who did `linstor rd set-property <rd> StorPoolName pool` can pin
+// future autoplace / spawn replicas to that pool without rewriting the
+// shared RG, while still being overridable by an explicit
+// `r c --auto-place --storage-pool other` invocation.
 func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.ResourceDefinition, req *apiv1.AutoSelectFilter) apiv1.AutoSelectFilter {
 	out := apiv1.AutoSelectFilter{}
 
@@ -634,6 +647,18 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 		if err == nil {
 			out = rg.SelectFilter
 		}
+	}
+
+	// Scenario 4.W15 RD-prop tier: an RD-level Props["StorPoolName"]
+	// overrides whatever the RG defaulted to. The request's own
+	// StoragePool below still wins, so the operator's per-call
+	// `--storage-pool` flag stays authoritative.
+	if rdPool := rd.Props["StorPoolName"]; rdPool != "" {
+		out.StoragePool = rdPool
+		// Drop any RG-inherited StoragePoolList — the explicit RD
+		// prop is a single-pool pin, so a list-form RG default would
+		// re-widen the candidate set and contradict operator intent.
+		out.StoragePoolList = nil
 	}
 
 	if req.PlaceCount > 0 {

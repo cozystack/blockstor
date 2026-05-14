@@ -2599,3 +2599,243 @@ func TestAutoplaceAdditionalPlusOneIgnoresDisklessExisting(t *testing.T) {
 		t.Errorf("diskful count: got %d, want 3 (existing 2 + new 1; witness must not be promoted)", diskfulCount)
 	}
 }
+
+// TestAutoplaceRequestStoragePoolBeatsRDProp pins scenario 4.W15
+// resolution-tier 1: the per-request `SelectFilter.StoragePool`
+// (operator typed `r c --auto-place --storage-pool pool_request`)
+// outranks any RD-level Props["StorPoolName"] default. The placer
+// must land on the pool the operator named even if the RD has a
+// different sticky default stamped on its Props map.
+//
+// Topology: RG-default `pool_rg` exists on n1, RD-prop `pool_rd`
+// exists on n2, request-flag `pool_req` exists on n3 — only one
+// pool per node so the placer's choice unambiguously identifies
+// which tier won the merge.
+func TestAutoplaceRequestStoragePoolBeatsRDProp(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-w15",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool_rg"},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-w15-req",
+		ResourceGroupName: "rg-w15",
+		Props:             map[string]string{"StorPoolName": "pool_rd"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	seed := []struct {
+		node string
+		pool string
+	}{
+		{"n1", "pool_rg"},
+		{"n2", "pool_rd"},
+		{"n3", "pool_req"},
+	}
+
+	for _, s := range seed {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: s.pool,
+			NodeName:        s.node,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s on %s: %v", s.pool, s.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool_req"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-w15-req/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-w15-req")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("placed: got %d, want 1", len(got))
+	}
+
+	if got[0].NodeName != "n3" {
+		t.Errorf("NodeName: got %q, want n3 (request StoragePool must beat RD prop)", got[0].NodeName)
+	}
+
+	if got[0].Props["StorPoolName"] != "pool_req" {
+		t.Errorf("StorPoolName: got %q, want pool_req", got[0].Props["StorPoolName"])
+	}
+}
+
+// TestAutoplaceRDPropBeatsRGSelectFilter pins scenario 4.W15
+// resolution-tier 2: when the request omits `--storage-pool` the
+// RD-level Props["StorPoolName"] default outranks the parent RG's
+// SelectFilter.StoragePool. This is the day-2 path operators take
+// after `linstor rd set-property <rd> StorPoolName pool_rd` to pin
+// future replicas of an existing RD to a specific pool without
+// rewriting the shared RG.
+//
+// Topology: pool_rg on n1, pool_rd on n2 — placer must select n2.
+func TestAutoplaceRDPropBeatsRGSelectFilter(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-w15",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool_rg"},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-w15-rd",
+		ResourceGroupName: "rg-w15",
+		Props:             map[string]string{"StorPoolName": "pool_rd"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	seed := []struct {
+		node string
+		pool string
+	}{
+		{"n1", "pool_rg"},
+		{"n2", "pool_rd"},
+	}
+
+	for _, s := range seed {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: s.pool,
+			NodeName:        s.node,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s on %s: %v", s.pool, s.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// No StoragePool on the request — the resolution chain must fall
+	// through to the RD's Props["StorPoolName"] before reaching the RG.
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-w15-rd/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-w15-rd")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("placed: got %d, want 1", len(got))
+	}
+
+	if got[0].NodeName != "n2" {
+		t.Errorf("NodeName: got %q, want n2 (RD prop must beat RG SelectFilter)", got[0].NodeName)
+	}
+
+	if got[0].Props["StorPoolName"] != "pool_rd" {
+		t.Errorf("StorPoolName: got %q, want pool_rd", got[0].Props["StorPoolName"])
+	}
+}
+
+// TestAutoplaceRGSelectFilterFallsThroughWhenNoRDProp pins scenario
+// 4.W15 resolution-tier 3: when neither the request nor the RD set
+// a StoragePool, the parent RG's SelectFilter.StoragePool drives
+// placement (the long-standing default RG → RD → resource inheritance
+// the previous TestAutoplaceInheritsRGFilter already covers, restated
+// here in the W15 series so the three tiers live in one test trio).
+//
+// Topology: pool_rg on n1, pool_other on n2 — placer must select
+// the RG-named pool on n1.
+func TestAutoplaceRGSelectFilterFallsThroughWhenNoRDProp(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-w15",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1, StoragePool: "pool_rg"},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	// Critical: RD has NO Props["StorPoolName"] — chain falls through
+	// to the RG.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-w15-rg",
+		ResourceGroupName: "rg-w15",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	seed := []struct {
+		node string
+		pool string
+	}{
+		{"n1", "pool_rg"},
+		{"n2", "pool_other"},
+	}
+
+	for _, s := range seed {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: s.pool,
+			NodeName:        s.node,
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		}); err != nil {
+			t.Fatalf("seed pool %s on %s: %v", s.pool, s.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: 1},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-w15-rg/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-w15-rg")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("placed: got %d, want 1", len(got))
+	}
+
+	if got[0].NodeName != "n1" {
+		t.Errorf("NodeName: got %q, want n1 (RG SelectFilter must drive when RD prop absent)", got[0].NodeName)
+	}
+
+	if got[0].Props["StorPoolName"] != "pool_rg" {
+		t.Errorf("StorPoolName: got %q, want pool_rg", got[0].Props["StorPoolName"])
+	}
+}
