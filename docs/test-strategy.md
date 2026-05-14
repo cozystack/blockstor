@@ -8,8 +8,8 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 
 | Phase | Group | Tests | Status | Branch / PR |
 |---|---|---|---|---|
-| 0 | Harness scaffold + smoke | 1 | pending | — |
-| 1 | A — Node | 10 | done | feat/integration-group-a-node |
+| 0 | Harness scaffold + smoke | 1 | done | landed in 2a8e532a5 |
+| 1 | A — Node | 10 | done | landed in ed96c13bf |
 | 1 | B — Storage Pool | 9 | pending | — |
 | 1 | C — Resource Group | 7 | pending | — |
 | 1 | D — Resource Definition | 9 | pending | — |
@@ -19,7 +19,7 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 | 1 | H — Controller / Error Reports / KV | 6 | pending | — |
 | 1 | I — Node/Resource connections | 6 | pending | — |
 | 1 | J — CSI | 12 | pending | — |
-| 1 | K — Workflows | 12 | pending | — |
+| 1 | K — Workflows | 12 | done | landed via cherry-pick |
 | 1 | L — Concurrency / cache trail | 6 | pending | — |
 | 2 | Tier 3 — drbd-utils contract | 5 | pending | — |
 | 2 | CI wiring (`.github/workflows/integration.yml`) | — | done | committed with this doc |

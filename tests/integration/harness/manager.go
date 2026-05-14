@@ -30,6 +30,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -164,11 +165,23 @@ func buildIntegrationManager(env *Env) (manager.Manager, error) {
 	scheme := clientgoscheme.Scheme
 	utilruntime.Must(blockstoriov1alpha1.AddToScheme(scheme))
 
+	// SkipNameValidation: controller-runtime enforces unique controller
+	// names per process by default. Every test in this package calls
+	// StartStack, which builds a fresh Manager with all reconcilers
+	// re-registered — the duplicate-name check would fail tests 2..N
+	// in a single `go test` run with
+	// "controller with name node already exists". Skipping the check
+	// is the documented escape hatch for test harnesses
+	// (https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/config).
+	skipNameValidation := true
 	mgr, err := ctrl.NewManager(env.Cfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 		LeaderElection:         false,
+		Controller: config.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("new manager: %w", err)
