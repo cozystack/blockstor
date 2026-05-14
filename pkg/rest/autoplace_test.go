@@ -834,6 +834,123 @@ func TestResourceCreateAndDelete(t *testing.T) {
 	}
 }
 
+// TestResourceCreateManualStorPoolBypassesAutoplacer pins scenario
+// 4.W16 (wave2-04-lifecycle.md): the manual placement path
+// `linstor r c <node> <rd> --storage-pool <pool>` lands as
+// `POST /v1/resource-definitions/{rd}/resources` with
+// `Resource.Props["StorPoolName"] = <pool>`. The handler must:
+//
+//  1. persist the chosen storage pool verbatim onto the Resource
+//     (so the satellite reconciler binds to that exact pool — not
+//     the RD-default, not whatever the autoplacer would pick);
+//  2. bypass the autoplacer entirely (no placer.Place() call, hence
+//     no "no candidate pools" 409 even on a cluster where autoplace
+//     would shortfall);
+//  3. NOT trigger the Bug 76 same-ProviderKind gate — that gate
+//     lives inside placer.allowsKindMix and only fires when the
+//     autoplacer is choosing pools. A manual placement is operator-
+//     explicit: the operator owns the consequences of mixing kinds,
+//     so the REST surface must let it through.
+//
+// The cluster shape below is deliberately Bug-76-hostile: three
+// nodes, three different ProviderKinds (LVM_THIN, ZFS_THIN, FILE).
+// A `--auto-place 3` call here would shortfall (no same-kind pair),
+// but the operator can still pin one replica on each node by
+// repeating the manual create with the appropriate StorPoolName.
+// We verify the first such create on `n2/pool_zfs` succeeds and
+// stores Props["StorPoolName"] == "pool_zfs".
+func TestResourceCreateManualStorPoolBypassesAutoplacer(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-manual"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Cross-kind cluster: three ProviderKinds with no same-kind pair.
+	// Autoplace with PlaceCount >= 2 would short-place here because
+	// Bug 76's same-kind gate rejects every cross-kind pairing.
+	seed := []struct {
+		node string
+		pool string
+		kind string
+	}{
+		{"n1", "pool_lvm", apiv1.StoragePoolKindLVMThin},
+		{"n2", "pool_zfs", apiv1.StoragePoolKindZFSThin},
+		{"n3", "pool_file", apiv1.StoragePoolKindFile},
+	}
+
+	for _, s := range seed {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: s.pool,
+			NodeName:        s.node,
+			ProviderKind:    s.kind,
+		}); err != nil {
+			t.Fatalf("seed pool %s on %s: %v", s.pool, s.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `linstor r c n2 pvc-manual --storage-pool pool_zfs` → operator
+	// pins the replica to n2's ZFS_THIN pool. golinstor serialises
+	// the --storage-pool flag as Props["StorPoolName"] on the
+	// embedded Resource of the ResourceCreate envelope.
+	body, err := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{
+			NodeName: "n2",
+			Props:    map[string]string{"StorPoolName": "pool_zfs"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-manual/resources", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (manual create must bypass autoplacer + Bug 76 gate)", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-manual", "n2")
+	if err != nil {
+		t.Fatalf("get manual replica: %v", err)
+	}
+
+	if got.NodeName != "n2" {
+		t.Errorf("NodeName: got %q, want %q", got.NodeName, "n2")
+	}
+
+	if got.Props["StorPoolName"] != "pool_zfs" {
+		t.Errorf("Props[StorPoolName]: got %q, want %q (operator-explicit pool must round-trip onto the Resource)",
+			got.Props["StorPoolName"], "pool_zfs")
+	}
+
+	// Belt-and-braces: the manual placement must not have been
+	// rewritten by any side-effect that flags the replica as
+	// diskless/tiebreaker — the operator asked for a diskful
+	// replica on a specific pool, and that's what they get.
+	for _, flag := range got.Flags {
+		if flag == apiv1.ResourceFlagDiskless || flag == apiv1.ResourceFlagTieBreaker {
+			t.Errorf("manual --storage-pool create must yield a diskful replica, got flag %q in %v",
+				flag, got.Flags)
+		}
+	}
+
+	// And exactly one replica was placed — no autoplace top-up
+	// expanded the result behind the operator's back.
+	all, err := st.Resources().ListByDefinition(ctx, "pvc-manual")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(all) != 1 {
+		t.Errorf("replica count: got %d, want 1 (manual create places exactly one, no autoplace top-up)", len(all))
+	}
+}
+
 // TestAutoplacePersistsLayerListOntoRD: linstor-csi (and piraeus-operator's
 // LinstorSatelliteConfiguration.spec.storageClasses[*].layerList) sets
 // layer_list on the autoplace request rather than on RD create. The REST
