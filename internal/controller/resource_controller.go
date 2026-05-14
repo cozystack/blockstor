@@ -728,21 +728,33 @@ func (r *ResourceReconciler) allocateMinor(ctx context.Context, nodeName string)
 }
 
 // portRangeForNode reads the DRBD TCP port range off the named Node
-// CRD, falling back to the controller-wide default. Phase 10.3:
-// typed `Spec.DRBDPortRange` wins; legacy `Props["DrbdOptions/
-// TcpPortRange"]` is the forward-compat fallback. Default
-// (7000-7999) covers fresh clusters with neither set.
+// CRD, falling back to the cluster-scope `TcpPortAutoRange` on the
+// ControllerConfig singleton, then the compiled-in default. Order:
+//
+//  1. Node.Spec.DRBDPortRange typed pointer — operator's per-node
+//     pin.
+//  2. Node.Spec.Props["DrbdOptions/TcpPortRange"] — legacy
+//     forward-compat per-node prop.
+//  3. ControllerConfig.Spec.ExtraProps["TcpPortAutoRange"] —
+//     cluster-scope dynamic-port range, the upstream-LINSTOR knob
+//     (`linstor controller set-property TcpPortAutoRange ...`).
+//  4. drbd.DefaultPortMin..drbd.DefaultPortMax (7000-7999).
+//
+// A malformed value at any tier surfaces as an error so the
+// operator notices the typo. Scenario 3.W05.
 func (r *ResourceReconciler) portRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
-	return r.nodeRange(ctx, nodeName,
+	return r.nodeRangeWithClusterFallback(ctx, nodeName,
 		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDPortRange },
 		"DrbdOptions/TcpPortRange",
+		"TcpPortAutoRange",
 		drbd.DefaultPortMin, drbd.DefaultPortMax)
 }
 
 func (r *ResourceReconciler) minorRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
-	return r.nodeRange(ctx, nodeName,
+	return r.nodeRangeWithClusterFallback(ctx, nodeName,
 		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDMinorRange },
 		"DrbdOptions/MinorNrRange",
+		"MinorNrAutoRange",
 		drbd.DefaultMinorMin, drbd.DefaultMinorMax)
 }
 
@@ -783,6 +795,77 @@ func (r *ResourceReconciler) nodeRange(
 	}
 
 	return low, high, nil
+}
+
+// nodeRangeWithClusterFallback layers the cluster-scope
+// `ControllerConfig.Spec.ExtraProps[clusterProp]` between the
+// per-node fallback and the compiled-in defaults. Mirrors
+// upstream LINSTOR's controller-scope `TcpPortAutoRange` /
+// `MinorNrAutoRange` knobs: operators set them via
+// `linstor controller set-property` to constrain dynamic
+// allocation cluster-wide without touching every Node CRD.
+//
+// Precedence (highest first):
+//
+//  1. Node typed pointer (`pick(&node.Spec)`)
+//  2. Node legacy props key (`legacyProp`)
+//  3. ControllerConfig.Spec.ExtraProps[clusterProp]
+//  4. (defLow, defHigh) compiled-in default
+//
+// Tier 1 and 2 are resolved by the existing `nodeRange` helper;
+// this wrapper falls through to tier 3+ only when the node
+// contributes nothing. Bad format at the cluster tier surfaces
+// as an error — silent fallback would hide misconfig.
+func (r *ResourceReconciler) nodeRangeWithClusterFallback(
+	ctx context.Context,
+	nodeName string,
+	pick func(*blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange,
+	legacyProp, clusterProp string,
+	defLow, defHigh int32,
+) (int32, int32, error) {
+	clusterLow, clusterHigh, ok, err := r.clusterRange(ctx, clusterProp, defLow, defHigh)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Determine the "fall-through default" the node-tier
+	// resolver returns when the Node CRD contributes nothing.
+	// When the cluster tier supplies a value it wins over the
+	// compiled-in default; the node tier can still override it.
+	fallbackLow, fallbackHigh := defLow, defHigh
+	if ok {
+		fallbackLow, fallbackHigh = clusterLow, clusterHigh
+	}
+
+	return r.nodeRange(ctx, nodeName, pick, legacyProp, fallbackLow, fallbackHigh)
+}
+
+// clusterRange reads the cluster-scope range prop off the
+// singleton ControllerConfig. Returns (low, high, set, err):
+// `set` is false when the ControllerConfig is missing or the
+// prop is absent — callers fall through to compiled-in
+// defaults in that case. Malformed values surface as an error.
+func (r *ResourceReconciler) clusterRange(ctx context.Context, prop string, defLow, defHigh int32) (int32, int32, bool, error) {
+	var cfg blockstoriov1alpha1.ControllerConfig
+	if err := r.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &cfg); err != nil {
+		if errors.IsNotFound(err) {
+			return defLow, defHigh, false, nil
+		}
+
+		return 0, 0, false, err
+	}
+
+	raw := cfg.Spec.ExtraProps[prop]
+	if raw == "" {
+		return defLow, defHigh, false, nil
+	}
+
+	low, high, err := drbd.ParseRange(raw)
+	if err != nil {
+		return 0, 0, false, err
+	}
+
+	return low, high, true, nil
 }
 
 // takenPortsOnNode scans every Resource scheduled on the given node

@@ -113,6 +113,17 @@ func (r *ResourceReconciler) RangeProp(ctx context.Context, nodeName, prop strin
 		prop, defLow, defHigh)
 }
 
+// RangePropWithClusterFallback exposes the cluster-scope-aware
+// resolver behind the port/minor allocators. Tests pin the
+// extra tier (ControllerConfig.Spec.ExtraProps[clusterProp])
+// between the per-node fallback and the compiled-in default
+// for scenario 3.W05.
+func (r *ResourceReconciler) RangePropWithClusterFallback(ctx context.Context, nodeName, legacyProp, clusterProp string, defLow, defHigh int32) (int32, int32, error) {
+	return r.nodeRangeWithClusterFallback(ctx, nodeName,
+		func(*blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return nil },
+		legacyProp, clusterProp, defLow, defHigh)
+}
+
 // QuorumPolicy exposes upstream-LINSTOR's isQuorumFeasible
 // decision: 2 diskful + ≥1 diskless OR ≥3 diskful → majority,
 // else off. Tests pin every (diskful, diskless) combination.
