@@ -72,9 +72,37 @@ func TestPassphraseCreateThenEnter(t *testing.T) {
 	}
 }
 
-// TestPassphraseCreateTwiceConflicts: a second POST without first
-// removing the existing passphrase → 409.
-func TestPassphraseCreateTwiceConflicts(t *testing.T) {
+// TestPassphraseCreateConflictsOnDifferent: a second POST with a
+// DIFFERENT passphrase against an established cluster → 409. Pins
+// scenario 6.W12's "POST is not how operators rotate" rule; the PUT
+// endpoint exists for rotation and requires the old passphrase.
+func TestPassphraseCreateConflictsOnDifferent(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	first, _ := json.Marshal(map[string]string{"new_passphrase": "secret"})
+	firstResp := httpPost(t, base+"/v1/encryption/passphrase", first)
+	_ = firstResp.Body.Close()
+
+	if firstResp.StatusCode != http.StatusCreated {
+		t.Fatalf("first create: got %d, want 201", firstResp.StatusCode)
+	}
+
+	second, _ := json.Marshal(map[string]string{"new_passphrase": "different"})
+	secondResp := httpPost(t, base+"/v1/encryption/passphrase", second)
+	_ = secondResp.Body.Close()
+
+	if secondResp.StatusCode != http.StatusConflict {
+		t.Errorf("second create with different passphrase: got %d, want 409", secondResp.StatusCode)
+	}
+}
+
+// TestPassphraseCreateSameIdempotent: a second POST with the SAME
+// passphrase against an established cluster → 200. Pins scenario
+// 6.W12's "idempotent on same passphrase" contract so a retried
+// `linstor encryption create-passphrase` (e.g. controller crash-loop
+// during bootstrap) doesn't blow up the bootstrapper.
+func TestPassphraseCreateSameIdempotent(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
@@ -83,11 +111,15 @@ func TestPassphraseCreateTwiceConflicts(t *testing.T) {
 	first := httpPost(t, base+"/v1/encryption/passphrase", body)
 	_ = first.Body.Close()
 
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first create: got %d, want 201", first.StatusCode)
+	}
+
 	second := httpPost(t, base+"/v1/encryption/passphrase", body)
 	_ = second.Body.Close()
 
-	if second.StatusCode != http.StatusConflict {
-		t.Errorf("second create: got %d, want 409", second.StatusCode)
+	if second.StatusCode != http.StatusOK {
+		t.Errorf("idempotent same-passphrase create: got %d, want 200", second.StatusCode)
 	}
 }
 
@@ -365,6 +397,92 @@ func TestPassphraseSecretCreateLandsInSecret(t *testing.T) {
 
 	if got := string(sec.Data[passphraseSecretKey]); got != "topsecret" {
 		t.Errorf("Secret data: got %q, want %q", got, "topsecret")
+	}
+}
+
+// TestPassphraseSecretCreateIdempotentSameValue pins that POSTing
+// the same passphrase twice against the Secret-backed path returns
+// 200 on the second call (scenario 6.W12 idempotency) and leaves the
+// Secret data byte-for-byte unchanged.
+func TestPassphraseSecretCreateIdempotentSameValue(t *testing.T) {
+	srv := newSecretPathServer(t)
+	cli := srv.Client
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	body, _ := json.Marshal(map[string]string{"new_passphrase": "topsecret"})
+
+	first := httpPost(t, base+"/v1/encryption/passphrase", body)
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first create: got %d, want 201", first.StatusCode)
+	}
+
+	second := httpPost(t, base+"/v1/encryption/passphrase", body)
+	_ = second.Body.Close()
+
+	if second.StatusCode != http.StatusOK {
+		t.Errorf("idempotent re-POST: got %d, want 200", second.StatusCode)
+	}
+
+	var sec corev1.Secret
+
+	err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace,
+		Name:      defaultPassphraseSecretName,
+	}, &sec)
+	if err != nil {
+		t.Fatalf("Secret missing after idempotent re-POST: %v", err)
+	}
+
+	if got := string(sec.Data[passphraseSecretKey]); got != "topsecret" {
+		t.Errorf("Secret data: got %q, want %q", got, "topsecret")
+	}
+}
+
+// TestPassphraseSecretCreateConflictsOnDifferentValue pins that
+// POSTing a different passphrase against an established cluster
+// returns 409 + leaves the Secret data unchanged. Scenario 6.W12
+// reserves rotation for the PUT (modify) endpoint.
+func TestPassphraseSecretCreateConflictsOnDifferentValue(t *testing.T) {
+	srv := newSecretPathServer(t)
+	cli := srv.Client
+
+	base, stop := startServerCustom(t, srv)
+	defer stop()
+
+	original, _ := json.Marshal(map[string]string{"new_passphrase": "original"})
+
+	resp := httpPost(t, base+"/v1/encryption/passphrase", original)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
+	}
+
+	rotate, _ := json.Marshal(map[string]string{"new_passphrase": "rotated"})
+
+	second := httpPost(t, base+"/v1/encryption/passphrase", rotate)
+	_ = second.Body.Close()
+
+	if second.StatusCode != http.StatusConflict {
+		t.Errorf("conflicting create: got %d, want 409", second.StatusCode)
+	}
+
+	var sec corev1.Secret
+
+	err := cli.Get(context.Background(), client.ObjectKey{
+		Namespace: passphraseSecretTestNamespace,
+		Name:      defaultPassphraseSecretName,
+	}, &sec)
+	if err != nil {
+		t.Fatalf("Secret missing: %v", err)
+	}
+
+	if got := string(sec.Data[passphraseSecretKey]); got != "original" {
+		t.Errorf("Secret data must NOT rotate via POST: got %q, want %q", got, "original")
 	}
 }
 

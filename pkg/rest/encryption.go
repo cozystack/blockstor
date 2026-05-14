@@ -68,8 +68,12 @@ func (s *Server) registerEncryption(mux *http.ServeMux) {
 		s.requireStore(s.handlePassphraseModify))
 }
 
-// handlePassphraseCreate sets the passphrase the first time. 409 if
-// one already exists; the caller is supposed to PATCH to change.
+// handlePassphraseCreate stamps the cluster-wide master passphrase
+// into the sealed K8s Secret on first call (→ 201 Created). If a
+// passphrase already exists, the body must match it byte-for-byte:
+// same value → 200 OK (idempotent retry, scenario 6.W12), different
+// value → 409 Conflict (rotations must go through PUT/modify with
+// proof-of-knowledge of the old passphrase).
 func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
@@ -94,7 +98,13 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if have != "" {
-		writeError(w, http.StatusConflict, "cluster passphrase already set; PATCH to modify")
+		if have == req.NewPassphrase {
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+
+		writeError(w, http.StatusConflict, "cluster passphrase already set; PUT to modify with old passphrase")
 
 		return
 	}
