@@ -204,6 +204,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerSnapshots(mux)
 	s.registerSpawn(mux)
 	s.registerAutoplace(mux)
+	s.registerResourceModify(mux)
 	s.registerControllerProperties(mux)
 	s.registerAdjust(mux)
 	s.registerResourceLifecycle(mux)

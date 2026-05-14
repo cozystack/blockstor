@@ -88,7 +88,7 @@ func TestGroupFRCreateExplicit(t *testing.T) {
 	}
 
 	got := resourceNodeNames(rows)
-	if !contains(got, harness.NodeWorker1) {
+	if !groupFContains(got, harness.NodeWorker1) {
 		t.Fatalf("resource list for %s missing node %s (got %v)",
 			rd, harness.NodeWorker1, got)
 	}
@@ -124,8 +124,8 @@ func TestGroupFRAutoPlace2ReachesUpToDate(t *testing.T) {
 	// 3. Auto-tiebreaker witness lands on the 3rd node, carrying
 	//    both TIE_BREAKER and DISKLESS flags.
 	witness := waitForTiebreakerWitness(t, stack, rd)
-	if !contains(witness.Spec.Flags, "TIE_BREAKER") ||
-		!contains(witness.Spec.Flags, "DISKLESS") {
+	if !groupFContains(witness.Spec.Flags, "TIE_BREAKER") ||
+		!groupFContains(witness.Spec.Flags, "DISKLESS") {
 		t.Fatalf("witness on %s missing TIE_BREAKER+DISKLESS flags: %v",
 			witness.Spec.NodeName, witness.Spec.Flags)
 	}
@@ -165,7 +165,7 @@ func TestGroupFRAutoPlace3WithTieBreaker(t *testing.T) {
 
 	all := listResourcesByRD(t, stack, rd)
 	for _, r := range all {
-		if contains(r.Spec.Flags, "TIE_BREAKER") {
+		if groupFContains(r.Spec.Flags, "TIE_BREAKER") {
 			t.Fatalf("3-replica RD got TIE_BREAKER on %s; flags=%v",
 				r.Spec.NodeName, r.Spec.Flags)
 		}
@@ -190,7 +190,7 @@ func TestGroupFRToggleDiskful2Diskless(t *testing.T) {
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		r := getResource(t, stack, rd, harness.NodeWorker1)
 
-		return r != nil && contains(r.Spec.Flags, "DISKLESS")
+		return r != nil && groupFContains(r.Spec.Flags, "DISKLESS")
 	}, "Resource "+rd+"."+harness.NodeWorker1+" never gained DISKLESS flag")
 }
 
@@ -208,7 +208,7 @@ func TestGroupFRToggleDiskless2Diskful(t *testing.T) {
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		r := getResource(t, stack, rd, harness.NodeWorker1)
 
-		return r != nil && contains(r.Spec.Flags, "DISKLESS")
+		return r != nil && groupFContains(r.Spec.Flags, "DISKLESS")
 	}, "initial DISKLESS replica never landed")
 
 	// Promote to diskful via a fresh create with --storage-pool — the
@@ -220,7 +220,7 @@ func TestGroupFRToggleDiskless2Diskful(t *testing.T) {
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		r := getResource(t, stack, rd, harness.NodeWorker1)
 
-		return r != nil && !contains(r.Spec.Flags, "DISKLESS")
+		return r != nil && !groupFContains(r.Spec.Flags, "DISKLESS")
 	}, "DISKLESS flag never cleared after promote")
 }
 
@@ -318,7 +318,7 @@ func TestGroupFRActivateDeactivate(t *testing.T) {
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		r := getResource(t, stack, rd, harness.NodeWorker1)
 
-		return r != nil && contains(r.Spec.Flags, "INACTIVE")
+		return r != nil && groupFContains(r.Spec.Flags, "INACTIVE")
 	}, "INACTIVE flag never appeared after deactivate")
 
 	// Activate: INACTIVE flag clears.
@@ -327,7 +327,7 @@ func TestGroupFRActivateDeactivate(t *testing.T) {
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		r := getResource(t, stack, rd, harness.NodeWorker1)
 
-		return r != nil && !contains(r.Spec.Flags, "INACTIVE")
+		return r != nil && !groupFContains(r.Spec.Flags, "INACTIVE")
 	}, "INACTIVE flag never cleared after activate")
 }
 
@@ -513,13 +513,13 @@ func TestGroupFRListVolumePoolField(t *testing.T) {
 // TestGroupFRSetPropertyDrbdNet — a per-Resource DrbdOptions/Net/<key>
 // prop MUST be persisted on the CRD so the dispatcher's effective-props
 // chain (Controller→RG→RD→Resource) picks it up at the satellite-facing
-// scope. blockstor does not yet expose
-// `PUT /v1/resource-definitions/{rd}/resources/{node}` (the upstream
-// path used by `linstor r sp`); the integration guard here drives the
-// write through the controller-runtime client so the rest of the
-// effective-props plumbing (dispatcher.mergeEffectiveProps,
-// pkg/drbd resolver) is still pinned. Implementing the missing REST
-// route is a Phase 2 task — this test surfaces the gap for that work.
+// scope. Drives the write through python-linstor's
+// `linstor resource set-property <node> <rd> <key> <val>`, which hits
+// `PUT /v1/resource-definitions/{rd}/resources/{node}` (Bug 86) — the
+// production code path the operator and CSI driver use. The integration
+// guard then asserts (a) the prop lands on Resource.Spec.Props via the
+// envtest client (CRD source of truth), and (b) surfaces back through
+// the REST view layer's `effective_props` bag.
 // ---------------------------------------------------------------------------
 
 func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
@@ -529,30 +529,46 @@ func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
 		"--storage-pool", "lvm-thin")
 	waitForResourceExists(t, stack, rd, harness.NodeWorker1)
 
-	// Stamp the prop on the Resource CRD directly. The downstream
-	// pieces (effective-props merge, dispatcher.BuildDesired
-	// folding DrbdOptions/* into the DRBD options bag) are what we
-	// pin here — not the upstream CLI surface.
+	const (
+		propKey = "DrbdOptions/Net/ping-timeout"
+		propVal = "500"
+	)
+
+	// Production path: drive the modify through the linstor CLI.
+	// Bug 86 wires `PUT /v1/resource-definitions/{rd}/resources/{node}`
+	// — before that route landed, this call hit 404 and the CLI
+	// surfaced a python traceback.
+	cli.Run(t, "resource", "set-property", harness.NodeWorker1, rd, propKey, propVal)
+
+	// CRD-side assertion (envtest client is read-only here): the
+	// REST handler MUST have merged override_props onto the Resource
+	// CRD. `DrbdOptions/Net/ping-timeout` is an UNRECOGNISED Net key in
+	// the k8s store's typed transcoder (`applyNetKey` switch), so the
+	// store routes it into Spec.ExtraProps rather than the typed
+	// Spec.DRBDOptions.Net struct — Spec.Props itself carries only
+	// non-DRBD residual keys. Reading via the controller-runtime client
+	// bypasses any REST-view caching so we observe the underlying
+	// source of truth.
 	ctx := context.Background()
 	name := rd + "." + harness.NodeWorker1
 
-	var r blockstoriov1alpha1.Resource
+	harness.Eventually(t, groupFAssertTimeout, func() bool {
+		var r blockstoriov1alpha1.Resource
 
-	err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: name}, &r)
-	if err != nil {
-		t.Fatalf("get Resource %s: %v", name, err)
-	}
+		err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: name}, &r)
+		if err != nil {
+			return false
+		}
 
-	if r.Spec.Props == nil {
-		r.Spec.Props = map[string]string{}
-	}
+		// Stored locations the store may pick depending on key
+		// recognition. Spec.Props for non-DRBD residual,
+		// Spec.ExtraProps for unrecognised DrbdOptions/* keys.
+		if r.Spec.Props[propKey] == propVal {
+			return true
+		}
 
-	r.Spec.Props["DrbdOptions/Net/ping-timeout"] = "500"
-
-	err = stack.Env.Client.Update(ctx, &r)
-	if err != nil {
-		t.Fatalf("update Resource %s props: %v", name, err)
-	}
+		return r.Spec.ExtraProps[propKey] == propVal
+	}, "Resource CRD did not pick up "+propKey+" via linstor r set-property")
 
 	// Round-trip the prop back through the REST view layer. The
 	// view's per-replica `effective_props` shape carries
@@ -566,7 +582,7 @@ func TestGroupFRSetPropertyDrbdNet(t *testing.T) {
 				continue
 			}
 
-			if _, found := eff["DrbdOptions/Net/ping-timeout"]; found {
+			if _, found := eff[propKey]; found {
 				return true
 			}
 		}
@@ -664,13 +680,13 @@ func waitForDiskfulReplicas(t *testing.T, stack *harness.Stack, rd string, want 
 		got = nil
 
 		for _, r := range listResourcesByRD(t, stack, rd) {
-			if !contains(r.Spec.Flags, "DISKLESS") {
+			if !groupFContains(r.Spec.Flags, "DISKLESS") {
 				got = append(got, r)
 			}
 		}
 
 		return len(got) == want
-	}, "diskful replica count never reached "+itoa(want))
+	}, "diskful replica count never reached "+groupFItoa(want))
 
 	return got
 }
@@ -684,7 +700,7 @@ func waitForTiebreakerWitness(t *testing.T, stack *harness.Stack, rd string) *bl
 
 	harness.Eventually(t, groupFAssertTimeout, func() bool {
 		for _, r := range listResourcesByRD(t, stack, rd) {
-			if contains(r.Spec.Flags, "TIE_BREAKER") {
+			if groupFContains(r.Spec.Flags, "TIE_BREAKER") {
 				cp := r
 
 				witness = &cp
@@ -1061,9 +1077,11 @@ func rowsContainRD(rows []map[string]any, rd string) bool {
 	return false
 }
 
-// contains is a tiny string-slice membership helper. Avoids pulling
-// in golang.org/x/exp/slices for one call.
-func contains(haystack []string, needle string) bool {
+// groupFContains is a tiny string-slice membership helper. Avoids pulling
+// in golang.org/x/exp/slices for one call. Renamed from `contains` to
+// avoid colliding with the same-named helper in `group_d_test.go` —
+// both files live under the shared `integration` build tag.
+func groupFContains(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {
 			return true
@@ -1073,8 +1091,10 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-// itoa is the local int-to-string helper so the Eventually message
-// strings stay readable without bringing in strconv at every call.
-func itoa(i int) string {
+// groupFItoa is the local int-to-string helper so the Eventually message
+// strings stay readable without bringing in strconv at every call. Renamed
+// from `itoa` to avoid colliding with the same-named helper in
+// `group_k_test.go`.
+func groupFItoa(i int) string {
 	return fmt.Sprintf("%d", i)
 }
