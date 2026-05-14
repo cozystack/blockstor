@@ -1036,3 +1036,104 @@ func TestResourceDefinitionListPropertiesEmptyDecodes(t *testing.T) {
 		t.Errorf("Props: unexpected entry %q=%q on an empty seed", k, v)
 	}
 }
+
+// TestResourceDefinitionReassignRGPreservesReplicas pins wave2 4.W14:
+// `linstor rd modify --resource-group <other>` reassigns the RD's
+// parent RG but MUST NOT touch the existing diskful/diskless replicas
+// — only future autoplace / `rg spawn` calls use the new defaults.
+// Doubles as a regression guard for the bug-60 family (re-autoplace
+// must not fire on rd-modify alone) and pins the upstream golinstor
+// CLI wire shape: the body field is `resource_group`, not
+// `resource_group_name`.
+// RD-level props survive the swap too — they still override the new
+// RG's defaults per the priority chain (VD > resource > RD > node).
+func TestResourceDefinitionReassignRGPreservesReplicas(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, rg := range []string{"rg-fast", "rg-slow"} {
+		if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: rg}); err != nil {
+			t.Fatalf("seed RG %s: %v", rg, err)
+		}
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-reassign",
+		ResourceGroupName: "rg-fast",
+		Props: map[string]string{
+			"DrbdOptions/Net/protocol": "C",
+		},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Three diskful replicas already placed by an earlier `rg spawn`.
+	// rd-modify must leave them on the same nodes.
+	seedNodes := []string{"worker-1", "worker-2", "worker-3"}
+	for _, n := range seedNodes {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name:     "pvc-reassign",
+			NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// CLI wire shape: `linstor rd modify --resource-group rg-slow`
+	// sends `{"resource_group": "rg-slow"}`, not the legacy
+	// `resource_group_name` key. Both must work — earlier tests pin
+	// the legacy form; this one pins the CLI form.
+	body, err := json.Marshal(map[string]string{"resource_group": "rg-slow"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-reassign", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, "pvc-reassign")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if got.ResourceGroupName != "rg-slow" {
+		t.Errorf("RG: got %q, want rg-slow", got.ResourceGroupName)
+	}
+
+	// RD-level prop survives (priority chain: RD overrides new RG).
+	if got.Props["DrbdOptions/Net/protocol"] != "C" {
+		t.Errorf("RD prop DrbdOptions/Net/protocol: got %q, want C (RD overrides RG)",
+			got.Props["DrbdOptions/Net/protocol"])
+	}
+
+	// Regression guard (bug-60 family): replicas untouched. rd-modify
+	// never triggers re-autoplace, so the node set + row count are
+	// preserved verbatim.
+	replicas, err := st.Resources().ListByDefinition(ctx, "pvc-reassign")
+	if err != nil {
+		t.Fatalf("list replicas: %v", err)
+	}
+
+	if len(replicas) != len(seedNodes) {
+		t.Errorf("replica count: got %d, want %d (rd-modify must not re-autoplace)",
+			len(replicas), len(seedNodes))
+	}
+
+	gotNodes := map[string]bool{}
+	for _, r := range replicas {
+		gotNodes[r.NodeName] = true
+	}
+
+	for _, n := range seedNodes {
+		if !gotNodes[n] {
+			t.Errorf("replica missing on %s after rd-modify (existing replicas must stay put)", n)
+		}
+	}
+}
