@@ -529,6 +529,153 @@ func TestRDCreateNoInheritWhenRGHasNoLayerStack(t *testing.T) {
 	}
 }
 
+// TestRDCreateScenario4W09BareRDDefaultsAndInherits closes wave2-04
+// scenario 4.W09: `linstor rd create <name>` with no further flags
+// reserves the RD by name only — storage allocation is deferred to
+// `r c` / `rg spawn`. The bare-create wire shape (just `name` set)
+// must:
+//
+//  1. Persist the RD under its given name (201 Created, GET returns it).
+//  2. Default `ResourceGroupName` to the canonical `DfltRscGrp` literal
+//     when the caller didn't pin one — and lazily create that RG.
+//  3. Leave `LayerStack` empty so the downstream legacy default
+//     (DRBD+STORAGE via dispatcher / needsDRBD) governs the eventual
+//     replicas without the apiserver locking in a stack at RD-create.
+//  4. NOT allocate a DRBD TCP port at this stage — port allocation is
+//     per-replica (internal/controller/resource_controller's
+//     `allocateDRBDFields` picks from `pkg/drbd.LowestFreePort` on the
+//     controller's per-node range) and happens on `r c`, not on
+//     RD-create. Bare RDs carry no `tcp_ports` on the wire.
+//
+// Sibling tests pin the explicit-RG branch (TestResourceDefinitionsCreateRoundTrip),
+// the canonical CamelCase contract (TestEnsureDefaultRGUsesCanonicalCamelCase),
+// and the Bug 54 LayerStack inheritance (TestRDCreateInheritsLayerStackFromRG).
+// This test is the scenario-anchored end-to-end pin so wave2-04 4.W09 has
+// one named assertion that fails together with any regression in the bare
+// create shape — operators reading the scenario can jump straight here.
+func TestRDCreateScenario4W09BareRDDefaultsAndInherits(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Bare create: only Name set. Mirrors `linstor rd create rd-bare`
+	// with no `--resource-group` / `--layer-list` flags.
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{Name: "rd-bare"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "rd-bare")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if rd.Name != "rd-bare" {
+		t.Errorf("Name: got %q, want %q", rd.Name, "rd-bare")
+	}
+
+	if rd.ResourceGroupName != DefaultResourceGroupName {
+		t.Errorf("ResourceGroupName: got %q, want %q (default RG)",
+			rd.ResourceGroupName, DefaultResourceGroupName)
+	}
+
+	if len(rd.LayerStack) != 0 {
+		t.Errorf("LayerStack: got %v, want empty (defer to legacy default)",
+			rd.LayerStack)
+	}
+
+	// Bare RD must NOT carry a per-replica DRBD layer entry — port
+	// allocation is deferred to `r c` / `rg spawn` at the controller
+	// (internal/controller/resource_controller.allocateDRBDFields).
+	for _, layer := range rd.LayerData {
+		if layer.Drbd != nil && len(layer.Drbd.TCPPorts) > 0 {
+			t.Errorf("bare RD carries DRBD TCPPorts %v — port allocation must defer to `r c`",
+				layer.Drbd.TCPPorts)
+		}
+	}
+
+	// Default RG was lazily materialised under the canonical literal.
+	rg, err := st.ResourceGroups().Get(ctx, DefaultResourceGroupName)
+	if err != nil {
+		t.Fatalf("default RG not created on bare RD-create: %v", err)
+	}
+
+	if rg.Name != DefaultResourceGroupName {
+		t.Errorf("default RG Name: got %q, want %q", rg.Name, DefaultResourceGroupName)
+	}
+}
+
+// TestRDCreateScenario4W09ExplicitRGPreserved closes the
+// `--resource-group <rg>` branch of scenario 4.W09: an operator-supplied
+// RG must be persisted verbatim (no rewrite to `DfltRscGrp`) and the
+// lazily-created default RG must NOT appear as a side effect — that
+// would pollute `linstor rg l` against clusters where the operator
+// curates their own RG set.
+func TestRDCreateScenario4W09ExplicitRGPreserved(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "ops-rg",
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{
+			Name:              "rd-explicit-rg",
+			ResourceGroupName: "ops-rg",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "rd-explicit-rg")
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if rd.ResourceGroupName != "ops-rg" {
+		t.Errorf("ResourceGroupName: got %q, want %q (explicit caller value)",
+			rd.ResourceGroupName, "ops-rg")
+	}
+
+	// No side-effect creation of the default RG.
+	rgs, err := st.ResourceGroups().List(ctx)
+	if err != nil {
+		t.Fatalf("list RGs: %v", err)
+	}
+
+	for _, rg := range rgs {
+		if rg.Name == DefaultResourceGroupName {
+			t.Errorf("explicit RG path created %q as a side effect (RG list: %v)",
+				DefaultResourceGroupName, rgNames(rgs))
+		}
+	}
+}
+
 // seedRDs is a small helper for the filter-test family: inserts the
 // named RDs into the in-memory store and returns the wired server.
 func seedRDsForFilterTests(t *testing.T, names ...string) (string, func()) {
