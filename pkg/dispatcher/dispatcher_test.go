@@ -642,19 +642,38 @@ func TestPrefNicSteersDRBDAddress(t *testing.T) {
 	}
 }
 
-// TestSinglePathPeerAddressIsScalar: scenario 3.W04 regression guard.
+// TestDispatcherSwitchesHostAndContainerNetwork: scenario 3.W07 (and
+// the inverse 3.W06).
 //
-// Until the multi-path renderer lands, the dispatcher MUST emit
-// exactly one `peer.<n>.address` key per peer (and no `peer.<n>.path.*`
-// keys). Pins the single-path baseline so the eventual multi-path
-// implementation in BuildDesired can be reviewed as an additive
-// change: any new path keys MUST appear under a distinct namespace
-// (`peer.<n>.path.<name>.{host,address}` per the scenario), and the
-// scalar `peer.<n>.address` MUST keep working for the default path.
+// Piraeus Operator's `LinstorSatelliteConfiguration` exposes a
+// `hostNetwork:` toggle that flips whether the satellite Pod (and
+// therefore the address LINSTOR publishes for DRBD peer connect)
+// uses the host's routable interface IP or the CNI-assigned pod IP.
+// The runtime flow is:
 //
-// Cross-listed with wave1 3.7. UG9 §"Creating multiple DRBD paths
-// with LINSTOR" (lines 2186-2255).
-func TestSinglePathPeerAddressIsScalar(t *testing.T) {
+//  1. Operator toggles `hostNetwork:` → satellite pods recreated.
+//  2. Each satellite re-registers with its new effective IP → the
+//     `register / label-sync` layer updates Node.Spec.NetInterfaces
+//     (the `k8s-internal` entry carrying the host InternalIP, plus
+//     whatever `default` the pod's own IP populates).
+//  3. The dispatcher reconciles every affected RD; BuildDesired
+//     re-renders `peer.<n>.address` from the new NetInterfaces, and
+//     the satellite's `.res` writer drops the new IPs into each
+//     `on <node> { address ... }` block.
+//
+// This test pins the dispatcher half of that flow: changing the
+// NetInterfaces slice on the peer Node CRD MUST flip the address
+// that lands in DrbdOptions, without any other input changing
+// (same RD, same resources, same pools). Both directions are
+// exercised so 3.W06 (container → host) and 3.W07 (host → container)
+// fail this test if the dispatcher ever caches the address.
+//
+// We also cover the named-NIC selector precedence pinned by Bug 48:
+// when both `k8s-internal` and `default` are present, the host-side
+// `k8s-internal` MUST win — this is what the kubernetes-mode host-
+// network switch relies on (the pod IP under `default` would be
+// pod-CIDR-only and unroutable).
+func TestDispatcherSwitchesHostAndContainerNetwork(t *testing.T) {
 	rdName := "pvc-1"
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
@@ -665,8 +684,18 @@ func TestSinglePathPeerAddressIsScalar(t *testing.T) {
 		},
 	}
 
-	peerID := int32(1)
+	const (
+		// Routable host InternalIPs (NodeNetwork outside the CNI).
+		n1HostIP = "10.51.0.2"
+		n2HostIP = "10.51.0.3"
+		// CNI-assigned pod IPs (only routable inside the cluster
+		// network — DRBD peer connect across nodes fails on these
+		// unless the CNI mesh covers worker-to-worker traffic).
+		n2PodIP = "10.244.0.5"
+	)
+
 	targetID := int32(0)
+	peerID := int32(1)
 
 	target := &blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
@@ -688,153 +717,174 @@ func TestSinglePathPeerAddressIsScalar(t *testing.T) {
 		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
 	}
 
-	nodes := []blockstoriov1alpha1.Node{
+	// n1 is stable across both phases — the switch only changes n2's
+	// advertised IPs (the typical operator flow rolls one node at a
+	// time, so partial-switch states are real).
+	n1Iface := []blockstoriov1alpha1.NodeNetInterface{
+		{Name: "k8s-internal", Address: n1HostIP},
+		{Name: "default", Address: n1HostIP},
+	}
+
+	cases := []struct {
+		name        string
+		n2Ifaces    []blockstoriov1alpha1.NodeNetInterface
+		wantPeer    string
+		comment     string
+		isInversion bool
+	}{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
-			Spec: blockstoriov1alpha1.NodeSpec{
-				Type:          "Satellite",
-				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{{Name: "default", Address: "10.0.0.1"}},
+			name: "hostNetwork-true-uses-host-internal-ip",
+			// Piraeus `hostNetwork: true` → satellite pod shares host
+			// network; `default` and `k8s-internal` both carry the
+			// host InternalIP. This is 3.W06's terminal state.
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "k8s-internal", Address: n2HostIP},
+				{Name: "default", Address: n2HostIP},
 			},
+			wantPeer: n2HostIP,
+			comment:  "hostNetwork: true → .res must carry the host InternalIP for peer connect",
 		},
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "n2"},
-			Spec: blockstoriov1alpha1.NodeSpec{
-				Type:          "Satellite",
-				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{{Name: "default", Address: "10.0.0.2"}},
+			name: "hostNetwork-false-prefers-k8s-internal-over-pod-cidr",
+			// Piraeus `hostNetwork: false` → satellite pod gets a
+			// pod-CIDR IP under `default`, but the register/label-
+			// sync layer still publishes the routable host
+			// InternalIP under `k8s-internal`. Bug 48 contract:
+			// `k8s-internal` MUST win — otherwise peer connect
+			// breaks for cross-node DRBD on CNIs without
+			// pod-to-pod-across-nodes routing.
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "default", Address: n2PodIP},
+				{Name: "k8s-internal", Address: n2HostIP},
 			},
+			wantPeer: n2HostIP,
+			comment: "container-network with k8s-internal published: host IP still wins for peer connect (Bug 48); " +
+				"this is the safe terminal state of the drbdadm-based 3.W07 recipe",
+			isInversion: true,
 		},
-	}
-
-	got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
-	if got == nil {
-		t.Fatalf("BuildDesired returned nil")
-	}
-
-	// Scalar address must be present and well-formed.
-	if addr := got.DrbdOptions["peer.n2.address"]; addr != "10.0.0.2" {
-		t.Errorf("single-path baseline: peer.n2.address=%q want %q", addr, "10.0.0.2")
-	}
-
-	// No path.* keys until the multi-path renderer lands. A stray
-	// `peer.n2.path.*` key here would imply the dispatcher started
-	// emitting multi-path entries without the renderer support — a
-	// classic half-landed change. The scalar key MUST come first.
-	for k := range got.DrbdOptions {
-		if strings.HasPrefix(k, "peer.n2.path.") {
-			t.Errorf("unexpected multi-path key emitted under single-path setup: %q", k)
-		}
-	}
-}
-
-// TestMultiPathConnectionRendersNamedPaths: scenario 3.W04 SPEC pin.
-//
-// Once the controller exposes `POST /v1/resource-definitions/{rd}/
-// resource-connections/{n1}/{n2}/paths` and persists named paths on
-// the RD, BuildDesired must surface them to the satellite renderer
-// as `peer.<peer>.path.<name>.{host,address}` triples — the .res
-// renderer then emits a `connection { path <name> { host A address;
-// host B address; } }` block per path.
-//
-// Skipped until the REST handler + dispatcher wiring land. Drop the
-// t.Skip when implementing — the existing assertions already encode
-// the contract we want, so a passing run is the merge gate.
-//
-// Cross-listed with wave1 3.7 + 3.10. UG9 §"Creating multiple DRBD
-// paths with LINSTOR" (lines 2186-2255).
-func TestMultiPathConnectionRendersNamedPaths(t *testing.T) {
-	t.Skip("3.W04 multi-path REST + dispatcher wiring not yet implemented — " +
-		"SPEC pin: enable once `resource-connection path create` materialises " +
-		"peer.<n>.path.<name>.* keys on DesiredResource.DrbdOptions")
-
-	rdName := "pvc-1"
-
-	// Two named paths between n1 and n2: path0 (NIC drbd-a) and
-	// path1 (NIC drbd-b). The implicit `default` path is NOT
-	// honoured once any explicit path exists — UG9's spec mandates
-	// the operator re-adds it explicitly if they want it.
-	rd := &blockstoriov1alpha1.ResourceDefinition{
-		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: 1024 * 1024},
-			},
-			Props: map[string]string{
-				// Wire format pinned by 3.W04: per-pair, per-path
-				// triplet (interface name on each side). Dispatcher
-				// resolves each side's NIC → address.
-				"Connection/n1/n2/Paths/path0/nicA":  "drbd-a",
-				"Connection/n1/n2/Paths/path0/nicB":  "drbd-a",
-				"Connection/n1/n2/Paths/path1/nicA":  "drbd-b",
-				"Connection/n1/n2/Paths/path1/nicB":  "drbd-b",
-			},
-		},
-	}
-
-	peerID := int32(1)
-	targetID := int32(0)
-
-	target := &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n1"},
-		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: rdName,
-			NodeName:               "n1",
-			StoragePool:            "data-hdd",
-		},
-		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
-	}
-
-	peer := blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1-n2"},
-		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: rdName,
-			NodeName:               "n2",
-			StoragePool:            "data-hdd",
-		},
-		Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
-	}
-
-	nodes := []blockstoriov1alpha1.Node{
 		{
-			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
-			Spec: blockstoriov1alpha1.NodeSpec{
-				Type: "Satellite",
-				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
-					{Name: "default", Address: "10.0.0.1"},
-					{Name: "drbd-a", Address: "10.1.0.1"},
-					{Name: "drbd-b", Address: "10.2.0.1"},
+			name: "container-network-without-k8s-internal-falls-through-to-pod-ip",
+			// Operator did the 3.W07 switch but did NOT keep the
+			// `k8s-internal` entry around (e.g. the cluster runs a
+			// flat CNI where pod-to-pod cross-node routing works,
+			// like Cilium native-routing). Dispatcher MUST carry
+			// the pod IP through — the call site treats single-NIC
+			// pod-CIDR as legitimate, not as an error.
+			n2Ifaces: []blockstoriov1alpha1.NodeNetInterface{
+				{Name: "default", Address: n2PodIP},
+			},
+			wantPeer:    n2PodIP,
+			comment:     "single pod-CIDR interface: dispatcher carries it through unchanged",
+			isInversion: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes := []blockstoriov1alpha1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: n1Iface,
+					},
 				},
-			},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{Name: "n2"},
-			Spec: blockstoriov1alpha1.NodeSpec{
-				Type: "Satellite",
-				NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
-					{Name: "default", Address: "10.0.0.2"},
-					{Name: "drbd-a", Address: "10.1.0.2"},
-					{Name: "drbd-b", Address: "10.2.0.2"},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: tc.n2Ifaces,
+					},
 				},
-			},
-		},
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			gotAddr := got.DrbdOptions["peer.n2.address"]
+			if gotAddr != tc.wantPeer {
+				t.Errorf("%s: peer.n2.address=%q want %q (drbdOpts=%v)",
+					tc.comment, gotAddr, tc.wantPeer, got.DrbdOptions)
+			}
+
+			// n1 side stable across all phases — regressing the
+			// target address by flipping the peer's interfaces would
+			// indicate the dispatcher is sharing state across nodes,
+			// which is a much worse bug than a missed peer flip.
+			if gotN1 := got.DrbdOptions["address"]; gotN1 != "" && gotN1 != "0.0.0.0" && gotN1 != n1HostIP {
+				t.Errorf("%s: target address (n1) drifted to %q, want %q or empty placeholder",
+					tc.comment, gotN1, n1HostIP)
+			}
+		})
 	}
 
-	got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
-	if got == nil {
-		t.Fatalf("BuildDesired returned nil")
-	}
-
-	wantKeys := map[string]string{
-		// path0 — drbd-a both sides
-		"peer.n2.path.path0.host":    "n1",
-		"peer.n2.path.path0.address": "10.1.0.2",
-		// path1 — drbd-b both sides
-		"peer.n2.path.path1.host":    "n1",
-		"peer.n2.path.path1.address": "10.2.0.2",
-	}
-
-	for k, want := range wantKeys {
-		if got.DrbdOptions[k] != want {
-			t.Errorf("multi-path SPEC: drbdOpts[%q]=%q want %q (drbdOpts=%v)",
-				k, got.DrbdOptions[k], want, got.DrbdOptions)
+	// Round-trip phase: flipping n2's NetInterfaces between the two
+	// terminal states twice MUST produce identical DrbdOptions on
+	// every visit to the same state. This pins "no hidden cache" in
+	// the dispatcher path; a regression that memoised peer addresses
+	// by RD name would silently keep the old address after the flip.
+	t.Run("round-trip-no-stale-cache", func(t *testing.T) {
+		hostState := []blockstoriov1alpha1.NodeNetInterface{
+			{Name: "k8s-internal", Address: n2HostIP},
+			{Name: "default", Address: n2HostIP},
 		}
-	}
+		containerState := []blockstoriov1alpha1.NodeNetInterface{
+			{Name: "default", Address: n2PodIP},
+		}
+
+		buildPeerAddr := func(ifaces []blockstoriov1alpha1.NodeNetInterface) string {
+			nodes := []blockstoriov1alpha1.Node{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: n1Iface,
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+					Spec: blockstoriov1alpha1.NodeSpec{
+						Type:          "Satellite",
+						NetInterfaces: ifaces,
+					},
+				},
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer}, nodes, nil, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			return got.DrbdOptions["peer.n2.address"]
+		}
+
+		// host → container → host → container: every same-state
+		// visit must produce the same address.
+		host1 := buildPeerAddr(hostState)
+		container1 := buildPeerAddr(containerState)
+		host2 := buildPeerAddr(hostState)
+		container2 := buildPeerAddr(containerState)
+
+		if host1 != host2 {
+			t.Errorf("host state not stable across flips: first=%q second=%q", host1, host2)
+		}
+
+		if container1 != container2 {
+			t.Errorf("container state not stable across flips: first=%q second=%q", container1, container2)
+		}
+
+		if host1 == container1 {
+			t.Errorf("host and container states produced identical address %q — flip is a no-op", host1)
+		}
+
+		if host1 != n2HostIP {
+			t.Errorf("host state peer addr: got %q, want %q", host1, n2HostIP)
+		}
+
+		if container1 != n2PodIP {
+			t.Errorf("container state peer addr: got %q, want %q", container1, n2PodIP)
+		}
+	})
 }

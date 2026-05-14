@@ -23,10 +23,12 @@ Cross-listed with wave1 3.1. POST `/v1/nodes/{node}/net-interfaces` creates by I
 
 ### 3.W02 `node interface modify ... --active` switches StltCon — P
 
-- **Priority:** P2  **Target:** e2e  **Complexity:** M
+- **Priority:** P2  **Target:** unit  **Complexity:** M
 - **Source:** UG9 §"Managing network interface cards" (lines 2161-2185) via tests/scenarios/day2-node-interface-modify-active.md
 
 Cross-listed with wave1 3.10. Phase 10.6 retired controller-satellite wire — `Active` field is presentation-only. Document the deferred state; assert `IsActive` synthesised as `i == 0`.
+
+**Unit:** `pkg/rest/net_interface_test.go::TestNetInterfaceModifyActiveIsPresentationOnly` — PUT with `is_active=true` on the second interface MUST NOT promote it; the only switch path is reorder (DELETE + recreate). `TestNetInterfaceModifyActiveBodyRoundTrips` pins that the wire decoder still accepts the field so upstream golinstor's `linstor n interface modify` doesn't 400.
 
 ### 3.W03 `node set-property PrefNic <nic>` steers DRBD replication — S
 
@@ -68,11 +70,12 @@ Piraeus Operator path — satellite pods restart with hostNetwork, LINSTOR recon
 
 ### 3.W07 Switch DRBD replication back to container network — P
 
-- **Priority:** P2  **Target:** e2e  **Complexity:** M
+- **Priority:** P2  **Target:** unit + e2e  **Complexity:** M
 - **Source:** linstor-kubernetes.adoc §"Configuring DRBD replication to use the container network" (lines 2891-2946) via tests/scenarios/day2-k8s-drbd-container-network-switch.md
 
 Inverse of 3.W06. Two recipes: drbdadm-based (suspend-io → disconnect → del-path → delete CR) keeps Pods running; reboot-based requires planned downtime. Test pins both paths.
 
+**Unit:** `pkg/dispatcher/dispatcher_test.go::TestDispatcherSwitchesHostAndContainerNetwork` — flipping Node.Spec.NetInterfaces between host-network state (`k8s-internal` + `default` carrying host InternalIP) and container-network state (`default` carrying pod IP) re-renders `peer.<n>.address` in DrbdOptions without cache poisoning. Round-trip subtest pins state stability across repeated flips.
 **E2E:** start from 3.W06 stand; run drbdadm-based recipe; `.res` flips to pod IPs; `drbdadm status Connected` after each node finishes.
 
 ---

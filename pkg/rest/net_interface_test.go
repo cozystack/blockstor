@@ -445,3 +445,211 @@ func TestNetInterfaceDeleteMissingIsIdempotent(t *testing.T) {
 		t.Errorf("existing interface lost: %v", got.NetInterfaces)
 	}
 }
+
+// TestNetInterfaceModifyActiveIsPresentationOnly: scenario 3.W02
+// (cross-listed wave1 3.10).
+//
+// Upstream LINSTOR's `linstor n interface modify <node> <nic> --active`
+// flips `StltConn/0/Active=true` on the named NIC, and the satellite
+// then re-dials the controller via that interface. Phase 10.6 of
+// blockstor retired the satellite→controller wire (satellites talk
+// only to kube-apiserver via `ctrl.GetConfig()`), so the wire-level
+// `is_active` flag is presentation-only: synthesised by
+// `DefaultNetInterfaceFields` as `i == 0`, irrespective of whatever
+// the caller PUT in the request body.
+//
+// This test pins the deferred contract so a future regression that
+// silently starts honouring `is_active=true` in the body (without
+// also wiring the satellite re-dial path) trips here loudly:
+//
+//  1. PATCH (PUT with `is_active=true`) on the *second* interface
+//     does NOT make it active on read — position [0] still wins.
+//  2. The only way to switch which NIC the `linstor n interface list`
+//     CLI renders as `Active` is to reorder the slice (DELETE the
+//     old [0], PUT the new entry, then PUT the previous [0] back so
+//     it falls to [1]). After that reorder, the formerly-second
+//     interface synthesises `IsActive=true`.
+//  3. The presentation-only contract holds across both `inmemory`
+//     and (by virtue of `DefaultNetInterfaceFields`) the K8s store.
+//
+// If anyone later implements scenario 3.10 Outcome A (resurrect a
+// custom satellite→controller wire that re-dials on `is_active`
+// changes), this test must be deleted alongside `redial_spec_test.go`
+// and replaced with a positive re-dial assertion. Until then the
+// REST surface MUST behave as documented.
+func TestNetInterfaceModifyActiveIsPresentationOnly(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.1"},
+			{Name: "satconn_1G", Address: "192.168.43.10"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Step 1: GET shows synthesized IsActive = (i == 0). The first
+	// interface (default) is active; the second (satconn_1G) is not.
+	preResp := httpGet(t, base+"/v1/nodes/n1/net-interfaces")
+
+	var pre []apiv1.NetInterface
+
+	if err := json.NewDecoder(preResp.Body).Decode(&pre); err != nil {
+		_ = preResp.Body.Close()
+		t.Fatalf("decode pre: %v", err)
+	}
+
+	_ = preResp.Body.Close()
+
+	if len(pre) != 2 {
+		t.Fatalf("pre len: got %d, want 2", len(pre))
+	}
+
+	if pre[0].Name != "default" || !pre[0].IsActive {
+		t.Errorf("pre[0]: want default+IsActive, got %+v", pre[0])
+	}
+
+	if pre[1].Name != "satconn_1G" || pre[1].IsActive {
+		t.Errorf("pre[1]: want satconn_1G+!IsActive, got %+v", pre[1])
+	}
+
+	// Step 2: PATCH the second interface with is_active=true via PUT.
+	// The wire decoder accepts the field (round-trip-safe — clients
+	// MUST be able to send the upstream payload without 400), but the
+	// synthesised value on read MUST still reflect position, not body.
+	body, _ := json.Marshal(apiv1.NetInterface{
+		Name: "satconn_1G", Address: "192.168.43.10", IsActive: true,
+	})
+
+	resp := httpPut(t, base+"/v1/nodes/n1/net-interfaces/satconn_1G", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT status: got %d, want 200", resp.StatusCode)
+	}
+
+	postResp := httpGet(t, base+"/v1/nodes/n1/net-interfaces")
+
+	var post []apiv1.NetInterface
+
+	if err := json.NewDecoder(postResp.Body).Decode(&post); err != nil {
+		_ = postResp.Body.Close()
+		t.Fatalf("decode post: %v", err)
+	}
+
+	_ = postResp.Body.Close()
+
+	if len(post) != 2 {
+		t.Fatalf("post len: got %d, want 2", len(post))
+	}
+
+	// Order preserved: default still at [0], satconn_1G still at [1].
+	// IsActive synthesised as (i == 0), unchanged from pre.
+	if post[0].Name != "default" || !post[0].IsActive {
+		t.Errorf("post[0]: PATCH leaked into ordering — want default+IsActive, got %+v; "+
+			"if this fires, scenario 3.10 Outcome A is being implemented — "+
+			"replace this test with a positive re-dial assertion", post[0])
+	}
+
+	if post[1].Name != "satconn_1G" || post[1].IsActive {
+		t.Errorf("post[1]: is_active=true in body was honoured on read — want satconn_1G+!IsActive, got %+v; "+
+			"if this fires, the synthesiser stopped enforcing i==0 — see scenario 3.W02 deferred contract", post[1])
+	}
+
+	// Step 3: the documented switch path — DELETE old [0], re-PUT it
+	// so it lands at the end. After that reorder, satconn_1G is at
+	// position [0] and synthesises IsActive=true.
+	delResp := httpDelete(t, base+"/v1/nodes/n1/net-interfaces/default")
+	_ = delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE default: got %d, want 200", delResp.StatusCode)
+	}
+
+	rebody, _ := json.Marshal(apiv1.NetInterface{Name: "default", Address: "10.0.0.1"})
+
+	recreate := httpPost(t, base+"/v1/nodes/n1/net-interfaces", rebody)
+	_ = recreate.Body.Close()
+
+	if recreate.StatusCode != http.StatusCreated {
+		t.Fatalf("POST default: got %d, want 201", recreate.StatusCode)
+	}
+
+	switchedResp := httpGet(t, base+"/v1/nodes/n1/net-interfaces")
+
+	var switched []apiv1.NetInterface
+
+	if err := json.NewDecoder(switchedResp.Body).Decode(&switched); err != nil {
+		_ = switchedResp.Body.Close()
+		t.Fatalf("decode switched: %v", err)
+	}
+
+	_ = switchedResp.Body.Close()
+
+	if len(switched) != 2 {
+		t.Fatalf("switched len: got %d, want 2; ifaces=%v", len(switched), switched)
+	}
+
+	// satconn_1G migrated to position [0] → now synthesises IsActive.
+	if switched[0].Name != "satconn_1G" || !switched[0].IsActive {
+		t.Errorf("switched[0]: reorder did not promote satconn_1G — got %+v", switched[0])
+	}
+
+	if switched[1].Name != "default" || switched[1].IsActive {
+		t.Errorf("switched[1]: re-added default did not demote — got %+v", switched[1])
+	}
+}
+
+// TestNetInterfaceModifyActiveBodyRoundTrips: scenario 3.W02
+// belt-and-braces. The PUT body MUST decode `is_active` cleanly even
+// though the value is presentation-only on read — upstream golinstor
+// always sends the field, and rejecting it with 400 would break every
+// `linstor n interface modify` call from the official CLI.
+//
+// We pin the wire contract (POST accepts `is_active`; PUT accepts
+// `is_active`; both round-trip to 200/201) so a future stricter
+// decoder doesn't accidentally start 400-ing on the field name alone.
+func TestNetInterfaceModifyActiveBodyRoundTrips(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// POST with is_active=true: upstream's create-flow on a node with
+	// a single NIC sends the field set; we must accept it.
+	postBody, _ := json.Marshal(apiv1.NetInterface{
+		Name: "default", Address: "10.0.0.1", IsActive: true,
+	})
+
+	postResp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", postBody)
+	_ = postResp.Body.Close()
+
+	if postResp.StatusCode != http.StatusCreated {
+		t.Errorf("POST is_active=true: got %d, want 201", postResp.StatusCode)
+	}
+
+	// PUT with is_active=true: the modify-active path.
+	putBody, _ := json.Marshal(apiv1.NetInterface{Address: "10.0.0.2", IsActive: true})
+
+	putResp := httpPut(t, base+"/v1/nodes/n1/net-interfaces/default", putBody)
+	_ = putResp.Body.Close()
+
+	if putResp.StatusCode != http.StatusOK {
+		t.Errorf("PUT is_active=true: got %d, want 200", putResp.StatusCode)
+	}
+}
