@@ -49,8 +49,9 @@ resource-group modify cascade, schedules, K8s integration).
 | 7  | [wave2-07-quorum-observability.md](wave2-07-quorum-observability.md) | `auto-quorum=disabled` manual mode, `AutoEvict*` tuning, `auto-diskful`, error-reports + sos-report, log-level + logback, K8s Prometheus stack, three over-subscription ratios |
 | 8  | [wave2-08-snapshots.md](wave2-08-snapshots.md)               | Local snapshot CRUD: create / delete / restore-into-new-RD / rollback-in-place / `AutoSnapshot/{RunEvery,Keep}` |
 | 9  | [wave2-09-resource-group.md](wave2-09-resource-group.md)     | RG full surface: create / delete-with-rds / modify-place-count / spawn (happy + impossible), all placement constraint flavours, unset-placement-property, RG DRBD options, RG FS-on-spawn |
-| 10 | [wave2-10-schedule.md](wave2-10-schedule.md)                 | Scheduled local-only snapshots: create / modify / enable / disable / delete + scope-specific delete (shipping is out-of-scope) |
 | 11 | [wave2-11-kubernetes.md](wave2-11-kubernetes.md)             | K8s-specific: HA controller, RWX PVC (NFS), Affinity Controller, K8s evacuate-via-label, set DRBD options from K8s, K8s VolumeSnapshot CRUD |
+
+(Group 10 — scheduled snapshots — moved to `out-of-scope.md`.)
 
 ## Out-of-scope
 

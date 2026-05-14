@@ -138,14 +138,12 @@ Cross-listed with wave1 5.8 / 5.15. Surviving primary records changes in dirty b
 
 ## Observability smoke
 
-### 5.W16 Prometheus alertmanager smoke: drbd-disconnect → alert fires — P
+### 5.W16 Prometheus alertmanager smoke: drbd-disconnect → alert fires — O
 
-- **Priority:** P2  **Target:** e2e  **Complexity:** L
+- **Priority:** —  **Target:** —  **Complexity:** —
 - **Source:** linstor-kubernetes.adoc §"Verifying the Prometheus Alertmanager web console deployment" (lines 3177-3239) via tests/scenarios/day2-drbd-disconnect-alertmanager-test.md
 
-Force-disconnect a Secondary replica → `drbdResourceSuspended` or `DrbdConnectionNotConnected` alert fires within ~1min → reconnect → alert resolves. Cross-listed with wave2-07's K8s monitoring stack.
-
-**WARNING:** use a Secondary replica; disconnecting a Primary risks I/O hang/split-brain in production.
+**Out of scope.** Alertmanager rules + ServiceMonitor / PrometheusRule live in cozystack's platform monitoring stack, not blockstor. blockstor's role stops at `/metrics` + the drbd-reactor sidecar (wave2-07 §7.W08). See `out-of-scope.md` → "Prometheus Alertmanager smoke".
 
 ---
 

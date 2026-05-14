@@ -83,6 +83,42 @@ why, here's the workaround," not "we'll add it in a sprint."
 - **Why deferred:** Cozystack runs blockstor inside the cluster — replacing the bare-metal controller is the reason blockstor exists. Pin the operator wiring (CR accepts the field) but blockstor's apiserver is independent of this knob.
 - **Sources:** day2-k8s-external-controller.md
 
+## Node type CRUD (`node modify --node-type combined|controller|auxiliary`)
+
+- **What:** Switching a node's LINSTOR role between `satellite` / `controller` / `combined` / `auxiliary` via `linstor node modify --node-type`.
+- **Why deferred:** blockstor runs satellite-only nodes in K8s; the controller is a separate Deployment, not co-located on a satellite. No combined / auxiliary / controller-on-host modes are supported by design. The `NodeType` field stays informational on the wire (Bug 59 keeps it round-tripping), but PUT that flips the type returns 501.
+- **Sources:** wave2-04 §4.W03 via tests/scenarios/day2-node-modify-type.md
+
+## Controller HA failover orchestration
+
+- **What:** Active/standby LINSTOR controller pair with explicit `linstor` CLI driving failover, plus Java `linstor.toml` `[controller-ha]` block.
+- **Why deferred:** K8s Deployment + Lease-based leader election already gives the controller HA for blockstor's apiserver (cozystack runs N≥3 replicas behind a Service). The Java-side pacemaker / DRBD-replicated DB orchestration is irrelevant.
+- **Sources:** wave2-04 §4.W27 via tests/scenarios/day2-controller-ha-failover.md
+
+## SOS / diagnostic bundle (`linstor sos-report create | download`)
+
+- **What:** `linstor sos-report create` collects controller + satellite logs + DRBD state + config files into a tarball for LINBIT support.
+- **Why deferred:** blockstor runs in K8s — `kubectl logs` / `kubectl cp` / cluster-wide log aggregation (Loki, Promtail) covers the same need without a LINSTOR-specific bundle format. Operators raise support cases via the cozystack channel.
+- **Sources:** wave2-07 §7.W05 via tests/scenarios/day2-sos-report.md
+
+## Logback rotation config (`logback.xml`)
+
+- **What:** Java `logback.xml` for controller / satellite log rotation, retention policy, log-level per logger.
+- **Why deferred:** blockstor is Go, not Java — no logback. Log rotation is handled at the K8s level (kubelet log rotation, fluent-bit). Log level changes go through controller's `--log-level` flag / env var, pinned in wave1 1.x.
+- **Sources:** wave2-07 §7.W07 via tests/scenarios/day2-controller-logback-config.md
+
+## Scheduled snapshots (local) — deferred wave
+
+- **What:** `linstor schedule create / modify / enable / disable / delete` + `linstor backup schedule` for local-only periodic snapshots (no remote shipping).
+- **Why deferred:** Snapshots themselves stay in scope (wave2-08 + wave1 F1) — only the *cron orchestration* layer is parked. Operators run external schedulers (K8s CronJob, Velero schedules) against `POST /v1/resource-definitions/{rd}/snapshots` while this lands. When demand surfaces, the 5 scenarios below can be reactivated; they're not architecturally blocked.
+- **Sources:** wave2-10 §10.W01 (create) / §10.W02 (delete) / §10.W03 (scope-specific delete) / §10.W04 (enable + disable) / §10.W05 (modify) via the corresponding tests/scenarios/day2-schedule-*.md / day2-backup-schedule-*.md.
+
+## Prometheus Alertmanager smoke (DRBD-disconnect alert firing)
+
+- **What:** End-to-end pipeline test: force-disconnect a DRBD Secondary → `drbdResourceSuspended` / `DrbdConnectionNotConnected` alert fires within ~1min via Alertmanager.
+- **Why deferred:** Alertmanager rules, ServiceMonitor / PodMonitor wiring, PrometheusRule definitions are cozystack platform concerns. blockstor's role stops at exposing `/metrics` (already done) and shipping the drbd-reactor sidecar that emits per-resource DRBD metrics (wave2-07 §7.W08). End-to-end alert-pipeline validation belongs in cozystack's smoke suite.
+- **Sources:** wave2-05 §5.W16 via tests/scenarios/day2-drbd-disconnect-alertmanager-test.md
+
 ## Shared LVM2 storage pools (SAN-style multi-attach)
 
 - **What:** `linstor sp create lvm --shared-space <uuid> --external-locking` for shared VGs across multiple nodes via sanlock / lvmlockd.

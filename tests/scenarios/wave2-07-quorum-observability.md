@@ -46,14 +46,12 @@ Cross-listed with wave1 4.25, 4.26. Hierarchy: RD > RG > controller. Auto-diskfu
 
 Cross-listed with wave1 5.38 / 7.17. GET `/v1/error-reports?node=...&since=...&limit=...` filters; `show <id>` returns full stack-trace + context. Prometheus `/metrics` exposes a count.
 
-### 7.W05 `sos-report create | download` bundles diagnostics — P
+### 7.W05 `sos-report create | download` bundles diagnostics — O
 
-- **Priority:** P2  **Target:** unit + e2e  **Complexity:** H
+- **Priority:** —  **Target:** —  **Complexity:** —
 - **Source:** UG9 §"Generating SOS reports" (lines 4653-4677) via tests/scenarios/day2-sos-report.md
 
-`pkg/rest/sos_report.go` doesn't exist today — `grep sos-report` zero hits. Spec lifted from UG9: `.tar.gz` archive with logs / dmesg / tool versions / `ip a` / DB dump / per-node debug info. Treat bundle as sensitive (contains node IPs, pool names, possibly Aux props).
-
-Per spec: include + mark P2/H since it's a "useful for later" Day2 surface that the copilot needs eventually.
+**Out of scope.** K8s log aggregation (`kubectl logs`, Loki/Promtail, cozystack support flows) covers the LINSTOR sos-report use case. See `out-of-scope.md` → "SOS / diagnostic bundle".
 
 ### 7.W06 `controller set-log-level DEBUG` (runtime) — S
 
@@ -62,12 +60,12 @@ Per spec: include + mark P2/H since it's a "useful for later" Day2 surface that 
 
 PATCH controller props → effective log level without restart. Supported: TRACE / DEBUG / INFO / WARN / ERROR. For blockstor (K8s deployment): `kubectl logs deploy/blockstor-apiserver` reflects the new level immediately.
 
-### 7.W07 `logback.xml` persistent rotation config — P
+### 7.W07 `logback.xml` persistent rotation config — O
 
-- **Priority:** P2  **Target:** e2e  **Complexity:** L
+- **Priority:** —  **Target:** —  **Complexity:** —
 - **Source:** UG9 §"Logging" (lines 3926+) via tests/scenarios/day2-controller-set-log-rotation-via-config.md
 
-Bundled `logback.xml` controls file rotation, per-logger levels. blockstor is Go (klog/slog), not Java/logback — this scenario maps to operator overriding `--v` / `--log-level` flags via ConfigMap. Test pins: a ConfigMap-mounted `--v=4` change rolls into restart with new verbosity.
+**Out of scope.** blockstor is Go, not Java — no logback. K8s handles log rotation at kubelet / fluent-bit level. Log level changes go through `--log-level` already pinned in wave1 1.x. See `out-of-scope.md` → "Logback rotation config".
 
 ### 7.W08 K8s Prometheus + Alertmanager + Grafana stack — P
 

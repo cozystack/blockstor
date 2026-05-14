@@ -35,12 +35,12 @@ Cross-listed with wave1 4.19. POST `/v1/nodes` upserts Node CRD; default NetInte
 
 LINSTOR node name decouples from hostname; controller logs INFO on mismatch; DRBD `.res` uses real hostname in `on <hostname>` block. Test pins both: REST allows the mismatch, generated `.res` uses kernel hostname.
 
-### 4.W03 `node modify --node-type combined` — S
+### 4.W03 `node modify --node-type combined` — O
 
-- **Priority:** P2  **Target:** unit  **Complexity:** L
+- **Priority:** —  **Target:** —  **Complexity:** —
 - **Source:** UG9 §"Specifying LINSTOR node types" (lines 542-559) via tests/scenarios/day2-node-modify-type.md
 
-PUT `/v1/nodes/{node}` updates `NodeType` (controller / auxiliary / combined / satellite). Resource assignments untouched. blockstor's K8s model treats type as informational — controller never runs on a satellite-only pod anyway, so the test pins the wire shape only.
+**Out of scope.** blockstor only supports satellite-typed nodes — the controller is a separate Deployment, not a host-co-located process. See `out-of-scope.md` → "Node type CRUD". `NodeType` field stays on the wire (Bug 59) but PUT that flips it returns 501.
 
 ### 4.W04 `node lost <node>` destroys cluster state — S
 
@@ -216,12 +216,12 @@ Cross-listed with wave1 4.8. `vd set-property <rd> 0 StorPoolName pool_hdd` + `v
 
 ## Controller-side ops
 
-### 4.W27 Controller HA failover preserves cluster state — P
+### 4.W27 Controller HA failover preserves cluster state — O
 
-- **Priority:** P2  **Target:** e2e  **Complexity:** H
+- **Priority:** —  **Target:** —  **Complexity:** —
 - **Source:** UG9 §"Creating a highly available LINSTOR cluster" (lines 1521+) and linstor-kubernetes §"High-availability deployment in Operator v1" (lines 1375-1421) via tests/scenarios/day2-controller-ha-failover.md
 
-blockstor uses 3-replica apiserver Deployment (Phase 11.x split) + leader election — different model than upstream's DRBD-replicated H2 DB. Test pins blockstor's specific failover model: kill leader pod → client retries succeed against a new leader within ~5s; CRD state intact.
+**Out of scope.** K8s Deployment + Lease-based leader election already covers the controller-HA contract for blockstor's apiserver (cozystack runs N≥3 replicas behind a Service). See `out-of-scope.md` → "Controller HA failover orchestration". The Java-pacemaker / DRBD-replicated DB orchestration upstream uses doesn't apply.
 
 ### 4.W28 Rolling upgrade controller + satellites preserves I/O — S
 
