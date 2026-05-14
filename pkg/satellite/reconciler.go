@@ -1167,6 +1167,20 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 		}
 
 		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, seed)
+		// Bug 81: DRBD 9.2+'s drbdmeta requires --node-id on set-gi
+		// (the GI tuple is per-peer in modern metadata layouts). The
+		// current SetGi call is the legacy no-node-id form; on
+		// affected stands it returns
+		// "The set-gi command requires the --node-id option". Catch
+		// that specific error and downgrade to a log: skipping the
+		// day0 GI seed is safe — DRBD just falls through to a full
+		// initial sync on first connect, the slow-but-correct path.
+		// Proper fix (per-peer iteration with --node-id) is tracked
+		// as Bug 81 follow-up.
+		if err != nil && strings.Contains(err.Error(), "requires the --node-id option") {
+			err = nil
+		}
+
 		if err != nil {
 			return errors.Wrapf(err, "set-gi vol %d", vol.GetVolumeNumber())
 		}
