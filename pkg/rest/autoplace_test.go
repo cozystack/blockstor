@@ -1920,3 +1920,93 @@ func TestAutoplaceCapacityShortfallSurfacesNumericDetails(t *testing.T) {
 		t.Errorf("details missing max-free '1 KiB', got:\n%s", details)
 	}
 }
+
+// TestResourceCreateDrbdDisklessPermanentClient pins scenario 4.W18
+// (P0 unit): `linstor r c <node> <rd> --drbd-diskless` posts a fresh
+// `POST .../resources` with `Flags:[DISKLESS]` against a node that
+// carries NO pre-existing replica. The REST handler must:
+//
+//  1. Persist Resource.Spec.Flags=[DISKLESS] on the freshly-created
+//     Resource (operator-requested permanent client, NOT a tiebreaker).
+//  2. Never stamp TIE_BREAKER — that flag belongs exclusively to the
+//     controller-driven auto-witness loop (gated by
+//     `DrbdOptions/AutoAddQuorumTiebreaker`). Distinguishes operator
+//     intent from the auto-stamped witness in `linstor r l` (see
+//     TestViewResourcesDistinguishesDisklessFromTiebreaker for the
+//     State-label half of the contract).
+//  3. Never touch the parent RD's auto-tiebreaker suppression
+//     annotation. Suppression fires only on TIE_BREAKER *deletes*
+//     (csi-driven detach); an operator-issued permanent-client create
+//     must not interact with the auto-witness gating, otherwise the
+//     reconciler would silently pause its tiebreaker placer every
+//     time an operator adds a permanent diskless client.
+//  4. Never flip the cluster-wide `DrbdOptions/AutoAddQuorumTiebreaker`
+//     prop on the RD — that gate is operator-owned and must survive
+//     a permanent-client create unchanged.
+//
+// Cross-listed with wave1 5.7. The replica consumes one TCP port via
+// the RD-level port allocator (the DRBD .res renderer emits `disk
+// none;` for the local host — see pkg/drbd.diskField) and lives until
+// an explicit `r d` removes it.
+func TestResourceCreateDrbdDisklessPermanentClient(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceCreate{
+		Resource: apiv1.Resource{
+			NodeName: "n4",
+			Flags:    []string{apiv1.ResourceFlagDiskless},
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/resources", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Resources().Get(ctx, "pvc-1", "n4")
+	if err != nil {
+		t.Fatalf("get freshly-created drbd-diskless replica: %v", err)
+	}
+
+	if !slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("DISKLESS flag missing on permanent diskless client: %v", got.Flags)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("operator-placed --drbd-diskless must NOT carry TIE_BREAKER; got %v", got.Flags)
+	}
+
+	// Operator-placed permanent diskless must NOT interact with the
+	// auto-witness suppression machinery — suppression is reserved for
+	// TIE_BREAKER deletes (csi-driven detach). Reading the parent RD
+	// pins that the create path never wrote the annotation.
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("get parent RD: %v", err)
+	}
+
+	if _, has := rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation]; has {
+		t.Errorf("parent RD must not carry auto-tiebreaker suppression "+
+			"on a drbd-diskless create; got annotations=%v", rd.Annotations)
+	}
+
+	// Differentiation from tiebreaker: AutoAddQuorumTiebreaker is the
+	// controller-side prop that gates auto-witness stamping. An
+	// operator `r c --drbd-diskless` MUST NOT touch it — otherwise
+	// every permanent-client create would flip the cluster-wide
+	// auto-witness behaviour.
+	if rd.Props["DrbdOptions/AutoAddQuorumTiebreaker"] != "" {
+		t.Errorf("DrbdOptions/AutoAddQuorumTiebreaker must remain unset; got %q",
+			rd.Props["DrbdOptions/AutoAddQuorumTiebreaker"])
+	}
+}
