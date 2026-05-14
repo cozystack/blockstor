@@ -173,8 +173,15 @@ func TestPassphraseModifyHappyPath(t *testing.T) {
 	}
 }
 
-// TestPassphraseModifyWrongOld: PUT with the wrong old → 403; the
-// stored passphrase must NOT change.
+// TestPassphraseModifyWrongOld: PUT with the wrong old → 401
+// (Unauthorized); the stored passphrase must NOT change. Scenario
+// 6.W14 narrows upstream's historical 403 down to 401 — symmetric
+// with the W13 PATCH-mismatch surface so `linstor encryption
+// modify-passphrase` and `linstor encryption enter-passphrase`
+// can share the same "wrong passphrase" CLI error string keyed
+// off the status code. A regression that flipped this back to
+// 200 would silently rotate the cluster master key to an
+// attacker-supplied value after a single guess.
 func TestPassphraseModifyWrongOld(t *testing.T) {
 	st := store.NewInMemory()
 	base, stop := startServerWithStore(t, st)
@@ -191,8 +198,8 @@ func TestPassphraseModifyWrongOld(t *testing.T) {
 	modifyResp := httpPut(t, base+"/v1/encryption/passphrase", body)
 	_ = modifyResp.Body.Close()
 
-	if modifyResp.StatusCode != http.StatusForbidden {
-		t.Fatalf("modify with wrong old: got %d, want 403", modifyResp.StatusCode)
+	if modifyResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("modify with wrong old: got %d, want 401", modifyResp.StatusCode)
 	}
 
 	// Old must still unlock — rotation didn't take effect.
@@ -202,6 +209,124 @@ func TestPassphraseModifyWrongOld(t *testing.T) {
 
 	if enterResp.StatusCode != http.StatusOK {
 		t.Errorf("real passphrase no longer unlocks after failed modify: got %d", enterResp.StatusCode)
+	}
+}
+
+// TestPassphraseModifySameNewIdempotent: PUT with old == new and the
+// right old → 200 + MASK_INFO envelope. Scenario 6.W14 pins the
+// idempotent no-op so a retried `linstor encryption modify-passphrase`
+// (e.g. operator runs the command twice from a script after a 502
+// from a transient apiserver blip) lands on the same final state
+// rather than rotating-then-failing on the second hop. Same-value
+// rotation MUST also flip the in-memory unlock flag (the operator
+// just demonstrated proof-of-knowledge), atomic with the W12/W13
+// unlock-on-success paths.
+func TestPassphraseModifySameNewIdempotent(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	createBody, _ := json.Marshal(map[string]string{"new_passphrase": "stay-the-same"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", createBody)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"old_passphrase": "stay-the-same",
+		"new_passphrase": "stay-the-same",
+	})
+
+	modifyResp := httpPut(t, base+"/v1/encryption/passphrase", body)
+	defer func() { _ = modifyResp.Body.Close() }()
+
+	if modifyResp.StatusCode != http.StatusOK {
+		t.Fatalf("same-new modify: got %d, want 200", modifyResp.StatusCode)
+	}
+
+	var rcs []struct {
+		RetCode int64  `json:"ret_code"`
+		Message string `json:"message,omitempty"`
+	}
+
+	if err := json.NewDecoder(modifyResp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1", len(rcs))
+	}
+
+	const maskInfo int64 = 0x0001_0000_0000
+	if rcs[0].RetCode&maskInfo == 0 {
+		t.Errorf("ret_code = %x, want MASK_INFO bit set", rcs[0].RetCode)
+	}
+
+	// Same-new still unlocks: subsequent PATCH with the
+	// unchanged passphrase MUST succeed (the unlock flag was
+	// flipped by the no-op rotation).
+	enterBody, _ := json.Marshal(map[string]string{"new_passphrase": "stay-the-same"})
+	enterResp := httpPatch(t, base+"/v1/encryption/passphrase", enterBody)
+	_ = enterResp.Body.Close()
+
+	if enterResp.StatusCode != http.StatusOK {
+		t.Errorf("post-noop PATCH: got %d, want 200", enterResp.StatusCode)
+	}
+}
+
+// TestPassphraseModifyHappyPathEnvelope pins that a successful
+// rotation returns a `[]ApiCallRc` body with the MASK_INFO bit set
+// — symmetric with the rest of the write-side endpoints (snapshots,
+// storage pools, etc.) and what python-linstor's CLI loop decodes
+// to print the success line. Scenario 6.W14 explicitly calls out
+// the envelope so a regression that returned an empty 200 body
+// would silently break the CLI's "Master passphrase modified."
+// log line.
+func TestPassphraseModifyHappyPathEnvelope(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	createBody, _ := json.Marshal(map[string]string{"new_passphrase": "v1"})
+	resp := httpPost(t, base+"/v1/encryption/passphrase", createBody)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seed create: got %d, want 201", resp.StatusCode)
+	}
+
+	modifyBody, _ := json.Marshal(map[string]string{
+		"old_passphrase": "v1",
+		"new_passphrase": "v2",
+	})
+
+	modifyResp := httpPut(t, base+"/v1/encryption/passphrase", modifyBody)
+	defer func() { _ = modifyResp.Body.Close() }()
+
+	if modifyResp.StatusCode != http.StatusOK {
+		t.Fatalf("modify: got %d, want 200", modifyResp.StatusCode)
+	}
+
+	var rcs []struct {
+		RetCode int64  `json:"ret_code"`
+		Message string `json:"message,omitempty"`
+	}
+
+	if err := json.NewDecoder(modifyResp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1", len(rcs))
+	}
+
+	const maskInfo int64 = 0x0001_0000_0000
+	if rcs[0].RetCode&maskInfo == 0 {
+		t.Errorf("ret_code = %x, want MASK_INFO bit set", rcs[0].RetCode)
+	}
+
+	if rcs[0].Message == "" {
+		t.Errorf("envelope message empty; want an operator-facing line")
 	}
 }
 

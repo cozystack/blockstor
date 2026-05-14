@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // passphraseRequest is the body upstream linstor expects on the
@@ -206,8 +207,34 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handlePassphraseModify rotates the passphrase. Old must verify, new
-// replaces it.
+// handlePassphraseModify rotates the cluster master passphrase
+// (scenario 6.W14). PUT `/v1/encryption/passphrase` with body
+// `{"old_passphrase":"…","new_passphrase":"…"}` swaps the sealed
+// Secret's stored value: old must verify, new replaces it, atomic.
+//
+// Status surface:
+//   - no prior passphrase → 412 Precondition Failed (must POST first)
+//   - wrong old → 401 Unauthorized. Scenario 6.W14 narrows upstream's
+//     historical 403 down to 401 — symmetric with the W13 PATCH
+//     mismatch path so `linstor encryption modify-passphrase` and
+//     `linstor encryption enter-passphrase` share one "wrong
+//     passphrase" CLI string keyed off the status code. The unlock
+//     flag MUST stay at its prior value; a regression that flipped
+//     it on mismatch would silently grant LUKS provisioning to any
+//     caller after a single wrong-old guess.
+//   - new == old (and old verified) → 200 OK + MASK_INFO envelope,
+//     no Secret write. Idempotent no-op for a retried CLI call.
+//   - happy rotation → 200 OK + MASK_INFO envelope with an
+//     operator-facing "modified" line, sealed Secret updated, and
+//     s.passphraseUnlocked flipped to true atomic with the
+//     create-passphrase + enter-passphrase paths (W12/W13). Without
+//     the flip, a post-rotation /v1/view/resources would still
+//     report Suspended on every LUKS replica until the operator
+//     did a follow-up PATCH.
+//
+// The envelope shape (`[]ApiCallRc` with MASK_INFO + message)
+// matches every other write-side endpoint in the apiserver so
+// python-linstor's CLI loop renders the success line uniformly.
 func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
@@ -232,7 +259,24 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if have != req.OldPassphrase {
-		writeError(w, http.StatusForbidden, "old passphrase mismatch")
+		writeError(w, http.StatusUnauthorized, "old passphrase mismatch")
+
+		return
+	}
+
+	// Idempotent no-op: caller proved knowledge of the old
+	// passphrase AND asked us to "rotate" to the same value.
+	// Skip the Secret write entirely so the resourceVersion
+	// stays put (no needless apiserver churn) but still flip
+	// the unlock flag — the caller demonstrably knows the
+	// value, exactly like the W12 same-value POST path.
+	if req.NewPassphrase == have {
+		s.passphraseUnlocked.Store(true)
+
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "Master passphrase unchanged (idempotent no-op)",
+		}})
 
 		return
 	}
@@ -252,7 +296,10 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	// operator who thought modify-passphrase was enough.
 	s.passphraseUnlocked.Store(true)
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "Master passphrase modified",
+	}})
 }
 
 // readPassphrase reads the current cluster passphrase. Empty
