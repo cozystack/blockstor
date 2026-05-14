@@ -17,7 +17,6 @@ limitations under the License.
 package dispatcher_test
 
 import (
-	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
