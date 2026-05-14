@@ -1516,6 +1516,82 @@ func TestStoragePoolListPropertiesEmptyDecodes(t *testing.T) {
 	}
 }
 
+// TestViewStoragePoolsFaultyStampsReports pins the Bug 83 fix
+// end-to-end through the REST view path: a pool whose store-side
+// PoolMissing carrier is true MUST surface on /v1/view/storage-
+// pools with both state=="Faulty" AND a non-empty reports[] array
+// whose first entry has MASK_ERROR set + a message identifying the
+// missing pool.
+//
+// Why both: the upstream Python linstor-client renders the State
+// column from `get_replies_state(storpool.reports)` — the
+// structured ApiCallRc array — NOT from the bare `state` string.
+// An empty reports[] always returns ("Ok", green), so a satellite-
+// reported "Faulty" pool kept rendering as Ok in `linstor sp l`
+// before the fix. This test pins the wire contract that closes
+// that gap: `linstor sp l` on a destroyed-zpool node must show
+// Faulty (or the Python CLI's equivalent of "error band first
+// reports entry") — not Ok.
+func TestViewStoragePoolsFaultyStampsReports(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed a Faulty pool: PoolMissing=true is the only way to
+	// reach the synthesise-reports path. We DON'T pre-populate
+	// State/Reports — the store's derive path must do that.
+	sp := apiv1.StoragePool{
+		StoragePoolName: "zfs-thin",
+		NodeName:        "w3",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+		PoolMissing:     true,
+	}
+	if err := st.StoragePools().Create(ctx, &sp); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/storage-pools")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("entries: got %d, want 1", len(got))
+	}
+
+	if got[0].State != "Faulty" {
+		t.Errorf("state: got %q, want %q", got[0].State, "Faulty")
+	}
+
+	if len(got[0].Reports) == 0 {
+		t.Fatalf("reports: empty; want >=1 ERROR entry so python-" +
+			"linstor's State column derives to Faulty (Bug 83)")
+	}
+
+	rc := got[0].Reports[0]
+	if rc.RetCode&apiv1.APICallRcMaskError == 0 {
+		t.Errorf("ret_code missing MASK_ERROR bit: %#x", rc.RetCode)
+	}
+
+	// Wording invariant: must contain "missing" so audit-log greppers
+	// can pattern-match on the failure mode without parsing ret_code.
+	if !strings.Contains(rc.Message, "missing") {
+		t.Errorf("message %q missing substring %q", rc.Message, "missing")
+	}
+
+	if !strings.Contains(rc.Message, "zfs-thin") {
+		t.Errorf("message %q missing pool name", rc.Message)
+	}
+}
 // TestSPModifyOverridePropsLands pins Bug 85's core wire contract:
 // `PUT /v1/nodes/{node}/storage-pools/{pool}` accepts the python-linstor
 // `storage_pool_modify` body `{override_props: {...}}` and merges the

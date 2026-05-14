@@ -241,9 +241,23 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 	// Surface the satellite's PoolMissing signal as the wire `state`
 	// field. Upstream LINSTOR uses "Ok" / "Faulty" / "Error" — we map
 	// PoolMissing=true → "Faulty", everything else → "Ok".
+	//
+	// The `state` string alone is not enough for the Python linstor-
+	// client to render the State column: `storpool_cmds.py` derives
+	// the column value from `get_replies_state(storpool.reports)`, the
+	// structured ApiCallRc array, NOT from the bare `state` field.
+	// With an empty reports[], `get_replies_state` returns ("Ok",
+	// green) regardless of `state` — so a satellite-reported "Faulty"
+	// pool still rendered as Ok in `linstor sp l`. Synthesise an
+	// ERROR-severity reports[] entry whenever PoolMissing=true so the
+	// CLI sees the real state. Bug 83.
 	state := "Ok"
+
+	var reports []apiv1.APICallRc
+
 	if crd.Status.PoolMissing {
 		state = "Faulty"
+		reports = []apiv1.APICallRc{poolMissingReport(crd.Spec.NodeName, poolName)}
 	}
 
 	return apiv1.StoragePool{
@@ -259,7 +273,40 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 		FreeSpaceMgrName: fsmName,
 		UUID:             string(crd.UID),
 		State:            state,
+		Reports:          reports,
 		PoolMissing:      crd.Status.PoolMissing,
+	}
+}
+
+// poolMissingReport builds the structured ApiCallRc entry blockstor stamps
+// onto a StoragePool's wire shape whenever the satellite has flagged its
+// backing storage as missing. The Python linstor-client's State column is
+// derived from `get_replies_state(storpool.reports)` rather than the bare
+// `state` string field — an empty reports[] always renders "Ok" — so the
+// entry MUST be present for `linstor sp l` to surface the real condition.
+//
+// The ret_code combines upstream LINSTOR's `MASK_ERROR` (severity bit) +
+// `MASK_STOR_POOL` (subject bit) + `FAIL_STOR_POOL_CONFIGURATION_ERROR`
+// (990) — byte-identical to the value upstream's `CtrlStorPoolApiCallHandler`
+// emits when a storage-pool's underlying configuration is broken. Bug 83.
+func poolMissingReport(node, pool string) apiv1.APICallRc {
+	return apiv1.APICallRc{
+		RetCode: apiv1.APICallRcMaskError |
+			apiv1.APICallRcMaskStorPool |
+			apiv1.APICallRcFailStorPoolConfigurationError,
+		Message: "pool backing storage missing on node " + node +
+			": storage pool " + pool + " is not present",
+		Cause: "The satellite probed the backing volume group / zpool / " +
+			"directory for this storage pool and found it absent — " +
+			"typically the result of an operator `zpool destroy`, " +
+			"`vgremove`, or an unmounted filesystem.",
+		Correc: "Re-discover the pool via `linstor ps cdp <provider> " +
+			"<node> <pool>` once the backing storage is restored, or " +
+			"recreate the pool with `linstor sp c`.",
+		ObjRefs: map[string]string{
+			"Node":     node,
+			"StorPool": pool,
+		},
 	}
 }
 

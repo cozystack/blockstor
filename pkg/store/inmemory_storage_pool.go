@@ -111,6 +111,12 @@ func (s *inMemoryStoragePools) Get(_ context.Context, node, pool string) (apiv1.
 // The Python CLI's `storpool_cmds.py` does `':' not in
 // free_space_mgr_name` and crashes with TypeError when the field is
 // null — so filling this defensively is also a CLI-stability fix.
+//
+// Bug 83: when PoolMissing=true we ALSO synthesise an ERROR-severity
+// reports[] entry, because python-linstor renders the State column
+// from `get_replies_state(storpool.reports)` rather than the bare
+// `state` string. Without the reports entry, `linstor sp l` shows Ok
+// against a Faulty pool. Mirrors the k8s store's poolMissingReport.
 func withDerivedState(sp *apiv1.StoragePool) {
 	if sp.State == "" {
 		if sp.PoolMissing {
@@ -120,12 +126,41 @@ func withDerivedState(sp *apiv1.StoragePool) {
 		}
 	}
 
+	if sp.PoolMissing && len(sp.Reports) == 0 {
+		sp.Reports = []apiv1.APICallRc{poolMissingReport(sp.NodeName, sp.StoragePoolName)}
+	}
+
 	if sp.FreeSpaceMgrName == "" {
 		if sp.SharedSpaceID != "" {
 			sp.FreeSpaceMgrName = sp.SharedSpaceID
 		} else if sp.NodeName != "" && sp.StoragePoolName != "" {
 			sp.FreeSpaceMgrName = sp.NodeName + ":" + sp.StoragePoolName
 		}
+	}
+}
+
+// poolMissingReport builds the same ERROR-severity ApiCallRc entry the k8s
+// store stamps onto a Faulty pool. Duplicated here (rather than importing
+// from pkg/store/k8s) to avoid a cyclic import — k8s already imports
+// pkg/store. Bug 83.
+func poolMissingReport(node, pool string) apiv1.APICallRc {
+	return apiv1.APICallRc{
+		RetCode: apiv1.APICallRcMaskError |
+			apiv1.APICallRcMaskStorPool |
+			apiv1.APICallRcFailStorPoolConfigurationError,
+		Message: "pool backing storage missing on node " + node +
+			": storage pool " + pool + " is not present",
+		Cause: "The satellite probed the backing volume group / zpool / " +
+			"directory for this storage pool and found it absent — " +
+			"typically the result of an operator `zpool destroy`, " +
+			"`vgremove`, or an unmounted filesystem.",
+		Correc: "Re-discover the pool via `linstor ps cdp <provider> " +
+			"<node> <pool>` once the backing storage is restored, or " +
+			"recreate the pool with `linstor sp c`.",
+		ObjRefs: map[string]string{
+			"Node":     node,
+			"StorPool": pool,
+		},
 	}
 }
 
