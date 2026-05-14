@@ -85,6 +85,14 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "create manager")
 	}
 
+	// Inject the manager's APIReader so reconcilers can bypass
+	// the informer cache for late-stage finalizer re-reads (Bug
+	// 65). Falls back gracefully in tests where the field is
+	// left nil — see Config.APIReader.
+	if cfg.APIReader == nil {
+		cfg.APIReader = mgr.GetAPIReader()
+	}
+
 	err = (&ResourceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup ResourceReconciler")

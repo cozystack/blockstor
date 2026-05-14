@@ -28,6 +28,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -475,6 +476,32 @@ func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha
 // no-ops on already-torn-down state. Removes our finalizer on
 // success so kube-apiserver finalises the delete.
 //
+// Bug 65 ordering contract (matches the tiebreaker-race fix in
+// memory/blockstor_tiebreaker_race.md):
+//
+//  1. The Resource passed in came from the cached client at the
+//     top of Reconcile, so its `Finalizers` slice may already be
+//     stale by the time we get here (the controller-side path
+//     force-strips its own `blockstor.io.blockstor.io/resource`
+//     finalizer concurrently). Operate on the slice as-is for
+//     the gating short-circuit only.
+//  2. Run the provider tear-down (Apply.DeleteResource: drbdadm
+//     down + DeleteVolume per volume + .res cleanup) BEFORE
+//     touching the finalizer. The previous order was already
+//     correct on this point; Bug 65 keeps it.
+//  3. AFTER DeleteResource returns Ok, re-fetch the Resource via
+//     the APIReader (uncached) so we see the freshest finalizer
+//     set, then RemoveFinalizer + Update. Without this re-read,
+//     the Update built from the cache-trailed snapshot can clobber
+//     a concurrent finalizer edit and leave an orphan zvol on
+//     one of two diskful peers (the bug's surface symptom).
+//  4. Storage Provider's DeleteVolume is idempotent on missing
+//     volumes — a second handleDelete pass after a partial first
+//     pass (DeleteResource succeeded, Update failed) re-issues
+//     the storage tear-down safely. Bug 43's storage sweeper is
+//     the wider-scope backstop; this ordering fix is the
+//     per-resource source-of-truth path.
+//
 // Phase 10.1. Once Phase 10.6 retires the gRPC contract,
 // `internal/controller.ResourceReconciler.runDelete` and its
 // finalizer (`blockstor.io.blockstor.io/resource`) go away —
@@ -514,15 +541,51 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	res.Finalizers = slices.DeleteFunc(res.Finalizers,
-		func(f string) bool { return f == SatelliteResourceFinalizer })
+	// Re-fetch via APIReader (uncached) so we strip ours off the
+	// freshest finalizer list. Falls back to the cached client
+	// when APIReader is nil (unit-test path).
+	reader := r.deleteReader()
 
-	err = r.Update(ctx, res)
+	var latest blockstoriov1alpha1.Resource
+
+	err = reader.Get(ctx, client.ObjectKey{Name: res.Name}, &latest)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Someone else (force-strip from the controller, the
+			// sweeper after a hung apply) finished the delete
+			// already — DeleteResource above was the idempotent
+			// no-op re-issue, nothing more to do.
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, errors.Wrap(err, "APIReader re-fetch for finalizer strip")
+	}
+
+	if !controllerutil.RemoveFinalizer(&latest, SatelliteResourceFinalizer) {
+		// Already gone — the Update on a previous pass either
+		// landed or a concurrent actor stripped it. Either way,
+		// no-op; the apiserver-finalise path takes over.
+		return ctrl.Result{}, nil
+	}
+
+	err = r.Update(ctx, &latest)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "strip finalizer")
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// deleteReader returns the APIReader-direct reader when the
+// manager wired one in, falling back to the cached client for
+// unit tests that construct the reconciler directly. Mirrors
+// `internal/controller.ResourceDefinitionReconciler.directOrCached`.
+func (r *ResourceReconciler) deleteReader() client.Reader {
+	if r.Config.APIReader != nil {
+		return r.Config.APIReader
+	}
+
+	return r.Client
 }
 
 // lookupVolumeNumbers reads the parent RD and returns its

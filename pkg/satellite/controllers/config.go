@@ -17,6 +17,8 @@ limitations under the License.
 package controllers
 
 import (
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 )
@@ -45,4 +47,14 @@ type Config struct {
 	// a Provider instance from a StoragePool CRD. Production
 	// wires `storage.RealExec{}`; tests inject `storage.FakeExec`.
 	Exec storage.Exec
+
+	// APIReader is a direct apiserver reader that bypasses the
+	// informer cache. Bug 65: handleDelete must re-read the
+	// Resource's finalizer slice right before stripping ours so
+	// concurrent finalizer edits (controller force-strip, external
+	// actors) are preserved rather than clobbered by an Update
+	// built off a cache-trailed snapshot. Production is wired from
+	// `mgr.GetAPIReader()` in NewManager; unit tests can leave it
+	// nil and the reconciler falls back to the cached client.
+	APIReader client.Reader
 }
