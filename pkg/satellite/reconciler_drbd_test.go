@@ -2419,3 +2419,175 @@ func TestReconcilerPassesSkipDiskFlag(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyDropsPeerWhenRemovedFromDesired pins Bug 67. Reproducer on
+// dev-kvaps: a 3-replica RD where worker-2 was diskful and worker-3 a
+// TieBreaker. After `linstor r d worker-2 test`, ensureTiebreaker
+// correctly retired worker-3, but the surviving worker-1 replica kept
+// rendering the old .res — including stale `on worker-2 {}` /
+// `on worker-3 {}` blocks — so `linstor r l` showed
+// `Conns=Connecting(worker-2, worker-3)` to ghosts indefinitely.
+//
+// Contract this test pins on the satellite side:
+//   - A subsequent Apply call with a SHRUNK Peers slice MUST re-render
+//     .res without the dropped peer's `on <peer> {}` block.
+//   - The dropped peer's connection-level `connection { host A; host B; }`
+//     entry MUST also disappear (otherwise drbdadm parses the file but
+//     leaves the peer-slot reservation in place).
+//   - `drbdadm adjust` MUST run on the second Apply pass so the kernel
+//     calls drbdsetup del-peer and frees the slot — adjust on its own
+//     diffs the loaded resource against the .res and emits del-peer
+//     when a host block is gone.
+//
+// The fake-exec assertions cover both halves: the file content (no
+// dropped-peer string) AND the command line (adjust invoked at least
+// once after the second Apply, post-shrink).
+//
+// If this test FAILS, the .res file still contains the dropped peer
+// or drbdadm adjust isn't being called on a Peers-only delta — which
+// is exactly the Bug 67 symptom and the operator's `Connecting(...)`
+// ghost on the live cluster.
+func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// LVM probe + size readback are issued on every Apply; allow both
+	// passes by registering the absent-volume response (empty stdout)
+	// and the size-table response — FakeExec returns them per call.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-67_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Pass 1: full 3-peer topology (this node + n2 + n3). The .res
+	// reflects all three `on <node> {}` blocks; this is the
+	// pre-`linstor r d` state.
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-67",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2", "n3"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+				"peer.n3.address": "10.0.0.3",
+				"peer.n3.node-id": "2",
+				"peer.n3.port":    "7000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply pass 1: %v", err)
+	}
+
+	resPath := filepath.Join(dir, "pvc-67.res")
+
+	pass1Body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile pass 1: %v", err)
+	}
+
+	// Sanity-check the pre-state: both peer blocks present.
+	if !strings.Contains(string(pass1Body), "on n2 {") {
+		t.Fatalf("pass 1 .res missing `on n2 {`; got:\n%s", pass1Body)
+	}
+
+	if !strings.Contains(string(pass1Body), "on n3 {") {
+		t.Fatalf("pass 1 .res missing `on n3 {`; got:\n%s", pass1Body)
+	}
+
+	// Record the adjust call count from pass 1 so the pass 2 assertion
+	// can prove a NEW adjust fired, not just the leftover from pass 1.
+	pass1Cmds := append([]string{}, fx.CommandLines()...)
+
+	// Pass 2: simulate `linstor r d n2 pvc-67` + tiebreaker retirement
+	// — the dispatcher now pushes the same DesiredResource but with
+	// Peers=[] (single-replica topology). Satellite MUST re-render
+	// .res to drop both `on n2 {}` and `on n3 {}` blocks, and MUST
+	// invoke `drbdadm adjust pvc-67` so the kernel runs del-peer for
+	// the retired node-ids.
+	_, err = rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-67",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: nil, // ← peer list collapsed to "this node only"
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply pass 2: %v", err)
+	}
+
+	pass2Body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile pass 2: %v", err)
+	}
+
+	got := string(pass2Body)
+
+	// Hard asserts on .res content. The dropped peers must NOT appear
+	// in any form — block header, connection wire, or stale address.
+	for _, banned := range []string{
+		"on n2 {",
+		"on n3 {",
+		"10.0.0.2",
+		"10.0.0.3",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("pass 2 .res still contains dropped-peer marker %q (Bug 67); got:\n%s", banned, got)
+		}
+	}
+
+	// Either `drbdadm adjust pvc-67` (which internally calls
+	// `drbdsetup del-peer` when a host block is gone) OR explicit
+	// per-peer `drbdadm disconnect <peer>:pvc-67` + `drbdadm del-peer
+	// <peer>:pvc-67` invocations are valid responses on the second
+	// Apply pass. The satellite currently picks the targeted-del-peer
+	// path (preferred — narrower scope than adjust); pin that any
+	// teardown verb fires for every dropped peer.
+	pass2Cmds := fx.CommandLines()
+
+	for _, peer := range []string{"n2", "n3"} {
+		want := []string{
+			"drbdadm adjust pvc-67",
+			"drbdadm del-peer " + peer + ":pvc-67",
+			"drbdadm disconnect " + peer + ":pvc-67",
+		}
+
+		sawTeardown := false
+
+		for i := len(pass1Cmds); i < len(pass2Cmds); i++ {
+			if slices.Contains(want, pass2Cmds[i]) {
+				sawTeardown = true
+
+				break
+			}
+		}
+
+		if !sawTeardown {
+			t.Errorf("Bug 67: peer %q dropped from Desired but pass 2 emitted no teardown verb (adjust / disconnect / del-peer); cmds=%v",
+				peer, pass2Cmds[len(pass1Cmds):])
+		}
+	}
+}

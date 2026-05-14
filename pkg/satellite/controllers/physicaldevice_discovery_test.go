@@ -383,3 +383,173 @@ func findCondition(conds []metav1.Condition, condType string) *metav1.Condition 
 
 	return nil
 }
+
+// TestPublishDeviceUsesKernelPath pins Bug 69. Operator's
+// `linstor ps l` is expected to render kernel-name paths
+// (`/dev/vda`, `/dev/sdb`, `/dev/nvme0n1`) so `linstor ps cdp`
+// and downstream tooling can be fed those values verbatim.
+// Current publishDevice hardcodes `/dev/disk/by-id/<stableID>`,
+// which for virtio-no-serial devices renders as
+// `/dev/disk/by-id/by-path-vda` — useless to operators and a
+// frequent dev-stand surprise.
+//
+// Pinned contract: Status.DevicePath = "/dev/<kname>" for every
+// published PhysicalDevice, regardless of stableID source (WWN /
+// model+serial / by-path fallback). The stableID is still recorded
+// in Status.StableID for CRD-name determinism and CRD-reuse on
+// device renumbering, but the user-facing path is the kernel name.
+func TestPublishDeviceUsesKernelPath(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Three rows exercise the three stableID paths:
+	//   - sdb with WWN → stableID is "wwn-0x…" → was rendering
+	//     `/dev/disk/by-id/wwn-0x…`; should be `/dev/sdb`.
+	//   - nvme0n1 with model+serial → was rendering
+	//     `/dev/disk/by-id/<model>-<serial>`; should be `/dev/nvme0n1`.
+	//   - vda (virtio, no WWN/serial) → stableID is the
+	//     "by-path-vda" fallback → was rendering
+	//     `/dev/disk/by-id/by-path-vda`; should be `/dev/vda`.
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{
+		Stdout: []byte(
+			lsblkRow("sdb", "sdb", "2000398934016", "", "disk", "", "0x5000c500a3b1c2d2", "DISK_B", "SN-B", "0", "sata") + "\n" +
+				lsblkRow("nvme0n1", "nvme0n1", "1000204886016", "", "disk", "", "", "Samsung_SSD_980", "S5GXNF0NB12345", "0", "nvme") + "\n" +
+				lsblkRow("vda", "vda", "10737418240", "", "disk", "", "", "", "", "1", "virtio") + "\n"),
+	})
+
+	// All three rows pass IsFreeBlockDevice (no FSType, TYPE=disk,
+	// no mountpoint). Each gets the standard signature-probe
+	// fan-out, all of which say "no signature".
+	for _, dev := range []string{"sdb", "nvme0n1", "vda"} {
+		fx.Expect("drbdmeta 0 v09 /dev/"+dev+" internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+		fx.Expect("wipefs -n /dev/"+dev, storage.FakeResponse{Stdout: []byte("")})
+	}
+
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+
+	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
+	if err != nil {
+		t.Fatalf("scanOnce: %v", err)
+	}
+
+	var list blockstoriov1alpha1.PhysicalDeviceList
+	if err := cli.List(t.Context(), &list,
+		client.MatchingLabels{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"}); err != nil {
+		t.Fatalf("list PhysicalDevices: %v", err)
+	}
+
+	got := indexByKName(list.Items)
+
+	for _, tc := range []struct {
+		kname    string
+		wantPath string
+	}{
+		{"sdb", "/dev/sdb"},
+		{"nvme0n1", "/dev/nvme0n1"},
+		{"vda", "/dev/vda"},
+	} {
+		dev, ok := got[tc.kname]
+		if !ok {
+			t.Errorf("no CRD for %s", tc.kname)
+
+			continue
+		}
+
+		if dev.Status.DevicePath != tc.wantPath {
+			t.Errorf("Bug 69: %s DevicePath: got %q, want %q (kernel name, not /dev/disk/by-id/...)",
+				tc.kname, dev.Status.DevicePath, tc.wantPath)
+		}
+	}
+}
+
+// TestPublishDeviceFiltersZFSZvols pins Bug 70. ZFS volume devices
+// (`/dev/zd0`, `/dev/zd16`, …) are kernel block devices with
+// MAJ:MIN starting at 230. They show up in `lsblk` as TYPE=disk
+// with no parent, and on a ZFS-host they outnumber the real disks
+// — so a non-filtered `linstor ps l` is dominated by entries for
+// volumes already in use by an existing zpool. Operators have no
+// way to tell apart "/dev/zd0 (this is YOUR zvol)" from
+// "/dev/sdb (free disk you can pool)".
+//
+// Pinned contract: lsblk rows whose KName matches `zd[0-9]+` MUST
+// NOT produce a PhysicalDevice CRD — the discovery runnable skips
+// them before signature probing. A small allow-list for the
+// kernel-name prefixes operators actually want to pool
+// (sd*, nvme*, vd*, hd*, xvd*, mmcblk*) is the cleanest gate.
+func TestPublishDeviceFiltersZFSZvols(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Mix of real disks + zvols. The discovery loop must publish
+	// CRDs for sdb / vdb, and SKIP zd0 / zd16 entirely.
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{
+		Stdout: []byte(
+			lsblkRow("sdb", "sdb", "2000398934016", "", "disk", "", "0x5000c500a3b1c2d2", "DISK_B", "SN-B", "0", "sata") + "\n" +
+				lsblkRow("vdb", "vdb", "10737418240", "", "disk", "", "", "", "", "1", "virtio") + "\n" +
+				lsblkRow("zd0", "zd0", "5368709120", "", "disk", "", "", "", "", "0", "") + "\n" +
+				lsblkRow("zd16", "zd16", "1073741824", "", "disk", "", "", "", "", "0", "") + "\n"),
+	})
+
+	// Signature probes are only invoked for the non-zvol rows. If
+	// the filter regresses and zvols slip through, FakeExec returns
+	// "unexpected command" for the missing zd0/zd16 probes — that
+	// surfaces as the test failing in a clear way separate from the
+	// "extra CRD created" assertion below.
+	for _, dev := range []string{"sdb", "vdb"} {
+		fx.Expect("drbdmeta 0 v09 /dev/"+dev+" internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+		fx.Expect("wipefs -n /dev/"+dev, storage.FakeResponse{Stdout: []byte("")})
+	}
+
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+
+	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
+	if err != nil {
+		t.Fatalf("scanOnce: %v", err)
+	}
+
+	var list blockstoriov1alpha1.PhysicalDeviceList
+	if err := cli.List(t.Context(), &list,
+		client.MatchingLabels{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"}); err != nil {
+		t.Fatalf("list PhysicalDevices: %v", err)
+	}
+
+	got := indexByKName(list.Items)
+
+	if got["zd0"] != nil || got["zd16"] != nil {
+		t.Errorf("Bug 70: zvols leaked into PhysicalDevice list (zd0=%v zd16=%v); they must be filtered out before signature probing",
+			got["zd0"] != nil, got["zd16"] != nil)
+	}
+
+	if got["sdb"] == nil || got["vdb"] == nil {
+		t.Errorf("Bug 70 regression: real disks dropped along with zvols (sdb=%v vdb=%v)",
+			got["sdb"] != nil, got["vdb"] != nil)
+	}
+}

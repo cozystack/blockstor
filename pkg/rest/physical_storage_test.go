@@ -531,3 +531,72 @@ func TestPhysicalStorageCreateRejectsAttached(t *testing.T) {
 		t.Errorf("status: got %d, want 404 (device already attached)", resp.StatusCode)
 	}
 }
+
+// TestPhysicalStorageCreateMatchesKernelNamePath pins Bug 68
+// end-to-end: operators type `linstor ps cdp ... zfs <node> /dev/vda`
+// expecting the kernel-name path to match the PhysicalDevice CRD's
+// DevicePath. Bug 69 changes DevicePath to `/dev/vda`-shape (was
+// `/dev/disk/by-id/by-path-vda`), but this test ALSO pins the
+// matching contract from the REST handler's POV — a regression that
+// reverted to by-id matching would re-break operator UX even with
+// the discovery path fix in place.
+//
+// Scenario: PhysicalDevice CRD already has DevicePath=/dev/vda
+// (post-Bug-69 shape). POST body says device_paths=["/dev/vda"].
+// Handler MUST find the CRD and flip Spec.AttachTo. Without this
+// test, a subtle handler-side rewrite to "always lookup by-id"
+// would silently break `linstor ps cdp` for the canonical
+// operator workflow.
+func TestPhysicalStorageCreateMatchesKernelNamePath(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-vda",
+		NodeName:   "n1",
+		DevicePath: "/dev/vda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "ZFS",
+			"device_paths": ["/dev/vda"],
+			"with_storage_pool": {
+				"name": "data",
+				"props": {"StorDriver/ZPool": "data"}
+			}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Bug 68: status: got %d, want 202 (kernel-name path must match the CRD's DevicePath)",
+			resp.StatusCode)
+	}
+
+	got, err := st.PhysicalDevices().Get(t.Context(), "n1-vda")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.AttachTo == nil {
+		t.Errorf("Bug 68: AttachTo: nil — handler didn't flip the CRD even though /dev/vda matched DevicePath")
+	}
+
+	// The auto-created StoragePool exists per the same request — Bug
+	// 68's symptom on the live stand was "operator runs cdp, nothing
+	// happens" because the device-paths matcher silently failed. Pin
+	// the StoragePool side-effect so a future regression that only
+	// flips AttachTo without provisioning the pool still fails the
+	// test.
+	pool, err := st.StoragePools().Get(t.Context(), "n1", "data")
+	if err != nil {
+		t.Errorf("Bug 68: StoragePool 'data' on n1 must be auto-created on cdp; got Get error %v", err)
+	} else if pool.ProviderKind != "ZFS" {
+		t.Errorf("Bug 68: StoragePool ProviderKind: got %q, want ZFS", pool.ProviderKind)
+	}
+}
