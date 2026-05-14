@@ -522,6 +522,272 @@ func TestNodeNetInterfaceUUIDDiffersByInterface(t *testing.T) {
 	}
 }
 
+// TestNetInterfaceCreate_Scenario3W01 pins wave2-03-networking.md
+// scenario 3.W01: POST /v1/nodes/{node}/net-interfaces creates a
+// NetInterface inline on Node.Spec.NetInterfaces[] (no separate CRD),
+// returns 201 + a non-empty ApiCallRc envelope (golinstor decodes the
+// response as []client.ApiCallRc and surfaces ret_code), persists
+// per-NIC SatellitePort + SatelliteEncryptionType verbatim, and is
+// idempotent on the (node, ifname) key — a second POST with the same
+// name replaces in place rather than growing the list.
+//
+// The three nested cases each carry one of the contract anchors the
+// scenario explicitly calls out, so a regression on any single axis
+// fails a named subtest rather than getting buried in unrelated noise.
+func TestNetInterfaceCreate_Scenario3W01(t *testing.T) {
+	t.Run("appends_to_node_spec_netinterfaces", func(t *testing.T) {
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: "n1",
+			Type: apiv1.NodeTypeSatellite,
+			NetInterfaces: []apiv1.NetInterface{
+				{Name: "default", Address: "10.0.0.1"},
+			},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		body, err := json.Marshal(apiv1.NetInterface{
+			Name:    "nic_10G",
+			Address: "192.168.43.231",
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", body)
+		defer func() { _ = resp.Body.Close() }()
+
+		// Upstream LINSTOR returns 201 + an ApiCallRc envelope for the
+		// per-interface POST; golinstor decodes the body as
+		// []client.ApiCallRc and asserts ret_code is non-zero on
+		// success. Pin both the status and the envelope shape so a
+		// caller using `linstor node interface create` doesn't trip
+		// on a silently-broken response body.
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status: got %d, want 201", resp.StatusCode)
+		}
+
+		var env []apiv1.APICallRc
+		if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+			t.Fatalf("decode envelope: %v", err)
+		}
+
+		if len(env) == 0 {
+			t.Fatalf("ApiCallRc envelope is empty; want at least 1 entry")
+		}
+
+		if env[0].RetCode == 0 {
+			t.Errorf("ApiCallRc.RetCode: got 0, want non-zero (LINSTOR maskInfo)")
+		}
+
+		if env[0].Message == "" {
+			t.Errorf("ApiCallRc.Message: got empty, want a human-readable line")
+		}
+
+		got, err := st.Nodes().Get(ctx, "n1")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		if len(got.NetInterfaces) != 2 {
+			t.Fatalf("NetInterfaces: got %d, want 2 (default + nic_10G); ifaces=%v",
+				len(got.NetInterfaces), got.NetInterfaces)
+		}
+
+		var added *apiv1.NetInterface
+
+		for i := range got.NetInterfaces {
+			if got.NetInterfaces[i].Name == "nic_10G" {
+				added = &got.NetInterfaces[i]
+
+				break
+			}
+		}
+
+		if added == nil {
+			t.Fatalf("nic_10G not appended to Node.Spec.NetInterfaces; got %v",
+				got.NetInterfaces)
+		}
+
+		if added.Address != "192.168.43.231" {
+			t.Errorf("Address: got %q, want 192.168.43.231", added.Address)
+		}
+	})
+
+	t.Run("persists_per_nic_port_and_encryption", func(t *testing.T) {
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: "n1",
+			Type: apiv1.NodeTypeSatellite,
+			NetInterfaces: []apiv1.NetInterface{
+				{Name: "default", Address: "10.0.0.1"},
+			},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		// UG9 §"Managing network interface cards" allows per-NIC
+		// satellite_port + satellite_encryption_type overrides at
+		// create time. Send non-default values so the assertion
+		// catches a handler that silently drops them back to
+		// upstream defaults (3366 / PLAIN) on persist.
+		body, err := json.Marshal(apiv1.NetInterface{
+			Name:                    "nic_ssl",
+			Address:                 "10.10.0.231",
+			SatellitePort:           7777,
+			SatelliteEncryptionType: "SSL",
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status: got %d, want 201", resp.StatusCode)
+		}
+
+		got, err := st.Nodes().Get(ctx, "n1")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		var added *apiv1.NetInterface
+
+		for i := range got.NetInterfaces {
+			if got.NetInterfaces[i].Name == "nic_ssl" {
+				added = &got.NetInterfaces[i]
+
+				break
+			}
+		}
+
+		if added == nil {
+			t.Fatalf("nic_ssl not stored; got %v", got.NetInterfaces)
+		}
+
+		if added.SatellitePort != 7777 {
+			t.Errorf("SatellitePort: got %d, want 7777 (per-NIC override must persist)",
+				added.SatellitePort)
+		}
+
+		if added.SatelliteEncryptionType != "SSL" {
+			t.Errorf("SatelliteEncryptionType: got %q, want %q",
+				added.SatelliteEncryptionType, "SSL")
+		}
+	})
+
+	t.Run("idempotent_on_same_name", func(t *testing.T) {
+		st := store.NewInMemory()
+		ctx := t.Context()
+
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: "n1",
+			Type: apiv1.NodeTypeSatellite,
+			NetInterfaces: []apiv1.NetInterface{
+				{Name: "default", Address: "10.0.0.1"},
+			},
+		}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+
+		base, stop := startServerWithStore(t, st)
+		defer stop()
+
+		// First create: address + port + encryption.
+		first, err := json.Marshal(apiv1.NetInterface{
+			Name:                    "nic_10G",
+			Address:                 "192.168.43.231",
+			SatellitePort:           7000,
+			SatelliteEncryptionType: "PLAIN",
+		})
+		if err != nil {
+			t.Fatalf("marshal first: %v", err)
+		}
+
+		resp := httpPost(t, base+"/v1/nodes/n1/net-interfaces", first)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("first POST status: got %d, want 201", resp.StatusCode)
+		}
+
+		// Second create on the same name with different address +
+		// port + encryption. Idempotency is keyed on (node, ifname):
+		// the list must not grow, and the values must be overwritten
+		// in place. Without this anchor, a satellite-bootstrap
+		// retry-loop would double-register the NIC every reconcile.
+		second, err := json.Marshal(apiv1.NetInterface{
+			Name:                    "nic_10G",
+			Address:                 "192.168.43.232",
+			SatellitePort:           7001,
+			SatelliteEncryptionType: "SSL",
+		})
+		if err != nil {
+			t.Fatalf("marshal second: %v", err)
+		}
+
+		resp = httpPost(t, base+"/v1/nodes/n1/net-interfaces", second)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("second POST status: got %d, want 201", resp.StatusCode)
+		}
+
+		got, err := st.Nodes().Get(ctx, "n1")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+
+		if len(got.NetInterfaces) != 2 {
+			t.Fatalf("NetInterfaces grew on repeated POST; got %d (%v), want 2",
+				len(got.NetInterfaces), got.NetInterfaces)
+		}
+
+		var updated *apiv1.NetInterface
+
+		for i := range got.NetInterfaces {
+			if got.NetInterfaces[i].Name == "nic_10G" {
+				updated = &got.NetInterfaces[i]
+
+				break
+			}
+		}
+
+		if updated == nil {
+			t.Fatalf("nic_10G missing after idempotent POST; got %v",
+				got.NetInterfaces)
+		}
+
+		if updated.Address != "192.168.43.232" {
+			t.Errorf("Address: got %q, want 192.168.43.232 (overwrite in place)",
+				updated.Address)
+		}
+
+		if updated.SatellitePort != 7001 {
+			t.Errorf("SatellitePort: got %d, want 7001 (overwrite in place)",
+				updated.SatellitePort)
+		}
+
+		if updated.SatelliteEncryptionType != "SSL" {
+			t.Errorf("SatelliteEncryptionType: got %q, want SSL (overwrite in place)",
+				updated.SatelliteEncryptionType)
+		}
+	})
+}
+
 // TestNodeCreateAutoCreatesDfltDisklessStorPool pins Bug 59 / parity
 // audit row #3: upstream LINSTOR provisions a `DfltDisklessStorPool`
 // per satellite at node-register time so the autoplacer's
