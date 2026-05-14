@@ -101,6 +101,37 @@ Test stance: `--shared-space` flag accepted in REST handler but returns 501 with
 
 Cross-listed with wave1 2.17 and wave2-02 2.W01. Per-SP `Autoplacer/MaxThroughput` value (bytes/sec) + controller `Autoplacer/Weights/MaxThroughput=N`. Per-volume `sys/fs/blkio_throttle_*` subtracted from pool budget — **depends on QoS** which is out-of-scope per wave1 7.22. P2 unless customer asks.
 
+## LUKS encryption — master-passphrase orchestration
+
+The wave1 LUKS layer (6.13 / 6.14 / 6.15) implements the per-volume encryption primitive. These three scenarios wire the **cluster-wide master passphrase** the controller uses to wrap per-volume LUKS keys and any remote-credential secrets, so a fresh controller restart can re-derive working LUKS keys without an operator stamping passphrases on every replica.
+
+### 6.W12 `linstor encryption create-passphrase` initialises the master key — S
+
+- **Priority:** P0  **Target:** unit + e2e  **Complexity:** M
+- **Source:** UG9 §"Encryption of storage volumes" via tests/scenarios/day2-encryption-create-passphrase.md
+
+POST `/v1/encryption/passphrase` with a fresh passphrase: controller derives a master key, stamps it sealed into a cluster-wide Secret (analogous to upstream's `ENCRYPTION_PASSPHRASE` table), and unlocks itself in-memory. Idempotency: a second POST with the same passphrase succeeds; a different passphrase returns 409. Returns no body on success.
+
+**Unit:** REST handler + store side (sealed-secret round-trip).
+**E2E:** create-passphrase on a fresh cluster; LUKS-stack RD becomes provisionable; controller restart with the same passphrase auto-unlocks.
+
+### 6.W13 `linstor encryption enter-passphrase` after controller restart — S
+
+- **Priority:** P0  **Target:** unit + e2e  **Complexity:** M
+- **Source:** UG9 §"Encryption of storage volumes" via tests/scenarios/day2-encryption-enter-passphrase-on-restart.md
+
+PATCH `/v1/encryption/passphrase` re-enters the operator's master passphrase after a controller restart that lost the in-memory key. LUKS-layer resources stay in `Suspended` (controller refuses to provision new) until the passphrase lands. Wrong passphrase → 401 + descriptive error; right passphrase → 200 + Suspended resources resume.
+
+**Unit:** in-memory store with sealed master key; wrong+right paths.
+**E2E:** restart controller; assert LUKS provisioning blocked; PATCH passphrase; LUKS provisioning resumes within next reconcile tick.
+
+### 6.W14 `linstor encryption modify-passphrase` rotates the master key — S
+
+- **Priority:** P1  **Target:** unit  **Complexity:** M
+- **Source:** UG9 §"Encryption of storage volumes" via tests/scenarios/day2-encryption-modify-passphrase.md
+
+PUT `/v1/encryption/passphrase` rotates: old passphrase decrypts existing wrapped keys, new passphrase re-wraps and rewrites the cluster Secret. Atomic — if any decrypt fails, the whole rotation rolls back. Test pins both happy + rollback paths.
+
 ---
 
 ## Group summary
@@ -108,8 +139,10 @@ Cross-listed with wave1 2.17 and wave2-02 2.W01. Per-SP `Autoplacer/MaxThroughpu
 | Tag | Count |
 |-----|------:|
 | P0 unit | 4 |
+| P0 unit + e2e (encryption) | 2 |
 | P0 integration | 4 |
 | P0 e2e | 1 |
+| P1 unit (encryption) | 1 |
 | P1 e2e | 1 |
 | P2 (any) | 4 |
 | T (implement first) | 1 |

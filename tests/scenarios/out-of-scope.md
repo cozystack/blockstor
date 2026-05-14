@@ -53,12 +53,6 @@ why, here's the workaround," not "we'll add it in a sprint."
 - **Why deferred:** Cozystack handles cluster TLS at platform level (cert-manager / K8s Service mesh). blockstor's apiserver doesn't manage certs; satellites talk to the kube-apiserver via `ctrl.GetConfig()` per Phase 10.6 (see wave1 3.10).
 - **Sources:** day2-tls-controller-satellite.md, day2-tls-rest-api.md
 
-## Encryption (LUKS at-rest passphrase orchestration)
-
-- **What:** `linstor encryption create-passphrase | enter-passphrase | modify-passphrase` for the master key that protects LUKS volumes and remote credentials.
-- **Why deferred:** LUKS-at-rest encryption is currently out of blockstor scope — flag for future work. Wave1 6.13 / 6.14 / 6.15 cover the LUKS layer contract (PLAN.md `pkg/luks`) but the passphrase CRUD endpoints are orchestrated by piraeus (wave1 6.17) when the time comes, not blockstor directly. Until LUKS lands as a supported feature, these endpoints stay stubbed.
-- **Sources:** day2-encryption-create-passphrase.md, day2-encryption-enter-passphrase-on-restart.md, day2-encryption-modify-passphrase.md
-
 ## QoS (sysfs blkio throttle)
 
 - **What:** Per-volume `sys/fs/blkio_throttle_{read,write}_{bps,iops}` props that satellite writes to cgroup v1 sysfs.
@@ -92,5 +86,10 @@ why, here's the workaround," not "we'll add it in a sprint."
 ## Shared LVM2 storage pools (SAN-style multi-attach)
 
 - **What:** `linstor sp create lvm --shared-space <uuid> --external-locking` for shared VGs across multiple nodes via sanlock / lvmlockd.
-- **Why deferred:** Cozystack runs HCI with node-local storage; shared LVM defeats the DRBD-replication premise. See wave2-06 6.W10 — REST handler accepts the flag and returns 501 with `unsupported in blockstor` text.
+- **Why deferred (today):** Cozystack runs HCI with node-local storage; shared LVM defeats the DRBD-replication premise. See wave2-06 6.W10 — REST handler currently returns 501 `unsupported in blockstor` text.
+- **API extensibility requirement:** `pkg/api/v1/storage_pool.go` and the StoragePool CRD MUST keep the wire shape extensible so the feature can land later without breaking changes. Specifically:
+  - Preserve `Props["StorDriver/SharedSpaceID"]` and `Props["StorDriver/ExternalLocking"]` keys round-trip through REST + store (no allow-list filtering that silently drops unknown StorDriver props).
+  - Reserve `SharedSpaceID` field on `apiv1.StoragePool` (already present per Bug 59) — do NOT drop it; it survives an unsupported-flag rejection so a future enable path doesn't need a schema migration.
+  - REST 501 path MUST preserve and echo the operator's submitted props in the error envelope so a future-enable wizard can resume from the same body.
+  - When shared-LVM lands, the wire shape should change in zero places — only the handler's "unsupported" check goes away and the satellite provider gets the sanlock plumbing.
 - **Sources:** day2-storage-pool-shared.md
