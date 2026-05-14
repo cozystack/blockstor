@@ -1430,6 +1430,127 @@ func TestNodeListPropertiesEmptySeedNotNil(t *testing.T) {
 	}
 }
 
+// TestNodeInfoEndpoint pins scenario 4.W08: `GET /v1/nodes/{node}/info`
+// returns the compact per-node provider/layer capability table
+// (`linstor node info <node>` — operator's fastest "why didn't
+// autoplace pick this node?" diagnostic). The supported sets MUST
+// list every provider/layer blockstor's satellite actually
+// implements (LVM_THIN / ZFS_THIN / FILE_THIN / DISKLESS providers;
+// DRBD / LUKS / STORAGE layers — wave1 6.11 scoped out CACHE /
+// WRITECACHE / NVME), and the unsupported sets MUST carry the
+// architectural-exclusion reasons so `linstor advise` doesn't
+// propose unreachable configurations.
+func TestNodeInfoEndpoint(t *testing.T) {
+	st := store.NewInMemory()
+	seedNodeForF2(t, st, "worker-1")
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/worker-1/info")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/nodes/worker-1/info status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.NodeInfo
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode NodeInfo: %v", err)
+	}
+
+	if got.Name != "worker-1" {
+		t.Errorf("Name: got %q, want %q", got.Name, "worker-1")
+	}
+
+	wantProviders := []string{"LVM_THIN", "ZFS_THIN", "FILE_THIN", "DISKLESS"}
+	for _, want := range wantProviders {
+		var found bool
+
+		for _, have := range got.SupportedProviders {
+			if have == want {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("SupportedProviders missing %q; got %v", want, got.SupportedProviders)
+		}
+	}
+
+	wantLayers := []string{"DRBD", "LUKS", "STORAGE"}
+	for _, want := range wantLayers {
+		var found bool
+
+		for _, have := range got.SupportedLayers {
+			if have == want {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("SupportedLayers missing %q; got %v", want, got.SupportedLayers)
+		}
+	}
+
+	// Architectural exclusions surface so `linstor advise` doesn't
+	// propose unreachable stacks.
+	wantUnsupportedLayers := []string{"CACHE", "WRITECACHE", "NVME"}
+	for _, want := range wantUnsupportedLayers {
+		reasons, ok := got.UnsupportedLayers[want]
+		if !ok {
+			t.Errorf("UnsupportedLayers missing %q; got keys=%v", want, mapKeys(got.UnsupportedLayers))
+
+			continue
+		}
+
+		if len(reasons) == 0 {
+			t.Errorf("UnsupportedLayers[%q]: got empty reason list, want at least one", want)
+		}
+	}
+
+	wantUnsupportedProviders := []string{
+		"OPENFLEX_TARGET", "REMOTE_SPDK", "SPDK",
+		"STORAGE_SPACES", "STORAGE_SPACES_THIN",
+		"EBS_TARGET", "EBS_INIT",
+	}
+	for _, want := range wantUnsupportedProviders {
+		reasons, ok := got.UnsupportedProviders[want]
+		if !ok {
+			t.Errorf("UnsupportedProviders missing %q; got keys=%v", want, mapKeys(got.UnsupportedProviders))
+
+			continue
+		}
+
+		if len(reasons) == 0 {
+			t.Errorf("UnsupportedProviders[%q]: got empty reason list, want at least one", want)
+		}
+	}
+}
+
+// TestNodeInfoUnknownNodeReturns404 pins the typo-safety clause of
+// scenario 4.W08: calling `linstor node info` against a non-existent
+// node MUST surface a 404 (golinstor maps to "Node 'ghost' not
+// found"). A 200 with empty supported sets would let a typo
+// masquerade as a node with no capabilities, which is the exact
+// "why didn't autoplace pick this node?" diagnostic this endpoint
+// is supposed to short-circuit.
+func TestNodeInfoUnknownNodeReturns404(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/ghost/info")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	}
+}
+
 // mapKeys is a tiny helper that returns the keys of a
 // `map[string][]string` as a sorted slice — used in failure messages
 // TestNodeCreateSynthesizesDefaultNetInterface: scenario 4.W01 —

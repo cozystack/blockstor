@@ -57,6 +57,7 @@ var defaultResolveHost resolveHostFunc = func(ctx context.Context, host string) 
 func (s *Server) registerNodes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/nodes", s.requireStore(s.handleNodesList))
 	mux.HandleFunc("GET /v1/nodes/{node}", s.requireStore(s.handleNodeGet))
+	mux.HandleFunc("GET /v1/nodes/{node}/info", s.requireStore(s.handleNodeInfo))
 	mux.HandleFunc("POST /v1/nodes", s.requireStore(s.handleNodeCreate))
 	mux.HandleFunc("PUT /v1/nodes/{node}", s.requireStore(s.handleNodeUpdate))
 	mux.HandleFunc("DELETE /v1/nodes/{node}", s.requireStore(s.handleNodeDelete))
@@ -308,6 +309,33 @@ func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, n)
+}
+
+// handleNodeInfo serves `GET /v1/nodes/{node}/info`. Scenario 4.W08:
+// operators run `linstor node info <node>` as the fastest "why
+// didn't autoplace pick this node?" diagnostic. The response is the
+// compact per-node capability table — supported + unsupported
+// providers and layers — synthesised from the same source of truth
+// the per-Node read path uses (SynthesizeNodeCapabilities). 404 on
+// unknown node so a typo doesn't masquerade as an empty capability
+// set.
+func (s *Server) handleNodeInfo(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("node")
+
+	n, err := s.Store.Nodes().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiv1.NodeInfo{
+		Name:                 n.Name,
+		SupportedProviders:   append([]string(nil), n.StorageProviders...),
+		SupportedLayers:      append([]string(nil), n.ResourceLayers...),
+		UnsupportedProviders: n.UnsupportedProviders,
+		UnsupportedLayers:    n.UnsupportedLayers,
+	})
 }
 
 func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {

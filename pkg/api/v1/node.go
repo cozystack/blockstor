@@ -211,6 +211,25 @@ const (
 	unsupportedProviderReason = "scoped out of blockstor (upstream-only provider)"
 )
 
+// NodeInfo is the compact per-node capability table returned by
+// `GET /v1/nodes/{node}/info`. It is the wire shape behind the
+// `linstor node info <node>` CLI diagnostic — the operator's fastest
+// answer to "why didn't autoplace pick this node?". Scenario 4.W08.
+//
+// Field order: `Name` first so JSON-streamed output reads top-down,
+// then the supported sets, then the unsupported sets. The supported
+// sets MUST mirror what `pkg/satellite/factory.go::NewProviderFromKind`
+// (for providers) and the satellite's layer dispatcher (for layers)
+// actually instantiate, so `linstor advise` only proposes reachable
+// configurations.
+type NodeInfo struct {
+	Name                 string              `json:"name"`
+	SupportedProviders   []string            `json:"supported_providers"`
+	SupportedLayers      []string            `json:"supported_layers"`
+	UnsupportedProviders map[string][]string `json:"unsupported_providers,omitempty"`
+	UnsupportedLayers    map[string][]string `json:"unsupported_layers,omitempty"`
+}
+
 // SynthesizeNodeCapabilities populates the upstream-LINSTOR
 // capability fields (UUID, resource_layers, storage_providers,
 // unsupported_layers, unsupported_providers, props.NodeUname,
