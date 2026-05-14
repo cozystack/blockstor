@@ -1036,22 +1036,62 @@ func (r *Reconciler) runFirstActivation(ctx context.Context, dr *intent.DesiredR
 
 func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	for _, vol := range dr.GetVolumes() {
-		if vol.GetSeedFromGi() == "" {
-			continue
-		}
-
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
 			continue
 		}
 
-		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, vol.GetSeedFromGi())
+		seed, ok := r.resolveSeedGi(dr.GetName(), vol)
+		if !ok {
+			continue
+		}
+
+		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, seed)
 		if err != nil {
 			return errors.Wrapf(err, "set-gi vol %d", vol.GetVolumeNumber())
 		}
 	}
 
 	return nil
+}
+
+// resolveSeedGi decides what GI to stamp on a fresh replica's
+// metadata block:
+//
+//   - Controller-supplied SeedFromGi wins. That's the Phase 8.1
+//     "copy from an existing UpToDate peer" path — the GI is the
+//     real CurrentGi of the peer, so DRBD's handshake sees a true
+//     match and skips initial-sync.
+//
+//   - Otherwise, when the backing provider is guaranteed to hand
+//     back zero-initialised storage (thin LVM, thin or thick ZFS,
+//     sparse file — see IsThinOrZFS), synthesise a deterministic
+//     per-RD, per-volume day0 GI. Same RD name + volume number
+//     produces the same GI on every node so DRBD's GI handshake
+//     matches and skips initial-sync even when no peer has been
+//     stamped UpToDate yet. Mirrors upstream LINSTOR's
+//     `DrbdLayerUtils.skipInitSync` short-circuit (Bug 77).
+//
+//   - Otherwise (thick LVM, opaque file, unknown provider, DISKLESS),
+//     return ok=false. DRBD then falls through to the full
+//     initial-sync on first connect, which is the only safe
+//     behaviour when the backing storage may carry pre-existing
+//     bytes the peer doesn't have.
+func (r *Reconciler) resolveSeedGi(resourceName string, vol *intent.DesiredVolume) (string, bool) {
+	if seed := vol.GetSeedFromGi(); seed != "" {
+		return seed, true
+	}
+
+	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
+	if !ok || provider == nil {
+		return "", false
+	}
+
+	if !IsThinOrZFS(provider.Kind()) {
+		return "", false
+	}
+
+	return day0GiFor(resourceName, vol.GetVolumeNumber()), true
 }
 
 // providerForResource resolves the provider that owns the named

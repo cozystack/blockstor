@@ -31,6 +31,7 @@ import (
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
+	"github.com/cozystack/blockstor/pkg/storage/zfs"
 )
 
 var (
@@ -1537,21 +1538,28 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	}
 }
 
-// TestApplyFirstActivationNoSeedSkipsSetGi pins the negative case:
-// SeedFromGi="" (e.g. the first replica in a fresh RD with no peer
-// to seed from) MUST NOT run drbdmeta — the freshly-created
-// metadata block stays at zero GI and DRBD pays the full
-// initial-sync cost on first connect, which is the acceptable
-// outcome.
-func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
+// TestApplyFirstActivationNoSkipOnLVMThick (Bug 77 negative case)
+// pins that on a fresh RD with no peer to seed from AND a backing
+// provider that does NOT guarantee zeroes on read (thick LVM hands
+// back whatever bytes were on the PV's extents previously), the
+// satellite MUST NOT issue a synthetic day0 set-gi. DRBD then
+// falls through to the full initial-sync on first connect, which
+// is the only safe behaviour: skipping initial-sync on thick LVM
+// would let pre-existing garbage on one replica's extents differ
+// from the other's and never resync.
+//
+// SeedFromGi is empty (no UpToDate peer in Status.Peers). The
+// existing-peer path is covered by TestApplyFirstActivationSeedsGiBeforeAdjust
+// and is unchanged.
+func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-noseed_00000",
 		storage.FakeResponse{Stdout: []byte("")})
 
-	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
-		Providers: map[string]storage.Provider{"thin1": thin},
+		Providers: map[string]storage.Provider{"thick1": thick},
 		Adm:       drbd.NewAdm(fx),
 		StateDir:  dir,
 		NodeName:  "n1",
@@ -1562,7 +1570,7 @@ func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
 			Name:     "pvc-noseed",
 			NodeName: "n1",
 			Volumes: []*intent.DesiredVolume{
-				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thick1"},
 			},
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
@@ -1575,8 +1583,137 @@ func TestApplyFirstActivationNoSeedSkipsSetGi(t *testing.T) {
 
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "drbdmeta") {
-			t.Errorf("drbdmeta ran without SeedFromGi: %s", line)
+			t.Errorf("drbdmeta ran on thick LVM without SeedFromGi: %s", line)
 		}
+	}
+}
+
+// TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS (Bug 77 fix)
+// pins the upstream-LINSTOR `DrbdLayerUtils.skipInitSync` behaviour:
+// when a fresh RD activates on a backing provider that is guaranteed
+// to hand back zero-initialised storage (thin LVM, thin or thick
+// ZFS, sparse file), the satellite stamps a deterministic per-RD,
+// per-volume "day 0" GI on each replica's metadata block before
+// `drbdadm adjust`. The day0 is the same on every node (derived
+// from the RD name + volume number), so DRBD-9's GI handshake on
+// first connect matches and skips the full initial-sync.
+//
+// Two cases via subtests: ProviderKind="ZFS_THIN" (sparse zvol)
+// and ProviderKind="LVM_THIN" (dm-thin volume). Both have the
+// "read-as-zero on unprovisioned blocks" property the upstream
+// short-circuit relies on.
+//
+// The fix MUST work without SeedFromGi being stamped by the
+// controller — that's the difference from the existing-peer path
+// already pinned by TestApplyFirstActivationSeedsGiBeforeAdjust.
+func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
+	cases := []struct {
+		name        string
+		newProvider func(storage.Exec) storage.Provider
+		poolName    string
+		// listProbe is the per-provider "does the volume exist?" exec
+		// line. The satellite issues it via Provider.CreateVolume's
+		// idempotency check.
+		listProbe string
+		// statProbe is the VolumeStatus exec line the satellite issues
+		// after CreateVolume to learn the on-disk device path.
+		statProbe string
+		// statReply is the stdout the FakeExec hands back for statProbe.
+		// Carries the device path the satellite then passes to drbdmeta.
+		statReply string
+		// wantDevice is the device path that must show up inside the
+		// drbdmeta set-gi command line.
+		wantDevice string
+	}{
+		{
+			name: "ZFS_THIN",
+			newProvider: func(ex storage.Exec) storage.Provider {
+				return zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, ex)
+			},
+			poolName:   "zfs-thin1",
+			listProbe:  "zfs list -H -o name tank/pvc-zskip_00000",
+			statProbe:  "zfs list -H -p -o name,volsize,used tank/pvc-zskip_00000",
+			statReply:  "tank/pvc-zskip_00000\t1073741824\t512\n",
+			wantDevice: "/dev/zvol/tank/pvc-zskip_00000",
+		},
+		{
+			name: "LVM_THIN",
+			newProvider: func(ex storage.Exec) storage.Provider {
+				return lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, ex)
+			},
+			poolName:   "lvm-thin1",
+			listProbe:  "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-zskip_00000",
+			statProbe:  "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-zskip_00000",
+			statReply:  "/dev/vg/pvc-zskip_00000|1048576\n",
+			wantDevice: "/dev/vg/pvc-zskip_00000",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			fx.Expect(tc.listProbe, storage.FakeResponse{Stdout: []byte("")})
+			fx.Expect(tc.statProbe, storage.FakeResponse{Stdout: []byte(tc.statReply)})
+
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{tc.poolName: tc.newProvider(fx)},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-zskip",
+					NodeName: "n1",
+					Volumes: []*intent.DesiredVolume{
+						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: tc.poolName},
+					},
+					DrbdOptions: map[string]string{
+						"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			calls := fx.CommandLines()
+
+			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.MaxPeers-1))
+			setGi := indexOfPrefix(calls, "drbdmeta --force pvc-zskip/0 v09 ")
+			adjust := indexOfPrefix(calls, "drbdadm adjust pvc-zskip")
+
+			if createMD < 0 {
+				t.Fatalf("missing drbdadm create-md in calls: %v", calls)
+			}
+
+			if setGi < 0 {
+				t.Fatalf("missing drbdmeta set-gi (day0 skip-init-sync) in calls: %v", calls)
+			}
+
+			if adjust < 0 {
+				t.Fatalf("missing drbdadm adjust in calls: %v", calls)
+			}
+
+			if createMD >= setGi || setGi >= adjust {
+				t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending); calls=%v",
+					createMD, setGi, adjust, calls)
+			}
+
+			// Pin the exact day0 GI shape: same current_uuid in BOTH
+			// current_uuid and bitmap_uuid slots, history zeroed. The
+			// satellite derives day0 deterministically from RD name +
+			// volume number — keep the expected value in sync with
+			// pkg/satellite/providerkind.go's day0GiFor().
+			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
+			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi %s:%s:0:0",
+				tc.wantDevice, day0, day0)
+			if !slices.Contains(calls, wantSetGi) {
+				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGi, calls)
+			}
+		})
 	}
 }
 
