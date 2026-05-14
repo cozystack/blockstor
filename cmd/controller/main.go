@@ -267,6 +267,12 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "snapshot")
 		os.Exit(1)
 	}
+	if err := (&controller.AutoSnapshotRunnable{
+		Client: mgr.GetClient(),
+	}).RegisterWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register runnable", "runnable", "auto-snapshot")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
