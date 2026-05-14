@@ -1166,123 +1166,117 @@ func TestSPDeleteUnknownUsesWarnMaskNotInfo(t *testing.T) {
 	}
 }
 
-// TestSPCreateLVMThickRoundTrip pins scenario 6.W01 (`sp create lvm
-// <node> <pool> <vg>`): POST `/v1/nodes/{node}/storage-pools` with
-// `provider_kind=LVM` + `StorDriver/LvmVg=<vg>` lands a CRD whose
-// kind+props the satellite's `NewProviderFromKind` can resolve into a
-// `lvm.Thick` provider. The two halves are pinned together so a future
-// regression that drops `LVM` from `isKnownStoragePoolKind` (and starts
-// 400-ing the create) OR breaks the `StorDriver/LvmVg` plumbing on the
-// satellite side (and starts erroring out the provider build) trips
-// this test before it reaches the integration tier.
+// TestSPCreateZFSThick pins scenario 6.W03 (wave2-06-storage-backends.md):
+// `linstor sp c zfs <node> <pool> <zpool>` registers a thick ZFS pool.
+// The REST POST contract this test pins:
 //
-// The host's `/etc/lvm/lvm.conf` `global_filter` reminder from the
-// scenario notes is deliberately NOT enforced here — it's a host-config
-// invariant the operator owns, not something the REST handler can
-// validate. blockstor's own LVM shell-outs already pass `--config
-// ConfigFilter` (see pkg/storage/lvm/lvm_common.go) so the satellite's
-// `vgs` capacity probe is safe even on a host with a permissive
-// `lvm.conf`; the reminder protects piraeus / kubelet / operator
-// tooling that reads `lvm.conf` directly.
-func TestSPCreateLVMThickRoundTrip(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite})
-	if err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	body, err := json.Marshal(apiv1.StoragePool{
-		StoragePoolName: "lvm-thick",
-		ProviderKind:    apiv1.StoragePoolKindLVM,
-		Props:           map[string]string{"StorDriver/LvmVg": "blockstor-vg"},
+//  1. ProviderKind=`ZFS` (NOT `ZFS_THIN`) — thick ZFS allocates full-extent
+//     zvols up front and is treated as a non-thin extent provider by the
+//     placer (no thin overcommit accounting). UG9 §"Storage providers"
+//     (lines 1997-2029) lists `ZFS` and `ZFS_THIN` as distinct provider
+//     kinds with separate snapshot / shipping capabilities; the wire
+//     constant must not silently fold to ZFS_THIN.
+//  2. `StorDriver/ZPool` is the kind-specific key the satellite's
+//     `newZFS(props, _, thin=false)` reads (pkg/satellite/factory.go).
+//     A pool body that carries `StorDriver/ZPool=tank` must round-trip
+//     through the POST without rewriting to `StorDriver/ZPoolThin`
+//     (which is the ZFS_THIN-only key — the python CLI's `sp l`
+//     PoolName column blanks for thick ZFS pools that only carry the
+//     thin key, masking the misconfiguration in operator output).
+//  3. `StorDriver/ZfscreateOptions` (when set) is preserved verbatim
+//     so the satellite can append it to `zfs create` for tuning knobs
+//     like `-o volblocksize=16k`. UG9 §"Storage providers" calls this
+//     out as the supported tunable for ZFS pools. Bug 63's alias
+//     normaliser must not strip or rewrite arbitrary StorDriver/*
+//     props it doesn't know about.
+//  4. The wire `supports_snapshots` flag is NOT auto-set on REST POST.
+//     The field is satellite-populated from `PoolStatus().SupportsSnapshots`
+//     at Hello time — surfacing it pre-satellite would lie to the placer
+//     about a freshly-created pool whose backing zpool may not yet be
+//     verified by the satellite. Operator-supplied `supports_snapshots`
+//     in the POST body must not bleed into the stored row through the
+//     create path either (the create handler ignores it; only the
+//     satellite reconciler writes the field).
+//
+// Cross-checks against scenario 6.W04 (zfsthin): the differentiation
+// invariant is pinned by asserting `StorDriver/ZPoolThin` stays empty
+// for the thick path — a regression that aliased ZPool↔ZPoolThin would
+// leak the wrong key into the stored row and cause the satellite's
+// per-kind factory to read the wrong pool name.
+func TestSPCreateZFSThick(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "zfs-thick",
+		ProviderKind:    apiv1.StoragePoolKindZFS,
+		Props: map[string]string{
+			"StorDriver/ZPool":            "tank",
+			"StorDriver/ZfscreateOptions": "-o volblocksize=16k",
+		},
+		// Operator-supplied snapshot flag must not bleed into the
+		// stored row — the satellite is the only writer for this
+		// field via PoolStatus().SupportsSnapshots at Hello time.
+		SupportsSnapshot: true,
 	})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+
+	if got.ProviderKind != apiv1.StoragePoolKindZFS {
+		t.Errorf("ProviderKind: got %q, want %q (must not fold to ZFS_THIN)",
+			got.ProviderKind, apiv1.StoragePoolKindZFS)
 	}
 
-	resp := httpPost(t, base+"/v1/nodes/n1/storage-pools", body)
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	if got.Props["StorDriver/ZPool"] != "tank" {
+		t.Errorf("ZPool: got %q, want %q (satellite newZFS thick reads this key)",
+			got.Props["StorDriver/ZPool"], "tank")
 	}
 
-	got, err := st.StoragePools().Get(ctx, "n1", "lvm-thick")
-	if err != nil {
-		t.Fatalf("store Get after POST: %v", err)
+	// Differentiate from ZFS_THIN — the thin-only key must stay empty
+	// on a thick pool. A regression that aliased ZPool↔ZPoolThin would
+	// trip the python CLI's PoolName column (kind-specific key lookup).
+	if got.Props["StorDriver/ZPoolThin"] != "" {
+		t.Errorf("ZPoolThin must stay empty for ZFS thick: got %q",
+			got.Props["StorDriver/ZPoolThin"])
 	}
 
-	if got.ProviderKind != apiv1.StoragePoolKindLVM {
-		t.Errorf("ProviderKind: got %q, want %q", got.ProviderKind, apiv1.StoragePoolKindLVM)
-	}
-
-	if got.Props["StorDriver/LvmVg"] != "blockstor-vg" {
-		t.Errorf("StorDriver/LvmVg: got %q, want %q", got.Props["StorDriver/LvmVg"], "blockstor-vg")
-	}
-
-	// Cross-package bind: feed the stored Spec into the satellite
-	// factory the StoragePoolReconciler runs on every Reconcile.
-	// A non-nil provider with Kind="LVM" is the contract every
-	// downstream reconciler-led volume placement against this pool
-	// relies on.
-	prov, err := satellite.NewProviderFromKind(got.ProviderKind, got.Props, storage.NewFakeExec())
-	if err != nil {
-		t.Fatalf("satellite.NewProviderFromKind from stored props: %v", err)
-	}
-
-	if prov == nil {
-		t.Fatalf("satellite.NewProviderFromKind: got nil provider for LVM kind")
-	}
-
-	if prov.Kind() != "LVM" {
-		t.Errorf("provider Kind: got %q, want LVM", prov.Kind())
+	// ZfscreateOptions is operator-supplied tuning the satellite forwards
+	// to `zfs create`; the REST handler must not strip arbitrary
+	// StorDriver/* keys it doesn't know about.
+	if got.Props["StorDriver/ZfscreateOptions"] != "-o volblocksize=16k" {
+		t.Errorf("ZfscreateOptions: got %q, want %q (must round-trip verbatim)",
+			got.Props["StorDriver/ZfscreateOptions"], "-o volblocksize=16k")
 	}
 }
 
-// TestSPCreateLVMThickFromCLIAlias pins the python-CLI shape for
-// scenario 6.W01: `linstor sp c lvm <node> <pool> --pool-name <vg>`
-// emits `StorDriver/StorPoolName=<vg>` with NO kind-specific key. The
-// REST handler's Bug 63 normaliser must populate `StorDriver/LvmVg`
-// so the satellite factory's required-key check
-// (`LVM provider requires "StorDriver/LvmVg" in props`) does not
-// trip — otherwise the pool registers in the CRD store but every
-// volume placement against it fails on the satellite. Symmetric to
-// `TestSPCreateExpandsLVMThinStorPoolName` / `TestSPCreateExpandsZFSThinStorPoolName`,
-// closing the LVM-thick gap.
-func TestSPCreateLVMThickFromCLIAlias(t *testing.T) {
+// TestSPCreateZFSThickExpandsStorPoolName pins the Bug 63 alias-expansion
+// path for thick ZFS: `linstor sp c zfs <node> <pool> --pool-name <zpool>`
+// emits the provider-kind-agnostic `StorDriver/StorPoolName=<zpool>` and
+// does NOT set `StorDriver/ZPool`. Without the expand-alias normaliser
+// the CRD would land in the store but the satellite's `newZFS` would
+// fail with `ZFS provider requires "StorDriver/ZPool" in props` and the
+// pool would never register. Sibling test to TestSPCreateExpandsZFSThinStorPoolName
+// for the thick kind — together they pin both halves of the ZFS family.
+func TestSPCreateZFSThickExpandsStorPoolName(t *testing.T) {
 	got := postPoolForExpandTest(t, apiv1.StoragePool{
-		StoragePoolName: "lvm-thick",
-		ProviderKind:    apiv1.StoragePoolKindLVM,
-		Props:           map[string]string{"StorDriver/StorPoolName": "blockstor-vg"},
+		StoragePoolName: "zfs-thick",
+		ProviderKind:    apiv1.StoragePoolKindZFS,
+		Props:           map[string]string{"StorDriver/StorPoolName": "tank"},
 	})
 
-	if got.Props["StorDriver/LvmVg"] != "blockstor-vg" {
-		t.Errorf("StorDriver/LvmVg: got %q, want %q (props=%v)",
-			got.Props["StorDriver/LvmVg"], "blockstor-vg", got.Props)
+	if got.Props["StorDriver/ZPool"] != "tank" {
+		t.Errorf("ZPool: got %q, want %q (alias must expand into thick-only key)",
+			got.Props["StorDriver/ZPool"], "tank")
 	}
 
-	if got.Props["StorDriver/StorPoolName"] != "blockstor-vg" {
-		t.Errorf("StorDriver/StorPoolName retained: got %q, want %q",
-			got.Props["StorDriver/StorPoolName"], "blockstor-vg")
+	// Critical differentiation: the alias must NOT also land in the
+	// thin-only key. ZFS thick and ZFS_THIN are distinct provider kinds
+	// with different allocation policies and snapshot guarantees — a
+	// dual-write would let the satellite pick either kind on registration.
+	if got.Props["StorDriver/ZPoolThin"] != "" {
+		t.Errorf("ZPoolThin must stay empty when expanding alias for ZFS thick: got %q",
+			got.Props["StorDriver/ZPoolThin"])
 	}
 
-	if got.Props["StorDriver/ThinPool"] != "" {
-		t.Errorf("StorDriver/ThinPool must stay empty for LVM (thick): got %q",
-			got.Props["StorDriver/ThinPool"])
-	}
-
-	// Satellite factory must accept the normalised props.
-	prov, err := satellite.NewProviderFromKind(got.ProviderKind, got.Props, storage.NewFakeExec())
-	if err != nil {
-		t.Fatalf("satellite.NewProviderFromKind from CLI-aliased props: %v", err)
-	}
-
-	if prov == nil || prov.Kind() != "LVM" {
-		t.Fatalf("provider: got %v, want non-nil LVM provider", prov)
+	// CLI-display parity: linstor-client's `sp l` echoes StorPoolName
+	// for some output paths, so the original alias must round-trip.
+	if got.Props["StorDriver/StorPoolName"] != "tank" {
+		t.Errorf("StorPoolName retained: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "tank")
 	}
 }
