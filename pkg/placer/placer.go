@@ -320,6 +320,13 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 		return nil, err
 	}
 
+	// Scenario 9.W06: `--replicas-on-same Aux/<key>=<val>` value-pin
+	// form drops every candidate whose node's real Aux value doesn't
+	// match the pinned value (and every node missing the property).
+	// This runs BEFORE pickSameGroup so the group partitioner only
+	// sees nodes the operator declared as the target value bucket.
+	candidates = filterSamePinned(candidates, nodes, filter.ReplicasOnSame)
+
 	state := newState(filter, existing, nodes, allPools)
 
 	if state.sameTuple == nil && len(filter.ReplicasOnSame) > 0 {
@@ -1211,8 +1218,12 @@ func matchesTuple(nodeProps map[string]string, keys []string, want map[string]st
 		return true
 	}
 
-	for _, k := range keys {
-		if nodeProps[auxKey(k)] != want[auxKey(k)] {
+	for _, spec := range keys {
+		// `key=value` form (scenario 9.W06): only the key half is
+		// looked up in nodeProps; want already carries the pinned
+		// value. Bare-key form falls through to the same comparison.
+		key, _, _ := parseSameSpec(spec)
+		if nodeProps[auxKey(key)] != want[auxKey(key)] {
 			return false
 		}
 	}
@@ -1241,8 +1252,19 @@ func collidesWithDiff(nodeProps map[string]string, keys []string, seen map[strin
 
 func lookupKeys(nodeProps map[string]string, keys []string) map[string]string {
 	out := make(map[string]string, len(keys))
-	for _, k := range keys {
-		out[auxKey(k)] = nodeProps[auxKey(k)]
+	for _, spec := range keys {
+		// `key=value` value-pin form (scenario 9.W06): tuple slot
+		// stores the pinned value directly so matchesTuple compares
+		// nodeProps against the operator-declared value, not against
+		// whatever the first-placed replica happened to carry.
+		key, value, hasValue := parseSameSpec(spec)
+		if hasValue {
+			out[auxKey(key)] = value
+
+			continue
+		}
+
+		out[auxKey(key)] = nodeProps[auxKey(key)]
 	}
 
 	return out
@@ -1264,6 +1286,22 @@ func auxKey(key string) string {
 // exclusion). The third return tells the caller which mode this spec
 // is in.
 func parseDiffSpec(spec string) (string, string, bool) {
+	k, v, ok := strings.Cut(spec, "=")
+	if !ok {
+		return spec, "", false
+	}
+
+	return k, v, true
+}
+
+// parseSameSpec splits a replicas_on_same entry into its key and
+// optional value half. Per UG9 (scenario 9.W06), a bare "key" means
+// "all replicas must share the same value of key" (group affinity);
+// a "key=value" form means "all replicas must carry exactly that
+// pair" (value pinning — nodes without the property or with a
+// different value are EXCLUDED). The third return tells the caller
+// which mode this spec is in. Mirrors parseDiffSpec.
+func parseSameSpec(spec string) (string, string, bool) {
 	k, v, ok := strings.Cut(spec, "=")
 	if !ok {
 		return spec, "", false
@@ -1335,6 +1373,59 @@ func matchesAnyExcludedPair(nodeProps map[string]string, keys []string) bool {
 	}
 
 	return false
+}
+
+// filterSamePinned drops every candidate whose node violates a
+// `replicas_on_same Aux/<key>=<val>` value-pin (scenario 9.W06).
+// Nodes whose Aux property is unset or carries a different value are
+// excluded outright — operator intent is "place ONLY on the pinned
+// bucket". Bare-key specs are unaffected; the function is a no-op
+// when no value-pin entries are present (zero allocations on the
+// common path).
+func filterSamePinned(candidates []apiv1.StoragePool, nodes map[string]map[string]string, keys []string) []apiv1.StoragePool {
+	hasAnyValueForm := false
+
+	for _, spec := range keys {
+		if _, _, hv := parseSameSpec(spec); hv {
+			hasAnyValueForm = true
+
+			break
+		}
+	}
+
+	if !hasAnyValueForm {
+		return candidates
+	}
+
+	out := candidates[:0:0]
+
+	for i := range candidates {
+		nodeProps := nodes[candidates[i].NodeName]
+
+		if matchesAllSamePins(nodeProps, keys) {
+			out = append(out, candidates[i])
+		}
+	}
+
+	return out
+}
+
+// matchesAllSamePins reports whether the node satisfies every value-
+// pin spec in keys. Bare-key specs are skipped — they are group-
+// affinity constraints handled by pickSameGroup, not exclusion gates.
+func matchesAllSamePins(nodeProps map[string]string, keys []string) bool {
+	for _, spec := range keys {
+		key, value, hasValue := parseSameSpec(spec)
+		if !hasValue {
+			continue
+		}
+
+		if nodeProps[auxKey(key)] != value {
+			return false
+		}
+	}
+
+	return true
 }
 
 // pickSameGroup partitions candidates by their `replicas_on_same`

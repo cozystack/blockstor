@@ -729,6 +729,151 @@ func TestPlaceReplicasOnSameNoQualifyingGroup(t *testing.T) {
 	}
 }
 
+// TestPlaceReplicasOnSameValuePin pins scenario 9.W06: the
+// `--replicas-on-same Aux/<key>=<val>` value-pin form forces every
+// replica onto nodes whose Aux/<key> equals <val> verbatim. Nodes
+// with a DIFFERENT value AND nodes WITHOUT the property are excluded
+// — even when their FreeCapacity dwarfs the pinned bucket, even when
+// excluding them leaves the cluster under-replicated. The operator
+// declared a value bucket; the placer must respect it.
+//
+// Scenario: 5 candidate nodes — a1/a2 carry Aux/zone=zone-a (small
+// free), b1/b2 carry Aux/zone=zone-b (huge free), nolabel has no
+// Aux/zone at all (huge free). Without the value-pin filter the
+// composite score would route both replicas to b1/b2 or nolabel;
+// scenario 9.W06 demands they land on a1+a2 instead.
+//
+// Cross-listed with wave1 2.5 (placer constraint). Mirrors UG9
+// §"Constraining automatic resource placement by using auxiliary
+// node properties" (lines 1006-1076).
+func TestPlaceReplicasOnSameValuePin(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string, free int64) {
+		props := map[string]string{}
+		if zone != "" {
+			props["Aux/zone"] = zone
+		}
+
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite, Props: props,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "p",
+			ProviderKind:  apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:  free,
+			TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	// zone-a pair: SMALL free — placer's biggest-first sort would
+	// reject them without the value-pin filter.
+	mk("a1", "zone-a", 100)
+	mk("a2", "zone-a", 100)
+	// zone-b pair: HUGE free — wrong value, must be rejected.
+	mk("b1", "zone-b", 999)
+	mk("b2", "zone-b", 999)
+	// no-label node: HUGE free but property unset → must be rejected
+	// ("nodes WITHOUT the property are excluded", per wave2-09 §9.W06).
+	mk("nolabel", "", 999)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		ReplicasOnSame: []string{"Aux/zone=zone-a"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 2/2", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 2 {
+		t.Fatalf("len: got %d, want 2; %+v", len(got), got)
+	}
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+	}
+
+	if on["b1"] || on["b2"] {
+		t.Errorf("zone-b node placed despite replicas_on_same=Aux/zone=zone-a; got %+v", on)
+	}
+
+	if on["nolabel"] {
+		t.Errorf("no-label node placed despite value-pin; missing-property must be excluded; got %+v", on)
+	}
+
+	if !on["a1"] || !on["a2"] {
+		t.Errorf("expected zone-a pair (a1+a2); got %+v", on)
+	}
+}
+
+// TestPlaceReplicasOnSameValuePinNoMatchingNodes pins the
+// value-pin under-replication path: when NO node carries the pinned
+// Aux value, the placer must surface placed=0 (or partial) rather
+// than silently spreading replicas to nodes with a different value.
+// Operators rely on this to detect typo'd values before the RD goes
+// to production with the wrong topology.
+//
+// Three nodes all in zone-b, filter pins zone=zone-a → placed=0.
+func TestPlaceReplicasOnSameValuePinNoMatchingNodes(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, name := range []string{"b1", "b2", "b3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/zone": "zone-b"},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "p",
+			ProviderKind:  apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:  500,
+			TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:     2,
+		ReplicasOnSame: []string{"Aux/zone=zone-a"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 0 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 0/2 (no node matches pinned value)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if len(got) != 0 {
+		t.Errorf("unexpected leak: zone-b nodes placed despite pin=zone-a; got %+v", got)
+	}
+}
+
 // TestPlaceCandidatePoolsFiltersByStoragePoolList pins the
 // StoragePoolList filter in candidatePools (was 84%): when the
 // filter carries a non-empty allow-list of pool names, only pools
