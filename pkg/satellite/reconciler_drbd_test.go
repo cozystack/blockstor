@@ -2728,3 +2728,126 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 		}
 	}
 }
+
+// TestApplyVDSetSizeOnlineGrowOrdering pins scenario 4.W12 (`vd set-size`
+// grows online): when the controller bumps VD.SizeKib above what the
+// provider has on disk, the satellite reconciler MUST run the backend
+// resize (`lvextend` for LVM / `zfs set volsize` for ZFS) BEFORE
+// `drbdadm resize`. Order matters — `drbdadm resize` re-reads the
+// backing device's size and propagates it to the kernel; if it fires
+// before the backing device has grown, DRBD picks up the OLD size and
+// the consumer's `resize2fs` / `xfs_growfs` later sees a smaller block
+// device than its FS expects → ESHRINK and a confusing operator-facing
+// failure two layers up from the actual root cause.
+//
+// Sub-cases:
+//   - LVM_THIN: lvs reports the LV at 1 GiB, desired 2 GiB → `lvextend
+//     --size 2048MiB` lands strictly before `drbdadm resize --assume-clean`.
+//   - ZFS_THIN: zfs list reports volsize=1 GiB, desired 2 GiB → `zfs set
+//     volsize=2048M` lands strictly before `drbdadm resize --assume-clean`.
+//
+// Pairs with the REST-side guarantee that PUT
+// /v1/resource-definitions/{rd}/volume-definitions/{vn} updates only
+// VD.SizeKib without zeroing it on a props-only modify
+// (TestVolumeDefinitionsUpdateGetRoundTrip,
+// TestVolumeDefinitionsUpdateMergeSemanticsPreservesSizeKib). Together
+// they cover the full CSI ControllerExpandVolume path.
+func TestApplyVDSetSizeOnlineGrowOrdering(t *testing.T) {
+	cases := []struct {
+		name        string
+		newProvider func(storage.Exec) storage.Provider
+		poolName    string
+		// existsProbe is the per-provider "does the volume exist?" exec
+		// line, invoked from Provider.CreateVolume's idempotency check.
+		existsProbe string
+		existsReply string
+		// statProbe is the VolumeStatus exec line; statReply reports the
+		// CURRENT on-disk size as 1 GiB so the desired 2 GiB triggers the
+		// grow branch (`vol.GetSizeKib() > status.UsableKib`).
+		statProbe string
+		statReply string
+		// backendResize is the exact command line the provider issues to
+		// grow the backing device.
+		backendResize string
+	}{
+		{
+			name: "LVM_THIN",
+			newProvider: func(ex storage.Exec) storage.Provider {
+				return lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, ex)
+			},
+			poolName:      "thin1",
+			existsProbe:   "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-w12_00000",
+			existsReply:   "pvc-w12_00000\n",
+			statProbe:     "lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-w12_00000",
+			statReply:     "/dev/vg/pvc-w12_00000|1048576\n",
+			backendResize: "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-w12_00000",
+		},
+		{
+			name: "ZFS_THIN",
+			newProvider: func(ex storage.Exec) storage.Provider {
+				return zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, ex)
+			},
+			poolName:      "zfs-thin1",
+			existsProbe:   "zfs list -H -o name tank/pvc-w12_00000",
+			existsReply:   "tank/pvc-w12_00000\n",
+			statProbe:     "zfs list -H -p -o name,volsize,used tank/pvc-w12_00000",
+			statReply:     "tank/pvc-w12_00000\t1073741824\t512\n",
+			backendResize: "zfs set volsize=2048M tank/pvc-w12_00000",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fx := storage.NewFakeExec()
+			fx.Expect(tc.existsProbe, storage.FakeResponse{Stdout: []byte(tc.existsReply)})
+			fx.Expect(tc.statProbe, storage.FakeResponse{Stdout: []byte(tc.statReply)})
+
+			rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+				Providers: map[string]storage.Provider{tc.poolName: tc.newProvider(fx)},
+				Adm:       drbd.NewAdm(fx),
+				StateDir:  dir,
+				NodeName:  "n1",
+			})
+
+			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+				{
+					Name:     "pvc-w12",
+					NodeName: "n1",
+					Volumes: []*intent.DesiredVolume{
+						// Desired: 2 GiB — exceeds the 1 GiB the
+						// VolumeStatus probes report on disk.
+						{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: tc.poolName},
+					},
+					DrbdOptions: map[string]string{
+						"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+
+			calls := fx.CommandLines()
+
+			backendIdx := slices.Index(calls, tc.backendResize)
+			drbdResizeIdx := indexOfPrefix(calls, "drbdadm resize")
+
+			if backendIdx < 0 {
+				t.Fatalf("missing backend resize %q in calls: %v", tc.backendResize, calls)
+			}
+
+			if drbdResizeIdx < 0 {
+				t.Fatalf("missing drbdadm resize in calls: %v", calls)
+			}
+
+			// Scenario 4.W12: backend grow MUST precede drbdadm resize.
+			// drbdadm resize re-reads the backing device size; running
+			// it first would propagate the OLD size to the DRBD kernel.
+			if backendIdx >= drbdResizeIdx {
+				t.Errorf("scenario 4.W12 order: backend resize @%d must precede drbdadm resize @%d; calls=%v",
+					backendIdx, drbdResizeIdx, calls)
+			}
+		})
+	}
+}
