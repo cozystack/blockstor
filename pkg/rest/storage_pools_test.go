@@ -1163,3 +1163,90 @@ func TestSPDeleteUnknownUsesWarnMaskNotInfo(t *testing.T) {
 		t.Errorf("message: got %q, want it to name both ghost-pool and ghost-node", rc[0].Message)
 	}
 }
+
+// TestSPCreateZFSThinScenario6W04 pins scenario 6.W04 (cross-listed with
+// wave1 6.2): `linstor sp c zfsthin <node> <pool> <zpool>`. Three things
+// must hold end-to-end on the REST handler:
+//
+//  1. The wire token `zfsthin` (lowercase, compressed — what python-linstor's
+//     `sp c zfsthin ...` emits on the network) normalises to the canonical
+//     `ZFS_THIN` enum the StoragePool CRD allows. Without this, the create
+//     lands as `provider_kind=zfsthin`, fails isKnownStoragePoolKind, and
+//     the CLI gets an opaque 400 — mirroring upstream's
+//     `DeviceProviderKind.valueOfIgnoreCase` is the parity contract. The
+//     same normalizeProviderKind() already wired into POST
+//     /v1/physical-storage (Bug 73) must apply here.
+//
+//  2. Bug 63's StorPoolName alias expansion routes a thin-mode zpool name
+//     into `StorDriver/ZPoolThin` (NOT `StorDriver/ZPool`). factory.go's
+//     `NewProviderFromKind(ZFS_THIN, ...)` reads ZPoolThin as the primary
+//     key; landing the value in ZPool would register the pool in the CRD
+//     store yet fail every provider lookup on the satellite with a
+//     `requires "StorDriver/ZPoolThin" in props` error.
+//
+//  3. Source-of-truth cross-refs (asserted in sibling tests, noted here
+//     for traceability): the ZFS Provider always reports
+//     `SupportsSnapshots=true` (pkg/storage/zfs/zfs.go PoolStatus) — the
+//     capability matrix in scenarios/06-storage-backends.md row "ZFS_THIN"
+//     — and Bug 77's initial-sync skip applies to thinly-provisioned ZFS
+//     pools (commit aacbcd9b4); both are out of scope for this REST-layer
+//     pin but linked because scenario 6.W04 calls them out as
+//     `zfsthin`-specific.
+//
+// Spelling note: the wave2-06 scenario draft writes "Props[StorDriver/ZPool]
+// = zpool" — that's a slip, the codebase (factory.go, factory_test.go
+// line 29, storage_pools.go expandStorPoolNameAlias) consistently treats
+// ZFS_THIN's kind-specific key as `StorDriver/ZPoolThin`. Pin the
+// established contract here; the scenario doc should track.
+func TestSPCreateZFSThinScenario6W04(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "zfs-thin",
+		ProviderKind:    "zfsthin", // wire-form: lowercase, compressed
+		Props:           map[string]string{"StorDriver/StorPoolName": "blockstor-zfs"},
+	})
+
+	if got.ProviderKind != apiv1.StoragePoolKindZFSThin {
+		t.Errorf("ProviderKind: got %q, want %q (normaliseProviderKind must map zfsthin → ZFS_THIN)",
+			got.ProviderKind, apiv1.StoragePoolKindZFSThin)
+	}
+
+	if got.Props["StorDriver/ZPoolThin"] != "blockstor-zfs" {
+		t.Errorf("ZPoolThin: got %q, want %q (Bug 63 alias must land in the thin-mode key; props=%v)",
+			got.Props["StorDriver/ZPoolThin"], "blockstor-zfs", got.Props)
+	}
+
+	if got.Props["StorDriver/ZPool"] != "" {
+		t.Errorf("ZPool must stay empty for ZFS_THIN: got %q (thick-mode key, would mis-register on satellite)",
+			got.Props["StorDriver/ZPool"])
+	}
+
+	if got.Props["StorDriver/StorPoolName"] != "blockstor-zfs" {
+		t.Errorf("StorPoolName retained for upstream-CLI display parity: got %q, want %q",
+			got.Props["StorDriver/StorPoolName"], "blockstor-zfs")
+	}
+}
+
+// TestSPCreateZFSThinCanonicalKindPassesThrough is the companion pin for
+// scenario 6.W04: when the caller already sends the canonical `ZFS_THIN`
+// token (piraeus's StoragePool CRD path, or any client that targeted
+// upstream-LINSTOR's API directly), the create path must NOT mangle the
+// kind — the normaliser is an idempotent alias map, not a rewrite layer.
+// This guards against a regression where a too-eager ToUpper / underscore
+// rewrite would corrupt the canonical form.
+func TestSPCreateZFSThinCanonicalKindPassesThrough(t *testing.T) {
+	got := postPoolForExpandTest(t, apiv1.StoragePool{
+		StoragePoolName: "zfs-thin",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin, // canonical form
+		Props:           map[string]string{"StorDriver/ZPoolThin": "blockstor-zfs"},
+	})
+
+	if got.ProviderKind != apiv1.StoragePoolKindZFSThin {
+		t.Errorf("ProviderKind: got %q, want %q (canonical must round-trip unchanged)",
+			got.ProviderKind, apiv1.StoragePoolKindZFSThin)
+	}
+
+	if got.Props["StorDriver/ZPoolThin"] != "blockstor-zfs" {
+		t.Errorf("ZPoolThin pass-through: got %q, want %q",
+			got.Props["StorDriver/ZPoolThin"], "blockstor-zfs")
+	}
+}
