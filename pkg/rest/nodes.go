@@ -308,11 +308,45 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Upstream LINSTOR auto-provisions a `DfltDisklessStorPool`
+	// per satellite at node-register time so the autoplacer (and
+	// `linstor advise`) can place diskless replicas without an
+	// explicit pool spec. The CLI parity audit row #3 flagged this
+	// as a behavioural gap: `linstor sp l` on blockstor was missing
+	// the diskless rows upstream shows. Synthesising the SP here
+	// keeps the autoplacer's "DisklessOnRemaining" path working out
+	// of the box for any newly-registered node. A pre-existing
+	// pool with the same name (e.g. operator-managed via piraeus)
+	// is left alone — the StoragePoolStore.Create returns
+	// ErrAlreadyExists and we ignore it.
+	disklessPool := &apiv1.StoragePool{
+		StoragePoolName: DfltDisklessStorPoolName,
+		NodeName:        n.Name,
+		ProviderKind:    apiv1.StoragePoolKindDiskless,
+	}
+	if poolErr := s.Store.StoragePools().Create(r.Context(), disklessPool); poolErr != nil &&
+		!errors.Is(poolErr, store.ErrAlreadyExists) {
+		// Don't fail the Node Create over an auxiliary
+		// synthesis error — the node is registered and useful
+		// without the diskless pool; the operator can re-issue
+		// `linstor sp c <node> DfltDisklessStorPool diskless` by
+		// hand if the synthesis race keeps tripping.
+		_ = poolErr
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "node created: " + n.Name,
 	}})
 }
+
+// DfltDisklessStorPoolName matches upstream LINSTOR's canonical
+// per-satellite diskless storage pool name. The autoplacer's
+// `disklessOnRemaining` path defaults to this pool when the caller
+// doesn't pin a specific pool list, and `linstor sp l` shows one
+// row per registered node from this synthesised pool. CSI / piraeus
+// rely on the exact string.
+const DfltDisklessStorPoolName = "DfltDisklessStorPool"
 
 func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")

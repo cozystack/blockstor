@@ -674,6 +674,77 @@ func TestPoolCreateRejectsNonCanonicalName(t *testing.T) {
 	}
 }
 
+// TestSPListIncludesFreeSpaceMgrName pins Bug 59 / CLI parity audit
+// row #3: `linstor sp l` SharedName column reads from
+// `free_space_mgr_name`. Upstream LINSTOR sets it to `<node>:<pool>`
+// for local pools and to the shared-space identifier for shared ones,
+// and the Python CLI's `':' not in free_space_mgr_name` check crashes
+// with TypeError when the field is null. Both store backends MUST
+// surface the field on read.
+func TestSPListIncludesFreeSpaceMgrName(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Local pool (no shared space) → expect `<node>:<pool>`.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "zfs-thin",
+		NodeName:        "dev-kvaps-worker-1",
+		ProviderKind:    apiv1.StoragePoolKindZFSThin,
+	}); err != nil {
+		t.Fatalf("seed local: %v", err)
+	}
+
+	// Shared pool → expect the shared-space identifier verbatim.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "san-pool",
+		NodeName:        "dev-kvaps-worker-2",
+		ProviderKind:    apiv1.StoragePoolKindLVM,
+		SharedSpaceID:   "shared-san-A",
+	}); err != nil {
+		t.Fatalf("seed shared: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/storage-pools")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.StoragePool
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	want := map[string]string{
+		"dev-kvaps-worker-1:zfs-thin": "dev-kvaps-worker-1:zfs-thin",
+		"dev-kvaps-worker-2:san-pool": "shared-san-A",
+	}
+
+	for i := range got {
+		key := got[i].NodeName + ":" + got[i].StoragePoolName
+
+		expect, ok := want[key]
+		if !ok {
+			continue
+		}
+
+		if got[i].FreeSpaceMgrName != expect {
+			t.Errorf("FreeSpaceMgrName for %s: got %q, want %q",
+				key, got[i].FreeSpaceMgrName, expect)
+		}
+
+		delete(want, key)
+	}
+
+	if len(want) != 0 {
+		t.Errorf("missing pools in response: %v", want)
+	}
+}
+
 // TestPoolCreateProducesCanonicalCRDName pins that a normal POST
 // stores a pool the (node, pool) key resolves and the round-trip
 // preserves both halves of the canonical name. The InMemory store

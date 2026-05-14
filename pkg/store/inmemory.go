@@ -130,6 +130,10 @@ func (s *inMemoryNodes) List(_ context.Context) ([]apiv1.Node, error) {
 
 	out := make([]apiv1.Node, 0, len(s.m))
 	for _, n := range s.m {
+		if len(n.NetInterfaces) > 0 {
+			n.NetInterfaces = apiv1.DefaultNetInterfaceFields(append([]apiv1.NetInterface(nil), n.NetInterfaces...))
+		}
+
 		out = append(out, n)
 	}
 
@@ -138,7 +142,11 @@ func (s *inMemoryNodes) List(_ context.Context) ([]apiv1.Node, error) {
 	return out, nil
 }
 
-// Get returns the named node or ErrNotFound.
+// Get returns the named node or ErrNotFound. NetInterface defaults
+// are applied on read so the in-memory store mirrors the K8s
+// backend's wire shape — both surfaces emit `satellite_port=3366` /
+// `satellite_encryption_type=PLAIN` when the caller omitted them at
+// Create time.
 func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -146,6 +154,10 @@ func (s *inMemoryNodes) Get(_ context.Context, name string) (apiv1.Node, error) 
 	n, ok := s.m[name]
 	if !ok {
 		return apiv1.Node{}, errors.Wrapf(ErrNotFound, "node %q", name)
+	}
+
+	if len(n.NetInterfaces) > 0 {
+		n.NetInterfaces = apiv1.DefaultNetInterfaceFields(append([]apiv1.NetInterface(nil), n.NetInterfaces...))
 	}
 
 	return n, nil

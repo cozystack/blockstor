@@ -205,6 +205,16 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 }
 
 // PoolStatus reports the directory's free / total bytes via statfs.
+//
+// SupportsSnapshots tracks the thin variant: FILE_THIN volumes are
+// sparse, and CreateSnapshot below copies them via `cp --reflink=auto`,
+// which is O(1) on reflink-capable filesystems (XFS, btrfs, ZFS-backed)
+// and a transparent full-copy fallback otherwise. Upstream LINSTOR
+// reports the same — FILE_THIN advertises CanSnapshots=True so
+// `linstor s c <rd> <snap>` doesn't refuse the request out-of-hand
+// for thin pools. Plain (thick) FILE pools keep SupportsSnapshots=false
+// to match upstream and avoid promising a feature the backend can't
+// implement efficiently (fallocate-backed files don't reflink).
 func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
 	free, total, err := diskFree(p.cfg.Dir)
 	if err != nil {
@@ -214,7 +224,7 @@ func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
 	return storage.PoolStatus{
 		FreeCapacityKib:   free / bytesPerKib,
 		TotalCapacityKib:  total / bytesPerKib,
-		SupportsSnapshots: false,
+		SupportsSnapshots: p.cfg.Thin,
 	}, nil
 }
 

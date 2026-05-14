@@ -207,30 +207,24 @@ func crdToWireNode(crd *crdv1alpha1.Node) apiv1.Node {
 		out.NetInterfaces = make([]apiv1.NetInterface, 0, len(crd.Spec.NetInterfaces))
 		for i := range crd.Spec.NetInterfaces {
 			iface := &crd.Spec.NetInterfaces[i]
-
-			// We DON'T default SatellitePort here: blockstor's
-			// satellite doesn't listen on the upstream-LINSTOR
-			// 3366/3367 (Phase 10.6 retired the gRPC wire — every
-			// satellite ↔ controller exchange flows through the
-			// Kubernetes apiserver). Synthesising "3366 (PLAIN)"
-			// just to make `linstor node list` render its
-			// Addresses column would be a lie; consumers that
-			// blindly dial that port would hang. Leave the value
-			// as the operator set it (usually 0) and accept the
-			// blank column.
-			//
-			// First interface still gets is_active=true so the
-			// CLI's `node info` reports a coherent shape; the
-			// flag is descriptive (= "this is the routable
-			// endpoint we advertise"), not a dial guarantee.
 			out.NetInterfaces = append(out.NetInterfaces, apiv1.NetInterface{
 				Name:                    iface.Name,
 				Address:                 iface.Address,
 				SatellitePort:           int(iface.SatellitePort),
 				SatelliteEncryptionType: iface.SatelliteEncryptionType,
-				IsActive:                i == 0,
 			})
 		}
+
+		// Surface upstream LINSTOR defaults on the wire when the
+		// CRD didn't pin specific values. The Python CLI renders
+		// `<address>:<port> (<TYPE>)` and a blank port/type leaves
+		// the Addresses column empty, which the parity audit
+		// (row #1) called out as the most visible wire-shape gap.
+		// Phase 10.6 retired the gRPC wire (satellite ↔ controller
+		// now flows through the apiserver) so 3366 is descriptive
+		// metadata rather than a routable port — but the CLI uses
+		// it purely for display, not dialing.
+		out.NetInterfaces = apiv1.DefaultNetInterfaceFields(out.NetInterfaces)
 	}
 
 	return out

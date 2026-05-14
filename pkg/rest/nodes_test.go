@@ -281,6 +281,127 @@ func TestNodesDeleteOK(t *testing.T) {
 	}
 }
 
+// TestNodeListIncludesNetInterfaceAddressAndPort pins Bug 59 / CLI
+// parity audit row #1: `linstor n l` Addresses column renders
+// `<address>:<port> (<TYPE>)`. When a Node is created with bare
+// address-only NetInterfaces (the common case — piraeus operator,
+// linstor-csi, and golinstor all let satellite_port/encryption_type
+// default), GET /v1/nodes MUST surface the upstream defaults
+// (port=3366, type=PLAIN) and IsActive=true on the first interface
+// so the CLI renders a non-empty Addresses column.
+func TestNodeListIncludesNetInterfaceAddressAndPort(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed via the store directly so the assertion isolates the
+	// read-path defaulting from any handler-side normalisation —
+	// the in-memory store stamps defaults on Get/List, mirroring
+	// the K8s backend's crdToWireNode.
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+		NetInterfaces: []apiv1.NetInterface{
+			{Name: "default", Address: "10.0.0.5"},
+		},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/nodes/n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.Node
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.NetInterfaces) != 1 {
+		t.Fatalf("NetInterfaces: got %d, want 1", len(got.NetInterfaces))
+	}
+
+	iface := got.NetInterfaces[0]
+	if iface.Address != "10.0.0.5" {
+		t.Errorf("Address: got %q, want 10.0.0.5", iface.Address)
+	}
+
+	if iface.SatellitePort != apiv1.DefaultSatellitePort {
+		t.Errorf("SatellitePort: got %d, want %d (upstream LINSTOR default)",
+			iface.SatellitePort, apiv1.DefaultSatellitePort)
+	}
+
+	if iface.SatelliteEncryptionType != apiv1.DefaultSatelliteEncryptionType {
+		t.Errorf("SatelliteEncryptionType: got %q, want %q",
+			iface.SatelliteEncryptionType, apiv1.DefaultSatelliteEncryptionType)
+	}
+
+	if !iface.IsActive {
+		t.Errorf("IsActive: first interface must be marked active")
+	}
+}
+
+// TestNodeCreateAutoCreatesDfltDisklessStorPool pins Bug 59 / parity
+// audit row #3: upstream LINSTOR provisions a `DfltDisklessStorPool`
+// per satellite at node-register time so the autoplacer's
+// DisklessOnRemaining path and `linstor sp l` show one diskless row
+// per node. The synthesis is the controller-side fix for the audit's
+// "BS never auto-creates DfltDisklessStorPool" delta.
+func TestNodeCreateAutoCreatesDfltDisklessStorPool(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+	})
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /v1/nodes status: got %d, want 201", resp.StatusCode)
+	}
+
+	// /v1/view/storage-pools is the call linstor-csi and the
+	// linstor CLI make to enumerate placement candidates. The new
+	// node MUST surface a DISKLESS pool entry.
+	viewResp := httpGet(t, base+"/v1/view/storage-pools?nodes=n1")
+	defer func() { _ = viewResp.Body.Close() }()
+
+	if viewResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET storage-pools status: got %d, want 200", viewResp.StatusCode)
+	}
+
+	var pools []apiv1.StoragePool
+	if err := json.NewDecoder(viewResp.Body).Decode(&pools); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var found bool
+
+	for i := range pools {
+		if pools[i].NodeName == "n1" &&
+			pools[i].StoragePoolName == DfltDisklessStorPoolName &&
+			pools[i].ProviderKind == apiv1.StoragePoolKindDiskless {
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("DfltDisklessStorPool not auto-created on node 'n1'; got pools=%+v", pools)
+	}
+}
+
 // TestNodesEndpointsWithoutStore: when Store is nil, every endpoint that
 // needs persistence returns 503 Service Unavailable. The version endpoint
 // continues to work.

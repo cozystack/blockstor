@@ -100,19 +100,32 @@ func (s *inMemoryStoragePools) Get(_ context.Context, node, pool string) (apiv1.
 }
 
 // withDerivedState fills the wire `state` field from the in-memory
-// PoolMissing carrier. Mirrors the k8s store's crdToWireStoragePool —
-// keeping the two backends in lockstep so the rest tests that use
-// the in-memory store still see "Ok" / "Faulty" the same way real
-// clusters do.
+// PoolMissing carrier and synthesises `free_space_mgr_name` for
+// non-shared pools when missing. Mirrors the k8s store's
+// crdToWireStoragePool — keeping the two backends in lockstep so the
+// rest tests that use the in-memory store still see "Ok" / "Faulty"
+// AND the per-pool free-space-manager name (`<node>:<pool>` for
+// non-shared pools, the shared-space identifier for shared ones) the
+// same way real clusters do.
+//
+// The Python CLI's `storpool_cmds.py` does `':' not in
+// free_space_mgr_name` and crashes with TypeError when the field is
+// null — so filling this defensively is also a CLI-stability fix.
 func withDerivedState(sp *apiv1.StoragePool) {
-	if sp.State != "" {
-		return
+	if sp.State == "" {
+		if sp.PoolMissing {
+			sp.State = "Faulty"
+		} else {
+			sp.State = "Ok"
+		}
 	}
 
-	if sp.PoolMissing {
-		sp.State = "Faulty"
-	} else {
-		sp.State = "Ok"
+	if sp.FreeSpaceMgrName == "" {
+		if sp.SharedSpaceID != "" {
+			sp.FreeSpaceMgrName = sp.SharedSpaceID
+		} else if sp.NodeName != "" && sp.StoragePoolName != "" {
+			sp.FreeSpaceMgrName = sp.NodeName + ":" + sp.StoragePoolName
+		}
 	}
 }
 

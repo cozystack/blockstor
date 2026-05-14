@@ -50,6 +50,45 @@ type NetInterface struct {
 	IsActive                bool   `json:"is_active,omitempty"`
 }
 
+// Upstream LINSTOR defaults for NetInterface fields. The Java
+// controller emits these when no explicit satellite_port /
+// satellite_encryption_type was set at node create time, and the
+// Python CLI renders the Addresses column from them. Blockstor
+// retired the gRPC wire in Phase 10.6 (satellite ↔ controller now
+// flows through the apiserver), so 3366 is descriptive metadata
+// rather than a routable port — but the parity audit requires the
+// fields populated so `linstor n l` doesn't render a blank Addresses
+// column.
+const (
+	DefaultSatellitePort           = 3366
+	DefaultSatelliteEncryptionType = "PLAIN"
+)
+
+// DefaultNetInterfaceFields fills upstream-default port + encryption
+// type on every interface that has an Address but missing port/type,
+// and marks the first interface IsActive. Both store backends call
+// this on read so the REST surface emits a consistent wire shape
+// regardless of which backend persists the Node.
+func DefaultNetInterfaceFields(ifaces []NetInterface) []NetInterface {
+	for i := range ifaces {
+		if ifaces[i].Address == "" {
+			continue
+		}
+
+		if ifaces[i].SatellitePort == 0 {
+			ifaces[i].SatellitePort = DefaultSatellitePort
+		}
+
+		if ifaces[i].SatelliteEncryptionType == "" {
+			ifaces[i].SatelliteEncryptionType = DefaultSatelliteEncryptionType
+		}
+
+		ifaces[i].IsActive = i == 0
+	}
+
+	return ifaces
+}
+
 // Node Type constants — these are the strings LINSTOR uses on the wire.
 const (
 	NodeTypeController          = "CONTROLLER"

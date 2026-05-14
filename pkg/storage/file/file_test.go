@@ -343,9 +343,12 @@ func TestSnapshotsCpReflink(t *testing.T) {
 }
 
 // TestPoolStatusReportsCapacity: PoolStatus reports the directory's
-// statfs free / total in KiB. Exact figures depend on the host's
-// filesystem so sanity-check the shape (positive, free <= total,
-// snapshots disabled).
+// statfs free / total in KiB for the thick variant. Exact figures
+// depend on the host's filesystem so sanity-check the shape (positive,
+// free <= total). Thick (fallocate-backed) FILE pools keep
+// SupportsSnapshots=false because fallocate'd files can't reflink —
+// `cp --reflink=auto` would silently fall back to a full byte copy
+// which is too expensive to advertise as a snapshot.
 func TestPoolStatusReportsCapacity(t *testing.T) {
 	dir := t.TempDir()
 	p := file.NewProvider(file.Config{Dir: dir}, storage.NewFakeExec())
@@ -365,7 +368,27 @@ func TestPoolStatusReportsCapacity(t *testing.T) {
 	}
 
 	if got.SupportsSnapshots {
-		t.Errorf("SupportsSnapshots: file backend never supports snapshots")
+		t.Errorf("SupportsSnapshots: thick FILE pool should not support snapshots")
+	}
+}
+
+// TestFileThinReportsSupportsSnapshotsTrue pins Bug 59 / scenario 6.11
+// + the CLI parity audit row #3: FILE_THIN must advertise
+// CanSnapshots=True so `linstor s c <rd> <snap>` is accepted for thin
+// file pools, matching upstream LINSTOR's FILE_THIN provider. The
+// underlying CreateSnapshot uses `cp --reflink=auto` which on a
+// reflink-capable filesystem (XFS, btrfs, ZFS-backed) is O(1) CoW.
+func TestFileThinReportsSupportsSnapshotsTrue(t *testing.T) {
+	dir := t.TempDir()
+	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, storage.NewFakeExec())
+
+	got, err := p.PoolStatus(t.Context())
+	if err != nil {
+		t.Fatalf("PoolStatus: %v", err)
+	}
+
+	if !got.SupportsSnapshots {
+		t.Errorf("FILE_THIN SupportsSnapshots: got false, want true (parity with upstream LINSTOR)")
 	}
 }
 
