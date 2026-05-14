@@ -59,11 +59,14 @@ func PickStableID(dev *LsblkDevice) string {
 	}
 
 	if dev.KName != "" {
-		// by-path style fallback — not derived from /dev/disk/by-path
-		// directly because that requires a host filesystem read,
-		// which is the caller's responsibility. We emit a marker
-		// derived from KName as a deterministic placeholder.
-		return "by-path-" + dev.KName
+		// Fallback: bare kernel name. We previously emitted
+		// `by-path-<kname>` as a placeholder, but the prefix was
+		// misleading — we don't actually consult /dev/disk/by-path/
+		// (which would require a host filesystem read) and the
+		// prefix bled into the CRD's metadata.name as
+		// `<node>.by-path-<kname>`. Using just `<kname>` keeps the
+		// CRD name short and readable (`<node>.sda`).
+		return dev.KName
 	}
 
 	return ""

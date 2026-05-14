@@ -82,13 +82,16 @@ func TestPickStableIDNVMe(t *testing.T) {
 	}
 }
 
-// TestPickStableIDByPathFallback pins the last-resort branch:
+// TestPickStableIDKNameFallback pins the last-resort branch:
 // virtio without serial passthrough — no WWN, no SCSI, no NVMe
-// identifier — falls through to the by-path-derived placeholder.
+// identifier — falls through to the bare kernel name.
 // Regression target: a virtio host that returns "" for all
 // stable signals would otherwise crash the satellite later when
 // PhysicalDeviceCRDName tries to derive a k8s name from "".
-func TestPickStableIDByPathFallback(t *testing.T) {
+// The fallback used to emit `by-path-<kname>` but the prefix was
+// misleading (we don't read /dev/disk/by-path/) and bled into
+// the CRD's metadata.name as `<node>.by-path-<kname>`.
+func TestPickStableIDKNameFallback(t *testing.T) {
 	t.Parallel()
 
 	dev := &satellite.LsblkDevice{
@@ -97,8 +100,8 @@ func TestPickStableIDByPathFallback(t *testing.T) {
 	}
 
 	got := satellite.PickStableID(dev)
-	if got != "by-path-vdb" {
-		t.Errorf("got %q, want by-path-vdb", got)
+	if got != "vdb" {
+		t.Errorf("got %q, want vdb", got)
 	}
 }
 
