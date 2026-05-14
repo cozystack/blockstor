@@ -869,3 +869,246 @@ func TestSpawnPartialFlagAllowsShortPlacement(t *testing.T) {
 		t.Errorf("placed: got %d, want ≤1 (only n1 has a pool)", len(got))
 	}
 }
+
+// TestSpawnImpossiblePlacementReturnsActionableError pins scenario 9.W05
+// (P1) — the impossible-placement spawn path that operators hit when a
+// freshly-created RG with PlaceCount=N is spawned against a cluster
+// holding only K<N same-kind pools. Cross-listed with wave1 2.19
+// ("place-count > nodes refused at spawn") and 9.W04's
+// TestSpawnAutoplaceRejectsCrossKindFromRG.
+//
+// The contract under pin (operator-facing surface):
+//
+//  1. The spawn call MUST surface the shortfall to the operator — not
+//     return a silent HTTP 201 with no envelope. Without this signal a
+//     `linstor rg spawn` followed by `linstor r l` would show an empty
+//     resource list and the operator has nothing to grep for in logs.
+//  2. The envelope MUST name BOTH numbers (placed vs requested) so the
+//     operator can immediately tell whether the gap is "off-by-one"
+//     (add one node) or catastrophic (no candidates at all). A plain
+//     "not enough nodes" without the numeric gap forces a second
+//     `linstor advise resource` round-trip to discover the same fact.
+//  3. The envelope MUST flag this as a deferred autoplace rather than
+//     a successful spawn — `linstor-csi` keys its retry behaviour off
+//     the deferral marker; a regression that drops the marker would
+//     turn this into a silent partial-placement leak.
+//  4. The RD MUST survive (definitions-land contract, same as the
+//     `PartialFlag=true` path). The operator can add nodes and re-run
+//     `r c --auto-place` once the cluster grows; rolling the RD back
+//     on shortfall would break that recovery flow and force a fresh
+//     `rg spawn` that loses the operator-supplied RD name.
+//
+// Note on "400 vs 202+deferred": the W05 scenario spec allows either
+// outcome, and existing /v1/resource-definitions/{rd}/autoplace
+// (TestAutoplaceConflictWhenInsufficient) ALREADY returns 409 with a
+// rich shortfall envelope (cause + correction + details bullet list)
+// via writeAutoplaceShortfall. The spawn handler today takes the
+// 201+deferred path instead — this test pins THAT path so a future
+// hardening that switches spawn over to writeAutoplaceShortfall is a
+// deliberate API change, not a silent break of the CSI retry loop.
+//
+// Fixture: RG asks for PlaceCount=3 on "pool"; only n1 carries
+// `pool` (same-kind LVM_THIN), so 2 of the 3 candidates can never
+// materialise. PartialFlag is explicitly false — i.e. the operator
+// did NOT opt into partial placement; this is the "impossible
+// constraints, no partial-flag escape hatch" path.
+func TestSpawnImpossiblePlacementReturnsActionableError(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-impossible",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  3,
+			StoragePool: "pool",
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	// Only n1 carries the named pool — placing 3 replicas is
+	// physically impossible regardless of free capacity, replicas-
+	// on-same, or any other filter knob.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    10_000_000,
+		TotalCapacity:   10_000_000,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-impossible",
+		VolumeSizes:            []int64{1024 * 1024},
+		// PartialFlag deliberately left false — this is the
+		// operator-error path, not the partial-recovery path.
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-impossible/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	// Either of the W05-permissible outcomes is acceptable:
+	//   - 201 Created + "autoplace deferred" message (current)
+	//   - 4xx with a structured shortfall envelope (post-hardening)
+	// Reject anything else — most importantly a silent 200/201 with
+	// no signal at all, which the next reconciler-level test pin
+	// could mask.
+	if resp.StatusCode != http.StatusCreated &&
+		resp.StatusCode != http.StatusAccepted &&
+		resp.StatusCode != http.StatusBadRequest &&
+		resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want one of {201, 202, 400, 409}", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].Message == "" {
+		t.Fatalf("empty envelope: %+v (operator has no signal of failure)", rc)
+	}
+
+	// The operator-facing message MUST surface the autoplace
+	// deferral / shortfall signal. We accept either dialect:
+	//   - "autoplace deferred" + numeric gap (current spawn dialect)
+	//   - "Not enough available nodes" (autoplace handler dialect,
+	//     post-hardening — matches writeAutoplaceShortfall and
+	//     wave1 scenario 2.19's exact text)
+	msg := rc[0].Message
+	deferredDialect := containsAll(msg, "autoplace deferred") &&
+		containsAll(msg, "not enough candidate storage pools") &&
+		containsAll(msg, "placed 1 of 3")
+	shortfallDialect := containsAll(msg, "Not enough available nodes")
+
+	if !deferredDialect && !shortfallDialect {
+		t.Errorf("message must name the shortfall actionably "+
+			"(either deferred-dialect with 'placed 1 of 3' or "+
+			"shortfall-dialect with 'Not enough available nodes'); got %q", msg)
+	}
+
+	// RD survives — definitions-land contract. A regression that
+	// rolls the RD back on shortfall would force operators to
+	// re-supply the RD name on retry (and break linstor-csi which
+	// keys idempotency on the operator-chosen name).
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-impossible"); err != nil {
+		t.Errorf("RD must survive impossible-placement spawn: %v", err)
+	}
+
+	// At most 1 replica may land — never 2 or 3 (no synthesis of
+	// cross-kind or duplicate-node placements to "satisfy" the
+	// impossible PlaceCount). A regression here would silently
+	// double-stamp on n1 or invent a phantom replica.
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-impossible")
+	if err != nil {
+		t.Fatalf("list resources: %v", err)
+	}
+
+	if len(got) > 1 {
+		t.Errorf("placed: got %d resources, want ≤1 "+
+			"(only n1 carries 'pool'; impossible placement must "+
+			"NOT synthesise replicas)", len(got))
+	}
+
+	// Each placed replica must sit on n1 with the requested pool —
+	// no silent fallback to a different node or pool name.
+	for _, r := range got {
+		if r.NodeName != "n1" {
+			t.Errorf("replica on unexpected node %q (only n1 has 'pool')", r.NodeName)
+		}
+
+		if r.Props["StorPoolName"] != "pool" {
+			t.Errorf("replica StorPoolName=%q, want %q", r.Props["StorPoolName"], "pool")
+		}
+	}
+}
+
+// TestSpawnImpossiblePlacementNoPoolsAtAll pins the harder edge of
+// scenario 9.W05: the RG names a pool that simply doesn't exist on
+// any node ("pool-ghost"). This is the "place-count over node count"
+// case from wave1 2.19 taken to the limit — zero candidate pools at
+// all, not just K<N. The operator MUST get an envelope with a
+// non-empty message (any of the accepted dialects); a 201 with a
+// blank Message would leave them grepping logs for the cause.
+//
+// We don't assert "exactly zero replicas" because the underlying
+// placer returns placed=0 + want=N + an error: the RD lands but no
+// Resource is ever stamped on a non-existent pool. The signal we
+// pin is the operator-facing envelope, not the count.
+func TestSpawnImpossiblePlacementNoPoolsAtAll(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-ghost",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  3,
+			StoragePool: "pool-ghost", // not present on any node
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	// A real pool on a different name so the store isn't empty —
+	// rules out the trivial "no nodes" path; the failure must come
+	// from the named-pool mismatch specifically.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: "pool-other",
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindLVMThin,
+		FreeCapacity:    10_000_000,
+		TotalCapacity:   10_000_000,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-ghost",
+		VolumeSizes:            []int64{1024 * 1024},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-groups/rg-ghost/spawn", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated &&
+		resp.StatusCode != http.StatusAccepted &&
+		resp.StatusCode != http.StatusBadRequest &&
+		resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want one of {201, 202, 400, 409}", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].Message == "" {
+		t.Fatalf("empty envelope: %+v (operator has no signal of failure)", rc)
+	}
+
+	// Same dialect contract as the K<N path — either current
+	// "autoplace deferred" or the shortfall dialect; both must
+	// surface the operator-facing failure reason.
+	msg := rc[0].Message
+	if !containsAll(msg, "autoplace deferred") && !containsAll(msg, "Not enough available nodes") {
+		t.Errorf("message must surface the shortfall: %q", msg)
+	}
+
+	// No replicas may have been placed — there is no candidate pool
+	// matching the RG's StoragePool filter.
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-ghost")
+	if len(got) != 0 {
+		t.Errorf("placed: got %d, want 0 (no pool named 'pool-ghost')", len(got))
+	}
+}
