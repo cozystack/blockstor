@@ -98,6 +98,23 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Bug 73: the python-linstor CLI sends provider names in
+	// lowercase (and in the compressed form `lvmthin` / `zfsthin` /
+	// `filethin`). The StoragePool CRD enum only allows the
+	// upstream-canonical uppercase tokens — pass-through would
+	// surface as an opaque "Unsupported value" error from apiserver.
+	// Normalise here so every CLI variant lands as the canonical
+	// form on the auto-created pool.
+	normalized, ok := normalizeProviderKind(req.ProviderKind)
+	if !ok {
+		writeError(w, http.StatusBadRequest,
+			"provider_kind: unknown value "+req.ProviderKind)
+
+		return
+	}
+
+	req.ProviderKind = normalized
+
 	if len(req.DevicePaths) == 0 {
 		writeError(w, http.StatusBadRequest, "device_paths is required")
 
@@ -525,4 +542,37 @@ func groupPhysicalDevices(devs []apiv1.PhysicalDevice) []physicalStorageEntry {
 	}
 
 	return out
+}
+
+// normalizeProviderKind maps a CLI-typed provider name to the
+// canonical upstream-LINSTOR enum the StoragePool CRD allows.
+// Handles every variant the python-linstor CLI emits (lowercase,
+// compressed `lvmthin` / `zfsthin` / `filethin`) plus the already-
+// canonical uppercase tokens. Returns false for anything else so
+// the handler surfaces a 400 instead of letting apiserver reject
+// the create with an opaque enum error.
+//
+// Mirrors upstream's `DeviceProviderKind.valueOfIgnoreCase` —
+// shape sourced from linstor-server's
+// `controller/src/main/java/com/linbit/linstor/storage/kinds/
+// DeviceProviderKind.java` and python-linstor's `consts.py`.
+func normalizeProviderKind(raw string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "LVM":
+		return "LVM", true
+	case "LVMTHIN", "LVM_THIN":
+		return "LVM_THIN", true
+	case "ZFS":
+		return "ZFS", true
+	case "ZFSTHIN", "ZFS_THIN":
+		return "ZFS_THIN", true
+	case "FILE":
+		return "FILE", true
+	case "FILETHIN", "FILE_THIN":
+		return "FILE_THIN", true
+	case "DISKLESS":
+		return "DISKLESS", true
+	default:
+		return "", false
+	}
 }

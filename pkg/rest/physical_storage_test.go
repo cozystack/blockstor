@@ -600,3 +600,104 @@ func TestPhysicalStorageCreateMatchesKernelNamePath(t *testing.T) {
 		t.Errorf("Bug 68: StoragePool ProviderKind: got %q, want ZFS", pool.ProviderKind)
 	}
 }
+
+// TestPhysicalStorageCreateNormalizesProviderKind pins Bug 73.
+// The python-linstor CLI sends lowercase provider names —
+// `linstor ps cdp zfs ...` posts `"provider_kind":"zfs"`. The
+// StoragePool CRD enum only allows the upstream-canonical
+// uppercase forms (`LVM`, `LVM_THIN`, `ZFS`, `ZFS_THIN`, `FILE`,
+// `FILE_THIN`, `DISKLESS`). Without normalisation the CDP POST
+// reaches apiserver as `zfs`, gets rejected by the OpenAPI
+// enum, and surfaces as a confusing "Unsupported value" error
+// to the operator — same UX as upstream LINSTOR's bug fixed
+// circa LBSAT-1041.
+//
+// Pin the lowercase + the LINSTOR-CLI compressed forms so the
+// REST handler accepts every variant the CLI emits and stamps
+// the canonical uppercase value on the auto-created pool.
+func TestPhysicalStorageCreateNormalizesProviderKind(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"zfs", "ZFS"},
+		{"ZFS", "ZFS"},
+		{"zfsthin", "ZFS_THIN"},
+		{"ZFS_THIN", "ZFS_THIN"},
+		{"lvm", "LVM"},
+		{"LVM", "LVM"},
+		{"lvmthin", "LVM_THIN"},
+		{"LVM_THIN", "LVM_THIN"},
+		{"file", "FILE"},
+		{"filethin", "FILE_THIN"},
+		{"diskless", "DISKLESS"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			if err := st.PhysicalDevices().Create(ctx, &apiv1.PhysicalDevice{
+				Name:       "n1-vda",
+				NodeName:   "n1",
+				DevicePath: "/dev/vda",
+				Phase:      "Available",
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			body := `{"provider_kind":"` + tc.input + `","device_paths":["/dev/vda"],` +
+				`"with_storage_pool":{"name":"p1"}}`
+			resp := httpPost(t, base+"/v1/physical-storage/n1", []byte(body))
+			_ = resp.Body.Close()
+
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status: got %d, want 202 for provider_kind=%q",
+					resp.StatusCode, tc.input)
+			}
+
+			pool, err := st.StoragePools().Get(ctx, "n1", "p1")
+			if err != nil {
+				t.Fatalf("StoragePool Get: %v", err)
+			}
+
+			if pool.ProviderKind != tc.want {
+				t.Errorf("Bug 73: provider_kind=%q should normalise to %q, got %q",
+					tc.input, tc.want, pool.ProviderKind)
+			}
+		})
+	}
+}
+
+// TestPhysicalStorageCreateRejectsUnknownProviderKind pins the
+// other half: a truly unrecognised provider must surface a 400
+// rather than be passed through unchanged into the apiserver
+// (where it would surface as the same opaque "Unsupported
+// value" error Bug 73 fixes). Bug 73.
+func TestPhysicalStorageCreateRejectsUnknownProviderKind(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-vda",
+		NodeName:   "n1",
+		DevicePath: "/dev/vda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{"provider_kind":"banana","device_paths":["/dev/vda"]}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown provider_kind must return 400, got %d", resp.StatusCode)
+	}
+}
