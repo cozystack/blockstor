@@ -34,6 +34,18 @@ type Resource struct {
 	UUID        string            `json:"uuid,omitempty"`
 	LayerObject *ResourceLayer    `json:"layer_object,omitempty"`
 
+	// Annotations carries the K8s-native metadata.annotations of the
+	// backing Resource CRD. Used by Bug 67's `PeerChangedAnnotation`
+	// signal: the REST `handleResourceDelete` writer stamps a fresh
+	// RFC3339Nano timestamp on every surviving sibling so the satellite
+	// reconciler's local-Resource watch fires and re-derives the peer
+	// set without the removed replica. Round-tripped through the K8s
+	// store via Get/Update so the bump survives the Update merge.
+	// Other annotation keys (operator-supplied, CSI metadata) round
+	// trip too, but Resource-level annotations are otherwise unused on
+	// the wire — Python CLI and golinstor both ignore the field.
+	Annotations map[string]string `json:"annotations,omitempty"`
+
 	// ToggleDiskCancel mirrors CRD `Spec.ToggleDiskCancel`. Set by
 	// the REST shim when the operator issues `linstor r td --cancel`
 	// (upstream LINSTOR shape) — the satellite reconciler observes

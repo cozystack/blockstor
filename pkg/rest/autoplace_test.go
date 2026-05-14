@@ -1191,6 +1191,246 @@ func TestResourceDeleteRegularReplicaSkipsSuppression(t *testing.T) {
 	}
 }
 
+// TestResourceDeleteBumpsSiblingPeers pins Bug 67's core invariant:
+// when `linstor r d <node> <rd>` drops one peer, every SURVIVING
+// sibling Resource of the same RD gets `blockstor.io/peer-changed`
+// stamped with a fresh RFC3339-parseable timestamp. The annotation is
+// the trigger the satellite's local-Resource watch sees — without it,
+// the survivor's Reconcile never re-derives the peer set and DRBD
+// stays stuck on `Connecting(<deleted-peer>)` forever.
+//
+// The deleted Resource itself is NOT annotated (it's gone), and the
+// stamp must be RFC3339-parseable so audit tooling that diffs the
+// value across reconciles can reason about ordering.
+func TestResourceDeleteBumpsSiblingPeers(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-3way"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"w1", "w2", "w3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-3way", NodeName: n}); err != nil {
+			t.Fatalf("seed replica on %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Capture a pre-DELETE clock floor so the stamp's monotonicity
+	// claim is checkable. The handler reads time.Now() AFTER the
+	// store Delete commits, so this floor is safely earlier.
+	before := time.Now().UTC()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-3way/resources/w2")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	// Survivors w1 and w3 must each carry a parseable timestamp.
+	for _, n := range []string{"w1", "w3"} {
+		got, err := st.Resources().Get(ctx, "pvc-3way", n)
+		if err != nil {
+			t.Fatalf("get survivor %s: %v", n, err)
+		}
+
+		raw, ok := got.Annotations[apiv1.PeerChangedAnnotation]
+		if !ok || raw == "" {
+			t.Fatalf("survivor %s missing %s annotation; annotations=%v",
+				n, apiv1.PeerChangedAnnotation, got.Annotations)
+		}
+
+		ts, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t.Fatalf("survivor %s annotation %q is not RFC3339Nano: %v", n, raw, err)
+		}
+
+		if ts.Before(before) {
+			t.Errorf("survivor %s stamp %v predates the DELETE call floor %v", n, ts, before)
+		}
+	}
+
+	// Deleted replica is gone — Get must surface NotFound. The
+	// store contract precludes annotating a row that no longer
+	// exists; this guard pins that the bump path doesn't somehow
+	// resurrect the dropped Resource as a stub.
+	if _, err := st.Resources().Get(ctx, "pvc-3way", "w2"); err == nil {
+		t.Errorf("deleted replica w2 still present after DELETE")
+	}
+}
+
+// TestResourceDeleteIdempotentWhenAlreadyAbsent pins Bug 67's
+// interaction with the Bug 56 idempotent envelope: a DELETE on a
+// (rd, node) pair that's already absent MUST NOT bump sibling
+// annotations. CSI's DeleteVolume retries until it sees success, so
+// every CSI replay would otherwise churn the satellite reconciler
+// (each replay = a fresh annotation = a fresh Reconcile + drbdadm
+// adjust on every survivor) and pollute audit tools that key off
+// `blockstor.io/peer-changed`.
+//
+// Only a REAL drop (the row left the store on this call) changes
+// the peer set the survivors render, so only a real drop justifies
+// the wake-up event.
+func TestResourceDeleteIdempotentWhenAlreadyAbsent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-idem"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Seed only two survivors. The "deleted" replica was never
+	// here in the first place — mirrors the CSI replay scenario
+	// where DeleteVolume re-fires after the first DELETE succeeded
+	// and the store row was cleaned up.
+	for _, n := range []string{"w1", "w3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-idem", NodeName: n}); err != nil {
+			t.Fatalf("seed replica on %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-idem/resources/w2")
+	defer func() { _ = resp.Body.Close() }()
+
+	// Bug 56 envelope: idempotent no-op MUST return 200 + WARN +
+	// "already absent". A regression that returned 404 would break
+	// the CSI retry loop — guard it alongside the no-bump assertion
+	// so a single test pins both invariants for the same call.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode&maskWarn == 0 {
+		t.Fatalf("expected WARN envelope for no-op DELETE, got %+v", rc)
+	}
+
+	if !strings.Contains(rc[0].Message, "already absent") {
+		t.Errorf("expected 'already absent' marker, got %q", rc[0].Message)
+	}
+
+	// Core Bug 67 idempotency claim: NO survivor got annotated.
+	// A bump here would let every CSI retry churn the satellite
+	// reconcile loop.
+	for _, n := range []string{"w1", "w3"} {
+		got, err := st.Resources().Get(ctx, "pvc-idem", n)
+		if err != nil {
+			t.Fatalf("get survivor %s: %v", n, err)
+		}
+
+		if v, ok := got.Annotations[apiv1.PeerChangedAnnotation]; ok {
+			t.Errorf("no-op DELETE must not bump %s on survivor %s; got %q",
+				apiv1.PeerChangedAnnotation, n, v)
+		}
+	}
+}
+
+// TestResourceDeleteBumpsTimestampMonotonic pins the freshness
+// guarantee: two real DELETEs (each dropping a different sibling)
+// produce strictly advancing timestamp values on the remaining
+// survivor. Without this, a regression that hard-coded the
+// annotation value (or computed it once at server start) would
+// satisfy the "annotation is set" check while silently breaking
+// the satellite watch — controller-runtime's resourceVersion gate
+// short-circuits Updates whose semantic payload didn't change, so
+// a static value would surface as "no Reconcile fires on the
+// second peer-drop". RFC3339Nano gives sub-second resolution so
+// the strict-advance claim holds even on fast test runs.
+func TestResourceDeleteBumpsTimestampMonotonic(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-mono"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"w1", "w2", "w3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-mono", NodeName: n}); err != nil {
+			t.Fatalf("seed replica on %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// First drop: w2. Survivor w1 should carry stamp #1.
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-mono/resources/w2")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	w1, err := st.Resources().Get(ctx, "pvc-mono", "w1")
+	if err != nil {
+		t.Fatalf("get w1 after first delete: %v", err)
+	}
+
+	first := w1.Annotations[apiv1.PeerChangedAnnotation]
+	if first == "" {
+		t.Fatalf("w1 missing stamp after first delete; annotations=%v", w1.Annotations)
+	}
+
+	firstTS, err := time.Parse(time.RFC3339Nano, first)
+	if err != nil {
+		t.Fatalf("first stamp %q is not RFC3339Nano: %v", first, err)
+	}
+
+	// Guarantee the second time.Now() call differs from the first.
+	// RFC3339Nano resolves to nanoseconds, so even a single
+	// instruction between the two reads suffices in practice, but
+	// a sleep makes the test deterministic on any clock.
+	time.Sleep(2 * time.Millisecond)
+
+	// Second drop: w3. Survivor w1 must carry a stamp >= first.
+	resp = httpDelete(t, base+"/v1/resource-definitions/pvc-mono/resources/w3")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	w1, err = st.Resources().Get(ctx, "pvc-mono", "w1")
+	if err != nil {
+		t.Fatalf("get w1 after second delete: %v", err)
+	}
+
+	second := w1.Annotations[apiv1.PeerChangedAnnotation]
+	if second == "" {
+		t.Fatalf("w1 missing stamp after second delete; annotations=%v", w1.Annotations)
+	}
+
+	secondTS, err := time.Parse(time.RFC3339Nano, second)
+	if err != nil {
+		t.Fatalf("second stamp %q is not RFC3339Nano: %v", second, err)
+	}
+
+	// "later >= earlier" — equality would only happen with a
+	// frozen clock; the sleep above rules that out, but the
+	// assertion stays generous so a fast-but-honest clock doesn't
+	// flake the suite.
+	if secondTS.Before(firstTS) {
+		t.Errorf("monotonicity violation: second stamp %v predates first %v", secondTS, firstTS)
+	}
+
+	if second == first {
+		t.Errorf("stamp value did not advance between two real DELETEs; "+
+			"controller-runtime resourceVersion gate would short-circuit the second Reconcile (got %q twice)",
+			first)
+	}
+}
+
 // TestMakeAvailablePromotesTiebreakerWitness pins the CSI
 // ControllerPublishVolume happy path: linstor-csi calls
 // `POST .../resources/{node}/make-available` with `{diskful:false}`

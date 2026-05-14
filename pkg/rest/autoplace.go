@@ -1063,6 +1063,13 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// Bug 56 idempotent envelope. Bug 67: a no-op DELETE
+			// must NOT bump sibling annotations — only a REAL drop
+			// changes the peer set the survivors render into .res.
+			// Spurious bumps on the CSI retry path would churn the
+			// satellite reconciler loop (every replay = one more
+			// drbdadm adjust on every survivor) and confuse audit
+			// tooling that watches `blockstor.io/peer-changed`.
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnRscNotFound,
 				Message: "resource already absent: " + rdName + " on " + node,
@@ -1076,10 +1083,80 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 67: notify surviving sibling Resources of the peer change so
+	// the satellite reconcilers re-derive their peer set without the
+	// dropped replica. The satellite's controller-runtime watch is
+	// scoped by `nodeNamePredicate` to its OWN Resource CRDs, so a
+	// peer-Resource Delete on another node never wakes the local
+	// reconciler — bumping an annotation on each survivor is the
+	// minimal-cost event the local watch DOES see. Best-effort: a
+	// failure here does NOT roll the delete back (the row is already
+	// gone) — the next user-initiated event or full reconcile sync
+	// will eventually converge. Order of operations is deliberately
+	// "delete first, bump second" so a survivor that reconciles on
+	// the annotation event observes the post-delete Resource list,
+	// not the racing pre-delete state.
+	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
+
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
 	}})
+}
+
+// bumpPeerChangedOnSiblings stamps an RFC3339Nano timestamp on every
+// surviving Resource of `rdName`, excluding `removedNode` (which is
+// already gone by the time we get here — Get would return NotFound).
+// The annotation value advances on every call, so repeated peer-drops
+// produce strictly monotonic timestamps; the satellite's watch sees
+// each as a fresh Update event regardless of clock resolution.
+//
+// RFC3339Nano is used (not RFC3339) so two bumps within the same
+// second still produce distinct values. The satellite doesn't parse
+// the value — only "did the annotation change since I last reconciled"
+// matters — but distinct strings keep the controller-runtime
+// resourceVersion gates from short-circuiting consecutive Updates as
+// "no semantic change".
+//
+// Best-effort throughout: List or Update failures are swallowed
+// because the operator-requested Delete has already succeeded; a
+// stale-peer-set survivor will catch up on the next event (RD spec
+// change, satellite heartbeat, full informer resync). Logging the
+// failures here would be useful but the REST package has no logger in
+// scope on this path — the satellite-side teardown already logs when
+// it eventually picks the change up.
+func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedNode string) {
+	siblings, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		return
+	}
+
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+
+	for i := range siblings {
+		sib := &siblings[i]
+		if sib.NodeName == removedNode {
+			// Defensive: the deleted Resource should already be
+			// absent from the list, but a racing Create could
+			// surface a fresh replica on the same node — never
+			// re-bump the row we just removed.
+			continue
+		}
+
+		if sib.Annotations == nil {
+			sib.Annotations = map[string]string{}
+		}
+
+		sib.Annotations[apiv1.PeerChangedAnnotation] = stamp
+
+		// Update is best-effort. A concurrent satellite SetState
+		// using SSA on Status doesn't race this Spec/metadata path
+		// (different field owners + different subresources), so the
+		// typical failure mode here is a conflict from another REST
+		// writer (rare) or NotFound from a same-instant peer Delete
+		// (already-fine outcome).
+		_ = s.Store.Resources().Update(ctx, sib)
+	}
 }
 
 // stampTiebreakerSuppression writes the

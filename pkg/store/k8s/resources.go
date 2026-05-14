@@ -164,6 +164,16 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 
 	existing.Spec = wireToCRDResourceSpec(in)
 
+	// Bug 67: round-trip wire-side Annotations through metadata so the
+	// REST writer's `blockstor.io/peer-changed` bump actually reaches
+	// the CRD ObjectMeta — without this the bump would silently no-op
+	// and the satellite's local-Resource watch would never fire.
+	// nil wire means "no annotation work requested" — preserve existing
+	// (mirrors RD store's `mergeUserAnnotationsInto` contract).
+	if in.Annotations != nil {
+		existing.Annotations = cloneAnnotations(in.Annotations)
+	}
+
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
 		return errors.Wrapf(err, "update Resource %s/%s", in.Name, in.NodeName)
@@ -376,7 +386,8 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 			volumesFromStatus(crd.Status.Volumes),
 			crd.Status.Connections,
 		),
-		UUID: string(crd.UID),
+		UUID:        string(crd.UID),
+		Annotations: cloneAnnotations(crd.Annotations),
 	}
 }
 
@@ -729,6 +740,7 @@ func wireToCRDResource(in *apiv1.Resource) *crdv1alpha1.Resource {
 				LabelResourceDefinition: in.Name,
 				LabelNodeName:           in.NodeName,
 			},
+			Annotations: cloneAnnotations(in.Annotations),
 		},
 		Spec: wireToCRDResourceSpec(in),
 	}

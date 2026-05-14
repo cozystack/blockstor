@@ -30,3 +30,28 @@ package v1
 // of truth without either package importing the other — pkg/api/v1
 // is the neutral, dependency-free shared layer both already import.
 const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
+
+// PeerChangedAnnotation is stamped by the REST `handleResourceDelete`
+// handler on every SURVIVING sibling Resource CRD when one peer of an
+// RD is dropped. The annotation value is an RFC3339Nano timestamp the
+// REST writer updates to the current wall-clock time on every bump, so
+// repeated peer-drops produce monotonically advancing values.
+//
+// Bug 67: removing a peer replica via `linstor r d <node> <rd>` left
+// the surviving satellites stuck on `Connecting(<deleted-peer>)`. The
+// satellite reconciler watches its OWN Resource CRDs via a node-name
+// predicate, so a peer-Resource Delete event landing on a different
+// node never triggered the survivor's Reconcile — the dispatcher would
+// have happily rebuilt the DesiredResource with a shrunk peer set, but
+// nothing woke the loop. Bumping a metadata annotation on each
+// survivor is the cheapest event the local watch DOES see: it forces a
+// Reconcile, the survivor's Reconcile re-derives the peer list from
+// remaining Resources, the dispatcher emits a peer-less DesiredResource,
+// and the already-working satellite teardown path runs `drbdadm
+// disconnect + del-peer` against the gone replica.
+//
+// Wire-side `apiv1.Resource.Annotations` carries this value through to
+// the K8s store, which surfaces it on the CRD's `metadata.annotations`
+// so the controller-runtime watch fires. The annotation is harmless to
+// the dispatcher / Python CLI (they ignore unknown keys).
+const PeerChangedAnnotation = "blockstor.io/peer-changed"
