@@ -1205,3 +1205,160 @@ func TestRGModifyUnsetViaDeletePropsArray(t *testing.T) {
 			got.SelectFilter.PlaceCount)
 	}
 }
+
+// TestRGModifyPlaceCountRoundTripNoAutoRebalance pins scenario 9.W03
+// (cross-listed wave1 4.4 + Bug 60 + 9.W12): PATCH
+// /v1/resource-groups/{rg} with select_filter.place_count = N updates
+// the persisted RG, the next `rg spawn` reads the new N via
+// effectiveSpawnFilter, and existing RDs / Resources are NOT mutated
+// inline by the REST handler. Bug 60's design: the handler stamps a
+// `blockstor.io/rebalance-pending` annotation and the
+// RGRebalanceReconciler picks up deferred autoplace out-of-band —
+// `rg modify` itself MUST stay a pure metadata write so the CSI hot
+// path (a parallel CreateVolume spawning into the same RG) isn't
+// blocked by a synchronous walk over every child RD. Mirrors
+// tests/scenarios/wave2-09-resource-group.md §9.W03 and
+// docs/cli-parity-audit-2026-05-14.md row #41.
+func TestRGModifyPlaceCountRoundTripNoAutoRebalance(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed parent RG at PlaceCount=2 — the old N the operator is
+	// raising. LayerStack pinned so we can assert downstream RDs
+	// retain their original shape after the modify (no inline
+	// rewrite of child layer stacks either).
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+			LayerStack: []string{"DRBD", "STORAGE"},
+		},
+	}); err != nil {
+		t.Fatalf("seed rg: %v", err)
+	}
+
+	// Two child RDs already spawned under the old place-count.
+	// Each carries a distinct annotation so we can assert byte
+	// equality after the PATCH (handler must not strip / merge
+	// anything on the RD side).
+	for _, n := range []string{"pvc-a", "pvc-b"} {
+		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+			Name:              n,
+			ResourceGroupName: "rg-1",
+			LayerStack:        []string{"DRBD", "STORAGE"},
+			Annotations:       map[string]string{"seeded-at": n},
+		}); err != nil {
+			t.Fatalf("seed rd %q: %v", n, err)
+		}
+	}
+
+	// Two Resources per RD (matches the old PlaceCount=2). If the
+	// handler were doing an inline rebalance, it would spawn a
+	// third Resource per RD here — which is exactly what scenario
+	// 9.W03 forbids.
+	for _, rd := range []string{"pvc-a", "pvc-b"} {
+		for _, node := range []string{"node-1", "node-2"} {
+			if err := st.Resources().Create(ctx, &apiv1.Resource{
+				Name:     rd,
+				NodeName: node,
+			}); err != nil {
+				t.Fatalf("seed resource %s@%s: %v", rd, node, err)
+			}
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `linstor rg modify rg-1 --place-count 3` wire shape: golinstor
+	// emits a partial ResourceGroup body carrying only the changed
+	// SelectFilter scalar. We use the raw JSON envelope so a future
+	// `omitempty` slip on AutoSelectFilter (which would silently drop
+	// place_count=0 in a struct marshal) can't mask a regression.
+	body := []byte(`{"select_filter":{"place_count":3}}`)
+
+	resp := httpPut(t, base+"/v1/resource-groups/rg-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH status: got %d, want 200", resp.StatusCode)
+	}
+
+	// 1) RG round-trip: persisted PlaceCount reflects the new N and
+	//    LayerStack survives the unmentioned-field merge (scenario
+	//    9.W12's contract reused here as a cross-listed assertion).
+	gotRG, err := st.ResourceGroups().Get(ctx, "rg-1")
+	if err != nil {
+		t.Fatalf("Get rg: %v", err)
+	}
+
+	if gotRG.SelectFilter.PlaceCount != 3 {
+		t.Errorf("persisted PlaceCount: got %d, want 3", gotRG.SelectFilter.PlaceCount)
+	}
+
+	if len(gotRG.SelectFilter.LayerStack) != 2 ||
+		gotRG.SelectFilter.LayerStack[0] != "DRBD" ||
+		gotRG.SelectFilter.LayerStack[1] != "STORAGE" {
+		t.Errorf("LayerStack mutated by place-count-only modify: got %v, want [DRBD STORAGE]",
+			gotRG.SelectFilter.LayerStack)
+	}
+
+	// 2) Subsequent `rg spawn` honours the new N. effectiveSpawnFilter
+	//    is the exact helper handleRGSpawn invokes before handing the
+	//    filter to the autoplacer; an empty spawn request (no
+	//    spawn-time overrides) must inherit RG.SelectFilter.PlaceCount.
+	spawnFilter := effectiveSpawnFilter(&gotRG, &apiv1.ResourceGroupSpawn{
+		ResourceDefinitionName: "pvc-new",
+	})
+
+	if spawnFilter.PlaceCount != 3 {
+		t.Errorf("spawn-time PlaceCount: got %d, want 3 (new RDs must honour modified N)",
+			spawnFilter.PlaceCount)
+	}
+
+	// 3) Bug 60 design: existing RDs are NOT auto-rebalanced inline.
+	//    The handler stamps an annotation; the actual autoplace pass
+	//    is deferred to RGRebalanceReconciler. Pin the negative side:
+	//    RD shape (LayerStack + Annotations) is byte-identical and
+	//    Resource count per RD is unchanged.
+	for _, n := range []string{"pvc-a", "pvc-b"} {
+		gotRD, err := st.ResourceDefinitions().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("Get rd %q: %v", n, err)
+		}
+
+		if !maps.Equal(gotRD.Annotations, map[string]string{"seeded-at": n}) {
+			t.Errorf("rd %q annotations mutated inline: got %v, want {seeded-at:%s}",
+				n, gotRD.Annotations, n)
+		}
+
+		if len(gotRD.LayerStack) != 2 ||
+			gotRD.LayerStack[0] != "DRBD" ||
+			gotRD.LayerStack[1] != "STORAGE" {
+			t.Errorf("rd %q LayerStack mutated inline: got %v, want [DRBD STORAGE]",
+				n, gotRD.LayerStack)
+		}
+
+		rs, err := st.Resources().ListByDefinition(ctx, n)
+		if err != nil {
+			t.Fatalf("ListByDefinition %q: %v", n, err)
+		}
+
+		if len(rs) != 2 {
+			t.Errorf("rd %q replica count: got %d, want 2 (inline rebalance forbidden — see Bug 60)",
+				n, len(rs))
+		}
+	}
+
+	// 4) The deferred-work signal IS present on the RG itself. This is
+	//    the "separate path" half of the scenario: operator-triggered
+	//    rebalance flows through the annotation → reconciler chain,
+	//    not through the REST modify call. Without this assertion the
+	//    test would pass on a hypothetical regression that simply
+	//    dropped the rebalance hook entirely.
+	if _, ok := gotRG.Annotations[apiv1.AnnotationRGRebalancePending]; !ok {
+		t.Errorf("rebalance-pending annotation missing; got annotations=%v "+
+			"(deferred rebalance must be scheduled — handler is the only "+
+			"writer of this signal)", gotRG.Annotations)
+	}
+}
