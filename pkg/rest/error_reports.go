@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -181,12 +182,24 @@ func (s *Server) registerErrorReports(mux *http.ServeMux) {
 // detached can still surface its own error stream.
 //
 // Query parameters honoured (upstream `Controller.GetErrorReports`
-// passes the same names): `?node=NAME` filters by satellite name
-// (case-insensitive); `?since=MILLIS` returns only entries with
-// `error_time >= since`. Both are advisory — the CLI requests them
-// when the operator passes `-n` / `--since`, but golinstor tolerates
-// servers that ignore the filter and re-filter client-side. Implementing
-// them here keeps the wire round-trip cheap.
+// passes the same names):
+//
+//   - `?node=NAME` filters by satellite name (case-insensitive). Repeated
+//     values aren't supported; the operator hits the endpoint per node.
+//   - `?since=...` returns only entries with `error_time >= since`. We
+//     accept either RFC3339 ("2026-05-14T10:00:00Z") — the form the
+//     `linstor err l --since` shorthand expands to — or a plain
+//     millis-since-epoch integer, which is what golinstor's
+//     `Controller.GetErrorReports` sends over the wire. Unparseable
+//     inputs are rejected with 400 so the operator catches the typo
+//     instead of seeing a silently-unfiltered list.
+//   - `?limit=N` caps the response to the N newest entries after node /
+//     since filtering. N must be a positive integer; 0 or absent means
+//     no cap. Anything else → 400.
+//
+// All three filters are applied controller-side so a paging CLI
+// (`linstor err l -n nodeA --since=1h --limit=20`) doesn't pull the
+// full ring across the wire only to throw most of it away.
 func (s *Server) handleErrorReportsList(w http.ResponseWriter, r *http.Request) {
 	var entries []ErrorReportEntry
 	if s.errorReports != nil {
@@ -197,7 +210,9 @@ func (s *Server) handleErrorReportsList(w http.ResponseWriter, r *http.Request) 
 		entries = []ErrorReportEntry{}
 	}
 
-	node := strings.TrimSpace(r.URL.Query().Get("node"))
+	query := r.URL.Query()
+
+	node := strings.TrimSpace(query.Get("node"))
 	if node != "" {
 		filtered := entries[:0]
 
@@ -210,7 +225,60 @@ func (s *Server) handleErrorReportsList(w http.ResponseWriter, r *http.Request) 
 		entries = filtered
 	}
 
+	if raw := strings.TrimSpace(query.Get("since")); raw != "" {
+		sinceMs, ok := parseSinceMillis(raw)
+		if !ok {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid 'since': %q (expected RFC3339 or millis-since-epoch)", raw))
+
+			return
+		}
+
+		filtered := entries[:0]
+
+		for i := range entries {
+			if entries[i].ErrorTime >= sinceMs {
+				filtered = append(filtered, entries[i])
+			}
+		}
+
+		entries = filtered
+	}
+
+	if raw := strings.TrimSpace(query.Get("limit")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 0 {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("invalid 'limit': %q (expected non-negative integer)", raw))
+
+			return
+		}
+
+		if limit > 0 && len(entries) > limit {
+			entries = entries[:limit]
+		}
+	}
+
 	writeJSON(w, http.StatusOK, entries)
+}
+
+// parseSinceMillis accepts the two forms the CLI surface produces:
+// an RFC3339 timestamp ("2026-05-14T10:00:00Z" — what shell wrappers
+// expand `--since=24h` into) and a plain millis-since-epoch integer
+// (what golinstor's typed client sends). Returning a single int64
+// keeps the filter loop trivial.
+func parseSinceMillis(raw string) (int64, bool) {
+	t, terr := time.Parse(time.RFC3339, raw)
+	if terr == nil {
+		return t.UTC().UnixMilli(), true
+	}
+
+	ms, merr := strconv.ParseInt(raw, 10, 64)
+	if merr == nil && ms >= 0 {
+		return ms, true
+	}
+
+	return 0, false
 }
 
 // handleErrorReportGet returns a single entry by its Filename id.
