@@ -186,6 +186,18 @@ const apiCallRcFailExistsSnapshotDfn int64 = 514
 // separate rule.
 const apiCallRcFailExistsRscDfn int64 = 501
 
+// apiCallRcFailInUse mirrors upstream LINSTOR's `ApiConsts.FAIL_IN_USE`
+// (997). Used when a delete is refused because an in-flight resource
+// still references the target — e.g. `sp delete` on a pool with
+// replicas.
+const apiCallRcFailInUse int64 = 997
+
+// apiCallRcFailInvldVlmSize mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_INVLD_VLM_SIZE` (206). Used when an operator-supplied
+// size violates the contract (e.g. `vd set-size` shrink without
+// `--force`).
+const apiCallRcFailInvldVlmSize int64 = 206
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the

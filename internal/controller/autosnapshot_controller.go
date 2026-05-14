@@ -197,7 +197,7 @@ func (r *AutoSnapshotRunnable) Tick(ctx context.Context) error {
 			continue
 		}
 
-		runEvery, ok := parsePositiveMinutes(rd.Spec.Props[PropAutoSnapshotRunEvery])
+		runEvery, ok := parsePositiveDurationMinutes(rd.Spec.Props[PropAutoSnapshotRunEvery])
 		if !ok {
 			continue
 		}
@@ -432,11 +432,11 @@ func (r *AutoSnapshotRunnable) RegisterWithManager(mgr manager.Manager) error {
 	return nil
 }
 
-// parsePositiveMinutes parses the upstream RunEvery property
+// parsePositiveDurationMinutes parses the upstream RunEvery property
 // (always a `long` in the OpenAPI spec — number of minutes).
 // Returns ok=false when the prop is absent, blank, unparseable, or
 // <=0 — all of which the OpenAPI doc explicitly maps to "disabled".
-func parsePositiveMinutes(raw string) (time.Duration, bool) {
+func parsePositiveDurationMinutes(raw string) (time.Duration, bool) {
 	if raw == "" {
 		return 0, false
 	}
