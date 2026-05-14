@@ -17,6 +17,7 @@ limitations under the License.
 package k8s
 
 import (
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -98,6 +99,111 @@ func TestCRDNameUsesPoolDotNodeOrder(t *testing.T) {
 	if got != want {
 		t.Errorf("crdName(\"w1\", \"zfs-thin\"): got %q, want %q (must be <pool>.<node>)",
 			got, want)
+	}
+}
+
+// TestCrdToWireStoragePoolFaultyStampsReports pins the Bug 83 fix:
+// when the CRD's Status.PoolMissing is true, the wire-shape value
+// MUST carry both `state == "Faulty"` AND a non-empty `Reports`
+// slice with an ERROR-severity ApiCallRc whose message identifies
+// the missing pool. Without the reports[] entry the Python linstor-
+// client's State column derivation (`get_replies_state` over an
+// empty reports[]) collapses to "Ok" — defeating the whole reason
+// state="Faulty" was added in Bug 50.
+//
+// We assert structurally (not on the exact wording) so the message
+// copy can evolve without breaking the test, but the wording MUST
+// contain "missing" + the pool name so audit-log greppers and
+// operator dashboards can pattern-match on the failure mode.
+func TestCrdToWireStoragePoolFaultyStampsReports(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "zfs-thin.w3"},
+		Spec: crdv1alpha1.StoragePoolSpec{
+			NodeName:     "w3",
+			PoolName:     "zfs-thin",
+			ProviderKind: apiv1.StoragePoolKindZFSThin,
+		},
+		Status: crdv1alpha1.StoragePoolStatus{
+			PoolMissing: true,
+		},
+	}
+
+	got := crdToWireStoragePool(crd)
+
+	if got.State != "Faulty" {
+		t.Errorf("State: got %q, want %q", got.State, "Faulty")
+	}
+
+	if len(got.Reports) == 0 {
+		t.Fatalf("Reports: got empty slice; want >=1 entry so " +
+			"python-linstor renders the State column as Faulty")
+	}
+
+	rc := got.Reports[0]
+
+	// MASK_ERROR bit must be set so python-linstor's
+	// `get_replies_state` classifies the entry as ERROR-severity.
+	if rc.RetCode&apiv1.APICallRcMaskError == 0 {
+		t.Errorf("RetCode missing MASK_ERROR bit: %#x", rc.RetCode)
+	}
+
+	// Sub-code must be the storpool-configuration-error mirror.
+	if rc.RetCode&0xFFFF != apiv1.APICallRcFailStorPoolConfigurationError {
+		t.Errorf("RetCode sub-code: got %d, want %d (FAIL_STOR_POOL_CONFIGURATION_ERROR)",
+			rc.RetCode&0xFFFF, apiv1.APICallRcFailStorPoolConfigurationError)
+	}
+
+	// Message must mention both "missing" and the pool name so the
+	// operator can correlate from `linstor sp l` output alone.
+	if !strings.Contains(rc.Message, "missing") {
+		t.Errorf("Message: %q, want substring %q", rc.Message, "missing")
+	}
+
+	if !strings.Contains(rc.Message, "zfs-thin") {
+		t.Errorf("Message: %q, want substring %q (pool name)",
+			rc.Message, "zfs-thin")
+	}
+
+	// ObjRefs must tag the entry with the (node, pool) pair so audit
+	// log queries can filter by either axis.
+	if rc.ObjRefs["Node"] != "w3" {
+		t.Errorf("ObjRefs[Node]: got %q, want %q", rc.ObjRefs["Node"], "w3")
+	}
+
+	if rc.ObjRefs["StorPool"] != "zfs-thin" {
+		t.Errorf("ObjRefs[StorPool]: got %q, want %q",
+			rc.ObjRefs["StorPool"], "zfs-thin")
+	}
+}
+
+// TestCrdToWireStoragePoolHealthyHasNoReports pins the inverse:
+// a pool whose Status.PoolMissing is false MUST emit an empty
+// Reports slice. Stamping a no-op entry on a healthy pool would
+// trip python-linstor's `get_replies_state` into rendering the
+// State column as the first-entry severity rather than Ok.
+func TestCrdToWireStoragePoolHealthyHasNoReports(t *testing.T) {
+	t.Parallel()
+
+	crd := &crdv1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "zfs-thin.w3"},
+		Spec: crdv1alpha1.StoragePoolSpec{
+			NodeName:     "w3",
+			PoolName:     "zfs-thin",
+			ProviderKind: apiv1.StoragePoolKindZFSThin,
+		},
+	}
+
+	got := crdToWireStoragePool(crd)
+
+	if got.State != "Ok" {
+		t.Errorf("State: got %q, want %q", got.State, "Ok")
+	}
+
+	if len(got.Reports) != 0 {
+		t.Errorf("Reports: got %d entries, want 0 (healthy pool)",
+			len(got.Reports))
 	}
 }
 

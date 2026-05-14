@@ -70,6 +70,34 @@ type APICallRc struct {
 	ErrorRep string            `json:"error_report_ids,omitempty"`
 }
 
+// MASK_ERROR / MASK_STOR_POOL / FAIL_STOR_POOL_CONFIGURATION_ERROR mirror the
+// upstream LINSTOR `ApiConsts` constants of the same name. Exposed on the
+// shared API package (rather than pkg/rest, where the rest-internal copies
+// live) so the store layer can stamp structured `Reports[]` entries without
+// pulling a cyclic dependency on pkg/rest. The values are byte-identical to
+// the upstream Java constants — golinstor and the Python CLI both
+// pattern-match on them.
+const (
+	// APICallRcMaskError is upstream `ApiConsts.MASK_ERROR`
+	// (`0xC000_0000_0000_0000L`). Negative when stored in int64. The
+	// Python CLI's `get_replies_state` treats any entry with this bit
+	// as severity ERROR and renders the state column as "Error".
+	APICallRcMaskError int64 = -0x4000_0000_0000_0000
+
+	// APICallRcMaskStorPool is upstream `ApiConsts.MASK_STOR_POOL`
+	// (`0x0000_0000_0014_0000L`). Tags the entry as "subject =
+	// StoragePool" so audit-log greppers can route it.
+	APICallRcMaskStorPool int64 = 0x0000_0000_0014_0000
+
+	// APICallRcFailStorPoolConfigurationError is upstream
+	// `ApiConsts.FAIL_STOR_POOL_CONFIGURATION_ERROR` (`990 |
+	// MASK_ERROR`). Closest semantic match in upstream's catalogue
+	// for "the storage pool's backing configuration is broken on the
+	// satellite" — exactly the situation `PoolMissing=true` describes
+	// after `zpool destroy` / `vgremove` on a backing pool (Bug 83).
+	APICallRcFailStorPoolConfigurationError int64 = 990
+)
+
 // Storage provider kind constants — the canonical strings LINSTOR uses.
 const (
 	StoragePoolKindLVM        = "LVM"
