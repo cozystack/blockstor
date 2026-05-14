@@ -52,6 +52,16 @@ type volumeDefinitionModifyBody struct {
 	// shape (matches the read-side wire field). Treated as an override
 	// overlay on the existing Props map — equivalent to OverrideProps.
 	Props map[string]string `json:"props,omitempty"`
+
+	// Force is the wave2 4.W13 escape hatch for a spec-shrink: when the
+	// operator has already shrunk the backing filesystem out-of-band
+	// (`resize2fs -s <new-size>`, etc.) they need a way to bring the
+	// LINSTOR spec back into sync with the now-smaller FS. Upstream
+	// LINSTOR rejects all shrinks unconditionally; blockstor matches
+	// that default but accepts force=true as an opt-in. Also honoured
+	// via the `?force=true` query parameter so ad-hoc `curl` scripts
+	// don't have to re-shape a golinstor payload.
+	Force bool `json:"force,omitempty"`
 }
 
 // registerVolumeDefinitions wires
@@ -245,9 +255,18 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Capture the pre-merge size so we can detect an explicit shrink
-	// after the patch has been applied. Done before mergeVolumeDefinitionPatch
+	// BEFORE the patch is applied. Done before mergeVolumeDefinitionPatch
 	// so we compare against the stored spec, not the in-place mutated one.
 	previousSizeKib := existing.SizeKib
+
+	// Scenario 4.W13: reject any shrink (`new < previous`) unless the
+	// operator opted in via `force=true`. Runs BEFORE the merge + store
+	// write so a rejected shrink leaves the stored spec untouched — a
+	// partial update would desync the controller spec from the
+	// satellite reality.
+	if rejectShrinkWithoutForce(w, r, &patch, rd, vn, previousSizeKib) {
+		return
+	}
 
 	mergeVolumeDefinitionPatch(&existing, &patch)
 
@@ -266,33 +285,103 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		Message: "volume definition modified",
 	}}
 
-	// Shrink advisory (docs/known-issues.md #38). Upstream LINSTOR rejects
-	// shrink-after-deploy at the API; blockstor accepts it (the satellite reconciler's
-	// grow branch is `vol.GetSizeKib() > status.UsableKib`, so a shrink
-	// in the spec never reaches `lvextend`/`zfs set volsize` and never
-	// truncates the backing device). Still, the operator should see a
-	// warning entry so the data-loss risk surfaces in the audit log —
-	// shrinking the spec without also shrinking the FS will eventually
-	// corrupt data if the FS later writes past the new size.
+	// Force-shrink advisory (Bug 38 / scenario 4.W13). When the
+	// operator opts into the shrink, retain the audit-log breadcrumb
+	// so the data-loss risk window is visible alongside the success
+	// line. Only reachable when force=true (the strict-reject branch
+	// above otherwise short-circuits with 400).
 	//
-	// Emit the warning as a SECOND envelope entry (success first, then
-	// advisory) — matches upstream's order in ApiCallRcImpl where the
-	// "operation succeeded" entry leads and per-resource warnings tail.
+	// Emit the warning as a SECOND envelope entry (success first,
+	// then advisory) — matches upstream's order in ApiCallRcImpl
+	// where the "operation succeeded" entry leads and per-resource
+	// warnings tail.
 	if patch.SizeKib != nil && *patch.SizeKib < previousSizeKib {
 		envelope = append(envelope, apiv1.APICallRc{
 			RetCode: warnVlmDfnResizeShrink,
 			Message: fmt.Sprintf(
-				"shrinking volume %d from %d KiB to %d KiB (DATA LOSS RISK — caller intent assumed)",
+				"shrinking volume %d from %d KiB to %d KiB (force=true; DATA LOSS RISK — caller intent assumed)",
 				vn, previousSizeKib, *patch.SizeKib,
 			),
 			ObjRefs: map[string]string{
-				"RscDfn": rd,
-				"VlmNr":  strconv.FormatInt(int64(vn), 10),
+				objRefRscDfn: rd,
+				"VlmNr":      strconv.FormatInt(int64(vn), 10),
 			},
 		})
 	}
 
 	writeJSON(w, http.StatusOK, envelope)
+}
+
+// rejectShrinkWithoutForce writes a 400 + FAIL_INVLD_VLM_SIZE
+// envelope when the patch reduces SizeKib without `force=true` and
+// returns true to signal the caller to short-circuit. The error path
+// is split out of handleVDUpdate to keep the HTTP handler under the
+// funlen budget; the formatted message stays inline here so a single
+// grep against the binary finds the operator-actionable text.
+//
+// LINSTOR does NOT auto-shrink the backing FS — `lvreduce` after a
+// spec-shrink without an in-FS `resize2fs -s` first would truncate
+// live data. Upstream LINSTOR's
+// CtrlVlmDfnModifyApiCallHandler.ensureShrinkingIsSupported raises
+// FAIL_INVLD_VLM_SIZE (206 | MASK_ERROR) on the same input; mirror
+// the wire code and 400 Bad Request HTTP status so golinstor's
+// `client.ApiCallError` surfaces the message in `linstor`'s exit-1
+// path.
+func rejectShrinkWithoutForce(
+	w http.ResponseWriter, r *http.Request, patch *volumeDefinitionModifyBody,
+	rd string, vn int32, previousSizeKib int64,
+) bool {
+	if patch.SizeKib == nil || *patch.SizeKib >= previousSizeKib {
+		return false
+	}
+
+	if shrinkForceRequested(r, patch) {
+		return false
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInvldVlmSize,
+		Message: fmt.Sprintf(
+			"cannot shrink volume %d from %d KiB to %d KiB: "+
+				"filesystem shrink-then-resize required; LINSTOR does NOT auto-shrink. "+
+				"Operator action: (1) `resize2fs -s <new>` or `xfs` dump+restore on the consumer, "+
+				"(2) unmount or detach the volume, "+
+				"(3) re-issue this PUT with `force=true` (body field) or `?force=true` (query).",
+			vn, previousSizeKib, *patch.SizeKib,
+		),
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			"VlmNr":      strconv.FormatInt(int64(vn), 10),
+		},
+	}})
+
+	return true
+}
+
+// shrinkForceRequested returns true when the caller opted into the
+// shrink escape hatch via either the JSON body's `force` field or the
+// `?force=true` query parameter. The query parameter exists so ad-hoc
+// `curl -X PUT … ?force=true` scripts work without re-shaping the
+// JSON body around a golinstor-shaped payload. Both knobs must accept
+// the literal string "true" (case-insensitive) — Go's
+// `strconv.ParseBool` covers "1"/"t"/"true"/"True"/"TRUE" which is a
+// strict superset of the documented form.
+func shrinkForceRequested(r *http.Request, patch *volumeDefinitionModifyBody) bool {
+	if patch.Force {
+		return true
+	}
+
+	raw := r.URL.Query().Get("force")
+	if raw == "" {
+		return false
+	}
+
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false
+	}
+
+	return v
 }
 
 // mergeVolumeDefinitionPatch overlays the modify delta onto an existing

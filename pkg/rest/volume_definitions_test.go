@@ -489,19 +489,22 @@ func TestVolumeDefinitionsUpdateNoOp(t *testing.T) {
 	}
 }
 
-// TestVolumeDefinitionsUpdateShrinkAccepted pins that the REST
-// surface accepts a smaller `size_kib` than the current VD size
-// without rejecting at the API layer. Data-loss prevention lives at
-// the satellite (`reconciler.go`: `if vol.GetSizeKib() > status.UsableKib`
-// — the grow branch is the only one that calls `ResizeVolume`, so a
-// shrink in the spec never reaches `lvextend`/`zfs set volsize` and
-// never truncates the backing device). Upstream LINSTOR's UG9
-// chapter 1.20.5 warns operators about this but doesn't reject at
-// the API either. If we ever start rejecting shrinks at REST, the
-// invariant "controller and satellite agree on the spec" breaks
-// because csi-resizer doesn't issue shrinks but admins doing
-// `linstor vd set-size` might.
-func TestVolumeDefinitionsUpdateShrinkAccepted(t *testing.T) {
+// TestVolumeDefinitionsUpdateShrinkRejected pins scenario 4.W13: a
+// PUT that reduces SizeKib without the `force=true` escape hatch must
+// be rejected at the REST layer with a 4xx and an operator-actionable
+// message. LINSTOR does NOT auto-shrink the backing FS — `lvreduce`
+// after a spec-shrink without an in-FS `resize2fs -s` first truncates
+// live data. Upstream LINSTOR's CtrlVlmDfnModifyApiCallHandler raises
+// FAIL_INVLD_VLM_SIZE on the same input ("Deployed volumes can only
+// grow in size, not shrink"); blockstor matches the wire shape but
+// makes the message UG9-actionable so the operator knows the exact
+// out-of-band sequence (shrink FS first, then resize device).
+//
+// Pre-4.W13 behaviour was "accept shrink + emit warning entry"; the
+// audit log warning was easy to miss under burst PUTs from
+// csi-resizer retries. Strict rejection matches upstream and stops
+// the foot-gun from firing in the first place.
+func TestVolumeDefinitionsUpdateShrinkRejected(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -518,25 +521,191 @@ func TestVolumeDefinitionsUpdateShrinkAccepted(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// Halve the size — explicit shrink.
+	// Halve the size — explicit shrink without force.
 	const shrunkKib = initialKib / 2
 
 	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: shrunkKib})
 
 	resp := httpPut(t, base+"/v1/resource-definitions/pvc-shrink/volume-definitions/0", body)
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("shrink status: got %d, want 200 (REST accepts shrinks; satellite is data-safe)", resp.StatusCode)
+	// 400 Bad Request — not 409, not 422. golinstor's `client.ApiCallError`
+	// classifies any 4xx as a client-fixable error and surfaces the
+	// envelope message in `linstor`'s exit-code-1 path. 400 is the
+	// closest match for "the caller's input is semantically invalid
+	// for the current resource state" — matching upstream LINSTOR's
+	// CtrlVlmDfnModifyApiCallHandler shrink rejection.
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("shrink status: got %d, want 400 (scenario 4.W13: strict rejection without force)", resp.StatusCode)
 	}
 
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1 (single error entry); got=%+v", len(rcs), rcs)
+	}
+
+	// MASK_ERROR + FAIL_INVLD_VLM_SIZE (upstream's `206 | MASK_ERROR`).
+	// Keeps the audit-log grep alongside upstream LINSTOR's traffic.
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("ret_code: got %#x, want MASK_ERROR bit set", rcs[0].RetCode)
+	}
+
+	if rcs[0].RetCode&apiCallRcFailInvldVlmSize == 0 {
+		t.Errorf("ret_code: got %#x, want FAIL_INVLD_VLM_SIZE (206) sub-code", rcs[0].RetCode)
+	}
+
+	// Message must carry the operator-actionable guidance: filesystem
+	// shrink first, then device resize, and the explicit "LINSTOR does
+	// NOT auto-shrink" disclaimer that scenario 4.W13 pins. Without
+	// these markers an audit-log grep would miss the data-loss-risk
+	// class entirely.
+	for _, want := range []string{
+		"filesystem shrink-then-resize required",
+		"LINSTOR does NOT auto-shrink",
+	} {
+		if !strings.Contains(rcs[0].Message, want) {
+			t.Errorf("message missing actionable marker %q: %q", want, rcs[0].Message)
+		}
+	}
+
+	// Both the source and target KiB must appear so the operator can
+	// sanity-check the magnitude of the rejected shrink in the audit log.
+	if !strings.Contains(rcs[0].Message, "4194304") {
+		t.Errorf("message missing source size %d KiB: %q", initialKib, rcs[0].Message)
+	}
+
+	if !strings.Contains(rcs[0].Message, "2097152") {
+		t.Errorf("message missing target size %d KiB: %q", shrunkKib, rcs[0].Message)
+	}
+
+	// Stored VD must be untouched — the rejection happens before the
+	// merge writes to the store. A partial update would leave the
+	// controller spec mismatched against the satellite reality.
 	got, err := st.VolumeDefinitions().Get(ctx, "pvc-shrink", 0)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
 
+	if got.SizeKib != initialKib {
+		t.Errorf("rejected shrink mutated the store: SizeKib got %d, want %d (untouched)",
+			got.SizeKib, initialKib)
+	}
+}
+
+// TestVolumeDefinitionsUpdateShrinkWithForceAccepted pins the escape
+// hatch: a PUT with `?force=true` (or `"force": true` in the body)
+// MUST accept the shrink. Operators who have already shrunk the FS
+// out-of-band (e.g. resize2fs -s <new-size>; umount; …) need a way
+// to bring the LINSTOR spec back into sync with the now-smaller FS.
+// Matches scenario 4.W13's "force flag required" alternative.
+//
+// The accepted-with-force path still emits the warning advisory
+// (existing wire contract from Bug 38) so the operator's audit log
+// retains the data-loss-risk breadcrumb.
+func TestVolumeDefinitionsUpdateShrinkWithForceAccepted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-force"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 4 * 1024 * 1024
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-force",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const shrunkKib = initialKib / 2
+
+	body, _ := json.Marshal(map[string]any{
+		"size_kib": shrunkKib,
+		"force":    true,
+	})
+
+	resp := httpPut(t, base+"/v1/resource-definitions/pvc-force/volume-definitions/0", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("shrink-with-force status: got %d, want 200 (force=true is the W13 escape hatch)",
+			resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 2 {
+		t.Fatalf("envelope entries: got %d, want 2 (success + shrink advisory); got=%+v", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&maskInfo == 0 {
+		t.Errorf("entry 0 ret_code = %x, want maskInfo bit set", rcs[0].RetCode)
+	}
+
+	if rcs[1].RetCode&maskWarn == 0 {
+		t.Errorf("entry 1 ret_code = %x, want warn-mask bit set (shrink advisory)", rcs[1].RetCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-force", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
 	if got.SizeKib != shrunkKib {
-		t.Errorf("SizeKib after shrink: got %d, want %d", got.SizeKib, shrunkKib)
+		t.Errorf("SizeKib after force-shrink: got %d, want %d", got.SizeKib, shrunkKib)
+	}
+}
+
+// TestVolumeDefinitionsUpdateShrinkWithForceQueryAccepted pins the
+// `?force=true` query-string variant of the W13 escape hatch. The
+// query knob exists so a `curl -X PUT … ?force=true` works without
+// re-shaping the JSON body — useful for ad-hoc operator scripts that
+// can't easily inject a field into a golinstor-shaped payload.
+func TestVolumeDefinitionsUpdateShrinkWithForceQueryAccepted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-fq"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 10240
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-fq",
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const shrunkKib = 5120
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: shrunkKib})
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-fq/volume-definitions/0?force=true", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("force-query status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-fq", 0)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.SizeKib != shrunkKib {
+		t.Errorf("SizeKib after ?force=true: got %d, want %d", got.SizeKib, shrunkKib)
 	}
 }
 
@@ -801,20 +970,17 @@ func TestVolumeDefinitionsUpdateDeletePropsRemovesKey(t *testing.T) {
 	}
 }
 
-// TestVDUpdateShrinkEmitsSTATEInfoWarning pins Bug 38's fix: a
-// VD-modify that reduces SizeKib must surface a warning ApiCallRc
-// entry alongside the success entry, so `linstor vd set-size`
-// operators see the data-loss-risk advisory in the audit log.
-// Pre-fix, blockstor silently accepted the shrink and returned a
-// single info entry — the operator had no indication that the
-// backing FS would need to be shrunk out-of-band.
+// TestVDUpdateShrinkWithForceEmitsAdvisoryWarning pins the W13
+// force-shrink path retains Bug 38's audit-log breadcrumb: when the
+// operator opts into the shrink (`"force": true` in the body), the
+// envelope still carries the warn-mask advisory entry so the data-
+// loss risk is visible in the audit log alongside the success line.
 //
 // Wire contract: HTTP 200, two-entry `[]ApiCallRc`. Entry 0 is the
-// success line (preserves the existing CLI behaviour where modify
-// returns one "volume definition modified" line). Entry 1 carries
-// the warn-mask bit, the from/to KiB values, and the literal token
-// "shrinking" so the Python CLI's message-print loop emits it.
-func TestVDUpdateShrinkEmitsSTATEInfoWarning(t *testing.T) {
+// success line. Entry 1 carries the warn-mask bit, the from/to KiB
+// values, and the literal token "shrinking" so the Python CLI's
+// message-print loop emits it.
+func TestVDUpdateShrinkWithForceEmitsAdvisoryWarning(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -833,7 +999,10 @@ func TestVDUpdateShrinkEmitsSTATEInfoWarning(t *testing.T) {
 
 	const shrunkKib = 5120
 
-	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: shrunkKib})
+	body, _ := json.Marshal(map[string]any{
+		"size_kib": shrunkKib,
+		"force":    true,
+	})
 
 	resp := httpPut(t, base+"/v1/resource-definitions/pvc-shrink-warn/volume-definitions/0", body)
 	defer func() { _ = resp.Body.Close() }()

@@ -166,6 +166,23 @@ const warnNoSatelliteConnection = maskWarn | int64(2057)
 // a separate rule.
 const apiCallRcFailExistsSnapshotDfn int64 = 514
 
+// apiCallRcFailInvldVlmSize mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_INVLD_VLM_SIZE` (`206 | MASK_ERROR`). Emitted by
+// `PUT /v1/resource-definitions/{rd}/volume-definitions/{vn}` when
+// the patch reduces SizeKib without the `force=true` escape hatch
+// (wave2 scenario 4.W13 / UG9 §"Creating and deploying resources and
+// volumes" line 851 WARNING). Upstream's
+// CtrlVlmDfnModifyApiCallHandler.ensureShrinkingIsSupported raises
+// the same `206 | MASK_ERROR` on the same input ("Deployed volumes
+// can only grow in size, not shrink"); blockstor matches the wire
+// code so audit-log greppers that already classify upstream's
+// FAIL_INVLD_VLM_SIZE traffic catch blockstor's equivalent without
+// a separate rule. The MASK_ERROR bit is OR'd in by the
+// `apiCallRcError` envelope wrapper at the call site; the bare 206
+// sub-code here keeps the wire shape byte-identical to upstream's
+// `linstor vd set-size <rd> <vn> <smaller>` reply.
+const apiCallRcFailInvldVlmSize int64 = 206
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the
