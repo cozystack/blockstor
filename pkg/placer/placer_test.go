@@ -2353,238 +2353,416 @@ func TestPlacePoolMissingNoCandidates(t *testing.T) {
 	}
 }
 
-// TestPlaceHonoursMaxFreeCapacityOversubscriptionRatioDefault20 pins
-// scenario 7.W09 (cross-listed wave1 7.19-7.21): the cluster-scope
-// `MaxFreeCapacityOversubscriptionRatio` defaults to 20 for thin
-// providers, and the architecture splits the gate across two layers:
+// TestPlaceWFFCLocalityAllowRemoteVolumeAccessFalse pins scenario
+// 2.W03: a StorageClass with `volumeBindingMode: WaitForFirstConsumer`
+// + `linstor.csi.linbit.com/allowRemoteVolumeAccess: "false"` must
+// land exactly ONE replica on the consuming Pod's node. The CSI
+// sidecar translates the SC combo into `NodeNameList=[<consumer>]`
+// + `PlaceCount=1` (with no DisklessOnRemaining fan-out, because
+// remote-access is forbidden) — the placer's job is to honour both
+// gates verbatim, so the replica lands on the consumer node and the
+// rest of the cluster stays untouched.
 //
-//   - REST/spawn (pkg/rest/spawn.go:rejectIfExceedsOversubGate +
-//     pkg/rest/oversubscription.go:poolMaxVolumeKib) enforces the
-//     LOGICAL budget MaxVolumeSize = FreeCapacity * ratio, with the
-//     default 20 applied when no pool- or controller-level prop is set.
-//   - placer (this layer) enforces the PHYSICAL FreeCapacity floor —
-//     a hard per-pool gate independent of any ratio.
+// Topology mirrors the e2e: worker-2 is the consuming pod's node
+// (it has the LARGEST free capacity to defeat a naive biggest-first
+// pick on the unconstrained candidate set — without NodeNameList
+// every healthy peer would be a candidate). The hard requirements:
 //
-// The two gates are independent so that a stale oversub-cached cluster
-// state (FreeCapacity from satellite's last push) can never let the
-// placer stamp a Resource on a pool that physically cannot host the
-// largest VD. The test below pins THREE properties of the boundary:
+//   - placed == 1 (single replica, no fan-out)
+//   - that replica lives on worker-2 (consumer locality)
+//   - no DISKLESS Resource gets stamped anywhere — remote-access=false
+//     forbids the diskless fanout that would otherwise let other nodes
+//     mount the volume over the DRBD network
 //
-//  1. Default ratio of 20 must NOT lift the placer's physical floor.
-//     A VD that fits inside FreeCapacity*20 (logical budget) but
-//     exceeds the raw FreeCapacity must STILL be rejected by the
-//     placer with a CapacityShortfallError.
-//  2. A request whose largest VD fits inside FreeCapacity is accepted
-//     regardless of the cluster-set MaxFreeCapacityOversubscriptionRatio
-//     value — the placer is purely a physical-floor check.
-//  3. The sum of VD SizeKib across multiple VDs on the same RD does
-//     NOT enter the placer's gate: only the LARGEST VD is checked
-//     against FreeCapacity (per the upstream LINSTOR contract that
-//     every VD of an RD provisions against the same pool, see
-//     pkg/placer/placer.go:requiredKib comment). The sum-vs-budget
-//     check is the REST/spawn layer's job (rejectIfExceedsOversubGate).
-//
-// Setup mirrors UG9 §"Configuring a maximum free capacity over
-// provisioning ratio" (lines 3453-3499): 2 LVM_THIN pools (default
-// ratio applies because no `MaxFreeCapacityOversubscriptionRatio` /
-// `MaxOversubscriptionRatio` prop is set on the pool or controller).
-// FreeCapacity=50 MiB, TotalCapacity=1 GiB. Three sub-cases probe the
-// three properties above.
-func TestPlaceHonoursMaxFreeCapacityOversubscriptionRatioDefault20(t *testing.T) {
+// Cross-listed with the linstor-csi side knob: blockstor itself does
+// not parse `allowRemoteVolumeAccess` — the CSI driver does, and
+// projects the decision onto the filter. This test pins the
+// placer-side contract that makes the CSI translation safe.
+func TestPlaceWFFCLocalityAllowRemoteVolumeAccessFalse(t *testing.T) {
 	t.Parallel()
 
-	const mib = int64(1024)
+	st := store.NewInMemory()
+	ctx := t.Context()
 
-	// sub-case 1: VD inside FreeCapacity*20 logical budget but exceeds
-	// raw FreeCapacity → placer must reject on the physical floor.
-	t.Run("logical_budget_does_not_lift_physical_floor", func(t *testing.T) {
-		t.Parallel()
-
-		st := store.NewInMemory()
-		ctx := t.Context()
-
-		for _, n := range []string{"n1", "n2"} {
-			if err := st.Nodes().Create(ctx, &apiv1.Node{
-				Name: n, Type: apiv1.NodeTypeSatellite,
-			}); err != nil {
-				t.Fatalf("seed node: %v", err)
-			}
-
-			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-				NodeName:        n,
-				StoragePoolName: "thin",
-				ProviderKind:    apiv1.StoragePoolKindLVMThin,
-				FreeCapacity:    50 * mib,
-				TotalCapacity:   1024 * mib,
-				// No oversub prop set — exercise the default-20 fallback.
-			}); err != nil {
-				t.Fatalf("seed pool: %v", err)
-			}
-		}
-
-		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-			Name: "pvc-default-ratio",
+	mk := func(name string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: name, Type: apiv1.NodeTypeSatellite,
 		}); err != nil {
-			t.Fatalf("seed RD: %v", err)
+			t.Fatalf("seed node %s: %v", name, err)
 		}
 
-		// 200 MiB ask: well inside 50 MiB * 20 = 1 GiB logical budget,
-		// but 4x the raw 50-MiB FreeCapacity. The placer must reject.
-		if err := st.VolumeDefinitions().Create(ctx, "pvc-default-ratio",
-			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 200 * mib}); err != nil {
-			t.Fatalf("seed VD: %v", err)
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
 		}
+	}
 
-		placed, want, err := placer.New(st).Place(ctx, "pvc-default-ratio",
-			&apiv1.AutoSelectFilter{PlaceCount: 2})
+	// worker-2 has the LARGEST free capacity AND is the consumer.
+	// Without the NodeNameList narrowing the placer would still pick
+	// it first, but the relevant signal is what happens when worker-3
+	// has MORE free than worker-2: the WFFC contract must still
+	// pin the replica to worker-2 because that's where the pod is.
+	mk("worker-1", 100)
+	mk("worker-2", 200)
+	mk("worker-3", 999) // largest free — must NOT be picked
 
-		if placed != 0 || want != 2 {
-			t.Errorf("placed/want: got %d/%d, want 0/2 "+
-				"(default-20 logical budget must not lift physical floor)",
-				placed, want)
-		}
-
-		var capErr *placer.CapacityShortfallError
-		if !errors.As(err, &capErr) {
-			t.Fatalf("err: got %v, want *CapacityShortfallError "+
-				"(placer is a physical-floor gate)", err)
-		}
-
-		if capErr.RequiredKib != 200*mib {
-			t.Errorf("RequiredKib: got %d, want %d", capErr.RequiredKib, 200*mib)
-		}
-
-		if capErr.MaxFreeKib != 50*mib {
-			t.Errorf("MaxFreeKib: got %d, want %d "+
-				"(physical floor — NOT FreeCapacity*defaultRatio)",
-				capErr.MaxFreeKib, 50*mib)
-		}
-
-		got, _ := st.Resources().ListByDefinition(ctx, "pvc-default-ratio")
-		if len(got) != 0 {
-			t.Errorf("no Resource may be created on physical-floor miss; got %+v", got)
-		}
+	placed, want, err := placer.New(st).Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:   1,
+		NodeNameList: []string{"worker-2"},
+		// DisklessOnRemaining is INTENTIONALLY false: allowRemoteVolumeAccess=false
+		// means the diskless witness fan-out is forbidden — only the consuming
+		// node may carry the resource.
 	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
 
-	// sub-case 2: VD inside raw FreeCapacity → placer accepts, the
-	// default-20 ratio prop value at controller level is irrelevant
-	// to the placer (REST handles the oversub logical budget).
-	t.Run("vd_within_free_capacity_is_accepted_regardless_of_ratio", func(t *testing.T) {
-		t.Parallel()
+	if placed != 1 || want != 1 {
+		t.Errorf("placed/want: got %d/%d, want 1/1 (WFFC locality)", placed, want)
+	}
 
-		st := store.NewInMemory()
-		ctx := t.Context()
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
 
-		// Seed controller props with an explicit ratio=20 (the upstream
-		// default) — the placer must IGNORE this and gate on free space.
-		if err := st.ControllerProps().Set(ctx, map[string]string{
-			"MaxFreeCapacityOversubscriptionRatio": "20",
-		}); err != nil {
-			t.Fatalf("seed controller props: %v", err)
+	if len(got) != 1 {
+		t.Fatalf("total resources: got %d, want 1; %+v", len(got), got)
+	}
+
+	if got[0].NodeName != "worker-2" {
+		t.Errorf("replica on wrong node: got %s, want worker-2 (consumer locality)", got[0].NodeName)
+	}
+
+	// remote-access=false → no DISKLESS witness anywhere. A regression
+	// that quietly fanned out diskless replicas would let pods on
+	// worker-1 / worker-3 mount the volume over DRBD-net, defeating
+	// the SC's locality contract.
+	for _, r := range got {
+		if slices.Contains(r.Flags, "DISKLESS") {
+			t.Errorf("DISKLESS replica present despite allowRemoteVolumeAccess=false: %+v", r)
 		}
+	}
+}
 
-		for _, n := range []string{"n1", "n2"} {
-			if err := st.Nodes().Create(ctx, &apiv1.Node{
-				Name: n, Type: apiv1.NodeTypeSatellite,
-			}); err != nil {
-				t.Fatalf("seed node: %v", err)
-			}
+// TestPlaceWFFCLocalityRejectsRemotePeer is the negative half of
+// 2.W03: when the SC narrows NodeNameList to a single consumer node,
+// a SECOND Place call asking for an additional replica on a DIFFERENT
+// node MUST refuse — the placer cannot reach beyond the filter even
+// when the diskful target is short.
+//
+// This protects the operator-visible "remote nodes refuse to bind"
+// guarantee from the SC spec. A regression that promoted a peer
+// outside NodeNameList to satisfy place_count would silently break
+// the SC's locality contract — the pod on worker-3 would happily
+// mount over DRBD-net even though the SC said it must not.
+func TestPlaceWFFCLocalityRejectsRemotePeer(t *testing.T) {
+	t.Parallel()
 
-			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-				NodeName:        n,
-				StoragePoolName: "thin",
-				ProviderKind:    apiv1.StoragePoolKindLVMThin,
-				FreeCapacity:    500 * mib,
-				TotalCapacity:   1024 * mib,
-			}); err != nil {
-				t.Fatalf("seed pool: %v", err)
-			}
-		}
+	st := store.NewInMemory()
+	seedStore(t, st, []string{"worker-1", "worker-2", "worker-3"})
 
-		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-			Name: "pvc-fits",
-		}); err != nil {
-			t.Fatalf("seed RD: %v", err)
-		}
+	p := placer.New(st)
 
-		// 100 MiB ask: fits comfortably inside 500-MiB FreeCapacity.
-		if err := st.VolumeDefinitions().Create(ctx, "pvc-fits",
-			&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 100 * mib}); err != nil {
-			t.Fatalf("seed VD: %v", err)
-		}
-
-		placed, want, err := placer.New(st).Place(ctx, "pvc-fits",
-			&apiv1.AutoSelectFilter{PlaceCount: 2})
-		if err != nil {
-			t.Fatalf("Place: %v", err)
-		}
-
-		if placed != 2 || want != 2 {
-			t.Errorf("placed/want: got %d/%d, want 2/2 (VD fits raw FreeCapacity)",
-				placed, want)
-		}
+	// place_count=2 but NodeNameList only carries worker-2 → only
+	// 1 candidate node, so placed=1/want=2 is the honest answer.
+	placed, want, err := p.Place(t.Context(), "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:   2,
+		NodeNameList: []string{"worker-2"},
 	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
 
-	// sub-case 3: multiple VDs whose SUM exceeds FreeCapacity*20 but
-	// whose LARGEST is inside raw FreeCapacity → placer accepts. The
-	// per-VD sum-vs-budget check belongs to REST's spawn-time gate,
-	// not the placer, so the placer must NOT reject. Pins the
-	// requiredKib() contract: only the largest VD is gated.
-	t.Run("sum_of_vds_is_not_a_placer_gate", func(t *testing.T) {
-		t.Parallel()
+	if placed != 1 || want != 2 {
+		t.Errorf("placed/want: got %d/%d, want 1/2 (single candidate node)", placed, want)
+	}
 
-		st := store.NewInMemory()
-		ctx := t.Context()
-
-		for _, n := range []string{"n1", "n2"} {
-			if err := st.Nodes().Create(ctx, &apiv1.Node{
-				Name: n, Type: apiv1.NodeTypeSatellite,
-			}); err != nil {
-				t.Fatalf("seed node: %v", err)
-			}
-
-			if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-				NodeName:        n,
-				StoragePoolName: "thin",
-				ProviderKind:    apiv1.StoragePoolKindLVMThin,
-				FreeCapacity:    50 * mib,
-				TotalCapacity:   1024 * mib,
-				// Default-20 fallback applies (no oversub prop set).
-			}); err != nil {
-				t.Fatalf("seed pool: %v", err)
-			}
+	got, _ := st.Resources().ListByDefinition(t.Context(), "pvc-1")
+	for _, r := range got {
+		if r.NodeName != "worker-2" {
+			t.Errorf("replica leaked outside NodeNameList: %+v", r)
 		}
+	}
+}
 
-		if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
-			Name: "pvc-many-vds",
+// TestPlaceReplicasOnDifferentZoneSpread pins scenario 2.W04: a SC
+// with `replicasOnDifferent: topology.kubernetes.io/zone` (bare-key
+// spread form, NOT key=value soft-exclusion) — combined with the
+// wave1 2.13 NodeLabelSyncReconciler propagating k8s labels into
+// `Aux/topology.kubernetes.io/zone` node props — MUST land the
+// replicas on DISTINCT zone values. Three zones × two workers each,
+// place_count=3 → one replica per zone, never two in the same zone.
+//
+// Cross-listed Bug 13 (K8s label sync): the bare-key form depends
+// entirely on `Aux/topology.kubernetes.io/zone` being populated on
+// the Node CRD. The label-sync reconciler is tested under
+// internal/controller/node_label_sync_test.go; this test pins the
+// downstream placer behaviour assuming that pre-condition holds.
+//
+// Topology:
+//
+//   - worker-1, worker-2 → zone-a
+//   - worker-3, worker-4 → zone-b
+//   - worker-5, worker-6 → zone-c
+//
+// FreeCapacity is staggered so the biggest-first sort would prefer
+// two workers from zone-a (worker-1 + worker-2) — without the
+// replicas-on-different gate the placer would land two replicas in
+// the same zone and silently break the AZ-spread contract.
+func TestPlaceReplicasOnDifferentZoneSpread(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/topology.kubernetes.io/zone": zone},
 		}); err != nil {
-			t.Fatalf("seed RD: %v", err)
+			t.Fatalf("seed node %s: %v", name, err)
 		}
 
-		// Two VDs of 40 MiB each: each individually fits inside the
-		// 50-MiB FreeCapacity (placer floor passes on the largest=40),
-		// but their SUM (80 MiB) ALSO fits inside FreeCapacity here —
-		// so the placer rightly accepts. The "sum > free*ratio" case
-		// is REST's responsibility and is not exercised at this layer.
-		for _, vn := range []int32{0, 1} {
-			if err := st.VolumeDefinitions().Create(ctx, "pvc-many-vds",
-				&apiv1.VolumeDefinition{VolumeNumber: vn, SizeKib: 40 * mib}); err != nil {
-				t.Fatalf("seed VD %d: %v", vn, err)
-			}
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
 		}
+	}
 
-		placed, want, err := placer.New(st).Place(ctx, "pvc-many-vds",
-			&apiv1.AutoSelectFilter{PlaceCount: 2})
-		if err != nil {
-			t.Fatalf("Place: %v (placer must gate on max VD, not sum)", err)
-		}
+	// zone-a hosts the two largest pools — without the spread gate
+	// the placer would pick worker-1 + worker-2 first and only
+	// touch zone-b/c if place_count exceeded 2. The spread MUST
+	// force one-per-zone instead.
+	mk("worker-1", "zone-a", 900)
+	mk("worker-2", "zone-a", 800)
+	mk("worker-3", "zone-b", 500)
+	mk("worker-4", "zone-b", 400)
+	mk("worker-5", "zone-c", 200)
+	mk("worker-6", "zone-c", 100)
 
-		if placed != 2 || want != 2 {
-			t.Errorf("placed/want: got %d/%d, want 2/2 "+
-				"(largest VD 40 MiB fits raw 50-MiB FreeCapacity)",
-				placed, want)
-		}
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          3,
+		ReplicasOnDifferent: []string{"Aux/topology.kubernetes.io/zone"},
 	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (one per zone)", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("len: got %d, want 3; %+v", len(got), got)
+	}
+
+	// Verify distinct zones — the load-bearing invariant of W04.
+	zoneByNode := map[string]string{
+		"worker-1": "zone-a", "worker-2": "zone-a",
+		"worker-3": "zone-b", "worker-4": "zone-b",
+		"worker-5": "zone-c", "worker-6": "zone-c",
+	}
+
+	seenZones := map[string]string{}
+	for _, r := range got {
+		zone, ok := zoneByNode[r.NodeName]
+		if !ok {
+			t.Errorf("replica on unknown node %q: %+v", r.NodeName, r)
+
+			continue
+		}
+
+		if existing, dup := seenZones[zone]; dup {
+			t.Errorf("zone-collision: %s and %s both in %s (replicas_on_different must spread)",
+				existing, r.NodeName, zone)
+		}
+
+		seenZones[zone] = r.NodeName
+	}
+
+	if len(seenZones) != 3 {
+		t.Errorf("zone-spread: got %d distinct zones, want 3; seenZones=%+v", len(seenZones), seenZones)
+	}
+}
+
+// TestPlaceReplicasOnDifferentZoneBareKeyShortAtTwoZones pins the
+// honest-shortfall half of 2.W04: when the cluster only offers two
+// zones but place_count=3, the placer MUST stop at 2 (one per
+// available zone) rather than silently doubling up in a zone.
+//
+// A regression that treated bare-key replicas_on_different as
+// "preference, not constraint" would land a third replica in zone-a
+// or zone-b — defeating the AZ-spread guarantee the operator
+// configured the SC for. This is the negative-path mirror of
+// TestPlaceReplicasOnDifferentZoneSpread.
+func TestPlaceReplicasOnDifferentZoneBareKeyShortAtTwoZones(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/topology.kubernetes.io/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("worker-1", "zone-a", 900)
+	mk("worker-2", "zone-a", 800)
+	mk("worker-3", "zone-b", 500)
+	mk("worker-4", "zone-b", 400)
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          3,
+		ReplicasOnDifferent: []string{"Aux/topology.kubernetes.io/zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 2 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 2/3 (only 2 zones available)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	zoneByNode := map[string]string{
+		"worker-1": "zone-a", "worker-2": "zone-a",
+		"worker-3": "zone-b", "worker-4": "zone-b",
+	}
+
+	seenZones := map[string]int{}
+	for _, r := range got {
+		seenZones[zoneByNode[r.NodeName]]++
+	}
+
+	for zone, count := range seenZones {
+		if count > 1 {
+			t.Errorf("zone %s carries %d replicas — replicas_on_different must cap at 1 per zone", zone, count)
+		}
+	}
+}
+
+// TestPlaceReplicasOnDifferentZoneRespectsExistingReplica pins the
+// idempotent-rerun half of 2.W04: a Place call against an RD that
+// already carries one replica in zone-a MUST avoid placing a second
+// replica in zone-a, instead picking from zone-b / zone-c. This is
+// the migration / re-spawn semantic — the placer reads existing
+// resources and seeds the diff-seen set from them via topologySeen,
+// so the constraint survives across separate Place invocations.
+//
+// Without this seeding, an operator running `linstor rg modify` to
+// raise place_count from 1 to 3 would risk landing the new replicas
+// on the same zone as the existing one, silently breaking AZ-spread
+// after the modify completes.
+func TestPlaceReplicasOnDifferentZoneRespectsExistingReplica(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	mk := func(name, zone string, free int64) {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name:  name,
+			Type:  apiv1.NodeTypeSatellite,
+			Props: map[string]string{"Aux/topology.kubernetes.io/zone": zone},
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", name, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName: name, StoragePoolName: "pool",
+			ProviderKind: apiv1.StoragePoolKindLVMThin,
+			FreeCapacity: free, TotalCapacity: 1000,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", name, err)
+		}
+	}
+
+	mk("worker-1", "zone-a", 900) // largest free in zone-a — biggest-first would pick it
+	mk("worker-2", "zone-a", 100) // also zone-a — would be a colliding second-pick
+	mk("worker-3", "zone-b", 500)
+	mk("worker-4", "zone-c", 400)
+
+	// Pre-seed: zone-a already has a replica on worker-1 (e.g. from
+	// a previous spawn). The next Place call must not double-up
+	// zone-a; the new replicas land on zone-b and zone-c instead.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "worker-1",
+		Props:    map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed existing resource: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:          3,
+		ReplicasOnDifferent: []string{"Aux/topology.kubernetes.io/zone"},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (existing+2 new)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	zoneByNode := map[string]string{
+		"worker-1": "zone-a", "worker-2": "zone-a",
+		"worker-3": "zone-b", "worker-4": "zone-c",
+	}
+
+	seenZones := map[string]string{}
+	for _, r := range got {
+		zone := zoneByNode[r.NodeName]
+		if prev, dup := seenZones[zone]; dup {
+			t.Errorf("zone-collision on rerun: %s and %s both in %s (existing replica not honoured)",
+				prev, r.NodeName, zone)
+		}
+
+		seenZones[zone] = r.NodeName
+	}
+
+	// worker-2 sits in zone-a alongside the pre-existing replica;
+	// the placer must never select it.
+	for _, r := range got {
+		if r.NodeName == "worker-2" {
+			t.Errorf("worker-2 selected despite zone-a collision with existing replica on worker-1: %+v", r)
+		}
+	}
 }
 
 // Keep go-vet happy on unused symbols in the import set.
