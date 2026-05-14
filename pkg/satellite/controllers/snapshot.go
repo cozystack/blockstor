@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,17 +34,30 @@ import (
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
+// SatelliteSnapshotFinalizer guards a Snapshot CRD while one of
+// its on-disk materialisations still exists on this satellite.
+// Without the finalizer the apiserver removes the Snapshot
+// object as soon as the user issues `kubectl delete`, often
+// before the satellite has observed the DeletionTimestamp
+// event — the on-disk ZFS snapshot / thin-pool LV survives as
+// an orphan because handleDelete never runs (Bug 64).
+//
+// Mirrors the per-satellite finalizer scheme used by
+// `SatelliteResourceFinalizer` and `StoragePoolFinalizer`.
+const SatelliteSnapshotFinalizer = "blockstor.io.blockstor.io/satellite-snapshot"
+
+// snapshotFinalizerRequeue is the short back-off between
+// stamping the finalizer and the next Reconcile pass that
+// actually runs `CreateSnapshot`. Matches the storagepool
+// reconciler's one-second cadence.
+const snapshotFinalizerRequeue = time.Second
+
 // SnapshotReconciler watches Snapshot CRDs and acts on those
 // whose `Spec.Nodes` list includes this satellite's name. The
 // snapshot semantic is per-node — one Snapshot CRD ends up
 // triggering CreateSnapshot on each node mentioned in its
 // Nodes list. Phase 10.1 replaces the gRPC `CreateSnapshot` /
 // `DeleteSnapshot` consumers.
-//
-// As with the Resource reconciler, this initial commit is a
-// skeleton: fetches the Snapshot, logs, exits. Follow-ups
-// delegate to `Config.Apply.CreateSnapshot` /
-// `Config.Apply.DeleteSnapshot`.
 type SnapshotReconciler struct {
 	client.Client
 
@@ -52,8 +66,11 @@ type SnapshotReconciler struct {
 
 // Reconcile handles the satellite-side snapshot lifecycle:
 // create on first appearance, delete on `DeletionTimestamp`.
-// Idempotent — re-runs on a snapshot that already exists are
-// safe.
+// Finalizer-aware: stamps `SatelliteSnapshotFinalizer` on
+// every observed Snapshot scoped to this node so kube-apiserver
+// waits for our `DeleteSnapshot` before allowing the CRD to
+// disappear. Idempotent — re-runs on a snapshot that already
+// exists are safe.
 func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("snapshot", req.Name)
 
@@ -79,6 +96,17 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	if !snap.DeletionTimestamp.IsZero() {
 		return r.handleDelete(ctx, &snap)
+	}
+
+	if !slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer) {
+		snap.Finalizers = append(snap.Finalizers, SatelliteSnapshotFinalizer)
+
+		err := r.Update(ctx, &snap)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "add snapshot finalizer")
+		}
+
+		return ctrl.Result{RequeueAfter: snapshotFinalizerRequeue}, nil
 	}
 
 	return r.handleCreate(ctx, &snap)
@@ -131,9 +159,26 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 }
 
 // handleDelete mirrors handleCreate for the DeletionTimestamp
-// case. Idempotent — DeleteSnapshot on a missing snapshot is
-// a no-op so a re-run after a satellite restart is safe.
+// case. Drives `Apply.DeleteSnapshot` (which routes to the
+// provider's `DeleteSnapshot` — `zfs destroy …@<snap>` for ZFS,
+// `lvremove` for LVM-thin/thick, `os.Remove` for FILE) before
+// stripping the finalizer so kube-apiserver only finalises the
+// CRD once the on-disk snapshot is gone. Idempotent — a
+// `DeleteSnapshot` on a missing snapshot is a no-op so a re-run
+// after a satellite restart is safe.
+//
+// Bug 64: prior to the finalizer the apiserver removed the
+// Snapshot object before the satellite saw the delete event,
+// leaving the on-disk snapshot as an orphan.
 func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	if !slices.Contains(snap.Finalizers, SatelliteSnapshotFinalizer) {
+		// Either we never stamped it (Snapshot created before this
+		// satellite came up) or someone already stripped it.
+		// Either way, nothing for us to do — let the apiserver
+		// finalise.
+		return ctrl.Result{}, nil
+	}
+
 	req := &intent.DeleteSnapshotRequest{
 		ResourceName: snap.Spec.ResourceDefinitionName,
 		SnapshotName: snap.Spec.SnapshotName,
@@ -145,8 +190,21 @@ func (r *SnapshotReconciler) handleDelete(ctx context.Context, snap *blockstorio
 	}
 
 	if !resp.GetOk() {
+		// Body-level failure — log and let controller-runtime
+		// back-off retry. Keep the finalizer in place so the
+		// CRD doesn't vanish before tear-down succeeds.
 		log.FromContext(ctx).Info("DeleteSnapshot per-snapshot failure",
 			"snapshot", snap.Spec.SnapshotName, "message", resp.GetMessage())
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	snap.Finalizers = slices.DeleteFunc(snap.Finalizers,
+		func(f string) bool { return f == SatelliteSnapshotFinalizer })
+
+	err = r.Update(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "strip snapshot finalizer")
 	}
 
 	return ctrl.Result{}, nil
