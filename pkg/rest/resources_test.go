@@ -713,3 +713,304 @@ func TestResourceDeleteSuccessUsesInfoMaskNotWarn(t *testing.T) {
 		t.Errorf("replica still present after DELETE; want it gone")
 	}
 }
+
+// walkResourceLayerStack walks the single-branch children chain of
+// `layer_object` and returns the discriminator type at each level.
+// Mirrors the Python LINSTOR client's `rsc.layer_data.layer_stack`
+// derivation — the CLI's `linstor r list` Layers column joins this
+// list with commas. Used by the F19 tests below.
+func walkResourceLayerStack(top *apiv1.ResourceLayer) []string {
+	if top == nil {
+		return nil
+	}
+
+	out := []string{top.Type}
+	cursor := top
+
+	for len(cursor.Children) > 0 {
+		cursor = &cursor.Children[0]
+		out = append(out, cursor.Type)
+	}
+
+	return out
+}
+
+// findResourceStorageLeaf walks `layer_object` for the STORAGE leaf
+// (always the bottom of the chain in DRBD-over-STORAGE deployments).
+// Returns nil when no STORAGE entry exists.
+func findResourceStorageLeaf(top *apiv1.ResourceLayer) *apiv1.ResourceLayer {
+	for cursor := top; cursor != nil; {
+		if cursor.Type == apiv1.LayerKindStorage {
+			return cursor
+		}
+
+		if len(cursor.Children) == 0 {
+			return nil
+		}
+
+		cursor = &cursor.Children[0]
+	}
+
+	return nil
+}
+
+// TestTieBreakerHasSTORAGEChildLayer pins F19's wire-shape: a Resource
+// with `Flags=[DISKLESS, TIE_BREAKER]` must still expose a STORAGE
+// child layer under `layer_object.children[0]`, with the storage
+// payload marked `provider_kind=DISKLESS`. Upstream LINSTOR keeps the
+// leaf for diskless replicas — stripping it makes the Python CLI's
+// `linstor r l` Layers column render `DRBD` instead of the upstream
+// `DRBD,STORAGE`, breaking CLI parity. Bug F19.
+func TestTieBreakerHasSTORAGEChildLayer(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Seed with the upstream-parity wire shape so the REST surface
+	// preserves it across encode/decode. The k8s store's
+	// `crdToWireResource` builds the same shape from CRD spec — the
+	// internal_test in pkg/store/k8s pins THAT synthesis; here we
+	// pin that the REST layer never re-strips or mutates it.
+	seed := apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n-witness",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		LayerObject: &apiv1.ResourceLayer{
+			Type: apiv1.LayerKindDRBD,
+			Children: []apiv1.ResourceLayer{{
+				Type: apiv1.LayerKindStorage,
+				Storage: &apiv1.StorageResourceLayer{
+					ProviderKind: apiv1.StoragePoolKindDiskless,
+				},
+			}},
+		},
+	}
+
+	if err := st.Resources().Create(ctx, &seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+
+	res := got[0]
+	if res.LayerObject == nil {
+		t.Fatal("layer_object missing — CLI would crash on AttributeError")
+	}
+
+	if res.LayerObject.Type != apiv1.LayerKindDRBD {
+		t.Errorf("top layer: got %q, want DRBD", res.LayerObject.Type)
+	}
+
+	if len(res.LayerObject.Children) != 1 {
+		t.Fatalf("children: got %v, want [STORAGE]", res.LayerObject.Children)
+	}
+
+	storage := &res.LayerObject.Children[0]
+	if storage.Type != apiv1.LayerKindStorage {
+		t.Errorf("children[0].type: got %q, want %q (F19 — upstream keeps STORAGE leaf on tiebreakers)",
+			storage.Type, apiv1.LayerKindStorage)
+	}
+
+	if storage.Storage == nil {
+		t.Fatal("children[0].storage payload nil — Layers column has no provider_kind to render")
+	}
+
+	if storage.Storage.ProviderKind != apiv1.StoragePoolKindDiskless {
+		t.Errorf("children[0].storage.provider_kind: got %q, want %q",
+			storage.Storage.ProviderKind, apiv1.StoragePoolKindDiskless)
+	}
+
+	if len(storage.Storage.StorageVolumes) != 0 {
+		t.Errorf("children[0].storage.storage_volumes: got %v, want empty (no backing on witness)",
+			storage.Storage.StorageVolumes)
+	}
+}
+
+// TestTieBreakerLayersColumnRendersDRBDSTORAGE walks the wire
+// `layer_object` the way the Python CLI's `rsc.layer_data.layer_stack`
+// derivation does and confirms that a tiebreaker emits BOTH `DRBD`
+// AND `STORAGE` in the chain — matching upstream LINSTOR's
+// `linstor r l` Layers column rendering. Without this guard, a
+// regression that re-strips the STORAGE leaf on diskless would slip
+// past the type-only assertion in the previous test (children empty
+// vs. children[0].type==STORAGE collapse to similar-looking failures
+// at first glance). F19.
+func TestTieBreakerLayersColumnRendersDRBDSTORAGE(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seed := apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n-witness",
+		Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		LayerObject: &apiv1.ResourceLayer{
+			Type: apiv1.LayerKindDRBD,
+			Children: []apiv1.ResourceLayer{{
+				Type: apiv1.LayerKindStorage,
+				Storage: &apiv1.StorageResourceLayer{
+					ProviderKind: apiv1.StoragePoolKindDiskless,
+				},
+			}},
+		},
+	}
+
+	if err := st.Resources().Create(ctx, &seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+
+	stack := walkResourceLayerStack(got[0].LayerObject)
+	want := []string{apiv1.LayerKindDRBD, apiv1.LayerKindStorage}
+
+	if len(stack) != len(want) {
+		t.Fatalf("layer_stack: got %v, want %v (`linstor r l` Layers column would render %q)",
+			stack, want, strings.Join(stack, ","))
+	}
+
+	for i := range want {
+		if stack[i] != want[i] {
+			t.Errorf("layer_stack[%d]: got %q, want %q", i, stack[i], want[i])
+		}
+	}
+
+	if rendered := strings.Join(stack, ","); rendered != "DRBD,STORAGE" {
+		t.Errorf("Layers column: got %q, want %q (upstream LINSTOR wire-parity)",
+			rendered, "DRBD,STORAGE")
+	}
+}
+
+// TestDiskfulResourceUnchanged is the regression guard for the F19
+// fix: a normal diskful Resource (no DISKLESS/TIE_BREAKER flags) must
+// STILL carry the STORAGE child with real `storage_volumes` derived
+// from the satellite-observed per-volume state. Without this, the
+// F19 fix could accidentally collapse the diskful path into the same
+// empty-payload shape as the witness, hiding `device_path` from the
+// CLI's `linstor v l` fallback.
+func TestDiskfulResourceUnchanged(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Diskful seed: no DISKLESS / TIE_BREAKER flag; the STORAGE leaf
+	// carries a real `device_path` per volume so the CLI's fallback
+	// rendering works when the DRBD-layer device_path is empty.
+	seed := apiv1.Resource{
+		Name:     "pvc-1",
+		NodeName: "n-storage",
+		// No DISKLESS / TIE_BREAKER — this is a diskful replica.
+		LayerObject: &apiv1.ResourceLayer{
+			Type: apiv1.LayerKindDRBD,
+			Children: []apiv1.ResourceLayer{{
+				Type: apiv1.LayerKindStorage,
+				Storage: &apiv1.StorageResourceLayer{
+					ProviderKind: apiv1.StoragePoolKindZFS,
+					StorageVolumes: []apiv1.StorageVolumeLayer{{
+						VolumeNumber:     0,
+						DevicePath:       "/dev/zvol/tank/pvc-1_00000",
+						AllocatedSizeKib: 4096,
+						UsableSizeKib:    4096,
+						DiskState:        "UpToDate",
+					}},
+				},
+			}},
+		},
+	}
+
+	if err := st.Resources().Create(ctx, &seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/resources")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got []apiv1.ResourceWithVolumes
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("len: got %d, want 1", len(got))
+	}
+
+	storage := findResourceStorageLeaf(got[0].LayerObject)
+	if storage == nil {
+		t.Fatal("diskful: STORAGE leaf missing — F19 regression collapsed diskful into witness shape")
+	}
+
+	if storage.Storage == nil {
+		t.Fatal("diskful: STORAGE payload nil — `linstor v l` device_path fallback broken")
+	}
+
+	// Diskful MUST NOT have provider_kind=DISKLESS — that's the
+	// exact discriminator the F19 fix uses to tell witnesses from
+	// real backings on the wire.
+	if storage.Storage.ProviderKind == apiv1.StoragePoolKindDiskless {
+		t.Errorf("diskful: provider_kind=%q, want anything except DISKLESS (witness collision)",
+			storage.Storage.ProviderKind)
+	}
+
+	if storage.Storage.ProviderKind != apiv1.StoragePoolKindZFS {
+		t.Errorf("diskful: provider_kind=%q, want %q (seeded value must round-trip)",
+			storage.Storage.ProviderKind, apiv1.StoragePoolKindZFS)
+	}
+
+	if len(storage.Storage.StorageVolumes) != 1 {
+		t.Fatalf("diskful: storage_volumes len=%d, want 1 (seeded volume should round-trip)",
+			len(storage.Storage.StorageVolumes))
+	}
+
+	vol := storage.Storage.StorageVolumes[0]
+	if vol.VolumeNumber != 0 || vol.DevicePath != "/dev/zvol/tank/pvc-1_00000" {
+		t.Errorf("diskful: storage_volumes[0]=%+v, want vol=0 device=/dev/zvol/tank/pvc-1_00000", vol)
+	}
+
+	if vol.DiskState != "UpToDate" {
+		t.Errorf("diskful: storage_volumes[0].disk_state=%q, want UpToDate", vol.DiskState)
+	}
+}

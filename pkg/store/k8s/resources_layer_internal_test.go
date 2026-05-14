@@ -139,22 +139,25 @@ func TestDrbdLayerFromStatusPortOnly(t *testing.T) {
 	}
 }
 
-// TestLayerObjectFromStackDiskless pins the DISKLESS / TIE_BREAKER
-// rule: a diskless resource must NOT advertise a STORAGE child
-// (there's no backing disk on this node). The Python CLI renders
-// the Layers column from the children chain, so getting this wrong
-// shows a fake STORAGE leaf for tiebreakers.
+// TestLayerObjectFromStackDiskless pins F19's wire-shape: a diskless
+// or tiebreaker resource still advertises the STORAGE child, but the
+// child carries `provider_kind=DISKLESS` and an empty `storage_volumes`
+// list. Upstream LINSTOR keeps the STORAGE leaf for diskless replicas
+// because the Python CLI's `linstor r list` Layers column reads the
+// children chain — stripping the leaf renders `DRBD` instead of the
+// upstream `DRBD,STORAGE`.
 func TestLayerObjectFromStackDiskless(t *testing.T) {
 	cases := []struct {
-		name      string
-		flags     []string
-		wantStack []string
+		name             string
+		flags            []string
+		wantStack        []string
+		wantDisklessLeaf bool
 	}{
-		{"default diskful", nil, []string{"DRBD", "STORAGE"}},
-		{"explicit STORAGE child", []string{}, []string{"DRBD", "STORAGE"}},
-		{"DISKLESS strips STORAGE", []string{"DISKLESS"}, []string{"DRBD"}},
-		{"TIE_BREAKER strips STORAGE", []string{"TIE_BREAKER"}, []string{"DRBD"}},
-		{"unrelated flag does not strip", []string{"INACTIVE"}, []string{"DRBD", "STORAGE"}},
+		{"default diskful", nil, []string{"DRBD", "STORAGE"}, false},
+		{"explicit STORAGE child", []string{}, []string{"DRBD", "STORAGE"}, false},
+		{"DISKLESS keeps STORAGE leaf marked diskless", []string{"DISKLESS"}, []string{"DRBD", "STORAGE"}, true},
+		{"TIE_BREAKER keeps STORAGE leaf marked diskless", []string{"TIE_BREAKER"}, []string{"DRBD", "STORAGE"}, true},
+		{"unrelated flag does not flip provider_kind", []string{"INACTIVE"}, []string{"DRBD", "STORAGE"}, false},
 	}
 
 	for _, tc := range cases {
@@ -165,8 +168,61 @@ func TestLayerObjectFromStackDiskless(t *testing.T) {
 			if !equalStrSlice(gotStack, tc.wantStack) {
 				t.Errorf("stack: got %v, want %v", gotStack, tc.wantStack)
 			}
+
+			assertStorageLeaf(t, top, tc.wantDisklessLeaf)
 		})
 	}
+}
+
+// assertStorageLeaf walks down to the STORAGE leaf and pins the
+// provider_kind + storage_volumes contract: a diskless / tiebreaker
+// replica MUST carry `provider_kind=DISKLESS` with an empty volume
+// list; a diskful replica MUST NOT collapse into the DISKLESS marker.
+func assertStorageLeaf(t *testing.T, top *apiv1.ResourceLayer, wantDisklessLeaf bool) {
+	t.Helper()
+
+	storage := findLastLayer(top)
+
+	if !wantDisklessLeaf {
+		if storage == nil || storage.Type != apiv1.LayerKindStorage || storage.Storage == nil {
+			return
+		}
+
+		if storage.Storage.ProviderKind == apiv1.StoragePoolKindDiskless {
+			t.Errorf("diskful: provider_kind unexpectedly DISKLESS: %+v", storage.Storage)
+		}
+
+		return
+	}
+
+	if storage == nil || storage.Type != apiv1.LayerKindStorage {
+		t.Fatalf("missing STORAGE leaf: %+v", top)
+	}
+
+	if storage.Storage == nil {
+		t.Fatalf("STORAGE leaf missing storage payload: %+v", storage)
+	}
+
+	if storage.Storage.ProviderKind != apiv1.StoragePoolKindDiskless {
+		t.Errorf("provider_kind: got %q, want %q",
+			storage.Storage.ProviderKind, apiv1.StoragePoolKindDiskless)
+	}
+
+	if len(storage.Storage.StorageVolumes) != 0 {
+		t.Errorf("storage_volumes: got %v, want empty for diskless", storage.Storage.StorageVolumes)
+	}
+}
+
+// findLastLayer walks the children chain (always single-branch in
+// blockstor) and returns the deepest layer. Used to assert against
+// the STORAGE leaf at the bottom of the stack.
+func findLastLayer(top *apiv1.ResourceLayer) *apiv1.ResourceLayer {
+	cursor := top
+	for cursor != nil && len(cursor.Children) > 0 {
+		cursor = &cursor.Children[0]
+	}
+
+	return cursor
 }
 
 // TestLayerObjectFromCRD wraps the stack derivation with the
@@ -205,10 +261,11 @@ func TestLayerObjectFromCRD(t *testing.T) {
 }
 
 // TestLayerObjectFromCRDDisklessSkipsDrbdEnrichment guards a subtle
-// case: a diskless replica is still on the DRBD layer (it just
-// has no STORAGE child), and must still surface peer connections.
-// Otherwise `linstor r list --faulty` cannot see broken peers from
-// a witness node's perspective.
+// case: a diskless replica is still on the DRBD layer AND advertises
+// the STORAGE leaf with `provider_kind=DISKLESS` (F19 — upstream wire
+// shape parity), while still surfacing peer connections so
+// `linstor r list --faulty` can see broken peers from a witness
+// node's perspective.
 func TestLayerObjectFromCRDDisklessSkipsDrbdEnrichment(t *testing.T) {
 	port := int32(7000)
 
@@ -228,9 +285,26 @@ func TestLayerObjectFromCRDDisklessSkipsDrbdEnrichment(t *testing.T) {
 		t.Fatal("got nil")
 	}
 
-	// Stack collapses to just DRBD (no STORAGE child).
-	if len(got.Children) != 0 {
-		t.Errorf("diskless: children = %v, want none", got.Children)
+	// F19: diskless replicas keep the STORAGE leaf with
+	// provider_kind=DISKLESS so `linstor r l` Layers column renders
+	// DRBD,STORAGE instead of DRBD alone.
+	if len(got.Children) != 1 || got.Children[0].Type != apiv1.LayerKindStorage {
+		t.Fatalf("diskless: children = %v, want [STORAGE]", got.Children)
+	}
+
+	storage := got.Children[0].Storage
+	if storage == nil {
+		t.Fatal("diskless STORAGE leaf: storage payload nil — Layers column would still hide provider_kind")
+	}
+
+	if storage.ProviderKind != apiv1.StoragePoolKindDiskless {
+		t.Errorf("diskless STORAGE leaf: provider_kind=%q, want %q",
+			storage.ProviderKind, apiv1.StoragePoolKindDiskless)
+	}
+
+	if len(storage.StorageVolumes) != 0 {
+		t.Errorf("diskless STORAGE leaf: storage_volumes=%v, want empty (no backing on witness)",
+			storage.StorageVolumes)
 	}
 
 	if got.Drbd == nil || len(got.Drbd.Connections) != 2 {

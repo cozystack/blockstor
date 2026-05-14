@@ -518,7 +518,89 @@ func layerObjectFromCRD(crd *crdv1alpha1.Resource) *apiv1.ResourceLayer {
 		top.Drbd = drbdLayerFromStatus(&crd.Status)
 	}
 
+	// Hydrate the STORAGE leaf for diskful replicas — F19 keeps the
+	// leaf always emitted, but only diskful replicas have actual
+	// storage_volumes derived from Status.Volumes. Diskless / tiebreaker
+	// replicas keep the empty payload layerObjectFromStack stamped.
+	hydrateStorageLeaf(top, crd)
+
 	return top
+}
+
+// hydrateStorageLeaf walks the children chain looking for the STORAGE
+// leaf and (for diskful replicas) attaches per-volume payload derived
+// from the satellite-observed `Resource.Status.Volumes`. For diskless
+// replicas the STORAGE leaf is left with the `provider_kind=DISKLESS`
+// marker that layerObjectFromStack already stamped — no volumes are
+// emitted because there's no backing device on this node. F19.
+func hydrateStorageLeaf(top *apiv1.ResourceLayer, crd *crdv1alpha1.Resource) {
+	if top == nil {
+		return
+	}
+
+	diskless := false
+
+	for _, f := range crd.Spec.Flags {
+		if f == apiv1.ResourceFlagDiskless || f == apiv1.ResourceFlagTieBreaker {
+			diskless = true
+
+			break
+		}
+	}
+
+	storage := findStorageLeaf(top)
+	if storage == nil {
+		return
+	}
+
+	if diskless {
+		// layerObjectFromStack has already set provider_kind=DISKLESS
+		// and left storage_volumes empty — nothing more to hydrate.
+		return
+	}
+
+	if len(crd.Status.Volumes) == 0 {
+		return
+	}
+
+	vols := make([]apiv1.StorageVolumeLayer, 0, len(crd.Status.Volumes))
+
+	for i := range crd.Status.Volumes {
+		vol := &crd.Status.Volumes[i]
+		vols = append(vols, apiv1.StorageVolumeLayer{
+			VolumeNumber:     vol.VolumeNumber,
+			DevicePath:       vol.DevicePath,
+			AllocatedSizeKib: vol.AllocatedKib,
+			UsableSizeKib:    vol.UsableKib,
+			DiskState:        vol.DiskState,
+		})
+	}
+
+	if storage.Storage == nil {
+		storage.Storage = &apiv1.StorageResourceLayer{}
+	}
+
+	storage.Storage.StorageVolumes = vols
+}
+
+// findStorageLeaf walks the layer_object children chain (always
+// single-branch in blockstor's layouts) and returns the STORAGE entry,
+// or nil if the stack carries no STORAGE layer (e.g. a future
+// non-DRBD-only deployment).
+func findStorageLeaf(layer *apiv1.ResourceLayer) *apiv1.ResourceLayer {
+	for cursor := layer; cursor != nil; {
+		if cursor.Type == apiv1.LayerKindStorage {
+			return cursor
+		}
+
+		if len(cursor.Children) == 0 {
+			return nil
+		}
+
+		cursor = &cursor.Children[0]
+	}
+
+	return nil
 }
 
 // drbdLayerFromStatus builds the wire-side `DrbdResourceLayer` from
@@ -585,12 +667,23 @@ func drbdLayerFromStatus(st *crdv1alpha1.ResourceStatus) *apiv1.DrbdResourceLaye
 // unconditionally, so callers that need CLI compatibility should
 // supply a fallback (default DRBD/STORAGE) before invoking this.
 //
-// DISKLESS resources have no STORAGE child even when the stack lists
-// it — drop the STORAGE leaf when the flag is set, so the wire shape
-// matches the actual on-disk layout the satellite renders.
+// DISKLESS / TIE_BREAKER resources keep the STORAGE child but the
+// payload differs from a diskful replica: the layer carries
+// `provider_kind=DISKLESS` and an empty `storage_volumes` list,
+// matching upstream LINSTOR's wire shape (`linstor r l` Layers column
+// renders `DRBD,STORAGE` for tiebreakers, not `DRBD` alone). F19.
+//
+// Diskful replicas synthesize one STORAGE volume per status-observed
+// volume in the layer payload via layerObjectFromCRD — the bare-stack
+// helper here only marks the layer kind; per-volume hydration happens
+// in the CRD-aware wrapper.
 func layerObjectFromStack(stack, flags []string) *apiv1.ResourceLayer {
 	if len(stack) == 0 {
 		stack = apiv1.DefaultLayerStack()
+	}
+
+	if len(stack) == 0 {
+		return nil
 	}
 
 	diskless := false
@@ -603,30 +696,24 @@ func layerObjectFromStack(stack, flags []string) *apiv1.ResourceLayer {
 		}
 	}
 
-	if diskless {
-		out := make([]string, 0, len(stack))
-
-		for _, s := range stack {
-			if s == apiv1.LayerKindStorage {
-				continue
-			}
-
-			out = append(out, s)
-		}
-
-		stack = out
-	}
-
-	if len(stack) == 0 {
-		return nil
-	}
-
 	top := &apiv1.ResourceLayer{Type: stack[0]}
 
 	cursor := top
 
 	for _, t := range stack[1:] {
 		child := apiv1.ResourceLayer{Type: t}
+
+		if t == apiv1.LayerKindStorage && diskless {
+			// F19: tiebreakers / operator-placed diskless replicas
+			// still expose a STORAGE leaf so the CLI's Layers column
+			// renders `DRBD,STORAGE` — the satellite simply has no
+			// backing device on this node, which the payload encodes
+			// via `provider_kind=DISKLESS` and an empty volume list.
+			child.Storage = &apiv1.StorageResourceLayer{
+				ProviderKind: apiv1.StoragePoolKindDiskless,
+			}
+		}
+
 		cursor.Children = []apiv1.ResourceLayer{child}
 		cursor = &cursor.Children[0]
 	}

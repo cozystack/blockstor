@@ -74,11 +74,44 @@ func DefaultLayerStack() []string {
 // red and to decide `--faulty` inclusion — empty `drbd` produces an
 // "Ok" Conns column regardless of actual peer state.
 type ResourceLayer struct {
-	Type       string             `json:"type"`
-	NameSuffix string             `json:"rsc_name_suffix,omitempty"`
-	Children   []ResourceLayer    `json:"children,omitempty"`
-	Drbd       *DrbdResourceLayer `json:"drbd,omitempty"`
-	Data       map[string]any     `json:"data,omitempty"`
+	Type       string                `json:"type"`
+	NameSuffix string                `json:"rsc_name_suffix,omitempty"`
+	Children   []ResourceLayer       `json:"children,omitempty"`
+	Drbd       *DrbdResourceLayer    `json:"drbd,omitempty"`
+	Storage    *StorageResourceLayer `json:"storage,omitempty"`
+	Data       map[string]any        `json:"data,omitempty"`
+}
+
+// StorageResourceLayer carries STORAGE-layer-specific runtime state
+// surfaced to the REST CLI. Subset of upstream LINSTOR's
+// `StorageRscData` — we only fill in the fields the CLI's
+// `linstor r list` Layers column and `--faulty` filter actually read.
+//
+// ProviderKind discriminates between a real backing (LVM / LVM_THIN /
+// ZFS / ZFS_THIN / FILE / …) and a DISKLESS witness — the CLI's
+// rsc_state derivation never special-cases the STORAGE layer for
+// DISKLESS, so the layer must still be present in the children chain;
+// otherwise `Layers` shows `DRBD` alone instead of upstream's
+// `DRBD,STORAGE`. F19.
+//
+// StorageVolumes is empty on DISKLESS replicas (no backing device);
+// diskful replicas carry one entry per volume with `volume_number` +
+// `device_path` (and any size hints the satellite has reported).
+type StorageResourceLayer struct {
+	ProviderKind   string               `json:"provider_kind,omitempty"`
+	StorageVolumes []StorageVolumeLayer `json:"storage_volumes,omitempty"`
+}
+
+// StorageVolumeLayer is one entry of StorageResourceLayer.StorageVolumes.
+// Wire shape matches upstream LINSTOR's `StorageVolume` — the Python
+// CLI's `linstor v l` reads `device_path` here as a fallback when the
+// per-Volume DRBD layer omits it.
+type StorageVolumeLayer struct {
+	VolumeNumber     int32  `json:"volume_number"`
+	DevicePath       string `json:"device_path,omitempty"`
+	AllocatedSizeKib int64  `json:"allocated_size_kib,omitempty"`
+	UsableSizeKib    int64  `json:"usable_size_kib,omitempty"`
+	DiskState        string `json:"disk_state,omitempty"`
 }
 
 // DrbdResourceLayer carries DRBD-layer-specific runtime state surfaced
