@@ -16,7 +16,7 @@ directory **supersedes them** by reorganising the same scenarios into
 **implementation complexity**, and labelled with **test target**
 (unit / integration / e2e).
 
-## The 7 groups
+## The 7 groups (Wave 1)
 
 | # | Doc                              | What it covers |
 |---|----------------------------------|----------------|
@@ -27,6 +27,40 @@ directory **supersedes them** by reorganising the same scenarios into
 | 5 | [drbd-state-recovery.md](05-drbd-state-recovery.md) | Observer translation (events2 → `Resource.Status`), state reporting (UpToDate/Outdated/Inconsistent/Diskless/TieBreaker/Connecting/StandAlone/SyncTarget), `SkipDisk`, recovery decision tree, fix recipes, mass-incident SOP, forbidden actions |
 | 6 | [storage-backends.md](06-storage-backends.md) | LVM/ZFS/FILE providers, layer stack rules (DRBD/LUKS/STORAGE — CACHE/WRITECACHE/NVME explicitly NOT supported), encryption (LUKS, DRBD shared-secret, master passphrase), external DRBD metadata pool, backend capability matrix, drive replacement, fault injection |
 | 7 | [quorum-observability.md](07-quorum-observability.md) | Quorum policies (`auto-quorum`, `AutoAddQuorumTiebreaker`, `suspend-io/io-error`, `on-no-data-accessible`), tiebreaker reconciler, three-level narrowing (PVC↔Resource↔DRBD), error-reports API, copilot data contract, over-subscription ratios, QoS |
+
+## Wave 2 — Day2 operations
+
+Wave 2 consolidates 143 per-scenario `day2-*.md` files harvested from
+UG9 §"Administering LINSTOR" + linstor-kubernetes.adoc into 11 group
+docs that mirror the wave1 format. Numbering uses a `W` prefix
+(`4.W01`, `4.W02`, …) to avoid collision with wave1's `4.1`, `4.2`.
+Scenarios are sorted into the same functional axes as wave1, plus
+four new groups for surfaces wave1 didn't have a home for (snapshots,
+resource-group modify cascade, schedules, K8s integration).
+
+| #  | Doc                              | What it covers |
+|----|----------------------------------|----------------|
+| 1  | [wave2-01-api-contract.md](wave2-01-api-contract.md)         | `list-properties` per scope, Aux/ set/unset, `query-size-info` preview, `cluster-state` smoke |
+| 2  | [wave2-02-placement.md](wave2-02-placement.md)               | `Autoplacer/Weights/*`, `BalanceResources*` disable, StorageClass locality + zone constraints |
+| 3  | [wave2-03-networking.md](wave2-03-networking.md)             | NetInterface CRUD, node `PrefNic`, `resource-connection path`, `TcpPortAutoRange`, K8s host-network ↔ container-network switch |
+| 4  | [wave2-04-lifecycle.md](wave2-04-lifecycle.md)               | Node CRUD + evacuate/restore/lost/info, RD CRUD + resize/reassign/default-storpool, Resource CRUD + toggle-disk variants, multi-volume RDs, controller HA / rolling upgrade |
+| 5  | [wave2-05-drbd-state-recovery.md](wave2-05-drbd-state-recovery.md) | DRBD options at every scope (RD/RG/resource/node-conn/resource-conn/unset), external metadata, disk-replace internal/external, split-brain, quorum-loss, SkipDisk auto+manual, alertmanager smoke |
+| 6  | [wave2-06-storage-backends.md](wave2-06-storage-backends.md) | LVM/LVM-thin/ZFS/ZFS-thin/Diskless pool CRUD, pool delete, mixing, `physical-storage list + create-device-pool`, `MaxThroughput` strategy |
+| 7  | [wave2-07-quorum-observability.md](wave2-07-quorum-observability.md) | `auto-quorum=disabled` manual mode, `AutoEvict*` tuning, `auto-diskful`, error-reports + sos-report, log-level + logback, K8s Prometheus stack, three over-subscription ratios |
+| 8  | [wave2-08-snapshots.md](wave2-08-snapshots.md)               | Local snapshot CRUD: create / delete / restore-into-new-RD / rollback-in-place / `AutoSnapshot/{RunEvery,Keep}` |
+| 9  | [wave2-09-resource-group.md](wave2-09-resource-group.md)     | RG full surface: create / delete-with-rds / modify-place-count / spawn (happy + impossible), all placement constraint flavours, unset-placement-property, RG DRBD options, RG FS-on-spawn |
+| 10 | [wave2-10-schedule.md](wave2-10-schedule.md)                 | Scheduled local-only snapshots: create / modify / enable / disable / delete + scope-specific delete (shipping is out-of-scope) |
+| 11 | [wave2-11-kubernetes.md](wave2-11-kubernetes.md)             | K8s-specific: HA controller, RWX PVC (NFS), Affinity Controller, K8s evacuate-via-label, set DRBD options from K8s, K8s VolumeSnapshot CRUD |
+
+## Out-of-scope
+
+A long-list of upstream LINSTOR features deliberately not supported
+by blockstor (backup shipping, S3/L2L remotes, NVMe layers, CACHE /
+WRITECACHE, LDAP auth, TLS cert mgmt, LUKS encryption orchestration,
+QoS, DB migrate/backup, LINBIT Gateway, bare-metal Prometheus,
+DRBD Proxy, shared LVM) is catalogued in
+[out-of-scope.md](out-of-scope.md) with the rationale per category
+and the source `day2-*.md` files mapped to each.
 
 ## How each scenario is labelled
 
