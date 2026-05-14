@@ -10,7 +10,7 @@ See `docs/agent-playbook.md` for the per-agent contract. Status values: `pending
 |---|---|---|---|---|
 | 0 | Harness scaffold + smoke | 1 | done | landed in 2a8e532a5 |
 | 1 | A — Node | 10 | done | landed in ed96c13bf |
-| 1 | B — Storage Pool | 9 | pending | — |
+| 1 | B — Storage Pool | 9 | done | landed via cherry-pick |
 | 1 | C — Resource Group | 7 | done | landed via cherry-pick |
 | 1 | D — Resource Definition | 9 | done | landed via cherry-pick |
 | 1 | E — Volume Definition | 7 | done | landed via cherry-pick |
