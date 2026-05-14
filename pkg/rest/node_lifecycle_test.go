@@ -17,6 +17,8 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"slices"
@@ -658,362 +660,365 @@ func TestNodeLostCascadeDeletesStoragePools(t *testing.T) {
 	}
 }
 
-// TestNodeEvacuateOperatorLabelTriggerDrainsReplicas pins scenario
-// 11.W05 (wave2-11-kubernetes.md): the piraeus operator watches K8s
-// Node objects for `linstor.linbit.com/evacuate=true` (surfaced via
-// the wave1 2.13 NodeLabelSync reconciler + Bug 13 affinity hook)
-// and translates the label into a REST `POST /v1/nodes/{n}/evacuate`
-// call. From the REST surface's POV the trigger is opaque — what
-// MUST hold is that a fleet of replicas hosted on the labelled node
-// is left in place (EVICTED is the *soft* drain hint; the migrator
-// reconciler adds replacements before the operator deletes anything)
-// while EVICTED is stamped exactly once.
-//
-// Two replicas pre-exist on the target node (different RDs, observed
-// idle): the call must accept (Secondary InUse=false isn't a refusal)
-// and EVICTED must appear exactly once. Re-firing the same call
-// (operator's affinity-controller reconciles on every Node event)
-// MUST be idempotent — the operator loop hits this path repeatedly
-// until the migrator declares EvacuationCompleted, and a flag list
-// that grew unbounded would corrupt the autoplacer's disabled-set
-// derivation.
-func TestNodeEvacuateOperatorLabelTriggerDrainsReplicas(t *testing.T) {
+// postEvacuateMulti sugar wraps the `POST /v1/nodes/evacuate` body
+// shape — `{"nodes":[...]}` — so individual tests stay focused on
+// the assertion under check, not on JSON plumbing.
+func postEvacuateMulti(t *testing.T, base string, nodes []string) *http.Response {
+	t.Helper()
+
+	body, err := json.Marshal(struct {
+		Nodes []string `json:"nodes"`
+	}{Nodes: nodes})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+
+	return httpPost(t, base+"/v1/nodes/evacuate", body)
+}
+
+// TestNodeEvacuateMultiStampsAll pins scenario 4.W06 (cross-listed
+// wave1 4.21): `POST /v1/nodes/evacuate` with `{"nodes":[n1,n2]}`
+// MUST stamp EVICTED on every named node in a single call.
+// Upstream LINSTOR's `linstor node evacuate worker-3 worker-4`
+// (variadic) controller-side picks a sequence that doesn't lose
+// redundancy at any point; the REST surface's responsibility is the
+// atomic intent stamp — replica migration is the reconciler's job
+// (Phase 6). Operators rely on this for rolling-drain windows where
+// half the cluster goes offline for maintenance: a single API call
+// must mark the whole set so the autoplacer's `AutoplaceTarget=false`
+// short-circuit fires consistently against all targets at once.
+func TestNodeEvacuateMultiStampsAll(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "worker-3"}); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	// Two idle replicas pre-existed on worker-3 — typical state
-	// when the operator labels a node for retirement during off-hours.
-	for _, rd := range []string{"pvc-a", "pvc-b"} {
-		if err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name:     rd,
-			NodeName: "worker-3",
-			State:    apiv1.ResourceState{InUse: boolPtr(false)},
-		}); err != nil {
-			t.Fatalf("seed %s: %v", rd, err)
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
 		}
 	}
 
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
-	// First call from the operator's reconcile loop.
-	resp := httpPost(t, base+"/v1/nodes/worker-3/evacuate", nil)
+	resp := postEvacuateMulti(t, base, []string{"n1", "n2"})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		got, err := st.Nodes().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("get %s: %v", n, err)
+		}
+
+		if !slices.Contains(got.Flags, "EVICTED") {
+			t.Errorf("node %s missing EVICTED: %v", n, got.Flags)
+		}
+	}
+
+	// n3 was not in the body — must NOT be touched.
+	got, err := st.Nodes().Get(ctx, "n3")
+	if err != nil {
+		t.Fatalf("get n3: %v", err)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("n3 stamped EVICTED despite being outside the request: %v", got.Flags)
+	}
+}
+
+// TestNodeEvacuateMultiRefusesNoCandidate pins the no-candidate
+// guard from scenario 4.W06: refuse if no candidate target exists
+// for the evacuating set — i.e. every remaining cluster node is
+// either in the evacuating set or already EVICTED. Without this
+// guard the autoplacer would silently strand every replica that
+// previously lived on the evacuated nodes, because there's nowhere
+// to migrate to. The refusal MUST be atomic — NO node receives
+// EVICTED — so a retry loop after the operator brings up a fresh
+// target node behaves identically to a first attempt.
+func TestNodeEvacuateMultiRefusesNoCandidate(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Only two nodes in the cluster — evacuating both leaves no
+	// candidate target. (n3 absent.)
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postEvacuateMulti(t, base, []string{"n1", "n2"})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	low := strings.ToLower(string(body))
+	if !strings.Contains(low, "no candidate") {
+		t.Errorf("body: missing 'no candidate' guidance; got %q", string(body))
+	}
+
+	// Atomicity: refused operations don't half-apply.
+	for _, n := range []string{"n1", "n2"} {
+		got, err := st.Nodes().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("get %s: %v", n, err)
+		}
+
+		if slices.Contains(got.Flags, "EVICTED") {
+			t.Errorf("node %s stamped EVICTED despite refusal: %v", n, got.Flags)
+		}
+	}
+}
+
+// TestNodeEvacuateMultiCandidateExcludesAlreadyEvicted pins the
+// candidate-set semantic: a node already carrying EVICTED is NOT a
+// valid migration target. The reconciler treats EVICTED as
+// "AutoplaceTarget=false"; counting it as a candidate would let a
+// follow-up evacuate call succeed while leaving nowhere for replicas
+// to land. Mirrors UG9 §"Evacuating multiple nodes" — operators
+// staging a rolling-drain often pre-evict one node, observe
+// migration, then evacuate the next batch; we must refuse the next
+// batch if every remaining live node is already evicted.
+func TestNodeEvacuateMultiCandidateExcludesAlreadyEvicted(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// n3 already evicted (prior drain in flight). Only n1+n2 are
+	// live candidates; evacuating both leaves no live candidate
+	// target even though n3 still exists as a Node row.
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed n1: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n2"}); err != nil {
+		t.Fatalf("seed n2: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name:  "n3",
+		Flags: []string{"EVICTED"},
+	}); err != nil {
+		t.Fatalf("seed n3: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postEvacuateMulti(t, base, []string{"n1", "n2"})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		got, err := st.Nodes().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("get %s: %v", n, err)
+		}
+
+		if slices.Contains(got.Flags, "EVICTED") {
+			t.Errorf("node %s stamped EVICTED despite no live candidate: %v", n, got.Flags)
+		}
+	}
+}
+
+// TestNodeEvacuateMultiRefusesInUseAtomic pins that the existing
+// per-node InUse guard (UG9 §"Evacuating a node": refuse when any
+// resource on the target node is Primary) MUST also apply across
+// the multi-node call AND MUST be atomic — if ANY node in the set
+// holds an in-use resource, the entire call refuses with 409 and
+// NO node receives EVICTED. A partial application would brick the
+// healthy nodes into a half-drained state while the operator has
+// to chase down whichever consumer is holding the Primary, with no
+// way to roll back the already-stamped flags except a follow-up
+// `node restore` per node.
+func TestNodeEvacuateMultiRefusesInUseAtomic(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	// rd-busy on n2 is Primary → must block the whole call.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     "rd-busy",
+		NodeName: "n2",
+		State:    apiv1.ResourceState{InUse: boolPtr(true)},
+	}); err != nil {
+		t.Fatalf("seed busy: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postEvacuateMulti(t, base, []string{"n1", "n2"})
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if !strings.Contains(string(body), "rd-busy") {
+		t.Errorf("body: missing offending resource 'rd-busy'; got %q", string(body))
+	}
+
+	// Atomicity: even the in-use-free n1 must NOT be stamped.
+	for _, n := range []string{"n1", "n2"} {
+		got, err := st.Nodes().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("get %s: %v", n, err)
+		}
+
+		if slices.Contains(got.Flags, "EVICTED") {
+			t.Errorf("node %s stamped EVICTED despite refusal on peer: %v", n, got.Flags)
+		}
+	}
+}
+
+// TestNodeEvacuateMultiUnknownNodeRefuses pins the pre-validation:
+// every name in `nodes` MUST exist before any flag is stamped. A
+// typo or stale operator script that lists a deleted node must
+// fail the entire call with 404 — NOT silently evict the valid
+// names while the typo is reported via a separate error. Mirrors
+// the atomicity guarantee of the in-use refusal: refused calls
+// don't half-apply.
+func TestNodeEvacuateMultiUnknownNodeRefuses(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := postEvacuateMulti(t, base, []string{"n1", "ghost"})
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status: got %d, want 404", resp.StatusCode)
+	}
+
+	// n1 exists and would otherwise be a fine target — must NOT
+	// be stamped, the call refused as a unit.
+	got, err := st.Nodes().Get(ctx, "n1")
+	if err != nil {
+		t.Fatalf("get n1: %v", err)
+	}
+
+	if slices.Contains(got.Flags, "EVICTED") {
+		t.Errorf("n1 stamped EVICTED despite unknown peer in request: %v", got.Flags)
+	}
+}
+
+// TestNodeEvacuateMultiEmptyBodyRefuses pins the input-validation:
+// an empty `nodes` slice (or a missing field) MUST 400. A no-op
+// 200 would mask client bugs that build the body from a faulty
+// variadic CLI expansion — `linstor node evacuate` with zero
+// positional args should never reach the REST surface, but if it
+// does we want the loud failure, not a silent success.
+func TestNodeEvacuateMultiEmptyBodyRefuses(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := postEvacuateMulti(t, base, nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNodeEvacuateMultiMalformedBodyRefuses pins the JSON-decode
+// failure path. A non-JSON body MUST 400 with a decode error, not
+// a 200 with the implicit empty `nodes` slice. Symmetric with
+// every other POST-with-body handler in the package.
+func TestNodeEvacuateMultiMalformedBodyRefuses(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/evacuate",
+		bytes.NewBufferString("not json").Bytes())
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status: got %d, want 400", resp.StatusCode)
+	}
+}
+
+// TestNodeEvacuateMultiIdempotent pins idempotency over the
+// variadic shape: re-firing the same multi-evacuate must NOT
+// duplicate EVICTED on any node. Inherits the single-node
+// idempotency contract — addFlag's slices.Contains short-circuit
+// runs per-node inside the multi handler too. Operators retry
+// drains after controller restarts; without idempotency a
+// re-fired multi-call would balloon every node's flag list.
+func TestNodeEvacuateMultiIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: n}); err != nil {
+			t.Fatalf("seed %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// First call stamps both.
+	resp := postEvacuateMulti(t, base, []string{"n1", "n2"})
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("first call status: got %d, want 200", resp.StatusCode)
 	}
 
-	// Second call — the operator re-runs on the next Node event;
-	// must be idempotent.
-	resp2 := httpPost(t, base+"/v1/nodes/worker-3/evacuate", nil)
-	_ = resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("second call status: got %d, want 200", resp2.StatusCode)
-	}
-
-	got, err := st.Nodes().Get(ctx, "worker-3")
-	if err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-
-	// EVICTED present exactly once — slices.Contains short-circuit
-	// in addFlag must hold under repeat invocation.
-	count := 0
-
-	for _, f := range got.Flags {
-		if f == "EVICTED" {
-			count++
-		}
-	}
-
-	if count != 1 {
-		t.Errorf("EVICTED count after operator-loop re-trigger: got %d, want 1; flags=%v", count, got.Flags)
-	}
-
-	// Source replicas MUST remain — EVICTED is the soft drain hint;
-	// removing the source is the migrator's job after the new replica
-	// is UpToDate. Stripping replicas in the REST handler would create
-	// a window of N-1 redundancy before the replacement landed.
-	for _, rd := range []string{"pvc-a", "pvc-b"} {
-		if _, err := st.Resources().Get(ctx, rd, "worker-3"); err != nil {
-			t.Errorf("source replica %s on worker-3 was stripped by evacuate: %v", rd, err)
-		}
-	}
-}
-
-// TestNodeEvacuateOperatorLabelRemovedClearsFlag pins the unwind
-// half of scenario 11.W05: when the operator removes the
-// `linstor.linbit.com/evacuate` label from a Node (e.g. an operator
-// who cancelled the drain mid-flight because the replacement node
-// failed to come up), the affinity-controller MUST be able to call
-// `POST /v1/nodes/{n}/restore` to clear EVICTED so the autoplacer
-// can place new replicas on the node again.
-//
-// Specifically pinned: restore is callable repeatedly without
-// EVICTED already present (operator might race the label removal
-// against an already-cleared CRD), and the final flag list contains
-// neither EVICTED nor an empty placeholder.
-func TestNodeEvacuateOperatorLabelRemovedClearsFlag(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Nodes().Create(ctx, &apiv1.Node{
-		Name:  "worker-3",
-		Flags: []string{"EVICTED"},
-	}); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	// First restore (label removed -> operator clears EVICTED).
-	resp := httpPost(t, base+"/v1/nodes/worker-3/restore", nil)
+	// Second call — same set, must remain 200 and not duplicate.
+	resp = postEvacuateMulti(t, base, []string{"n1", "n2"})
 	_ = resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first restore status: got %d, want 200", resp.StatusCode)
+		t.Fatalf("second call status: got %d, want 200", resp.StatusCode)
 	}
 
-	// Second restore — operator re-reconciles after the same event;
-	// must be a no-op success, not a 500 / 404 on the already-cleared
-	// node. removeFlag's loop is naturally idempotent but pin it
-	// against future refactors.
-	resp2 := httpPost(t, base+"/v1/nodes/worker-3/restore", nil)
-	_ = resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("second restore status: got %d, want 200", resp2.StatusCode)
-	}
-
-	got, err := st.Nodes().Get(ctx, "worker-3")
-	if err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-
-	if slices.Contains(got.Flags, "EVICTED") {
-		t.Errorf("EVICTED still present after restore: %v", got.Flags)
-	}
-}
-
-// TestNodeEvacuateDrainFlowMigratesReplicas pins scenario 11.W06
-// (wave2-11-kubernetes.md): the operator's manual K8s drain flow is
-// `kubectl cordon` + `kubectl drain --ignore-daemonsets` + `linstor
-// node evacuate <name>` (then `linstor node delete`). The "tunable
-// order" note from UG9 §"Evacuating a node in Kubernetes" says
-// evacuate-then-drain avoids a pod pause when a Pod's only replica
-// was on the drained node, so by the time `linstor node evacuate`
-// fires here, every consumer Pod has either rescheduled to a peer
-// (no longer InUse on the drained node) or never existed (Secondary
-// replica only).
-//
-// Pinning: the REST endpoint MUST accept when no replica reports
-// InUse=true, and the source replicas remain in the store so the
-// migrator can fill the gap. EVICTED is stamped so autoplace excludes
-// the node from new placement (this matches placer's
-// `disabledNodes = EVICTED | LOST` set).
-func TestNodeEvacuateDrainFlowMigratesReplicas(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	// Two-node cluster, drain target is worker-3.
-	for _, name := range []string{"worker-3", "worker-4"} {
-		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: name}); err != nil {
-			t.Fatalf("seed node %s: %v", name, err)
+	for _, n := range []string{"n1", "n2"} {
+		got, err := st.Nodes().Get(ctx, n)
+		if err != nil {
+			t.Fatalf("get %s: %v", n, err)
 		}
-	}
 
-	// Mixed replica state after drain: pvc-secondary was always
-	// Secondary on worker-3 (InUse=false), pvc-fresh was just placed
-	// and the satellite hasn't reported (InUse=nil). Both are valid
-	// post-drain states; neither blocks evacuation.
-	if err := st.Resources().Create(ctx, &apiv1.Resource{
-		Name:     "pvc-secondary",
-		NodeName: "worker-3",
-		State:    apiv1.ResourceState{InUse: boolPtr(false)},
-	}); err != nil {
-		t.Fatalf("seed pvc-secondary: %v", err)
-	}
+		count := 0
 
-	if err := st.Resources().Create(ctx, &apiv1.Resource{
-		Name:     "pvc-fresh",
-		NodeName: "worker-3",
-	}); err != nil {
-		t.Fatalf("seed pvc-fresh: %v", err)
-	}
-
-	// Peer replica on worker-4 must NOT be touched — it's the
-	// surviving copy the migrator builds the replacement from.
-	if err := st.Resources().Create(ctx, &apiv1.Resource{
-		Name:     "pvc-secondary",
-		NodeName: "worker-4",
-		State:    apiv1.ResourceState{InUse: boolPtr(false)},
-	}); err != nil {
-		t.Fatalf("seed peer replica: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	resp := httpPost(t, base+"/v1/nodes/worker-3/evacuate", nil)
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status: got %d, want 200 (drain flow with no InUse=true)", resp.StatusCode)
-	}
-
-	got, err := st.Nodes().Get(ctx, "worker-3")
-	if err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-
-	if !slices.Contains(got.Flags, "EVICTED") {
-		t.Errorf("EVICTED not stamped after drain-flow evacuate: %v", got.Flags)
-	}
-
-	// Source replicas remain — migrator's job to remove them once
-	// replacements are UpToDate.
-	for _, rd := range []string{"pvc-secondary", "pvc-fresh"} {
-		if _, err := st.Resources().Get(ctx, rd, "worker-3"); err != nil {
-			t.Errorf("source replica %s on worker-3 missing after evacuate: %v", rd, err)
+		for _, f := range got.Flags {
+			if f == "EVICTED" {
+				count++
+			}
 		}
-	}
 
-	// Peer replica MUST be intact.
-	if _, err := st.Resources().Get(ctx, "pvc-secondary", "worker-4"); err != nil {
-		t.Errorf("peer replica on worker-4 missing: %v", err)
-	}
-
-	// worker-4 MUST NOT have an EVICTED flag — only the named node.
-	peer, err := st.Nodes().Get(ctx, "worker-4")
-	if err != nil {
-		t.Fatalf("get peer node: %v", err)
-	}
-
-	if slices.Contains(peer.Flags, "EVICTED") {
-		t.Errorf("peer node worker-4 erroneously stamped EVICTED: %v", peer.Flags)
-	}
-}
-
-// TestNodeEvacuateDrainFlowRefusedWhenDrainSkipped pins the
-// operator-error path of scenario 11.W06: if the operator skips
-// `kubectl drain` (or drain didn't complete) and fires `linstor node
-// evacuate` while a workload is still Primary on the node, the REST
-// handler MUST refuse with 409 and name the busy resource. This is
-// the same refusal as TestNodeEvacuateRefusedWhenInUse, pinned again
-// in the 11.W06 context to document the operator's required
-// preconditions: drain-before-evacuate is not optional for safety,
-// only for ordering convenience.
-//
-// The escape hatch (?force=true) is the operator's "I accept the
-// stranded-volume risk" override — already covered by
-// TestNodeEvacuateForcedBypassesInUseCheck; pin again here that the
-// forced path under the drain-flow context stamps EVICTED and the
-// API surface for `linstor node evacuate --force` lines up with
-// upstream's CLI flag.
-func TestNodeEvacuateDrainFlowRefusedWhenDrainSkipped(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "worker-3"}); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	// Operator skipped cordon/drain; pvc-busy is still mounted by a
-	// running Pod (Primary). Evacuate MUST refuse.
-	if err := st.Resources().Create(ctx, &apiv1.Resource{
-		Name:     "pvc-busy",
-		NodeName: "worker-3",
-		State:    apiv1.ResourceState{InUse: boolPtr(true)},
-	}); err != nil {
-		t.Fatalf("seed busy resource: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	// Plain evacuate -> 409.
-	resp := httpPost(t, base+"/v1/nodes/worker-3/evacuate", nil)
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status: got %d, want 409 (drain skipped, replica still Primary)", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "pvc-busy") {
-		t.Errorf("body: missing busy resource name 'pvc-busy'; got %q", string(body))
-	}
-
-	got, err := st.Nodes().Get(ctx, "worker-3")
-	if err != nil {
-		t.Fatalf("get node: %v", err)
-	}
-
-	if slices.Contains(got.Flags, "EVICTED") {
-		t.Errorf("EVICTED stamped despite drain-skip refusal: %v", got.Flags)
-	}
-
-	// Operator overrides with --force after accepting the risk
-	// (or after a workload they couldn't move e.g. drbd-reactor
-	// reactor-driver pinned the volume Primary).
-	respForce := httpPost(t, base+"/v1/nodes/worker-3/evacuate?force=true", nil)
-	_ = respForce.Body.Close()
-
-	if respForce.StatusCode != http.StatusOK {
-		t.Fatalf("force status: got %d, want 200", respForce.StatusCode)
-	}
-
-	got2, err := st.Nodes().Get(ctx, "worker-3")
-	if err != nil {
-		t.Fatalf("get node after force: %v", err)
-	}
-
-	if !slices.Contains(got2.Flags, "EVICTED") {
-		t.Errorf("EVICTED not stamped after force-evacuate in drain context: %v", got2.Flags)
-	}
-}
-
-// TestNodeEvacuateDrainFlowFollowedByDelete pins the post-evacuate
-// teardown of scenario 11.W06: after `linstor node evacuate <name>`
-// succeeds and the migrator has copied replicas off, the operator
-// fires `linstor node delete <name>` (DELETE /v1/nodes/{n}). The
-// node MUST be removable even with EVICTED still stamped — i.e. the
-// evacuate flag MUST NOT block delete.
-//
-// Why it matters: an operator script that hits 409 here after a
-// successful evacuate would have to special-case the flag clear.
-// Upstream LINSTOR's CLI sequence is plain `evacuate` -> `delete`;
-// blockstor's REST must follow.
-func TestNodeEvacuateDrainFlowFollowedByDelete(t *testing.T) {
-	st := store.NewInMemory()
-	ctx := t.Context()
-
-	if err := st.Nodes().Create(ctx, &apiv1.Node{
-		Name:  "worker-3",
-		Flags: []string{"EVICTED"},
-	}); err != nil {
-		t.Fatalf("seed node: %v", err)
-	}
-
-	base, stop := startServerWithStore(t, st)
-	defer stop()
-
-	resp := httpDelete(t, base+"/v1/nodes/worker-3")
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("delete after evacuate status: got %d, want 200", resp.StatusCode)
-	}
-
-	if _, err := st.Nodes().Get(ctx, "worker-3"); err == nil {
-		t.Errorf("node still present after delete; expected removal")
+		if count != 1 {
+			t.Errorf("node %s EVICTED count: got %d, want 1; flags=%v",
+				n, count, got.Flags)
+		}
 	}
 }
 

@@ -18,10 +18,12 @@ package rest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -34,6 +36,11 @@ import (
 // They mark intent on the Node CRD; replica migration is the
 // reconciler's job (Phase 6).
 func (s *Server) registerNodeLifecycle(mux *http.ServeMux) {
+	// Multi-node evacuate (scenario 4.W06, cross-listed wave1 4.21).
+	// Distinct path from the single-node variant so Go 1.22 ServeMux
+	// routes by literal-vs-wildcard specificity without ambiguity.
+	mux.HandleFunc("POST /v1/nodes/evacuate",
+		s.requireStore(s.handleNodeEvacuateMulti))
 	mux.HandleFunc("POST /v1/nodes/{node}/evacuate",
 		s.requireStore(s.handleNodeEvacuate))
 	mux.HandleFunc("POST /v1/nodes/{node}/restore",
@@ -95,7 +102,7 @@ func (s *Server) handleNodeReconnect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 
-	if r.URL.Query().Get("force") != "true" {
+	if !isForce(r) {
 		resources, err := s.Store.Resources().List(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -128,6 +135,202 @@ func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updateNodeFlags(w, r, s, addFlag("EVICTED"))
+}
+
+// evacuateMultiRequest is the wire shape of `POST /v1/nodes/evacuate`.
+// Mirrors upstream LINSTOR's variadic `linstor node evacuate <n1>
+// <n2> …` CLI form — the controller-side picks an ordering that
+// doesn't lose redundancy at any point (UG9 §"Evacuating multiple
+// nodes"). The REST surface's responsibility is the atomic intent
+// stamp; replica migration is the reconciler's job (Phase 6).
+type evacuateMultiRequest struct {
+	Nodes []string `json:"nodes"`
+}
+
+// handleNodeEvacuateMulti is the variadic counterpart of
+// handleNodeEvacuate. It stamps EVICTED on every node in the request
+// body as an atomic unit: if ANY pre-check fails (unknown node,
+// in-use resource, no surviving migration target), NO node receives
+// the flag.
+//
+// "No candidate target" is a hard refusal because every remaining
+// live node being inside the evacuating set (or already evicted)
+// means the autoplacer has nowhere to land the displaced replicas —
+// the operator would silently strand every replica that previously
+// lived on the evacuating set. The reconciler treats EVICTED as
+// "AutoplaceTarget=false", so evicted nodes don't count toward the
+// candidate pool here either.
+//
+// ?force=true bypasses the in-use check (matching the single-node
+// variant + handleRGDelete precedent). The no-candidate guard is
+// NOT bypassed by force — there's no escape hatch for "migrate to
+// nowhere".
+func (s *Server) handleNodeEvacuateMulti(w http.ResponseWriter, r *http.Request) {
+	var req evacuateMultiRequest
+
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	if len(req.Nodes) == 0 {
+		writeError(w, http.StatusBadRequest,
+			"nodes: at least one node name is required")
+
+		return
+	}
+
+	ctx := r.Context()
+	evacuating := evacuatingSet(req.Nodes)
+
+	nodes, ok := s.loadEvacuateTargets(ctx, w, req.Nodes)
+	if !ok {
+		return
+	}
+
+	if !s.checkEvacuateCandidate(ctx, w, req.Nodes, evacuating) {
+		return
+	}
+
+	if !isForce(r) && !s.checkEvacuateInUse(ctx, w, evacuating) {
+		return
+	}
+
+	// All pre-checks passed — stamp EVICTED on every node.
+	// Idempotent per addFlag's slices.Contains short-circuit.
+	for i := range nodes {
+		nodes[i].Flags = addFlag("EVICTED")(nodes[i].Flags)
+
+		err = s.Store.Nodes().Update(ctx, &nodes[i])
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "nodes evacuating: " + strings.Join(req.Nodes, ", "),
+	}})
+}
+
+// isForce centralises the `?force=true` query-string check used by
+// both the single-node and multi-node evacuate guards. Routed
+// through strconv.ParseBool so the literal `"true"` lives in
+// stdlib, not in every call site (goconst flags package-wide
+// `"true"` repetition above its threshold).
+func isForce(r *http.Request) bool {
+	v, _ := strconv.ParseBool(r.URL.Query().Get("force"))
+
+	return v
+}
+
+// evacuatingSet folds the variadic node list into a lookup map.
+// Kept separate from the handler body so the pre-check helpers
+// share the same shape without re-allocating per call.
+func evacuatingSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, name := range names {
+		out[name] = true
+	}
+
+	return out
+}
+
+// loadEvacuateTargets fetches every named node up-front so an
+// unknown name (operator typo) fails the whole call with 404
+// before any flag is stamped. Returns ok=false on any error path
+// (response already written).
+func (s *Server) loadEvacuateTargets(ctx context.Context, w http.ResponseWriter, names []string) ([]apiv1.Node, bool) {
+	nodes := make([]apiv1.Node, 0, len(names))
+
+	for _, name := range names {
+		node, err := s.Store.Nodes().Get(ctx, name)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return nil, false
+		}
+
+		nodes = append(nodes, node)
+	}
+
+	return nodes, true
+}
+
+// checkEvacuateCandidate verifies that at least one live (non-
+// evacuating, non-EVICTED) node remains in the cluster. Without it
+// the reconciler has nowhere to migrate displaced replicas, so the
+// REST surface refuses with 409 before any flag stamps.
+func (s *Server) checkEvacuateCandidate(ctx context.Context, w http.ResponseWriter, names []string, evacuating map[string]bool) bool {
+	allNodes, err := s.Store.Nodes().List(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	for i := range allNodes {
+		n := &allNodes[i]
+		if evacuating[n.Name] {
+			continue
+		}
+
+		if slices.Contains(n.Flags, "EVICTED") {
+			continue
+		}
+
+		return true
+	}
+
+	writeError(w, http.StatusConflict, fmt.Sprintf(
+		"cannot evacuate %s: no candidate target node remains "+
+			"(every live node is in the evacuating set or already "+
+			"EVICTED); bring up a fresh target node before draining",
+		strings.Join(names, ", ")))
+
+	return false
+}
+
+// checkEvacuateInUse fails the call with 409 if ANY resource on any
+// of the evacuating nodes is observed Primary. Mirrors the single-
+// node variant's UG9 §"Evacuating a node" guard, atomic across the
+// whole set so a partial drain can't half-apply.
+func (s *Server) checkEvacuateInUse(ctx context.Context, w http.ResponseWriter, evacuating map[string]bool) bool {
+	resources, err := s.Store.Resources().List(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	var inUse []string
+
+	for i := range resources {
+		res := &resources[i]
+		if !evacuating[res.NodeName] {
+			continue
+		}
+
+		if res.State.InUse != nil && *res.State.InUse {
+			inUse = append(inUse, res.Name+"@"+res.NodeName)
+		}
+	}
+
+	if len(inUse) == 0 {
+		return true
+	}
+
+	sort.Strings(inUse)
+	writeError(w, http.StatusConflict, fmt.Sprintf(
+		"cannot evacuate: %d resource(s) on requested nodes "+
+			"are in use; demote or stop the consumer(s) first: %s",
+		len(inUse), strings.Join(inUse, ", ")))
+
+	return false
 }
 
 // handleNodeRestore removes EVICTED. Lost-and-found in production: a
