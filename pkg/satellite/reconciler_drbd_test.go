@@ -4369,3 +4369,124 @@ func TestApplyResFileUsesKernelHostnameNotLINSTORName(t *testing.T) {
 			badOn, got)
 	}
 }
+
+// TestApplyRendersPingTimeoutIntoNetBlock pins scenario 5.W03
+// (wave2-05 §5.W03, UG9 §"Setting DRBD options for node connections").
+// `DrbdOptions/Net/ping-timeout` is set at any scope the operator
+// reaches it from — `linstor controller set-property`, `linstor rd
+// drbd-options --ping-timeout`, or `linstor node-connection
+// drbd-peer-options --ping-timeout`. By the time it arrives at the
+// satellite the effective-props resolver has already folded the
+// scope hierarchy into one flat bag on `DesiredResource.DrbdOptions`,
+// so the renderer's contract is scope-agnostic: any
+// `DrbdOptions/Net/<key>` entry lands verbatim inside the rendered
+// `net { … }` block with the section prefix stripped (the form
+// drbdadm parses).
+//
+// `ping-timeout 500;` is the canonical example from UG9 — DRBD
+// encodes the value in 1/10-second units, so `500` is 50.0 s. We
+// assert against a 2-replica RD on n1↔n2 to mirror the production
+// shape where every per-peer net option must reach a mesh of N>1
+// peers (a single-replica .res has no `connection { … }` block at
+// all and would let a renderer regression that only fires on multi-
+// peer paths slip through).
+//
+// Pinning the `net {` framing — rather than the bare `ping-timeout`
+// substring — keeps the assertion honest: a regression that dropped
+// the prop from `splitDRBDOptions` but left a hand-typed default
+// elsewhere in the renderer would still leave the substring present
+// at the wrong scope.
+func TestApplyRendersPingTimeoutIntoNetBlock(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ping_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-ping",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []string{"n2"},
+			DrbdOptions: map[string]string{
+				"port":            "7000",
+				"node-id":         "0",
+				"address":         "10.0.0.1",
+				"minor":           "1000",
+				"peer.n2.address": "10.0.0.2",
+				"peer.n2.node-id": "1",
+				"peer.n2.port":    "7000",
+
+				// 5.W03 payload: the effective-props resolver folded
+				// the operator-set net-option into this bag regardless
+				// of which scope (`linstor controller set-property` /
+				// `linstor rd drbd-options --ping-timeout` / `linstor
+				// node-connection drbd-peer-options --ping-timeout`)
+				// they reached it from. From here on the contract is
+				// scope-agnostic.
+				"DrbdOptions/Net/ping-timeout": "500",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join(dir, "pvc-ping.res"))
+	if err != nil {
+		t.Fatalf("read .res: %v", err)
+	}
+
+	got := string(body)
+
+	// The 2-replica RD must render a connection mesh — without one
+	// any per-peer net option is moot. Assert the framing first so a
+	// renderer regression that suppresses the mesh entirely produces
+	// a clear error rather than a misleading "missing ping-timeout"
+	// follow-on.
+	if !strings.Contains(got, "connection {") {
+		t.Errorf(".res missing connection{} mesh; body=%s", got)
+	}
+
+	// Must contain a top-level `net { … ping-timeout 500; … }` block
+	// — the scenario's load-bearing assertion against `grep
+	// ping-timeout /var/lib/linstor.d/pvc-ping.res`. Pinning the
+	// `net {` framing (not just the bare `ping-timeout 500;`
+	// substring) keeps the assertion honest: a regression that
+	// dropped the prop from splitDRBDOptions but left a hand-typed
+	// default elsewhere in the renderer would still leave the
+	// substring present at the wrong scope.
+	netStart := strings.Index(got, "net {")
+	if netStart < 0 {
+		t.Fatalf(".res missing net{} block; body=%s", got)
+	}
+
+	netEnd := strings.Index(got[netStart:], "}")
+	if netEnd < 0 {
+		t.Fatalf("net{} block not delimited; body=%s", got)
+	}
+
+	netBlock := got[netStart : netStart+netEnd]
+	if !strings.Contains(netBlock, "ping-timeout 500;") {
+		t.Errorf("net{} block missing `ping-timeout 500;`; net-block=%q\nfull=%s", netBlock, got)
+	}
+
+	// Defence in depth: the LINSTOR prop key must NOT leak verbatim
+	// into the .res — splitDRBDOptions strips the `DrbdOptions/Net/`
+	// prefix before handing the bare key to the ConfFileBuilder.
+	// drbdadm rejects the unstripped form with "expected: cpu-mask
+	// | ... but got 'DrbdOptions'".
+	if strings.Contains(got, "DrbdOptions/Net/ping-timeout") {
+		t.Errorf("unstripped LINSTOR prop key leaked into .res; body=%s", got)
+	}
+}

@@ -34,12 +34,14 @@ PATCH `rd <rd>` props → `.res` `net { protocol C; }` on every replica. Hierarc
 
 `linstor rd drbd-options --unset-protocol backups` → prop deleted; next adjust returns option to DRBD default. Same `--unset-` syntax for `drbd-options` and `drbd-peer-options`.
 
-### 5.W03 `node-connection drbd-peer-options --ping-timeout` — S
+### 5.W03 `node-connection drbd-peer-options --ping-timeout` — S ✓
 
 - **Priority:** P2  **Target:** unit + e2e  **Complexity:** L
 - **Source:** UG9 §"Setting DRBD options for node connections" (lines 3386-3398) via tests/scenarios/day2-drbd-peer-options-node-connection.md
 
 Per (nodeA, nodeB) pair, applies to every RD's connection between them. Resource-level / RD-level options take precedence. DRBD time encoding is 1/10 of a second (`--ping-timeout 299` = 29.9s).
+
+**Unit:** `pkg/satellite.TestApplyRendersPingTimeoutIntoNetBlock` pins the renderer-side contract — a `DesiredResource.DrbdOptions["DrbdOptions/Net/ping-timeout"]="500"` on a 2-replica RD (n1↔n2) flows through `splitDRBDOptions` into the `net { … }` block of the rendered `.res` as a verbatim `ping-timeout 500;` line, with the `DrbdOptions/Net/` prefix stripped (the form drbdadm parses). The hand-off from the controller-side effective-props resolver — which folds controller-scope, RD-scope, and node-connection-scope keys into one flat bag before dispatch — is scope-agnostic by construction, so one renderer test covers all three set-property paths.
 
 ### 5.W04 `resource-connection drbd-peer-options --max-buffers` — S
 
