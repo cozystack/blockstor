@@ -691,8 +691,12 @@ func (s *Server) handlePhysicalStorageListForNode(w http.ResponseWriter, r *http
 }
 
 // filterAvailable drops PhysicalDevices that are Attaching/Failed
-// or already have an AttachTo target. Available + AttachTo=nil is
-// the "free for new pool" signal upstream cares about.
+// or already have an AttachTo target, AND devices the satellite
+// has flagged with Status.Conditions[Free]=False (Bug 90: the list
+// and ps-cdp endpoints MUST agree — without the Free check `ps l`
+// would surface a candidate that `ps cdp` then refuses with 409,
+// confusing the operator into thinking the system contradicts
+// itself).
 func filterAvailable(devs []apiv1.PhysicalDevice) []apiv1.PhysicalDevice {
 	out := make([]apiv1.PhysicalDevice, 0, len(devs))
 
@@ -702,6 +706,10 @@ func filterAvailable(devs []apiv1.PhysicalDevice) []apiv1.PhysicalDevice {
 		}
 
 		if devs[i].AttachTo != nil {
+			continue
+		}
+
+		if devs[i].Free != nil && !*devs[i].Free {
 			continue
 		}
 
