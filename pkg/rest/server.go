@@ -20,10 +20,13 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -143,7 +146,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	srv := &http.Server{
 		Addr:              s.Addr,
-		Handler:           withLogging(mux),
+		Handler:           withLogging(with404Envelope(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
@@ -277,4 +280,129 @@ type statusRecorder struct {
 func (s *statusRecorder) WriteHeader(code int) {
 	s.status = code
 	s.ResponseWriter.WriteHeader(code)
+}
+
+// with404Envelope wraps the inner handler so that a bare 404 reply
+// (the http.ServeMux fallback that writes the plain-text body
+// "404 page not found\n") is rewritten to the LINSTOR `[]ApiCallRc`
+// JSON envelope. Bug 103: python-linstor's error-decoding path tries
+// JSON, falls back to XML on parse failure, and crashes with
+// `xml.etree.ElementTree.ParseError: syntax error: line 1, column 0`
+// on the plain-text body — instead of surfacing a typed `ERROR:`
+// line, the CLI dies with a Python traceback.
+//
+// Only the http.ServeMux fallback shape is rewritten:
+//   - status == 404
+//   - the body matches the plain-text "404 page not found" marker
+//     (or is empty)
+//
+// 405 Method Not Allowed (wrong method on an existing route) flows
+// through unchanged. A previous attempt at this fix used a naked
+// catch-all `mux.HandleFunc("/", …)` which broke the per-route 405
+// dispatch — that's why this is implemented as a body-buffering
+// wrapper around the mux rather than a route on the mux itself.
+//
+// Handlers that produce their own 404 with a JSON body (e.g.
+// `GET /v1/nodes/{name}` on a missing node, which already emits a
+// LINSTOR envelope through writeError) are not touched — the body-
+// shape sniff catches only the plain-text fallback.
+func with404Envelope(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := &envelopeBuffer{
+			header: http.Header{},
+			status: http.StatusOK,
+		}
+
+		next.ServeHTTP(buf, r)
+
+		if buf.status == http.StatusNotFound && isPlainText404Body(buf.body.Bytes()) {
+			writeNotFoundEnvelope(w, r)
+
+			return
+		}
+
+		// Pass through unchanged.
+		maps.Copy(w.Header(), buf.header)
+		w.WriteHeader(buf.status)
+		_, _ = w.Write(buf.body.Bytes())
+	})
+}
+
+// envelopeBuffer is a buffering http.ResponseWriter used by
+// with404Envelope. The wrapper needs to inspect the inner handler's
+// status AND body before deciding whether to forward bytes to the
+// real client — for that the writes must land in a buffer, not on
+// the wire. Status code defaults to 200 (matches net/http semantics
+// when a handler writes a body without explicitly calling WriteHeader).
+type envelopeBuffer struct {
+	header      http.Header
+	body        bytes.Buffer
+	status      int
+	wroteHeader bool
+}
+
+func (b *envelopeBuffer) Header() http.Header {
+	return b.header
+}
+
+func (b *envelopeBuffer) Write(p []byte) (int, error) {
+	if !b.wroteHeader {
+		b.wroteHeader = true
+	}
+
+	return b.body.Write(p) //nolint:wrapcheck // bytes.Buffer.Write never returns a non-nil error
+}
+
+func (b *envelopeBuffer) WriteHeader(code int) {
+	if b.wroteHeader {
+		return
+	}
+
+	b.status = code
+	b.wroteHeader = true
+}
+
+// isPlainText404Body reports whether body looks like the http.ServeMux
+// fallback "404 page not found\n" line. We deliberately accept the
+// empty body case too: a handler that calls
+// `http.Error(w, "", http.StatusNotFound)` with no message lands here,
+// and the python-linstor crash is identical.
+//
+// Handler-emitted JSON 404s (already-formed `[]ApiCallRc` envelopes
+// from writeError) are recognised by the leading `[` — they're NOT
+// rewritten, the original body flows through.
+func isPlainText404Body(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return true
+	}
+
+	// JSON envelope already — preserve it.
+	if trimmed[0] == '[' || trimmed[0] == '{' {
+		return false
+	}
+
+	return strings.Contains(string(trimmed), "404 page not found")
+}
+
+// writeNotFoundEnvelope emits the LINSTOR-shaped `[]ApiCallRc` body
+// for an unwired endpoint. Bug 103: see with404Envelope.
+//
+// ret_code: APICallRcMaskError so python-linstor classifies the entry
+// as ERROR. We don't OR in a sub-code mask (upstream's
+// `FAIL_UNKNOWN_ERROR` is a generic 0 in the error band) — the
+// message + cause carry the operator-facing detail.
+func writeNotFoundEnvelope(w http.ResponseWriter, r *http.Request) {
+	envelope := []apiv1.APICallRc{{
+		RetCode: apiv1.APICallRcMaskError,
+		Message: "endpoint not implemented",
+		Cause: "the path " + r.Method + " " + r.URL.Path +
+			" is not registered on this apiserver",
+		Correc: "check the blockstor REST API documentation " +
+			"or upgrade the controller",
+	}}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(envelope)
 }
