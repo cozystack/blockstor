@@ -282,27 +282,31 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// with404Envelope wraps the inner handler so that a bare 404 reply
-// (the http.ServeMux fallback that writes the plain-text body
-// "404 page not found\n") is rewritten to the LINSTOR `[]ApiCallRc`
-// JSON envelope. Bug 103: python-linstor's error-decoding path tries
-// JSON, falls back to XML on parse failure, and crashes with
+// with404Envelope wraps the inner handler so that a bare 404 OR 405
+// reply from the http.ServeMux fallback (plain-text "404 page not
+// found\n" or "Method Not Allowed\n") is rewritten to the LINSTOR
+// `[]ApiCallRc` JSON envelope. Bug 103 (404) and Bug 109 (405):
+// python-linstor's error-decoding path tries JSON, falls back to XML
+// on parse failure, and crashes with
 // `xml.etree.ElementTree.ParseError: syntax error: line 1, column 0`
 // on the plain-text body — instead of surfacing a typed `ERROR:`
 // line, the CLI dies with a Python traceback.
 //
 // Only the http.ServeMux fallback shape is rewritten:
-//   - status == 404
-//   - the body matches the plain-text "404 page not found" marker
-//     (or is empty)
+//   - status == 404 with the plain-text "404 page not found" marker
+//     (or an empty body), OR
+//   - status == 405 with the plain-text "Method Not Allowed" marker
+//     (or an empty body).
 //
-// 405 Method Not Allowed (wrong method on an existing route) flows
-// through unchanged. A previous attempt at this fix used a naked
-// catch-all `mux.HandleFunc("/", …)` which broke the per-route 405
-// dispatch — that's why this is implemented as a body-buffering
-// wrapper around the mux rather than a route on the mux itself.
+// A previous attempt at the 404 fix used a naked catch-all
+// `mux.HandleFunc("/", …)` which broke the per-route 405 dispatch —
+// that's why this is implemented as a body-buffering wrapper around
+// the mux rather than a route on the mux itself. The 405 path
+// preserves both the status code AND the `Allow:` header that
+// http.ServeMux populates for wrong-verb requests, so spec-compliant
+// HTTP clients can still discover the supported verbs.
 //
-// Handlers that produce their own 404 with a JSON body (e.g.
+// Handlers that produce their own 404/405 with a JSON body (e.g.
 // `GET /v1/nodes/{name}` on a missing node, which already emits a
 // LINSTOR envelope through writeError) are not touched — the body-
 // shape sniff catches only the plain-text fallback.
@@ -315,8 +319,13 @@ func with404Envelope(next http.Handler) http.Handler {
 
 		next.ServeHTTP(buf, r)
 
-		if buf.status == http.StatusNotFound && isPlainText404Body(buf.body.Bytes()) {
+		switch {
+		case buf.status == http.StatusNotFound && isPlainTextFallbackBody(buf.body.Bytes(), "404 page not found"):
 			writeNotFoundEnvelope(w, r)
+
+			return
+		case buf.status == http.StatusMethodNotAllowed && isPlainTextFallbackBody(buf.body.Bytes(), "Method Not Allowed"):
+			writeMethodNotAllowedEnvelope(w, r, buf.header.Get("Allow"))
 
 			return
 		}
@@ -362,16 +371,18 @@ func (b *envelopeBuffer) WriteHeader(code int) {
 	b.wroteHeader = true
 }
 
-// isPlainText404Body reports whether body looks like the http.ServeMux
-// fallback "404 page not found\n" line. We deliberately accept the
-// empty body case too: a handler that calls
-// `http.Error(w, "", http.StatusNotFound)` with no message lands here,
-// and the python-linstor crash is identical.
+// isPlainTextFallbackBody reports whether body looks like an
+// http.ServeMux fallback plain-text response — either empty or
+// containing the supplied marker (e.g. "404 page not found",
+// "Method Not Allowed"). We deliberately accept the empty body case
+// too: a handler that calls `http.Error(w, "", http.StatusNotFound)`
+// with no message lands here, and the python-linstor crash is
+// identical.
 //
-// Handler-emitted JSON 404s (already-formed `[]ApiCallRc` envelopes
-// from writeError) are recognised by the leading `[` — they're NOT
-// rewritten, the original body flows through.
-func isPlainText404Body(body []byte) bool {
+// Handler-emitted JSON 4xx replies (already-formed `[]ApiCallRc`
+// envelopes from writeError) are recognised by the leading `[` —
+// they're NOT rewritten, the original body flows through.
+func isPlainTextFallbackBody(body []byte, marker string) bool {
 	trimmed := bytes.TrimSpace(body)
 	if len(trimmed) == 0 {
 		return true
@@ -382,7 +393,7 @@ func isPlainText404Body(body []byte) bool {
 		return false
 	}
 
-	return strings.Contains(string(trimmed), "404 page not found")
+	return strings.Contains(string(trimmed), marker)
 }
 
 // writeNotFoundEnvelope emits the LINSTOR-shaped `[]ApiCallRc` body
@@ -404,5 +415,33 @@ func writeNotFoundEnvelope(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(envelope)
+}
+
+// writeMethodNotAllowedEnvelope emits the LINSTOR-shaped `[]ApiCallRc`
+// body for a wrong-verb request against a wired path. Bug 109: see
+// with404Envelope. The `Allow` header captured from http.ServeMux's
+// fallback response is propagated so HTTP-spec-aware clients can still
+// retry with a supported verb.
+//
+// ret_code: APICallRcMaskError matches the 404 envelope so the python
+// CLI classifies the reply as an ERROR (typed `ERROR: method not
+// allowed` line) instead of a Python traceback.
+func writeMethodNotAllowedEnvelope(w http.ResponseWriter, r *http.Request, allow string) {
+	envelope := []apiv1.APICallRc{{
+		RetCode: apiv1.APICallRcMaskError,
+		Message: "method not allowed",
+		Cause: "the path " + r.Method + " " + r.URL.Path +
+			" is registered, but not for this verb",
+		Correc: "check the LINSTOR REST API documentation; " +
+			"the Allow header lists supported methods",
+	}}
+
+	if allow != "" {
+		w.Header().Set("Allow", allow)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMethodNotAllowed)
 	_ = json.NewEncoder(w).Encode(envelope)
 }
