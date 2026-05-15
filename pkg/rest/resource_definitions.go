@@ -207,21 +207,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = validateLayerStack(rd.LayerStack)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
-		return
-	}
-
-	// Bug 95: refuse to create a LUKS-stacked RD when no encryption
-	// passphrase has been set on the controller scope. Without the
-	// passphrase the satellite's LUKS layer has no key material to
-	// seed `cryptsetup luksFormat` with, so the previous behaviour
-	// (silently dropping LUKS at the projection edge) hid the
-	// misconfiguration as plaintext-on-DRBD. A 400 here surfaces the
-	// missing prerequisite at the create call instead.
-	err = s.refuseLUKSWithoutPassphrase(r.Context(), rd.LayerStack)
+	err = s.validateRDLayerStackOnCreate(r.Context(), &rd)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -355,6 +341,78 @@ func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.Resource
 	rd.LayerStack = append([]string(nil), rg.SelectFilter.LayerStack...)
 
 	return nil
+}
+
+// validateRDLayerStackOnCreate is the wire-boundary layer-validation
+// fan-in for `handleRDCreate`. It normalises the python-linstor CLI's
+// `layer_data: [{type:...},...]` wire shape onto `rd.LayerStack`,
+// runs the structural validator (allowlist + ordering rules), then
+// enforces the Bug 95 LUKS-prereq gate. All three are surfaced as a
+// single 400 by the caller — no intermediate writes happen until the
+// store-side cascade kicks in.
+//
+// Returns nil for the happy path.
+func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, rd *apiv1.ResourceDefinition) error {
+	normaliseLayerStackFromLayerData(rd)
+
+	err := validateLayerStack(rd.LayerStack)
+	if err != nil {
+		return err
+	}
+
+	// Bug 95: refuse to create a LUKS-stacked RD when no encryption
+	// passphrase has been set on the controller scope. Without the
+	// passphrase the satellite's LUKS layer has no key material to
+	// seed `cryptsetup luksFormat` with, so the previous behaviour
+	// (silently dropping LUKS at the projection edge) hid the
+	// misconfiguration as plaintext-on-DRBD.
+	return s.refuseLUKSWithoutPassphrase(ctx, rd.LayerStack)
+}
+
+// normaliseLayerStackFromLayerData mirrors the python-linstor CLI's
+// RD-create wire shape onto our internal canonical view.
+//
+// Bug 95 root cause: `linstor rd c X --layer-list DRBD,LUKS,STORAGE`
+// posts `{"resource_definition": {"name": "X", "layer_data":
+// [{"type":"DRBD"},{"type":"LUKS"},{"type":"STORAGE"}]}}` — NOT the
+// `layer_stack: ["DRBD","LUKS","STORAGE"]` field that RG-create uses.
+// The previous fix wired the LUKS-prereq gate to `rd.LayerStack`,
+// which stays empty for every CLI-originated create, so the gate
+// silently passed and the RD landed without LUKS. After this
+// normalisation the validator, the LUKS-prereq gate, the RG-stack
+// inheritance helper, and `wireToCRDRDSpec` all see the same
+// canonical `rd.LayerStack` view regardless of which wire field
+// the client populated.
+func normaliseLayerStackFromLayerData(rd *apiv1.ResourceDefinition) {
+	if len(rd.LayerStack) > 0 || len(rd.LayerData) == 0 {
+		return
+	}
+
+	rd.LayerStack = layerStackFromLayerData(rd.LayerData)
+}
+
+// layerStackFromLayerData walks the wire `layer_data` array — a
+// flat list of `{type: ...}` entries the python-linstor CLI sends on
+// `rd c --layer-list ...` — and projects it down to the
+// `["DRBD","LUKS","STORAGE"]` string slice the rest of the create
+// path operates on. Empty input → empty output (caller falls through
+// to the validator's "empty → default" rule).
+func layerStackFromLayerData(data []apiv1.ResourceLayer) []string {
+	if len(data) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(data))
+
+	for _, layer := range data {
+		if layer.Type == "" {
+			continue
+		}
+
+		out = append(out, layer.Type)
+	}
+
+	return out
 }
 
 // drbdEncryptPassphraseKey is the upstream LINSTOR controller-scope

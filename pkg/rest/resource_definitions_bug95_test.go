@@ -318,6 +318,122 @@ func TestBug95LUKSCreateAcceptedWithPassphrase(t *testing.T) {
 	}
 }
 
+// TestBug95LUKSRefusedWhenCLIUsesLayerData is the regression guard
+// that pins the production wire shape. The python-linstor client
+// posts `rd c --layer-list DRBD,LUKS,STORAGE` as
+//
+//	{"resource_definition": {"name": "X",
+//	   "layer_data": [{"type":"DRBD"},{"type":"LUKS"},{"type":"STORAGE"}]}}
+//
+// — NOT as `layer_stack: ["DRBD","LUKS","STORAGE"]`. The previous
+// Bug-95 fix (40fd5f269) wired the LUKS-prereq gate to
+// `rd.LayerStack`, which is empty for every CLI-originated create —
+// so the gate silently passed and the RD landed without LUKS on
+// dev-kvaps. This test posts the exact CLI wire shape and asserts
+// the 400 fires + nothing is persisted.
+func TestBug95LUKSRefusedWhenCLIUsesLayerData(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	cli := newFakeRESTClient(t)
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	// Raw POST body matching `linstor --curl rd c X --layer-list
+	// DRBD,LUKS,STORAGE` byte-for-byte — no `layer_stack` field at
+	// all, just `layer_data`.
+	body := []byte(`{"resource_definition":{"name":"luktest-cli",` +
+		`"layer_data":[{"type":"DRBD"},{"type":"LUKS"},{"type":"STORAGE"}]}}`)
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		bodyBytes, _ := readAllBody(resp)
+		t.Fatalf("status: got %d, want 400. Body: %s (Bug 95 CLI wire shape: layer_data must be honoured by the prereq gate)",
+			resp.StatusCode, bodyBytes)
+	}
+
+	bodyBytes, _ := readAllBody(resp)
+	if !strings.Contains(string(bodyBytes), "DrbdOptions/EncryptPassphrase") {
+		t.Errorf("response body missing prop name: %s", bodyBytes)
+	}
+
+	_, err := st.ResourceDefinitions().Get(t.Context(), "luktest-cli")
+	if err == nil {
+		t.Errorf("RD luktest-cli persisted despite 400 — gate is leaky on the CLI wire shape")
+	}
+}
+
+// TestBug95LUKSAcceptedWhenCLIUsesLayerData is the happy-path
+// counterpart of TestBug95LUKSRefusedWhenCLIUsesLayerData: with the
+// controller-scope passphrase set, the CLI's `layer_data: [...]`
+// wire shape must round-trip cleanly to `rd.LayerStack` on the
+// persisted CRD so the dispatcher's `rd.Spec.LayerStack` read
+// surfaces the LUKS layer to the satellite.
+func TestBug95LUKSAcceptedWhenCLIUsesLayerData(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	cli := newFakeRESTClient(t)
+	ctx := t.Context()
+
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			ExtraProps: map[string]string{
+				"DrbdOptions/EncryptPassphrase": "blockstorpass",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	body := []byte(`{"resource_definition":{"name":"luktest-cli",` +
+		`"layer_data":[{"type":"DRBD"},{"type":"LUKS"},{"type":"STORAGE"}]}}`)
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		bodyBytes, _ := readAllBody(resp)
+		t.Fatalf("status: got %d, want 201. Body: %s",
+			resp.StatusCode, bodyBytes)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "luktest-cli")
+	if err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	wantStack := []string{"DRBD", "LUKS", "STORAGE"}
+	if len(rd.LayerStack) != len(wantStack) {
+		t.Fatalf("RD LayerStack: got %v, want %v (layer_data must round-trip to layer_stack)",
+			rd.LayerStack, wantStack)
+	}
+
+	for i, want := range wantStack {
+		if rd.LayerStack[i] != want {
+			t.Errorf("RD LayerStack[%d]: got %q, want %q",
+				i, rd.LayerStack[i], want)
+		}
+	}
+}
+
 // readAllBody slurps an HTTP response body so the calling assertion
 // can inline it into a failure message. Errors are swallowed; the
 // only caller is a t.Errorf / t.Fatalf shortcut where producing a
