@@ -1320,6 +1320,13 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 			// satellite reconciler loop (every replay = one more
 			// drbdadm adjust on every survivor) and confuse audit
 			// tooling that watches `blockstor.io/peer-changed`.
+			//
+			// Bug 124: still drain the local cache on the no-op
+			// branch — a retry-after-success-on-sibling-replica
+			// can land here while this replica's informer cache
+			// still has the row.
+			s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnRscNotFound,
 				Message: "resource already absent: " + rdName + " on " + node,
@@ -1332,6 +1339,12 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 124: wait for the local informer cache to observe the
+	// per-replica drop so the very next `r l` / `view/resources` on
+	// this apiserver replica reflects it. See
+	// pkg/rest/cache_invalidation.go.
+	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
 	// Bug 67: notify surviving sibling Resources of the peer change so
 	// the satellite reconcilers re-derive their peer set without the

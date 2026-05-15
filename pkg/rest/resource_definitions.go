@@ -726,6 +726,13 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	err = s.Store.ResourceDefinitions().Delete(r.Context(), name)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// Bug 124: even on the idempotent-no-op branch, drain the
+			// local cache. A retry-of-a-prior-success path can land
+			// here on a sibling replica whose informer cache still
+			// has the RD; the user expects the follow-up `r l` to
+			// reflect the (already-committed) deletion.
+			s.waitForRDDeletionVisible(r.Context(), name)
+
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnRDNotFound,
 				Message: "resource definition already absent: " + name,
@@ -738,6 +745,13 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 124: block the response until the local informer cache has
+	// observed the RD + child Resource deletions. Without this gate,
+	// `linstor rd d <rd>` returns SUCCESS and the very next
+	// `linstor r l` shows phantom rows for 5–30 s until the cache
+	// catches up on its watch stream. See pkg/rest/cache_invalidation.go.
+	s.waitForRDDeletionVisible(r.Context(), name)
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
