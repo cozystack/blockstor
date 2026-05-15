@@ -1539,3 +1539,203 @@ func TestSnapshotViewSurfacesSatelliteReadyStatus(t *testing.T) {
 		t.Errorf("Flags: leaked FAILED on a Successful snapshot: %v", got[0].Flags)
 	}
 }
+
+// TestSnapshotStateIgnoresTieBreaker is the Bug-106 regression guard.
+// Setup mirrors the production trace: RD `bug106test` has two diskful
+// replicas (worker-1, worker-2 UpToDate) and one auto-placed TieBreaker
+// (worker-3, DISKLESS+TIE_BREAKER). The satellite reconciler stamps
+// Status.NodeStatus only for the diskful peers (TieBreaker holds no
+// data, never takes the snapshot). Before the fix, `linstor s l`
+// showed State=Incomplete forever because the apiserver never derived
+// the `SUCCESSFUL` flag the python CLI's State column reads. The fix
+// adds an apiserver-side derivation that excludes DISKLESS+TIE_BREAKER
+// peers from the "every replica is ready" denominator, then stamps
+// `SUCCESSFUL` on the top-level Flags slice.
+func TestSnapshotStateIgnoresTieBreaker(t *testing.T) {
+	ctx := t.Context()
+
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "bug106test",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Two diskful peers + one DISKLESS+TIE_BREAKER witness — the same
+	// topology `rd ap --place-count 2` auto-places on a 3-node stand.
+	resources := []apiv1.Resource{
+		{Name: "bug106test", NodeName: "worker-1"},
+		{Name: "bug106test", NodeName: "worker-2"},
+		{
+			Name:     "bug106test",
+			NodeName: "worker-3",
+			Flags:    []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		},
+	}
+
+	for i := range resources {
+		if err := st.Resources().Create(ctx, &resources[i]); err != nil {
+			t.Fatalf("seed Resource %s: %v", resources[i].NodeName, err)
+		}
+	}
+
+	// Snapshot row: Spec.Nodes is the diskful set only (the apiserver's
+	// hydrateSnapshotFromRD path already filters DISKLESS out via
+	// listDiskfulNodes), and the satellite has reported CreateTimestamp
+	// for both diskful peers — the "every diskful replica took it"
+	// success signal.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap1",
+		ResourceName: "bug106test",
+		Nodes:        []string{"worker-1", "worker-2"},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
+			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 1714000050},
+		},
+	}); err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// 1) Aggregate view.
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("Flags: got %v, want SUCCESSFUL (every diskful peer reported, "+
+			"TieBreaker MUST be excluded from the denominator)", got[0].Flags)
+	}
+
+	// 2) Per-RD list — same derivation MUST fire on this path so the
+	// upstream CLI's `s l --resources bug106test` agrees with `s l`.
+	resp := httpGet(t, base+"/v1/resource-definitions/bug106test/snapshots")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("per-RD list status: got %d, want 200", resp.StatusCode)
+	}
+
+	var perRD []apiv1.Snapshot
+	if err := json.NewDecoder(resp.Body).Decode(&perRD); err != nil {
+		t.Fatalf("per-RD decode: %v", err)
+	}
+
+	if len(perRD) != 1 || !slices.Contains(perRD[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("per-RD list Flags: got %+v, want SUCCESSFUL", perRD)
+	}
+
+	// 3) Single-snapshot GET — same.
+	getResp := httpGet(t, base+"/v1/resource-definitions/bug106test/snapshots/snap1")
+	defer func() { _ = getResp.Body.Close() }()
+
+	var single apiv1.Snapshot
+	if err := json.NewDecoder(getResp.Body).Decode(&single); err != nil {
+		t.Fatalf("single decode: %v", err)
+	}
+
+	if !slices.Contains(single.Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("single GET Flags: got %v, want SUCCESSFUL", single.Flags)
+	}
+}
+
+// TestSnapshotStateIncompleteWhenDiskfulPeerMissing pins the
+// "still in progress" half of the Bug-106 derivation: when at least
+// one diskful peer hasn't reported a CreateTimestamp, the snapshot
+// MUST stay Incomplete (no `SUCCESSFUL` flag) — otherwise the
+// operator would think a half-taken snapshot is durable.
+func TestSnapshotStateIncompleteWhenDiskfulPeerMissing(t *testing.T) {
+	ctx := t.Context()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "bug106-incomplete",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, nodeName := range []string{"worker-1", "worker-2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "bug106-incomplete", NodeName: nodeName,
+		}); err != nil {
+			t.Fatalf("seed Resource: %v", err)
+		}
+	}
+
+	// Only worker-1 has reported back — worker-2 still in flight.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap1",
+		ResourceName: "bug106-incomplete",
+		Nodes:        []string{"worker-1", "worker-2"},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
+			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 0},
+		},
+	}); err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("Flags: leaked SUCCESSFUL while a diskful peer (worker-2) hasn't "+
+			"reported back: %v", got[0].Flags)
+	}
+}
+
+// TestSnapshotStateNotMarkedSuccessfulWhenFailed pins the precedence:
+// a FAILED stamp (terminal-error marker from the satellite snapshot
+// reconciler) MUST outrank SUCCESSFUL. If both flags were present the
+// python CLI would render "Failed" (it checks FAILED first), but
+// leaking SUCCESSFUL on a dead-letter snapshot would confuse anything
+// that filters on the SUCCESSFUL token directly (CSI drivers, scripts).
+func TestSnapshotStateNotMarkedSuccessfulWhenFailed(t *testing.T) {
+	ctx := t.Context()
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "bug106-failed",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "bug106-failed", NodeName: "worker-1",
+	}); err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap1",
+		ResourceName: "bug106-failed",
+		Nodes:        []string{"worker-1"},
+		Flags:        []string{"FAILED"},
+		Snapshots: []apiv1.SnapshotPerNode{
+			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
+		},
+	}); err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("Flags: leaked SUCCESSFUL alongside FAILED: %v", got[0].Flags)
+	}
+}

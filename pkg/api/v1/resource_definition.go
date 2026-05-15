@@ -44,6 +44,21 @@ type ResourceDefinition struct {
 	// (linstorapi.py::resource_dfn_list). Omitted by default so the
 	// plain `rd l` view stays compact.
 	VolumeDefinitions []VolumeDefinition `json:"volume_definitions,omitempty"`
+
+	// EffectiveProps is the merged Controller→RG→RD view of the
+	// property bag for this RD. Populated on GET and List read paths;
+	// ignored on writes. Mirrors `Resource.EffectiveProps` (the
+	// `/v1/view/resources` shape) so callers that already understand
+	// scope tags can read inherited values with the origin recorded.
+	//
+	// Inherited-prop visibility (Bug-105 follow-up): `linstor rd
+	// list-properties` (`rd lp`) reads the bare `props` map for its
+	// table, so the read-side handlers also merge inherited Controller
+	// / RG keys into `Props` (without overwriting locally-set RD keys).
+	// Operators that `c sp <key> <value>` then `rd lp <rd>` now see
+	// the inherited entry rather than thinking the controller-scope
+	// prop never propagated.
+	EffectiveProps EffectiveProperties `json:"effective_props,omitempty"`
 }
 
 // Layer kind constants — the strings LINSTOR uses on the wire.

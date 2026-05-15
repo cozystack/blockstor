@@ -92,6 +92,21 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Inherited-prop visibility on the read side: `linstor rd lp` calls
+	// resource_dfn_list with a name filter and renders the bare `props`
+	// map. Without an inheritance merge the operator's `c sp <key> <v>`
+	// is invisible at the RD scope even though it is effective at the
+	// DRBD layer. Stamp the merged scope-tagged map AND inline the
+	// inherited keys into `props` (locally-set RD keys still win).
+	for i := range rds {
+		mergeErr := s.stampRDEffectiveProps(r.Context(), &rds[i])
+		if mergeErr != nil {
+			writeStoreError(w, mergeErr)
+
+			return
+		}
+	}
+
 	writeJSON(w, http.StatusOK, rds)
 }
 
@@ -109,7 +124,63 @@ func (s *Server) handleRDGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Inherited-prop visibility (Bug-105 follow-up): merge the
+	// Controller→RG→RD chain so `linstor rd lp <rd>` renders inherited
+	// entries. See stampRDEffectiveProps for the precedence rules.
+	err = s.stampRDEffectiveProps(r.Context(), &rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
 	writeJSON(w, http.StatusOK, rd)
+}
+
+// stampRDEffectiveProps populates rd.EffectiveProps with the merged
+// scope-tagged Controller→RG→RD view, and inlines inherited keys into
+// rd.Props (without overwriting locally-set RD keys) so the python CLI's
+// `rd lp` table — which reads the bare `props` map — sees inherited
+// entries. Mirrors the parent-fetch soft-fail semantics of
+// effectivePropsForRD: a missing parent RG yields a partial map rather
+// than a 5xx, since the read-side handler MUST stay forgiving on a
+// half-migrated cluster.
+//
+// Idempotent: calling on an RD whose Props already contains every
+// merged key (e.g. a re-render on the same response) is a no-op.
+func (s *Server) stampRDEffectiveProps(ctx context.Context, rd *apiv1.ResourceDefinition) error {
+	eff, err := effectivePropsForRD(ctx, s.Client, s.Store, rd)
+	if err != nil {
+		return err
+	}
+
+	if len(eff) == 0 {
+		return nil
+	}
+
+	rd.EffectiveProps = eff
+
+	if rd.Props == nil {
+		rd.Props = map[string]string{}
+	}
+
+	for key, entry := range eff {
+		// RD-scope keys are already in rd.Props verbatim; only inline
+		// parent-scope keys the RD didn't override. The scope check
+		// uses the entry's recorded origin so an RD that locally
+		// shadows an inherited key keeps its own value untouched.
+		if entry.Scope == apiv1.EffectivePropScopeResourceDefinition {
+			continue
+		}
+
+		if _, alreadySet := rd.Props[key]; alreadySet {
+			continue
+		}
+
+		rd.Props[key] = entry.Value
+	}
+
+	return nil
 }
 
 func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {

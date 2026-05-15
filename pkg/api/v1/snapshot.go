@@ -87,3 +87,25 @@ type SnapshotVolume struct {
 	VolumeNumber int32  `json:"vlm_nr"`
 	State        string `json:"state,omitempty"`
 }
+
+// Snapshot-definition flag constants on the wire. Match the upstream
+// LINSTOR `FLAG_*` literals python-linstor-client reads in
+// snapshot_cmds.show — the State column resolves to:
+//
+//	FAILED_DEPLOYMENT  -> "Failed"
+//	FAILED_DISCONNECT  -> "Satellite disconnected"
+//	SUCCESSFUL         -> "Successful"
+//	(anything else)    -> "Incomplete"
+//
+// blockstor used to ship the `FAILED` shorthand (terminal-error stamp
+// from the satellite snapshot reconciler); we keep that one and ALSO
+// stamp `SUCCESSFUL` on the wire view once every diskful peer reports
+// Ready. TIE_BREAKER + DISKLESS replicas hold no data and never take
+// the snapshot, so they MUST be excluded from the "every replica is
+// ready" denominator — otherwise the State column hangs in Incomplete
+// forever on auto-placed 2-diskful + 1-tiebreaker topologies.
+const (
+	SnapshotFlagFailedDeployment = "FAILED_DEPLOYMENT"
+	SnapshotFlagFailedDisconnect = "FAILED_DISCONNECT"
+	SnapshotFlagSuccessful       = "SUCCESSFUL"
+)

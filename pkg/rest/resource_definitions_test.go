@@ -1711,3 +1711,185 @@ func TestUnsetDrbdOptionClusterScope(t *testing.T) {
 			drbdOptProtocolKey, eff)
 	}
 }
+
+// TestRDListPropertiesInheritsControllerScope is the Bug-105 wire
+// regression guard. Operator workflow:
+//
+//	c sp DrbdOptions/Net/ping-timeout 200
+//	rd c bug105test; vd c bug105test 32M; rd ap --place-count 2 ...
+//	rd lp bug105test                 # MUST show ping-timeout=200
+//
+// Before the fix, `rd lp` rendered only RD-scope keys (`quorum=majority`),
+// because the python CLI reads the bare `props` map from
+// `GET /v1/resource-definitions/{rd}` and that response carried RD-local
+// keys only. The fix merges inherited Controller / RG keys into `props`
+// and ALSO surfaces the scope-tagged map in `effective_props` so callers
+// that already understand inheritance origin can read it without parsing
+// `(R)` markers.
+func TestRDListPropertiesInheritsControllerScope(t *testing.T) {
+	ctx := context.Background()
+	const pingTimeoutKey = "DrbdOptions/Net/ping-timeout"
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "bug105test",
+		// RD carries one local key so the merge MUST stay additive
+		// (local wins, inherited keys land alongside).
+		Props: map[string]string{"DrbdOptions/Resource/quorum": "majority"},
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := newFakeRESTClient(t)
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			ExtraProps: map[string]string{pingTimeoutKey: "200"},
+		},
+	}); err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/bug105test")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Python CLI's `rd lp` reads `props` — inherited ping-timeout MUST
+	// show up here for the operator to know the controller-scope set
+	// propagated.
+	if got.Props[pingTimeoutKey] != "200" {
+		t.Errorf("Props[%s]: got %q, want 200 (inherited from CTRL scope must be merged)",
+			pingTimeoutKey, got.Props[pingTimeoutKey])
+	}
+
+	// RD-local keys MUST survive the merge verbatim — the inherited
+	// inlining is additive, never destructive.
+	if got.Props["DrbdOptions/Resource/quorum"] != "majority" {
+		t.Errorf("Props[quorum]: got %q, want majority (RD-local key clobbered by merge)",
+			got.Props["DrbdOptions/Resource/quorum"])
+	}
+
+	// And the new scope-tagged map: ping-timeout MUST carry scope=CTRL
+	// so callers that look at effective_props can render `(R)` markers.
+	entry, ok := got.EffectiveProps[pingTimeoutKey]
+	if !ok {
+		t.Fatalf("EffectiveProps[%s]: missing; want {value:200 scope:CTRL}", pingTimeoutKey)
+	}
+
+	if entry.Value != "200" || entry.Scope != apiv1.EffectivePropScopeController {
+		t.Errorf("EffectiveProps[%s]: got %+v, want {value:200 scope:CTRL}", pingTimeoutKey, entry)
+	}
+}
+
+// TestRDListPropertiesInheritsResourceGroup pins the RG rung of the
+// inheritance chain — keys set on the parent RG (`linstor rg sp <rg>
+// <key> <value>`) are visible via `rd lp` with scope=RG.
+func TestRDListPropertiesInheritsResourceGroup(t *testing.T) {
+	ctx := context.Background()
+
+	st := store.NewInMemory()
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:  "rg-1",
+		Props: map[string]string{"Aux/team": "storage"},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "bug105test-rg",
+		ResourceGroupName: "rg-1",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/bug105test-rg")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got apiv1.ResourceDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Props["Aux/team"] != "storage" {
+		t.Errorf("Props[Aux/team]: got %q, want storage (inherited from RG must be in props)",
+			got.Props["Aux/team"])
+	}
+
+	entry, ok := got.EffectiveProps["Aux/team"]
+	if !ok || entry.Scope != apiv1.EffectivePropScopeResourceGroup {
+		t.Errorf("EffectiveProps[Aux/team]: got %+v, want scope=RG", entry)
+	}
+}
+
+// TestRDListPropertiesRDOverridesController pins the precedence
+// invariant: an RD-local key wins over an inherited Controller key
+// of the same name. The merge MUST never clobber a locally-set value.
+func TestRDListPropertiesRDOverridesController(t *testing.T) {
+	ctx := context.Background()
+	const key = "DrbdOptions/Net/ping-timeout"
+
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:  "bug105test-override",
+		Props: map[string]string{key: "500"}, // RD-local wins
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	cli := newFakeRESTClient(t)
+	if err := cli.Create(ctx, &blockstoriov1alpha1.ControllerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
+		Spec: blockstoriov1alpha1.ControllerConfigSpec{
+			ExtraProps: map[string]string{key: "200"},
+		},
+	}); err != nil {
+		t.Fatalf("seed ControllerConfig: %v", err)
+	}
+
+	base, stop := startServerCustom(t, &Server{
+		Addr:      pickFreeAddr(t),
+		Store:     st,
+		Client:    cli,
+		Namespace: testRESTNamespace,
+	})
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/resource-definitions/bug105test-override")
+	defer func() { _ = resp.Body.Close() }()
+
+	var got apiv1.ResourceDefinition
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if got.Props[key] != "500" {
+		t.Errorf("Props[%s]: got %q, want 500 (RD-local MUST win over CTRL)", key, got.Props[key])
+	}
+
+	if got.EffectiveProps[key].Scope != apiv1.EffectivePropScopeResourceDefinition {
+		t.Errorf("EffectiveProps[%s].Scope: got %q, want RD", key, got.EffectiveProps[key].Scope)
+	}
+}

@@ -171,6 +171,17 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 		filtered = append(filtered, snaps[i])
 	}
 
+	// Derive the State-column flag for the python CLI's `s l` table.
+	// Runs after filter (don't bother computing for snapshots the
+	// caller filtered out) but before paginate so all callers — full
+	// page or windowed — see the same Flags slice.
+	err = s.stampSnapshotSuccessful(r.Context(), filtered)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
 	// Pagination: golinstor's ListOpts.{Offset,Limit} surface as
 	// `?offset=N&limit=M`. linstor-csi forwards csi-sanity's
 	// max_entries + starting_token into these, and CSI's
@@ -220,6 +231,13 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		snaps = []apiv1.Snapshot{}
 	}
 
+	err = s.stampSnapshotSuccessful(r.Context(), snaps)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
 	writeJSON(w, http.StatusOK, snaps)
 }
 
@@ -234,7 +252,150 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, snap)
+	// Single-snapshot view: reuse the slice helper so the SUCCESSFUL
+	// derivation logic lives in one place. Cheap (one Resources()
+	// list call per snapshot — the same call the multi-snapshot path
+	// makes per RD anyway).
+	single := []apiv1.Snapshot{snap}
+
+	err = s.stampSnapshotSuccessful(r.Context(), single)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, single[0])
+}
+
+// stampSnapshotSuccessful derives the python-CLI `State` column from
+// the per-node materialisation. For each snapshot:
+//
+//  1. If `Flags` already carries `FAILED_DEPLOYMENT` / `FAILED_DISCONNECT`
+//     / `FAILED` (the satellite-stamped terminal-error marker) — leave
+//     the entry alone; those flags outrank SUCCESSFUL in the CLI.
+//  2. Else, look up the parent RD's diskful peer set (Resources whose
+//     Flags slice contains neither DISKLESS nor TIE_BREAKER — the
+//     TIE_BREAKER witness holds no data so it MUST be excluded from
+//     the success denominator, otherwise auto-placed 2-diskful + 1-TB
+//     topologies hang in Incomplete forever).
+//  3. If every diskful peer has a `Snapshots[]` entry with non-zero
+//     CreateTimestamp (the satellite-reported "I took the snapshot"
+//     signal), stamp `SUCCESSFUL` on the wire `Flags` so `linstor s l`
+//     renders the State column as `Successful`.
+//
+// Failure to enumerate Resources soft-fails to "no stamp": better to
+// leave the row at `Incomplete` than 5xx the whole list call.
+func (s *Server) stampSnapshotSuccessful(ctx context.Context, snaps []apiv1.Snapshot) error {
+	// Cache the per-RD diskful node set so a List of N snapshots
+	// against the same RD only walks Resources once.
+	diskfulByRD := map[string]map[string]struct{}{}
+
+	for i := range snaps {
+		snap := &snaps[i]
+
+		if slices.ContainsFunc(snap.Flags, isTerminalSnapshotFlag) {
+			continue
+		}
+
+		diskful, ok := diskfulByRD[snap.ResourceName]
+		if !ok {
+			built, err := s.diskfulPeerSet(ctx, snap.ResourceName)
+			if err != nil {
+				return err
+			}
+
+			diskful = built
+			diskfulByRD[snap.ResourceName] = diskful
+		}
+
+		if isSnapshotSuccessful(snap, diskful) {
+			snap.Flags = append(snap.Flags, apiv1.SnapshotFlagSuccessful)
+		}
+	}
+
+	return nil
+}
+
+// legacySnapshotFlagFailed is the satellite snapshot reconciler's
+// terminal-error stamp (F18 cli-parity wiring) kept for backwards-compat
+// with existing CRDs that carry the token in Status.Flags. Mirrored
+// from the SnapshotStatusFlagFailed constant on the CRD package;
+// duplicated here so the REST package doesn't need a v1alpha1 import
+// just to read one literal.
+const legacySnapshotFlagFailed = "FAILED"
+
+// isTerminalSnapshotFlag reports whether a flag value already pins the
+// snapshot to a non-Incomplete State that outranks `SUCCESSFUL`.
+// Mirrors the python CLI's elif-chain order in snapshot_cmds.show.
+func isTerminalSnapshotFlag(flag string) bool {
+	return flag == apiv1.SnapshotFlagFailedDeployment ||
+		flag == apiv1.SnapshotFlagFailedDisconnect ||
+		flag == apiv1.SnapshotFlagSuccessful ||
+		flag == legacySnapshotFlagFailed
+}
+
+// isSnapshotSuccessful is true iff every diskful peer of the parent RD
+// has a per-node entry with non-zero CreateTimestamp. An empty
+// diskful peer set returns false — a 0-replica RD with a snapshot row
+// is a degenerate state the operator should investigate, not silently
+// auto-mark as success.
+func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) bool {
+	if len(diskful) == 0 {
+		return false
+	}
+
+	reported := map[string]struct{}{}
+
+	for j := range snap.Snapshots {
+		entry := &snap.Snapshots[j]
+		if entry.CreateTimestamp == 0 {
+			continue
+		}
+
+		reported[entry.NodeName] = struct{}{}
+	}
+
+	for node := range diskful {
+		if _, ok := reported[node]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// diskfulPeerSet enumerates the Resources of an RD and returns the
+// set of node names whose Flags slice contains neither DISKLESS nor
+// TIE_BREAKER. NotFound on the RD soft-fails to an empty set —
+// matches handleSnapshotList's "treat orphan snapshot rows as
+// renderable" stance.
+func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]struct{}, error) {
+	resList, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return map[string]struct{}{}, nil
+		}
+
+		return nil, err //nolint:wrapcheck // surfaced via writeError
+	}
+
+	out := make(map[string]struct{}, len(resList))
+
+	for i := range resList {
+		flags := resList[i].Flags
+		if slices.Contains(flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		if slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+			continue
+		}
+
+		out[resList[i].NodeName] = struct{}{}
+	}
+
+	return out, nil
 }
 
 func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
