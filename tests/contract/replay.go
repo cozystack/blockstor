@@ -67,11 +67,25 @@ func Replay(ctx context.Context, client *http.Client, baseURL string, traces []T
 	return results, nil
 }
 
+// replayBodyIPPlaceholder is the deterministic IP literal substituted
+// for the `<ip>` placeholder in trace bodies at replay time. Recorded
+// traces scrub real worker IPs to `<ip>` so the fixtures are portable
+// across stands; but Bug 120 added wire-boundary IP validation on
+// POST /v1/nodes, so a literal `"<ip>"` in the body now (correctly)
+// returns 400. Substituting a parseable literal here keeps the
+// fixtures portable while still exercising the rest of the pipeline.
+const replayBodyIPPlaceholder = "10.0.0.1"
+
 // replayOne issues a single trace against baseURL.
 func replayOne(ctx context.Context, client *http.Client, baseURL string, trace *Trace) (Result, error) {
 	var body io.Reader
 	if len(trace.Body) > 0 {
-		body = bytes.NewReader(trace.Body)
+		// Bug 120 follow-on: rehydrate the `<ip>` placeholder in the
+		// request body so the wire-boundary IP validation accepts the
+		// payload. The expected-body comparison still runs through
+		// Normalize, which re-scrubs IPv4 literals back to `<ip>` —
+		// so the fixture stays portable and the diff stays clean.
+		body = bytes.NewReader(rehydrateIPPlaceholder(trace.Body))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, trace.Method, baseURL+trace.Path, body)
@@ -144,6 +158,37 @@ func compare(trace *Trace, result *Result) []string {
 	}
 
 	return diffs
+}
+
+// rehydrateIPPlaceholder substitutes every `<ip>` placeholder in raw
+// JSON with replayBodyIPPlaceholder. Operates on the raw bytes (not
+// via Unmarshal) so structural ordering of the original recording is
+// preserved bit-for-bit through to the replay HTTP request. Bug 120's
+// IP validation rejects unparseable literals; without this rehydration
+// the recorded trace fixtures (which scrub real IPs to `<ip>`) would
+// fail at the wire boundary before reaching the handler we're trying
+// to exercise.
+//
+// Two forms are substituted because json.RawMessage preserves the
+// recorder's choice of escape — Go's default `json.Marshal` is
+// HTML-safe and emits `<` as the Unicode escape `<` (so the
+// placeholder appears as `<ip>` in the on-disk fixtures),
+// while a hand-authored fixture or a marshaller with
+// `SetEscapeHTML(false)` writes the literal `<ip>`. Both forms must
+// rehydrate to the same parseable IP at replay time.
+func rehydrateIPPlaceholder(in []byte) []byte {
+	target := []byte(`"` + replayBodyIPPlaceholder + `"`)
+	// Literal-`<`-`>` form: hand-authored or non-HTML-safe encoder.
+	out := bytes.ReplaceAll(in, []byte(`"<ip>"`), target)
+	// HTML-safe-escape form: Go's default json.Marshal emits `<` as
+	// the 6-byte sequence `<` and `>` as `>` to prevent
+	// script-injection in HTML-embedded JSON. Recorded oracle traces
+	// went through that path, so the on-disk bytes are the escape
+	// form, not the literal `<`/`>`. Use a double-quoted Go string
+	// literal here so `\\u003c` produces the on-wire 6-byte sequence.
+	out = bytes.ReplaceAll(out, []byte("\"\\u003cip\\u003e\""), target)
+
+	return out
 }
 
 // itoa avoids dragging strconv into this file's import set; we only

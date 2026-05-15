@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -383,6 +384,20 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		}}
 	}
 
+	// Bug 120: validate every NetInterface address at the wire
+	// boundary. Upstream LINSTOR accepts either an IP literal (v4
+	// or v6) or a DNS-resolvable hostname; the previous behaviour
+	// accepted ANY non-empty string, so `n c bogusnode 999.999.999.999`
+	// returned 201 with a satellite that could never connect.
+	// validateNetInterfaceAddresses refuses an address that's neither
+	// a parseable IP literal nor resolvable via DNS within 1s.
+	ifaceErr := s.validateNetInterfaceAddresses(r.Context(), n.NetInterfaces)
+	if ifaceErr != nil {
+		writeError(w, http.StatusBadRequest, ifaceErr.Error())
+
+		return
+	}
+
 	// Idempotent upsert (cli-parity-audit row #44): upstream LINSTOR's
 	// `node create` re-issues become no-op updates, not 409s. Cozystack
 	// reconcilers retry node registration on every operator restart;
@@ -453,6 +468,70 @@ func buildNodeCreateEnvelope(n *apiv1.Node) []apiv1.APICallRc {
 	}
 
 	return envelope
+}
+
+// netInterfaceDNSTimeout caps the per-address DNS lookup the Bug 120
+// validation falls back to when net.ParseIP rejects the literal.
+// Bounded so a slow/broken resolver can't stall the node-create path
+// indefinitely — upstream LINSTOR's controller also fronts the
+// resolution with a short timeout. 1s is enough for any reachable
+// resolver and short enough that an operator-typo for a non-existent
+// hostname still surfaces a 400 within the human-perceptible budget.
+const netInterfaceDNSTimeout = time.Second
+
+// validateNetInterfaceAddresses walks every NetInterface and refuses
+// the request when any Address is neither a parseable IP literal nor
+// a DNS-resolvable hostname. Empty addresses are also refused — a
+// satellite with no Address can never connect, and the previous
+// behaviour silently persisted one (Bug 120).
+//
+// Two acceptance paths (mirrors upstream LINSTOR's NetInterface
+// validation):
+//
+//  1. net.ParseIP succeeds — covers IPv4 dotted-quad, IPv4 with
+//     leading zeros, IPv6 incl. link-local. Fast path, no DNS hit.
+//  2. ParseIP fails BUT s.lookupHost returns at least one address
+//     within netInterfaceDNSTimeout — covers DNS hostnames
+//     (`worker-1.cluster.local`) that piraeus-operator commonly
+//     registers via K8s DNS.
+//
+// On rejection the returned error carries the offending literal and
+// the rule it violated, so the LINSTOR envelope's `message` is
+// directly actionable for the operator.
+func (s *Server) validateNetInterfaceAddresses(ctx context.Context, ifaces []apiv1.NetInterface) error {
+	for i := range ifaces {
+		addr := strings.TrimSpace(ifaces[i].Address)
+		if addr == "" {
+			return errors.Errorf(
+				"net-interface %q: address is empty; use a valid IPv4 or IPv6 literal "+
+					"(e.g. 10.0.0.1 or fe80::1) or a DNS-resolvable hostname",
+				ifaces[i].Name)
+		}
+
+		if net.ParseIP(addr) != nil {
+			continue
+		}
+
+		// DNS-fallback: upstream LINSTOR accepts hostnames here.
+		// Bounded by netInterfaceDNSTimeout so a broken resolver
+		// can't stall the create path.
+		lookupCtx, cancel := context.WithTimeout(ctx, netInterfaceDNSTimeout)
+		hosts, lookupErr := s.lookupHost(lookupCtx, addr)
+
+		cancel()
+
+		if lookupErr == nil && len(hosts) > 0 {
+			continue
+		}
+
+		return errors.Errorf(
+			"net-interface %q: address %q is not a valid IPv4 or IPv6 literal "+
+				"and DNS resolution failed; use a parseable IP literal "+
+				"(e.g. 10.0.0.1 or fe80::1) or a resolvable hostname",
+			ifaces[i].Name, addr)
+	}
+
+	return nil
 }
 
 // resolveDefaultAddress synthesises the address for the default
