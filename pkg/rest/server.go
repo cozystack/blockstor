@@ -228,6 +228,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerAdvise(mux)
 	s.registerPhysicalStorage(mux)
 	s.registerResourceGroupExtras(mux)
+	s.registerSchedules(mux)
 
 	return mux
 }

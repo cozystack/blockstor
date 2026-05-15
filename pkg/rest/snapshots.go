@@ -45,6 +45,14 @@ func (s *Server) registerSnapshots(mux *http.ServeMux) {
 		s.requireStore(s.handleSnapshotDelete))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshots/{snap}/rollback",
 		s.requireStore(s.handleSnapshotRollback))
+	// Bug 98: python-linstor 1.27.1 (and upstream LINSTOR's Java
+	// server) POST `linstor snapshot rollback` at this canonical
+	// shape — without it the CLI crashes on the bare 404 page.
+	// Wire it to the same handler so both shapes return identical
+	// envelopes; the legacy `/snapshots/{snap}/rollback` stays for
+	// existing internal callers.
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-rollback/{snap}",
+		s.requireStore(s.handleSnapshotRollback))
 }
 
 // handleSnapshotRollback answers the upstream `linstor snapshot rollback`

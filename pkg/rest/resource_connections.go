@@ -44,6 +44,58 @@ func (s *Server) registerResourceConnections(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceConnectionPathCreate))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resource-connections/{nodeA}/{nodeB}/paths/{name}",
 		s.requireStore(s.handleResourceConnectionPathDelete))
+	// Bug 99: `linstor resource-connection list <rd>` calls
+	// `GET /v1/resource-definitions/{rd}/resource-connections` and
+	// expects a JSON array of `{node_a, node_b, props, flags, port}`
+	// objects. blockstor does not yet model per-(rd, a, b) connection
+	// state outside the multi-path subkey, so the list is always
+	// empty for now — the important contract is the JSON envelope
+	// (top-level `[]`) so the python CLI doesn't crash with a
+	// ParseError. The path is also surfaced at the legacy upstream
+	// `/v1/resource-connections/{rd}` shape some older clients still
+	// hit.
+	mux.HandleFunc("GET /v1/resource-definitions/{rd}/resource-connections",
+		s.requireStore(s.handleResourceConnectionList))
+	mux.HandleFunc("GET /v1/resource-connections/{rd}",
+		s.requireStore(s.handleResourceConnectionList))
+}
+
+// resourceConnectionListEntry is the wire shape python-linstor's
+// ResourceConnection class consumes (see linstor/responses.py:1841).
+// We keep the type local because the storage layer does not yet
+// produce these — once it does, this stub grows a real builder.
+type resourceConnectionListEntry struct {
+	NodeA string            `json:"node_a"`
+	NodeB string            `json:"node_b"`
+	Flags []string          `json:"flags,omitempty"`
+	Props map[string]string `json:"props,omitempty"`
+	Port  *int32            `json:"port,omitempty"`
+}
+
+// handleResourceConnectionList returns the per-pair connection list
+// for the named RD. We respond 200 with `[]` whenever the RD exists
+// but no per-pair state has been stamped; the store error envelope
+// (typically 404) when the RD itself is unknown. Bug 99: previously
+// this path 404'd at the router and the python CLI couldn't parse
+// the body.
+func (s *Server) handleResourceConnectionList(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+
+	// Existence probe — returns the canonical not-found envelope on
+	// typos so the operator sees the actual problem.
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	// blockstor stores per-pair state only under the multi-path
+	// subkey today; there are no top-level resource-connection
+	// objects to enumerate. Returning an empty array is the same
+	// shape upstream LINSTOR returns for a fresh RD before any
+	// `resource-connection set-property` calls land.
+	writeJSON(w, http.StatusOK, []resourceConnectionListEntry{})
 }
 
 // resourceConnectionPathsPropKey is the RD-prop namespace under which

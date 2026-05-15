@@ -31,16 +31,27 @@ import (
 // flip a single replica between diskless and diskful in one
 // call, typically before/after a node-maintenance rotation.
 //
-// Three shapes are accepted, mirroring upstream / python-linstor:
+// Several shapes are accepted, mirroring upstream / python-linstor
+// 1.27.1 (which builds `/toggle-disk/{diskless,diskful}[/{pool}]`):
 //
 //	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk
 //	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/storage-pool/{pool}
 //	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless
+//	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless/{pool}
+//	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskful
+//	PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskful/{pool}
 //
 // Without a suffix we toggle to the side opposite the current state.
 // With `/storage-pool/{pool}` we stamp the pool when promoting to
-// diskful. With `/diskless` we force a demote to diskless, regardless
-// of current state — this is what `linstor r td --diskless` POSTs.
+// diskful (legacy shape kept for tests / older clients). With
+// `/diskless[/{pool}]` we force a demote to diskless — what
+// `linstor r td --diskless` POSTs; the optional {pool} is the
+// diskless pool name and currently ignored (we don't model per-
+// replica diskless-pool placement, only DISKLESS flag flips). With
+// `/diskful[/{pool}]` we force a promote to diskful — Bug 93:
+// `linstor r td <node> <rd> --storage-pool <pool>` POSTs the
+// `/diskful/{pool}` variant; previously this hit a bare 404 page
+// which the python CLI couldn't parse.
 //
 // The work itself (drbdadm attach / detach) happens out-of-band on
 // the satellite reconciler — this endpoint is a thin spec-flag
@@ -53,6 +64,12 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceToggleDisk))
 	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless",
 		s.requireStore(s.handleResourceToggleDiskToDiskless))
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskless/{pool}",
+		s.requireStore(s.handleResourceToggleDiskToDiskless))
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskful",
+		s.requireStore(s.handleResourceToggleDiskToDiskful))
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{node}/toggle-disk/diskful/{pool}",
+		s.requireStore(s.handleResourceToggleDiskToDiskful))
 	// Upstream LINSTOR's `linstor r td --migrate-from <src>` shape:
 	// move a replica between nodes without dropping below the original
 	// diskful count. Path-param order matches python-linstor's URL
@@ -176,6 +193,50 @@ func (s *Server) handleResourceToggleDiskToDiskless(w http.ResponseWriter, r *ht
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource '" + rdName + "' on '" + node + "' toggled to diskless",
+	}})
+}
+
+// handleResourceToggleDiskToDiskful forces the replica to diskful,
+// regardless of its current state. Matches python-linstor's
+// `linstor r td <node> <rd> [--storage-pool <pool>]` shape
+// (PUT .../toggle-disk/diskful[/{pool}]). Bug 93: the back-to-diskful
+// path was previously unreachable, so an operator who demoted a
+// replica with `r td --diskless` had no way to re-promote it via REST.
+//
+// When {pool} is present we stamp it on Spec so the satellite picks
+// the requested pool when reattaching storage. When absent the
+// controller's auto-diskful path picks a pool on the hosting node
+// during the next reconcile. Idempotent: a replica that's already
+// diskful stays diskful (and gets its pool re-stamped if one was
+// supplied).
+func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+	pool := r.PathValue("pool")
+
+	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, false)
+
+	if pool != "" {
+		stampStoragePool(&res, pool)
+	}
+
+	err = s.Store.Resources().Update(r.Context(), &res)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' on '" + node + "' toggled to diskful",
 	}})
 }
 
