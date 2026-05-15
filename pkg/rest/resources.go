@@ -122,10 +122,18 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 // stamped here — true while the controller is locked (master
 // passphrase not yet entered in this process), false once unlocked.
 // stampSuspendedOnLUKS centralises the layer-walk + flag-read.
+//
+// Bug 95: the resolved parent RD's LayerStack is re-stamped onto the
+// replica's LayerObject + per-volume LayerDataList here. The k8s
+// store's CRD projection defaults to `[DRBD,STORAGE]` because the
+// Resource CRD does not carry the parent's LayerStack — without the
+// re-stamp, an RD created with `--layer-list DRBD,LUKS,STORAGE`
+// silently emits the default chain, so operators see plaintext while
+// believing they have encryption.
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
-	eff, err := effectivePropsForResource(ctx, s.Client, s.Store, rsc)
+	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
 		return apiv1.ResourceWithVolumes{}, err
 	}
@@ -141,6 +149,17 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 		Volumes:  annotated,
 	}
 	rwv.Volumes = annotated
+
+	// Re-stamp the layer surfaces from the RD's LayerStack so a
+	// `--layer-list DRBD,LUKS,STORAGE` RD doesn't get silently
+	// projected as `[DRBD,STORAGE]` by the store-level default
+	// (Bug 95). nil/empty stack falls through to the existing
+	// projection so back-compat with the legacy default-stack
+	// path is preserved.
+	if rd != nil && len(rd.LayerStack) > 0 {
+		apiv1.ApplyLayerStack(&rwv.Resource, rd.LayerStack)
+		apiv1.ApplyLayerStackToVolumes(rwv.Volumes, rd.LayerStack)
+	}
 
 	if len(eff) > 0 {
 		rwv.EffectiveProps = eff

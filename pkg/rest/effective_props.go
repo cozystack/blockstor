@@ -109,9 +109,27 @@ func effectivePropsForRD(ctx context.Context, c client.Reader, st store.Store, r
 // level → empty" so a partially-migrated cluster still returns a
 // usable response.
 func effectivePropsForResource(ctx context.Context, c client.Reader, st store.Store, rsc *apiv1.Resource) (apiv1.EffectiveProperties, error) {
+	eff, _, err := effectivePropsAndRDForResource(ctx, c, st, rsc)
+
+	return eff, err
+}
+
+// effectivePropsAndRDForResource is the sibling of
+// `effectivePropsForResource` that also returns the resolved parent
+// ResourceDefinition. `/v1/view/resources` uses the RD's LayerStack
+// to re-stamp the per-replica `layer_object` / `layer_data_list`
+// surfaces (Bug 95 — without this the CRD-projection's hardcoded
+// DefaultLayerStack silently drops LUKS from RDs created with
+// `--layer-list DRBD,LUKS,STORAGE`). Both halves share the RG/RD
+// fetch so we don't pay the round-trip twice per replica.
+//
+// The returned *apiv1.ResourceDefinition is nil when the parent RD
+// can't be found — callers must fall back to the wire-as-is shape in
+// that case (the response is still useful, just defaulted).
+func effectivePropsAndRDForResource(ctx context.Context, c client.Reader, st store.Store, rsc *apiv1.Resource) (apiv1.EffectiveProperties, *apiv1.ResourceDefinition, error) {
 	ctrl, err := controllerScopeProps(ctx, c)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	rd, getRDErr := st.ResourceDefinitions().Get(ctx, rsc.Name)
@@ -119,11 +137,13 @@ func effectivePropsForResource(ctx context.Context, c client.Reader, st store.St
 	var (
 		rgProps map[string]string
 		rdProps map[string]string
+		rdOut   *apiv1.ResourceDefinition
 	)
 
 	switch {
 	case getRDErr == nil:
 		rdProps = rd.Props
+		rdOut = &rd
 
 		if rd.ResourceGroupName != "" {
 			rg, getRGErr := st.ResourceGroups().Get(ctx, rd.ResourceGroupName)
@@ -133,13 +153,13 @@ func effectivePropsForResource(ctx context.Context, c client.Reader, st store.St
 			case errors.Is(getRGErr, store.ErrNotFound):
 				// Soft-fail; surface a partial map.
 			default:
-				return nil, errors.Wrapf(getRGErr, "get ResourceGroup %q", rd.ResourceGroupName)
+				return nil, nil, errors.Wrapf(getRGErr, "get ResourceGroup %q", rd.ResourceGroupName)
 			}
 		}
 	case errors.Is(getRDErr, store.ErrNotFound):
 		// Soft-fail; the parent RD vanished — emit Controller + Resource only.
 	default:
-		return nil, errors.Wrapf(getRDErr, "get ResourceDefinition %q", rsc.Name)
+		return nil, nil, errors.Wrapf(getRDErr, "get ResourceDefinition %q", rsc.Name)
 	}
 
 	return buildEffectiveProps(
@@ -147,7 +167,7 @@ func effectivePropsForResource(ctx context.Context, c client.Reader, st store.St
 		effectiveScope{Props: rgProps, Scope: apiv1.EffectivePropScopeResourceGroup},
 		effectiveScope{Props: rdProps, Scope: apiv1.EffectivePropScopeResourceDefinition},
 		effectiveScope{Props: rsc.Props, Scope: apiv1.EffectivePropScopeResource},
-	), nil
+	), rdOut, nil
 }
 
 // controllerScopeProps fetches ControllerConfig.Spec.ExtraProps via

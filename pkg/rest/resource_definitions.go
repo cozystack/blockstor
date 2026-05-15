@@ -214,6 +214,20 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 95: refuse to create a LUKS-stacked RD when no encryption
+	// passphrase has been set on the controller scope. Without the
+	// passphrase the satellite's LUKS layer has no key material to
+	// seed `cryptsetup luksFormat` with, so the previous behaviour
+	// (silently dropping LUKS at the projection edge) hid the
+	// misconfiguration as plaintext-on-DRBD. A 400 here surfaces the
+	// missing prerequisite at the create call instead.
+	err = s.refuseLUKSWithoutPassphrase(r.Context(), rd.LayerStack)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
 	// Upstream LINSTOR parity: every RD belongs to an RG. The
 	// well-known DfltRscGrp serves as the catch-all for clients that
 	// don't specify one (linstor-csi, the legacy CSI shipper, manual
@@ -341,6 +355,63 @@ func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.Resource
 	rd.LayerStack = append([]string(nil), rg.SelectFilter.LayerStack...)
 
 	return nil
+}
+
+// drbdEncryptPassphraseKey is the upstream LINSTOR controller-scope
+// property the operator sets via `linstor controller set-property
+// DrbdOptions/EncryptPassphrase <passphrase>` to seed the cluster's
+// LUKS master key material. Bug 95 requires its presence as a hard
+// prerequisite for accepting an RD whose LayerStack carries LUKS —
+// without it, the satellite's `cryptsetup luksFormat` has no key to
+// format the volume with and the layer chain silently fell back to
+// plaintext-on-DRBD before this gate landed.
+//
+//nolint:gosec // prop key name, not a credential
+const drbdEncryptPassphraseKey = "DrbdOptions/EncryptPassphrase"
+
+// ErrLUKSRequiresPassphrase is the static sentinel surfaced as a 400
+// when an RD-create body asks for a LUKS layer but the controller
+// has no `DrbdOptions/EncryptPassphrase` set. Sentinel-shaped to
+// match the layer-validation style; the handler wraps it with the
+// human-readable remediation hint.
+var ErrLUKSRequiresPassphrase = errors.New(
+	"LUKS layer requires DrbdOptions/EncryptPassphrase to be set first")
+
+// refuseLUKSWithoutPassphrase rejects an RD-create whose LayerStack
+// includes LUKS when the controller-scope props bag has no
+// `DrbdOptions/EncryptPassphrase` set (Bug 95). Returns nil for the
+// happy path: non-LUKS stack, or LUKS stack with the prerequisite
+// already in place. The caller surfaces the returned error as a 400
+// so the operator sees the missing prerequisite immediately instead
+// of waiting for replicas to come up plaintext.
+//
+// Falls through (nil) when the controller client is unconfigured —
+// the test-only code paths that build a Server without a Client
+// can't read ControllerConfig anyway, and forcing a 400 there would
+// regress every unit-test that creates a LUKS RD against an in-memory
+// store. The k8s-deployed apiserver always has a real client wired.
+func (s *Server) refuseLUKSWithoutPassphrase(ctx context.Context, layers []string) error {
+	if !apiv1.LayerInStack(layers, apiv1.LayerKindLUKS) {
+		return nil
+	}
+
+	if s.Client == nil {
+		return nil
+	}
+
+	ctrl, err := controllerScopeProps(ctx, s.Client)
+	if err != nil {
+		return errors.Wrap(err, "read controller props for LUKS prereq check")
+	}
+
+	if ctrl[drbdEncryptPassphraseKey] != "" {
+		return nil
+	}
+
+	return errors.Wrapf(ErrLUKSRequiresPassphrase,
+		"run `linstor controller set-property %s <passphrase>` "+
+			"before creating a LUKS-layered RD",
+		drbdEncryptPassphraseKey)
 }
 
 // resourceDefinitionModifyBody is the shape upstream golinstor sends
