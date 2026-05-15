@@ -19,6 +19,7 @@ package drbd
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -167,12 +168,16 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 	return a.run(ctx, "resize", "--assume-clean", resource)
 }
 
-// SetGi pre-seeds this replica's DRBD metadata with the GI tuple of
-// an existing UpToDate peer, so DRBD's GI handshake on first connect
-// recognises the new replica as already-in-sync and skips the full
-// initial-sync. Must be called AFTER `create-md` (which writes the
-// fresh metadata block this then mutates) and BEFORE `drbdadm up`
-// (which reads the metadata into kernel state).
+// SetGi pre-seeds the per-peer GI slot in this replica's DRBD
+// metadata with the GI tuple of an existing UpToDate peer (or a
+// deterministic day0 seed for fresh thin/ZFS-backed RDs), so DRBD's
+// GI handshake on first connect recognises the new replica as
+// already-in-sync against that specific peer and skips the full
+// initial-sync.
+//
+// Must be called AFTER `create-md` (which writes the fresh metadata
+// block this then mutates) and BEFORE `drbdadm up` (which reads the
+// metadata into kernel state).
 //
 // The GI tuple format DRBD's `set-gi` accepts is
 // `<current>:<bitmap>:<history0>:<history1>`. We set both
@@ -181,16 +186,36 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 // to the peer". History is zeroed — DRBD's handshake never matches
 // against history when current+bitmap match, so it doesn't matter.
 //
+// DRBD 9.2+ requires `--node-id <peerNodeID>` because the current/
+// bitmap UUID tuple lives in a per-peer slot in the modern v09
+// metadata layout. Without `--node-id`, drbdmeta refuses the call
+// with "The set-gi command requires the --node-id option" (the
+// e2e regression guard pins the failure shape). The caller MUST
+// invoke SetGi once per peer node-id of the resource so every
+// peer's bitmap slot carries the matching tuple; this is what makes
+// the day0 skip-sync optimisation actually take effect on DRBD 9.2+.
+//
+// peerNodeID is the DRBD node-id of the peer whose slot is being
+// stamped. The value is the one the controller-side allocator wrote
+// onto `Resource.Status.DRBDNodeID` for that peer and that
+// dispatcher.BuildDesired propagated into
+// `DrbdOptions["peer.<name>.node-id"]` — keeping the .res render
+// and the set-gi call reading from the same authoritative map (so
+// the two satellites can't disagree about which bitmap slot a given
+// peer occupies).
+//
 // Tested via FakeExec capture in pkg/drbd/drbdadm_test.go and
 // pinned end-to-end in pkg/satellite/reconciler_drbd_test.go's
 // first-activation case.
-func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device, peerCurrentGi string) error {
+func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device string, peerNodeID int32, peerCurrentGi string) error {
 	target := fmt.Sprintf("%s/%d", resource, volume)
 	gi := fmt.Sprintf("%s:%s:0:0", peerCurrentGi, peerCurrentGi)
 
-	_, err := a.exec.Run(ctx, "drbdmeta", "--force", target, "v09", device, "internal", "set-gi", gi)
+	_, err := a.exec.Run(ctx,
+		"drbdmeta", "--force", target, "v09", device, "internal",
+		"set-gi", "--node-id", strconv.Itoa(int(peerNodeID)), gi)
 	if err != nil {
-		return errors.Wrapf(err, "drbdmeta set-gi %s", target)
+		return errors.Wrapf(err, "drbdmeta set-gi %s --node-id %d", target, peerNodeID)
 	}
 
 	return nil

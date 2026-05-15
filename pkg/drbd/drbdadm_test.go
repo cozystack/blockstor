@@ -190,24 +190,32 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 
 // TestAdmSetGiInvokesDrbdmeta pins the initial-sync skip seeding
 // command shape: `drbdmeta --force <res>/<vol> v09 <device>
-// internal set-gi <peer_gi>:<peer_gi>:0:0`. Phase 8.1.
+// internal set-gi --node-id <peer> <peer_gi>:<peer_gi>:0:0`.
 //
-// The format MUST be peer-gi twice (current_uuid + bitmap_uuid both
-// match the peer's current_uuid), then two zero history slots — a
-// regression that emits just the bare GI or that swaps current/
-// bitmap order would silently break the GI-handshake match and
-// re-introduce the full initial-sync this whole pipeline exists to
-// avoid.
+// Two invariants this regression guard pins:
+//
+//   - The GI tuple MUST be peer-gi twice (current_uuid + bitmap_uuid
+//     both match the peer's current_uuid), then two zero history
+//     slots. Swapping current/bitmap order or emitting a bare GI
+//     would silently break the GI-handshake match and re-introduce
+//     the full initial-sync the day0-skip pipeline exists to avoid.
+//
+//   - `--node-id <peer>` MUST be on the command line. DRBD 9.2+'s
+//     drbdmeta refuses the legacy single-call form with "The set-gi
+//     command requires the --node-id option" because the GI tuple
+//     lives in a per-peer bitmap slot in the modern v09 layout. A
+//     regression to the no-node-id shape would silently re-introduce
+//     a fall-through to the full initial-sync on DRBD 9.2+.
 func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", "78A0DDDABCDEF000")
+	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", 1, "78A0DDDABCDEF000")
 	if err != nil {
 		t.Fatalf("SetGi: %v", err)
 	}
 
-	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}

@@ -1155,6 +1155,15 @@ func (r *Reconciler) runFirstActivation(ctx context.Context, dr *intent.DesiredR
 }
 
 func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+	// peerNodeIDs is the deterministic peer-name → DRBD node-id map
+	// the dispatcher already materialised onto DrbdOptions["peer.
+	// <name>.node-id"] from each peer's controller-allocated
+	// Status.DRBDNodeID. Reading from the same source the .res
+	// renderer consumes guarantees both satellites stamp the same
+	// per-peer bitmap slots even when their reconciles race the
+	// fresh-allocation window.
+	peerNodeIDs := peerNodeIDsFromOpts(dr)
+
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
@@ -1166,27 +1175,81 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 			continue
 		}
 
-		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, seed)
-		// Bug 81: DRBD 9.2+'s drbdmeta requires --node-id on set-gi
-		// (the GI tuple is per-peer in modern metadata layouts). The
-		// current SetGi call is the legacy no-node-id form; on
-		// affected stands it returns
-		// "The set-gi command requires the --node-id option". Catch
-		// that specific error and downgrade to a log: skipping the
-		// day0 GI seed is safe — DRBD just falls through to a full
-		// initial sync on first connect, the slow-but-correct path.
-		// Proper fix (per-peer iteration with --node-id) is tracked
-		// as Bug 81 follow-up.
-		if err != nil && strings.Contains(err.Error(), "requires the --node-id option") {
-			err = nil
-		}
-
+		err := r.seedPerPeerGi(ctx, dr, vol, device, seed, peerNodeIDs)
 		if err != nil {
-			return errors.Wrapf(err, "set-gi vol %d", vol.GetVolumeNumber())
+			return err
 		}
 	}
 
 	return nil
+}
+
+// seedPerPeerGi stamps the day0/peer GI tuple into every peer's
+// bitmap slot for one (resource, volume) pair. DRBD 9.2+ stores
+// current/bitmap UUIDs per-peer (one slot per peer node-id), so
+// skipping the full initial-sync requires `drbdmeta set-gi
+// --node-id <peer>` to run once per peer with the same tuple. The
+// peer iteration order is GetPeers() (which the dispatcher sorted
+// for deterministic output, so both satellites visit slots in the
+// same order — keeps test assertions stable too).
+//
+// Returns the first non-nil error from drbdmeta. The "requires
+// --node-id" failure mode the legacy single-call form hit on DRBD
+// 9.2+ is now structurally unreachable: every call carries
+// `--node-id <peer>`.
+func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string, peerNodeIDs map[string]int32) error {
+	for _, peer := range dr.GetPeers() {
+		peerID, ok := peerNodeIDs[peer]
+		if !ok {
+			// Controller-side allocator hasn't stamped this peer's
+			// Status.DRBDNodeID yet — waitForControllerAllocation
+			// SHOULD have gated apply, but be defensive: skip the
+			// per-peer seed for this peer rather than emit a
+			// bogus --node-id=0 that would collide with the local
+			// slot. Next reconcile (driven by the peer's status
+			// update event) will retry with a real id.
+			continue
+		}
+
+		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, peerID, seed)
+		if err != nil {
+			return errors.Wrapf(err, "set-gi vol %d peer %s (node-id %d)",
+				vol.GetVolumeNumber(), peer, peerID)
+		}
+	}
+
+	return nil
+}
+
+// peerNodeIDsFromOpts extracts the peer-name → DRBD-node-id map
+// from a DesiredResource's flat DrbdOptions bag. The keys are the
+// `peer.<name>.node-id` entries dispatcher.BuildDesired's
+// addPeerEntries populates from each peer's
+// Status.DRBDNodeID. Bad / missing values are skipped (the caller
+// then leaves that peer's bitmap slot unseeded; DRBD falls through
+// to a real initial-sync on first connect with that peer — slow
+// but correct).
+func peerNodeIDsFromOpts(dr *intent.DesiredResource) map[string]int32 {
+	opts := dr.GetDrbdOptions()
+	peers := dr.GetPeers()
+
+	out := make(map[string]int32, len(peers))
+
+	for _, peer := range peers {
+		raw, ok := opts["peer."+peer+".node-id"]
+		if !ok || raw == "" {
+			continue
+		}
+
+		id, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			continue
+		}
+
+		out[peer] = int32(id)
+	}
+
+	return out
 }
 
 // resolveSeedGi decides what GI to stamp on a fresh replica's

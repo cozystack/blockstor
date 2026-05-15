@@ -1796,6 +1796,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 		{
 			Name:     "pvc-seed",
 			NodeName: "n1",
+			Peers:    []string{"n2"},
 			Volumes: []*intent.DesiredVolume{
 				{
 					VolumeNumber: 0,
@@ -1806,6 +1807,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 			},
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
 			},
 		},
 	})
@@ -1837,8 +1839,10 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	}
 
 	// Pin the exact GI tuple shape so the seed gets the peer's
-	// current_uuid in BOTH current_uuid and bitmap_uuid slots.
-	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	// current_uuid in BOTH current_uuid and bitmap_uuid slots,
+	// stamped via `set-gi --node-id <peer>` (DRBD 9.2+ per-peer
+	// slot layout).
+	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
 	if !slices.Contains(calls, wantSetGi) {
 		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGi, calls)
 	}
@@ -2228,11 +2232,13 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 				{
 					Name:     "pvc-zskip",
 					NodeName: "n1",
+					Peers:    []string{"n2"},
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: tc.poolName},
 					},
 					DrbdOptions: map[string]string{
 						"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+						"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
 					},
 				},
 			})
@@ -2264,17 +2270,136 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			}
 
 			// Pin the exact day0 GI shape: same current_uuid in BOTH
-			// current_uuid and bitmap_uuid slots, history zeroed. The
-			// satellite derives day0 deterministically from RD name +
-			// volume number — keep the expected value in sync with
+			// current_uuid and bitmap_uuid slots, history zeroed,
+			// stamped via `set-gi --node-id <peer>` (DRBD 9.2+
+			// per-peer slot layout). The satellite derives day0
+			// deterministically from RD name + volume number — keep
+			// the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi %s:%s:0:0",
+			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:%s:0:0",
 				tc.wantDevice, day0, day0)
 			if !slices.Contains(calls, wantSetGi) {
 				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGi, calls)
 			}
 		})
+	}
+}
+
+// TestApplyFirstActivationSeedsEveryPeerSlotConsistently pins the
+// race-free per-peer GI-seed invariant: on a multi-peer fresh RD,
+// the satellite's first-activation pass MUST stamp a `drbdmeta
+// set-gi --node-id <P>` call for EVERY peer's bitmap slot using
+// the deterministic peer-id map the controller already wrote onto
+// each peer's Status.DRBDNodeID and the dispatcher propagated into
+// DrbdOptions["peer.<name>.node-id"]. Reading from the same
+// authoritative source the .res renderer consumes guarantees both
+// satellites of a fresh RD converge on the same per-peer slot
+// stamps — so DRBD's first-connect GI handshake on every peer-pair
+// matches and the full initial-sync is skipped on every side.
+//
+// Before the fix, seedInitialGi called the legacy single-call
+// SetGi with no `--node-id`, which on DRBD 9.2+ failed with "The
+// set-gi command requires the --node-id option" and was silently
+// downgraded to a no-op — leaving every peer bitmap slot
+// unseeded, so the GI handshake mismatched and the full initial-
+// sync ran on first connect (defeating the day0-skip
+// optimisation). The 3-replica case below exercises that exact
+// regression: we assert two distinct `set-gi --node-id <P>`
+// invocations land — one per peer — both carrying the identical
+// day0 tuple. A regression that emits only one (or none) re-
+// introduces the broken behaviour the fix exists to prevent.
+func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-race_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-race_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-race_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// 3-replica fresh RD; the controller has allocated node-ids
+	// 0/1/2 deterministically (smallest-free per RD). The
+	// satellite on n1 (id=0) must stamp both peer slots — n2's
+	// (id=1) AND n3's (id=2) — with the SAME day0 tuple.
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-race",
+			NodeName: "n1",
+			Peers:    []string{"n2", "n3"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
+				"peer.n3.port": "7000", "peer.n3.node-id": "2", "peer.n3.address": "10.0.0.3",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+	day0 := satellite.Day0GiForTest("pvc-race", 0)
+
+	// Both peer slots must be stamped, with the identical tuple,
+	// via `set-gi --node-id <peer-id>`. The peer order in the
+	// emitted call sequence MUST follow GetPeers() iteration
+	// (n2 → n3) so both satellites visit slots in the same order
+	// (eliminates an FS-write ordering source of divergence).
+	wantN2 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:%s:0:0", day0, day0)
+	wantN3 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:%s:0:0", day0, day0)
+
+	if !slices.Contains(calls, wantN2) {
+		t.Errorf("missing per-peer set-gi for n2 (node-id 1): want %q in calls: %v", wantN2, calls)
+	}
+
+	if !slices.Contains(calls, wantN3) {
+		t.Errorf("missing per-peer set-gi for n3 (node-id 2): want %q in calls: %v", wantN3, calls)
+	}
+
+	// Regression guard: any `drbdmeta ... set-gi ...` call WITHOUT
+	// `--node-id` re-introduces the silent fallback the fix exists
+	// to prevent.
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "drbdmeta") {
+			continue
+		}
+
+		if !strings.Contains(c, "set-gi") {
+			continue
+		}
+
+		if !strings.Contains(c, "--node-id ") {
+			t.Errorf("drbdmeta set-gi call without --node-id (DRBD 9.2+ regression): %q", c)
+		}
+	}
+
+	// Ordering: both per-peer set-gi calls land between create-md
+	// and adjust (drbdmeta must not run on a non-existent or
+	// already-attached metadata block).
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-race", drbd.MaxPeers-1))
+	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-race")
+
+	for _, want := range []string{wantN2, wantN3} {
+		idx := slices.Index(calls, want)
+		if idx < 0 {
+			continue // already reported above
+		}
+
+		if createMD >= idx || idx >= adjust {
+			t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending) for %q",
+				createMD, idx, adjust, want)
+		}
 	}
 }
 
