@@ -624,3 +624,198 @@ func TestSnapshotDeleteScenarioW02IdempotentOnAbsentFinalizer(t *testing.T) {
 			fx.CommandLines())
 	}
 }
+
+// TestSnapshotReconcileStampsNodeStatusOnSuccess is the Bug 106
+// regression guard: when Apply.CreateSnapshot returns Ok=true, the
+// SnapshotReconciler MUST upsert our node's entry in
+// Status.NodeStatus with Ready=true and a non-zero CreateTimestamp.
+//
+// Why this matters: the apiserver's `stampSnapshotSuccessful`
+// derivation (commit 3c593c5f7) walks `Snapshots[].CreateTimestamp`
+// to decide whether every diskful peer reported back, and the
+// store-side projection in pkg/store/k8s/snapshots.go reads
+// `crd.Status.NodeStatus[i].CreateTimestamp` to populate it. Before
+// this stamp landed, no code path ever wrote to Status.NodeStatus
+// on success, so the wire field stayed zero, the apiserver's
+// success denominator never closed, and `linstor s l` rendered
+// State=Incomplete forever on a perfectly-materialised snapshot.
+//
+// Setup mirrors TestSnapshotReconcileDrainsOnDelete's seed (one
+// thin-pool provider on n1, RD `pvc-1` already applied) but with
+// a fresh Snapshot whose `lvcreate --snapshot` succeeds —
+// reproducing the production "happy-path snapshot on a 2-diskful
+// + 1-tiebreaker topology hangs in Incomplete" trace.
+func TestSnapshotReconcileStampsNodeStatusOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-1.snap-1",
+			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1", "n2"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(snap).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Seed: lvs returns empty so the seed CreateVolume pass runs.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Snapshot path: lvcreate --snapshot succeeds.
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	rec := seedThinResource(t, fx, "pvc-1", "thin1")
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    rec,
+			Exec:     fx,
+		},
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if result.RequeueAfter > 0 {
+		t.Errorf("successful snapshot should NOT requeue; got %+v", result)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// FAILED must not leak onto the success path.
+	if slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+		t.Errorf("Status.Flags carries FAILED on success: %+v", got.Status.Flags)
+	}
+
+	// Bug 106 wire-shape assertion: our node's NodeStatus entry MUST
+	// exist with Ready=true and a non-zero CreateTimestamp so the
+	// apiserver's success derivation can flip State to "Successful".
+	if len(got.Status.NodeStatus) != 1 {
+		t.Fatalf("Status.NodeStatus: got %d entries, want 1 (the n1 stamp). full: %+v",
+			len(got.Status.NodeStatus), got.Status.NodeStatus)
+	}
+
+	entry := got.Status.NodeStatus[0]
+	if entry.NodeName != "n1" {
+		t.Errorf("Status.NodeStatus[0].NodeName: got %q, want n1", entry.NodeName)
+	}
+
+	if !entry.Ready {
+		t.Errorf("Status.NodeStatus[0].Ready: got false, want true (Bug 106: success not visible to apiserver)")
+	}
+
+	if entry.CreateTimestamp == 0 {
+		t.Errorf("Status.NodeStatus[0].CreateTimestamp: got 0; apiserver's `s l` will stay Incomplete")
+	}
+}
+
+// TestSnapshotReconcileNodeStatusIdempotentRestamp pins the
+// "already-stamped" short-circuit: re-running Reconcile on a
+// Snapshot whose Status.NodeStatus already carries our entry
+// with the same CreateTimestamp MUST NOT trigger another
+// Status().Update — pointless ResourceVersion churn and a
+// retry-budget burner on the satellite. Conditional on the
+// satellite's CreateSnapshot still returning Ok=true on a
+// second invocation (which it does — `lvcreate --snapshot` on
+// an existing LV is the provider's idempotent path).
+func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
+	t.Parallel()
+
+	scheme := newSnapshotScheme(t)
+
+	// Pre-stamp Status.NodeStatus with a synthetic timestamp so we
+	// can detect whether the second pass replaced it (it shouldn't:
+	// the satellite reconciler picks `time.Now().Unix()` afresh on
+	// every CreateSnapshot, so a re-stamp would change the value
+	// and the assertion below would fire).
+	const seedTimestamp int64 = 1714000000
+
+	snap := &blockstoriov1alpha1.Snapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "pvc-1.snap-1",
+			Finalizers: []string{controllers.SatelliteSnapshotFinalizer},
+		},
+		Spec: blockstoriov1alpha1.SnapshotSpec{
+			ResourceDefinitionName: "pvc-1",
+			SnapshotName:           "snap-1",
+			Nodes:                  []string{"n1"},
+		},
+		Status: blockstoriov1alpha1.SnapshotStatus{
+			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
+				{NodeName: "n1", Ready: true, CreateTimestamp: seedTimestamp},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.Snapshot{}).
+		WithObjects(snap).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// Seed lvs response + lvcreate --snapshot success.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Provider is idempotent — lvcreate on an existing LV returns
+	// success without re-running, mimicking the production short-circuit.
+	fx.Expect("lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --name pvc-1_snap-1_00000 vg/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	rec := seedThinResource(t, fx, "pvc-1", "thin1")
+
+	reconciler := &controllers.SnapshotReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    rec,
+			Exec:     fx,
+		},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "pvc-1.snap-1"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Snapshot
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "pvc-1.snap-1"}, &got)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if len(got.Status.NodeStatus) != 1 {
+		t.Fatalf("Status.NodeStatus: got %d entries, want 1", len(got.Status.NodeStatus))
+	}
+
+	if got.Status.NodeStatus[0].CreateTimestamp != seedTimestamp {
+		t.Errorf("Status.NodeStatus[0].CreateTimestamp: got %d, want %d (idempotent re-stamp must skip the update)",
+			got.Status.NodeStatus[0].CreateTimestamp, seedTimestamp)
+	}
+}

@@ -160,6 +160,22 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	if resp.GetOk() {
+		// Bug 106: stamp the per-node success entry on
+		// Status.NodeStatus so the apiserver's
+		// `stampSnapshotSuccessful` derivation can flip the
+		// snapshot from "Incomplete" to "Successful" once every
+		// diskful peer reports back. Without this stamp the wire
+		// view's `snapshots[].create_timestamp` stays zero, the
+		// apiserver's success denominator never closes, and
+		// `linstor s l` hangs in `Incomplete` forever — even on a
+		// fully-materialised snapshot (the 3c593c5f7 fix shipped
+		// the apiserver-side derivation but bet on a stamp that
+		// no code path was actually writing).
+		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
 		return ctrl.Result{}, nil
 	}
 
@@ -194,6 +210,131 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// stampSnapshotPerNodeReady upserts our node's entry in
+// Status.NodeStatus with Ready=true and the satellite-reported
+// CreateTimestamp. This is the missing half of the Bug 106 fix:
+// the apiserver's `stampSnapshotSuccessful` derivation reads
+// `Snapshots[].CreateTimestamp` to decide whether every diskful
+// peer reported back, and without this write nothing ever populates
+// it (commit 3c593c5f7 shipped the apiserver-side derivation but
+// no code path was writing the stamp). Once every diskful peer has
+// upserted, the apiserver flips the snapshot from "Incomplete" to
+// "Successful" in the wire view.
+//
+// Concurrent satellites race against each other on the same Status
+// subresource — the optimistic-lock conflict is retried up to
+// snapshotStatusUpdateRetries times against a fresh fetch, which
+// converges in well under a second on a 3-node stand. After the
+// retry budget the caller's outer reconcile rate-limiter backs off
+// and we try again on the next pass.
+func (r *SnapshotReconciler) stampSnapshotPerNodeReady(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, createTimestamp int64,
+) error {
+	key := client.ObjectKeyFromObject(snap)
+
+	for attempt := range snapshotStatusUpdateRetries {
+		_ = attempt
+
+		var current blockstoriov1alpha1.Snapshot
+
+		err := r.Get(ctx, key, &current)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				// Snapshot vanished mid-reconcile — nothing to stamp.
+				return nil
+			}
+
+			return errors.Wrap(err, "get Snapshot for NodeStatus stamp")
+		}
+
+		if perNodeStatusReady(current.Status.NodeStatus, r.Config.NodeName) {
+			// Idempotent: another reconcile pass on this satellite
+			// already wrote our entry. Skip the update so we don't
+			// touch ResourceVersion needlessly.
+			return nil
+		}
+
+		current.Status.NodeStatus = upsertPerNodeStatus(
+			current.Status.NodeStatus, r.Config.NodeName, createTimestamp)
+
+		err = r.Status().Update(ctx, &current)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return errors.Wrap(err, "stamp Status.NodeStatus")
+		}
+
+		// Conflict — sibling satellite raced our write. Re-fetch
+		// and try again. The loop budget bounds the worst case.
+	}
+
+	return errors.New("Status.NodeStatus update conflicted out of retries")
+}
+
+// snapshotStatusUpdateRetries bounds the optimistic-lock retry
+// loop in stampSnapshotPerNodeReady. Three retries cover the
+// 3-node stand's worst case (every other satellite writes
+// between our fetch and our update); beyond that we yield to the
+// outer reconcile rate limiter rather than hot-spinning.
+const snapshotStatusUpdateRetries = 5
+
+// perNodeStatusReady reports whether the NodeStatus slice already
+// carries our entry with Ready=true and a non-zero CreateTimestamp.
+// Used to skip no-op Status().Update calls on a satellite that has
+// already stamped its row — the satellite picks `time.Now().Unix()`
+// afresh on every CreateSnapshot, so comparing exact timestamps
+// would defeat the idempotence guard. The Ready+timestamp pair is
+// what the apiserver's success derivation actually reads, so any
+// non-zero stamp keeps the wire shape correct.
+func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	for i := range entries {
+		if entries[i].NodeName != nodeName {
+			continue
+		}
+
+		return entries[i].Ready && entries[i].CreateTimestamp != 0
+	}
+
+	return false
+}
+
+// upsertPerNodeStatus returns a copy of the NodeStatus slice with
+// our entry either replaced (matching NodeName found) or appended.
+// Preserves the existing slice order so concurrent siblings see a
+// stable view in the conflict-retry race.
+func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string, createTimestamp int64) []blockstoriov1alpha1.SnapshotPerNodeStatus {
+	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries)+1)
+	replaced := false
+
+	for i := range entries {
+		if entries[i].NodeName == nodeName {
+			out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
+				NodeName:        nodeName,
+				Ready:           true,
+				CreateTimestamp: createTimestamp,
+			})
+
+			replaced = true
+
+			continue
+		}
+
+		out = append(out, entries[i])
+	}
+
+	if !replaced {
+		out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
+			NodeName:        nodeName,
+			Ready:           true,
+			CreateTimestamp: createTimestamp,
+		})
+	}
+
+	return out
 }
 
 // handleDelete mirrors handleCreate for the DeletionTimestamp

@@ -252,8 +252,14 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 	}
 
 	return &intent.CreateSnapshotResponse{
-		Ok:                  true,
-		CreateTimestampUnix: time.Now().Unix(),
+		Ok: true,
+		// Upstream LINSTOR's OpenAPI declares
+		// `create_timestamp` as **milliseconds** since unix
+		// epoch in UTC (pkg/api/openapi/types.gen.go), and the
+		// python CLI's `linstor s l` "CreatedOn" column divides
+		// by 1000 before formatting. UnixMilli matches; Unix
+		// (seconds) would render the stamp as 1970-01-21.
+		CreateTimestampUnix: time.Now().UnixMilli(),
 	}, nil
 }
 

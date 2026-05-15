@@ -184,6 +184,14 @@ var volatileTopLevel = map[string]struct{}{ //nolint:gochecknoglobals // table-d
 	// here. Drop both sides; the wire-shape contract is fine
 	// without it.
 	"is_active": {},
+	// `effective_props` is blockstor's inherited-prop view
+	// (Bug 105 fix): the merged Controller→RG→RD scope-tagged
+	// map stamped on RD GET / List responses so `linstor rd lp`
+	// surfaces inherited keys. Upstream LINSTOR doesn't emit this
+	// field on the same endpoint, so the oracle trace doesn't
+	// carry it — dropping it from the diff keeps the contract
+	// stable while still letting `props` round-trip-check pass.
+	"effective_props": {},
 }
 
 func scrubWith(value any, opts NormalizeOptions) any {
