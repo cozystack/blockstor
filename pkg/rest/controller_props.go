@@ -81,7 +81,15 @@ func (s *Server) handleControllerPropsGet(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	writeJSON(w, http.StatusOK, props)
+	// Bug 115: never let `DrbdOptions/EncryptPassphrase` (or any
+	// deny-listed sensitive key) leak through the read-only `c lp`
+	// surface. readControllerProps returns the live backing map —
+	// copy before mutating so a future caller (or a sibling handler
+	// in the same request) that re-reads gets the un-redacted view.
+	wire := maps.Clone(props)
+	redactSensitiveProps(wire)
+
+	writeJSON(w, http.StatusOK, wire)
 }
 
 // handleControllerPropsModify applies an OverrideProps /

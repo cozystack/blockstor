@@ -162,8 +162,20 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	}
 
 	if len(eff) > 0 {
+		// Bug 115: scrub deny-listed sensitive keys before exposing
+		// the inheritance-merged view on `/v1/view/resources`. Without
+		// this, an operator with read-only LINSTOR access could grep
+		// `DrbdOptions/EncryptPassphrase` out of the per-replica
+		// effective_props bag.
+		redactSensitiveEffectiveProps(eff)
 		rwv.EffectiveProps = eff
 	}
+
+	// Bug 115 sibling: the bare per-resource Props map (rsc.Props)
+	// can also carry an Aux/secret* override; redact in place so the
+	// wire view stays clean even on RDs that locally stamped a
+	// sensitive key.
+	redactSensitiveProps(rwv.Props)
 
 	s.stampSuspendedOnLUKS(&rwv)
 

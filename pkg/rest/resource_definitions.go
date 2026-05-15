@@ -180,6 +180,17 @@ func (s *Server) stampRDEffectiveProps(ctx context.Context, rd *apiv1.ResourceDe
 		rd.Props[key] = entry.Value
 	}
 
+	// Bug 115: scrub sensitive controller-scope keys (passphrase,
+	// password, shared-secret, cram-hmac-alg, ...) from both the
+	// inlined `props` map AND the scope-annotated `effective_props`
+	// bag before they cross the REST boundary. Inheritance is still
+	// surfaced — operators see that the prop IS set, just not the
+	// secret material. Applied here (after the inheritance merge)
+	// so every read-side handler that re-uses stampRDEffectiveProps
+	// inherits the redaction for free.
+	redactSensitiveProps(rd.Props)
+	redactSensitiveEffectiveProps(rd.EffectiveProps)
+
 	return nil
 }
 
