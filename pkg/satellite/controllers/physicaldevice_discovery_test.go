@@ -633,3 +633,81 @@ func TestScanOnceFiltersDRBDDevices(t *testing.T) {
 		t.Errorf("Bug 72 regression: real disk dropped along with DRBD")
 	}
 }
+
+// TestReconcilerSkipsDevicesClaimedByStoragePool pins Bug 91: when
+// a local StoragePool's `StoragePoolAnnotationAttachedKNames`
+// annotation lists a kname, the discovery loop MUST NOT publish a
+// PhysicalDevice CRD for that kname even if lsblk still surfaces
+// the device (with or without an on-disk signature). Without this
+// skip, every tick after `ps cdp` would re-create a Free=False CRD
+// for the device the operator just consumed into a pool.
+func TestReconcilerSkipsDevicesClaimedByStoragePool(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	// Pre-existing StoragePool on this node that claims `sda` via
+	// the annotation a satellite reconciler would have stamped after
+	// a successful attach.
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "lvm-thin.n1",
+			Annotations: map[string]string{
+				blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames: "sda",
+			},
+		},
+		Spec: blockstoriov1alpha1.StoragePoolSpec{
+			NodeName:     "n1",
+			PoolName:     "lvm-thin",
+			ProviderKind: "LVM_THIN",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(pool).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	// lsblk surfaces both sda (claimed by SP) and sdb (free).
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{
+		Stdout: []byte(
+			lsblkRow("sda", "sda", "1000204886016", "lvm2_member", "disk", "", "0xWWN-A", "DISK_A", "SN-A", "0", "sata") + "\n" +
+				lsblkRow("sdb", "sdb", "2000398934016", "", "disk", "", "0xWWN-B", "DISK_B", "SN-B", "0", "sata") + "\n"),
+	})
+
+	// Signature probes should fire only for sdb — sda is short-
+	// circuited by the claimed-kname filter before probeFree runs.
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdmeta 0 v09 /dev/sdb internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+	fx.Expect("wipefs -n /dev/sdb", storage.FakeResponse{Stdout: []byte("")})
+
+	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
+	if err != nil {
+		t.Fatalf("scanOnce: %v", err)
+	}
+
+	var list blockstoriov1alpha1.PhysicalDeviceList
+	if err := cli.List(t.Context(), &list,
+		client.MatchingLabels{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"}); err != nil {
+		t.Fatalf("list PhysicalDevices: %v", err)
+	}
+
+	got := indexByKName(list.Items)
+
+	if got["sda"] != nil {
+		t.Errorf("Bug 91: sda was claimed by StoragePool annotation but discovery published a CRD anyway: %+v", got["sda"])
+	}
+
+	if got["sdb"] == nil {
+		t.Errorf("Bug 91 regression: free sdb wrongly suppressed alongside claimed sda")
+	}
+}

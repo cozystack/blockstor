@@ -20,6 +20,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// StoragePoolAnnotationAttachedKNames is the metadata.annotation key
+// the satellite's PhysicalDeviceReconciler stamps after a successful
+// attach, listing the lsblk kernel name(s) of the underlying device(s)
+// that back the pool. Comma-separated when multiple devices contribute
+// (future multi-vdev pools).
+//
+// Read by the satellite's PhysicalDeviceDiscoveryRunnable so the
+// per-tick `lsblk` rescan does NOT re-create a PhysicalDevice CRD for
+// a device that's already been consumed into a StoragePool — the CRD's
+// "candidate" role ends at attach, the annotation makes that contract
+// machine-readable for discovery without parsing `pvs` / `zpool list`
+// output again. Bug 91.
+const StoragePoolAnnotationAttachedKNames = "blockstor.io/attached-knames"
+
 // StoragePoolSpec is the desired state of a LINSTOR storage pool.
 //
 // LINSTOR storage pools are keyed by (node_name, pool_name); a single CRD

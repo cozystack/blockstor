@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -233,6 +234,19 @@ func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstor
 
 	r.Config.Apply.RegisterProvider(result.PoolName, provider)
 
+	// Record this device's kernel name on the target
+	// StoragePool so the satellite's discovery loop knows the
+	// device has been consumed and stops re-publishing a Free=False
+	// PhysicalDevice CRD for it on every lsblk pass. Best-effort —
+	// a transient apiserver failure here doesn't roll back the
+	// already-completed pool create; the next reconcile / discovery
+	// tick re-runs the stamp. See Bug 91 retro.
+	err = r.recordAttachedKName(ctx, dev, result.PoolName)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "record attached kname on StoragePool",
+			"physicaldevice", dev.Name, "storagepool", result.PoolName)
+	}
+
 	// Strip our finalizer BEFORE Delete; otherwise the apiserver
 	// keeps the CRD around with a DeletionTimestamp until the
 	// next reconcile pass, leaving a window where
@@ -254,6 +268,102 @@ func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstor
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// recordAttachedKName stamps the lsblk kernel name of `dev` onto the
+// target StoragePool's `StoragePoolAnnotationAttachedKNames`
+// annotation so the discovery loop can skip re-publishing a
+// PhysicalDevice CRD for this device after attach (Bug 91). Idempotent
+// — re-recording an already-present kname no-ops at the apiserver.
+//
+// The kname is the leaf of `Status.DevicePath` (e.g. `/dev/sdb` →
+// `sdb`); falls back to `Status.CurrentDevPath` since some discovery
+// paths leave DevicePath empty until the next tick. Returns nil and
+// skips the write for FILE/FILE_THIN pools, which carry no underlying
+// kname (directory-backed).
+func (r *PhysicalDeviceReconciler) recordAttachedKName(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice, poolName string) error {
+	kname := extractKName(dev)
+	if kname == "" {
+		return nil
+	}
+
+	var pools blockstoriov1alpha1.StoragePoolList
+
+	err := r.List(ctx, &pools)
+	if err != nil {
+		return errors.Wrap(err, "list StoragePool")
+	}
+
+	var target *blockstoriov1alpha1.StoragePool
+
+	for i := range pools.Items {
+		p := &pools.Items[i]
+		if p.Spec.PoolName == poolName && p.Spec.NodeName == r.Config.NodeName {
+			target = p
+
+			break
+		}
+	}
+
+	if target == nil {
+		return errors.Errorf("target StoragePool %q not found on node %q", poolName, r.Config.NodeName)
+	}
+
+	if target.Annotations == nil {
+		target.Annotations = map[string]string{}
+	}
+
+	existing := target.Annotations[blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames]
+	if knameInList(existing, kname) {
+		return nil
+	}
+
+	if existing == "" {
+		target.Annotations[blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames] = kname
+	} else {
+		target.Annotations[blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames] = existing + "," + kname
+	}
+
+	err = r.Update(ctx, target)
+	if err != nil {
+		return errors.Wrap(err, "annotate StoragePool with attached kname")
+	}
+
+	return nil
+}
+
+// extractKName returns the lsblk kernel name (e.g. `sdb`) the
+// PhysicalDevice was published from. Strips the `/dev/` prefix off
+// `Status.DevicePath`, falling back to `Status.CurrentDevPath`. Empty
+// when the CRD has no resolved device path (FILE pool / pre-discovery
+// race).
+func extractKName(dev *blockstoriov1alpha1.PhysicalDevice) string {
+	for _, p := range []string{dev.Status.DevicePath, dev.Status.CurrentDevPath} {
+		kname := strings.TrimPrefix(p, "/dev/")
+		if kname != "" && kname != p {
+			// Strip ran — value started with `/dev/`. Keep it.
+			return kname
+		}
+	}
+
+	return ""
+}
+
+// knameInList returns true when `kname` is already a comma-separated
+// element of `list`. The annotation is the source of truth on which
+// devices belong to a pool; idempotency probe before append.
+func knameInList(list, kname string) bool {
+	if list == "" {
+		return false
+	}
+
+	for item := range strings.SplitSeq(list, ",") {
+		if strings.TrimSpace(item) == kname {
+			return true
+		}
+	}
+
+	return false
 }
 
 // stripAttachFinalizer removes our finalizer from the CRD when

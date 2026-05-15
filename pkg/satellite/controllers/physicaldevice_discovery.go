@@ -20,6 +20,7 @@ import (
 	"context"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -199,6 +200,23 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 	// happily attaches the disk and corrupts the running root FS.
 	busyChildren := collectBusyChildren(rows)
 
+	// Build the set of knames already claimed by a local
+	// StoragePool (Bug 91). The PhysicalDeviceReconciler stamps the
+	// device's kname on the SP's annotation after a successful
+	// attach; without this filter the next discovery tick would
+	// publish a fresh Free=False PhysicalDevice CRD for the same
+	// device on every pass, polluting `linstor ps l` skip-logic and
+	// every operator-facing view that iterates raw-device candidates.
+	attachedKNames, err := p.attachedKNamesForNode(ctx)
+	if err != nil {
+		logger.Error(err, "list StoragePool for attached-kname filter")
+		// Continue without the filter — a transient apiserver hiccup
+		// MUST NOT stop discovery; the worst case is one extra
+		// Free=False CRD for an already-attached device, which the
+		// next tick reaps once the apiserver recovers.
+		attachedKNames = map[string]struct{}{}
+	}
+
 	discovered := map[string]struct{}{}
 
 	for i := range rows {
@@ -213,6 +231,16 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 		// wipe. Exclude them here, mirroring upstream LINSTOR's
 		// LsBlkUtils.filterDeviceCandidates.
 		if row.Major == satellite.MajorDRBD {
+			continue
+		}
+
+		// Skip devices already consumed into a local
+		// StoragePool. Without this filter the discovery loop would
+		// re-create a Free=False PhysicalDevice CRD for the device
+		// on every tick after attach, perpetuating the lifecycle
+		// gap the PhysicalDeviceReconciler's delete-as-completion
+		// call was meant to fix. See Bug 91 retro.
+		if _, claimed := attachedKNames[row.KName]; claimed {
 			continue
 		}
 
@@ -481,6 +509,45 @@ func buildDiscoveryStatus(nodeName, stableID, devicePath, currentDevPath string,
 			},
 		},
 	}
+}
+
+// attachedKNamesForNode returns the set of lsblk kernel names
+// already consumed into a local StoragePool on this satellite's
+// node. The PhysicalDeviceReconciler stamps each device's kname
+// on the SP's `StoragePoolAnnotationAttachedKNames` annotation as
+// the final step of a successful attach; the discovery loop reads
+// that annotation here to decide which lsblk rows to skip on the
+// next tick. Bug 91.
+func (p *PhysicalDeviceDiscoveryRunnable) attachedKNamesForNode(ctx context.Context) (map[string]struct{}, error) {
+	out := map[string]struct{}{}
+
+	var pools blockstoriov1alpha1.StoragePoolList
+
+	err := p.Client.List(ctx, &pools)
+	if err != nil {
+		return nil, errors.Wrap(err, "list StoragePool")
+	}
+
+	for i := range pools.Items {
+		pool := &pools.Items[i]
+		if pool.Spec.NodeName != p.NodeName {
+			continue
+		}
+
+		raw := pool.Annotations[blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames]
+		if raw == "" {
+			continue
+		}
+
+		for kname := range strings.SplitSeq(raw, ",") {
+			trimmed := strings.TrimSpace(kname)
+			if trimmed != "" {
+				out[trimmed] = struct{}{}
+			}
+		}
+	}
+
+	return out, nil
 }
 
 // pruneDisappeared deletes PhysicalDevice CRDs for devices that

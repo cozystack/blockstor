@@ -280,3 +280,95 @@ func TestPhysicalDeviceReconcileStripsFinalizerOnDelete(t *testing.T) {
 		t.Errorf("finalizer still present after delete-on-mid-attach: %v", got.Finalizers)
 	}
 }
+
+// TestPhysicalDeviceReconcileReapsCRDAfterAttach pins Bug 91: a
+// successful attach end-to-end must (1) stamp the device's kname on
+// the target StoragePool's `StoragePoolAnnotationAttachedKNames`
+// annotation so the discovery loop knows the device has been
+// consumed, and (2) Delete the PhysicalDevice CRD as the
+// delete-as-completion signal. Without (1) the discovery loop's
+// next tick republishes a Free=False PhysicalDevice CRD for the
+// same kname on every pass, polluting `linstor ps l`.
+func TestPhysicalDeviceReconcileReapsCRDAfterAttach(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "n1.wwn-0xDEADBEEF",
+			Labels:     map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"},
+			Finalizers: []string{controllers.PhysicalDeviceAttachFinalizer},
+		},
+		Spec: blockstoriov1alpha1.PhysicalDeviceSpec{
+			AttachTo: &blockstoriov1alpha1.AttachToPool{
+				StoragePoolName: "lvm-thin",
+				ProviderKind:    "LVM_THIN",
+				VGName:          "vg",
+				ThinPoolName:    "tp",
+			},
+		},
+		Status: blockstoriov1alpha1.PhysicalDeviceStatus{
+			NodeName:   "n1",
+			DevicePath: "/dev/sdb",
+			Phase:      blockstoriov1alpha1.PhysicalDevicePhaseAttaching,
+		},
+	}
+
+	// Target StoragePool exists (passes the Step-4 race-matrix
+	// gate) so the reconciler runs the full Attach path through
+	// to the kname-stamp + Delete steps.
+	pool := &blockstoriov1alpha1.StoragePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "lvm-thin.n1"},
+		Spec: blockstoriov1alpha1.StoragePoolSpec{
+			NodeName:     "n1",
+			PoolName:     "lvm-thin",
+			ProviderKind: "LVM_THIN",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(dev, pool).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	reconciler := &controllers.PhysicalDeviceReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    newSatelliteReconcilerForTests(),
+			Exec:     storage.NewFakeExec(),
+		},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "n1.wwn-0xDEADBEEF"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// (1) PhysicalDevice CRD must be gone — delete-as-completion.
+	var pdGet blockstoriov1alpha1.PhysicalDevice
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "n1.wwn-0xDEADBEEF"}, &pdGet)
+	if err == nil {
+		t.Errorf("PhysicalDevice still present after successful attach (Bug 91); got %+v", pdGet)
+	}
+
+	// (2) StoragePool must carry the attached-kname annotation so
+	// the discovery loop skips the device on its next tick.
+	var poolGet blockstoriov1alpha1.StoragePool
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: "lvm-thin.n1"}, &poolGet)
+	if err != nil {
+		t.Fatalf("get StoragePool: %v", err)
+	}
+
+	got := poolGet.Annotations[blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames]
+	if got != "sdb" {
+		t.Errorf("StoragePool annotation %s: got %q, want %q (kname of /dev/sdb)",
+			blockstoriov1alpha1.StoragePoolAnnotationAttachedKNames, got, "sdb")
+	}
+}
