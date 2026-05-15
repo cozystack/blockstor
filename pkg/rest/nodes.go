@@ -19,9 +19,11 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -535,8 +537,47 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 // surfaced as a fatal `ParseError` instead of the intended no-op.
 // Folding NotFound into a 200 + warn-mask envelope keeps the retry
 // loop exit-0 on the second call.
+//
+// Refuses with 409 + FAIL_IN_USE (Bug 92) when any Resource CRD
+// still references the node. The previous behaviour wrote SUCCESS
+// while leaving `<rd>.<node>` Resource CRDs alive: the controller
+// "forgot" the satellite (`n l` dropped it), but the satellite Pod
+// and its DRBD kernel state stayed up, and `n restore` returned
+// `object not found` — no path back. Mirrors handleNodeEvacuate's
+// in-use refusal pattern from cli-parity-audit Bug 18: the operator
+// must `r d` / `n evacuate` first, or pass `?force=true` to accept
+// the orphan-cascade.
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
+
+	if !isForce(r) {
+		refs, err := s.resourcesOnNode(r.Context(), name)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		if len(refs) > 0 {
+			writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+				RetCode: apiCallRcError | apiCallRcFailInUse,
+				Message: "Node '" + name + "' cannot be deleted because " +
+					"it still hosts resource replicas.",
+				Cause: fmt.Sprintf(
+					"%d resource(s) reference node '%s': %s",
+					len(refs), name, strings.Join(refs, ", ")),
+				Correc: "Delete the listed resources first " +
+					"(`linstor r d <node> <rd>`) or evacuate the node " +
+					"(`linstor n evacuate <node>`); pass `?force=true` " +
+					"to delete the node anyway and orphan the replicas.",
+				ObjRefs: map[string]string{
+					objRefNode: name,
+				},
+			}})
+
+			return
+		}
+	}
 
 	err := s.Store.Nodes().Delete(r.Context(), name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -558,6 +599,32 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "node deleted: " + name,
 	}})
+}
+
+// resourcesOnNode returns the sorted list of Resource names whose
+// NodeName matches the target — the wire shape upstream LINSTOR's
+// `CtrlNodeApiCallHandler.delete()` builds when refusing a node-
+// delete with `FAIL_IN_USE`. Sorted so the surfaced "cause" line is
+// stable across calls (the Resources store has no fixed iteration
+// order on the K8s backend, and operators rerun `n d` to confirm
+// the refusal message after every replica drop).
+func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
+	resources, err := s.Store.Resources().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var refs []string
+
+	for i := range resources {
+		if resources[i].NodeName == node {
+			refs = append(refs, resources[i].Name)
+		}
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
 }
 
 // writeStoreError maps store sentinel errors to HTTP statuses so handlers
