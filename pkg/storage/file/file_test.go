@@ -17,6 +17,7 @@ limitations under the License.
 package file_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -335,10 +336,93 @@ func TestSnapshotsCpReflink(t *testing.T) {
 	}
 
 	// DeleteSnapshot is a plain os.Remove — exit cleanly on missing.
+	// PoolName intentionally left empty here to mirror the satellite
+	// reconciler's call shape (it only fills ResourceName + SnapshotName);
+	// the provider MUST resolve the path through its own cfg.Dir.
 	err = p.DeleteSnapshot(t.Context(),
-		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1", PoolName: dir})
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "s1"})
 	if err != nil {
 		t.Errorf("DeleteSnapshot: %v", err)
+	}
+}
+
+// errSimulatedDetachBusy is a static sentinel the disk-leak test uses
+// to simulate a real-world `losetup -d` failure. Hoisted out of the
+// test body so err113 doesn't object to a dynamic errors.New.
+var errSimulatedDetachBusy = errors.New("simulated: losetup detach failed: device or resource busy")
+
+// TestDeleteVolumeUnlinksEvenWhenLosetupDetachFails pins the
+// disk-leak fix for FILE / FILE_THIN. The satellite reconciler's
+// DeleteResource path used to bubble up `losetup -d` errors (EBUSY
+// while a kernel consumer was still tearing down, or the loop having
+// been auto-cleared and re-detached racily) and return early WITHOUT
+// removing the `.img`. Every RD ever created leaked one
+// `<rd>_00000.img` in the pool dir until an operator manually `rm`-ed
+// it; the FILE_THIN pool on `stand` would silently run out of free
+// capacity.
+//
+// The provider's contract: detach is best-effort, unlink is mandatory.
+func TestDeleteVolumeUnlinksEvenWhenLosetupDetachFails(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	preexisting := filepath.Join(dir, "leaky_00000.img")
+	if err := os.WriteFile(preexisting, []byte("data"), 0o600); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	// Simulate the production failure mode: `losetup -j` discovers an
+	// attached /dev/loop7, but the detach errors out (EBUSY-style).
+	fx.Expect("losetup -j "+preexisting,
+		storage.FakeResponse{Stdout: []byte("/dev/loop7: [64772]:1 (" + preexisting + ")\n")})
+	fx.Expect("losetup -d /dev/loop7",
+		storage.FakeResponse{Err: errSimulatedDetachBusy})
+
+	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "leaky",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume MUST swallow detach failures and continue: got err=%v", err)
+	}
+
+	if _, err := os.Stat(preexisting); !os.IsNotExist(err) {
+		t.Errorf("disk-leak regression: backing .img survived DeleteVolume "+
+			"(stat err=%v); the pool would leak storage on every `linstor rd delete`", err)
+	}
+}
+
+// TestDeleteSnapshotResolvesPathThroughProviderDir pins the second
+// half of the disk-leak fix: the snapshot reconciler calls
+// DeleteSnapshot with PoolName="" (only ResourceName + SnapshotName
+// are populated), so the provider MUST resolve the path through its
+// own cfg.Dir. The pre-fix code joined snap.PoolName + filename which
+// produced a relative path; os.Remove silently no-op'd against the
+// satellite's cwd and the snapshot .img leaked indefinitely.
+func TestDeleteSnapshotResolvesPathThroughProviderDir(t *testing.T) {
+	dir := t.TempDir()
+	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, storage.NewFakeExec())
+
+	snapPath := filepath.Join(dir, "rd1_snap1_00000.img")
+	if err := os.WriteFile(snapPath, []byte("snap"), 0o600); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	// Note: PoolName intentionally left empty to mirror the
+	// reconciler.DeleteSnapshot call shape on the satellite.
+	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
+		ResourceName: "rd1",
+		SnapshotName: "snap1",
+	})
+	if err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	if _, err := os.Stat(snapPath); !os.IsNotExist(err) {
+		t.Errorf("disk-leak regression: snapshot .img survived DeleteSnapshot "+
+			"(stat err=%v); every `linstor s delete` leaks one snap file", err)
 	}
 }
 

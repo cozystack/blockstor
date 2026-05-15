@@ -153,18 +153,26 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 
 // DeleteVolume detaches the loop device (if any) and removes the
 // backing file. Missing file → no-op.
+//
+// Detach is best-effort: a failing `losetup -d` (e.g. EBUSY while a
+// kernel consumer is still tearing down, or the device was already
+// auto-cleared) MUST NOT block the unlink. Returning early on a detach
+// error would leave the `.img` permanently on disk — the satellite
+// reconciler drops its reference once the Resource CRD is removed, so
+// the FILE_THIN pool would leak one `<rd>_00000.img` per RD ever
+// created and `stand` would eventually run out of free capacity.
 func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 
-	dev, err := p.lookupLoop(ctx, path)
-	if err == nil && dev != "" {
-		_, detachErr := p.exec.Run(ctx, "losetup", "-d", dev)
-		if detachErr != nil {
-			return errors.Wrapf(detachErr, "losetup -d %s", dev)
-		}
+	dev, lookupErr := p.lookupLoop(ctx, path)
+	if lookupErr == nil && dev != "" {
+		// Detach is best-effort; the unlink below is the load-bearing
+		// step. losetup -d failures are non-fatal so the .img is
+		// always reaped on every delete pass.
+		_, _ = p.exec.Run(ctx, "losetup", "-d", dev)
 	}
 
-	err = os.Remove(path)
+	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "remove %s", path)
 	}
@@ -281,8 +289,16 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 }
 
 // DeleteSnapshot removes the .img copy. Missing → no-op.
-func (*Provider) DeleteSnapshot(_ context.Context, snap storage.Snapshot) error {
-	path := snapshotPathRaw(snap)
+//
+// The path MUST be resolved through the provider's configured pool
+// dir (p.cfg.Dir). The satellite reconciler calls DeleteSnapshot with
+// snap.PoolName="" (only ResourceName + SnapshotName are populated),
+// so deriving the path from snap.PoolName produces a relative name
+// like `proptest_snap1_00000.img` and os.Remove silently no-op's
+// against the satellite's cwd — every `linstor s delete` then leaks
+// its snapshot file in /var/lib/blockstor-pool/.
+func (p *Provider) DeleteSnapshot(_ context.Context, snap storage.Snapshot) error {
+	path := p.snapshotPath(snap)
 
 	err := os.Remove(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -453,13 +469,6 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 // snapshots land in Phase 4).
 func (p *Provider) snapshotPath(snap storage.Snapshot) string {
 	return filepath.Join(p.cfg.Dir, fmt.Sprintf("%s_%s_00000.img", snap.ResourceName, snap.SnapshotName))
-}
-
-// snapshotPathRaw is the package-level shape used by DeleteSnapshot
-// (which doesn't have access to cfg.Dir at that callsite when the
-// receiver is the bare type).
-func snapshotPathRaw(snap storage.Snapshot) string {
-	return filepath.Join(snap.PoolName, fmt.Sprintf("%s_%s_00000.img", snap.ResourceName, snap.SnapshotName))
 }
 
 // volumePathByResource is volumePath but indexed by resource name +
