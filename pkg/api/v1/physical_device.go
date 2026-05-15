@@ -78,6 +78,29 @@ type PhysicalDevice struct {
 	// be folded into a pool. nil when the device is published
 	// as available.
 	AttachTo *PhysicalDeviceAttachTo `json:"attach_to,omitempty"`
+
+	// Free reflects the satellite's most-recent assessment of
+	// whether the device carries any blocking signature (lsblk
+	// FSType / mountpoint / LVM PV / ZFS / DRBD / wipefs match).
+	// Sourced from Status.Conditions[Type=Free].Status on the CRD
+	// — nil means the discovery loop hasn't published a verdict
+	// yet (mid-bootstrap). Bug 89: the REST `ps cdp` path checks
+	// this before accepting an attach; the `ps l` endpoint
+	// already filters non-free devices out of its bucket list,
+	// so the two paths must agree.
+	Free *bool `json:"free,omitempty"`
+
+	// FreeReason carries the human-readable explanation the
+	// discovery loop stamped alongside Free — e.g.
+	// "SignatureFound" / "FreeBlockDevice" — so the REST handler
+	// can surface a `cause` line on `ps cdp` rejection. Bug 89.
+	FreeReason string `json:"free_reason,omitempty"`
+
+	// FreeMessage is the discovery loop's longer explanation
+	// (Status.Conditions[Type=Free].Message). Quoted verbatim
+	// in the `cause` field of the 409 envelope so the operator
+	// sees the same wording the CRD carries. Bug 89.
+	FreeMessage string `json:"free_message,omitempty"`
 }
 
 // PhysicalDeviceAttachTo mirrors the CRD's Spec.AttachTo at the

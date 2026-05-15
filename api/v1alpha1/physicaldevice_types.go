@@ -169,6 +169,14 @@ const (
 	PhysicalDevicePhaseFailed    = "Failed"
 )
 
+// PhysicalDeviceConditionFree is the Status.Conditions[type] the
+// satellite-side discovery loop stamps to record whether the device
+// passed the IsDeviceFree probe on the most recent scan. Surfaced
+// to the REST layer (Bug 89) so `ps cdp` can refuse attaches on
+// devices the `ps l` endpoint already hides — keeping the list and
+// attach paths in lock-step.
+const PhysicalDeviceConditionFree = "Free"
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster

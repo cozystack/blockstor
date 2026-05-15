@@ -47,6 +47,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -57,6 +58,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/tests/integration/harness"
 )
 
@@ -94,6 +96,9 @@ func TestGroupB(t *testing.T) {
 	})
 	t.Run("PhysicalStorageCDPPropsPerKind", func(t *testing.T) {
 		testPhysicalStorageCDPPropsPerKind(t, stack)
+	})
+	t.Run("PhysicalStorageCDPRefusesBusyDevice", func(t *testing.T) {
+		testPhysicalStorageCDPRefusesBusyDevice(t, stack)
 	})
 
 	// SPPoolMissingReportsFaulty mutates the satellite mock's
@@ -788,5 +793,140 @@ func testPhysicalStorageCDPPropsPerKind(t *testing.T, stack *harness.Stack) {
 				}
 			}
 		})
+	}
+}
+
+// testPhysicalStorageCDPRefusesBusyDevice pins Bug 89: the
+// `linstor ps cdp` path MUST refuse to attach a PhysicalDevice
+// whose satellite-stamped Status.Conditions[Free]=False — the
+// list endpoint already hides such devices, and silently
+// accepting a busy device here is the regression that corrupted
+// /var/lib/blockstor-pool on the live dev-kvaps stand
+// (operator typed `linstor ps cdp ... /dev/vda` while vda4 was
+// mounted; the REST handler returned SUCCESS and created a
+// pre-formatted SP CRD).
+//
+// End-to-end shape: seed a PhysicalDevice with Free=False
+// (Reason=ChildInUse, Message points at the mounted child),
+// POST a CDP request matching its DevicePath, assert the
+// response is 409 with the cause/correction lines the operator
+// sees on the CLI. The StoragePool CRD MUST NOT be created.
+func testPhysicalStorageCDPRefusesBusyDevice(t *testing.T, stack *harness.Stack) {
+	t.Helper()
+
+	const (
+		devName = "worker-3.cdp-busy"
+		devPath = "/dev/disk/by-id/scsi-cdp-busy"
+		spName  = "cdp-busy-pool"
+	)
+
+	ctx := context.Background()
+
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: devName,
+			Labels: map[string]string{
+				blockstoriov1alpha1.PhysicalDeviceLabelNode: "worker-3",
+			},
+		},
+	}
+	if err := stack.Env.Client.Create(ctx, dev); err != nil {
+		t.Fatalf("create PhysicalDevice: %v", err)
+	}
+
+	var got blockstoriov1alpha1.PhysicalDevice
+	if err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: devName}, &got); err != nil {
+		t.Fatalf("get PhysicalDevice: %v", err)
+	}
+
+	// Bug 89 fixture: stamp the satellite-side condition the
+	// discovery loop would write on a parent disk whose child
+	// partition is mounted. The REST handler MUST quote
+	// Reason/Message verbatim in the 409 envelope.
+	got.Status = blockstoriov1alpha1.PhysicalDeviceStatus{
+		NodeName:   "worker-3",
+		StableID:   "scsi-cdp-busy",
+		DevicePath: devPath,
+		SizeBytes:  4294967296,
+		Phase:      blockstoriov1alpha1.PhysicalDevicePhaseAvailable,
+		Conditions: []metav1.Condition{
+			{
+				Type:               blockstoriov1alpha1.PhysicalDeviceConditionFree,
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: metav1.NewTime(time.Now()),
+				Reason:             "ChildInUse",
+				Message:            "parent disk " + devPath + " has busy child /dev/cdp-busy4 (mounted at /var/lib/blockstor-pool)",
+			},
+		},
+	}
+	if err := stack.Env.Client.Status().Update(ctx, &got); err != nil {
+		t.Fatalf("status update: %v", err)
+	}
+
+	body := `{
+		"provider_kind": "ZFS",
+		"pool_name": "datafail",
+		"device_paths": ["` + devPath + `"],
+		"with_storage_pool": {"name": "` + spName + `"}
+	}`
+
+	resp, err := http.Post(stack.RestURL+"/v1/physical-storage/worker-3",
+		"application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST cdp: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Bug 89: status: got %d, want 409 (busy device must be refused); body=%s",
+			resp.StatusCode, raw)
+	}
+
+	var entries []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode 409 envelope: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("entries: got %d, want 1 (single ERROR entry)", len(entries))
+	}
+
+	rc := entries[0]
+	if !strings.Contains(rc.Message, "is busy") {
+		t.Errorf("Bug 89: Message: got %q, want substring 'is busy'", rc.Message)
+	}
+
+	if !strings.Contains(rc.Cause, "ChildInUse") || !strings.Contains(rc.Cause, "/var/lib/blockstor-pool") {
+		t.Errorf("Bug 89: Cause must quote satellite Reason+Message: got %q", rc.Cause)
+	}
+
+	if !strings.Contains(rc.Correc, "linstor physical-storage list") {
+		t.Errorf("Bug 89: Correction must point at `linstor ps l`: got %q", rc.Correc)
+	}
+
+	// The StoragePool MUST NOT have been auto-created — accepting
+	// the attach would have stamped a pre-formatted SP CRD that the
+	// satellite later tries to reconcile against the wrong device.
+	var pool blockstoriov1alpha1.StoragePool
+
+	err = stack.Env.Client.Get(ctx, types.NamespacedName{Name: spName + ".worker-3"}, &pool)
+	if err == nil {
+		t.Errorf("Bug 89: StoragePool %q created despite 409 — busy-device path must not stamp side effects",
+			spName+".worker-3")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("Bug 89: unexpected error checking StoragePool absence: %v", err)
+	}
+
+	// Spec.AttachTo MUST NOT have been flipped either — the
+	// PhysicalDevice stays Available for a future retry once the
+	// operator frees the device.
+	var pd blockstoriov1alpha1.PhysicalDevice
+	if err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: devName}, &pd); err != nil {
+		t.Fatalf("re-get PhysicalDevice: %v", err)
+	}
+
+	if pd.Spec.AttachTo != nil {
+		t.Errorf("Bug 89: PhysicalDevice.Spec.AttachTo flipped despite 409: %+v", pd.Spec.AttachTo)
 	}
 }

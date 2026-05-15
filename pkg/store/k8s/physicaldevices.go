@@ -206,6 +206,27 @@ func crdToWirePhysicalDevice(crd *crdv1alpha1.PhysicalDevice) apiv1.PhysicalDevi
 		out.NodeName = crd.Labels[crdv1alpha1.PhysicalDeviceLabelNode]
 	}
 
+	// Bug 89: surface the satellite-stamped Free condition on the
+	// wire shape so the REST `ps cdp` handler can refuse attaches
+	// on devices the `ps l` endpoint already filters out. The
+	// condition is the source of truth — `pkg/satellite/controllers/
+	// physicaldevice_discovery.go::buildDiscoveryStatus` writes
+	// True/False with Reason=FreeBlockDevice/SignatureFound on
+	// every scan tick.
+	for i := range crd.Status.Conditions {
+		cond := &crd.Status.Conditions[i]
+		if cond.Type != crdv1alpha1.PhysicalDeviceConditionFree {
+			continue
+		}
+
+		free := cond.Status == metav1.ConditionTrue
+		out.Free = &free
+		out.FreeReason = cond.Reason
+		out.FreeMessage = cond.Message
+
+		break
+	}
+
 	if crd.Spec.AttachTo != nil {
 		out.AttachTo = &apiv1.PhysicalDeviceAttachTo{
 			StoragePoolName: crd.Spec.AttachTo.StoragePoolName,

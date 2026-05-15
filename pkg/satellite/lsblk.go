@@ -65,6 +65,14 @@ type LsblkDevice struct {
 	// DRBD devices (major 147) from the PhysicalDevice discovery
 	// loop — see MajorDRBD. Bug 72.
 	Major int
+	// PKName is the kernel name of the parent block device (the
+	// `PKNAME` lsblk column) — e.g. partition `vda4` has
+	// PKName="vda". Empty for top-level disks. Bug 89: the
+	// discovery loop uses this to detect "parent disk has a
+	// mounted child partition" so `vda` with `vda4` mounted
+	// gets stamped Free=False rather than surfacing as a
+	// publishable bucket entry.
+	PKName string
 }
 
 // IsFreeBlockDevice reports whether this device is a candidate for
@@ -103,14 +111,16 @@ func (d *LsblkDevice) IsFreeBlockDevice() bool {
 	return true
 }
 
-// Lsblk runs `lsblk -Pb -o NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,
-// MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN` and parses the output
+// Lsblk runs `lsblk -Pb -o NAME,KNAME,PKNAME,MAJ:MIN,SIZE,FSTYPE,
+// TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN` and parses the output
 // into a slice of `LsblkDevice`. The `-P` flag emits key=value
 // pairs; `-b` switches SIZE to raw bytes so callers don't have
 // to parse human-readable suffixes. Phase 10.7.
 //
 // MAJ:MIN is included so callers can filter out DRBD devices
-// (major 147) — see MajorDRBD / Bug 72.
+// (major 147) — see MajorDRBD / Bug 72. PKNAME is included so
+// the discovery loop can detect parent disks with mounted child
+// partitions — see Bug 89.
 //
 // Returns the unfiltered list — callers run `IsFreeBlockDevice` on
 // each row + the cross-checks (pvs, zpool, drbdmeta) before
@@ -118,7 +128,7 @@ func (d *LsblkDevice) IsFreeBlockDevice() bool {
 func Lsblk(ctx context.Context, exec storage.Exec) ([]LsblkDevice, error) {
 	out, err := exec.Run(ctx, "lsblk",
 		"-Pb",
-		"-o", "NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN")
+		"-o", "NAME,KNAME,PKNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN")
 	if err != nil {
 		return nil, errors.Wrap(err, "lsblk")
 	}
@@ -143,6 +153,7 @@ func parseLsblkPairs(raw string) []LsblkDevice {
 		dev := LsblkDevice{
 			Name:       fields["NAME"],
 			KName:      fields["KNAME"],
+			PKName:     fields["PKNAME"],
 			FSType:     fields["FSTYPE"],
 			Type:       fields["TYPE"],
 			Mountpoint: fields["MOUNTPOINT"],

@@ -41,7 +41,7 @@ var errNoDRBDMeta = errors.New("drbdmeta: no metadata")
 // for `satellite.Lsblk`. Centralised here so a change to Lsblk's
 // arg list (e.g. adding a column) trips one match-string to update
 // instead of one per test.
-const lsblkCmdLine = "lsblk -Pb -o NAME,KNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN"
+const lsblkCmdLine = "lsblk -Pb -o NAME,KNAME,PKNAME,MAJ:MIN,SIZE,FSTYPE,TYPE,MOUNTPOINT,WWN,MODEL,SERIAL,ROTA,TRAN"
 
 // pvsCmdLine matches the LVM signature probe key. The flag-string
 // is built by `lvm.Args(...)` — pinning the literal here keeps the
@@ -52,9 +52,18 @@ const pvsCmdLine = "pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'
 // lsblkRow returns the canonical `KEY="value" KEY="value" ...` line
 // the lsblk parser expects, for one fake device. Keeps the test
 // readable — three rows of inline `KEY="..."` would dominate the
-// happy-path test.
+// happy-path test. PKNAME is empty for top-level disks; partitions
+// emit it as their parent disk's kname (Bug 89 parent-child
+// detection).
 func lsblkRow(name, kname, size, fstype, typ, mount, wwn, model, serial, rota, tran string) string {
-	return `NAME="` + name + `" KNAME="` + kname + `" SIZE="` + size + `" FSTYPE="` + fstype + `" TYPE="` + typ + `" MOUNTPOINT="` + mount + `" WWN="` + wwn + `" MODEL="` + model + `" SERIAL="` + serial + `" ROTA="` + rota + `" TRAN="` + tran + `"`
+	return lsblkRowWithParent(name, kname, "", size, fstype, typ, mount, wwn, model, serial, rota, tran)
+}
+
+// lsblkRowWithParent is the Bug 89 variant that takes an explicit
+// PKNAME. Use this for partition rows so the discovery loop's
+// parent-child busy-disk detection has the data it needs.
+func lsblkRowWithParent(name, kname, pkname, size, fstype, typ, mount, wwn, model, serial, rota, tran string) string {
+	return `NAME="` + name + `" KNAME="` + kname + `" PKNAME="` + pkname + `" SIZE="` + size + `" FSTYPE="` + fstype + `" TYPE="` + typ + `" MOUNTPOINT="` + mount + `" WWN="` + wwn + `" MODEL="` + model + `" SERIAL="` + serial + `" ROTA="` + rota + `" TRAN="` + tran + `"`
 }
 
 // TestReconcilerPublishesFreeDisks pins the happy path: a fresh

@@ -74,7 +74,11 @@ const PhysicalDeviceDiscoveryFieldOwner = "blockstor-satellite-discovery"
 // publishable disks and `Free=False` (with `Reason=SignatureFound`)
 // for disks that lsblk says are unused but `wipefs -n` / `pvs` /
 // `zpool` / `drbdmeta` say carry a signature.
-const physicalDeviceDiscoveryConditionFree = "Free"
+//
+// Re-exported as `blockstoriov1alpha1.PhysicalDeviceConditionFree`
+// so the REST layer (Bug 89) can read the same constant when it
+// translates the CRD into the wire `apiv1.PhysicalDevice` shape.
+const physicalDeviceDiscoveryConditionFree = blockstoriov1alpha1.PhysicalDeviceConditionFree
 
 // PhysicalDeviceDiscoveryRunnable scans local block devices on a
 // periodic tick (PhysicalDeviceDiscoveryPeriod) and publishes one
@@ -187,6 +191,14 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 		return errors.Wrap(err, "lsblk")
 	}
 
+	// Bug 89: pre-scan the full lsblk output to learn which parent
+	// disks have any in-use child (mounted partition, FS-bearing
+	// partition, LVM child, MD member). A disk with a mounted
+	// `vda4` partition MUST land as Free=False even though `vda`
+	// itself has no FSType / no Mountpoint — otherwise `ps cdp`
+	// happily attaches the disk and corrupts the running root FS.
+	busyChildren := collectBusyChildren(rows)
+
 	discovered := map[string]struct{}{}
 
 	for i := range rows {
@@ -204,7 +216,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 			continue
 		}
 
-		free, signatureErr := satellite.IsDeviceFree(ctx, p.Exec, &row)
+		free, freeReason, freeMessage, signatureErr := p.probeFree(ctx, &row, busyChildren[row.KName])
 		if signatureErr != nil {
 			// One device's probe failing shouldn't sink the whole
 			// scan — log and move on so the other disks still get
@@ -214,7 +226,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 			continue
 		}
 
-		name, ok := p.publishDevice(ctx, logger, &row, free)
+		name, ok := p.publishDeviceWithReason(ctx, logger, &row, free, freeReason, freeMessage)
 		if ok {
 			discovered[name] = struct{}{}
 		}
@@ -225,8 +237,103 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 	return nil
 }
 
-// publishDevice creates or updates the CRD for one lsblk row.
-// Returns the CRD's metadata.name + ok=true on success so the
+// probeFree runs the standard `IsDeviceFree` cross-checks on the
+// row, then applies the Bug 89 parent-child guard: a disk with any
+// in-use child (mounted partition / partition with FSType / LVM
+// child / md member) is stamped Free=False even when its own
+// signature probes come back clean, so `ps l` and `ps cdp` agree
+// that the disk isn't safe to wipe.
+//
+// Returns (free, reason, message, err). Reason/Message map onto
+// the Status.Conditions[Free].Reason / Message the REST layer
+// quotes verbatim in the 409 envelope on `ps cdp` rejection.
+func (p *PhysicalDeviceDiscoveryRunnable) probeFree(ctx context.Context, row, busyChild *satellite.LsblkDevice) (bool, string, string, error) {
+	free, err := satellite.IsDeviceFree(ctx, p.Exec, row)
+	if err != nil {
+		return false, "", "", errors.Wrap(err, "IsDeviceFree")
+	}
+
+	if !free {
+		return false, discoveryReasonSignatureFound, discoveryMessageSignatureFound, nil
+	}
+
+	if busyChild != nil {
+		return false, discoveryReasonChildInUse, formatChildInUseMessage(row.KName, busyChild), nil
+	}
+
+	return true, discoveryReasonFreeBlockDevice, discoveryMessageFreeBlockDevice, nil
+}
+
+// Reason / message strings for the Status.Conditions[Free] entry.
+// Surfaced verbatim by the REST shim in the Bug 89 `ps cdp`
+// rejection envelope, so operators see the same wording regardless
+// of which surface they hit. Centralised here so a future copy
+// edit happens in one place rather than every test pinning its
+// own substring.
+const (
+	discoveryReasonFreeBlockDevice  = "FreeBlockDevice"
+	discoveryMessageFreeBlockDevice = "device passed lsblk + signature probes"
+	discoveryReasonSignatureFound   = "SignatureFound"
+	discoveryMessageSignatureFound  = "lsblk / pvs / zpool / drbdmeta / wipefs detected an on-disk signature"
+	discoveryReasonChildInUse       = "ChildInUse"
+)
+
+// formatChildInUseMessage renders the Bug 89 Status.Conditions[Free].Message
+// for a parent disk whose child partition is mounted / formatted /
+// LVM-owned. Includes the child kname + the specific in-use
+// signal so operators see exactly which child is blocking.
+func formatChildInUseMessage(parent string, busyChild *satellite.LsblkDevice) string {
+	what := "in use"
+
+	switch {
+	case busyChild.Mountpoint != "":
+		what = "mounted at " + busyChild.Mountpoint
+	case busyChild.FSType != "":
+		what = "carries signature " + busyChild.FSType
+	}
+
+	return "parent disk /dev/" + parent + " has busy child /dev/" + busyChild.KName + " (" + what + ")"
+}
+
+// collectBusyChildren maps parent kname -> first busy child row.
+// A child is busy when it has a non-empty Mountpoint or FSType
+// (LVM/MD/ZFS members surface as FSType=LVM2_member / md_raid_member /
+// zfs_member; ext4/xfs/... show the filesystem). Skips
+// PKNAME-less rows (top-level disks) and DRBD children
+// (parent already filtered by major 147).
+//
+// Returns a map keyed by parent KName so the per-disk loop can do
+// an O(1) lookup. The first busy child wins per parent — the
+// Status message includes a single concrete child path which is
+// enough for the operator to identify the problem; the rest of
+// the busy children show up under `lsblk /dev/<parent>` anyway.
+func collectBusyChildren(rows []satellite.LsblkDevice) map[string]*satellite.LsblkDevice {
+	out := map[string]*satellite.LsblkDevice{}
+
+	for i := range rows {
+		child := &rows[i]
+		if child.PKName == "" {
+			continue
+		}
+
+		if child.Mountpoint == "" && child.FSType == "" {
+			continue
+		}
+
+		if _, exists := out[child.PKName]; exists {
+			continue
+		}
+
+		out[child.PKName] = child
+	}
+
+	return out
+}
+
+// publishDeviceWithReason creates or updates the CRD for one lsblk row,
+// stamping the supplied Reason/Message on Status.Conditions[Free] so the
+// REST layer (Bug 89) can quote them verbatim in the `ps cdp` rejection
+// envelope. Returns the CRD's metadata.name + ok=true on success so the
 // caller can build the discovered-set for prune.
 //
 // Lifecycle: a missing CRD is Create()d with metadata + Status
@@ -234,7 +341,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) scanOnce(ctx context.Context, logger l
 // its Status refreshed in place — Spec.AttachTo authored by the
 // REST shim / operator is preserved (we never touch Spec here;
 // discovery owns Status only).
-func (p *PhysicalDeviceDiscoveryRunnable) publishDevice(ctx context.Context, logger logr.Logger, row *satellite.LsblkDevice, free bool) (string, bool) {
+func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Context, logger logr.Logger, row *satellite.LsblkDevice, free bool, reason, message string) (string, bool) {
 	// Bug 70: ZFS zvols (KName like zd0, zd16, …) come from an
 	// existing zpool — they're already in use as block devices for
 	// blockstor's own DRBD volumes (or operator-managed zvols).
@@ -273,7 +380,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDevice(ctx context.Context, log
 
 	rotational := row.Rotational
 
-	desiredStatus := buildDiscoveryStatus(p.NodeName, stableID, devicePath, currentDevPath, row, &rotational, free)
+	desiredStatus := buildDiscoveryStatus(p.NodeName, stableID, devicePath, currentDevPath, row, &rotational, free, reason, message)
 
 	var existing blockstoriov1alpha1.PhysicalDevice
 
@@ -343,16 +450,14 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDevice(ctx context.Context, log
 // buildDiscoveryStatus assembles the Status subresource the
 // discovery runnable writes. Pulled out of publishDevice so the
 // function stays under the funlen budget and so the per-field
-// mapping (lsblk → Status) is a single readable expression.
-func buildDiscoveryStatus(nodeName, stableID, devicePath, currentDevPath string, row *satellite.LsblkDevice, rotational *bool, free bool) blockstoriov1alpha1.PhysicalDeviceStatus {
-	condReason := "FreeBlockDevice"
+// mapping (lsblk → Status) is a single readable expression. The
+// Reason/Message passed in are surfaced on Status.Conditions[Free]
+// so the REST shim (Bug 89) can quote them verbatim when refusing
+// a `ps cdp` attach.
+func buildDiscoveryStatus(nodeName, stableID, devicePath, currentDevPath string, row *satellite.LsblkDevice, rotational *bool, free bool, reason, message string) blockstoriov1alpha1.PhysicalDeviceStatus {
 	condStatus := metav1.ConditionTrue
-	condMessage := "device passed lsblk + signature probes"
-
 	if !free {
 		condStatus = metav1.ConditionFalse
-		condReason = "SignatureFound"
-		condMessage = "lsblk / pvs / zpool / drbdmeta / wipefs detected an on-disk signature"
 	}
 
 	return blockstoriov1alpha1.PhysicalDeviceStatus{
@@ -371,8 +476,8 @@ func buildDiscoveryStatus(nodeName, stableID, devicePath, currentDevPath string,
 				Type:               physicalDeviceDiscoveryConditionFree,
 				Status:             condStatus,
 				LastTransitionTime: metav1.NewTime(time.Now()),
-				Reason:             condReason,
-				Message:            condMessage,
+				Reason:             reason,
+				Message:            message,
 			},
 		},
 	}

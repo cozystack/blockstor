@@ -109,7 +109,12 @@ type physicalStorageCreatePoolDetails struct {
 // Returns 404 when none of the requested device paths match a
 // free PhysicalDevice on this node — surfacing the failure
 // rather than silently succeeding lets piraeus-operator retry
-// after the discovery loop catches up.
+// after the discovery loop catches up. Returns 409 when a
+// matching CRD exists but its Status.Conditions[Free]=False
+// (Bug 89) — the device has an on-disk signature / mounted
+// partition the satellite already knows about and `ps l`
+// already hides; accepting the attach would corrupt host
+// state.
 func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
@@ -125,7 +130,13 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	target := pickFreeDeviceForAttach(devs, req.DevicePaths)
+	target, busy := pickFreeDeviceForAttach(devs, req.DevicePaths)
+	if busy != nil {
+		writePhysicalStorageBusyDevice(w, node, busy)
+
+		return
+	}
+
 	if target == nil {
 		writeError(w, http.StatusNotFound,
 			"no free PhysicalDevice on node "+node+" matches device_paths ["+strings.Join(req.DevicePaths, " ")+"]")
@@ -215,6 +226,45 @@ func decodePhysicalStorageCreateRequest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	return req, true
+}
+
+// writePhysicalStorageBusyDevice emits the Bug 89 rejection envelope:
+// a 409 Conflict carrying a LINSTOR-shaped APICallRc entry whose
+// `cause` quotes the satellite's own Free-condition Message verbatim
+// (so the operator sees the same wording `kubectl describe physicaldevice`
+// would render) and whose `correction` points at `linstor ps l`. The
+// shape mirrors the rest of the REST surface's structured-error envelopes
+// (resource_definitions.go::writeRDNotFound, snapshots.go::writeSnapshot
+// NotFound) so the python CLI's `get_replies_state` walks it as a single
+// ERROR entry and prints the cause/correction lines under the standard
+// `ERROR:` log band.
+//
+// HTTP 409 (rather than 400) follows the upstream LINSTOR shape for
+// "request well-formed but conflicts with current state" — the device
+// exists and is named correctly, the conflict is the in-flight
+// signature / mount the satellite already observed.
+func writePhysicalStorageBusyDevice(w http.ResponseWriter, node string, dev *apiv1.PhysicalDevice) {
+	msg := "device " + dev.DevicePath + " on node '" + node + "' is busy"
+
+	cause := dev.FreeMessage
+	if cause == "" {
+		cause = "satellite-side IsDeviceFree probe stamped Status.Conditions[Free]=False"
+	}
+
+	if dev.FreeReason != "" {
+		cause = "[" + dev.FreeReason + "] " + cause
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: msg,
+		Cause:   cause,
+		Correc:  "free the device on the host (umount partitions, pvremove, zpool destroy, wipefs) or pick another device from `linstor physical-storage list`",
+		ObjRefs: map[string]string{
+			"Node":   node,
+			"Device": dev.DevicePath,
+		},
+	}})
 }
 
 // writePhysicalStorageCreateAccepted writes the 202 Accepted reply for
@@ -322,18 +372,32 @@ func hasOwnerReference(refs []metav1.OwnerReference, uid types.UID) bool {
 // `Status.DevicePath` (or `Status.CurrentDevPath`, as a fallback
 // since some operators pass volatile /dev/sdN paths) appears in
 // the requested device_paths list. Skips devices that are already
-// being attached or assigned. Returns nil when no match.
+// being attached or assigned. Returns (nil, nil) when no path
+// matches at all (handler maps to 404).
 //
-// Note: this picks the first match deterministically by store
-// order (which the in-memory + k8s impls both stable-sort by
-// name). Multi-device pool requests trigger one PhysicalDevice
-// flip per device — piraeus-operator already POSTs per-device
-// in practice.
-func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) *apiv1.PhysicalDevice {
+// Bug 89: when the matched device's Status.Conditions[Free]=False
+// (the satellite stamped it as carrying a signature / mounted
+// partition / LVM PV / ZFS / DRBD metadata), the function returns
+// (nil, busy) so the caller surfaces a 409 with the satellite's
+// own Reason/Message rather than silently accepting an attach
+// `linstor ps l` would have hidden. Without this, the list and
+// attach endpoints drift apart — the exact regression Bug 89
+// documents on the live stand.
+//
+// Note: the picker considers a Free=False entry as a TARGET match
+// (not a "no path matched" miss), so the user sees the explicit
+// busy reason instead of the generic 404. Ordering follows the
+// store's stable-sort-by-name; the first matched-but-busy device
+// wins the report. Multi-device pool requests trigger one
+// PhysicalDevice flip per device — piraeus-operator already
+// POSTs per-device in practice.
+func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) (*apiv1.PhysicalDevice, *apiv1.PhysicalDevice) {
 	want := map[string]bool{}
 	for _, p := range paths {
 		want[p] = true
 	}
+
+	var busy *apiv1.PhysicalDevice
 
 	for i := range devs {
 		dev := &devs[i]
@@ -345,12 +409,28 @@ func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) *apiv1
 			continue
 		}
 
-		if want[dev.DevicePath] || want[dev.CurrentDevPath] {
-			return dev
+		if !want[dev.DevicePath] && !want[dev.CurrentDevPath] {
+			continue
 		}
+
+		// Bug 89: the satellite-stamped Free condition is the
+		// source of truth. False ⇒ surface the busy reason so
+		// the operator sees the same cause `ps l`'s filter
+		// applied; nil ⇒ pre-discovery (no scan yet) so we
+		// fall through to the legacy permissive path rather
+		// than block bootstrap. True ⇒ accept the attach.
+		if dev.Free != nil && !*dev.Free {
+			if busy == nil {
+				busy = dev
+			}
+
+			continue
+		}
+
+		return dev, nil
 	}
 
-	return nil
+	return nil, busy
 }
 
 // ensureStoragePoolForAttach creates a StoragePool CRD that
