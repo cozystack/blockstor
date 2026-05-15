@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,17 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
+
+// passphraseOpTimeout bounds every Secret access from an encryption
+// handler. Bug 110 root cause: without `secrets` RBAC the controller-
+// runtime cache informer stalls on a never-syncing Forbidden list/
+// watch, and a cached Get blocks until the upstream client hangs up
+// (~10s default). Even with RBAC fixed, an apiserver-side outage
+// would otherwise let a single bad request tie up a worker for the
+// process-default request timeout. Capping at 5s keeps the worst
+// case bounded and matches the operator's tolerance window — the
+// CLI's surrounding retry loop kicks in well before this.
+const passphraseOpTimeout = 5 * time.Second
 
 // passphraseRequest is the body upstream linstor expects on the
 // encryption/passphrase endpoints.
@@ -112,7 +124,10 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	have, err := s.readPassphrase(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	have, err := s.readPassphrase(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -138,7 +153,7 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(r.Context(), req.NewPassphrase)
+	err = s.writePassphrase(ctx, req.NewPassphrase)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -183,7 +198,10 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	have, err := s.readPassphrase(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	have, err := s.readPassphrase(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -245,7 +263,10 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	have, err := s.readPassphrase(r.Context())
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	have, err := s.readPassphrase(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -281,7 +302,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(r.Context(), req.NewPassphrase)
+	err = s.writePassphrase(ctx, req.NewPassphrase)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 

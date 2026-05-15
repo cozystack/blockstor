@@ -19,7 +19,11 @@ metadata:
 #   - emit Events (no reconcile-trigger writes from REST).
 #   - need leases (leader election is off — every apiserver
 #     replica serves independently).
-# What's left is plain CRUD on the blockstor.io CRDs themselves.
+# What's left is plain CRUD on the blockstor.io CRDs themselves,
+# plus Secrets for the encryption-passphrase code path (Bug 110:
+# without `secrets` verbs the controller-runtime cache informer
+# stalls on a Forbidden list/watch and `PATCH /v1/encryption/
+# passphrase` hangs ~6s before dropping the connection).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -28,6 +32,16 @@ rules:
   - apiGroups: [blockstor.io.blockstor.io]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
+  # Secrets — the cluster passphrase (sealed in
+  # `blockstor-cluster-passphrase` by default; override via
+  # ControllerConfig.Spec.PassphraseSecretRef) is read on every
+  # `linstor encryption enter-passphrase`, written on
+  # `create-passphrase` / `modify-passphrase`. Cluster-scoped
+  # because the cache informer needs cluster-wide list/watch to
+  # warm up; per-namespace Role is not enough.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
