@@ -125,11 +125,20 @@ type ResourceWithVolumes struct {
 }
 
 // Volume is a single volume of a placed resource (replica) on a node.
+//
+// Bug 112: `allocated_size_kib` MUST always be emitted as an int —
+// never absent, never null. The python CLI's `vlm.allocated_size`
+// property is `_rest_data.get('allocated_size_kib')` (linstor/
+// responses.py:1602), so a Go-zero collapsing to omitted under
+// `omitempty` returned None to the caller, and
+// `SizeCalc.approximate_size_string(None)` crashed `linstor n
+// describe`. The wire contract is: present as int, default 0 when the
+// satellite hasn't reported usage yet.
 type Volume struct {
 	VolumeNumber int32             `json:"volume_number"`
 	StoragePool  string            `json:"storage_pool_name,omitempty"`
 	DevicePath   string            `json:"device_path,omitempty"`
-	AllocatedKib int64             `json:"allocated_size_kib,omitempty"`
+	AllocatedKib int64             `json:"allocated_size_kib"`
 	UsableKib    int64             `json:"usable_size_kib,omitempty"`
 	Props        map[string]string `json:"props,omitempty"`
 	Flags        []string          `json:"flags,omitempty"`

@@ -121,10 +121,17 @@ type StorageResourceLayer struct {
 // Wire shape matches upstream LINSTOR's `StorageVolume` — the Python
 // CLI's `linstor v l` reads `device_path` here as a fallback when the
 // per-Volume DRBD layer omits it.
+//
+// Bug 112: `allocated_size_kib` MUST always be emitted as an int.
+// The Python CLI walks `layer_data_list[i].data.storage_volumes[j].
+// allocated_size_kib` in addition to the top-level `volumes[i].
+// allocated_size_kib`; a Go-zero collapsing to absent under
+// `omitempty` produced the same `None` crash in `n describe` as the
+// top-level path. Wire contract: present as int, default 0.
 type StorageVolumeLayer struct {
 	VolumeNumber     int32  `json:"volume_number"`
 	DevicePath       string `json:"device_path,omitempty"`
-	AllocatedSizeKib int64  `json:"allocated_size_kib,omitempty"`
+	AllocatedSizeKib int64  `json:"allocated_size_kib"`
 	UsableSizeKib    int64  `json:"usable_size_kib,omitempty"`
 	DiskState        string `json:"disk_state,omitempty"`
 }
