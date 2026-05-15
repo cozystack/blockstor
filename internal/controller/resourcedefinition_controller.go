@@ -198,8 +198,8 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 }
 
 // shouldTieBreakerExist decides whether the RD should carry an
-// auto-managed TIE_BREAKER witness. Splits into two complementary
-// branches, both gated on DrbdOptions/AutoAddQuorumTiebreaker
+// auto-managed TIE_BREAKER witness. Splits into three complementary
+// branches, all gated on DrbdOptions/AutoAddQuorumTiebreaker
 // (upstream LINSTOR's auto-tiebreaker prop):
 //
 //  1. Create branch (mirrors upstream shouldTieBreakerExist exactly):
@@ -221,6 +221,25 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 //     to defend). Suppression is not consulted here — that
 //     annotation is stamped at delete-time and is only meaningful
 //     when the witness has already been removed.
+//
+//  3. Post-toggle race branch (Bug 108): the v2 bug-hunt agent
+//     reproduced (3/3) a regression where `rd ap --place-count 2`
+//     followed IMMEDIATELY by `r td --diskless <one-of-diskful>`
+//     leaves the RD at 1 diskful + 1 user-diskless + ZERO witness.
+//     Bug 104's keep branch can't help — no witness was ever
+//     stamped because the toggle landed inside the cache-trail
+//     window between the auto-place's two-Resource fan-out and
+//     the RD-reconciler's first witness-creation pass. The keep
+//     branch only preserves what's there. This branch closes the
+//     race: when the post-toggle topology matches the steady
+//     state the keep branch defends (1 diskful + 1 user-diskless,
+//     no witness), MAKE a witness so the next toggle-back returns
+//     us to the canonical 2-diskful + 1-witness shape. Cap at
+//     diskful < 3 so a 3-replica RD with a transient diskless
+//     replica (e.g. node-evacuate in flight) doesn't grow a
+//     fourth peer. Suppression is honoured because the same
+//     race-after-tiebreaker-delete pattern would otherwise
+//     re-stamp the witness an operator just dropped.
 func shouldTieBreakerExist(
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	diskful, diskless, witness []apiv1.Resource,
@@ -239,7 +258,29 @@ func shouldTieBreakerExist(
 	keepExistingWitness := len(witness) > 0 &&
 		len(diskful) >= 1 && len(diskful) < witnessUnnecessaryDiskfulCount
 
-	return wantNewWitness || keepExistingWitness
+	// Bug 108: post-toggle race repair. The keep branch above
+	// preserves an existing witness across diskful→diskless; this
+	// branch creates one when the race ate the witness-creation
+	// pass. Scoped to total-non-witness-replicas == 2 (i.e. 1
+	// diskful + 1 user-diskless after a `r td --diskless` on one
+	// of two place_count=2 replicas) so we don't grow a witness
+	// for the upstream-LINSTOR steady state "2 diskful + 1
+	// user-diskless" (3 voters, parity odd) which TestTiebreaker-
+	// EvenWithDiskless pins as "no witness". The 2-voter window
+	// is the one the v2 bug-hunt agent reported: without a
+	// witness, the next toggle-back to diskful would return us
+	// to 2 diskful + 1 user-diskless (3 voters, fine) — but
+	// during the partition-vulnerable window of "1 diskful + 1
+	// user-diskless" we're at 2 voters with no majority. The
+	// witness restores the third voter that the operator's
+	// place_count=2 + auto-witness contract promised.
+	repairAfterToggleRace := !isTiebreakerSuppressed(rd) &&
+		len(witness) == 0 &&
+		len(diskful) >= 1 && len(diskful) < witnessUnnecessaryDiskfulCount &&
+		nonWitnessDiskless >= 1 &&
+		(len(diskful)+nonWitnessDiskless) == 2
+
+	return wantNewWitness || keepExistingWitness || repairAfterToggleRace
 }
 
 // isAutoQuorumDisabled reports whether the RD opted out of the

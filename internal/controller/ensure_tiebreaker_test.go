@@ -646,3 +646,254 @@ func TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless(t *testing.T) {
 	// 1-diskful state is intentionally a transient operator
 	// workflow, not steady state.
 }
+
+// TestBug108EnsureTiebreakerFullSequenceAfterToggle reproduces the
+// EXACT production sequence reported in bug-hunt v2 for Bug 108:
+//
+//  1. `rd ap --place-count 2` lands 2 diskful replicas; the RD
+//     reconciler runs `EnsureTiebreaker` and AUTO-CREATES the
+//     TIE_BREAKER witness on the third node (so we don't pre-seed
+//     n3 — the reconciler picks it).
+//  2. `r td --diskless dev-kvaps-worker-1 <rd>` updates the n1
+//     replica spec to add the DISKLESS flag (the only thing
+//     handleResourceToggleDiskToDiskless does — see
+//     pkg/rest/resource_toggle_disk.go).
+//  3. The Resource Update event fires the RD-reconciler watch.
+//     `EnsureTiebreaker` runs a SECOND time and must NOT drop the
+//     auto-stamped witness.
+//
+// Unlike TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless
+// (which pre-seeds the witness with the TIE_BREAKER flag), this
+// test verifies the witness survives across the
+// create-then-evaluate cycle the auto-place flow actually
+// exercises in production. This is the no-race path: the witness
+// IS stamped before the toggle fires.
+func TestBug108EnsureTiebreakerFullSequenceAfterToggle(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// Step 1a: auto-place lands 2 diskful (n1, n2).
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "poke108e", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "poke108e"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// Step 1b: first reconcile creates the witness on the unused node.
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker (step 1): %v", err)
+	}
+
+	pre, err := st.Resources().ListByDefinition(ctx, "poke108e")
+	if err != nil {
+		t.Fatalf("list pre-toggle: %v", err)
+	}
+
+	if len(pre) != 3 {
+		t.Fatalf("pre-toggle: got %d replicas, want 3 (2 diskful + 1 TB); entries=%v",
+			len(pre), pre)
+	}
+
+	// Identify the witness node so we can verify it survives.
+	witnessNode := ""
+
+	for i := range pre {
+		hasTB := false
+
+		for _, f := range pre[i].Flags {
+			if f == apiv1.ResourceFlagTieBreaker {
+				hasTB = true
+			}
+		}
+
+		if hasTB {
+			witnessNode = pre[i].NodeName
+		}
+	}
+
+	if witnessNode == "" {
+		t.Fatalf("pre-toggle: no TIE_BREAKER found in %v", pre)
+	}
+
+	// Step 2: toggle n1 to diskless — what handleResourceToggleDiskToDiskless does.
+	if err := st.Resources().Update(ctx, &apiv1.Resource{
+		Name: "poke108e", NodeName: "n1",
+		Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("toggle n1 to diskless: %v", err)
+	}
+
+	// Refresh the RD spec from the fake client — setQuorum may have
+	// mutated it during step 1, and production runs hit a fresh Get
+	// at the top of every Reconcile.
+	if err := cli.Get(ctx, types.NamespacedName{Name: "poke108e"}, rd); err != nil {
+		t.Fatalf("refresh rd: %v", err)
+	}
+
+	// Step 3: Resource Update event triggers a second reconcile.
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker (step 3): %v", err)
+	}
+
+	post, err := st.Resources().ListByDefinition(ctx, "poke108e")
+	if err != nil {
+		t.Fatalf("list post-toggle: %v", err)
+	}
+
+	// Bug 108 invariant: TIE_BREAKER on witnessNode MUST survive.
+	if len(post) != 3 {
+		t.Fatalf("post-toggle: got %d replicas, want 3; entries=%v", len(post), post)
+	}
+
+	witnessSurvived := false
+
+	for i := range post {
+		if post[i].NodeName != witnessNode {
+			continue
+		}
+
+		for _, f := range post[i].Flags {
+			if f == apiv1.ResourceFlagTieBreaker {
+				witnessSurvived = true
+			}
+		}
+	}
+
+	if !witnessSurvived {
+		t.Fatalf("Bug 108: TIE_BREAKER on %s reaped after toggle; post=%v",
+			witnessNode, post)
+	}
+}
+
+// TestBug108EnsureTiebreakerToggleBeforeWitnessLands pins the EXACT
+// regression the bug-hunt v2 agent reported (3/3 repros):
+//
+//  1. `rd c <rd>; vd c <rd> 32M; rd ap --place-count 2` posts the
+//     two diskful replicas. The RD reconciler is enqueued but the
+//     witness-creation step hasn't run yet (or just started).
+//  2. `r td --diskless worker-1 <rd>` lands BEFORE the witness
+//     Resource hits the apiserver. Toggle handler updates n1 →
+//     Resource Update event fires the RD watch.
+//  3. The (now-final) reconcile sees 1 diskful + 1 user-diskless +
+//     0 witness. Bug 104's keep-branch only preserves an EXISTING
+//     witness; with none present, both branches gate to false and
+//     `wantWitness=false`. Final state: 2 replicas, no witness.
+//
+// Bug 108's invariant is "TIE_BREAKER survives the toggle, full
+// stop" — that has to extend to "a witness is created when the
+// post-toggle state needs one, even if the steady-state precursor
+// reconcile never landed it". Without this, an unlucky timing
+// permanently kills the witness; subsequent reconciles see "1
+// diskful + 1 diskless" and stay in the no-witness branch forever.
+// Mirrors the v2 report's curl observation: `len(resources) == 2`.
+func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// Steady state just after `rd ap --place-count 2`: 2 diskful
+	// replicas land. The witness reconcile hasn't run yet — this
+	// IS the race the bug-hunt v2 agent hit. No TIE_BREAKER on n3.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "poke108e", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	// Operator fires `r td --diskless n1 poke108e` BEFORE the RD
+	// reconciler runs (cache-trail / queue-drain race). Toggle
+	// handler only flips the DISKLESS flag — see
+	// handleResourceToggleDiskToDiskless in resource_toggle_disk.go.
+	if err := st.Resources().Update(ctx, &apiv1.Resource{
+		Name: "poke108e", NodeName: "n1",
+		Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("toggle n1 to diskless: %v", err)
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "poke108e"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// RD-reconciler drains its work queue and runs (post-toggle
+	// view). Bug 104's keep-branch can't help — no witness was
+	// ever stamped. The fix must extend wantWitness to cover this
+	// transient case.
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	post, err := st.Resources().ListByDefinition(ctx, "poke108e")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	// Bug 108 invariant from v2 report: a TIE_BREAKER witness MUST
+	// land on the unused node (n3). Pre-fix the controller settled
+	// at 2 replicas with no witness — len==2 in the v2 curl trace.
+	if len(post) != 3 {
+		t.Fatalf("Bug 108: post-toggle replica count = %d, want 3 "+
+			"(1 diskful + 1 user-diskless + 1 auto-witness); entries=%v",
+			len(post), post)
+	}
+
+	witnessCount := 0
+
+	for i := range post {
+		for _, f := range post[i].Flags {
+			if f == apiv1.ResourceFlagTieBreaker {
+				witnessCount++
+			}
+		}
+	}
+
+	if witnessCount != 1 {
+		t.Fatalf("Bug 108: TIE_BREAKER count = %d, want 1; entries=%v",
+			witnessCount, post)
+	}
+}
