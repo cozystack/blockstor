@@ -201,8 +201,16 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		rd.ExternalName = body.ExternalName
 	}
 
-	if rd.Name == "" {
-		writeError(w, http.StatusBadRequest, "resource definition name is required")
+	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
+	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
+	// hash-prefixes the input. Without this gate `linstor rd c "  "`
+	// leaked the raw apimachinery "metadata.name: Invalid value:
+	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;
+	// with the gate the operator sees a LINSTOR-shaped envelope
+	// naming the offending input.
+	nameErr := validateLinstorName("resource definition", rd.Name)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
 
 		return
 	}

@@ -161,6 +161,17 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 
 	filter := mergeAutoplaceFilter(r.Context(), s.Store, &rd, &req.SelectFilter)
 
+	// Bug 94: when the caller pinned the placement to a specific node
+	// via `linstor r c --auto-place 1 --node <name> <rd>` (which the
+	// CLI lowers onto `select_filter.node_name_list`), refuse the
+	// request if any name in the list doesn't resolve to a Node CRD.
+	// Without this gate the placer's downstream "no candidate pools"
+	// shortfall fired with a generic 409 — operators couldn't tell
+	// "pool full" from "you typo'd the node name".
+	if !s.refuseAutoplaceOnUnknownNodes(w, r, filter.NodeNameList) {
+		return
+	}
+
 	// Scenario 4.W17 (`r c --auto-place +1 <rd>`): see
 	// resolveAdditionalPlaceCount doc — the Python CLI's `+1` shorthand
 	// posts `additional_place_count`, and we fold it into the effective
@@ -209,6 +220,39 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
 	}})
+}
+
+// refuseAutoplaceOnUnknownNodes is Bug 94's autoplace-side guard. The
+// CLI's `linstor r c --auto-place 1 --node <name> <rd>` lands as
+// `select_filter.node_name_list`; without this check, an unknown node
+// name made the placer fall through to its generic "no candidate
+// pools" shortfall message and the operator never learned that the
+// real cause was a typo. We resolve every name through the Node store
+// first and 404 with a LINSTOR envelope listing the missing names.
+//
+// Returns true when the caller may proceed (empty list or all names
+// resolve), false when the HTTP error has already been written.
+func (s *Server) refuseAutoplaceOnUnknownNodes(w http.ResponseWriter, r *http.Request, names []string) bool {
+	for _, name := range names {
+		_, err := s.Store.Nodes().Get(r.Context(), name)
+		if err == nil {
+			continue
+		}
+
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				"node '"+name+"' not found: create the node first with "+
+					"`linstor n c <name>` or pass a valid existing node name")
+
+			return false
+		}
+
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	return true
 }
 
 // persistAutoplaceLayerList writes a CSI-supplied layer_list onto the
@@ -795,6 +839,30 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		if strings.Contains(rdName, ".") {
 			writeError(w, http.StatusBadRequest,
 				"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
+
+			return nil, false
+		}
+
+		// Bug 94: refuse to stage a Resource CRD pointing at a node
+		// the controller never registered. Without this gate
+		// `linstor r c <bogus-node> <rd>` happily wrote
+		// `<rd>.<bogus-node>` into the store and the satellite
+		// reconciler then had no way to reach the named node — the
+		// phantom CRD survived forever as orphaned state. We do the
+		// existence check here (not in the per-replica store create)
+		// so the operator sees a 404 + LINSTOR envelope with the
+		// exact unresolved name + an actionable correction hint.
+		_, nodeErr := s.Store.Nodes().Get(r.Context(), res.NodeName)
+		if errors.Is(nodeErr, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				"node '"+res.NodeName+"' not found: create the node first with "+
+					"`linstor n c <name>` or pass a valid existing node name")
+
+			return nil, false
+		}
+
+		if nodeErr != nil {
+			writeStoreError(w, nodeErr)
 
 			return nil, false
 		}

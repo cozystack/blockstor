@@ -670,8 +670,16 @@ func TestPoolCreateRejectsNonCanonicalName(t *testing.T) {
 	bodyBuf := make([]byte, 1<<10)
 
 	n, _ := resp.Body.Read(bodyBuf)
-	if !strings.Contains(string(bodyBuf[:n]), "metadata.name must equal") {
-		t.Errorf("body: got %q, want substring \"metadata.name must equal\"", string(bodyBuf[:n]))
+	// Bug 97 hardening replaced the per-handler "<pool>.<node>"
+	// convention message with the shared validator's RFC-1123 reject:
+	// "<offending name> is not a valid identifier (…)". An embedded
+	// '.' fails the new rule because the regex doesn't admit dotted
+	// names, so the wire-level guarantee (no '.' in user-supplied
+	// pool names) is preserved while the message is unified across
+	// every name-bearing endpoint. Pin the substantive bits.
+	got := string(bodyBuf[:n])
+	if !strings.Contains(got, "thin.evil") || !strings.Contains(got, "not a valid identifier") {
+		t.Errorf("body: got %q, want substring \"thin.evil\" + \"not a valid identifier\"", got)
 	}
 }
 

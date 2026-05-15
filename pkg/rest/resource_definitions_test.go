@@ -157,6 +157,13 @@ func TestResourceCreateDuplicateNodeRDPairConflict(t *testing.T) {
 		t.Fatalf("seed RD: %v", err)
 	}
 
+	// Bug 94: handleResourceCreate now refuses replica-creates on
+	// unknown Nodes; seed the Node so the test exercises the 409
+	// conflict path (not the new 404 missing-node path).
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed Node: %v", err)
+	}
+
 	// Seed a plain diskful replica on n1. No DISKLESS / TIE_BREAKER
 	// flag → the promote path in createOrPromoteResource must not
 	// engage, so a second create for the same (rd, node) pair has to

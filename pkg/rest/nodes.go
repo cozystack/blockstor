@@ -350,8 +350,12 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if n.Name == "" {
-		writeError(w, http.StatusBadRequest, "node name is required")
+	// Bug 97: validate at the wire boundary, before pkg/store/k8s.Name()
+	// slugifies + hash-prefixes the input. Same rationale as
+	// handleRDCreate; see pkg/rest/input_validation.go.
+	nameErr := validateLinstorName("node", n.Name)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
 
 		return
 	}
@@ -411,30 +415,35 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		ProviderKind:    apiv1.StoragePoolKindDiskless,
 	})
 
+	writeJSON(w, http.StatusCreated, buildNodeCreateEnvelope(&n))
+}
+
+// buildNodeCreateEnvelope assembles the `[]ApiCallRc` reply for a
+// successful node-create. Extracted from handleNodeCreate so the
+// parent stays under the funlen budget after the Bug-97 validation
+// gate landed.
+//
+// Always emits a SUCCESS entry first (the controller-side record was
+// written). cli-parity-audit row #40: upstream LINSTOR's
+// `CtrlNodeApiCallHandler.createNode` then appends a second WARNING
+// entry — "No active connection to satellite '<name>'" — when the
+// daemon hasn't checked in yet. blockstor's REST shim used to collapse
+// to a single SUCCESS entry; tooling that parses `replies[].ret_code`
+// by mask (tests/contract/normalize.go, the Python CLI's print loop)
+// then missed the deployment-incomplete signal.
+//
+// `ConnectionStatus == "ONLINE"` covers the operator-pre-seeded /
+// adopted-already-running-satellite case used by tests; everything
+// else (including the empty default) emits the warning. Upstream's
+// wire vocabulary here is {"ONLINE","OFFLINE","CONNECTING",…}; matching
+// on ONLINE is the strictest interpretation of "active connection".
+func buildNodeCreateEnvelope(n *apiv1.Node) []apiv1.APICallRc {
 	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "node created: " + n.Name,
 		ObjRefs: map[string]string{objRefNode: n.Name},
 	}}
 
-	// Append the "no active connection" warning when the satellite
-	// hasn't checked in yet. cli-parity-audit row #40: upstream
-	// LINSTOR's `CtrlNodeApiCallHandler.createNode` returns two
-	// ApiCallRc entries on the wire — a SUCCESS for the controller-
-	// side record creation, then a WARNING with the exact text
-	// "No active connection to satellite '<name>'" so the operator
-	// learns the daemon still needs to come up. blockstor's REST shim
-	// was collapsing to a single SUCCESS entry; tooling that parses
-	// `replies[].ret_code` by mask (the contract normaliser at
-	// tests/contract/normalize.go, the Python CLI's print loop) then
-	// missed the deployment-incomplete signal.
-	//
-	// We treat `ConnectionStatus == "ONLINE"` as "the operator pre-seeded
-	// a connected node" — used by tests and by clusters that adopt an
-	// already-running satellite. Any other value (including the empty
-	// default) emits the warning. Upstream LINSTOR's wire vocabulary
-	// here is {"ONLINE","OFFLINE","CONNECTING",…}; matching on ONLINE
-	// is the strictest interpretation of "active connection".
 	if !strings.EqualFold(n.ConnectionStatus, apiv1.NodeTypeOnline) {
 		envelope = append(envelope, apiv1.APICallRc{
 			RetCode: warnNoSatelliteConnection,
@@ -443,7 +452,7 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, http.StatusCreated, envelope)
+	return envelope
 }
 
 // resolveDefaultAddress synthesises the address for the default

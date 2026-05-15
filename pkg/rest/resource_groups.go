@@ -108,8 +108,12 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if rg.Name == "" {
-		writeError(w, http.StatusBadRequest, "resource group name is required")
+	// Bug 97: see pkg/rest/input_validation.go — RFC-1123 subdomain
+	// validation at the REST boundary, before pkg/store/k8s.Name()
+	// mangles the input.
+	nameErr := validateLinstorName("resource group", rg.Name)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
 
 		return
 	}

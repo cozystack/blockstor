@@ -810,6 +810,13 @@ func TestResourceCreateAndDelete(t *testing.T) {
 		t.Fatalf("seed RD: %v", err)
 	}
 
+	// Bug 94: handleResourceCreate now requires the target Node to exist
+	// in the controller's store. Seed the Node so this test exercises
+	// the explicit-placement happy path rather than the new 404.
+	if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed Node: %v", err)
+	}
+
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
@@ -881,6 +888,10 @@ func TestResourceCreateManualStorPoolBypassesAutoplacer(t *testing.T) {
 	}
 
 	for _, s := range seed {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{Name: s.node}); err != nil {
+			t.Fatalf("seed node %s: %v", s.node, err)
+		}
+
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
 			StoragePoolName: s.pool,
 			NodeName:        s.node,
@@ -1060,6 +1071,10 @@ func TestResourceCreatePersistsLayerList(t *testing.T) {
 
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-csi-explicit"}); err != nil {
 		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1"}); err != nil {
+		t.Fatalf("seed Node: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
@@ -1903,6 +1918,10 @@ func TestResourceCreatePromotesTiebreakerWithDisklessFlag(t *testing.T) {
 		t.Fatalf("seed RD: %v", err)
 	}
 
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n3"}); err != nil {
+		t.Fatalf("seed Node: %v", err)
+	}
+
 	witness := &apiv1.Resource{
 		Name:     "pvc-1",
 		NodeName: "n3",
@@ -2179,6 +2198,10 @@ func TestResourceCreateDrbdDisklessPermanentClient(t *testing.T) {
 
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
 		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n4"}); err != nil {
+		t.Fatalf("seed Node: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)

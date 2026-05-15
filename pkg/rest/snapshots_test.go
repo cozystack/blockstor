@@ -299,8 +299,13 @@ func TestSnapshotsCreateMissingName(t *testing.T) {
 	n, _ := resp.Body.Read(bodyBytes)
 	got := string(bodyBytes[:n])
 
-	if !strings.Contains(got, "snapshot name is required") {
-		t.Errorf("body: got %q, want it to contain 'snapshot name is required'", got)
+	// Bug 97 hardening replaced the plain "snapshot name is required"
+	// message with the validator's structured "name is required:
+	// snapshot" form (sentinel-wrapped). Match the substantive parts
+	// of both shapes so the test pins the operator-visible signal
+	// without locking the exact wording.
+	if !strings.Contains(got, "snapshot") || !strings.Contains(got, "name") || !strings.Contains(got, "required") {
+		t.Errorf("body: got %q, want it to mention snapshot name being required", got)
 	}
 }
 
@@ -336,8 +341,13 @@ func TestSnapshotsCreateWhitespaceOnlyName(t *testing.T) {
 	n, _ := resp.Body.Read(bodyBytes)
 	got := string(bodyBytes[:n])
 
-	if !strings.Contains(got, "snapshot name is required") {
-		t.Errorf("body: got %q, want it to contain 'snapshot name is required'", got)
+	// Bug 97 hardening replaced the plain "snapshot name is required"
+	// message with the validator's structured "name is required:
+	// snapshot" form (sentinel-wrapped). Match the substantive parts
+	// of both shapes so the test pins the operator-visible signal
+	// without locking the exact wording.
+	if !strings.Contains(got, "snapshot") || !strings.Contains(got, "name") || !strings.Contains(got, "required") {
+		t.Errorf("body: got %q, want it to mention snapshot name being required", got)
 	}
 }
 

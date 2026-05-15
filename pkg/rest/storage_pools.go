@@ -453,22 +453,14 @@ func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string
 
 	body.NodeName = node
 
-	if body.StoragePoolName == "" {
-		writeError(w, http.StatusBadRequest, "storage_pool_name is required")
-
-		return apiv1.StoragePool{}, false
-	}
-
-	// Enforce the cluster-wide naming convention up front: the CRD
-	// metadata.name will be `<pool>.<node>`, so a pool name carrying a
-	// '.' would silently shift the boundary and either collide with
-	// another (pool, node) pair or stage a CRD the CEL rule on the
-	// type would later reject with a 422. Catch it here with a
-	// friendly 400 so callers don't have to parse the k8s Invalid
-	// envelope to figure out what went wrong.
-	if strings.Contains(body.StoragePoolName, ".") {
-		writeError(w, http.StatusBadRequest,
-			"storage_pool_name must not contain '.': metadata.name must equal <pool>.<node>")
+	// Bug 97: REST-boundary identifier validation runs before any
+	// store call so a whitespace-only / RFC-1123-illegal pool name
+	// fails fast with a LINSTOR envelope (rather than leaking the
+	// k8s "metadata.name is invalid: <hex>-" error after Name()
+	// mangling). See pkg/rest/input_validation.go.
+	poolNameErr := validateLinstorName("storage pool", body.StoragePoolName)
+	if poolNameErr != nil {
+		writeError(w, http.StatusBadRequest, poolNameErr.Error())
 
 		return apiv1.StoragePool{}, false
 	}

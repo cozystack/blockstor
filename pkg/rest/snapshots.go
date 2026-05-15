@@ -431,8 +431,13 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	// whitespace-only `"   "` previously slipped through and persisted
 	// an unaddressable snapshot row (zfs barfs on the snap name later;
 	// linstor-csi sees a "created" response and never retries).
-	if strings.TrimSpace(snap.Name) == "" {
-		writeError(w, http.StatusBadRequest, "snapshot name is required")
+	//
+	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
+	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
+	// before pkg/store/k8s.Name() slugifies the input.
+	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
+	if snapNameErr != nil {
+		writeError(w, http.StatusBadRequest, snapNameErr.Error())
 
 		return
 	}
