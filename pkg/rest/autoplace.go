@@ -255,6 +255,44 @@ func (s *Server) refuseAutoplaceOnUnknownNodes(w http.ResponseWriter, r *http.Re
 	return true
 }
 
+// refuseResourceCreateOnUnknownPool is Bug 118's gate. When the
+// caller pinned a storage pool by name (`linstor r c <node> <rd>
+// --storage-pool <pool>` lands as
+// `body.resource.props["StorPoolName"]`), the pool must already
+// exist on the target node. Without this check the Resource CRD
+// persisted with a dangling pool reference: the satellite
+// reconciler would forever wait for a pool that never
+// materializes, and the operator's only feedback was "SUCCESS" on
+// the create. Mirrors Bug 94's gate shape — 404 + LINSTOR envelope
+// naming the offending (pool, node) pair. Skipped when no pool is
+// named (diskless replicas, RD-prop inheritance, autoplace-style
+// filter-driven selection). Returns true when the caller may
+// proceed, false when the HTTP error has already been written.
+func (s *Server) refuseResourceCreateOnUnknownPool(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) bool {
+	pool := res.Props["StorPoolName"]
+	if pool == "" {
+		return true
+	}
+
+	_, err := s.Store.StoragePools().Get(r.Context(), res.NodeName, pool)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound,
+			"storage pool '"+pool+"' not found on node '"+res.NodeName+
+				"': create the pool first with `linstor sp c <node> <pool> ...` "+
+				"or pass a valid existing pool name")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
+}
+
 // persistAutoplaceLayerList writes a CSI-supplied layer_list onto the
 // RD's LayerStack so the dispatcher → satellite chain sees the right
 // composition. Pulled out of handleAutoplace to keep that function under
@@ -864,6 +902,10 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		if nodeErr != nil {
 			writeStoreError(w, nodeErr)
 
+			return nil, false
+		}
+
+		if !s.refuseResourceCreateOnUnknownPool(w, r, &res) {
 			return nil, false
 		}
 
