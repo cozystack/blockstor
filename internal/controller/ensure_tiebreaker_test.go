@@ -509,3 +509,140 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless pins Bug
+// 104. Starting from the steady state the auto-witness path creates
+// (2 diskful + 1 TIE_BREAKER), an operator toggles one diskful to
+// DISKLESS via `linstor r td --diskless`. The pre-Bug-104 invariant
+// recomputed wantWitness from scratch and saw "1 diskful, 1
+// non-witness diskless" — flipping the decision to "no witness
+// needed" and DELETING the TIE_BREAKER. That collapses the cluster
+// to 1 diskful + 1 diskless with no third voter, so the next
+// network partition freezes the volume read-only (UG9 §"Quorum"
+// failure-mode 2). The fix keeps the witness whenever it already
+// exists and diskful is in [1, 3): the cluster needs the witness
+// MORE in that window, not less.
+func TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// Steady state after auto-witness placement: n1 + n2 diskful,
+	// n3 carries the auto-stamped TIE_BREAKER witness.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug104", NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed n1: %v", err)
+	}
+
+	// Operator toggled the diskful on n1 to diskless (the
+	// observable effect of `linstor r td --diskless n1 pvc-bug104`,
+	// which is the only path the REST layer wires today — see
+	// handleResourceToggleDiskToDiskless in
+	// pkg/rest/resource_toggle_disk.go).
+	if err := st.Resources().Update(ctx, &apiv1.Resource{
+		Name: "pvc-bug104", NodeName: "n1",
+		Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("toggle n1 to diskless: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug104", NodeName: "n2",
+	}); err != nil {
+		t.Fatalf("seed n2: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug104", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed n3 witness: %v", err)
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug104"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// Bug 104 invariant: all three Resources MUST still exist.
+	// Pre-fix, n3 (TIE_BREAKER) got removed by applyWitnessDecision.
+	all, err := st.Resources().ListByDefinition(ctx, "pvc-bug104")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(all) != 3 {
+		t.Fatalf("replica count: got %d, want 3 (1 diskful + 1 diskless + 1 TIE_BREAKER); entries=%v",
+			len(all), all)
+	}
+
+	witnessCount := 0
+	disklessCount := 0
+	diskfulCount := 0
+
+	for i := range all {
+		hasDiskless := false
+		hasTB := false
+
+		for _, f := range all[i].Flags {
+			if f == apiv1.ResourceFlagDiskless {
+				hasDiskless = true
+			}
+
+			if f == apiv1.ResourceFlagTieBreaker {
+				hasTB = true
+			}
+		}
+
+		switch {
+		case hasTB:
+			witnessCount++
+		case hasDiskless:
+			disklessCount++
+		default:
+			diskfulCount++
+		}
+	}
+
+	if diskfulCount != 1 || disklessCount != 1 || witnessCount != 1 {
+		t.Errorf("post-toggle composition: diskful=%d diskless=%d witness=%d, want 1/1/1; entries=%v",
+			diskfulCount, disklessCount, witnessCount, all)
+	}
+
+	// Quorum prop must remain "majority": diskful=1 + diskless=2
+	// (1 user-diskless + 1 witness) still satisfies the
+	// `(diskful == 2 AND diskless ≥ 1) OR diskful ≥ 3` upstream
+	// rule? No — diskful=1 + diskless=2 falls into the "off" branch
+	// of quorumPolicy. The witness preservation is about not making
+	// the situation WORSE: with the witness gone we'd have
+	// diskful=1+diskless=1=2, still "off", but the operator can
+	// recover by re-toggling. Without the witness, re-toggling
+	// gives 2 diskful + 1 user-diskless and quorumPolicy returns
+	// "majority" — but during the partition-vulnerable window the
+	// witness was still useful as a connection-mesh participant.
+	// We do not pin a specific quorum prop value here because the
+	// 1-diskful state is intentionally a transient operator
+	// workflow, not steady state.
+}

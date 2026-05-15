@@ -154,25 +154,8 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 
 	diskful, diskless := splitByDiskless(replicas)
 	witness := filterTieBreaker(diskless)
-	nonWitnessDiskless := len(diskless) - len(witness)
 
-	// Tiebreaker decision (mirrors shouldTieBreakerExist).
-	// Gate on DrbdOptions/AutoAddQuorumTiebreaker — upstream LINSTOR
-	// only runs the auto-witness logic when the prop is "true". On
-	// cozystack / piraeus-operator clusters this prop is set
-	// cluster-wide via ControllerProps; vanilla blockstor leaves it
-	// off so explicit DISKLESS replicas don't race with the auto
-	// reconciler.
-	//
-	// Suppression: if an operator (or the REST per-resource-delete
-	// handler) recently dropped a TIE_BREAKER replica, the RD
-	// carries a short-lived annotation telling us "don't re-stamp
-	// the witness right now". Without this, `linstor r d
-	// <tiebreaker> <rd>` returns success only to have the next
-	// reconcile bring the witness right back milliseconds later.
-	wantWitness := isAutoTieBreakerEnabled(rd) &&
-		!isTiebreakerSuppressed(rd) &&
-		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
+	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness)
 
 	willCreate := wantWitness && len(witness) == 0
 	willRemove := !wantWitness && len(witness) > 0
@@ -212,6 +195,51 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	}
 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
+}
+
+// shouldTieBreakerExist decides whether the RD should carry an
+// auto-managed TIE_BREAKER witness. Splits into two complementary
+// branches, both gated on DrbdOptions/AutoAddQuorumTiebreaker
+// (upstream LINSTOR's auto-tiebreaker prop):
+//
+//  1. Create branch (mirrors upstream shouldTieBreakerExist exactly):
+//     diskful ≥ 2, parity is even, and no user-added diskless already
+//     breaks the tie. Suppression also gates this branch — the REST
+//     per-resource-delete handler stamps a short-lived annotation
+//     right before dropping the witness so the next reconcile
+//     doesn't put it back milliseconds later.
+//
+//  2. Keep branch (Bug 104): preserve an already-stamped TIE_BREAKER
+//     across toggle-disk diskful→diskless transitions. Without this,
+//     `r td --diskless <one-of-diskful>` on a 2-diskful + 1-witness
+//     RD would see diskful drop to 1 and a user-added diskless climb
+//     to 1, flip wantWitness to false, and remove the witness —
+//     leaving 1 diskful + 1 diskless with no third voter, which
+//     freezes quorum:majority the moment those two lose comms. Once
+//     a witness exists, only drop it when diskful ≥ 3 (clear
+//     majority without help) or there's no diskful at all (nothing
+//     to defend). Suppression is not consulted here — that
+//     annotation is stamped at delete-time and is only meaningful
+//     when the witness has already been removed.
+func shouldTieBreakerExist(
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	diskful, diskless, witness []apiv1.Resource,
+) bool {
+	if !isAutoTieBreakerEnabled(rd) {
+		return false
+	}
+
+	nonWitnessDiskless := len(diskless) - len(witness)
+
+	wantNewWitness := !isTiebreakerSuppressed(rd) &&
+		len(diskful) >= 2 && len(diskful)%2 == 0 && nonWitnessDiskless == 0
+
+	const witnessUnnecessaryDiskfulCount = 3
+
+	keepExistingWitness := len(witness) > 0 &&
+		len(diskful) >= 1 && len(diskful) < witnessUnnecessaryDiskfulCount
+
+	return wantNewWitness || keepExistingWitness
 }
 
 // isAutoQuorumDisabled reports whether the RD opted out of the

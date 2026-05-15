@@ -258,6 +258,107 @@ func TestGroupFRToggleCancel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// TestGroupFRToggleDiskful2DisklessPreservesTieBreaker — Bug 104
+// (P1, QUORUM HAZARD). Starting from the steady auto-place(2) state
+// (2 diskful + 1 TIE_BREAKER on the 3rd node), `linstor r td
+// --diskless <one-of-diskful>` MUST leave the TIE_BREAKER Resource
+// intact. Pre-fix, the RD reconciler recomputed wantWitness from
+// scratch after the toggle, saw "1 diskful + 1 non-witness diskless"
+// (the freshly-flipped replica), flipped its decision to "no witness
+// needed", and DELETED the TIE_BREAKER Resource — collapsing the
+// quorum surface to 1 diskful + 1 diskless with no third voter. The
+// next network partition would freeze the volume read-only.
+// ---------------------------------------------------------------------------
+
+func TestGroupFRToggleDiskful2DisklessPreservesTieBreaker(t *testing.T) {
+	stack, cli, rd := setupGroupFRD(t, "td-tb")
+
+	// Steady state: auto-place 2 lands diskful on worker-1+worker-2,
+	// the RD reconciler stamps the auto TIE_BREAKER on worker-3.
+	cli.JSON(t, "resource", "create", rd, "--auto-place", "2",
+		"--storage-pool", "lvm-thin")
+
+	diskful := waitForDiskfulReplicas(t, stack, rd, 2)
+	if len(diskful) != 2 {
+		t.Fatalf("auto-place 2 produced %d diskful replicas, want 2", len(diskful))
+	}
+
+	witness := waitForTiebreakerWitness(t, stack, rd)
+	witnessNode := witness.Spec.NodeName
+
+	// Toggle the first diskful node to diskless.
+	target := diskful[0].Spec.NodeName
+	cli.JSON(t, "resource", "toggle-disk", target, rd, "--diskless")
+
+	// The toggled node MUST gain the DISKLESS flag.
+	harness.Eventually(t, groupFAssertTimeout, func() bool {
+		r := getResource(t, stack, rd, target)
+
+		return r != nil && groupFContains(r.Spec.Flags, "DISKLESS")
+	}, "Resource "+rd+"."+target+" never gained DISKLESS flag")
+
+	// Bug 104 invariant: the TIE_BREAKER Resource on `witnessNode`
+	// MUST still exist after the toggle settles. We give the RD
+	// reconciler a generous beat (rdReconcileRequeue + apply) and
+	// poll for a STABLE 3-replica composition: 1 diskful + 1
+	// non-witness diskless + 1 TIE_BREAKER.
+	deadline := time.Now().Add(groupFAssertTimeout)
+
+	for time.Now().Before(deadline) {
+		all := listResourcesByRD(t, stack, rd)
+
+		if assertBug104Composition(all, witnessNode) {
+			time.Sleep(2 * time.Second) // settle window
+
+			all = listResourcesByRD(t, stack, rd)
+
+			if assertBug104Composition(all, witnessNode) {
+				return // success
+			}
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	all := listResourcesByRD(t, stack, rd)
+	t.Fatalf("Bug 104: post-toggle replica set drifted from "+
+		"{1 diskful + 1 user-diskless + 1 TIE_BREAKER on %s}; got %d entries: %v",
+		witnessNode, len(all), all)
+}
+
+// assertBug104Composition returns true iff the replica set looks
+// like {1 diskful + 1 user-diskless + 1 TIE_BREAKER on witnessNode}.
+// Bug 104's failure mode is the TIE_BREAKER on witnessNode getting
+// reaped, so we pin both the count (3) and the node identity.
+func assertBug104Composition(all []blockstoriov1alpha1.Resource, witnessNode string) bool {
+	if len(all) != 3 {
+		return false
+	}
+
+	witnessFound := false
+	diskfulCount := 0
+	userDisklessCount := 0
+
+	for i := range all {
+		isDiskless := groupFContains(all[i].Spec.Flags, "DISKLESS")
+		isTB := groupFContains(all[i].Spec.Flags, "TIE_BREAKER")
+
+		switch {
+		case isTB:
+			if all[i].Spec.NodeName == witnessNode {
+				witnessFound = true
+			}
+		case isDiskless:
+			userDisklessCount++
+		default:
+			diskfulCount++
+		}
+	}
+
+	return witnessFound && diskfulCount == 1 && userDisklessCount == 1
+}
+
+// ---------------------------------------------------------------------------
 // TestGroupFRMigrateDisk — Bug 34. `r migrate-disk` is upstream
 // LINSTOR's add-before-drop replica move; the REST endpoint stamps
 // the destination with BlockstorMigratingFrom and leaves the source
