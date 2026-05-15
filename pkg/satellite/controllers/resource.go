@@ -19,12 +19,15 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -274,34 +277,9 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "satellite Apply")
 	}
 
-	var anyFailed bool
+	anyFailed := r.recordPerResourceFailures(results, logger)
 
-	for _, ar := range results {
-		if !ar.GetOk() {
-			anyFailed = true
-
-			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
-		}
-	}
-
-	// Stamp per-volume DevicePath into Status.Volumes so
-	// linstor-csi / any consumer that reads the CRD sees the
-	// /dev path the satellite materialised. Done even when one
-	// volume's apply failed: a partial success is still useful
-	// to surface (volumes that did apply have a real device).
-	err = r.stampVolumeStatus(ctx, res, results)
-	if err != nil {
-		logger.Error(err, "stamp Status.Volumes")
-	}
-
-	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
-	// per-resource result. The helper is a no-op when the Resource
-	// isn't mid diskless→diskful conversion, so it's safe to call
-	// unconditionally on every apply pass.
-	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
-	if err != nil {
-		logger.Error(err, "record toggle-disk outcome")
-	}
+	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
@@ -314,6 +292,61 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// recordPerResourceFailures logs each per-resource Apply failure and
+// returns whether any of the results came back not-Ok. Extracted from
+// runApply so the orchestration stays under the funlen budget.
+func (r *ResourceReconciler) recordPerResourceFailures(results []*intent.ResourceApplyResult, logger logr.Logger) bool {
+	var anyFailed bool
+
+	for _, ar := range results {
+		if !ar.GetOk() {
+			anyFailed = true
+
+			logger.Info("Apply per-resource failure", "name", ar.GetName(), "message", ar.GetMessage())
+		}
+	}
+
+	return anyFailed
+}
+
+// stampPostApply runs the three best-effort post-apply stamps:
+// Status.Volumes (per-volume DevicePath), the Bug-107 volume-numbers
+// annotation, and the Bug-39 toggle-disk retry counter. Each helper
+// is independently fallible — we log and move on so a transient
+// apiserver hiccup on one stamp doesn't suppress the others.
+func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
+	// Stamp per-volume DevicePath into Status.Volumes so
+	// linstor-csi / any consumer that reads the CRD sees the
+	// /dev path the satellite materialised. Done even when one
+	// volume's apply failed: a partial success is still useful
+	// to surface (volumes that did apply have a real device).
+	err := r.stampVolumeStatus(ctx, res, results)
+	if err != nil {
+		logger.Error(err, "stamp Status.Volumes")
+	}
+
+	// Bug 107: persist the parent RD's volume-number set onto the
+	// Resource itself so a future cascade-delete (RD CRD removed
+	// first, then per-Resource finalizer fires) can still tell
+	// `Apply.DeleteResource` which volume numbers to clean up. The
+	// annotation is the only surviving record once the RD is gone
+	// — without it, `handleDelete` iterates over zero volumes and
+	// the backing .img / ZVOL / LV leaks forever.
+	err = r.stampVolumeNumbersAnnotation(ctx, res, rd)
+	if err != nil {
+		logger.Error(err, "stamp volume-numbers annotation")
+	}
+
+	// Bug 39: bump or clear Status.ToggleDiskRetries based on the
+	// per-resource result. The helper is a no-op when the Resource
+	// isn't mid diskless→diskful conversion, so it's safe to call
+	// unconditionally on every apply pass.
+	err = r.recordToggleDiskOutcome(ctx, res, !anyFailed)
+	if err != nil {
+		logger.Error(err, "record toggle-disk outcome")
+	}
 }
 
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
@@ -377,6 +410,101 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 // apiserver merges the two slices cleanly under
 // `listMapKey=volumeNumber`.
 const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
+
+// stampVolumeNumbersAnnotation writes the parent RD's volume-number
+// set onto the Resource's metadata.annotations under
+// `blockstor.io/volume-numbers`. The value is a comma-separated list
+// of int32 (e.g. "0,1,2"). This is the Bug-107 fallback record:
+// when `linstor rd delete <X>` cascade-deletes the parent RD CRD via
+// owner refs, the satellite's `handleDelete` runs AFTER the RD is
+// already gone — without this annotation, `lookupVolumeNumbers`
+// returns an empty slice on the NotFound path and the per-volume
+// DeleteVolume loop iterates over zero items.
+//
+// Uses a JSON-merge patch with a re-fetch-and-compare guard to avoid
+// hot-loop writes when the annotation value hasn't changed. The
+// volume-number set only changes when an operator adds or removes a
+// VolumeDefinition on the parent RD, so the typical apply pass
+// short-circuits at the equality check.
+//
+// JSON-merge (rather than SSA Apply) keeps the patch minimal and
+// avoids stomping other field-managers' annotation entries. The
+// payload is `{"metadata":{"annotations":{"<key>":"<value>"}}}` —
+// kube-apiserver merges this in place, preserving every other
+// annotation already stamped on the Resource.
+func (r *ResourceReconciler) stampVolumeNumbersAnnotation(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	want := formatVolumeNumbers(rd.Spec.VolumeDefinitions)
+	if want == "" {
+		// Defensive — an RD with zero VolumeDefinitions is a no-op
+		// at the storage layer too. Don't claim a "0 volumes" record
+		// that could confuse a later operator reading the annotation.
+		return nil
+	}
+
+	if res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers] == want {
+		return nil
+	}
+
+	// JSON-merge: kube-apiserver applies the patch as a recursive
+	// merge against the live object's metadata.annotations map.
+	// JSON-encoding the value through %q gives correct quoting for
+	// the (digit-only) annotation value the formatter emits.
+	body := []byte(`{"metadata":{"annotations":{"` +
+		blockstoriov1alpha1.ResourceAnnotationVolumeNumbers + `":"` + want + `"}}}`)
+
+	err := r.Patch(ctx, res, client.RawPatch(types.MergePatchType, body))
+	if err != nil {
+		return errors.Wrap(err, "merge-patch annotation blockstor.io/volume-numbers")
+	}
+
+	return nil
+}
+
+// formatVolumeNumbers renders a slice of VolumeDefinitions as the
+// comma-separated list stored in the Bug-107 fallback annotation.
+// Empty input → empty string (caller short-circuits on empty).
+func formatVolumeNumbers(defs []blockstoriov1alpha1.ResourceDefinitionVolume) string {
+	if len(defs) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(defs))
+	for i := range defs {
+		parts = append(parts, strconv.FormatInt(int64(defs[i].VolumeNumber), 10))
+	}
+
+	return strings.Join(parts, ",")
+}
+
+// parseVolumeNumbers is the inverse of formatVolumeNumbers. Malformed
+// entries (non-int32, empty after split) are skipped silently — the
+// annotation is an operator-readable hint, not an authoritative wire
+// contract, so a partial parse is preferable to refusing to delete
+// anything on a single corrupted byte.
+func parseVolumeNumbers(s string) []int32 {
+	if s == "" {
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+	out := make([]int32, 0, len(parts))
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		n, err := strconv.ParseInt(part, 10, 32)
+		if err != nil {
+			continue
+		}
+
+		out = append(out, int32(n))
+	}
+
+	return out
+}
 
 // enqueueLocalSiblings maps a Resource event to the LOCAL Resource
 // of the same RD (if any). When a peer on another node appears or
@@ -629,7 +757,7 @@ func (r *ResourceReconciler) handleDelete(ctx context.Context, res *blockstoriov
 		return ctrl.Result{}, nil
 	}
 
-	volumeNumbers, err := r.lookupVolumeNumbers(ctx, res.Spec.ResourceDefinitionName)
+	volumeNumbers, err := r.lookupVolumeNumbers(ctx, res)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -703,18 +831,32 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 }
 
 // lookupVolumeNumbers reads the parent RD and returns its
-// VolumeDefinitions' numbers. The satellite's DeleteResource
-// uses the list to drop matching LVs / loopfiles. A missing RD
-// (e.g. cascade-delete already removed it) silently returns an
-// empty list — the satellite's `DeleteVolume` paths short-
-// circuit on missing storage anyway.
-func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, rdName string) ([]int32, error) {
+// VolumeDefinitions' numbers. The satellite's DeleteResource uses
+// the list to drop matching LVs / loopfiles.
+//
+// Bug 107: when `linstor rd delete` cascade-deletes the parent RD
+// CRD via owner refs, the satellite's `handleDelete` runs AFTER the
+// RD is already gone. The RD Get returns NotFound, but we still need
+// to feed `DeleteResource` the volume-number set so the per-volume
+// `provider.DeleteVolume` loop actually unlinks the backing storage.
+// Fall back to the `blockstor.io/volume-numbers` annotation that
+// `stampVolumeNumbersAnnotation` writes on every successful apply.
+//
+// The fallback is best-effort: an annotation parse miss (corrupted
+// value, never-applied resource) returns nil, and the per-volume
+// loop in DeleteResource no-ops. That's the pre-Bug-107 behaviour
+// and matches the contract that DeleteVolume on a missing volume is
+// already idempotent.
+func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil
+			// Cascade-delete path — RD CRD vanished before we got
+			// here. Fall back to the annotation we stamped on the
+			// last successful apply.
+			return parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]), nil
 		}
 
 		return nil, errors.Wrap(err, "get parent RD for delete")

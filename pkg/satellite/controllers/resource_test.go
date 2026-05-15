@@ -18,6 +18,8 @@ package controllers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,7 @@ import (
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/storage/file"
 )
 
 // orderingProvider records the call order of DeleteVolume against a
@@ -423,4 +426,217 @@ func TestHandleDeleteIdempotentOnSecondPass(t *testing.T) {
 	}
 
 	_ = rdName
+}
+
+// TestHandleDeleteUnlinksFileImgAfterCascadedRDDelete pins the
+// Bug-107 fix: when `linstor rd delete <X>` cascades the parent RD
+// CRD via owner refs, the satellite's `handleDelete` MUST still
+// invoke `Provider.DeleteVolume` for every volume number the RD
+// declared at apply time. Without the fix, `lookupVolumeNumbers`
+// hits NotFound on the RD Get, returns an empty list, and the
+// per-volume DeleteVolume loop in `Apply.DeleteResource` iterates
+// over zero items — the backing `.img` (FILE_THIN) / ZVOL (ZFS) /
+// LV (LVM) stays on disk forever.
+//
+// Test shape:
+//   - Real `file.Provider` rooted at t.TempDir() (no mock — the test
+//     needs to observe the actual unlink).
+//   - Resource carries the `blockstor.io/volume-numbers` annotation
+//     the satellite's apply-path stamps on every successful pass.
+//   - Parent RD intentionally absent (cascade-delete already
+//     happened) so the lookup is forced through the annotation
+//     fallback path.
+//   - The .img file is pre-seeded as if a prior CreateVolume already
+//     materialised it.
+//
+// After one Reconcile pass, the .img must be gone.
+func TestHandleDeleteUnlinksFileImgAfterCascadedRDDelete(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-bug107"
+		pool   = "file-thin"
+		rdName = "pvc-bug107"
+	)
+
+	scheme := newToggleDiskTestScheme(t)
+
+	// Pre-seed the .img to mimic the post-CreateVolume disk state.
+	// The file.Provider names files as `<resource>_<vol5digit>.img`
+	// (matches upstream LINSTOR's FILE / FILE_THIN naming).
+	poolDir := t.TempDir()
+	imgPath := filepath.Join(poolDir, rdName+"_00000.img")
+
+	err := os.WriteFile(imgPath, []byte("leaked-without-bug-107-fix"), 0o600)
+	if err != nil {
+		t.Fatalf("pre-seed .img: %v", err)
+	}
+
+	now := metav1.Now()
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              rdName + "." + node,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{SatelliteResourceFinalizer},
+			Annotations: map[string]string{
+				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0",
+			},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               node,
+			ResourceDefinitionName: rdName,
+			StoragePool:            pool,
+		},
+	}
+
+	// NOTE: NO ResourceDefinition seeded. This is the load-bearing
+	// half of the test — handleDelete must succeed when the RD is
+	// already gone.
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	provider := file.NewProvider(file.Config{Dir: poolDir, Thin: true}, storage.NewFakeExec())
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{pool: provider},
+		NodeName:  node,
+	})
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{
+			NodeName:  node,
+			Apply:     rec,
+			Exec:      storage.NewFakeExec(),
+			APIReader: cli,
+		},
+	}
+
+	_, err = reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: res.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if _, statErr := os.Stat(imgPath); !os.IsNotExist(statErr) {
+		t.Errorf("Bug 107 regression: backing .img survived handleDelete "+
+			"after parent RD CRD was cascade-deleted (stat err=%v); the "+
+			"FILE_THIN pool would leak storage on every `linstor rd delete`",
+			statErr)
+	}
+}
+
+// TestStampVolumeNumbersAnnotationFormatsCommaSeparated pins the
+// Bug-107 stamp half: a successful apply MUST write the parent RD's
+// `spec.volumeDefinitions[].volumeNumber` list onto the Resource's
+// metadata.annotations under `blockstor.io/volume-numbers` as a
+// comma-separated decimal string. Without the stamp, the future
+// cascade-delete fallback in `lookupVolumeNumbers` has no record to
+// fall back on and the per-volume DeleteVolume loop iterates over
+// zero items.
+//
+// Multi-volume RDs (rare today, but the field is a list) must
+// preserve every volume number — handleDelete needs the full set so
+// every backing `.img` / ZVOL / LV gets cleaned up.
+func TestStampVolumeNumbersAnnotationFormatsCommaSeparated(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-stamp"
+		rdName = "pvc-stamp-volnums"
+	)
+
+	scheme := newToggleDiskTestScheme(t)
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               node,
+			ResourceDefinitionName: rdName,
+		},
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 65536},
+				{VolumeNumber: 1, SizeKib: 65536},
+				{VolumeNumber: 2, SizeKib: 65536},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(res, rd).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{NodeName: node},
+	}
+
+	err := reconciler.stampVolumeNumbersAnnotation(context.Background(), res, rd)
+	if err != nil {
+		t.Fatalf("stampVolumeNumbersAnnotation: %v", err)
+	}
+
+	var after blockstoriov1alpha1.Resource
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: res.Name}, &after)
+	if err != nil {
+		t.Fatalf("post-stamp Get: %v", err)
+	}
+
+	got, ok := after.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]
+	if !ok {
+		t.Fatalf("annotation %q missing; got annotations %+v",
+			blockstoriov1alpha1.ResourceAnnotationVolumeNumbers, after.Annotations)
+	}
+
+	const want = "0,1,2"
+	if got != want {
+		t.Errorf("annotation value: got %q, want %q", got, want)
+	}
+}
+
+// TestParseVolumeNumbersTolerantOfMalformedEntries pins the fallback
+// parser's contract: a corrupted annotation value MUST NOT crash or
+// surface an error — handleDelete falls back to "no volumes to
+// delete" rather than refusing to strip the finalizer. The intent is
+// best-effort cleanup: a partially-readable annotation still lets the
+// satellite reclaim what it can.
+func TestParseVolumeNumbersTolerantOfMalformedEntries(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		input string
+		want  []int32
+	}{
+		{name: "empty", input: "", want: nil},
+		{name: "single", input: "0", want: []int32{0}},
+		{name: "multi", input: "0,1,2", want: []int32{0, 1, 2}},
+		{name: "whitespace", input: "0, 1 , 2", want: []int32{0, 1, 2}},
+		{name: "skip_garbage", input: "0,abc,2", want: []int32{0, 2}},
+		{name: "trailing_comma", input: "0,1,", want: []int32{0, 1}},
+		{name: "leading_comma", input: ",0,1", want: []int32{0, 1}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := parseVolumeNumbers(tc.input)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("parseVolumeNumbers(%q) = %v, want %v",
+					tc.input, got, tc.want)
+			}
+		})
+	}
 }

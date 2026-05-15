@@ -20,6 +20,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ResourceAnnotationVolumeNumbers is the metadata.annotation key the
+// satellite reconciler stamps on a Resource CRD after every successful
+// apply pass. The value is a comma-separated list of int32 volume
+// numbers sourced from the parent ResourceDefinition's
+// `spec.volumeDefinitions[].volumeNumber` at apply time.
+//
+// Bug 107: when `linstor rd delete` cascades the parent RD CRD via
+// owner refs, the per-Resource satellite finalizer runs `handleDelete`
+// AFTER the RD CRD is already gone. The pre-fix `lookupVolumeNumbers`
+// read the volume-number list straight from `rd.Spec.VolumeDefinitions`
+// — with the RD gone it returned empty, the per-volume DeleteVolume
+// loop iterated over zero items, and the backing `.img` / ZVOL / LV
+// stayed on disk forever. This annotation is the surviving record that
+// lets handleDelete fall back to the last-known volume-number set when
+// the RD lookup hits NotFound.
+//
+// Stamped only on successful apply so the annotation never claims
+// volumes that haven't been materialised yet. Comma-separated rather
+// than JSON so a human operator can `kubectl get resource <r> -o
+// yaml | grep volume-numbers` and read it without parsing.
+const ResourceAnnotationVolumeNumbers = "blockstor.io/volume-numbers"
+
 // ResourceSpec is the desired state of one replica of a ResourceDefinition
 // placed on a node. The composite key is (resourceDefinitionName, nodeName);
 // metadata.name encodes that as `<rd>.<node>`.

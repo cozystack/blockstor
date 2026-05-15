@@ -175,7 +175,7 @@ func (r *ResourceReconciler) handleToggleDiskCancel(ctx context.Context, res *bl
 		"retries", res.Status.ToggleDiskRetries)
 
 	if isToggleDiskInFlight(res) {
-		volumeNumbers, err := r.lookupVolumeNumbers(ctx, res.Spec.ResourceDefinitionName)
+		volumeNumbers, err := r.lookupVolumeNumbers(ctx, res)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
