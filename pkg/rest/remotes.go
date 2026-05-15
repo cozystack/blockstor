@@ -19,6 +19,7 @@ package rest
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"sort"
 	"sync"
 
@@ -136,6 +137,26 @@ func handleEmptyRemoteArray(w http.ResponseWriter, _ *http.Request) {
 // when the body is malformed — without that, golinstor surfaces a
 // generic decode error which is harder for operators to act on.
 //
+// URL validation (Bug 119): the pre-fix handler stored whatever
+// `url` field the body carried, so `linstor remote c linstor t1
+// not-a-url` landed a remote nothing could reach. The fix parses
+// with `net/url.Parse` and rejects bodies whose URL has no scheme
+// or no host — `not-a-url`, `http://`, `//host`, `garbage:` all
+// trip the gate. golinstor's `client.LinstorRemote` ships only an
+// absolute http(s) URL in practice, so a strict scheme/host check
+// is the right shape: false-rejects in normal usage are zero.
+//
+// Wire shape (Bug 119): the pre-fix handler returned 201 with the
+// bare `linstorRemoteEntry` object as the body. python-linstor
+// 1.27.1 decodes the body as `[ApiCallResponse]` unconditionally
+// (responses.py:124 `data[0]["ret_code"]`), so a bare object
+// crashed the CLI with `TypeError: string indices must be integers,
+// not 'str'`. We now return the standard `[]APICallRc` envelope on
+// success — same shape every other write-side handler in this
+// package uses (see Bug 101 / aa5134fcf for the node-connection
+// precedent). The 201 status is preserved so HTTP-level callers
+// can still distinguish "newly created" from "list".
+//
 // Idempotent on duplicate `remote_name`: upstream's behaviour is
 // 201 with the previous entry overwritten — we mirror that. A
 // future CRD-backed implementation should surface 409 on conflict;
@@ -163,8 +184,19 @@ func (s *Server) handleCreateLinstorRemote(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	parsed, parseErr := url.Parse(entry.URL)
+	if parseErr != nil || parsed.Scheme == "" || parsed.Host == "" {
+		writeError(w, http.StatusBadRequest,
+			"url is not a valid absolute URL (need scheme and host): "+entry.URL)
+
+		return
+	}
+
 	s.linstorRemotes.put(entry)
-	writeJSON(w, http.StatusCreated, entry)
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "remote created: " + entry.RemoteName,
+	}})
 }
 
 // handleDeleteRemote removes a remote by `remote_name` query

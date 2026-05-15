@@ -136,13 +136,23 @@ func TestLinstorRemoteCRUD(t *testing.T) {
 		t.Fatalf("POST status: got %d, want 201; body=%s", createResp.StatusCode, gotBody)
 	}
 
-	var created map[string]string
-	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
-		t.Fatalf("decode create response: %v", err)
+	// Bug 119: the create response is the LINSTOR `[]APICallRc`
+	// envelope, not the bare entry object. python-linstor decodes
+	// the body as a list of ApiCallResponses unconditionally — a
+	// bare object trips `TypeError: string indices must be integers`
+	// in `responses.py:124`. The remote_name is verified by reading
+	// it back from the GET list below.
+	var createdRcs []apiv1.APICallRc
+	if err := json.NewDecoder(createResp.Body).Decode(&createdRcs); err != nil {
+		t.Fatalf("decode create envelope: %v", err)
 	}
 
-	if created["remote_name"] != remoteName {
-		t.Errorf("created remote_name: got %q, want %q", created["remote_name"], remoteName)
+	if len(createdRcs) != 1 {
+		t.Fatalf("create envelope len: got %d, want 1; got=%+v", len(createdRcs), createdRcs)
+	}
+
+	if !strings.Contains(createdRcs[0].Message, remoteName) {
+		t.Errorf("create message: got %q, want substring %q", createdRcs[0].Message, remoteName)
 	}
 
 	// --- GET /v1/remotes/linstor: typed-array list ---
