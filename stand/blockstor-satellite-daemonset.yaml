@@ -126,15 +126,32 @@ spec:
           securityContext:
             privileged: true
           # PreStop hook: gracefully release DRBD-9 connections
-          # before SIGTERM. Without this, `kubectl delete pod`
-          # (no --force) leaves drbd kernel state with stuck
-          # `Connecting` peers, and the kernel module is
-          # host-level on the Talos node so it persists across
-          # pod restarts. `drbdadm down --all` walks /etc/drbd.d
-          # in order; the per-resource 5s budget keeps a single
-          # half-hung connection from blocking the whole drain.
-          # Wrapped in `timeout 25` so the overall hook stays
-          # under terminationGracePeriodSeconds (30).
+          # before SIGTERM with a kernel-direct fallback (Bug 82).
+          #
+          # Without this, `kubectl delete pod` (no --force) leaves
+          # drbd kernel state with stuck `Connecting` peers, and the
+          # kernel module is host-level on the Talos node so it
+          # persists across pod restarts.
+          #
+          # Bug 82: `drbdadm down <res>` blocks indefinitely on
+          # `suspended:quorum` slots — a resource mid-quorum-loss
+          # (controller deleted the RD while a peer was offline)
+          # will hang `drbdadm down` until a peer comes back. The
+          # old hook timed out the per-resource call at 5s, leaving
+          # the kernel slot loaded. Next satellite start sees the
+          # stale `/dev/drbd<minor>` and a recycled port→minor pair
+          # fails create-md with "Device '<minor>' is configured!"
+          #
+          # New flow per resource:
+          #   1. Try `timeout 5 drbdadm down`. Happy path.
+          #   2. On failure / timeout: force-detach each volume via
+          #      `drbdsetup detach --force <res>/<vol>` (no quorum
+          #      wait) so the lower disk is released.
+          #   3. `drbdsetup down <res>` kernel-direct slot release
+          #      (also bypasses drbdadm's quorum-aware wait).
+          #
+          # Wrapped in `timeout 25` so the overall hook stays under
+          # terminationGracePeriodSeconds (30).
           lifecycle:
             preStop:
               exec:
@@ -144,10 +161,31 @@ spec:
                   - |
                     set +e
                     timeout 25 sh -c '
-                      for r in $(drbdsetup status --json 2>/dev/null \
-                          | python3 -c "import json,sys; print(\" \".join(r[\"name\"] for r in json.load(sys.stdin)))" 2>/dev/null); do
-                        timeout 5 drbdadm down "$r" 2>/dev/null || true
-                      done
+                      drbdsetup status --json 2>/dev/null \
+                        | python3 -c "
+                    import json, sys
+                    try:
+                        rs = json.load(sys.stdin)
+                    except Exception:
+                        sys.exit(0)
+                    for r in rs:
+                        name = r.get(\"name\", \"\")
+                        vols = [str(v.get(\"volume\", 0)) for v in r.get(\"volumes\", [])]
+                        print(name + \"\\t\" + \",\".join(vols))
+                    " 2>/dev/null \
+                        | while IFS=$(printf "\t") read -r r vols; do
+                            [ -z "$r" ] && continue
+                            timeout 5 drbdadm down "$r" 2>/dev/null && continue
+                            # Fallback: kernel-direct teardown for
+                            # suspended:quorum-stuck slots.
+                            IFS=,
+                            for v in $vols; do
+                              [ -z "$v" ] && continue
+                              drbdsetup detach --force "$r/$v" 2>/dev/null || true
+                            done
+                            unset IFS
+                            drbdsetup down "$r" 2>/dev/null || true
+                          done
                     '
           volumeMounts:
             - {name: dev, mountPath: /dev}

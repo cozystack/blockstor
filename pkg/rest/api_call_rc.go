@@ -198,6 +198,26 @@ const apiCallRcFailInUse int64 = 997
 // `--force`).
 const apiCallRcFailInvldVlmSize int64 = 206
 
+// apiCallRcFailStorPoolConfigurationError mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_STOR_POOL_CONFIGURATION_ERROR` (`990 | MASK_ERROR`).
+// Sub-code 990 is the closest semantic match in upstream's catalogue
+// for "the storage pool's backing configuration is broken on the
+// satellite" — exactly the situation that produces PoolMissing=true
+// after the satellite's StoragePool reconciler trips on a destroyed
+// backing zpool / vg. The MASK_ERROR bit is OR'd in by the
+// `apiCallRcError` envelope wrapper at the call site (Bug 83).
+const apiCallRcFailStorPoolConfigurationError int64 = 990
+
+// apiCallRcMaskStorPool mirrors upstream LINSTOR's
+// `ApiConsts.MASK_STOR_POOL` (`0x0000_0000_0014_0000`). OR'd into the
+// `ret_code` of any ApiCallRc entry whose primary subject is a
+// StoragePool, so audit-log greppers and the Python CLI's reply
+// classifier can route the entry to the storage-pool bucket. We tag
+// the PoolMissing reports[] entry with this mask so `linstor sp l`
+// renders the State column from the structured reply rather than
+// reporting "Ok" against an empty reports slice (Bug 83).
+const apiCallRcMaskStorPool int64 = 0x0000_0000_0014_0000
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the
