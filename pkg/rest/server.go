@@ -214,7 +214,14 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerResourceToggleDisk(mux)
 	s.registerStats(mux)
 	s.registerErrorReports(mux)
-	s.registerPropertiesInfo(mux)
+	// Bug 126: previously we wired /v1/.../properties/info to a stub
+	// that returned a bare `[]`. The CLI consumed the empty array
+	// silently with no signal that the catalogue isn't populated. We
+	// now leave the routes unregistered so the with404Envelope
+	// catch-all (Bug 103) emits the typed LINSTOR "endpoint not
+	// implemented" envelope — operators get a real ERROR line, and
+	// once a real property catalogue ships the route can be re-wired
+	// with the populated payload.
 	s.registerSnapshotRestore(mux)
 	s.registerEncryption(mux)
 	s.registerNodeLifecycle(mux)
