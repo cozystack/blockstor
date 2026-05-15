@@ -205,6 +205,16 @@ type ResourceDefinitionCreate struct {
 	DrbdSecret         string             `json:"drbd_secret,omitempty"`
 	ExternalName       string             `json:"external_name,omitempty"`
 
+	// LayerList is the top-level layer composition the upstream
+	// golinstor SDK and several non-python clients populate on RD-
+	// create (the field surfaces at the same level as
+	// `resource_definition`, NOT inside it — see Bug 116). Accepted
+	// as a peer of `resource_definition.layer_stack` and
+	// `resource_definition.layer_data`; the wire handler merges all
+	// three views before running validation so no shape silently
+	// bypasses the LUKS-prereq gate.
+	LayerList []string `json:"layer_list,omitempty"`
+
 	// OverrideProps mirrors GenericPropsModify — golinstor stuffs RG
 	// spawn defaults into this when creating an RD via spawn, so the
 	// REST handler must accept it even if we don't yet diff the values.

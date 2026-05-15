@@ -226,7 +226,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.validateRDLayerStackOnCreate(r.Context(), &rd)
+	err = s.validateRDLayerStackOnCreate(r.Context(), &body, &rd)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -362,19 +362,128 @@ func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.Resource
 	return nil
 }
 
+// mergeRDCreateLayerInputs reconciles the three wire shapes
+// `POST /v1/resource-definitions` accepts for the layer
+// composition:
+//
+//  1. body.LayerList — top-level `layer_list` field. Golinstor SDK
+//     and several non-python HTTP clients populate this (the v2
+//     operator-poke report's Bug 116 reproducer landed here).
+//  2. rd.LayerStack — nested `resource_definition.layer_stack`.
+//     The OpenAPI ResourceDefinition.layer_stack field; used by
+//     RG-spawn and raw HTTP clients.
+//  3. rd.LayerData — nested `resource_definition.layer_data`. The
+//     python-linstor CLI's `--layer-list ...` wire shape (Bug 95).
+//
+// Precedence: if multiple non-empty inputs disagree, the request is
+// AMBIGUOUS → 400. If they agree (or only one is set), the merged
+// view lands on `rd.LayerStack` so every downstream consumer (the
+// validator, the LUKS-prereq gate, the RG-stack inheritance helper,
+// and `wireToCRDRDSpec`) sees the same canonical slice.
+//
+// Bug 116 root cause: pre-fix, `body.LayerList` was silently dropped
+// (no struct field on `ResourceDefinitionCreate`) and the LUKS gate
+// ran against an empty `rd.LayerStack`, so any non-python client
+// that posts `{"resource_definition": {"name": "X"}, "layer_list":
+// ["DRBD","LUKS","STORAGE"]}` got an unencrypted RD silently.
+func mergeRDCreateLayerInputs(body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) error {
+	// `layer_data` only enters the merge after we project it down to
+	// the bare string list; the validator + LUKS gate read a flat
+	// stack, not the LayerData tree.
+	fromLayerData := layerStackFromLayerData(rd.LayerData)
+
+	views := []rdLayerInputView{
+		{label: "layer_list", stack: body.LayerList},
+		{label: "resource_definition.layer_stack", stack: rd.LayerStack},
+		{label: "resource_definition.layer_data", stack: fromLayerData},
+	}
+
+	var (
+		picked    []string
+		pickedLbl string
+	)
+
+	for _, view := range views {
+		if len(view.stack) == 0 {
+			continue
+		}
+
+		if picked == nil {
+			picked = view.stack
+			pickedLbl = view.label
+
+			continue
+		}
+
+		if !layerStacksEqual(picked, view.stack) {
+			return errors.Wrapf(ErrAmbiguousRDLayerInputs,
+				"%s=%v conflicts with %s=%v",
+				pickedLbl, picked, view.label, view.stack)
+		}
+	}
+
+	if picked != nil {
+		rd.LayerStack = append([]string(nil), picked...)
+	}
+
+	return nil
+}
+
+// rdLayerInputView is one of the three wire shapes the RD-create
+// handler accepts for the layer composition. Lifted out of
+// mergeRDCreateLayerInputs as a named type so the closure scope
+// stays simple and varnamelen-friendly.
+type rdLayerInputView struct {
+	label string
+	stack []string
+}
+
+// ErrAmbiguousRDLayerInputs is the static sentinel surfaced as a
+// 400 when an RD-create body carries conflicting non-empty values
+// across `layer_list` / `resource_definition.layer_stack` /
+// `resource_definition.layer_data`. Sentinel-shaped so callers
+// (and the test suite) can errors.Is-detect the class without
+// scraping the message; the wrapper carries the field names.
+var ErrAmbiguousRDLayerInputs = errors.New(
+	"ambiguous resource definition create: pass a single layer composition " +
+		"(one of layer_list, resource_definition.layer_stack, " +
+		"resource_definition.layer_data) or ensure all populated fields agree")
+
+// layerStacksEqual compares two flat layer slices element-wise.
+// nil and empty are equivalent (both → "no opinion at this rung",
+// already filtered upstream); non-empty slices must agree on both
+// length and order.
+func layerStacksEqual(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
 // validateRDLayerStackOnCreate is the wire-boundary layer-validation
-// fan-in for `handleRDCreate`. It normalises the python-linstor CLI's
-// `layer_data: [{type:...},...]` wire shape onto `rd.LayerStack`,
-// runs the structural validator (allowlist + ordering rules), then
-// enforces the Bug 95 LUKS-prereq gate. All three are surfaced as a
-// single 400 by the caller — no intermediate writes happen until the
-// store-side cascade kicks in.
+// fan-in for `handleRDCreate`. It merges the top-level `layer_list`
+// (Bug 116) plus the nested `resource_definition.layer_stack` and
+// `resource_definition.layer_data` (Bug 95) views onto the canonical
+// `rd.LayerStack`, runs the structural validator (allowlist +
+// ordering rules), then enforces the LUKS-prereq gate. All three
+// errors surface as a single 400 by the caller — no intermediate
+// writes happen until the store-side cascade kicks in.
 //
 // Returns nil for the happy path.
-func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, rd *apiv1.ResourceDefinition) error {
-	normaliseLayerStackFromLayerData(rd)
+func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) error {
+	err := mergeRDCreateLayerInputs(body, rd)
+	if err != nil {
+		return err
+	}
 
-	err := validateLayerStack(rd.LayerStack)
+	err = validateLayerStack(rd.LayerStack)
 	if err != nil {
 		return err
 	}
@@ -391,25 +500,6 @@ func (s *Server) validateRDLayerStackOnCreate(ctx context.Context, rd *apiv1.Res
 // normaliseLayerStackFromLayerData mirrors the python-linstor CLI's
 // RD-create wire shape onto our internal canonical view.
 //
-// Bug 95 root cause: `linstor rd c X --layer-list DRBD,LUKS,STORAGE`
-// posts `{"resource_definition": {"name": "X", "layer_data":
-// [{"type":"DRBD"},{"type":"LUKS"},{"type":"STORAGE"}]}}` — NOT the
-// `layer_stack: ["DRBD","LUKS","STORAGE"]` field that RG-create uses.
-// The previous fix wired the LUKS-prereq gate to `rd.LayerStack`,
-// which stays empty for every CLI-originated create, so the gate
-// silently passed and the RD landed without LUKS. After this
-// normalisation the validator, the LUKS-prereq gate, the RG-stack
-// inheritance helper, and `wireToCRDRDSpec` all see the same
-// canonical `rd.LayerStack` view regardless of which wire field
-// the client populated.
-func normaliseLayerStackFromLayerData(rd *apiv1.ResourceDefinition) {
-	if len(rd.LayerStack) > 0 || len(rd.LayerData) == 0 {
-		return
-	}
-
-	rd.LayerStack = layerStackFromLayerData(rd.LayerData)
-}
-
 // layerStackFromLayerData walks the wire `layer_data` array — a
 // flat list of `{type: ...}` entries the python-linstor CLI sends on
 // `rd c --layer-list ...` — and projects it down to the
