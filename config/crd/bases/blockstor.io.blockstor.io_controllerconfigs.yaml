@@ -223,6 +223,29 @@ spec:
                   populated only by the REST shim when golinstor sends an
                   unknown key. Drained as we type more fields here.
                 type: object
+              nodeConnections:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  type: object
+                description: |-
+                  nodeConnections is the per-(nodeA,nodeB) property bag exposed
+                  at `/v1/node-connections/{nodeA}/{nodeB}` — backs upstream
+                  LINSTOR's `linstor node-connection set-property / list` CLI
+                  (Bug 101). Keys are the canonical pair-id `<lo>::<hi>` where
+                  `<lo>` and `<hi>` are the lexicographically lower / higher of
+                  the two node names — so a write against (A,B) and a read
+                  against (B,A) hit the same record without the caller having
+                  to remember any ordering convention.
+
+                  Stored on the cluster-wide ControllerConfig singleton rather
+                  than a per-pair CRD: upstream LINSTOR persists these on a
+                  flat in-memory matrix attached to the Controller, and the
+                  cozystack node-connection use case is overwhelmingly empty
+                  or one-off ("flag this pair as cross-site"). A dedicated CRD
+                  per pair would add admission/RBAC surface for a feature that
+                  in practice carries ≤ a handful of rows on any given cluster.
+                type: object
               passphraseSecretRef:
                 description: |-
                   passphraseSecretRef points at the Secret carrying the
