@@ -379,8 +379,23 @@ func (s *Server) handleNodeRestore(w http.ResponseWriter, r *http.Request) {
 // them pollutes `linstor sp l` and the autoplacer's free-space
 // ranking. Surviving peer replicas are left alone so the
 // TieBreaker reconciler can stamp.
+//
+// Refuses with 409 + FAIL_IN_USE (Bug 111) when the satellite is
+// `ONLINE` and/or any Resource CRD still references the node.
+// Upstream LINSTOR documents `n lost` as the "satellite is gone
+// for good, force-cleanup" escape hatch — running it against a
+// live satellite (still sending heartbeats / observation events)
+// orphans the resources, leaves the DRBD kernel state on the host
+// and unregisters a running satellite. Operator's correct path is
+// `n d` (clean delete) or `n evacuate` first; `?force=true`
+// mirrors the Bug 92 pattern on `n d` for the rare disaster-
+// recovery override.
 func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
+
+	if !isForce(r) && !s.checkNodeLostAllowed(w, r, name) {
+		return
+	}
 
 	err := s.cascadeOrphansForLostNode(r.Context(), name)
 	if err != nil {
@@ -400,6 +415,120 @@ func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "node lost: " + name,
 	}})
+}
+
+// checkNodeLostAllowed enforces the Bug 111 safety gate. Returns
+// true (proceed) when the node is genuinely lost (ConnectionStatus
+// != ONLINE) — that is the documented `n lost` precondition. The
+// gate refuses (returns false after writing 409 + envelope) when:
+//
+//  1. The satellite is still ONLINE — this is the Bug 111 footgun:
+//     operator runs `n lost` against a live satellite, orphans its
+//     Resources, leaves DRBD kernel state up on the host, and
+//     unregisters a still-running daemon. Safer alternatives are
+//     `n d` (clean delete) or `n evacuate` (drain first).
+//  2. The satellite is ONLINE AND Resources still reference it —
+//     same root cause, but the cause line surfaces both signals so
+//     the operator sees the full picture in one round-trip.
+//
+// An OFFLINE node with Resources hosting on it is allowed through:
+// that IS the documented `n lost` use case (the satellite is dead,
+// cascade its orphans). Pinned by TestNodeLostCascadeDeletesResources.
+//
+// "Online" is decided on the wire field the satellite stamps every
+// heartbeat (`Node.ConnectionStatus`). The blockstor satellite
+// flips the field to ONLINE on every successful reconcile loop and
+// the controller-side observer downgrades it to OFFLINE / UNKNOWN
+// when watches go silent. Anything other than the literal "ONLINE"
+// string is treated as not-online so a partial outage (`CONNECTING`,
+// `OFFLINE`, blank) still lets the operator force the lost cleanup
+// without the escape hatch.
+//
+// Empty / unknown ConnectionStatus is treated as offline — a freshly
+// created Node row hasn't seen its satellite check in yet, and
+// refusing `n lost` on it would brick the cluster-init recovery flow
+// where an operator-pre-seeded node was never reachable.
+//
+// Missing-node is folded into proceed=true so the unknown-is-
+// idempotent contract (TestNodeLostUnknownIsIdempotent) stays
+// intact — the parent handler's cascade and Delete are both
+// NotFound-tolerant.
+func (s *Server) checkNodeLostAllowed(w http.ResponseWriter, r *http.Request, name string) bool {
+	ctx := r.Context()
+
+	node, err := s.Store.Nodes().Get(ctx, name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return true
+		}
+
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if !strings.EqualFold(node.ConnectionStatus, apiv1.NodeTypeOnline) {
+		return true
+	}
+
+	refs, err := s.resourcesOnNode(ctx, name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "Node '" + name + "' cannot be lost while its " +
+			"satellite is still reporting as ONLINE.",
+		Cause:   buildNodeLostRefusalCause(name, refs),
+		Correc:  buildNodeLostRefusalCorrection(len(refs) > 0),
+		ObjRefs: map[string]string{objRefNode: name},
+	}})
+
+	return false
+}
+
+// buildNodeLostRefusalCause assembles the operator-facing "why
+// blocked" line. Surfaces the live-satellite signal plus the list
+// of referencing Resources when present, so the operator sees the
+// full picture without a second round-trip.
+func buildNodeLostRefusalCause(name string, refs []string) string {
+	cause := "satellite is reporting ConnectionStatus=ONLINE; " +
+		"`n lost` is intended for genuinely unreachable nodes"
+
+	if len(refs) > 0 {
+		cause += fmt.Sprintf(
+			"; %d resource(s) still reference node '%s': %s",
+			len(refs), name, strings.Join(refs, ", "))
+	}
+
+	return cause
+}
+
+// buildNodeLostRefusalCorrection assembles the operator-facing
+// remediation. Mirrors the Bug 92 `n d` refusal shape: name the
+// safer alternatives first, then the `?force=true` escape hatch
+// for the rare case where the operator truly wants to override.
+func buildNodeLostRefusalCorrection(hasRefs bool) string {
+	parts := []string{
+		"use `linstor n d <node>` for a clean delete of a " +
+			"reachable satellite",
+	}
+
+	if hasRefs {
+		parts = append(parts,
+			"or delete the listed resources first "+
+				"(`linstor r d <node> <rd>`) / evacuate the node "+
+				"(`linstor n evacuate <node>`)")
+	}
+
+	parts = append(parts,
+		"pass `?force=true` to accept the orphan-cascade and lose "+
+			"the node anyway")
+
+	return strings.Join(parts, "; ")
 }
 
 // cascadeOrphansForLostNode walks Resources + StoragePools and
