@@ -145,16 +145,29 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 // onto existing.Annotations. Behavior:
 //   - nil wire input: no-op (preserves whatever the controller-side
 //     reconciler may have stamped under blockstor.io/* keys).
-//   - non-nil: replaces ALL non-blockstor.io annotations with the
-//     wire set; blockstor.io/* keys (the OriginalName store-internal
-//     marker) survive.
+//   - non-nil: replaces ALL non-preserved annotations with the wire
+//     set; keys in `preserve` survive (the OriginalName store-internal
+//     marker, satellite-stamped Bug-107 fallback keys, etc.).
 //
 // Phase 10.4: lets the REST KV-store handler write
 // `blockstor.io/csi-volume-data` via Update without losing the
 // store-internal `blockstor.io/original-name`.
-func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string) {
+//
+// Bug 210: the `preserve` slice extends the preservation set per-store
+// — Resources adds `blockstor.io/volume-numbers` (the satellite-stamped
+// fallback used by the RD cascade-delete path) so a wire-snapshot that
+// raced the satellite stamp does not wipe it on the wholesale replace.
+func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string, preserve ...string) {
 	if wire == nil {
 		return
+	}
+
+	preserved := map[string]string{}
+
+	for _, k := range append([]string{AnnotationLinstorName}, preserve...) {
+		if v, ok := meta.Annotations[k]; ok {
+			preserved[k] = v
+		}
 	}
 
 	if meta.Annotations == nil {
@@ -163,7 +176,7 @@ func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string) {
 
 	// Drop existing user keys.
 	for k := range meta.Annotations {
-		if k == AnnotationLinstorName {
+		if _, keep := preserved[k]; keep {
 			continue
 		}
 
@@ -171,6 +184,14 @@ func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string) {
 	}
 
 	maps.Copy(meta.Annotations, wire)
+
+	// Re-stamp preserved internal keys after the wire copy so a
+	// caller that accidentally includes a stale (or even zero) value
+	// for a preserved key on the wire does not clobber the live CRD
+	// state. The wire surface should never carry internal keys —
+	// `userAnnotations` filters them out on read — but a defensive
+	// re-stamp keeps the invariant robust against future regressions.
+	maps.Copy(meta.Annotations, preserved)
 
 	if len(meta.Annotations) == 0 {
 		meta.Annotations = nil

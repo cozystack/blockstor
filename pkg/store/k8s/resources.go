@@ -181,11 +181,16 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// REST writer's `blockstor.io/peer-changed` bump actually reaches
 	// the CRD ObjectMeta — without this the bump would silently no-op
 	// and the satellite's local-Resource watch would never fire.
-	// nil wire means "no annotation work requested" — preserve existing
-	// (mirrors RD store's `mergeUserAnnotationsInto` contract).
-	if in.Annotations != nil {
-		existing.Annotations = cloneAnnotations(in.Annotations)
-	}
+	//
+	// Bug 210: merge rather than wholesale-replace so the satellite-
+	// stamped `blockstor.io/volume-numbers` annotation (Bug 107 cascade-
+	// delete fallback) survives a wire-snapshot that raced the stamp.
+	// Without this, a routine `linstor r <verb>` between Get and Update
+	// wipes the annotation; a concurrent RD cascade-delete that hits
+	// `lookupVolumeNumbers` during the harm window leaks the backing
+	// LV / zvol. Mirrors the RD / RG / Snapshot stores.
+	mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations,
+		crdv1alpha1.ResourceAnnotationVolumeNumbers)
 
 	err = s.c.Update(ctx, &existing)
 	if err != nil {
@@ -243,9 +248,17 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
 
-		if wire.Annotations != nil {
-			existing.Annotations = cloneAnnotations(wire.Annotations)
-		}
+		// Bug 210: merge rather than wholesale-replace so the
+		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
+		// survives even if the closure built `wire.Annotations`
+		// from a stale snapshot that pre-dated the satellite stamp.
+		// PatchResourceSpec already has 409-retry via
+		// MergeFromWithOptimisticLock, but the merge keeps the
+		// annotation invariant uniform with the wholesale `Update`
+		// path and protects against future closures that explicitly
+		// reset live.Annotations.
+		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations,
+			crdv1alpha1.ResourceAnnotationVolumeNumbers)
 
 		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Resource %s/%s", rdName, node)
