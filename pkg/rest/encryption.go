@@ -110,12 +110,88 @@ const passphraseSecretKey = "passphrase"
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=controllerconfigs,verbs=get;list;watch
 func (s *Server) registerEncryption(mux *http.ServeMux) {
+	// Bug 196: GET reports whether the cluster has a passphrase
+	// set + whether this controller process has unlocked it.
+	// Upstream OpenAPI operationId `passphraseStatus`; the state
+	// is fully derivable in-process from s.passphraseUnlocked +
+	// readPassphrase so no Secret round-trip on the hot path.
+	mux.HandleFunc("GET /v1/encryption/passphrase",
+		s.requireStore(s.handlePassphraseStatus))
 	mux.HandleFunc("POST /v1/encryption/passphrase",
 		s.requireStore(s.handlePassphraseCreate))
 	mux.HandleFunc("PATCH /v1/encryption/passphrase",
 		s.requireStore(s.handlePassphraseEnter))
 	mux.HandleFunc("PUT /v1/encryption/passphrase",
 		s.requireStore(s.handlePassphraseModify))
+}
+
+// passphraseStatus is the upstream `PassphraseStatus` schema
+// (rest_v1_openapi.yaml lines 8357-8367): a single tri-state
+// status field. The wire envelope is an ARRAY of this object —
+// upstream's OpenAPI wraps it in a slice to match every other
+// `[]ApiCallRc`-style REST reply, even though the field is
+// effectively a singleton.
+type passphraseStatus struct {
+	Status string `json:"status"`
+}
+
+const (
+	passphraseStatusUnset    = "unset"
+	passphraseStatusLocked   = "locked"
+	passphraseStatusUnlocked = "unlocked"
+)
+
+// handlePassphraseStatus reports whether the cluster has a master
+// passphrase set + whether the controller has unlocked it.
+//
+// Bug 196 (P2): `linstor encryption status` GETs this path; pre-
+// fix the catch-all returned a 404 envelope, leaving operators no
+// way to discover the controller's encryption state without
+// reading the Secret out-of-band.
+//
+// Resolution order:
+//
+//  1. Secret read via readPassphrase. Errors here surface as 500;
+//     in particular, a controller without an apiserver Client wired
+//     gets `cluster passphrase requires an apiserver client`, which
+//     is operator-actionable.
+//  2. Empty value (Secret missing or key empty) → "unset". Maps
+//     directly onto the "POST to create" workflow.
+//  3. Non-empty + s.passphraseUnlocked == true → "unlocked".
+//     The POST/PUT/PATCH success paths flip this flag explicitly so
+//     a post-restart cluster only lands here once the operator has
+//     re-PATCHed the passphrase.
+//  4. Non-empty + flag == false → "locked". The Bug 173 PATCH
+//     path's "wrong passphrase → flag unchanged" rule is what
+//     keeps this distinct from "unlocked" — a single bad guess
+//     does not bump the flag.
+//
+// Status code is always 200 — the endpoint is a state query, not
+// a verb. Wire shape is `[{"status":"<enum>"}]` (array-wrapped per
+// upstream's `PassphraseStatus` slice schema).
+func (s *Server) handlePassphraseStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
+	defer cancel()
+
+	have, err := s.readPassphrase(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	var state string
+
+	switch {
+	case have == "":
+		state = passphraseStatusUnset
+	case s.passphraseUnlocked.Load():
+		state = passphraseStatusUnlocked
+	default:
+		state = passphraseStatusLocked
+	}
+
+	writeJSON(w, http.StatusOK, []passphraseStatus{{Status: state}})
 }
 
 // handlePassphraseCreate stamps the cluster-wide master passphrase
