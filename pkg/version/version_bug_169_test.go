@@ -18,6 +18,7 @@ package version
 
 import (
 	"os"
+	"regexp"
 	"testing"
 	"time"
 )
@@ -93,8 +94,11 @@ func TestBug169LdflagsOverrideTakesEffect(t *testing.T) {
 		t.Skip("LINSTOR_LDFLAGS_PROBE not set; production-image assertion skipped on unit-test build")
 	}
 
-	if LinstorGitHash == "blockstor" || LinstorGitHash == "" {
-		t.Errorf("LinstorGitHash is still the placeholder %q — -ldflags -X did not take effect", LinstorGitHash)
+	// Tightened post-171: a real commit SHA, not just "not the
+	// pre-fix sentinel". Catches the Bug 171 case where the
+	// Dockerfile default `unknown` leaked through unchanged.
+	if !regexp.MustCompile(`^[0-9a-f]{7,40}$`).MatchString(LinstorGitHash) {
+		t.Errorf("LinstorGitHash %q is not a real commit SHA — -ldflags -X did not take effect (or build wrapper passed a placeholder like 'unknown'/'blockstor')", LinstorGitHash)
 	}
 
 	if LinstorBuildTime == "2026-01-01T00:00:00+00:00" || LinstorBuildTime == "" {

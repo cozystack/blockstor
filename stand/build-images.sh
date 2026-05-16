@@ -8,6 +8,16 @@
 # stand pull these via the per-cluster bridge gateway (see
 # install-blockstor.sh) but the underlying registry is a single
 # host-local one — so we push once and every parallel stand sees it.
+#
+# Bug 171: stamp the image with the real git SHA and build time at
+# `docker build` time. Without these --build-args, the Dockerfile's
+# ARG defaults leak through (`GIT_HASH=unknown`) because
+# `.dockerignore` excludes `.git`, so the in-container `git rev-parse
+# HEAD` fallback has no repo to read. We resolve the SHA on the host
+# (where the .git tree DOES exist) and pass it via --build-arg.
+# Tarball builds (no .git) fall back to `sha-unavailable-tarball` so a
+# bad build is distinguishable from a build that simply lacks VCS
+# context.
 
 set -euo pipefail
 
@@ -15,14 +25,28 @@ REGISTRY=${1:-localhost:5000}
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
+if [ -d .git ] && command -v git >/dev/null 2>&1; then
+    GIT_HASH=$(git rev-parse HEAD)
+else
+    GIT_HASH="sha-unavailable-tarball"
+fi
+BUILD_TIME=$(date -u +%FT%TZ)
+
+echo ">> stamping GIT_HASH=$GIT_HASH BUILD_TIME=$BUILD_TIME"
+
+BUILD_ARGS=(
+    --build-arg "GIT_HASH=$GIT_HASH"
+    --build-arg "BUILD_TIME=$BUILD_TIME"
+)
+
 echo ">> docker build $REGISTRY/blockstor:dev (controller stage)"
-docker build --target controller -t "$REGISTRY/blockstor:dev" .
+docker build "${BUILD_ARGS[@]}" --target controller -t "$REGISTRY/blockstor:dev" .
 
 echo ">> docker build $REGISTRY/blockstor-apiserver:dev (apiserver stage)"
-docker build --target apiserver -t "$REGISTRY/blockstor-apiserver:dev" .
+docker build "${BUILD_ARGS[@]}" --target apiserver -t "$REGISTRY/blockstor-apiserver:dev" .
 
 echo ">> docker build $REGISTRY/blockstor-satellite:dev (satellite stage)"
-docker build --target satellite  -t "$REGISTRY/blockstor-satellite:dev" .
+docker build "${BUILD_ARGS[@]}" --target satellite  -t "$REGISTRY/blockstor-satellite:dev" .
 
 echo ">> docker push $REGISTRY/blockstor:dev"
 docker push "$REGISTRY/blockstor:dev"

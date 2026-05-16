@@ -27,10 +27,18 @@ COPY . .
 # carried the same fake identity on /v1/controller/version and
 # operators could not correlate a wire bug to a commit. The vars are
 # also propagated for legacy `version.Version` / `version.GitCommit`
-# (logger banners). Defaults are wired so a build that lacks .git
-# (e.g. a tarball build) still produces a working binary — the values
-# fall back to `unknown` / now-UTC instead of failing the build.
-ARG GIT_HASH=unknown
+# (logger banners).
+#
+# Bug 171: callers (`stand/build-images.sh`, top-level Makefile)
+# resolve the SHA on the HOST and pass it via --build-arg, because
+# `.dockerignore` excludes `.git` — the in-container `git rev-parse`
+# fallback below only kicks in for the (rare) case where someone runs
+# `docker build .` directly without going through the wrappers and
+# `.dockerignore` happens to be permissive. Default is the structured
+# sentinel `sha-build-arg-missing` so a misconfigured CI is obvious
+# (not the previous `unknown`, which is indistinguishable from a real
+# tarball build).
+ARG GIT_HASH=sha-build-arg-missing
 ARG BUILD_TIME
 ENV LDFLAGS="-X github.com/cozystack/blockstor/pkg/version.LinstorGitHash=${GIT_HASH} \
              -X github.com/cozystack/blockstor/pkg/version.GitCommit=${GIT_HASH} \

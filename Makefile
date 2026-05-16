@@ -136,12 +136,21 @@ build: manifests generate fmt vet ## Build controller + satellite binaries.
 run: manifests generate fmt vet ## Run the controller from your host.
 	go run ./cmd/controller
 
+# Bug 171: resolve the git SHA + build time on the HOST and pass them
+# via --build-arg, because `.dockerignore` excludes `.git` so the
+# in-container `git rev-parse HEAD` fallback has no repo to read.
+# Tarball builds (no .git) fall back to `sha-unavailable-tarball` —
+# distinguishable from a build bug.
+GIT_HASH ?= $(shell if [ -d .git ] && command -v git >/dev/null 2>&1; then git rev-parse HEAD; else echo sha-unavailable-tarball; fi)
+BUILD_TIME ?= $(shell date -u +%FT%TZ)
+DOCKER_BUILD_ARGS = --build-arg GIT_HASH=$(GIT_HASH) --build-arg BUILD_TIME=$(BUILD_TIME)
+
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build $(DOCKER_BUILD_ARGS) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -160,7 +169,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name blockstor-builder
 	$(CONTAINER_TOOL) buildx use blockstor-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build $(DOCKER_BUILD_ARGS) --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
 	- $(CONTAINER_TOOL) buildx rm blockstor-builder
 	rm Dockerfile.cross
 
