@@ -1168,10 +1168,31 @@ func writeStoreError(w http.ResponseWriter, err error) {
 // retCode follows the upstream convention: high bit set means
 // FATAL/error; we use 0xC000_0000 which is the masked-but-untyped
 // "generic error" the controller uses when no specific code applies.
+//
+// Bug 199 (P2): every message goes through `scrubImplDetails` before
+// hitting the wire. Bug 162 fixed `writeStoreError`'s default branch
+// to scrub etcd / apimachinery / k8s.io / `*.blockstor.io` substrings
+// out of the response body, but 51 other call sites in pkg/rest/
+// reach `writeError` directly with the raw `err.Error()` from the
+// K8s-backed store (controller_props, snapshot_multi, autoplace,
+// encryption, stats, snapshots, spawn, resource_connections,
+// query_size_info, storage_pools, node_connections, node_lifecycle,
+// advise, nodes, resource_groups, resource_group_extras,
+// resource_definitions, rd_clone, volume_definitions, resources).
+// Every one of them bypassed the scrub and leaked the persistence-
+// backend identity on any 500-shaped failure.
+//
+// Wrapping `writeError` itself is the single-point fix: the function
+// contract becomes "the LINSTOR envelope is always scrubbed of
+// backend impl details," which is what every caller expects anyway.
+// `scrubImplDetails` is a string-replacer with a fixed allow-list of
+// backend sentinels — it is a noop on operator-friendly literal
+// strings ("remote_name is required", "passphrase mismatch", ...)
+// so the existing 4xx call sites pass through unchanged.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, []apiv1.APICallRc{{
 		RetCode: apiCallRcError,
-		Message: msg,
+		Message: scrubImplDetails(msg),
 	}})
 }
 
