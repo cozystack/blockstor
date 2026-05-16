@@ -19,19 +19,48 @@ limitations under the License.
 // /v1/controller/version so that golinstor clients can negotiate.
 package version
 
-// Build-time identity of this binary.
-const (
-	Project   = "blockstor"
+// Build-time identity of this binary. Project is a const because the
+// binary's own name never changes; Version / GitCommit are vars so the
+// container build can stamp them via `-ldflags -X` (Bug 169).
+const Project = "blockstor"
+
+// Version / GitCommit identify the blockstor build. Defaults are
+// development-friendly placeholders; the production Dockerfile rewrites
+// them via `go build -ldflags "-X .../version.Version=<tag> -X
+// .../version.GitCommit=<sha>"`. `-ldflags -X` only works against
+// package-level string vars, never consts.
+var (
 	Version   = "0.0.0-dev"
 	GitCommit = "unknown"
 )
 
 // LINSTOR REST contract identity reported in /v1/controller/version.
-// We mimic a recent upstream Java LINSTOR so strict golinstor clients accept
-// our responses.
+// We mimic a recent upstream Java LINSTOR so strict golinstor clients
+// accept our responses.
+//
+// LinstorVersion / RestAPIVersion are bound to upstream LINSTOR's
+// release cadence and only change with code; consts express the
+// invariant. LinstorGitHash and LinstorBuildTime carry the BLOCKSTOR
+// commit + image build time, which differ per image — vars (Bug 169)
+// so the Dockerfile can stamp them via `-ldflags -X`.
 const (
-	LinstorVersion   = "1.33.2"
+	LinstorVersion = "1.33.2"
+	RestAPIVersion = "1.23.0"
+)
+
+// LinstorGitHash is the blockstor source commit SHA. Default
+// "blockstor" matches the dev-build sentinel; the production image
+// rewrites it via `-ldflags -X .../version.LinstorGitHash=$(git
+// rev-parse HEAD)` so /v1/controller/version reports a real commit
+// (Bug 169). Operators correlate wire bugs to commits via this field.
+//
+// LinstorBuildTime is the image build timestamp, RFC3339 with `+00:00`
+// offset to match upstream LINSTOR's Java-formatted shape. Default
+// "2026-01-01T00:00:00+00:00" is the dev sentinel; production
+// rewrites via `-ldflags -X .../version.LinstorBuildTime=$(date -u
+// +%FT%TZ)`. Parses cleanly as time.RFC3339 so contract tests don't
+// gate on the exact value.
+var (
 	LinstorGitHash   = "blockstor"
 	LinstorBuildTime = "2026-01-01T00:00:00+00:00"
-	RestAPIVersion   = "1.23.0"
 )

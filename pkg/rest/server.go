@@ -163,6 +163,13 @@ func (s *Server) Start(ctx context.Context) error {
 	// Middleware order, outer → inner:
 	//   withLogging         — observes the final status code (incl. 4xx
 	//                          envelopes the inner layers emit).
+	//   instrumentRequests  — Bug 168: emits the blockstor_requests_total
+	//                          / blockstor_request_duration_seconds
+	//                          series. Sits inside withLogging so the
+	//                          status code observation matches the one
+	//                          the log line records, but outside the
+	//                          envelope/content-type middlewares so 4xx
+	//                          replies they emit are still counted.
 	//   with404Envelope     — rewrites ServeMux's plain-text 404/405
 	//                          fallback bodies to LINSTOR `[]ApiCallRc`
 	//                          (Bug 103, Bug 109).
@@ -178,7 +185,7 @@ func (s *Server) Start(ctx context.Context) error {
 	//                          etcd/k8s rejection string in a 500.
 	srv := &http.Server{
 		Addr:              s.Addr,
-		Handler:           withLogging(withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))),
+		Handler:           withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux)))))),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
@@ -917,6 +924,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 //     strings are stripped before they
 //     hit the wire).
 func writeDecodeError(w http.ResponseWriter, err error) {
+	// Bug 168: mint the decode-failure metric BEFORE the per-shape
+	// branches so a regression in the message-formatting code (a
+	// reordering, an early return) can't lose the observation.
+	observeDecodeFailure(err)
+
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
 		writeError(w, http.StatusRequestEntityTooLarge,

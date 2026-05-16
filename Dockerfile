@@ -19,9 +19,30 @@ COPY . .
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o controller ./cmd/controller
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o apiserver  ./cmd/apiserver
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o satellite  ./cmd/satellite
+#
+# Bug 169: stamp `version.LinstorGitHash` / `version.LinstorBuildTime`
+# at link time via `-ldflags -X`. Pre-fix the constants in
+# `pkg/version/version.go` shipped as the literal placeholders
+# `"blockstor"` and `"2026-01-01T00:00:00+00:00"`, so every image
+# carried the same fake identity on /v1/controller/version and
+# operators could not correlate a wire bug to a commit. The vars are
+# also propagated for legacy `version.Version` / `version.GitCommit`
+# (logger banners). Defaults are wired so a build that lacks .git
+# (e.g. a tarball build) still produces a working binary — the values
+# fall back to `unknown` / now-UTC instead of failing the build.
+ARG GIT_HASH=unknown
+ARG BUILD_TIME
+ENV LDFLAGS="-X github.com/cozystack/blockstor/pkg/version.LinstorGitHash=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.GitCommit=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.LinstorBuildTime=${BUILD_TIME}"
+RUN if [ -d .git ]; then GIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "${GIT_HASH}"); fi; \
+    BUILD_TIME=${BUILD_TIME:-$(date -u +%FT%TZ)}; \
+    LDFLAGS="-X github.com/cozystack/blockstor/pkg/version.LinstorGitHash=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.GitCommit=${GIT_HASH} \
+             -X github.com/cozystack/blockstor/pkg/version.LinstorBuildTime=${BUILD_TIME}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${LDFLAGS}" -o controller ./cmd/controller && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${LDFLAGS}" -o apiserver  ./cmd/apiserver && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${LDFLAGS}" -o satellite  ./cmd/satellite
 
 # The satellite needs to shell out to drbdadm/lvs/zfs/cryptsetup, none
 # of which are in distroless:static. We use debian-slim for it (and let
