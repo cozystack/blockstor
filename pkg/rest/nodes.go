@@ -815,24 +815,51 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 // Folding NotFound into a 200 + warn-mask envelope keeps the retry
 // loop exit-0 on the second call.
 //
-// Refuses with 409 + FAIL_IN_USE (Bug 92) when any Resource CRD
-// still references the node. The previous behaviour wrote SUCCESS
-// while leaving `<rd>.<node>` Resource CRDs alive: the controller
-// "forgot" the satellite (`n l` dropped it), but the satellite Pod
-// and its DRBD kernel state stayed up, and `n restore` returned
-// `object not found` — no path back. Mirrors handleNodeEvacuate's
-// in-use refusal pattern from cli-parity-audit Bug 18: the operator
-// must `r d` / `n evacuate` first, or pass `?force=true` to accept
-// the orphan-cascade.
+// Refuses with 409 + FAIL_IN_USE (Bug 92, Bug 179) when any
+// Resource CRD OR StoragePool CRD still references the node. The
+// pre-Bug-92 behaviour wrote SUCCESS while leaving `<rd>.<node>`
+// Resource CRDs alive: the controller "forgot" the satellite
+// (`n l` dropped it), but the satellite Pod and its DRBD kernel
+// state stayed up, and `n restore` returned `object not found` —
+// no path back. Bug 179 extends the refusal to StoragePools — the
+// pre-Bug-179 gate ignored SPs, so `n d` of a node carrying only
+// SPs (no Resources) silently orphaned the SP CRDs, and the
+// autoplacer's free-space ranking then crashed on a nil-Node
+// lookup the next reconcile. Mirrors handleNodeEvacuate's in-use
+// refusal pattern from cli-parity-audit Bug 18: the operator
+// must `r d` / `sp d` / `n evacuate` first, or pass `?force=true`
+// to accept the cascade.
 //
 // Bug 174 (P2): wraps the pre-Delete refusal + Delete pair in the
 // shared `deleteWithRollback` close so a concurrent
-// `r c <node>` that slips between the pre-walk and the Delete
-// can't leak an orphan Resource CRD pointing at a deleted Node.
-// Same shape as Bug 145 on `sp d`.
+// `r c <node>` / `sp c <node>` that slips between the pre-walk
+// and the Delete can't leak an orphan Resource / StoragePool CRD
+// pointing at a deleted Node. Same shape as Bug 145 on `sp d`.
+//
+// `?force=true` semantics (Bug 179): cascade-delete every
+// referencing Resource and StoragePool CRD before dropping the
+// Node row, matching `n lost`'s cascadeOrphansForLostNode. The
+// alternative — strip-and-let-the-operator-clean — would re-create
+// the exact orphan-SP state Bug 179 closed, so the cascade variant
+// is the only choice that keeps the post-condition "no SP / Resource
+// row references a deleted Node" invariant.
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 	force := isForce(r)
+
+	// Bug 179: `?force=true` cascade-deletes every referencing
+	// Resource + StoragePool CRD before dropping the Node — same
+	// shape `n lost` already enforces. Without the cascade,
+	// force-delete would leave orphan SP CRDs pointing at a deleted
+	// Node, which is precisely the symptom Bug 179 closed.
+	if force {
+		err := s.cascadeOrphansForLostNode(r.Context(), name)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+	}
 
 	(&deleteWithRollback[apiv1.Node]{
 		refuseIfReferenced: func() bool {
@@ -870,41 +897,138 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	}).run(w)
 }
 
-// refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 walk.
-// Returns true when the HTTP error has already been written (the
-// caller must stop processing) and false when the delete may
+// refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 / Bug 179
+// walk. Returns true when the HTTP error has already been written
+// (the caller must stop processing) and false when the delete may
 // proceed. Pulled out of handleNodeDelete so the shared Bug 174
 // close (deleteWithRollback) can call it from both pre-walk and
 // post-walk slots.
+//
+// Bug 179: walks BOTH Resources and StoragePools on the node. The
+// pre-Bug-179 gate only walked Resources, so `n d` of a node
+// carrying only StoragePools (no Resources) silently orphaned the
+// SP CRDs — they survived pointing at a deleted Node row, and the
+// autoplacer's free-space ranking then crashed on the nil-Node
+// lookup. Mirrors `n lost`'s cascadeOrphansForLostNode which
+// already walks both stores in lock-step.
 func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string) bool {
-	refs, err := s.resourcesOnNode(r.Context(), name)
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return true
 	}
 
-	if len(refs) == 0 {
+	if len(resourceRefs) == 0 && len(spRefs) == 0 {
 		return false
 	}
 
-	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs))
+
+	return true
+}
+
+// referencesOnNode bundles the two reference walks the Bug 92 /
+// Bug 179 gates run in lock-step (Resources + StoragePools on the
+// target node). Returning both lists in one call keeps the
+// pre-walk and the post-Delete re-walk byte-identical — drift
+// between the two would let a racing dependent through the gate.
+func (s *Server) referencesOnNode(ctx context.Context, name string) ([]string, []string, error) {
+	resourceRefs, err := s.resourcesOnNode(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	spRefs, err := s.storagePoolsOnNode(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return resourceRefs, spRefs, nil
+}
+
+// storagePoolsOnNode returns the sorted list of StoragePool names
+// hosted on the target node — the SP-side counterpart of
+// resourcesOnNode used by Bug 179. Sorted so the surfaced "cause"
+// line is stable across calls; the K8s backend's iteration order
+// is non-deterministic, and operators rerun `n d` to confirm the
+// refusal message.
+//
+// Bug 179: DfltDisklessStorPool — the per-satellite diskless pool
+// upstreamLINSTOR (and blockstor's handleNodeCreate) auto-provisions
+// at node-register time — is filtered out of the refusal list. It's
+// an internal artefact of the satellite registration, not an
+// operator-managed resource; surfacing it would make every `n d`
+// hit the refusal even on a freshly-created idle node and the
+// operator-facing fix would be "delete the auto-created pool first",
+// which makes no sense. The cascade still drops it (the live
+// satellite is going away with the node anyway).
+func (s *Server) storagePoolsOnNode(ctx context.Context, node string) ([]string, error) {
+	pools, err := s.Store.StoragePools().ListByNode(ctx, node)
+	if err != nil {
+		return nil, fmt.Errorf("list storage pools on node %q: %w", node, err)
+	}
+
+	var refs []string
+
+	for i := range pools {
+		if pools[i].StoragePoolName == DfltDisklessStorPoolName {
+			continue
+		}
+
+		refs = append(refs, pools[i].StoragePoolName)
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// buildNodeDeleteRefusal assembles the 409 envelope for the Bug 92
+// / Bug 179 in-use refusal. Surfaces BOTH the referencing Resource
+// list AND the referencing StoragePool list in a single round-trip
+// so the operator sees the full cleanup workload without having to
+// retry `n d` after dropping the first half. Mirrors `n lost`'s
+// cause-line shape (buildNodeLostRefusalCause) which already
+// concatenates the two signals.
+//
+// At least one of `resourceRefs` / `spRefs` is expected to be
+// non-empty — callers guard the no-reference happy path. The
+// envelope's Message stays object-typed ("hosts resource replicas
+// and/or storage pools") so audit-log greps disambiguate
+// node-delete refusals from RG-delete and SP-delete refusals which
+// reuse the same FAIL_IN_USE sub-code.
+func buildNodeDeleteRefusal(name string, resourceRefs, spRefs []string) []apiv1.APICallRc {
+	var causeParts []string
+
+	if len(resourceRefs) > 0 {
+		causeParts = append(causeParts, fmt.Sprintf(
+			"%d resource(s) reference node '%s': %s",
+			len(resourceRefs), name, strings.Join(resourceRefs, ", ")))
+	}
+
+	if len(spRefs) > 0 {
+		causeParts = append(causeParts, fmt.Sprintf(
+			"%d storage pool(s) on node '%s': %s",
+			len(spRefs), name, strings.Join(spRefs, ", ")))
+	}
+
+	correction := "Delete the listed resources first " +
+		"(`linstor r d <node> <rd>`) and storage pools " +
+		"(`linstor sp d <node> <pool>`), or evacuate the node " +
+		"(`linstor n evacuate <node>`); pass `?force=true` to " +
+		"delete the node anyway and cascade the orphans."
+
+	return []apiv1.APICallRc{{
 		RetCode: apiCallRcError | apiCallRcFailInUse,
 		Message: "Node '" + name + "' cannot be deleted because " +
-			"it still hosts resource replicas.",
-		Cause: fmt.Sprintf(
-			"%d resource(s) reference node '%s': %s",
-			len(refs), name, strings.Join(refs, ", ")),
-		Correc: "Delete the listed resources first " +
-			"(`linstor r d <node> <rd>`) or evacuate the node " +
-			"(`linstor n evacuate <node>`); pass `?force=true` " +
-			"to delete the node anyway and orphan the replicas.",
+			"it still hosts resource replicas and/or storage pools.",
+		Cause:  strings.Join(causeParts, "; "),
+		Correc: correction,
 		ObjRefs: map[string]string{
 			objRefNode: name,
 		},
-	}})
-
-	return true
+	}}
 }
 
 // captureNode grabs a snapshot of the Node CRD so the Bug 174
@@ -923,21 +1047,24 @@ func (s *Server) captureNode(ctx context.Context, name string) (apiv1.Node, bool
 }
 
 // rollbackNodeDeleteIfRaced runs the Bug 174 post-Delete re-scan.
-// If a Resource reference appeared between the pre-walk and the
-// Delete, restore the captured Node and write the 409 envelope
-// the pre-walk would have written. Returns true when the rollback
-// fired (HTTP error already written, caller must stop) and false
-// when the delete is safe to commit. Mirrors Bug 145's
-// `rollbackSPDeleteIfRaced` shape exactly.
+// If a Resource or StoragePool reference appeared between the
+// pre-walk and the Delete, restore the captured Node and write
+// the 409 envelope the pre-walk would have written. Returns true
+// when the rollback fired (HTTP error already written, caller must
+// stop) and false when the delete is safe to commit. Mirrors Bug
+// 145's `rollbackSPDeleteIfRaced` shape; Bug 179 extends the
+// re-walk to ALSO catch a racing `sp c <node>` so an SP CRD
+// persisted during the TOCTOU window can't orphan into a deleted
+// Node either.
 func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.Node) bool {
-	refs, err := s.resourcesOnNode(r.Context(), name)
+	resourceRefs, spRefs, err := s.referencesOnNode(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return true
 	}
 
-	if len(refs) == 0 {
+	if len(resourceRefs) == 0 && len(spRefs) == 0 {
 		return false
 	}
 
@@ -957,21 +1084,7 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-		RetCode: apiCallRcError | apiCallRcFailInUse,
-		Message: "Node '" + name + "' cannot be deleted because " +
-			"it still hosts resource replicas.",
-		Cause: fmt.Sprintf(
-			"%d resource(s) reference node '%s': %s",
-			len(refs), name, strings.Join(refs, ", ")),
-		Correc: "Delete the listed resources first " +
-			"(`linstor r d <node> <rd>`) or evacuate the node " +
-			"(`linstor n evacuate <node>`); pass `?force=true` " +
-			"to delete the node anyway and orphan the replicas.",
-		ObjRefs: map[string]string{
-			objRefNode: name,
-		},
-	}})
+	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs))
 
 	return true
 }
