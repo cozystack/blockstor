@@ -284,6 +284,44 @@ func (s *Server) refuseAutoplaceOnUnknownNodes(w http.ResponseWriter, r *http.Re
 	return true
 }
 
+// refuseResourceCreateOnUnknownRD is Bug 144's gate (regression of
+// Bug 98). `POST /v1/resource-definitions/{rd}/resources` MUST refuse
+// with 404 + LINSTOR envelope when no parent RD exists, BEFORE any
+// per-replica node / pool / minor / port allocation runs. Pre-fix the
+// handler walked straight into createOrPromoteResource and staged a
+// Resource CRD whose spec.resourceDefinitionName pointed at no
+// parent — the satellite reconciler then allocated a DRBD minor + port
+// for a row that could never be reconciled, effectively a port-pool
+// leak under CSI retry / operator-script workloads.
+//
+// Uses getRDWithCacheRetry for the same reason every other handler
+// under `/v1/resource-definitions/{rd}/...` does: the RD may have been
+// written via a sibling apiserver replica seconds ago and the local
+// informer cache trail surfaces as a transient NotFound. Mirrors Bug
+// 94 (unknown node), Bug 118 (unknown pool), Bug 134 (unknown RG),
+// Bug 143 (unknown RD on r lp) envelope shape — 404 + []ApiCallRc
+// naming the missing RD plus an actionable correction hint. Returns
+// true when the caller may proceed, false when the HTTP error has
+// already been written.
+func (s *Server) refuseResourceCreateOnUnknownRD(w http.ResponseWriter, r *http.Request, rdName string) bool {
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound,
+			"resource definition '"+rdName+"' not found: check the "+
+				"name with `linstor rd l` or create it first")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
+}
+
 // refuseResourceCreateOnUnknownPool is Bug 118's gate. When the
 // caller pinned a storage pool by name (`linstor r c <node> <rd>
 // --storage-pool <pool>` lands as
@@ -904,6 +942,10 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 // success; writes the HTTP error and returns (nil, false) on the
 // first failure.
 func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName string, envelopes []apiv1.ResourceCreate) ([]apiv1.Resource, bool) {
+	if !s.refuseResourceCreateOnUnknownRD(w, r, rdName) {
+		return nil, false
+	}
+
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
@@ -911,57 +953,7 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 		res := env.Resource
 		res.Name = rdName
 
-		if res.NodeName == "" {
-			writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
-
-			return nil, false
-		}
-
-		// Enforce the cluster-wide naming convention up front: the CRD
-		// metadata.name will be `<rd>.<node>`, so an embedded '.' in
-		// either side would shift the boundary and either collide with
-		// another (rd, node) pair or stage a CRD the CEL rule on the
-		// type would later reject with a 422. Catch it here with a
-		// friendly 400.
-		if strings.Contains(res.NodeName, ".") {
-			writeError(w, http.StatusBadRequest,
-				"node_name must not contain '.': metadata.name must equal <rd>.<node>")
-
-			return nil, false
-		}
-
-		if strings.Contains(rdName, ".") {
-			writeError(w, http.StatusBadRequest,
-				"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
-
-			return nil, false
-		}
-
-		// Bug 94: refuse to stage a Resource CRD pointing at a node
-		// the controller never registered. Without this gate
-		// `linstor r c <bogus-node> <rd>` happily wrote
-		// `<rd>.<bogus-node>` into the store and the satellite
-		// reconciler then had no way to reach the named node — the
-		// phantom CRD survived forever as orphaned state. We do the
-		// existence check here (not in the per-replica store create)
-		// so the operator sees a 404 + LINSTOR envelope with the
-		// exact unresolved name + an actionable correction hint.
-		_, nodeErr := s.Store.Nodes().Get(r.Context(), res.NodeName)
-		if errors.Is(nodeErr, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound,
-				"node '"+res.NodeName+"' not found: create the node first with "+
-					"`linstor n c <name>` or pass a valid existing node name")
-
-			return nil, false
-		}
-
-		if nodeErr != nil {
-			writeStoreError(w, nodeErr)
-
-			return nil, false
-		}
-
-		if !s.refuseResourceCreateOnUnknownPool(w, r, &res) {
+		if !s.validateResourceCreateEnvelope(w, r, rdName, &res) {
 			return nil, false
 		}
 
@@ -986,6 +978,67 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	}
 
 	return created, true
+}
+
+// validateResourceCreateEnvelope runs the per-envelope wire-shape and
+// existence checks for a single ResourceCreate body entry: required
+// node_name, no embedded '.' in either side of the future
+// `<rd>.<node>` metadata.name, Node existence (Bug 94), and storage-
+// pool existence (Bug 118). Pulled out of createResources so the
+// latter stays under the funlen budget after Bug 144 added the
+// up-front RD-existence gate. Returns true when the caller may
+// proceed, false when the HTTP error has already been written.
+func (s *Server) validateResourceCreateEnvelope(w http.ResponseWriter, r *http.Request, rdName string, res *apiv1.Resource) bool {
+	if res.NodeName == "" {
+		writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
+
+		return false
+	}
+
+	// Enforce the cluster-wide naming convention up front: the CRD
+	// metadata.name will be `<rd>.<node>`, so an embedded '.' in
+	// either side would shift the boundary and either collide with
+	// another (rd, node) pair or stage a CRD the CEL rule on the
+	// type would later reject with a 422. Catch it here with a
+	// friendly 400.
+	if strings.Contains(res.NodeName, ".") {
+		writeError(w, http.StatusBadRequest,
+			"node_name must not contain '.': metadata.name must equal <rd>.<node>")
+
+		return false
+	}
+
+	if strings.Contains(rdName, ".") {
+		writeError(w, http.StatusBadRequest,
+			"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
+
+		return false
+	}
+
+	// Bug 94: refuse to stage a Resource CRD pointing at a node the
+	// controller never registered. Without this gate `linstor r c
+	// <bogus-node> <rd>` happily wrote `<rd>.<bogus-node>` into the
+	// store and the satellite reconciler then had no way to reach the
+	// named node — the phantom CRD survived forever as orphaned state.
+	// We do the existence check here (not in the per-replica store
+	// create) so the operator sees a 404 + LINSTOR envelope with the
+	// exact unresolved name + an actionable correction hint.
+	_, nodeErr := s.Store.Nodes().Get(r.Context(), res.NodeName)
+	if errors.Is(nodeErr, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound,
+			"node '"+res.NodeName+"' not found: create the node first with "+
+				"`linstor n c <name>` or pass a valid existing node name")
+
+		return false
+	}
+
+	if nodeErr != nil {
+		writeStoreError(w, nodeErr)
+
+		return false
+	}
+
+	return s.refuseResourceCreateOnUnknownPool(w, r, res)
 }
 
 // createOrPromoteResource creates res or promotes an existing
