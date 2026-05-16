@@ -36,6 +36,26 @@ type nodeConnectionPutBody struct {
 	DeleteNamespaces []string          `json:"delete_namespaces,omitempty"`
 }
 
+// seedNodeConnectionEndpoints returns a fresh in-memory store with the
+// named Node CRDs pre-seeded. After Bug 133 wired the node-existence
+// gate on PUT /v1/node-connections/{a}/{b}, every test that exercises
+// the persistence / list surface must seed both endpoints; the wire
+// handler now 404s on bogus names. The helper keeps the test bodies
+// focused on the property-modify shape rather than CRD seeding.
+func seedNodeConnectionEndpoints(t *testing.T, names ...string) store.Store {
+	t.Helper()
+
+	st := store.NewInMemory()
+
+	for _, name := range names {
+		if err := st.Nodes().Create(t.Context(), &apiv1.Node{Name: name}); err != nil {
+			t.Fatalf("seed node %q: %v", name, err)
+		}
+	}
+
+	return st
+}
+
 // TestNodeConnectionPutReturnsEnvelope is Bug 101's primary
 // regression: PUT /v1/node-connections/{a}/{b} with a non-empty
 // override_props body must return 200 + the LINSTOR `[]APICallRc`
@@ -50,7 +70,7 @@ type nodeConnectionPutBody struct {
 // branch fires and the operator's `linstor node-connection
 // set-property` exits 0.
 func TestNodeConnectionPutReturnsEnvelope(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "alpha", "beta"))
 	defer stop()
 
 	body, err := json.Marshal(nodeConnectionPutBody{
@@ -108,7 +128,7 @@ func TestNodeConnectionPutReturnsEnvelope(t *testing.T) {
 // showed an empty matrix even after the operator's set-property
 // "succeeded".
 func TestNodeConnectionPutPersists(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "alpha", "beta"))
 	defer stop()
 
 	body, err := json.Marshal(nodeConnectionPutBody{
@@ -173,7 +193,7 @@ func TestNodeConnectionPutPersists(t *testing.T) {
 // different rows — confusing operators and breaking idempotent
 // reconciler patterns that don't track a canonical name order.
 func TestNodeConnectionPairOrderIndependent(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "alpha", "beta"))
 	defer stop()
 
 	body, err := json.Marshal(nodeConnectionPutBody{
@@ -222,7 +242,7 @@ func TestNodeConnectionPairOrderIndependent(t *testing.T) {
 // running `linstor node-connection list` saw an empty table even
 // after a "successful" set-property.
 func TestNodeConnectionListReturnsArray(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "n1", "n2"))
 	defer stop()
 
 	body, err := json.Marshal(nodeConnectionPutBody{
@@ -276,7 +296,8 @@ func TestNodeConnectionListReturnsArray(t *testing.T) {
 // operator running `linstor node-connection list dev-kvaps-worker-1`
 // doesn't get a flood of unrelated rows from large clusters.
 func TestNodeConnectionListFilterByNode(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t,
+		seedNodeConnectionEndpoints(t, "alpha", "beta", "gamma", "delta"))
 	defer stop()
 
 	cases := []struct {
@@ -340,7 +361,7 @@ func TestNodeConnectionListFilterByNode(t *testing.T) {
 // MASK_ERROR bit, not the HTTP status alone; surfacing as a typed
 // error here keeps the operator-facing diagnostic actionable.
 func TestNodeConnectionPutEmptyBodyIs4xx(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "alpha", "beta"))
 	defer stop()
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
@@ -375,7 +396,7 @@ func TestNodeConnectionPutEmptyBodyIs4xx(t *testing.T) {
 // only remaining key is gone, the pair MUST drop out of the list
 // response entirely (no zero-props ghost rows).
 func TestNodeConnectionDeleteProp(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	base, stop := startServerWithStore(t, seedNodeConnectionEndpoints(t, "n1", "n2"))
 	defer stop()
 
 	// First, set.

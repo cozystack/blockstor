@@ -31,6 +31,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/store"
 )
 
 // registerNodeConnections wires the upstream LINSTOR
@@ -192,6 +193,20 @@ func (s *Server) handleNodeConnectionModify(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Bug 133: refuse set-property when either node doesn't exist.
+	// Without this gate `linstor node-connection set-property bogus-A
+	// bogus-B Sites/Site x` persisted a phantom pair entry against
+	// non-existent nodes (after Bug 101 wired the persistence path).
+	// Mirrors Bug 94's node-existence gate on `r c` — 404 + LINSTOR
+	// envelope naming the missing node.
+	if !s.refuseNodeConnectionOnUnknownNode(w, r, src) {
+		return
+	}
+
+	if !s.refuseNodeConnectionOnUnknownNode(w, r, dst) {
+		return
+	}
+
 	err = s.applyNodeConnectionProps(r.Context(), src, dst, &modify)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -207,6 +222,37 @@ func (s *Server) handleNodeConnectionModify(w http.ResponseWriter, r *http.Reque
 			objRefNodeB: dst,
 		},
 	}})
+}
+
+// refuseNodeConnectionOnUnknownNode is Bug 133's node-existence
+// gate. Both endpoints of a node-connection set-property must resolve
+// to a registered Node CRD; without this check the handler persisted
+// a phantom pair entry on `ControllerConfig.Spec.NodeConnections` and
+// `linstor node-connection list` then rendered a row referencing
+// nodes that don't exist. Mirrors Bug 94's gate shape — 404 + LINSTOR
+// envelope naming the missing node. Returns true when the caller may
+// proceed, false when the HTTP error has already been written.
+func (s *Server) refuseNodeConnectionOnUnknownNode(w http.ResponseWriter, r *http.Request, name string) bool {
+	if s.Store == nil {
+		return true
+	}
+
+	_, err := s.Store.Nodes().Get(r.Context(), name)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound,
+			"node '"+name+"' not found: create the node first with "+
+				"`linstor n c <name>` or pass a valid existing node name")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
 }
 
 // handleNodeConnectionDelete drops every stored property for the

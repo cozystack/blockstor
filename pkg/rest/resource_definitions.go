@@ -233,6 +233,20 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 134: when the caller pinned a resource group by name
+	// (`linstor rd c <rd> --resource-group <rg>` lands as
+	// `resource_definition.resource_group_name`), the RG must
+	// already exist. Without this gate the RD persisted with a
+	// dangling RG reference; downstream rg-inherited operations
+	// then silently fell back to DfltRscGrp (or errored on later
+	// reads) and the operator's only feedback was "SUCCESS" on the
+	// create. Mirrors Bug 118's pool-existence gate — 404 + LINSTOR
+	// envelope naming the missing RG. Empty name is left for
+	// ensureDefaultRGAssignment to handle (DfltRscGrp fallback).
+	if !s.refuseRDCreateOnUnknownRG(w, r, &rd) {
+		return
+	}
+
 	// Upstream LINSTOR parity: every RD belongs to an RG. The
 	// well-known DfltRscGrp serves as the catch-all for clients that
 	// don't specify one (linstor-csi, the legacy CSI shipper, manual
@@ -274,6 +288,41 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition created: " + rd.Name,
 	}})
+}
+
+// refuseRDCreateOnUnknownRG is Bug 134's gate. When the caller pinned
+// a resource group by name on RD create, the RG must already exist —
+// otherwise the RD persisted with a dangling RG reference and the
+// downstream rg-inherited reads silently fell back to DfltRscGrp.
+// Empty `ResourceGroupName` is left to ensureDefaultRGAssignment for
+// the DfltRscGrp fallback (the caller didn't pick an RG, so there's
+// no name to validate). Mirrors Bug 118's pool-existence gate shape —
+// 404 + LINSTOR envelope naming the missing RG. Returns true when the
+// caller may proceed, false when the HTTP error has already been
+// written.
+func (s *Server) refuseRDCreateOnUnknownRG(w http.ResponseWriter, r *http.Request, rd *apiv1.ResourceDefinition) bool {
+	if rd.ResourceGroupName == "" {
+		return true
+	}
+
+	_, err := s.Store.ResourceGroups().Get(r.Context(), rd.ResourceGroupName)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound,
+			"resource group '"+rd.ResourceGroupName+
+				"' not found: create the resource group first with "+
+				"`linstor rg c <name>` or pass a valid existing "+
+				"resource group name")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
 }
 
 // DefaultResourceGroupName is the well-known RG every RD falls into

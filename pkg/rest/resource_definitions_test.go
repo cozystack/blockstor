@@ -54,7 +54,15 @@ func TestResourceDefinitionsListEmpty(t *testing.T) {
 
 // TestResourceDefinitionsCreateRoundTrip: create via golinstor, get it back.
 func TestResourceDefinitionsCreateRoundTrip(t *testing.T) {
-	base, stop := startServerWithStore(t, store.NewInMemory())
+	st := store.NewInMemory()
+	// Bug 134: RD-create now refuses non-existent RG references; seed
+	// the parent RG so the happy-path round-trip still exercises the
+	// wire shape (not the validation gate).
+	if err := st.ResourceGroups().Create(t.Context(), &apiv1.ResourceGroup{Name: "rg-1"}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
 	defer stop()
 
 	c := newClient(t, base)
