@@ -17,7 +17,6 @@ limitations under the License.
 package rest
 
 import (
-	"encoding/json"
 	"maps"
 	"net/http"
 
@@ -59,10 +58,7 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 
 	var patch apiv1.GenericPropsModify
 
-	err := json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &patch) {
 		return
 	}
 

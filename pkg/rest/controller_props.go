@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 
@@ -114,14 +113,11 @@ func (s *Server) handleControllerPropsModify(w http.ResponseWriter, r *http.Requ
 
 	var modify apiv1.GenericPropsModify
 
-	err := json.NewDecoder(r.Body).Decode(&modify)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &modify) {
 		return
 	}
 
-	err = applyControllerProps(r.Context(), s.Client, &modify)
+	err := applyControllerProps(r.Context(), s.Client, &modify)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 

@@ -247,10 +247,7 @@ func (s *Server) handleResourceConnectionPathCreate(w http.ResponseWriter, r *ht
 
 	var body resourceConnectionPath
 
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 
@@ -260,7 +257,7 @@ func (s *Server) handleResourceConnectionPathCreate(w http.ResponseWriter, r *ht
 		return
 	}
 
-	err = s.upsertResourceConnectionPath(r.Context(), rdName, nodeA, nodeB, body)
+	err := s.upsertResourceConnectionPath(r.Context(), rdName, nodeA, nodeB, body)
 	if err != nil {
 		writeStoreError(w, err)
 

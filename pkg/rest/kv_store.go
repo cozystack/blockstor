@@ -175,9 +175,14 @@ func decodeKVModifyBody(w http.ResponseWriter, r *http.Request) (apiv1.GenericPr
 		raw   map[string]json.RawMessage
 	)
 
+	// Bug 158: route empty / malformed / oversized bodies through the
+	// typed-envelope writeDecodeError helper so the wire never carries
+	// a raw `"EOF"` / `"invalid character …"` / Go-side type name. The
+	// target here is a raw map (not a struct), so the per-key unknown-
+	// field gate below already covers Bug 161 manually.
 	err := json.NewDecoder(r.Body).Decode(&raw)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		writeDecodeError(w, err)
 
 		return patch, false
 	}

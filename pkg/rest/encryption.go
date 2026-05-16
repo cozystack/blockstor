@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -111,10 +110,8 @@ func (s *Server) registerEncryption(mux *http.ServeMux) {
 func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	// Bug 158/161: typed-envelope decode + DisallowUnknownFields.
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -202,10 +199,7 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -267,10 +261,7 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) {
 	var req passphraseRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

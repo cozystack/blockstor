@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"sort"
@@ -175,14 +174,10 @@ func (s *Server) handleNodeConnectionModify(w http.ResponseWriter, r *http.Reque
 
 	var modify apiv1.GenericPropsModify
 
-	err := json.NewDecoder(r.Body).Decode(&modify)
-	if err != nil {
-		// Empty body or malformed JSON: surface as a 400 + envelope
-		// rather than a 500, so the python CLI's
-		// `if rc.is_error()` branch prints the cause instead of
-		// crashing on a non-JSON response.
-		writeError(w, http.StatusBadRequest, "decode body: "+err.Error())
-
+	// Bug 158/161: empty body or malformed JSON surfaces as 400 +
+	// LINSTOR envelope (typed wire shape, no Go-side type leak),
+	// and unknown top-level fields are refused at the wire boundary.
+	if !decodeJSON(w, r, &modify) {
 		return
 	}
 
@@ -207,7 +202,7 @@ func (s *Server) handleNodeConnectionModify(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	err = s.applyNodeConnectionProps(r.Context(), src, dst, &modify)
+	err := s.applyNodeConnectionProps(r.Context(), src, dst, &modify)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 

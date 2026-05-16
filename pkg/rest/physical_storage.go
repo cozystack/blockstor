@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"strings"
@@ -196,10 +195,7 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 func decodePhysicalStorageCreateRequest(w http.ResponseWriter, r *http.Request) (physicalStorageCreateRequest, bool) {
 	var req physicalStorageCreateRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return req, false
 	}
 

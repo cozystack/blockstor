@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"strconv"
@@ -66,10 +65,7 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 
 	var patch apiv1.GenericPropsModify
 
-	err := json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &patch) {
 		return
 	}
 
@@ -602,10 +598,7 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string) (apiv1.StoragePool, bool) {
 	var body apiv1.StoragePool
 
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &body) {
 		return apiv1.StoragePool{}, false
 	}
 

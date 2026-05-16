@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 
@@ -69,10 +68,7 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 
 	var req rdCloneRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

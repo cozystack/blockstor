@@ -17,7 +17,6 @@ limitations under the License.
 package rest
 
 import (
-	"encoding/json"
 	"net/http"
 )
 
@@ -42,10 +41,7 @@ func (s *Server) handleDRBDPassphraseSet(w http.ResponseWriter, r *http.Request)
 
 	var req drbdPassphraseRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

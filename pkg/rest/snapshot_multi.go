@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -64,10 +63,7 @@ type multiSnapshotCreateEntry struct {
 func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Request) {
 	var body multiSnapshotCreateBody
 
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 

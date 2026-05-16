@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -187,10 +186,7 @@ type evacuateMultiRequest struct {
 func (s *Server) handleNodeEvacuateMulti(w http.ResponseWriter, r *http.Request) {
 	var req evacuateMultiRequest
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -222,7 +218,7 @@ func (s *Server) handleNodeEvacuateMulti(w http.ResponseWriter, r *http.Request)
 	for i := range nodes {
 		nodes[i].Flags = addFlag("EVICTED")(nodes[i].Flags)
 
-		err = s.Store.Nodes().Update(ctx, &nodes[i])
+		err := s.Store.Nodes().Update(ctx, &nodes[i])
 		if err != nil {
 			writeStoreError(w, err)
 

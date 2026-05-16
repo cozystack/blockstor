@@ -17,7 +17,6 @@ limitations under the License.
 package rest
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"sort"
@@ -164,11 +163,10 @@ func handleEmptyRemoteArray(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleCreateLinstorRemote(w http.ResponseWriter, r *http.Request) {
 	var entry linstorRemoteEntry
 
-	err := json.NewDecoder(r.Body).Decode(&entry)
-	if err != nil {
-		writeError(w, http.StatusBadRequest,
-			"failed to decode LinstorRemote: "+err.Error())
-
+	// Bug 158/161: typed-envelope decode (oversized → 413, empty → 400
+	// "request body is empty", wrong shape → 400 with no Go type leak,
+	// unknown top-level field → 400 + envelope).
+	if !decodeJSON(w, r, &entry) {
 		return
 	}
 

@@ -944,14 +944,22 @@ func decodeAutoplaceBody(w http.ResponseWriter, r *http.Request) ([]byte, apiv1.
 
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return nil, req, false
 	}
 
-	err = json.Unmarshal(rawBody, &req)
+	// Bug 158/161: typed-envelope decode + DisallowUnknownFields so a
+	// stray top-level field (or an empty / malformed body) surfaces as
+	// a stable 400 + LINSTOR envelope with no Go-side type leak. The
+	// raw bytes are still needed by the Bug 156 zero-value-aware probe
+	// downstream — we just discipline the decode path here.
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	dec.DisallowUnknownFields()
+
+	err = dec.Decode(&req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return nil, req, false
 	}
@@ -1046,14 +1054,21 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return
 	}
 
 	envelopes, err := decodeResourceCreateBody(body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		// Bug 158/161: route every decode failure through the
+		// typed-envelope helper so an empty body, malformed JSON,
+		// wrong shape, OR an unknown top-level field surfaces as a
+		// stable LINSTOR `[]ApiCallRc` reply with no Go-side type
+		// leak. decodeResourceCreateBody returns the underlying
+		// decoder error wrapped via cockroachdb/errors.Wrap, so the
+		// helper's errors.As checks unwrap it correctly.
+		writeDecodeError(w, err)
 
 		return
 	}
@@ -1472,18 +1487,24 @@ func decodeMakeAvailableBody(w http.ResponseWriter, r *http.Request) (apiv1.Reso
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return req, false
 	}
 
+	// Empty body is the documented opt-in default (diskful:false) —
+	// don't tip it into the typed-decode path, just return the zero req.
 	if len(bytes.TrimSpace(body)) == 0 {
 		return req, true
 	}
 
-	err = json.Unmarshal(body, &req)
+	// Bug 158/161: typed-envelope decode + DisallowUnknownFields.
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+
+	err = dec.Decode(&req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return req, false
 	}
@@ -1584,15 +1605,27 @@ func (s *Server) makeAvailableCreate(ctx context.Context, rdName, node string, r
 // `[]ResourceCreate` envelope (the shape the CLI posts) or a bare
 // `ResourceCreate` object (legacy blockstor callers). Returns a
 // normalised slice the handler iterates over.
+//
+// Bug 161: uses `json.NewDecoder` + `DisallowUnknownFields()` (not the
+// permissive `json.Unmarshal`) so a stray top-level `props` (instead
+// of `resource.props`) — the v5-report repro — is refused at the wire
+// boundary rather than slipping past the Bug 117/118 SP-existence
+// gate. The decoder's unknown-field error propagates verbatim so the
+// caller's `writeDecodeError` (Bug 158) maps it to a 400 + LINSTOR
+// envelope naming the offending key.
 func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 	trimmed := bytes.TrimLeft(body, " \t\r\n")
 
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var envelopes []apiv1.ResourceCreate
 
-		err := json.Unmarshal(body, &envelopes)
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+
+		err := dec.Decode(&envelopes)
 		if err != nil {
-			return nil, errors.Wrap(err, "decode resource create array")
+			//nolint:wrapcheck // raw decoder error preserved so writeDecodeError can route by type
+			return nil, err
 		}
 
 		return envelopes, nil
@@ -1600,9 +1633,13 @@ func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 
 	var single apiv1.ResourceCreate
 
-	err := json.Unmarshal(body, &single)
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+
+	err := dec.Decode(&single)
 	if err != nil {
-		return nil, errors.Wrap(err, "decode resource create object")
+		//nolint:wrapcheck // raw decoder error preserved so writeDecodeError can route by type
+		return nil, err
 	}
 
 	return []apiv1.ResourceCreate{single}, nil

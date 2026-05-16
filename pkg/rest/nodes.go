@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"net"
@@ -225,10 +224,7 @@ func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutat
 
 	var iface apiv1.NetInterface
 
-	err := json.NewDecoder(r.Body).Decode(&iface)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &iface) {
 		return
 	}
 
@@ -351,10 +347,7 @@ func (s *Server) handleNodeInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	var n apiv1.Node
 
-	err := json.NewDecoder(r.Body).Decode(&n)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &n) {
 		return
 	}
 
@@ -706,10 +699,7 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	// patch on top.
 	var patch apiv1.NodeModify
 
-	err := json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &patch) {
 		return
 	}
 

@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
@@ -155,10 +154,7 @@ func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {
 
 	var in apiv1.VolumeGroup
 
-	err := json.NewDecoder(r.Body).Decode(&in)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 
@@ -208,10 +204,7 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		DeleteProps   []string          `json:"delete_props,omitempty"`
 	}
 
-	err := json.NewDecoder(r.Body).Decode(&in)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &in) {
 		return
 	}
 

@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 
@@ -197,16 +196,12 @@ func (s *Server) stampRDEffectiveProps(ctx context.Context, rd *apiv1.ResourceDe
 func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	var body apiv1.ResourceDefinitionCreate
 
-	dec := json.NewDecoder(r.Body)
-	// upstream LINSTOR has tolerated extra fields here historically; mirror
-	// that to keep golinstor (and any home-grown clients) happy.
-	err := dec.Decode(&body)
-	if err != nil {
-		// Bug 146: route oversized-body errors to a typed 413 envelope
-		// and scrub etcd/k8s impl-detail strings out of any raw decoder
-		// message before it goes on the wire. See pkg/rest/server.go.
-		writeDecodeError(w, err)
-
+	// Bug 158/161 + Bug 146: typed-envelope decode that routes
+	// oversized-body errors to 413, empty/malformed bodies to a
+	// scrubbed 400 envelope (no Go-side `v1.RD` leak, no raw decoder
+	// strings on the wire), and refuses unknown top-level fields so
+	// a stray key can't slip past upstream contract.
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 
@@ -229,7 +224,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.validateRDLayerStackOnCreate(r.Context(), &body, &rd)
+	err := s.validateRDLayerStackOnCreate(r.Context(), &body, &rd)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -652,6 +647,24 @@ type resourceDefinitionModifyBody struct {
 	// instead of the modify envelope (matches the read-side
 	// `ResourceDefinition` wire field). Accept both — first non-empty wins.
 	ResourceGroupName string `json:"resource_group_name,omitempty"`
+
+	// Bug 161 (DisallowUnknownFields): the legacy "PUT the full
+	// ResourceDefinition read-side shape" wire convention is still
+	// in use — golinstor (older versions), home-grown clients, and
+	// the existing test suite all marshal `apiv1.ResourceDefinition`
+	// verbatim and PUT it here. Accept the full set of read-side
+	// keys so DisallowUnknownFields doesn't break that contract.
+	// The path's `{rd}` segment remains authoritative for the target,
+	// and only the modify-shaped fields above drive the merge — the
+	// fields below are informational and ignored by mergeRDPatch.
+	Name         string                `json:"name,omitempty"`
+	ExternalName string                `json:"external_name,omitempty"`
+	Props        map[string]string     `json:"props,omitempty"`
+	Annotations  map[string]string     `json:"annotations,omitempty"`
+	Flags        []string              `json:"flags,omitempty"`
+	LayerData    []apiv1.ResourceLayer `json:"layer_data,omitempty"`
+	LayerStack   []string              `json:"layer_stack,omitempty"`
+	UUID         string                `json:"uuid,omitempty"`
 }
 
 func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
@@ -659,10 +672,7 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var patch resourceDefinitionModifyBody
 
-	err := json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &patch) {
 		return
 	}
 

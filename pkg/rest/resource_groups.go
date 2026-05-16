@@ -109,10 +109,7 @@ func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 	var rg apiv1.ResourceGroup
 
-	err := json.NewDecoder(r.Body).Decode(&rg)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &rg) {
 		return
 	}
 
@@ -126,7 +123,7 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = validateLayerStack(rg.SelectFilter.LayerStack)
+	err := validateLayerStack(rg.SelectFilter.LayerStack)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
@@ -229,14 +226,20 @@ func readRGUpdatePatch(w http.ResponseWriter, r *http.Request) ([]byte, apiv1.Re
 
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return nil, patch, false
 	}
 
-	err = json.Unmarshal(raw, &patch)
+	// Bug 158/161: typed-envelope decode + DisallowUnknownFields. We
+	// keep `raw` for the downstream Bug 156-style "field explicitly
+	// mentioned?" probe; the decode just disciplines the typed view.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+
+	err = dec.Decode(&patch)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeDecodeError(w, err)
 
 		return nil, patch, false
 	}

@@ -228,4 +228,31 @@ type ResourceDefinitionCreate struct {
 	OverrideProps   map[string]string `json:"override_props,omitempty"`
 	DeleteProps     []string          `json:"delete_props,omitempty"`
 	DeleteNamespace []string          `json:"delete_namespaces,omitempty"`
+
+	// Bug 161 (DisallowUnknownFields) requires the body to declare
+	// every legitimate top-level key. The following mirror python-
+	// linstor 1.27.1's RD-create wire shape (Bug 116 reproducer)
+	// AND golinstor v0.60.0's optional DRBD-layer hints; they're
+	// accepted but informational — the merged LayerList +
+	// ResourceDefinition.LayerData remain authoritative.
+	DrbdResourceDefinition *DrbdResourceDefinitionData `json:"drbd_resource_definition,omitempty"`
+	DrbdPort               int32                       `json:"drbd_port,omitempty"`
+	DrbdTransportType      string                      `json:"drbd_transport_type,omitempty"`
+}
+
+// DrbdResourceDefinitionData is the per-create DRBD-layer hint
+// upstream LINSTOR's API accepts at the top of the body (peer of
+// `resource_definition`). Fields are informational only on the
+// blockstor surface — the satellite stamps live values during
+// reconcile from RD properties + per-resource ResourceLayer. Accept
+// here purely so Bug 161's DisallowUnknownFields gate doesn't
+// reject the wire shape python-linstor + curl-from-doc send.
+type DrbdResourceDefinitionData struct {
+	ResourceNameSuffix string `json:"resource_name_suffix,omitempty"`
+	PeerSlots          int32  `json:"peer_slots,omitempty"`
+	AlStripes          int64  `json:"al_stripes,omitempty"`
+	Port               int32  `json:"port,omitempty"`
+	TransportType      string `json:"transport_type,omitempty"`
+	Secret             string `json:"secret,omitempty"`
+	Down               bool   `json:"down,omitempty"`
 }

@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"net/http"
@@ -63,6 +62,17 @@ type volumeDefinitionModifyBody struct {
 	// via the `?force=true` query parameter so ad-hoc `curl` scripts
 	// don't have to re-shape a golinstor payload.
 	Force bool `json:"force,omitempty"`
+
+	// VolumeNumber + UUID round-trip the read-side `apiv1.VolumeDefinition`
+	// shape that legacy callers PUT verbatim — the path's `{vn}` segment
+	// remains authoritative, but accepting the body-side field keeps
+	// Bug 161's DisallowUnknownFields gate from breaking
+	// `json.Marshal(apiv1.VolumeDefinition{...})` callers that send the
+	// full read-side object. The handler reads VolumeNumber from the path
+	// and ignores the body value (see TestVDSetSizeUsesPathVolumeNumber
+	// in volume_definitions_test.go); UUID is similarly informational.
+	VolumeNumber int32  `json:"volume_number,omitempty"`
+	UUID         string `json:"uuid,omitempty"`
 }
 
 // registerVolumeDefinitions wires
@@ -193,12 +203,7 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 
 	var envelope apiv1.VolumeDefinitionCreate
 
-	dec := json.NewDecoder(r.Body)
-
-	err := dec.Decode(&envelope)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &envelope) {
 		return
 	}
 
@@ -213,7 +218,7 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
+	err := s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
 	if err != nil {
 		// Bug 140: duplicate-VD conflict gets a typed envelope with
 		// the upstream FAIL_EXISTS_VLM_DFN sub-code plus actionable
@@ -367,10 +372,7 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	var patch volumeDefinitionModifyBody
 
-	err = json.NewDecoder(r.Body).Decode(&patch)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &patch) {
 		return
 	}
 

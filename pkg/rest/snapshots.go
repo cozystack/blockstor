@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"slices"
 	"strconv"
@@ -418,10 +417,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 
 	var snap apiv1.Snapshot
 
-	err := json.NewDecoder(r.Body).Decode(&snap)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &snap) {
 		return
 	}
 
@@ -444,7 +440,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 
 	snap.ResourceName = rd
 
-	err = s.hydrateSnapshotFromRD(r.Context(), &snap, rd)
+	err := s.hydrateSnapshotFromRD(r.Context(), &snap, rd)
 	if err != nil {
 		writeStoreError(w, err)
 

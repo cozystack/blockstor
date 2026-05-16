@@ -51,6 +51,22 @@ type NodeModify struct {
 	GenericPropsModify
 
 	NodeType string `json:"node_type,omitempty"`
+
+	// Bug 161 (DisallowUnknownFields): legacy callers PUT the full
+	// `Node` read-side shape verbatim — accept those keys so the gate
+	// doesn't reject them. The path's `{node}` segment is the
+	// authoritative target; Type drives the merge via NodeType above,
+	// the rest are informational. Same shape as the v0 spec field-set.
+	Name                 string              `json:"name,omitempty"`
+	Type                 string              `json:"type,omitempty"`
+	UUID                 string              `json:"uuid,omitempty"`
+	Flags                []string            `json:"flags,omitempty"`
+	NetInterfaces        []NetInterface      `json:"net_interfaces,omitempty"`
+	ConnectionStatus     string              `json:"connection_status,omitempty"`
+	ResourceLayers       []string            `json:"resource_layers,omitempty"`
+	StorageProviders     []string            `json:"storage_providers,omitempty"`
+	UnsupportedLayers    map[string][]string `json:"unsupported_layers,omitempty"`
+	UnsupportedProviders map[string][]string `json:"unsupported_providers,omitempty"`
 }
 
 // NetInterface mirrors `NetInterface` from upstream. UUID is synthesized

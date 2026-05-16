@@ -18,7 +18,6 @@ package rest
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"strconv"
@@ -48,10 +47,7 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 
 	var req apiv1.ResourceGroupSpawn
 
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"maps"
 	"mime"
 	"net"
@@ -780,19 +781,88 @@ func writeUnsupportedMediaTypeEnvelope(w http.ResponseWriter, r *http.Request, g
 	_ = json.NewEncoder(w).Encode(envelope)
 }
 
+// decodeJSON is the typed-envelope JSON decode helper used by every
+// `r.Body`-consuming REST handler in this package. It enforces the
+// LINSTOR `[]ApiCallRc` envelope invariant on every failure mode and
+// gates inbound bodies against unknown fields (Bug 161).
+//
+// Wire contract (Bug 158 — typed envelope invariant):
+//
+//   - empty body            → 400 + envelope ("request body is empty")
+//   - oversized body        → 413 + envelope (Bug 146 short-circuit;
+//     `*http.MaxBytesError` routed through the
+//     cap-byte-count message handler)
+//   - malformed JSON        → 400 + envelope ("request body is not
+//     valid JSON"); the std-lib decoder's
+//     "invalid character '\x1f' …" /
+//     "literal null" strings DO NOT reach the
+//     wire — they leak the JSON internals.
+//   - wrong JSON shape      → 400 + envelope citing the offending
+//     wire-side field name (NOT the Go-side
+//     type name; `v1.Node` is an internal
+//     API identifier).
+//   - unknown field         → 400 + envelope citing the offending
+//     wire-side field name (Bug 161 —
+//     DisallowUnknownFields).
+//   - any other decode err  → 400 + envelope with a scrubbed message
+//     (etcd / k8s impl-detail strings are
+//     stripped before they hit the wire).
+//
+// On success returns true; on failure writes the envelope and returns
+// false — the caller must `return` immediately.
+//
+// Operators see an `ERROR:` line with a stable, actionable message;
+// python-linstor's `[]ApiCallRc` decoder no longer crashes on the
+// plain-text leak. The Go-side type name is never on the wire.
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	dec := json.NewDecoder(r.Body)
+	// Bug 161: refuse unknown top-level (and recursively, nested)
+	// fields so a stray `{"props":…}` at the wrong nesting level
+	// doesn't sail past the Bug 117/118 SP-existence gate. Without
+	// this gate a buggy client puts `props` at the top level instead
+	// of inside `resource`, the SP gate never fires (wrong field
+	// carries the pool reference) and the Resource lands in Unknown.
+	dec.DisallowUnknownFields()
+
+	err := dec.Decode(target)
+	if err == nil {
+		return true
+	}
+
+	writeDecodeError(w, err)
+
+	return false
+}
+
 // writeDecodeError is the handler-side bridge for the Bug 146 body
-// limit AND the Bug 146 impl-detail scrub. Handlers that decode a
-// JSON body call this with the decoder's error; we route as follows:
+// limit AND the Bug 158 typed-envelope invariant. Handlers that
+// decode a JSON body via decodeJSON route through here on failure;
+// the routing is:
 //
-//   - `*http.MaxBytesError` → 413 + LINSTOR envelope ("request body too
-//     large"); the cap byte-count is surfaced in the `cause` so
-//     operators know the contract.
-//   - any other error → 400 + LINSTOR envelope with a scrubbed
-//     message (etcd / k8s impl-detail strings are stripped before
-//     they reach the wire).
-//
-// Handlers using this helper short-circuit on a true return — the
-// envelope is already on the wire.
+//   - `*http.MaxBytesError`     → 413 + envelope ("request body too
+//     large"); the cap byte-count is
+//     surfaced so operators know the
+//     contract.
+//   - `io.EOF` (empty body)     → 400 + envelope ("request body is
+//     empty"); pre-fix the wire surfaced
+//     the literal string `EOF`.
+//   - `*json.SyntaxError`       → 400 + envelope ("request body is
+//     not valid JSON"); the std-lib's
+//     internal "invalid character …" /
+//     "literal null" / "\x1f" strings
+//     DO NOT reach the wire.
+//   - `*json.UnmarshalTypeError` → 400 + envelope citing the wire-side
+//     field name only — the Go-side type
+//     (`v1.Node`, `apiv1.Resource`) is
+//     scrubbed.
+//   - unknown field (Bug 161)   → 400 + envelope citing the field
+//     name; the helper detects the
+//     std-lib's `json: unknown field
+//     "<name>"` shape.
+//   - any other decode err      → 400 + envelope with a scrubbed
+//     message (etcd / k8s impl-detail
+//     strings are stripped before they
+//     hit the wire).
 func writeDecodeError(w http.ResponseWriter, err error) {
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
@@ -802,7 +872,99 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 		return
 	}
 
+	// Empty body. The std-lib decoder returns io.EOF when called on a
+	// zero-byte stream; the message is literally "EOF" — operators see
+	// a wire reply of `[{"message":"EOF"}]`, python-linstor's CLI
+	// surfaces "ERROR: EOF" with no hint that the body was empty.
+	if errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest,
+			"request body is empty: send the JSON payload this endpoint expects")
+
+		return
+	}
+
+	// Truncated body — the decoder consumed something but ran out of
+	// bytes mid-structure. Same operator-facing shape as an empty body.
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		writeError(w, http.StatusBadRequest,
+			"request body is truncated: re-send the complete JSON payload")
+
+		return
+	}
+
+	// Unknown field (Bug 161). DisallowUnknownFields emits a plain
+	// `*errors.errorString` (not a sentinel value), so we match on the
+	// std-lib's stable prefix `json: unknown field "<name>"`. The
+	// field name is operator-actionable — it tells the caller exactly
+	// which key to remove (or move to the right nesting level).
+	if name, ok := unknownFieldName(err); ok {
+		writeError(w, http.StatusBadRequest,
+			`unknown field "`+name+`" in request body: this endpoint does not `+
+				`accept that key; check the LINSTOR REST API documentation`)
+
+		return
+	}
+
+	// Wrong JSON shape. UnmarshalTypeError carries the Go-side type
+	// name (e.g. `v1.Node`) — that's an internal identifier; the wire
+	// must surface only the JSON field name (which the operator
+	// controls) plus a generic "wrong type" cue. Top-level decodes
+	// have Field == ""; in that case fall back to the generic message.
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		msg := "wrong JSON shape: request body has the wrong type for this endpoint"
+		if typeErr.Field != "" {
+			msg = `wrong JSON shape: field "` + typeErr.Field + `" has the wrong type`
+		}
+
+		writeError(w, http.StatusBadRequest, msg)
+
+		return
+	}
+
+	// Malformed JSON — bad bytes, gzip body, unterminated string, etc.
+	// SyntaxError messages name the offending byte ("invalid character
+	// '\x1f' …"), which leaks the JSON internals AND, in the gzip
+	// case, the magic-byte fingerprint of the wrong content encoding.
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		writeError(w, http.StatusBadRequest,
+			"request body is not valid JSON: send `application/json` "+
+				"content; verify the body parses with `jq .`")
+
+		return
+	}
+
 	writeError(w, http.StatusBadRequest, scrubImplDetails(err.Error()))
+}
+
+// unknownFieldName extracts the offending key from Go's
+// DisallowUnknownFields error. The std-lib emits a plain
+// `*errors.errorString` with the message `json: unknown field "<name>"`
+// — there's no typed sentinel to errors.As against, so we parse the
+// message. Returns (name, true) on a match; (empty, false) otherwise.
+//
+// Stable since Go 1.10 (DisallowUnknownFields' introduction); the
+// upstream error is constructed by `encoding/json/decode.go`'s
+// `Decoder.Decode` via fmt.Errorf with this exact format string.
+func unknownFieldName(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+
+	const prefix = `json: unknown field "`
+
+	msg := err.Error()
+	if !strings.HasPrefix(msg, prefix) {
+		return "", false
+	}
+
+	name, _, ok := strings.Cut(msg[len(prefix):], `"`)
+	if !ok {
+		return "", false
+	}
+
+	return name, true
 }
 
 // scrubImplDetails strips backend-implementation identifiers from a
