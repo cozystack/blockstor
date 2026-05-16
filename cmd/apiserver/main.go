@@ -41,6 +41,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"log/slog"
@@ -156,13 +157,23 @@ func resolveNamespace(flagValue string) string {
 	return "blockstor-system"
 }
 
-func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserverFlags, namespace string) error {
+// registerProbesAndREST wires the /healthz + /readyz endpoints
+// and registers the REST server as a manager Runnable. /healthz
+// stays a liveness probe (manager alive ⇒ 200); /readyz is gated
+// by `ready` which flips to 200 only after BOTH the
+// controller-runtime cache has completed its initial sync AND the
+// REST listener has bound (issue 213).
+//
+// The cache-sync handoff lives in main() (it needs the manager's
+// own ctx); here we only register the gate and the OnReady hook
+// on the rest.Server so the bind signal flows through.
+func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserverFlags, namespace string, ready *readyState) error {
 	err := mgr.AddHealthzCheck("healthz", healthz.Ping)
 	if err != nil {
 		return errors.Wrap(err, "add healthz check")
 	}
 
-	err = mgr.AddReadyzCheck("readyz", healthz.Ping)
+	err = mgr.AddReadyzCheck("apiserver-ready", ready.Check)
 	if err != nil {
 		return errors.Wrap(err, "add readyz check")
 	}
@@ -172,12 +183,29 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 		Store:     st,
 		Client:    mgr.GetClient(),
 		Namespace: namespace,
+		OnReady:   ready.MarkBound,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add rest server")
 	}
 
 	return nil
+}
+
+// waitForCacheSync blocks on the manager's cache sync and then
+// flips the cache-sync latch on `ready` exactly once. Run in a
+// goroutine off main so the apiserver boot path never blocks on
+// cache warmup — production clusters with hundreds of CRDs can
+// take seconds to list on a cold apiserver. Context cancellation
+// (pod shutting down) suppresses the flip — at that point kubelet
+// readiness no longer matters.
+func waitForCacheSync(ctx context.Context, mgr manager.Manager, ready *readyState, log func(string)) {
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		return
+	}
+
+	log("apiserver cache sync complete, marking ready")
+	ready.MarkCacheSynced()
 }
 
 func main() {
@@ -197,7 +225,10 @@ func main() {
 	// in-process state pointless across replicas.
 	st := storek8s.New(mgr.GetClient())
 
-	err = registerProbesAndREST(mgr, st, flags, namespace)
+	ready := newReadyState()
+	go waitForCacheSync(ctrl.SetupSignalHandler(), mgr, ready, func(msg string) { setupLog.Info(msg) })
+
+	err = registerProbesAndREST(mgr, st, flags, namespace, ready)
 	if err != nil {
 		setupLog.Error(err, "Failed to register apiserver components")
 		os.Exit(1)

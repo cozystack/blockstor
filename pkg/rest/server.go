@@ -126,6 +126,21 @@ type Server struct {
 	// the unit suite hermetic — nil means "use the production
 	// net.DefaultResolver via defaultResolveHost".
 	resolveHost resolveHostFunc
+
+	// OnReady, when non-nil, is invoked exactly once after the
+	// TCP listener has been successfully bound and BEFORE the
+	// HTTP serve loop accepts the first connection. The apiserver
+	// uses this to flip its readyz gate (issue 213): kube-proxy
+	// must not see the pod Ready until clients can actually
+	// connect to s.Addr, otherwise rolling restarts of the
+	// apiserver Deployment surface as transient `Connection
+	// refused` / 5xx at every CSI / CLI client.
+	//
+	// Set from outside before mgr.Add(&rest.Server{...}); never
+	// mutated by Start. Callbacks must be non-blocking — Start
+	// invokes the callback inline on its own goroutine and any
+	// blocking work delays the serve loop entry.
+	OnReady func()
 }
 
 // SetResolveHost overrides the DNS-lookup function used by
@@ -191,6 +206,24 @@ func (s *Server) Start(ctx context.Context) error {
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
 
+	// Bind the listener up-front so we can signal OnReady BEFORE
+	// entering the serve loop. Splitting net.Listen + srv.Serve
+	// out of the combined srv.ListenAndServe lets the apiserver
+	// hold its /readyz at 503 until clients can actually connect
+	// (issue 213). Bind errors are surfaced synchronously — the
+	// caller's manager treats Runnable startup failure as fatal,
+	// same shape as the pre-split ListenAndServe error path.
+	lc := &net.ListenConfig{}
+
+	ln, err := lc.Listen(ctx, "tcp", s.Addr)
+	if err != nil {
+		return errors.Wrap(err, "REST server listen")
+	}
+
+	if s.OnReady != nil {
+		s.OnReady()
+	}
+
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -199,7 +232,7 @@ func (s *Server) Start(ctx context.Context) error {
 			"linstor_contract", version.LinstorVersion,
 			"rest_api", version.RestAPIVersion)
 
-		errCh <- srv.ListenAndServe()
+		errCh <- srv.Serve(ln)
 	}()
 
 	select {
