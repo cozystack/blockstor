@@ -175,6 +175,22 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		return errors.Wrap(err, "register PhysicalDeviceDiscoveryRunnable")
 	}
 
+	// Bug 135 follow-up: publish the host's enumerated VGs / zpools
+	// onto the Node CRD's Spec.Props so the apiserver's
+	// `refuseUnknownBackingStorage` pre-flight has a real list to
+	// check against. Without this runnable the apiserver's
+	// permissive fall-through admits `sp c` against any garbage
+	// backing-storage name. See pkg/rest/storage_pools.go
+	// checkAdvertised + the discovered_storage.go doc block.
+	err = (&DiscoveredStorageRunnable{
+		Client:   mgr.GetClient(),
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "register DiscoveredStorageRunnable")
+	}
+
 	return nil
 }
 

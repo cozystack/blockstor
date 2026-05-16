@@ -31,3 +31,12 @@ import (
 func ScanOnceForTest(ctx context.Context, p *PhysicalDeviceDiscoveryRunnable, logger logr.Logger) error {
 	return p.scanOnce(ctx, logger)
 }
+
+// DiscoveryTickForTest is the test-only entry point that drives one
+// DiscoveredStorage tick without starting the ticker goroutine.
+// Same pattern as ScanOnceForTest — kept exported in the _test
+// binary only so production callers can't accidentally bypass the
+// loop's error-logging path.
+func DiscoveryTickForTest(ctx context.Context, d *DiscoveredStorageRunnable, logger logr.Logger) error {
+	return d.tick(ctx, logger)
+}
