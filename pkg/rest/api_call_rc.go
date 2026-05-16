@@ -151,6 +151,25 @@ const warnSnapshotNotFound = maskWarn | int64(2056)
 // warnSnapshotNotFound.
 const warnNoSatelliteConnection = maskWarn | int64(2057)
 
+// apiCallRcFailSnapshotFinalizerStuck is emitted by `DELETE /v1/
+// resource-definitions/{rd}/snapshots/{snap}` (Bug 193) when the
+// Snapshot CRD's satellite-side finalizer
+// (`blockstor.io.blockstor.io/satellite-snapshot`) fails to drain
+// inside `snapshotDeleteWaitBudget`. The pre-fix wire shape was an
+// immediate 200 + SUCCESS line that lied to the caller — the
+// snapshot CRD survived under `kubectl get snapshot` with the
+// finalizer still attached. The fix surfaces a 504 + envelope
+// citing the stuck-state and pointing the operator at the
+// satellite (cause + correction strings render in `linstor s d`'s
+// CLI output unchanged).
+//
+// Sub-code 998 sits next to apiCallRcFailInUse (997) — both
+// describe "the delete acked locally but the upstream owner of
+// the resource is still holding on", which the audit-log greppers
+// already cluster together. The MASK_ERROR bit is OR'd in by the
+// envelope wrapper at the call site.
+const apiCallRcFailSnapshotFinalizerStuck int64 = 998
+
 // apiCallRcFailExistsSnapshotDfn mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_SNAPSHOT_DFN` (`514 | MASK_ERROR`). Emitted by
 // `DELETE /v1/resource-definitions/{rd}` when the RD still has at

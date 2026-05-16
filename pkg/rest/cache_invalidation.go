@@ -247,3 +247,105 @@ func vdDeletionVisible(ctx context.Context, st store.Store, rdName string, volum
 	// transport, decode — counts as "stop waiting".
 	return true
 }
+
+// Bug 193: `linstor s d X mysnap` returns 200 immediately even when
+// the Snapshot CRD's satellite-side finalizer never runs (paused /
+// disconnected / crashed satellite). The DELETE call lands K8s-side
+// metadata.deletionTimestamp but the CRD survives until the
+// satellite reconciler drops `blockstor.io.blockstor.io/satellite-
+// snapshot` from the finalizer list. Operators saw orphan Snapshot
+// CRDs piling up under `kubectl get snapshot` because the apiserver's
+// success reply made them (and CSI replays) move on, none the wiser.
+//
+// The fix is a Bug-124/139-style bounded wait, but with a different
+// failure mode: if the snapshot stays observable past the budget we
+// surface 504 + an actionable envelope instead of swallowing the
+// timeout, because the underlying assumption (satellite finalizer
+// will run any moment now) has demonstrably broken. Operators get a
+// concrete next action ("check satellite status") instead of a
+// silently-half-completed delete.
+
+// snapshotDeleteWaitBudget is the upper bound on how long
+// handleSnapshotDelete will block waiting for the Snapshot CRD to
+// disappear after issuing Delete. 10s leaves comfortable headroom
+// for a healthy satellite's reconcile loop (the satellite's own
+// snapshot finalizer requeue is 1s — pkg/satellite/controllers/
+// snapshot.go: `snapshotFinalizerRequeue = time.Second`) while
+// still capping the per-call worst-case latency. Past the budget
+// we conclude the satellite is stuck and surface 504.
+const snapshotDeleteWaitBudget = 10 * time.Second
+
+// snapshotDeleteWaitPoll is the cadence between successive Get
+// probes during the wait. 500ms matches the Bug 124 / 139 spec
+// — fast enough that a one-tick reconcile lands inside the second
+// poll, slow enough that the K8s read load is negligible on a
+// 3-replica apiserver.
+const snapshotDeleteWaitPoll = 500 * time.Millisecond
+
+// waitForSnapshotDeletionVisible blocks until the local Store
+// reports the Snapshot (rdName, snapName) is gone, OR the wait
+// budget elapses. Returns true if convergence was observed (the
+// snapshot is gone — finalizer drained, CRD reaped); returns false
+// on budget exhaustion or ctx cancellation (the snapshot is still
+// observable, satellite likely stuck).
+//
+// Unlike waitForRDDeletionVisible / waitForVDDeletionVisible (which
+// always return success because the apiserver write committed even
+// if the cache hasn't caught up), this helper's caller MUST
+// distinguish converged-vs-timeout: a stuck satellite is a real
+// failure mode the operator needs to know about, not a silently-
+// swallowed "still pending" cache lag.
+//
+// Use the request context's deadline if shorter than the budget so
+// CSI-side gRPC deadlines cap our wait, not the other way around.
+func (s *Server) waitForSnapshotDeletionVisible(ctx context.Context, rdName, snapName string) bool {
+	if s == nil || s.Store == nil {
+		return true
+	}
+
+	deadline := time.Now().Add(snapshotDeleteWaitBudget)
+
+	// Honour the caller's deadline if it sits inside ours — a CSI
+	// driver with a tight gRPC timeout shouldn't get parked for a
+	// full 10s.
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+
+	for {
+		if snapshotDeletionVisible(ctx, s.Store, rdName, snapName) {
+			return true
+		}
+
+		if !time.Now().Before(deadline) {
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(snapshotDeleteWaitPoll):
+		}
+	}
+}
+
+// snapshotDeletionVisible is the single-shot predicate behind
+// waitForSnapshotDeletionVisible: "does the local store agree that
+// this Snapshot is gone?". A NotFound from Get means converged
+// (finalizer drained, CRD reaped); a successful Get means the CRD
+// is still observable, almost certainly because the satellite
+// finalizer hasn't run yet. Any non-NotFound transport error counts
+// as "stop waiting" — we don't loop forever on a permanent
+// store-layer failure.
+func snapshotDeletionVisible(ctx context.Context, st store.Store, rdName, snapName string) bool {
+	_, err := st.Snapshots().Get(ctx, rdName, snapName)
+	if err == nil {
+		// CRD still observable — finalizer likely still set.
+		return false
+	}
+
+	// NotFound OR any other error: stop waiting. NotFound is the
+	// converged case; a transport error means we can't probe and
+	// looping won't help.
+	return true
+}

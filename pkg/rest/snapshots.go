@@ -848,6 +848,20 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 // CSI doesn't read the mask so it still got its idempotent success;
 // operators tailing the API log now see the same "no-op" annotation
 // upstream emits.
+//
+// Bug 193: after the apiserver Delete returns, wait for the local
+// store to observe the Snapshot CRD's actual disappearance — the
+// satellite-side finalizer (`SatelliteSnapshotFinalizer`,
+// pkg/satellite/controllers/snapshot.go:47) has to run before the
+// CRD is reaped. A paused/disconnected/crashed satellite leaves the
+// CRD pinned under `kubectl get snapshot` indefinitely, but the
+// pre-fix wire shape returned 200 + "snapshot deleted" the moment
+// the K8s Delete call landed deletionTimestamp. Operators (and CSI
+// replays) moved on with the snapshot still present on disk. Now
+// we block up to `snapshotDeleteWaitBudget` on the Get probe and
+// surface 504 + an actionable envelope citing the stuck-state if
+// the budget runs out. The success path (snapshot reaped within
+// budget) keeps the existing 200 + maskInfo wire shape.
 func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
@@ -868,6 +882,35 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeStoreError(w, err)
+
+		return
+	}
+
+	// Bug 193: wait until the Snapshot CRD is actually gone (finalizer
+	// drained, CRD reaped) before declaring success. A bounded budget
+	// caps the worst-case latency; on timeout we surface 504 + a
+	// stuck-satellite envelope so the operator gets a concrete next
+	// action instead of a silently-half-completed delete.
+	converged := s.waitForSnapshotDeletionVisible(r.Context(), rd, snapName)
+	if !converged {
+		writeJSON(w, http.StatusGatewayTimeout, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailSnapshotFinalizerStuck,
+			Message: "snapshot delete acked but satellite finalizer " +
+				"not removed within timeout: " + snapName,
+			Cause: "the satellite-side finalizer " +
+				"(blockstor.io.blockstor.io/satellite-snapshot) did " +
+				"not drain within the wait budget; the snapshot may " +
+				"still be present on disk and the Snapshot CRD will " +
+				"remain visible until the satellite reconciler runs",
+			Correc: "check satellite status on the affected nodes " +
+				"(satellite pod alive, reconciler not crash-looping, " +
+				"network reachability to the apiserver); re-issue " +
+				"the delete once the satellite is healthy",
+			ObjRefs: map[string]string{
+				objRefRscDfn:      rd,
+				objRefSnapshotDfn: snapName,
+			},
+		}})
 
 		return
 	}
