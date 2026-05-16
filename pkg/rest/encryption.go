@@ -290,6 +290,17 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	// alias in either upstream LINSTOR or the W13 CLI shape.
 	want := req.proofOfKnowledge()
 
+	// Bug 172 (P1 security/data-loss): pre-fix, an empty `want`
+	// fell through to `writePassphrase(ctx, "")` after auth passed,
+	// silently wiping the cluster passphrase Secret while returning
+	// 200 + "Master passphrase modified". Sibling
+	// handlePassphraseCreate (line 137) already had this guard;
+	// port verbatim so create/modify share one validation contract.
+	if want == "" {
+		writeError(w, http.StatusBadRequest, "new_passphrase is required: modify must specify a non-empty new value")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
