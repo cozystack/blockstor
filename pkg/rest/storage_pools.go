@@ -76,39 +76,41 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 
 	patch := body.GenericPropsModify
 
-	existing, err := s.Store.StoragePools().Get(r.Context(), node, pool)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 204b: route through PatchStoragePoolSpec so the override /
+	// delete delta is re-applied to the freshly-fetched StoragePool on
+	// every retry. The previous `Get → mutate → Update` path used the
+	// wholesale, un-retried StoragePool Update, so concurrent satellite
+	// Status pushes / piraeus-operator Hello loops could silently
+	// clobber the prop mutation.
+	err := s.Store.StoragePools().PatchStoragePoolSpec(r.Context(), node, pool, func(sp *apiv1.StoragePool) error {
+		if sp.Props == nil && (len(patch.OverrideProps) > 0 ||
+			len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0) {
+			sp.Props = map[string]string{}
+		}
 
-		return
-	}
+		maps.Copy(sp.Props, patch.OverrideProps)
 
-	if existing.Props == nil && (len(patch.OverrideProps) > 0 ||
-		len(patch.DeleteProps) > 0 || len(patch.DeleteNamespace) > 0) {
-		existing.Props = map[string]string{}
-	}
+		for _, k := range patch.DeleteProps {
+			delete(sp.Props, k)
+		}
 
-	maps.Copy(existing.Props, patch.OverrideProps)
+		// DeleteNamespace: drop every key under the given namespace
+		// prefix. Mirrors upstream LINSTOR's `delete_namespaces`
+		// behaviour — the namespace separator is '/' and the prefix
+		// is matched literally (no glob). An entry "Aux" drops every
+		// "Aux/..." key.
+		for _, ns := range patch.DeleteNamespace {
+			prefix := ns + "/"
 
-	for _, k := range patch.DeleteProps {
-		delete(existing.Props, k)
-	}
-
-	// DeleteNamespace: drop every key under the given namespace prefix.
-	// Mirrors upstream LINSTOR's `delete_namespaces` behaviour — the
-	// namespace separator is '/' and the prefix is matched literally
-	// (no glob). An entry "Aux" drops every "Aux/..." key.
-	for _, ns := range patch.DeleteNamespace {
-		prefix := ns + "/"
-
-		for k := range existing.Props {
-			if strings.HasPrefix(k, prefix) {
-				delete(existing.Props, k)
+			for k := range sp.Props {
+				if strings.HasPrefix(k, prefix) {
+					delete(sp.Props, k)
+				}
 			}
 		}
-	}
 
-	err = s.Store.StoragePools().Update(r.Context(), &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 

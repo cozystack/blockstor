@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -180,6 +181,55 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	}
 
 	return nil
+}
+
+// PatchResourceSpec runs `mutate` against the freshly-fetched current
+// wire-shape Resource and persists the mutated value via a typed-Patch
+// (JSON-merge-patch) under `RetryOnConflict` with the Bug 201 backoff.
+// On 409 the cycle re-runs against fresh state — so concurrent disjoint
+// edits (r modify, toggle-disk, r activate, autoplace) converge instead
+// of silently dropping the loser via the wholesale `Update`'s un-retried
+// wire-snapshot replace (Bug 204b).
+//
+// Annotations follow `Update`'s contract: nil wire means "no annotation
+// work requested" (preserve existing); non-nil replaces the annotation
+// set atomically. The closure operates on wire-shape Annotations.
+func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.Resource
+
+		key := types.NamespacedName{Name: resourceCRDName(rdName, node)}
+
+		err := s.c.Get(ctx, key, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "resource %q on node %q", rdName, node)
+			}
+
+			return errors.Wrapf(err, "get Resource %s/%s", rdName, node)
+		}
+
+		base := existing.DeepCopy()
+
+		wire := crdToWireResource(&existing)
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		existing.Spec = wireToCRDResourceSpec(&wire)
+
+		if wire.Annotations != nil {
+			existing.Annotations = cloneAnnotations(wire.Annotations)
+		}
+
+		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch Resource %s/%s", rdName, node)
 }
 
 func (s *resources) Delete(ctx context.Context, rdName, node string) error {

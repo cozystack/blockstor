@@ -132,6 +132,57 @@ func (s *volumeDefinitions) Update(ctx context.Context, rdName string, vd *apiv1
 	}), "update RD %q for volume %d", rdName, vd.VolumeNumber)
 }
 
+// PatchVolumeDefinitionSpec runs `mutate` against the freshly-fetched
+// VolumeDefinition (resolved out of the parent RD's
+// spec.volumeDefinitions[] by volumeNumber) and persists the mutated
+// value via a typed-Patch (JSON-merge-patch) on the parent RD under
+// `RetryOnConflict` with the Bug 201 backoff. On 409 the entire fetch+
+// mutate+patch cycle re-runs against the live RD — so concurrent
+// disjoint VD prop edits (vd set-property under linstor-csi load,
+// satellite-side reconciler bumps) converge instead of being lost to
+// the wholesale `Update`'s stale-wire-snapshot replay (Bug 204b).
+func (s *volumeDefinitions) PatchVolumeDefinitionSpec(ctx context.Context, rdName string, volumeNumber int32, mutate func(*apiv1.VolumeDefinition) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		rd, err := s.fetchRD(ctx, rdName)
+		if err != nil {
+			return err
+		}
+
+		idx := -1
+
+		for i := range rd.Spec.VolumeDefinitions {
+			if rd.Spec.VolumeDefinitions[i].VolumeNumber == volumeNumber {
+				idx = i
+
+				break
+			}
+		}
+
+		if idx == -1 {
+			return errors.Wrapf(store.ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
+		}
+
+		base := rd.DeepCopy()
+
+		wire := crdToWireVD(&rd.Spec.VolumeDefinitions[idx])
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		// Re-derive the inline CRD entry from the mutated wire value
+		// and write it back into the parent RD's slice.
+		rd.Spec.VolumeDefinitions[idx] = wireToCRDVD(&wire)
+
+		return s.c.Patch(ctx, rd, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch RD %q for volume %d", rdName, volumeNumber)
+}
+
 func (s *volumeDefinitions) Delete(ctx context.Context, rdName string, volumeNumber int32) error {
 	return errors.Wrapf(retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		rd, err := s.fetchRD(ctx, rdName)

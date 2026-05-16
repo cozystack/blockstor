@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -183,6 +184,56 @@ func (s *storagePools) Update(ctx context.Context, in *apiv1.StoragePool) error 
 	}
 
 	return nil
+}
+
+// PatchStoragePoolSpec runs `mutate` against the freshly-fetched current
+// wire-shape StoragePool and persists the mutated value via a typed-
+// Patch (JSON-merge-patch) under `RetryOnConflict` with the Bug 201
+// backoff. On 409 the cycle re-runs against fresh state — so concurrent
+// disjoint edits (sp set-property racing satellite Status pushes / the
+// piraeus operator's racing Hello loop) converge instead of being lost
+// to the wholesale `Update`'s un-retried wire-snapshot replace
+// (Bug 204b).
+//
+// Resolves the underlying CRD by Spec.NodeName / Spec.PoolName, mirroring
+// `Get`/`Delete`/`Update`, so operator-managed pools whose metadata.name
+// doesn't follow blockstor's canonical "<pool>.<node>" shape (e.g.
+// piraeus's `zfs-thin-w3`) are reachable here too. Bug 55 parity.
+func (s *storagePools) PatchStoragePoolSpec(ctx context.Context, node, pool string, mutate func(*apiv1.StoragePool) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		name, err := s.resolveCRDName(ctx, node, pool)
+		if err != nil {
+			return err
+		}
+
+		var existing crdv1alpha1.StoragePool
+
+		err = s.c.Get(ctx, types.NamespacedName{Name: name}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "storage pool %q on node %q", pool, node)
+			}
+
+			return errors.Wrapf(err, "get StoragePool %s/%s", node, pool)
+		}
+
+		base := existing.DeepCopy()
+
+		wire := crdToWireStoragePool(&existing)
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		existing.Spec = wireToCRDStoragePoolSpec(&wire)
+
+		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch StoragePool %s/%s", node, pool)
 }
 
 // Delete removes the named pool. Registry-only: the REST DELETE

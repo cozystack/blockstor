@@ -124,6 +124,10 @@ func (l *laggingResources) ClearDRBDPort(ctx context.Context, rdName, node strin
 	return l.inner.ClearDRBDPort(ctx, rdName, node) //nolint:wrapcheck // test helper
 }
 
+func (l *laggingResources) PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error {
+	return l.inner.PatchResourceSpec(ctx, rdName, node, mutate) //nolint:wrapcheck // test helper
+}
+
 // laggingRDs wraps the inMemory ResourceDefinitionStore: Delete
 // returns immediately but the underlying inner.Delete fires after
 // `lag`, so reads continue to surface the RD for the lag window.
@@ -147,6 +151,10 @@ func (l *laggingRDs) Create(ctx context.Context, rd *apiv1.ResourceDefinition) e
 
 func (l *laggingRDs) Update(ctx context.Context, rd *apiv1.ResourceDefinition) error {
 	return l.inner.Update(ctx, rd) //nolint:wrapcheck // test helper
+}
+
+func (l *laggingRDs) PatchResourceDefinitionSpec(ctx context.Context, name string, mutate func(*apiv1.ResourceDefinition) error) error {
+	return l.inner.PatchResourceDefinitionSpec(ctx, name, mutate) //nolint:wrapcheck // test helper
 }
 
 func (l *laggingRDs) Delete(ctx context.Context, name string) error {

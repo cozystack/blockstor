@@ -102,6 +102,34 @@ func (s *inMemoryVolumeDefinitions) Update(_ context.Context, rdName string, vd 
 	return nil
 }
 
+// PatchVolumeDefinitionSpec runs `mutate` atomically against the live
+// entry under the write lock. The InMemory store has no
+// resourceVersion surface, so a lock-held single-shot mutate covers
+// what RetryOnConflict does on the k8s backend. Bug 204b shim.
+func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context, rdName string, volumeNumber int32, mutate func(*apiv1.VolumeDefinition) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := vdKey{rdName, volumeNumber}
+
+	vd, ok := s.m[k]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
+	}
+
+	if err := mutate(&vd); err != nil {
+		return errors.Wrapf(err, "patch volume %d on resource definition %q", volumeNumber, rdName)
+	}
+
+	s.m[k] = vd
+
+	return nil
+}
+
 func (s *inMemoryVolumeDefinitions) Delete(_ context.Context, rdName string, volumeNumber int32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

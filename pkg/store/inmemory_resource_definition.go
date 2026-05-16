@@ -91,6 +91,32 @@ func (s *inMemoryResourceDefinitions) Update(_ context.Context, rd *apiv1.Resour
 	return nil
 }
 
+// PatchResourceDefinitionSpec runs `mutate` atomically against the live
+// entry under the write lock. The InMemory store has no resourceVersion
+// surface, so a lock-held single-shot mutate covers what RetryOnConflict
+// does on the k8s backend. Bug 204b shim.
+func (s *inMemoryResourceDefinitions) PatchResourceDefinitionSpec(_ context.Context, name string, mutate func(*apiv1.ResourceDefinition) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rd, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "resource definition %q", name)
+	}
+
+	if err := mutate(&rd); err != nil {
+		return errors.Wrapf(err, "patch resource definition %q", name)
+	}
+
+	s.m[name] = rd
+
+	return nil
+}
+
 func (s *inMemoryResourceDefinitions) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

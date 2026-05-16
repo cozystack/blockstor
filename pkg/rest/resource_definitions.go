@@ -787,34 +787,35 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	// / delete_props delta and expects the rest of the RD spec to be
 	// preserved. A naïve Decode(&fullRD) + Update wipes the whole
 	// spec (VolumeDefinitions vanish, the resource reconciler can't
-	// spawn replicas, the cluster stalls). Fetch + merge instead.
-	existing, err := s.Store.ResourceDefinitions().Get(r.Context(), name)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	if existing.Props == nil && len(patch.OverrideProps) > 0 {
-		existing.Props = map[string]string{}
-	}
-
-	maps.Copy(existing.Props, patch.OverrideProps)
-
-	for _, k := range patch.DeleteProps {
-		delete(existing.Props, k)
-	}
-
+	// spawn replicas, the cluster stalls). Bug 204b: route through
+	// PatchResourceDefinitionSpec so the override / delete delta is
+	// re-applied to the freshly-fetched RD on every retry — the
+	// previous `Get → mutate → Update` path's retry loop replayed the
+	// caller's stale wire snapshot and silently lost concurrent
+	// disjoint writes from racing drbd-passphrase / autoplace /
+	// r-conn paths.
 	rgChange := patch.ResourceGroup
 	if rgChange == "" {
 		rgChange = patch.ResourceGroupName
 	}
 
-	if rgChange != "" {
-		existing.ResourceGroupName = rgChange
-	}
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name, func(rd *apiv1.ResourceDefinition) error {
+		if rd.Props == nil && len(patch.OverrideProps) > 0 {
+			rd.Props = map[string]string{}
+		}
 
-	err = s.Store.ResourceDefinitions().Update(r.Context(), &existing)
+		maps.Copy(rd.Props, patch.OverrideProps)
+
+		for _, k := range patch.DeleteProps {
+			delete(rd.Props, k)
+		}
+
+		if rgChange != "" {
+			rd.ResourceGroupName = rgChange
+		}
+
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -823,7 +824,7 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "resource definition modified: " + existing.Name,
+		Message: "resource definition modified: " + name,
 	}})
 }
 

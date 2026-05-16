@@ -386,6 +386,9 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 
 	rd.LayerStack = append([]string(nil), layerList...)
 
+	// TODO(Bug 204b followup): switch to PatchResourceDefinitionSpec — this
+	// path runs once per RD create, low contention, but is still subject to
+	// the same stale-wire-snapshot retry hazard.
 	err := s.Store.ResourceDefinitions().Update(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
@@ -1052,6 +1055,7 @@ func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) e
 
 	rd.Props[propKey] = "false"
 
+	// TODO(Bug 204b followup): switch to PatchResourceDefinitionSpec.
 	err = s.Store.ResourceDefinitions().Update(ctx, &rd)
 	if err != nil {
 		return err //nolint:wrapcheck // surfaced via writeStoreError

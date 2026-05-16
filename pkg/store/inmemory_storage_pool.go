@@ -223,6 +223,34 @@ func (s *inMemoryStoragePools) SetCapacity(_ context.Context, node, pool string,
 	return nil
 }
 
+// PatchStoragePoolSpec runs `mutate` atomically against the live entry
+// under the write lock. The InMemory store has no resourceVersion
+// surface, so a lock-held single-shot mutate covers what
+// RetryOnConflict does on the k8s backend. Bug 204b shim.
+func (s *inMemoryStoragePools) PatchStoragePoolSpec(_ context.Context, node, pool string, mutate func(*apiv1.StoragePool) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	k := spKey{node, pool}
+
+	sp, ok := s.m[k]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
+	}
+
+	if err := mutate(&sp); err != nil {
+		return errors.Wrapf(err, "patch storage pool %q on node %q", pool, node)
+	}
+
+	s.m[k] = sp
+
+	return nil
+}
+
 // Delete removes a pool by (node, name). Returns ErrNotFound if absent.
 func (s *inMemoryStoragePools) Delete(_ context.Context, node, pool string) error {
 	s.mu.Lock()

@@ -88,6 +88,15 @@ type StoragePoolStore interface {
 	// ProviderKind / Props edits. linstor-csi GetCapacity reads the
 	// FreeCapacity field; the autoplacer's free-space ranking too.
 	SetCapacity(ctx context.Context, node, pool string, freeKib, totalKib int64, supportsSnap bool) error
+
+	// PatchStoragePoolSpec runs `mutate` against the freshly-fetched
+	// StoragePool wire value and persists the result. On 409 the
+	// fetch+mutate+patch cycle re-runs against fresh state — so
+	// disjoint concurrent edits (sp set-property / racing Hello /
+	// satellite Status pushes) all converge instead of being lost by
+	// the wholesale `Update`'s un-retried wire-snapshot replace
+	// (Bug 204b).
+	PatchStoragePoolSpec(ctx context.Context, node, pool string, mutate func(*apiv1.StoragePool) error) error
 }
 
 // ResourceGroupStore persists ResourceGroup objects. Keyed by name.
@@ -117,6 +126,15 @@ type ResourceDefinitionStore interface {
 	Create(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Update(ctx context.Context, rd *apiv1.ResourceDefinition) error
 	Delete(ctx context.Context, name string) error
+
+	// PatchResourceDefinitionSpec runs `mutate` against the freshly-fetched
+	// ResourceDefinition wire value and persists the result. On 409 the
+	// fetch+mutate+patch cycle re-runs against fresh state — so disjoint
+	// concurrent edits (RD modify, drbd-passphrase, autoplace LayerStack,
+	// r-conn) all converge instead of clobbering one another via stale
+	// wire snapshots that the wholesale `Update`'s retry loop replays
+	// verbatim (Bug 204b).
+	PatchResourceDefinitionSpec(ctx context.Context, name string, mutate func(*apiv1.ResourceDefinition) error) error
 }
 
 // ResourceStore persists Resource (replica placement) objects. The
@@ -160,6 +178,14 @@ type ResourceStore interface {
 	// in-flight I/O is wired to. Returns ErrNotFound when the named
 	// replica doesn't exist.
 	ClearDRBDPort(ctx context.Context, rdName, node string) error
+
+	// PatchResourceSpec runs `mutate` against the freshly-fetched
+	// Resource wire value and persists the result. On 409 the
+	// fetch+mutate+patch cycle re-runs against fresh state — so
+	// disjoint concurrent edits (r modify, toggle-disk, r activate,
+	// autoplace) all converge instead of being silently lost by the
+	// wholesale `Update`'s un-retried wire-snapshot replace (Bug 204b).
+	PatchResourceSpec(ctx context.Context, rdName, node string, mutate func(*apiv1.Resource) error) error
 }
 
 // VolumeDefinitionStore persists VolumeDefinition objects. The composite
@@ -173,6 +199,17 @@ type VolumeDefinitionStore interface {
 	Create(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 	Update(ctx context.Context, rdName string, vd *apiv1.VolumeDefinition) error
 	Delete(ctx context.Context, rdName string, volumeNumber int32) error
+
+	// PatchVolumeDefinitionSpec runs `mutate` against the freshly-
+	// fetched VolumeDefinition wire value (resolved out of the parent
+	// RD's spec.volumeDefinitions[] by volumeNumber) and persists the
+	// result via a JSON-merge-patch on the parent RD under
+	// `RetryOnConflict`. On 409 the entire fetch+mutate+patch cycle
+	// re-runs against fresh RD state — so concurrent VD modifies on
+	// disjoint props converge instead of clobbering each other via
+	// the stale-wire-snapshot the wholesale `Update` retry loop
+	// replays verbatim (Bug 204b).
+	PatchVolumeDefinitionSpec(ctx context.Context, rdName string, volumeNumber int32, mutate func(*apiv1.VolumeDefinition) error) error
 }
 
 // SnapshotStore persists Snapshot objects. The composite key is

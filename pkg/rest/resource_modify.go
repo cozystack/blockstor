@@ -67,29 +67,28 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.Store.Resources().Get(r.Context(), rdName, node)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 204b: route through PatchResourceSpec so the override /
+	// delete delta is re-applied to the freshly-fetched Resource on
+	// every retry. The previous `Get → mutate → Update` path used
+	// the wholesale, un-retried Resource Update, so concurrent
+	// toggle-disk / r-activate / autoplace writers could silently
+	// clobber the prop mutation.
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node, func(res *apiv1.Resource) error {
+		if res.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
+			res.Props = map[string]string{}
+		}
 
-		return
-	}
+		// Override before delete — matches upstream LINSTOR
+		// CtrlRscModifyApiCallHandler ordering and the sibling
+		// handleControllerPropsModify / handleNodeUpdate behaviour.
+		maps.Copy(res.Props, patch.OverrideProps)
 
-	if existing.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
-		existing.Props = map[string]string{}
-	}
+		for _, k := range patch.DeleteProps {
+			delete(res.Props, k)
+		}
 
-	// Override before delete — matches the upstream LINSTOR
-	// CtrlRscModifyApiCallHandler ordering and the sibling
-	// handleControllerPropsModify / handleNodeUpdate behaviour. The keys
-	// are independent in practice (the CLI never sends the same key in
-	// both halves), but pinning the order keeps the precedence visible.
-	maps.Copy(existing.Props, patch.OverrideProps)
-
-	for _, k := range patch.DeleteProps {
-		delete(existing.Props, k)
-	}
-
-	err = s.Store.Resources().Update(r.Context(), &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 

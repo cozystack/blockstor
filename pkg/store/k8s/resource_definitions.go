@@ -169,6 +169,59 @@ func mergeUserAnnotationsInto(meta *metav1.ObjectMeta, wire map[string]string) {
 	}
 }
 
+// PatchResourceDefinitionSpec runs `mutate` against the freshly-fetched
+// current wire-shape ResourceDefinition and persists the mutated value
+// via a typed-Patch (JSON-merge-patch). On 409 the cycle re-runs against
+// fresh state, with `mutate` re-applied to the live wire value — so
+// concurrent disjoint edits converge instead of clobbering one another.
+//
+// Distinct from `Update`, whose `RetryOnConflict` loop replays the
+// stale wire-side snapshot the caller built once before the loop and
+// therefore re-applies the same stale write on every retry (Bug 204b).
+// As with `Update`, the parent RD's inline Spec.VolumeDefinitions are
+// preserved across the spec rebuild (VDs have no wire-side counterpart)
+// and user annotations are merged through `mergeUserAnnotationsInto`.
+func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, name string, mutate func(*apiv1.ResourceDefinition) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.ResourceDefinition
+
+		err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "resource definition %q", name)
+			}
+
+			return errors.Wrapf(err, "get ResourceDefinition %q", name)
+		}
+
+		base := existing.DeepCopy()
+
+		// Surface as wire shape so the closure runs in the same
+		// vocabulary as REST handlers.
+		wire := crdToWireRD(&existing)
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		// Preserve inline VolumeDefinitions — they have no wire-side
+		// counterpart and would be wiped by a naïve spec rebuild.
+		// Mirrors the carry-across in `Update`.
+		prevVDs := existing.Spec.VolumeDefinitions
+		existing.Spec = wireToCRDRDSpec(&wire)
+		existing.Spec.VolumeDefinitions = prevVDs
+
+		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
+
+		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch ResourceDefinition %q", name)
+}
+
 func (s *resourceDefinitions) Delete(ctx context.Context, name string) error {
 	crd := &crdv1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: Name(name)}}
 

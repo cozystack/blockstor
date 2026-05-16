@@ -542,6 +542,13 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-merge fetch needed only for the shrink-refusal precheck —
+	// PatchVolumeDefinitionSpec performs the real fetch+merge+write
+	// loop. Doing the precheck against this snapshot is sound: shrink
+	// rejection is invariant under concurrent prop edits (only the
+	// SizeKib comparison matters, and the only writer that touches
+	// SizeKib is the resize CSI path itself, which is serialised at
+	// the linstor-csi caller).
 	existing, err := s.Store.VolumeDefinitions().Get(r.Context(), rd, vn)
 	if err != nil {
 		writeStoreError(w, err)
@@ -549,9 +556,6 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Capture the pre-merge size so we can detect an explicit shrink
-	// BEFORE the patch is applied. Done before mergeVolumeDefinitionPatch
-	// so we compare against the stored spec, not the in-place mutated one.
 	previousSizeKib := existing.SizeKib
 
 	// Scenario 4.W13: reject any shrink (`new < previous`) unless the
@@ -563,12 +567,20 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mergeVolumeDefinitionPatch(&existing, &patch)
+	// Bug 204b: route the merge-write through PatchVolumeDefinitionSpec
+	// so the modify delta is re-applied to the freshly-fetched VD on
+	// every retry. The previous `Get → mutate → Update` path's retry
+	// loop replayed the caller's stale wire snapshot and silently lost
+	// concurrent prop edits on the same VD.
+	err = s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(r.Context(), rd, vn, func(vd *apiv1.VolumeDefinition) error {
+		mergeVolumeDefinitionPatch(vd, &patch)
 
-	// Path-derived VolumeNumber wins — never trust the body's vol_num.
-	existing.VolumeNumber = vn
+		// Path-derived VolumeNumber wins — never trust the body's
+		// vol_num.
+		vd.VolumeNumber = vn
 
-	err = s.Store.VolumeDefinitions().Update(r.Context(), rd, &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
