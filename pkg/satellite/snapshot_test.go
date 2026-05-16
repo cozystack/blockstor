@@ -101,6 +101,10 @@ func TestDeleteSnapshotDispatchesToProvider(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Bug 212 added an `lvExists` pre-check before lvremove. Stub it
+	// so the snapshot is reported as present and lvremove still fires.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -196,6 +200,12 @@ func TestDeleteSnapshotProviderErrorReturnsOkFalse(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Bug 212: pre-check must report the snapshot LV as present so we
+	// reach the failing lvremove; otherwise the idempotent fold turns
+	// the call into a no-op and the test no longer exercises the
+	// fail-then-Ok=false path.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-fail_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-fail_00000\n")})
 	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-fail_00000",
 		storage.FakeResponse{Err: errSnapshotProviderFailed})
 

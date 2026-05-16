@@ -179,6 +179,10 @@ func TestSnapshotReconcileDrainsOnDelete(t *testing.T) {
 	// CreateVolume runs (lvcreate --thin …).
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Bug 212: DeleteSnapshot pre-checks LV existence. Stub the
+	// snapshot LV as present so lvremove still fires.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
 
 	rec := seedThinResource(t, fx, "pvc-1", "thin1")
 
@@ -503,6 +507,10 @@ func TestSnapshotDeleteScenarioW02PerReplicaBackendTeardown(t *testing.T) {
 		// will key off.
 		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
 			storage.FakeResponse{Stdout: []byte("")})
+		// Bug 212: DeleteSnapshot pre-checks LV existence. Report the
+		// snapshot LV as present so lvremove still fires on each node.
+		fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+			storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
 
 		rec := seedThinResource(t, fx, "pvc-1", "thin1")
 
