@@ -321,21 +321,30 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-// with404Envelope wraps the inner handler so that a bare 404 OR 405
-// reply from the http.ServeMux fallback (plain-text "404 page not
-// found\n" or "Method Not Allowed\n") is rewritten to the LINSTOR
-// `[]ApiCallRc` JSON envelope. Bug 103 (404) and Bug 109 (405):
-// python-linstor's error-decoding path tries JSON, falls back to XML
-// on parse failure, and crashes with
+// with404Envelope wraps the inner handler so that a bare 404 / 405 /
+// 3xx-redirect reply from the http.ServeMux fallback (plain-text
+// "404 page not found\n" / "Method Not Allowed\n" / HTML
+// `<a href="...">Moved Permanently</a>`) is rewritten to the LINSTOR
+// `[]ApiCallRc` JSON envelope. Bug 103 (404), Bug 109 (405) and
+// Bug 166 (3xx): python-linstor's error-decoding path tries JSON,
+// falls back to XML on parse failure, and crashes with
 // `xml.etree.ElementTree.ParseError: syntax error: line 1, column 0`
-// on the plain-text body — instead of surfacing a typed `ERROR:`
-// line, the CLI dies with a Python traceback.
+// on a non-JSON body — instead of surfacing a typed `ERROR:` line,
+// the CLI dies with a Python traceback.
 //
-// Only the http.ServeMux fallback shape is rewritten:
+// The http.ServeMux fallback shapes intercepted here:
 //   - status == 404 with the plain-text "404 page not found" marker
-//     (or an empty body), OR
+//     (or an empty body),
 //   - status == 405 with the plain-text "Method Not Allowed" marker
-//     (or an empty body).
+//     (or an empty body), and
+//   - status ∈ {301, 307, 308} that ServeMux emits on URL
+//     pathologies (double slash `//v1/nodes`, parent-relative
+//     `/v1/../v1/nodes`, trailing slash on a no-trailing-slash route).
+//     These come with `Content-Type: text/html` and an HTML body —
+//     the same defect class. We collapse them to a 404 envelope
+//     because the LINSTOR REST contract does not need redirects:
+//     every path either exists (handler runs) or doesn't (404). The
+//     CLI never expected redirects in the first place.
 //
 // A previous attempt at the 404 fix used a naked catch-all
 // `mux.HandleFunc("/", …)` which broke the per-route 405 dispatch —
@@ -367,6 +376,17 @@ func with404Envelope(next http.Handler) http.Handler {
 			writeMethodNotAllowedEnvelope(w, r, buf.header.Get("Allow"))
 
 			return
+		case isServeMuxRedirect(buf.status, buf.header):
+			// Bug 166: ServeMux's URL-canonicalisation redirect
+			// (//path, /a/../b, /path/ → /path) ships with an HTML
+			// body that crashes python-linstor's JSON-only error
+			// decoder. The LINSTOR REST API contract has no use
+			// for client-side redirects, so we collapse the whole
+			// 3xx class to a 404 envelope (same body shape as the
+			// "unknown path" case — operators get a typed ERROR).
+			writeNotFoundEnvelope(w, r)
+
+			return
 		}
 
 		// Pass through unchanged.
@@ -374,6 +394,39 @@ func with404Envelope(next http.Handler) http.Handler {
 		w.WriteHeader(buf.status)
 		_, _ = w.Write(buf.body.Bytes())
 	})
+}
+
+// isServeMuxRedirect reports whether the buffered reply looks like an
+// http.ServeMux URL-canonicalisation redirect. Three signals must
+// align before we rewrite (so we never shadow a legitimate handler-
+// emitted 3xx — there isn't one today, but the check stays defensive):
+//
+//  1. The status is 301, 307 or 308 (the redirect codes net/http's
+//     `Redirect` emits; ServeMux currently uses 301 for cleanPath
+//     and the same code for the trailing-slash case).
+//  2. A `Location` header is present (every legitimate redirect
+//     carries one; ServeMux's redirect handler always sets it).
+//  3. The Content-Type is text/html OR absent (a handler that
+//     produced its own JSON 3xx would set application/json; we
+//     don't want to clobber such a body even though no current
+//     route emits one).
+func isServeMuxRedirect(status int, header http.Header) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+	default:
+		return false
+	}
+
+	if header.Get("Location") == "" {
+		return false
+	}
+
+	ct := header.Get("Content-Type")
+	if ct == "" {
+		return true
+	}
+
+	return strings.HasPrefix(ct, "text/html")
 }
 
 // envelopeBuffer is a buffering http.ResponseWriter used by
