@@ -198,6 +198,23 @@ const apiCallRcFailInUse int64 = 997
 // `--force`).
 const apiCallRcFailInvldVlmSize int64 = 206
 
+// apiCallRcFailExistsVlmDfn mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_VLM_DFN` (502). Emitted by `POST
+// /v1/resource-definitions/{rd}/volume-definitions` when the
+// requested VolumeNumber already has a definition under the parent
+// RD. Bug 140: the in-tree handler used to surface
+// `writeStoreError` on ErrAlreadyExists which carried the
+// MASK_ERROR bit but no cause/correction/sub-code; scripts and
+// audit-log greppers that routed on the upstream catalogue missed
+// the conflict.
+//
+// Choosing 502 (rather than a fresh sub-code in our 996+ range)
+// keeps the wire shape byte-identical to upstream's `linstor vd c`
+// reply on the same input — alongside FAIL_EXISTS_RSC_DFN (501)
+// and FAIL_EXISTS_SNAPSHOT_DFN (514) which are already in this
+// file.
+const apiCallRcFailExistsVlmDfn int64 = 502
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the

@@ -206,6 +206,21 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 
 	err = s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
 	if err != nil {
+		// Bug 140: duplicate-VD conflict gets a typed envelope with
+		// the upstream FAIL_EXISTS_VLM_DFN sub-code plus actionable
+		// cause/correction so scripts and audit-log greppers route
+		// the same way they do for upstream's `linstor vd c` reply.
+		// The bare writeStoreError fallback emitted apiCallRcError
+		// alone — high-bit error, no sub-code, no cause/correction
+		// — which the Python CLI rendered as a generic "object
+		// already exists" line that didn't tell the operator which
+		// VlmNr to twist.
+		if errors.Is(err, store.ErrAlreadyExists) {
+			writeVDExistsConflict(w, rd, vd.VolumeNumber)
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
@@ -219,6 +234,41 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition created",
+	}})
+}
+
+// writeVDExistsConflict emits the Bug 140 typed conflict envelope on
+// a duplicate `POST /v1/resource-definitions/{rd}/volume-definitions`.
+// Wire shape matches upstream LINSTOR's `linstor vd c` reply on the
+// same input: 409 Conflict + ApiCallRc with apiCallRcError |
+// FAIL_EXISTS_VLM_DFN sub-code, an operator-actionable message
+// naming the parent RD and the duplicate VlmNr, and a non-empty
+// cause/correction so the Python CLI surfaces the refusal as an
+// ERROR line (not a generic "object already exists").
+//
+// Per cli-parity-audit alignment, the correction names the two
+// remedial commands: PUT to modify the existing VD (`vd m`) or
+// POST with an explicit, free VolumeNumber (`vd c --vlmnr`).
+func writeVDExistsConflict(w http.ResponseWriter, rd string, vn int32) {
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsVlmDfn,
+		Message: fmt.Sprintf(
+			"volume definition %d already exists on resource definition %q",
+			vn, rd),
+		Cause: fmt.Sprintf(
+			"a volume definition with VlmNr=%d is already registered under %q; "+
+				"`linstor vd c` without --vlmnr defaults to 0 and the second invocation "+
+				"collides with the first",
+			vn, rd),
+		Correc: fmt.Sprintf(
+			"to modify the existing volume use `linstor vd m %s %d <new-size>`; "+
+				"to add a second volume pick a free VlmNr explicitly "+
+				"(`linstor vd c --vlmnr=<N> %s <size>`)",
+			rd, vn, rd),
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
 	}})
 }
 

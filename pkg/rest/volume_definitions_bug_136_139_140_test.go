@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -347,5 +348,152 @@ func TestBug139VDDeleteRemovesVolumeFromViewProjection(t *testing.T) {
 	if len(post[0].Volumes) != 0 {
 		t.Errorf("post-delete view: resource still carries %d volume(s) after VD delete: %+v",
 			len(post[0].Volumes), post[0].Volumes)
+	}
+}
+
+// TestBug140VDCreateConflictReturnsErrorMask pins the wire shape on a
+// duplicate-VD create: the envelope's ret_code MUST have the
+// MASK_ERROR bit (negative int64) set, NOT MASK_INFO. Scripts that
+// filter on `ret_code >= 0` to detect success would otherwise treat
+// the conflict as a no-op and skip the corrective action.
+func TestBug140VDCreateConflictReturnsErrorMask(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const rdName = "pvc-bug140"
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.VolumeDefinitionCreate{
+		VolumeDefinition: apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32 * 1024},
+	})
+
+	// First create succeeds.
+	first := httpPost(t, base+"/v1/resource-definitions/"+rdName+"/volume-definitions", body)
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first POST status: got %d, want 200", first.StatusCode)
+	}
+
+	// Second create conflicts.
+	second := httpPost(t, base+"/v1/resource-definitions/"+rdName+"/volume-definitions", body)
+	defer func() { _ = second.Body.Close() }()
+
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate POST status: got %d, want 409", second.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+
+	err = json.NewDecoder(second.Body).Decode(&rcs)
+	if err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) == 0 {
+		t.Fatalf("envelope empty on conflict; want at least one entry")
+	}
+
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("ret_code: got %#x, want MASK_ERROR bit set (apiCallRcError=%#x)",
+			rcs[0].RetCode, apiCallRcError)
+	}
+
+	// Sub-code must be FAIL_EXISTS_VLM_DFN (upstream 502 | MASK_ERROR).
+	// Audit-log greppers that route on the upstream catalogue need
+	// the same sub-code, not a generic "high-bit set" error.
+	if rcs[0].RetCode&apiCallRcFailExistsVlmDfn == 0 {
+		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (%#x) sub-code set",
+			rcs[0].RetCode, apiCallRcFailExistsVlmDfn)
+	}
+
+	// Envelope MUST NOT carry the MASK_INFO bit on the conflict
+	// entry — that was Bug 140's misclassification.
+	if rcs[0].RetCode&maskInfo != 0 {
+		t.Errorf("ret_code: got %#x, MASK_INFO bit set on a conflict envelope", rcs[0].RetCode)
+	}
+}
+
+// TestBug140VDCreateConflictHasCorrection pins the operator-actionable
+// payload on the duplicate-VD conflict envelope: cause names the
+// conflict (the duplicate VolumeNumber + parent RD), correction
+// points at the right remedial command. Without these the upstream
+// Python CLI prints a bare "object already exists" line that doesn't
+// tell the operator which knob to twist.
+func TestBug140VDCreateConflictHasCorrection(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const rdName = "pvc-bug140-cause"
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	err = st.VolumeDefinitions().Create(ctx, rdName,
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32 * 1024})
+	if err != nil {
+		t.Fatalf("seed first VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.VolumeDefinitionCreate{
+		VolumeDefinition: apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32 * 1024},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/"+rdName+"/volume-definitions", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+
+	err = json.NewDecoder(resp.Body).Decode(&rcs)
+	if err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) == 0 {
+		t.Fatalf("envelope empty; want at least one entry")
+	}
+
+	if rcs[0].Cause == "" {
+		t.Errorf("envelope missing cause field: %+v", rcs[0])
+	}
+
+	if rcs[0].Correc == "" {
+		t.Errorf("envelope missing correction field: %+v", rcs[0])
+	}
+
+	// The cause must name the conflict so the operator knows what
+	// was rejected. We don't lock the exact text (so the message
+	// can evolve), but it must reference the parent RD and the
+	// duplicate VolumeNumber so a `grep` on an audit log catches
+	// the operator-relevant identifiers.
+	for _, want := range []string{rdName, "volume"} {
+		if !strings.Contains(strings.ToLower(rcs[0].Cause+" "+rcs[0].Message), strings.ToLower(want)) {
+			t.Errorf("cause/message missing marker %q: cause=%q message=%q",
+				want, rcs[0].Cause, rcs[0].Message)
+		}
+	}
+
+	// ObjRefs let CLI tooling route the entry to the right object
+	// when rendering — without RscDfn the Python CLI's group-by
+	// renders the error against an empty resource label.
+	if rcs[0].ObjRefs[objRefRscDfn] != rdName {
+		t.Errorf("ObjRefs[RscDfn]: got %q, want %q",
+			rcs[0].ObjRefs[objRefRscDfn], rdName)
 	}
 }
