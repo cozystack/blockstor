@@ -201,7 +201,13 @@ func Build(r Resource) (string, error) {
 
 	fmt.Fprintf(&b, "resource %s {\n", r.Name)
 
-	if r.Net.ProtocolC {
+	// Emit the top-level `protocol …;` clause only when the user has
+	// NOT supplied an explicit `DrbdOptions/Net/protocol` override.
+	// Any `Net.Options["protocol"]` value lands inside `net { … }`
+	// via writeNet; stamping a second clause at the resource top
+	// level would let drbd pick the outer (default) value and
+	// silently ignore the operator's choice.
+	if r.Net.ProtocolC && r.Net.Options["protocol"] == "" {
 		b.WriteString("  protocol C;\n")
 	}
 
