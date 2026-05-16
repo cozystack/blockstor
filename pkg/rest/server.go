@@ -28,6 +28,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1063,8 +1064,33 @@ func scrubImplDetails(msg string) string {
 		k8sPrefix, opaque,
 	}
 
-	return strings.NewReplacer(replacements...).Replace(msg)
+	out := strings.NewReplacer(replacements...).Replace(msg)
+
+	// Bug 162: apimachinery's status messages embed the
+	// GroupResource — e.g. "controllerconfigs.blockstor.io" or
+	// "controllerconfigs.blockstor.io.blockstor.io" (resource name
+	// suffixed with group, then printed as <resource>.<group>). The
+	// CRD plural names ARE the persistence backend's identity from
+	// the operator's perspective — the wire surface speaks LINSTOR,
+	// not K8s. Strip them with a regex that matches the
+	// `<word>.blockstor.io[.suffix...]` shape.
+	return blockstorGroupRefRE.ReplaceAllString(out, opaque)
 }
+
+// blockstorGroupRefRE matches an apimachinery-style group/resource
+// reference rooted at our project's API group. Two shapes occur in
+// the wild:
+//
+//	controllerconfigs.blockstor.io
+//	controllerconfigs.blockstor.io.blockstor.io
+//
+// The first is the GroupResource.String() output; the second appears
+// when the CRD's plural itself carries the group suffix
+// (controllerconfigs.blockstor.io is the literal resource name) and
+// apimachinery re-appends the group. We greedily consume any number
+// of trailing ".blockstor.io" segments so both shapes collapse to a
+// single <backend> token.
+var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.io(\.blockstor\.io)*`)
 
 // formatBytes renders n as a short human-readable size string for
 // operator-facing error messages. Stays in MiB/KiB granularity so

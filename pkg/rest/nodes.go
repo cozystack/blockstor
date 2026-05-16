@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
@@ -891,14 +892,44 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 
 // writeStoreError maps store sentinel errors to HTTP statuses so handlers
 // don't repeat the same switch.
+//
+// Bug 162 (P0): every non-sentinel branch routes the message through
+// scrubImplDetails before emitting. Without scrubbing, an etcd-side
+// rejection ("etcdserver: request is too large") or an apimachinery
+// status error ("controllerconfigs.blockstor.io.blockstor.io ...")
+// reached the wire verbatim, leaking the persistence backend's
+// identity. Bug 146 already scrubbed the inbound JSON-decode path;
+// this is the matching outbound guard.
+//
+// Bug 164 (P1): K8s-shaped status errors (apierrors.IsConflict /
+// IsAlreadyExists) bypass the local store sentinels and used to fall
+// through to the default 500 branch. linstor-csi treats 5xx as fatal
+// but 409 as retryable, so a single optimistic-lock collision wedged
+// every CSI call against the affected RD. The IsConflict /
+// IsAlreadyExists branches map to 409 with a generic message — the
+// raw apimachinery string is dropped to avoid the Bug 162 leak.
 func writeStoreError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, store.ErrAlreadyExists):
 		writeError(w, http.StatusConflict, err.Error())
+	case apierrors.IsConflict(err):
+		// Optimistic-lock conflict. Generic message — the apimachinery
+		// error embeds the GroupResource string which leaks the CRD
+		// plural and API group. CSI retries on 409.
+		writeError(w, http.StatusConflict,
+			"conflict: store object was modified, retry the request")
+	case apierrors.IsAlreadyExists(err):
+		writeError(w, http.StatusConflict,
+			"conflict: store object already exists")
+	case apierrors.IsNotFound(err):
+		// Same shape as the local sentinel — keep the wire status
+		// uniform so CSI's 404-handling path fires the same way.
+		writeError(w, http.StatusNotFound, "not found")
 	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
+		writeError(w, http.StatusInternalServerError,
+			"store error: "+scrubImplDetails(err.Error()))
 	}
 }
 
