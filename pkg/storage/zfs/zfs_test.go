@@ -211,6 +211,11 @@ func TestCreateSnapshotIssuesZfsSnap(t *testing.T) {
 // TestDeleteSnapshotIssuesZfsDestroy.
 func TestDeleteSnapshotIssuesZfsDestroy(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Bug 212 added a `datasetExists` pre-check — stub it so the
+	// snapshot is reported as present, then assert destroy fires.
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000@snap-1",
+		storage.FakeResponse{Stdout: []byte("tank/pvc-1_00000@snap-1\n")})
+
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
 	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
@@ -574,6 +579,11 @@ func TestZFSThickPoolStatusMatchesZpoolFree(t *testing.T) {
 // <snap>` failure must surface with the "zfs destroy" wrap keyword.
 func TestDeleteSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Bug 212: pre-check must report the snapshot as present so we
+	// reach the real destroy invocation. The fail-then-wrap contract
+	// applies only to non-not-found errors.
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000@snap-1",
+		storage.FakeResponse{Stdout: []byte("tank/pvc-1_00000@snap-1\n")})
 	fx.Expect("zfs destroy tank/pvc-1_00000@snap-1",
 		storage.FakeResponse{Err: errZFSListMissing})
 

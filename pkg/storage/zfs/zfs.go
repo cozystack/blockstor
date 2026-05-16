@@ -230,8 +230,16 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 // disappears from the LINSTOR view while staying on disk to keep
 // the dependent clone alive. When the last clone is destroyed, the
 // marker is swept by DeleteVolume's origin check.
+//
+// Missing snapshot → no-op so the satellite reconciler can strip
+// the Snapshot CRD's finalizer instead of looping on a "dataset
+// does not exist" surface error.
 func (p *Provider) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
 	src := p.snapshotDataset(snap)
+
+	if !p.datasetExists(ctx, src) {
+		return nil
+	}
 
 	out, err := p.exec.Run(ctx, "zfs", "destroy", src)
 	if err == nil {

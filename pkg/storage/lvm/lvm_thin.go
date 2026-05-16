@@ -189,8 +189,15 @@ func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error 
 	return nil
 }
 
-// DeleteSnapshot mirrors DeleteVolume on the snapshot LV.
+// DeleteSnapshot mirrors DeleteVolume on the snapshot LV. Missing
+// snapshot LV → no-op so the satellite's reconcile loop can strip
+// the Snapshot CRD's finalizer instead of looping forever on a
+// "not found" surface error.
 func (t *Thin) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	if !t.lvExists(ctx, snapshotLVName(snap)) {
+		return nil
+	}
+
 	_, err := t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)

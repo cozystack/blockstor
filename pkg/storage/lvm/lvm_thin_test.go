@@ -285,6 +285,11 @@ func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 // LINSTOR's LVM_THIN snapshot delete drives.
 func TestThinDeleteSnapshot(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Pretend the snapshot LV exists so DeleteSnapshot actually
+	// proceeds past the missing-LV idempotency short-circuit.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
+
 	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 
 	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
@@ -403,6 +408,10 @@ func TestThinCreateSnapshotErrorWraps(t *testing.T) {
 // surface with the "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } -f" wrap keyword.
 func TestThinDeleteSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Snapshot LV exists so DeleteSnapshot proceeds past the
+	// missing-LV idempotency short-circuit and actually fires lvremove.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
 	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 

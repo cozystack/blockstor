@@ -175,8 +175,14 @@ func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error
 	return nil
 }
 
-// DeleteSnapshot mirrors Thin's.
+// DeleteSnapshot mirrors Thin's, including the missing-LV idempotency
+// short-circuit so the satellite reconciler can strip the Snapshot
+// CRD's finalizer instead of looping on a "not found" surface error.
 func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	if !t.lvExists(ctx, snapshotLVName(snap)) {
+		return nil
+	}
+
 	_, err := t.exec.Run(ctx, "lvremove",
 		Args("--force",
 			t.cfg.VolumeGroup+"/"+snapshotLVName(snap))...)

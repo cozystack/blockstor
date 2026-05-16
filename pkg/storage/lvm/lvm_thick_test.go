@@ -181,6 +181,11 @@ func TestThickCreateSnapshot(t *testing.T) {
 // LINSTOR's snapshot-delete REST call works against either kind.
 func TestThickDeleteSnapshot(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Bug 212 added an `lvExists` pre-check — stub it so the snapshot
+	// LV is reported as present, then assert lvremove fires.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
+
 	p := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
 
 	err := p.DeleteSnapshot(t.Context(), storage.Snapshot{
@@ -305,6 +310,11 @@ func TestThickCreateSnapshotErrorWraps(t *testing.T) {
 // surface with the "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } -f" wrap keyword.
 func TestThickDeleteSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Bug 212: pre-check must report the snapshot LV as present so we
+	// reach lvremove. The fail-then-wrap contract applies only to
+	// non-not-found errors.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-1_snap-1_00000\n")})
 	fx.Expect("lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/pvc-1_snap-1_00000",
 		storage.FakeResponse{Err: errLVMCmdFailed})
 
