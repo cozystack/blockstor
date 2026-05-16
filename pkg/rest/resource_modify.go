@@ -56,7 +56,12 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	var patch apiv1.GenericPropsModify
+	// Bug 163 (P0): use the modify-shaped envelope rather than the
+	// bare GenericPropsModify so DisallowUnknownFields tolerates the
+	// full Resource read-side shape on `curl GET | jq | curl PUT`.
+	// Only the embedded override_props / delete_props /
+	// delete_namespaces drive the merge.
+	var patch apiv1.ResourceModify
 
 	if !decodeJSON(w, r, &patch) {
 		return

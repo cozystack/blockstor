@@ -63,11 +63,18 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 
-	var patch apiv1.GenericPropsModify
+	// Bug 163: decode into the full StoragePoolModify shape (which
+	// embeds GenericPropsModify and adds the read-side keys the GET
+	// response emits — free_space_mgr_name, state, uuid, etc.) so
+	// operators can `curl GET | jq | curl PUT` without tripping
+	// Bug 161's DisallowUnknownFields.
+	var body apiv1.StoragePoolModify
 
-	if !decodeJSON(w, r, &patch) {
+	if !decodeJSON(w, r, &body) {
 		return
 	}
+
+	patch := body.GenericPropsModify
 
 	existing, err := s.Store.StoragePools().Get(r.Context(), node, pool)
 	if err != nil {

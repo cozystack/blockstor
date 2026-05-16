@@ -232,3 +232,69 @@ type VolumeObservation struct {
 	VolumeNumber int32
 	State        VolumeState
 }
+
+// ResourceModify is the upstream payload for `linstor r set-property`
+// / golinstor's ResourceService.Modify. golinstor and the python CLI
+// send a `GenericPropsModify` envelope (override_props / delete_props
+// / delete_namespaces); the merge path on the server side picks up
+// only those keys.
+//
+// Bug 163 (DisallowUnknownFields, P0): operators doing
+// `curl GET /v1/resource-definitions/{rd}/resources/{node} | jq | curl PUT`
+// round-trip the full read-side Resource shape verbatim — every key the
+// GET emits (name, node_name, props, flags, state, uuid, layer_object,
+// volumes, effective_props, annotations, toggle_disk_cancel) must be
+// tolerated on the modify endpoint so DisallowUnknownFields doesn't
+// reject the fetched body. The path's `{rd}` + `{node}` segments are
+// the authoritative target; only override_props / delete_props /
+// delete_namespaces drive the merge — the rest are informational and
+// ignored by the handler.
+type ResourceModify struct {
+	GenericPropsModify
+
+	Name             string            `json:"name,omitempty"`
+	NodeName         string            `json:"node_name,omitempty"`
+	Props            map[string]string `json:"props,omitempty"`
+	Flags            []string          `json:"flags,omitempty"`
+	State            ResourceState     `json:"state,omitzero"`
+	UUID             string            `json:"uuid,omitempty"`
+	LayerObject      *ResourceLayer    `json:"layer_object,omitempty"`
+	Annotations      map[string]string `json:"annotations,omitempty"`
+	ToggleDiskCancel bool              `json:"toggle_disk_cancel,omitempty"`
+	// NO `omitempty` here: mirrors Resource.Volumes / ResourceWithVolumes.Volumes
+	// (Bug 137 follow-up). GET emits `volumes` even when nil/empty;
+	// the operator's round-trip pipes the same wire shape back.
+	Volumes        []Volume            `json:"volumes,omitempty"`
+	EffectiveProps EffectiveProperties `json:"effective_props,omitempty"`
+}
+
+// StoragePoolModify is the upstream payload for `linstor sp
+// set-property` / golinstor's StoragePoolService.Modify. The merge
+// path uses override_props / delete_props / delete_namespaces from
+// the embedded GenericPropsModify.
+//
+// Bug 163 (DisallowUnknownFields, P0): operators round-trip the
+// `GET /v1/nodes/{node}/storage-pools/{pool}` response shape verbatim
+// through PUT. Every read-side key (storage_pool_name, node_name,
+// provider_kind, props, static_traits, free_capacity, total_capacity,
+// free_space_mgr_name, shared_space, reports, supports_snapshots,
+// external_locking, uuid, state) must be tolerated; the path's
+// `{node}` + `{pool}` segments stay authoritative.
+type StoragePoolModify struct {
+	GenericPropsModify
+
+	StoragePoolName  string            `json:"storage_pool_name,omitempty"`
+	NodeName         string            `json:"node_name,omitempty"`
+	ProviderKind     string            `json:"provider_kind,omitempty"`
+	Props            map[string]string `json:"props,omitempty"`
+	StaticTraits     map[string]string `json:"static_traits,omitempty"`
+	FreeCapacity     int64             `json:"free_capacity,omitempty"`
+	TotalCapacity    int64             `json:"total_capacity,omitempty"`
+	FreeSpaceMgrName string            `json:"free_space_mgr_name,omitempty"`
+	SharedSpaceID    string            `json:"shared_space,omitempty"`
+	Reports          []APICallRc       `json:"reports,omitempty"`
+	SupportsSnapshot bool              `json:"supports_snapshots,omitempty"`
+	ExternalLocking  bool              `json:"external_locking,omitempty"`
+	UUID             string            `json:"uuid,omitempty"`
+	State            string            `json:"state,omitempty"`
+}

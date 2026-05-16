@@ -57,10 +57,20 @@ type NodeModify struct {
 	// doesn't reject them. The path's `{node}` segment is the
 	// authoritative target; Type drives the merge via NodeType above,
 	// the rest are informational. Same shape as the v0 spec field-set.
+	//
+	// Bug 163 (DisallowUnknownFields, P0): the GET /v1/nodes/{node}
+	// response emits `props` as the bare current-value map, which an
+	// operator's `curl GET | jq | curl PUT` round-trip pipes back
+	// through here. The merge path uses `override_props` /
+	// `delete_props` from the embedded GenericPropsModify; `props`
+	// itself is informational on write and ignored — declared here
+	// purely so the DisallowUnknownFields gate doesn't reject the
+	// fetched body verbatim.
 	Name                 string              `json:"name,omitempty"`
 	Type                 string              `json:"type,omitempty"`
 	UUID                 string              `json:"uuid,omitempty"`
 	Flags                []string            `json:"flags,omitempty"`
+	Props                map[string]string   `json:"props,omitempty"`
 	NetInterfaces        []NetInterface      `json:"net_interfaces,omitempty"`
 	ConnectionStatus     string              `json:"connection_status,omitempty"`
 	ResourceLayers       []string            `json:"resource_layers,omitempty"`

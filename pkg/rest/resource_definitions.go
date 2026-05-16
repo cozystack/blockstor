@@ -657,14 +657,25 @@ type resourceDefinitionModifyBody struct {
 	// The path's `{rd}` segment remains authoritative for the target,
 	// and only the modify-shaped fields above drive the merge — the
 	// fields below are informational and ignored by mergeRDPatch.
-	Name         string                `json:"name,omitempty"`
-	ExternalName string                `json:"external_name,omitempty"`
-	Props        map[string]string     `json:"props,omitempty"`
-	Annotations  map[string]string     `json:"annotations,omitempty"`
-	Flags        []string              `json:"flags,omitempty"`
-	LayerData    []apiv1.ResourceLayer `json:"layer_data,omitempty"`
-	LayerStack   []string              `json:"layer_stack,omitempty"`
-	UUID         string                `json:"uuid,omitempty"`
+	//
+	// Bug 163 (DisallowUnknownFields, P0): operators piping
+	// `curl GET /v1/resource-definitions/{rd} | curl PUT @-` need
+	// every read-side key the GET emits to be tolerated on PUT.
+	// `effective_props` (computed Controller→RG→RD merge) and
+	// `volume_definitions` (inline VD list on
+	// `?with_volume_definitions=true`) round-trip through here as
+	// read-only metadata — informational on write, ignored by
+	// the merge.
+	Name              string                    `json:"name,omitempty"`
+	ExternalName      string                    `json:"external_name,omitempty"`
+	Props             map[string]string         `json:"props,omitempty"`
+	Annotations       map[string]string         `json:"annotations,omitempty"`
+	Flags             []string                  `json:"flags,omitempty"`
+	LayerData         []apiv1.ResourceLayer     `json:"layer_data,omitempty"`
+	LayerStack        []string                  `json:"layer_stack,omitempty"`
+	UUID              string                    `json:"uuid,omitempty"`
+	EffectiveProps    apiv1.EffectiveProperties `json:"effective_props,omitempty"`
+	VolumeDefinitions []apiv1.VolumeDefinition  `json:"volume_definitions,omitempty"`
 }
 
 func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
