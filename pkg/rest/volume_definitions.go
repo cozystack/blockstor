@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -595,6 +597,17 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 // into a 200 + warn-mask envelope. linstor-csi's ControllerExpand /
 // shrink paths re-issue `vd d` on retry; the bare 404 used to crash
 // the Python CLI on its XML decoder fallback (see Bug 56 commentary).
+//
+// Bug 186 (P2): refuses with 409 + FAIL_IN_USE | MASK_ERROR when at
+// least one Resource on the parent RD still carries a Volume row for
+// the dropped VolumeNumber. Mirrors upstream LINSTOR's
+// CtrlVlmDfnDeleteApiCallHandler refusal pattern (Bug 92 /
+// Bug 174 envelope shape) — the previous behaviour silently dropped
+// the spec and pruned satellite-observed Volume rows off the
+// Resource CRDs, leaving no operator-visible signal that the delete
+// was unsafe. `?force=true` (and the body's `force` field for parity
+// with Bug 92 / W13) bypasses the refusal so the operator can drop
+// the spec out from under a stuck satellite.
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
@@ -602,6 +615,15 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 
+		return
+	}
+
+	// Bug 186: pre-Delete walk of referencing Resources. Runs BEFORE
+	// the store-level Delete so a refused call leaves the VD spec and
+	// every dependent Resource.Volumes row untouched — partial-state
+	// after a rejected DELETE would be a worse failure mode than the
+	// bug itself.
+	if !isForce(r) && s.refuseVDDeleteIfReferenced(w, r, rd, vn) {
 		return
 	}
 
@@ -640,6 +662,121 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: fmt.Sprintf("volume definition deleted: %s/%d", rd, vn),
 	}})
+}
+
+// refuseVDDeleteIfReferenced runs the Bug 186 pre-Delete walk: any
+// Resource of the parent RD whose Volumes carry a row for the
+// dropped VolumeNumber is a live reference and must block the
+// delete. Returns true when the HTTP error has already been written
+// (the caller must stop processing) and false when the delete may
+// proceed.
+//
+// Cause line names the referencing Resources sorted by NodeName so
+// the surfaced text is deterministic across cache iteration orders.
+// Wire shape mirrors Bug 92 (node delete in-use) and Bug 152 (sp
+// delete in-use) — 409 + FAIL_IN_USE | MASK_ERROR, Cause/Correction
+// pointing at the remedial commands.
+func (s *Server) refuseVDDeleteIfReferenced(w http.ResponseWriter, r *http.Request, rd string, vn int32) bool {
+	refs, err := s.resourcesReferencingVolume(r.Context(), rd, vn)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 {
+		return false
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: fmt.Sprintf(
+			"Volume definition %d on resource definition %q cannot be "+
+				"deleted because resource replicas still reference it.",
+			vn, rd),
+		Cause: fmt.Sprintf(
+			"%d resource replica(s) reference VolumeNumber %d on %q: %s",
+			len(refs), vn, rd, strings.Join(refs, ", ")),
+		Correc: "Delete the listed resource replicas first " +
+			"(`linstor r d <node> " + rd + "`), or pass `?force=true` " +
+			"to drop the volume definition anyway and accept the " +
+			"orphan replicas.",
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	}})
+
+	return true
+}
+
+// resourcesReferencingVolume returns the sorted-by-NodeName list of
+// Resources on the parent RD that reference the given VolumeNumber.
+// Used by Bug 186's pre-Delete walk; sort order pinned so the
+// surfaced 409 envelope's Cause line is byte-identical across cache
+// iteration orders (the same trick node_lifecycle.go uses for the
+// in-use evacuate refusal).
+//
+// Two reference shapes count as live:
+//
+//  1. The Resource carries an explicit Volumes[] entry whose
+//     VolumeNumber matches `vn` — this is what the unit tests seed
+//     directly and what fully-converged Resources carry on the wire
+//     once the satellite has stamped Status.Volumes.
+//  2. The Resource has no Volumes[] rows yet — common in production
+//     while the satellite is mid-reconcile, on freshly-created
+//     diskless / TIE_BREAKER replicas, and any time DRBD hasn't
+//     advanced past `Unknown`. Upstream LINSTOR's
+//     CtrlVlmDfnDeleteApiCallHandler treats every Resource on the
+//     RD as an implicit reference to every VD on that RD — the
+//     spec contract says "Resource has one Volume per VD"; a missing
+//     Status.Volumes row means "not yet stamped", not "the spec
+//     doesn't reference it".
+//
+// The blanket shape (2) closes the live-cluster reproducer where
+// `vd d` slipped past the prune-only check because the satellite
+// hadn't filled in Status.Volumes yet — exactly the Bug 186 symptom
+// upstream LINSTOR's FAIL_IN_USE refusal exists to prevent.
+func (s *Server) resourcesReferencingVolume(ctx context.Context, rd string, vn int32) ([]string, error) {
+	if s == nil || s.Store == nil {
+		return nil, nil
+	}
+
+	resources, err := s.Store.Resources().ListByDefinition(ctx, rd)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // surfaced to writeStoreError
+	}
+
+	var refs []string
+
+	for i := range resources {
+		if resourceReferencesVolume(&resources[i], vn) {
+			refs = append(refs, resources[i].NodeName)
+		}
+	}
+
+	sort.Strings(refs)
+
+	return refs, nil
+}
+
+// resourceReferencesVolume returns true when the Resource is a live
+// reference to the (RD, VolumeNumber) pair under Bug 186's refusal
+// semantics. See resourcesReferencingVolume for the two reference
+// shapes (explicit Volume row OR implicit "spec contract" reference
+// while the satellite has not yet stamped Status.Volumes).
+func resourceReferencesVolume(rsc *apiv1.Resource, vn int32) bool {
+	if len(rsc.Volumes) == 0 {
+		return true
+	}
+
+	for i := range rsc.Volumes {
+		if rsc.Volumes[i].VolumeNumber == vn {
+			return true
+		}
+	}
+
+	return false
 }
 
 // pruneVolumesFromResources walks every Resource of the named RD
