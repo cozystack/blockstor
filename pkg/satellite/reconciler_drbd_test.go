@@ -1222,10 +1222,10 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 
 	// The cryptsetup resize is the chain link between storage grow
 	// and DRBD resize — without it the consumer's view stays at the
-	// original LUKS-mapped portion. runWithKey single-quotes args so
-	// the dm-name appears as 'pvc-luks-grow-0-luks' in the recorded
-	// pipeline.
-	if !saw("'resize' 'pvc-luks-grow-0-luks'") {
+	// original LUKS-mapped portion. Post-Issue 175 runWithKey calls
+	// cryptsetup directly (no `sh -c`), so the recorded line is
+	// `cryptsetup resize pvc-luks-grow-0-luks --key-file -`.
+	if !saw("cryptsetup resize pvc-luks-grow-0-luks") {
 		t.Errorf("expected cryptsetup resize on the LUKS mapper; got %v",
 			fx.CommandLines())
 	}
@@ -1516,8 +1516,10 @@ func TestApplyLUKSFormatErrorWraps(t *testing.T) {
 		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-format_00000|1048576\n")})
 	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-format_00000",
 		storage.FakeResponse{Err: errNotALUKSDevice})
-	// luksFormat fails: simulate the device being busy.
-	fx.Expect(`sh -c printf %s "topsecret" | cryptsetup 'luksFormat' '--batch-mode' '/dev/vg/pvc-luks-format_00000' '--key-file' '-'`,
+	// luksFormat fails: simulate the device being busy. Post-Issue
+	// 175 the cryptsetup invocation is direct, so the Expect key is
+	// the cryptsetup argv verbatim with no shell pipeline wrapping.
+	fx.Expect("cryptsetup luksFormat --batch-mode /dev/vg/pvc-luks-format_00000 --key-file -",
 		storage.FakeResponse{Err: errLUKSFormatBusy})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)

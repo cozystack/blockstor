@@ -128,11 +128,12 @@ func TestDevicePath(t *testing.T) {
 // size. Without this step, drbdadm only sees the original
 // LUKS-mapped portion and the consumer's view stays at the old size.
 //
-// The pipeline must include the dm name and the --key-file - flag
+// The argv must include the dm name and the --key-file - flag
 // (passphrase fed via stdin to cryptsetup, not as a cryptsetup arg)
-// — runWithKey shell-wraps the key into printf, but the cryptsetup
-// argv itself MUST NOT carry the secret. A regression that swapped
-// to argv would leak the passphrase into cryptsetup's audit logs.
+// — runWithKey now delivers the key via cmd.Stdin (Issue 175 fix),
+// and the cryptsetup argv itself MUST NOT carry the secret. A
+// regression that swapped to argv would leak the passphrase into
+// cryptsetup's audit logs and (worse) into procfs.
 func TestResizeRunsCryptsetupResize(t *testing.T) {
 	fx := storage.NewFakeExec()
 	c := luks.NewCryptsetup(fx)
@@ -163,15 +164,11 @@ func TestResizeRunsCryptsetupResize(t *testing.T) {
 			fx.CommandLines())
 	}
 
-	// Defensive: the passphrase must reach cryptsetup via stdin
-	// (`printf %s "$KEY" | cryptsetup ...`), not as a cryptsetup
-	// arg. A regression that put the passphrase directly after
-	// `cryptsetup` would surface here. printf carrying the secret
-	// is the intentional design — it's already pre-existing on
-	// every Format/Open/Close call.
+	// Defensive: the passphrase must reach cryptsetup via stdin,
+	// not as a cryptsetup arg. A regression that put the passphrase
+	// directly into argv would surface here.
 	for _, line := range fx.CommandLines() {
-		if strings.Contains(line, "cryptsetup 'supersecret'") ||
-			strings.Contains(line, "cryptsetup supersecret") {
+		if strings.Contains(line, "supersecret") {
 			t.Errorf("passphrase leaked into cryptsetup argv: %s", line)
 		}
 	}
@@ -180,9 +177,12 @@ func TestResizeRunsCryptsetupResize(t *testing.T) {
 // TestOpenErrorWraps pins the cockroachdb error wrap on Open: a
 // `cryptsetup luksOpen` failure (wrong passphrase, dm name busy)
 // must surface with the "luksOpen" keyword for operator grep.
+//
+// Post-Issue 175 the cryptsetup invocation is direct (no `sh -c`),
+// so the Expect key matches the cryptsetup argv verbatim.
 func TestOpenErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("sh -c printf %s \"k\" | cryptsetup 'luksOpen' '/dev/sda' 'pvc-1' '--key-file' '-'",
+	fx.Expect("cryptsetup luksOpen /dev/sda pvc-1 --key-file -",
 		storage.FakeResponse{Err: errLuksFailed})
 
 	c := luks.NewCryptsetup(fx)
@@ -219,9 +219,12 @@ func TestCloseErrorWraps(t *testing.T) {
 // because resize failures are silently swallowed by the satellite
 // reconciler today (best-effort); a regression that dropped the
 // wrap would erase the operator-visible breadcrumb in the log.
+//
+// Post-Issue 175 the cryptsetup invocation is direct (no `sh -c`),
+// so the Expect key matches the cryptsetup argv verbatim.
 func TestResizeErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("sh -c printf %s \"k\" | cryptsetup 'resize' 'pvc-1' '--key-file' '-'",
+	fx.Expect("cryptsetup resize pvc-1 --key-file -",
 		storage.FakeResponse{Err: errLuksFailed})
 
 	c := luks.NewCryptsetup(fx)

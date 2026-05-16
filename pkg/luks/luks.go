@@ -22,7 +22,6 @@ package luks
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -102,15 +101,24 @@ func (c *Cryptsetup) runProbe(ctx context.Context, args ...string) error {
 	return nil
 }
 
-// runWithKey executes cryptsetup with the keyfile passed via stdin.
-// We don't yet have a stdin path on storage.Exec, so we shell out via
-// `sh -c 'printf %s "$KEY" | cryptsetup ...'` to keep secrets off the
-// argv (visible to other procs) and out of disk-resident temp files.
+// runWithKey executes cryptsetup with the passphrase delivered on
+// stdin via `--key-file -`. We invoke the binary directly through
+// storage.Exec.RunWithStdin — no `sh -c`, no `printf`, no shell
+// metacharacter parsing — because the previous shell-pipeline form
+// (Bug 175, P1 SECURITY) used fmt.Sprintf("%q", key) which does NOT
+// escape shell command substitution (`$(...)`, backticks) or
+// statement separators. A passphrase set through unauthenticated
+// REST PATCH on a resource-definition therefore got evaluated as
+// root on every satellite node.
+//
+// Mirrors the stdin pattern already in pkg/storage/zfs/zfs.go and
+// pkg/storage/lvm/lvm_thin.go: pass an io.Reader, never a shell
+// string. Argv carries only fixed cryptsetup flags and operator-
+// owned device/dm names.
 func (c *Cryptsetup) runWithKey(ctx context.Context, key []byte, args ...string) error {
-	pipeline := fmt.Sprintf("printf %%s %q | cryptsetup %s",
-		string(key), shellQuoteArgs(args))
-
-	_, err := c.exec.Run(ctx, "sh", "-c", pipeline)
+	_, err := c.exec.RunWithStdin(ctx,
+		strings.NewReader(string(key)),
+		"cryptsetup", args...)
 	if err != nil {
 		return errors.Wrap(err, "cryptsetup")
 	}
@@ -122,24 +130,4 @@ func (c *Cryptsetup) runWithKey(ctx context.Context, key []byte, args ...string)
 // callers should hand to DRBD as the lower disk.
 func DevicePath(dmName string) string {
 	return "/dev/mapper/" + dmName
-}
-
-// shellQuoteArgs single-quote-wraps each arg so the resulting `sh -c`
-// pipeline doesn't accidentally re-interpret characters in device or
-// dm-name strings. We don't bother with full POSIX rules — these
-// strings are pinned by the satellite to known-safe paths.
-func shellQuoteArgs(args []string) string {
-	var b strings.Builder
-
-	for i, arg := range args {
-		if i > 0 {
-			b.WriteString(" ")
-		}
-
-		b.WriteString("'")
-		b.WriteString(arg)
-		b.WriteString("'")
-	}
-
-	return b.String()
 }
