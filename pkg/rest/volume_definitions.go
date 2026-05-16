@@ -17,6 +17,7 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -280,36 +281,45 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 136: on a grow, stamp the per-resource resize-pending
+	// annotation. See stampResizePendingOnResources for rationale.
+	if patch.SizeKib != nil && *patch.SizeKib > previousSizeKib {
+		s.stampResizePendingOnResources(r.Context(), rd, vn, *patch.SizeKib)
+	}
+
 	envelope := []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "volume definition modified",
 	}}
 
-	// Force-shrink advisory (Bug 38 / scenario 4.W13). When the
-	// operator opts into the shrink, retain the audit-log breadcrumb
-	// so the data-loss risk window is visible alongside the success
-	// line. Only reachable when force=true (the strict-reject branch
-	// above otherwise short-circuits with 400).
-	//
-	// Emit the warning as a SECOND envelope entry (success first,
-	// then advisory) — matches upstream's order in ApiCallRcImpl
-	// where the "operation succeeded" entry leads and per-resource
-	// warnings tail.
-	if patch.SizeKib != nil && *patch.SizeKib < previousSizeKib {
-		envelope = append(envelope, apiv1.APICallRc{
-			RetCode: warnVlmDfnResizeShrink,
-			Message: fmt.Sprintf(
-				"shrinking volume %d from %d KiB to %d KiB (force=true; DATA LOSS RISK — caller intent assumed)",
-				vn, previousSizeKib, *patch.SizeKib,
-			),
-			ObjRefs: map[string]string{
-				objRefRscDfn: rd,
-				"VlmNr":      strconv.FormatInt(int64(vn), 10),
-			},
-		})
-	}
+	envelope = appendForceShrinkAdvisory(envelope, &patch, rd, vn, previousSizeKib)
 
 	writeJSON(w, http.StatusOK, envelope)
+}
+
+// appendForceShrinkAdvisory appends the force-shrink warning entry
+// to the success envelope when the patch reduced SizeKib. Only
+// reachable when force=true (the strict-reject branch in
+// rejectShrinkWithoutForce otherwise short-circuits with 400).
+// Matches upstream's ApiCallRcImpl order where the "operation
+// succeeded" entry leads and per-resource warnings tail. Bug 38 /
+// scenario 4.W13.
+func appendForceShrinkAdvisory(envelope []apiv1.APICallRc, patch *volumeDefinitionModifyBody, rd string, vn int32, previousSizeKib int64) []apiv1.APICallRc {
+	if patch.SizeKib == nil || *patch.SizeKib >= previousSizeKib {
+		return envelope
+	}
+
+	return append(envelope, apiv1.APICallRc{
+		RetCode: warnVlmDfnResizeShrink,
+		Message: fmt.Sprintf(
+			"shrinking volume %d from %d KiB to %d KiB (force=true; DATA LOSS RISK — caller intent assumed)",
+			vn, previousSizeKib, *patch.SizeKib,
+		),
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	})
 }
 
 // rejectShrinkWithoutForce writes a 400 + FAIL_INVLD_VLM_SIZE
@@ -465,4 +475,49 @@ func parseVolNum(raw string) (int32, error) {
 	}
 
 	return int32(v), nil
+}
+
+// resizePendingAnnotationPrefix is the per-volume annotation key
+// prefix the REST VD-grow handler stamps on each affected Resource
+// (Bug 136). The full key is
+// `<prefix><VolumeNumber>` and the value is the new SizeKib (decimal
+// string, KiB). Per-volume so multi-volume RDs (rare today but on
+// the roadmap) keep the grow signal distinguishable when several
+// volumes resize at once.
+//
+// Operators read this via `kubectl get resource -o yaml`; the
+// satellite reconciler doesn't strictly require it (the RD-watch
+// in `enqueueResourcesForRD` already re-applies on any RD-spec
+// change), but it gives a steady-state breadcrumb that explains
+// why the satellite re-rendered and what the target size is.
+const resizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
+
+// stampResizePendingOnResources walks every Resource of the named
+// RD and stamps the per-volume "resize pending" annotation with the
+// new size. Best-effort by design: a single Resource failing to
+// re-Update doesn't roll back the others nor the VD spec change
+// itself. Bug 136.
+func (s *Server) stampResizePendingOnResources(ctx context.Context, rd string, vn int32, sizeKib int64) {
+	if s == nil || s.Store == nil {
+		return
+	}
+
+	resources, err := s.Store.Resources().ListByDefinition(ctx, rd)
+	if err != nil {
+		return
+	}
+
+	key := resizePendingAnnotationPrefix + strconv.FormatInt(int64(vn), 10)
+	value := strconv.FormatInt(sizeKib, 10)
+
+	for i := range resources {
+		rsc := resources[i]
+		if rsc.Annotations == nil {
+			rsc.Annotations = map[string]string{}
+		}
+
+		rsc.Annotations[key] = value
+
+		_ = s.Store.Resources().Update(ctx, &rsc)
+	}
 }

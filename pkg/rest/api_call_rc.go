@@ -208,4 +208,5 @@ const (
 	objRefRscGrp      = "RscGrp"
 	objRefSnapshotDfn = "SnapshotDfn"
 	objRefStorPool    = "StorPool"
+	objRefVlmNr       = "VlmNr"
 )
