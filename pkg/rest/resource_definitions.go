@@ -772,20 +772,52 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 // RD-delete that already cleared its replicas must still let the
 // final Store.ResourceDefinitions().Delete see its own NotFound and
 // produce the right HTTP code).
+//
+// Bug 130: the simple single-pass enumerate-then-delete races the RD
+// reconciler's auto-tiebreaker path. The reconciler takes its own
+// snapshot of children via the Store and, on seeing 2 diskful + 0
+// witness, Creates a fresh TIE_BREAKER Resource on a third node.
+// If that Create lands between our List and the per-child Delete
+// loop (or even AFTER the loop but BEFORE we drop the RD itself),
+// the new witness is a phantom — its parent RD vanishes from under
+// it and no follow-up reconcile can reap it (the reconciler's
+// `Get(rd)` returns NotFound, so its enumerate-and-clean path bails).
+//
+// The mitigation is a bounded retry-until-empty loop: re-list after
+// each pass, delete any newcomers, repeat until the list returns
+// empty or the iteration cap fires. Combined with the controller-
+// side `rdIsDeleting` guard (internal/controller/resourcedefinition_
+// controller.go::ensureTiebreaker), this closes the race from both
+// ends — the controller skips witness creation when the RD is being
+// deleted, and the cascade reaps anything that slips through.
+//
+// The cap is intentionally low: every extra pass costs an apiserver
+// round-trip, and a healthy controller stamps at most one witness per
+// RD. Five passes covers the pathological case of every pass
+// observing one late-landing row while still bounding the worst-
+// case latency.
+const cascadeDeleteMaxPasses = 5
+
 func (s *Server) cascadeDeleteResources(ctx context.Context, rdName string) error {
-	children, err := s.Store.Resources().ListByDefinition(ctx, rdName)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+	for range cascadeDeleteMaxPasses {
+		children, err := s.Store.Resources().ListByDefinition(ctx, rdName)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil
+			}
+
+			return err //nolint:wrapcheck // surfaced via writeStoreError
+		}
+
+		if len(children) == 0 {
 			return nil
 		}
 
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
-
-	for i := range children {
-		err = s.Store.Resources().Delete(ctx, rdName, children[i].NodeName)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err //nolint:wrapcheck // surfaced via writeStoreError
+		for i := range children {
+			err = s.Store.Resources().Delete(ctx, rdName, children[i].NodeName)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err //nolint:wrapcheck // surfaced via writeStoreError
+			}
 		}
 	}
 

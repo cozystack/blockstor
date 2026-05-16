@@ -146,7 +146,23 @@ const rdReconcileRequeue = 5 * time.Second
 // We mirror that logic exactly so a cluster running blockstor sees
 // the same tiebreaker / quorum decisions as one running upstream
 // LINSTOR — important for the cozystack migration story.
+//
+// Bug 130 guard: if the RD is being deleted (CRD DeletionTimestamp
+// set, or the Store row has already vanished under a concurrent
+// rd-delete cascade), short-circuit BEFORE creating any new Resource.
+// Without this, a Reconcile fired by a Resource watch event that
+// landed milliseconds before the rd-delete REST handler would race
+// the cascade's snapshot-then-delete sequence and stamp a fresh
+// TIE_BREAKER witness on a third node — which the cascade then
+// misses, leaving a phantom Resource CRD that blocks reuse of the
+// RD name. The cascade-side retry loop (pkg/rest) catches whatever
+// slips past this guard; together they make the rd-delete fan-out
+// race-free.
 func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	if r.rdIsDeleting(ctx, rd) {
+		return nil
+	}
+
 	replicas, err := r.listReplicasDirect(ctx, rd.Name)
 	if err != nil {
 		return err
@@ -329,6 +345,36 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	}
 
 	return time.Now().Before(deadline)
+}
+
+// rdIsDeleting reports whether the RD is mid-delete from the
+// controller's perspective: the CRD has a DeletionTimestamp
+// stamped. The CRD-level DeletionTimestamp is the canonical
+// "k8s is finalising this object" signal — the rd-delete REST
+// handler stamps it before walking the cascade, and the controller
+// must not stamp new Resources on a rd that's being torn down.
+// Any witness created in that window is the Bug 130 phantom.
+//
+// We deliberately do NOT probe the Store for RD presence here.
+// Several existing tests (Bug 104, Bug 108) construct an RD in the
+// fake client only — the in-memory Store has no parallel row — and
+// rely on EnsureTiebreaker creating the witness anyway. Reading the
+// Store would mis-classify those legitimate witness creations as
+// "rd mid-delete" and break the auto-quorum invariant on every
+// reconcile. The CRD-DeletionTimestamp probe stays narrow: it
+// catches the case Bug 130 documents (controller fires AFTER
+// `kubectl delete rd` stamps the timestamp but BEFORE the cascade
+// finishes) while leaving the long-standing happy path alone.
+//
+// The cascade-side multi-pass list-then-delete (Bug 130 fix in
+// pkg/rest/resource_definitions.go) is the second half of the
+// invariant: it reaps any witness that slipped past this guard.
+func (r *ResourceDefinitionReconciler) rdIsDeleting(_ context.Context, rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if rd == nil {
+		return true
+	}
+
+	return !rd.DeletionTimestamp.IsZero()
 }
 
 // directOrCached returns the APIReader-direct reader when available
