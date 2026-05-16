@@ -153,8 +153,11 @@ func TestResourceConnectionPathDeleteLeavesOthers(t *testing.T) {
 
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE status: got %d, want 204", resp.StatusCode)
+	// Bug 198: DELETE now returns 200 + ApiCallRc envelope (was 204
+	// + empty body). golinstor / python-linstor decode every write
+	// reply as `[]ApiCallRc` unconditionally and crash on empty bodies.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status: got %d, want 200", resp.StatusCode)
 	}
 
 	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-1/resource-connections/n1/n2/paths")

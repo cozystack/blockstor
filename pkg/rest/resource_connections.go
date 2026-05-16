@@ -321,6 +321,15 @@ func upsertByName(paths []resourceConnectionPath, incoming resourceConnectionPat
 // handleResourceConnectionPathDelete answers DELETE on
 // /paths/{name}. Removing the last path also drops the storage key so
 // GET reverts to the canonical empty list.
+//
+// Bug 198: pre-fix wire shape was 204 + empty body. golinstor and
+// python-linstor decode every write reply as `[]ApiCallRc`
+// unconditionally — an empty body trips json.Unmarshal with "Unable
+// to parse REST json data: Expecting value" and the Python CLI
+// further dereferences `replies[0].ret_code`. Mirrors the Bug 45
+// envelope shape: 200 + `[{ret_code: MASK_INFO, message: ...}]` on a
+// real drop; 200 + warn envelope on a no-op replay (Bug 56 / 66
+// pattern for delete-of-missing).
 func (s *Server) handleResourceConnectionPathDelete(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	nodeA := r.PathValue("nodeA")
@@ -341,6 +350,7 @@ func (s *Server) handleResourceConnectionPathDelete(w http.ResponseWriter, r *ht
 		return
 	}
 
+	existed := containsPathName(paths, name)
 	paths = deleteByName(paths, name)
 
 	err = storePaths(&rd, nodeA, nodeB, paths)
@@ -357,7 +367,35 @@ func (s *Server) handleResourceConnectionPathDelete(w http.ResponseWriter, r *ht
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	if !existed {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnRscConnPathNotFound,
+			Message: "resource-connection path already absent: " +
+				name + " on " + rdName + " (" + nodeA + "," + nodeB + ")",
+		}})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "path deleted: " + name + " on " + rdName +
+			" (" + nodeA + "," + nodeB + ")",
+	}})
+}
+
+// containsPathName reports whether paths contains an entry with the
+// given Name. Used by the DELETE handler to distinguish "real drop"
+// from "no-op replay" so the envelope's ret_code can carry the right
+// mask (MASK_INFO vs MASK_WARN) — see Bug 198.
+func containsPathName(paths []resourceConnectionPath, name string) bool {
+	for i := range paths {
+		if paths[i].Name == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // deleteByName drops the entry with matching Name. Order-preserving.

@@ -151,6 +151,17 @@ const warnSnapshotNotFound = maskWarn | int64(2056)
 // warnSnapshotNotFound.
 const warnNoSatelliteConnection = maskWarn | int64(2057)
 
+// warnRscConnPathNotFound flags a delete-of-missing on
+// `DELETE /v1/resource-definitions/{rd}/resource-connections/{a}/{b}/
+// paths/{name}`. Bug 198: the pre-fix handler replied 204 + empty body
+// regardless of whether the named path existed; golinstor and python-
+// linstor both crash decoding the empty body as `[]ApiCallRc`. Folding
+// into a 200 + WARN envelope mirrors the Bug 56 / 66 pattern used by
+// every other "delete-of-missing" handler in this file. Sub-code 2058
+// keeps the warn-band numbering contiguous with warnNoSatelliteConnection
+// (2057).
+const warnRscConnPathNotFound = maskWarn | int64(2058)
+
 // apiCallRcFailSnapshotFinalizerStuck is emitted by `DELETE /v1/
 // resource-definitions/{rd}/snapshots/{snap}` (Bug 193) when the
 // Snapshot CRD's satellite-side finalizer
