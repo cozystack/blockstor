@@ -150,7 +150,21 @@ func (n *nodes) Update(ctx context.Context, in *apiv1.Node) error {
 		return errors.Wrapf(err, "get Node %q", in.Name)
 	}
 
+	// DRBDPortRange / DRBDMinorRange are operator-only typed
+	// pointers on the Node CRD with no counterpart on the wire
+	// `apiv1.Node` shape — `wireToCRDNodeSpec` therefore builds a
+	// spec that always omits them. Without an explicit carry-across,
+	// a routine REST modify (`linstor n set-property ...`) wipes
+	// the operator-pinned per-node DRBD port/minor range and pushes
+	// new replicas back onto the cluster-wide default 7000-7999 /
+	// 1000-1099 range, frequently into firewall-blocked ports
+	// (Bug 208). Same root-cause class as Bug 206's Spec.Volumes
+	// carry-across — mirror that pattern here.
+	prevPortRange := existing.Spec.DRBDPortRange
+	prevMinorRange := existing.Spec.DRBDMinorRange
 	existing.Spec = wireToCRDNodeSpec(in)
+	existing.Spec.DRBDPortRange = prevPortRange
+	existing.Spec.DRBDMinorRange = prevMinorRange
 
 	err = n.c.Update(ctx, &existing)
 	if err != nil {
@@ -302,7 +316,14 @@ func (n *nodes) PatchNodeSpec(ctx context.Context, name string, mutate func(*api
 			return err
 		}
 
+		// Preserve operator-only typed pointers — they have no
+		// wire-side counterpart and would be wiped by a naïve spec
+		// rebuild. Mirrors the carry-across in `Update` (Bug 208).
+		prevPortRange := existing.Spec.DRBDPortRange
+		prevMinorRange := existing.Spec.DRBDMinorRange
 		existing.Spec = wireToCRDNodeSpec(&wire)
+		existing.Spec.DRBDPortRange = prevPortRange
+		existing.Spec.DRBDMinorRange = prevMinorRange
 
 		return n.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
 	}), "patch Node %q", name)

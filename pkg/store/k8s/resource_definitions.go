@@ -123,9 +123,17 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		// set-property, RG-rebind, etc.). Carry them across
 		// explicitly. Status volumes are on a subresource and
 		// aren't touched by spec writes.
+		//
+		// The typed Encryption pointer is the same shape of
+		// problem (Bug 209): operator-only, no wire counterpart,
+		// silently wiped on every routine RD modify, which
+		// downgrades subsequent volumes to unencrypted. Carry it
+		// across alongside VolumeDefinitions.
 		prevVDs := existing.Spec.VolumeDefinitions
+		prevEncryption := existing.Spec.Encryption
 		existing.Spec = wireToCRDRDSpec(in)
 		existing.Spec.VolumeDefinitions = prevVDs
+		existing.Spec.Encryption = prevEncryption
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
@@ -209,12 +217,15 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 			return err
 		}
 
-		// Preserve inline VolumeDefinitions — they have no wire-side
+		// Preserve inline VolumeDefinitions and the typed Encryption
+		// pointer — both are operator-only with no wire-side
 		// counterpart and would be wiped by a naïve spec rebuild.
-		// Mirrors the carry-across in `Update`.
+		// Mirrors the carry-across in `Update` (Bug 206 / Bug 209).
 		prevVDs := existing.Spec.VolumeDefinitions
+		prevEncryption := existing.Spec.Encryption
 		existing.Spec = wireToCRDRDSpec(&wire)
 		existing.Spec.VolumeDefinitions = prevVDs
+		existing.Spec.Encryption = prevEncryption
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
 
