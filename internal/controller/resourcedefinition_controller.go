@@ -553,6 +553,23 @@ func quorumPolicy(diskful, diskless int) string {
 
 // createWitness picks a healthy non-replica node and creates a
 // DISKLESS+TIE_BREAKER Resource on it.
+//
+// Bug 153 burst-aware rollback: after the witness Create succeeds,
+// re-probe the parent RD via the APIReader (direct apiserver path,
+// no informer cache). If the CRD is now NotFound — i.e. the
+// cascade has dropped it during the window between
+// `rdIsDeleting` and the Create — delete the just-created witness
+// so it doesn't outlive its parent and become a phantom. Combined
+// with the cascade-side retry-until-empty (Bug 130 fix in
+// pkg/rest/resource_definitions.go::cascadeDeleteResources) and
+// the existing DeletionTimestamp guard, this closes the burst
+// race from a third side without requiring K8s owner-reference
+// GC (which the in-memory Store doesn't model and which the
+// satellite finalizer chain interacts with in non-trivial ways).
+//
+// The probe only runs when APIReader is non-nil — unit-test setups
+// that construct the reconciler directly and rely on the
+// Bug 104/108 fake-client-only fixtures stay unaffected.
 func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) error {
 	hostingReplica := map[string]bool{}
 	for i := range existing {
@@ -581,7 +598,36 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 		return err
 	}
 
+	r.rollbackWitnessIfRDGone(ctx, rd.Name, tiebreakerNode)
+
 	return nil
+}
+
+// rollbackWitnessIfRDGone probes the parent RD via the APIReader
+// after a successful witness Create and rolls back if the CRD is
+// now absent or has gained a DeletionTimestamp. Best-effort —
+// any error in the rollback path is logged via the reconciler's
+// usual error surface (returning here keeps the original Create
+// successful; the next reconcile will catch the orphan via the
+// cascade's retry loop).
+func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Context, rdName, witnessNode string) {
+	if r.APIReader == nil {
+		return
+	}
+
+	var fresh blockstoriov1alpha1.ResourceDefinition
+
+	err := r.APIReader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
+	if err == nil && fresh.DeletionTimestamp.IsZero() {
+		// RD is still live and not mid-delete; witness is valid.
+		return
+	}
+
+	// Either NotFound (cascade dropped the CRD) or DeletionTimestamp
+	// is set (cascade in progress). Either way the witness must not
+	// outlive its parent — roll it back. Swallow ErrNotFound: a
+	// concurrent reconcile may have already done the cleanup.
+	_ = r.Store.Resources().Delete(ctx, rdName, witnessNode)
 }
 
 // filterTieBreaker returns the subset of diskless replicas that
