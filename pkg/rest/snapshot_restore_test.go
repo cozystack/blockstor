@@ -161,6 +161,13 @@ func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name: "snap-1", ResourceName: "pvc-src", Nodes: []string{"n1", "n2"},
+		// Bug 151 follow-up: empty-VD snapshots are now refused; this
+		// test cares about the provider-filter path, so we attach a
+		// small placeholder VD to keep the restore on the success
+		// path without exceeding the candidate pools' FreeCapacity.
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 64},
+		},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
 	}
@@ -268,6 +275,12 @@ func TestSnapshotRestoreFailsWhenNoMatchingProvider(t *testing.T) {
 
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name: "snap-1", ResourceName: "pvc-src", Nodes: []string{"n2", "n3"},
+		// Bug 151 follow-up: empty-VD snapshots are now refused;
+		// this test cares about the provider-mismatch error path
+		// on autoplace, so we attach a placeholder VD.
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
 	}
@@ -544,6 +557,13 @@ func TestSnapshotRestoreConflict(t *testing.T) {
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
 		Name:         "snap-1",
 		ResourceName: "pvc-src",
+		// Bug 151 follow-up: empty-VD snapshots are now refused;
+		// this test cares about the target-already-exists 409
+		// path, so we attach a placeholder VD to advance past the
+		// vol-less-source gate.
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
 	}); err != nil {
 		t.Fatalf("seed snap: %v", err)
 	}

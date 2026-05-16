@@ -92,6 +92,28 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 151: a vol-less snapshot taken of a vol-less source RD
+	// restores to a structurally meaningless target — no volumes
+	// to clone, no resources to place. Operator-poke v4 reproduced
+	// this by snapshotting an RD with no VDs and seeing an empty
+	// shell on the other side. Refuse with 400 + a LINSTOR-shape
+	// envelope explaining the gap; rollback nothing because we
+	// haven't touched the Store yet.
+	if len(snap.VolumeDefinitions) == 0 {
+		writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot '" + snapName + "' on '" + srcRD +
+				"' has no volume definitions; refusing to restore an empty shell",
+			Cause: "the snapshot was taken of a resource definition with no " +
+				"VolumeDefinitions, so there is nothing to restore from",
+			Correc: "create the volume definitions on '" + srcRD +
+				"' (`linstor vd c " + srcRD + " <size>`), retake the snapshot, " +
+				"then re-run `linstor s resource restore`",
+		}})
+
+		return
+	}
+
 	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap)
 	if err != nil {
 		writeStoreError(w, err)
@@ -131,9 +153,17 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	}
 
 	newRD := apiv1.ResourceDefinition{
-		Name:       req.ToResource,
-		Props:      maps.Clone(snap.Props),
-		LayerStack: srcRDObj.LayerStack,
+		Name: req.ToResource,
+		// Bug 151: carry over the source's ResourceGroupName so the
+		// restored RD inherits the same parent RG. Pre-fix the field
+		// was silently dropped — `linstor rd l <restored>` then
+		// showed a blank resource_group_name column, breaking the
+		// `s resource restore` → `rd l` operator workflow upstream
+		// LINSTOR ties together (the parent RG drives subsequent
+		// auto-placement and prop inheritance).
+		ResourceGroupName: srcRDObj.ResourceGroupName,
+		Props:             maps.Clone(snap.Props),
+		LayerStack:        srcRDObj.LayerStack,
 	}
 
 	if newRD.Props == nil {
