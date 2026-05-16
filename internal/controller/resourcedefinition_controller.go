@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,19 @@ import (
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// Bug148ResizePendingAnnotationPrefix is the per-volume annotation
+// key the controller stamps on every Resource of an RD whose
+// `spec.volumeDefinitions[].sizeKib` differs from the Resource's
+// observed `status.volumes[n].usableKib`. Mirrors the production
+// constant in pkg/rest/volume_definitions.go (`resizePending
+// AnnotationPrefix`) — Bug 136's REST handler stamps the same key
+// on the PUT path; Bug 148 extends coverage to the kubectl-edit
+// path that bypasses REST.
+//
+// Per-volume key suffix so multi-volume RDs (rare today but on the
+// roadmap) keep concurrent grow-shrink decisions distinguishable.
+const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
 
 // ResourceDefinitionReconciler watches RD CRDs and maintains the
 // tiebreaker invariant: an RD with exactly 2 diskful replicas in a
@@ -103,6 +117,22 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 	err = r.ensureTiebreaker(ctx, &rd)
 	if err != nil {
 		log.Error(err, "ensure tiebreaker", "rd", rd.Name)
+
+		return ctrl.Result{}, err
+	}
+
+	// Bug 148: stamp the per-volume resize-pending annotation on
+	// every Resource whose `status.volumes[n].usableKib` lags the
+	// RD's `spec.volumeDefinitions[].sizeKib`. The REST handler
+	// (Bug 136) already stamps on the PUT path; this branch covers
+	// the kubectl-edit path where `spec.volumeDefinitions[].sizeKib`
+	// is mutated directly and the REST handler never runs. Without
+	// this, a kubectl-edit'd grow would change the spec but leave
+	// the satellite with no resize-pending breadcrumb — the on-disk
+	// block device stays at the old size forever.
+	err = r.stampResizePending(ctx, &rd)
+	if err != nil {
+		log.Error(err, "stamp resize-pending", "rd", rd.Name)
 
 		return ctrl.Result{}, err
 	}
@@ -702,6 +732,109 @@ func alreadyExists(err error) bool {
 	}
 
 	return strings.Contains(err.Error(), "already exists")
+}
+
+// stampResizePending walks the RD's volume-definitions and for each
+// child Resource whose observed `Status.Volumes[n].UsableKib` lags
+// the RD spec's `SizeKib`, stamps the per-volume resize-pending
+// annotation so operators (and downstream watchers) can see that
+// the satellite still owes the resize. Bug 148.
+//
+// Mirrors Bug 136's REST-handler stamp but fires on EVERY reconcile,
+// so kubectl-edit-driven grows (which bypass the REST surface)
+// gain the same operator-visible signal. Idempotent: a Resource
+// whose UsableKib already matches the target size doesn't get
+// re-stamped, avoiding apiserver write thrash on every periodic
+// reconcile.
+//
+// Best-effort on per-Resource Update errors — the RD spec change
+// is the load-bearing mutation; an annotation-stamp failure on
+// one Resource doesn't roll back the others, and the next
+// reconcile re-tries the failed entries.
+//
+// Operates on the K8s Resource CRDs (not the in-memory Store)
+// because the annotation is what `kubectl get resource -o yaml`
+// surfaces and what the satellite reconciler's RD-watch hook
+// keys off of when it re-renders.
+func (r *ResourceDefinitionReconciler) stampResizePending(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	if len(rd.Spec.VolumeDefinitions) == 0 {
+		return nil
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+
+	err := r.List(ctx, &resList)
+	if err != nil {
+		return err
+	}
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName != rd.Name {
+			continue
+		}
+
+		err = r.stampResizePendingOnResource(ctx, rd, &resList.Items[i])
+		if err != nil && !apierrors.IsNotFound(err) {
+			logf.FromContext(ctx).Info("stampResizePending: update skipped",
+				"resource", resList.Items[i].Name, "err", err.Error())
+		}
+	}
+
+	return nil
+}
+
+// stampResizePendingOnResource stamps the per-volume annotation on
+// one Resource whose Status.Volumes[n].UsableKib lags the RD spec.
+// Returns nil when the Resource needs no update (idempotent path).
+func (r *ResourceDefinitionReconciler) stampResizePendingOnResource(
+	ctx context.Context,
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	res *blockstoriov1alpha1.Resource,
+) error {
+	updated := false
+
+	for _, vd := range rd.Spec.VolumeDefinitions {
+		observed := observedUsableKib(res, vd.VolumeNumber)
+		if observed == vd.SizeKib {
+			continue
+		}
+
+		key := Bug148ResizePendingAnnotationPrefix + strconv.FormatInt(int64(vd.VolumeNumber), 10)
+		value := strconv.FormatInt(vd.SizeKib, 10)
+
+		if res.Annotations != nil && res.Annotations[key] == value {
+			continue
+		}
+
+		if res.Annotations == nil {
+			res.Annotations = map[string]string{}
+		}
+
+		res.Annotations[key] = value
+		updated = true
+	}
+
+	if !updated {
+		return nil
+	}
+
+	return r.Update(ctx, res)
+}
+
+// observedUsableKib returns the satellite-reported UsableKib for the
+// given volume number on this Resource, or 0 when the satellite has
+// not yet reported volumes for that slot. Treating 0 as "lags the
+// target" is correct: a freshly-spawned Resource with no observed
+// volumes yet should get the resize-pending stamp so the satellite's
+// first apply pass sees the target size as the desired state.
+func observedUsableKib(res *blockstoriov1alpha1.Resource, vn int32) int64 {
+	for i := range res.Status.Volumes {
+		if res.Status.Volumes[i].VolumeNumber == vn {
+			return res.Status.Volumes[i].UsableKib
+		}
+	}
+
+	return 0
 }
 
 // SetupWithManager sets up the controller with the Manager.

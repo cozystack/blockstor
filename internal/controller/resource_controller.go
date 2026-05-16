@@ -139,7 +139,104 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	// Bug 149: orphan detection. `kubectl delete rd --cascade=orphan`
+	// removes the parent RD CRD without touching its child Resources
+	// — leaving Resources alive with no parent. They never get GC'd
+	// because:
+	//   - the controller-side rd-delete cascade (which would tear
+	//     them down) doesn't run on the kubectl path;
+	//   - the satellite reconciler's handleDelete only fires on a
+	//     DeletionTimestamp, which the orphan never gets without
+	//     us setting it.
+	//
+	// Trigger Delete on the orphan Resource so kube-apiserver stamps
+	// a DeletionTimestamp; the satellite reconciler then runs its
+	// teardown chain (with Bug 107's annotation-based volume-number
+	// fallback for the case where the RD CRD really is gone).
+	orphaned, err := r.handleOrphan(ctx, &target)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if orphaned {
+		return ctrl.Result{}, nil
+	}
+
 	return r.runApply(ctx, &target)
+}
+
+// satelliteResourceFinalizer mirrors the
+// `pkg/satellite/controllers.SatelliteResourceFinalizer` constant
+// without an import — the satellite package imports
+// `internal/controller` for shared helpers, so the reverse direction
+// is forbidden to avoid a cycle. Duplicating one string is the
+// pragmatic fix; a rename on either side breaks compile here via the
+// related tests, which reference the same literal.
+const satelliteResourceFinalizer = "blockstor.io.blockstor.io/satellite-resource"
+
+// handleOrphan checks whether the Resource's parent ResourceDefinition
+// CRD still exists. When the RD is gone — the kubectl-cascade-orphan
+// state Bug 149 documents — Delete is invoked on the Resource so the
+// satellite finalizer chain runs and the orphan eventually disappears.
+// Returns true when the Resource was orphaned (caller short-circuits
+// the rest of the reconcile chain because housekeeping on a doomed
+// Resource is wasted work).
+//
+// Production-state gate: the orphan path only fires for Resources
+// that have been successfully applied at least once — either they
+// carry the satellite finalizer (`SatelliteResourceFinalizer`) or
+// the Bug 107 `blockstor.io/volume-numbers` annotation. Fresh
+// scaffolded Resources that have never reached a satellite (e.g.
+// envtest scenarios that mint a Resource without an RD as a stub)
+// are left alone — there's nothing for the satellite to tear down,
+// and triggering Delete on them would surprise downstream test
+// harnesses that build Resources without their parent RD.
+func (r *ResourceReconciler) handleOrphan(ctx context.Context, target *blockstoriov1alpha1.Resource) (bool, error) {
+	if !resourceWasApplied(target) {
+		return false, nil
+	}
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: target.Spec.ResourceDefinitionName}, &rd)
+	if err == nil {
+		return false, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return false, err
+	}
+
+	// Parent RD gone — invoke Delete so the satellite finalizer chain
+	// runs. Idempotent: a second pass on an already-deleting Resource
+	// surfaces a no-op because kube-apiserver doesn't re-stamp the
+	// DeletionTimestamp once set.
+	err = r.Delete(ctx, target)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// resourceWasApplied reports whether the Resource carries evidence
+// of at least one successful satellite-side apply pass: either the
+// satellite finalizer (stamped on first reconcile by the satellite
+// reconciler) or the Bug 107 volume-numbers annotation (stamped on
+// every successful apply). Without either, the Resource is a
+// freshly-scaffolded stub and the orphan path is a no-op.
+func resourceWasApplied(target *blockstoriov1alpha1.Resource) bool {
+	if slices.Contains(target.Finalizers, satelliteResourceFinalizer) {
+		return true
+	}
+
+	if target.Annotations != nil {
+		if _, ok := target.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]; ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 // runApply is the apply branch of Reconcile. Pulled out to keep
