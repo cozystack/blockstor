@@ -55,6 +55,22 @@ type NodeStore interface {
 	// polls /v1/nodes/<name> for connection_status:"ONLINE"; this is
 	// where the satellite's gRPC Hello surfaces that state.
 	SetConnectionStatus(ctx context.Context, name, status string) error
+
+	// PatchNetInterfaces runs `mutate` against the freshly-fetched
+	// current NetInterface list and persists the returned slice. The
+	// store handles Get + retry-on-conflict; `mutate` is re-invoked
+	// against a re-fetched current state on every conflict retry, so
+	// disjoint concurrent edits all converge (Bug 201).
+	//
+	// Distinct from `Update(...)` which applies a wire-side snapshot
+	// wholesale and silently drops concurrent peer additions.
+	PatchNetInterfaces(ctx context.Context, name string, mutate func([]apiv1.NetInterface) ([]apiv1.NetInterface, error)) error
+
+	// PatchProps runs `mutate` against the freshly-fetched current
+	// Props map and persists the mutated map. Same retry-on-conflict
+	// semantics as PatchNetInterfaces; `mutate` is re-applied to the
+	// re-fetched current state on every retry (Bug 201).
+	PatchProps(ctx context.Context, name string, mutate func(map[string]string) error) error
 }
 
 // StoragePoolStore persists StoragePool objects. The composite key is
@@ -81,6 +97,17 @@ type ResourceGroupStore interface {
 	Create(ctx context.Context, rg *apiv1.ResourceGroup) error
 	Update(ctx context.Context, rg *apiv1.ResourceGroup) error
 	Delete(ctx context.Context, name string) error
+
+	// PatchResourceGroup runs `mutate` against the freshly-fetched
+	// current ResourceGroup wire value and persists the result. The
+	// store handles Get + retry-on-conflict; `mutate` is re-invoked
+	// against a re-fetched current state on every conflict retry, so
+	// disjoint concurrent edits (RG modify + per-key prop delete)
+	// all converge (Bug 201).
+	//
+	// Distinct from `Update(...)` which applies the wire snapshot
+	// wholesale and silently drops concurrent peer mutations.
+	PatchResourceGroup(ctx context.Context, name string, mutate func(*apiv1.ResourceGroup) error) error
 }
 
 // ResourceDefinitionStore persists ResourceDefinition objects. Keyed by name.

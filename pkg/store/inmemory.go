@@ -213,6 +213,65 @@ func (s *inMemoryNodes) Update(_ context.Context, n *apiv1.Node) error {
 	return nil
 }
 
+// PatchNetInterfaces runs `mutate` atomically against the live node
+// entry under the write lock. The InMemory store has no
+// resourceVersion surface, so lock-held single-shot mutate covers
+// what `RetryOnConflict` does on the k8s backend. Disjoint
+// concurrent NetInterface edits all converge.
+func (s *inMemoryNodes) PatchNetInterfaces(_ context.Context, name string, mutate func([]apiv1.NetInterface) ([]apiv1.NetInterface, error)) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "node %q", name)
+	}
+
+	out, err := mutate(node.NetInterfaces)
+	if err != nil {
+		return errors.Wrapf(err, "patch NetInterfaces of node %q", name)
+	}
+
+	node.NetInterfaces = out
+	s.m[name] = node
+
+	return nil
+}
+
+// PatchProps runs `mutate` atomically against the live node's Props
+// map under the write lock. The map handed to `mutate` is the live
+// reference, so in-place edits land directly; nil is initialised to
+// an empty map first so callers can unconditionally write.
+func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(map[string]string) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "node %q", name)
+	}
+
+	if node.Props == nil {
+		node.Props = map[string]string{}
+	}
+
+	if err := mutate(node.Props); err != nil {
+		return errors.Wrapf(err, "patch Props of node %q", name)
+	}
+
+	s.m[name] = node
+
+	return nil
+}
+
 // Delete removes a node by name. Returns ErrNotFound if absent.
 func (s *inMemoryNodes) Delete(_ context.Context, name string) error {
 	s.mu.Lock()

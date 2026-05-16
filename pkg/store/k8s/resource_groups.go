@@ -118,6 +118,57 @@ func (s *resourceGroups) Update(ctx context.Context, in *apiv1.ResourceGroup) er
 	}), "update ResourceGroup %q", in.Name)
 }
 
+// PatchResourceGroup runs `mutate` against the freshly-fetched
+// current wire-shape ResourceGroup and persists the mutated value via
+// a typed-Patch (JSON-merge-patch). On 409 the cycle re-runs against
+// fresh state.
+//
+// Unlike `Update`, the mutation closure runs against state re-derived
+// from the apiserver on every retry — so concurrent disjoint writes
+// (e.g. `rg modify --override-props` racing with `rg dp <key>`)
+// converge instead of clobbering one another via stale wire snapshots
+// (Bug 201). The closure receives the live wire ResourceGroup; the
+// store reconstructs the CRD Spec from the post-mutate value and
+// preserves user annotations via `mergeUserAnnotationsInto` exactly
+// as `Update` does.
+func (s *resourceGroups) PatchResourceGroup(ctx context.Context, name string, mutate func(*apiv1.ResourceGroup) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.ResourceGroup
+
+		err := s.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "resource group %q", name)
+			}
+
+			return errors.Wrapf(err, "get ResourceGroup %q", name)
+		}
+
+		base := existing.DeepCopy()
+
+		// Surface as wire shape so the closure runs in the same
+		// vocabulary as REST handlers.
+		wire := crdToWireRG(&existing)
+		// Preserve OriginalName etc. on the wire copy is automatic
+		// (crdToWireRG already pulled it from the annotation).
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		// Re-derive Spec from the mutated wire value. Annotations
+		// follow `Update`'s merge contract.
+		existing.Spec = wireToCRDRGSpec(&wire)
+		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
+
+		return s.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch ResourceGroup %q", name)
+}
+
 func (s *resourceGroups) Delete(ctx context.Context, name string) error {
 	crd := &crdv1alpha1.ResourceGroup{ObjectMeta: metav1.ObjectMeta{Name: Name(name)}}
 

@@ -91,6 +91,32 @@ func (s *inMemoryResourceGroups) Update(_ context.Context, rg *apiv1.ResourceGro
 	return nil
 }
 
+// PatchResourceGroup runs `mutate` atomically against the live entry
+// under the write lock — the InMemory store has no resourceVersion
+// surface so a single lock-held mutate doubles as the retry loop the
+// k8s backend needs. Disjoint concurrent edits all converge.
+func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name string, mutate func(*apiv1.ResourceGroup) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rg, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "resource group %q", name)
+	}
+
+	if err := mutate(&rg); err != nil {
+		return errors.Wrapf(err, "patch ResourceGroup %q", name)
+	}
+
+	s.m[name] = rg
+
+	return nil
+}
+
 func (s *inMemoryResourceGroups) Delete(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

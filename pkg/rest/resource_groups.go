@@ -170,39 +170,38 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// golinstor's RG Modify sends a `ResourceGroupModify` body —
-	// override_props / delete_props on top of the existing
-	// SelectFilter. Load existing and merge instead of clobbering
-	// (the old replace-whole-object semantic nuked select_filter
-	// + props on every prop-only PUT).
-	existing, err := s.Store.ResourceGroups().Get(r.Context(), name)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 201: routes through Store.ResourceGroups().PatchResourceGroup
+	// so the merge runs against state re-fetched after every 409
+	// instead of replaying the stale wire snapshot captured at the
+	// REST-layer Get. A concurrent `linstor rg dp <key>` or sibling
+	// `rg modify --override-props` cannot silently overwrite this
+	// PUT's contribution.
+	var rebalanceScheduled bool
 
-		return
-	}
+	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
+		prevFilter := existing.SelectFilter
+		applyRGUpdatePatch(existing, &patch, raw)
 
-	prevFilter := existing.SelectFilter
-	applyRGUpdatePatch(&existing, &patch, raw)
+		// Bug 60 (cli-parity-audit row #41): upstream LINSTOR
+		// re-runs autoplace on every child RD when `rg modify`
+		// raises PlaceCount or changes a placement-affecting
+		// filter. Phase 11.x split pushed reconcilers into a
+		// separate process, so the REST handler can't walk RDs
+		// inline — instead it stamps the
+		// `blockstor.io/rebalance-pending` annotation and the
+		// RGRebalanceReconciler picks it up. Scale-DOWN
+		// intentionally does NOT trigger anything.
+		rebalanceScheduled = rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
+		if rebalanceScheduled {
+			if existing.Annotations == nil {
+				existing.Annotations = map[string]string{}
+			}
 
-	// Bug 60 (cli-parity-audit row #41): upstream LINSTOR re-runs
-	// autoplace on every child RD when `rg modify` raises PlaceCount
-	// or changes a placement-affecting filter. Phase 11.x split
-	// pushed reconcilers into a separate process, so the REST
-	// handler can't walk RDs inline — instead it stamps the
-	// `blockstor.io/rebalance-pending` annotation and the
-	// RGRebalanceReconciler picks it up. Scale-DOWN intentionally
-	// does NOT trigger anything.
-	rebalanceScheduled := rgNeedsRebalance(&prevFilter, &existing.SelectFilter)
-	if rebalanceScheduled {
-		if existing.Annotations == nil {
-			existing.Annotations = map[string]string{}
+			existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
 		}
 
-		existing.Annotations[apiv1.AnnotationRGRebalancePending] = time.Now().UTC().Format(time.RFC3339Nano)
-	}
-
-	err = s.Store.ResourceGroups().Update(r.Context(), &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -721,14 +720,19 @@ func (s *Server) handleRGPropDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// Bug 201: probe with Get for the "already absent" idempotent
+	// envelope (warn-mask response shape), then route the actual
+	// delete through Store.ResourceGroups().PatchResourceGroup so a
+	// concurrent `linstor rg modify` cannot silently overwrite this
+	// deletion via wholesale-Spec-replace.
+	probe, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	if _, present := existing.Props[key]; !present {
+	if _, present := probe.Props[key]; !present {
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 			RetCode: maskWarn,
 			Message: "resource group " + rgName + " property already absent: " + key,
@@ -738,9 +742,11 @@ func (s *Server) handleRGPropDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	delete(existing.Props, key)
+	err = s.Store.ResourceGroups().PatchResourceGroup(r.Context(), rgName, func(existing *apiv1.ResourceGroup) error {
+		delete(existing.Props, key)
 
-	err = s.Store.ResourceGroups().Update(r.Context(), &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 

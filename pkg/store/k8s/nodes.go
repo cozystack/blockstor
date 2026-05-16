@@ -21,17 +21,56 @@ import (
 	"maps"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
+
+// Bug 201 Patch helpers tune their own conflict-retry backoff
+// rather than reusing `retry.DefaultRetry`. The default's 5 steps
+// at 10 ms each handle low-concurrency RG/Node updates, but the
+// REST surface fan-outs that Bug 201 targets — NetInterface CRUD
+// from satellite controllers, RG-prop mutation under linstor-csi
+// load — can fan in dozens of concurrent writers to the same CRD.
+// patchRetrySteps with patchRetryBaseDuration base and
+// patchRetryFactor escalation budgets enough retries for a 50-way
+// burst to converge under the fake-client's all-or-nothing
+// conflict model; on the real apiserver the backoff Cap caps any
+// single retry below ~1 s even if the satellite reconciler is
+// bombarding the object.
+const (
+	patchRetrySteps        = 20
+	patchRetryBaseDuration = 5 * time.Millisecond
+	patchRetryFactor       = 1.5
+	patchRetryJitter       = 0.3
+	patchRetryCap          = time.Second
+)
+
+// patchRetryBackoff returns a fresh Backoff value — wait.Backoff
+// mutates `Duration`/`Steps` in place during exponential walks, so
+// the loop body in `RetryOnConflict` needs a fresh copy each call.
+// Keeping this a function (rather than a package-level var)
+// sidesteps the gochecknoglobals lint and avoids accidental shared
+// state between concurrent callers.
+func patchRetryBackoff() wait.Backoff {
+	return wait.Backoff{
+		Steps:    patchRetrySteps,
+		Duration: patchRetryBaseDuration,
+		Factor:   patchRetryFactor,
+		Jitter:   patchRetryJitter,
+		Cap:      patchRetryCap,
+	}
+}
 
 // nodes implements store.NodeStore against the Node CRD.
 type nodes struct {
@@ -146,6 +185,122 @@ func (n *nodes) SetConnectionStatus(ctx context.Context, name, status string) er
 	}
 
 	return nil
+}
+
+// PatchNetInterfaces runs `mutate` against the freshly-fetched current
+// NetInterface list and persists the returned slice via a typed-Patch
+// (JSON-merge-patch). On 409 the entire Get → mutate → Patch cycle
+// re-runs against the fresh state — so a concurrent peer's
+// NetInterface additions/deletions are visible to `mutate` on the
+// retry, and the wholesale `existing.Spec = wireToCRDNodeSpec(in)`
+// stale-snapshot lost-update (Bug 201) cannot happen.
+//
+// `mutate` receives the current wire-shape NetInterfaces and returns
+// the desired list. Returning nil or empty wipes the field; the spec
+// converter normalises both the same way as Update.
+func (n *nodes) PatchNetInterfaces(ctx context.Context, name string, mutate func([]apiv1.NetInterface) ([]apiv1.NetInterface, error)) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.Node
+
+		err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "node %q", name)
+			}
+
+			return errors.Wrapf(err, "get Node %q", name)
+		}
+
+		// Surface the CRD's NetInterfaces in wire shape so the
+		// closure works in the same vocabulary as REST handlers.
+		current := make([]apiv1.NetInterface, 0, len(existing.Spec.NetInterfaces))
+		for i := range existing.Spec.NetInterfaces {
+			ni := &existing.Spec.NetInterfaces[i]
+			current = append(current, apiv1.NetInterface{
+				Name:                    ni.Name,
+				Address:                 ni.Address,
+				SatellitePort:           int(ni.SatellitePort),
+				SatelliteEncryptionType: ni.SatelliteEncryptionType,
+			})
+		}
+
+		next, err := mutate(current)
+		if err != nil {
+			return err
+		}
+
+		// Build a typed-patch base: copy existing, mutate only the
+		// NetInterfaces slice, send a JSON-merge-patch diff. The
+		// merge-patch ensures the apiserver only sees the field we
+		// intend to write — any concurrent peer edit on Props or
+		// SatelliteEndpoint is preserved on the server side.
+		base := existing.DeepCopy()
+
+		existing.Spec.NetInterfaces = existing.Spec.NetInterfaces[:0]
+		if cap(existing.Spec.NetInterfaces) < len(next) {
+			existing.Spec.NetInterfaces = make([]crdv1alpha1.NodeNetInterface, 0, len(next))
+		}
+
+		for i := range next {
+			ni := &next[i]
+			existing.Spec.NetInterfaces = append(existing.Spec.NetInterfaces, crdv1alpha1.NodeNetInterface{
+				Name:                    ni.Name,
+				Address:                 ni.Address,
+				SatellitePort:           int32(ni.SatellitePort), //nolint:gosec // upstream LINSTOR ports fit in int32
+				SatelliteEncryptionType: strings.ToUpper(ni.SatelliteEncryptionType),
+			})
+		}
+
+		return n.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch NetInterfaces of Node %q", name)
+}
+
+// PatchProps runs `mutate` against the freshly-fetched current Props
+// map and persists the mutated map via a typed-Patch
+// (JSON-merge-patch). On 409 the cycle re-runs against fresh state.
+//
+// `mutate` receives the live wire-shape Props (initialised to a
+// non-nil map when the CRD's was nil); in-place edits land directly.
+// SatelliteEndpoint is re-derived from the post-mutate map, matching
+// `wireToCRDNodeSpec`.
+func (n *nodes) PatchProps(ctx context.Context, name string, mutate func(map[string]string) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.Node
+
+		err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "node %q", name)
+			}
+
+			return errors.Wrapf(err, "get Node %q", name)
+		}
+
+		base := existing.DeepCopy()
+
+		props := existing.Spec.Props
+		if props == nil {
+			props = map[string]string{}
+		}
+
+		err = mutate(props)
+		if err != nil {
+			return err
+		}
+
+		existing.Spec.Props = props
+		existing.Spec.SatelliteEndpoint = props["SatelliteEndpoint"]
+
+		return n.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch Props of Node %q", name)
 }
 
 // Delete removes the named Node CRD.

@@ -137,73 +137,76 @@ func (s *Server) handleNetInterfaceGet(w http.ResponseWriter, r *http.Request) {
 
 // handleNetInterfaceCreate appends a NetInterface to the Node's spec.
 // Idempotent: a second create with the same name updates in place.
+//
+// Bug 201: routes through Store.Nodes().PatchNetInterfaces so the
+// mutation closure runs against state re-fetched after every 409,
+// instead of replaying a wire snapshot captured at the REST-layer
+// Get. A concurrent peer's `handleNetInterfaceDelete` cannot
+// silently overwrite this addition.
 func (s *Server) handleNetInterfaceCreate(w http.ResponseWriter, r *http.Request) {
-	mutateNetInterface(w, r, s, func(n *apiv1.Node, iface apiv1.NetInterface) error {
-		for i := range n.NetInterfaces {
-			if n.NetInterfaces[i].Name == iface.Name {
-				n.NetInterfaces[i] = iface
+	mutateNetInterface(w, r, s, func(current []apiv1.NetInterface, iface apiv1.NetInterface) ([]apiv1.NetInterface, error) {
+		for i := range current {
+			if current[i].Name == iface.Name {
+				current[i] = iface
 
-				return nil
+				return current, nil
 			}
 		}
 
-		n.NetInterfaces = append(n.NetInterfaces, iface)
-
-		return nil
+		return append(current, iface), nil
 	})
 }
 
 // handleNetInterfaceUpdate is the per-name replace. The path's
 // {name} wins over any name in the body so callers can omit it.
+//
+// Bug 201: see handleNetInterfaceCreate. Same Patch routing.
 func (s *Server) handleNetInterfaceUpdate(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 
-	mutateNetInterface(w, r, s, func(n *apiv1.Node, iface apiv1.NetInterface) error {
+	mutateNetInterface(w, r, s, func(current []apiv1.NetInterface, iface apiv1.NetInterface) ([]apiv1.NetInterface, error) {
 		iface.Name = name
 
-		for i := range n.NetInterfaces {
-			if n.NetInterfaces[i].Name == name {
-				n.NetInterfaces[i] = iface
+		for i := range current {
+			if current[i].Name == name {
+				current[i] = iface
 
-				return nil
+				return current, nil
 			}
 		}
 
 		// Update on a missing interface is also a create — matches
 		// upstream LINSTOR's PUT-creates semantic for `linstor n
 		// interface modify`.
-		n.NetInterfaces = append(n.NetInterfaces, iface)
-
-		return nil
+		return append(current, iface), nil
 	})
 }
 
 // handleNetInterfaceDelete drops the named NetInterface. Missing →
 // no-op (idempotent).
+//
+// Bug 201: routes through Store.Nodes().PatchNetInterfaces — the
+// delete closure re-runs against state re-fetched after every 409,
+// so a sibling `handleNetInterfaceCreate` adding a different
+// interface concurrently won't be silently dropped on the
+// wholesale-Spec-replace path the old `Update` used.
 func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request) {
 	nodeName := r.PathValue("node")
 	name := r.PathValue("name")
 
-	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
-	if err != nil {
-		writeStoreError(w, err)
+	err := s.Store.Nodes().PatchNetInterfaces(r.Context(), nodeName, func(current []apiv1.NetInterface) ([]apiv1.NetInterface, error) {
+		out := current[:0]
 
-		return
-	}
+		for i := range current {
+			if current[i].Name == name {
+				continue
+			}
 
-	out := node.NetInterfaces[:0]
-
-	for i := range node.NetInterfaces {
-		if node.NetInterfaces[i].Name == name {
-			continue
+			out = append(out, current[i])
 		}
 
-		out = append(out, node.NetInterfaces[i])
-	}
-
-	node.NetInterfaces = out
-
-	err = s.Store.Nodes().Update(r.Context(), &node)
+		return out, nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -216,11 +219,11 @@ func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request
 	}})
 }
 
-// mutateNetInterface decodes a NetInterface body, runs the supplied
-// mutation against the node's interface list, and persists. Used by
-// both create and update so the decoder + Get + Update plumbing stays
-// in one place.
-func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutate func(*apiv1.Node, apiv1.NetInterface) error) {
+// mutateNetInterface decodes a NetInterface body and runs the
+// supplied mutation against the node's NetInterface list via the
+// Bug 201 Patch helper. Used by both create and update so the
+// decoder + Patch plumbing stays in one place.
+func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutate func([]apiv1.NetInterface, apiv1.NetInterface) ([]apiv1.NetInterface, error)) {
 	nodeName := r.PathValue("node")
 
 	var iface apiv1.NetInterface
@@ -235,21 +238,9 @@ func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutat
 		return
 	}
 
-	node, err := s.Store.Nodes().Get(r.Context(), nodeName)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	err = mutate(&node, iface)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
-	err = s.Store.Nodes().Update(r.Context(), &node)
+	err := s.Store.Nodes().PatchNetInterfaces(r.Context(), nodeName, func(current []apiv1.NetInterface) ([]apiv1.NetInterface, error) {
+		return mutate(current, iface)
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -718,6 +709,20 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 201: NodeType lives on the typed Spec.Type field (not
+	// in Props), so a `node_type` toggle needs the wholesale-Spec
+	// Update surface. The typical prop-only path routes through
+	// PatchProps — the lost-update class lives on the prop-
+	// mutation flank. node_type is rarely toggled in production
+	// (linstor-csi and piraeus pin it at register time and never
+	// flip it), so applying it via the wholesale Update path is
+	// acceptable for now.
+	//
+	// We probe Get first so the 404 semantics for a missing node
+	// still surface for a body that touches neither NodeType nor
+	// Props/DeleteProps (`{"type":"SATELLITE"}` with no
+	// node_type/override_props/delete_props is a legitimate
+	// no-op-but-must-exist request shape).
 	existing, err := s.Store.Nodes().Get(r.Context(), name)
 	if err != nil {
 		writeStoreError(w, err)
@@ -725,25 +730,32 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if patch.NodeType != "" {
+	if patch.NodeType != "" && patch.NodeType != existing.Type {
 		existing.Type = patch.NodeType
+
+		err = s.Store.Nodes().Update(r.Context(), &existing)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
 	}
 
-	if existing.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
-		existing.Props = map[string]string{}
-	}
+	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 {
+		err = s.Store.Nodes().PatchProps(r.Context(), name, func(props map[string]string) error {
+			maps.Copy(props, patch.OverrideProps)
 
-	maps.Copy(existing.Props, patch.OverrideProps)
+			for _, k := range patch.DeleteProps {
+				delete(props, k)
+			}
 
-	for _, k := range patch.DeleteProps {
-		delete(existing.Props, k)
-	}
+			return nil
+		})
+		if err != nil {
+			writeStoreError(w, err)
 
-	err = s.Store.Nodes().Update(r.Context(), &existing)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -770,14 +782,21 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	// Bug 201: routes through Store.Nodes().PatchProps. The
+	// "already absent" idempotent envelope still needs a Get for
+	// the warn-mask response shape, so we probe via Get first; if
+	// the probe says "absent" we exit early without writing. The
+	// race window between probe and Patch is benign (a concurrent
+	// peer can re-add the key, and the delete then no-ops on the
+	// retry — still converges).
+	probe, err := s.Store.Nodes().Get(r.Context(), nodeName)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	if _, present := existing.Props[key]; !present {
+	if _, present := probe.Props[key]; !present {
 		// Idempotent no-op: same surface as warnNodeNotFound for `n d`
 		// — operators see a distinct warn-band entry that "already
 		// absent" without an error mask.
@@ -790,9 +809,11 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	delete(existing.Props, key)
+	err = s.Store.Nodes().PatchProps(r.Context(), nodeName, func(props map[string]string) error {
+		delete(props, key)
 
-	err = s.Store.Nodes().Update(r.Context(), &existing)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
