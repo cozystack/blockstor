@@ -406,7 +406,7 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 	// (node, pool) and doesn't FK to NodeStore) and the satellite
 	// would learn about a pool on a node the controller doesn't
 	// know — a permanent orphan from the controller's POV.
-	_, nodeErr := s.Store.Nodes().Get(r.Context(), node)
+	nodeObj, nodeErr := s.Store.Nodes().Get(r.Context(), node)
 	if nodeErr != nil {
 		if errors.Is(nodeErr, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "node not found: "+node)
@@ -415,6 +415,34 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 		}
 
 		writeError(w, http.StatusInternalServerError, nodeErr.Error())
+
+		return
+	}
+
+	// Bug 135: refuse pools whose backing VG / zpool isn't in the
+	// satellite's stamped discovery set. Mirrors the Bug 89 shape
+	// (busy-device refusal): the source of truth is the satellite,
+	// which advertises its enumerated VGs/zpools as `Aux/DiscoveredVGs`
+	// / `Aux/DiscoveredZPools` on the Node CRD. Pre-flight here
+	// keeps a garbage CRD out of the store; without it the create
+	// 201s, the pool surfaces State=Ok in `sp l`, and the satellite
+	// fails silently on the first volume placement (the v3 report's
+	// exact symptom). Permissive when the satellite hasn't published
+	// a discovery list yet — mid-bootstrap or older-build satellites
+	// MUST NOT deadlock fresh clusters.
+	if refusalMsg, refused := refuseUnknownBackingStorage(&nodeObj, &body); refused {
+		writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | apiCallRcFailInvldStorPoolName,
+			Message: refusalMsg,
+			Correc: "Apply the backing VG / zpool on the node first " +
+				"(e.g. `linstor physical-storage create-device-pool`), " +
+				"or check `kubectl get node.blockstor " + node +
+				" -o jsonpath='{.spec.props}'` for the discovery list.",
+			ObjRefs: map[string]string{
+				objRefNode:     node,
+				objRefStorPool: body.StoragePoolName,
+			},
+		}})
 
 		return
 	}
@@ -634,4 +662,117 @@ func expandLVMThinAlias(props map[string]string, alias string) {
 	}
 
 	setPropIfEmpty(props, propLvmVG, alias)
+}
+
+// Bug 135 — discovery-list pre-flight for storage-pool create.
+//
+// The satellite's discovery loop enumerates the host's VGs (via
+// `vgs --noheadings -o vg_name`) and zpools (via `zpool list -H -o
+// name`) on every tick and stamps them onto the Node CRD's Spec.Props
+// under the LINSTOR `Aux/` namespace. Two keys:
+//
+//   - `Aux/DiscoveredVGs="vg1,vg2"`    — populated on every satellite
+//     tick where `vgs` exits zero, even if the list is empty (then
+//     the key holds "" — which still counts as "advertised").
+//   - `Aux/DiscoveredZPools="zp1,zp2"` — same shape for `zpool list`.
+//
+// The two keys are distinct: a host without ZFS leaves
+// `Aux/DiscoveredZPools` unset (vs. set-and-empty). The validator
+// treats unset as "satellite hasn't advertised, fall through
+// permissive"; an explicitly empty value counts as "advertised,
+// nothing matches" → refusal.
+//
+// FILE / FILE_THIN / DISKLESS providers have no VG/zpool to validate
+// against. They short-circuit out of the function before the lookup.
+const (
+	nodePropDiscoveredVGs    = "Aux/DiscoveredVGs"
+	nodePropDiscoveredZPools = "Aux/DiscoveredZPools"
+)
+
+// refuseUnknownBackingStorage runs the Bug 135 pre-flight check on a
+// pool create. Returns `(msg, true)` to refuse the create, or
+// `("", false)` to let it proceed.
+//
+// Branching follows the apiv1 provider-kind constants:
+//
+//   - LVM      → check Props["StorDriver/LvmVg"]    against discovered VGs.
+//   - LVM_THIN → same; ThinPool check is delegated to the satellite's
+//     NewProviderFromKind on registration (the validator only
+//     pins existence of the VG, not the thin LV inside it).
+//   - ZFS      → check Props["StorDriver/ZPool"]     against discovered zpools.
+//   - ZFS_THIN → check Props["StorDriver/ZPoolThin"] against discovered zpools.
+//   - FILE / FILE_THIN / DISKLESS → no validation.
+//
+// The validator stays permissive when the satellite hasn't published
+// the corresponding `Aux/Discovered*` key (mid-bootstrap, older
+// satellite build). Without this carve-out a freshly-bootstrapped
+// cluster would deadlock waiting for the first discovery tick.
+// Mirrors the Bug 89 nil-Free fall-through.
+func refuseUnknownBackingStorage(nodeObj *apiv1.Node, body *apiv1.StoragePool) (string, bool) {
+	switch body.ProviderKind {
+	case apiv1.StoragePoolKindLVM, apiv1.StoragePoolKindLVMThin:
+		return checkAdvertised(nodeObj, nodePropDiscoveredVGs,
+			body.Props[propLvmVG], "VG", body.ProviderKind)
+	case apiv1.StoragePoolKindZFS:
+		return checkAdvertised(nodeObj, nodePropDiscoveredZPools,
+			body.Props[propZPool], "ZPool", body.ProviderKind)
+	case apiv1.StoragePoolKindZFSThin:
+		return checkAdvertised(nodeObj, nodePropDiscoveredZPools,
+			body.Props[propZPoolThin], "ZPool", body.ProviderKind)
+	}
+
+	// FILE / FILE_THIN / DISKLESS: no backing VG/zpool to validate.
+	return "", false
+}
+
+// checkAdvertised looks up the comma-separated discovery list on the
+// node's Props bag and reports whether `want` is in the set. Returns
+// `("", false)` (no refusal) when:
+//
+//   - The discovery key is absent entirely (satellite hasn't stamped
+//     it yet — bootstrap path, see refuseUnknownBackingStorage doc).
+//   - `want` is present in the advertised set.
+//
+// Returns `(refusalMsg, true)` when:
+//
+//   - The kind-specific key is empty (e.g. Bug 63's `expandLVMThinAlias`
+//     decomposed `/no/such/path` into VG="" + ThinPool="no/such/path"
+//     because the alias starts with `/`) AND the satellite has spoken.
+//     A garbage `--pool-name` value still has to be refused even when
+//     the alias expander produced a syntactically empty VG slot — the
+//     v3 report's `linstor sp c lvmthin <node> <pool> /total/garbage/path`
+//     case lands here.
+//   - The kind-specific key is non-empty but isn't in the advertised
+//     set (the headline Bug 135 case).
+func checkAdvertised(nodeObj *apiv1.Node, propKey, want, label, kind string) (string, bool) {
+	raw, advertised := nodeObj.Props[propKey]
+	if !advertised {
+		// Satellite hasn't published a discovery list yet (mid-bootstrap
+		// or older build). Permissive fall-through, matches the Bug 89
+		// nil-Free fall-through.
+		return "", false
+	}
+
+	if want == "" {
+		// Discovery list is present but the caller didn't supply a
+		// backing-storage identifier — e.g. Bug 63's alias decomposed
+		// `/garbage` into VG="" because the path starts with `/`, or
+		// the operator hand-rolled a body with no StorDriver/* key.
+		// Refuse rather than fall through to the satellite — without
+		// this carve-out the v3 report's garbage-path case still slips
+		// past the pre-flight.
+		return "missing " + label + " in props (provider kind " + kind +
+			") — satellite advertised " + label + "s: " + strconv.Quote(raw), true
+	}
+
+	for candidate := range strings.SplitSeq(raw, ",") {
+		if strings.TrimSpace(candidate) == want {
+			return "", false
+		}
+	}
+
+	return "no " + label + " named " + strconv.Quote(want) +
+		" on node " + strconv.Quote(nodeObj.Name) +
+		" — satellite advertised " + label + "s: " + strconv.Quote(raw) +
+		" (provider kind " + kind + ")", true
 }

@@ -215,6 +215,21 @@ const apiCallRcFailInvldVlmSize int64 = 206
 // file.
 const apiCallRcFailExistsVlmDfn int64 = 502
 
+// apiCallRcFailInvldStorPoolName mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_INVLD_STOR_POOL_NAME` (552). Bug 135 uses it on
+// `POST /v1/nodes/{node}/storage-pools` when the requested backing
+// VG / zpool isn't in the satellite's `Aux/DiscoveredVGs` /
+// `Aux/DiscoveredZPools` set. The MASK_ERROR bit is OR'd in by the
+// envelope wrapper at the call site; the bare 552 sub-code here
+// keeps the wire shape byte-identical to upstream's `linstor sp c`
+// reply on the same input.
+//
+// Choosing 552 (rather than a fresh sub-code in our 996+ range) lets
+// audit-log greppers that already classify upstream's
+// FAIL_INVLD_STOR_POOL_NAME traffic catch blockstor's equivalent
+// without a separate rule.
+const apiCallRcFailInvldStorPoolName int64 = 552
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the
