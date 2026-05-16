@@ -914,6 +914,22 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 180 post-Delete snapshot sweep — symmetric close of the
+	// snap-create / rd-delete TOCTOU window. The pre-walk above
+	// refused on a non-empty snapshot set, but the walk and the
+	// final Delete are not atomic: a concurrent
+	// `linstor s c <rd> <snap>` can slip between the snapshot
+	// pre-walk and the RD-Delete and land its Snapshots().Create()
+	// in the window. The snap-create side's post-write re-Get
+	// closes one half of the race (it sees the now-deleted RD and
+	// rolls back its own row); this sweep closes the other half
+	// where the snap-c's re-Get observed the RD still alive
+	// (rd-d's Delete hadn't fired yet). After our own Delete
+	// committed, mop up any snapshot rows that slipped through the
+	// pre-walk so no orphan survives. Mirrors Bug 174's two-sided
+	// close: either ordering yields a clean cluster.
+	s.sweepOrphanSnapshotsAfterRDDelete(r.Context(), name)
+
 	// Bug 124: block the response until the local informer cache has
 	// observed the RD + child Resource deletions. Without this gate,
 	// `linstor rd d <rd>` returns SUCCESS and the very next
@@ -925,6 +941,34 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition deleted: " + name,
 	}})
+}
+
+// sweepOrphanSnapshotsAfterRDDelete drops any Snapshot rows that
+// raced past the pre-Delete `ensureNoSnapDfns` walk in handleRDDelete.
+// Bug 180: a concurrent `linstor s c <rd> <snap>` can slip between
+// the pre-walk and the final `ResourceDefinitions().Delete()` — the
+// pre-walk sees an empty snapshot set, the racing snap-c persists
+// its row, then we drop the RD. Without a sweep the snapshot
+// survives as a Bug-180 orphan (parent RD gone, satellite can't
+// address it).
+//
+// Best-effort: per-Snapshot Delete errors are logged but don't fail
+// the rd-d response — the operator already saw the RD-delete success
+// and a follow-up snapshot-not-found is the only observable
+// anomaly. Mirrors Bug 174's post-Delete re-walk pattern (see
+// rollbackNodeDeleteIfRaced / rollbackRGDeleteIfRaced) but in the
+// "delete the racing dependent" direction rather than "restore the
+// primary": there's no RD to restore (rd-d's success was a deliberate
+// caller intent), so the right action is to mop up the orphan.
+func (s *Server) sweepOrphanSnapshotsAfterRDDelete(ctx context.Context, rdName string) {
+	leftovers, err := s.Store.Snapshots().ListByDefinition(ctx, rdName)
+	if err != nil || len(leftovers) == 0 {
+		return
+	}
+
+	for i := range leftovers {
+		_ = s.Store.Snapshots().Delete(ctx, rdName, leftovers[i].Name)
+	}
 }
 
 // cascadeDeleteResources enumerates every Resource replica under the

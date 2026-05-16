@@ -443,41 +443,8 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
-	// Reject whitespace-only RD names before the JSON decode: csi-sanity's
-	// "CreateSnapshot should fail when the source volume is not specified"
-	// path forwards an empty source-volume-id into linstor-csi which
-	// concatenates it into the path. Without an explicit trim, a `%20`
-	// or pure-empty {rd} segment slugs into a real-looking row that no
-	// subsequent reconcile can address (the satellite scans by RD name
-	// and never matches a blank one). Distinct message from the snap
-	// validation below so the CSI driver's error surface tells the
-	// operator which field was wrong.
-	if strings.TrimSpace(rd) == "" {
-		writeError(w, http.StatusBadRequest, "resource definition name is required")
-
-		return
-	}
-
-	var snap apiv1.Snapshot
-
-	if !decodeJSON(w, r, &snap) {
-		return
-	}
-
-	// TrimSpace guards the "silent slug-of-empty" bug class csi-sanity
-	// surfaces with "CreateSnapshot should fail when the name field is
-	// missing"/"empty". A bare `""` already 400'd here, but a
-	// whitespace-only `"   "` previously slipped through and persisted
-	// an unaddressable snapshot row (zfs barfs on the snap name later;
-	// linstor-csi sees a "created" response and never retries).
-	//
-	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
-	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
-	// before pkg/store/k8s.Name() slugifies the input.
-	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
-	if snapNameErr != nil {
-		writeError(w, http.StatusBadRequest, snapNameErr.Error())
-
+	snap, ok := validateSnapshotCreateBody(w, r, rd)
+	if !ok {
 		return
 	}
 
@@ -490,25 +457,35 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 180 pre-write guard: refuse the create if the parent RD is
+	// already mid-tear-down. Upstream LINSTOR stamps the `DELETE` flag
+	// on a ResourceDefinition while CtrlRscDfnDeleteApiCallHandler is
+	// cascading children — the wire-side analog of a CRD's
+	// `metadata.DeletionTimestamp`. Letting a snap-create land on
+	// such an RD re-opens the orphan window: the rd-delete path that
+	// stamped DELETE will eventually drop the RD, leaving the
+	// just-staged Snapshot dangling.
+	if rdHasDeleteFlag(r.Context(), s, rd) {
+		writeError(w, http.StatusConflict,
+			"resource definition '"+rd+"' is being deleted "+
+				"(DELETE flag set): retry against a different RD or "+
+				"wait for the tear-down to complete (Bug 180)")
+
+		return
+	}
+
 	// Materialise the per-node `Snapshots[]` array so reads see one
-	// SnapshotNode per diskful peer. linstor-csi's CreateSnapshot
-	// flow lists snapshots immediately after create and treats an
-	// empty `snapshots[]` array as "the satellite never took it" —
-	// surfaced as "failed to create snapshot: missing snapshots".
-	// blockstor's actual snapshot is taken by the satellite during
-	// reconcile, but the REST shim's view of "where it landed"
-	// derives deterministically from Spec.Nodes. F20: each per-node
-	// entry also carries the `snapshot_volumes[]` slot array so the
-	// CLI's per-node volume table renders the volume_number column.
+	// SnapshotNode per diskful peer. linstor-csi's CreateSnapshot flow
+	// lists snapshots immediately after create and treats an empty
+	// `snapshots[]` array as "the satellite never took it". F20: each
+	// per-node entry also carries the `snapshot_volumes[]` slot array
+	// so the CLI's per-node volume table renders the volume_number
+	// column.
 	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes, snap.VolumeDefinitions)
 
 	// Idempotent create: a CSI driver retries CreateSnapshot for the
-	// same (rd, snap_name) until success, so a re-request must
-	// return 200 + ApiCallRc rather than 409. Mirrors upstream
-	// LINSTOR's behaviour for snapshot name collisions on the same
-	// RD. Different-source name collision is detected at the
-	// linstor-csi layer (it maps CSI snapshot ids to LINSTOR
-	// (rd, snap_name) tuples).
+	// same (rd, snap_name) until success, so a re-request must return
+	// 200 + ApiCallRc rather than 409.
 	existing, getErr := s.Store.Snapshots().Get(r.Context(), rd, snap.Name)
 	if getErr == nil {
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -526,10 +503,135 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 180 post-write re-check. handleRDDelete walks Snapshots().
+	// ListByDefinition first (FAIL_EXISTS_SNAPSHOT_DFN refusal), then
+	// cascades, then drops the RD. A snap-create whose Create() lands
+	// BETWEEN the snapshot pre-walk and ResourceDefinitions().Delete()
+	// would otherwise survive as an orphan. Re-Get the RD and roll
+	// back if it's gone or DELETE flag was stamped in the window.
+	if !s.refuseSnapshotCreateOnRDDeletedRace(w, r, &snap) {
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
 	}})
+}
+
+// validateSnapshotCreateBody runs the wire-boundary gates that
+// handleSnapshotCreate applied inline before Bug 180: empty-RD trim,
+// JSON decode, and the snap-name RFC-1123 check. Returns the decoded
+// Snapshot + true on success; on failure the HTTP error envelope has
+// already been written and the handler returns. Pulled out so the
+// parent stays under funlen's 60-line cap once the Bug 180 pre+post
+// RD-existence guards land.
+func validateSnapshotCreateBody(w http.ResponseWriter, r *http.Request, rd string) (apiv1.Snapshot, bool) {
+	// Reject whitespace-only RD names before the JSON decode: csi-sanity's
+	// "CreateSnapshot should fail when the source volume is not specified"
+	// path forwards an empty source-volume-id into linstor-csi which
+	// concatenates it into the path. Without an explicit trim, a `%20`
+	// or pure-empty {rd} segment slugs into a real-looking row that no
+	// subsequent reconcile can address (the satellite scans by RD name
+	// and never matches a blank one). Distinct message from the snap
+	// validation below so the CSI driver's error surface tells the
+	// operator which field was wrong.
+	if strings.TrimSpace(rd) == "" {
+		writeError(w, http.StatusBadRequest, "resource definition name is required")
+
+		return apiv1.Snapshot{}, false
+	}
+
+	var snap apiv1.Snapshot
+
+	if !decodeJSON(w, r, &snap) {
+		return apiv1.Snapshot{}, false
+	}
+
+	// TrimSpace guards the "silent slug-of-empty" bug class csi-sanity
+	// surfaces with "CreateSnapshot should fail when the name field is
+	// missing"/"empty". A bare `""` already 400'd here, but a
+	// whitespace-only `"   "` previously slipped through and persisted
+	// an unaddressable snapshot row (zfs barfs on the snap name later;
+	// linstor-csi sees a "created" response and never retries).
+	//
+	// Bug 97: tighten further to the full RFC-1123 subdomain rule so
+	// `linstor s c <rd> "Foo Bar"` is refused with a LINSTOR envelope
+	// before pkg/store/k8s.Name() slugifies the input.
+	snapNameErr := validateLinstorName("snapshot", strings.TrimSpace(snap.Name))
+	if snapNameErr != nil {
+		writeError(w, http.StatusBadRequest, snapNameErr.Error())
+
+		return apiv1.Snapshot{}, false
+	}
+
+	return snap, true
+}
+
+// rdHasDeleteFlag returns true when the named RD exists and carries
+// the upstream `DELETE` flag (cluster-side analog of a CRD
+// DeletionTimestamp — see pkg/rest/flags_validation.go::rdFlagDelete).
+// A missing RD or a Get error soft-fails to false: the surrounding
+// hydrate path has already surfaced the relevant store error to the
+// caller, and the post-write re-check picks up the disappeared-RD
+// case anyway. Pulled out so handleSnapshotCreate's pre-write gate
+// stays a single readable conditional.
+func rdHasDeleteFlag(ctx context.Context, s *Server, rd string) bool {
+	got, err := s.Store.ResourceDefinitions().Get(ctx, rd)
+	if err != nil {
+		return false
+	}
+
+	return slices.Contains(got.Flags, rdFlagDelete)
+}
+
+// refuseSnapshotCreateOnRDDeletedRace closes the Bug 180 TOCTOU
+// window on the snap-create side. Called immediately after the
+// Snapshot has been persisted, it re-verifies that the parent RD
+// still exists AND has not been stamped with DELETE in the window
+// between hydrate and Snapshots().Create(). On a miss it rolls back
+// the just-persisted Snapshot (so no orphan CRD survives) and
+// writes a 4xx + envelope citing the race.
+//
+// Returns true when the caller may continue; false when the HTTP
+// error has already been written and the Snapshot has been rolled
+// back. Mirrors refuseResourceCreateOnNodeDeletedRace /
+// refuseRDCreateOnRGDeletedRace exactly — dependent-create side of
+// the two-sided Bug 174 / Bug 180 close. The opposite ordering
+// (snap-c lands before rd-d's pre-walk) is caught by the existing
+// FAIL_EXISTS_SNAPSHOT_DFN refusal in handleRDDelete.
+func (s *Server) refuseSnapshotCreateOnRDDeletedRace(w http.ResponseWriter, r *http.Request, snap *apiv1.Snapshot) bool {
+	got, err := s.Store.ResourceDefinitions().Get(r.Context(), snap.ResourceName)
+	if err == nil && !slices.Contains(got.Flags, rdFlagDelete) {
+		return true
+	}
+
+	if err == nil || errors.Is(err, store.ErrNotFound) {
+		// Roll back the just-persisted Snapshot so the operator
+		// doesn't get a phantom row on a failed call. Best-effort:
+		// if the rollback itself errors (store gone, context
+		// cancelled), the operator still gets the 4xx envelope and
+		// the satellite-side reconciler will surface the dangling-
+		// parent error on its next tick.
+		_ = s.Store.Snapshots().Delete(r.Context(), snap.ResourceName, snap.Name)
+
+		reason := "was deleted"
+		if err == nil {
+			reason = "was marked for deletion (DELETE flag stamped)"
+		}
+
+		writeError(w, http.StatusConflict,
+			"resource definition '"+snap.ResourceName+"' "+reason+
+				" concurrently with the snapshot create (Bug 180): "+
+				"retry after re-creating the resource definition, or "+
+				"pick a different RD")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
 }
 
 // paginateSnapshots applies golinstor's ListOpts.{Offset,Limit}
