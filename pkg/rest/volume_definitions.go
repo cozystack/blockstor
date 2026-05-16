@@ -17,8 +17,11 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"sort"
@@ -231,16 +234,54 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 // handleVDCreate accepts either the upstream `VolumeDefinitionCreate`
 // envelope (`{"volume_definition": {...}}`) or a bare VolumeDefinition body —
 // both shapes appear in the wild.
+//
+// Bug 191 (P2 SPEC): upstream LINSTOR documents `volume_number` as
+// optional — when absent the controller auto-assigns the smallest free
+// VlmNr. The pre-fix handler decoded an absent field to Go's int32
+// zero value and silently forwarded VlmNr=0; the second `linstor vd c
+// X 32M` invocation then collided with Bug 140's FAIL_EXISTS_VLM_DFN
+// refusal. The fix probes the raw JSON for the literal
+// `volume_number` key inside the `volume_definition` object (mirrors
+// Bug 156's `disklessOnRemainingExplicitlyFalse` pattern); when
+// absent/null it walks the parent RD's existing VDs and assigns the
+// smallest free non-negative integer.
 func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeDecodeError(w, err)
+
+		return
+	}
+
 	var envelope apiv1.VolumeDefinitionCreate
 
-	if !decodeJSON(w, r, &envelope) {
+	dec := json.NewDecoder(bytes.NewReader(rawBody))
+	dec.DisallowUnknownFields()
+
+	if decErr := dec.Decode(&envelope); decErr != nil {
+		writeDecodeError(w, decErr)
+
 		return
 	}
 
 	vd := envelope.VolumeDefinition
+
+	// Bug 191: distinguish "client omitted volume_number" (auto-assign)
+	// from "client sent volume_number=0" (explicit zero). The typed
+	// decode above can't tell them apart because the wire field is a
+	// plain int32 — both shapes deserialise to VolumeNumber=0.
+	if !vdCreateVolumeNumberExplicit(rawBody) {
+		assigned, assignErr := s.autoAssignVolumeNumber(r.Context(), rd)
+		if assignErr != nil {
+			writeStoreError(w, assignErr)
+
+			return
+		}
+
+		vd.VolumeNumber = assigned
+	}
 
 	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
 	// satellite reconciler doesn't hot-loop on `drbdadm create-md`
@@ -251,7 +292,7 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
+	err = s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
 	if err != nil {
 		// Bug 140: duplicate-VD conflict gets a typed envelope with
 		// the upstream FAIL_EXISTS_VLM_DFN sub-code plus actionable
@@ -282,6 +323,98 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "volume definition created",
 	}})
+}
+
+// vdCreateVolumeNumberExplicit reports whether the raw POST body
+// carries an explicit `volume_number` key inside the
+// `volume_definition` object. Bug 191: a typed decode into
+// `apiv1.VolumeDefinitionCreate` flattens an absent/null
+// `volume_number` to Go's int32 zero — indistinguishable from an
+// explicit `"volume_number": 0`. The handler walks the wire shape
+// directly so the auto-assign branch only fires when the operator
+// actually omitted the field (`linstor vd c X 32M` without
+// --vlmnr).
+//
+// Two wire shapes are supported, matching `handleVDCreate`'s decode:
+//
+//  1. Envelope: `{"volume_definition": {"size_kib": ..., ...}}` —
+//     upstream golinstor's `VolumeDefinitionCreate`. Walk into the
+//     inner object.
+//  2. Bare: `{"size_kib": ..., ...}` — some legacy callers POST the
+//     bare VolumeDefinition shape. Walk the top level directly.
+//
+// Returns false on malformed JSON, missing key, or explicit JSON
+// `null` (treated as "absent" per the Bug 156 idiom). Treats an
+// explicit `"volume_number": 0` as present so an operator who
+// genuinely wants VlmNr=0 (e.g. seeding the first VD on a fresh RD
+// via a script that always sends 0) keeps that behaviour.
+func vdCreateVolumeNumberExplicit(raw []byte) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+
+	var envelope map[string]json.RawMessage
+
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return false
+	}
+
+	// Shape 1: `{"volume_definition": {...}}` envelope.
+	if inner, ok := envelope["volume_definition"]; ok {
+		var innerObj map[string]json.RawMessage
+
+		if err := json.Unmarshal(inner, &innerObj); err != nil {
+			return false
+		}
+
+		return rawHasNonNullKey(innerObj, "volume_number")
+	}
+
+	// Shape 2: bare VolumeDefinition at the top level.
+	return rawHasNonNullKey(envelope, "volume_number")
+}
+
+// rawHasNonNullKey returns true when the key is present in the
+// decoded JSON object AND its value is not the literal `null`.
+// Matches Bug 156's "absent or null both mean unset" rule.
+func rawHasNonNullKey(obj map[string]json.RawMessage, key string) bool {
+	raw, ok := obj[key]
+	if !ok {
+		return false
+	}
+
+	return !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// autoAssignVolumeNumber returns the smallest free non-negative
+// VolumeNumber under the given RD. Mirrors upstream LINSTOR's
+// CtrlVlmDfnCrtApiCallHandler smallest-hole rule: with VDs 0 and 2
+// present, an auto-assign POST lands at 1 — not 3.
+//
+// A missing RD surfaces here as the underlying store's ErrNotFound;
+// the caller routes it through writeStoreError so the wire shape
+// matches the pre-fix 404 path for an unknown parent RD.
+func (s *Server) autoAssignVolumeNumber(ctx context.Context, rd string) (int32, error) {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rd)
+	if err != nil {
+		return 0, err //nolint:wrapcheck // surfaced to writeStoreError
+	}
+
+	used := make(map[int32]bool, len(vds))
+	for i := range vds {
+		used[vds[i].VolumeNumber] = true
+	}
+
+	for candidate := int32(0); candidate >= 0; candidate++ {
+		if !used[candidate] {
+			return candidate, nil
+		}
+	}
+
+	// Unreachable for any sane RD (the smallest-free walk terminates
+	// at the first gap; an RD with 2^31 VDs is impossible on real
+	// storage). Pin the contract anyway.
+	return 0, errors.New("auto-assign: VolumeNumber space exhausted")
 }
 
 // minVolumeDefinitionSizeKib is the smallest accepted size_kib on
