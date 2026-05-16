@@ -155,42 +155,48 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
+	force := isForce(r)
 
-	// Refuse if any Resource replica on this node still references
-	// the pool. We scan the full Resource list rather than per-RD
-	// because the store has no (pool → resources) reverse index;
-	// the cost is bounded by the cluster-wide replica count, which
-	// is well below the typical Resource-list path latency budget.
-	refs, err := s.referencingResources(r.Context(), node, pool)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
+	// Bug 152 escape hatch (mirrors Bug 92 node delete, Bug 111
+	// single-node evacuate, W13 VD shrink): `?force=true` skips
+	// the still-referenced refusal so an operator can reclaim a
+	// pool on a dead node whose Resource CRDs are already
+	// tombstoned. The referencing replicas are left as-is for
+	// out-of-band cleanup. Without this knob the only escape
+	// path is dropping every replica by hand first, which races
+	// the satellite reconciler.
+	if !force {
+		if refused := s.refuseSPDeleteIfReferenced(w, r, node, pool); refused {
+			return
+		}
 	}
 
-	if len(refs) > 0 {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailInUse,
-			Message: "The specified storage pool '" + pool +
-				"' on node '" + node + "' can not be deleted as " +
-				"volumes / snapshot-volumes are still using it.",
-			Details: "Volumes that are still using the storage pool: " +
-				strings.Join(refs, ", "),
-			Correc: "Delete the listed volumes first.",
-			ObjRefs: map[string]string{
-				objRefNode:     node,
-				objRefStorPool: pool,
-			},
-		}})
+	// Bug 145 TOCTOU close. Capture the SP body before deleting
+	// so we can restore it if a racing `r c -s <pool>` slipped
+	// in between the pre-walk and the Delete. Without the capture
+	// the only rollback path would require the operator to
+	// recreate the pool by hand.
+	captured, capturedOK := s.captureStoragePool(r.Context(), node, pool)
 
-		return
-	}
-
-	err = s.Store.StoragePools().Delete(r.Context(), node, pool)
+	err := s.Store.StoragePools().Delete(r.Context(), node, pool)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		writeStoreError(w, err)
 
 		return
+	}
+
+	// Bug 145 post-delete re-scan. A `r c -s <pool>` racing this
+	// handler may have slipped between the pre-walk and the
+	// Delete: the pre-walk saw an empty reference set, then the
+	// racing create persisted its Resource, then we just dropped
+	// the SP. Re-scan after the Delete: if any reference exists
+	// now, restore the SP (we captured it before Delete) and
+	// surface the 409 the operator should have seen pre-race.
+	// `?force=true` callers opt past this check too.
+	if !force && capturedOK {
+		if rolled := s.rollbackSPDeleteIfRaced(w, r, node, pool, &captured); rolled {
+			return
+		}
 	}
 
 	// Promote the "already absent" path to the warn band (Bug 66
@@ -215,18 +221,127 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 	}})
 }
 
+// refuseSPDeleteIfReferenced runs the pre-Delete Bug 152 refusal
+// walk. Returns true when the HTTP error has already been
+// written (the caller must stop processing) and false when the
+// delete may proceed.
+func (s *Server) refuseSPDeleteIfReferenced(w http.ResponseWriter, r *http.Request, node, pool string) bool {
+	// Refuse if any Resource replica on this node still references
+	// the pool. We scan the full Resource list rather than per-RD
+	// because the store has no (pool → resources) reverse index;
+	// the cost is bounded by the cluster-wide replica count, which
+	// is well below the typical Resource-list path latency budget.
+	refs, err := s.referencingResources(r.Context(), node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 {
+		return false
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "The specified storage pool '" + pool +
+			"' on node '" + node + "' can not be deleted as " +
+			"volumes / snapshot-volumes are still using it.",
+		Details: "Volumes that are still using the storage pool: " +
+			strings.Join(refs, ", "),
+		Correc: "Delete the listed volumes first, or pass " +
+			"`?force=true` to bypass the refusal and accept " +
+			"the orphan replicas.",
+		ObjRefs: map[string]string{
+			objRefNode:     node,
+			objRefStorPool: pool,
+		},
+	}})
+
+	return true
+}
+
+// captureStoragePool grabs a snapshot of the (node, pool) SP CRD
+// so the Bug 145 post-delete re-scan has something to restore
+// when a racing `r c -s <pool>` slipped past the pre-walk. The
+// second return is false when the pool no longer exists at
+// capture time (a benign idempotent-delete replay) — the
+// rollback path is skipped in that case.
+func (s *Server) captureStoragePool(ctx context.Context, node, pool string) (apiv1.StoragePool, bool) {
+	sp, err := s.Store.StoragePools().Get(ctx, node, pool)
+	if err != nil {
+		return apiv1.StoragePool{}, false
+	}
+
+	return sp, true
+}
+
+// rollbackSPDeleteIfRaced runs the Bug 145 post-Delete re-scan.
+// If a Resource reference appeared between the pre-walk and the
+// Delete, restore the captured SP and write the 409 envelope the
+// pre-walk would have written. Returns true when the rollback
+// fired (HTTP error already written, caller must stop) and false
+// when the delete is safe to commit.
+func (s *Server) rollbackSPDeleteIfRaced(w http.ResponseWriter, r *http.Request, node, pool string, captured *apiv1.StoragePool) bool {
+	refs, err := s.referencingResources(r.Context(), node, pool)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 {
+		return false
+	}
+
+	// Best-effort restore: a Create error here means the rollback
+	// itself raced (another goroutine recreated the SP). Either
+	// outcome leaves the SP present, which is what we want —
+	// surface the 409 either way so the operator retries.
+	_ = s.Store.StoragePools().Create(r.Context(), captured)
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "The specified storage pool '" + pool +
+			"' on node '" + node + "' can not be deleted as " +
+			"volumes / snapshot-volumes are still using it.",
+		Details: "Volumes that are still using the storage pool: " +
+			strings.Join(refs, ", "),
+		Correc: "Delete the listed volumes first, or pass " +
+			"`?force=true` to bypass the refusal and accept " +
+			"the orphan replicas.",
+		ObjRefs: map[string]string{
+			objRefNode:     node,
+			objRefStorPool: pool,
+		},
+	}})
+
+	return true
+}
+
 // referencingResources returns the `<rd>/<vol_nr>` keys of every
 // Volume on `node` whose `StoragePool` matches `pool`. Used by the
 // storage-pool delete refusal path (scenario 6.W06).
 //
 // Resources whose satellite hasn't reported Volumes yet (no
-// per-replica observation) intentionally do NOT count as "using" the
-// pool — without a populated Volumes slice we can't prove the
-// replica's storage came from this specific pool, and refusing on a
-// not-yet-observed replica would block legitimate pool removal on a
-// freshly-restored cluster. Matches upstream LINSTOR, which iterates
-// `VlmProviderObject`s on the pool — a replica that has not yet been
-// materialized has no provider objects bound to the pool either.
+// per-replica observation) but already carry a pinned
+// `Props["StorPoolName"]` reference (Bug 145: a `r c -s <pool>`
+// that just persisted in the same window as the racing `sp d`)
+// MUST count as "using" the pool too — without this carve-out
+// the TOCTOU race window between `r c` and `sp d` would leak
+// orphan Resource CRDs through the post-delete re-scan. The
+// `<rd>/spec` key shape disambiguates these "spec-only" refs
+// from the satellite-observed `<rd>/<vol_nr>` refs.
+//
+// Resources whose satellite hasn't reported Volumes AND have no
+// pinned `Props["StorPoolName"]` still do NOT count — without
+// either signal we can't prove the replica is bound to this
+// specific pool, and refusing on a not-yet-observed replica
+// would block legitimate pool removal on a freshly-restored
+// cluster. Matches upstream LINSTOR, which iterates
+// `VlmProviderObject`s on the pool — a replica that has not yet
+// been materialized has no provider objects bound to the pool
+// either.
 func (s *Server) referencingResources(ctx context.Context, node, pool string) ([]string, error) {
 	all, err := s.Store.Resources().List(ctx)
 	if err != nil {
@@ -240,13 +355,28 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 			continue
 		}
 
+		matched := false
+
 		for _, v := range all[i].Volumes {
 			if v.StoragePool == pool {
 				refs = append(refs,
 					all[i].Name+"/"+strconv.FormatInt(int64(v.VolumeNumber), 10))
 
+				matched = true
+
 				break
 			}
+		}
+
+		// Bug 145: pick up specs whose Volumes haven't been
+		// observed yet — a freshly-created `r c -s <pool>`
+		// carries the pool name in Props["StorPoolName"] before
+		// the satellite reports any Volumes. Without this the
+		// post-delete re-scan would never see the racing
+		// resource and the SP delete would proceed even though
+		// the spec-only Resource is about to dangle.
+		if !matched && all[i].Props["StorPoolName"] == pool {
+			refs = append(refs, all[i].Name+"/spec")
 		}
 	}
 

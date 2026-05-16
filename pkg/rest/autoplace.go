@@ -284,25 +284,13 @@ func (s *Server) refuseAutoplaceOnUnknownNodes(w http.ResponseWriter, r *http.Re
 	return true
 }
 
-// refuseResourceCreateOnUnknownRD is Bug 144's gate (regression of
-// Bug 98). `POST /v1/resource-definitions/{rd}/resources` MUST refuse
-// with 404 + LINSTOR envelope when no parent RD exists, BEFORE any
-// per-replica node / pool / minor / port allocation runs. Pre-fix the
-// handler walked straight into createOrPromoteResource and staged a
-// Resource CRD whose spec.resourceDefinitionName pointed at no
-// parent — the satellite reconciler then allocated a DRBD minor + port
-// for a row that could never be reconciled, effectively a port-pool
-// leak under CSI retry / operator-script workloads.
-//
-// Uses getRDWithCacheRetry for the same reason every other handler
-// under `/v1/resource-definitions/{rd}/...` does: the RD may have been
-// written via a sibling apiserver replica seconds ago and the local
-// informer cache trail surfaces as a transient NotFound. Mirrors Bug
-// 94 (unknown node), Bug 118 (unknown pool), Bug 134 (unknown RG),
-// Bug 143 (unknown RD on r lp) envelope shape — 404 + []ApiCallRc
-// naming the missing RD plus an actionable correction hint. Returns
-// true when the caller may proceed, false when the HTTP error has
-// already been written.
+// refuseResourceCreateOnUnknownRD is Bug 144's gate. Without it
+// `POST /v1/resource-definitions/<bogus-rd>/resources` happily
+// allocated a DRBD minor/port and persisted a `<bogus>.<node>`
+// Resource CRD that the satellite reconciler could never reconcile
+// (no parent RD to read VolumeDefinitions from). Mirror the Bug
+// 94/118/134 envelope shape and refuse with 404 + LINSTOR envelope
+// naming the missing RD.
 func (s *Server) refuseResourceCreateOnUnknownRD(w http.ResponseWriter, r *http.Request, rdName string) bool {
 	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err == nil {
@@ -942,6 +930,11 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 // success; writes the HTTP error and returns (nil, false) on the
 // first failure.
 func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName string, envelopes []apiv1.ResourceCreate) ([]apiv1.Resource, bool) {
+	// Bug 144: refuse r c when the parent RD doesn't exist. Without
+	// this gate the per-envelope createOneResource happily wrote
+	// `<bogus-rd>.<node>` into the store with allocated minor+port,
+	// leaving an orphan Resource the satellite reconciler could never
+	// reconcile (no RD to read VolumeDefinitions from).
 	if !s.refuseResourceCreateOnUnknownRD(w, r, rdName) {
 		return nil, false
 	}
@@ -949,27 +942,7 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	created := make([]apiv1.Resource, 0, len(envelopes))
 
 	for i := range envelopes {
-		env := &envelopes[i]
-		res := env.Resource
-		res.Name = rdName
-
-		if !s.validateResourceCreateEnvelope(w, r, rdName, &res) {
-			return nil, false
-		}
-
-		// Same CSI pass-through as handleAutoplace: linstor-csi may set
-		// layer_list on the explicit-placement call rather than on RD create.
-		// Persist onto rd.LayerStack if not already set so the satellite
-		// reconciler sees the right composition.
-		if len(env.LayerList) > 0 {
-			rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-			if getErr == nil && len(rd.LayerStack) == 0 {
-				rd.LayerStack = append([]string(nil), env.LayerList...)
-				_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
-			}
-		}
-
-		out, ok := s.createOrPromoteResource(w, r, &res)
+		out, ok := s.createOneResource(w, r, rdName, &envelopes[i])
 		if !ok {
 			return nil, false
 		}
@@ -980,19 +953,24 @@ func (s *Server) createResources(w http.ResponseWriter, r *http.Request, rdName 
 	return created, true
 }
 
-// validateResourceCreateEnvelope runs the per-envelope wire-shape and
-// existence checks for a single ResourceCreate body entry: required
-// node_name, no embedded '.' in either side of the future
-// `<rd>.<node>` metadata.name, Node existence (Bug 94), and storage-
-// pool existence (Bug 118). Pulled out of createResources so the
-// latter stays under the funlen budget after Bug 144 added the
-// up-front RD-existence gate. Returns true when the caller may
-// proceed, false when the HTTP error has already been written.
-func (s *Server) validateResourceCreateEnvelope(w http.ResponseWriter, r *http.Request, rdName string, res *apiv1.Resource) bool {
+// createOneResource runs the full per-envelope wire-boundary
+// pipeline for a single Resource create entry: shape validation,
+// Bug 94 / Bug 118 gates, layer-list pass-through, store
+// persistence, and the Bug 145 post-write SP-deletion race
+// check. Writes the HTTP error on the first failure and returns
+// (nil, false); returns (&out, true) on success.
+//
+// Pulled out of createResources to keep that loop under
+// funlen's 60-line limit — the envelope-walk is now a thin
+// wrapper, each per-envelope concern lives here.
+func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdName string, env *apiv1.ResourceCreate) (*apiv1.Resource, bool) {
+	res := env.Resource
+	res.Name = rdName
+
 	if res.NodeName == "" {
 		writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
 
-		return false
+		return nil, false
 	}
 
 	// Enforce the cluster-wide naming convention up front: the CRD
@@ -1005,23 +983,78 @@ func (s *Server) validateResourceCreateEnvelope(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusBadRequest,
 			"node_name must not contain '.': metadata.name must equal <rd>.<node>")
 
-		return false
+		return nil, false
 	}
 
 	if strings.Contains(rdName, ".") {
 		writeError(w, http.StatusBadRequest,
 			"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
 
-		return false
+		return nil, false
 	}
 
-	// Bug 94: refuse to stage a Resource CRD pointing at a node the
-	// controller never registered. Without this gate `linstor r c
-	// <bogus-node> <rd>` happily wrote `<rd>.<bogus-node>` into the
-	// store and the satellite reconciler then had no way to reach the
-	// named node — the phantom CRD survived forever as orphaned state.
-	// We do the existence check here (not in the per-replica store
-	// create) so the operator sees a 404 + LINSTOR envelope with the
+	if !s.checkResourceCreateNodeAndPool(w, r, &res) {
+		return nil, false
+	}
+
+	// Same CSI pass-through as handleAutoplace: linstor-csi may set
+	// layer_list on the explicit-placement call rather than on RD create.
+	// Persist onto rd.LayerStack if not already set so the satellite
+	// reconciler sees the right composition.
+	if len(env.LayerList) > 0 {
+		rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+		if getErr == nil && len(rd.LayerStack) == 0 {
+			rd.LayerStack = append([]string(nil), env.LayerList...)
+			_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+		}
+	}
+
+	out, ok := s.createOrPromoteResource(w, r, &res)
+	if !ok {
+		return nil, false
+	}
+
+	// Bug 145 post-write re-check. The pre-write Bug 118 gate
+	// (refuseResourceCreateOnUnknownPool) and the Resource
+	// store Create are not atomic: a concurrent
+	// `linstor sp d <pool>` can interleave between the two
+	// and slip past Bug 152's still-referenced refusal —
+	// the refusal walks the Resource list BEFORE this
+	// goroutine has persisted the new Resource, sees an
+	// empty reference set, and proceeds to drop the SP.
+	// Without this re-check the Resource CRD then lands
+	// with a dangling `Props["StorPoolName"]` and the
+	// satellite reconciler waits forever for a pool that
+	// never returns.
+	//
+	// The fix closes the race in one direction: after the
+	// Resource has been persisted, look up the SP one more
+	// time. If it's gone, undo the create and surface the
+	// same 404 envelope the pre-write gate would have
+	// emitted. In the opposite ordering (sp-d's walk runs
+	// after our Resource Create) Bug 152's refusal already
+	// fires on the SP-delete side. Either ordering yields
+	// a clean error envelope and zero orphan Resources.
+	if !s.refuseResourceCreateOnSPDeletedRace(w, r, out) {
+		return nil, false
+	}
+
+	return out, true
+}
+
+// checkResourceCreateNodeAndPool runs the Bug 94 (unknown node)
+// and Bug 118 (unknown pool) gates back-to-back. Returns true
+// when the caller may proceed; false when the HTTP error has
+// already been written.
+func (s *Server) checkResourceCreateNodeAndPool(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) bool {
+	// Bug 94: refuse to stage a Resource CRD pointing at a node
+	// the controller never registered. Without this gate
+	// `linstor r c <bogus-node> <rd>` happily wrote
+	// `<rd>.<bogus-node>` into the store and the satellite
+	// reconciler then had no way to reach the named node — the
+	// phantom CRD survived forever as orphaned state. We do the
+	// existence check here (not in the per-replica store create)
+	// so the operator sees a 404 + LINSTOR envelope with the
 	// exact unresolved name + an actionable correction hint.
 	_, nodeErr := s.Store.Nodes().Get(r.Context(), res.NodeName)
 	if errors.Is(nodeErr, store.ErrNotFound) {
@@ -1039,6 +1072,50 @@ func (s *Server) validateResourceCreateEnvelope(w http.ResponseWriter, r *http.R
 	}
 
 	return s.refuseResourceCreateOnUnknownPool(w, r, res)
+}
+
+// refuseResourceCreateOnSPDeletedRace closes the Bug 145 TOCTOU
+// window. Called immediately after the Resource has been
+// persisted, it re-verifies that the pinned StorPool still
+// exists on the target node. On a miss, it rolls back the
+// just-persisted Resource (so no orphan CRD survives) and
+// writes the same 404 + envelope shape the pre-write Bug 118
+// gate uses.
+//
+// Returns true when the caller may continue; false when the
+// HTTP error has already been written and the Resource has
+// been rolled back.
+func (s *Server) refuseResourceCreateOnSPDeletedRace(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) bool {
+	pool := res.Props["StorPoolName"]
+	if pool == "" {
+		return true
+	}
+
+	_, err := s.Store.StoragePools().Get(r.Context(), res.NodeName, pool)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		// Roll back the just-persisted Resource so the operator
+		// doesn't get a phantom CRD on a failed call. Best-effort:
+		// if the rollback itself errors (store gone, context
+		// cancelled), the operator still gets the 404 envelope
+		// and the satellite-side reconciler will surface the
+		// dangling-pool error on its next tick.
+		_ = s.Store.Resources().Delete(r.Context(), res.Name, res.NodeName)
+
+		writeError(w, http.StatusNotFound,
+			"storage pool '"+pool+"' was deleted on node '"+res.NodeName+
+				"' concurrently with the resource create (Bug 145): "+
+				"retry after re-creating the pool, or pick a different pool")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
 }
 
 // createOrPromoteResource creates res or promotes an existing
