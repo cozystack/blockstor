@@ -42,6 +42,14 @@ func (s *Server) registerResourceGroups(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-groups", s.requireStore(s.handleRGCreate))
 	mux.HandleFunc("PUT /v1/resource-groups/{rg}", s.requireStore(s.handleRGUpdate))
 	mux.HandleFunc("DELETE /v1/resource-groups/{rg}", s.requireStore(s.handleRGDelete))
+	// Bug 154: `linstor rg dp <rg> <key>` returned 404 because the
+	// per-key DELETE route was never registered. Mirrors Bug 142's
+	// `n dp` shape exactly — Go 1.22's `{key...}` wildcard captures
+	// slash-bearing keys like `DrbdOptions/auto-quorum` whole, and a
+	// delete-of-missing folds into 200 + warn-mask so reconciler
+	// retries don't hot-spin.
+	mux.HandleFunc("DELETE /v1/resource-groups/{rg}/properties/{key...}",
+		s.requireStore(s.handleRGPropDelete))
 }
 
 func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
@@ -602,6 +610,55 @@ func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource group deleted: " + name,
+	}})
+}
+
+// handleRGPropDelete implements Bug 154: per-key DELETE for resource-
+// group properties. Mirrors Bug 142's `handleNodePropDelete` byte-for-
+// byte aside from the store accessor — slash-bearing keys like
+// `DrbdOptions/auto-quorum` round-trip via Go 1.22's `{key...}`
+// wildcard, and a delete-of-missing folds into a 200 + warn-mask
+// envelope so reconciler retries don't hot-spin on the second pass.
+func (s *Server) handleRGPropDelete(w http.ResponseWriter, r *http.Request) {
+	rgName := r.PathValue("rg")
+
+	key := r.PathValue("key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing property key")
+
+		return
+	}
+
+	existing, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if _, present := existing.Props[key]; !present {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: maskWarn,
+			Message: "resource group " + rgName + " property already absent: " + key,
+			ObjRefs: map[string]string{objRefRscGrp: rgName},
+		}})
+
+		return
+	}
+
+	delete(existing.Props, key)
+
+	err = s.Store.ResourceGroups().Update(r.Context(), &existing)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource group " + rgName + " property deleted: " + key,
+		ObjRefs: map[string]string{objRefRscGrp: rgName},
 	}})
 }
 

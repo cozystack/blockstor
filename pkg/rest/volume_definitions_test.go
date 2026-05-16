@@ -37,7 +37,9 @@ func TestVolumeDefinitionsCreateRoundTrip(t *testing.T) {
 	defer stop()
 
 	body, err := json.Marshal(apiv1.VolumeDefinitionCreate{
-		VolumeDefinition: apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 2048},
+		// 32 MiB — above Bug 155's 4 MiB minimum, matches the rest
+		// of the test suite's canonical size.
+		VolumeDefinition: apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: 32768},
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -60,8 +62,8 @@ func TestVolumeDefinitionsCreateRoundTrip(t *testing.T) {
 		t.Fatalf("decode: %v", jErr)
 	}
 
-	if len(vds) != 1 || vds[0].SizeKib != 2048 {
-		t.Errorf("got %+v, want one VD with SizeKib=2048", vds)
+	if len(vds) != 1 || vds[0].SizeKib != 32768 {
+		t.Errorf("got %+v, want one VD with SizeKib=32768", vds)
 	}
 }
 

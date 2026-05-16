@@ -204,6 +204,15 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 
 	vd := envelope.VolumeDefinition
 
+	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
+	// satellite reconciler doesn't hot-loop on `drbdadm create-md`
+	// failures. See validateVDSize for the bounds rationale.
+	if sizeErr := validateVDSize(vd.SizeKib); sizeErr != nil {
+		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
+
+		return
+	}
+
 	err = s.Store.VolumeDefinitions().Create(r.Context(), rd, &vd)
 	if err != nil {
 		// Bug 140: duplicate-VD conflict gets a typed envelope with
@@ -235,6 +244,73 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "volume definition created",
 	}})
+}
+
+// minVolumeDefinitionSizeKib is the smallest accepted size_kib on
+// `POST /v1/resource-definitions/{rd}/volume-definitions` (Bug 155).
+// DRBD reserves ~32 KiB of metadata per peer; backing-storage layers
+// (LVM-thin, ZFS, LUKS) layer additional alignment on top. Picking
+// 4 MiB as the floor keeps every layered composition viable without
+// having to chase the exact ceiling for each provider.
+const minVolumeDefinitionSizeKib int64 = 4 * 1024
+
+// maxVolumeDefinitionSizeKib is the largest accepted size_kib (Bug
+// 155). 16 TiB is DRBD's hard per-device ceiling — the on-disk
+// activity-log encoding can't address more than 16 TiB of net data.
+// Requests above that bound will fail at `drbdadm create-md` time
+// regardless of backing storage capacity, so refusing here gets the
+// operator a typed error envelope instead of an opaque satellite
+// retry loop.
+const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
+
+// validateVDSize returns nil when the requested size_kib is within
+// the accepted bounds [minVolumeDefinitionSizeKib,
+// maxVolumeDefinitionSizeKib] (Bug 155). Otherwise it returns a
+// human-readable rejection reason the caller formats into the
+// LINSTOR envelope.
+func validateVDSize(sizeKib int64) error {
+	if sizeKib < minVolumeDefinitionSizeKib {
+		return fmt.Errorf(
+			"size_kib=%d below minimum %d KiB (DRBD reserves ~32 KiB of "+
+				"metadata per peer; backing layers add alignment on top)",
+			sizeKib, minVolumeDefinitionSizeKib,
+		)
+	}
+
+	if sizeKib > maxVolumeDefinitionSizeKib {
+		return fmt.Errorf(
+			"size_kib=%d above maximum %d KiB (DRBD's per-device hard ceiling)",
+			sizeKib, maxVolumeDefinitionSizeKib,
+		)
+	}
+
+	return nil
+}
+
+// writeVDSizeRejection emits the Bug 155 size-out-of-bounds refusal
+// envelope. 400 + FAIL_INVLD_VLM_SIZE keeps the wire shape byte-
+// identical to upstream LINSTOR's `linstor vd c` reply on the same
+// input (the shrink branch in handleVDUpdate uses the same sub-code).
+func writeVDSizeRejection(w http.ResponseWriter, rd string, vn int32, sizeKib int64, reason error) {
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInvldVlmSize,
+		Message: fmt.Sprintf("invalid volume definition size for %q vlm=%d: %s",
+			rd, vn, reason.Error()),
+		Cause: fmt.Sprintf(
+			"size_kib must be in [%d, %d]; the satellite reconciler "+
+				"would loop on drbdadm create-md otherwise",
+			minVolumeDefinitionSizeKib, maxVolumeDefinitionSizeKib,
+		),
+		Correc: fmt.Sprintf(
+			"pick a size between %d KiB (~4 MiB) and %d KiB (~16 TiB) and re-issue `linstor vd c`",
+			minVolumeDefinitionSizeKib, maxVolumeDefinitionSizeKib,
+		),
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	}})
+	_ = sizeKib // retained for future audit-log fields
 }
 
 // writeVDExistsConflict emits the Bug 140 typed conflict envelope on
