@@ -166,7 +166,18 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	// immediately-following PATCH to start provisioning LUKS.
 	s.passphraseUnlocked.Store(true)
 
-	w.WriteHeader(http.StatusCreated)
+	// Bug 129: python-linstor 1.27.1 unconditionally json-decodes
+	// every non-204 2xx response, so a bare `WriteHeader(201)`
+	// with no body crashes the CLI with "Unable to parse REST
+	// json data: Expecting value: line 1 column 1 (char 0)".
+	// Match the MASK_INFO envelope shape every sibling write-side
+	// endpoint (handlePassphraseEnter / handlePassphraseModify,
+	// controller_props create, autoplace create, …) emits so
+	// python-linstor renders a clean operator-visible success line.
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "Master passphrase created",
+	}})
 }
 
 // handlePassphraseEnter unlocks the in-memory crypto context for
