@@ -886,14 +886,38 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	dec.DisallowUnknownFields()
 
 	err := dec.Decode(target)
-	if err == nil {
-		return true
+	if err != nil {
+		writeDecodeError(w, err)
+
+		return false
 	}
 
-	writeDecodeError(w, err)
+	// Bug 203: refuse residual bytes after the primary JSON value.
+	// The std-lib decoder is happy once it has parsed one complete
+	// JSON value; `{"valid":"json"}garbage` returns nil here and the
+	// handler then runs with the partially-decoded value. dec.More()
+	// reports whether the buffered Reader still has non-whitespace
+	// bytes — if it does, treat the body as malformed and surface the
+	// same Bug 158 envelope shape every other decode-failure mode
+	// emits ("trailing JSON data after the request body"). A
+	// streaming endpoint that legitimately wants multiple JSON values
+	// on one connection would NOT route through decodeJSON in the
+	// first place; every caller of this helper expects exactly one
+	// top-level value.
+	if dec.More() {
+		writeDecodeError(w, errTrailingJSONData)
 
-	return false
+		return false
+	}
+
+	return true
 }
+
+// errTrailingJSONData signals the Bug 203 decode-failure mode (residual
+// bytes after the primary JSON value). Module-scoped sentinel so
+// `writeDecodeError` can errors.Is against it without parsing message
+// strings; pre-Bug-203 there was no value to thread through here at all.
+var errTrailingJSONData = errors.New("trailing JSON data after the request body")
 
 // writeDecodeError is the handler-side bridge for the Bug 146 body
 // limit AND the Bug 158 typed-envelope invariant. Handlers that
@@ -938,23 +962,7 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 		return
 	}
 
-	// Empty body. The std-lib decoder returns io.EOF when called on a
-	// zero-byte stream; the message is literally "EOF" — operators see
-	// a wire reply of `[{"message":"EOF"}]`, python-linstor's CLI
-	// surfaces "ERROR: EOF" with no hint that the body was empty.
-	if errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest,
-			"request body is empty: send the JSON payload this endpoint expects")
-
-		return
-	}
-
-	// Truncated body — the decoder consumed something but ran out of
-	// bytes mid-structure. Same operator-facing shape as an empty body.
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		writeError(w, http.StatusBadRequest,
-			"request body is truncated: re-send the complete JSON payload")
-
+	if writeDecodeBodyShapeError(w, err) {
 		return
 	}
 
@@ -1002,6 +1010,52 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 	}
 
 	writeError(w, http.StatusBadRequest, scrubImplDetails(err.Error()))
+}
+
+// writeDecodeBodyShapeError handles the body-shape-level decode
+// failure modes that don't depend on JSON-internal types: empty body
+// (io.EOF), truncated body (io.ErrUnexpectedEOF), and trailing data
+// after the primary value (Bug 203 sentinel). Pulled out of
+// writeDecodeError so the parent function stays under the linter's
+// funlen budget while still emitting per-shape operator-facing cues.
+// Returns true when the branch fired (caller must stop); false
+// otherwise (caller continues to the JSON-typed branches).
+func writeDecodeBodyShapeError(w http.ResponseWriter, err error) bool {
+	// Empty body. The std-lib decoder returns io.EOF when called on a
+	// zero-byte stream; the message is literally "EOF" — operators
+	// see a wire reply of `[{"message":"EOF"}]`, python-linstor's
+	// CLI surfaces "ERROR: EOF" with no hint that the body was empty.
+	if errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest,
+			"request body is empty: send the JSON payload this endpoint expects")
+
+		return true
+	}
+
+	// Truncated body — the decoder consumed something but ran out of
+	// bytes mid-structure. Same operator-facing shape as empty body.
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		writeError(w, http.StatusBadRequest,
+			"request body is truncated: re-send the complete JSON payload")
+
+		return true
+	}
+
+	// Bug 203: trailing bytes after the primary JSON value. The
+	// std-lib decoder is happy after one complete value, so
+	// `{"valid":"json"}garbage` decoded cleanly and the handler ran
+	// with the partial value. `decodeJSON` now checks `dec.More()`
+	// after the primary Decode and routes that case through this
+	// branch with the operator-actionable cue "trailing JSON data".
+	if errors.Is(err, errTrailingJSONData) {
+		writeError(w, http.StatusBadRequest,
+			"trailing JSON data after the request body: send exactly one "+
+				"top-level JSON value per request")
+
+		return true
+	}
+
+	return false
 }
 
 // unknownFieldName extracts the offending key from Go's

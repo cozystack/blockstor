@@ -417,6 +417,20 @@ func decodePassphraseEnterBody(w http.ResponseWriter, r *http.Request) (passphra
 			return passphraseRequest{}, false
 		}
 
+		// Bug 203: refuse residual bytes after the bare-string value.
+		// The std-lib decoder is happy after the closing quote, so a
+		// body of `"valid-pass"trailing` decoded cleanly and stuffed
+		// "valid-pass" into NewPassphrase — the downstream auth path
+		// then ran on the partial value. Same dec.More() guard the
+		// wrapped-object branch picks up via decodeJSON, applied here
+		// directly because this branch decodes into a `string` rather
+		// than through decodeJSON.
+		if dec.More() {
+			writeDecodeError(w, errTrailingJSONData)
+
+			return passphraseRequest{}, false
+		}
+
 		// Stuff the bare-string value into NewPassphrase so the
 		// downstream proofOfKnowledge() lookup keeps working
 		// unchanged. NewPassphrase wins over Passphrase in
