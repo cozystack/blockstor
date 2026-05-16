@@ -163,7 +163,19 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 		return errors.Wrapf(err, "get Resource %s/%s", in.Name, in.NodeName)
 	}
 
+	// Bug 206: Spec.Volumes carries the controller-stamped per-volume
+	// seeding state (SeedFromGi for DRBD's initial-sync fast path) and
+	// has no counterpart on the wire `Resource` shape — upstream
+	// LINSTOR exposes these knobs via the satellite-side reconciler,
+	// not the REST surface. `wireToCRDResourceSpec` rebuilds the Spec
+	// from the wire, so a naïve replace would silently wipe Volumes on
+	// every routine modify (prop bump, flag toggle, layer-stack change)
+	// and DRBD would do a full initial-sync over the wire instead of
+	// the seeded fast path. Carry it across explicitly — mirrors the
+	// VolumeDefinitions carry-across `resourceDefinitions.Update` does.
+	prevVolumes := existing.Spec.Volumes
 	existing.Spec = wireToCRDResourceSpec(in)
+	existing.Spec.Volumes = prevVolumes
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
 	// REST writer's `blockstor.io/peer-changed` bump actually reaches
@@ -222,7 +234,14 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 			return err
 		}
 
+		// Bug 206: preserve controller-stamped Spec.Volumes across
+		// the wire-rebuild — see the matching carry-across in `Update`
+		// above. `base := existing.DeepCopy()` happened BEFORE this
+		// assignment, so the JSON-merge-patch diff still computes
+		// correctly against the pre-mutate state.
+		prevVolumes := existing.Spec.Volumes
 		existing.Spec = wireToCRDResourceSpec(&wire)
+		existing.Spec.Volumes = prevVolumes
 
 		if wire.Annotations != nil {
 			existing.Annotations = cloneAnnotations(wire.Annotations)
