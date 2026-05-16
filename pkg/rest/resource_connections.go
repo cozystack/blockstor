@@ -272,31 +272,29 @@ func (s *Server) handleResourceConnectionPathCreate(w http.ResponseWriter, r *ht
 // later GET under either (a, b) or (b, a) reads the same blob and
 // only needs to flip A/B at the wire edge.
 func (s *Server) upsertResourceConnectionPath(ctx context.Context, rdName, nodeA, nodeB string, incoming resourceConnectionPath) error {
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
-	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
+	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — re-fetches
+	// the live RD on every conflict and re-runs the read-modify-write
+	// against the freshly-decoded path list. Two concurrent r-conn
+	// upserts on disjoint (nodeA, nodeB) pairs both land instead of one
+	// silently overwriting the other via the wholesale-Update snapshot
+	// path. (Pre-fix witness: TestPatchResourceConnectionsConcurrent.)
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+		paths, swap, lerr := loadPaths(rd, nodeA, nodeB)
+		if lerr != nil {
+			return lerr
+		}
 
-	paths, swap, err := loadPaths(&rd, nodeA, nodeB)
-	if err != nil {
-		return err
-	}
+		// Translate the request's A/B into canonical-order A/B
+		// before merging.
+		canonical := incoming
+		if swap {
+			canonical = swapPathAB(incoming)
+		}
 
-	// Translate the request's A/B into canonical-order A/B before
-	// merging.
-	canonical := incoming
-	if swap {
-		canonical = swapPathAB(incoming)
-	}
+		paths = upsertByName(paths, canonical)
 
-	paths = upsertByName(paths, canonical)
-
-	err = storePaths(&rd, nodeA, nodeB, paths)
-	if err != nil {
-		return err
-	}
-
-	err = s.Store.ResourceDefinitions().Update(ctx, &rd)
+		return storePaths(rd, nodeA, nodeB, paths)
+	})
 	if err != nil {
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}

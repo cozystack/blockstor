@@ -71,6 +71,20 @@ type NodeStore interface {
 	// semantics as PatchNetInterfaces; `mutate` is re-applied to the
 	// re-fetched current state on every retry (Bug 201).
 	PatchProps(ctx context.Context, name string, mutate func(map[string]string) error) error
+
+	// PatchNodeSpec runs `mutate` against the freshly-fetched Node
+	// wire value and persists the result. On 409 the
+	// fetch+mutate+patch cycle re-runs against fresh state — so
+	// disjoint concurrent edits (re-evacuate loop adding EVICTED, an
+	// operator stamping a different flag, etc.) all converge instead
+	// of being silently lost by the wholesale `Update`'s un-retried
+	// wire-snapshot replace (Bug 205).
+	//
+	// Distinct from `PatchNetInterfaces` / `PatchProps` (which take
+	// narrowly-typed mutators on a single sub-slice / sub-map); this
+	// hands the closure the whole wire Node so multi-field
+	// mutations stay atomic.
+	PatchNodeSpec(ctx context.Context, name string, mutate func(*apiv1.Node) error) error
 }
 
 // StoragePoolStore persists StoragePool objects. The composite key is

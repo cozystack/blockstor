@@ -1046,32 +1046,45 @@ func (s *Server) pruneVolumesFromResources(ctx context.Context, rd string, vn in
 	}
 
 	for i := range resources {
-		rsc := resources[i]
+		rsc := &resources[i]
 		if len(rsc.Volumes) == 0 {
 			continue
 		}
 
-		out := make([]apiv1.Volume, 0, len(rsc.Volumes))
-
-		dropped := false
-
-		for j := range rsc.Volumes {
-			if rsc.Volumes[j].VolumeNumber == vn {
-				dropped = true
-
-				continue
+		// Bug 205: typed-Patch via PatchResourceSpec — the closure
+		// re-runs against the live Resource on every conflict, so a
+		// racing satellite SetState (Status subresource, different
+		// field owner) doesn't race the prune. NotFound and Patch
+		// errors are swallowed identical to the wholesale `Update`
+		// this replaces — the prune is best-effort, the eventual
+		// satellite re-stamp closes the gap regardless.
+		_ = s.Store.Resources().PatchResourceSpec(ctx, rsc.Name, rsc.NodeName, func(live *apiv1.Resource) error {
+			if len(live.Volumes) == 0 {
+				return nil
 			}
 
-			out = append(out, rsc.Volumes[j])
-		}
+			out := make([]apiv1.Volume, 0, len(live.Volumes))
 
-		if !dropped {
-			continue
-		}
+			dropped := false
 
-		rsc.Volumes = out
+			for j := range live.Volumes {
+				if live.Volumes[j].VolumeNumber == vn {
+					dropped = true
 
-		_ = s.Store.Resources().Update(ctx, &rsc)
+					continue
+				}
+
+				out = append(out, live.Volumes[j])
+			}
+
+			if !dropped {
+				return nil
+			}
+
+			live.Volumes = out
+
+			return nil
+		})
 	}
 }
 
@@ -1118,13 +1131,23 @@ func (s *Server) stampResizePendingOnResources(ctx context.Context, rd string, v
 	value := strconv.FormatInt(sizeKib, 10)
 
 	for i := range resources {
-		rsc := resources[i]
-		if rsc.Annotations == nil {
-			rsc.Annotations = map[string]string{}
-		}
+		rsc := &resources[i]
 
-		rsc.Annotations[key] = value
+		// Bug 205: typed-Patch via PatchResourceSpec — the closure
+		// re-runs against the live Resource on every conflict so a
+		// racing satellite SetState (Status subresource, different
+		// field owner) or peer-modify doesn't race the resize-pending
+		// stamp. Patch errors are swallowed identical to the wholesale
+		// `Update` it replaces — the stamp is best-effort breadcrumb,
+		// not a correctness signal.
+		_ = s.Store.Resources().PatchResourceSpec(ctx, rsc.Name, rsc.NodeName, func(live *apiv1.Resource) error {
+			if live.Annotations == nil {
+				live.Annotations = map[string]string{}
+			}
 
-		_ = s.Store.Resources().Update(ctx, &rsc)
+			live.Annotations[key] = value
+
+			return nil
+		})
 	}
 }

@@ -272,6 +272,32 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 	return nil
 }
 
+// PatchNodeSpec runs `mutate` atomically against the live Node entry
+// under the write lock. The InMemory store has no resourceVersion
+// surface, so a lock-held single-shot mutate covers what
+// RetryOnConflict does on the k8s backend. Bug 205 shim.
+func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate func(*apiv1.Node) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	node, ok := s.m[name]
+	if !ok {
+		return errors.Wrapf(ErrNotFound, "node %q", name)
+	}
+
+	if err := mutate(&node); err != nil {
+		return errors.Wrapf(err, "patch Node %q", name)
+	}
+
+	s.m[name] = node
+
+	return nil
+}
+
 // Delete removes a node by name. Returns ErrNotFound if absent.
 func (s *inMemoryNodes) Delete(_ context.Context, name string) error {
 	s.mu.Lock()

@@ -215,10 +215,18 @@ func (s *Server) handleNodeEvacuateMulti(w http.ResponseWriter, r *http.Request)
 
 	// All pre-checks passed — stamp EVICTED on every node.
 	// Idempotent per addFlag's slices.Contains short-circuit.
+	//
+	// Bug 205: typed-Patch via PatchNodeSpec — the closure re-runs
+	// against the live Node on every conflict so a racing operator-
+	// driven flag toggle or satellite Hello (NetInterface upsert)
+	// converges with the EVICTED stamp instead of being silently
+	// dropped by the wholesale `Update` from the pre-loop snapshot.
 	for i := range nodes {
-		nodes[i].Flags = addFlag("EVICTED")(nodes[i].Flags)
+		err := s.Store.Nodes().PatchNodeSpec(ctx, nodes[i].Name, func(live *apiv1.Node) error {
+			live.Flags = addFlag("EVICTED")(live.Flags)
 
-		err := s.Store.Nodes().Update(ctx, &nodes[i])
+			return nil
+		})
 		if err != nil {
 			writeStoreError(w, err)
 

@@ -386,10 +386,23 @@ func (s *Server) persistAutoplaceLayerList(w http.ResponseWriter, r *http.Reques
 
 	rd.LayerStack = append([]string(nil), layerList...)
 
-	// TODO(Bug 204b followup): switch to PatchResourceDefinitionSpec — this
-	// path runs once per RD create, low contention, but is still subject to
-	// the same stale-wire-snapshot retry hazard.
-	err := s.Store.ResourceDefinitions().Update(r.Context(), rd)
+	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
+	// closure mutates a freshly-fetched live RD on every retry, so
+	// concurrent disjoint edits (RG-supplied props, racing r-conn
+	// add, autoplace LayerStack stamp) all converge instead of
+	// being lost by a stale-wire-snapshot replay.
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rd.Name, func(live *apiv1.ResourceDefinition) error {
+		if len(live.LayerStack) > 0 {
+			// A racing writer already set LayerStack — leave it
+			// alone (RD-level wins over autoplace-supplied list,
+			// matching the original guard at the top of this fn).
+			return nil
+		}
+
+		live.LayerStack = append([]string(nil), layerList...)
+
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -1040,23 +1053,24 @@ func (s *Server) applyBug156AutoTiebreakerOptOut(
 func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) error {
 	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
 
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
-	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
+	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
+	// closure re-runs on every conflict against the live RD, so
+	// disjoint concurrent edits (RG-supplied props, racing r-conn
+	// add) converge with the tiebreaker opt-out instead of being
+	// lost by a stale-wire-snapshot replay.
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(live *apiv1.ResourceDefinition) error {
+		if live.Props != nil && live.Props[propKey] == "false" {
+			return nil
+		}
 
-	if rd.Props != nil && rd.Props[propKey] == "false" {
+		if live.Props == nil {
+			live.Props = map[string]string{}
+		}
+
+		live.Props[propKey] = "false"
+
 		return nil
-	}
-
-	if rd.Props == nil {
-		rd.Props = map[string]string{}
-	}
-
-	rd.Props[propKey] = "false"
-
-	// TODO(Bug 204b followup): switch to PatchResourceDefinitionSpec.
-	err = s.Store.ResourceDefinitions().Update(ctx, &rd)
+	})
 	if err != nil {
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
@@ -1427,25 +1441,74 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 // replica is NOT a diskless witness (i.e. a real conflict the caller
 // should surface as 409).
 func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resource) (*apiv1.Resource, error) {
-	existing, err := s.Store.Resources().Get(ctx, target.Name, target.NodeName)
-	if err != nil {
-		return nil, errors.Wrapf(err, "lookup existing replica %s.%s", target.Name, target.NodeName)
-	}
-
 	wantDiskful := target.Props["StorPoolName"] != "" &&
 		!containsResourceFlag(target.Flags, apiv1.ResourceFlagDiskless)
 
+	var (
+		promoted   apiv1.Resource
+		notDiskful bool
+	)
+
+	// Bug 205: typed-Patch via PatchResourceSpec — the closure
+	// re-runs on every conflict against the live replica, so a
+	// racing satellite SetState (Status subresource) or operator-
+	// driven flag-toggle on the same Resource converges instead of
+	// being silently dropped by the wholesale `Update`. The
+	// witness-vs-real-conflict check is re-evaluated each retry
+	// against fresh state.
+	err := s.Store.Resources().PatchResourceSpec(ctx, target.Name, target.NodeName, func(live *apiv1.Resource) error {
+		keep, wasDiskless := stripDisklessAndWitnessFlags(live.Flags, wantDiskful)
+
+		if !wasDiskless {
+			notDiskful = true
+
+			return nil
+		}
+
+		live.Flags = keep
+
+		if wantDiskful {
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
+
+			live.Props["StorPoolName"] = target.Props["StorPoolName"]
+		}
+
+		promoted = *live
+
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, errors.Wrapf(err, "lookup existing replica %s.%s", target.Name, target.NodeName)
+		}
+
+		return nil, errors.Wrapf(err, "promote diskless %s.%s", target.Name, target.NodeName)
+	}
+
+	if notDiskful {
+		return nil, errors.Wrapf(store.ErrAlreadyExists,
+			"resource %q on node %q already diskful", target.Name, target.NodeName)
+	}
+
+	return &promoted, nil
+}
+
+// stripDisklessAndWitnessFlags walks `flags` and produces the post-promote
+// flag list: TIE_BREAKER is always stripped; DISKLESS is stripped only
+// when the caller asked for diskful. Returns the kept slice and whether
+// the original flag set contained a witness (DISKLESS or TIE_BREAKER) —
+// promoteDisklessReplica needs the latter to surface ErrAlreadyExists on
+// real diskful replicas. Pulled out of promoteDisklessReplica to keep
+// that function under the funlen budget after the Bug 205 Patch refactor.
+func stripDisklessAndWitnessFlags(flags []string, wantDiskful bool) ([]string, bool) {
 	wasDiskless := false
+	keep := flags[:0]
 
-	keep := existing.Flags[:0]
-
-	for _, flag := range existing.Flags {
+	for _, flag := range flags {
 		switch flag {
 		case apiv1.ResourceFlagTieBreaker:
-			// Always strip the witness marker on any
-			// caller-driven promote — the replica is now
-			// owned by an operator/CSI request, not the
-			// auto-placer.
 			wasDiskless = true
 		case apiv1.ResourceFlagDiskless:
 			wasDiskless = true
@@ -1460,28 +1523,7 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 		}
 	}
 
-	if !wasDiskless {
-		// Existing replica is a real diskful one — true conflict.
-		return nil, errors.Wrapf(store.ErrAlreadyExists,
-			"resource %q on node %q already diskful", target.Name, target.NodeName)
-	}
-
-	existing.Flags = keep
-
-	if wantDiskful {
-		if existing.Props == nil {
-			existing.Props = map[string]string{}
-		}
-
-		existing.Props["StorPoolName"] = target.Props["StorPoolName"]
-	}
-
-	err = s.Store.Resources().Update(ctx, &existing)
-	if err != nil {
-		return nil, errors.Wrapf(err, "promote diskless %s.%s", target.Name, target.NodeName)
-	}
-
-	return &existing, nil
+	return keep, wasDiskless
 }
 
 // containsResourceFlag is a small helper so the create/promote
@@ -1622,38 +1664,46 @@ func (s *Server) applyMakeAvailable(w http.ResponseWriter, r *http.Request, rdNa
 // the caller asked for diskful. Diskful replicas with no flag changes
 // are a no-op (already available).
 func (s *Server) makeAvailableUpdate(ctx context.Context, existing *apiv1.Resource, req *apiv1.ResourceMakeAvailable) error {
-	changed := false
+	// Bug 205: typed-Patch via PatchResourceSpec — the closure
+	// re-runs on every conflict against the live replica, so a
+	// racing satellite SetState (Status subresource) or operator-
+	// driven flag-toggle converges with the make-available promote
+	// instead of being silently dropped by the wholesale `Update`.
+	err := s.Store.Resources().PatchResourceSpec(ctx, existing.Name, existing.NodeName, func(live *apiv1.Resource) error {
+		changed := false
+		keep := live.Flags[:0]
 
-	keep := existing.Flags[:0]
-
-	for _, flag := range existing.Flags {
-		switch flag {
-		case apiv1.ResourceFlagTieBreaker:
-			// Tiebreaker witnesses always shed the marker on
-			// make-available — the controller's tiebreaker
-			// cleanup hands ownership to the consumer.
-			changed = true
-		case apiv1.ResourceFlagDiskless:
-			if req.Diskful {
-				// Promoting to diskful: drop DISKLESS too.
+		for _, flag := range live.Flags {
+			switch flag {
+			case apiv1.ResourceFlagTieBreaker:
+				// Tiebreaker witnesses always shed the marker on
+				// make-available — the controller's tiebreaker
+				// cleanup hands ownership to the consumer.
 				changed = true
+			case apiv1.ResourceFlagDiskless:
+				if req.Diskful {
+					// Promoting to diskful: drop DISKLESS too.
+					changed = true
 
-				continue
+					continue
+				}
+
+				keep = append(keep, flag)
+			default:
+				keep = append(keep, flag)
 			}
-
-			keep = append(keep, flag)
-		default:
-			keep = append(keep, flag)
 		}
-	}
 
-	if !changed {
+		if !changed {
+			// No flag change — Spec stays identical to the live
+			// value and PatchResourceSpec ends up as a no-op patch.
+			return nil
+		}
+
+		live.Flags = keep
+
 		return nil
-	}
-
-	existing.Flags = keep
-
-	err := s.Store.Resources().Update(ctx, existing)
+	})
 	if err != nil {
 		return errors.Wrapf(err, "make-available update %s.%s", existing.Name, existing.NodeName)
 	}
@@ -1865,19 +1915,27 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 			continue
 		}
 
-		if sib.Annotations == nil {
-			sib.Annotations = map[string]string{}
-		}
-
-		sib.Annotations[apiv1.PeerChangedAnnotation] = stamp
-
-		// Update is best-effort. A concurrent satellite SetState
+		// Bug 205: typed-Patch via PatchResourceSpec — re-fetches the
+		// live sibling on every conflict so a racing peer-Delete or
+		// peer-modify on the same row converges with the
+		// PeerChanged stamp instead of being silently dropped by the
+		// wholesale `Update` snapshot.
+		//
+		// Patch is still best-effort. A concurrent satellite SetState
 		// using SSA on Status doesn't race this Spec/metadata path
 		// (different field owners + different subresources), so the
-		// typical failure mode here is a conflict from another REST
-		// writer (rare) or NotFound from a same-instant peer Delete
-		// (already-fine outcome).
-		_ = s.Store.Resources().Update(ctx, sib)
+		// typical failure mode here is a NotFound from a same-instant
+		// peer Delete (already-fine outcome) — swallowed identical to
+		// the wholesale `Update` it replaces.
+		_ = s.Store.Resources().PatchResourceSpec(ctx, sib.Name, sib.NodeName, func(live *apiv1.Resource) error {
+			if live.Annotations == nil {
+				live.Annotations = map[string]string{}
+			}
+
+			live.Annotations[apiv1.PeerChangedAnnotation] = stamp
+
+			return nil
+		})
 	}
 }
 
@@ -1892,21 +1950,26 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 // concurrent RD-delete cascade is the most common reason and the
 // caller doesn't care.
 func (s *Server) stampTiebreakerSuppression(ctx context.Context, rdName string) error {
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil
+	deadline := time.Now().Add(autoTiebreakerSuppressionWindow).UTC().Format(time.RFC3339)
+
+	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — re-fetches
+	// the live RD on every conflict so a racing RD-modify or r-conn
+	// upsert on the same RD converges with the tiebreaker-suppression
+	// annotation instead of being lost by a stale-wire-snapshot replay.
+	// NotFound is still treated as "fine, RD already gone" — the
+	// caller (best-effort cascade) doesn't care.
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+		if rd.Annotations == nil {
+			rd.Annotations = map[string]string{}
 		}
 
-		return err //nolint:wrapcheck // best-effort, caller swallows
+		rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation] = deadline
+
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
 	}
 
-	if rd.Annotations == nil {
-		rd.Annotations = map[string]string{}
-	}
-
-	deadline := time.Now().Add(autoTiebreakerSuppressionWindow).UTC().Format(time.RFC3339)
-	rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation] = deadline
-
-	return s.Store.ResourceDefinitions().Update(ctx, &rd) //nolint:wrapcheck // best-effort
+	return err //nolint:wrapcheck // best-effort, caller swallows
 }

@@ -259,6 +259,55 @@ func (n *nodes) PatchNetInterfaces(ctx context.Context, name string, mutate func
 	}), "patch NetInterfaces of Node %q", name)
 }
 
+// PatchNodeSpec runs `mutate` against the freshly-fetched current wire-
+// shape Node and persists the result via a typed-Patch
+// (JSON-merge-patch) under `RetryOnConflict` with the Bug 201 backoff.
+// On 409 the cycle re-runs against fresh state — so disjoint concurrent
+// edits (re-evacuate loop adding EVICTED, an operator stamping a
+// different flag, etc.) converge instead of being silently dropped by
+// the wholesale `Update`'s un-retried wire-snapshot replace (Bug 205).
+//
+// Status is not touched here (the satellite reconciler owns it via the
+// Status subresource). User annotations on the Node CRD are preserved
+// verbatim — the patch reaches only Spec.
+//
+// The closure receives the wire-shape Node so REST handlers can mutate
+// Flags / Props / NetInterfaces in a single atomic patch, mirroring the
+// shape the wholesale `Update` accepted.
+func (n *nodes) PatchNodeSpec(ctx context.Context, name string, mutate func(*apiv1.Node) error) error {
+	if mutate == nil {
+		return errors.New("nil mutate")
+	}
+
+	return errors.Wrapf(retry.RetryOnConflict(patchRetryBackoff(), func() error {
+		var existing crdv1alpha1.Node
+
+		err := n.c.Get(ctx, types.NamespacedName{Name: Name(name)}, &existing)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(store.ErrNotFound, "node %q", name)
+			}
+
+			return errors.Wrapf(err, "get Node %q", name)
+		}
+
+		base := existing.DeepCopy()
+
+		// Surface as wire shape so the closure runs in the same
+		// vocabulary as REST handlers.
+		wire := crdToWireNode(&existing)
+
+		err = mutate(&wire)
+		if err != nil {
+			return err
+		}
+
+		existing.Spec = wireToCRDNodeSpec(&wire)
+
+		return n.c.Patch(ctx, &existing, ctrlclient.MergeFromWithOptions(base, ctrlclient.MergeFromWithOptimisticLock{}))
+	}), "patch Node %q", name)
+}
+
 // PatchProps runs `mutate` against the freshly-fetched current Props
 // map and persists the mutated map via a typed-Patch
 // (JSON-merge-patch). On 409 the cycle re-runs against fresh state.
