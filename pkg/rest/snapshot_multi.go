@@ -105,22 +105,39 @@ func (s *Server) createOneFromMulti(ctx context.Context, entry *multiSnapshotCre
 
 	err := s.hydrateSnapshotFromRD(ctx, &snap, entry.ResourceName)
 	if err != nil {
-		return apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: entry.ResourceName + "/" + entry.Name + ": " + err.Error(),
-		}
+		return multiSnapshotEntryErr(entry, err)
 	}
 
 	err = s.Store.Snapshots().Create(ctx, &snap)
 	if err != nil {
-		return apiv1.APICallRc{
-			RetCode: apiCallRcError,
-			Message: entry.ResourceName + "/" + entry.Name + ": " + err.Error(),
-		}
+		return multiSnapshotEntryErr(entry, err)
 	}
 
 	return apiv1.APICallRc{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + entry.ResourceName + "/" + entry.Name,
+	}
+}
+
+// multiSnapshotEntryErr packages a per-entry failure into an ApiCallRc
+// envelope, routing the underlying error string through
+// `scrubImplDetails` so backend identifiers (etcd / apimachinery /
+// k8s.io / `*.blockstor.io`) never reach the wire. Bug 199 wrapped
+// `writeError` at the envelope-emission seam, but `createOneFromMulti`
+// returns its envelopes to `handleSnapshotCreateMulti` which calls
+// `writeJSON` directly — that path bypasses the writeError-level
+// scrub. Bug 200 plugs the multi-create batch path by centralising
+// the inline `APICallRc{Message: ...err.Error()}` construction here:
+// every multi-create failure goes through this single seam, every
+// future addition to `createOneFromMulti` reuses it for free.
+//
+// The "rd/snap: " per-entry prefix is operator context and is NOT
+// scrubbed — only the underlying err string is rewritten, so an
+// already-scrubbed literal ("snapshot already exists") passes
+// through byte-for-byte.
+func multiSnapshotEntryErr(entry *multiSnapshotCreateEntry, err error) apiv1.APICallRc {
+	return apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: entry.ResourceName + "/" + entry.Name + ": " + scrubImplDetails(err.Error()),
 	}
 }
