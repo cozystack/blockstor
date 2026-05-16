@@ -302,6 +302,15 @@ func (s *Server) handleNodesList(w http.ResponseWriter, r *http.Request) {
 		nodes = []apiv1.Node{}
 	}
 
+	// Bug 183: scrub deny-listed sensitive keys (passphrase, password,
+	// shared-secret, ...) from every Node's Props bag before emit.
+	// Mirrors Bug 115's RD-side redaction at the REST boundary — the
+	// satellite-side reads (which need the un-redacted value for the
+	// LUKS-prereq gate) bypass this path.
+	for i := range nodes {
+		redactSensitiveProps(nodes[i].Props)
+	}
+
 	writeJSON(w, http.StatusOK, nodes)
 }
 
@@ -314,6 +323,11 @@ func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 183: scrub the per-Node Props bag at the REST boundary.
+	// The Get() return is a value copy so the in-place redaction is
+	// local to this response — store cache stays un-redacted.
+	redactSensitiveProps(n.Props)
 
 	writeJSON(w, http.StatusOK, n)
 }

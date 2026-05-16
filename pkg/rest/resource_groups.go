@@ -84,6 +84,16 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 		rgs = []apiv1.ResourceGroup{}
 	}
 
+	// Bug 181: scrub sensitive keys (passphrase, password, shared-
+	// secret, ...) from every RG's Props map before the JSON encode.
+	// Bug 115 wired this same deny list into RD / Controller /
+	// Resource read paths but never extended it to RG. `linstor rg lp
+	// <rg>` rendered DrbdOptions/EncryptPassphrase verbatim from the
+	// list path the python CLI hits when it filters by name.
+	for i := range rgs {
+		redactSensitiveProps(rgs[i].Props)
+	}
+
 	writeJSON(w, http.StatusOK, rgs)
 }
 
@@ -100,6 +110,12 @@ func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 181: scrub the per-RG Props bag at the REST boundary.
+	// getRGWithCacheRetry returns a value copy, so the in-place
+	// mutation is local to this response and does not leak back
+	// into the store cache.
+	redactSensitiveProps(rg.Props)
 
 	writeJSON(w, http.StatusOK, rg)
 }

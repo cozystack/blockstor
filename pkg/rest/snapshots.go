@@ -148,6 +148,15 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 182: scrub sensitive keys from every prop bag the snapshot
+	// view emits before any further processing — the view shape
+	// inherits parent-RD `props` via hydrateSnapshotFromRD, so the
+	// passphrase landed verbatim under three top-level maps
+	// (`props`, `snapshot_definition_props`, `resource_definition_props`)
+	// plus the per-VD `volume_definition_props` slot. Mirrors
+	// Bug 115's RD-side redaction at the REST boundary.
+	redactSnapshotsInPlace(snaps)
+
 	// Optional filters golinstor sends: ?resources=rd1,rd2 &
 	// snapshots=name1,name2 — case-insensitive set membership against
 	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
@@ -237,6 +246,13 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 182: same redaction as the cluster-wide view path. The
+	// per-RD list inherits the parent-RD props through every
+	// snapshot create call's hydrateSnapshotFromRD, so the three
+	// snapshot-level prop bags + per-VD `volume_definition_props`
+	// all carry the canary on the wire without this sweep.
+	redactSnapshotsInPlace(snaps)
+
 	writeJSON(w, http.StatusOK, snaps)
 }
 
@@ -264,7 +280,34 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 182: scrub before emit. The Snapshots().Get() above
+	// returned a value copy, so the in-place mutation is local to
+	// this response — the store cache stays un-redacted for the
+	// satellite-side LUKS reads which need the real value.
+	redactSnapshotsInPlace(single)
+
 	writeJSON(w, http.StatusOK, single[0])
+}
+
+// redactSnapshotsInPlace walks every prop bag a Snapshot DTO emits
+// and scrubs deny-listed keys. Covers the three top-level maps the
+// snapshot wire shape carries (`Props`, `SnapshotDefinitionProps`,
+// `ResourceDefinitionProps`) plus each per-VD `VolumeDefinitionProps`
+// slot. Mirrors the Bug 115 RD redaction pattern but applied to
+// every snapshot in the slice. Idempotent: a second pass is a no-op.
+func redactSnapshotsInPlace(snaps []apiv1.Snapshot) {
+	for i := range snaps {
+		snap := &snaps[i]
+
+		redactSensitiveProps(snap.Props)
+		redactSensitiveProps(snap.SnapshotDefinitionProps)
+		redactSensitiveProps(snap.ResourceDefinitionProps)
+
+		vds := snap.VolumeDefinitions
+		for j := range vds {
+			redactSensitiveProps(vds[j].VolumeDefinitionProps)
+		}
+	}
 }
 
 // stampSnapshotSuccessful derives the python-CLI `State` column from

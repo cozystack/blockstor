@@ -401,6 +401,13 @@ func (s *Server) handleStoragePoolsView(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Bug 184: scrub sensitive keys from every pool's Props bag
+	// before emit. Mirrors Bug 115's RD-side redaction — `linstor sp
+	// lp` and `linstor sp l` both surface controller-side props
+	// (StorDriver/EncryptPassphrase + Aux/* secrets) that must not
+	// cross the read boundary.
+	redactStoragePoolsInPlace(out)
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -433,7 +440,22 @@ func (s *Server) handleNodeStoragePoolsList(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Bug 184: same redaction as the cluster-wide view path. The
+	// per-node list is the surface linstor-csi hits on every
+	// NodeRegister, so a leak here surfaces on every node bootstrap.
+	redactStoragePoolsInPlace(out)
+
 	writeJSON(w, http.StatusOK, out)
+}
+
+// redactStoragePoolsInPlace walks every StoragePool's Props map and
+// scrubs deny-listed keys. Centralised so the per-node + cluster-
+// wide + per-pool GET paths share the same wire-edge invariant.
+// Idempotent: a second pass is a no-op.
+func redactStoragePoolsInPlace(pools []apiv1.StoragePool) {
+	for i := range pools {
+		redactSensitiveProps(pools[i].Props)
+	}
 }
 
 // listFilteredStoragePools returns the wire-shape pool slice after applying
@@ -473,6 +495,11 @@ func (s *Server) handleNodeStoragePoolGet(w http.ResponseWriter, r *http.Request
 
 		return
 	}
+
+	// Bug 184: redact sensitive Props at the REST boundary. The
+	// Get() returns a value copy so the mutation is local to this
+	// response — the store cache stays un-redacted.
+	redactSensitiveProps(sp.Props)
 
 	writeJSON(w, http.StatusOK, sp)
 }

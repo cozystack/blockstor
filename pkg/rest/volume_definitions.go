@@ -133,17 +133,40 @@ func (s *Server) handleVDView(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Bug 185: scrub sensitive keys from every VD's Props bag
+		// before bundling into the aggregate view. Mirrors Bug 115's
+		// RD-side redaction — `linstor vd l` would otherwise surface
+		// the LUKS passphrase verbatim under each volume's `props`.
+		// The parent RD's Props bag is ALSO redacted here for parity
+		// with /v1/resource-definitions which has Bug 115's
+		// stampRDEffectiveProps redaction on the same key set; the
+		// VD-view emits a bare per-RD Props map that bypasses that
+		// path entirely.
+		rdProps := rds[i].Props
+		redactSensitiveProps(rdProps)
+		redactVolumeDefinitionsInPlace(vds)
+
 		out = append(out, rdWithVDs{
 			Name:              rds[i].Name,
 			ExternalName:      rds[i].ExternalName,
 			ResourceGroupName: rds[i].ResourceGroupName,
 			Flags:             rds[i].Flags,
-			Props:             rds[i].Props,
+			Props:             rdProps,
 			VolumeDefinitions: vds,
 		})
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// redactVolumeDefinitionsInPlace walks every VD's Props bag and
+// scrubs deny-listed keys. Centralised so the per-RD list + cluster-
+// wide view + per-VD GET paths share the wire-edge invariant.
+// Idempotent.
+func redactVolumeDefinitionsInPlace(vds []apiv1.VolumeDefinition) {
+	for i := range vds {
+		redactSensitiveProps(vds[i].Props)
+	}
 }
 
 func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
@@ -172,6 +195,9 @@ func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
 		vds = []apiv1.VolumeDefinition{}
 	}
 
+	// Bug 185: scrub sensitive Props on every VD before emit.
+	redactVolumeDefinitionsInPlace(vds)
+
 	writeJSON(w, http.StatusOK, vds)
 }
 
@@ -191,6 +217,11 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 185: redact the per-VD Props bag at the REST boundary.
+	// Get() returns a value copy, so the in-place mutation is local
+	// to this response — the store cache stays un-redacted.
+	redactSensitiveProps(vd.Props)
 
 	writeJSON(w, http.StatusOK, vd)
 }
