@@ -20,12 +20,29 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 
 	"github.com/cockroachdb/errors"
 )
+
+// localeOverrideEnv pins LC_ALL=C (and LANG=C) for every child
+// process spawned through RealExec. The satellite parses several
+// shell tools' human-readable output (cryptsetup EEXIST, drbdadm
+// peer states, lvm/zfs error class detection) with substring
+// matches that assume English. A satellite container launched with
+// a non-C locale would see translated messages and silently
+// misclassify errors — Bug 215 shows the cryptsetup luksOpen path
+// corrupting an already-formatted device on de_DE because "Gerät
+// existiert bereits" didn't match the English-only "already
+// exists" probe. Forcing the locale here is the single chokepoint
+// that immunises every exec.Run caller, including future ones
+// that might add their own English-substring parsers.
+func localeOverrideEnv() []string {
+	return []string{"LC_ALL=C", "LANG=C"}
+}
 
 // Exec is a context-aware shell-out abstraction. Production uses
 // RealExec which wraps os/exec; tests substitute FakeExec to assert what
@@ -67,6 +84,11 @@ func (RealExec) RunWithStdin(
 	args ...string,
 ) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+
+	// Inherit the parent env but override LC_ALL/LANG so the child's
+	// output is English regardless of how the satellite container was
+	// launched. See localeOverrideEnv for rationale (Bug 215).
+	cmd.Env = append(os.Environ(), localeOverrideEnv()...)
 
 	var (
 		stdout bytes.Buffer

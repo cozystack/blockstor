@@ -56,15 +56,72 @@ func (c *Cryptsetup) Format(ctx context.Context, device string, key []byte) erro
 	return nil
 }
 
+// ErrAlreadyOpen marks the cryptsetup EEXIST class — the dm-crypt
+// mapper is already active for this device. Returned by Open wrapped
+// via errors.Wrap so callers can both errors.Is-match the sentinel
+// and surface the original cryptsetup message in logs.
+//
+// Bug 215: the reconciler used to detect this class via
+// `strings.Contains(err.Error(), "already exists")` which silently
+// missed translated cryptsetup output (e.g. de_DE "Gerät existiert
+// bereits") and led to a luksFormat retry — a corruption-class
+// outcome that wipes the key slots of an already-formatted device.
+// Exposing the typed sentinel lets the reconciler classify the
+// error by identity instead of by English substring, immune to
+// locale drift even if storage.RealExec's LC_ALL=C guard is bypassed.
+var ErrAlreadyOpen = errors.New("luks: device already open")
+
 // Open unlocks device under the dm-crypt name `dmName`. The opened
-// device shows up at /dev/mapper/<dmName>.
+// device shows up at /dev/mapper/<dmName>. When the mapper is
+// already open (the everyday idempotent-reconcile path), the
+// returned error wraps ErrAlreadyOpen so callers can errors.Is-match
+// instead of substring-matching cryptsetup output.
 func (c *Cryptsetup) Open(ctx context.Context, device, dmName string, key []byte) error {
 	err := c.runWithKey(ctx, key, "luksOpen", device, dmName, "--key-file", "-")
-	if err != nil {
-		return errors.Wrapf(err, "luksOpen %s -> %s", device, dmName)
+	if err == nil {
+		return nil
 	}
 
-	return nil
+	if classifyAlreadyOpen(err) {
+		return errors.Wrapf(
+			errors.Mark(err, ErrAlreadyOpen),
+			"luksOpen %s -> %s", device, dmName)
+	}
+
+	return errors.Wrapf(err, "luksOpen %s -> %s", device, dmName)
+}
+
+// classifyAlreadyOpen returns true when err's message matches any
+// known cryptsetup EEXIST translation. The match is locale-tolerant
+// because cryptsetup doesn't expose a structured error and we can't
+// rely on its exit code through the storage.Exec abstraction (it
+// folds exec.ExitError into a generic wrapped error). The needle
+// list enumerates the cryptsetup "already exists" message in the
+// locales the satellite is most likely to encounter; the exec layer
+// already pins LC_ALL=C, so the English needle covers production
+// and the non-English needles defend against env rewrites
+// downstream of RealExec.
+func classifyAlreadyOpen(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	needles := []string{
+		"already exists",    // C / en_US — the post-LC_ALL=C path
+		"existiert bereits", // de_DE
+		"existe déjà",       // fr_FR
+		"уже существует",    // ru_RU
+		"ya existe",         // es_ES
+	}
+
+	msg := err.Error()
+	for _, needle := range needles {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Resize tells cryptsetup the underlying device has grown — without

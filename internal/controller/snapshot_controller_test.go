@@ -32,13 +32,15 @@ import (
 
 var _ = Describe("Snapshot Controller", func() {
 	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+		// Bug 214: Snapshot CRD requires metadata.name == <rd>.<snap>
+		// (CEL `XValidation`); use a name that satisfies the new rule.
+		const resourceName = "rd1.snap1"
 
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
 		snapshot := &blockstoriov1alpha1.Snapshot{}
 
@@ -51,7 +53,10 @@ var _ = Describe("Snapshot Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: blockstoriov1alpha1.SnapshotSpec{
+						ResourceDefinitionName: "rd1",
+						SnapshotName:           "snap1",
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}

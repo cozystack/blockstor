@@ -97,8 +97,19 @@ type SnapshotPerNodeStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:validation:XValidation:rule="oldSelf.hasValue() || self.metadata.name == self.spec.resourceDefinitionName + '.' + self.spec.snapshotName",message="metadata.name must equal <spec.resourceDefinitionName>.<spec.snapshotName>",optionalOldSelf=true
 
-// Snapshot is the Schema for the snapshots API
+// Snapshot is the Schema for the snapshots API.
+//
+// The CEL rule above enforces the cluster-wide naming convention every
+// composite-keyed CRD in the project follows: `metadata.name == <rd>.<snap>`.
+// Keeping the composite key encoded in the name lets the store's
+// `snapshotCRDName` helper round-trip the (rd, snap) pair through k8s
+// metadata without a sidecar index, and lets operators grep for
+// `<rd>.` across kinds (Resource, Snapshot, StoragePool) to find every
+// object bound to one parent. The `optionalOldSelf` escape makes the
+// rule create-only — finalizer-strip on a stale-named Snapshot
+// (e.g. one created before this marker existed) is never blocked.
 type Snapshot struct {
 	metav1.TypeMeta `json:",inline"`
 

@@ -481,9 +481,13 @@ func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, 
 		err = r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
 		if err != nil {
 			// EEXIST is expected on every reconcile after the first —
-			// the device is already opened. Best-effort string check
-			// because cryptsetup doesn't return a structured error.
-			if !strings.Contains(err.Error(), "already exists") {
+			// the device is already opened. Classify via the typed
+			// luks.ErrAlreadyOpen sentinel so we are immune to
+			// cryptsetup output locale (Bug 215): the prior English-
+			// only substring match silently failed on de_DE / fr_FR /
+			// ru_RU satellites and would have triggered a luksFormat
+			// retry against an already-formatted device.
+			if !errors.Is(err, luks.ErrAlreadyOpen) {
 				return nil, errors.Wrapf(err, "luks open %s -> %s", dev, dmName)
 			}
 		}

@@ -56,6 +56,13 @@ var _ = Describe("CEL naming-convention validation", func() {
 		_ = k8sClient.Delete(ctx, res)
 	}
 
+	cleanupSnapshot := func(name string) {
+		sn := &blockstoriov1alpha1.Snapshot{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+		}
+		_ = k8sClient.Delete(ctx, sn)
+	}
+
 	Context("StoragePool.metadata.name", func() {
 		It("accepts a canonical <pool>.<node> name", func() {
 			name := "zfs-thin.w1"
@@ -149,6 +156,66 @@ var _ = Describe("CEL naming-convention validation", func() {
 		})
 	})
 
+	// Bug 214: Snapshot CRD was missing the CEL XValidation rule that
+	// pins metadata.name to `<resourceDefinitionName>.<snapshotName>`.
+	// Without it, a direct `kubectl apply` of a Snapshot with an
+	// arbitrary name created an orphan CRD the satellite never picked
+	// up (the store keyed by `snapshotCRDName(rd, snap)` would never
+	// find the mis-named object). Mirror the Resource/StoragePool rule
+	// onto Snapshot to close the gap.
+	Context("Snapshot.metadata.name", func() {
+		It("accepts a canonical <rd>.<snap> name", func() {
+			name := "pvc-cel-ok.snap1"
+
+			defer cleanupSnapshot(name)
+
+			sn := &blockstoriov1alpha1.Snapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: blockstoriov1alpha1.SnapshotSpec{
+					ResourceDefinitionName: "pvc-cel-ok",
+					SnapshotName:           "snap1",
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, sn)).To(Succeed())
+		})
+
+		It("rejects a name that doesn't match <rd>.<snap>", func() {
+			name := "wrong-snapshot-name"
+
+			defer cleanupSnapshot(name)
+
+			sn := &blockstoriov1alpha1.Snapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: blockstoriov1alpha1.SnapshotSpec{
+					ResourceDefinitionName: "pvc-cel-bad",
+					SnapshotName:           "snap1",
+				},
+			}
+
+			err := k8sClient.Create(ctx, sn)
+			Expect(err).To(HaveOccurred())
+			Expect(strings.Contains(err.Error(), "metadata.name must equal")).To(BeTrue(),
+				"expected CEL message, got: %s", err.Error())
+		})
+
+		It("rejects a flipped <snap>.<rd> name", func() {
+			name := "snap1.pvc-cel-ok"
+
+			defer cleanupSnapshot(name)
+
+			sn := &blockstoriov1alpha1.Snapshot{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: blockstoriov1alpha1.SnapshotSpec{
+					ResourceDefinitionName: "pvc-cel-ok",
+					SnapshotName:           "snap1",
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, sn)).To(HaveOccurred())
+		})
+	})
+
 	// Bug 71: when a CRD ends up in a state where `metadata.name` no
 	// longer matches the composite naming rule (e.g. created before
 	// the CEL marker was added, or by an older satellite that picked
@@ -223,6 +290,32 @@ var _ = Describe("CEL naming-convention validation", func() {
 			res.Finalizers = nil
 			Expect(k8sClient.Update(ctx, res)).To(Succeed(),
 				"create-only rule must let finalizer-strip through even on a name-violating Resource")
+		})
+
+		It("Snapshot: rule does not fire on update path (allows finalizer-strip on stale name)", func() {
+			name := "bug214sndel.snap1"
+			defer cleanupSnapshot(name)
+
+			sn := &blockstoriov1alpha1.Snapshot{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       name,
+					Finalizers: []string{"blockstor.io.blockstor.io/satellite-snapshot"},
+				},
+				Spec: blockstoriov1alpha1.SnapshotSpec{
+					ResourceDefinitionName: "bug214sndel",
+					SnapshotName:           "snap1",
+				},
+			}
+			Expect(k8sClient.Create(ctx, sn)).To(Succeed())
+
+			Expect(k8sClient.Delete(ctx, sn)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, sn)).To(Succeed())
+			Expect(sn.DeletionTimestamp).NotTo(BeNil())
+
+			sn.Spec.SnapshotName = "snap2"
+			sn.Finalizers = nil
+			Expect(k8sClient.Update(ctx, sn)).To(Succeed(),
+				"create-only rule must let finalizer-strip through even on a name-violating Snapshot")
 		})
 	})
 })
