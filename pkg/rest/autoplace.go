@@ -165,12 +165,8 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 
-	var req apiv1.AutoPlaceRequest
-
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	rawBody, req, ok := decodeAutoplaceBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -181,6 +177,13 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeStoreError(w, err)
 
+		return
+	}
+
+	// Bug 156: when the operator explicitly passes
+	// `--diskless-on-remaining false`, also suppress the
+	// auto-tiebreaker reconciler's TIE_BREAKER witness.
+	if !s.applyBug156AutoTiebreakerOptOut(r.Context(), w, rawBody, rdName, &rd) {
 		return
 	}
 
@@ -880,6 +883,147 @@ func mergeAutoplaceFilterFromRequest(out, req *apiv1.AutoSelectFilter) {
 	if req.DisklessOnRemaining {
 		out.DisklessOnRemaining = true
 	}
+}
+
+// disklessOnRemainingExplicitlyFalse decodes the raw autoplace body
+// into a key-presence map and reports whether the caller passed
+// `diskless_on_remaining: false` explicitly. A bare `false` and a
+// missing field both decode to the same Go zero value, so this
+// helper inspects the wire shape directly — mirrors the
+// `rgSelectFilterKeys` pattern in pkg/rest/resource_groups.go.
+//
+// Returns false on malformed JSON or missing key; callers must
+// validate the body separately before relying on this answer.
+func disklessOnRemainingExplicitlyFalse(raw []byte) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+
+	var envelope map[string]json.RawMessage
+
+	err := json.Unmarshal(raw, &envelope)
+	if err != nil {
+		return false
+	}
+
+	raw, ok := envelope["diskless_on_remaining"]
+	if !ok {
+		return false
+	}
+
+	var explicit bool
+
+	err = json.Unmarshal(raw, &explicit)
+	if err != nil {
+		return false
+	}
+
+	return !explicit
+}
+
+// decodeAutoplaceBody reads the request body once and returns both
+// the raw bytes (for the Bug 156 zero-value-aware probe) and the
+// typed `AutoPlaceRequest`. Returns ok=false after writing the
+// envelope when the body is unreadable or malformed; callers must
+// abort the handler.
+//
+// Hoisted out of handleAutoplace to keep its funlen under budget
+// once the Bug 156 wire-shape probe landed.
+func decodeAutoplaceBody(w http.ResponseWriter, r *http.Request) ([]byte, apiv1.AutoPlaceRequest, bool) {
+	var req apiv1.AutoPlaceRequest
+
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return nil, req, false
+	}
+
+	err = json.Unmarshal(rawBody, &req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return nil, req, false
+	}
+
+	return rawBody, req, true
+}
+
+// applyBug156AutoTiebreakerOptOut is the wire-level hook for Bug
+// 156: when the autoplace body carries an explicit
+// `diskless_on_remaining: false`, stamp
+// `DrbdOptions/AutoAddQuorumTiebreaker=false` on the RD so the
+// controller's auto-witness reconciler stays out of the way. The
+// flag's name leads operators to expect "no diskless residual,
+// including the witness"; pre-fix the witness was always stamped.
+//
+// We probe the raw body for the literal key (zero-value bool can't
+// be distinguished from "field absent" through the typed decode).
+// Returns false on error after writing the envelope (caller must
+// abort the handler); returns true on success or no-op.
+//
+// On success the in-memory `rd` copy is refreshed so the downstream
+// merge sees the stamped prop.
+func (s *Server) applyBug156AutoTiebreakerOptOut(
+	ctx context.Context, w http.ResponseWriter, rawBody []byte, rdName string,
+	rd *apiv1.ResourceDefinition,
+) bool {
+	if !disklessOnRemainingExplicitlyFalse(rawBody) {
+		return true
+	}
+
+	err := s.stampAutoTiebreakerOptOut(ctx, rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	refreshed, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	*rd = refreshed
+
+	return true
+}
+
+// stampAutoTiebreakerOptOut writes `DrbdOptions/AutoAddQuorumTiebreaker=false`
+// onto the named RD so the internal/controller reconciler's
+// `isAutoTieBreakerEnabled` reads false and skips witness creation.
+// Idempotent: re-stamping the same value is a no-op.
+//
+// Bug 156: the operator's explicit `--diskless-on-remaining false`
+// intent is recorded as a per-RD prop because the auto-witness
+// decision happens out-of-band in the controller — the REST handler
+// can't suppress it inline.
+func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) error {
+	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
+
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	if rd.Props != nil && rd.Props[propKey] == "false" {
+		return nil
+	}
+
+	if rd.Props == nil {
+		rd.Props = map[string]string{}
+	}
+
+	rd.Props[propKey] = "false"
+
+	err = s.Store.ResourceDefinitions().Update(ctx, &rd)
+	if err != nil {
+		return err //nolint:wrapcheck // surfaced via writeStoreError
+	}
+
+	return nil
 }
 
 // handleResourceCreate creates one or more Resources from the upstream
