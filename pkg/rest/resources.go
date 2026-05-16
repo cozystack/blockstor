@@ -133,6 +133,21 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdSizes map[int32]int64) (apiv1.ResourceWithVolumes, error) {
 	annotated := annotateSyncProgress(rsc.Volumes, vdSizes)
 
+	// Bug 137: diskless / TIE_BREAKER replicas never get a
+	// per-volume Status row written by the satellite (no local
+	// backing device, no usage to report). The CRD-to-wire
+	// projection therefore returns Volumes=nil, the JSON encoder
+	// drops the `volumes` key under `omitempty`, and python-linstor
+	// crashes on `rsc._rest_data['volumes'][0]` with AttributeError
+	// because the key is `None`. Synthesise one placeholder per
+	// parent-RD VolumeDefinition so the wire shape mirrors a
+	// diskful replica — same volume_number, same layer chain — but
+	// with no satellite-observed allocation. Non-diskless replicas
+	// with an empty Volumes slice still get a `[]` (the absent-key
+	// regression strikes them too: e.g. a freshly-created diskful
+	// replica before the satellite has reported usage).
+	annotated = ensureVolumesForView(annotated, rsc, vdSizes)
+
 	eff, rd, err := effectivePropsAndRDForResource(ctx, s.Client, s.Store, rsc)
 	if err != nil {
 		return apiv1.ResourceWithVolumes{}, err
@@ -180,6 +195,78 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	s.stampSuspendedOnLUKS(&rwv)
 
 	return rwv, nil
+}
+
+// ensureVolumesForView returns a non-nil Volume slice for the wire
+// view. Bug 137: a nil slice serialises as a missing JSON key under
+// `omitempty`, and python-linstor's `linstor r l` / `linstor n
+// describe` walk `rsc._rest_data['volumes']` unconditionally — a
+// missing key returns `None` and the next attribute access crashes
+// the CLI with AttributeError. We solve this in two tiers:
+//
+//  1. Diskless / TIE_BREAKER replica with no observed Volumes:
+//     synthesise one placeholder per parent-RD VolumeDefinition so
+//     the wire entry has the same volume_number cardinality as a
+//     diskful replica. StoragePool is stamped with the canonical
+//     "DISKLESS" sentinel so a consumer can still recognise the
+//     witness role from the volume row.
+//  2. Any other replica that happens to arrive with an empty
+//     Volumes slice (e.g. fresh diskful replica before the
+//     satellite has written Status.Volumes): emit `[]` rather than
+//     omitting the key. Same crash class, just less common.
+//
+// Diskful replicas with already-populated Volumes are passed
+// through verbatim — the placeholder path must not shadow real
+// satellite-observed allocation / disk_state.
+func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes map[int32]int64) []apiv1.Volume {
+	if len(observed) > 0 {
+		return observed
+	}
+
+	if !isDisklessReplica(rsc) {
+		// Empty slice instead of nil so the JSON encoder emits
+		// `[]` not the absent key. Bug 137 wire contract.
+		return []apiv1.Volume{}
+	}
+
+	// Stable iteration over the VD index: map keys are
+	// non-deterministic and the wire order has to be stable across
+	// calls so paginated CLI consumers don't see volume_number
+	// jitter between requests.
+	volNums := make([]int32, 0, len(vdSizes))
+	for vn := range vdSizes {
+		volNums = append(volNums, vn)
+	}
+
+	slices.Sort(volNums)
+
+	out := make([]apiv1.Volume, 0, len(volNums))
+
+	for _, vn := range volNums {
+		out = append(out, apiv1.Volume{
+			VolumeNumber: vn,
+			StoragePool:  apiv1.StoragePoolKindDiskless,
+			// AllocatedKib defaults to 0 (the Bug 112 contract:
+			// always emit the key as an int >= 0). Diskless has
+			// no real allocation, so 0 is the truthful value.
+		})
+	}
+
+	return out
+}
+
+// isDisklessReplica reports whether the replica carries a DISKLESS
+// or TIE_BREAKER flag — i.e. has no local backing storage and
+// therefore no satellite-observed Volumes rows. Both flags imply
+// "no local disk", so both trigger the placeholder-synthesis path.
+func isDisklessReplica(rsc *apiv1.Resource) bool {
+	for _, f := range rsc.Flags {
+		if f == apiv1.ResourceFlagDiskless || f == apiv1.ResourceFlagTieBreaker {
+			return true
+		}
+	}
+
+	return false
 }
 
 // stampSuspendedOnLUKS sets `state.suspended` on a resource that
