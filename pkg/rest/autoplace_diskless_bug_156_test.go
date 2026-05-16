@@ -187,6 +187,50 @@ func TestBug156DisklessOnRemainingTrueStillCreatesTiebreaker(t *testing.T) {
 	}
 }
 
+// TestBug156DisklessOnRemainingNullDefaultsToTrue is the post-live-
+// validation regression guard. python-linstor 1.27.1 serialises the
+// unset CLI flag as JSON `null` (NOT an omitted key). Without the
+// `null`-is-absent gate, json.Unmarshal(null, &bool) silently set
+// the bool to false and the autoplace handler over-eagerly stamped
+// `AutoAddQuorumTiebreaker=false` on EVERY default-case RD,
+// stripping the TIE_BREAKER witness cluster-wide. This test pins
+// the null path explicitly so a future refactor can't regress.
+func TestBug156DisklessOnRemainingNullDefaultsToTrue(t *testing.T) {
+	st, base, stop := commonBug156Setup(t, "bug156-null")
+	defer stop()
+
+	// Body sends diskless_on_remaining: null — the exact wire shape
+	// python-linstor emits when --diskless-on-remaining is omitted.
+	body, _ := json.Marshal(map[string]any{
+		"diskless_on_remaining": nil,
+		"select_filter": map[string]any{
+			"place_count":  2,
+			"storage_pool": "pool",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/bug156-null/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(t.Context(), "bug156-null")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
+
+	got := rd.Props[propKey]
+	if got == "false" {
+		t.Errorf("Bug 156: %s must NOT be stamped 'false' when "+
+			"diskless_on_remaining is null (the python-linstor 1.27.1 "+
+			"default wire shape); got %q", propKey, got)
+	}
+}
+
 // TestBug156DisklessOnRemainingUnsetDefaultsToTrue pins the
 // no-flag-supplied path: a bare autoplace body (no
 // `diskless_on_remaining` key at all) must behave like the

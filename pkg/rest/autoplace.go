@@ -911,6 +911,16 @@ func disklessOnRemainingExplicitlyFalse(raw []byte) bool {
 		return false
 	}
 
+	// python-linstor 1.27.1 wire shape: when the operator does NOT
+	// pass --diskless-on-remaining, the CLI serialises the field as
+	// JSON `null` (not omitted). json.Unmarshal(null, &bool) sets
+	// the bool to zero (false) without error, which would flip the
+	// default-case autoplace into "no auto-witness" and strip the
+	// TIE_BREAKER from every default RD. Treat null as "absent".
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false
+	}
+
 	var explicit bool
 
 	err = json.Unmarshal(raw, &explicit)
