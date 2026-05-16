@@ -160,68 +160,59 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 	pool := r.PathValue("pool")
 	force := isForce(r)
 
-	// Bug 152 escape hatch (mirrors Bug 92 node delete, Bug 111
-	// single-node evacuate, W13 VD shrink): `?force=true` skips
-	// the still-referenced refusal so an operator can reclaim a
-	// pool on a dead node whose Resource CRDs are already
-	// tombstoned. The referencing replicas are left as-is for
-	// out-of-band cleanup. Without this knob the only escape
-	// path is dropping every replica by hand first, which races
-	// the satellite reconciler.
-	if !force {
-		if refused := s.refuseSPDeleteIfReferenced(w, r, node, pool); refused {
-			return
-		}
-	}
+	(&deleteWithRollback[apiv1.StoragePool]{
+		refuseIfReferenced: func() bool {
+			// Bug 152 escape hatch (mirrors Bug 92 node delete,
+			// Bug 111 single-node evacuate, W13 VD shrink):
+			// `?force=true` skips the still-referenced refusal
+			// so an operator can reclaim a pool on a dead node
+			// whose Resource CRDs are already tombstoned. The
+			// referencing replicas are left as-is for out-of-
+			// band cleanup. Without this knob the only escape
+			// path is dropping every replica by hand first,
+			// which races the satellite reconciler.
+			if force {
+				return false
+			}
 
-	// Bug 145 TOCTOU close. Capture the SP body before deleting
-	// so we can restore it if a racing `r c -s <pool>` slipped
-	// in between the pre-walk and the Delete. Without the capture
-	// the only rollback path would require the operator to
-	// recreate the pool by hand.
-	captured, capturedOK := s.captureStoragePool(r.Context(), node, pool)
+			return s.refuseSPDeleteIfReferenced(w, r, node, pool)
+		},
+		capture: func() (apiv1.StoragePool, bool) {
+			return s.captureStoragePool(r.Context(), node, pool)
+		},
+		remove: func() error {
+			return s.Store.StoragePools().Delete(r.Context(), node, pool)
+		},
+		rolledBackIfRaced: func(captured apiv1.StoragePool, capturedOK bool) bool {
+			// `?force=true` callers opt past this check too.
+			if force || !capturedOK {
+				return false
+			}
 
-	err := s.Store.StoragePools().Delete(r.Context(), node, pool)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	// Bug 145 post-delete re-scan. A `r c -s <pool>` racing this
-	// handler may have slipped between the pre-walk and the
-	// Delete: the pre-walk saw an empty reference set, then the
-	// racing create persisted its Resource, then we just dropped
-	// the SP. Re-scan after the Delete: if any reference exists
-	// now, restore the SP (we captured it before Delete) and
-	// surface the 409 the operator should have seen pre-race.
-	// `?force=true` callers opt past this check too.
-	if !force && capturedOK {
-		if rolled := s.rollbackSPDeleteIfRaced(w, r, node, pool, &captured); rolled {
-			return
-		}
-	}
-
-	// Promote the "already absent" path to the warn band (Bug 66
-	// alignment): the original Bug 52 fix used maskInfo for both
-	// outcomes, hiding the no-op replay from audit-log greppers.
-	// All other delete handlers fold NotFound into the warn band
-	// (warnRGNotFound, warnVDNotFound, warnVGNotFound, …); keeping
-	// this one in step makes `grep WARN` reliably surface every
-	// no-op replay across the entire delete surface.
-	if err != nil {
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: warnStoragePoolNotFound,
-			Message: "storage pool already absent: " + pool + " on " + node,
-		}})
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "storage pool deleted: " + pool + " on " + node,
-	}})
+			return s.rollbackSPDeleteIfRaced(w, r, node, pool, &captured)
+		},
+		writeWarn: func() {
+			// Promote the "already absent" path to the warn band
+			// (Bug 66 alignment): the original Bug 52 fix used
+			// maskInfo for both outcomes, hiding the no-op
+			// replay from audit-log greppers. All other delete
+			// handlers fold NotFound into the warn band
+			// (warnRGNotFound, warnVDNotFound, warnVGNotFound,
+			// warnNodeNotFound) — keeping this one in step makes
+			// `grep WARN` reliably surface every no-op replay
+			// across the entire delete surface.
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnStoragePoolNotFound,
+				Message: "storage pool already absent: " + pool + " on " + node,
+			}})
+		},
+		writeSuccess: func() {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "storage pool deleted: " + pool + " on " + node,
+			}})
+		},
+	}).run(w)
 }
 
 // refuseSPDeleteIfReferenced runs the pre-Delete Bug 152 refusal

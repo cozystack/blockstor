@@ -251,10 +251,67 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 174 post-write re-check on the RG side. Mirrors the
+	// Bug 145 SP-delete close and the Bug 174 Node-delete close:
+	// the pre-write Bug 134 unknown-RG gate and the RD store
+	// Create are not atomic, so a concurrent `linstor rg d <rg>`
+	// can slip between the two and drop the RG out from under the
+	// just-persisted RD. The `rg d` handler's own post-Delete
+	// re-walk closes the other half of the race; this re-check
+	// closes the half where the RD Create lands AFTER the `rg d`
+	// handler's post-walk has already committed the delete.
+	if !s.refuseRDCreateOnRGDeletedRace(w, r, &rd) {
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource definition created: " + rd.Name,
 	}})
+}
+
+// refuseRDCreateOnRGDeletedRace closes the Bug 174 TOCTOU window
+// on the RD-create side. Called immediately after the RD has been
+// persisted, it re-verifies that the pinned ResourceGroup still
+// exists. On a miss, it rolls back the just-persisted RD (so no
+// orphan CRD survives) and writes the same 404 + envelope shape
+// the pre-write Bug 134 gate uses.
+//
+// Returns true when the caller may continue; false when the HTTP
+// error has already been written and the RD has been rolled back.
+// Mirrors refuseResourceCreateOnSPDeletedRace / Bug 174's Node
+// sibling exactly.
+func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Request, rd *apiv1.ResourceDefinition) bool {
+	if rd.ResourceGroupName == "" {
+		return true
+	}
+
+	_, err := s.Store.ResourceGroups().Get(r.Context(), rd.ResourceGroupName)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		// Roll back the just-persisted RD so the operator doesn't
+		// get a phantom CRD on a failed call. Best-effort: if the
+		// rollback itself errors (store gone, context cancelled),
+		// the operator still gets the 404 envelope and the
+		// downstream rg-inherited reads will surface the dangling-
+		// RG error on the next access.
+		_ = s.Store.ResourceDefinitions().Delete(r.Context(), rd.Name)
+
+		writeError(w, http.StatusNotFound,
+			"resource group '"+rd.ResourceGroupName+"' was deleted "+
+				"concurrently with the resource-definition create "+
+				"(Bug 174): retry after re-creating the resource group, "+
+				"or pick a different resource group")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
 }
 
 // validateRDCreateBody runs every pre-store wire-boundary gate for

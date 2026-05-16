@@ -810,58 +810,146 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 // in-use refusal pattern from cli-parity-audit Bug 18: the operator
 // must `r d` / `n evacuate` first, or pass `?force=true` to accept
 // the orphan-cascade.
+//
+// Bug 174 (P2): wraps the pre-Delete refusal + Delete pair in the
+// shared `deleteWithRollback` close so a concurrent
+// `r c <node>` that slips between the pre-walk and the Delete
+// can't leak an orphan Resource CRD pointing at a deleted Node.
+// Same shape as Bug 145 on `sp d`.
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
+	force := isForce(r)
 
-	if !isForce(r) {
-		refs, err := s.resourcesOnNode(r.Context(), name)
-		if err != nil {
-			writeStoreError(w, err)
+	(&deleteWithRollback[apiv1.Node]{
+		refuseIfReferenced: func() bool {
+			if force {
+				return false
+			}
 
-			return
-		}
+			return s.refuseNodeDeleteIfReferenced(w, r, name)
+		},
+		capture: func() (apiv1.Node, bool) {
+			return s.captureNode(r.Context(), name)
+		},
+		remove: func() error {
+			return s.Store.Nodes().Delete(r.Context(), name)
+		},
+		rolledBackIfRaced: func(captured apiv1.Node, capturedOK bool) bool {
+			if force || !capturedOK {
+				return false
+			}
 
-		if len(refs) > 0 {
-			writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-				RetCode: apiCallRcError | apiCallRcFailInUse,
-				Message: "Node '" + name + "' cannot be deleted because " +
-					"it still hosts resource replicas.",
-				Cause: fmt.Sprintf(
-					"%d resource(s) reference node '%s': %s",
-					len(refs), name, strings.Join(refs, ", ")),
-				Correc: "Delete the listed resources first " +
-					"(`linstor r d <node> <rd>`) or evacuate the node " +
-					"(`linstor n evacuate <node>`); pass `?force=true` " +
-					"to delete the node anyway and orphan the replicas.",
-				ObjRefs: map[string]string{
-					objRefNode: name,
-				},
+			return s.rollbackNodeDeleteIfRaced(w, r, name, &captured)
+		},
+		writeWarn: func() {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnNodeNotFound,
+				Message: "node already absent: " + name,
 			}})
+		},
+		writeSuccess: func() {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "node deleted: " + name,
+			}})
+		},
+	}).run(w)
+}
 
-			return
-		}
-	}
-
-	err := s.Store.Nodes().Delete(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+// refuseNodeDeleteIfReferenced runs the pre-Delete Bug 92 walk.
+// Returns true when the HTTP error has already been written (the
+// caller must stop processing) and false when the delete may
+// proceed. Pulled out of handleNodeDelete so the shared Bug 174
+// close (deleteWithRollback) can call it from both pre-walk and
+// post-walk slots.
+func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string) bool {
+	refs, err := s.resourcesOnNode(r.Context(), name)
+	if err != nil {
 		writeStoreError(w, err)
 
-		return
+		return true
 	}
 
-	if err != nil {
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: warnNodeNotFound,
-			Message: "node already absent: " + name,
-		}})
-
-		return
+	if len(refs) == 0 {
+		return false
 	}
 
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "node deleted: " + name,
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "Node '" + name + "' cannot be deleted because " +
+			"it still hosts resource replicas.",
+		Cause: fmt.Sprintf(
+			"%d resource(s) reference node '%s': %s",
+			len(refs), name, strings.Join(refs, ", ")),
+		Correc: "Delete the listed resources first " +
+			"(`linstor r d <node> <rd>`) or evacuate the node " +
+			"(`linstor n evacuate <node>`); pass `?force=true` " +
+			"to delete the node anyway and orphan the replicas.",
+		ObjRefs: map[string]string{
+			objRefNode: name,
+		},
 	}})
+
+	return true
+}
+
+// captureNode grabs a snapshot of the Node CRD so the Bug 174
+// post-delete re-scan has something to restore when a racing
+// `r c <node>` slipped past the pre-walk. The second return is
+// false when the node no longer exists at capture time (benign
+// idempotent-delete replay) — the rollback path is skipped in
+// that case.
+func (s *Server) captureNode(ctx context.Context, name string) (apiv1.Node, bool) {
+	n, err := s.Store.Nodes().Get(ctx, name)
+	if err != nil {
+		return apiv1.Node{}, false
+	}
+
+	return n, true
+}
+
+// rollbackNodeDeleteIfRaced runs the Bug 174 post-Delete re-scan.
+// If a Resource reference appeared between the pre-walk and the
+// Delete, restore the captured Node and write the 409 envelope
+// the pre-walk would have written. Returns true when the rollback
+// fired (HTTP error already written, caller must stop) and false
+// when the delete is safe to commit. Mirrors Bug 145's
+// `rollbackSPDeleteIfRaced` shape exactly.
+func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.Node) bool {
+	refs, err := s.resourcesOnNode(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 {
+		return false
+	}
+
+	// Best-effort restore: a Create error here means the rollback
+	// itself raced (another goroutine recreated the Node). Either
+	// outcome leaves the Node present, which is what we want —
+	// surface the 409 either way so the operator retries.
+	_ = s.Store.Nodes().Create(r.Context(), captured)
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "Node '" + name + "' cannot be deleted because " +
+			"it still hosts resource replicas.",
+		Cause: fmt.Sprintf(
+			"%d resource(s) reference node '%s': %s",
+			len(refs), name, strings.Join(refs, ", ")),
+		Correc: "Delete the listed resources first " +
+			"(`linstor r d <node> <rd>`) or evacuate the node " +
+			"(`linstor n evacuate <node>`); pass `?force=true` " +
+			"to delete the node anyway and orphan the replicas.",
+		ObjRefs: map[string]string{
+			objRefNode: name,
+		},
+	}})
+
+	return true
 }
 
 // resourcesOnNode returns the sorted list of Resource names whose

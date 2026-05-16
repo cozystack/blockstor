@@ -27,8 +27,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/cockroachdb/errors"
-
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -575,45 +573,109 @@ func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
 
-	// Refuse the delete if any child RD still references this RG.
+	(&deleteWithRollback[apiv1.ResourceGroup]{
+		refuseIfReferenced: func() bool {
+			return s.refuseRGDeleteIfReferenced(w, r, name)
+		},
+		capture: func() (apiv1.ResourceGroup, bool) {
+			return s.captureResourceGroup(r.Context(), name)
+		},
+		remove: func() error {
+			return s.Store.ResourceGroups().Delete(r.Context(), name)
+		},
+		rolledBackIfRaced: func(captured apiv1.ResourceGroup, capturedOK bool) bool {
+			if !capturedOK {
+				return false
+			}
+
+			return s.rollbackRGDeleteIfRaced(w, r, name, &captured)
+		},
+		writeWarn: func() {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnRGNotFound,
+				Message: "resource group already absent: " + name,
+			}})
+		},
+		writeSuccess: func() {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "resource group deleted: " + name,
+			}})
+		},
+	}).run(w)
+}
+
+// refuseRGDeleteIfReferenced runs the pre-Delete Scenario 9.W02
+// walk. Returns true when the HTTP error has already been
+// written (the caller must stop processing) and false when the
+// delete may proceed. Pulled out so the shared Bug 174 close
+// (deleteWithRollback) can call it from both pre-walk and
+// post-walk slots.
+func (s *Server) refuseRGDeleteIfReferenced(w http.ResponseWriter, r *http.Request, name string) bool {
 	// The count is best-effort: a -1 sentinel from countChildRDs
 	// signals the list-side hiccup. We surface the refusal anyway
 	// (the RG is presumed unsafe to drop) but degrade the message
 	// to omit the unknown count rather than print "-1 resource-
 	// definitions".
 	childCount := countChildRDs(r.Context(), s.Store, name)
-	if childCount != 0 {
-		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
-			RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
-			Message: rgDeleteRefusedMessage(name, childCount),
-			ObjRefs: map[string]string{
-				objRefRscGrp: name,
-			},
-		}})
-
-		return
+	if childCount == 0 {
+		return false
 	}
 
-	err := s.Store.ResourceGroups().Delete(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	if err != nil {
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: warnRGNotFound,
-			Message: "resource group already absent: " + name,
-		}})
-
-		return
-	}
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "resource group deleted: " + name,
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+		Message: rgDeleteRefusedMessage(name, childCount),
+		ObjRefs: map[string]string{
+			objRefRscGrp: name,
+		},
 	}})
+
+	return true
+}
+
+// captureResourceGroup grabs a snapshot of the RG CRD so the
+// Bug 174 post-delete re-scan has something to restore when a
+// racing `rd c --resource-group <rg>` slipped past the pre-walk.
+// The second return is false when the RG no longer exists at
+// capture time (benign idempotent-delete replay) — the rollback
+// path is skipped in that case.
+func (s *Server) captureResourceGroup(ctx context.Context, name string) (apiv1.ResourceGroup, bool) {
+	rg, err := s.Store.ResourceGroups().Get(ctx, name)
+	if err != nil {
+		return apiv1.ResourceGroup{}, false
+	}
+
+	return rg, true
+}
+
+// rollbackRGDeleteIfRaced runs the Bug 174 post-Delete re-scan.
+// If a child RD reference appeared between the pre-walk and the
+// Delete, restore the captured RG and write the 409 envelope the
+// pre-walk would have written. Returns true when the rollback
+// fired (HTTP error already written, caller must stop) and false
+// when the delete is safe to commit. Mirrors Bug 145's
+// `rollbackSPDeleteIfRaced` shape.
+func (s *Server) rollbackRGDeleteIfRaced(w http.ResponseWriter, r *http.Request, name string, captured *apiv1.ResourceGroup) bool {
+	childCount := countChildRDs(r.Context(), s.Store, name)
+	if childCount == 0 {
+		return false
+	}
+
+	// Best-effort restore: a Create error here means the rollback
+	// itself raced (another goroutine recreated the RG). Either
+	// outcome leaves the RG present, which is what we want —
+	// surface the 409 either way so the operator retries.
+	_ = s.Store.ResourceGroups().Create(r.Context(), captured)
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,
+		Message: rgDeleteRefusedMessage(name, childCount),
+		ObjRefs: map[string]string{
+			objRefRscGrp: name,
+		},
+	}})
+
+	return true
 }
 
 // handleRGPropDelete implements Bug 154: per-key DELETE for resource-

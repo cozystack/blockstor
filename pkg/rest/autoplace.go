@@ -1219,6 +1219,19 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		return nil, false
 	}
 
+	// Bug 174 post-write re-check on the Node side. Mirrors the
+	// Bug 145 SP-delete close above: the pre-write Bug 94 unknown-
+	// node gate and the Resource store Create are not atomic, so a
+	// concurrent `linstor n d <node>` can slip between the two and
+	// drop the Node out from under the just-persisted Resource. The
+	// `n d` handler's own post-Delete re-walk closes the other half
+	// of the race; this re-check closes the half where the Resource
+	// Create lands AFTER the `n d` handler's post-walk has already
+	// committed the delete.
+	if !s.refuseResourceCreateOnNodeDeletedRace(w, r, out) {
+		return nil, false
+	}
+
 	return out, true
 }
 
@@ -1289,6 +1302,44 @@ func (s *Server) refuseResourceCreateOnSPDeletedRace(w http.ResponseWriter, r *h
 			"storage pool '"+pool+"' was deleted on node '"+res.NodeName+
 				"' concurrently with the resource create (Bug 145): "+
 				"retry after re-creating the pool, or pick a different pool")
+
+		return false
+	}
+
+	writeStoreError(w, err)
+
+	return false
+}
+
+// refuseResourceCreateOnNodeDeletedRace closes the Bug 174 TOCTOU
+// window on the Resource-create side. Called immediately after the
+// Resource has been persisted, it re-verifies that the pinned Node
+// still exists. On a miss, it rolls back the just-persisted
+// Resource (so no orphan CRD survives) and writes the same 404 +
+// envelope shape the pre-write Bug 94 gate uses.
+//
+// Returns true when the caller may continue; false when the HTTP
+// error has already been written and the Resource has been rolled
+// back. Mirrors refuseResourceCreateOnSPDeletedRace exactly.
+func (s *Server) refuseResourceCreateOnNodeDeletedRace(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) bool {
+	_, err := s.Store.Nodes().Get(r.Context(), res.NodeName)
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, store.ErrNotFound) {
+		// Roll back the just-persisted Resource so the operator
+		// doesn't get a phantom CRD on a failed call. Best-effort:
+		// if the rollback itself errors (store gone, context
+		// cancelled), the operator still gets the 404 envelope
+		// and the satellite-side reconciler will surface the
+		// dangling-node error on its next tick.
+		_ = s.Store.Resources().Delete(r.Context(), res.Name, res.NodeName)
+
+		writeError(w, http.StatusNotFound,
+			"node '"+res.NodeName+"' was deleted concurrently with "+
+				"the resource create (Bug 174): retry after re-creating "+
+				"the node, or pick a different node")
 
 		return false
 	}
