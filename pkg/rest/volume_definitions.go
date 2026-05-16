@@ -743,6 +743,7 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 // the spec out from under a stuck satellite.
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
+	force := isForce(r)
 
 	vn, err := parseVolNum(r.PathValue("vn"))
 	if err != nil {
@@ -756,9 +757,17 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	// every dependent Resource.Volumes row untouched — partial-state
 	// after a rejected DELETE would be a worse failure mode than the
 	// bug itself.
-	if !isForce(r) && s.refuseVDDeleteIfReferenced(w, r, rd, vn) {
+	if !force && s.refuseVDDeleteIfReferenced(w, r, rd, vn) {
 		return
 	}
+
+	// Bug 202: capture the VD pre-Delete so the post-Delete re-walk
+	// has something to restore if a racing `r c` slipped between the
+	// pre-walk and the store-level Delete. Capture-after-refuse
+	// matches the Bug 174 ordering (deleteWithRollback in
+	// pkg/rest/delete_toctou.go) — a refused call discards the
+	// snapshot anyway, so we don't waste the Get on the refusal path.
+	captured, capturedOK := s.captureVolumeDefinition(r.Context(), rd, vn)
 
 	err = s.Store.VolumeDefinitions().Delete(r.Context(), rd, vn)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -781,6 +790,21 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 202: post-Delete re-walk. A racing `r c` may have slipped
+	// between the Bug 186 pre-walk and the Delete above: the pre-walk
+	// saw an empty reference set, then the racing create persisted a
+	// Resource on the parent RD (implicit reference per the spec
+	// contract, see resourceReferencesVolume), then we dropped the
+	// VD spec out from under it. The post-walk catches that
+	// ordering, restores the captured VD via store Create, and
+	// surfaces the same 409 envelope the pre-walk would have
+	// emitted. Skipped on the explicit `?force=true` bypass (the
+	// operator opted in to the cascade) and on the capture-miss
+	// path (idempotent-delete replay — nothing to roll back to).
+	if !force && capturedOK && s.rollbackVDDeleteIfRaced(w, r, rd, vn, &captured) {
+		return
+	}
+
 	// Bug 139: prune the deleted VolumeNumber off each child
 	// Resource's Status.Volumes, then wait for the VD delete to be
 	// observable on the local store. The satellite reconciler
@@ -795,6 +819,85 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: fmt.Sprintf("volume definition deleted: %s/%d", rd, vn),
 	}})
+}
+
+// captureVolumeDefinition grabs a snapshot of the VD spec so the
+// Bug 202 post-Delete re-walk has something to restore when a racing
+// `r c <rd>.<node>` slipped past the Bug 186 pre-walk. The second
+// return is false when the VD no longer exists at capture time
+// (benign idempotent-delete replay) — the rollback path is skipped
+// in that case.
+func (s *Server) captureVolumeDefinition(ctx context.Context, rd string, vn int32) (apiv1.VolumeDefinition, bool) {
+	vd, err := s.Store.VolumeDefinitions().Get(ctx, rd, vn)
+	if err != nil {
+		return apiv1.VolumeDefinition{}, false
+	}
+
+	return vd, true
+}
+
+// rollbackVDDeleteIfRaced runs the Bug 202 post-Delete re-walk.
+// If a Resource reference appeared between the pre-walk and the
+// Delete, restore the captured VD via store Create and write the
+// 409 envelope the pre-walk would have written. Returns true when
+// the rollback fired (HTTP error already written, caller must stop)
+// and false when the delete is safe to commit. Mirrors Bug 174's
+// `rollbackRGDeleteIfRaced` shape — same Bug 178 5xx envelope when
+// the restore Create itself fails so the operator gets an actionable
+// signal that the deleted primary may need manual restoration.
+func (s *Server) rollbackVDDeleteIfRaced(
+	w http.ResponseWriter,
+	r *http.Request,
+	rd string,
+	vn int32,
+	captured *apiv1.VolumeDefinition,
+) bool {
+	refs, err := s.resourcesReferencingVolume(r.Context(), rd, vn)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if len(refs) == 0 {
+		return false
+	}
+
+	// Bug 178: a Create error here used to be silently swallowed in
+	// sibling rollback paths, so the cluster ended up with the VD
+	// deleted, a racing Resource still on the parent RD, and the
+	// operator handed a 409 "still referenced" envelope while
+	// staring at a cluster whose VD row no longer exists. Surface
+	// a 5xx envelope that names the rollback failure explicitly.
+	createErr := s.Store.VolumeDefinitions().Create(r.Context(), rd, captured)
+	if createErr != nil {
+		writeRollbackRestoreFailure(r.Context(), w, createErr,
+			"volume definition", fmt.Sprintf("%s/%d", rd, vn),
+			"linstor vd l "+rd)
+
+		return true
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: fmt.Sprintf(
+			"Volume definition %d on resource definition %q cannot be "+
+				"deleted because resource replicas still reference it.",
+			vn, rd),
+		Cause: fmt.Sprintf(
+			"%d resource replica(s) reference VolumeNumber %d on %q: %s",
+			len(refs), vn, rd, strings.Join(refs, ", ")),
+		Correc: "Delete the listed resource replicas first " +
+			"(`linstor r d <node> " + rd + "`), or pass `?force=true` " +
+			"to drop the volume definition anyway and accept the " +
+			"orphan replicas.",
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	}})
+
+	return true
 }
 
 // refuseVDDeleteIfReferenced runs the Bug 186 pre-Delete walk: any
