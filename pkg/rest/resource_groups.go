@@ -661,11 +661,22 @@ func (s *Server) rollbackRGDeleteIfRaced(w http.ResponseWriter, r *http.Request,
 		return false
 	}
 
-	// Best-effort restore: a Create error here means the rollback
-	// itself raced (another goroutine recreated the RG). Either
-	// outcome leaves the RG present, which is what we want —
-	// surface the 409 either way so the operator retries.
-	_ = s.Store.ResourceGroups().Create(r.Context(), captured)
+	// Bug 178: a Create error here used to be silently swallowed,
+	// so the cluster ended up with the RG deleted, the racing
+	// child RD pointing at a dropped row (the spawn / rd-list
+	// path then silently falls back to DfltRscGrp), and the
+	// operator handed a 409 "still has resource definitions"
+	// envelope that referenced an RG which no longer exists.
+	// Surface a 500 envelope that names the rollback failure so
+	// the operator knows the deleted primary may need manual
+	// restoration.
+	createErr := s.Store.ResourceGroups().Create(r.Context(), captured)
+	if createErr != nil {
+		writeRollbackRestoreFailure(r.Context(), w, createErr,
+			objRefRscGrp, name, "linstor rg l")
+
+		return true
+	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 		RetCode: apiCallRcError | apiCallRcFailExistsRscDfn,

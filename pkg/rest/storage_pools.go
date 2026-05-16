@@ -288,11 +288,20 @@ func (s *Server) rollbackSPDeleteIfRaced(w http.ResponseWriter, r *http.Request,
 		return false
 	}
 
-	// Best-effort restore: a Create error here means the rollback
-	// itself raced (another goroutine recreated the SP). Either
-	// outcome leaves the SP present, which is what we want —
-	// surface the 409 either way so the operator retries.
-	_ = s.Store.StoragePools().Create(r.Context(), captured)
+	// Bug 178: a Create error here used to be silently swallowed,
+	// so the cluster ended up with the SP deleted, the racing
+	// replica's `Props["StorPoolName"]` pointing at a dropped row,
+	// and the operator handed a 409 "still in use" envelope that
+	// referenced a pool which no longer exists. Surface a 500
+	// envelope that names the rollback failure so the operator
+	// knows the deleted primary may need manual restoration.
+	createErr := s.Store.StoragePools().Create(r.Context(), captured)
+	if createErr != nil {
+		writeRollbackRestoreFailure(r.Context(), w, createErr,
+			objRefStorPool, node+"/"+pool, "linstor sp l")
+
+		return true
+	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 		RetCode: apiCallRcError | apiCallRcFailInUse,

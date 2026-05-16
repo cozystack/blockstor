@@ -17,10 +17,13 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -161,4 +164,61 @@ func (d *deleteWithRollback[T]) run(w http.ResponseWriter) {
 	}
 
 	d.writeSuccess()
+}
+
+// writeRollbackRestoreFailure emits the Bug 178 5xx envelope when a
+// `rollback*DeleteIfRaced` path observed a racing dependent, tried
+// to restore the captured primary via `store.Create`, and got an
+// error back instead. Pre-fix every rollback path swallowed that
+// error and still wrote the misleading 409 "still referenced"
+// envelope — but the primary object is GONE (the Delete already
+// landed), the racing dependent is now an orphan, and the operator
+// reads "still referenced" while staring at a cluster whose primary
+// row no longer exists.
+//
+// The 5xx envelope below names the failure mode explicitly:
+//   - `message`: "rollback failed: cluster state may be inconsistent"
+//   - `cause`: cites the racing-delete completion and the scrubbed
+//     restore-Create error so operators can grep the audit log for
+//     the original primary name without it leaking apimachinery /
+//     etcd identifiers (Bug 162 sibling).
+//   - `correction`: points at the `linstor n l` / `rg l` / `sp l`
+//     surface the operator should use to verify cluster state and
+//     manually restore the primary if needed.
+//
+// The error is also logged via the request-context logger
+// (controller-runtime style — same scheme handlers like
+// `handleResourceSpawn` already use) so the platform-side
+// observability stack catches the inconsistency even when the
+// caller has disconnected.
+//
+// ctx carries the request scope so the log entry inherits request
+// correlation IDs and the request-trace span. err is the raw
+// store error from the rollback Create. objectKind is the LINSTOR-
+// shaped object name (Node / ResourceGroup / StoragePool) — used in
+// both the log message and the cause / correction lines so audit
+// greps can disambiguate which delete handler raced. objectName is
+// the primary key (or "<node>/<pool>" composite for storage pools).
+// listCmd is the operator-facing command the correction line points
+// at (e.g. "linstor n l").
+func writeRollbackRestoreFailure(
+	ctx context.Context,
+	w http.ResponseWriter,
+	err error,
+	objectKind, objectName, listCmd string,
+) {
+	log.FromContext(ctx).WithName("rest").
+		Error(err, "rollback Create failed: cluster state may be inconsistent",
+			"objectKind", objectKind,
+			"objectName", objectName)
+
+	writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+		RetCode: apiCallRcError,
+		Message: "rollback failed: cluster state may be inconsistent",
+		Cause: "the racing delete completed but the rollback Create returned " +
+			scrubImplDetails(err.Error()) + "; " + objectKind + " '" + objectName +
+			"' may be lost",
+		Correc: "verify cluster state via `" + listCmd + "`; the deleted " +
+			objectKind + " may need manual restoration",
+	}})
 }

@@ -927,11 +927,21 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 		return false
 	}
 
-	// Best-effort restore: a Create error here means the rollback
-	// itself raced (another goroutine recreated the Node). Either
-	// outcome leaves the Node present, which is what we want —
-	// surface the 409 either way so the operator retries.
-	_ = s.Store.Nodes().Create(r.Context(), captured)
+	// Bug 178: best-effort restore is no longer truly best-effort.
+	// On `context.Canceled` (client disconnect) or any other Create
+	// failure the cluster ends up with NO Node row + a live
+	// referencing Resource — and the operator gets handed a 409
+	// "still hosts resource replicas" envelope while the Node they
+	// were told about no longer exists. Surface a 500 envelope that
+	// names the rollback failure explicitly so the operator knows
+	// the deleted primary may need manual restoration.
+	createErr := s.Store.Nodes().Create(r.Context(), captured)
+	if createErr != nil {
+		writeRollbackRestoreFailure(r.Context(), w, createErr,
+			objRefNode, name, "linstor n l")
+
+		return true
+	}
 
 	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
 		RetCode: apiCallRcError | apiCallRcFailInUse,
