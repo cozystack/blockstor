@@ -120,6 +120,14 @@ func (s *Server) handleVGList(w http.ResponseWriter, r *http.Request) {
 		out = []apiv1.VolumeGroup{}
 	}
 
+	// Bug 190 (P0): scrub deny-listed sensitive keys from every VG's
+	// Props bag. Sibling RG-level redaction landed in Bug 181 but the
+	// VolumeGroup entries nested under the RG were missed — operators
+	// could still grep `DrbdOptions/EncryptPassphrase` out of
+	// `linstor rg vg l <rg>`. ResourceGroups().Get returns a value
+	// copy, so the in-place mutation is local to this response.
+	redactVolumeGroupsInPlace(out)
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -140,6 +148,11 @@ func (s *Server) handleVGGet(w http.ResponseWriter, r *http.Request) {
 
 	for i := range rg.VolumeGroups {
 		if rg.VolumeGroups[i].VolumeNumber == vlmNr {
+			// Bug 190 (P0): same scrub on the per-VG read path. The
+			// store returned a value copy; mutating the local slice
+			// element doesn't leak back into the store cache.
+			redactSensitiveProps(rg.VolumeGroups[i].Props)
+
 			writeJSON(w, http.StatusOK, rg.VolumeGroups[i])
 
 			return
@@ -147,6 +160,17 @@ func (s *Server) handleVGGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeError(w, http.StatusNotFound, "volume group not found")
+}
+
+// redactVolumeGroupsInPlace walks every VolumeGroup in the slice and
+// scrubs deny-listed sensitive keys from each Props bag. Mirrors the
+// Bug 181-185 helper-per-DTO pattern; the function name is a sibling
+// to `redactSnapshotsInPlace` / `redactStoragePoolsInPlace` etc. so
+// the redaction surface is grep-able as a family.
+func redactVolumeGroupsInPlace(vgs []apiv1.VolumeGroup) {
+	for i := range vgs {
+		redactSensitiveProps(vgs[i].Props)
+	}
 }
 
 func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {

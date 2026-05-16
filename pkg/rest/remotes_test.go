@@ -180,12 +180,16 @@ func TestLinstorRemoteCRUD(t *testing.T) {
 		t.Errorf("list[0].url: got %q, want %q", list[0]["url"], remoteURL)
 	}
 
-	// passphrase round-trips on the typed-array view (the operator
-	// posted it, the operator can read it back). A future hardening
-	// pass may redact it; pin the current behaviour so the change is
-	// intentional.
-	if list[0]["passphrase"] != remotePass {
-		t.Errorf("list[0].passphrase: got %q, want %q", list[0]["passphrase"], remotePass)
+	// Bug 187 (P0): the typed-array view MUST redact `passphrase`
+	// on the read path. The operator posted the secret, but any
+	// read-only operator could subsequently grep it out of the
+	// envelope — same exposure class as the Bug 115 LUKS-passphrase
+	// fix applied to RD / Controller / Resource prop bags. We pin
+	// the key as preserved (operators must see "encryption IS
+	// configured") and the value as the shared `<redacted>` marker.
+	if list[0]["passphrase"] != redactedPropValue {
+		t.Errorf("list[0].passphrase: got %q, want %q",
+			list[0]["passphrase"], redactedPropValue)
 	}
 
 	// --- GET /v1/remotes: envelope view also sees the entry ---

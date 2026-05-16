@@ -108,6 +108,17 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, apiv1.ResourceWithVolumes{Resource: resList[i]})
 	}
 
+	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
+	// password, shared-secret, ...) from every Resource's Props map
+	// before the JSON encode. Sibling `/v1/view/resources` already
+	// redacts via Bug 115 / buildResourceView, but the RD-scoped read
+	// path bypassed that pipeline — `linstor r lp <rd>` rendered
+	// DrbdOptions/EncryptPassphrase verbatim. Resources().List returns
+	// a value copy, so the in-place mutation is local to this response.
+	for i := range out {
+		redactSensitiveProps(out[i].Props)
+	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -152,6 +163,11 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	// Bug 188 (P0): scrub deny-listed sensitive keys before emit.
+	// Resources().Get returns a value copy, so the in-place mutation
+	// stays local to this response. Mirrors the list-side scrub above.
+	redactSensitiveProps(res.Props)
 
 	writeJSON(w, http.StatusOK, apiv1.ResourceWithVolumes{Resource: res})
 }

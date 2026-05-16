@@ -60,6 +60,15 @@ var (
 // handleKVList returns every instance as a `KV{Name, Props}` entry
 // in a flat array — the wire shape golinstor's KeyValueStoreService
 // decodes into `[]KV`.
+//
+// Bug 189 (P1): scrub deny-listed sensitive keys before emit. The KV
+// store is operator-facing for linstor-csi backup credentials and
+// per-PVC snapshot bookkeeping, so any `password` / `passphrase` /
+// `secret`-named entry would leak verbatim from a read-only operator's
+// `linstor key-value-store l`. The maps.Copy above already produced a
+// per-response copy, so the in-place mutation stays local — the
+// kvBag's source-of-truth bag retains the real value for any
+// satellite-side reads.
 func handleKVList(w http.ResponseWriter, _ *http.Request) {
 	kvBagMu.Lock()
 	defer kvBagMu.Unlock()
@@ -70,6 +79,7 @@ func handleKVList(w http.ResponseWriter, _ *http.Request) {
 		if len(props) > 0 {
 			entry.Props = map[string]string{}
 			maps.Copy(entry.Props, props)
+			redactSensitiveProps(entry.Props)
 		}
 
 		out = append(out, entry)
@@ -83,6 +93,10 @@ func handleKVList(w http.ResponseWriter, _ *http.Request) {
 // (see upstream's keyvaluestore.go) — a bare object response breaks
 // linstor-csi's snapshot lookup with "cannot unmarshal object into
 // Go value of type []client.KV".
+//
+// Bug 189 (P1): scrub deny-listed sensitive keys before emit. Same
+// rationale as handleKVList — the per-instance read surface emits the
+// same Props map shape.
 func handleKVGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("instance")
 	entry := apiv1.KV{Name: name}
@@ -91,6 +105,7 @@ func handleKVGet(w http.ResponseWriter, r *http.Request) {
 	if props, ok := kvBag[name]; ok && len(props) > 0 {
 		entry.Props = map[string]string{}
 		maps.Copy(entry.Props, props)
+		redactSensitiveProps(entry.Props)
 	}
 	kvBagMu.Unlock()
 

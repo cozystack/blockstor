@@ -113,13 +113,40 @@ type emptyRemoteList = remoteListEnvelope
 func (s *Server) handleRemotesEnvelope(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, remoteListEnvelope{
 		S3Remotes:      []map[string]string{},
-		LinstorRemotes: s.linstorRemotes.snapshot(),
+		LinstorRemotes: redactLinstorRemotes(s.linstorRemotes.snapshot()),
 		EbsRemotes:     []map[string]string{},
 	})
 }
 
 func (s *Server) handleListLinstorRemotes(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.linstorRemotes.snapshot())
+	writeJSON(w, http.StatusOK, redactLinstorRemotes(s.linstorRemotes.snapshot()))
+}
+
+// redactLinstorRemotes scrubs the `passphrase` field on every Linstor
+// remote before the wire emit. The in-memory registry stores the
+// operator-supplied value verbatim so the satellite-side ship path
+// can use it for the cross-cluster handshake; the REST read surface
+// must NOT echo it back. Bug 187 (P0): pre-fix, `GET /v1/remotes` and
+// `GET /v1/remotes/linstor` rendered `passphrase` verbatim — any
+// read-only operator could grep the cross-cluster shared secret.
+//
+// The empty-string sentinel collapses to the `passphrase,omitempty`
+// JSON tag, which would DROP the key entirely and hide that
+// encryption IS configured. We stamp `<redacted>` instead so the
+// key survives the encode and the operator-facing wire shape still
+// surfaces "encryption is set". Mirrors the Bug 115 pattern used by
+// `redactSensitiveProps` for the prop-bag deny list.
+//
+// snapshot() already returns a deep copy of the registry, so the
+// in-place mutation here is local to the response.
+func redactLinstorRemotes(in []linstorRemoteEntry) []linstorRemoteEntry {
+	for i := range in {
+		if in[i].Passphrase != "" {
+			in[i].Passphrase = redactedPropValue
+		}
+	}
+
+	return in
 }
 
 // handleEmptyRemoteArray returns `[]` for stubbed remote types
