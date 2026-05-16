@@ -757,6 +757,27 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 		out.AdditionalPlaceCount = req.AdditionalPlaceCount
 	}
 
+	mergeAutoplaceFilterFromRequest(&out, req)
+
+	if out.PlaceCount == 0 {
+		out.PlaceCount = 1
+	}
+
+	return out
+}
+
+// mergeAutoplaceFilterFromRequest applies the per-field "request wins"
+// overrides onto the RG-default-seeded out. Pulled out of
+// mergeAutoplaceFilter so the latter stays under the gocyclo budget
+// once the Bug 131 ProviderList copy was added.
+//
+// Every field on AutoSelectFilter that the wire shape exposes (per
+// upstream LINSTOR / pkg/api/v1.AutoSelectFilter) is propagated here —
+// the only fields the caller never sees are OverrideVlmID
+// (per-spawn-call, not a select filter knob) and LayerStack (which
+// also lacks a request-side merge today: a separate issue, but not
+// Bug 131's scope).
+func mergeAutoplaceFilterFromRequest(out, req *apiv1.AutoSelectFilter) {
 	if req.StoragePool != "" {
 		out.StoragePool = req.StoragePool
 	}
@@ -789,15 +810,21 @@ func mergeAutoplaceFilter(ctx context.Context, st store.Store, rd *apiv1.Resourc
 		out.XReplicasOnDifferentMap = maps.Clone(req.XReplicasOnDifferentMap)
 	}
 
+	// Bug 131: copy the request's provider_list onto the merged
+	// filter so the placer's matchesPoolFilter actually enforces it.
+	// Pre-fix this field was silently dropped — autoplace returned
+	// 200 even when no candidate pool's ProviderKind matched, and
+	// replicas landed on the wrong tier. Request wins over RG-default
+	// (mirrors every other slice field on this struct); a copy is
+	// taken so a later mutation on the request body can't reach into
+	// the merged filter.
+	if len(req.ProviderList) > 0 {
+		out.ProviderList = append([]string(nil), req.ProviderList...)
+	}
+
 	if req.DisklessOnRemaining {
 		out.DisklessOnRemaining = true
 	}
-
-	if out.PlaceCount == 0 {
-		out.PlaceCount = 1
-	}
-
-	return out
 }
 
 // handleResourceCreate creates one or more Resources from the upstream
