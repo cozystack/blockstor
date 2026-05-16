@@ -113,9 +113,38 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
 // returning the single Resource on that node or 404.
+//
+// Bug 143: `linstor r lp <bogus-rd> <bogus-node>` reads its property
+// map from this endpoint's response. Pre-fix we went straight to
+// Resources().Get, which only knows about the (rd, node) tuple and
+// returns the same generic "resource X on node Y not found" envelope
+// whether the RD is missing, the node is missing, or just the replica
+// is. Python-linstor's CLI then rendered the empty response with the
+// noisy "No property map found" message, hiding the precondition
+// failure. The fix mirrors Bug 94 (unknown node on r c) / Bug 118
+// (unknown pool on r c) / Bug 133 / Bug 134: probe the RD store first
+// so the 404 envelope explicitly labels the missing object as a
+// "resource definition" when that's what the operator typo'd, before
+// falling through to the per-replica Get whose ErrNotFound names the
+// (rd, node) pair.
 func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
+
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound,
+				"resource definition '"+rdName+"' not found: check the "+
+					"name with `linstor rd l` or create it first")
+
+			return
+		}
+
+		writeStoreError(w, err)
+
+		return
+	}
 
 	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
 	if err != nil {
