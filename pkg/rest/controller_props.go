@@ -53,6 +53,16 @@ func (s *Server) registerControllerProperties(mux *http.ServeMux) {
 	// is `omitempty` so the wire shape is `{}` which deserializes into
 	// a zero-value ControllerConfig without error.
 	mux.HandleFunc("GET /v1/controller/config", handleControllerConfig)
+	// Bug 159: `linstor c set-log-level <LVL>` routes through PUT on
+	// the same path (python-linstor 1.27.1, linstorapi.py:3146-3173).
+	// Before this wire-up the apiserver only registered GET so the CLI
+	// got 405 + the Bug 109 typed envelope — clean error, but the
+	// operator could not change the log level at all. handlePutControllerConfig
+	// translates the upstream nested shape `{"log":{"level":"<LVL>"}}`
+	// (and a flat operator-friendly `{"log_level":"<LVL>"}` alias)
+	// onto the same runtimeLogLevel LevelVar applyRuntimeLogLevel
+	// already mutates on the property-bag path.
+	mux.HandleFunc("PUT /v1/controller/config", handlePutControllerConfig)
 }
 
 // handleControllerConfig returns an empty ControllerConfig object.

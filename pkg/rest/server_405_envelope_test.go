@@ -29,12 +29,15 @@ import (
 
 // TestWrongMethodReturnsLINSTORJSONEnvelope pins Bug 109: when the
 // python-linstor CLI hits an existing path with a verb the apiserver
-// has not wired (e.g. `PUT /v1/controller/config` for
-// `linstor c set-log-level`), Go's http.ServeMux replies with a bare
-// `text/plain` body `Method Not Allowed\n` and status 405. The CLI's
+// has not wired (e.g. `DELETE /v1/controller/config` for a GET+PUT-
+// only route), Go's http.ServeMux replies with a bare `text/plain`
+// body `Method Not Allowed\n` and status 405. The CLI's
 // error-decoding path tries JSON, falls back to XML and crashes with
 // `xml.etree.ElementTree.ParseError`. This is the same defect class as
 // Bug 103, just for 405 instead of 404.
+//
+// (Bug 159 wired PUT /v1/controller/config so the original
+// 405 sample for this test moved to the DELETE verb on the same path.)
 //
 // The fix extends the existing with404Envelope wrapper to also catch
 // 405 plaintext bodies and rewrite them to the LINSTOR `[]ApiCallRc`
@@ -60,7 +63,10 @@ func TestWrongMethodReturnsLINSTORJSONEnvelope(t *testing.T) {
 		method string
 		path   string
 	}{
-		{"controller config PUT", http.MethodPut, "/v1/controller/config"},
+		// Bug 159 wired PUT /v1/controller/config (linstor c set-
+		// log-level), so that pair is no longer a 405 case. The
+		// wrapper contract continues to be exercised by the
+		// remaining wired-but-wrong-verb routes below.
 		{"remotes s3 POST", http.MethodPost, "/v1/remotes/s3"},
 		{"remotes ebs POST", http.MethodPost, "/v1/remotes/ebs"},
 		{"node reconnect POST", http.MethodPost, "/v1/nodes/alpha/reconnect"},
@@ -185,8 +191,12 @@ func TestWrongMethodEnvelopeHasCorrection(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut,
-		base+"/v1/controller/config", nil)
+	// POST /v1/nodes/<n>/reconnect (unwired verb on a wired path)
+	// — Bug 159 wired PUT /v1/controller/config so this test was
+	// switched to the next unwired-verb pair from the Bug 109
+	// endpoint inventory.
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		base+"/v1/nodes/alpha/reconnect", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
