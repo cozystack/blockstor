@@ -49,13 +49,18 @@ func TestWrongMethodReturnsLINSTORJSONEnvelope(t *testing.T) {
 	// Bug 109 endpoint list — each (method, path) pair is a wired
 	// route on a different verb, so http.ServeMux currently returns
 	// the plaintext 405 marker.
+	//
+	// Bug 141 wired POST /v1/schedules (and PUT/DELETE on the
+	// /{name} sub-path) as canned 501 envelopes, so that pair is no
+	// longer a 405 case — it now has its own dedicated typed reply.
+	// The 405 wrapper contract is exercised here against the
+	// remaining wired-but-wrong-verb routes.
 	cases := []struct {
 		name   string
 		method string
 		path   string
 	}{
 		{"controller config PUT", http.MethodPut, "/v1/controller/config"},
-		{"schedules POST", http.MethodPost, "/v1/schedules"},
 		{"remotes s3 POST", http.MethodPost, "/v1/remotes/s3"},
 		{"remotes ebs POST", http.MethodPost, "/v1/remotes/ebs"},
 		{"node reconnect POST", http.MethodPost, "/v1/nodes/alpha/reconnect"},

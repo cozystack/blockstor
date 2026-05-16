@@ -18,22 +18,26 @@ package rest
 
 import "net/http"
 
-// registerSchedules wires the upstream LINSTOR `linstor schedule list`
+// registerSchedules wires the upstream LINSTOR `linstor schedule`
 // surface. blockstor does not yet implement scheduled snapshots /
-// scheduled backups, but the endpoint must answer with a parseable
-// `{"data": []}` envelope — python-linstor (1.27.1) decodes the body
-// into responses.ScheduleListResponse which reads `data["data"]`,
-// and a bare 404 page crashes the client with
-// xml.etree.ElementTree.ParseError (Bug 100). The wire shape matches
-// upstream's empty-list reply for a controller with no schedules
-// defined.
+// scheduled backups, but every CLI verb must answer with a typed
+// envelope rather than fall through to the generic 404/405 catch-all
+// — otherwise operators see two unrelated error stories ("method not
+// allowed" / "endpoint not implemented") for the same half-implemented
+// feature.
 //
-// The list endpoint is intentionally the only schedule route we wire
-// — create / modify / delete are write paths that need real storage
-// support before they can return anything but "501 not implemented".
-// Once schedules are modelled, this file grows the full CRUD set.
+// Bug 100 wired the LIST verb to return `{"data": []}` so
+// python-linstor's ScheduleListResponse decodes cleanly. Bug 141
+// completes the contract: POST / PUT / DELETE all return a canned
+// 501 envelope that names the verb ("schedule create not yet
+// implemented" etc.) — same pattern as Bug 127's sos-report create
+// + download. Once schedules are modelled, each of these handlers
+// is replaced with the real implementation.
 func (s *Server) registerSchedules(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/schedules", s.handleScheduleList)
+	mux.HandleFunc("POST /v1/schedules", handleScheduleCreate)
+	mux.HandleFunc("PUT /v1/schedules/{name}", handleScheduleModify)
+	mux.HandleFunc("DELETE /v1/schedules/{name}", handleScheduleDelete)
 }
 
 // scheduleListResponse is the wire shape ScheduleListResponse expects
@@ -63,4 +67,29 @@ type scheduleEntry struct {
 // to read; the body shape is what matters.
 func (s *Server) handleScheduleList(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, scheduleListResponse{Data: []scheduleEntry{}})
+}
+
+// handleScheduleCreate returns the canned "not yet implemented"
+// envelope for `linstor schedule create`. Mirrors the Bug 127
+// sos-report-create shape — same 501 status, same `[]ApiCallRc` body
+// with a verb-naming message so the CLI's ERROR line tells the
+// operator exactly which feature is missing.
+func handleScheduleCreate(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotImplemented, "schedule create not yet implemented")
+}
+
+// handleScheduleModify is the PUT/modify side of the canned envelope
+// triplet. `linstor schedule modify <name>` posts a PUT against
+// /v1/schedules/{name}.
+func handleScheduleModify(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotImplemented, "schedule modify not yet implemented")
+}
+
+// handleScheduleDelete is the DELETE side. `linstor schedule delete
+// <name>` posts a DELETE against /v1/schedules/{name}. Without this
+// route the CLI hit the Bug 103 404 catch-all envelope, which is
+// structurally correct but carries a generic "endpoint not
+// implemented" message that doesn't name the schedule verb.
+func handleScheduleDelete(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotImplemented, "schedule delete not yet implemented")
 }
