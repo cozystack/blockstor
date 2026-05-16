@@ -116,15 +116,18 @@ type deleteWithRollback[T any] struct {
 // store Delete → post-walk gate → success/warn envelope. Caller
 // passes a writer so the helper can route store errors uniformly.
 //
-// The capture deliberately runs BEFORE the pre-walk so the
+// The capture deliberately runs AFTER the pre-walk so the
 // happy-path orderings stays identical to Bug 145's:
 //
-//	captureStoragePool → refuseSPDeleteIfReferenced → Delete →
+//	refuseSPDeleteIfReferenced → captureStoragePool → Delete →
 //	rollbackSPDeleteIfRaced
 //
-// (We could pull capture inside the !refusedPre branch, but
-// keeping it ahead of the gate keeps the helper's call ordering
-// trivially auditable against the SP-delete reference shape.)
+// (Capture-after-refuse keeps the helper from issuing a wasted
+// Get on the refused path — the refusal envelope is the only
+// observable on that branch, and the captured snapshot would
+// have been discarded anyway. The post-walk + restore order
+// remains the same: a racing dependent only matters once the
+// primary has been removed.)
 func (d *deleteWithRollback[T]) run(w http.ResponseWriter) {
 	if d.refuseIfReferenced() {
 		return
