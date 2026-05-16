@@ -25,12 +25,12 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+	k8sstore "github.com/cozystack/blockstor/pkg/store/k8s"
 )
 
 // registerNodeConnections wires the upstream LINSTOR
@@ -397,41 +397,16 @@ func (s *Server) readAllNodeConnections(ctx context.Context) ([]nodeConnectionWi
 func (s *Server) applyNodeConnectionProps(
 	ctx context.Context, src, dst string, modify *apiv1.GenericPropsModify,
 ) error {
-	var ctrlConfig blockstoriov1alpha1.ControllerConfig
-
 	key := nodeConnectionPairKey(src, dst)
 
-	err := s.Client.Get(ctx,
-		client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName},
-		&ctrlConfig,
-	)
-	if apierrors.IsNotFound(err) {
-		ctrlConfig = blockstoriov1alpha1.ControllerConfig{
-			ObjectMeta: metav1.ObjectMeta{Name: blockstoriov1alpha1.ControllerConfigName},
-			Spec: blockstoriov1alpha1.ControllerConfigSpec{
-				NodeConnections: map[string]map[string]string{},
-			},
-		}
+	err := k8sstore.PatchControllerNodeConnections(ctx, s.Client,
+		func(conn map[string]map[string]string) error {
+			mergeNodeConnectionPropsInto(conn, key, modify)
 
-		mergeNodeConnectionProps(&ctrlConfig, key, modify)
-
-		err = s.Client.Create(ctx, &ctrlConfig)
-		if err != nil {
-			return errors.Wrap(err, "create ControllerConfig")
-		}
-
-		return nil
-	}
-
+			return nil
+		})
 	if err != nil {
-		return errors.Wrap(err, "get ControllerConfig")
-	}
-
-	mergeNodeConnectionProps(&ctrlConfig, key, modify)
-
-	err = s.Client.Update(ctx, &ctrlConfig)
-	if err != nil {
-		return errors.Wrap(err, "update ControllerConfig")
+		return errors.Wrap(err, "patch ControllerConfig")
 	}
 
 	return nil
@@ -443,51 +418,37 @@ func (s *Server) applyNodeConnectionProps(
 // pair has no props after this call", which a missing record
 // already satisfies.
 func (s *Server) dropNodeConnection(ctx context.Context, src, dst string) error {
-	var ctrlConfig blockstoriov1alpha1.ControllerConfig
-
-	err := s.Client.Get(ctx,
-		client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName},
-		&ctrlConfig,
-	)
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-
-	if err != nil {
-		return errors.Wrap(err, "get ControllerConfig")
-	}
-
 	key := nodeConnectionPairKey(src, dst)
-	if _, present := ctrlConfig.Spec.NodeConnections[key]; !present {
-		return nil
-	}
 
-	delete(ctrlConfig.Spec.NodeConnections, key)
+	err := k8sstore.PatchControllerNodeConnections(ctx, s.Client,
+		func(conn map[string]map[string]string) error {
+			delete(conn, key)
 
-	err = s.Client.Update(ctx, &ctrlConfig)
+			return nil
+		})
 	if err != nil {
-		return errors.Wrap(err, "update ControllerConfig")
+		return errors.Wrap(err, "patch ControllerConfig")
 	}
 
 	return nil
 }
 
-// mergeNodeConnectionProps applies an OverrideProps / DeleteProps
-// batch onto the pair entry. The map-of-maps allocation tracks the
-// existing-entry / empty-after-delete cases so a freshly emptied
-// pair doesn't leave a `{key: {}}` ghost on the CRD — list output
-// would render it as a row with zero props, which is the same
-// shape upstream LINSTOR emits for a `set-property` immediately
-// followed by `drop-property`; cozystack treats "no props" as "no
-// pair" for the list output so the ghost is explicitly pruned.
-func mergeNodeConnectionProps(
-	ctrlConfig *blockstoriov1alpha1.ControllerConfig, key string, modify *apiv1.GenericPropsModify,
+// mergeNodeConnectionPropsInto applies an OverrideProps / DeleteProps
+// batch onto the pair entry inside the map-of-maps `conn`. Operates
+// on the inner map by reference so PatchControllerNodeConnections's
+// retry closure (Bug 204a) can re-apply the same merge against the
+// freshly-fetched state without touching the outer ControllerConfig.
+//
+// Empty-after-merge: when every key has been deleted, the pair entry
+// is dropped from `conn` entirely so a subsequent list doesn't render
+// an empty-props row. Same shape upstream LINSTOR emits for a
+// `set-property` immediately followed by `drop-property`; cozystack
+// treats "no props" as "no pair" for the list output so the ghost is
+// explicitly pruned.
+func mergeNodeConnectionPropsInto(
+	conn map[string]map[string]string, key string, modify *apiv1.GenericPropsModify,
 ) {
-	if ctrlConfig.Spec.NodeConnections == nil {
-		ctrlConfig.Spec.NodeConnections = map[string]map[string]string{}
-	}
-
-	props := ctrlConfig.Spec.NodeConnections[key]
+	props := conn[key]
 	if props == nil {
 		props = map[string]string{}
 	}
@@ -512,10 +473,10 @@ func mergeNodeConnectionProps(
 	}
 
 	if len(props) == 0 {
-		delete(ctrlConfig.Spec.NodeConnections, key)
+		delete(conn, key)
 
 		return
 	}
 
-	ctrlConfig.Spec.NodeConnections[key] = props
+	conn[key] = props
 }
