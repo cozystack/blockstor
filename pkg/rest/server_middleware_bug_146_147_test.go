@@ -216,12 +216,16 @@ func TestBug147ContentTypeRequiredForPOSTNoCharset(t *testing.T) {
 	}
 }
 
-// TestBug147MissingContentTypeRejected pins the no-header variant:
-// a POST with NO Content-Type header at all must be rejected with
-// 415. Plenty of broken clients (and `curl -d` without `-H`) omit
-// the header entirely; we must not silently accept whatever bytes
-// they send.
-func TestBug147MissingContentTypeRejected(t *testing.T) {
+// TestBug147MissingContentTypeAccepted pins the Bug 157-relaxed
+// no-header path: Bug 147's original strict gate refused POSTs
+// without Content-Type, but python-linstor 1.27.1 omits the header
+// and Python's http.client auto-fills `application/x-www-form-
+// urlencoded` — every CLI write op started getting 415. The relaxed
+// gate accepts missing Content-Type (the JSON body decoder is the
+// real validity gate). The Bug 147 protection is still in place for
+// egregious mismatches like `text/html` (covered by the regression
+// guard below).
+func TestBug147MissingContentTypeAccepted(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
@@ -241,22 +245,202 @@ func TestBug147MissingContentTypeRejected(t *testing.T) {
 
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusUnsupportedMediaType {
-		t.Errorf("status: got %d, want 415 (missing Content-Type)", resp.StatusCode)
+	// Missing CT must NOT be rejected post-Bug 157. The endpoint
+	// handler may still write its own status (201, 400, etc.) —
+	// just not 415.
+	if resp.StatusCode == http.StatusUnsupportedMediaType {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status: got 415 — Bug 157 must accept missing CT (body: %s)", body)
 	}
+}
 
-	body, err := io.ReadAll(resp.Body)
+// TestBug157POSTWithUrlencodedCTAccepted pins Bug 157: the Bug 147
+// strict-mode gate was too narrow — python-linstor 1.27.1 does NOT
+// set Content-Type explicitly, so Python's http.client auto-fills
+// `application/x-www-form-urlencoded` whenever there is a request
+// body. That sailed past every blockstor write op (rd c / vd c /
+// r c / sp c / n c / kvs / encryption) with a 415, leaving the CLI
+// non-functional against stock python-linstor.
+//
+// The relaxed rule: accept the media types real-world LINSTOR
+// clients actually send — application/json, application/<vendor>+json,
+// application/x-www-form-urlencoded, and missing Content-Type — and
+// rely on the JSON decoder to reject malformed bodies. Egregious
+// mismatches (text/*, multipart/*, image/*, video/*, audio/*) remain
+// 415. The body decoder is the actual JSON-validity gate; the
+// Content-Type gate is only a safety net against truly-wrong media
+// types.
+func TestBug157POSTWithUrlencodedCTAccepted(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{Name: "bug157-urlencoded"},
+	})
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		t.Fatalf("marshal: %v", err)
 	}
 
-	var rc []apiv1.APICallRc
-	if err := json.Unmarshal(body, &rc); err != nil {
-		t.Fatalf("decode envelope: %v\nbody: %s", err, body)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		base+"/v1/resource-definitions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
 	}
 
-	if len(rc) == 0 {
-		t.Fatalf("empty envelope")
+	// This is what python-linstor's http.client auto-fills when the
+	// caller does not set Content-Type explicitly.
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnsupportedMediaType {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got 415 — Bug 157: middleware must accept "+
+			"application/x-www-form-urlencoded so stock python-linstor "+
+			"can talk to the apiserver (body: %s)", respBody)
+	}
+
+	// Any 2xx is fine; the body is valid JSON so the create succeeds.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 2xx (body: %s)", resp.StatusCode, respBody)
+	}
+}
+
+// TestBug157POSTWithMissingCTAccepted pins the Bug 157 sibling: a
+// POST with NO Content-Type header AND a valid JSON body must be
+// accepted. Bug 147 originally rejected this to force clients to
+// declare their media type, but real-world python-linstor on the
+// stand never sets the header, so the strict rule made the CLI
+// unusable. Replacing strict-reject with permissive-decode keeps
+// the operator's CLI working while still rejecting egregious
+// non-JSON via the decoder.
+func TestBug157POSTWithMissingCTAccepted(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{Name: "bug157-nocta"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		base+"/v1/resource-definitions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	// Explicitly remove the Content-Type header net/http would add.
+	req.Header.Del("Content-Type")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnsupportedMediaType {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got 415 — Bug 157: middleware must accept a "+
+			"missing Content-Type when the body is valid JSON (body: %s)", respBody)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 2xx (body: %s)", resp.StatusCode, respBody)
+	}
+}
+
+// TestBug147RegressionGuardTextPlainStillRefused pins Bug 147's
+// original protection: egregious media-type mismatches (text/html,
+// text/plain, image/*, multipart/*, video/*, audio/*) must still
+// return 415. Relaxing the gate for Bug 157 must NOT degenerate into
+// "accept anything"; the gate still guards against, e.g., a browser
+// form submission landing in a JSON endpoint.
+func TestBug147RegressionGuardTextPlainStillRefused(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	for _, ct := range []string{
+		"text/html",
+		"text/plain",
+		"image/png",
+		"multipart/form-data; boundary=----abc",
+		"video/mp4",
+		"audio/mpeg",
+	} {
+		t.Run(ct, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+				base+"/v1/resource-definitions",
+				bytes.NewReader([]byte(`{"resource_definition":{"name":"x"}}`)))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+
+			req.Header.Set("Content-Type", ct)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusUnsupportedMediaType {
+				respBody, _ := io.ReadAll(resp.Body)
+				t.Errorf("Content-Type %q: status %d, want 415 (egregious "+
+					"non-JSON media types must remain rejected) (body: %s)",
+					ct, resp.StatusCode, respBody)
+			}
+		})
+	}
+}
+
+// TestBug147RegressionGuardJSONAccepted pins the Bug 147 happy path
+// under the relaxed rules: `Content-Type: application/json` (with or
+// without parameters) is still the preferred shape and must produce
+// 2xx for a valid body.
+func TestBug147RegressionGuardJSONAccepted(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{Name: "bug147-happy"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
+		base+"/v1/resource-definitions", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnsupportedMediaType {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got 415 — relaxation must not break application/json (body: %s)", respBody)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status: got %d, want 2xx (body: %s)", resp.StatusCode, respBody)
 	}
 }
 

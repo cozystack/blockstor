@@ -27,6 +27,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -176,7 +177,7 @@ func (s *Server) Start(ctx context.Context) error {
 	//                          etcd/k8s rejection string in a 500.
 	srv := &http.Server{
 		Addr:              s.Addr,
-		Handler:           withLogging(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux)))),
+		Handler:           withLogging(withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
@@ -530,37 +531,47 @@ func withBodyLimit(maxBytes int64, next http.Handler) http.Handler {
 	})
 }
 
-// withContentTypeJSON gates POST/PUT/PATCH requests on a JSON
-// Content-Type. Bug 147: before this gate any header value (or none
-// at all) was accepted — a `curl -d '<json>'` without `-H` would
-// silently 201 even on the wrong endpoint, and a client that sent
-// `Content-Type: text/plain` past a JSON endpoint also went through.
-// Both shapes hid bugs at the caller side (the apiserver decoded
-// happens-to-look-like-JSON bytes regardless of what the sender
-// claimed) and made interop with HTTP-spec tooling (RFC 7231 § 6.5.13)
-// inconsistent.
+// withContentTypeJSON gates POST/PUT/PATCH requests so egregious
+// non-JSON bodies are refused at the wire edge before any handler
+// tries to decode random bytes as JSON.
 //
-// Rules:
-//   - GET / HEAD / DELETE / OPTIONS pass through unconditionally —
-//     no body, no media-type to validate.
+// Bug 147 originally made this strict: only `application/json` (with
+// or without parameters) was accepted, everything else was 415. That
+// turned out to be too narrow — Bug 157 (P0 regression): stock
+// `python-linstor 1.27.1` does NOT set Content-Type, so Python's
+// http.client.HTTPConnection.request auto-fills
+// `application/x-www-form-urlencoded` whenever there is a request
+// body. Every blockstor CLI write op (`rd c`, `vd c`, `r c`, `sp c`,
+// `n c`, `kvs`, encryption, …) was rejected with 415, leaving the
+// deployed CLI unusable against the apiserver.
+//
+// The compromise: accept the media types real-world LINSTOR clients
+// actually send AND let the JSON decoder be the final validator on
+// the body shape. The Bug 147 protection survives only against
+// egregious mismatches that no legitimate JSON client sends.
+//
+// Accepted (next.ServeHTTP runs, body decoder takes over):
+//   - missing Content-Type (python-linstor default before
+//     http.client's fallback kicks in)
+//   - `application/json` (with or without parameters)
+//   - `application/x-www-form-urlencoded` (python-linstor's actual
+//     wire shape after http.client's auto-fill)
+//   - any other `application/*` (covers application/vnd...+json,
+//     application/cbor, application/yaml — narrow JSON encoders that
+//     a future client might use; the body decoder will reject if the
+//     bytes aren't JSON)
+//
+// Rejected with 415 + LINSTOR envelope:
+//   - `text/*`, `image/*`, `multipart/*`, `video/*`, `audio/*` and
+//     anything else that's clearly NOT a structured-data media type
+//
+// Other rules unchanged from the Bug 147 wiring:
+//   - GET / HEAD / DELETE / OPTIONS pass through unconditionally.
 //   - Requests that the mux can't dispatch (unknown path → 404 /
 //     wrong verb → 405) also pass through so the with404Envelope
-//     wrapper above can still emit the correct typed reply; running
-//     this gate first would convert every misrouted POST into a 415
-//     and shadow the 404/405 paths (Bug 103 / Bug 109 wrappers).
+//     wrapper can still emit the correct typed reply.
 //   - Requests with an empty body (Content-Length 0 AND not chunked)
-//     also pass through. Upstream LINSTOR has several verb-only
-//     mutation endpoints (`PUT /v1/nodes/{n}/reconnect`,
-//     `POST /v1/.../restart`, …) where the action is purely the path
-//     + method — no JSON to validate. Bug 147's intent is to refuse
-//     wrong-type *bodies*, not to refuse empty PUTs.
-//   - For body-carrying verbs (POST, PUT, PATCH) that DO dispatch to
-//     a real handler AND have a body, the Content-Type header must
-//     parse and its media-type must equal "application/json".
-//     Parameters (charset, boundary, …) are allowed — `application/
-//     json; charset=utf-8` is accepted as that's the common curl
-//     default.
-//   - Anything else returns 415 + LINSTOR envelope.
+//     pass through — verb-only mutation endpoints carry no JSON.
 //
 // The mux argument is the actual http.ServeMux so we can peek at
 // whether the request would dispatch — needed for the 404/405
@@ -594,7 +605,7 @@ func withContentTypeJSON(mux *http.ServeMux, next http.Handler) http.Handler {
 		}
 
 		ct := r.Header.Get("Content-Type")
-		if !isJSONContentType(ct) {
+		if !isAcceptableBodyContentType(ct) {
 			writeUnsupportedMediaTypeEnvelope(w, r, ct)
 
 			return
@@ -635,14 +646,105 @@ func methodCarriesBody(method string) bool {
 	}
 }
 
-// isJSONContentType reports whether ct names the application/json
-// media type, with or without parameters. Empty string → false (the
-// caller must send the header; we don't paper over missing ones).
-// Parse failures → false (malformed Content-Type headers are
-// unparseable, not "implicit JSON").
-func isJSONContentType(ct string) bool {
+// withHEADContentLength wraps the handler chain so HEAD requests
+// return the same headers as the GET counterpart — including a
+// Content-Length matching the would-be body byte count — without
+// writing the body itself. Bug 160: net/http's default chunked-
+// stripping behaviour on HEAD removes the body but does not
+// substitute Content-Length, violating RFC 9110 §9.3.2 and breaking
+// curl -I, some LB health checks, and oncall scripts that lean on
+// the response size.
+//
+// Implementation: for HEAD, replace the ResponseWriter with a
+// buffering recorder; run the inner handler; on completion set
+// Content-Length from the buffered size, flush the recorded
+// headers + status to the real writer, and drop the body.
+func withHEADContentLength(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// The mux is registered for GET routes; ServeMux serves
+		// HEAD via the GET handler natively, but it doesn't add
+		// Content-Length. Run the handler as GET against a
+		// recorder, then replay headers + Content-Length to the
+		// real writer.
+		rec := &headRecorder{header: http.Header{}, status: http.StatusOK}
+		// Rewrite Method to GET so handlers that branch on
+		// Method (e.g. some bug-pattern envelopes) treat this
+		// like a normal GET; the recorder swallows the body.
+		probe := r.Clone(r.Context())
+		probe.Method = http.MethodGet
+		next.ServeHTTP(rec, probe)
+
+		for key, vals := range rec.header {
+			for _, val := range vals {
+				w.Header().Add(key, val)
+			}
+		}
+
+		w.Header().Set("Content-Length", strconv.Itoa(rec.body.Len()))
+		w.WriteHeader(rec.status)
+	})
+}
+
+// headRecorder is a write-once buffer used by withHEADContentLength
+// to capture the GET-shaped response so we can stamp Content-Length
+// before dropping the body. The body byte count is the only payload
+// metric Bug 160 needs.
+type headRecorder struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (h *headRecorder) Header() http.Header {
+	return h.header
+}
+
+func (h *headRecorder) Write(b []byte) (int, error) {
+	return h.body.Write(b)
+}
+
+func (h *headRecorder) WriteHeader(code int) {
+	h.status = code
+}
+
+// isAcceptableBodyContentType reports whether ct names a media type
+// that withContentTypeJSON should let through to the body decoder.
+//
+// Bug 157 (the Bug 147 follow-up): the original Bug 147 implementation
+// only accepted `application/json`. That broke stock python-linstor,
+// which never sets Content-Type — Python's http.client then auto-fills
+// `application/x-www-form-urlencoded` whenever there is a request
+// body, and every blockstor CLI write op started returning 415.
+//
+// Relaxed rule:
+//
+//   - Empty string → true. Missing Content-Type is exactly what
+//     python-linstor produces before http.client's fallback fires,
+//     and is the most common case for hand-rolled curl probes. The
+//     body decoder is the actual JSON-validity gate; the wire-edge
+//     gate is just here to refuse obviously-wrong media types.
+//   - Any `application/*` media type → true. Covers the legitimate
+//     shapes blockstor sees in the wild: `application/json`,
+//     `application/json; charset=utf-8`, `application/x-www-form-
+//     urlencoded` (python-linstor's actual wire shape), and
+//     `application/vnd.foo+json` (vendor JSON profiles).
+//   - Anything else (text/*, image/*, multipart/*, video/*, audio/*,
+//     and other major types) → false. These are clearly not
+//     structured-data JSON bodies, so we refuse at the wire edge
+//     instead of forcing the body decoder to surface a confusing
+//     error.
+//   - A Content-Type header that won't parse → false. A malformed
+//     header is a programming bug at the caller, not "implicit
+//     JSON".
+func isAcceptableBodyContentType(ct string) bool {
 	if ct == "" {
-		return false
+		return true
 	}
 
 	mediaType, _, err := mime.ParseMediaType(ct)
@@ -650,7 +752,7 @@ func isJSONContentType(ct string) bool {
 		return false
 	}
 
-	return strings.EqualFold(mediaType, "application/json")
+	return strings.HasPrefix(strings.ToLower(mediaType), "application/")
 }
 
 // writeUnsupportedMediaTypeEnvelope emits the LINSTOR-shaped 415 reply
