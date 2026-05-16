@@ -17,7 +17,6 @@ limitations under the License.
 package rest
 
 import (
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -221,10 +220,15 @@ var acceptedLogLevels = []string{logLevelTrace, logLevelDebug, logLevelInfo, log
 func handlePutControllerConfig(w http.ResponseWriter, r *http.Request) {
 	var body putControllerConfigBody
 
-	err := json.NewDecoder(r.Body).Decode(&body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
+	// Bug 197: route the decode through the canonical decodeJSON
+	// helper so empty / malformed / unknown-field bodies hit the
+	// Bug 158/161 typed-envelope path (no raw `EOF` / `invalid
+	// character ...` text on the wire, unknown top-level fields
+	// refused with 400 + envelope citing the offending field).
+	// Pre-fix this handler used a bare `json.NewDecoder` + raw
+	// `writeError(400, err.Error())`, the one decode site Bug 161's
+	// sweep missed because Bug 159 landed two days after Bug 161.
+	if !decodeJSON(w, r, &body) {
 		return
 	}
 
