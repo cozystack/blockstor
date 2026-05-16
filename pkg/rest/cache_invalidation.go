@@ -197,3 +197,53 @@ func resourceDeletionVisible(ctx context.Context, st store.Store, rdName, node s
 	// Non-NotFound error: don't loop on a permanent failure.
 	return true
 }
+
+// waitForVDDeletionVisible blocks until the local Store reports that
+// VolumeDefinition (rdName, volumeNumber) is gone from the cache
+// view, or `cacheConvergeBudget` elapses. Mirror of
+// waitForRDDeletionVisible for the per-VD DELETE endpoint
+// (`DELETE /v1/resource-definitions/{rd}/volume-definitions/{vn}`).
+// Bug 139: without this hook the very next `GET /v1/view/resources`
+// after VD delete catches the pre-delete picture in the informer
+// cache and surfaces the dropped volume on the per-resource Volumes
+// slice for tens of seconds.
+func (s *Server) waitForVDDeletionVisible(ctx context.Context, rdName string, volumeNumber int32) {
+	if s == nil || s.Store == nil {
+		return
+	}
+
+	deadline := time.Now().Add(cacheConvergeBudget)
+
+	for {
+		if vdDeletionVisible(ctx, s.Store, rdName, volumeNumber) {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(cacheConvergePollInterval):
+		}
+	}
+}
+
+// vdDeletionVisible is the single-shot predicate behind
+// waitForVDDeletionVisible: "does the local store agree that this
+// VD is gone?". A NotFound from Get means converged; any non-
+// NotFound error is also treated as "stop waiting" (same rationale
+// as rdDeletionVisible). The parent RD missing also counts as
+// converged — the VD can't exist under an absent parent.
+func vdDeletionVisible(ctx context.Context, st store.Store, rdName string, volumeNumber int32) bool {
+	_, err := st.VolumeDefinitions().Get(ctx, rdName, volumeNumber)
+	if err == nil {
+		return false
+	}
+
+	// Any error path — NotFound on either VD or parent RD,
+	// transport, decode — counts as "stop waiting".
+	return true
+}

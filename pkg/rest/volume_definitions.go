@@ -454,6 +454,11 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
+		// Bug 139: even on the idempotent no-op branch, drain the
+		// local cache so a re-issued DELETE during a real delete-in-
+		// flight is still read-your-writes on the follow-up view.
+		s.waitForVDDeletionVisible(r.Context(), rd, vn)
+
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 			RetCode: warnVDNotFound,
 			Message: fmt.Sprintf("volume definition already absent: %s/%d", rd, vn),
@@ -462,10 +467,68 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 139: prune the deleted VolumeNumber off each child
+	// Resource's Status.Volumes, then wait for the VD delete to be
+	// observable on the local store. The satellite reconciler
+	// eventually re-stamps Status.Volumes when it re-applies after
+	// the RD spec change, but the gap surfaces the dropped volume
+	// on `view/resources` for tens of seconds. Pre-stamping the
+	// Status.Volumes update here closes the gap synchronously.
+	s.pruneVolumesFromResources(r.Context(), rd, vn)
+	s.waitForVDDeletionVisible(r.Context(), rd, vn)
+
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: fmt.Sprintf("volume definition deleted: %s/%d", rd, vn),
 	}})
+}
+
+// pruneVolumesFromResources walks every Resource of the named RD
+// and drops the deleted VolumeNumber from its Volumes slice. Bug
+// 139: the satellite eventually re-stamps Status.Volumes after the
+// RD-watch fires, but `view/resources` reads in the gap surface
+// the phantom volume — pre-stamp here so the gap is zero.
+//
+// Best-effort: a single Resource failing to re-Update doesn't roll
+// back the others nor the VD delete itself.
+func (s *Server) pruneVolumesFromResources(ctx context.Context, rd string, vn int32) {
+	if s == nil || s.Store == nil {
+		return
+	}
+
+	resources, err := s.Store.Resources().ListByDefinition(ctx, rd)
+	if err != nil {
+		return
+	}
+
+	for i := range resources {
+		rsc := resources[i]
+		if len(rsc.Volumes) == 0 {
+			continue
+		}
+
+		out := make([]apiv1.Volume, 0, len(rsc.Volumes))
+
+		dropped := false
+
+		for j := range rsc.Volumes {
+			if rsc.Volumes[j].VolumeNumber == vn {
+				dropped = true
+
+				continue
+			}
+
+			out = append(out, rsc.Volumes[j])
+		}
+
+		if !dropped {
+			continue
+		}
+
+		rsc.Volumes = out
+
+		_ = s.Store.Resources().Update(ctx, &rsc)
+	}
 }
 
 func parseVolNum(raw string) (int32, error) {

@@ -266,3 +266,86 @@ func TestBug136VDSetSizeStorageProviderResizeCalled(t *testing.T) {
 		t.Errorf("Resize SizeKib: got %d, want %d", resizes[0].SizeKib, newSize)
 	}
 }
+
+// TestBug139VDDeleteRemovesVolumeFromViewProjection pins the wire-
+// level invariant that motivated Bug 139: after DELETE
+// /v1/resource-definitions/<rd>/volume-definitions/<vn> returns 200,
+// the very next GET /v1/view/resources MUST NOT carry the dropped
+// volume on the per-resource Volumes slice. Without the fix the
+// projection trails the spec until the satellite re-observes — the
+// CRD spec and the wire view disagree.
+//
+// The fix is dual: (a) drop the Volume entry from each Resource at
+// view-render time when its VolumeNumber no longer matches any VD
+// in the parent RD, AND (b) wait for the store's read path to
+// observe the VD delete before responding so a re-issued GET on a
+// laggy cache doesn't catch the pre-delete picture.
+func TestBug139VDDeleteRemovesVolumeFromViewProjection(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const (
+		rdName  = "pvc-bug139"
+		node    = "node-a"
+		volNum  = int32(0)
+		sizeKib = int64(32 * 1024)
+	)
+
+	err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rdName})
+	if err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	err = st.VolumeDefinitions().Create(ctx, rdName,
+		&apiv1.VolumeDefinition{VolumeNumber: volNum, SizeKib: sizeKib})
+	if err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	// Resource carries Status.Volumes with the volume entry — the
+	// satellite would have stamped this on a previous reconcile.
+	err = st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     rdName,
+		NodeName: node,
+		Volumes: []apiv1.Volume{
+			{VolumeNumber: volNum, DevicePath: "/dev/fake/" + rdName + "_00000"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Sanity: the seeded volume is observable before the delete.
+	pre := getViewResources(t, base)
+	if len(pre) != 1 || len(pre[0].Volumes) != 1 {
+		t.Fatalf("pre-delete view: got %+v, want 1 resource with 1 volume", pre)
+	}
+
+	delResp := httpDelete(t,
+		fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/%d",
+			base, rdName, volNum))
+	_ = delResp.Body.Close()
+
+	if delResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE status: got %d, want 200", delResp.StatusCode)
+	}
+
+	// Wire-level invariant: the GET that runs *immediately* after
+	// DELETE returns MUST NOT include the dropped volume on the
+	// per-resource Volumes slice. Bug 139's symptom was the volume
+	// surviving for tens of seconds (or indefinitely on a stuck
+	// satellite reconciler).
+	post := getViewResources(t, base)
+	if len(post) != 1 {
+		t.Fatalf("post-delete view: got %d resources, want 1; rows=%+v",
+			len(post), post)
+	}
+
+	if len(post[0].Volumes) != 0 {
+		t.Errorf("post-delete view: resource still carries %d volume(s) after VD delete: %+v",
+			len(post[0].Volumes), post[0].Volumes)
+	}
+}
