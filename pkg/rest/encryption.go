@@ -17,7 +17,10 @@ limitations under the License.
 package rest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"time"
 
@@ -211,14 +214,30 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 //     so the very next /v1/view/resources GET reports every LUKS
 //     replica as Suspended=false (Available).
 //
-// Body shape accepts BOTH `{"new_passphrase":"..."}` (historical,
-// upstream-LINSTOR-compatible) AND `{"passphrase":"..."}` (the W13
-// CLI shape). passphraseRequest.proofOfKnowledge centralises the
-// choice so the rest of the handler is dual-key-agnostic.
+// Body shape accepts THREE wire forms (Bug 173):
+//
+//   - bare JSON string `"…"` — the upstream-LINSTOR canonical shape
+//     (`PassPhraseEnter: type: string` in the OpenAPI spec, decoded
+//     via `readValue(jsonData, String.class)` in upstream's Java
+//     handler, and the exact body golinstor's
+//     `EncryptionService.Enter()` puts on the wire).
+//   - `{"new_passphrase":"…"}` — historical wrapped form kept by
+//     pre-Bug-173 clients and the Bug 165 dual-key wire surface.
+//   - `{"passphrase":"…"}` — the W13 CLI / `--curl` wrapped alias.
+//
+// passphraseRequest.proofOfKnowledge centralises the wrapped-form
+// field resolution; the bare-string branch fills in NewPassphrase
+// up-front so the rest of the handler stays dual-key-agnostic.
+//
+// Pre-Bug-173 this method decoded straight into passphraseRequest
+// and a bare string body crashed the decoder with `wrong JSON
+// shape: …has the wrong type` (400). Strict-OpenAPI clients
+// (golinstor 0.55+, terraform-provider-linstor, hand-rolled
+// `curl -d '"…"'`) all hit that — they correctly follow the spec
+// and the apiserver was the diverging side.
 func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
-	var req passphraseRequest
-
-	if !decodeJSON(w, r, &req) {
+	req, ok := decodePassphraseEnterBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -247,6 +266,103 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 	s.passphraseUnlocked.Store(true)
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// decodePassphraseEnterBody implements the Bug 173 dual-shape decode
+// for PATCH `/v1/encryption/passphrase`. The upstream OpenAPI spec
+// pins `PassPhraseEnter: type: string` (bare JSON string body) so
+// golinstor and strict-OpenAPI clients send `"…"` verbatim, while
+// the historical Bug 165 dual-key wrapped object form
+// (`{"passphrase":"…"}` / `{"new_passphrase":"…"}`) is still on the
+// wire from every `--curl` and pre-strict client out there.
+//
+// The decoder picks between the two by peeking at the first
+// non-whitespace byte:
+//
+//   - `"` → bare-string branch. Decoded into a plain `string` and
+//     stuffed into NewPassphrase so the downstream
+//     proofOfKnowledge() resolution stays dual-key-agnostic. An
+//     empty `""` body proceeds (the auth path will surface 401).
+//   - `{` → wrapped-object branch. Routed through the standard
+//     decodeJSON path so the Bug 158/161 envelope semantics
+//     (DisallowUnknownFields, typed error envelope) still apply.
+//   - anything else → 400 + standard envelope, same as a wrapped
+//     object with the wrong top-level shape.
+//
+// Empty / truncated / oversize bodies go through `decodeJSON`'s
+// existing branches so error-envelope shape stays uniform across
+// the encryption endpoints.
+func decodePassphraseEnterBody(w http.ResponseWriter, r *http.Request) (passphraseRequest, bool) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeDecodeError(w, err)
+
+		return passphraseRequest{}, false
+	}
+
+	// Re-wrap the body so the wrapped-object branch can keep using
+	// `decodeJSON` (Bug 158/161 envelope + DisallowUnknownFields).
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	// First non-whitespace byte tells us whether the caller sent the
+	// bare-string form (`"…"`) or the wrapped-object form (`{…}`).
+	// Anything else is malformed and falls through to the standard
+	// envelope.
+	first, ok := firstJSONToken(body)
+	if !ok {
+		// Empty / whitespace-only body. Mirror `decodeJSON`'s
+		// io.EOF branch by re-running it; we already consumed the
+		// body so the Reader is empty and the std-lib returns EOF.
+		writeDecodeError(w, io.EOF)
+
+		return passphraseRequest{}, false
+	}
+
+	if first == '"' {
+		var pass string
+
+		dec := json.NewDecoder(bytes.NewReader(body))
+
+		err = dec.Decode(&pass)
+		if err != nil {
+			writeDecodeError(w, err)
+
+			return passphraseRequest{}, false
+		}
+
+		// Stuff the bare-string value into NewPassphrase so the
+		// downstream proofOfKnowledge() lookup keeps working
+		// unchanged. NewPassphrase wins over Passphrase in
+		// proofOfKnowledge so a future caller mixing forms is
+		// impossible here (only one field is populated).
+		return passphraseRequest{NewPassphrase: pass}, true
+	}
+
+	var req passphraseRequest
+
+	if !decodeJSON(w, r, &req) {
+		return passphraseRequest{}, false
+	}
+
+	return req, true
+}
+
+// firstJSONToken returns the first non-whitespace byte of a JSON
+// payload and whether one was found. Whitespace per RFC 8259
+// (space, tab, LF, CR). Used by decodePassphraseEnterBody to tell
+// the bare-string and wrapped-object body shapes apart without
+// double-decoding the payload.
+func firstJSONToken(body []byte) (byte, bool) {
+	for _, b := range body {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		default:
+			return b, true
+		}
+	}
+
+	return 0, false
 }
 
 // handlePassphraseModify rotates the cluster master passphrase
