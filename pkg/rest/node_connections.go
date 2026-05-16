@@ -130,6 +130,16 @@ func (s *Server) handleNodeConnectionList(w http.ResponseWriter, r *http.Request
 		pairs = []nodeConnectionWire{}
 	}
 
+	// Bug 194 (P1 security): scrub deny-listed sensitive keys before
+	// emit. Operators legitimately set `DrbdOptions/Net/shared-secret`
+	// and `DrbdOptions/Net/cram-hmac-alg` per-pair (upstream UG9), so
+	// the raw values would leak to anyone with read-only LINSTOR
+	// access. `readAllNodeConnections` clones each props map before
+	// returning (see line 351), so in-place mutation here is safe.
+	for i := range pairs {
+		redactSensitiveProps(pairs[i].Props)
+	}
+
 	writeJSON(w, http.StatusOK, pairs)
 }
 
@@ -149,6 +159,12 @@ func (s *Server) handleNodeConnectionGet(w http.ResponseWriter, r *http.Request)
 
 		return
 	}
+
+	// Bug 194 (P1 security): scrub deny-listed sensitive keys before
+	// emit. `readNodeConnectionProps` clones the stored map (see
+	// line 314), so in-place mutation here is safe and doesn't
+	// disturb the on-CRD value.
+	redactSensitiveProps(props)
 
 	writeJSON(w, http.StatusOK, nodeConnectionWire{
 		NodeA: src,
