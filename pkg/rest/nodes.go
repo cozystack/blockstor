@@ -64,6 +64,13 @@ func (s *Server) registerNodes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/nodes", s.requireStore(s.handleNodeCreate))
 	mux.HandleFunc("PUT /v1/nodes/{node}", s.requireStore(s.handleNodeUpdate))
 	mux.HandleFunc("DELETE /v1/nodes/{node}", s.requireStore(s.handleNodeDelete))
+	// Bug 142: `linstor n dp <node> <key>` returned 404 because the
+	// per-key DELETE route was never registered. The controller-scope
+	// analog (`DELETE /v1/controller/properties/{key...}`) already
+	// works; this route mirrors the same shape — Go 1.22's `{key...}`
+	// wildcard captures slash-bearing keys like `Aux/rack-id` whole.
+	mux.HandleFunc("DELETE /v1/nodes/{node}/properties/{key...}",
+		s.requireStore(s.handleNodePropDelete))
 
 	// Per-interface CRUD: clusters with separate replication and
 	// management networks need to add/remove NetInterfaces on a
@@ -398,26 +405,56 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 132: `linstor n c <existing> <new-ip>` used to silently
+	// overwrite the stored NetInterface.Address as part of the
+	// idempotent-upsert path (Bug 66). Resource .res files would
+	// then reference the new IP while the live satellite was still
+	// bound to the old one, breaking DRBD wiring with no audit
+	// trail. The refusal surfaces the mismatch as 409 + envelope —
+	// matching the Bug 92 / Bug 111 refusal pattern — and the
+	// `?force=true` query string preserves the deliberate-renumber
+	// escape hatch.
+	if !isForce(r) && s.refuseNodeIPRewrite(w, r, &n) {
+		return
+	}
+
+	if !s.upsertNodeAndDiskless(w, r, &n) {
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, buildNodeCreateEnvelope(&n))
+}
+
+// upsertNodeAndDiskless wires the Bug-66 idempotent-upsert path
+// followed by the Bug-?? `DfltDisklessStorPool` auto-provision.
+// Extracted from handleNodeCreate so the parent stays under the
+// funlen budget after the Bug-132 refusal gate landed.
+//
+// Returns true on success (caller writes the success envelope);
+// false when the response has already been written with a
+// store-error envelope (caller must early-return).
+func (s *Server) upsertNodeAndDiskless(w http.ResponseWriter, r *http.Request, n *apiv1.Node) bool {
 	// Idempotent upsert (cli-parity-audit row #44): upstream LINSTOR's
 	// `node create` re-issues become no-op updates, not 409s. Cozystack
 	// reconcilers retry node registration on every operator restart;
 	// returning 409 made the loop hot-spin until human intervention.
 	// We try Create first (the common path), and fall through to Update
 	// only when the store reports the name is already taken.
-	err = s.Store.Nodes().Create(r.Context(), &n)
+	err := s.Store.Nodes().Create(r.Context(), n)
 	switch {
 	case err == nil:
 		// fresh create — normal path
 	case errors.Is(err, store.ErrAlreadyExists):
-		if upErr := s.Store.Nodes().Update(r.Context(), &n); upErr != nil {
-			writeStoreError(w, upErr)
+		err = s.Store.Nodes().Update(r.Context(), n)
+		if err != nil {
+			writeStoreError(w, err)
 
-			return
+			return false
 		}
 	default:
 		writeStoreError(w, err)
 
-		return
+		return false
 	}
 
 	// Upstream LINSTOR auto-provisions a `DfltDisklessStorPool`
@@ -430,7 +467,100 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		ProviderKind:    apiv1.StoragePoolKindDiskless,
 	})
 
-	writeJSON(w, http.StatusCreated, buildNodeCreateEnvelope(&n))
+	return true
+}
+
+// refuseNodeIPRewrite implements the Bug 132 guard: a re-POST to
+// `/v1/nodes` that targets an existing node whose NetInterface[]
+// addresses differ from the request body refuses with 409 +
+// LINSTOR envelope. Returns true when the response has been
+// written (handler must early-return), false when no existing
+// Node was found OR the addresses are byte-identical to the
+// request (idempotent path, Bug 66 contract).
+//
+// Comparison is per-interface-name: a request body that re-sends
+// the canonical {Name:"default", Address:"<old>"} pair against a
+// stored {Name:"default", Address:"<old>"} survives as a no-op,
+// while a request that flips the address (or adds an interface
+// whose name matches an existing one but with a different
+// address) trips the refusal. Interfaces present in the body but
+// not yet stored are tolerated — that's the "add a second
+// management network" workflow handleNetInterfaceCreate already
+// supports.
+func (s *Server) refuseNodeIPRewrite(w http.ResponseWriter, r *http.Request, requested *apiv1.Node) bool {
+	existing, err := s.Store.Nodes().Get(r.Context(), requested.Name)
+	if err != nil {
+		// NotFound is the common path (fresh create); any other
+		// error surfaces through the downstream Create/Update.
+		return false
+	}
+
+	conflict := findNetInterfaceConflict(existing.NetInterfaces, requested.NetInterfaces)
+	if conflict == "" {
+		return false
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "Node '" + requested.Name + "' already exists with a different network address.",
+		Cause:   conflict,
+		Correc: "Use `linstor node modify` (PUT /v1/nodes/<name>) to change " +
+			"node properties, or pass `?force=true` to accept the " +
+			"NetInterface rewrite and risk breaking existing DRBD wiring.",
+		ObjRefs: map[string]string{objRefNode: requested.Name},
+	}})
+
+	return true
+}
+
+// findNetInterfaceConflict returns a human-readable description of
+// the first (sorted by interface name) address mismatch between
+// the stored interfaces and the request body. Returns "" when no
+// stored interface shares a name with a request interface OR every
+// shared name maps to a byte-identical Address. Matching is on
+// Name only — Address is what we're guarding.
+func findNetInterfaceConflict(stored, requested []apiv1.NetInterface) string {
+	storedByName := make(map[string]string, len(stored))
+	for i := range stored {
+		storedByName[stored[i].Name] = stored[i].Address
+	}
+
+	// Stable iteration order so the surfaced cause is deterministic
+	// across calls — operators rerun `n c` to confirm the message.
+	names := make([]string, 0, len(requested))
+	for i := range requested {
+		names = append(names, requested[i].Name)
+	}
+
+	sort.Strings(names)
+
+	for _, name := range names {
+		storedAddr, present := storedByName[name]
+		if !present {
+			continue
+		}
+
+		var requestedAddr string
+
+		for i := range requested {
+			if requested[i].Name == name {
+				requestedAddr = requested[i].Address
+
+				break
+			}
+		}
+
+		if storedAddr == requestedAddr {
+			continue
+		}
+
+		return fmt.Sprintf(
+			"NetInterface %q currently has address %q; "+
+				"request body asked for %q",
+			name, storedAddr, requestedAddr)
+	}
+
+	return ""
 }
 
 // buildNodeCreateEnvelope assembles the `[]ApiCallRc` reply for a
@@ -614,6 +744,60 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "node modified: " + name,
+	}})
+}
+
+// handleNodePropDelete implements Bug 142: per-key DELETE for node
+// properties. Mirrors the controller-property analog
+// (`controller_props.go::handleControllerPropDelete`) — slash-bearing
+// keys like `Aux/rack-id` round-trip intact via Go 1.22's `{key...}`
+// wildcard, and a delete-of-missing folds into a 200 + warn-mask
+// envelope so reconciler retry loops don't hot-spin on the second
+// pass (cli-parity-audit: `linstor n dp` is idempotent on the
+// upstream LINSTOR controller for the same reason).
+func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
+	nodeName := r.PathValue("node")
+
+	key := r.PathValue("key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "missing property key")
+
+		return
+	}
+
+	existing, err := s.Store.Nodes().Get(r.Context(), nodeName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if _, present := existing.Props[key]; !present {
+		// Idempotent no-op: same surface as warnNodeNotFound for `n d`
+		// — operators see a distinct warn-band entry that "already
+		// absent" without an error mask.
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: maskWarn,
+			Message: "node " + nodeName + " property already absent: " + key,
+			ObjRefs: map[string]string{objRefNode: nodeName},
+		}})
+
+		return
+	}
+
+	delete(existing.Props, key)
+
+	err = s.Store.Nodes().Update(r.Context(), &existing)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "node " + nodeName + " property deleted: " + key,
+		ObjRefs: map[string]string{objRefNode: nodeName},
 	}})
 }
 

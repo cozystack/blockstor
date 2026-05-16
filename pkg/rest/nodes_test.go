@@ -139,6 +139,13 @@ func TestNodesGetMissing(t *testing.T) {
 // cozystack reconcilers on every operator restart; returning 409
 // made the reconciler hot-spin. Second POST MUST update the node
 // rather than fail with conflict.
+//
+// Bug 132: the upsert path is still allowed to flip Type (and other
+// non-wiring fields) — only a NetInterface.Address mismatch trips
+// the new refusal, because that's the case that silently broke DRBD
+// wiring. The test pins both behaviours together: same-IP repost
+// rotates Type from AUXILIARY to SATELLITE, but the NetInterface
+// stays byte-identical (and so the Bug-132 guard is silent).
 func TestNodesCreateIdempotent(t *testing.T) {
 	st := store.NewInMemory()
 	if err := st.Nodes().Create(t.Context(), &apiv1.Node{
@@ -158,7 +165,7 @@ func TestNodesCreateIdempotent(t *testing.T) {
 		Name: "n1",
 		Type: apiv1.NodeTypeSatellite,
 		NetInterfaces: []apiv1.NetInterface{
-			{Name: "default", Address: "10.0.0.42"},
+			{Name: "default", Address: "10.0.0.1"},
 		},
 	})
 	if err != nil {
@@ -182,8 +189,8 @@ func TestNodesCreateIdempotent(t *testing.T) {
 			got.Type, apiv1.NodeTypeSatellite)
 	}
 
-	if len(got.NetInterfaces) != 1 || got.NetInterfaces[0].Address != "10.0.0.42" {
-		t.Errorf("NetInterfaces: got %+v, want default=10.0.0.42",
+	if len(got.NetInterfaces) != 1 || got.NetInterfaces[0].Address != "10.0.0.1" {
+		t.Errorf("NetInterfaces: got %+v, want default=10.0.0.1",
 			got.NetInterfaces)
 	}
 }
