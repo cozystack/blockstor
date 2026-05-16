@@ -1162,6 +1162,17 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		return nil, false
 	}
 
+	// Bug 167: refuse Resource-create entries that carry a flag string
+	// outside the documented upstream LINSTOR enum. Pre-fix the phantom
+	// flag persisted onto the CRD; the satellite reconciler then had to
+	// guess whether the typo was a no-op or a misspelled `DISKLESS`.
+	flagErr := validateResourceFlags(res.Flags)
+	if flagErr != nil {
+		writeError(w, http.StatusBadRequest, flagErr.Error())
+
+		return nil, false
+	}
+
 	if !s.checkResourceCreateNodeAndPool(w, r, &res) {
 		return nil, false
 	}

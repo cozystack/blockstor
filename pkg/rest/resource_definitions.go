@@ -210,38 +210,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		rd.ExternalName = body.ExternalName
 	}
 
-	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
-	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
-	// hash-prefixes the input. Without this gate `linstor rd c "  "`
-	// leaked the raw apimachinery "metadata.name: Invalid value:
-	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;
-	// with the gate the operator sees a LINSTOR-shaped envelope
-	// naming the offending input.
-	nameErr := validateLinstorName("resource definition", rd.Name)
-	if nameErr != nil {
-		writeError(w, http.StatusBadRequest, nameErr.Error())
-
-		return
-	}
-
-	err := s.validateRDLayerStackOnCreate(r.Context(), &body, &rd)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
-		return
-	}
-
-	// Bug 134: when the caller pinned a resource group by name
-	// (`linstor rd c <rd> --resource-group <rg>` lands as
-	// `resource_definition.resource_group_name`), the RG must
-	// already exist. Without this gate the RD persisted with a
-	// dangling RG reference; downstream rg-inherited operations
-	// then silently fell back to DfltRscGrp (or errored on later
-	// reads) and the operator's only feedback was "SUCCESS" on the
-	// create. Mirrors Bug 118's pool-existence gate — 404 + LINSTOR
-	// envelope naming the missing RG. Empty name is left for
-	// ensureDefaultRGAssignment to handle (DfltRscGrp fallback).
-	if !s.refuseRDCreateOnUnknownRG(w, r, &rd) {
+	if !s.validateRDCreateBody(w, r, &body, &rd) {
 		return
 	}
 
@@ -251,7 +220,7 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// `linstor rd create` without `--resource-group`, etc). Without
 	// this default some CLI subcommands fail open lookups and operator
 	// workflows that walk `rd → rg → spawn args` break silently.
-	err = s.ensureDefaultRGAssignment(r.Context(), &rd)
+	err := s.ensureDefaultRGAssignment(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -286,6 +255,63 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "resource definition created: " + rd.Name,
 	}})
+}
+
+// validateRDCreateBody runs every pre-store wire-boundary gate for
+// `POST /v1/resource-definitions` back-to-back: name (Bug 97), flags
+// (Bug 167), layer-stack merge + LUKS prereq (Bug 95/116), and the
+// RG-exists gate (Bug 134). Each gate writes its own LINSTOR envelope
+// on failure; the function returns true when the caller may proceed
+// to the RG-assignment step, false when the HTTP error has already
+// been written.
+//
+// Pulled out of handleRDCreate so that handler stays under funlen's
+// 60-line cap and so each new wire-boundary refusal lives in one
+// canonical spot rather than as another diff inside the parent.
+func (s *Server) validateRDCreateBody(w http.ResponseWriter, r *http.Request, body *apiv1.ResourceDefinitionCreate, rd *apiv1.ResourceDefinition) bool {
+	// Bug 97: refuse whitespace-only / RFC-1123-illegal names at the
+	// REST wire boundary, BEFORE pkg/store/k8s.Name() slugifies +
+	// hash-prefixes the input. Without this gate `linstor rd c "  "`
+	// leaked the raw apimachinery "metadata.name: Invalid value:
+	// \"<hex>-\"" error and exposed the internal hash-prefix scheme;
+	// with the gate the operator sees a LINSTOR-shaped envelope
+	// naming the offending input.
+	nameErr := validateLinstorName("resource definition", rd.Name)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
+
+		return false
+	}
+
+	// Bug 167: refuse RD-create bodies carrying a flag string outside
+	// the documented upstream LINSTOR enum. Pre-fix the phantom flag
+	// persisted onto the CRD and the dispatcher/reconciler then had to
+	// guess whether the typo was a no-op or a misspelled real flag.
+	flagErr := validateResourceDefinitionFlags(rd.Flags)
+	if flagErr != nil {
+		writeError(w, http.StatusBadRequest, flagErr.Error())
+
+		return false
+	}
+
+	err := s.validateRDLayerStackOnCreate(r.Context(), body, rd)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return false
+	}
+
+	// Bug 134: when the caller pinned a resource group by name
+	// (`linstor rd c <rd> --resource-group <rg>` lands as
+	// `resource_definition.resource_group_name`), the RG must
+	// already exist. Without this gate the RD persisted with a
+	// dangling RG reference; downstream rg-inherited operations
+	// then silently fell back to DfltRscGrp (or errored on later
+	// reads) and the operator's only feedback was "SUCCESS" on the
+	// create. Mirrors Bug 118's pool-existence gate — 404 + LINSTOR
+	// envelope naming the missing RG. Empty name is left for
+	// ensureDefaultRGAssignment to handle (DfltRscGrp fallback).
+	return s.refuseRDCreateOnUnknownRG(w, r, rd)
 }
 
 // refuseRDCreateOnUnknownRG is Bug 134's gate. When the caller pinned
@@ -684,6 +710,18 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	var patch resourceDefinitionModifyBody
 
 	if !decodeJSON(w, r, &patch) {
+		return
+	}
+
+	// Bug 167: refuse RD-modify bodies carrying a flag string outside
+	// the documented upstream LINSTOR enum. The legacy "PUT the full
+	// ResourceDefinition read-side shape" wire convention (Bug 161) is
+	// still in use; without this gate a stray `flags` value sneaks
+	// through the merge and the phantom flag persists on the CRD.
+	flagErr := validateResourceDefinitionFlags(patch.Flags)
+	if flagErr != nil {
+		writeError(w, http.StatusBadRequest, flagErr.Error())
+
 		return
 	}
 
