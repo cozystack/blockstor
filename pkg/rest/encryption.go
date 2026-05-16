@@ -45,15 +45,25 @@ const passphraseOpTimeout = 5 * time.Second
 // passphraseRequest is the body upstream linstor expects on the
 // encryption/passphrase endpoints.
 //
-// Two field names accepted on `PATCH /v1/encryption/passphrase`:
+// Two field names accepted on ALL three verbs (POST/PATCH/PUT) of
+// `/v1/encryption/passphrase`:
 //   - `new_passphrase` — the historical upstream-LINSTOR shape that
-//     `linstor encryption modify` and golinstor's `Passphrase.Enter`
-//     have always posted.
+//     `linstor encryption create-passphrase` / `modify-passphrase`
+//     and golinstor's `Passphrase.Create` / `Passphrase.Enter` have
+//     always posted. Canonical.
 //   - `passphrase` — the W13 bare-key shape `linstor encryption
-//     enter-passphrase` documents post-Phase-10. Either field is
-//     equivalent on the wire; the handler prefers `passphrase` when
-//     both are set so a typo-defensive caller (sending both for
-//     belt-and-braces) doesn't accidentally use the wrong one.
+//     enter-passphrase` documents post-Phase-10, also what
+//     operator-facing `--curl` scripts and hand-rolled wire-shape
+//     clients tend to send. Alias.
+//
+// Bug 165: pre-fix, POST (create) only honoured `new_passphrase`
+// while PATCH (enter) honoured both via proofOfKnowledge — operators
+// hitting the same wire surface with the same body got an asymmetric
+// 400-then-200. The fix routes every handler through
+// proofOfKnowledge so the create/enter/modify trio accepts the same
+// dual-key body. `new_passphrase` wins when both are set so a
+// typo-defensive caller (sending both for belt-and-braces) lands on
+// the canonical upstream value rather than the alias.
 type passphraseRequest struct {
 	NewPassphrase string `json:"new_passphrase,omitempty"`
 	OldPassphrase string `json:"old_passphrase,omitempty"`
@@ -61,13 +71,16 @@ type passphraseRequest struct {
 }
 
 // proofOfKnowledge returns the operator-supplied passphrase from the
-// PATCH body, honouring the dual-key wire surface above.
+// request body, honouring the dual-key wire surface above. Used by
+// POST/PATCH/PUT alike so every encryption verb sees the same field
+// resolution (Bug 165). Canonical `new_passphrase` wins when both
+// fields are populated.
 func (r passphraseRequest) proofOfKnowledge() string {
-	if r.Passphrase != "" {
-		return r.Passphrase
+	if r.NewPassphrase != "" {
+		return r.NewPassphrase
 	}
 
-	return r.NewPassphrase
+	return r.Passphrase
 }
 
 // defaultPassphraseSecretName is the Secret the controller falls
@@ -115,7 +128,13 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if req.NewPassphrase == "" {
+	// Bug 165: accept BOTH `new_passphrase` (canonical upstream) and
+	// `passphrase` (alias / W13 CLI shape) here so POST is symmetric
+	// with the PATCH/PUT siblings. Pre-fix, POST checked only
+	// req.NewPassphrase, so `--curl` callers sending `{"passphrase":…}`
+	// got 400 here even though the very same body unlocked on PATCH.
+	want := req.proofOfKnowledge()
+	if want == "" {
 		writeError(w, http.StatusBadRequest, "new_passphrase is required")
 
 		return
@@ -132,7 +151,7 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if have != "" {
-		if have == req.NewPassphrase {
+		if have == want {
 			// Idempotent re-create from a caller that
 			// demonstrably knows the value — flip the
 			// in-memory unlock too so a crash-loop-during-
@@ -150,7 +169,7 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(ctx, req.NewPassphrase)
+	err = s.writePassphrase(ctx, want)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
@@ -265,6 +284,12 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Bug 165: the NEW value accepts both `new_passphrase` (canonical)
+	// and `passphrase` (alias) symmetric with POST/PATCH. The OLD
+	// value stays on its own `old_passphrase` field — that one has no
+	// alias in either upstream LINSTOR or the W13 CLI shape.
+	want := req.proofOfKnowledge()
+
 	ctx, cancel := context.WithTimeout(r.Context(), passphraseOpTimeout)
 	defer cancel()
 
@@ -293,7 +318,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	// stays put (no needless apiserver churn) but still flip
 	// the unlock flag — the caller demonstrably knows the
 	// value, exactly like the W12 same-value POST path.
-	if req.NewPassphrase == have {
+	if want == have {
 		s.passphraseUnlocked.Store(true)
 
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -304,7 +329,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	err = s.writePassphrase(ctx, req.NewPassphrase)
+	err = s.writePassphrase(ctx, want)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 
