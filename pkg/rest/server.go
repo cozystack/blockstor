@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -41,6 +42,19 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/version"
 )
+
+// maxRequestBodyBytes caps an inbound REST request body before any
+// decode attempt. Upstream LINSTOR's RD/Resource/snapshot payloads
+// are all well under 64 KiB (a populous RG-spawn lands around 8 KiB
+// in practice); 1 MiB leaves a generous headroom for clusters with
+// hundreds of aux-props per RD while still being well below the K8s
+// CRD object cap (~1 MiB request, ~1.5 MiB stored) AND below etcd's
+// 1.5 MiB request limit. Bug 146: without this cap an oversized POST
+// flowed straight into the persistence backend, which returned the
+// raw `etcdserver: request is too large` string in the 500 body —
+// leaking the K8s/etcd impl identity AND crashing python-linstor's
+// `[]ApiCallRc` decoder.
+const maxRequestBodyBytes int64 = 1 << 20
 
 // Server implements manager.Runnable so it shuts down with the manager.
 //
@@ -144,9 +158,25 @@ func (s *Server) Start(ctx context.Context) error {
 
 	mux := s.buildMux()
 
+	// Middleware order, outer → inner:
+	//   withLogging         — observes the final status code (incl. 4xx
+	//                          envelopes the inner layers emit).
+	//   with404Envelope     — rewrites ServeMux's plain-text 404/405
+	//                          fallback bodies to LINSTOR `[]ApiCallRc`
+	//                          (Bug 103, Bug 109).
+	//   withContentTypeJSON — Bug 147: refuses POST/PUT/PATCH with a
+	//                          non-JSON Content-Type before any handler
+	//                          tries to decode random bytes as JSON.
+	//                          Consults the mux so a wrong-verb request
+	//                          (which would 405) is not pre-empted with
+	//                          a 415 — the 405 path stays intact.
+	//   withBodyLimit       — Bug 146: caps the request body so an
+	//                          oversized POST trips a 413 envelope at
+	//                          the wire edge instead of leaking the
+	//                          etcd/k8s rejection string in a 500.
 	srv := &http.Server{
 		Addr:              s.Addr,
-		Handler:           withLogging(with404Envelope(mux)),
+		Handler:           withLogging(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux)))),
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(_ net.Listener) context.Context { return ctx },
 	}
@@ -451,4 +481,299 @@ func writeMethodNotAllowedEnvelope(w http.ResponseWriter, r *http.Request, allow
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusMethodNotAllowed)
 	_ = json.NewEncoder(w).Encode(envelope)
+}
+
+// withBodyLimit caps every inbound request body at max bytes. Bug 146:
+// without this cap, an oversized POST (a misbehaving client, a stuck
+// uploader, a malicious peer) sailed past every wire-edge check and
+// landed in the persistence backend, which on the K8s/etcd path
+// returned the raw `etcdserver: request is too large` string in the
+// 500 body. Three things broke:
+//
+//   - operators saw the etcd error string and learned the backend
+//     identity from a single curl, defeating the apiserver's
+//     abstraction;
+//   - python-linstor's `[]ApiCallRc` decoder crashed because the body
+//     wasn't a JSON array; and
+//   - the controller burned cycles serialising a CRD it was about to
+//     drop on the floor anyway.
+//
+// The middleware uses two complementary mechanisms:
+//
+//  1. If the client advertised a Content-Length larger than the cap,
+//     reject immediately with 413 — no point burning bytes off the
+//     wire. This is the common case for honest clients that just sent
+//     too much; it also covers payloads that aren't valid JSON
+//     (without this short-circuit a 2MB stream of `x` characters
+//     would trip the json decoder's SyntaxError on byte 1 long before
+//     the MaxBytesReader fired, surfacing as a 400 instead of 413).
+//
+//  2. http.MaxBytesReader on the request body — catches chunked
+//     transfers and lying Content-Length headers. When that reader
+//     trips, json.Decode returns `*http.MaxBytesError`; the decode-
+//     error path (writeDecodeError) maps the sentinel to a 413 +
+//     LINSTOR envelope.
+func withBodyLimit(maxBytes int64, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > maxBytes {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				"request body too large (limit "+formatBytes(maxBytes)+")")
+
+			return
+		}
+
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withContentTypeJSON gates POST/PUT/PATCH requests on a JSON
+// Content-Type. Bug 147: before this gate any header value (or none
+// at all) was accepted — a `curl -d '<json>'` without `-H` would
+// silently 201 even on the wrong endpoint, and a client that sent
+// `Content-Type: text/plain` past a JSON endpoint also went through.
+// Both shapes hid bugs at the caller side (the apiserver decoded
+// happens-to-look-like-JSON bytes regardless of what the sender
+// claimed) and made interop with HTTP-spec tooling (RFC 7231 § 6.5.13)
+// inconsistent.
+//
+// Rules:
+//   - GET / HEAD / DELETE / OPTIONS pass through unconditionally —
+//     no body, no media-type to validate.
+//   - Requests that the mux can't dispatch (unknown path → 404 /
+//     wrong verb → 405) also pass through so the with404Envelope
+//     wrapper above can still emit the correct typed reply; running
+//     this gate first would convert every misrouted POST into a 415
+//     and shadow the 404/405 paths (Bug 103 / Bug 109 wrappers).
+//   - Requests with an empty body (Content-Length 0 AND not chunked)
+//     also pass through. Upstream LINSTOR has several verb-only
+//     mutation endpoints (`PUT /v1/nodes/{n}/reconnect`,
+//     `POST /v1/.../restart`, …) where the action is purely the path
+//     + method — no JSON to validate. Bug 147's intent is to refuse
+//     wrong-type *bodies*, not to refuse empty PUTs.
+//   - For body-carrying verbs (POST, PUT, PATCH) that DO dispatch to
+//     a real handler AND have a body, the Content-Type header must
+//     parse and its media-type must equal "application/json".
+//     Parameters (charset, boundary, …) are allowed — `application/
+//     json; charset=utf-8` is accepted as that's the common curl
+//     default.
+//   - Anything else returns 415 + LINSTOR envelope.
+//
+// The mux argument is the actual http.ServeMux so we can peek at
+// whether the request would dispatch — needed for the 404/405
+// passthrough rule above.
+func withContentTypeJSON(mux *http.ServeMux, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !methodCarriesBody(r.Method) {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// mux.Handler returns the std-lib's NotFoundHandler / a
+		// method-mismatch handler with an empty registered pattern
+		// when the route isn't wired for this (method, path) combo.
+		// In that case let the request through so with404Envelope
+		// emits the correct LINSTOR envelope.
+		if _, pattern := mux.Handler(r); pattern == "" {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// Empty-body verbs (e.g. `PUT /v1/nodes/{n}/reconnect`) carry
+		// no JSON; the Content-Type gate doesn't apply. We detect by
+		// Content-Length == 0 with no chunked transfer encoding.
+		if requestHasNoBody(r) {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		ct := r.Header.Get("Content-Type")
+		if !isJSONContentType(ct) {
+			writeUnsupportedMediaTypeEnvelope(w, r, ct)
+
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requestHasNoBody reports whether the incoming request advertised an
+// empty body — Content-Length == 0 AND no chunked transfer encoding.
+// Used by withContentTypeJSON to skip the JSON content-type gate on
+// verb-only endpoints like `PUT /v1/nodes/{n}/reconnect`.
+func requestHasNoBody(r *http.Request) bool {
+	if r.ContentLength != 0 {
+		return false
+	}
+
+	for _, te := range r.TransferEncoding {
+		if strings.EqualFold(te, "chunked") {
+			return false
+		}
+	}
+
+	return true
+}
+
+// methodCarriesBody reports whether the HTTP method conventionally
+// carries a request body that the apiserver will try to JSON-decode.
+// GET/HEAD/DELETE/OPTIONS are body-less in this REST contract — the
+// Content-Type gate doesn't apply.
+func methodCarriesBody(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return true
+	default:
+		return false
+	}
+}
+
+// isJSONContentType reports whether ct names the application/json
+// media type, with or without parameters. Empty string → false (the
+// caller must send the header; we don't paper over missing ones).
+// Parse failures → false (malformed Content-Type headers are
+// unparseable, not "implicit JSON").
+func isJSONContentType(ct string) bool {
+	if ct == "" {
+		return false
+	}
+
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(mediaType, "application/json")
+}
+
+// writeUnsupportedMediaTypeEnvelope emits the LINSTOR-shaped 415 reply
+// for the Bug 147 Content-Type gate. ret_code carries MASK_ERROR so
+// python-linstor classifies the entry as ERROR rather than crashing
+// on a plain-text body.
+func writeUnsupportedMediaTypeEnvelope(w http.ResponseWriter, r *http.Request, got string) {
+	cause := "this endpoint accepts application/json bodies only"
+	if got != "" {
+		cause += "; received Content-Type: " + got
+	} else {
+		cause += "; no Content-Type header was sent"
+	}
+
+	envelope := []apiv1.APICallRc{{
+		RetCode: apiv1.APICallRcMaskError,
+		Message: "unsupported media type",
+		Cause:   cause,
+		Correc: "retry with `Content-Type: application/json`" +
+			" (charset parameter optional) — see " + r.Method + " " + r.URL.Path,
+	}}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnsupportedMediaType)
+	_ = json.NewEncoder(w).Encode(envelope)
+}
+
+// writeDecodeError is the handler-side bridge for the Bug 146 body
+// limit AND the Bug 146 impl-detail scrub. Handlers that decode a
+// JSON body call this with the decoder's error; we route as follows:
+//
+//   - `*http.MaxBytesError` → 413 + LINSTOR envelope ("request body too
+//     large"); the cap byte-count is surfaced in the `cause` so
+//     operators know the contract.
+//   - any other error → 400 + LINSTOR envelope with a scrubbed
+//     message (etcd / k8s impl-detail strings are stripped before
+//     they reach the wire).
+//
+// Handlers using this helper short-circuit on a true return — the
+// envelope is already on the wire.
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			"request body too large (limit "+formatBytes(maxErr.Limit)+")")
+
+		return
+	}
+
+	writeError(w, http.StatusBadRequest, scrubImplDetails(err.Error()))
+}
+
+// scrubImplDetails strips backend-implementation identifiers from a
+// decode/error message before it goes on the wire. Bug 146 sibling:
+// even when the body is in-cap, a malformed JSON payload or a
+// store-layer error can carry the etcd/k8s identity through to the
+// REST envelope. The python CLI doesn't care about the strings, but
+// operators do — surfacing "etcdserver:" tells anyone running curl
+// against the apiserver exactly which persistence backend is in
+// play, which is a small but real abstraction leak.
+//
+// We replace the offending substrings with a stable, opaque token
+// rather than dropping them — keeps the message length sensible and
+// the error class identifiable for log greps without leaking the
+// backend.
+func scrubImplDetails(msg string) string {
+	const (
+		opaque       = "<backend>"
+		etcdServer   = "etcdserver"
+		etcdShort    = "etcd"
+		apimachinery = "apimachinery"
+		k8sPrefix    = "k8s.io"
+	)
+
+	replacements := []string{
+		etcdServer + ":", opaque + ":",
+		etcdServer, opaque,
+		etcdShort, opaque,
+		k8sPrefix + "/" + apimachinery, opaque,
+		apimachinery, opaque,
+		k8sPrefix, opaque,
+	}
+
+	return strings.NewReplacer(replacements...).Replace(msg)
+}
+
+// formatBytes renders n as a short human-readable size string for
+// operator-facing error messages. Stays in MiB/KiB granularity so
+// tests can match exact byte values when the cap is well-known.
+func formatBytes(n int64) string {
+	const (
+		kib = int64(1024)
+		mib = kib * kib
+	)
+
+	switch {
+	case n >= mib && n%mib == 0:
+		return formatInt(n/mib) + " MiB"
+	case n >= kib && n%kib == 0:
+		return formatInt(n/kib) + " KiB"
+	default:
+		return formatInt(n) + " bytes"
+	}
+}
+
+// formatInt renders a non-negative int64 in base 10. Stays in the
+// std lib without importing strconv at the top — keeps the diff
+// scoped to wire-edge concerns.
+func formatInt(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+
+	var (
+		buf [20]byte
+		i   = len(buf)
+	)
+
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+
+	return string(buf[i:])
 }

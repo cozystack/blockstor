@@ -42,6 +42,10 @@ func TestDRBDProxyEndpointsRespond(t *testing.T) {
 
 	for _, tc := range cases {
 		req, _ := http.NewRequestWithContext(t.Context(), tc.method, base+tc.path, nil)
+		// Bug 147: body-carrying verbs must declare a JSON Content-Type
+		// to reach the wired handler; without it the gate would reply
+		// 415 and short-circuit the 501 the test cares about.
+		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {

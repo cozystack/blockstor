@@ -202,7 +202,10 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 	// that to keep golinstor (and any home-grown clients) happy.
 	err := dec.Decode(&body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		// Bug 146: route oversized-body errors to a typed 413 envelope
+		// and scrub etcd/k8s impl-detail strings out of any raw decoder
+		// message before it goes on the wire. See pkg/rest/server.go.
+		writeDecodeError(w, err)
 
 		return
 	}

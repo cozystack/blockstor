@@ -85,6 +85,7 @@ func TestNodeConnectionPutReturnsEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -146,6 +147,7 @@ func TestNodeConnectionPutPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -209,6 +211,7 @@ func TestNodeConnectionPairOrderIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -257,6 +260,7 @@ func TestNodeConnectionListReturnsArray(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -324,6 +328,7 @@ func TestNodeConnectionListFilterByNode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("new request: %v", err)
 		}
+		req.Header.Set("Content-Type", "application/json")
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -369,6 +374,7 @@ func TestNodeConnectionPutEmptyBodyIs4xx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -412,6 +418,7 @@ func TestNodeConnectionDeleteProp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new set request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -433,6 +440,7 @@ func TestNodeConnectionDeleteProp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new del request: %v", err)
 	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
