@@ -80,6 +80,14 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		// holding. Skip it; the DaemonSet enforces
 		// one-pod-per-node already.
 		LeaderElection: false,
+		// HealthProbeBindAddress wires the manager's /healthz +
+		// /readyz HTTP endpoints. cmd/satellite/main.go sets this
+		// from --health-probe-bind-address so the DaemonSet's
+		// kubelet probes have something to talk to; an empty
+		// string disables the probe server entirely (the
+		// controller-runtime default), which is what tests rely on
+		// to avoid port-binding races between parallel runs.
+		HealthProbeBindAddress: cfg.HealthProbeBindAddress,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "create manager")

@@ -44,7 +44,12 @@ import (
 // cmd/satellite/main.go so pkg/satellite stays free of an
 // import on pkg/satellite/controllers (which itself imports
 // pkg/satellite for *Reconciler — direct import would cycle).
-type ManagerFactory func(restCfg *rest.Config, nodeName string, rec *Reconciler) (manager.Manager, error)
+//
+// The factory receives the agent's own knobs (REST config, node
+// name, apply-chain reconciler) plus a `probeAddr` so the
+// HealthProbeBindAddress flag flows end-to-end without smuggling
+// it through globals.
+type ManagerFactory func(restCfg *rest.Config, nodeName, probeAddr string, rec *Reconciler) (manager.Manager, error)
 
 // Config holds the parameters that come in from the satellite binary's
 // command-line flags or its container env. Phase 10.6 retired every
@@ -82,6 +87,21 @@ type Config struct {
 	// Runnable. Both are required — the gRPC fallback path is gone.
 	RESTConfig     *rest.Config
 	ManagerFactory ManagerFactory
+
+	// HealthProbeBindAddress is the address the c-r manager's
+	// /healthz + /readyz endpoints bind to. Empty disables the
+	// probe server (controller-runtime default) — production
+	// cmd/satellite passes `:8081` so the DaemonSet's kubelet
+	// probes have something to hit; tests leave it empty to avoid
+	// port-binding races between parallel runs.
+	HealthProbeBindAddress string
+
+	// OnCacheSynced fires once the controller-runtime manager's
+	// caches have completed their initial sync. cmd/satellite uses
+	// it to flip /readyz from 503 to 200 so kubelet only routes
+	// traffic to a satellite pod whose CRD view is current.
+	// Optional — nil is a no-op.
+	OnCacheSynced func()
 }
 
 // Agent is the satellite runtime. It is constructed with NewAgent and run
@@ -201,8 +221,13 @@ func (a *Agent) startStreamServer(ctx context.Context, rec *Reconciler) {
 // Returns once `mgr.Start` is in flight. Constructed via the
 // `controllers.NewManager` factory so this stays a one-liner if
 // the manager's scheme / leader-election story changes later.
+//
+// If Config.OnCacheSynced is set, a side goroutine waits for the
+// manager's cache to declare itself synced and then fires the
+// callback exactly once. This is the readiness signal cmd/satellite
+// uses to flip /readyz from 503 to 200 (Bug 207).
 func (a *Agent) startControllerRuntime(ctx context.Context, rec *Reconciler) error {
-	mgr, err := a.cfg.ManagerFactory(a.cfg.RESTConfig, a.cfg.NodeName, rec)
+	mgr, err := a.cfg.ManagerFactory(a.cfg.RESTConfig, a.cfg.NodeName, a.cfg.HealthProbeBindAddress, rec)
 	if err != nil {
 		return errors.Wrap(err, "build manager")
 	}
@@ -214,5 +239,25 @@ func (a *Agent) startControllerRuntime(ctx context.Context, rec *Reconciler) err
 		}
 	}()
 
+	if a.cfg.OnCacheSynced != nil {
+		go a.signalCacheSync(ctx, mgr)
+	}
+
 	return nil
+}
+
+// signalCacheSync blocks on the manager's cache sync and then fires
+// the OnCacheSynced callback exactly once. Run in a goroutine off
+// startControllerRuntime so the agent boot path never blocks on
+// cache warmup — production has hundreds of Resource CRDs and the
+// initial list can take seconds on a cold apiserver.
+func (a *Agent) signalCacheSync(ctx context.Context, mgr manager.Manager) {
+	if !mgr.GetCache().WaitForCacheSync(ctx) {
+		// Context cancelled before sync completed (pod shutting
+		// down). Don't fire the callback — the satellite is on
+		// its way out, kubelet readiness no longer matters.
+		return
+	}
+
+	a.cfg.OnCacheSynced()
 }

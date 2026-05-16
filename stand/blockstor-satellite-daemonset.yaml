@@ -106,6 +106,11 @@ spec:
             # Phase 10.6 retired all gRPC wires — the satellite
             # talks to the controller through the apiserver only,
             # no listen port or controller address needed here.
+            # Bug 207: bind health probes on a host-unique port so
+            # kubelet livenessProbe / readinessProbe restart wedged
+            # satellites instead of letting Node.Online lie via
+            # stale heartbeat-reconciler timestamps.
+            - --health-probe-bind-address=:9101
           env:
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
@@ -123,6 +128,30 @@ spec:
               containerPort: 9100
               hostPort: 9100
               protocol: TCP
+            # Bug 207: kubelet health probe surface. hostNetwork=true
+            # exposes this on the node, so the port must be unique
+            # across the host (snap-stream:9100, healthz:9101).
+            - name: healthz
+              containerPort: 9101
+              hostPort: 9101
+              protocol: TCP
+          # Bug 207: liveness/readiness probes hit the c-r manager's
+          # /healthz and /readyz endpoints. A wedged satellite stops
+          # answering healthz; kubelet restarts the pod, breaking the
+          # stale-heartbeat lie where Node.Online stayed true while
+          # the satellite was deadlocked.
+          livenessProbe:
+            httpGet: {path: /healthz, port: healthz}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /readyz, port: healthz}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           securityContext:
             privileged: true
           # PreStop hook: gracefully release DRBD-9 connections

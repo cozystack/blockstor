@@ -36,6 +36,7 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
@@ -52,14 +53,17 @@ func main() {
 // as the os.Exit call.
 func run() int {
 	var (
-		nodeName string
-		stateDir string
+		nodeName  string
+		stateDir  string
+		probeAddr string
 	)
 
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
 		"name this satellite registers under (defaults to NODE_NAME env)")
 	flag.StringVar(&stateDir, "state-dir", "/var/lib/blockstor-satellite",
 		"directory the satellite uses to persist DRBD .res files and per-resource state")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
+		"The address the /healthz and /readyz probe endpoints bind to.")
 
 	flag.Parse()
 
@@ -110,27 +114,41 @@ func run() int {
 	// every Resource shortly after, so a transient down is safe.
 	cleanKernelState(ctx, logger)
 
-	restCfg, mgrFactory, err := buildControllerRuntime()
+	restCfg, err := loadRESTConfig()
 	if err != nil {
 		logger.Error("no Kubernetes config", "err", err)
 
 		return 1
 	}
 
+	// readyState gates the /readyz probe: not-ready until the
+	// controller-runtime manager's cache has completed its initial
+	// sync, then flipped permanently. Bug 207: without this, a
+	// satellite pod whose CRD view is stale would still pass
+	// readiness and route traffic. The agent fires OnCacheSynced
+	// from a goroutine off mgr.GetCache().WaitForCacheSync.
+	ready := newReadyState()
+
 	agent := satellite.NewAgent(satellite.Config{
-		NodeName:       nodeName,
-		StateDir:       stateDir,
-		Providers:      providers,
-		LocalAddress:   localAddress,
-		Logger:         logger,
-		RESTConfig:     restCfg,
-		ManagerFactory: mgrFactory,
+		NodeName:               nodeName,
+		StateDir:               stateDir,
+		Providers:              providers,
+		LocalAddress:           localAddress,
+		Logger:                 logger,
+		RESTConfig:             restCfg,
+		ManagerFactory:         mgrFactory(ready, logger),
+		HealthProbeBindAddress: probeAddr,
+		OnCacheSynced: func() {
+			logger.Info("satellite cache sync complete, marking ready")
+			ready.MarkReady()
+		},
 	})
 
 	logger.Info("blockstor-satellite starting",
 		"node_name", nodeName,
 		"state_dir", stateDir,
-		"local_address", localAddress)
+		"local_address", localAddress,
+		"health_probe_addr", probeAddr)
 
 	err = agent.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -142,26 +160,55 @@ func run() int {
 	return 0
 }
 
-// buildControllerRuntime returns the in-cluster Kubernetes config
-// + a manager factory the agent uses to spin up the c-r manager.
-// Phase 10.6 made the c-r path mandatory; failing to load the
-// config now aborts startup rather than silently falling back to
-// the (removed) gRPC path.
-func buildControllerRuntime() (*rest.Config, satellite.ManagerFactory, error) {
+// loadRESTConfig returns the in-cluster Kubernetes config the
+// satellite's DaemonSet pod gets from its ServiceAccount. Phase
+// 10.6 made the c-r path mandatory; failing to load the config
+// now aborts startup rather than silently falling back to the
+// (removed) gRPC path.
+func loadRESTConfig() (*rest.Config, error) {
 	cfg, err := ctrl.GetConfig()
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "load Kubernetes config")
+		return nil, errors.Wrap(err, "load Kubernetes config")
 	}
 
-	factory := func(restCfg *rest.Config, nodeName string, rec *satellite.Reconciler) (manager.Manager, error) {
-		return controllers.NewManager(restCfg, controllers.Config{
-			NodeName: nodeName,
-			Apply:    rec,
-			Exec:     storage.RealExec{},
+	return cfg, nil
+}
+
+// mgrFactory returns a satellite.ManagerFactory closure that builds
+// the controller-runtime manager and wires the /healthz + /readyz
+// endpoints. /healthz returns 200 once the manager is alive
+// (healthz.Ping); /readyz is gated by `ready` which the agent flips
+// once the cache has completed its first sync (Bug 207).
+//
+// The factory shape lets the agent stay ignorant of the readyState
+// + logger plumbing — it only sees the standard
+// satellite.ManagerFactory signature.
+func mgrFactory(ready *readyState, logger *slog.Logger) satellite.ManagerFactory {
+	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
+		mgr, err := controllers.NewManager(restCfg, controllers.Config{
+			NodeName:               nodeName,
+			Apply:                  rec,
+			Exec:                   storage.RealExec{},
+			HealthProbeBindAddress: probeAddr,
 		})
-	}
+		if err != nil {
+			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps
+		}
 
-	return cfg, factory, nil
+		err = mgr.AddHealthzCheck("healthz", healthz.Ping)
+		if err != nil {
+			return nil, errors.Wrap(err, "add healthz check")
+		}
+
+		err = mgr.AddReadyzCheck("readyz", ready.Check)
+		if err != nil {
+			return nil, errors.Wrap(err, "add readyz check")
+		}
+
+		logger.Info("health probe endpoints registered", "addr", probeAddr)
+
+		return mgr, nil
+	}
 }
 
 // cleanStateDir wipes every *.res file in dir on satellite startup.

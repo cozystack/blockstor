@@ -150,7 +150,8 @@ func TestSatelliteFlagsLackControllerBindAddress(t *testing.T) {
 	// Belt-and-braces: pin the exact flag set we expect today, so
 	// any drift (added or removed) trips review. The order matches
 	// the order declared in cmd/satellite/main.go.
-	want := []string{"node-name", "state-dir"}
+	// Bug 207 added health-probe-bind-address for kubelet livenessProbe.
+	want := []string{"node-name", "state-dir", "health-probe-bind-address"}
 	if !equalStringSlices(flags, want) {
 		t.Fatalf("satellite flag set drifted: got %v, want %v. "+
 			"If this is intentional, update the want list AND update tests/scenarios/03-networking.md §3.10 "+

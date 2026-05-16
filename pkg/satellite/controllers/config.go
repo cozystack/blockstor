@@ -57,4 +57,12 @@ type Config struct {
 	// `mgr.GetAPIReader()` in NewManager; unit tests can leave it
 	// nil and the reconciler falls back to the cached client.
 	APIReader client.Reader
+
+	// HealthProbeBindAddress is the address the manager's healthz /
+	// readyz HTTP endpoints bind to. Empty disables the probe
+	// server (controller-runtime default). Production wires
+	// `:8081` from cmd/satellite/main.go; tests typically leave it
+	// empty so the probe server doesn't race port bindings between
+	// parallel runs.
+	HealthProbeBindAddress string
 }
