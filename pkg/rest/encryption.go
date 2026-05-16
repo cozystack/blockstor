@@ -19,6 +19,7 @@ package rest
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -154,7 +155,11 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if have != "" {
-		if have == want {
+		// Bug 176: constant-time to avoid timing oracle on the master
+		// passphrase. A plain `have == want` compare short-circuits at
+		// the first differing byte, leaking the best-match-prefix
+		// length to a probing attacker.
+		if subtle.ConstantTimeCompare([]byte(have), []byte(want)) == 1 {
 			// Idempotent re-create from a caller that
 			// demonstrably knows the value — flip the
 			// in-memory unlock too so a crash-loop-during-
@@ -257,7 +262,13 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if have != req.proofOfKnowledge() {
+	// Bug 176: constant-time to avoid timing oracle on the master
+	// passphrase. A plain `have != req.proofOfKnowledge()` compare
+	// short-circuits at the first differing byte, so a remote
+	// attacker timing many PATCH probes could recover the stored
+	// passphrase character-by-character. ConstantTimeCompare scans
+	// both operands end-to-end regardless of where they diverge.
+	if subtle.ConstantTimeCompare([]byte(have), []byte(req.proofOfKnowledge())) != 1 {
 		writeError(w, http.StatusUnauthorized, "passphrase mismatch")
 
 		return
@@ -433,7 +444,14 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if have != req.OldPassphrase {
+	// Bug 176: constant-time to avoid timing oracle on the master
+	// passphrase. The PUT rotation path is the highest-value timing
+	// target — a remote attacker who learns the old passphrase via
+	// byte-by-byte latency probing here can then rotate the
+	// cluster master out from under the operator. ConstantTimeCompare
+	// keeps the auth path's response time independent of where
+	// `have` and `req.OldPassphrase` diverge.
+	if subtle.ConstantTimeCompare([]byte(have), []byte(req.OldPassphrase)) != 1 {
 		writeError(w, http.StatusUnauthorized, "old passphrase mismatch")
 
 		return
@@ -445,7 +463,15 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	// stays put (no needless apiserver churn) but still flip
 	// the unlock flag — the caller demonstrably knows the
 	// value, exactly like the W12 same-value POST path.
-	if want == have {
+	//
+	// Bug 176: constant-time compare for parity with the auth
+	// branches above. Auth has passed by this point so the
+	// timing-oracle surface is narrower, but `have` is still the
+	// stored master passphrase — keeping every passphrase compare
+	// in this file uniform makes future review easier and rules
+	// out a partial-knowledge attacker probing `want` against an
+	// already-trusted operator's body.
+	if subtle.ConstantTimeCompare([]byte(want), []byte(have)) == 1 {
 		s.passphraseUnlocked.Store(true)
 
 		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
