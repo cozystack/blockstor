@@ -62,7 +62,20 @@ type Resource struct {
 	// + `--faulty` filter on whether at least one disk_state is
 	// present. Without Volumes, every resource appears as "Unknown"
 	// and Conns silently hides peer-connection state.
-	Volumes []Volume `json:"volumes,omitempty"`
+	//
+	// Bug 137 follow-up: NO `omitempty` — diskless / TIE_BREAKER
+	// replicas have no satellite-written Volumes rows (no local
+	// backing storage), and python-linstor's `responses.py` reads
+	// `rsc._rest_data['volumes']` unconditionally and walks the
+	// entries. The wire contract is: the `volumes` key is ALWAYS
+	// present, even if the slice is `[]`. Initial Bug 137 commit
+	// kept `omitempty` and relied on slice-init to non-nil for
+	// option (B); that doesn't help because Go's `omitempty`
+	// considers a zero-length slice "empty" regardless of nil-ness,
+	// so a fresh diskful replica before the satellite has reported
+	// volumes (empty slice from the in-memory store) still loses
+	// the wire key under `omitempty`.
+	Volumes []Volume `json:"volumes"`
 
 	// EffectiveProps is the merged Controller→RG→RD→Resource view
 	// of the property bag for this replica. Populated on the
@@ -118,10 +131,17 @@ type ResourceState struct {
 // ResourceWithVolumes is the shape `/v1/view/resources` returns — Resource
 // plus the per-volume runtime details. linstor-csi expects this exact key
 // (`volumes`) on the same level as the embedded Resource fields.
+//
+// Bug 137 follow-up: NO `omitempty` here either — Go's encoding/json
+// picks the outermost tagged field when an embedded struct and the
+// outer wrapper declare the same JSON name, so this is the field that
+// actually wins on the wire. Mirrors the parent Resource.Volumes
+// contract so the `volumes` key is always present (even as `[]`)
+// regardless of replica flags or satellite-observation latency.
 type ResourceWithVolumes struct {
 	Resource
 
-	Volumes []Volume `json:"volumes,omitempty"`
+	Volumes []Volume `json:"volumes"`
 }
 
 // Volume is a single volume of a placed resource (replica) on a node.

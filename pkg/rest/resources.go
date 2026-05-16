@@ -197,19 +197,36 @@ func (s *Server) buildResourceView(ctx context.Context, rsc *apiv1.Resource, vdS
 	return rwv, nil
 }
 
+// disklessStorPoolName is the upstream LINSTOR sentinel for the
+// per-volume `storage_pool_name` field on diskless replicas. It is
+// NOT the wire-canonical `apiv1.StoragePoolKindDiskless` ("DISKLESS")
+// provider-kind string — that one names a *kind* of pool. The Python
+// CLI's `n describe` literal-matches the volume's `storage_pool_name`
+// against `node_cmds.DISKLESS_STORAGE_POOL = "DfltDisklessStorPool"`
+// to route a diskless volume under a synthetic "diskless resource"
+// subtree. Any other spelling (including "DISKLESS") causes the
+// CLI's `node_map[node].find_child(storage_pool_name)` to return
+// None on a node that has no such pool, and the next `add_child`
+// crashes the CLI with AttributeError.
+const disklessStorPoolName = "DfltDisklessStorPool"
+
 // ensureVolumesForView returns a non-nil Volume slice for the wire
-// view. Bug 137: a nil slice serialises as a missing JSON key under
-// `omitempty`, and python-linstor's `linstor r l` / `linstor n
-// describe` walk `rsc._rest_data['volumes']` unconditionally — a
-// missing key returns `None` and the next attribute access crashes
-// the CLI with AttributeError. We solve this in two tiers:
+// view. Bug 137 follow-up: a nil slice OR a zero-length non-nil slice
+// both serialise as a missing JSON key when the field carries
+// `omitempty` (the initial fix kept the tag and only solved half the
+// case). The wire shape contract is now: `volumes` key always
+// present.
+//
+// We solve the empty-slice case in two tiers:
 //
 //  1. Diskless / TIE_BREAKER replica with no observed Volumes:
 //     synthesise one placeholder per parent-RD VolumeDefinition so
 //     the wire entry has the same volume_number cardinality as a
-//     diskful replica. StoragePool is stamped with the canonical
-//     "DISKLESS" sentinel so a consumer can still recognise the
-//     witness role from the volume row.
+//     diskful replica. `storage_pool_name` is stamped with the
+//     upstream-LINSTOR sentinel `DfltDisklessStorPool` (see
+//     disklessStorPoolName) so `linstor n describe` recognises the
+//     row as a diskless witness instead of crashing on
+//     `find_child(...)` returning None.
 //  2. Any other replica that happens to arrive with an empty
 //     Volumes slice (e.g. fresh diskful replica before the
 //     satellite has written Status.Volumes): emit `[]` rather than
@@ -245,7 +262,7 @@ func ensureVolumesForView(observed []apiv1.Volume, rsc *apiv1.Resource, vdSizes 
 	for _, vn := range volNums {
 		out = append(out, apiv1.Volume{
 			VolumeNumber: vn,
-			StoragePool:  apiv1.StoragePoolKindDiskless,
+			StoragePool:  disklessStorPoolName,
 			// AllocatedKib defaults to 0 (the Bug 112 contract:
 			// always emit the key as an int >= 0). Diskless has
 			// no real allocation, so 0 is the truthful value.

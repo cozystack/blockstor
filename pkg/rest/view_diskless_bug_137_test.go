@@ -149,6 +149,17 @@ func TestBug137ViewResourcesDisklessHasVolumesArray(t *testing.T) {
 	if _, present := vmap["allocated_size_kib"]; !present {
 		t.Errorf("volume[0] missing allocated_size_kib — Bug 112 regression on diskless placeholder")
 	}
+
+	// storage_pool_name MUST be the upstream LINSTOR sentinel
+	// `DfltDisklessStorPool` (NOT the wire `DISKLESS` provider kind).
+	// The Python CLI's `n describe` literal-matches this exact
+	// string to route the row under the synthetic "diskless
+	// resource" subtree; mis-spelling it crashes the CLI on
+	// `find_child` returning None.
+	if sp, _ := vmap["storage_pool_name"].(string); sp != "DfltDisklessStorPool" {
+		t.Errorf("storage_pool_name: got %q, want %q (Python CLI n describe sentinel)",
+			sp, "DfltDisklessStorPool")
+	}
 }
 
 // TestBug137ViewResourcesTieBreakerHasVolumesArray is the
@@ -235,6 +246,13 @@ func TestBug137ViewResourcesTieBreakerHasVolumesArray(t *testing.T) {
 
 	if _, present := vmap["allocated_size_kib"]; !present {
 		t.Errorf("TIE_BREAKER volume[0] missing allocated_size_kib — Bug 112 regression on placeholder")
+	}
+
+	// Same upstream-LINSTOR-sentinel check as the DISKLESS variant —
+	// the Python CLI's `n describe` only routes a witness row when
+	// `storage_pool_name` equals `DfltDisklessStorPool`.
+	if sp, _ := vmap["storage_pool_name"].(string); sp != "DfltDisklessStorPool" {
+		t.Errorf("TIE_BREAKER storage_pool_name: got %q, want %q", sp, "DfltDisklessStorPool")
 	}
 }
 
