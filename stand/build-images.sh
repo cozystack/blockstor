@@ -25,12 +25,19 @@ REGISTRY=${1:-localhost:5000}
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 
-if [ -d .git ] && command -v git >/dev/null 2>&1; then
-    GIT_HASH=$(git rev-parse HEAD)
-else
-    GIT_HASH="sha-unavailable-tarball"
+# GIT_HASH / BUILD_TIME can be overridden by callers (CI, dev shims)
+# that already know the right values; otherwise resolve from the host
+# checkout. Tarball builds (no .git) fall back to a structured
+# sentinel so a bad build is distinguishable from a missing VCS
+# context.
+if [ -z "${GIT_HASH:-}" ]; then
+    if [ -d .git ] && command -v git >/dev/null 2>&1; then
+        GIT_HASH=$(git rev-parse HEAD)
+    else
+        GIT_HASH="sha-unavailable-tarball"
+    fi
 fi
-BUILD_TIME=$(date -u +%FT%TZ)
+BUILD_TIME="${BUILD_TIME:-$(date -u +%FT%TZ)}"
 
 echo ">> stamping GIT_HASH=$GIT_HASH BUILD_TIME=$BUILD_TIME"
 
