@@ -1163,10 +1163,50 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 // runAdjust dispatches to the plain `drbdadm adjust` or the
 // `--skip-disk` variant based on the `DrbdOptions/SkipDisk` prop
 // (scenario 5.11).
+//
+// Bug 280 (P1): the prop-only gate races the observer's
+// SkipDisk-stamp path. When an operator runs `drbdadm detach
+// --force` against the satellite shell:
+//
+//  1. Kernel transitions UpToDate → Diskless and emits
+//     `change device disk:Diskless` on events2.
+//  2. The observer's UpToDate→Diskless gate writes
+//     `DrbdOptions/SkipDisk=True` onto Spec.Props.
+//  3. The Diskless event also causes a Status update which fires a
+//     parallel reconcile.
+//
+// A reconcile already in flight when the operator's command landed
+// loaded `res` from the watch cache BEFORE the prop write hit the
+// apiserver. Its `dr.Props` view has SkipDisk absent, the
+// prop-only gate dispatches plain `drbdadm adjust`, and the disk
+// re-attaches in sub-second — the operator's poll never observes
+// Diskless.
+//
+// Probe the kernel directly via `HasDisklessVolume`: the kernel is
+// the authority on the disk's current state, independent of any
+// apiserver cache trail. When the kernel reports Diskless on a
+// slot that's already loaded (so we're past first activation), we
+// coerce the adjust onto `--skip-disk` regardless of the prop's
+// cache visibility. The operator's SkipDisk-stamp is a hint that
+// will catch up via the apiserver; the kernel probe closes the
+// race window in the meantime.
+//
+// Errors from the probe fall through to the prop-only gate (the
+// pre-Bug-280 behaviour) so a transient netlink hiccup doesn't
+// strand the reconciler.
 func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) error {
+	skipDisk := isSkipDiskEnabled(dr)
+
+	if !skipDisk {
+		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+		if probeErr == nil && diskless {
+			skipDisk = true
+		}
+	}
+
 	var err error
 
-	if isSkipDiskEnabled(dr) {
+	if skipDisk {
 		err = r.cfg.Adm.AdjustSkipDisk(ctx, dr.GetName())
 	} else {
 		err = r.cfg.Adm.Adjust(ctx, dr.GetName())

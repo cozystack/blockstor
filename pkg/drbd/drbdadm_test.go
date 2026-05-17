@@ -372,3 +372,118 @@ func TestAdmIsLoadedFalseEmptyStdout(t *testing.T) {
 		t.Errorf("IsLoaded(empty stdout): got true, want false")
 	}
 }
+
+// TestAdmHasDisklessVolumeTrue pins the post-detach case used by
+// the Bug 280 fix: when the operator runs `drbdadm detach --force`
+// against the satellite shell, the kernel transitions UpToDate →
+// Diskless. The reconciler's runAdjust probes the kernel via
+// HasDisklessVolume before dispatching adjust; a Diskless local
+// volume must coerce the dispatch onto `adjust --skip-disk` so a
+// reconcile-in-flight with a stale prop view doesn't re-attach
+// the disk before the operator's SkipDisk-stamp has propagated.
+func TestAdmHasDisklessVolumeTrue(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-detached", storage.FakeResponse{
+		Stdout: []byte(`pvc-detached node-id:0 role:Primary suspended:no force-io-failures:no
+  volume:0 minor:1002 disk:Diskless backing_dev:none quorum:yes blocked:no
+      worker-2 node-id:1 connection:Connected role:Secondary congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-detached")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+	}
+
+	if !diskless {
+		t.Errorf("HasDisklessVolume(post-detach): got false, want true")
+	}
+}
+
+// TestAdmHasDisklessVolumeFalseUpToDate pins the steady-state
+// case: a healthy diskful replica reports disk:UpToDate, the probe
+// returns false, and runAdjust dispatches plain `drbdadm adjust` as
+// before. Guards against a regression where the probe over-trips
+// on `peer-disk:Diskless` (a peer-side state we don't care about
+// for our local skip-disk dispatch).
+func TestAdmHasDisklessVolumeFalseUpToDate(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-healthy", storage.FakeResponse{
+		Stdout: []byte(`pvc-healthy node-id:0 role:Primary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/loop6 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-healthy")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+	}
+
+	if diskless {
+		t.Errorf("HasDisklessVolume(UpToDate): got true, want false")
+	}
+}
+
+// TestAdmHasDisklessVolumeFalseAbsentSlot pins the convergence-
+// pending case: the kernel doesn't have a slot yet for the named
+// resource (first activation, pre-`drbdadm up`). `drbdsetup status
+// --verbose` returns non-zero — we treat it the same way IsLoaded
+// does (false + nil error) so the caller doesn't have to branch on
+// the kernel-absent signal.
+func TestAdmHasDisklessVolumeFalseAbsentSlot(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-absent", storage.FakeResponse{
+		Stdout: []byte("No currently configured DRBD found.\n"),
+		Err:    errFakeFailure,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-absent")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume(absent): unexpected error %v", err)
+	}
+
+	if diskless {
+		t.Errorf("HasDisklessVolume(absent slot): got true, want false")
+	}
+}
+
+// TestAdmHasDisklessVolumeFalsePeerDiskless pins the per-peer
+// distinction: when the local volume is UpToDate but a PEER reports
+// peer-disk:Diskless (e.g., the operator detached the OTHER replica,
+// or the peer is a diskless quorum-tiebreaker), HasDisklessVolume
+// must NOT trip. Tripping here would falsely coerce the adjust on
+// the healthy local replica onto `--skip-disk`, leaving the local
+// disk's reconfig pinned even though the local kernel reports
+// UpToDate. We only care about the local-side `disk:` token, not
+// the `peer-disk:` token.
+func TestAdmHasDisklessVolumeFalsePeerDiskless(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-peer-down", storage.FakeResponse{
+		Stdout: []byte(`pvc-peer-down node-id:0 role:Primary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/loop6 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:Diskless
+`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-peer-down")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+	}
+
+	if diskless {
+		t.Errorf("HasDisklessVolume(peer-disk:Diskless only): got true, want false")
+	}
+}

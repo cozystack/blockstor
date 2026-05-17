@@ -3623,6 +3623,100 @@ func TestReconcilerPassesSkipDiskFlag(t *testing.T) {
 	}
 }
 
+// TestReconcilerCoercesAdjustToSkipDiskOnKernelDiskless pins the
+// Bug 280 (P1) race-close. The prop-only gate
+// (TestReconcilerPassesSkipDiskFlag above) covers the steady-state
+// case where the operator's `linstor r sp <n> <r> DrbdOptions/SkipDisk
+// True` (or the observer's auto-stamp on a Failed-event) has
+// already landed on Spec.Props before the next reconcile loads it.
+// The race opens when a reconcile is ALREADY IN FLIGHT when the
+// operator runs `drbdadm detach --force` against the satellite shell:
+//
+//   - Kernel transitions UpToDate → Diskless (sub-second).
+//   - The observer fires the UpToDate→Diskless gate and writes
+//     Spec.Props[DrbdOptions/SkipDisk]=True onto the apiserver.
+//   - The in-flight reconcile loaded its DesiredResource from the
+//     watch cache BEFORE that prop write hit, so its `dr.Props` view
+//     has SkipDisk absent. Prop-only gate dispatches plain
+//     `drbdadm adjust` → kernel re-attaches the lower disk → the
+//     operator's poll never observes Diskless.
+//
+// Fix: runAdjust additionally probes kernel state via
+// `Adm.HasDisklessVolume`. A Diskless local volume in the kernel
+// (independent of the prop's cache visibility) coerces the
+// dispatch onto `adjust --skip-disk`. The kernel is the authority
+// on the disk's current state — the prop is just a hint that will
+// catch up via the apiserver.
+//
+// This test wires the FakeExec so `drbdsetup status --verbose
+// pvc-bug280` returns a Diskless local volume but the DesiredResource
+// has NO SkipDisk prop (mirroring the in-flight reconcile's stale
+// cache view). The reconciler MUST still dispatch `drbdadm adjust
+// --skip-disk pvc-bug280`.
+func TestReconcilerCoercesAdjustToSkipDiskOnKernelDiskless(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug280_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	// Kernel reports the local volume as Diskless — the post-detach
+	// shape that opens the race window.
+	fx.Expect("drbdsetup status --verbose pvc-bug280", storage.FakeResponse{
+		Stdout: []byte(`pvc-bug280 node-id:0 role:Primary
+  volume:0 minor:1000 disk:Diskless backing_dev:none quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug280",
+			NodeName: "n1",
+			// Deliberately NO SkipDisk in Props or DrbdOptions —
+			// this is the in-flight reconcile's stale view.
+			Props: map[string]string{},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	skipDiskCmd := "drbdadm adjust --skip-disk pvc-bug280"
+	bareCmd := "drbdadm adjust pvc-bug280"
+
+	hasSkip := slices.Contains(cmds, skipDiskCmd)
+	hasBare := slices.Contains(cmds, bareCmd)
+
+	if !hasSkip {
+		t.Errorf("kernel-Diskless without prop: expected %q in commands; got %v", skipDiskCmd, cmds)
+	}
+
+	if hasBare {
+		t.Errorf("kernel-Diskless without prop: bare %q must not run (would re-attach the operator-detached disk); got %v",
+			bareCmd, cmds)
+	}
+}
+
 // TestApplyDropsPeerWhenRemovedFromDesired pins Bug 67. Reproducer on
 // dev-kvaps: a 3-replica RD where worker-2 was diskful and worker-3 a
 // TieBreaker. After `linstor r d worker-2 test`, ensureTiebreaker

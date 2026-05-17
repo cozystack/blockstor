@@ -399,6 +399,84 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 	return strings.TrimSpace(string(out)) != "", nil
 }
 
+// HasDisklessVolume reports whether any of the named resource's
+// volumes are currently in disk:Diskless state in the kernel. Used
+// by the reconciler's runAdjust dispatch to detect the Bug 280
+// race window:
+//
+//   - Operator runs `drbdadm detach --force <rsc>` against the
+//     satellite shell. The kernel emits `change device disk:Diskless`
+//     on its events2 stream.
+//   - The observer's UpToDate→Diskless gate writes
+//     `DrbdOptions/SkipDisk=True` onto Spec.Props and the kernel's
+//     Status update fires a parallel reconcile.
+//   - A reconcile already in flight when the operator's detach
+//     command landed loaded `res` from cache BEFORE the prop write
+//     hit the apiserver. Its `dr.Spec.Props` view has SkipDisk
+//     absent, runAdjust dispatches plain `drbdadm adjust`, and the
+//     disk re-attaches before the operator's poll can observe
+//     Diskless.
+//
+// `HasDisklessVolume` lets runAdjust probe the kernel directly
+// — the kernel is the authority on the disk's current state,
+// independent of any apiserver cache trail. When the kernel reports
+// Diskless we coerce the adjust onto `--skip-disk` regardless of
+// what the prop view says. Safe because:
+//
+//   - The first-activation path goes through `drbdadm up`, not
+//     adjust; this probe is only consulted by runAdjust, so a
+//     not-yet-attached resource (kernel slot absent → status
+//     returns non-zero → IsLoaded false → runApplyDRBDVerb routes
+//     to Up) never reaches here.
+//   - On a healthy steady-state diskful replica the kernel reports
+//     disk:UpToDate, the probe returns false, and runAdjust
+//     continues onto plain adjust as before.
+//   - `--skip-disk` on an already-UpToDate kernel is a no-op for
+//     the disk portion (it only skips disk-level reconfig; the
+//     connections/peers half still adjusts), so an over-zealous
+//     coerce-to-SkipDisk wouldn't break anything either.
+//
+// Convention (matches IsLoaded):
+//   - non-zero exit from drbdsetup → false + nil (slot absent;
+//     not our race window)
+//   - parses each indented volume line (`disk:<state>`) and returns
+//     true on the first match for `disk:Diskless`.
+func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
+	if err != nil {
+		// Slot absent / netlink hiccup → not in the race window we
+		// care about. Same convention IsLoaded uses (zero value +
+		// nil error) so the caller never has to branch on err.
+		_ = err
+
+		return false, nil
+	}
+
+	// `drbdsetup status --verbose` emits one block per resource;
+	// per-volume lines are indented and carry `disk:<state>`.
+	// `disk:Diskless` is the post-detach steady state; we don't
+	// match transient `disk:Detaching` / `disk:Attaching` because
+	// the kernel may bounce through those during a healthy reconcile
+	// and we'd false-trip the SkipDisk coerce.
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if !strings.Contains(line, "disk:Diskless") {
+			continue
+		}
+
+		// Skip `peer-disk:Diskless` lines — that's the remote
+		// peer's disk state, not ours. The local-disk line carries
+		// the `disk:` token without the `peer-` prefix.
+		if strings.Contains(line, "peer-disk:Diskless") &&
+			!strings.Contains(line, " disk:Diskless") {
+			continue
+		}
+
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // run is the single shell-out site so every drbdadm error gets
 // uniform context (subcommand + resource) for log triage.
 func (a *Adm) run(ctx context.Context, args ...string) error {
