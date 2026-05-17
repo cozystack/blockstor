@@ -226,7 +226,14 @@ func main() {
 	st := storek8s.New(mgr.GetClient())
 
 	ready := newReadyState()
-	go waitForCacheSync(ctrl.SetupSignalHandler(), mgr, ready, func(msg string) { setupLog.Info(msg) })
+
+	// Bug 219: `ctrl.SetupSignalHandler` is one-shot — a second call
+	// panics with "close of closed channel" because the signal channel
+	// is closed on first invocation. Capture the context once and pass
+	// the same instance to both the cache-sync watcher and mgr.Start.
+	signalCtx := ctrl.SetupSignalHandler()
+
+	go waitForCacheSync(signalCtx, mgr, ready, func(msg string) { setupLog.Info(msg) })
 
 	err = registerProbesAndREST(mgr, st, flags, namespace, ready)
 	if err != nil {
@@ -236,7 +243,7 @@ func main() {
 
 	setupLog.Info("Starting apiserver", "rest", flags.restAddr, "namespace", namespace)
 
-	err = mgr.Start(ctrl.SetupSignalHandler())
+	err = mgr.Start(signalCtx)
 	if err != nil {
 		setupLog.Error(err, "apiserver failed")
 		os.Exit(1)
