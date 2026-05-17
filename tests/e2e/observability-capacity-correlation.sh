@@ -349,18 +349,34 @@ fi
 # Autoplace probe: try to create a 1 GiB RD on the saturated pool.
 # Must be rejected with "not enough candidate storage pools".
 echo "   probe: create 1 GiB RD pinned to $FILL_NODE/$FILL_POOL → expect rejection"
-PROBE_BODY=$(cat <<EOF
-{
-  "resource_definition": {"name": "${PROBE_RD}"},
-  "volume_definitions": [{"volume_number": 0, "size_kib": 1048576}]
-}
+# Upstream LINSTOR's `POST /v1/resource-definitions` envelope does NOT
+# accept a top-level `volume_definitions` peer — VDs live under their
+# own `/v1/resource-definitions/{rd}/volume-definitions` endpoint. The
+# blockstor REST surface enforces this with DisallowUnknownFields, so
+# we split the probe into two writes: bare RD create, then a separate
+# VD POST. Without the VD the placer's requiredKib stays at 0 and the
+# capacity gate (placer.applyCapacityAndOversubGates) is a no-op —
+# the autoplace would then "succeed" against a 0-free pool and the
+# Level-2b assertion would never fire.
+RD_BODY=$(cat <<EOF
+{"resource_definition": {"name": "${PROBE_RD}"}}
 EOF
 )
 rd_create_out=$(curl -fsS -m 10 -XPOST \
     -H 'Content-Type: application/json' \
     "http://127.0.0.1:${PF_PORT}/v1/resource-definitions" \
-    -d "$PROBE_BODY" 2>&1 || true)
+    -d "$RD_BODY" 2>&1 || true)
 echo "   rd create: $rd_create_out"
+
+VD_BODY=$(cat <<EOF
+{"volume_definition": {"volume_number": 0, "size_kib": 1048576}}
+EOF
+)
+vd_create_out=$(curl -fsS -m 10 -XPOST \
+    -H 'Content-Type: application/json' \
+    "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${PROBE_RD}/volume-definitions" \
+    -d "$VD_BODY" 2>&1 || true)
+echo "   vd create: $vd_create_out"
 
 AUTO_BODY=$(cat <<EOF
 {"select_filter":{"place_count":1,"storage_pool":"${FILL_POOL}","node_name_list":["${FILL_NODE}"]}}
