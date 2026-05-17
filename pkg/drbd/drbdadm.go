@@ -147,42 +147,6 @@ func (a *Adm) Secondary(ctx context.Context, resource string) error {
 	return a.run(ctx, "secondary", resource)
 }
 
-// IsSuspendedOnQuorum reports whether the kernel currently shows the
-// resource as Primary with I/O suspended on quorum loss
-// (`role:Primary ... suspended:quorum`). Bug 279 (P1): the
-// runAutoPromote demote-after-mkfs step would otherwise yank Primary
-// out from under an operator who ran `drbdadm primary --force` after
-// quorum loss — they want this replica to stay Primary so writes
-// land somewhere durable. Probing the kernel role directly keeps the
-// gate self-contained (no extra control-plane state needed).
-//
-// Returns false on any drbdsetup error so the caller's existing
-// demote path stays the default behaviour — we err on the side of
-// "act like before this guard existed" if status is unavailable.
-func (a *Adm) IsSuspendedOnQuorum(ctx context.Context, resource string) bool {
-	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource)
-	if err != nil {
-		return false
-	}
-
-	// drbdsetup top-line shape: `<name> role:Primary node-id:N ...
-	// suspended:quorum ...`. We look for both tokens on the resource-
-	// scope line so a SyncTarget peer's `suspended:quorum` on its own
-	// volume line doesn't falsely gate the local Primary demote.
-	for line := range strings.SplitSeq(string(out), "\n") {
-		if line == "" || line[0] == ' ' || line[0] == '\t' {
-			continue
-		}
-
-		if strings.Contains(line, "role:Primary") &&
-			strings.Contains(line, "suspended:quorum") {
-			return true
-		}
-	}
-
-	return false
-}
-
 // Detach drops the local lower-disk binding without bringing the
 // resource down. The replica becomes Diskless on this node — peers
 // stay UpToDate, the consumer keeps doing I/O via DRBD's network
