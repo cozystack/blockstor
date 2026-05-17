@@ -313,6 +313,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerPhysicalStorage(mux)
 	s.registerResourceGroupExtras(mux)
 	s.registerSchedules(mux)
+	s.registerUpstreamParity225_229(mux)
 
 	return mux
 }

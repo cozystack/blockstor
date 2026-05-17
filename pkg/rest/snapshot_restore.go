@@ -48,11 +48,72 @@ type snapshotRestoreRequest struct {
 
 // registerSnapshotRestore wires the controller-side restore endpoint.
 // linstor CLI's `snapshot resource restore` lands here.
+//
+// Bug 225 (P2): the sibling `snapshot-restore-volume-definition` route
+// upstream LINSTOR exposes (Java
+// `controller/.../SnapshotRestoreVolumeDefinition.java`) was missing —
+// `linstor snapshot volume-definition-restore` returned 404. The
+// VD-only variant copies the snapshot's recorded volume layout onto a
+// (typically pre-existing) target RD without spawning replicas; the
+// operator then drives placement via a separate `rd ap` call. Wire
+// shape matches the resource-restore handler — same
+// `{to_resource: ...}` body, snapshot name carried in the URL path.
 func (s *Server) registerSnapshotRestore(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-restore-resource",
 		s.requireStore(s.handleSnapshotRestore))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-restore-resource/{snap}",
 		s.requireStore(s.handleSnapshotRestore))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/snapshot-restore-volume-definition/{snap}",
+		s.requireStore(s.handleSnapshotRestoreVolumeDefinition))
+}
+
+// handleSnapshotRestoreVolumeDefinition serves the Bug 225 endpoint.
+// Resolves the source snapshot, validates the target RD exists, then
+// hydrates the snapshot's VolumeDefinition slice onto the target. The
+// target RD is NOT created here (resource-restore is the
+// new-RD-spawning variant) — if the operator wants a fresh RD they
+// run `rd c <new>` first.
+func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r *http.Request) {
+	srcRD := r.PathValue("rd")
+	snapName := r.PathValue("snap")
+
+	var req snapshotRestoreRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if req.ToResource == "" {
+		writeError(w, http.StatusBadRequest, "to_resource is required")
+
+		return
+	}
+
+	snap, err := s.Store.Snapshots().Get(r.Context(), srcRD, snapName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	_, err = s.Store.ResourceDefinitions().Get(r.Context(), req.ToResource)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "snapshot volume definitions restored: " +
+			snapName + " → " + req.ToResource,
+	}})
 }
 
 // handleSnapshotRestore creates a new ResourceDefinition from a
