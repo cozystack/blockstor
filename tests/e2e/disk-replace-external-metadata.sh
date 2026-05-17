@@ -131,8 +131,8 @@ RECOVERY_WINDOW=${RECOVERY_WINDOW:-120}
 N1=$WORKER_1
 N2=$WORKER_2
 
-META_SP_1="${META_POOL}-on-${N1}"
-META_SP_2="${META_POOL}-on-${N2}"
+META_SP_1="${META_POOL}.${N1}"
+META_SP_2="${META_POOL}.${N2}"
 
 # Track on which workers we created the meta thinpool so cleanup
 # only tries to lvremove what we own.

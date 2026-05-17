@@ -54,7 +54,7 @@
 # into install-pools.sh; the meta pool is created on the fly inside
 # the satellite container as a small (256M) sibling thin pool in
 # the same VG `blockstor-lvm`, then exposed via per-node
-# StoragePool CRDs `meta-thin-<worker>`.
+# StoragePool CRDs `meta-thin.<worker>`.
 #
 # Cleanup tears the meta pool back down so the stand is reusable
 # for the next iter.
@@ -88,12 +88,13 @@ META_SIZE=${META_SIZE:-256M}
 N1=$WORKER_1
 N2=$WORKER_2
 
-# Per-node StoragePool CRD names. Convention from
-# stand/blockstor-storagepools.yaml: <poolName>-<worker-suffix>.
-# We name them deterministically off $META_POOL so cleanup is a
-# label-free `kubectl delete` by exact name.
-META_SP_1="${META_POOL}-on-${N1}"
-META_SP_2="${META_POOL}-on-${N2}"
+# Per-node StoragePool CRD names. The admission webhook enforces
+# `<spec.poolName>.<spec.nodeName>` as the CRD metadata.name —
+# stand/blockstor-storagepools.yaml uses the same dotted form
+# (e.g. `lvm-thin.<worker>`). We name them deterministically off
+# $META_POOL so cleanup is a label-free `kubectl delete` by exact name.
+META_SP_1="${META_POOL}.${N1}"
+META_SP_2="${META_POOL}.${N2}"
 
 # Track on which workers we successfully created the meta thinpool
 # so cleanup only tries to lvremove where there is something to
