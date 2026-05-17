@@ -45,7 +45,16 @@ var (
 // so the Dockerfile can stamp them via `-ldflags -X`.
 const (
 	LinstorVersion = "1.33.2"
-	RestAPIVersion = "1.23.0"
+	// RestAPIVersion: bumped from "1.23.0" → "1.27.0" (Bug 222). The
+	// upstream Java LINSTOR contract advanced through 1.24, 1.25, 1.26
+	// and 1.27 while we still advertised 1.23 — and python-linstor's
+	// `_require_version()` gates every CLI flag added in that window
+	// (e.g. `--storage-pool-list`, `--diskless-on-remaining` second
+	// form, several rg-modify keys) client-side on this string. Until
+	// we report a version >= the gate, the CLI refuses to even send
+	// the request and blockstor looks like it's missing features it
+	// actually serves.
+	RestAPIVersion = "1.27.0"
 )
 
 // LinstorGitHash is the blockstor source commit SHA. Default

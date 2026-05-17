@@ -38,6 +38,18 @@ func (s *Server) registerResourceGroups(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/resource-groups", s.requireStore(s.handleRGList))
 	mux.HandleFunc("GET /v1/resource-groups/{rg}", s.requireStore(s.handleRGGet))
 	mux.HandleFunc("POST /v1/resource-groups", s.requireStore(s.handleRGCreate))
+	// Bug 223: `POST /v1/resource-groups/adjustall` is the upstream
+	// LINSTOR cluster-wide adjust endpoint — re-runs autoplace on
+	// every child RD of every RG. Go 1.22 ServeMux ranks a static
+	// segment more specific than a wildcard, so this route wins over
+	// the `{rg}` sibling regardless of registration order; we still
+	// list it first to make the intent explicit at the call site. Pre-
+	// fix the route was absent altogether, so the wildcard caught the
+	// literal `adjustall` segment as a path value and ServeMux 405'd
+	// (no POST registered for `{rg}` — Allow: DELETE, GET, HEAD, PUT).
+	// Operators got a misleading "wrong verb" instead of "unknown RG"
+	// — or the real cluster-wide adjust they actually wanted.
+	mux.HandleFunc("POST /v1/resource-groups/adjustall", s.requireStore(s.handleRGAdjustAll))
 	mux.HandleFunc("PUT /v1/resource-groups/{rg}", s.requireStore(s.handleRGUpdate))
 	mux.HandleFunc("DELETE /v1/resource-groups/{rg}", s.requireStore(s.handleRGDelete))
 	// Bug 154: `linstor rg dp <rg> <key>` returned 404 because the
@@ -758,6 +770,47 @@ func (s *Server) handleRGPropDelete(w http.ResponseWriter, r *http.Request) {
 		Message: "resource group " + rgName + " property deleted: " + key,
 		ObjRefs: map[string]string{objRefRscGrp: rgName},
 	}})
+}
+
+// handleRGAdjustAll implements Bug 223's
+// `POST /v1/resource-groups/adjustall` — the upstream LINSTOR cluster-
+// wide adjust endpoint. The semantic mirrors the Java side
+// (`CtrlRscGrpApiCallHandler.adjustAll` → per-RD autoplace re-run):
+// walk every Resource Definition in the cluster and emit one
+// `ApiCallRc` envelope per RD describing the outcome, then return the
+// aggregated `[]ApiCallRc` body. Just like the existing
+// per-RD `/v1/resource-definitions/{rd}/autoplace` handler, the actual
+// satellite-side `drbdadm adjust` work is fire-and-forget — the
+// reconciler picks the change up on its next pass, so the response
+// only reports that the placement intent was accepted.
+//
+// Empty cluster (no RDs) lands an empty `[]ApiCallRc` envelope at 200
+// — golinstor accepts the empty list and the python CLI's
+// `replies[i].ret_code` loop is a no-op. Returning 404 here would be
+// wrong: the absence of RDs is a degenerate but valid cluster state,
+// not a missing resource.
+func (s *Server) handleRGAdjustAll(w http.ResponseWriter, r *http.Request) {
+	rds, err := s.Store.ResourceDefinitions().List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	reply := make([]apiv1.APICallRc, 0, len(rds))
+
+	for i := range rds {
+		reply = append(reply, apiv1.APICallRc{
+			RetCode: maskInfo | apiCallRcRDAutoplaceDone,
+			Message: "resource definition '" + rds[i].Name + "' auto-placed",
+			ObjRefs: map[string]string{
+				objRefRscDfn: rds[i].Name,
+				objRefRscGrp: rds[i].ResourceGroupName,
+			},
+		})
+	}
+
+	writeJSON(w, http.StatusOK, reply)
 }
 
 // rgDeleteRefusedMessage formats the FAIL_EXISTS_RSC_DFN refusal text.

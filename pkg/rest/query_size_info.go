@@ -34,6 +34,13 @@ func (s *Server) registerQuerySizeInfo(mux *http.ServeMux) {
 		s.requireStore(s.handleQuerySizeInfo))
 	mux.HandleFunc("POST /v1/query-all-size-info",
 		s.requireStore(s.handleQueryAllSizeInfo))
+	// Bug 224: upstream LINSTOR mounts this under the canonical
+	// /v1/queries/resource-groups/query-all-size-info URL; keep the
+	// flat alias above for backwards compat with any pre-Bug-224
+	// client and register the canonical form so current python-linstor
+	// 1.27.1 + golinstor v0.60.0 don't 404.
+	mux.HandleFunc("POST /v1/queries/resource-groups/query-all-size-info",
+		s.requireStore(s.handleQueryAllSizeInfo))
 }
 
 // handleQuerySizeInfo answers the per-RG capacity check.
