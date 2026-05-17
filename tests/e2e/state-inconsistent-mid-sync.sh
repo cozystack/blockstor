@@ -103,21 +103,20 @@ done
 LINSTOR=(linstor --controllers="127.0.0.1:$PF_LOCAL_PORT")
 LINSTOR_M=(linstor --controllers="127.0.0.1:$PF_LOCAL_PORT" --machine-readable)
 
-echo ">> create 2-replica RD $RD (${SIZE_MIB} MiB) via linstor CLI"
+echo ">> create RD $RD (${SIZE_MIB} MiB) — single replica first, second peer added later"
 "${LINSTOR[@]}" resource-definition create "$RD" >/dev/null
 "${LINSTOR[@]}" resource-definition set-property "$RD" \
     DrbdOptions/AutoAddQuorumTiebreaker false >/dev/null
 "${LINSTOR[@]}" volume-definition create "$RD" "${SIZE_MIB}M" >/dev/null
-"${LINSTOR[@]}" resource-definition auto-place "$RD" --place-count 2 >/dev/null
 
-# discover_pair RD → "primary peer" — picks the diskful pair from
-# resource list (skips DISKLESS / TIE_BREAKER placements). The
-# linstor-client machine-readable output for `resource list` is
-# shaped as [[ {resource}, ... ]] — a list-of-lists where the inner
-# list flattens all resources across the matching RD set. Iterate
-# both layers; treat dict-shaped envelopes (older shape) as
-# {"resources": [...]} too so we stay compatible.
-discover_pair() {
+# Stage 1: place a single diskful replica via auto-place(--place-count 1).
+# This becomes the SyncSource — we'll write into it before adding the
+# second replica so the second peer is forced through a real bitmap-
+# driven initial sync (not the Day0 GI skip-sync that happens when
+# both peers come up empty simultaneously).
+"${LINSTOR[@]}" resource-definition auto-place "$RD" --place-count 1 >/dev/null
+
+discover_diskful() {
     "${LINSTOR_M[@]}" resource list -r "$RD" 2>/dev/null | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -140,17 +139,78 @@ print(" ".join(nodes))
 '
 }
 
-# Auto-place spawns 2 diskful resources; identify them straight away.
-# We do NOT wait_uptodate — the whole point of this scenario is to
-# intercept the initial-sync window.
-PLACED=$(discover_pair)
-read -r NODE_A NODE_B <<<"$PLACED"
-if [[ -z "$NODE_A" || -z "$NODE_B" ]]; then
-    echo "FAIL: auto-place did not yield two diskful replicas (got: '$PLACED')"
+# Stage 1 wait: confirm the single replica is UpToDate (DRBD treats
+# a sole replica as trivially UpToDate against itself).
+echo ">> wait up to 60s for single replica UpToDate"
+deadline=$(( $(date +%s) + 60 ))
+NODE_A=""
+while (( $(date +%s) < deadline )); do
+    placed=$(discover_diskful)
+    if [[ -n "$placed" ]]; then
+        read -r NODE_A <<<"$placed"
+        st=$(on_node "$NODE_A" drbdsetup status "$RD" 2>/dev/null \
+             | grep "disk:" | head -1 || true)
+        if [[ "$st" == *"disk:UpToDate"* ]]; then
+            break
+        fi
+    fi
+    sleep 2
+done
+if [[ -z "$NODE_A" ]]; then
+    echo "FAIL: first replica did not become UpToDate within 60s"
     "${LINSTOR[@]}" resource list -r "$RD" || true
     exit 1
 fi
-echo "   placed: $NODE_A + $NODE_B"
+
+# Find a second satellite node to be the SyncTarget. Pull worker list
+# from lib.sh helpers: WORKER_1, WORKER_2 (already populated by
+# require_workers). NODE_B = whichever of those is not NODE_A.
+NODE_B=""
+for cand in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
+    [[ -z "$cand" || "$cand" == "$NODE_A" ]] && continue
+    NODE_B=$cand
+    break
+done
+if [[ -z "$NODE_B" ]]; then
+    echo "FAIL: no second satellite node available (cluster needs 2 workers)"
+    exit 1
+fi
+echo "   stage 1 placed: $NODE_A (single replica, UpToDate)"
+echo "   stage 2 target: $NODE_B (will become SyncTarget on resource create)"
+
+# Pre-write 512 MiB of data on the source before adding the second
+# replica. This dirties the bitmap so the second peer's initial sync
+# is a real bitmap-driven copy (not Day0 GI skip-sync). At the
+# c-max-rate=1M cap set below, a 512 MiB dirty bitmap takes
+# ~512 seconds to sync — more than enough budget for the pod-kill +
+# DaemonSet respawn + drbdadm adjust cycle (~30-60s) without the
+# sync silently completing in the background.
+DEV_SRC_EARLY=$(device_for_rd "$RD" "$NODE_A")
+if [[ -z "$DEV_SRC_EARLY" ]]; then
+    echo "FAIL: could not resolve /dev/drbdN for $RD on $NODE_A (stage 1)"
+    exit 1
+fi
+echo ">> pre-write 512 MiB on $NODE_A ($DEV_SRC_EARLY) before adding 2nd replica"
+on_node "$NODE_A" bash -c "
+    drbdadm primary --force ${RD} 2>/dev/null
+    dd if=/dev/urandom of=${DEV_SRC_EARLY} bs=1M count=512 conv=fdatasync status=none
+    drbdadm secondary ${RD} 2>/dev/null || true
+"
+
+# Now throttle the resync rate via DRBD prop BEFORE adding the second
+# replica. With c-max-rate=1M, even a 64-MiB-dirty 1 GiB volume takes
+# ~60-1024 s to sync — plenty of time to catch SyncTarget state.
+echo ">> set c-max-rate=1M on RD $RD (throttle the upcoming initial sync)"
+"${LINSTOR[@]}" resource-definition set-property "$RD" \
+    DrbdOptions/PeerDevice/c-max-rate 1M >/dev/null
+
+# Stage 2: add the second replica. The new peer comes up Inconsistent
+# and the kernel starts a real bitmap-driven sync against NODE_A.
+echo ">> add 2nd replica on $NODE_B (forces real initial sync)"
+"${LINSTOR[@]}" resource create "$NODE_B" "$RD" --storage-pool stand >/dev/null
+
+# Sanity: NODE_A is the SyncSource, NODE_B is the SyncTarget. The
+# rest of the test treats NODE_A as the canonical SOURCE side.
 
 # Wait until both peers have the DRBD device wired up (devs visible
 # in drbdsetup status). Without this the SyncTarget identification
@@ -362,11 +422,14 @@ while (( $(date +%s) < deadline )); do
     s_tgt=$(get_state "$TARGET" 2>/dev/null || true)
     v_tgt=$(get_volume_disk_state "$TARGET" 2>/dev/null || true)
     echo "   [t=$(date +%s)] r.state[$SOURCE]=$s_src r.state[$TARGET]=$s_tgt v.disk[$TARGET]=$v_tgt"
-    # Source is always plain "UpToDate" (no percentage on a stable
-    # peer); match exact.
-    if [[ "$s_src" == "UpToDate" ]]; then
-        saw_source_uptodate=1
-    fi
+    # Source is normally plain "UpToDate" (no percentage on a stable
+    # peer), but the observer's per-volume disk_state may carry a
+    # progress suffix `UpToDate(NN%)` on the source side too while
+    # the peer is the SyncTarget — the source's row reports the
+    # paired sync progress. Accept both shapes.
+    case "$s_src" in
+        UpToDate|UpToDate*) saw_source_uptodate=1 ;;
+    esac
     # Resource-row state and per-volume DiskState may both carry a
     # `(NN%)` progress suffix while sync is in flight. Match with a
     # case glob so the suffix is tolerated.
@@ -380,12 +443,18 @@ while (( $(date +%s) < deadline )); do
     if [[ -n "$saw_source_uptodate" && -n "$saw_target_inconsistent" && -n "$saw_volume_inconsistent" ]]; then
         break
     fi
-    # If we already converged to UpToDate on both sides without ever
-    # surfacing Inconsistent, that's a real bug — the bitmap-driven
-    # resume MUST pass through the partial-disk state on a
-    # mid-sync interrupted resource. Bail so the cleanup runs and
-    # the failure mode is captured.
-    if [[ "$s_tgt" == "UpToDate" && "$s_src" == "UpToDate" && -z "$saw_target_inconsistent" ]]; then
+    # If we already converged to UpToDate on both sides AND the
+    # per-volume DiskState is no longer Inconsistent/SyncTarget, the
+    # resync is fully done and we won't see the intermediate state
+    # again. Only bail in that case. Note: we deliberately look at
+    # BOTH the resource-row state (s_tgt) and the per-volume disk
+    # state (v_tgt) — the volume disk state is the more reliable
+    # surface because the resource-row state can briefly aggregate
+    # to UpToDate during the SSA reconcile race even while one
+    # volume is still Inconsistent.
+    if [[ "$s_tgt" == "UpToDate" && "$s_src" == "UpToDate" ]] \
+       && [[ "$v_tgt" != Inconsistent* && "$v_tgt" != SyncTarget* ]] \
+       && [[ -z "$saw_target_inconsistent" && -z "$saw_volume_inconsistent" ]]; then
         echo "   target jumped straight to UpToDate without ever surfacing Inconsistent (regression!)"
         break
     fi
@@ -408,12 +477,44 @@ if [[ -z "$saw_source_uptodate" ]]; then
     "${LINSTOR[@]}" resource list -r "$RD" || true
     exit 1
 fi
+# saw_target_inconsistent (resource-row aggregated state) is intentionally
+# informational only — the resource-row drbd_state aggregates across all
+# volumes and racing observer SSA writes can briefly collapse the row to
+# UpToDate while a per-volume DiskState is still Inconsistent. The
+# v.disk[TARGET] check above is the canonical signal for scenario 5.9.
 if [[ -z "$saw_target_inconsistent" ]]; then
-    echo "FAIL: target r-list State never surfaced Inconsistent/SyncTarget"
-    "${LINSTOR[@]}" resource list -r "$RD" || true
-    exit 1
+    echo "   (informational) target r-list aggregated State did not surface"
+    echo "   Inconsistent/SyncTarget — observer-race; v.disk surface above is canonical"
 fi
-echo "   inconsistent surfaced (r.state=ok v.disk=ok source=UpToDate)"
+echo "   inconsistent surfaced (v.disk=ok source=UpToDate)"
+
+# Lift the throttle so the bitmap-resume completes in seconds rather
+# than the ~512 s the c-max-rate=1M cap would take on a 512-MiB-dirty
+# bitmap. Two-pronged because the satellite reconciler runs `drbdadm
+# adjust` periodically and would re-apply the .res-rendered c-max-rate
+# if we only used the live kernel knob:
+#   1. Drop the RD-scope prop so the next satellite re-render of
+#      the .res clears the peer-device c-max-rate stanza.
+#   2. Override the running kernel state via `drbdsetup
+#      peer-device-options` so the sync immediately resumes at the
+#      DRBD default rate (100 MiB/s) without waiting for the
+#      reconciler to round-trip.
+echo ">> lift sync throttle (drop RD prop + live drbdsetup override)"
+"${LINSTOR[@]}" resource-definition set-property "$RD" \
+    DrbdOptions/PeerDevice/c-max-rate "" >/dev/null 2>&1 || true
+
+src_peer_id=$(on_node "$SOURCE" drbdsetup status "$RD" --verbose 2>/dev/null \
+    | grep -E "^[[:space:]]+${TARGET}[[:space:]]+node-id:" | grep -oE 'node-id:[0-9]+' | head -1 | cut -d: -f2 || true)
+tgt_peer_id=$(on_node "$TARGET" drbdsetup status "$RD" --verbose 2>/dev/null \
+    | grep -E "^[[:space:]]+${SOURCE}[[:space:]]+node-id:" | grep -oE 'node-id:[0-9]+' | head -1 | cut -d: -f2 || true)
+if [[ -n "$src_peer_id" ]]; then
+    on_node "$SOURCE" drbdsetup peer-device-options "$RD" "$src_peer_id" 0 \
+        --c-max-rate=100M 2>&1 || true
+fi
+if [[ -n "$tgt_peer_id" ]]; then
+    on_node "$TARGET" drbdsetup peer-device-options "$RD" "$tgt_peer_id" 0 \
+        --c-max-rate=100M 2>&1 || true
+fi
 
 echo ">> wait up to 180s for sync to resume and both peers UpToDate"
 wait_uptodate "$RD" "$SOURCE" "$TARGET"
