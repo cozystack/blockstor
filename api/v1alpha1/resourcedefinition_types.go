@@ -97,6 +97,27 @@ type ResourceDefinitionStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// drbdPort is the cluster-scope TCP port allocated for THIS RD's
+	// DRBD replication mesh. All Resources of the RD inherit this
+	// value into their own Status.DRBDPort so the satellite's `.res`
+	// renderer writes the SAME port on every `on <node>` block —
+	// divergent ports across peers break drbdadm adjust. Allocated
+	// once when the first Resource of the RD reconciles and never
+	// changes for the lifetime of the RD. Bug 266.
+	// +optional
+	DRBDPort *int32 `json:"drbdPort,omitempty"`
+
+	// drbdMinor is the cluster-scope /dev/drbd<N> minor allocated for
+	// THIS RD. All Resources inherit this value into their own
+	// Status.DRBDMinor — the satellite's `.res` renderer writes ONE
+	// minor for every `on <node>` block in the file, so divergent
+	// minors across peers produce inconsistent .res files and
+	// drbdadm adjust rejects "minor mismatch". Multi-volume RDs
+	// consume drbdMinor..drbdMinor+N-1 (volume k → minor+k).
+	// Allocated once and stable for the RD's lifetime. Bug 268.
+	// +optional
+	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 }
 
 // +kubebuilder:object:root=true

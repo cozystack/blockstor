@@ -187,24 +187,37 @@ func TestDRBDPortPerReplicaUniqueOnNode(t *testing.T) {
 }
 
 // TestDRBDPortRangePerNodeProp verifies that
-// `DrbdOptions/TcpPortRange` on the Node CRD overrides the
-// controller's default range for replicas hosted on that node. Two
-// nodes with disjoint ranges produce non-overlapping ports — that's
-// the operator-affordance reason upstream went per-node in the
-// first place.
+// `DrbdOptions/TcpPortRange` on the Node CRD constrains the
+// per-RD allocator (Bug 266 contract): the chosen port MUST sit in
+// the INTERSECTION of every hosting node's range — divergent ports
+// across peers of the same RD would break drbdadm adjust, so the
+// allocator picks one value that's allocatable on every node.
+//
+// Bug 266 (per-RD allocation) replaces the old per-node semantics
+// where each replica picked its own port from its node's range —
+// that produced the divergence the live stand hit. The new
+// invariant: same port on every replica of one RD; per-node
+// ranges still constrain the choice via intersection.
 func TestDRBDPortRangePerNodeProp(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	scheme := newScheme(t)
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(
+			&blockstoriov1alpha1.Resource{},
+			&blockstoriov1alpha1.ResourceDefinition{},
+		).
+		Build()
 
-	// n1: 7000-7000 (one slot), n2: 8000-8001
+	// Overlapping ranges: n1 allows 7000-7100, n2 allows 7050-7200.
+	// Intersection = 7050-7100. The per-RD allocator must pick a
+	// port in that band.
 	for _, spec := range []struct {
 		name, portRange string
 	}{
-		{"n1", "7000-7000"},
-		{"n2", "8000-8001"},
+		{"n1", "7000-7100"},
+		{"n2", "7050-7200"},
 	} {
 		n := &blockstoriov1alpha1.Node{
 			ObjectMeta: metav1.ObjectMeta{Name: spec.name},
@@ -221,6 +234,12 @@ func TestDRBDPortRangePerNodeProp(t *testing.T) {
 
 	rd := "pvc-range"
 
+	rdObj := &blockstoriov1alpha1.ResourceDefinition{}
+	rdObj.Name = rd
+	if err := cli.Create(ctx, rdObj); err != nil {
+		t.Fatalf("create rd: %v", err)
+	}
+
 	for _, node := range []string{"n1", "n2"} {
 		create(ctx, t, cli, rd, node)
 	}
@@ -233,18 +252,34 @@ func TestDRBDPortRangePerNodeProp(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	for i := range list.Items {
-		port := *list.Items[i].Status.DRBDPort
+	const wantLow, wantHigh int32 = 7050, 7100
 
-		switch list.Items[i].Spec.NodeName {
-		case "n1":
-			if port != 7000 {
-				t.Errorf("n1 port: got %d, want 7000", port)
-			}
-		case "n2":
-			if port < 8000 || port > 8001 {
-				t.Errorf("n2 port: got %d, want 8000..8001", port)
-			}
+	var (
+		seenPort     *int32
+		seenPortNode string
+	)
+
+	for i := range list.Items {
+		port := list.Items[i].Status.DRBDPort
+		if port == nil {
+			t.Fatalf("%s: port not allocated", list.Items[i].Name)
+		}
+
+		if *port < wantLow || *port > wantHigh {
+			t.Errorf("%s port %d outside intersection [%d,%d]",
+				list.Items[i].Spec.NodeName, *port, wantLow, wantHigh)
+		}
+
+		if seenPort == nil {
+			seenPort = port
+			seenPortNode = list.Items[i].Spec.NodeName
+
+			continue
+		}
+
+		if *port != *seenPort {
+			t.Errorf("per-RD port differs across peers: %s=%d vs %s=%d",
+				seenPortNode, *seenPort, list.Items[i].Spec.NodeName, *port)
 		}
 	}
 }

@@ -559,12 +559,71 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 // replicas (they have no backing disk) and routes diskful ones to
 // applyStorage. Pulled out of applyOne to keep the latter under
 // funlen.
+//
+// Bug 267 (HIGH, capacity leak): when a previously-diskful replica
+// is toggled to diskless via `linstor r td <node> <rd> --diskless`,
+// the REST handler flips Spec.Flags=[DISKLESS] but keeps Spec.
+// StoragePool intact so the operator can toggle back. The dispatcher
+// stamps the historical pool onto every DesiredVolume on the
+// toggle-to-diskless path. THIS function detects that shape
+// (diskless=true AND at least one Volume carries a non-empty
+// StoragePool) and invokes provider.DeleteVolume to reclaim the
+// backing LV / zvol — without this, the volume sits on disk forever
+// counted against the pool's free-space budget; repeated
+// demote-promote cycles compound the leak.
+//
+// Fresh DISKLESS replicas (no prior storage, every Volume's
+// StoragePool empty) hit the no-op short-circuit at the top.
 func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
 	if diskless {
+		err := r.reclaimVolumesForDiskless(ctx, dr)
+		if err != nil {
+			return nil, false, false, err
+		}
+
 		return map[int32]string{}, false, false, nil
 	}
 
 	return r.applyStorage(ctx, dr)
+}
+
+// reclaimVolumesForDiskless iterates the DesiredResource's volumes
+// and calls provider.DeleteVolume on each that carries a non-empty
+// StoragePool (the dispatcher's marker for a toggle-to-diskless
+// transition — see applyStorageIfDiskful's godoc). Idempotent:
+// the provider's DeleteVolume is a no-op on already-missing
+// volumes, so a re-reconcile after a partial first pass safely
+// finishes the cleanup.
+//
+// An unknown pool is silently skipped — the dispatcher may stamp a
+// historical pool the satellite no longer has registered (e.g.
+// after a pool rename). The orphan-storage sweeper backstops with
+// its own scan in that edge case.
+func (r *Reconciler) reclaimVolumesForDiskless(ctx context.Context, dr *intent.DesiredResource) error {
+	for _, vol := range dr.GetVolumes() {
+		pool := vol.GetStoragePool()
+		if pool == "" {
+			continue
+		}
+
+		provider, ok := r.cfg.Providers[pool]
+		if !ok {
+			continue
+		}
+
+		err := provider.DeleteVolume(ctx, storage.Volume{
+			ResourceName: dr.GetName(),
+			VolumeNumber: vol.GetVolumeNumber(),
+			PoolName:     pool,
+		})
+		if err != nil {
+			return errors.Wrapf(err,
+				"reclaim volume %s/%d on diskless toggle",
+				dr.GetName(), vol.GetVolumeNumber())
+		}
+	}
+
+	return nil
 }
 
 // the pool.

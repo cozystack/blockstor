@@ -580,6 +580,16 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 
 // fields on target.Status. Pulled out of ensureDRBDIDs so the retry
 // loop body stays under the funlen budget.
+//
+// Bug 266+268 (CRITICAL, data-correctness): port and minor allocation
+// runs at PER-RD (cluster) scope, not per-node. The satellite's `.res`
+// renderer writes ONE port and ONE minor across every `on <node>`
+// block in the file — divergent values across peers produce
+// inconsistent .res files, drbdadm adjust rejects "minor mismatch" /
+// conflicting node-ids, and the connection stays Connecting forever
+// (no initial sync). The per-RD-scope allocator picks ONE value for
+// the RD, persists it on the parent RD's Status, and every Resource
+// inherits from there.
 func (r *ResourceReconciler) allocateDRBDFields(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
 	if target.Status.DRBDNodeID == nil {
 		id, err := r.allocateNodeIDLocked(ctx, target)
@@ -590,22 +600,17 @@ func (r *ResourceReconciler) allocateDRBDFields(ctx context.Context, target *blo
 		target.Status.DRBDNodeID = &id
 	}
 
-	if target.Status.DRBDPort == nil {
-		port, err := r.allocatePort(ctx, target.Spec.NodeName)
-		if err != nil {
-			return err
-		}
-
-		target.Status.DRBDPort = &port
+	rdPort, rdMinor, err := r.ensureRDPortMinor(ctx, target)
+	if err != nil {
+		return err
 	}
 
-	if target.Status.DRBDMinor == nil {
-		minor, err := r.allocateMinor(ctx, target.Spec.NodeName)
-		if err != nil {
-			return err
-		}
+	if target.Status.DRBDPort == nil || *target.Status.DRBDPort != rdPort {
+		target.Status.DRBDPort = &rdPort
+	}
 
-		target.Status.DRBDMinor = &minor
+	if target.Status.DRBDMinor == nil || *target.Status.DRBDMinor != rdMinor {
+		target.Status.DRBDMinor = &rdMinor
 	}
 
 	return nil
@@ -783,24 +788,472 @@ func ptrEqI32(a, b *int32) bool {
 	}
 }
 
-// allocatePort picks a TCP port from the hosting node's range.
-// Upstream LINSTOR moved from per-RD to per-resource ports: each
-// replica picks its own port from its node's local range. That way
-// nodes can run unrelated TCP-port pools (port 7000 on n1 has nothing
-// to do with port 7000 on n2), and a port collision on one node
-// doesn't affect the rest of the cluster.
+// ensureRDPortMinor returns the cluster-scope port and minor for the
+// RD that owns `target`, allocating both on the parent RD's Status
+// the first time and reusing them on every subsequent call. The
+// returned values are guaranteed identical across every Resource
+// of the RD — that's the load-bearing invariant the satellite's
+// `.res` renderer depends on (Bug 266 + Bug 268).
 //
-// Range source: the node's `DrbdOptions/TcpPortRange` prop ("min-max")
-// with controller-wide defaults [DefaultPortMin, DefaultPortMax] when
-// the prop is absent. Taken set: every Resource currently scheduled
-// on the same node.
-func (r *ResourceReconciler) allocatePort(ctx context.Context, nodeName string) (int32, error) {
+// Allocation strategy:
+//
+//  1. If RD.Status.DRBDPort/DRBDMinor are already set, return them.
+//
+//  2. Otherwise, compute the INTERSECTION of every hosting node's
+//     range — a value must be allocatable on every node that hosts
+//     a replica of this RD. Per-node `DrbdOptions/TcpPortRange` and
+//     `DrbdOptions/MinorNrRange` props still constrain the choice;
+//     cluster-scope `TcpPortAutoRange` / `MinorNrAutoRange` provide
+//     the default when no per-node override exists.
+//
+//  3. Gather taken values cluster-wide:
+//     - ports: every Resource.Status.DRBDPort across the cluster +
+//     every RD.Status.DRBDPort already allocated.
+//     - minors: every Resource.Status.DRBDMinor (expanded to its
+//     RD's multi-volume range) + every RD.Status.DRBDMinor's
+//     range across the cluster.
+//
+//  4. Pick the lowest free value from the intersected range that
+//     isn't in the taken set, and stamp it on RD.Status via an
+//     SSA-Patch — optimistic-concurrency loses cleanly to a
+//     racing reconcile (which picked the same or a higher value),
+//     and the next reconcile reads back the committed value.
+//
+// Multi-volume RDs reserve drbdMinor..drbdMinor+N-1 (the .res
+// renderer emits volume k at base+k, so adjacent RDs must not land
+// in the middle of an already-claimed range).
+func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *blockstoriov1alpha1.Resource) (int32, int32, error) {
+	rdName := target.Spec.ResourceDefinitionName
+
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// RD absent (unit-test fast path or rd-delete in flight).
+			// Inherit from any sibling Resource that already has
+			// values allocated — that's how we maintain the
+			// per-RD invariant when no RD CRD exists to persist on.
+			// First replica picks via the cluster-wide allocator;
+			// every subsequent replica copies the sibling's values.
+			return r.ensureRDPortMinorWithoutRD(ctx, target)
+		}
+
+		return 0, 0, err
+	}
+
+	if rd.Status.DRBDPort != nil && rd.Status.DRBDMinor != nil {
+		return *rd.Status.DRBDPort, *rd.Status.DRBDMinor, nil
+	}
+
+	port, minor, err := r.allocateRDPortMinor(ctx, &rd)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	rd.Status.DRBDPort = &port
+	rd.Status.DRBDMinor = &minor
+
+	err = r.Status().Update(ctx, &rd)
+	if err != nil {
+		// On conflict, a sibling reconcile already stamped values.
+		// Re-fetch and return whatever they committed.
+		if errors.IsConflict(err) {
+			var fresh blockstoriov1alpha1.ResourceDefinition
+
+			fetchErr := r.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
+			if fetchErr != nil {
+				return 0, 0, fetchErr
+			}
+
+			if fresh.Status.DRBDPort != nil && fresh.Status.DRBDMinor != nil {
+				return *fresh.Status.DRBDPort, *fresh.Status.DRBDMinor, nil
+			}
+		}
+
+		return 0, 0, err
+	}
+
+	return port, minor, nil
+}
+
+// ensureRDPortMinorWithoutRD is the fallback used when the parent
+// RD CRD is absent — unit-test fast-paths and the legacy code paths
+// where Resources exist without an RD CRD. The contract is the
+// same as the main path: every Resource of the RD must observe the
+// SAME (port, minor) pair.
+//
+// Algorithm: scan sibling Resources of the same RD. If any sibling
+// already has Status.DRBDPort / Status.DRBDMinor stamped, inherit
+// those values. Otherwise pick fresh values via the cluster-wide
+// allocator (this becomes the seed every later replica copies).
+//
+// This branch is exercised primarily by tests that construct
+// Resources without a parent RD; production reconciles always have
+// the parent RD present (the REST handler creates RD → Resources
+// in that order).
+func (r *ResourceReconciler) ensureRDPortMinorWithoutRD(ctx context.Context, target *blockstoriov1alpha1.Resource) (int32, int32, error) {
+	// Stable-on-already-set: target carries its own committed values
+	// from a prior reconcile. Returning them keeps the per-RD
+	// invariant stable across re-allocate passes (the test's
+	// `allocate()` loop runs the allocator multiple times until no
+	// further writes — without this short-circuit, every pass would
+	// re-pick a fresh value and `LowestFreePort` would eventually
+	// trip ErrPortPoolExhausted on the second iteration of a
+	// narrow-range test).
+	port, minor := readSiblingPortMinor(target)
+
+	if port == nil || minor == nil {
+		// Look at sibling Resources of the same RD: if any one of
+		// them already stamped a value, inherit it.
+		sp, sm, err := r.scanSiblingPortMinor(ctx, target)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		if port == nil {
+			port = sp
+		}
+
+		if minor == nil {
+			minor = sm
+		}
+	}
+
+	if port != nil && minor != nil {
+		return *port, *minor, nil
+	}
+
+	// First replica of the RD: allocate fresh via the cluster-wide
+	// path. The per-RD mutex held by the caller (ensureDRBDIDs)
+	// serialises this so only one goroutine for the RD reaches the
+	// fresh-allocation branch at a time.
+	if port == nil {
+		fresh, err := r.allocatePortAcrossCluster(ctx, target.Spec.NodeName)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		port = &fresh
+	}
+
+	if minor == nil {
+		fresh, err := r.allocateMinorAcrossCluster(ctx, target.Spec.NodeName)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		minor = &fresh
+	}
+
+	return *port, *minor, nil
+}
+
+// readSiblingPortMinor returns target's own currently-stamped
+// (port, minor) pointers. Pulled out for testability and to keep
+// ensureRDPortMinorWithoutRD under the cyclomatic budget.
+func readSiblingPortMinor(target *blockstoriov1alpha1.Resource) (*int32, *int32) {
+	return target.Status.DRBDPort, target.Status.DRBDMinor
+}
+
+// scanSiblingPortMinor walks every Resource of the same RD as
+// `target` (excluding target itself) and returns the first
+// non-nil port and minor it finds. Used by the no-RD fallback to
+// inherit the RD-scope values from an already-allocated sibling.
+func (r *ResourceReconciler) scanSiblingPortMinor(ctx context.Context, target *blockstoriov1alpha1.Resource) (*int32, *int32, error) {
+	rdName := target.Spec.ResourceDefinitionName
+
+	var resList blockstoriov1alpha1.ResourceList
+	if err := r.List(ctx, &resList); err != nil {
+		return nil, nil, err
+	}
+
+	var (
+		port  *int32
+		minor *int32
+	)
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName != rdName {
+			continue
+		}
+
+		if resList.Items[i].Name == target.Name {
+			continue
+		}
+
+		if port == nil && resList.Items[i].Status.DRBDPort != nil {
+			port = resList.Items[i].Status.DRBDPort
+		}
+
+		if minor == nil && resList.Items[i].Status.DRBDMinor != nil {
+			minor = resList.Items[i].Status.DRBDMinor
+		}
+
+		if port != nil && minor != nil {
+			break
+		}
+	}
+
+	return port, minor, nil
+}
+
+// allocateRDPortMinor picks an RD-scope port and minor that:
+//   - fits the intersection of every hosting node's range
+//   - is free cluster-wide (no other RD or Resource holds it)
+//
+// Returns the chosen (port, minor) pair. Used by ensureRDPortMinor
+// to seed a fresh RD's Status.
+func (r *ResourceReconciler) allocateRDPortMinor(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) (int32, int32, error) {
+	hostNodes, err := r.hostingNodesForRD(ctx, rd.Name)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	portLow, portHigh, err := r.intersectPortRange(ctx, hostNodes)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	minorLow, minorHigh, err := r.intersectMinorRange(ctx, hostNodes)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	portTaken, err := r.takenPortsCluster(ctx, rd.Name)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	minorTaken, err := r.takenMinorsCluster(ctx, rd.Name)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	port, err := drbd.LowestFreePort(portTaken, portLow, portHigh)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	minor, err := drbd.LowestFreeMinor(minorTaken, minorLow, minorHigh)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return port, minor, nil
+}
+
+// hostingNodesForRD returns the set of nodes hosting a Resource of
+// the named RD. Used by the per-RD allocator to intersect each
+// node's port/minor range.
+func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName string) ([]string, error) {
+	list := &blockstoriov1alpha1.ResourceList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	out := make([]string, 0, len(list.Items))
+
+	for i := range list.Items {
+		if list.Items[i].Spec.ResourceDefinitionName != rdName {
+			continue
+		}
+
+		node := list.Items[i].Spec.NodeName
+		if seen[node] {
+			continue
+		}
+
+		seen[node] = true
+		out = append(out, node)
+	}
+
+	return out, nil
+}
+
+// intersectPortRange computes the intersection of every hosting
+// node's TCP-port range. Empty node set → cluster-default range.
+// Disjoint ranges produce (0,0) — `LowestFreePort` then returns
+// `ErrPortPoolExhausted`, which is the operator-actionable signal
+// that node ranges must be reconciled before any RD can land on
+// the cross-section.
+func (r *ResourceReconciler) intersectPortRange(ctx context.Context, hostNodes []string) (int32, int32, error) {
+	return r.intersectRange(ctx, hostNodes,
+		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDPortRange },
+		"DrbdOptions/TcpPortRange", "TcpPortAutoRange",
+		drbd.DefaultPortMin, drbd.DefaultPortMax)
+}
+
+// intersectMinorRange mirrors intersectPortRange for minors.
+func (r *ResourceReconciler) intersectMinorRange(ctx context.Context, hostNodes []string) (int32, int32, error) {
+	return r.intersectRange(ctx, hostNodes,
+		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDMinorRange },
+		"DrbdOptions/MinorNrRange", "MinorNrAutoRange",
+		drbd.DefaultMinorMin, drbd.DefaultMinorMax)
+}
+
+// intersectRange walks every hosting node, resolves its
+// port/minor range via the existing cluster-fallback chain, and
+// returns the intersection (max-of-lows, min-of-highs). Empty node
+// list falls back to the cluster defaults so the very first
+// Resource of an empty cluster can still allocate.
+func (r *ResourceReconciler) intersectRange(
+	ctx context.Context,
+	hostNodes []string,
+	pick func(*blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange,
+	legacyProp, clusterProp string,
+	defLow, defHigh int32,
+) (int32, int32, error) {
+	low := defLow
+	high := defHigh
+
+	first := true
+
+	for _, node := range hostNodes {
+		nLow, nHigh, err := r.nodeRangeWithClusterFallback(ctx, node,
+			pick, legacyProp, clusterProp, defLow, defHigh)
+		if err != nil {
+			return 0, 0, err
+		}
+
+		if first {
+			low = nLow
+			high = nHigh
+			first = false
+
+			continue
+		}
+
+		if nLow > low {
+			low = nLow
+		}
+
+		if nHigh < high {
+			high = nHigh
+		}
+	}
+
+	return low, high, nil
+}
+
+// takenPortsCluster returns every port already claimed cluster-wide:
+//   - every OTHER RD's Status.DRBDPort
+//   - every Resource.Status.DRBDPort (legacy / mid-migration shape)
+//
+// Excludes `selfRD` so an RD that's mid-allocation doesn't trip on
+// its own draft.
+func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD string) ([]int32, error) {
+	out := make([]int32, 0, 16)
+
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+	if err := r.List(ctx, &rdList); err != nil {
+		return nil, err
+	}
+
+	for i := range rdList.Items {
+		if rdList.Items[i].Name == selfRD {
+			continue
+		}
+
+		if p := rdList.Items[i].Status.DRBDPort; p != nil {
+			out = append(out, *p)
+		}
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+	if err := r.List(ctx, &resList); err != nil {
+		return nil, err
+	}
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == selfRD {
+			continue
+		}
+
+		if p := resList.Items[i].Status.DRBDPort; p != nil {
+			out = append(out, *p)
+		}
+	}
+
+	return out, nil
+}
+
+// takenMinorsCluster returns every minor claimed cluster-wide. A
+// multi-volume RD reserves N consecutive minors (the .res renderer
+// emits volume k at base+k), so we expand each base value to the
+// full range via the parent RD's VolumeDefinitions count.
+func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
+	out := make([]int32, 0, 16)
+
+	rdVolCounts := map[string]int{}
+
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+	if err := r.List(ctx, &rdList); err != nil {
+		return nil, err
+	}
+
+	for i := range rdList.Items {
+		volCount := 1
+		if n := len(rdList.Items[i].Spec.VolumeDefinitions); n > 0 {
+			volCount = n
+		}
+
+		rdVolCounts[rdList.Items[i].Name] = volCount
+
+		if rdList.Items[i].Name == selfRD {
+			continue
+		}
+
+		base := rdList.Items[i].Status.DRBDMinor
+		if base == nil {
+			continue
+		}
+
+		for off := range int32(volCount) {
+			out = append(out, *base+off)
+		}
+	}
+
+	var resList blockstoriov1alpha1.ResourceList
+	if err := r.List(ctx, &resList); err != nil {
+		return nil, err
+	}
+
+	for i := range resList.Items {
+		if resList.Items[i].Spec.ResourceDefinitionName == selfRD {
+			continue
+		}
+
+		base := resList.Items[i].Status.DRBDMinor
+		if base == nil {
+			continue
+		}
+
+		volCount, ok := rdVolCounts[resList.Items[i].Spec.ResourceDefinitionName]
+		if !ok {
+			volCount = 1
+		}
+
+		for off := range int32(volCount) {
+			out = append(out, *base+off)
+		}
+	}
+
+	return out, nil
+}
+
+// allocatePortAcrossCluster is the fallback used when the parent RD
+// is absent (test fast-path / rd-delete in flight). Picks the lowest
+// free port across the cluster's taken-set, using the node's local
+// range for bounds.
+func (r *ResourceReconciler) allocatePortAcrossCluster(ctx context.Context, nodeName string) (int32, error) {
 	low, high, err := r.portRangeForNode(ctx, nodeName)
 	if err != nil {
 		return 0, err
 	}
 
-	taken, err := r.takenPortsOnNode(ctx, nodeName)
+	taken, err := r.takenPortsCluster(ctx, "")
 	if err != nil {
 		return 0, err
 	}
@@ -808,15 +1261,14 @@ func (r *ResourceReconciler) allocatePort(ctx context.Context, nodeName string) 
 	return drbd.LowestFreePort(taken, low, high)
 }
 
-// allocateMinor mirrors allocatePort for /dev/drbd<N>. Minor numbers
-// are local device-name suffixes; per-node scope is the natural fit.
-func (r *ResourceReconciler) allocateMinor(ctx context.Context, nodeName string) (int32, error) {
+// allocateMinorAcrossCluster mirrors allocatePortAcrossCluster.
+func (r *ResourceReconciler) allocateMinorAcrossCluster(ctx context.Context, nodeName string) (int32, error) {
 	low, high, err := r.minorRangeForNode(ctx, nodeName)
 	if err != nil {
 		return 0, err
 	}
 
-	taken, err := r.takenMinorsOnNode(ctx, nodeName)
+	taken, err := r.takenMinorsCluster(ctx, "")
 	if err != nil {
 		return 0, err
 	}
@@ -963,88 +1415,6 @@ func (r *ResourceReconciler) clusterRange(ctx context.Context, prop string, defL
 	}
 
 	return low, high, true, nil
-}
-
-// takenPortsOnNode scans every Resource scheduled on the given node
-// and returns its persisted DRBDPort. The allocator uses this to
-// guarantee no two replicas on the same node take the same port.
-func (r *ResourceReconciler) takenPortsOnNode(ctx context.Context, nodeName string) ([]int32, error) {
-	return r.takenOnNode(ctx, nodeName, func(s *blockstoriov1alpha1.ResourceStatus) *int32 { return s.DRBDPort })
-}
-
-// takenMinorsOnNode returns every minor consumed on the node. A
-// multi-volume RD consumes N consecutive minors (the .res renderer
-// emits volume k at base+k), so for each Resource we expand its
-// recorded base minor to the full range based on the parent RD's
-// VolumeDefinitions count. Without this expansion, a fresh
-// Resource's allocator would happily pick base+1 on a node where a
-// 2-volume sibling already owns base..base+1.
-func (r *ResourceReconciler) takenMinorsOnNode(ctx context.Context, nodeName string) ([]int32, error) {
-	list := &blockstoriov1alpha1.ResourceList{}
-	if err := r.List(ctx, list); err != nil {
-		return nil, err
-	}
-
-	rdVolCounts := map[string]int{}
-
-	out := make([]int32, 0, len(list.Items))
-
-	for i := range list.Items {
-		if list.Items[i].Spec.NodeName != nodeName {
-			continue
-		}
-
-		base := list.Items[i].Status.DRBDMinor
-		if base == nil {
-			continue
-		}
-
-		rdName := list.Items[i].Spec.ResourceDefinitionName
-		volCount, cached := rdVolCounts[rdName]
-
-		if !cached {
-			volCount = 1 // safe default: at least the base is taken
-
-			var rd blockstoriov1alpha1.ResourceDefinition
-			if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd); err == nil {
-				if n := len(rd.Spec.VolumeDefinitions); n > 0 {
-					volCount = n
-				}
-			}
-
-			rdVolCounts[rdName] = volCount
-		}
-
-		for off := range int32(volCount) {
-			out = append(out, *base+off)
-		}
-	}
-
-	return out, nil
-}
-
-// takenOnNode is the shared scan: list every Resource on `nodeName`,
-// pluck the int32 pointer the caller cares about, and return the
-// non-nil set. Used by the per-node port and minor allocators.
-func (r *ResourceReconciler) takenOnNode(ctx context.Context, nodeName string, pick func(*blockstoriov1alpha1.ResourceStatus) *int32) ([]int32, error) {
-	list := &blockstoriov1alpha1.ResourceList{}
-	if err := r.List(ctx, list); err != nil {
-		return nil, err
-	}
-
-	out := make([]int32, 0, len(list.Items))
-
-	for i := range list.Items {
-		if list.Items[i].Spec.NodeName != nodeName {
-			continue
-		}
-
-		if v := pick(&list.Items[i].Status); v != nil {
-			out = append(out, *v)
-		}
-	}
-
-	return out, nil
 }
 
 // resolveEffectiveProps delegates to the shared `pkg/effectiveprops`

@@ -130,26 +130,44 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
-	// LUKS passphrase: lift `DrbdOptions/Encryption/passphrase` from
-	// the resolved options bag onto a stable `LuksPassphrase` prop the
-	// satellite's LUKS layer reads. Match upstream LINSTOR's prop
-	// name for compatibility with `linstor rd set-property`.
-	if pass := drbdOpts[drbdEncryptionPassphraseKey]; pass != "" {
+	// LUKS passphrase: lift the operator-set master passphrase onto
+	// the stable `LuksPassphrase` prop the satellite's LUKS layer
+	// reads. Two source keys are accepted, in order:
+	//
+	//  1. `DrbdOptions/EncryptPassphrase` — upstream LINSTOR's
+	//     canonical cluster-scope master-key name, stamped via
+	//     `linstor controller set-property DrbdOptions/
+	//     EncryptPassphrase <pass>`. Bug 95 enforces its presence
+	//     as a hard prerequisite for any LUKS-layered RD; this is
+	//     the key the REST layer surfaces through
+	//     effectiveprops.Resolve (it copies ControllerConfig.
+	//     ExtraProps onto the output map verbatim).
+	//
+	//  2. `DrbdOptions/Encryption/passphrase` — legacy per-RD shape
+	//     the early-Phase-9 dispatcher introduced (Bug 265 root cause:
+	//     this was the ONLY key the dispatcher read, while the
+	//     controller wrote the cluster master under the upstream
+	//     name in #1 → the operator-set master key never reached
+	//     the satellite and every LUKS RD looped on `Props.
+	//     LuksPassphrase empty`). Kept as a backwards-compat alias.
+	//
+	// The first non-empty wins; both keys are dropped from drbdOpts
+	// after lifting so splitDRBDOptions on the satellite side
+	// doesn't render either as a `passphrase` line in the .res file's
+	// options block (drbdadm create-md rejects unknown options with
+	// `expected: cpu-mask | ... but got 'passphrase'`). The
+	// passphrase reaches the LUKS layer via wireProps, not the .res
+	// file.
+	if pass := pickLUKSPassphrase(drbdOpts); pass != "" {
 		if wireProps == nil {
 			wireProps = map[string]string{}
 		}
 
 		wireProps["LuksPassphrase"] = pass
-
-		// Drop the key from drbdOpts after lifting — splitDRBDOptions
-		// on the satellite side would otherwise render it as a
-		// `passphrase` line in the .res file's options block, and
-		// `drbdadm create-md` rejects unknown options with
-		// `expected: cpu-mask | ... but got 'passphrase'`. The
-		// passphrase reaches the LUKS layer via wireProps, not the
-		// .res file.
-		delete(drbdOpts, drbdEncryptionPassphraseKey)
 	}
+
+	delete(drbdOpts, drbdEncryptionPassphraseKey)
+	delete(drbdOpts, drbdEncryptPassphraseKey)
 
 	var layerStack []string
 	if rd != nil {
@@ -169,11 +187,40 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 }
 
-// drbdEncryptionPassphraseKey is the upstream LINSTOR prop key
-// operators set with `linstor rd set-property <rd> Encryption/passphrase`.
+// drbdEncryptionPassphraseKey is the legacy per-RD shape the
+// early-Phase-9 dispatcher introduced. Kept as a backwards-compat
+// alias source key — operators on older clusters who set the
+// passphrase via the inner-namespace form should keep working
+// without re-stamping. Bug 265 root cause: the dispatcher used to
+// read ONLY this key, never the upstream master-key one below.
 //
 //nolint:gosec // not a credential value, the string is a prop key name
 const drbdEncryptionPassphraseKey = "DrbdOptions/Encryption/passphrase"
+
+// drbdEncryptPassphraseKey is upstream LINSTOR's canonical cluster-
+// scope master-key name. Operators set it via `linstor controller
+// set-property DrbdOptions/EncryptPassphrase <pass>`; Bug 95 enforces
+// its presence as a hard prerequisite for any LUKS-layered RD. The
+// REST/effectiveprops layer surfaces it under this exact key, so the
+// dispatcher MUST read it to receive the operator-set master key.
+//
+//nolint:gosec // not a credential value, the string is a prop key name
+const drbdEncryptPassphraseKey = "DrbdOptions/EncryptPassphrase"
+
+// pickLUKSPassphrase returns the LUKS passphrase from the resolved
+// options bag, preferring the upstream-canonical master-key shape
+// over the legacy per-RD alias. Empty when neither is set; the
+// caller suppresses the wire-prop stamp in that case so the
+// satellite surfaces the missing-passphrase failure at the LUKS
+// layer (the apply-time failure point that produces actionable
+// error messages on the resource Status.Conditions).
+func pickLUKSPassphrase(opts map[string]string) string {
+	if v := opts[drbdEncryptPassphraseKey]; v != "" {
+		return v
+	}
+
+	return opts[drbdEncryptionPassphraseKey]
+}
 
 // mergeEffectiveProps splits the resolver's output into:
 //   - DRBD options (DrbdOptions/...) → folded into drbdOpts so the
@@ -521,17 +568,23 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 	// name (it lives on a per-volume VG.Props in
 	// ResourceGroupVolumeGroup; the RD-prop fallback is the legacy
 	// shim).
-	rdPool := ""
+	// Pool resolution differs subtly between the diskful and
+	// diskless paths. Diskful: full upstream-LINSTOR precedence chain
+	// (Spec.StoragePool typed → Resource.Props legacy → RD.Props
+	// legacy). Diskless: typed + Resource.Props only, NEVER the RD
+	// fallback — a fresh DISKLESS replica that never had storage
+	// MUST emit an empty pool so the satellite's reclaim path
+	// (Bug 267) skips it; a toggled-to-diskless replica keeps the
+	// historical Spec.StoragePool that the REST handler preserved on
+	// demote, which is exactly the marker the satellite needs to
+	// know which provider to call DeleteVolume against.
+	rdPool := target.Spec.StoragePool
+	if rdPool == "" {
+		rdPool = target.Spec.Props["StorPoolName"]
+	}
 
-	if !diskless {
-		rdPool = target.Spec.StoragePool
-		if rdPool == "" {
-			rdPool = target.Spec.Props["StorPoolName"]
-		}
-
-		if rdPool == "" {
-			rdPool = rd.Spec.Props["StorPoolName"]
-		}
+	if !diskless && rdPool == "" {
+		rdPool = rd.Spec.Props["StorPoolName"]
 	}
 
 	// External-metadata pool (scenario 6.18, UG9
