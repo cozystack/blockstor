@@ -17,6 +17,8 @@ limitations under the License.
 package controllers
 
 import (
+	"time"
+
 	"github.com/cockroachdb/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -73,6 +75,20 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.New("controllers: Apply is required")
 	}
 
+	// Bug 285: bound the manager's stop sequence so a wedged
+	// reconciler / Runnable can't keep the satellite container
+	// alive past the DaemonSet rolling-update grace window.
+	// terminationGracePeriodSeconds is 30 s; pre-Stop has already
+	// consumed up to 25 s of that running `drbdadm down`, so the
+	// manager only has ~5 s of headroom before kubelet escalates
+	// to SIGKILL. 10 s is generous for the in-flight Reconciles
+	// + informer cache shutdown and still fires well before
+	// kubelet would have to SIGKILL the container — a SIGKILL
+	// during DaemonSet rollout leaves the next satellite
+	// incarnation observing the rolling-upgrade scenario's
+	// stuck-state pattern from `memory/blockstor_drbd_stuck_state.md`.
+	gracefulShutdownTimeout := 10 * time.Second
+
 	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme: scheme,
 		// Satellite is per-node; leader election would require
@@ -87,7 +103,8 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		// string disables the probe server entirely (the
 		// controller-runtime default), which is what tests rely on
 		// to avoid port-binding races between parallel runs.
-		HealthProbeBindAddress: cfg.HealthProbeBindAddress,
+		HealthProbeBindAddress:  cfg.HealthProbeBindAddress,
+		GracefulShutdownTimeout: &gracefulShutdownTimeout,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "create manager")

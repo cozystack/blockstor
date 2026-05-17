@@ -111,9 +111,18 @@ step "cleanup leftover" \
 # Wipe per-resource .res + .md-created markers too — the satellite
 # wipes /etc/drbd.d on startup but a no-restart iter (controller
 # image unchanged) skips that path.
-step "drbdadm down stale resources on satellites" \
+#
+# Bug 285: use `drbdsetup down` not `drbdadm down` because the
+# satellite's startup-side cleanStateDir() wipes /etc/drbd.d/*.res
+# BEFORE this cleanup gets to run (the satellite cycle may have
+# completed an extra restart between the previous iter and this
+# one), and `drbdadm down <name>` then fails with `no resources
+# defined!` because drbdadm can't enumerate without a .res file.
+# `drbdsetup` operates directly on kernel state and doesn't need
+# the .res file at all.
+step "drbdsetup down stale resources on satellites" \
     "kubectl -n blockstor-system get pod -l app=blockstor-satellite -o name | while read p; do
-        timeout 30 kubectl -n blockstor-system exec \$p -- bash -c 'for r in \$(drbdsetup status --json 2>/dev/null | python3 -c \"import json,sys; print(\\\" \\\".join(r[\\\"name\\\"] for r in json.load(sys.stdin)))\" 2>/dev/null); do timeout 5 drbdadm down \$r 2>/dev/null || true; done; rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true' 2>&1 | sed \"s|^|\$p: |\" || true;
+        timeout 30 kubectl -n blockstor-system exec \$p -- bash -c 'for r in \$(drbdsetup status --json 2>/dev/null | python3 -c \"import json,sys; print(\\\" \\\".join(r[\\\"name\\\"] for r in json.load(sys.stdin)))\" 2>/dev/null); do timeout 5 drbdsetup down \$r 2>/dev/null || true; done; rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true' 2>&1 | sed \"s|^|\$p: |\" || true;
     done"
 
 step "e2e:$SCENARIO" "make e2e NAME=$NAME SCENARIO=$SCENARIO"

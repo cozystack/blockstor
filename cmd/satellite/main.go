@@ -255,42 +255,115 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 	}
 }
 
-// cleanKernelState runs `drbdadm down all` to detach every resource
-// the kernel still holds from the previous satellite incarnation.
-// Best-effort: failures are logged + ignored. The c-r reconciler will
-// re-render and `drbdadm adjust` each Resource CRD shortly after.
+// cleanKernelState detaches every DRBD resource the kernel still
+// holds from the previous satellite incarnation. Best-effort:
+// failures are logged + ignored. The c-r reconciler will re-render
+// and `drbdadm adjust` each Resource CRD shortly after.
 //
 // Why: a reconcile cycle that re-allocates a node-id (different
 // dispatcher run after a peer left/joined) hits `peer node id cannot
 // be my own node id` because the kernel still has the old id pinned
-// for that resource. `drbdadm down` clears that.
+// for that resource. Dropping kernel state clears that.
 //
 // Bug 274 (P1): bounded ctx — a wedged DRBD kernel (stuck-state
 // pattern documented in `memory/blockstor_drbd_stuck_state.md`)
-// hangs `drbdadm down all` forever. Without a deadline the satellite
-// startup never reaches `/readyz`, K8s rollout stalls, and the pod
-// restart loop reproduces the same hang. 60 s is well above any
-// healthy detach time but short enough that an operator notices the
-// failure mode in one reconcile interval.
+// hangs forever. Without a deadline the satellite startup never
+// reaches `/readyz`, K8s rollout stalls, and the pod restart loop
+// reproduces the same hang.
+//
+// Bug 285 (P1): cleanStateDir() above wipes /etc/drbd.d/*.res
+// before this runs, which made the previous `drbdadm down all`
+// shape a no-op — drbdadm needs the .res file to enumerate
+// resources, and after the wipe it just prints "no resources
+// defined". The orphan kernel state then survives every restart
+// and the next reconcile's `drbdsetup new-minor` fails with
+// "Minor or volume exists already". Switch to enumeration via
+// `drbdsetup status` (kernel-state, no .res files needed) and
+// per-resource `drbdsetup down <name>` calls with their own
+// short timeout so one wedged resource doesn't starve the rest.
 func cleanKernelState(ctx context.Context, logger *slog.Logger) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "drbdadm", "down", "all")
-
-	out, err := cmd.CombinedOutput()
+	names, err := listKernelResources(ctx)
 	if err != nil {
-		// "no resources defined" / "no kernel module loaded" / etc.
-		// are routine on the first satellite start of a fresh node,
-		// so don't escalate — just trace at INFO with the output.
-		logger.Info("drbdadm down all (best-effort)",
-			"err", err.Error(),
-			"output", strings.TrimSpace(string(out)))
+		logger.Info("drbdsetup status (best-effort)", "err", err.Error())
 
 		return
 	}
 
-	if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
-		logger.Info("drbdadm down all", "output", trimmed)
+	if len(names) == 0 {
+		return
 	}
+
+	logger.Info("detaching stale kernel resources", "resources", names)
+
+	// Per-resource timeout: one stuck resource must not starve the
+	// rest. 5 s is generous for a healthy `drbdsetup down` and short
+	// enough that the outer 60 s ctx still gets through a dozen
+	// orphans before bailing.
+	const perResourceTimeout = 5 * time.Second
+
+	for _, name := range names {
+		downCtx, downCancel := context.WithTimeout(ctx, perResourceTimeout)
+		out, err := exec.CommandContext(downCtx, "drbdsetup", "down", name).CombinedOutput()
+		downCancel()
+
+		if err != nil {
+			logger.Info("drbdsetup down (best-effort)",
+				"resource", name,
+				"err", err.Error(),
+				"output", strings.TrimSpace(string(out)))
+
+			continue
+		}
+
+		if trimmed := strings.TrimSpace(string(out)); trimmed != "" {
+			logger.Info("drbdsetup down", "resource", name, "output", trimmed)
+		}
+	}
+}
+
+// listKernelResources enumerates every resource name the local DRBD
+// kernel currently owns. Mirrors pkg/drbd.Adm.StatusResources but
+// re-implemented here to keep cmd/satellite/main.go's startup path
+// import-light (it would otherwise pull the whole drbd package +
+// its storage.Exec dependency just for this one call).
+//
+// Output convention: every resource block starts at column 0 with
+// `<name> role:<role> [...]`; per-volume / per-peer lines are
+// indented. Empty output ("No currently configured DRBD found." +
+// non-zero exit) means a fresh kernel and returns nil, nil.
+func listKernelResources(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "drbdsetup", "status").CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No currently configured DRBD") {
+			return nil, nil
+		}
+
+		return nil, errors.Wrap(err, "drbdsetup status")
+	}
+
+	var names []string
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if line == "" || line[0] == ' ' || line[0] == '\t' {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+
+		// Skip comment / banner lines (Bug 264 guard).
+		name := fields[0]
+		if strings.HasPrefix(name, "#") {
+			continue
+		}
+
+		names = append(names, name)
+	}
+
+	return names, nil
 }
