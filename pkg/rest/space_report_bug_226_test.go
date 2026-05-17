@@ -89,8 +89,11 @@ func TestBug226SpaceReportAggregatesPools(t *testing.T) {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
+	// Bug 230: the wire field is `reportText` (Jackson default
+	// camelCase, matching upstream Java); Bug 226 originally emitted
+	// snake_case `report_text` and was corrected in Bug 230.
 	var got struct {
-		ReportText string `json:"report_text"`
+		ReportText string `json:"reportText"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
@@ -131,8 +134,11 @@ func TestBug226SpaceReportEmptyCluster(t *testing.T) {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
+	// Bug 230: the wire field is `reportText` (Jackson default
+	// camelCase, matching upstream Java); Bug 226 originally emitted
+	// snake_case `report_text` and was corrected in Bug 230.
 	var got struct {
-		ReportText string `json:"report_text"`
+		ReportText string `json:"reportText"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
@@ -141,5 +147,46 @@ func TestBug226SpaceReportEmptyCluster(t *testing.T) {
 
 	if got.ReportText == "" {
 		t.Errorf("report_text empty on empty cluster; want a non-empty placeholder summary")
+	}
+}
+
+// TestBug230SpaceReportUsesCamelCaseReportText pins the upstream-
+// canonical wire shape for `GET /v1/space-report`. Bug 226 wired the
+// handler but emitted the field as snake_case `report_text` (see Java
+// `JsonSpaceTracking.java:12`: the canonical field is `reportText`,
+// Jackson default camelCase). python-linstor and golinstor's
+// `SpaceTrackingService.Query()` both decode the response into a
+// struct keyed on `reportText`; the snake_case form decoded as the
+// zero value and `linstor space-reporting query` crashed downstream
+// with a KeyError on `reportText` access.
+//
+// The fix is a one-line JSON tag flip on the response struct; this
+// test pins that the wire body carries the camelCase key. We decode
+// into a loose `map[string]any` rather than a typed struct so the
+// assertion is impossible to satisfy by accident — only the actual
+// JSON key name on the wire matters.
+func TestBug230SpaceReportUsesCamelCaseReportText(t *testing.T) {
+	base, stop := startServerWithStore(t, store.NewInMemory())
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/space-report")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	var got map[string]any
+
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	if _, ok := got["reportText"]; !ok {
+		t.Errorf("response missing canonical `reportText` key (Bug 230); body=%v", got)
+	}
+
+	if _, ok := got["report_text"]; ok {
+		t.Errorf("response still emits snake_case `report_text` (Bug 230 — upstream Java uses Jackson default camelCase `reportText`); body=%v", got)
 	}
 }

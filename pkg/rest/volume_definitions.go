@@ -95,6 +95,17 @@ func (s *Server) registerVolumeDefinitions(mux *http.ServeMux) {
 		s.requireStore(s.handleVDUpdate))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/volume-definitions/{vn}",
 		s.requireStore(s.handleVDDelete))
+	// Bug 233 (P3): per-VD LUKS passphrase rotation. Upstream Java
+	// `VolumeDefinitions.java:modifyVolumeDefinitionPassphrase`
+	// (line 278); body shape is `VolumeDefinitionModifyPassphrase`
+	// (`{"new_passphrase":"…"}`). We also accept the bare-string
+	// `PassPhraseEnter` shape symmetric with the Bug 173 dual-form
+	// cluster-passphrase PATCH. Pre-fix this 404'd, breaking
+	// `linstor vd set-passphrase` entirely. Path uses `{vlmNr}` to
+	// match the upstream OpenAPI spec.
+	mux.HandleFunc(
+		"PUT /v1/resource-definitions/{rd}/volume-definitions/{vlmNr}/encryption-passphrase",
+		s.requireStore(s.handleVDPassphraseRotate))
 }
 
 // handleVDView is the cluster-wide aggregate for

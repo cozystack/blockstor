@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // This file gathers four upstream-parity endpoints blockstor was
@@ -51,19 +53,32 @@ func (s *Server) registerUpstreamParity225_229(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/resource-definitions/{rd}/sync-status",
 		s.requireStore(s.handleResourceDefinitionSyncStatus))
 	mux.HandleFunc("GET /v1/nodes/{node}/config", s.requireStore(s.handleNodeConfig))
+	// Bug 231 (P2): PUT mirror of Bug 228's GET — `linstor node
+	// set-log-level <node> <LVL>` PUTs the same SatelliteConfig wire
+	// shape to flip the satellite's log level. Pre-fix this 405'd
+	// because only GET was wired.
+	mux.HandleFunc("PUT /v1/nodes/{node}/config", s.requireStore(s.handleNodeConfigPut))
 	mux.HandleFunc("GET /v1/storage-pool-definitions/{name}",
 		s.requireStore(s.handleStoragePoolDefinitionSingle))
 }
 
 // spaceReport mirrors upstream Java's JsonSpaceTracking.SpaceReport:
-// a single string field `report_text` containing the human-readable
+// a single string field `reportText` containing the human-readable
 // cluster-wide capacity summary the python CLI's `linstor
 // space-reporting query` renders verbatim. Upstream's
 // SpaceTrackingService produces a multi-line aggregate; blockstor
 // derives the equivalent from the StoragePool table because we don't
 // run upstream's SpaceTracking subsystem.
+//
+// Bug 230 (P1): Bug 226 wired this struct with `report_text`
+// (snake_case); upstream Java uses Jackson's default camelCase and
+// the python-linstor consumer + golinstor's `SpaceTrackingService.
+// Query()` both decode the response keyed on `reportText`. The
+// snake_case form decoded as the zero value and the CLI crashed
+// downstream with a KeyError on `reportText` access. The tag flip
+// is a one-line wire-shape fix; the report body itself is unchanged.
 type spaceReport struct {
-	ReportText string `json:"report_text"`
+	ReportText string `json:"reportText"`
 }
 
 // handleSpaceReport serves Bug 226. Builds a free/total capacity
@@ -230,6 +245,93 @@ func (s *Server) handleNodeConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, cfg)
+}
+
+// handleNodeConfigPut serves Bug 231 — the PUT mirror of Bug 228's
+// GET. python-linstor's `linstor node set-log-level <node> <LVL>`
+// issues a PUT against this URL with a `SatelliteConfig` body
+// (matches upstream Java `Nodes.java:setConfig` which decodes via
+// `objectMapper.readValue(jsonData, JsonGenTypes.SatelliteConfig.class)`).
+//
+// blockstor doesn't run upstream's StltConfig push protocol, so the
+// only field that has real runtime effect is the log-level subset.
+// We accept both the upstream-shaped nested
+// `{"log":{"level":"<LVL>"}}` form AND the flat `{"log_level":"<LVL>"}`
+// shape symmetric with the controller-config PUT (Bug 159), so the
+// CLI's nested-body callers and `--curl` operators alike land cleanly.
+//
+// When a parseable log level is present we route it through the same
+// `runtimeLogLevel` LevelVar `handlePutControllerConfig` mutates, so
+// the receiving replica's slog level flips immediately — operators
+// running `node set-log-level n1 DEBUG` against the apiserver
+// replica observe the change in that pod's logs without waiting for
+// a per-satellite push.
+//
+// TODO(phase-12): persist the level into the Node's props bag so a
+// satellite restart re-applies it, and (later) fan out via the
+// satellite-side reconciler so the per-node level actually reaches
+// the targeted satellite — today the flip is local to the receiving
+// apiserver replica, which matches upstream's "set on controller"
+// semantics minus the satellite-side push.
+//
+// Other fields (`net`, `special_satellite`, etc.) are accepted-and-
+// ignored so a strict-OpenAPI client posting a complete projection
+// doesn't get 400'd. The response is a standard `[]APICallRc`
+// envelope so python-linstor renders the success line uniformly.
+func (s *Server) handleNodeConfigPut(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("node")
+
+	// Verify the target node exists so a missing node is 404, not 200
+	// with a silent no-op. Mirrors the Bug 228 GET sibling's contract.
+	_, err := s.Store.Nodes().Get(r.Context(), name)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	// Same dual-shape body as the controller-config PUT (Bug 159):
+	// accept both the nested upstream `{"log":{"level":…}}` and the
+	// flat `{"log_level":…}` alias. Route the decode through
+	// decodeJSON so empty / malformed / oversized bodies hit the
+	// Bug 158/161 typed-envelope path.
+	var body putControllerConfigBody
+
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+
+	raw := body.LogLevel
+	if raw == "" {
+		raw = body.Log.pickLevel()
+	}
+
+	// A log level isn't required (other fields of SatelliteConfig may
+	// be intended as no-ops by an upstream-shaped strict client), but
+	// when present it must parse — otherwise return 400 with the
+	// accepted-levels envelope so the operator can self-correct.
+	msg := "node config accepted"
+
+	if raw != "" {
+		level, ok := parseLogLevel(raw)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"unknown log level %q; accepted levels: %s",
+				raw, strings.Join(acceptedLogLevels, ", "),
+			))
+
+			return
+		}
+
+		runtimeLogLevel.Set(level)
+
+		msg = "log level for " + name + " set to " + strings.ToUpper(strings.TrimSpace(raw))
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: msg,
+	}})
 }
 
 // handleStoragePoolDefinitionSingle serves Bug 229. Walks the
