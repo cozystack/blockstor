@@ -249,7 +249,11 @@ func (p *Provider) PoolStatus(_ context.Context) (storage.PoolStatus, error) {
 	_, err := os.Stat(p.cfg.Dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return storage.PoolStatus{}, errors.Errorf("pool dir %s not found", p.cfg.Dir)
+			// Bug 282: tag with ErrPoolGone so writeCapacity flips
+			// PoolMissing=true. Transient errors (statfs hiccup,
+			// ctx-deadline) MUST NOT carry this tag.
+			return storage.PoolStatus{},
+				errors.Wrapf(storage.ErrPoolGone, "pool dir %s not found", p.cfg.Dir)
 		}
 
 		return storage.PoolStatus{}, errors.Wrapf(err, "stat %s", p.cfg.Dir)

@@ -43,6 +43,16 @@ var (
 	// transient cause (lvm temporary lock, busy dataset) WITHOUT this
 	// sentinel to keep retry semantics intact.
 	ErrTerminal = errors.New("provider terminal error")
+	// ErrPoolGone — PoolStatus reports the backing pool is definitely
+	// not present (operator ran `zpool destroy` / `vgremove` / removed
+	// the file-thin dir). The satellite controller writeCapacity
+	// path tests for this via errors.Is and flips
+	// Status.PoolMissing=true. Any OTHER PoolStatus error preserves
+	// the prior Status (Bug 282): a transient lvs/zfs hiccup, a
+	// withProbeTimeout (Bug 270/271) cancel under load, or a "pool
+	// is full but reachable" probe must NOT be mis-classified as
+	// "pool gone".
+	ErrPoolGone = errors.New("storage pool not present")
 )
 
 // Volume identifies a block-level volume on a satellite. The triple

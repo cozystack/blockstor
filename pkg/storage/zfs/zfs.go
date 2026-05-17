@@ -238,7 +238,11 @@ func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 
 	line := strings.TrimSpace(string(out))
 	if line == "" {
-		return storage.PoolStatus{}, errors.Errorf("zpool %s not found", p.cfg.Pool)
+		// Bug 282: tag with ErrPoolGone so writeCapacity flips
+		// PoolMissing=true. Transient zpool errors (timeout, etc.)
+		// MUST NOT carry this tag.
+		return storage.PoolStatus{}, errors.Wrapf(storage.ErrPoolGone,
+			"zpool %s not found", p.cfg.Pool)
 	}
 
 	parts := strings.Split(line, "\t")

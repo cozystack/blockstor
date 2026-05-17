@@ -141,7 +141,11 @@ func (t *Thick) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 
 	line := strings.TrimSpace(string(out))
 	if line == "" {
-		return storage.PoolStatus{}, errors.Errorf("vg %s not found", t.cfg.VolumeGroup)
+		// Bug 282: tag with ErrPoolGone so writeCapacity flips
+		// PoolMissing=true. Transient vgs errors (timeout, locked)
+		// MUST NOT carry this tag.
+		return storage.PoolStatus{}, errors.Wrapf(storage.ErrPoolGone,
+			"vg %s not found", t.cfg.VolumeGroup)
 	}
 
 	parts := strings.SplitN(line, "|", lvsCols)

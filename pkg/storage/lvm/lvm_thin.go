@@ -158,8 +158,11 @@ func (t *Thin) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 
 	line := strings.TrimSpace(string(out))
 	if line == "" {
-		return storage.PoolStatus{}, errors.Errorf("thin pool %s/%s not found",
-			t.cfg.VolumeGroup, t.cfg.ThinPool)
+		// Bug 282: tag with ErrPoolGone so writeCapacity flips
+		// PoolMissing=true. Transient lvs errors (timeout, vg locked)
+		// MUST NOT carry this tag.
+		return storage.PoolStatus{}, errors.Wrapf(storage.ErrPoolGone,
+			"thin pool %s/%s not found", t.cfg.VolumeGroup, t.cfg.ThinPool)
 	}
 
 	parts := strings.SplitN(line, "|", lvsCols)

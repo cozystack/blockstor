@@ -169,6 +169,22 @@ func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockst
 
 	status, err := provider.PoolStatus(ctx)
 	if err != nil {
+		// Bug 282 (P2): distinguish "permanently gone" from
+		// transient errors. Only providers that explicitly tag
+		// the error with storage.ErrPoolGone (the "vgremove /
+		// zpool destroy / file-thin dir absent" case) flip
+		// PoolMissing=true. Probe-timeout cancels (Bug 270/271)
+		// or other transient hiccups must preserve the prior
+		// Status — the placer would otherwise drop the pool the
+		// moment a withProbeTimeout fires under load (full pool +
+		// slow probe), turning a "pool is full" symptom into a
+		// "pool is gone" reaction.
+		if !errors.Is(err, storage.ErrPoolGone) {
+			logger.Info("pool status probe transient error; keeping prior Status", "err", err)
+
+			return
+		}
+
 		// Operator-initiated destroy is a legitimate state — Info,
 		// not Error. The next successful probe clears PoolMissing.
 		logger.Info("pool disappeared", "err", err)
