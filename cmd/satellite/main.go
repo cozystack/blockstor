@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
@@ -263,7 +264,18 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 // dispatcher run after a peer left/joined) hits `peer node id cannot
 // be my own node id` because the kernel still has the old id pinned
 // for that resource. `drbdadm down` clears that.
+//
+// Bug 274 (P1): bounded ctx — a wedged DRBD kernel (stuck-state
+// pattern documented in `memory/blockstor_drbd_stuck_state.md`)
+// hangs `drbdadm down all` forever. Without a deadline the satellite
+// startup never reaches `/readyz`, K8s rollout stalls, and the pod
+// restart loop reproduces the same hang. 60 s is well above any
+// healthy detach time but short enough that an operator notices the
+// failure mode in one reconcile interval.
 func cleanKernelState(ctx context.Context, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
 	cmd := exec.CommandContext(ctx, "drbdadm", "down", "all")
 
 	out, err := cmd.CombinedOutput()

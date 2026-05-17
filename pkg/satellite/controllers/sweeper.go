@@ -161,7 +161,21 @@ func (s *OrphanSweeperRunnable) RegisterWithManager(mgr manager.Manager) error {
 // Exposed (lowercase, package-internal) for the unit tests so a
 // table-driven run can pin one tick's behaviour against canned
 // kernel + CRD state without juggling a ticker.
+//
+// Bug 275 (P1): per-tick deadline so the sweeper that's supposed to
+// recover from DRBD-stuck-state isn't itself stuck by it. The budget
+// is the sweep period — a tick that exceeds its own period would
+// pile up behind the next ticker fire anyway, so cancelling at the
+// period boundary keeps the loop in lock-step with the schedule.
 func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logger) error {
+	period := s.Period
+	if period == 0 {
+		period = SweeperPeriod
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, period)
+	defer cancel()
+
 	skip, err := s.shouldSkip(ctx)
 	if err != nil {
 		// Read failures on the Node CRD shouldn't block the sweep —

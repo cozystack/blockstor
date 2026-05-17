@@ -61,6 +61,13 @@ import (
 // flooding the apiserver with no-op writes on a quiescent host.
 const DiscoveredStoragePeriod = 60 * time.Second
 
+// discoveryProbeTimeout bounds each vgs/zpool list invocation
+// (Bug 277). Mirrors the 30s ceiling used by the storage providers'
+// withProbeTimeout — short enough that the next tick still happens
+// within DiscoveredStoragePeriod, long enough that a slow but
+// healthy probe completes.
+const discoveryProbeTimeout = 30 * time.Second
+
 // Node CRD Props keys the runnable stamps. Mirrors the constants
 // the apiserver pre-flight reads in pkg/rest/storage_pools.go —
 // kept verbatim here so a grep across the tree pairs writer and
@@ -249,6 +256,14 @@ func (d *DiscoveredStorageRunnable) tick(ctx context.Context, logger logr.Logger
 // still completes. The error is logged at V(1) so a quiet host
 // without LVM doesn't flood the satellite log.
 func probeVGs(ctx context.Context, exec storage.Exec, logger logr.Logger) []string {
+	// Bug 277 (P2): discovery ticker runs unattended; bound the
+	// vgs call so a suspended VG can't hold the discovery loop
+	// indefinitely. Same surface as the storage providers' new
+	// withProbeTimeout wrap, kept local to avoid a cross-package
+	// dep.
+	ctx, cancel := context.WithTimeout(ctx, discoveryProbeTimeout)
+	defer cancel()
+
 	out, err := exec.Run(ctx, "vgs", lvm.Args("--noheadings", "-o", "vg_name")...)
 	if err != nil {
 		// Single-driver host or transient probe failure — empty
@@ -270,6 +285,10 @@ func probeVGs(ctx context.Context, exec storage.Exec, logger logr.Logger) []stri
 // PATH) degrades to an empty list — see probeVGs doc for the
 // rationale.
 func probeZPools(ctx context.Context, exec storage.Exec, logger logr.Logger) []string {
+	// Bug 277 (P2): same rationale as probeVGs above.
+	ctx, cancel := context.WithTimeout(ctx, discoveryProbeTimeout)
+	defer cancel()
+
 	out, err := exec.Run(ctx, "zpool", "list", "-H", "-o", "name")
 	if err != nil {
 		logger.V(1).Info("zpool list probe failed; advertising empty zpool list",

@@ -550,6 +550,13 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 //     them alone is the right call (operator may have placed them
 //     there intentionally).
 func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
+	// Bug 276 (P1, class-extension of Bug 271/273): the orphan-
+	// storage sweeper ticker calls this on every cycle; a suspended
+	// pool would otherwise wedge the sweep loop forever — same
+	// surface as the other ZFS probe sites.
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := p.exec.Run(ctx, "zfs",
 		"list", "-H", "-r", "-d", "1",
 		"-o", "name", "-t", "volume",

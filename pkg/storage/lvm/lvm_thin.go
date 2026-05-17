@@ -390,7 +390,15 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 // LVs have type '-' (thick) or 'V' (thin virtual); snapshot LVs use
 // 's' (regular) or carry origin metadata differentiable through
 // lv_attr.
+// Bug 276 (P1, class-extension of Bug 270): bound the ctx here too.
+// ListVolumeNames runs from the storage orphan-sweeper ticker (every
+// SweeperPeriod) and bypassed the lvExists-level wrap that catches
+// other lvs calls. A suspended VG would silently kill the sweep
+// loop without the bound.
 func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
 }
 
