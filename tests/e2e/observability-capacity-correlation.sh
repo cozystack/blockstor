@@ -104,6 +104,15 @@ cleanup() {
     for rd in "${SPAWNED_RDS[@]}"; do
         delete_rd "$rd" 2>/dev/null
     done
+    # Revert LinstorCluster.spec.externalController unconditionally so a
+    # FAIL exit doesn't leave linstor-csi wired at blockstor's apiserver
+    # for the rest of the e2e batch. Without this, downstream scenarios
+    # never reach UpToDate because piraeus tears down its in-cluster
+    # Java linstor-controller when an external one is configured.
+    # Cascade-fail repro: e2e1 batch on 2026-05-17 (4 downstream FAILs).
+    kubectl patch linstorcluster linstorcluster --type=json \
+        -p='[{"op":"remove","path":"/spec/externalController"}]' \
+        2>/dev/null
     kill "$PF_PID" 2>/dev/null
     wait "$PF_PID" 2>/dev/null
     set -e
