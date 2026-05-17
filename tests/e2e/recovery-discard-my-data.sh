@@ -185,8 +185,27 @@ on_node "$N2" bash -c "
 "
 
 echo ">> connect kick on $N1 to clear stale half"
+# Resolve $N2's node-id from $N1's connection view so `drbdsetup
+# disconnect ... --force=yes` can fully drop N1's net-config FSM into
+# StandAlone. Plain `drbdadm disconnect` races the satellite
+# reconciler (drbdadm adjust re-arms within ~1s) and the subsequent
+# `drbdadm connect` then rejects with "Device has a net-config (use
+# disconnect first)" — same FSM-stuck-with-net-config trap the test
+# already avoids on $N2.
+n2_node_id_from_n1=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null \
+    | grep -oE "node-id:[0-9]+" | head -2 | tail -1 | cut -d: -f2 || true)
+if [[ -z "$n2_node_id_from_n1" ]]; then
+    n2_node_id_from_n1=$(on_node "$N1" bash -c "
+        awk '/^on / { host=\$2 } /node-id/ { print host, \$2 }' /etc/drbd.d/${RD}.res
+    " | awk -v h="$N2" '$1 == h { print $2 }' | tr -d ';' | head -1)
+fi
+echo "   $N2 node-id (from $N1's view) = ${n2_node_id_from_n1:-<unknown>}"
+if [[ -z "$n2_node_id_from_n1" ]]; then
+    echo "FAIL: could not resolve $N2's DRBD node-id from $N1's view"
+    exit 1
+fi
 on_node "$N1" bash -c "
-    drbdadm disconnect ${RD} 2>&1 || true
+    drbdsetup disconnect ${RD} ${n2_node_id_from_n1} --force=yes 2>&1 || true
     drbdadm connect ${RD}
 "
 
