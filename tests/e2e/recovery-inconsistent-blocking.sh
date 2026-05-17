@@ -111,8 +111,17 @@ done
 # masking the bug we're trying to detect.
 local_disk_state() {
     local node=$1 rd=$2
+    # Bug 285: || true on the kubectl-exec call — `drbdsetup status
+    # <rd>` exits non-zero while the satellite is still bringing the
+    # resource up (initial reconcile races the test's `wait UpToDate`
+    # poll). With pipefail+errexit the non-zero on $? upstream of the
+    # awk pipeline killed the entire scenario before the wait loop
+    # could deadline; the trap then ran while only the first replica
+    # had reported UpToDate and the test "failed" with no diagnostic
+    # output.
     on_node "$node" drbdsetup status "$rd" 2>/dev/null \
-        | awk 'NR==2 { for (i=1; i<=NF; i++) if ($i ~ /^disk:/) { print $i; exit } }'
+        | awk 'NR==2 { for (i=1; i<=NF; i++) if ($i ~ /^disk:/) { print $i; exit } }' \
+        || true
 }
 
 echo ">> wait for all 3 replicas UpToDate"
