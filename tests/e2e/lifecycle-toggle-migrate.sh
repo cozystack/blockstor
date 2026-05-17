@@ -105,7 +105,32 @@ fi
 # ---------- Endpoint is live: run the full migration drill ----------
 
 echo ">> create 2-replica RD on $WORKER_1 + $WORKER_2 (zfs-thin pool)"
-rd_apply "$RD" "$WORKER_1" "$WORKER_2" 65536
+# Bug 285: disable auto-tiebreaker — with 2 diskful replicas the
+# RD reconciler would auto-stamp a DISKLESS+TIE_BREAKER on
+# $WORKER_3, which is exactly the migration target. The pre-flight
+# "$WORKER_3 has no copy" sanity check below would then trip on
+# the auto-witness and FAIL before any migration happened.
+cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: ResourceDefinition
+metadata: {name: ${RD}}
+spec:
+  props:
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
+  volumeDefinitions:
+    - {volumeNumber: 0, sizeKib: 65536}
+EOF
+for n in "$WORKER_1" "$WORKER_2"; do
+    cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: Resource
+metadata: {name: ${RD}.${n}}
+spec:
+  resourceDefinitionName: ${RD}
+  nodeName: ${n}
+  props: {StorPoolName: stand}
+EOF
+done
 
 wait_uptodate "$RD" "$WORKER_1" "$WORKER_2"
 

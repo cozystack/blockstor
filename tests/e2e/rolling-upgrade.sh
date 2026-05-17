@@ -128,7 +128,38 @@ PEER=$WORKER_2
 
 # ---------- Step 1: create RD, wait for UpToDate ----------
 echo ">> apply 2-replica RD on $PRIMARY + $PEER"
-rd_apply "$RD" "$PRIMARY" "$PEER" 65536
+# Bug 285: disable auto-tiebreaker for this 2-diskful RD. The
+# default behaviour creates a DISKLESS+TIE_BREAKER on the 3rd
+# worker, which is harmless on its own — but during step 5's
+# `kubectl rollout restart ds/blockstor-satellite` the tiebreaker
+# pod is bounced too, and its preStop `drbdadm down <tiebreaker>`
+# races the rolling-update of the diskful peers. With both diskful
+# satellites concurrently restarting, the disconnect handshake
+# stalls and the tiebreaker satellite sits in Terminating past
+# terminationGracePeriodSeconds — the DS rollout-status then
+# times out at the test's 180s budget. Tiebreaker isn't part of
+# the rolling-upgrade contract — strip it.
+cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: ResourceDefinition
+metadata: {name: ${RD}}
+spec:
+  props:
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
+  volumeDefinitions:
+    - {volumeNumber: 0, sizeKib: 65536}
+EOF
+for n in "$PRIMARY" "$PEER"; do
+    cat <<EOF | kubectl apply -f -
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: Resource
+metadata: {name: ${RD}.${n}}
+spec:
+  resourceDefinitionName: ${RD}
+  nodeName: ${n}
+  props: {StorPoolName: stand}
+EOF
+done
 wait_uptodate "$RD" "$PRIMARY" "$PEER"
 
 # Promote on $PRIMARY and resolve the device path.

@@ -173,11 +173,18 @@ echo ">> stage privileged corruptor pod on ${N3} (hostPath /dev)"
 #   - kubectl debug node/<n> is rejected by the cluster's PodSecurity
 #     baseline default (hostNetwork / hostPID / hostPath forbidden).
 #   - talosctl on the stand host doesn't have `nodes` set in its
-#     config (10.51.x is Talos-internal, not exposed).
+#     config (10.x.x.x is Talos-internal, not exposed).
 # Workaround: spawn a privileged sidecar in blockstor-system (PSA
 # enforce=privileged on that namespace), mount /dev from the host
 # and run `dd` on /dev/zd<N>. This is the only general-purpose
 # fault-injection harness for Talos in this stand.
+#
+# Bug 285: derive the registry IP from the cluster's NodeInternalIP
+# the same way stand/install-blockstor.sh does. Hardcoding 10.51.0.1
+# only worked on one stand; on e2e3 the worker subnet is 10.22.0.x
+# and kubelet rejects ImagePull with 0 connections.
+NODE_IP_FOR_REG=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+REGISTRY="${NODE_IP_FOR_REG%.*}.1:5000"
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -192,7 +199,7 @@ spec:
     - operator: Exists
   containers:
     - name: corruptor
-      image: 10.51.0.1:5000/blockstor-satellite:dev
+      image: ${REGISTRY}/blockstor-satellite:dev
       command: ["/bin/sh", "-c", "sleep 3600"]
       securityContext:
         privileged: true
