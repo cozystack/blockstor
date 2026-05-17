@@ -81,28 +81,20 @@ func (p *Provider) Kind() string {
 //
 // Re-runs no-op cleanly: stat skips the allocation step and the
 // attach helper reuses any existing loop dev for the file.
+//
+// Bug 256 (P2, space-guarantee): the pre-fix idempotent-skip path
+// returned without re-fallocating, so a sparse-by-history backing file
+// (e.g. truncate-only seeded by an older satellite or by a crash mid-
+// fallocate) silently survived reconciles. ensureFallocated runs on the
+// skip path in thick mode so the extents are reserved on disk on every
+// pass. Thin mode no-ops inside the helper.
 func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 	sizeBytes := vol.SizeKib * bytesPerKib
 
-	_, err := os.Stat(path)
+	err := p.createBackingFile(ctx, path, sizeBytes)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return errors.Wrapf(err, "stat %s", path)
-		}
-
-		tool := "fallocate"
-		flag := "-l"
-
-		if p.cfg.Thin {
-			tool = "truncate"
-			flag = "-s"
-		}
-
-		_, err = p.exec.Run(ctx, tool, flag, strconv.FormatInt(sizeBytes, 10), path)
-		if err != nil {
-			return errors.Wrapf(err, "%s %s", tool, path)
-		}
+		return err
 	}
 
 	_, err = p.attach(ctx, path)
@@ -125,6 +117,13 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // Without the fallocate, a thick resize would silently downgrade
 // space guarantees — the first write into the extended range could
 // ENOSPC even though the file's apparent size grew.
+//
+// Bug 256 (P2, space-guarantee): the no-grow short-circuit
+// (`info.Size() >= target`) previously returned without re-fallocating,
+// so a sparse-by-history file at the requested size silently survived
+// the resize-as-reconcile pass. ensureFallocated runs on the no-grow
+// branch so the extents are reserved on every reconcile. Thin mode
+// no-ops inside the helper.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 
@@ -140,7 +139,11 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	target := vol.SizeKib * bytesPerKib
 
 	if info.Size() >= target {
-		return nil
+		// Bug 256 fix: no-grow path still reconciles the allocation
+		// guarantee. ensureFallocated no-ops on thin and on thick re-
+		// runs `fallocate -l <bytes>` so a sparse-by-history file at
+		// the requested size gets its extents reserved on disk.
+		return p.ensureFallocated(ctx, path, target)
 	}
 
 	_, err = p.exec.Run(ctx, "truncate", "-s", strconv.FormatInt(target, 10), path)
@@ -148,15 +151,9 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 		return errors.Wrapf(err, "truncate %s", path)
 	}
 
-	if !p.cfg.Thin {
-		// Reserve the extended range on disk so the thick space
-		// guarantee survives the resize. fallocate -l N is idempotent
-		// against an already-allocated file (no-op if blocks are
-		// reserved) and matches the CreateVolume thick path.
-		_, err = p.exec.Run(ctx, "fallocate", "-l", strconv.FormatInt(target, 10), path)
-		if err != nil {
-			return errors.Wrapf(err, "fallocate %s", path)
-		}
+	err = p.ensureFallocated(ctx, path, target)
+	if err != nil {
+		return errors.Wrapf(err, "ensure fallocated %s", path)
 	}
 
 	dev, lerr := p.lookupLoop(ctx, path)
@@ -507,6 +504,71 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	_, err = p.attach(ctx, finalPath)
 	if err != nil {
 		return errors.Wrapf(err, "losetup %s", finalPath)
+	}
+
+	return nil
+}
+
+// createBackingFile materialises the backing file or — if it already
+// exists — re-runs ensureFallocated so a sparse-by-history file gets
+// its thick allocation reconciled. Extracted from CreateVolume to keep
+// the nesting low and the Bug 256 retrofit obvious.
+func (p *Provider) createBackingFile(ctx context.Context, path string, sizeBytes int64) error {
+	_, statErr := os.Stat(path)
+	if statErr == nil {
+		// Bug 256 fix: existing backing file → still reconcile the
+		// allocation guarantee. ensureFallocated no-ops on thin and on
+		// thick re-runs `fallocate -l <bytes>` (idempotent for already-
+		// allocated ranges; fills holes for sparse-by-history files).
+		err := p.ensureFallocated(ctx, path, sizeBytes)
+		if err != nil {
+			return errors.Wrapf(err, "ensure fallocated %s", path)
+		}
+
+		return nil
+	}
+
+	if !os.IsNotExist(statErr) {
+		return errors.Wrapf(statErr, "stat %s", path)
+	}
+
+	tool := "fallocate"
+	flag := "-l"
+
+	if p.cfg.Thin {
+		tool = "truncate"
+		flag = "-s"
+	}
+
+	_, err := p.exec.Run(ctx, tool, flag, strconv.FormatInt(sizeBytes, 10), path)
+	if err != nil {
+		return errors.Wrapf(err, "%s %s", tool, path)
+	}
+
+	return nil
+}
+
+// ensureFallocated is the unified allocation-guarantee policy point for
+// the FILE provider (Bug 247+250+256). On thin it's a no-op (sparse /
+// overcommit is the FILE_THIN contract). On thick it runs `fallocate -l
+// <bytes> <path>` — idempotent for an already-allocated range (fast
+// no-op on ext4/xfs) and the load-bearing step that fills holes in a
+// sparse-by-history file.
+//
+// Callable on every path that may observe an existing backing file:
+// CreateVolume's idempotent-skip, ResizeVolume's no-grow short-circuit,
+// and the post-truncate step in ResizeVolume's grow branch. Centralising
+// the policy in one helper keeps the reconcile-friendly invariant — a
+// thick FILE volume always has its full byte range reserved on disk —
+// in lock-step across every path.
+func (p *Provider) ensureFallocated(ctx context.Context, path string, sizeBytes int64) error {
+	if p.cfg.Thin {
+		return nil
+	}
+
+	_, err := p.exec.Run(ctx, "fallocate", "-l", strconv.FormatInt(sizeBytes, 10), path)
+	if err != nil {
+		return errors.Wrapf(err, "fallocate %s", path)
 	}
 
 	return nil

@@ -61,10 +61,24 @@ func (p *Provider) Kind() string {
 	return "ZFS"
 }
 
-// CreateVolume creates a zvol. Idempotent: existing dataset → no-op.
+// CreateVolume creates a zvol. Idempotent: existing dataset → still
+// reconciles refreservation (Bug 255) so a crash between `zfs create`
+// and the implicit thick-refreservation pass leaves no permanently
+// sparse-thick state across reconciles.
+//
+// Bug 255 (P2, capacity safety): the pre-fix idempotency check returned
+// early BEFORE ensureRefreservation, so any path that observed an
+// existing-but-historically-sparse dataset silently downgraded the
+// thick guarantee. Same root cause as Bug 253/254 — every path that may
+// observe an existing dataset must end on ensureRefreservation. Thin
+// mode no-ops inside the helper.
 func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
-	if p.datasetExists(ctx, p.volumeDataset(vol)) {
-		return nil
+	dataset := p.volumeDataset(vol)
+
+	if p.datasetExists(ctx, dataset) {
+		// Bug 255 fix: do NOT short-circuit before ensuring refreservation.
+		// A prior crash may have left the dataset sparse-thick.
+		return p.ensureRefreservation(ctx, dataset)
 	}
 
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
@@ -74,11 +88,22 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 		args = append(args, "-s")
 	}
 
-	args = append(args, "-V", strconv.FormatInt(sizeMiB, 10)+"M", p.volumeDataset(vol))
+	args = append(args, "-V", strconv.FormatInt(sizeMiB, 10)+"M", dataset)
 
 	_, err := p.exec.Run(ctx, "zfs", args...)
 	if err != nil {
-		return errors.Wrapf(err, "zfs create %s", p.volumeDataset(vol))
+		return errors.Wrapf(err, "zfs create %s", dataset)
+	}
+
+	// THICK mode: `zfs create -V` (no `-s`) reserves the volume size up
+	// front, but explicitly re-set refreservation so a future
+	// ensureRefreservation pre-check observes the value rather than the
+	// inherited default (`zfs get refreservation` on a thick `zfs create
+	// -V` zvol can report "none" on some ZFS versions because the
+	// reservation is implicit). Thin mode no-ops inside the helper.
+	err = p.ensureRefreservation(ctx, dataset)
+	if err != nil {
+		return errors.Wrapf(err, "ensure refreservation on created %s", dataset)
 	}
 
 	return nil

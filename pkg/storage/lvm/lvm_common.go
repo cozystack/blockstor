@@ -63,6 +63,41 @@ func Args(extra ...string) []string {
 	return out
 }
 
+// RestoreIncompleteTag is the LV tag used as a completion sentinel for
+// the two-step restore/recv operations (Bug 257). It is set inline on
+// the lvcreate that allocates the target LV BEFORE the dd byte-copy and
+// removed via `lvchange --deltag` after the dd succeeds. The
+// idempotent-skip on subsequent reconciles inspects the tag:
+//
+//   - tag absent → previous run completed cleanly, short-circuit.
+//   - tag present → previous run crashed mid-dd, re-run the whole
+//     sequence (the dd overwrites the garbage left behind).
+//
+// Without this sentinel a crash between lvcreate and dd would leave the
+// LV existing but holding garbage; the next reconcile's bare
+// "lvExists?" check would mis-trust it as the restored volume — silent
+// data loss. The `@` prefix is the standard LVM tag-namespace marker so
+// `lvs -o lv_tags` reports the exact string this constant carries.
+const RestoreIncompleteTag = "@blockstor-restore-incomplete"
+
+// lvHasRestoreIncompleteTag reports whether the named LV carries the
+// completion sentinel (Bug 257). Used by the idempotent-skip path of
+// Thick.RestoreVolumeFromSnapshot and Thin.RecvSnapshot to decide
+// between "previous run completed, skip" and "previous run crashed,
+// re-run the dd step". Errors from `lvs` are folded into false — the
+// caller's subsequent op surfaces the real cause if the LV is gone.
+func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName string) bool {
+	out, err := ex.Run(ctx, "lvs",
+		Args("--noheadings",
+			"-o", "lv_tags",
+			vg+"/"+lvName)...)
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(out), RestoreIncompleteTag)
+}
+
 // volumeStatusViaLVS runs `lvs <vg>/<lv>` and parses the resulting
 // (path, size) pair into a storage.VolumeStatus. Empty output → the
 // LV doesn't exist; surface NOT_PROVISIONED so the satellite reconciler's

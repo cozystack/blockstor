@@ -47,6 +47,13 @@ func TestCreateVolumeThick(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Post-create ensureRefreservation pass (Bug 255 retrofit): volsize
+	// observable as the just-created 1 GiB, refreservation already
+	// matches (thick `zfs create -V` reserves up front).
+	fx.Expect("zfs get -Hp -o value volsize tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
+	fx.Expect("zfs get -Hp -o value refreservation tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
@@ -88,11 +95,19 @@ func TestCreateVolumeThin(t *testing.T) {
 	}
 }
 
-// TestCreateVolumeIdempotent: existing dataset → no-op.
+// TestCreateVolumeIdempotent: existing dataset → no `zfs create`, but
+// ensureRefreservation still runs (Bug 255). The volsize lookup +
+// refreservation lookup are wired so the helper observes a thick-correct
+// steady state (refreservation already == volsize) and emits no `zfs
+// set`.
 func TestCreateVolumeIdempotent(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("tank/pvc-1_00000\n")})
+	fx.Expect("zfs get -Hp -o value volsize tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
+	fx.Expect("zfs get -Hp -o value refreservation tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
@@ -469,6 +484,12 @@ func TestZFSThickCreateOmitsSparseFlag(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Post-create ensureRefreservation pass (Bug 255 retrofit):
+	// observable thick steady state — no `zfs set` issued.
+	fx.Expect("zfs get -Hp -o value volsize tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
+	fx.Expect("zfs get -Hp -o value refreservation tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
 
 	p := zfs.NewProvider(zfs.Config{Pool: "tank", Thin: false}, fx)
 

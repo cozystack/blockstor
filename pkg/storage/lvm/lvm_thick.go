@@ -212,23 +212,48 @@ func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error
 // CoW; thick has no such shortcut.
 //
 // Canonical thick-restore path:
-//  1. `lvcreate --size <origin_size> --name <new>` — fully-allocated
-//     independent LV matching the thick semantic.
+//  1. `lvcreate --size <origin_size> --addtag @blockstor-restore-incomplete
+//     --name <new>` — fully-allocated independent LV tagged
+//     mid-operation.
 //  2. `dd if=/dev/<vg>/<snap> of=/dev/<vg>/<new> bs=1M conv=fsync` —
 //     copy the snapshot bytes onto the new LV.
+//  3. `lvchange --deltag @blockstor-restore-incomplete <vg>/<new>` —
+//     clear the sentinel.
 //
 // Heavy I/O, but the correct semantic for "restore snapshot to a new
 // independent volume on thick LVM". The new volume survives arbitrary
 // write volume because it isn't a COW overlay.
 //
-// Idempotent: target LV present → resumed reconcile, no-op.
+// Bug 257 (P1, data integrity): the pre-fix idempotency check was a
+// bare lvExists — a crash BETWEEN lvcreate and dd left the LV existing
+// with garbage content, and the next reconcile mis-trusted it as the
+// restored volume. The fix is a completion sentinel: the lvcreate
+// carries `--addtag @blockstor-restore-incomplete` inline so the
+// sentinel is present from the first byte of the LV's existence, and
+// only the post-dd deltag clears it. Idempotent-skip checks the tag:
+// present → previous run crashed mid-dd, re-run the dd; absent →
+// previous run completed cleanly, short-circuit.
 func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
 	tgtName := volumeLVName(target)
+	srcName := snapshotLVName(src)
+
 	if t.lvExists(ctx, tgtName) {
-		return nil
+		// Bug 257: idempotent-skip is conditional on the sentinel
+		// being absent. Present → previous run crashed mid-dd; re-run
+		// just the dd + deltag steps (lvcreate is skipped since the LV
+		// already holds an allocation).
+		if !lvHasRestoreIncompleteTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName) {
+			return nil
+		}
+
+		if !t.lvExists(ctx, srcName) {
+			return errors.Wrapf(storage.ErrNotFound,
+				"snapshot LV %s/%s for restore re-run", t.cfg.VolumeGroup, srcName)
+		}
+
+		return t.copyAndClearSentinel(ctx, srcName, tgtName)
 	}
 
-	srcName := snapshotLVName(src)
 	if !t.lvExists(ctx, srcName) {
 		return errors.Wrapf(storage.ErrNotFound, "snapshot LV %s/%s for clone", t.cfg.VolumeGroup, srcName)
 	}
@@ -245,9 +270,14 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 
 	sizeMiB := max(srcStatus.UsableKib/mibPerKib, 1)
 
+	// lvcreate carries `--addtag` inline (Bug 257): the sentinel is set
+	// in the same LVM transaction that allocates the LV, so a crash
+	// BEFORE dd cannot leave an un-tagged LV that would be mis-trusted
+	// on the next reconcile.
 	_, err = t.exec.Run(ctx, "lvcreate",
 		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", tgtName,
+			"--addtag", RestoreIncompleteTag,
 			// Same udev-less satellite workaround as CreateVolume.
 			"--config", "activation{udev_sync=0 udev_rules=0}",
 			"-Wn", "-Zn",
@@ -256,19 +286,32 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 		return errors.Wrapf(err, "lvcreate --size %s for restore", tgtName)
 	}
 
-	// Copy snapshot bytes onto the new LV. conv=fsync forces the dirty
-	// cache to disk before dd returns, so a satellite crash after this
-	// call leaves a consistent-on-disk volume.
+	return t.copyAndClearSentinel(ctx, srcName, tgtName)
+}
+
+// copyAndClearSentinel runs the dd byte-copy and, on success, clears
+// the completion sentinel (Bug 257). Failure of the dd leaves the
+// sentinel in place so the next reconcile re-runs the sequence; failure
+// of the deltag itself is propagated because a successful dd with a
+// surviving tag would re-trigger the dd on every subsequent reconcile.
+func (t *Thick) copyAndClearSentinel(ctx context.Context, srcName, tgtName string) error {
 	srcPath := "/dev/" + t.cfg.VolumeGroup + "/" + srcName
 	tgtPath := "/dev/" + t.cfg.VolumeGroup + "/" + tgtName
 
-	_, err = t.exec.Run(ctx, "dd",
+	_, err := t.exec.Run(ctx, "dd",
 		"if="+srcPath,
 		"of="+tgtPath,
 		"bs=1M",
 		"conv=fsync")
 	if err != nil {
 		return errors.Wrapf(err, "dd %s → %s for restore", srcName, tgtName)
+	}
+
+	_, err = t.exec.Run(ctx, "lvchange",
+		Args("--deltag", RestoreIncompleteTag,
+			t.cfg.VolumeGroup+"/"+tgtName)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvchange --deltag %s/%s", t.cfg.VolumeGroup, tgtName)
 	}
 
 	return nil

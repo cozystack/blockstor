@@ -101,8 +101,16 @@ func TestCreateVolumeThinSparse(t *testing.T) {
 	}
 }
 
-// TestCreateVolumeIdempotent: existing file → no allocator run; the
-// losetup attach still runs to ensure the loop dev exists.
+// TestCreateVolumeIdempotent: existing file in THIN mode → no allocator
+// run (sparse / overcommit is the FILE_THIN contract); the losetup attach
+// still runs to ensure the loop dev exists.
+//
+// Note: the thick-mode idempotent-skip MUST issue `fallocate` on every
+// reconcile (Bug 256) to reconcile a sparse-by-history backing file.
+// That behaviour is pinned by TestThickCreateIdempotentSkipStillFallocates
+// in idempotent_thick_bug_256_test.go — keeping it in a Thin-only test
+// here makes the no-allocator invariant precisely scoped to the variant
+// where it still holds.
 func TestCreateVolumeIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
@@ -115,7 +123,7 @@ func TestCreateVolumeIdempotent(t *testing.T) {
 
 	fakeLosetup(fx, preexisting, "/dev/loop42")
 
-	p := file.NewProvider(file.Config{Dir: dir}, fx)
+	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, fx)
 
 	err := p.CreateVolume(t.Context(), storage.Volume{
 		ResourceName: "pvc-1",
@@ -128,7 +136,7 @@ func TestCreateVolumeIdempotent(t *testing.T) {
 
 	for _, line := range fx.CommandLines() {
 		if line[:9] == "fallocate" || line[:8] == "truncate" {
-			t.Errorf("idempotent CreateVolume issued allocator: %s", line)
+			t.Errorf("idempotent CreateVolume (THIN) issued allocator: %s", line)
 		}
 	}
 }

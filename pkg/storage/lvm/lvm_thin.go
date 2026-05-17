@@ -322,37 +322,48 @@ func (r *lvmDDReader) Close() error {
 // The post-recv dance is the same as ZFS: drbdmeta drop-md +
 // drbdadm create-md to stamp the local node-id over the embedded
 // metadata, then drbdadm adjust.
+//
+// Bug 257 (P1, data integrity): the pre-fix idempotency check was a
+// bare lvExists — a crash BETWEEN lvcreate and dd left the LV existing
+// with garbage stream bytes (or nothing at all), and the next reconcile
+// mis-trusted it as the received snapshot. The fix is the same
+// completion sentinel used by Thick.RestoreVolumeFromSnapshot: lvcreate
+// carries `--addtag @blockstor-restore-incomplete` inline, the dd
+// runs, and post-dd `lvchange --deltag` clears the sentinel. The
+// idempotent-skip path inspects the tag: present → re-run the dd;
+// absent → previous run completed cleanly.
 func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
 	tgtName := volumeLVName(target)
+
 	if t.lvExists(ctx, tgtName) {
-		return nil
+		// Bug 257: idempotent-skip is conditional on the sentinel
+		// being absent. Present → previous run crashed mid-dd; re-run
+		// just the dd + deltag steps (lvcreate is skipped — the LV is
+		// already allocated, the dd will overwrite the bytes).
+		if !lvHasRestoreIncompleteTag(ctx, t.exec, t.cfg.VolumeGroup, tgtName) {
+			return nil
+		}
+
+		return t.ddRecvAndClearSentinel(ctx, target, src)
 	}
 
-	// Allocate the target LV first so dd has somewhere to write.
-	// CreateVolume's idempotency already handles the "exists"
-	// branch; pass through so the lvcreate flags match what a
-	// regular CreateVolume would have done.
-	err := t.CreateVolume(ctx, target)
+	// Allocate the target LV with the sentinel set inline so the tag is
+	// present from the first byte of the LV's existence; a crash BEFORE
+	// dd cannot leave an un-tagged LV that would be mis-trusted on the
+	// next reconcile (Bug 257).
+	sizeMiB := max(target.SizeKib/mibPerKib, 1)
+
+	_, err := t.exec.Run(ctx, "lvcreate",
+		Args("--thin",
+			"--virtualsize", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--name", tgtName,
+			"--addtag", RestoreIncompleteTag,
+			t.cfg.VolumeGroup+"/"+t.cfg.ThinPool)...)
 	if err != nil {
 		return errors.Wrapf(err, "pre-create LV %s for recv", tgtName)
 	}
 
-	devPath := "/dev/" + t.cfg.VolumeGroup + "/" + tgtName
-
-	cmd := exec.CommandContext(ctx, "dd", "of="+devPath, "bs=1M", "status=none", "conv=fsync") //nolint:gosec // VG / LV names come from operator-owned StoragePool CRDs
-	cmd.Stdin = src
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		// Roll back the pre-created LV so the next reconcile re-
-		// streams cleanly. Best-effort lvremove — if it also fails
-		// the operator will see both errors in the surrounding log.
-		_ = t.DeleteVolume(ctx, target)
-
-		return errors.Wrapf(err, "dd recv %s: %s", devPath, strings.TrimSpace(string(out)))
-	}
-
-	return nil
+	return t.ddRecvAndClearSentinel(ctx, target, src)
 }
 
 // ListVolumeNames enumerates every LV in the configured VG that
@@ -368,6 +379,41 @@ func (t *Thin) RecvSnapshot(ctx context.Context, target storage.Volume, src io.R
 // lv_attr.
 func (t *Thin) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error) {
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
+}
+
+// ddRecvAndClearSentinel runs the dd byte-copy from src into the
+// pre-allocated thin LV and, on success, clears the completion sentinel
+// (Bug 257). On dd failure the LV is removed so the next reconcile
+// re-streams cleanly (matches the pre-fix rollback behaviour). Failure
+// of the deltag itself is propagated because a successful dd with a
+// surviving tag would re-trigger the dd on every subsequent reconcile.
+//
+// The dd is run through storage.Exec.RunWithStdin so unit tests can
+// inject a FakeExec and assert the argv shape — same seam the LUKS path
+// uses (Bug 175 hardening pulled RunWithStdin into the contract).
+func (t *Thin) ddRecvAndClearSentinel(ctx context.Context, target storage.Volume, src io.Reader) error {
+	tgtName := volumeLVName(target)
+	devPath := "/dev/" + t.cfg.VolumeGroup + "/" + tgtName
+
+	out, err := t.exec.RunWithStdin(ctx, src, "dd",
+		"of="+devPath, "bs=1M", "status=none", "conv=fsync")
+	if err != nil {
+		// Roll back the pre-created LV so the next reconcile re-
+		// streams cleanly. Best-effort lvremove — if it also fails
+		// the operator will see both errors in the surrounding log.
+		_ = t.DeleteVolume(ctx, target)
+
+		return errors.Wrapf(err, "dd recv %s: %s", devPath, strings.TrimSpace(string(out)))
+	}
+
+	_, err = t.exec.Run(ctx, "lvchange",
+		Args("--deltag", RestoreIncompleteTag,
+			t.cfg.VolumeGroup+"/"+tgtName)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvchange --deltag %s/%s", t.cfg.VolumeGroup, tgtName)
+	}
+
+	return nil
 }
 
 // listLVMVolumes is the shared LV-enumeration helper used by both

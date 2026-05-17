@@ -128,6 +128,14 @@ func TestNamingContract_ZFSThick(t *testing.T) {
 	const pool = "blockstor-zfs"
 
 	fx := storage.NewFakeExec()
+	// Post-create ensureRefreservation pass (Bug 255 retrofit): the
+	// helper observes the just-created 1 MiB dataset already at the
+	// thick-correct refreservation, so no `zfs set` is issued.
+	fx.Expect("zfs get -Hp -o value volsize "+pool+"/pvc-42_00007",
+		storage.FakeResponse{Stdout: []byte("1048576\n")})
+	fx.Expect("zfs get -Hp -o value refreservation "+pool+"/pvc-42_00007",
+		storage.FakeResponse{Stdout: []byte("1048576\n")})
+
 	p := zfs.NewProvider(zfs.Config{Pool: pool, Thin: false}, fx)
 
 	err := p.CreateVolume(t.Context(), storage.Volume{

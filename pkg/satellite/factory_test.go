@@ -156,8 +156,18 @@ func TestFactoryZFSMissingBothKeysErrors(t *testing.T) {
 // black-box way to verify which prop key was picked, because the
 // Config struct lives in the zfs package and isn't exposed back
 // through the storage.Provider interface.
+//
+// Pre-loads the post-create ensureRefreservation observability lookups
+// (Bug 255 retrofit) so the thick variant's helper finishes cleanly;
+// thin providers skip those lookups inside the helper itself.
 func assertZFSProviderUsesPool(t *testing.T, prov storage.Provider, fx *storage.FakeExec, wantPool string) {
 	t.Helper()
+
+	probeDataset := wantPool + "/probe_00000"
+	fx.Expect("zfs get -Hp -o value volsize "+probeDataset,
+		storage.FakeResponse{Stdout: []byte("1048576\n")})
+	fx.Expect("zfs get -Hp -o value refreservation "+probeDataset,
+		storage.FakeResponse{Stdout: []byte("1048576\n")})
 
 	err := prov.CreateVolume(t.Context(), storage.Volume{
 		ResourceName: "probe",
