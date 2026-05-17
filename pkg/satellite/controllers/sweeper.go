@@ -32,13 +32,53 @@ import (
 
 // SweeperPeriod is the default cadence at which the orphan sweeper
 // reconciles kernel-resident DRBD resources against Resource CRDs
-// on this node. Five minutes is the same ballpark as kubelet's
-// volume-GC cycle: long enough to avoid hammering drbdsetup on a
-// healthy cluster, short enough that a force-strip-leftover (the
-// failure mode this exists to catch — see the
-// `blockstor_drbd_stuck_state` recovery skill) clears within one
-// HPA / human-attention window.
-const SweeperPeriod = 5 * time.Minute
+// on this node.
+//
+// Bug 290 (P1): the previous 5-minute cadence proved far too long
+// once a single orphan kernel slot reliably blocks every new RD
+// that would re-use its minor. With `drbdsetup new-minor` failing
+// on a reconcile-tight feedback loop ("Minor or volume exists
+// already" / "Device '<minor>' is configured!"), the kubelet-side
+// PVC binding and the e2e harness's `wait_uptodate` both time out
+// long before the 5-minute window elapses. 30 s keeps
+// drbdsetup-status traffic negligible on a healthy cluster
+// (~one call/min per satellite, plus the immediate-on-start
+// sweep) while shrinking post-strip recovery latency to a window
+// an e2e run or an interactive operator can tolerate. The
+// SweeperRDGrace window (60s) still protects against
+// create/delete-fanout races (Bug 291) — the grace check fires
+// against the RD timestamp, not the tick cadence.
+const SweeperPeriod = 30 * time.Second
+
+// SweeperSetupDownTimeout bounds the per-resource `drbdsetup down`
+// call the sweeper issues against an orphan.
+//
+// Bug 290 (P1): without this bound, `sweepOnce` passed its whole
+// tick context — `context.WithTimeout(parent, SweeperPeriod)` —
+// straight into `Adm.SetupDown`, so a SINGLE wedged kernel slot
+// (the DRBD-stuck-state pattern from
+// `blockstor_drbd_stuck_state`, where `drbdsetup down` hangs
+// forever on a netlink op against a gone peer) consumed the
+// entire tick budget. The sweeper then made zero forward progress
+// on any OTHER orphan, and on the next tick the same wedged slot
+// re-burned the next tick's budget the same way. Observed on
+// e2e7-worker-1 Run 7 (pv-test minor 1000 leaked + drbd_w_pv-test
+// kernel thread stuck on dead peer) where the 5-min ctx kill
+// fired every cycle and the slot blocked every fresh 2-replica
+// RD from reaching UpToDate.
+//
+// 10 s is generous for a healthy `drbdsetup down` (finishes in
+// well under a second) and short enough that the sweeper still
+// scans many orphans within one tick + the per-cycle rate-limit.
+// The per-call ctx is derived from the tick ctx so a tick
+// cancellation still aborts the in-flight call promptly.
+//
+// Note: this does NOT recover the kernel-stuck state itself —
+// that requires a node reboot (the kernel thread is stuck inside
+// netlink, beyond userspace's reach). The bound exists so the
+// sweeper doesn't compound the kernel-stuck state by ALSO making
+// the userspace cleanup loop unresponsive to other orphans.
+const SweeperSetupDownTimeout = 10 * time.Second
 
 // SweeperMaxDownPerCycle bounds the number of `drbdadm down` calls
 // the sweeper issues per tick. The whole point of the sweeper is
@@ -55,6 +95,35 @@ const SweeperPeriod = 5 * time.Minute
 // any plausible production resource count, so a true orphan storm
 // stays visible in logs without a self-inflicted outage.
 const SweeperMaxDownPerCycle = 3
+
+// SweeperRDGrace bounds how recently a matching ResourceDefinition
+// may have been created or marked for deletion before the sweeper
+// will tear down its kernel slot.
+//
+// Bug 291 (P1): the sweeper's "no local Resource CRD ⇒ orphan"
+// rule races the controller's create / delete propagation. When
+// `linstor rd create` lands, the controller writes the
+// ResourceDefinition first, then the per-node Resource CRDs in a
+// follow-up reconcile pass; the satellite reconciler may have
+// already issued `drbdadm up` on this node (because the .res file
+// was written eagerly) before the matching Resource CRD lands in
+// the cache the sweeper consults. A sweep tick that fires in that
+// window sees a kernel slot with no local CRD and tears it down —
+// the next reconciler pass then has to bootstrap the slot from
+// scratch, and on a busy stand the slot never converges before
+// the e2e `wait_uptodate` budget elapses. Mirror-image race on
+// delete: kubectl deletes the RD, kernel slot survives by design
+// (CRD finalizers gate teardown), but the cached Resource CRDs
+// drop out of the list before the satellite's DeleteResource
+// finishes — the sweeper sees "orphan" and tears down the slot
+// the satellite was still cleaning up, leaking partial state.
+//
+// 60s covers both: the controller's create-fanout reliably
+// completes within ~5s on a healthy apiserver, and the
+// satellite's DeleteResource bounds itself to ~30s per resource
+// even on the slowest path. Anything still orphaned after 60s is
+// the genuine force-strip aftermath this code exists for.
+const SweeperRDGrace = 60 * time.Second
 
 // SweeperSkipAnnotation is the annotation key the sweeper honours
 // on the LOCAL Node CRD (NOT the Resource CRD — orphans by
@@ -103,6 +172,32 @@ type OrphanSweeperRunnable struct {
 	// want to assert the full-list behaviour without juggling the
 	// bound).
 	MaxDownPerCycle int
+
+	// RDGrace overrides SweeperRDGrace (test-only). A zero value
+	// falls back to SweeperRDGrace; a negative value disables the
+	// grace window entirely (legacy behaviour, useful in tests
+	// that assert the immediate-tear-down path).
+	RDGrace time.Duration
+
+	// SetupDownTimeout overrides SweeperSetupDownTimeout (test-only).
+	// A zero value falls back to SweeperSetupDownTimeout; a negative
+	// value disables the per-resource bound entirely (only used by
+	// tests that want to assert the pre-Bug-290 unbounded behaviour
+	// from a regression-guard angle).
+	SetupDownTimeout time.Duration
+
+	// now returns the current time; pluggable for tests so the
+	// grace-window assertions don't have to juggle real-time
+	// sleeps. Defaults to time.Now when unset.
+	now func() time.Time
+
+	// setupDownFn is a test-only hook for the per-orphan
+	// `drbdsetup down` call. Defaults to s.Adm.SetupDown when
+	// unset. Tests use it to capture the per-resource ctx deadline
+	// (asserting the SweeperSetupDownTimeout bound is applied) and
+	// to simulate the DRBD-stuck-state hang without needing a real
+	// drbdsetup process. Production callers must leave this nil.
+	setupDownFn func(ctx context.Context, resource string) error
 }
 
 // NeedLeaderElection returns false. Every satellite must run its
@@ -114,11 +209,20 @@ func (*OrphanSweeperRunnable) NeedLeaderElection() bool { return false }
 // Start runs the sweep loop until ctx cancels. Surface errors are
 // logged but never abort the loop — a transient drbdsetup hiccup
 // or apiserver blip must not take the satellite out of service.
-// The first sweep waits one period before firing: on satellite
-// startup the c-r cache hasn't yet warmed (the four reconcilers
-// are still flushing initial CRD events) and a sweep against a
-// half-populated cache would mistake every legitimate resource
-// for an orphan and tear them all down.
+//
+// Bug 290 (P1): the first sweep fires IMMEDIATELY rather than
+// waiting one full period. controller-runtime starts the non-
+// leader-election Runnables (which we are) only after the cache
+// has completed its initial sync (see
+// `runnables.Caches.Start` → `runnables.Others.Start` in c-r
+// 0.23.3 internal.go), so the previous "wait for cache to warm"
+// rationale no longer applies. On a satellite restart that left a
+// leaked kernel slot behind (force-strip pattern from
+// `blockstor_drbd_stuck_state`), every extra second the slot
+// lingers is a second the next RD wanting its minor stays
+// Inconsistent / fails create-md. Sweeping once on Start clears
+// that within the first second of pod readiness instead of after
+// one tick.
 func (s *OrphanSweeperRunnable) Start(ctx context.Context) error {
 	period := s.Period
 	if period == 0 {
@@ -126,6 +230,16 @@ func (s *OrphanSweeperRunnable) Start(ctx context.Context) error {
 	}
 
 	logger := log.FromContext(ctx).WithName("orphan-sweeper").WithValues("node", s.NodeName)
+
+	// Bug 290: immediate sweep on Start. controller-runtime has
+	// already waited for cache sync before calling us, so the
+	// orphan classification cannot mis-fire against a half-warm
+	// cache. ctx propagation in sweepOnce ensures a shutdown still
+	// aborts any in-flight drbdsetup call.
+	err := s.sweepOnce(ctx, logger)
+	if err != nil {
+		logger.Error(err, "initial sweep")
+	}
 
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -203,41 +317,118 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 		return errors.Wrap(err, "list local Resource CRDs")
 	}
 
+	rdAges, err := s.listResourceDefinitionAges(ctx)
+	if err != nil {
+		// RD-read failures shouldn't abort the sweep — fall back to
+		// "no grace window" so a transient apiserver blip doesn't
+		// silently disable the safety net. The pre-grace behaviour
+		// is the safe-side default: at worst the sweeper tears down
+		// a slot that the reconciler then rebuilds, which is a
+		// recoverable loss.
+		logger.Error(err, "list ResourceDefinitions for grace window; proceeding without grace")
+
+		rdAges = nil
+	}
+
+	s.tearDownOrphans(ctx, logger, kernel, owned, rdAges)
+
+	return nil
+}
+
+// sweepDecision is the per-orphan-candidate outcome from
+// classifyOrphan: whether to skip (matching CRD), defer (inside
+// RD grace window), or tear it down.
+type sweepDecision int
+
+const (
+	sweepKeep sweepDecision = iota
+	sweepDefer
+	sweepTearDown
+)
+
+// classifyOrphan decides what to do with one kernel resource: keep
+// (matching local Resource CRD), defer (no CRD but the RD was
+// touched inside the grace window), or tear it down. Pulled out of
+// sweepOnce to bring the orchestration function back under the
+// gocyclo budget after the Bug 291 grace-window addition.
+func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration) (sweepDecision, time.Duration) {
+	if _, ok := owned[rsc]; ok {
+		return sweepKeep, 0
+	}
+
+	if grace <= 0 {
+		return sweepTearDown, 0
+	}
+
+	anchor, ok := rdAges[rsc]
+	if !ok {
+		return sweepTearDown, 0
+	}
+
+	age := now.Sub(anchor)
+	if age < grace {
+		return sweepDefer, age
+	}
+
+	return sweepTearDown, age
+}
+
+// tearDownOrphans iterates the kernel-resource list and applies the
+// classifyOrphan decision to each, subject to the per-cycle
+// rate-limit. Pulled out of sweepOnce for gocyclo budget reasons.
+func (s *OrphanSweeperRunnable) tearDownOrphans(ctx context.Context, logger logr.Logger, kernel []string, owned map[string]struct{}, rdAges map[string]time.Time) {
 	limit := s.MaxDownPerCycle
 	if limit == 0 {
 		limit = SweeperMaxDownPerCycle
 	}
 
+	grace := s.RDGrace
+	if grace == 0 {
+		grace = SweeperRDGrace
+	}
+
+	clock := s.now
+	if clock == nil {
+		clock = time.Now
+	}
+
+	now := clock()
+
 	var torn int
 
 	for _, rsc := range kernel {
-		if _, ok := owned[rsc]; ok {
+		decision, age := classifyOrphan(rsc, owned, rdAges, now, grace)
+
+		switch decision {
+		case sweepKeep:
 			continue
+		case sweepDefer:
+			logger.V(1).Info("orphan candidate within RD grace window; deferring",
+				"resource", rsc,
+				"age", age,
+				"grace", grace)
+
+			continue
+		case sweepTearDown:
+			// fall through to teardown below
 		}
 
 		if limit >= 0 && torn >= limit {
 			logger.Info("orphan sweep rate-limit hit; deferring remainder to next cycle",
 				"limit", limit, "kernel_total", len(kernel))
 
-			return nil
+			return
 		}
 
 		// Use `drbdsetup down` (kernel-direct) rather than
 		// `drbdadm down` (which needs the .res file to enumerate
-		// the resource). The whole reason the sweeper exists is
-		// the .res-less aftermath: DeleteResource removed the
-		// .res file but its own drbdadm-down step never reached
-		// the kernel, or a restart wiped /etc/drbd.d before the
-		// kernel slot was torn down. Calling drbdadm-down here
-		// would always fail with `'<rsc>' not defined in your
-		// config (for this host)` / `no resources defined!`, the
-		// kernel slot would survive forever, and the next RD
-		// re-using the same minor would fail create-md with
-		// "Device '<minor>' is configured!" (issue 288).
+		// the resource). See issue 288 for the full rationale.
+		// Bug 290: bound the per-call to SweeperSetupDownTimeout
+		// so a single wedged slot can't burn the whole tick.
 		logger.Info("orphan DRBD resource detected; running drbdsetup down",
 			"resource", rsc)
 
-		downErr := s.Adm.SetupDown(ctx, rsc)
+		downErr := s.callSetupDown(ctx, rsc)
 		if downErr != nil {
 			// Per-resource failure shouldn't abort the cycle —
 			// move on to the next orphan and let the next tick
@@ -250,8 +441,40 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 
 		torn++
 	}
+}
 
-	return nil
+// callSetupDown wraps the per-orphan `drbdsetup down` invocation
+// with the per-resource bound (SweeperSetupDownTimeout) and the
+// test-only setupDownFn hook.
+//
+// Bug 290 (P1): a single wedged kernel slot used to consume the
+// whole sweep tick because the per-orphan call inherited the
+// tick's 5-minute ctx. The bound limits each call to
+// SweeperSetupDownTimeout (10s by default) so the sweeper keeps
+// scanning even when one slot is in the stuck-state pattern from
+// `blockstor_drbd_stuck_state`.
+//
+// A negative SetupDownTimeout disables the bound (test-only — see
+// the field doc on OrphanSweeperRunnable).
+func (s *OrphanSweeperRunnable) callSetupDown(ctx context.Context, resource string) error {
+	timeout := s.SetupDownTimeout
+	if timeout == 0 {
+		timeout = SweeperSetupDownTimeout
+	}
+
+	setupDown := s.setupDownFn
+	if setupDown == nil {
+		setupDown = s.Adm.SetupDown
+	}
+
+	if timeout < 0 {
+		return setupDown(ctx, resource)
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	return setupDown(callCtx, resource)
 }
 
 // shouldSkip checks the local Node CRD for the SweeperSkipAnnotation.
@@ -297,6 +520,45 @@ func (s *OrphanSweeperRunnable) listOwnedResourceNames(ctx context.Context) (map
 		}
 
 		out[r.Spec.ResourceDefinitionName] = struct{}{}
+	}
+
+	return out, nil
+}
+
+// listResourceDefinitionAges returns a per-RD-name "freshness
+// anchor" used by the grace window in sweepOnce. The anchor is
+// the most recent of CreationTimestamp and DeletionTimestamp:
+// either one means the controller / satellite is mid-fanout and
+// the sweeper should defer.
+//
+// An RD whose status has been stable for longer than the grace
+// window is NOT included — those are the steady-state cases
+// where any orphan kernel slot is the genuine force-strip
+// aftermath the sweeper exists to clean up.
+//
+// Returning a nil map (no RDs / read failure handled by caller)
+// is a valid zero result: callers MUST treat "name absent" as
+// "no grace window applies".
+func (s *OrphanSweeperRunnable) listResourceDefinitionAges(ctx context.Context) (map[string]time.Time, error) {
+	var list blockstoriov1alpha1.ResourceDefinitionList
+
+	err := s.Client.List(ctx, &list)
+	if err != nil {
+		return nil, errors.Wrap(err, "list ResourceDefinitions")
+	}
+
+	out := map[string]time.Time{}
+
+	for i := range list.Items {
+		rd := &list.Items[i]
+
+		anchor := rd.CreationTimestamp.Time
+
+		if rd.DeletionTimestamp != nil && rd.DeletionTimestamp.After(anchor) {
+			anchor = rd.DeletionTimestamp.Time
+		}
+
+		out[rd.Name] = anchor
 	}
 
 	return out, nil

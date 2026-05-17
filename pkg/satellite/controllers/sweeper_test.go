@@ -17,10 +17,13 @@ limitations under the License.
 package controllers
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -271,5 +274,169 @@ func TestSweeperSkipAnnotationDisablesSweep(t *testing.T) {
 		if strings.HasPrefix(line, "drbdadm down") || strings.HasPrefix(line, "drbdsetup down") {
 			t.Errorf("sweeper ignored skip annotation: %s", line)
 		}
+	}
+}
+
+// TestSweeperBoundsPerResourceSetupDown pins the load-bearing
+// Bug 290 invariant: when one orphan's `drbdsetup down` wedges
+// (the DRBD-stuck-state pattern where the kernel netlink call
+// hangs forever on a gone peer), the sweeper MUST move past it
+// within SetupDownTimeout and try the NEXT orphan rather than
+// burning the whole tick budget on the one stuck slot.
+//
+// The setupDownFn hook simulates the wedge: the first call to
+// `pvc-stuck` blocks until its own ctx fires (which the sweeper's
+// per-resource timeout will cancel within SetupDownTimeout), then
+// returns ctx.Err(). The second orphan `pvc-other` must still get
+// a tear-down attempt inside the same sweep cycle.
+func TestSweeperBoundsPerResourceSetupDown(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+			Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status", storage.FakeResponse{
+		Stdout: []byte("pvc-stuck role:Secondary\n  volume:0 disk:UpToDate\n\n" +
+			"pvc-other role:Secondary\n  volume:0 disk:Diskless\n"),
+	})
+
+	var stuckCalls, otherCalls atomic.Int32
+
+	sweeper := &OrphanSweeperRunnable{
+		Client:           cli,
+		Adm:              drbd.NewAdm(fx),
+		NodeName:         "n1",
+		SetupDownTimeout: 50 * time.Millisecond,
+		// Negative RDGrace disables the grace window so the
+		// table-driven orphan list lands in tear-down directly.
+		RDGrace: -1,
+		setupDownFn: func(ctx context.Context, resource string) error {
+			switch resource {
+			case "pvc-stuck":
+				stuckCalls.Add(1)
+				// Block until ctx fires — simulates the kernel-stuck
+				// hang. The per-resource WithTimeout in callSetupDown
+				// must cancel us within SetupDownTimeout.
+				<-ctx.Done()
+
+				return ctx.Err()
+			case "pvc-other":
+				otherCalls.Add(1)
+
+				return nil
+			}
+
+			return nil
+		},
+	}
+
+	start := time.Now()
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if stuckCalls.Load() != 1 {
+		t.Errorf("pvc-stuck call count = %d; want 1", stuckCalls.Load())
+	}
+
+	if otherCalls.Load() != 1 {
+		t.Errorf("pvc-other never got a chance after pvc-stuck wedged; "+
+			"the per-resource bound is not being applied (Bug 290 regression). "+
+			"otherCalls=%d, elapsed=%s", otherCalls.Load(), elapsed)
+	}
+
+	// 50ms timeout + 50ms slack should be plenty. If the test
+	// takes more than ~500ms, the per-resource bound is broken
+	// (probably reverted to passing the whole tick ctx in).
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("sweepOnce took %s for one stuck orphan + one healthy one; "+
+			"per-resource bound is not being honoured (Bug 290 regression)", elapsed)
+	}
+}
+
+// TestSweeperRunsImmediatelyOnStart pins the second half of
+// Bug 290: the sweeper Start() must fire its first sweep
+// immediately rather than after one full Period. On a satellite
+// restart that left a leaked kernel slot behind, every extra
+// second of latency on the first sweep is a second the next RD
+// wanting that minor stays Inconsistent / fails create-md.
+func TestSweeperRunsImmediatelyOnStart(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(&blockstoriov1alpha1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+			Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+		}).
+		Build()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status",
+		storage.FakeResponse{Stdout: []byte("pvc-orphan role:Secondary\n  volume:0 disk:Diskless\n")})
+
+	swept := make(chan string, 1)
+
+	sweeper := &OrphanSweeperRunnable{
+		Client: cli,
+		Adm:    drbd.NewAdm(fx),
+		// 1h Period: if the first sweep waited for the ticker
+		// we'd time out the test long before it fired. The
+		// immediate-sweep semantics is the only path that can
+		// satisfy the assertion below.
+		Period:   time.Hour,
+		NodeName: "n1",
+		RDGrace:  -1,
+		setupDownFn: func(_ context.Context, resource string) error {
+			select {
+			case swept <- resource:
+			default:
+			}
+
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+
+	go func() {
+		_ = sweeper.Start(ctx)
+		close(done)
+	}()
+
+	select {
+	case got := <-swept:
+		if got != "pvc-orphan" {
+			t.Errorf("first sweep tore down %q; want pvc-orphan", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not run an immediate sweep; ticker-only Start is a Bug 290 regression")
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after ctx cancel")
 	}
 }
