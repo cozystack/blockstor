@@ -33,6 +33,15 @@ rules:
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get, list, watch]
+  # Bug 283: enrichNodesWithInternalIP lists corev1.Node to synthesise
+  # a k8s-internal NetInterface from each node's InternalIP. Without
+  # this RBAC the helper falls back silently to pod-CIDR addresses,
+  # peer DRBD connections target unroutable IPs, and no 2-replica RD
+  # ever reaches UpToDate. Read-only; the daemonset never mutates
+  # corev1.Node.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch, delete]
