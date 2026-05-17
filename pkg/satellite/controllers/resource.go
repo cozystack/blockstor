@@ -325,7 +325,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
 	if rdNeedsDRBD(&rd) {
-		if waitResult, waitOK := r.waitForControllerAllocation(res, peers, logger); !waitOK {
+		if waitResult, waitOK := r.waitForControllerAllocation(ctx, res, peers, logger); !waitOK {
 			return waitResult, nil
 		}
 	}
@@ -746,14 +746,33 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // typically completes within hundreds of milliseconds — no point
 // waiting the full apply-failure backoff for a write that's
 // already in flight.
-func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
+//
+// Bug 289: when the cached view of `res` reports nil DRBD-IDs the
+// controller may have already stamped them — the satellite's c-r
+// informer cache trails the apiserver during the initial-create
+// burst, and a single stale watch event can pin the cache on a
+// pre-allocation revision well past the controller's actual
+// commit. We re-fetch the Resource through the uncached APIReader
+// before declaring "still nil" so the recovery-down-reverses
+// revive path (which depends on a previously-allocated Resource)
+// no longer wedges behind a stale cache. Mutates `res` in place
+// so the caller's downstream `dispatcher.BuildDesired` sees the
+// fresh allocation in the same reconcile.
+func (r *ResourceReconciler) waitForControllerAllocation(ctx context.Context, res *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, logger logr.Logger) (ctrl.Result, bool) {
 	if res.Status.DRBDNodeID == nil || res.Status.DRBDPort == nil || res.Status.DRBDMinor == nil {
-		logger.Info("waiting for controller-side DRBD-ID allocation",
-			"nodeID", res.Status.DRBDNodeID,
-			"port", res.Status.DRBDPort,
-			"minor", res.Status.DRBDMinor)
+		// APIReader fall-through (Bug 289): when the cached view
+		// reports nil DRBD-IDs, the controller may have already
+		// stamped them — re-fetch uncached before declaring the
+		// wait. refreshTargetFromAPIReader mutates `res` in place
+		// when the apiserver has the fresh allocation.
+		if !r.refreshTargetFromAPIReader(ctx, res, logger) {
+			logger.Info("waiting for controller-side DRBD-ID allocation",
+				"nodeID", res.Status.DRBDNodeID,
+				"port", res.Status.DRBDPort,
+				"minor", res.Status.DRBDMinor)
 
-		return ctrl.Result{RequeueAfter: applyFailureRequeue}, false
+			return ctrl.Result{RequeueAfter: applyFailureRequeue}, false
+		}
 	}
 
 	if !dispatcher.DiskfulPeersAllocated(res, peers) {
@@ -764,6 +783,48 @@ func (r *ResourceReconciler) waitForControllerAllocation(res *blockstoriov1alpha
 	}
 
 	return ctrl.Result{}, true
+}
+
+// refreshTargetFromAPIReader does an uncached Get on the target
+// Resource and overwrites `res` in place when the APIReader reports
+// non-nil DRBD-IDs. Returns true iff every DRBD-ID is now populated,
+// signalling the caller to fall through the wait gate. Returns false
+// when the APIReader also reports nil (controller really hasn't
+// stamped yet) or on lookup error (caller falls back to the cached
+// view and the next requeue retries).
+//
+// Bug 289: the c-r informer cache can pin a Resource on a pre-
+// allocation revision past the controller's commit (race window
+// observable on the recovery-down-reverses scenario when satellite
+// reconciles fire from a sibling-Resource Watches event before the
+// target's own watch tick lands). APIReader bypasses the cache so a
+// single requeue is enough — without this the satellite chains 5s
+// requeues against the same stale cache entry indefinitely.
+func (r *ResourceReconciler) refreshTargetFromAPIReader(ctx context.Context, res *blockstoriov1alpha1.Resource, logger logr.Logger) bool {
+	reader := r.peerReader()
+	if reader == nil {
+		return false
+	}
+
+	var fresh blockstoriov1alpha1.Resource
+
+	err := reader.Get(ctx, client.ObjectKey{Name: res.Name}, &fresh)
+	if err != nil {
+		logger.V(1).Info("APIReader refresh failed; falling back to cached view",
+			"err", err.Error())
+
+		return false
+	}
+
+	if fresh.Status.DRBDNodeID == nil || fresh.Status.DRBDPort == nil || fresh.Status.DRBDMinor == nil {
+		return false
+	}
+
+	res.Status.DRBDNodeID = fresh.Status.DRBDNodeID
+	res.Status.DRBDPort = fresh.Status.DRBDPort
+	res.Status.DRBDMinor = fresh.Status.DRBDMinor
+
+	return true
 }
 
 // peersMissingNodeID collects the names of diskful peer Resources

@@ -640,3 +640,136 @@ func TestParseVolumeNumbersTolerantOfMalformedEntries(t *testing.T) {
 		})
 	}
 }
+
+// TestRefreshTargetFromAPIReaderUnstucksWaitWhenCacheTrails pins
+// Bug 289: the controller-side allocator has already stamped
+// Status.DRBDNodeID / DRBDPort / DRBDMinor, but the satellite's c-r
+// cache trails and the per-replica Reconcile-top Get returns a
+// stale view with nil IDs. Without the APIReader fall-through the
+// satellite chains 5s requeues against the same stale entry; with
+// it, the helper refreshes `res` in place from the uncached reader
+// and returns true so the wait gate falls through on the same
+// reconcile pass — the recovery-down-reverses revival completes
+// in one tick instead of stalling for ~5 minutes.
+func TestRefreshTargetFromAPIReaderUnstucksWaitWhenCacheTrails(t *testing.T) {
+	t.Parallel()
+
+	const resName = "down-reverses.worker-2"
+
+	scheme := newToggleDiskTestScheme(t)
+
+	// Fresh apiserver-side Resource carries the controller-stamped
+	// allocation. This is what the APIReader returns.
+	nodeID := int32(1)
+	port := int32(7000)
+	minor := int32(1000)
+	fresh := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: resName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               "worker-2",
+			ResourceDefinitionName: "down-reverses",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: &nodeID,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(fresh).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	// Cached client returns the stale view (Status DRBD-IDs nil) —
+	// what the satellite's informer cache holds during the trail
+	// window right after the controller's Status patch.
+	stale := fresh.DeepCopy()
+	stale.Status = blockstoriov1alpha1.ResourceStatus{}
+
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(stale).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cachedClient,
+		Config: Config{
+			NodeName:  "worker-2",
+			APIReader: apiReader,
+		},
+	}
+
+	// Caller's `res` is built from the cached client — nil IDs.
+	res := stale.DeepCopy()
+
+	ok := reconciler.refreshTargetFromAPIReader(context.Background(), res, ctrl.Log)
+	if !ok {
+		t.Fatalf("refreshTargetFromAPIReader: got false, want true (apiserver has fresh allocation)")
+	}
+
+	if res.Status.DRBDNodeID == nil || *res.Status.DRBDNodeID != nodeID {
+		t.Errorf("DRBDNodeID after refresh: got %v, want %d", res.Status.DRBDNodeID, nodeID)
+	}
+
+	if res.Status.DRBDPort == nil || *res.Status.DRBDPort != port {
+		t.Errorf("DRBDPort after refresh: got %v, want %d", res.Status.DRBDPort, port)
+	}
+
+	if res.Status.DRBDMinor == nil || *res.Status.DRBDMinor != minor {
+		t.Errorf("DRBDMinor after refresh: got %v, want %d", res.Status.DRBDMinor, minor)
+	}
+}
+
+// TestRefreshTargetFromAPIReaderHonorsRealNilAllocation pins the
+// negative half of Bug 289: when the controller-side allocator
+// genuinely has not yet stamped Status (APIReader also reports
+// nil), the helper returns false and `res` stays unchanged so the
+// caller emits the wait log + requeue. This is the "still waiting,
+// not a cache trail" path.
+func TestRefreshTargetFromAPIReaderHonorsRealNilAllocation(t *testing.T) {
+	t.Parallel()
+
+	const resName = "fresh-rd.worker-1"
+
+	scheme := newToggleDiskTestScheme(t)
+
+	// Both readers see the unallocated Resource — controller really
+	// hasn't run yet.
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: resName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               "worker-1",
+			ResourceDefinitionName: "fresh-rd",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{
+			NodeName:  "worker-1",
+			APIReader: cli,
+		},
+	}
+
+	target := res.DeepCopy()
+
+	ok := reconciler.refreshTargetFromAPIReader(context.Background(), target, ctrl.Log)
+	if ok {
+		t.Fatalf("refreshTargetFromAPIReader: got true, want false (apiserver also nil)")
+	}
+
+	if target.Status.DRBDNodeID != nil ||
+		target.Status.DRBDPort != nil ||
+		target.Status.DRBDMinor != nil {
+		t.Errorf("target.Status DRBD-IDs unexpectedly mutated: %+v", target.Status)
+	}
+}
