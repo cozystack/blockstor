@@ -25,5 +25,19 @@ if [[ -d "$STATE_DIR" ]]; then
     done
 fi
 
-sudo rm -rf "$WORK_DIR"
+# Preserve symlink-based work-dir indirection: the dev stand symlinks
+# `.work/<name>` → `/var/lib/blockstor/work-<name>` because root fs is
+# small. `rm -rf` on the symlink would only unlink the pointer; on the
+# real dir it would also free disk space. Solve both: when WORK_DIR is
+# a symlink, wipe its target's contents and keep the symlink alive so
+# `up.sh` can re-populate via the same path. Plain dirs fall back to
+# the original rm -rf.
+if [[ -L "$WORK_DIR" ]]; then
+    target=$(readlink -f "$WORK_DIR")
+    if [[ -n "$target" && -d "$target" ]]; then
+        sudo find "$target" -mindepth 1 -delete 2>/dev/null || true
+    fi
+else
+    sudo rm -rf "$WORK_DIR"
+fi
 echo ">> done"
