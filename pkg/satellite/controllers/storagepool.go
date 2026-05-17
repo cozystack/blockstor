@@ -169,18 +169,23 @@ func (r *StoragePoolReconciler) writeCapacity(ctx context.Context, pool *blockst
 
 	status, err := provider.PoolStatus(ctx)
 	if err != nil {
-		// Bug 282 (P2): distinguish "permanently gone" from
-		// transient errors. Only providers that explicitly tag
-		// the error with storage.ErrPoolGone (the "vgremove /
-		// zpool destroy / file-thin dir absent" case) flip
-		// PoolMissing=true. Probe-timeout cancels (Bug 270/271)
-		// or other transient hiccups must preserve the prior
-		// Status — the placer would otherwise drop the pool the
-		// moment a withProbeTimeout fires under load (full pool +
-		// slow probe), turning a "pool is full" symptom into a
-		// "pool is gone" reaction.
-		if !errors.Is(err, storage.ErrPoolGone) {
-			logger.Info("pool status probe transient error; keeping prior Status", "err", err)
+		// Bug 282 (P2, revised): preserve prior Status only for
+		// genuinely transient ctx-deadline / cancel errors
+		// (withProbeTimeout firing under load). Every other
+		// error — including non-zero exec exits like `zpool list
+		// <gone-pool>` returning "no such pool" — flips
+		// PoolMissing=true. This keeps Bug 50/74 "operator
+		// destroys pool → state=Faulty" working while still
+		// shielding the placer from a single probe-timeout flap.
+		//
+		// The original Bug 282 patch tagged only the empty-stdout
+		// "not found" branch with ErrPoolGone, which missed the
+		// non-zero-exit path most providers actually hit on a
+		// destroyed pool. Caught by recovery-poolmissing-real-zfs
+		// regression on e2e6 (2026-05-17 run 2).
+		if errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			logger.Info("pool status probe ctx error; keeping prior Status", "err", err)
 
 			return
 		}
