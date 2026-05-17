@@ -1008,6 +1008,19 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
 	}
 
+	// Bug 279 (P1): respect operator-driven `drbdadm primary --force`
+	// under quorum loss. If the kernel reports the resource is Primary
+	// with I/O suspended on quorum, the operator has explicitly chosen
+	// this node as the sole authoritative writer until peers come back.
+	// Auto-demoting here would yank Primary out from under them and
+	// fail the quorum-loss-recovery e2e (caught on stand e2e5,
+	// 2026-05-17). The auto-mkfs run above had to be Primary anyway,
+	// so the only thing we'd be doing here is the demote — skip it
+	// when the operator's intent is clearly "stay Primary".
+	if r.cfg.Adm.IsSuspendedOnQuorum(ctx, dr.GetName()) {
+		return nil
+	}
+
 	err = r.cfg.Adm.Secondary(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "auto-secondary %s", dr.GetName())
