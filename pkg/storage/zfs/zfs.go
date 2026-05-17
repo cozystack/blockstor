@@ -285,6 +285,19 @@ func hasDependentClonesError(stdout, stderr string) bool {
 // the source snapshot. ZFS clones are CoW — instant create, lazy
 // allocation as writes diverge from the snapshot.
 //
+// Bug 246 (P2, capacity safety): `zfs clone` always produces a sparse
+// zvol regardless of the origin's reservation. In thick mode the
+// cloned volume would silently lose its space guarantee and could
+// hit ENOSPC mid-write — defeating the whole point of thick. After
+// the clone, in thick mode, restore `refreservation=<volsize-bytes>`
+// so the cloned zvol is fully reserved (same contract as
+// `zfs create -V` without `-s`). The clone inherits volsize from
+// origin; setting refreservation to that value makes it thick again.
+//
+// If the pool free space at clone time is < volsize, the
+// `zfs set refreservation=…` fails with ENOSPC — propagated as the
+// thick-provisioning contract working as intended.
+//
 // Upstream LINSTOR equivalent: `zfs clone <pool>/<src>@<snap> <pool>/<tgt>`.
 // Idempotent: target dataset present → treat as resumed reconcile.
 func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
@@ -301,6 +314,23 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	_, err := p.exec.Run(ctx, "zfs", "clone", srcDS, tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs clone %s → %s", srcDS, tgtDS)
+	}
+
+	// THICK mode: restore the space guarantee that `zfs clone` always
+	// drops. Thin mode skips this — sparse-everywhere is the thin
+	// contract by design.
+	if !p.cfg.Thin {
+		volsizeBytes, err := p.datasetVolsize(ctx, tgtDS)
+		if err != nil {
+			return errors.Wrapf(err, "lookup volsize on cloned %s", tgtDS)
+		}
+
+		_, err = p.exec.Run(ctx, "zfs", "set",
+			"refreservation="+strconv.FormatInt(volsizeBytes, 10),
+			tgtDS)
+		if err != nil {
+			return errors.Wrapf(err, "zfs set refreservation on cloned %s", tgtDS)
+		}
 	}
 
 	return nil
@@ -506,6 +536,30 @@ func (p *Provider) volumeOrigin(ctx context.Context, ds string) string {
 	}
 
 	return value
+}
+
+// datasetVolsize reads the zvol's `volsize` property in bytes. Used
+// by RestoreVolumeFromSnapshot to size the post-clone refreservation
+// at exactly the clone's own volsize — which `zfs clone` inherits
+// from the origin snapshot, so we don't need to trust the caller's
+// requested SizeKib.
+func (p *Provider) datasetVolsize(ctx context.Context, dataset string) (int64, error) {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-Hp", "-o", "value", "volsize", dataset)
+	if err != nil {
+		return 0, errors.Wrapf(err, "zfs get volsize %s", dataset)
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return 0, errors.Errorf("zfs get volsize %s: empty output", dataset)
+	}
+
+	bytes, err := strconv.ParseInt(line, 10, 64)
+	if err != nil {
+		return 0, errors.Wrapf(err, "parse volsize %q", line)
+	}
+
+	return bytes, nil
 }
 
 // datasetExists is the idempotency primitive — analogous to lvExists.

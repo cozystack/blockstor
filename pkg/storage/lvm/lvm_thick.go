@@ -201,12 +201,25 @@ func (t *Thick) DeleteSnapshot(ctx context.Context, snap storage.Snapshot) error
 	return nil
 }
 
-// RestoreVolumeFromSnapshot for thick LV uses `lvconvert --merge`
-// semantics indirectly: take a writable snapshot of the source
-// snapshot's COW area (acts as a fresh thin-style overlay), name it
-// as the target. Thick snapshots are size-bounded so this CAN
-// overflow under heavy churn — upstream LINSTOR recommends thin
-// pools for clone-heavy workloads.
+// RestoreVolumeFromSnapshot materialises target as an independent,
+// fully-allocated thick LV holding the snapshot's bytes.
+//
+// Bug 245 (P1): the previous implementation used
+// `lvcreate --snapshot --extents 25%ORIGIN`, producing a COW overlay
+// capped at 25 % of origin size. Writes exceeding that silently
+// invalidated the LV (lv_attr → I), corrupting the restored PV.
+// The thin variant can do this because thin snapshots are uncapped
+// CoW; thick has no such shortcut.
+//
+// Canonical thick-restore path:
+//  1. `lvcreate --size <origin_size> --name <new>` — fully-allocated
+//     independent LV matching the thick semantic.
+//  2. `dd if=/dev/<vg>/<snap> of=/dev/<vg>/<new> bs=1M conv=fsync` —
+//     copy the snapshot bytes onto the new LV.
+//
+// Heavy I/O, but the correct semantic for "restore snapshot to a new
+// independent volume on thick LVM". The new volume survives arbitrary
+// write volume because it isn't a COW overlay.
 //
 // Idempotent: target LV present → resumed reconcile, no-op.
 func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
@@ -220,13 +233,42 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 		return errors.Wrapf(storage.ErrNotFound, "snapshot LV %s/%s for clone", t.cfg.VolumeGroup, srcName)
 	}
 
-	_, err := t.exec.Run(ctx, "lvcreate",
-		Args("--snapshot",
-			"--extents", "25%ORIGIN",
-			"--name", tgtName,
-			t.cfg.VolumeGroup+"/"+srcName)...)
+	// Size the new LV at the origin snapshot's full size — the restored
+	// volume must hold every byte the snapshot could have, regardless
+	// of what the caller passed in vol.SizeKib (CSI controllers usually
+	// pre-fill it to match, but we trust the source size to keep dd's
+	// dst large enough for the copy).
+	srcStatus, err := volumeStatusViaLVS(ctx, t.exec, t.cfg.VolumeGroup+"/"+srcName)
 	if err != nil {
-		return errors.Wrapf(err, "lvcreate -s %s → %s", srcName, tgtName)
+		return errors.Wrapf(err, "lvs %s for restore-size lookup", srcName)
+	}
+
+	sizeMiB := max(srcStatus.UsableKib/mibPerKib, 1)
+
+	_, err = t.exec.Run(ctx, "lvcreate",
+		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--name", tgtName,
+			// Same udev-less satellite workaround as CreateVolume.
+			"--config", "activation{udev_sync=0 udev_rules=0}",
+			"-Wn", "-Zn",
+			t.cfg.VolumeGroup)...)
+	if err != nil {
+		return errors.Wrapf(err, "lvcreate --size %s for restore", tgtName)
+	}
+
+	// Copy snapshot bytes onto the new LV. conv=fsync forces the dirty
+	// cache to disk before dd returns, so a satellite crash after this
+	// call leaves a consistent-on-disk volume.
+	srcPath := "/dev/" + t.cfg.VolumeGroup + "/" + srcName
+	tgtPath := "/dev/" + t.cfg.VolumeGroup + "/" + tgtName
+
+	_, err = t.exec.Run(ctx, "dd",
+		"if="+srcPath,
+		"of="+tgtPath,
+		"bs=1M",
+		"conv=fsync")
+	if err != nil {
+		return errors.Wrapf(err, "dd %s → %s for restore", srcName, tgtName)
 	}
 
 	return nil
