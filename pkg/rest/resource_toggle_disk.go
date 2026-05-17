@@ -91,17 +91,16 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 // Idempotent: toggling a diskful replica when no pool argument
 // was given drops the DISKLESS flag if currently set; toggling
 // it back when DISKLESS was absent re-adds it.
+//
+// Bug 281 (P2): the toggle path used to be a Get → mutate → Update
+// triplet that hit HTTP 409 under rapid diskful↔diskless churn
+// (recovery-bitmap-drop e2e). Routed through PatchResourceSpec so
+// the closure re-runs against the fresh resourceVersion on
+// optimistic-lock conflicts.
 func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
-
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
 
 	// Bug 40: `linstor r td --cancel` aborts an in-flight conversion.
 	// Upstream LINSTOR uses an explicit cancel verb; we accept the
@@ -113,9 +112,12 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 	// rollback so an external observer sees DISKLESS reappear only
 	// AFTER drbdadm down + storage Delete succeed.
 	if r.URL.Query().Get("cancel") == "true" {
-		res.ToggleDiskCancel = true
+		err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+			func(res *apiv1.Resource) error {
+				res.ToggleDiskCancel = true
 
-		err = s.Store.Resources().Update(r.Context(), &res)
+				return nil
+			})
 		if err != nil {
 			writeStoreError(w, err)
 
@@ -130,25 +132,19 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	wasDiskless := slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
+	var wasDiskless bool
 
-	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, !wasDiskless)
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			wasDiskless = slices.Contains(res.Flags, apiv1.ResourceFlagDiskless)
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, !wasDiskless)
 
-	switch {
-	case wasDiskless && pool != "":
-		// Promote with explicit pool target.
-		stampStoragePool(&res, pool)
-	case wasDiskless && pool == "":
-		// Promote without explicit pool; controller's
-		// auto-diskful pick path runs on the next
-		// reconcile.
-	case !wasDiskless:
-		// Demote — keep the historical pool intact in
-		// case the operator toggles back, but the
-		// satellite will detach on the next reconcile.
-	}
+			if wasDiskless && pool != "" {
+				stampStoragePool(res, pool)
+			}
 
-	err = s.Store.Resources().Update(r.Context(), &res)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -174,16 +170,13 @@ func (s *Server) handleResourceToggleDiskToDiskless(w http.ResponseWriter, r *ht
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 281: same Get → Update race as handleResourceToggleDisk.
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, true)
 
-		return
-	}
-
-	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, true)
-
-	err = s.Store.Resources().Update(r.Context(), &res)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -214,20 +207,17 @@ func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *htt
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 281: same Get → Update race as handleResourceToggleDisk.
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, false)
 
-		return
-	}
+			if pool != "" {
+				stampStoragePool(res, pool)
+			}
 
-	res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, false)
-
-	if pool != "" {
-		stampStoragePool(&res, pool)
-	}
-
-	err = s.Store.Resources().Update(r.Context(), &res)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
