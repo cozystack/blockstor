@@ -219,6 +219,15 @@ sleep 3
 # the dispatcher only consults StorPoolNameDrbdMeta to pick the
 # meta pool. Same upstream LINSTOR convention.
 echo ">> step 3: apply RD $RD with StorPoolNameDrbdMeta=$META_POOL on $N1+$N2"
+# Tiebreaker disabled: this scenario asserts the meta-disk render
+# contract counting internal+external lines across the whole .res.
+# With AutoAddQuorumTiebreaker on (the default), a Diskless witness
+# is auto-placed on the third worker and gets its own `meta-disk
+# internal;` line — inflating the internal count from the expected
+# 1 (one diskful peer) to 2 (peer + tiebreaker) and breaking the
+# strict `n_internal == 1` assertion at step 5. Disabling the
+# tiebreaker keeps the .res to exactly 2 `on` blocks (the two
+# diskful peers), one of which carries the external meta-disk path.
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
@@ -226,6 +235,7 @@ metadata: {name: ${RD}}
 spec:
   props:
     StorPoolNameDrbdMeta: ${META_POOL}
+    DrbdOptions/AutoAddQuorumTiebreaker: "false"
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
