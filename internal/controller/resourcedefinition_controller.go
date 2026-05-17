@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	stderrors "errors"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -576,7 +577,12 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 		hostingReplica[existing[i].NodeName] = true
 	}
 
-	tiebreakerNode, err := r.pickTiebreakerNode(ctx, hostingReplica)
+	// Bug 261: route through the RD-aware selector so a stale
+	// `existing` snapshot can't slip a diskful node into the
+	// witness-candidate set. The selector re-probes the store for
+	// diskful Resources of the RD and hard-excludes them — defense-
+	// in-depth against caller-snapshot staleness.
+	tiebreakerNode, err := r.pickTiebreakerNodeForRD(ctx, rd.Name, hostingReplica)
 	if err != nil {
 		return err
 	}
@@ -723,7 +729,60 @@ func splitByDiskless(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resou
 // already hosting a replica of this RD. Picks deterministically
 // (lowest name first) so two reconcile races converge on the same
 // answer instead of both creating a tiebreaker.
+//
+// Bug 261 (P1, data-loss class): the per-call `hostingReplica` map
+// is a snapshot built by the caller from `listReplicasDirect` at
+// the top of `ensureTiebreaker`. A stale snapshot (Resource watch
+// race, REST cache lag on a sibling apiserver replica) could miss a
+// diskful node — and the downstream `Store.Resources().Create` of
+// a `[DISKLESS, TIE_BREAKER]` Resource on that node would land
+// inside the partition-vulnerable window of an `r d <witness>`
+// operator flow, leaving the cluster one race away from a silent
+// `r td --diskless` against the diskful Resource (data-loss class).
+//
+// `pickTiebreakerNodeForRD` re-probes the store for diskful
+// Resources of the RD and excludes them unconditionally — defense-
+// in-depth against any caller-snapshot staleness. The legacy
+// `pickTiebreakerNode` shim stays as a back-compat surface (only
+// the pick_tiebreaker_test.go callers exercise it without an RD
+// name); production wiring goes through the RD-aware variant.
 func (r *ResourceDefinitionReconciler) pickTiebreakerNode(ctx context.Context, hostingReplica map[string]bool) (string, error) {
+	return r.pickTiebreakerNodeForRD(ctx, "", hostingReplica)
+}
+
+// pickTiebreakerNodeForRD is the Bug-261-defended selector: same
+// contract as pickTiebreakerNode plus an unconditional hard-exclude
+// of every node currently hosting a diskful Resource of `rdName`,
+// re-probed against the store on every call. When `rdName==""` the
+// store re-probe is skipped (legacy caller surface).
+func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
+	ctx context.Context,
+	rdName string,
+	hostingReplica map[string]bool,
+) (string, error) {
+	excluded := make(map[string]bool, len(hostingReplica))
+	maps.Copy(excluded, hostingReplica)
+
+	if rdName != "" {
+		// Defense-in-depth: re-probe the store for diskful Resources
+		// of this RD and exclude them. Caller's hostingReplica may be
+		// stale, but the store snapshot read inline here is the
+		// freshest signal the controller-side can get without a full
+		// reconcile fan-out.
+		live, err := r.Store.Resources().ListByDefinition(ctx, rdName)
+		if err != nil {
+			return "", err
+		}
+
+		for i := range live {
+			if slices.Contains(live[i].Flags, apiv1.ResourceFlagDiskless) {
+				continue
+			}
+
+			excluded[live[i].NodeName] = true
+		}
+	}
+
 	nodes, err := r.Store.Nodes().List(ctx)
 	if err != nil {
 		return "", err
@@ -732,7 +791,7 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNode(ctx context.Context, h
 	candidates := make([]string, 0, len(nodes))
 
 	for i := range nodes {
-		if hostingReplica[nodes[i].Name] {
+		if excluded[nodes[i].Name] {
 			continue
 		}
 

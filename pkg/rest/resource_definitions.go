@@ -244,6 +244,20 @@ func (s *Server) handleRDCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 262 (P2): stand-caught — `linstor rd lp <new-rd> | grep
+	// quorum` reported `DrbdOptions/Resource/quorum off` on freshly-
+	// created RDs because the RG-create surface never seeded the
+	// auto-quorum default. Combined with the auto-tiebreaker
+	// reconciler stamping a witness on 2-diskful RDs, the cluster
+	// silently runs the 3-voter set with quorum off — defeating the
+	// purpose of the witness. Stamp the upstream-default policy
+	// (`auto-quorum=majority` + `on-no-quorum=suspend-io`) onto every
+	// fresh RD if the operator didn't pin one explicitly; the
+	// universal write point is here (every path lands through
+	// handleRDCreate), so a single seed covers RG-spawn, rd-create,
+	// and the linstor-csi CreateVolume hot path.
+	seedAutoQuorumDefaults(&rd)
+
 	err = s.Store.ResourceDefinitions().Create(r.Context(), &rd)
 	if err != nil {
 		writeStoreError(w, err)
@@ -490,6 +504,42 @@ func (s *Server) inheritLayerStackFromRG(ctx context.Context, rd *apiv1.Resource
 	rd.LayerStack = append([]string(nil), rg.SelectFilter.LayerStack...)
 
 	return nil
+}
+
+// seedAutoQuorumDefaults stamps the upstream LINSTOR auto-quorum
+// policy (`auto-quorum=majority` + `on-no-quorum=suspend-io`) onto a
+// fresh RD's Props bag when the operator didn't pin one explicitly.
+// Bug 262 fix.
+//
+// Operator-supplied values win — silently overriding an explicit
+// `disabled` / `io-error` would re-introduce the silent-quorum
+// surface from the other direction (the operator's manual quorum
+// policy is load-bearing for split-brain handling).
+//
+// Stamped on RD create rather than RG create so the invariant holds
+// for RDs spawned against pre-existing RGs that don't carry the
+// prop, RDs created via the rd-spawn-from-rg path, and the
+// linstor-csi CreateVolume hot path — every RD-create entry lands
+// through handleRDCreate.
+func seedAutoQuorumDefaults(rd *apiv1.ResourceDefinition) {
+	if rd.Props == nil {
+		rd.Props = map[string]string{}
+	}
+
+	const (
+		autoQuorumKey  = "DrbdOptions/auto-quorum"
+		onNoQuorumKey  = "DrbdOptions/Resource/on-no-quorum"
+		defaultPolicy  = "majority"
+		defaultOnNoneQ = "suspend-io"
+	)
+
+	if _, present := rd.Props[autoQuorumKey]; !present {
+		rd.Props[autoQuorumKey] = defaultPolicy
+	}
+
+	if _, present := rd.Props[onNoQuorumKey]; !present {
+		rd.Props[onNoQuorumKey] = defaultOnNoneQ
+	}
 }
 
 // mergeRDCreateLayerInputs reconciles the three wire shapes

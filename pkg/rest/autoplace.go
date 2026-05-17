@@ -1404,8 +1404,26 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 	// carry a TIE_BREAKER witness, and the witness must be stripped
 	// to its plain-DISKLESS form so the reconciler exposes a
 	// usable DRBD device.
+	//
+	// Bug 260 (P1): the pre-fix gate was gated on `StorPoolName!=""`
+	// OR `Flags:[DISKLESS]`. A bare `linstor r c <node> <rd>` (no
+	// `--storage-pool`, no flags) on top of an existing TIE_BREAKER
+	// hit the gate and surfaced 409 — but upstream
+	// CtrlRscCrtApiHelper.resourceToggleDisk treats this shape as
+	// "promote the witness". Detect the witness by probing the
+	// existing replica's flags; if it carries TIE_BREAKER, allow
+	// the promote path and resolve the storage pool from sibling
+	// diskful replicas (or the parent RG default) inside
+	// promoteDisklessReplica.
 	wantsPromote := res.Props["StorPoolName"] != "" ||
 		containsResourceFlag(res.Flags, apiv1.ResourceFlagDiskless)
+	if errors.Is(err, store.ErrAlreadyExists) && !wantsPromote {
+		existing, getErr := s.Store.Resources().Get(r.Context(), res.Name, res.NodeName)
+		if getErr == nil && containsResourceFlag(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+			wantsPromote = true
+		}
+	}
+
 	if errors.Is(err, store.ErrAlreadyExists) && wantsPromote {
 		promoted, promErr := s.promoteDisklessReplica(r.Context(), res)
 		if promErr != nil {
@@ -1441,8 +1459,28 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 // replica is NOT a diskless witness (i.e. a real conflict the caller
 // should surface as 409).
 func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resource) (*apiv1.Resource, error) {
-	wantDiskful := target.Props["StorPoolName"] != "" &&
-		!containsResourceFlag(target.Flags, apiv1.ResourceFlagDiskless)
+	// Bug 260 (P1): `linstor r c <node> <rd>` (no `--storage-pool`,
+	// no flags) on top of an existing TIE_BREAKER lands here with
+	// `StorPoolName=""` AND no DISKLESS flag on the target. Upstream
+	// CtrlRscCrtApiHelper.resourceToggleDisk treats this shape as
+	// "promote the witness to diskful" and resolves the pool from
+	// sibling diskful replicas (first match) or the parent RG's
+	// `SelectFilter.StoragePool` default. Mirror that here: resolve
+	// once, BEFORE the patch closure, so the closure stamps a
+	// consistent StorPoolName even across retries.
+	wantsToggle := !containsResourceFlag(target.Flags, apiv1.ResourceFlagDiskless)
+	resolvedPool := target.Props["StorPoolName"]
+
+	if wantsToggle && resolvedPool == "" {
+		resolved, resolveErr := s.resolveTakeoverStorPool(ctx, target.Name, target.NodeName)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+
+		resolvedPool = resolved
+	}
+
+	wantDiskful := resolvedPool != "" && wantsToggle
 
 	var (
 		promoted   apiv1.Resource
@@ -1472,7 +1510,7 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 				live.Props = map[string]string{}
 			}
 
-			live.Props["StorPoolName"] = target.Props["StorPoolName"]
+			live.Props["StorPoolName"] = resolvedPool
 		}
 
 		promoted = *live
@@ -1493,6 +1531,62 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 	}
 
 	return &promoted, nil
+}
+
+// resolveTakeoverStorPool implements the Bug 260 fallback chain for
+// `linstor r c <node> <rd>` against an existing TIE_BREAKER witness
+// when the wire request omits `--storage-pool`. Mirrors upstream
+// CtrlRscCrtApiHelper.resourceToggleDisk's "use the sibling's pool,
+// else the RG default" rule.
+//
+// Returns ("", nil) when nothing matches — promoteDisklessReplica
+// then leaves DISKLESS in place (TIE_BREAKER still stripped) so the
+// next operator `r c --storage-pool <p>` (or the satellite-driven
+// make-available chain) can finish the conversion. Errors are
+// wrapped so the caller's `writeStoreError` surfaces an
+// operator-actionable envelope.
+func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNode string) (string, error) {
+	siblings, listErr := s.Store.Resources().ListByDefinition(ctx, rdName)
+	if listErr == nil {
+		for i := range siblings {
+			if siblings[i].NodeName == takeoverNode {
+				continue
+			}
+
+			if containsResourceFlag(siblings[i].Flags, apiv1.ResourceFlagDiskless) {
+				continue
+			}
+
+			if pool := siblings[i].Props["StorPoolName"]; pool != "" {
+				return pool, nil
+			}
+		}
+	}
+
+	// Fall through to the parent RG's SelectFilter.StoragePool.
+	rd, rdErr := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if rdErr != nil {
+		if errors.Is(rdErr, store.ErrNotFound) {
+			return "", nil
+		}
+
+		return "", errors.Wrapf(rdErr, "lookup RD %q for takeover pool resolution", rdName)
+	}
+
+	if rd.ResourceGroupName == "" {
+		return "", nil
+	}
+
+	rg, rgErr := s.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+	if rgErr != nil {
+		if errors.Is(rgErr, store.ErrNotFound) {
+			return "", nil
+		}
+
+		return "", errors.Wrapf(rgErr, "lookup RG %q for takeover pool resolution", rd.ResourceGroupName)
+	}
+
+	return rg.SelectFilter.StoragePool, nil
 }
 
 // stripDisklessAndWitnessFlags walks `flags` and produces the post-promote

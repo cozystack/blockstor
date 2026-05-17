@@ -151,6 +151,19 @@ func (r *ResourceDefinitionReconciler) PickTiebreakerNode(ctx context.Context, h
 	return r.pickTiebreakerNode(ctx, hostingReplica)
 }
 
+// PickTiebreakerNodeForRD exposes the Bug-261-defended selector
+// (re-probes the store for diskful Resources of the RD and excludes
+// their nodes unconditionally). Pinned via the bug 261 tests so the
+// defense-in-depth contract — "never pick a diskful node, even on a
+// stale hostingReplica snapshot" — doesn't quietly regress.
+func (r *ResourceDefinitionReconciler) PickTiebreakerNodeForRD(
+	ctx context.Context,
+	rdName string,
+	hostingReplica map[string]bool,
+) (string, error) {
+	return r.pickTiebreakerNodeForRD(ctx, rdName, hostingReplica)
+}
+
 // IsDisabledNode exposes the EVICTED/LOST flag check used by both
 // the placer and the RD-level tiebreaker path. Pins the "drain
 // signal" flag set so the witness path doesn't pin a dying node.
