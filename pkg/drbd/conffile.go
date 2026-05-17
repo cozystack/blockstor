@@ -53,6 +53,27 @@ type Resource struct {
 	// before emission for stable output.
 	Options map[string]string
 
+	// Disk carries DrbdOptions/Disk/* values (e.g. `on-io-error`,
+	// `c-plan-ahead`) and renders as a resource-scope `disk { ... }`
+	// block. drbd-9 rejects these keys inside `options{}` — they
+	// must live in their own block. See Bug 258.
+	Disk map[string]string
+
+	// Handlers carries DrbdOptions/Handlers/* values (e.g.
+	// `fence-peer`, `after-resync-target`) and renders as a
+	// resource-scope `handlers { ... }` block. Same rationale as
+	// Disk — drbd-9 has a dedicated section for these.
+	Handlers map[string]string
+
+	// PeerDevice carries DrbdOptions/PeerDevice/* values (e.g.
+	// `c-fill-target`, `c-max-rate`) and renders as a `disk { ... }`
+	// sub-block INSIDE each `connection { ... }` block — drbd-9's
+	// scope for peer-device-flavour options. The same map applies to
+	// every connection; per-peer overrides aren't surfaced here
+	// today (matches upstream LINSTOR's fallback path when no
+	// per-resource-connection prop override exists).
+	PeerDevice map[string]string
+
 	// Connections carries explicit per-peer-pair overrides used by
 	// the multi-path-DRBD feature (scenario 3.7, UG9 §"Creating
 	// multiple DRBD paths with LINSTOR"). For any (NodeA, NodeB)
@@ -213,12 +234,14 @@ func Build(r Resource) (string, error) {
 
 	writeNet(&b, r.Net)
 	writeOptions(&b, r.Options)
+	writeNamedBlock(&b, "disk", r.Disk)
+	writeNamedBlock(&b, "handlers", r.Handlers)
 
 	for i := range r.Hosts {
 		writeOnBlock(&b, &r.Hosts[i], r.Volumes)
 	}
 
-	writeConnectionMesh(&b, r.Hosts, r.Connections)
+	writeConnectionMesh(&b, r.Hosts, r.Connections, r.PeerDevice)
 
 	b.WriteString("}\n")
 
@@ -254,6 +277,25 @@ func writeOptions(b *strings.Builder, opts map[string]string) {
 	}
 
 	b.WriteString("  options {\n")
+
+	for _, k := range sortedKeys(opts) {
+		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
+	}
+
+	b.WriteString("  }\n")
+}
+
+// writeNamedBlock emits a resource-scope `<name> { … }` block from a
+// sorted key/value map. Empty map → no block. Used for the `disk { }`
+// and `handlers { }` sections that Bug 258 routed away from the
+// catch-all `options { }` block. Indentation matches the existing
+// `options { }` block at the resource level.
+func writeNamedBlock(b *strings.Builder, name string, opts map[string]string) {
+	if len(opts) == 0 {
+		return
+	}
+
+	fmt.Fprintf(b, "  %s {\n", name)
 
 	for _, k := range sortedKeys(opts) {
 		fmt.Fprintf(b, "    %s %s;\n", k, opts[k])
@@ -337,14 +379,14 @@ func metaField(host *Host, vol Volume) string {
 // drop the default lines from the connection block in that case —
 // otherwise drbdadm-adjust would silently rewrite our .res and
 // trigger phantom reloads on every reconcile.
-func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConnection) {
+func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConnection, peerDevice map[string]string) {
 	if len(hosts) < minMeshPeers {
 		return
 	}
 
 	for i := range hosts {
 		for k := i + 1; k < len(hosts); k++ {
-			writeOneConnection(b, &hosts[i], &hosts[k], conns)
+			writeOneConnection(b, &hosts[i], &hosts[k], conns, peerDevice)
 		}
 	}
 }
@@ -352,7 +394,12 @@ func writeConnectionMesh(b *strings.Builder, hosts []Host, conns []ResourceConne
 // writeOneConnection emits a single `connection { … }` block for the
 // (hostA, hostB) pair. Either a multi-path block (when conns has an
 // entry with at least one Path) or the default two-line inline pair.
-func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []ResourceConnection) {
+// When peerDevice is non-empty it is rendered as a `disk { … }`
+// sub-block — drbd-9's scope for peer-device-flavour options like
+// `c-fill-target` / `c-max-rate`. Bug 258 routed these out of the
+// resource-scope `options{}` block; this emits them at the correct
+// scope so drbdadm accepts the .res.
+func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []ResourceConnection, peerDevice map[string]string) {
 	b.WriteString("  connection {\n")
 
 	if paths := lookupPaths(conns, hostA.NodeName, hostB.NodeName); len(paths) > 0 {
@@ -360,6 +407,16 @@ func writeOneConnection(b *strings.Builder, hostA, hostB *Host, conns []Resource
 	} else {
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostA.NodeName, hostA.Address, hostA.Port)
 		fmt.Fprintf(b, "    host %s address %s:%d;\n", hostB.NodeName, hostB.Address, hostB.Port)
+	}
+
+	if len(peerDevice) > 0 {
+		b.WriteString("    disk {\n")
+
+		for _, k := range sortedKeys(peerDevice) {
+			fmt.Fprintf(b, "      %s %s;\n", k, peerDevice[k])
+		}
+
+		b.WriteString("    }\n")
 	}
 
 	b.WriteString("  }\n")

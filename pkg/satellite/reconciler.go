@@ -1376,14 +1376,17 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 
 	vols := buildResVolumes(dr, devices, minor)
 
-	netOpts, resOpts := splitDRBDOptions(opts)
+	sections := splitDRBDOptions(opts)
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
-		Net:         drbd.Net{ProtocolC: true, Options: netOpts},
+		Net:         drbd.Net{ProtocolC: true, Options: sections.Net},
 		Hosts:       hosts,
 		Volumes:     vols,
-		Options:     resOpts,
+		Options:     sections.Resource,
+		Disk:        sections.Disk,
+		Handlers:    sections.Handlers,
+		PeerDevice:  sections.PeerDevice,
 		Connections: buildResConnections(dr),
 	})
 	if err != nil {
@@ -1473,14 +1476,35 @@ func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor
 	return vols
 }
 
+// drbdOptionSections holds the per-section maps splitDRBDOptions
+// produces. Each map corresponds to one `.res` block; the renderer
+// consumes them in writeNet / writeOptions / writeNamedBlock /
+// per-connection disk{}. See SectionFor for the routing decision.
+type drbdOptionSections struct {
+	Net        map[string]string
+	Resource   map[string]string
+	Disk       map[string]string
+	PeerDevice map[string]string
+	Handlers   map[string]string
+}
+
 // splitDRBDOptions partitions the satellite-received drbd_options bag
 // into per-section maps. Per-replica wiring (port/node-id/peer.*.…)
-// is dropped — those are not user-tunable knobs. Anything under
-// `DrbdOptions/Net/...` lands on the `net { }` block, anything else
-// under `DrbdOptions/<Section>/...` lands on the resource-level
-// `options { }` block (drbd's catch-all). The ConfFileBuilder writes
-// the keys verbatim with the `DrbdOptions/<Section>/` prefix stripped
-// — that's the form drbdadm expects.
+// is dropped — those are not user-tunable knobs.
+//
+// Routing uses `drbd.SectionFor`, which maps each
+// `DrbdOptions/<Section>/<Key>` to the right `.res` block:
+//
+//   - `DrbdOptions/Net/*`     → `net { }`         (Net)
+//   - `DrbdOptions/Disk/*`    → `disk { }`        at resource scope
+//   - `DrbdOptions/Handlers/*` → `handlers { }`   at resource scope
+//   - `DrbdOptions/PeerDevice/*` → `disk { }`     inside each connection
+//   - `DrbdOptions/Resource/*` (and unknown sections) → `options { }`
+//     (drbd's catch-all top-level block)
+//
+// The renderer writes the keys verbatim with the
+// `DrbdOptions/<Section>/` prefix stripped — that's the form drbdadm
+// expects.
 //
 // Section-less keys (`DrbdOptions/<Key>` with nothing after the
 // prefix beyond a single segment) are LINSTOR-controller-only props
@@ -1489,9 +1513,21 @@ func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor
 // those into the .res file makes drbdadm fail with "expected:
 // cpu-mask | on-no-data-accessible | ... but got: <name>". Drop
 // them on the satellite side; the convention upstream is the same.
-func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]string) {
-	netOpts := map[string]string{}
-	resOpts := map[string]string{}
+//
+// Bug 258: prior to this routing rewrite, `Disk`, `Handlers` and
+// `PeerDevice` keys all collapsed onto the resource-level options{}
+// map, where drbd-9 rejected them at parse time ("expected: …
+// got: on-io-error") — wedging the reconciler on any
+// `linstor rd sp <rd> DrbdOptions/Disk/on-io-error detach` (a common
+// operator action).
+func splitDRBDOptions(opts map[string]string) drbdOptionSections {
+	out := drbdOptionSections{
+		Net:        map[string]string{},
+		Resource:   map[string]string{},
+		Disk:       map[string]string{},
+		PeerDevice: map[string]string{},
+		Handlers:   map[string]string{},
+	}
 
 	for key, value := range opts {
 		rest, ok := strings.CutPrefix(key, drbd.PropPrefix)
@@ -1499,29 +1535,32 @@ func splitDRBDOptions(opts map[string]string) (map[string]string, map[string]str
 			continue
 		}
 
-		section, rawKey, hasSection := strings.Cut(rest, "/")
+		_, rawKey, hasSection := strings.Cut(rest, "/")
 		if !hasSection {
 			// LINSTOR-only key (no DRBD section subpath); these
 			// don't belong in the rendered .res. See doc comment.
 			continue
 		}
 
-		switch strings.ToLower(section) {
-		case "net":
-			netOpts[rawKey] = value
-		case "disk", "peerdevice", "peer-device", "handlers": //nolint:goconst,nolintlint // DRBD section name, semantic-distinct from LsblkTypeDisk
-			// These sections aren't plumbed through Net struct
-			// today; surface them as resource-level options so
-			// drbdadm at least sees them. Full per-section
-			// emission lands when ConfFileBuilder grows the
-			// disk/peer-device blocks.
-			resOpts[rawKey] = value
+		switch drbd.SectionFor(key) {
+		case drbd.SectionNet:
+			out.Net[rawKey] = value
+		case drbd.SectionDisk:
+			out.Disk[rawKey] = value
+		case drbd.SectionPeerDevice:
+			out.PeerDevice[rawKey] = value
+		case drbd.SectionHandlers:
+			out.Handlers[rawKey] = value
 		default:
-			resOpts[rawKey] = value
+			// SectionOptions — drbd's catch-all top-level block.
+			// Covers `DrbdOptions/Resource/*` plus any unknown
+			// section so a future upstream key still lands
+			// somewhere sensible (matches SectionFor's fallback).
+			out.Resource[rawKey] = value
 		}
 	}
 
-	return netOpts, resOpts
+	return out
 }
 
 // drbdAddrPlaceholder is what the controller stamps on a Resource
