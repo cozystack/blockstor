@@ -38,12 +38,75 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	corev1 "k8s.io/api/core/v1"
+
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
 	"github.com/cozystack/blockstor/pkg/effectiveprops"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
+
+// kubeInternalNICName is the NetInterface name the dispatcher prefers
+// over piraeus-operator's `default-ipv4` (which gets the pod-CIDR
+// satellite-pod IP, not routable peer-to-peer when blockstor
+// satellites run with hostNetwork:true). We synthesise it from
+// corev1.Node InternalIP at dispatch time so the .res files carry
+// the routable host IP for every peer. Mirrors the constant in
+// pkg/dispatcher (kept in sync — duplicated to avoid widening the
+// dispatcher package's API surface for what is a satellite-side
+// pre-processing concern). Bug 283.
+const kubeInternalNICName = "k8s-internal"
+
+// enrichNodesWithInternalIP appends a `k8s-internal` NetInterface
+// to each blockstor Node CRD whose name matches a corev1.Node,
+// using that corev1.Node's InternalIP. The dispatcher's
+// preferredNetInterfaceAddress already favours `k8s-internal` over
+// any other NetInterface name, so adding the entry steers peer
+// address resolution onto the host-routable IP without touching
+// the dispatcher code. Idempotent: skips nodes that already carry a
+// `k8s-internal` entry (e.g. tests pre-stamp it) and nodes whose
+// corev1.Node InternalIP cannot be resolved (the existing fallback
+// chain still applies in that case).
+func enrichNodesWithInternalIP(nodes []blockstoriov1alpha1.Node, corev1Nodes []corev1.Node) {
+	internalIPByName := make(map[string]string, len(corev1Nodes))
+
+	for i := range corev1Nodes {
+		for _, addr := range corev1Nodes[i].Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP && addr.Address != "" {
+				internalIPByName[corev1Nodes[i].Name] = addr.Address
+
+				break
+			}
+		}
+	}
+
+	for i := range nodes {
+		internalIP, ok := internalIPByName[nodes[i].Name]
+		if !ok || internalIP == "" {
+			continue
+		}
+
+		hasInternal := false
+
+		for j := range nodes[i].Spec.NetInterfaces {
+			if nodes[i].Spec.NetInterfaces[j].Name == kubeInternalNICName {
+				hasInternal = true
+
+				break
+			}
+		}
+
+		if hasInternal {
+			continue
+		}
+
+		nodes[i].Spec.NetInterfaces = append(nodes[i].Spec.NetInterfaces, blockstoriov1alpha1.NodeNetInterface{
+			Name:    kubeInternalNICName,
+			Address: internalIP,
+		})
+	}
+}
 
 // SatelliteResourceFinalizer is the per-satellite-instance
 // finalizer key the satellite reconciler stamps on every
@@ -564,6 +627,24 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	err := r.List(ctx, &nodeList)
 	if err != nil {
 		return nil, errors.Wrap(err, "list Nodes")
+	}
+
+	// Bug 283: piraeus-operator overwrites Node CRD NetInterfaces
+	// with a single `default-ipv4` entry carrying the satellite POD
+	// IP — a pod-CIDR address that isn't routable between
+	// hostNetwork:true blockstor satellites. Synthesise a
+	// `k8s-internal` NetInterface from each corev1.Node's
+	// InternalIP so the dispatcher's existing preferred-name lookup
+	// (`k8s-internal` → `default` → first non-empty) lands on the
+	// routable host IP for every peer block in the rendered .res.
+	// Failures listing corev1.Nodes are non-fatal: the old
+	// pod-CIDR fallback still produces a syntactically valid .res,
+	// just one that can't connect — the same behaviour as before.
+	var corev1NodeList corev1.NodeList
+
+	listErr := r.List(ctx, &corev1NodeList)
+	if listErr == nil {
+		enrichNodesWithInternalIP(nodeList.Items, corev1NodeList.Items)
 	}
 
 	var poolList blockstoriov1alpha1.StoragePoolList

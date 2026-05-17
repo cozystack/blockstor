@@ -103,6 +103,20 @@ rules:
   verbs:
   - create
   - patch
+# corev1.Node — read-only access for Bug 283 .res rendering: the
+# dispatcher's peer-address lookup needs each node's routable
+# InternalIP to overcome piraeus-operator's pod-CIDR overwrite of
+# Spec.NetInterfaces. The satellite synthesises a `k8s-internal`
+# NetInterface from corev1.Node.Status.Addresses[type=InternalIP]
+# before calling dispatcher.BuildDesired.
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
 # Leader election — the satellite is per-node singleton via host
 # DaemonSet, so leader election is technically optional, but the
 # controller-runtime manager wires it by default. Use a Lease per
