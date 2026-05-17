@@ -175,7 +175,18 @@ func (t *Thin) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 
 // CreateSnapshot is `lvcreate -s` of the resource's volume 0. Multi-volume
 // resources land in Phase 4.
+//
+// Idempotent: a pre-existing snapshot LV → no-op (Bug 216). Without
+// the fold the real `lvm` would reject the second `lvcreate
+// --snapshot` with "already exists" on every reconcile pass, looping
+// the satellite-side reconciler forever on an already-materialised
+// snapshot. Mirrors the lvExists pre-check the delete path uses
+// (Bug 212).
 func (t *Thin) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	if t.lvExists(ctx, snapshotLVName(snap)) {
+		return nil
+	}
+
 	source := fmt.Sprintf("%s_%05d", snap.ResourceName, 0)
 
 	_, err := t.exec.Run(ctx, "lvcreate",

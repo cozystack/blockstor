@@ -747,8 +747,9 @@ func TestSnapshotReconcileStampsNodeStatusOnSuccess(t *testing.T) {
 // Status().Update — pointless ResourceVersion churn and a
 // retry-budget burner on the satellite. Conditional on the
 // satellite's CreateSnapshot still returning Ok=true on a
-// second invocation (which it does — `lvcreate --snapshot` on
-// an existing LV is the provider's idempotent path).
+// second invocation (which it does — the provider's lvExists
+// pre-check (Bug 216) folds an already-materialised snapshot LV
+// into success without re-running `lvcreate --snapshot`).
 func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
 	t.Parallel()
 

@@ -160,7 +160,15 @@ func (t *Thick) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 // CreateSnapshot is `lvcreate --snapshot --size <N>` for thick LV.
 // We allocate the snapshot at 25 % of the source LV's size — bigger
 // snapshots waste extents, smaller ones overflow on heavy churn.
+//
+// Idempotent: pre-existing snapshot LV → no-op (Bug 216). See
+// Thin.CreateSnapshot for rationale; the reconcile-loop trap is the
+// same on LVM-classic.
 func (t *Thick) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error {
+	if t.lvExists(ctx, snapshotLVName(snap)) {
+		return nil
+	}
+
 	source := fmt.Sprintf("%s_%05d", snap.ResourceName, 0)
 
 	_, err := t.exec.Run(ctx, "lvcreate",

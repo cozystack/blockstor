@@ -129,9 +129,15 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // handleCreate translates a Snapshot CRD into a CreateSnapshot
 // gRPC-shaped request and dispatches it to the existing
-// `Config.Apply.CreateSnapshot` body. Idempotent — re-running
-// on an existing snapshot is a no-op (the provider-side
-// `lvcreate --snapshot` already short-circuits on existing LV).
+// `Config.Apply.CreateSnapshot` body. Idempotent — re-running on
+// an existing snapshot is a no-op because the provider's
+// CreateSnapshot folds a pre-existing snapshot LV / dataset into
+// success via its lvExists / datasetExists pre-check (Bug 216).
+// The underlying tools (`lvcreate --snapshot`, `zfs snapshot`)
+// do NOT short-circuit on their own — they reject the second
+// invocation with "already exists", which without the pre-check
+// would loop the reconciler forever on an already-materialised
+// snapshot.
 //
 // Failure routing — F18 (cli-parity for `linstor s l` State column):
 //   - Apply.CreateSnapshot returned Terminal=true ⇒ stamp

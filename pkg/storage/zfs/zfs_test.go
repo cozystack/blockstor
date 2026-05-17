@@ -418,6 +418,12 @@ func TestDeleteVolumeMissingIsNoop(t *testing.T) {
 // in logs.
 func TestCreateSnapshotErrorWraps(t *testing.T) {
 	fx := storage.NewFakeExec()
+	// Pre-check (Bug 216): dataset reports missing so CreateSnapshot
+	// proceeds past the idempotency short-circuit and actually fires
+	// `zfs snapshot`. The fail-then-wrap contract applies only to
+	// non-not-found errors.
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000@snap-1",
+		storage.FakeResponse{Err: errZFSListMissing})
 	fx.Expect("zfs snapshot tank/pvc-1_00000@snap-1",
 		storage.FakeResponse{Err: errZFSListMissing})
 
@@ -431,7 +437,7 @@ func TestCreateSnapshotErrorWraps(t *testing.T) {
 		t.Fatalf("CreateSnapshot: got nil, want error")
 	}
 
-	if !slices.Contains([]string{"zfs snapshot tank/pvc-1_00000@snap-1"}, fx.CommandLines()[0]) {
+	if !slices.Contains(fx.CommandLines(), "zfs snapshot tank/pvc-1_00000@snap-1") {
 		t.Errorf("expected snapshot cmd in calls; got %v", fx.CommandLines())
 	}
 

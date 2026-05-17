@@ -212,10 +212,23 @@ func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
 }
 
 // CreateSnapshot is `zfs snapshot <pool>/<rd>_00000@<snap>`.
+//
+// Idempotent: pre-existing snapshot dataset → no-op (Bug 216).
+// Without the fold the real `zfs` would reject the second
+// `zfs snapshot` with "dataset already exists" on every reconcile
+// pass, looping the satellite-side reconciler forever on an
+// already-materialised snapshot. Mirrors the datasetExists pre-check
+// the delete path uses (Bug 212).
 func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) error {
-	_, err := p.exec.Run(ctx, "zfs", "snapshot", p.snapshotDataset(snap))
+	dataset := p.snapshotDataset(snap)
+
+	if p.datasetExists(ctx, dataset) {
+		return nil
+	}
+
+	_, err := p.exec.Run(ctx, "zfs", "snapshot", dataset)
 	if err != nil {
-		return errors.Wrapf(err, "zfs snapshot %s", p.snapshotDataset(snap))
+		return errors.Wrapf(err, "zfs snapshot %s", dataset)
 	}
 
 	return nil
