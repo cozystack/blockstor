@@ -281,6 +281,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerSpawn(mux)
 	s.registerAutoplace(mux)
 	s.registerResourceModify(mux)
+	s.registerVolumesPerResource(mux)
 	s.registerControllerProperties(mux)
 	s.registerAdjust(mux)
 	s.registerResourceLifecycle(mux)
