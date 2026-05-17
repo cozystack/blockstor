@@ -115,8 +115,16 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 
 // ResizeVolume grows the backing file to vol.SizeKib bytes and
 // refreshes the loop device's reported capacity with `losetup -c`.
-// truncate handles both thick (fallocate-created) and thin
-// (truncate-created) cases. Shrinks are rejected.
+// Shrinks are rejected (silent no-op) — shrinking a backing file
+// under DRBD would corrupt the replicated state.
+//
+// The grow step honours cfg.Thin: thin → `truncate -s N` widens the
+// file with sparse holes (matching the FILE_THIN overcommit
+// contract); thick → `truncate -s N` followed by `fallocate -l N` so
+// the extended bytes are actually reserved on the backing filesystem.
+// Without the fallocate, a thick resize would silently downgrade
+// space guarantees — the first write into the extended range could
+// ENOSPC even though the file's apparent size grew.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	path := p.volumePath(vol)
 
@@ -138,6 +146,17 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	_, err = p.exec.Run(ctx, "truncate", "-s", strconv.FormatInt(target, 10), path)
 	if err != nil {
 		return errors.Wrapf(err, "truncate %s", path)
+	}
+
+	if !p.cfg.Thin {
+		// Reserve the extended range on disk so the thick space
+		// guarantee survives the resize. fallocate -l N is idempotent
+		// against an already-allocated file (no-op if blocks are
+		// reserved) and matches the CreateVolume thick path.
+		_, err = p.exec.Run(ctx, "fallocate", "-l", strconv.FormatInt(target, 10), path)
+		if err != nil {
+			return errors.Wrapf(err, "fallocate %s", path)
+		}
 	}
 
 	dev, lerr := p.lookupLoop(ctx, path)
@@ -308,12 +327,18 @@ func (p *Provider) DeleteSnapshot(_ context.Context, snap storage.Snapshot) erro
 	return nil
 }
 
-// RestoreVolumeFromSnapshot materialises target.img by reflink-copying
-// the snapshot .img then attaching it to a loop device, matching the
+// RestoreVolumeFromSnapshot materialises target.img by copying the
+// snapshot .img then attaching it to a loop device, matching the
 // CreateVolume tail. Pre-existing target → resumed reconcile, no-op.
 //
-// Upstream LINSTOR for FILE/FILE_THIN: `cp --reflink=auto <snap>.img
-// <vol>.img`. Reflink keeps the copy O(1); writes diverge lazily.
+// The copy honours cfg.Thin: thin → `cp --reflink=auto` (upstream
+// LINSTOR FILE_THIN behaviour — O(1) on reflink-capable filesystems
+// like XFS, btrfs, cow-enabled ext4, with writes diverging lazily);
+// thick → plain `cp` (no --reflink) so the new file gets its own
+// allocated blocks. Without the reflink-strip on thick, the restored
+// "thick" volume would CoW-share blocks with the snapshot and the
+// first divergent write could ENOSPC despite the operator-visible
+// size reporting full allocation.
 func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
 	dstPath := p.volumePath(target)
 
@@ -343,9 +368,16 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 		return errors.Wrapf(sErr, "stat %s", srcPath)
 	}
 
-	_, err = p.exec.Run(ctx, "cp", "--reflink=auto", srcPath, dstPath)
+	if p.cfg.Thin {
+		_, err = p.exec.Run(ctx, "cp", "--reflink=auto", srcPath, dstPath)
+	} else {
+		// Thick: force a full byte copy so the new file has its own
+		// allocated blocks (no CoW share with the snapshot).
+		_, err = p.exec.Run(ctx, "cp", srcPath, dstPath)
+	}
+
 	if err != nil {
-		return errors.Wrapf(err, "cp --reflink %s → %s", srcPath, dstPath)
+		return errors.Wrapf(err, "cp %s → %s", srcPath, dstPath)
 	}
 
 	_, err = p.attach(ctx, dstPath)
