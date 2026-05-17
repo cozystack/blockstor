@@ -27,10 +27,38 @@ import (
 )
 
 // rdCloneRequest is the body for `resource-definition clone`. Only the
-// new name is required; advanced options (override props, RG override)
-// land when there's demand.
+// new name is required.
+//
+// Bug 232: after Bug 222 bumped the wire-advertised rest_api_version
+// from 1.23.0 to 1.27.0, python-linstor's `_require_version()` gates
+// open up `override_props` / `delete_props` (gated on 1.26.0) and
+// the `src_snap_name` snapshot-based clone path. Pre-fix the
+// DisallowUnknownFields decoder rejects them as 400 + "unknown field"
+// and the CLI crashes on the malformed envelope.
+//
+//   - `override_props` (map[string]string): properties to overwrite
+//     on the cloned RD's prop set. Wired through:
+//     handleRDClone applies these on top of the source Props after
+//     the shallow-copy, so the operator's `--override-prop K=V`
+//     lands on the cloned RD.
+//   - `delete_props` ([]string): property keys to drop from the
+//     cloned RD's prop set. Wired through alongside override_props.
+//   - `src_snap_name` (string): name of the source snapshot the
+//     clone should materialise from (vs. live-resource clone). Accept
+//     here so the decode passes, but accept-and-no-op until the
+//     data-plane clone path (snapshot send/recv) lands. Bug 114's
+//     empty-VD-source contract still holds for the live clone path;
+//     the source-with-VDs path returns 501 today, and the snapshot
+//     path is part of the same satellite-side data-plane gap.
+//
+// TODO(bug-232-followup): when the snapshot-based clone data plane
+// lands, dispatch on a non-empty SrcSnapName to a snapshot-restore-
+// equivalent path instead of the live-RD shell copy.
 type rdCloneRequest struct {
-	Name string `json:"name"`
+	Name          string            `json:"name"`
+	OverrideProps map[string]string `json:"override_props,omitempty"`
+	DeleteProps   []string          `json:"delete_props,omitempty"`
+	SrcSnapName   string            `json:"src_snap_name,omitempty"`
 }
 
 // registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoints.
@@ -103,7 +131,7 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.cloneEmptyRDShell(w, r, &src, req.Name)
+	s.cloneEmptyRDShell(w, r, &src, &req)
 }
 
 // cloneEmptyRDShell materialises the empty-source clone path: shallow-copy
@@ -111,16 +139,31 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 // smoke test pins this branch — a freshly-created vol-less RD must be
 // cloneable with Props and RG carried over. Extracted out of handleRDClone
 // to keep its funlen under budget after the Bug 114 VD-presence gate.
+//
+// Bug 232: the `req.OverrideProps` map is applied on top of the
+// source's Props after the shallow-copy, and `req.DeleteProps` keys
+// are dropped before the Create lands. python-linstor 1.27.0 sends
+// these via `linstor resource-definition clone --override-prop K=V`
+// / `--delete-prop K`; wiring them through here keeps the operator's
+// intent honoured for the empty-VD path. `req.SrcSnapName` is
+// accepted-and-no-op (see rdCloneRequest docstring) — the snapshot-
+// based clone data plane lands separately.
 func (s *Server) cloneEmptyRDShell(w http.ResponseWriter, r *http.Request,
-	src *apiv1.ResourceDefinition, cloneName string,
+	src *apiv1.ResourceDefinition, req *rdCloneRequest,
 ) {
 	clone := *src
-	clone.Name = cloneName
+	clone.Name = req.Name
 	clone.UUID = ""
 
-	if src.Props != nil {
-		clone.Props = make(map[string]string, len(src.Props))
+	if src.Props != nil || len(req.OverrideProps) > 0 {
+		clone.Props = make(map[string]string, len(src.Props)+len(req.OverrideProps))
 		maps.Copy(clone.Props, src.Props)
+	}
+
+	maps.Copy(clone.Props, req.OverrideProps)
+
+	for _, k := range req.DeleteProps {
+		delete(clone.Props, k)
 	}
 
 	err := s.Store.ResourceDefinitions().Create(r.Context(), &clone)

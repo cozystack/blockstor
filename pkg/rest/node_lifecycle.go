@@ -161,8 +161,26 @@ func (s *Server) handleNodeEvacuate(w http.ResponseWriter, r *http.Request) {
 // doesn't lose redundancy at any point (UG9 §"Evacuating multiple
 // nodes"). The REST surface's responsibility is the atomic intent
 // stamp; replica migration is the reconciler's job (Phase 6).
+//
+// Bug 232: after Bug 222 bumped the wire-advertised `rest_api_version`
+// from 1.23.0 to 1.27.0, python-linstor's `_require_version()` gates
+// opened up the `target` / `do_not_target` arguments client-side; the
+// CLI now adds those keys to the same evacuate body when the operator
+// passes `--target` / `--do-not-target`. The fields mirror upstream
+// LINSTOR's `NodeEvacuate` schema (both arrays of node names that
+// narrow / forbid the autoplace destination set). Acceptance is the
+// minimum needed to keep the CLI from 400'ing on the
+// DisallowUnknownFields decoder; the narrowing semantics live in the
+// reconciler and are wired through in a follow-up — accept-and-no-op
+// here so the operator-facing command stops crashing.
 type evacuateMultiRequest struct {
 	Nodes []string `json:"nodes"`
+	// Bug 232: accepted-and-no-op. Forwarded to the migration
+	// reconciler (Phase 6) is the deferred wire-through.
+	// TODO(bug-232-followup): narrow the autoplace target set to
+	// `Target` when non-empty, exclude `DoNotTarget` from candidates.
+	Target      []string `json:"target,omitempty"`
+	DoNotTarget []string `json:"do_not_target,omitempty"`
 }
 
 // handleNodeEvacuateMulti is the variadic counterpart of

@@ -730,6 +730,30 @@ type resourceDefinitionModifyBody struct {
 	// instead of the modify envelope (matches the read-side
 	// `ResourceDefinition` wire field). Accept both — first non-empty wins.
 	ResourceGroupName string `json:"resource_group_name,omitempty"`
+	// Bug 232: after Bug 222 bumped the wire-advertised rest_api_version
+	// to 1.27.0, python-linstor's `_require_version()` gates open up
+	// the `--dst-rsc-grp` / `--force-mv-rsc-grp` arguments on the
+	// `rd modify` and `rd move` CLI paths. Upstream's JsonGenTypes
+	// uses these same names for the BackupRestore / BackupShip /
+	// BackupSchedule schemas; python-linstor reuses the spelling for
+	// the RD-modify body when sending the cross-RG-move intent.
+	// Pre-fix the DisallowUnknownFields decoder rejects them as 400
+	// + "unknown field" and the CLI crashes on the malformed envelope.
+	//
+	// `dst_rsc_grp` is wired through as a `resource_group`-equivalent
+	// alias — when non-empty it updates RD.Spec.ResourceGroupName,
+	// matching the existing `resource_group` / `resource_group_name`
+	// fields (first non-empty wins, see handleRDUpdate).
+	//
+	// `force_mv_rsc_grp` is accepted-and-no-op. Upstream's purpose is
+	// to bypass the BalanceResourceTask safety check when moving an
+	// RD with replicas across RGs; blockstor's reconciler-driven
+	// placement doesn't run that BalanceResourceTask today, so the
+	// flag has no behaviour to gate.
+	// TODO(bug-232-followup): if/when blockstor grows a cross-RG
+	// rebalance safety guard, key it off this flag.
+	DstRscGrp     string `json:"dst_rsc_grp,omitempty"`
+	ForceMvRscGrp bool   `json:"force_mv_rsc_grp,omitempty"`
 
 	// Bug 161 (DisallowUnknownFields): the legacy "PUT the full
 	// ResourceDefinition read-side shape" wire convention is still
@@ -797,6 +821,15 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	rgChange := patch.ResourceGroup
 	if rgChange == "" {
 		rgChange = patch.ResourceGroupName
+	}
+	// Bug 232: `dst_rsc_grp` is python-linstor 1.27.0's third spelling
+	// for the same cross-RG-move intent (see resourceDefinitionModifyBody
+	// docstring). First non-empty wins so the existing
+	// `resource_group` / `resource_group_name` callers keep their
+	// precedence; `dst_rsc_grp` is the fallback when the operator goes
+	// through the `--dst-rsc-grp` CLI flag.
+	if rgChange == "" {
+		rgChange = patch.DstRscGrp
 	}
 
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name, func(rd *apiv1.ResourceDefinition) error {
