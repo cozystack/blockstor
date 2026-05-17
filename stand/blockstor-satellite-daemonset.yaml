@@ -170,11 +170,23 @@ spec:
                 command:
                   - /bin/sh
                   - -c
+                  # Bug 241: the previous shape piped `drbdsetup status
+                  # --json` through `python3`, which is not in the
+                  # satellite image (Bug 240's Debian-slim base ships
+                  # only drbd-utils/lvm2/zfs/cryptsetup userspace +
+                  # iptables). `2>/dev/null` swallowed the missing
+                  # interpreter so the for-loop iterated zero times
+                  # and `drbdadm down` never ran on graceful
+                  # termination — silently undoing the whole point of
+                  # Bug 82. Switch to pure POSIX: `drbdsetup status`
+                  # without --json prints resource names as the first
+                  # token of each unindented line; awk extracts them
+                  # without any interpreter dependency.
                   - |
                     set +e
                     timeout 25 sh -c '
-                      for r in $(drbdsetup status --json 2>/dev/null \
-                          | python3 -c "import json,sys; print(\" \".join(r[\"name\"] for r in json.load(sys.stdin)))" 2>/dev/null); do
+                      for r in $(drbdsetup status 2>/dev/null \
+                          | awk "/^[^[:space:]]/ {print \$1; next}"); do
                         timeout 5 drbdadm down "$r" 2>/dev/null || true
                       done
                     '

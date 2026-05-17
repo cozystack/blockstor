@@ -82,7 +82,8 @@ RUN sed -i 's|^Components: main$|Components: main contrib|' /etc/apt/sources.lis
     apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         drbd-utils lvm2 cryptsetup-bin zfsutils-linux gdisk parted ca-certificates \
-        iptables && \
+        iptables \
+        e2fsprogs xfsprogs && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /
 COPY --from=builder /workspace/satellite /usr/local/bin/satellite
