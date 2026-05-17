@@ -294,14 +294,33 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	var downMsg string
 
 	if r.cfg.Adm != nil {
+		// Try `drbdadm down` first — it's the canonical teardown
+		// path and exercises drbd-utils' full graceful sequence
+		// (Secondary → Detach → Disconnect → Down).
 		err := r.cfg.Adm.Down(ctx, req.GetName())
 		if err != nil {
-			// Best-effort: a "not configured" error is fine here
-			// (resource was already torn down on a prior pass), but we
-			// still want to surface the message back to the controller
-			// so it shows up in the gRPC response. Don't fail — DRBD
-			// down errors shouldn't block the storage cleanup.
+			// drbdadm fails with "not defined in your config (for
+			// this host)" / "no resources defined!" whenever the
+			// .res file in /etc/drbd.d is missing — which is the
+			// state we land in when DeleteResource ran once already
+			// (cleanup wiped the .res below) but the kernel slot
+			// somehow survived. Fall back to `drbdsetup down`
+			// (kernel-direct, no .res file needed) so the kernel
+			// slot doesn't leak past CRD deletion (issue 288: the
+			// leaked slot pins the resource's minor in the kernel,
+			// blocking any subsequent RD re-using that minor with
+			// "Device '<minor>' is configured!" on create-md).
+			//
+			// Best-effort either way: a "not configured" failure
+			// on both is fine (kernel didn't know the resource).
+			// Surface the original drbdadm error so operators can
+			// see whether the fallback fired.
 			downMsg = "drbdadm down: " + err.Error()
+
+			setupErr := r.cfg.Adm.SetupDown(ctx, req.GetName())
+			if setupErr != nil {
+				downMsg += "; drbdsetup down: " + setupErr.Error()
+			}
 		}
 	}
 
@@ -1181,6 +1200,18 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 // Errors from the probe fall through to the prop-only gate (the
 // pre-Bug-280 behaviour) so a transient netlink hiccup doesn't
 // strand the reconciler.
+//
+// Bug 287 / scenario 5.32 race: even when the `runBringUpOrAdjust`
+// kernel probe reads as "loaded" (or when this path runs on first
+// activation), the kernel slot can be torn down between the probe
+// and the `drbdadm adjust` shell-out — that's the half-torn window
+// right after an operator's `drbdadm down` finishes its kernel-side
+// teardown. `drbdadm adjust` in that state issues
+// `drbdsetup new-minor` without `new-resource` first and bails with
+// `Failure: (158) Unknown resource`. Catch that exact error string,
+// fall back to `drbdadm up <rsc>` (which always issues
+// new-resource + new-minor + attach + connect), and let the next
+// reconcile re-converge.
 func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) error {
 	skipDisk := isSkipDiskEnabled(dr)
 
@@ -1199,11 +1230,44 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) 
 		err = r.cfg.Adm.Adjust(ctx, dr.GetName())
 	}
 
-	if err != nil {
-		return errors.Wrapf(err, "adjust %s", dr.GetName())
+	if err == nil {
+		return nil
 	}
 
-	return nil
+	// Recover from the Bug-287 race: the kernel slot the probe just
+	// saw vanished before adjust ran. `drbdadm up` is the only verb
+	// that bootstraps a missing slot from a valid .res + on-disk
+	// metadata; surface its error directly so the reconciler retry
+	// loop can re-converge if up also fails.
+	if isUnknownResourceErr(err) {
+		upErr := r.cfg.Adm.Up(ctx, dr.GetName())
+		if upErr != nil {
+			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
+		}
+
+		return nil
+	}
+
+	return errors.Wrapf(err, "adjust %s", dr.GetName())
+}
+
+// isUnknownResourceErr reports whether a drbdadm error is the
+// `(158) Unknown resource` failure mode — adjust saw the kernel
+// slot vanish between the satellite's probe and adjust's own
+// `drbdsetup new-minor` shell-out (Bug 287 / scenario 5.32 race).
+// We grep the wrapped error text rather than introducing a typed
+// errno because drbdadm surfaces 158 via a textual message; the
+// caller's wrap chain already preserves the verbatim stderr from
+// `pkg/storage/exec.go`.
+func isUnknownResourceErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+
+	return strings.Contains(msg, "(158) Unknown resource") ||
+		strings.Contains(msg, "unknown resource")
 }
 
 // seedInitialGi pre-stamps each diskful volume's freshly-created

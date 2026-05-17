@@ -40,6 +40,14 @@ var (
 	errDrbdadmAdjustFail   = errors.New("drbdadm: simulated mid-Apply abort")
 	errDrbdadmResizeFail   = errors.New("drbdadm: resize failed (peer disconnected)")
 	errDrbdsetupNoResource = errors.New("drbdsetup: exit status 10")
+	// errDrbdadmAdjust158 mirrors the verbatim stderr drbdadm-9 emits
+	// when `drbdsetup new-minor` fires on a kernel slot that vanished
+	// between the satellite's IsLoaded probe and adjust's own exec
+	// (Bug 287 / scenario 5.32 race). isUnknownResourceErr's substring
+	// match keys on the parenthesised errno + verb.
+	errDrbdadmAdjust158 = errors.New("pvc-down158: Failure: (158) Unknown resource\n" +
+		"additional info from kernel:\nunknown resource\n" +
+		"Command 'drbdsetup new-minor pvc-down158 1000 0' terminated with exit code 10: exit status 1")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -4682,5 +4690,119 @@ func TestApplyResFileUsesKernelHostnameNotLINSTORName(t *testing.T) {
 	if strings.Contains(got, badOn) {
 		t.Errorf("LINSTOR name leaked into local `on { }` header (%q); .res must use kernel hostname:\n%s",
 			badOn, got)
+	}
+}
+
+// TestApplyFallsBackToUpOnAdjust158 pins the Bug 287 / scenario 5.32
+// race recovery: after an operator's `drbdadm down` from the satellite
+// shell, the kernel slot is gone but the satellite's IsLoaded probe
+// can briefly read "loaded" because DRBD-9 surfaces a half-torn state
+// for a sub-second window right after `drbdadm down` returns. The
+// reconciler dispatches `drbdadm adjust`, which then fails with
+// `(158) Unknown resource` because the slot finished tearing down
+// between probe and exec. The fix: catch the 158 error and fall
+// back to `drbdadm up <rsc>` (which always issues new-resource +
+// new-minor) so the resource gets re-bootstrapped in the same
+// reconcile pass — the e2e scenario polls for <=30s and would FAIL
+// without this fallback.
+//
+// Test shape:
+//   - First Apply seeds the .res + md-marker so the second pass goes
+//     through `runBringUpOrAdjust` (firstActivation=false).
+//   - Second Apply stages `drbdsetup status` returning a populated
+//     status block (IsLoaded reads "loaded") — mirroring the
+//     half-torn kernel state — and stages `drbdadm adjust` to fail
+//     with the verbatim 158 stderr drbdadm-9 emits.
+//   - Assert: the reconciler issued `drbdadm up <rsc>` after the
+//     failed adjust, AND the Apply result reports Ok=true (the
+//     fallback recovered the failure).
+func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// First pass: standard first-activation. LV absent, lvcreate +
+	// create-md + adjust all succeed; the .res + md-marker land on
+	// disk so the second pass takes the steady-state branch.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-down158_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-down158",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (1st, first activation): %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("expected Ok=true on first activation; got results=%+v", results)
+	}
+
+	// Second pass: steady-state, simulate the post-operator-down
+	// race. `drbdsetup status` returns a populated block (IsLoaded
+	// reads "loaded" → dispatch into runAdjust), but `drbdadm
+	// adjust` fails with the verbatim 158 stderr the kernel emits
+	// when new-minor lands on a torn-down slot.
+	fx.Reset()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-down158_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-down158_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-down158_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-down158_00000|1048576\n")})
+	fx.Expect("drbdsetup status pvc-down158", storage.FakeResponse{
+		Stdout: []byte("pvc-down158 role:Secondary\n  volume:0 disk:UpToDate\n"),
+	})
+	fx.Expect("drbdadm adjust pvc-down158", storage.FakeResponse{Err: errDrbdadmAdjust158})
+	// `drbdadm up` is the recovery verb — must succeed for the
+	// reconcile to converge.
+	fx.Expect("drbdadm up pvc-down158", storage.FakeResponse{})
+
+	results, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (2nd, post-operator-down race): %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	sawAdjust := false
+	sawUp := false
+
+	for _, line := range cmds {
+		if strings.Contains(line, "drbdadm adjust pvc-down158") {
+			sawAdjust = true
+		}
+
+		if strings.Contains(line, "drbdadm up pvc-down158") {
+			sawUp = true
+		}
+	}
+
+	if !sawAdjust {
+		t.Errorf("expected reconciler to first try `drbdadm adjust pvc-down158`; got %v", cmds)
+	}
+
+	if !sawUp {
+		t.Errorf("expected reconciler to fall back to `drbdadm up pvc-down158` after adjust 158; got %v", cmds)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Errorf("expected Ok=true after up-fallback recovery; got results=%+v", results)
 	}
 }
