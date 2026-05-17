@@ -222,16 +222,28 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 			return nil
 		}
 
-		logger.Info("orphan DRBD resource detected; running drbdadm down",
+		// Use `drbdsetup down` (kernel-direct) rather than
+		// `drbdadm down` (which needs the .res file to enumerate
+		// the resource). The whole reason the sweeper exists is
+		// the .res-less aftermath: DeleteResource removed the
+		// .res file but its own drbdadm-down step never reached
+		// the kernel, or a restart wiped /etc/drbd.d before the
+		// kernel slot was torn down. Calling drbdadm-down here
+		// would always fail with `'<rsc>' not defined in your
+		// config (for this host)` / `no resources defined!`, the
+		// kernel slot would survive forever, and the next RD
+		// re-using the same minor would fail create-md with
+		// "Device '<minor>' is configured!" (issue 288).
+		logger.Info("orphan DRBD resource detected; running drbdsetup down",
 			"resource", rsc)
 
-		downErr := s.Adm.Down(ctx, rsc)
+		downErr := s.Adm.SetupDown(ctx, rsc)
 		if downErr != nil {
 			// Per-resource failure shouldn't abort the cycle —
 			// move on to the next orphan and let the next tick
 			// retry the failure. We don't increment `torn` so the
 			// rate-limit budget still reflects successful tear-downs.
-			logger.Error(downErr, "drbdadm down on orphan", "resource", rsc)
+			logger.Error(downErr, "drbdsetup down on orphan", "resource", rsc)
 
 			continue
 		}

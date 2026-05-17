@@ -52,6 +52,35 @@ func (a *Adm) Down(ctx context.Context, resource string) error {
 	return a.run(ctx, "down", resource)
 }
 
+// SetupDown tears down a kernel-resident DRBD resource via
+// `drbdsetup down <res>`, bypassing drbdadm's .res-file lookup.
+//
+// 288 P1: the orphan sweeper used to call `drbdadm down`
+// on resources it discovered via `drbdsetup status` but for which
+// no Resource CRD existed on this node. drbdadm refuses with
+// `'<rsc>' not defined in your config (for this host)` /
+// `no resources defined!` whenever the corresponding .res file
+// in /etc/drbd.d is missing — which is precisely the state we
+// land in after `DeleteResource` removed the .res file but its
+// `drbdadm down` step never reached the kernel (e.g. the resource
+// was already torn down once and a subsequent restart wiped the
+// .res via cleanStateDir; or the controller raced the satellite
+// and CRD delete fired before drbdadm down propagated).
+//
+// `drbdsetup down` reads kernel state directly (the resource
+// name is the kernel-side handle, not the config) so it works
+// in the .res-less state the sweeper exists to clean up.
+// Mirrors `cleanKernelState` in cmd/satellite/main.go (issue 285)
+// for runtime use rather than startup.
+func (a *Adm) SetupDown(ctx context.Context, resource string) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "down", resource)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup down %s", resource)
+	}
+
+	return nil
+}
+
 // Adjust reconciles kernel state to the on-disk .res file. Called after
 // the ConfFileBuilder writes a new file and we need DRBD to pick up
 // changes (added/removed peers, new options).

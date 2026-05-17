@@ -40,6 +40,12 @@ var (
 	errDrbdadmAdjustFail   = errors.New("drbdadm: simulated mid-Apply abort")
 	errDrbdadmResizeFail   = errors.New("drbdadm: resize failed (peer disconnected)")
 	errDrbdsetupNoResource = errors.New("drbdsetup: exit status 10")
+	// errDrbdadmDownNotInConfig mirrors the verbatim stderr drbdadm
+	// emits when the .res file is missing from /etc/drbd.d — the
+	// state the orphan-sweeper / DeleteResource-after-restart path
+	// hits whenever the satellite wiped the .res file before the
+	// kernel slot was torn down (issue 288).
+	errDrbdadmDownNotInConfig = errors.New("pvc-leak not defined in your config for this host")
 	// errDrbdadmAdjust158 mirrors the verbatim stderr drbdadm-9 emits
 	// when `drbdsetup new-minor` fires on a kernel slot that vanished
 	// between the satellite's IsLoaded probe and adjust's own exec
@@ -1378,6 +1384,82 @@ func TestDeleteResourceClosesLUKSMapper(t *testing.T) {
 	if closeIdx >= 0 && removeIdx >= 0 && closeIdx > removeIdx {
 		t.Errorf("luksClose must run BEFORE lvremove (mapper would dangle on a missing LV); got close@%d remove@%d in %v",
 			closeIdx, removeIdx, calls)
+	}
+}
+
+// TestDeleteResourceFallsBackToDrbdsetupDown pins the .res-less
+// teardown fallback (issue 288). When the .res file in
+// /etc/drbd.d/<rsc>.res has already been wiped (e.g. by a prior
+// partial DeleteResource pass, or by cleanStateDir at satellite
+// startup), `drbdadm down` exits non-zero with "not defined in
+// your config (for this host)" because drbdadm enumerates
+// resources from the .res file. DeleteResource MUST then fall
+// back to `drbdsetup down` (kernel-direct, no .res lookup) so
+// the kernel slot doesn't leak past CRD deletion — a leaked
+// slot pins the resource's minor in the kernel, blocking
+// every subsequent RD that lands on that minor with
+// "Device '<minor>' is configured!" on create-md.
+//
+// Without this fallback, a single failed `drbdadm down` on a
+// .res-less resource strands the kernel slot forever; the
+// orphan sweeper at 5-min cadence (also routed through
+// SetupDown now) eventually cleans it, but the
+// fast-rebuild path the e2e suite exercises (delete + recreate
+// with the same name) hits the leaked-minor wall first.
+func TestDeleteResourceFallsBackToDrbdsetupDown(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// Simulate the .res-less state: drbdadm down fails with
+	// the diagnostic the kernel actually prints when no .res
+	// file is on disk for the resource. Real shape (paraphrased
+	// from a live e2e capture):
+	//   `'pvc-leak' not defined in your config (for this host).`
+	// or
+	//   `no resources defined!`
+	fx.Expect("drbdadm down pvc-leak",
+		storage.FakeResponse{
+			Err: errDrbdadmDownNotInConfig,
+		})
+	// drbdsetup down succeeds — kernel-direct, no .res file
+	// needed. This is what tears down the leaked slot.
+	fx.Expect("drbdsetup down pvc-leak", storage.FakeResponse{})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	resp, err := rec.DeleteResource(t.Context(), &intent.DeleteResourceRequest{
+		Name:          "pvc-leak",
+		VolumeNumbers: []int32{0},
+	})
+	if err != nil {
+		t.Fatalf("DeleteResource: %v", err)
+	}
+
+	// DeleteResource keeps Ok=true even when drbdadm fails —
+	// the fallback succeeded; the drbdadm error is surfaced in
+	// the message field for operator visibility.
+	if !resp.GetOk() {
+		t.Fatalf("DeleteResource Ok=false: %s", resp.GetMessage())
+	}
+
+	calls := fx.CommandLines()
+
+	// Load-bearing: drbdsetup down MUST be in the call stream.
+	// Without it the kernel slot would leak past CRD deletion.
+	if !slices.Contains(calls, "drbdsetup down pvc-leak") {
+		t.Errorf("DeleteResource did not fall back to drbdsetup down on .res-less drbdadm failure; calls=%v",
+			calls)
+	}
+
+	// Sanity: the message should mention both attempts so an
+	// operator triaging a leaked slot can see what was tried.
+	if !strings.Contains(resp.GetMessage(), "drbdadm down") {
+		t.Errorf("expected message to mention drbdadm down attempt; got %q",
+			resp.GetMessage())
 	}
 }
 

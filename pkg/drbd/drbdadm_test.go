@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -55,6 +56,42 @@ func TestAdmDownInvokesDrbdadm(t *testing.T) {
 	want := "drbdadm down pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
+	}
+}
+
+// TestAdmSetupDownInvokesDrbdsetup pins the kernel-direct teardown
+// shape: SetupDown → `drbdsetup down <res>`. Distinct from Down
+// because drbdsetup operates on kernel state directly, with no
+// /etc/drbd.d/<rsc>.res lookup — this is the only path that
+// actually works once the .res file has been removed.
+//
+// Issue 288: the orphan sweeper used to call `drbdadm down` on
+// resources discovered via `drbdsetup status`, which always
+// failed (".res file missing → 'not defined in your config'")
+// and left the kernel slot leaked. The sweeper now routes
+// through SetupDown to close that hole.
+func TestAdmSetupDownInvokesDrbdsetup(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	if err := adm.SetupDown(t.Context(), "pvc-1"); err != nil {
+		t.Fatalf("SetupDown: %v", err)
+	}
+
+	want := "drbdsetup down pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
+	}
+
+	// Regression guard: SetupDown MUST NOT shell out to drbdadm.
+	// The whole reason this method exists is to skip drbdadm's
+	// .res-file lookup; a regression that fell back to drbdadm
+	// would re-introduce the kernel-slot leak.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") {
+			t.Errorf("SetupDown shelled out to drbdadm (defeats the .res-less recovery purpose): %s",
+				line)
+		}
 	}
 }
 

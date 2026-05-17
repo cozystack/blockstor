@@ -78,7 +78,7 @@ func sweeperFixture(t *testing.T, nodeName string, kernelStatusOut string, resou
 
 // TestSweeperLeavesMatchingResourceAlone pins the core invariant:
 // when the kernel has a resource AND a matching Resource CRD
-// exists on this node, the sweeper MUST NOT issue `drbdadm down`.
+// exists on this node, the sweeper MUST NOT issue a down call.
 // A regression here would tear down healthy replicas every sweep
 // cycle — the worst possible failure mode for this code.
 func TestSweeperLeavesMatchingResourceAlone(t *testing.T) {
@@ -102,7 +102,7 @@ func TestSweeperLeavesMatchingResourceAlone(t *testing.T) {
 	}
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm down") {
+		if strings.HasPrefix(line, "drbdadm down") || strings.HasPrefix(line, "drbdsetup down") {
 			t.Errorf("sweeper tore down matching resource: %s; calls=%v", line, fx.CommandLines())
 		}
 	}
@@ -110,9 +110,16 @@ func TestSweeperLeavesMatchingResourceAlone(t *testing.T) {
 
 // TestSweeperDownsOrphan pins the load-bearing case: kernel
 // reports a resource for which no Resource CRD exists on this
-// node → `drbdadm down <rsc>` MUST run. Without this, the
+// node → `drbdsetup down <rsc>` MUST run. Without this, the
 // force-strip aftermath documented in the blockstor_drbd_stuck_state
 // recovery skill never resolves automatically.
+//
+// Issue 288: use `drbdsetup down` (kernel-direct, no .res lookup)
+// rather than `drbdadm down`. The sweeper exists to clean up the
+// .res-less aftermath; calling drbdadm-down with no .res in
+// /etc/drbd.d fails with "not defined in your config" and the
+// kernel slot leaks forever, pinning the minor and blocking
+// re-creation of any RD that lands on that minor.
 func TestSweeperDownsOrphan(t *testing.T) {
 	t.Parallel()
 
@@ -126,9 +133,19 @@ func TestSweeperDownsOrphan(t *testing.T) {
 		t.Fatalf("sweepOnce: %v", err)
 	}
 
-	want := "drbdadm down pvc-orphan"
+	want := "drbdsetup down pvc-orphan"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("sweeper did not down orphan; want %q in %v", want, fx.CommandLines())
+	}
+
+	// Regression guard: drbdadm down requires the .res file and
+	// fails on the .res-less orphan we're trying to clean up.
+	// Calling it here would have leaked the kernel slot forever.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm down") {
+			t.Errorf("sweeper used drbdadm down on orphan (needs .res file, would leak slot): %s",
+				line)
+		}
 	}
 }
 
@@ -162,7 +179,7 @@ func TestSweeperOnlyConsidersLocalResources(t *testing.T) {
 		t.Fatalf("sweepOnce: %v", err)
 	}
 
-	want := "drbdadm down pvc-xxx"
+	want := "drbdsetup down pvc-xxx"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("sweeper did not down foreign-CRD orphan; want %q in %v", want, fx.CommandLines())
 	}
@@ -196,7 +213,7 @@ func TestSweeperRespectsRateLimit(t *testing.T) {
 	var downCount int
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm down ") {
+		if strings.HasPrefix(line, "drbdsetup down ") {
 			downCount++
 		}
 	}
@@ -251,7 +268,7 @@ func TestSweeperSkipAnnotationDisablesSweep(t *testing.T) {
 	// but the load-bearing assertion is that no down command was
 	// issued.
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm down") {
+		if strings.HasPrefix(line, "drbdadm down") || strings.HasPrefix(line, "drbdsetup down") {
 			t.Errorf("sweeper ignored skip annotation: %s", line)
 		}
 	}
