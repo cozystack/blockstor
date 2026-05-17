@@ -235,8 +235,20 @@ func TestDeleteSnapshotIssuesZfsDestroy(t *testing.T) {
 // TestZFSResizeVolumeIssuesZfsSet locks `zfs set volsize=<MiB>M`
 // as the resize command. Used by the satellite reconciler when a
 // VolumeDefinition update bumps the size.
+//
+// Post-Bug-252 the thick path also runs `ensureRefreservation` after
+// the volsize set, which probes volsize + refreservation. Seed both so
+// the helper sees refreservation already matches the new volsize and
+// stays a no-op — keeps this test focused on the resize command shape
+// (the dedicated Bug 252 test in refreservation_policy_bug_252_254_test.go
+// pins the re-set behaviour).
 func TestZFSResizeVolumeIssuesZfsSet(t *testing.T) {
 	fx := storage.NewFakeExec()
+	fx.Expect("zfs get -Hp -o value volsize tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("2147483648\n")})
+	fx.Expect("zfs get -Hp -o value refreservation tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("2147483648\n")})
+
 	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
 
 	err := p.ResizeVolume(t.Context(), storage.Volume{

@@ -89,14 +89,27 @@ func (p *Provider) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // idempotent. Shrinks are rejected by ZFS itself when the existing
 // volume already holds more data — the CSI grow-only contract makes
 // the no-shrink invariant a non-issue here.
+//
+// Bug 252 (P2, capacity safety): `zfs set volsize=` does NOT auto-grow
+// refreservation. In thick mode, a post-restore resize would silently
+// leave the grown range sparse and could hit ENOSPC mid-write —
+// defeating the thick contract on the new space. After the volsize
+// grow, call ensureRefreservation so the refreservation tracks the
+// new volsize. Thin mode no-ops inside the helper.
 func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
+	dataset := p.volumeDataset(vol)
 
 	_, err := p.exec.Run(ctx, "zfs", "set",
 		"volsize="+strconv.FormatInt(sizeMiB, 10)+"M",
-		p.volumeDataset(vol))
+		dataset)
 	if err != nil {
-		return errors.Wrapf(err, "zfs set volsize %s", p.volumeDataset(vol))
+		return errors.Wrapf(err, "zfs set volsize %s", dataset)
+	}
+
+	err = p.ensureRefreservation(ctx, dataset)
+	if err != nil {
+		return errors.Wrapf(err, "ensure refreservation after resize %s", dataset)
 	}
 
 	return nil
@@ -299,11 +312,22 @@ func hasDependentClonesError(stdout, stderr string) bool {
 // thick-provisioning contract working as intended.
 //
 // Upstream LINSTOR equivalent: `zfs clone <pool>/<src>@<snap> <pool>/<tgt>`.
-// Idempotent: target dataset present → treat as resumed reconcile.
+//
+// Idempotent: target dataset present → treat as resumed reconcile and
+// skip the `zfs clone`. Bug 253 (P2, capacity safety): the pre-fix
+// idempotency check returned early BEFORE the refreservation step. A
+// crash between `zfs clone` and `zfs set refreservation=` left the
+// dataset permanently sparse-thick across reconciles. Even on the
+// idempotent-skip path, ensureRefreservation is called so the thick
+// guarantee is restored on every reconcile, not just on the first
+// happy-path invocation.
 func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Volume, src storage.Snapshot) error {
 	tgtDS := p.volumeDataset(target)
+
 	if p.datasetExists(ctx, tgtDS) {
-		return nil
+		// Bug 253 fix: do NOT short-circuit before ensuring refreservation.
+		// A prior crash may have left the dataset sparse-thick.
+		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
 	srcDS := p.snapshotDataset(src)
@@ -317,20 +341,11 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	}
 
 	// THICK mode: restore the space guarantee that `zfs clone` always
-	// drops. Thin mode skips this — sparse-everywhere is the thin
-	// contract by design.
-	if !p.cfg.Thin {
-		volsizeBytes, err := p.datasetVolsize(ctx, tgtDS)
-		if err != nil {
-			return errors.Wrapf(err, "lookup volsize on cloned %s", tgtDS)
-		}
-
-		_, err = p.exec.Run(ctx, "zfs", "set",
-			"refreservation="+strconv.FormatInt(volsizeBytes, 10),
-			tgtDS)
-		if err != nil {
-			return errors.Wrapf(err, "zfs set refreservation on cloned %s", tgtDS)
-		}
+	// drops. Thin mode no-ops inside the helper — sparse-everywhere is
+	// the thin contract by design.
+	err = p.ensureRefreservation(ctx, tgtDS)
+	if err != nil {
+		return errors.Wrapf(err, "ensure refreservation on cloned %s", tgtDS)
 	}
 
 	return nil
@@ -440,10 +455,20 @@ func (r *zfsSendReader) Close() error {
 // sparse-by-inheritance and silently downgrades the thick guarantee.
 // Re-setting refreservation here defends against the peer-version
 // skew window during a partial cluster upgrade.
+//
+// Bug 254 (P2, capacity safety): the pre-fix idempotency check
+// returned early BEFORE the refreservation step. A crash between
+// `zfs recv` and `zfs set refreservation=` left the recv'd dataset
+// permanently sparse-thick across reconciles. Even on the
+// idempotent-skip path, ensureRefreservation is called so the thick
+// guarantee is restored on every reconcile.
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
+
 	if p.datasetExists(ctx, tgtDS) {
-		return nil
+		// Bug 254 fix: do NOT short-circuit before ensuring refreservation.
+		// A prior crash may have left the recv'd dataset sparse-thick.
+		return p.ensureRefreservation(ctx, tgtDS)
 	}
 
 	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
@@ -458,19 +483,11 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 
 	// THICK mode: restore the space guarantee even if the peer sender
 	// shipped the stream without `-p` (Bug 251 defence-in-depth). Same
-	// pattern as Bug 246's post-clone refreservation re-set.
-	if !p.cfg.Thin {
-		volsizeBytes, vErr := p.datasetVolsize(ctx, tgtDS)
-		if vErr != nil {
-			return errors.Wrapf(vErr, "lookup volsize on recv'd %s", tgtDS)
-		}
-
-		_, sErr := p.exec.Run(ctx, "zfs", "set",
-			"refreservation="+strconv.FormatInt(volsizeBytes, 10),
-			tgtDS)
-		if sErr != nil {
-			return errors.Wrapf(sErr, "zfs set refreservation on recv'd %s", tgtDS)
-		}
+	// pattern as Bug 246's post-clone refreservation re-set. Thin mode
+	// no-ops inside the helper.
+	err = p.ensureRefreservation(ctx, tgtDS)
+	if err != nil {
+		return errors.Wrapf(err, "ensure refreservation on recv'd %s", tgtDS)
 	}
 
 	return nil
@@ -609,6 +626,80 @@ func (p *Provider) datasetVolsize(ctx context.Context, dataset string) (int64, e
 	}
 
 	return bytes, nil
+}
+
+// datasetRefreservation reads the zvol's `refreservation` property in
+// bytes. ZFS reports an unset refreservation as the literal string
+// "none" (and as "0" on some versions or after `zfs set
+// refreservation=0`); both are normalised to int64(0) so callers can
+// compare numerically against volsize without string-juggling.
+func (p *Provider) datasetRefreservation(ctx context.Context, dataset string) (int64, error) {
+	out, err := p.exec.Run(ctx, "zfs", "get", "-Hp", "-o", "value", "refreservation", dataset)
+	if err != nil {
+		return 0, errors.Wrapf(err, "zfs get refreservation %s", dataset)
+	}
+
+	line := strings.TrimSpace(string(out))
+	if line == "" || line == "none" || line == "-" {
+		return 0, nil
+	}
+
+	bytes, err := strconv.ParseInt(line, 10, 64)
+	if err != nil {
+		return 0, errors.Wrapf(err, "parse refreservation %q", line)
+	}
+
+	return bytes, nil
+}
+
+// ensureRefreservation is the unified refreservation policy point for
+// the ZFS provider (Bug 252+253+254). On thin it's a no-op (sparse
+// oversubscription is the thin contract). On thick it verifies the
+// dataset's refreservation matches its volsize and re-sets it if not,
+// so every path that mutates volsize OR short-circuits on dataset
+// existence still lands on a thick-correct end state.
+//
+// Idempotent on purpose: callable on every reconcile pass and on the
+// idempotent-skip branches of RestoreVolumeFromSnapshot / RecvSnapshot
+// without spamming `zfs set` when the dataset is already in the right
+// shape. The pre-check costs two `zfs get` calls; the set is only
+// issued when refreservation < volsize (covers "none", "0", and the
+// partial-write case where refreservation tracks an older volsize).
+//
+// Failure modes propagate as errors:
+//   - volsize lookup failure on the target dataset.
+//   - refreservation lookup failure.
+//   - `zfs set refreservation=` failure (notably ENOSPC, which IS the
+//     thick contract working as intended — the pool can't honour the
+//     reservation, so the operation must visibly fail rather than
+//     silently downgrade the volume to sparse).
+func (p *Provider) ensureRefreservation(ctx context.Context, dataset string) error {
+	if p.cfg.Thin {
+		return nil
+	}
+
+	volsizeBytes, err := p.datasetVolsize(ctx, dataset)
+	if err != nil {
+		return errors.Wrapf(err, "lookup volsize for refreservation policy on %s", dataset)
+	}
+
+	currentRefres, err := p.datasetRefreservation(ctx, dataset)
+	if err != nil {
+		return errors.Wrapf(err, "lookup refreservation on %s", dataset)
+	}
+
+	if currentRefres >= volsizeBytes {
+		return nil
+	}
+
+	_, err = p.exec.Run(ctx, "zfs", "set",
+		"refreservation="+strconv.FormatInt(volsizeBytes, 10),
+		dataset)
+	if err != nil {
+		return errors.Wrapf(err, "zfs set refreservation on %s", dataset)
+	}
+
+	return nil
 }
 
 // datasetExists is the idempotency primitive — analogous to lvExists.
