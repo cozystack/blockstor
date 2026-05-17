@@ -99,7 +99,7 @@ func TestThickResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-1_00000"
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB --config activation{udev_sync=0 udev_rules=0} vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}

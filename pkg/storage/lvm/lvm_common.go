@@ -19,11 +19,42 @@ package lvm
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
 	"github.com/cozystack/blockstor/pkg/storage"
 )
+
+// probeTimeout bounds every read-only LVM probe (lvs/vgs/pvs) so a
+// stuck backend can't wedge the satellite reconcile loop forever.
+//
+// Bug 270 (P1, @drbd_ru #22302 et al): a satellite that lost its
+// LVM metadata cache reports `ERROR Failed to query 'lvs' info`
+// and all subsequent REST operations on the affected node block
+// indefinitely until reboot. controller-runtime hands Reconcile a
+// ctx with no deadline; without an explicit bound the os/exec
+// child inherits "wait forever" semantics and the worker thread
+// is consumed.
+//
+// 30 s is comfortably above any healthy lvs response time (typical
+// well under 1 s) but below controller-runtime's per-worker
+// reconcile budget (~5 min default), so a stuck probe surfaces as
+// an ordinary reconcile error and the next requeue retries —
+// the satellite stays responsive instead of going REST-blackout.
+const probeTimeout = 30 * time.Second
+
+// withProbeTimeout derives a bounded child context for a probe
+// call. If the caller already supplied a deadline (e.g. a unit
+// test passing a fixture ctx), we preserve theirs — never
+// shorten — so explicit overrides remain authoritative.
+func withProbeTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+
+	return context.WithTimeout(ctx, probeTimeout)
+}
 
 // State strings shared between Thin / Thick. Match the upstream LINSTOR
 // values that REST clients display via `linstor v list`.
@@ -101,6 +132,9 @@ const RestoreIncompleteTag = "blockstor-restore-incomplete"
 // `blockstor-restore-incomplete-v2` would have matched a bare
 // `strings.Contains` check).
 func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName string) bool {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := ex.Run(ctx, "lvs",
 		Args("--noheadings",
 			"-o", "lv_tags",
@@ -123,6 +157,9 @@ func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName 
 // LV doesn't exist; surface NOT_PROVISIONED so the satellite reconciler's
 // next pass triggers a CreateVolume.
 func volumeStatusViaLVS(ctx context.Context, exec storage.Exec, vgLV string) (storage.VolumeStatus, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := exec.Run(ctx, "lvs",
 		Args("--noheadings",
 			"--separator", "|",

@@ -95,11 +95,19 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // support online shrink and CSI ControllerExpandVolume is grow-only.
 // `lvextend --size` is a no-op when the requested size matches, so
 // the call stays idempotent.
+//
+// Bug 269 (P1, @drbd_ru #17589/#13568): inherits the same udev-less
+// workaround CreateVolume uses. The satellite container has no
+// udev daemon; without `activation{udev_sync=0 udev_rules=0}` the
+// post-resize `/dev/<vg>/<lv>` symlink races the next reconcile's
+// `blockdev --getsize64`, leaving the volume stuck in `Resizing`
+// state until the operator runs `vgmknodes` + restarts satellite.
 func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
 		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--config", "activation{udev_sync=0 udev_rules=0}",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
@@ -130,8 +138,13 @@ func (t *Thin) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.Vo
 	return volumeStatusViaLVS(ctx, t.exec, t.cfg.VolumeGroup+"/"+volumeLVName(vol))
 }
 
-// PoolStatus reports the thin pool's free/total capacity.
+// PoolStatus reports the thin pool's free/total capacity. Bug 270:
+// bounded ctx so a stuck `lvs` can't wedge the satellite reconciler
+// — see withProbeTimeout in lvm_common.go.
 func (t *Thin) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := t.exec.Run(ctx, "lvs",
 		Args("--noheadings",
 			"--separator", "|",
@@ -502,8 +515,11 @@ const lvNumberDigits = 5
 // lvExists is the idempotency primitive used by Create/Delete. Errors
 // from `lvs` are folded into "missing": we can't distinguish "lv not
 // found" from "vg locked" via stdout, and the caller's subsequent op
-// surfaces the real cause anyway.
+// surfaces the real cause anyway. Bug 270: bounded ctx.
 func (t *Thin) lvExists(ctx context.Context, lvName string) bool {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := t.exec.Run(ctx, "lvs",
 		Args("--noheadings",
 			"-o", "lv_name",

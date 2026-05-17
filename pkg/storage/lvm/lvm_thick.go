@@ -74,13 +74,17 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// ResizeVolume grows the LV to vol.SizeKib. Same flag set as Thin's
-// resize; LV-thick resize is just `lvextend` over the requested size.
+// ResizeVolume grows the LV to vol.SizeKib. Bug 269 (P1): inherits
+// the udev-less workaround CreateVolume uses; satellite container
+// has no udev daemon so `activation{udev_sync=0 udev_rules=0}` keeps
+// `lvextend` from blocking on a sync that never completes (see
+// Thin.ResizeVolume doc for the @drbd_ru repro chain).
 func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
 		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+			"--config", "activation{udev_sync=0 udev_rules=0}",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
@@ -117,8 +121,13 @@ func (t *Thick) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, error
 	return listLVMVolumes(ctx, t.exec, t.cfg.VolumeGroup)
 }
 
-// PoolStatus reports the VG's free/total capacity.
+// PoolStatus reports the VG's free/total capacity. Bug 270: bounded
+// ctx so a stuck `vgs` can't wedge the satellite — see
+// withProbeTimeout in lvm_common.go.
 func (t *Thick) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := t.exec.Run(ctx, "vgs",
 		Args("--noheadings",
 			"--separator", "|",
@@ -317,8 +326,12 @@ func (t *Thick) copyAndClearSentinel(ctx context.Context, srcName, tgtName strin
 	return nil
 }
 
-// lvExists is the same idempotency primitive Thin uses.
+// lvExists is the same idempotency primitive Thin uses. Bug 270:
+// bounded ctx so a stuck `lvs` cannot block the create/delete path.
 func (t *Thick) lvExists(ctx context.Context, lvName string) bool {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := t.exec.Run(ctx, "lvs",
 		Args("--noheadings",
 			"-o", "lv_name",
