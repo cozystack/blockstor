@@ -144,7 +144,13 @@ sudo -E talosctl cluster create \
     --extra-disks-size ${EXTRA_DISK_SIZE_MB:-16384} \
     --wait
 
-sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR"
+# `chown -R` does not follow a top-level symlink, so when WORK_DIR is
+# a symlink (the dev stand redirects `.work/<name>` →
+# `/var/lib/blockstor/work-<name>` for disk-space reasons) the
+# kubeconfig/talosconfig written by the `sudo talosctl cluster create`
+# above stay root-owned. Resolve via realpath so the recursion lands
+# on the actual directory. Found by parallel e2e run on 2026-05-17.
+sudo chown -R "$(id -u):$(id -g)" "$(realpath "$WORK_DIR")"
 
 # Talos qemu provisioner allocates IPs deterministically: first controlplane
 # is at .2 in the cluster CIDR.
