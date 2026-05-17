@@ -76,9 +76,16 @@ func Args(extra ...string) []string {
 // Without this sentinel a crash between lvcreate and dd would leave the
 // LV existing but holding garbage; the next reconcile's bare
 // "lvExists?" check would mis-trust it as the restored volume — silent
-// data loss. The `@` prefix is the standard LVM tag-namespace marker so
-// `lvs -o lv_tags` reports the exact string this constant carries.
-const RestoreIncompleteTag = "@blockstor-restore-incomplete"
+// data loss.
+//
+// Bug 259: the constant MUST be a bare tag name without the `@` prefix.
+// `--addtag X` / `--deltag X` accept bare names; `@X` is reserved for
+// tag *references* in select/filter expressions. Upstream LINSTOR uses
+// the same convention (LvmCommands.java's LVM_TAG_CLONE_SNAPSHOT is the
+// bare `linstor_clone_snapshot`). `lvs -o lv_tags` reports tags as
+// comma-separated bare names so the match logic strips both the `@`
+// and any surrounding tags.
+const RestoreIncompleteTag = "blockstor-restore-incomplete"
 
 // lvHasRestoreIncompleteTag reports whether the named LV carries the
 // completion sentinel (Bug 257). Used by the idempotent-skip path of
@@ -86,6 +93,13 @@ const RestoreIncompleteTag = "@blockstor-restore-incomplete"
 // between "previous run completed, skip" and "previous run crashed,
 // re-run the dd step". Errors from `lvs` are folded into false — the
 // caller's subsequent op surfaces the real cause if the LV is gone.
+//
+// Bug 259 fix: `lvs -o lv_tags` emits a comma-separated list of bare
+// tag names (e.g. `blockstor-restore-incomplete,linstor_other_tag`),
+// not the `@`-prefixed reference form. Split on commas and match
+// whole-token to avoid substring false-positives (e.g. a sibling tag
+// `blockstor-restore-incomplete-v2` would have matched a bare
+// `strings.Contains` check).
 func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName string) bool {
 	out, err := ex.Run(ctx, "lvs",
 		Args("--noheadings",
@@ -95,7 +109,13 @@ func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName 
 		return false
 	}
 
-	return strings.Contains(string(out), RestoreIncompleteTag)
+	for _, tag := range strings.Split(strings.TrimSpace(string(out)), ",") {
+		if strings.TrimSpace(tag) == RestoreIncompleteTag {
+			return true
+		}
+	}
+
+	return false
 }
 
 // volumeStatusViaLVS runs `lvs <vg>/<lv>` and parses the resulting
