@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -366,5 +368,199 @@ func TestToggleDiskCancelUnwindsPartialState(t *testing.T) {
 
 	if got := atomic.LoadInt32(&provider.deleted); got == 0 {
 		t.Errorf("DeleteVolume not invoked during cancel rollback")
+	}
+}
+
+// TestPatchToggleDiskRetriesIsFieldSurgical pins Bug 293 (P0,
+// data-correctness): the satellite's `patchToggleDiskRetries`
+// must NOT issue a wholesale Status subresource REPLACE — every
+// Status field the local snapshot is missing would otherwise get
+// wiped from the apiserver, including the controller-side
+// allocator's `DRBDNodeID` / `DRBDPort` / `DRBDMinor`. Race window:
+// the controller stamps the IDs via SSA, the c-r informer cache
+// trails, the satellite reconcile fires on an Apply failure
+// mid-conversion, reads the pre-allocation cached snapshot, and a
+// wholesale `Status().Update` overwrites Status with the cached
+// nil-IDs. Subsequent reconciles wedge on
+// `waitForControllerAllocation` logging `nodeID:null port:null
+// minor:null` indefinitely; surface symptom is
+// `recovery-down-reverses.sh` timing out at 30s.
+//
+// Assertion: the helper must issue a JSON merge-patch whose body
+// is scoped to `status.toggleDiskRetries` ONLY. We pin this via
+// the controller-runtime fake client's SubResourcePatch
+// interceptor: every Status-subresource patch the helper writes is
+// captured, decoded, and inspected. The patch body MUST NOT carry
+// keys for any other Status field. The fake client's own merge
+// logic is too lenient to catch the bug end-to-end (it preserves
+// fields the patch doesn't mention even when the writer would have
+// issued a full Update), so we assert at the patch-body level
+// instead — the apiserver-side wholesale-replace semantic is well
+// known and surfaces exactly when the body carries fields beyond
+// the one being mutated.
+func TestPatchToggleDiskRetriesIsFieldSurgical(t *testing.T) {
+	t.Parallel()
+
+	const (
+		rdName = "down-reverses"
+		node   = "n-revive"
+	)
+
+	resName := rdName + "." + node
+
+	scheme := newToggleDiskTestScheme(t)
+
+	// Apiserver-side: Resource carries the controller-allocator's
+	// DRBD-IDs. The fake client persists them; the assertion below
+	// then independently checks the patch body the helper would
+	// have sent to a real apiserver.
+	nodeID := int32(1)
+	port := int32(7000)
+	minor := int32(1000)
+
+	apiserverRes := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       resName,
+			Finalizers: []string{SatelliteResourceFinalizer},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               node,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: &nodeID,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	base := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(apiserverRes).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	// Capture every Status subresource patch the helper issues so
+	// the body shape can be asserted. We need the FULL JSON body —
+	// patch.Type() must be JSON merge-patch, and the decoded body
+	// must contain `status.toggleDiskRetries` and NOTHING ELSE
+	// under `status`.
+	type captured struct {
+		patchType types.PatchType
+		body      []byte
+	}
+
+	var patches []captured
+
+	cli := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string,
+			obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption,
+		) error {
+			body, err := patch.Data(obj)
+			if err != nil {
+				return errors.Wrap(err, "extract patch body")
+			}
+
+			patches = append(patches, captured{
+				patchType: patch.Type(),
+				body:      body,
+			})
+
+			return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+		},
+		// Bug 293 regression guard: any Status().Update (the pre-fix
+		// wholesale-replace shape) is the bug. Fail fast so the test
+		// surfaces a clear message instead of a roundabout assertion
+		// failure later on patch-count.
+		SubResourceUpdate: func(_ context.Context, _ client.Client, _ string,
+			obj client.Object, _ ...client.SubResourceUpdateOption,
+		) error {
+			return errors.Newf("forbidden Status subresource Update on %s/%s "+
+				"(Bug 293: pre-fix wholesale-replace would wipe DRBD-IDs); "+
+				"writers must use a JSON merge-patch scoped to the mutated field",
+				obj.GetNamespace(), obj.GetName())
+		},
+	})
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{NodeName: node},
+	}
+
+	// Caller's "stale cached snapshot": no DRBD-IDs visible. The
+	// helper MUST NOT carry these nil-IDs into the patch body —
+	// the JSON merge-patch must mention `toggleDiskRetries` only.
+	staleCopy := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       resName,
+			Finalizers: []string{SatelliteResourceFinalizer},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               node,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			ToggleDiskRetries: 0,
+		},
+	}
+
+	err := reconciler.patchToggleDiskRetries(context.Background(), staleCopy, 1)
+	if err != nil {
+		t.Fatalf("patchToggleDiskRetries: %v", err)
+	}
+
+	if len(patches) != 1 {
+		t.Fatalf("Status subresource patch count: got %d, want 1", len(patches))
+	}
+
+	got := patches[0]
+
+	// Bug 293 invariant #1: the helper MUST use a JSON merge-patch
+	// (NOT a Status().Update / Apply with the full object). Update
+	// is the pre-fix shape that wipes adjacent Status fields.
+	if got.patchType != types.MergePatchType {
+		t.Errorf("patch type: got %q, want %q (JSON merge-patch)",
+			got.patchType, types.MergePatchType)
+	}
+
+	// Bug 293 invariant #2: the body must mention `toggleDiskRetries`
+	// ONLY under `status`. Any other key (drbdPort, drbdMinor,
+	// drbdNodeId, volumes, conditions, …) implies the writer is
+	// echoing the caller's stale snapshot, which on a real apiserver
+	// would replace the wholesale Status subresource and wipe the
+	// allocator's DRBD-IDs.
+	var decoded struct {
+		Status map[string]any `json:"status"`
+	}
+
+	err = json.Unmarshal(got.body, &decoded)
+	if err != nil {
+		t.Fatalf("decode patch body %q: %v", got.body, err)
+	}
+
+	if len(decoded.Status) != 1 {
+		t.Errorf("patch body has %d Status keys, want 1; body=%s",
+			len(decoded.Status), got.body)
+	}
+
+	if _, ok := decoded.Status["toggleDiskRetries"]; !ok {
+		t.Errorf("patch body missing toggleDiskRetries; body=%s", got.body)
+	}
+
+	// Belt-and-suspenders: pin every controller-allocator key
+	// individually — these are the exact fields the pre-fix bug
+	// wiped.
+	for _, banned := range []string{"drbdNodeId", "drbdPort", "drbdMinor"} {
+		if _, ok := decoded.Status[banned]; ok {
+			t.Errorf("patch body carries forbidden key %q (Bug 293 regression); body=%s",
+				banned, got.body)
+		}
+	}
+
+	// Caller's local copy must reflect the new retry value so an
+	// in-reconcile follow-up read doesn't see a stale 0.
+	if staleCopy.Status.ToggleDiskRetries != 1 {
+		t.Errorf("local copy ToggleDiskRetries: got %d, want 1",
+			staleCopy.Status.ToggleDiskRetries)
 	}
 }

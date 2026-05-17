@@ -19,9 +19,12 @@ package controllers
 import (
 	"context"
 	"slices"
+	"strconv"
 
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -83,28 +86,53 @@ func (r *ResourceReconciler) recordToggleDiskOutcome(ctx context.Context, res *b
 }
 
 // patchToggleDiskRetries writes Status.ToggleDiskRetries via the
-// Status subresource. Uses a plain Update against a refreshed object
-// (the fake client used in unit tests doesn't support
-// Status.Patch(Apply) cleanly, and the real apiserver accepts a
-// Status().Update on a status-subresource-enabled CRD without
-// stomping Spec).
+// Status subresource.
+//
+// Bug 293 (P0, data-correctness): the previous implementation built
+// a typed Resource from a cached Get and called `Status().Update`.
+// That issues a wholesale Status subresource REPLACE — every
+// Status field the cached copy is missing gets wiped from the
+// apiserver, including the controller-side allocator's
+// `DRBDNodeID` / `DRBDPort` / `DRBDMinor`. Race window: the
+// controller stamps the IDs via SSA, the c-r informer cache trails
+// the apiserver by hundreds of milliseconds, the satellite reconcile
+// fires on a (legitimate) Apply failure mid-conversion, reads the
+// pre-allocation cached copy, bumps the retry counter, and
+// `Status().Update` overwrites Status with `DRBDPort=nil` /
+// `DRBDMinor=nil` / `DRBDNodeID=nil`. Subsequent reconciles then
+// wedge on `waitForControllerAllocation` because the allocator's
+// SSA managed-fields entry now points at fields that no longer
+// exist on the object; the controller has to re-allocate (or
+// declare them already-stamped via its own cache, depending on
+// timing) and the satellite logs `nodeID:null port:null minor:null`
+// indefinitely. Surface symptom: `recovery-down-reverses.sh` fails
+// because the operator-issued `drbdadm down` triggers an Apply
+// retry, the retry-counter bump wipes DRBD-IDs, and the revive path
+// never gets past the wait gate.
+//
+// Fix: use a JSON merge-patch scoped to `status.toggleDiskRetries`
+// only. The apiserver applies it as a field-surgical mutation —
+// every other Status field (DRBDPort, DRBDMinor, DRBDNodeID,
+// Conditions, Volumes, DrbdState, etc.) survives untouched.
 func (r *ResourceReconciler) patchToggleDiskRetries(ctx context.Context, res *blockstoriov1alpha1.Resource, want int32) error {
-	var fresh blockstoriov1alpha1.Resource
-
-	err := r.Get(ctx, client.ObjectKey{Name: res.Name}, &fresh)
-	if err != nil {
-		return errors.Wrap(err, "get Resource for toggle-disk retry patch")
-	}
-
-	if fresh.Status.ToggleDiskRetries == want {
+	if res.Status.ToggleDiskRetries == want {
 		return nil
 	}
 
-	fresh.Status.ToggleDiskRetries = want
+	// Field-surgical: JSON merge-patch touches ONLY the named
+	// field. The apiserver merges this into Status without
+	// reading or replacing any other field, so the controller-side
+	// allocator's DRBD-ID writes (and any other field owner's
+	// claims) survive untouched.
+	body := []byte(`{"status":{"toggleDiskRetries":` + strconv.FormatInt(int64(want), 10) + `}}`)
 
-	err = r.Status().Update(ctx, &fresh)
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
+	}
+
+	err := r.Status().Patch(ctx, target, client.RawPatch(types.MergePatchType, body))
 	if err != nil {
-		return errors.Wrap(err, "update Status.ToggleDiskRetries")
+		return errors.Wrap(err, "merge-patch Status.ToggleDiskRetries")
 	}
 
 	// Reflect the write back onto the caller's copy so subsequent
