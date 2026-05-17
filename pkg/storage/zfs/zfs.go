@@ -336,7 +336,7 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 	return nil
 }
 
-// SendSnapshot streams `zfs send <pool>/<rd>_00000@<snap>` so a peer
+// SendSnapshot streams `zfs send -p <pool>/<rd>_00000@<snap>` so a peer
 // satellite can pipe it into its own `zfs recv` and reproduce the
 // dataset byte-for-byte (including the DRBD metadata block embedded
 // in the zvol). The returned ReadCloser wraps the running zfs
@@ -346,14 +346,31 @@ func (p *Provider) RestoreVolumeFromSnapshot(ctx context.Context, target storage
 // Bypasses storage.Exec because Exec.Run buffers the full output in
 // memory; multi-GB snapshot streams need a pipe. FakeExec tests
 // don't cover this path — the integration test on the stand drives
-// it through a real peer Fetch.
+// it through a real peer Fetch. SendSnapshotArgs is the test seam
+// for the argv shape (Bug 251).
+//
+// Bug 251 (P2, capacity safety, cross-node): `-p` forces zfs to
+// include dataset properties (notably `refreservation`) in the stream
+// so the receiver's `zfs recv` reproduces the thick guarantee.
+// Without `-p`, the recv produced a sparse-by-inheritance dataset and
+// the cross-node-cloned thick zvol lost its space reservation — same
+// blast as Bug 246 but on the wire path. The recv-side defensively
+// re-sets refreservation too (in case the peer sender is an old
+// un-patched binary), see RecvSnapshot.
 func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.ReadCloser, error) {
 	srcDS := p.snapshotDataset(snap)
 	if !p.datasetExists(ctx, srcDS) {
 		return nil, errors.Wrapf(storage.ErrNotFound, "snapshot %s for send", srcDS)
 	}
 
-	cmd := exec.CommandContext(ctx, "zfs", "send", srcDS)
+	// G204 is a false positive here: SendSnapshotArgs is a closed-form
+	// constructor over an internal `storage.Snapshot` (no user-supplied
+	// strings reach argv), and the previous inline call had the same
+	// shape — extracting it into a helper just makes the test seam
+	// explicit. The original `exec.CommandContext(ctx, "zfs", "send",
+	// srcDS)` form did not trip gosec because the third arg was a plain
+	// string literal-concat; the variadic spread now flags it.
+	cmd := exec.CommandContext(ctx, "zfs", p.SendSnapshotArgs(snap)...) //nolint:gosec // G204: argv built from internal Snapshot struct
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -366,6 +383,15 @@ func (p *Provider) SendSnapshot(ctx context.Context, snap storage.Snapshot) (io.
 	}
 
 	return &zfsSendReader{cmd: cmd, stdout: stdout}, nil
+}
+
+// SendSnapshotArgs returns the argv (excluding the leading "zfs"
+// binary) that SendSnapshot would pass to `exec.CommandContext` for
+// the given snapshot. Exposed so unit tests can assert command-line
+// shape (notably the `-p` flag from Bug 251) without spawning a real
+// `zfs send` process.
+func (p *Provider) SendSnapshotArgs(snap storage.Snapshot) []string {
+	return []string{"send", "-p", p.snapshotDataset(snap)}
 }
 
 // zfsSendReader bundles the zfs-send process with its stdout pipe
@@ -405,16 +431,22 @@ func (r *zfsSendReader) Close() error {
 // Idempotent on a pre-existing target dataset: the recv is skipped
 // and any leftover staging artifacts cleaned up. matches
 // FILE backend's resumed-reconcile semantic.
+//
+// Bug 251 (P2, capacity safety, cross-node): after recv completes
+// successfully, in thick mode, defensively re-set `refreservation`
+// on the dataset. The send side (Bug 251) now uses `zfs send -p` to
+// embed props in the stream, but an old un-patched peer might still
+// send a stream without `-p`, which leaves the recv'd dataset
+// sparse-by-inheritance and silently downgrades the thick guarantee.
+// Re-setting refreservation here defends against the peer-version
+// skew window during a partial cluster upgrade.
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
 	tgtDS := p.volumeDataset(target)
 	if p.datasetExists(ctx, tgtDS) {
 		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, "zfs", "recv", "-F", tgtDS)
-	cmd.Stdin = src
-
-	out, err := cmd.CombinedOutput()
+	out, err := p.exec.RunWithStdin(ctx, src, "zfs", "recv", "-F", tgtDS)
 	if err != nil {
 		// On failure leave nothing behind — `zfs recv -F` may have
 		// partially created the dataset; nuke it so the next
@@ -422,6 +454,23 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 		_, _ = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 
 		return errors.Wrapf(err, "zfs recv %s: %s", tgtDS, strings.TrimSpace(string(out)))
+	}
+
+	// THICK mode: restore the space guarantee even if the peer sender
+	// shipped the stream without `-p` (Bug 251 defence-in-depth). Same
+	// pattern as Bug 246's post-clone refreservation re-set.
+	if !p.cfg.Thin {
+		volsizeBytes, vErr := p.datasetVolsize(ctx, tgtDS)
+		if vErr != nil {
+			return errors.Wrapf(vErr, "lookup volsize on recv'd %s", tgtDS)
+		}
+
+		_, sErr := p.exec.Run(ctx, "zfs", "set",
+			"refreservation="+strconv.FormatInt(volsizeBytes, 10),
+			tgtDS)
+		if sErr != nil {
+			return errors.Wrapf(sErr, "zfs set refreservation on recv'd %s", tgtDS)
+		}
 	}
 
 	return nil

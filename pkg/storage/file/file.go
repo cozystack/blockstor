@@ -432,29 +432,29 @@ func (p *Provider) SendSnapshot(_ context.Context, snap storage.Snapshot) (io.Re
 // drbdmeta drop-md + create-md follow on the caller side to stamp
 // this node's DRBD node-id over the metadata block embedded in the
 // stream.
+//
+// Bug 250 (P2, space-guarantee, cross-node): in thick mode the .partial
+// is pre-allocated via `fallocate -l <SizeKib*1024>` BEFORE io.Copy so
+// the backing range is reserved on the host filesystem. Without this,
+// a cross-node-cloned thick FILE volume had no on-disk reservation —
+// the io.Copy could out-allocate the FS mid-stream and a subsequent
+// divergent write could ENOSPC even though the file's apparent size
+// looked fine. Thin path skips fallocate (sparse / overcommit is the
+// FILE_THIN contract).
 func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src io.Reader) error {
 	finalPath := p.volumePath(target)
 	partialPath := finalPath + ".partial"
 
-	_, statErr := os.Stat(finalPath)
-	if statErr == nil {
-		_, err := p.attach(ctx, finalPath)
-		if err != nil {
-			return errors.Wrapf(err, "losetup %s", finalPath)
-		}
-
-		return nil
-	}
-
-	if !os.IsNotExist(statErr) {
-		return errors.Wrapf(statErr, "stat %s", finalPath)
+	resumed, err := p.recvSnapshotResumeIfFinal(ctx, finalPath)
+	if err != nil || resumed {
+		return err
 	}
 
 	// Either no prior attempt or one that aborted before rename. Drop
 	// the leftover .partial (if any) so OpenFile O_EXCL succeeds and
 	// we re-stream from byte zero — partial bytes from a previous
 	// crash are unsafe to trust.
-	err := os.Remove(partialPath)
+	err = os.Remove(partialPath)
 	if err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "remove stale %s", partialPath)
 	}
@@ -462,6 +462,22 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	dst, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, volumeFilePerm)
 	if err != nil {
 		return errors.Wrapf(err, "create %s", partialPath)
+	}
+
+	if !p.cfg.Thin {
+		// Reserve the full expected range on disk BEFORE streaming so
+		// the io.Copy can never out-allocate the FS — peer-cloned thick
+		// FILE volumes must honour the thick space guarantee (Bug 250).
+		// fallocate -l is idempotent on a freshly-created empty file.
+		sizeBytes := target.SizeKib * bytesPerKib
+
+		_, falErr := p.exec.Run(ctx, "fallocate", "-l", strconv.FormatInt(sizeBytes, 10), partialPath)
+		if falErr != nil {
+			_ = dst.Close()
+			_ = os.Remove(partialPath)
+
+			return errors.Wrapf(falErr, "fallocate %s", partialPath)
+		}
 	}
 
 	_, copyErr := io.Copy(dst, src)
@@ -494,6 +510,30 @@ func (p *Provider) RecvSnapshot(ctx context.Context, target storage.Volume, src 
 	}
 
 	return nil
+}
+
+// recvSnapshotResumeIfFinal handles the resumed-reconcile branch of
+// RecvSnapshot: if `finalPath` already exists, re-attach the loop dev
+// and signal "done" (resumed=true). Returns (false, nil) when there's
+// no prior recv to resume — the caller proceeds to the fresh-stream
+// path. Extracted from RecvSnapshot to keep funlen under control after
+// the Bug 250 fallocate addition.
+func (p *Provider) recvSnapshotResumeIfFinal(ctx context.Context, finalPath string) (bool, error) {
+	_, statErr := os.Stat(finalPath)
+	if statErr == nil {
+		_, err := p.attach(ctx, finalPath)
+		if err != nil {
+			return false, errors.Wrapf(err, "losetup %s", finalPath)
+		}
+
+		return true, nil
+	}
+
+	if !os.IsNotExist(statErr) {
+		return false, errors.Wrapf(statErr, "stat %s", finalPath)
+	}
+
+	return false, nil
 }
 
 // snapshotPath is `<dir>/<resource>_<snap>_00000.img`. Matches the
