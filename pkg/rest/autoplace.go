@@ -1113,9 +1113,33 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := s.createResources(w, r, rdName, envelopes)
+	created, ok := s.createResources(w, r, rdName, envelopes)
 	if !ok {
 		return
+	}
+
+	// Bug 263 (P1, stand-caught): notify surviving sibling Resources
+	// of the new peer so each satellite reconciles and re-renders its
+	// .res to add the freshly joined replica's `on <node>` block /
+	// `drbdadm adjust`. The satellite-side c-r sibling watch DOES
+	// fire on the Spec create, but typically lands BEFORE the
+	// controller-side allocator has stamped Status.DRBDNodeID on the
+	// new replica — `waitForControllerAllocation` then requeues at
+	// 2s and the follow-up Status patch event can be filtered or
+	// coalesced by controller-runtime under load. Stamping the
+	// annotation HERE (after every per-envelope create has committed)
+	// guarantees a deterministic wake-up on each survivor; the
+	// annotation value is monotonic with Bug 67's delete-path stamp
+	// so the satellite watch can't short-circuit on resourceVersion.
+	//
+	// Bumps are emitted per created replica (excluding the just-
+	// created node itself — its own reconciler picks it up via the
+	// `For` watch with the node-name predicate). Best-effort: a
+	// failure here MUST NOT roll the create back (the row is already
+	// gone); the satellite's own watch + the 2s requeue still
+	// converges, just less deterministically.
+	for i := range created {
+		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
 	}
 
 	// Python CLI demands an ApiCallRc list envelope; upstream's

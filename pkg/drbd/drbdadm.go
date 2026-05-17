@@ -305,6 +305,19 @@ func (a *Adm) StatusResources(ctx context.Context) ([]string, error) {
 			continue
 		}
 
+		// Bug 264 (P3): drbdsetup text output emits `# ...` banner
+		// or comment lines in some environments (wrapper scripts,
+		// kernel-side configuration hints). Without this guard the
+		// column-0 `#` token was misread as a resource named "#"
+		// and the orphan-sweeper looped every 5 minutes on
+		// `drbdadm down #` — which always failed with
+		// `no resources defined!`. Comments have always been the
+		// documented convention for drbdsetup text output; the
+		// JSON variant has no such ambiguity.
+		if strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+
 		names = append(names, fields[0])
 	}
 
