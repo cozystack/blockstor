@@ -170,8 +170,14 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	return nil
 }
 
-// VolumeStatus parses `zfs list -p` output (bytes, no suffixes).
+// VolumeStatus parses `zfs list -p` output (bytes, no suffixes). Bug
+// 273: bounded ctx so a SUSPENDED zpool that wedges `zfs list` in
+// kernel I/O-wait cannot consume the satellite reconcile worker
+// indefinitely. See withProbeTimeout below.
 func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := p.exec.Run(ctx, "zfs",
 		"list", "-H", "-p",
 		"-o", "name,volsize,used",
@@ -217,6 +223,14 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 // check, an empty stdout would slip through as success-with-no-data
 // and the pool would silently report state=Ok with zeroed capacity.
 func (p *Provider) PoolStatus(ctx context.Context) (storage.PoolStatus, error) {
+	// Bug 271: bounded ctx so a suspended zpool cannot block the
+	// every-30-seconds writeCapacity loop. Without this the
+	// controller-runtime reconcile worker stays parked in `zpool
+	// list` indefinitely and `linstor sp l` returns nothing for the
+	// affected node — same symptom class as the LVM Bug 270 wedge.
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := p.exec.Run(ctx, "zpool", "list", "-H", "-p", "-o", "size,free", p.cfg.Pool)
 	if err != nil {
 		return storage.PoolStatus{}, errors.Wrapf(err, "zpool list %s", p.cfg.Pool)
@@ -728,13 +742,38 @@ func (p *Provider) ensureRefreservation(ctx context.Context, dataset string) err
 }
 
 // datasetExists is the idempotency primitive — analogous to lvExists.
+// Bug 272: bounded ctx; same rationale as PoolStatus/VolumeStatus, but
+// the hot-path impact is larger — datasetExists is called from every
+// Create/Delete/Restore on the satellite reconcile worker.
 func (p *Provider) datasetExists(ctx context.Context, ds string) bool {
+	ctx, cancel := withProbeTimeout(ctx)
+	defer cancel()
+
 	out, err := p.exec.Run(ctx, "zfs", "list", "-H", "-o", "name", ds)
 	if err != nil {
 		return false
 	}
 
 	return strings.TrimSpace(string(out)) != ""
+}
+
+// probeTimeout bounds every read-only ZFS probe (zfs list / zpool
+// list / zfs get). 30 s mirrors the LVM Bug 270 helper — comfortably
+// above any healthy zfs response time but below the controller-
+// runtime per-worker reconcile budget. Mutating calls (zfs create /
+// destroy / send / recv / set) keep the caller's ctx so legitimate
+// long-running operations are not truncated.
+const probeTimeout = 30 * time.Second
+
+// withProbeTimeout derives a bounded child context. If the caller
+// already has a Deadline (unit test override, parent op already
+// bounded), it is preserved — never shortened.
+func withProbeTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+
+	return context.WithTimeout(ctx, probeTimeout)
 }
 
 // volumeDataset is `<pool>/<resource>_<vol5digits>`.
