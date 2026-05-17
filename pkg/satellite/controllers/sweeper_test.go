@@ -367,6 +367,211 @@ func TestSweeperBoundsPerResourceSetupDown(t *testing.T) {
 	}
 }
 
+// TestSweeperGraceWindowDefersFreshRD pins the Bug 291 grace
+// window: a kernel-resident orphan whose matching
+// ResourceDefinition was created inside SweeperRDGrace MUST NOT
+// be torn down — the satellite reconciler is mid-fanout bringing
+// up the Resource CRD for this node, and a sweep tick that fires
+// in the race window would tear down the slot the reconciler is
+// about to converge.
+//
+// Without this guard, the cascade observed on e2e3 Run 7 fired:
+// the sweeper raced the controller's `linstor rd create` fanout,
+// tore down a freshly-brought-up slot, and the reconciler's
+// retry never got the kernel slot back to UpToDate before the
+// e2e `wait_uptodate` budget elapsed — failing
+// lifecycle-toggle-migrate / observability-linstor-node-bridge /
+// recovery-inconsistent-blocking / rolling-upgrade in one shot.
+func TestSweeperGraceWindowDefersFreshRD(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	// RD freshly created 5s ago — well inside the 60s grace
+	// window. No Resource CRD on this node yet (the controller's
+	// per-node fanout hasn't landed). Pre-Bug-291 this is the
+	// orphan-classification false positive.
+	frozenNow := metav1.Now()
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-fresh",
+			CreationTimestamp: metav1.NewTime(frozenNow.Add(-5 * time.Second)),
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			&blockstoriov1alpha1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+				Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+			},
+			rd,
+		).
+		Build()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status",
+		storage.FakeResponse{Stdout: []byte("pvc-fresh role:Secondary\n  volume:0 disk:Diskless\n")})
+
+	var downCalls atomic.Int32
+
+	sweeper := &OrphanSweeperRunnable{
+		Client:   cli,
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+		// Default 60s RDGrace applies — the test relies on the
+		// production constant matching the assertion.
+		now: func() time.Time { return frozenNow.Time },
+		setupDownFn: func(_ context.Context, _ string) error {
+			downCalls.Add(1)
+
+			return nil
+		},
+	}
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	// Load-bearing assertion: the slot MUST NOT be torn down
+	// inside the grace window, period.
+	if got := downCalls.Load(); got != 0 {
+		t.Errorf("sweeper tore down kernel slot inside RD grace window "+
+			"(Bug 291 regression); setupDown calls = %d, want 0", got)
+	}
+}
+
+// TestSweeperTearsDownAgedOrphan pins the steady-state: an RD
+// whose CreationTimestamp is older than SweeperRDGrace, with no
+// matching Resource CRD on this node, IS a genuine orphan and
+// MUST be torn down. The grace window must not turn the sweeper
+// into a no-op for the legitimate force-strip aftermath it
+// exists to recover from.
+func TestSweeperTearsDownAgedOrphan(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	frozenNow := metav1.Now()
+	// RD created 5 minutes ago — well past the 60s grace.
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-aged",
+			CreationTimestamp: metav1.NewTime(frozenNow.Add(-5 * time.Minute)),
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			&blockstoriov1alpha1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+				Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+			},
+			rd,
+		).
+		Build()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status",
+		storage.FakeResponse{Stdout: []byte("pvc-aged role:Secondary\n  volume:0 disk:Diskless\n")})
+
+	var downCalls atomic.Int32
+
+	sweeper := &OrphanSweeperRunnable{
+		Client:   cli,
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+		now:      func() time.Time { return frozenNow.Time },
+		setupDownFn: func(_ context.Context, _ string) error {
+			downCalls.Add(1)
+
+			return nil
+		},
+	}
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	if got := downCalls.Load(); got != 1 {
+		t.Errorf("aged orphan not torn down; setupDown calls = %d, want 1", got)
+	}
+}
+
+// TestSweeperGraceWindowDefersRecentlyDeletedRD pins the
+// mirror-image race (Bug 291): the RD has DeletionTimestamp set
+// inside the grace window, the per-node Resource CRDs have
+// already been collected by the cache, but the satellite's
+// DeleteResource is still mid-flight. Pre-fix the sweeper would
+// race the satellite's own teardown and try `drbdsetup down` on
+// the same slot the satellite is cleaning up — leaving partial
+// state behind.
+func TestSweeperGraceWindowDefersRecentlyDeletedRD(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	frozenNow := metav1.Now()
+	// RD created an hour ago (well past grace) but DeletionTimestamp
+	// set 10s ago — grace window MUST anchor on the more recent
+	// of (Creation, Deletion) so this defers.
+	delTS := metav1.NewTime(frozenNow.Add(-10 * time.Second))
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "pvc-deleting",
+			CreationTimestamp: metav1.NewTime(frozenNow.Add(-time.Hour)),
+			DeletionTimestamp: &delTS,
+			Finalizers:        []string{"blockstor.io/test"},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			&blockstoriov1alpha1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+				Spec:       blockstoriov1alpha1.NodeSpec{Type: "SATELLITE"},
+			},
+			rd,
+		).
+		Build()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status",
+		storage.FakeResponse{Stdout: []byte("pvc-deleting role:Secondary\n  volume:0 disk:Diskless\n")})
+
+	var downCalls atomic.Int32
+
+	sweeper := &OrphanSweeperRunnable{
+		Client:   cli,
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+		now:      func() time.Time { return frozenNow.Time },
+		setupDownFn: func(_ context.Context, _ string) error {
+			downCalls.Add(1)
+
+			return nil
+		},
+	}
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	if got := downCalls.Load(); got != 0 {
+		t.Errorf("sweeper tore down slot while RD DeletionTimestamp inside grace window "+
+			"(Bug 291 regression); setupDown calls = %d, want 0", got)
+	}
+}
+
 // TestSweeperRunsImmediatelyOnStart pins the second half of
 // Bug 290: the sweeper Start() must fire its first sweep
 // immediately rather than after one full Period. On a satellite

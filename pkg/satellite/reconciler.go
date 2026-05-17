@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1259,16 +1260,39 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) 
 // errno because drbdadm surfaces 158 via a textual message; the
 // caller's wrap chain already preserves the verbatim stderr from
 // `pkg/storage/exec.go`.
+//
+// Bug 291 (P1): the original predicate also accepted the bare
+// substring `"unknown resource"` (case-sensitive but unanchored)
+// as a fallback. That substring appears verbatim in DRBD's
+// `additional info from kernel: unknown resource` diagnostic — but
+// also in unrelated drbdsetup errors (`drbdsetup new-path …
+// unknown resource`, `drbdsetup detach … unknown resource`, even
+// LINSTOR's `ApiCallRc: unknown resource <name>` when the rest
+// adapter surfaces a not-found through the same wrap chain). Any
+// of those false-positive matches triggers an unconditional
+// `drbdadm up`, which races a partial teardown and leaves kernel
+// state half-up; the next reconcile pass loops on the same
+// failure mode while peers stay Connecting/StandAlone. Tightened
+// to a single canonical regex anchored on the `(158)` errno + the
+// `Unknown resource` verb drbdadm-9 emits (verified verbatim
+// against `drbdadm adjust` on a slot-less resource).
 func isUnknownResourceErr(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	msg := err.Error()
-
-	return strings.Contains(msg, "(158) Unknown resource") ||
-		strings.Contains(msg, "unknown resource")
+	return drbd158ErrRegex.MatchString(err.Error())
 }
+
+// drbd158ErrRegex matches drbdadm-9's verbatim 158-error
+// stderr: `Failure: (158) Unknown resource`. The match is
+// case-sensitive and anchored on the parenthesised errno so
+// stray "unknown resource" diagnostics from unrelated callers
+// (drbdsetup detach, LINSTOR not-found, etc.) don't trigger
+// the up-fallback. Compiled once at package init via MustCompile
+// because a misspelled pattern is a build-time bug, not a
+// runtime concern.
+var drbd158ErrRegex = regexp.MustCompile(`\(158\) Unknown resource`)
 
 // seedInitialGi pre-stamps each diskful volume's freshly-created
 // DRBD metadata block with the GI the controller picked from an
