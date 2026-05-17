@@ -95,6 +95,12 @@ if [[ "$phase" != "Bound" ]]; then
 fi
 
 echo ">> Pod on $WORKER_1 mounts the PVC"
+# securityContext fields satisfy the PodSecurity "restricted" profile that
+# Talos enforces on the default namespace by default. Without them the API
+# server emits a Warning at apply time and (when enforce mode is on) blocks
+# the pod outright. Run as UID 1000 because /data is mounted from an ext4
+# block volume; CSI publishes it with root-only perms but alpine's BusyBox
+# sh + dd + md5sum + df all run fine as non-root once we chown via fsGroup.
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: Pod
@@ -102,10 +108,19 @@ metadata: {name: $POD}
 spec:
   nodeName: $WORKER_1
   restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile: {type: RuntimeDefault}
   containers:
     - name: w
       image: alpine:3
       command: ["sleep", "600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
       volumeMounts:
         - {name: data, mountPath: /data}
   volumes:
@@ -124,35 +139,30 @@ echo "   pre-grow: md5=$md5_pre filesystem_size_kb=$fs_size_pre_kb"
 echo ">> patch PVC.spec.resources.requests.storage → $SIZE_GROWN"
 kubectl patch pvc "$PVC" --type=merge -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"$SIZE_GROWN\"}}}}"
 
-# csi-resizer reconciles into PV.spec.capacity, then NodeExpand resizes
-# the filesystem in-Pod. Both need to finish before df reflects the new
-# size. PVC.status.capacity flips when both legs land. Allow 90 s.
-echo ">> wait PVC.status.capacity == $SIZE_GROWN (90s)"
-deadline=$(( $(date +%s) + 90 ))
-got=""
+# csi-resizer reconciles into PV.spec.capacity, then NodeExpandVolume
+# resizes the filesystem in-Pod (`resize2fs` invoked by piraeus-csi node
+# plugin). The two legs land independently and PVC.status.capacity can
+# flip to the new size before NodeExpand finishes — so we poll the
+# filesystem view from inside the pod directly, which is the only
+# observable that proves both block-device grow AND fs grow completed.
+# Expect ≥1.5× of pre-grow size (we doubled 128→256 MiB; fs overhead
+# trims a bit, ×2 strict is unreliable). 1.5× catches the
+# "did not resize at all" case unambiguously. Allow 120 s.
+echo ">> wait for filesystem-level grow inside pod (120s)"
+threshold=$(( fs_size_pre_kb * 3 / 2 ))
+deadline=$(( $(date +%s) + 120 ))
+fs_size_post_kb=0
 while (( $(date +%s) < deadline )); do
-    got=$(kubectl get pvc "$PVC" -o jsonpath='{.status.capacity.storage}' 2>/dev/null || true)
-    [[ "$got" == "$SIZE_GROWN" ]] && break
+    fs_size_post_kb=$(kubectl exec "$POD" -- sh -c "df -k /data | awk 'NR==2{print \$2}'" 2>/dev/null || echo 0)
+    (( fs_size_post_kb >= threshold )) && break
     sleep 3
 done
-
-if [[ "$got" != "$SIZE_GROWN" ]]; then
-    echo "FAIL: PVC.status.capacity never reached $SIZE_GROWN (got=$got)"
-    kubectl describe pvc "$PVC" | tail -30
-    exit 1
-fi
-
-echo ">> verify filesystem-level grow (df sees larger size)"
-fs_size_post_kb=$(kubectl exec "$POD" -- sh -c "df -k /data | awk 'NR==2{print \$2}'")
 echo "   post-grow: filesystem_size_kb=$fs_size_post_kb"
 
-# Expect the filesystem to see at least 1.5× of the pre-grow size
-# (we doubled the request 128→256 MiB; filesystem overhead trims a
-# bit so a strict ×2 isn't reliable). 1.5× catches the "did not
-# resize at all" case unambiguously.
-threshold=$(( fs_size_pre_kb * 3 / 2 ))
 if (( fs_size_post_kb < threshold )); then
-    echo "FAIL: filesystem did not grow — post=$fs_size_post_kb pre=$fs_size_pre_kb threshold=$threshold"
+    got=$(kubectl get pvc "$PVC" -o jsonpath='{.status.capacity.storage}' 2>/dev/null || true)
+    echo "FAIL: filesystem did not grow — post=$fs_size_post_kb pre=$fs_size_pre_kb threshold=$threshold pvc.status.capacity=$got"
+    kubectl describe pvc "$PVC" | tail -30
     exit 1
 fi
 
