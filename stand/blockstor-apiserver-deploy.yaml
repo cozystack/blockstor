@@ -96,11 +96,20 @@ spec:
           ports:
             - {name: rest, containerPort: 3370}
             - {name: health, containerPort: 8081}
+          # Bug 218: probes hit the controller-runtime manager's
+          # /healthz and /readyz endpoints on the named `health`
+          # port. tcpSocket on the REST port (3370) marked the pod
+          # Ready as soon as the listener bound, defeating the
+          # cache-sync + REST-bind gate landed for Bug 213. The
+          # livenessProbe must also be an HTTP GET so a manager
+          # deadlock (listener still up, /healthz wedged) actually
+          # triggers a kubelet restart. Mirrors the canonical
+          # pattern in stand/blockstor-satellite-daemonset.yaml.
           readinessProbe:
-            tcpSocket: {port: 3370}
+            httpGet: {path: /readyz, port: health}
             initialDelaySeconds: 5
           livenessProbe:
-            httpGet: {path: /healthz, port: 8081}
+            httpGet: {path: /healthz, port: health}
             initialDelaySeconds: 15
           securityContext:
             runAsNonRoot: true
