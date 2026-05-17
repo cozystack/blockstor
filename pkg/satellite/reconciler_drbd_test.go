@@ -2405,6 +2405,100 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	}
 }
 
+// TestApplyFirstActivationSeedsLocalSlotBug284 pins the Bug 284 fix:
+// the first-activation pass MUST stamp the LOCAL node-id's bitmap
+// slot with day0 even when GetPeers() is empty at apply time
+// (sequential-create race: `linstor r create N1 RD` lands its
+// satellite reconcile BEFORE `linstor r create N2 RD` creates the
+// second Resource, so N1 sees no diskful peers in its DesiredResource
+// at the moment seedInitialGi runs).
+//
+// Pre-fix shape: seedPerPeerGi looped only over GetPeers(), so with
+// zero peers it stamped nothing. `drbdadm create-md` then left the
+// local current_uuid at a random value. When N2 later joined,
+// dispatcher re-rendered .res, satellite re-applied — but
+// firstActivation was already false (`.md-created` marker present),
+// so seedInitialGi never re-ran. The handshake then saw N1's random
+// current_uuid vs N2's day0 → `uuid_compare()=unrelated-data` →
+// `Unrelated data, aborting!` → permanent StandAlone.
+//
+// Fix: seedPerPeerGi additionally stamps `--node-id <local>` with
+// the same day0 tuple BEFORE the peer loop. This test exercises
+// the zero-peer first-activation and asserts the local-slot
+// drbdmeta set-gi call lands.
+func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-b284_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-b284_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-b284_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Sequential-create race shape: n1's first reconcile fires
+	// while it's the SOLE Resource for this RD (no n2 Resource
+	// yet). Peers list is empty; the satellite has no peer to
+	// iterate but MUST still stamp its own current_uuid slot
+	// with day0 so the later-joining peer's handshake matches.
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-b284",
+			NodeName: "n1",
+			Peers:    nil, // <-- sequential-create race: no peers yet
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+	day0 := satellite.Day0GiForTest("pvc-b284", 0)
+
+	// The fix MUST emit `set-gi --node-id 0` (the local node-id)
+	// with the day0 tuple in both current/bitmap slots. Without
+	// this call the local current_uuid stays at the random value
+	// drbdadm create-md generated → permanent unrelated-data on
+	// every future handshake against a later-joining peer.
+	wantLocal := fmt.Sprintf("drbdmeta --force pvc-b284/0 v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:%s:0:0",
+		day0, day0)
+	if !slices.Contains(calls, wantLocal) {
+		t.Errorf("missing local-slot set-gi (Bug 284 fix): want %q in calls: %v", wantLocal, calls)
+	}
+
+	// Ordering: the local set-gi MUST land between create-md
+	// (which writes the fresh metadata block) and adjust (which
+	// reads the metadata into kernel state).
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-b284", drbd.MaxPeers-1))
+	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-b284")
+	setGi := slices.Index(calls, wantLocal)
+
+	if createMD < 0 || adjust < 0 || setGi < 0 {
+		t.Fatalf("missing one of create-md@%d / set-gi@%d / adjust@%d in calls: %v",
+			createMD, setGi, adjust, calls)
+	}
+
+	if createMD >= setGi || setGi >= adjust {
+		t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending)",
+			createMD, setGi, adjust)
+	}
+}
+
 // TestApplyDefersAdjustDuringSyncTarget (scenario 5.16, Bug 8 unit
 // pin) encodes the satellite-side invariant the e2e test
 // `tests/e2e/recovery-synctarget-defer.sh` exercises end-to-end:
