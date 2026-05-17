@@ -360,7 +360,7 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	}
 
 	want := []string{
-		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB vg/pvc-grow_00000",
+		"lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB --config activation{udev_sync=0 udev_rules=0} vg/pvc-grow_00000",
 		"drbdadm resize --assume-clean pvc-grow",
 	}
 
