@@ -185,20 +185,25 @@ func TestBug232RDModifyAcceptsDstRscGrp(t *testing.T) {
 	}
 }
 
-// TestBug232RDCloneAcceptsOverrideDeletePropsAndSrcSnap pins that
-// the RD-clone POST handler accepts the three fields python-linstor
-// 1.27.0+ sends on `linstor resource-definition clone --override-prop`
-// / `--delete-prop` / snapshot-based clone:
+// TestBug232RDCloneAcceptsOverrideDeleteProps pins that the RD-clone
+// POST handler accepts the two non-snapshot 1.27 fields python-linstor
+// sends on `linstor resource-definition clone --override-prop`
+// / `--delete-prop`:
 //
 //   - override_props (map[string]string) — apply over the cloned RD's Props
 //   - delete_props ([]string)            — remove from the cloned RD's Props
-//   - src_snap_name (string)             — accepted, no-op TODO (the
-//     satellite-side data-plane lands separately; Bug 114's empty-VD
-//     path is still the safe contract here).
 //
 // Pre-fix DisallowUnknownFields returns 400 + "json: unknown field
 // \"override_props\"" and the CLI crashes before any clone can land.
-func TestBug232RDCloneAcceptsOverrideDeletePropsAndSrcSnap(t *testing.T) {
+//
+// Bug 239 supersession: `src_snap_name` USED to ride along in the
+// original Bug 232 fixture as accept-and-no-op, but that turned out
+// to be a silent-drop trap (operator asks for snapshot clone, gets
+// a non-snapshot empty shell). Bug 239 now refuses src_snap_name
+// with an explicit 501 — see TestBug239RDCloneSrcSnapNameReturns501
+// for that contract. This Bug 232 fixture is the override/delete-
+// only happy path; src_snap_name is exercised separately.
+func TestBug232RDCloneAcceptsOverrideDeleteProps(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -216,11 +221,13 @@ func TestBug232RDCloneAcceptsOverrideDeletePropsAndSrcSnap(t *testing.T) {
 	base, stop := startServerWithStore(t, st)
 	defer stop()
 
+	// NB: src_snap_name deliberately absent — Bug 239 now refuses it
+	// with 501; the override/delete contract pinned here is the live-
+	// RD-shell clone path, unchanged.
 	body, err := json.Marshal(map[string]any{
 		"name":           "rd-clone",
 		"override_props": map[string]string{"override-me": "new", "extra": "added"},
 		"delete_props":   []string{"drop-me"},
-		"src_snap_name":  "snap-2026-05-17",
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -231,7 +238,7 @@ func TestBug232RDCloneAcceptsOverrideDeletePropsAndSrcSnap(t *testing.T) {
 	_ = resp.Body.Close()
 
 	if resp.StatusCode == http.StatusBadRequest {
-		t.Fatalf("rd clone with override_props/delete_props/src_snap_name should not 400; got 400 body=%s",
+		t.Fatalf("rd clone with override_props/delete_props should not 400; got 400 body=%s",
 			respBody)
 	}
 
@@ -267,12 +274,19 @@ func TestBug232RDCloneAcceptsOverrideDeletePropsAndSrcSnap(t *testing.T) {
 	}
 }
 
-// TestBug232RDCloneAcceptsSrcSnapNameAlone pins that the
-// `src_snap_name` field on its own (no override/delete props) also
-// passes decode. python-linstor's snapshot-based clone path sends
-// only `name` + `src_snap_name`; the override-only test above
-// would silently pass even if the src_snap_name JSON tag regressed.
-func TestBug232RDCloneAcceptsSrcSnapNameAlone(t *testing.T) {
+// TestBug232RDCloneSrcSnapNameDecodes pins that the
+// `src_snap_name` JSON tag still resolves on the wire — even though
+// Bug 239 now refuses the request semantically (501), the decoder
+// MUST still parse the field, not 400 on it. Without this guard a
+// future refactor could remove the field from rdCloneRequest and
+// the decoder would slip back to 400 + "unknown field" instead of
+// the operator-actionable 501 Bug 239 surfaces.
+//
+// The contract: `src_snap_name` decodes (no 400) AND surfaces 501
+// (the Bug 239 refusal). The detailed envelope-shape assertion lives
+// in TestBug239RDCloneSrcSnapNameReturns501 — here we just want to
+// know the field name is wired into the struct.
+func TestBug232RDCloneSrcSnapNameDecodes(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -296,17 +310,22 @@ func TestBug232RDCloneAcceptsSrcSnapNameAlone(t *testing.T) {
 	}
 
 	if resp.StatusCode == http.StatusBadRequest {
-		t.Fatalf("rd clone with src_snap_name should not 400; got 400 body=%s", respBody)
+		t.Fatalf("rd clone with src_snap_name should not 400 (Bug 232 decode contract); got 400 body=%s",
+			respBody)
 	}
 
-	if resp.StatusCode != http.StatusCreated {
-		// Use Contains to surface what actually came back for debugging.
-		t.Fatalf("status: got %d, want 201 (body=%s)", resp.StatusCode, string(respBody))
+	// Bug 239 supersession: this body MUST now surface 501. The
+	// detailed envelope assertion lives in the Bug 239 test; here
+	// we only need to know the decoder doesn't 400.
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want 501 (Bug 239 supersedes Bug 232's accept-and-no-op for src_snap_name; body=%s)",
+			resp.StatusCode, string(respBody))
 	}
 
-	// Sanity: response envelope still has the standard clone-started
-	// shape — accepting the new field must not change the response.
+	// Sanity: the response is the CloneStarted envelope (Bug 239's
+	// shape) — proves the decoder routed through the snapshot-clone
+	// 501 branch rather than some unrelated 501.
 	if !strings.Contains(string(respBody), `"clone_name":"rd-clone"`) {
-		t.Errorf("response missing clone_name=rd-clone: %s", respBody)
+		t.Errorf("response missing clone_name=rd-clone in CloneStarted envelope: %s", respBody)
 	}
 }

@@ -54,6 +54,24 @@ const (
 	// we report a version >= the gate, the CLI refuses to even send
 	// the request and blockstor looks like it's missing features it
 	// actually serves.
+	//
+	// Bug 238 (OpenAPI spec version drift): the vendored OpenAPI spec
+	// at `third_party/linstor-openapi/rest_v1_openapi.yaml` carries
+	// `info.version: 1.28.0` — strictly newer than what we serve
+	// here. The served version is deliberately the LOWER of (vendored
+	// spec, supported endpoints): the 1.28.0 spec includes endpoints
+	// blockstor has not yet wired (snapshot-clone data plane, full
+	// rebalance, etc.), so advertising 1.28.0 would open additional
+	// python-linstor `_require_version` gates whose CLI calls then
+	// either 404 or silently produce wrong results.
+	//
+	// When bumping this string a future contributor MUST:
+	//   1. confirm every endpoint added between RestAPIVersion and
+	//      `third_party/linstor-openapi/rest_v1_openapi.yaml`
+	//      info.version is either wired or refused with an explicit
+	//      501 envelope;
+	//   2. update `pkg/version/bug_238_test.go` to reflect the new
+	//      alignment (or document the new divergence).
 	RestAPIVersion = "1.27.0"
 )
 

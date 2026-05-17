@@ -44,15 +44,18 @@ import (
 //   - `delete_props` ([]string): property keys to drop from the
 //     cloned RD's prop set. Wired through alongside override_props.
 //   - `src_snap_name` (string): name of the source snapshot the
-//     clone should materialise from (vs. live-resource clone). Accept
-//     here so the decode passes, but accept-and-no-op until the
-//     data-plane clone path (snapshot send/recv) lands. Bug 114's
-//     empty-VD-source contract still holds for the live clone path;
-//     the source-with-VDs path returns 501 today, and the snapshot
-//     path is part of the same satellite-side data-plane gap.
+//     clone should materialise from (vs. live-resource clone). Bug
+//     239: a non-empty value MUST surface an explicit HTTP 501 +
+//     CloneStarted-envelope refusal rather than silently dropping
+//     to the live-RD shell-copy path. Pre-Bug-239 the field was
+//     accepted-and-no-op (Bug 232), which gave operators a fresh
+//     empty shell with no error — the "snap" intent vanished.
+//     Until the snapshot-based clone data plane lands (Phase 12)
+//     the operator should fall back to the snapshot-then-restore
+//     workflow the writeCloneNotImplemented envelope hints at.
 //
-// TODO(bug-232-followup): when the snapshot-based clone data plane
-// lands, dispatch on a non-empty SrcSnapName to a snapshot-restore-
+// TODO(bug-239-followup / Phase 12): when the snapshot-based clone
+// data plane lands, replace the 501 branch with a snapshot-restore-
 // equivalent path instead of the live-RD shell copy.
 type rdCloneRequest struct {
 	Name          string            `json:"name"`
@@ -102,6 +105,19 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 
 	if req.Name == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
+
+		return
+	}
+
+	// Bug 239: snapshot-based clone is not implemented yet. The Bug 232
+	// decoder accepts `src_snap_name` so the CLI stops crashing on the
+	// wire-shape mismatch, but silently dropping it gave operators a
+	// fresh empty shell that lied about the snapshot. Surface an
+	// explicit 501 + CloneStarted envelope so the operator sees the gap
+	// (and the matching snapshot-then-restore workaround) before the
+	// snapshot-clone data plane lands in Phase 12.
+	if req.SrcSnapName != "" {
+		writeSnapshotCloneNotImplemented(w, srcName, req.Name, req.SrcSnapName)
 
 		return
 	}
@@ -289,6 +305,44 @@ func writeCloneNotImplemented(w http.ResponseWriter, srcName, cloneName string) 
 				" --from-snapshot <snap> --to-resource " + cloneName + "`",
 			ObjRefs: map[string]string{
 				"RscDfn": srcName,
+			},
+		}},
+	})
+}
+
+// writeSnapshotCloneNotImplemented stamps the Bug 239 refusal envelope
+// for the `src_snap_name`-bearing clone path. Same wire shape as
+// writeCloneNotImplemented (CloneStarted-object on 501 so python-
+// linstor's `resource_dfn_clone` can decode it without crashing), but
+// the messages are scoped to the snapshot-clone gap rather than the
+// VD-copy gap. The operator gets a concrete fallback that uses the
+// `s create` + `s resource restore` workflow which IS wired today.
+//
+// Bug 232 used to accept `src_snap_name` and silently drop it,
+// producing a fresh empty shell on the live-RD path with the wrong
+// data shape — Bug 239 trades the silent-success for an explicit
+// 501 so the operator either learns the gap immediately or scripts
+// the snapshot+restore fallback.
+func writeSnapshotCloneNotImplemented(w http.ResponseWriter, srcName, cloneName, srcSnapName string) {
+	writeJSON(w, http.StatusNotImplemented, cloneStartedResponse{
+		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
+		SourceName: srcName,
+		CloneName:  cloneName,
+		Messages: &[]apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "snapshot-based clone not implemented in this release (pending Phase 12)",
+			Cause: "the apiserver accepts `src_snap_name` on the wire for python-linstor 1.27.0 " +
+				"compatibility (Bug 232 + 237) but the satellite-side snapshot-clone data plane is " +
+				"not yet wired; silently falling back to a live-RD shell copy would discard the " +
+				"snapshot intent and produce a clone with the wrong contents",
+			Correc: "use the snapshot-then-restore workflow which IS wired today: " +
+				"`linstor s create " + srcName + " " + srcSnapName + "` (if the snapshot " +
+				"doesn't already exist) then " +
+				"`linstor s resource restore --from-resource " + srcName +
+				" --from-snapshot " + srcSnapName + " --to-resource " + cloneName + "`",
+			ObjRefs: map[string]string{
+				objRefRscDfn: srcName,
+				"SnapName":   srcSnapName,
 			},
 		}},
 	})
