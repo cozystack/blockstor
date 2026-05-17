@@ -97,11 +97,22 @@ step "rollout-status (satellite)" "kubectl -n blockstor-system rollout status ds
 # is going to clear those finalizers, and `kubectl delete` then
 # hangs forever waiting for the apiserver to remove the object.
 # Patching finalizers=[] makes the next delete actually succeed.
+#
+# Bug 285 cleanup: clear stale Node.Spec.Flags (most importantly
+# EVICTED, which is sticky and disqualifies a node from being
+# picked as a tiebreaker witness candidate; an auto-evict tick that
+# fired during a controller restart while LastHeartbeatTime was nil
+# would otherwise leave the next iter without a 3rd-node witness
+# candidate — confirmed root cause of 5 of Run 5's e2e scenarios on
+# stand e2e7). Strips the spec.flags array entirely on every Node;
+# the auto-evict / heartbeat loops re-stamp it within seconds when
+# the underlying condition is genuinely still true.
 step "cleanup leftover" \
     "kubectl get resource -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=merge -p '{\"metadata\":{\"finalizers\":[]}}' >/dev/null 2>&1 || true;
      kubectl delete resource --all --ignore-not-found --timeout=30s 2>&1 | tail -3;
      kubectl get resourcedefinitions -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=merge -p '{\"metadata\":{\"finalizers\":[]}}' >/dev/null 2>&1 || true;
-     kubectl delete resourcedefinition --all --ignore-not-found --timeout=30s 2>&1 | tail -3"
+     kubectl delete resourcedefinition --all --ignore-not-found --timeout=30s 2>&1 | tail -3;
+     kubectl get nodes.blockstor.io.blockstor.io -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=json -p='[{\"op\":\"remove\",\"path\":\"/spec/flags\"}]' >/dev/null 2>&1 || true"
 
 # Tear down any DRBD resources the kernel modules still hold on the
 # satellite pods. `kubectl delete --force --grace-period=0` above

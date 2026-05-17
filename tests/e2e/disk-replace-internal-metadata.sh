@@ -257,9 +257,18 @@ window_start=$(date +%s)
 # binds the kernel to the lower disk again. DRBD reads the freshly-
 # created metadata, sees an empty bitmap + zeroed GI, hands the peer
 # control of the resync direction → SyncTarget from $N2.
+# --max-peers must match what the satellite originally stamped via
+# `drbdadm create-md --max-peers=<N>` (pkg/drbd/drbdadm.go pins it
+# to drbd.MaxPeers-1 = 15). The previous value 31 inflated the
+# activity-log + bitmap metadata zone past what the kernel had
+# already learned the device's data capacity to be, and `drbdadm
+# attach` then failed `Low.dev. smaller than requested DRBD-dev.
+# size. Current (diskless) capacity 130936, cannot attach smaller
+# (130872) disk` — the operator-recipe doc value (31) is upstream
+# DRBD-9's max but doesn't match blockstor's deployment shape.
 echo ">> recipe: drbdmeta create-md + drbdadm attach on $N1"
 on_node "$N1" bash -c "
-    drbdmeta --force 0 v09 ${BACK_DEV} internal create-md 31
+    drbdmeta --force 0 v09 ${BACK_DEV} internal create-md 15
     drbdadm attach ${RD}
 "
 

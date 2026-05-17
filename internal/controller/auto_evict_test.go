@@ -509,3 +509,80 @@ func TestAutoEvict_OnlineNodeNotEvicted(t *testing.T) {
 		t.Errorf("ONLINE node must never be evicted; flags=%v", flags)
 	}
 }
+
+// TestAutoEvict_NeverReportedHeartbeatNotEvicted (Bug 285): a Node
+// that has been OFFLINE since creation and has never stamped a
+// LastHeartbeatTime MUST NOT be auto-evicted — even when its CRD's
+// creationTimestamp is well past AfterTime.
+//
+// Pre-Bug-285, the missing-heartbeat fallback was the CRD's
+// CreationTimestamp, which conflates "just-installed cluster
+// waiting for the satellite daemonset to come up" with "node that
+// the controller has been talking to for hours and lost contact
+// with". Both look identical at the gate: OFFLINE +
+// LastHeartbeatTime=nil + creationTimestamp old. The first case is
+// a false positive that mass-evicts every-not-yet-online node on a
+// slow bootstrap; the EVICTED flag is sticky (no auto-recovery on
+// reconnect; only manual `linstor node restore` clears it), so the
+// cluster ends up one node short of place_count for every RD until
+// an operator notices and runs the restore by hand.
+//
+// Repro caught on stand e2e7 during Run 5: worker-3 was EVICTED by
+// an auto-evict tick that fired before the satellite ever reported
+// in (Node CRD created 16:14, satellite pods didn't connect until
+// later). That left subsequent 2-replica e2e scenarios with no
+// candidate node for the tiebreaker witness — root cause of 5 of
+// the 7 scenarios in Run 5's batch failing their wait_uptodate
+// gates (recovery-port-collision, resize-luks, tiebreaker,
+// snapshot-restore-cross-node, disk-replace-internal-metadata).
+//
+// Fixed by refusing eviction until a real LastHeartbeatTime is
+// observed (hasBeenOfflineLongEnough returns false on nil-LHT).
+// Real "node truly gone forever" still works because the node will
+// eventually stamp a heartbeat once, then go offline and trip the
+// gate from a known-good baseline.
+func TestAutoEvict_NeverReportedHeartbeatNotEvicted(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	// Node was created 2 hours ago — well past the 60-min AfterTime
+	// default. Status.ConnectionStatus=OFFLINE (the heartbeat
+	// watchdog flips it that way for nodes whose LHT is nil or
+	// stale). The pre-fix code would have CreationTimestamp-
+	// fallbacked to "2h offline" and stamped EVICTED on this tick.
+	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+	createdAt := metav1.NewTime(now.Add(-2 * time.Hour))
+
+	node := &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sat-never-reported",
+			CreationTimestamp: createdAt,
+		},
+		Spec: blockstoriov1alpha1.NodeSpec{Type: apiv1.NodeTypeSatellite},
+		Status: blockstoriov1alpha1.NodeStatus{
+			ConnectionStatus: blockstoriov1alpha1.NodeConnectionStatusOffline,
+			// LastHeartbeatTime intentionally nil — never reported.
+			LastHeartbeatTime: nil,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(node).
+		Build()
+
+	r := &controllerpkg.AutoEvictReconciler{
+		Client: cli,
+		Clock:  &autoEvictClock{t: now},
+	}
+
+	err := r.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	flags := getNodeFlags(t, cli, "sat-never-reported")
+	if slices.Contains(flags, apiv1.NodeFlagEvicted) {
+		t.Errorf("Bug 285: node with nil LastHeartbeatTime must NOT be auto-evicted regardless of CRD age; flags=%v", flags)
+	}
+}

@@ -401,29 +401,48 @@ func isNodeOffline(node *blockstoriov1alpha1.Node) bool {
 }
 
 // hasBeenOfflineLongEnough reports whether the Node's last
-// heartbeat is older than `afterTime`. A nil LastHeartbeatTime
-// (Node just created, satellite never reported) is treated as
-// "long enough" since the satellite is by definition gone — we
-// fall back to the Node's metadata.creationTimestamp so a
-// freshly-created Node CRD doesn't immediately get evicted on the
-// next tick.
+// heartbeat is older than `afterTime`.
+//
+// Bug 285: a nil LastHeartbeatTime means the satellite has never
+// reported in to the controller yet. Two realistic causes:
+//
+//  1. Brand-new install — Node CRD was applied but the satellite
+//     daemonset pod hasn't come up / connected yet. AfterTime is
+//     60 min by default; on a slow control-plane bootstrap the
+//     pod can easily lag the Node CRD by that much, and the
+//     pre-Bug-285 fallback to CreationTimestamp would silently
+//     EVICT the node before its satellite ever shook hands. The
+//     EVICTED flag is sticky (no auto-recovery on reconnect),
+//     so the cluster ends up one node short of its place-count
+//     for every RD until an operator notices and `linstor node
+//     restore`s — the exact pre-condition that broke 5 of Run 5's
+//     e2e scenarios on stand e2e7 (worker-3 EVICTED → tiebreaker
+//     witness has no candidate → 2-replica RDs never get a
+//     witness → recovery-port-collision / resize-luks / tiebreaker
+//     / snapshot-restore-cross-node / disk-replace all fail their
+//     wait_uptodate gates).
+//
+//  2. Controller restart — the heartbeat controller stamps
+//     Status.LastHeartbeatTime on the K8s Node CRD on every tick.
+//     If the controller pod was restarted after the heartbeat
+//     status was stamped, the field persists. If it was restarted
+//     before the field was ever populated (sub-second window), the
+//     same nil-LHT shape appears on a perfectly healthy cluster.
+//
+// In both cases the safe behaviour is "wait until we actually see
+// a heartbeat before we start counting offline time" — eviction
+// without a single ever-observed heartbeat is a false positive.
+// Real "node truly gone forever" is caught by NodeFlagLost; that's
+// already an operator gesture, not an auto path.
 func hasBeenOfflineLongEnough(node *blockstoriov1alpha1.Node, now time.Time, afterTime time.Duration) bool {
-	if node.Status.LastHeartbeatTime != nil {
-		return now.Sub(node.Status.LastHeartbeatTime.Time) >= afterTime
+	if node.Status.LastHeartbeatTime == nil {
+		// Never heard from the satellite. Refuse to evict until
+		// a real heartbeat lands and the AfterTime window starts
+		// counting from a known-good baseline.
+		return false
 	}
 
-	// Fall back to the CRD creation time. A Node that's been in
-	// the system since before AutoEvict became aware of it is a
-	// genuine candidate; one that was created seconds ago is not.
-	if !node.CreationTimestamp.IsZero() {
-		return now.Sub(node.CreationTimestamp.Time) >= afterTime
-	}
-
-	// No heartbeat AND no creation timestamp shouldn't happen on a
-	// real cluster, but if it does the safer default is "not long
-	// enough" — better to let the next tick reconsider than to
-	// evict on missing data.
-	return false
+	return now.Sub(node.Status.LastHeartbeatTime.Time) >= afterTime
 }
 
 // countDisconnected returns the count of Nodes that are
