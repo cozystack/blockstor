@@ -30,9 +30,9 @@ clobber a concurrent Status write and vice versa. Status writes
 **must** go through the Status subresource (`Status().Update()`);
 Spec writes use the regular `Update()` path.
 
-This rule is enforced by code review for now; once Phase 10.2
-lands the satellite-side reconciler entirely (its writes will
-naturally route through Status only), it becomes mechanical.
+This rule is enforced by code review for now; with Phase 10.2
+landed, the satellite-side reconciler's writes naturally route
+through Status only, making the invariant mechanical.
 
 ### Field placement cheatsheet
 
@@ -61,7 +61,7 @@ either side rewrites the **whole** Status subresource, which can
 clobber the other side's writes that landed between Get and
 Update.
 
-Phase 10.2 routes those writes through Kubernetes Server-Side
+Phase 10.2 routed those writes through Kubernetes Server-Side
 Apply with distinct field managers (`blockstor-controller`,
 `blockstor-satellite`) so each side only touches the fields it
 owns. See `pkg/store/k8s/resources.go` `SetState` for the
@@ -147,20 +147,57 @@ The pipeline is end-to-end gated by
 
 ## Controllers and reconcilers
 
-* `internal/controller.ResourceReconciler` — Resource CRDs.
-  Allocates DRBD node-id / port / minor; picks SeedFromGi;
-  promotes DISKLESS to diskful when actively used; dispatches
-  the desired-state to the satellite via gRPC.
-* `internal/controller.ResourceDefinitionReconciler` — RD CRDs.
+Controller-side reconcilers (`internal/controller/`) — primary
+CRD owners:
+
+* `ResourceReconciler` (`resource_controller.go`, ~1245 LOC) —
+  Resource CRDs. Allocates DRBD node-id / port / minor; picks
+  SeedFromGi; promotes DISKLESS to diskful when actively used;
+  writes desired-state to the CRD for the satellite to pick up.
+* `ResourceDefinitionReconciler`
+  (`resourcedefinition_controller.go`, ~917 LOC) — RD CRDs.
   Auto-creates `DISKLESS+TIE_BREAKER` witnesses when an RD has
   even diskful replicas; sets the resource-level quorum policy.
-* `internal/controller.ResourceGroupReconciler` /
-  `NodeReconciler` / `StoragePoolReconciler` /
-  `SnapshotReconciler` — currently scaffolded but largely no-op
-  past CRD persistence; reconcile logic lives in the dispatcher
-  + satellite.
+* `NodeReconciler` (`node_controller.go`, ~239 LOC) — Node
+  CRDs. Owns the Node bookkeeping that the heartbeat watchdog
+  (Phase 10.6) relies on.
+* `ResourceGroupReconciler` (`resourcegroup_controller.go`,
+  ~132 LOC), `StoragePoolReconciler`
+  (`storagepool_controller.go`, ~68 LOC),
+  `SnapshotReconciler` (`snapshot_controller.go`, ~60 LOC) —
+  smaller reconcilers that own CRD-level invariants for their
+  kind. The bulk of placement / capacity / snapshot-ship logic
+  lives in the dispatcher + satellite controllers below.
 
-Phase 10.1 lifts the satellite's gRPC-driven reconciler logic
-into `pkg/satellite/controllers/` controller-runtime reconcilers
-that watch the apiserver directly; that change retires the
-`pkg/dispatcher/` + `pkg/satellitecontroller/` layers entirely.
+Sibling controllers in the same package handle cross-cutting
+concerns:
+
+* `node_heartbeat_controller.go` (~243 LOC) — Phase 10.6
+  heartbeat watchdog; flips Node `ConnectionStatus` to OFFLINE
+  when satellites stop refreshing their lease.
+* `node_label_sync_controller.go` (~326 LOC) — propagates
+  selected k8s Node labels to the blockstor Node CRD.
+* `auto_diskful_controller.go` (~493 LOC) — DISKLESS → diskful
+  promotion when a resource is actively used.
+* `auto_evict_controller.go` (~452 LOC) — evicts replicas from
+  unhealthy / drained nodes.
+* `autosnapshot_controller.go` (~536 LOC) — periodic snapshot
+  scheduling per RG/RD policy.
+* `rg_rebalance_controller.go` (~539 LOC) — rebalances RG
+  membership / spawns shortfall replicas.
+* `resource_migration_controller.go` (~217 LOC) — migrates a
+  Resource between nodes.
+
+Satellite-side reconcilers live in `pkg/satellite/controllers/`
+and watch the apiserver directly via controller-runtime (Phase
+10.1). They drive DRBD / LUKS / STORAGE layers and write
+observed state back via Status SSA.
+
+Phase 10.1 lifted the satellite's gRPC-driven reconciler logic
+into those `pkg/satellite/controllers/` reconcilers. That
+change retired `pkg/satellitecontroller/`, but `pkg/dispatcher/`
+is still live: it provides the CRD → DesiredResource translator
+(resolves layer_stack, options, passphrases) and is imported by
+the satellite-side reconciler at
+`pkg/satellite/controllers/resource.go` (and exercised by
+`pkg/dispatcher/dispatcher_test.go`).

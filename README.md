@@ -29,7 +29,7 @@ blockstor implements a LINSTOR-compatible REST API and was inspired by LINBIT's 
 ## What's here
 
 - `cmd/` — three binaries from the Phase 11.x apiserver split:
-  - `cmd/controller/` — controller-runtime manager hosting the RD / RG / RP / Snapshot / Resource / Node reconcilers (no REST surface).
+  - `cmd/controller/` — controller-runtime manager hosting the RD / RG / RP / Snapshot / Resource / Node reconcilers. The LINSTOR-compatible REST surface is disabled by default since the Phase 11.x apiserver split; pass `--enable-rest-api` (with `--rest-bind-address`) for the legacy single-binary deployment.
   - `cmd/satellite/` — per-node controller-runtime manager that watches its own slice of CRDs and reconciles DRBD / LUKS / STORAGE layers + drives the events2 observer.
   - `cmd/apiserver/` — stateless LINSTOR-compatible REST front end backed by the CRD store; runs as a 3-replica Deployment.
 - `pkg/api/v1/` — REST shape types, layer-stack resolver.
