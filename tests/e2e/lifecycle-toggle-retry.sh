@@ -219,15 +219,14 @@ fi
 
 echo ">> step 3b: wait ${STUCK_WINDOW}s and assert N3 is still NOT UpToDate"
 sleep "$STUCK_WINDOW"
-n3_disk=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+n3_disk=$(status_disk_state "$RD" "$N3")
 echo "   N3 disk state: $n3_disk"
 
 # When the VG is gone, lvcreate fails and the satellite can't
-# attach a backing device. drbdsetup status shows either no
-# resource at all, or disk:Diskless / disk:Inconsistent /
-# disk:Attaching. Anything other than UpToDate is "stuck enough"
-# for this scenario.
-if [[ "$n3_disk" == *"disk:UpToDate"* ]]; then
+# attach a backing device. Resource.Status reports either no row at
+# all, or Diskless / Inconsistent / Attaching. Anything other than
+# UpToDate is "stuck enough" for this scenario.
+if [[ "$n3_disk" == "UpToDate" ]]; then
     mark_fail "N3 promoted to UpToDate despite broken VG — pool fault not surfaced"
 else
     echo "   stuck as expected (not UpToDate)"
@@ -252,9 +251,9 @@ fi
 # broken). UG9: retry should fail again with the same error
 # surface. blockstor: silently 200.
 sleep 10
-n3_disk_after_retry=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+n3_disk_after_retry=$(status_disk_state "$RD" "$N3")
 echo "   N3 after retry: $n3_disk_after_retry"
-if [[ "$n3_disk_after_retry" == *"disk:UpToDate"* ]]; then
+if [[ "$n3_disk_after_retry" == "UpToDate" ]]; then
     mark_fail "N3 became UpToDate after retry despite broken VG"
 fi
 
@@ -278,15 +277,15 @@ echo ">> step 5b: wait ${CANCEL_DRAIN}s for N3 to settle back to Diskless"
 deadline=$(( $(date +%s) + CANCEL_DRAIN ))
 final_state=
 while (( $(date +%s) < deadline )); do
-    final_state=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$final_state" == *"Diskless"* || -z "$final_state" ]]; then
+    final_state=$(status_disk_state "$RD" "$N3")
+    if [[ "$final_state" == "Diskless" || -z "$final_state" ]]; then
         break
     fi
     sleep 2
 done
 echo "   N3 final state: ${final_state:-<no resource>}"
 
-if [[ -n "$final_state" && "$final_state" != *"Diskless"* ]]; then
+if [[ -n "$final_state" && "$final_state" != "Diskless" ]]; then
     mark_spec "N3 did not return to Diskless within ${CANCEL_DRAIN}s after cancel (got: $final_state) — UG9 cancel semantics may not be wired"
 fi
 
@@ -305,8 +304,8 @@ fi
 # regressed during the stuck-toggle dance. Drift here would be a
 # real bug regardless of the SPEC verdict on the cancel path.
 for peer in "$N1" "$N2"; do
-    state=$(on_node "$peer" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$state" != *"UpToDate"* ]]; then
+    state=$(status_disk_state "$RD" "$peer")
+    if [[ "$state" != "UpToDate" ]]; then
         mark_fail "$peer disk regressed during the stuck-toggle dance (got: $state)"
     fi
 done

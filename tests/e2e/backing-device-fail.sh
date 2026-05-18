@@ -96,15 +96,15 @@ sleep 30
 # Detach success criteria: local disk in {Diskless, Failed, Detaching, Outdated};
 # peer still UpToDate. The exact target state depends on the DRBD-9
 # minor version; any non-UpToDate state is acceptable for this test.
-prim_disk=$(on_node "$PRIMARY" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$prim_disk" == *"disk:UpToDate"* ]]; then
+prim_disk=$(status_disk_state "$RD" "$PRIMARY")
+if [[ "$prim_disk" == "UpToDate" ]]; then
     echo "FAIL: $PRIMARY disk stayed UpToDate despite forced I/O errors (got: $prim_disk)"
     on_node "$PRIMARY" dmsetup remove "blockstor-fail-${RD}" 2>/dev/null || true
     exit 1
 fi
 
-peer_disk=$(on_node "$PEER" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$peer_disk" != *"UpToDate"* ]]; then
+peer_disk=$(status_disk_state "$RD" "$PEER")
+if [[ "$peer_disk" != "UpToDate" ]]; then
     echo "FAIL: $PEER disk no longer UpToDate (got: $peer_disk)"
     exit 1
 fi

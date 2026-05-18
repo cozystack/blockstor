@@ -140,13 +140,13 @@ curl -fsS -XPOST -H'Content-Type: application/json' \
 echo ">> wait all 3 replicas UpToDate"
 deadline=$(( $(date +%s) + 180 ))
 while (( $(date +%s) < deadline )); do
-    s1=$(on_node "$WORKER_1" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s2=$(on_node "$WORKER_2" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s3=$(on_node "$WORKER_3" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    if (( s1 >= 1 && s2 >= 1 && s3 >= 1 )); then break; fi
+    s1=$(status_disk_state "$RD" "$WORKER_1")
+    s2=$(status_disk_state "$RD" "$WORKER_2")
+    s3=$(status_disk_state "$RD" "$WORKER_3")
+    if [[ "$s1" == "UpToDate" && "$s2" == "UpToDate" && "$s3" == "UpToDate" ]]; then break; fi
     sleep 3
 done
-if (( s1 < 1 || s2 < 1 || s3 < 1 )); then
+if [[ "$s1" != "UpToDate" || "$s2" != "UpToDate" || "$s3" != "UpToDate" ]]; then
     echo "FAIL: RD never reached UpToDate everywhere (s1=$s1 s2=$s2 s3=$s3)"
     exit 1
 fi
@@ -356,13 +356,13 @@ echo ">> SKILL recipe: linstor rd ap $RD --place-count 3 --storage-pool stand"
 echo ">> wait all 3 replicas UpToDate after re-placement"
 deadline=$(( $(date +%s) + 180 ))
 while (( $(date +%s) < deadline )); do
-    s1=$(on_node "$WORKER_1" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s2=$(on_node "$WORKER_2" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s3=$(on_node "$WORKER_3" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    if (( s1 >= 1 && s2 >= 1 && s3 >= 1 )); then break; fi
+    s1=$(status_disk_state "$RD" "$WORKER_1")
+    s2=$(status_disk_state "$RD" "$WORKER_2")
+    s3=$(status_disk_state "$RD" "$WORKER_3")
+    if [[ "$s1" == "UpToDate" && "$s2" == "UpToDate" && "$s3" == "UpToDate" ]]; then break; fi
     sleep 3
 done
-if (( s1 < 1 || s2 < 1 || s3 < 1 )); then
+if [[ "$s1" != "UpToDate" || "$s2" != "UpToDate" || "$s3" != "UpToDate" ]]; then
     echo "FAIL: not all 3 replicas UpToDate after recovery (s1=$s1 s2=$s2 s3=$s3)"
     on_node "$WORKER_1" drbdsetup status "$RD" 2>&1 | head -20 || true
     on_node "$WORKER_2" drbdsetup status "$RD" 2>&1 | head -20 || true

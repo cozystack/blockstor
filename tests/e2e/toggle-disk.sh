@@ -91,14 +91,14 @@ curl -fsS -X PUT \
 echo ">> wait up to 90s for N3 to become UpToDate"
 deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
-    state=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$state" == *"UpToDate"* ]]; then
+    state=$(status_disk_state "$RD" "$N3")
+    if [[ "$state" == "UpToDate" ]]; then
         break
     fi
     sleep 2
 done
 
-if [[ "$state" != *"UpToDate"* ]]; then
+if [[ "$state" != "UpToDate" ]]; then
     echo "FAIL: N3 not UpToDate after toggle-disk → diskful (state: $state)"
     exit 1
 fi
@@ -111,14 +111,14 @@ curl -fsS -X PUT \
 echo ">> wait up to 60s for satellite to detach"
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    state=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$state" == *"Diskless"* ]]; then
+    state=$(status_disk_state "$RD" "$N3")
+    if [[ "$state" == "Diskless" ]]; then
         break
     fi
     sleep 2
 done
 
-if [[ "$state" != *"Diskless"* ]]; then
+if [[ "$state" != "Diskless" ]]; then
     echo "FAIL: N3 not Diskless after toggle-disk back (state: $state)"
     exit 1
 fi

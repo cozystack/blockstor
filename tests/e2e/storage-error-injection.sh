@@ -242,8 +242,8 @@ echo "   ${SKIP_DISK_KEY}=True stamped on ${primary_res_name}"
 
 # Phase D: peer must still be UpToDate (single-leg failure must not
 # propagate to the surviving replica).
-peer_disk=$(on_node "$PEER" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$peer_disk" != *"UpToDate"* ]]; then
+peer_disk=$(status_disk_state "$RD" "$PEER")
+if [[ "$peer_disk" != "UpToDate" ]]; then
     echo "FAIL: ${PEER} dropped out of UpToDate (got: ${peer_disk})"
     exit 1
 fi
@@ -253,8 +253,8 @@ echo "   PEER ${PEER} still UpToDate"
 # target state depends on whether the observer's auto-detach has
 # already converted the lower disk to Diskless, or whether the
 # kernel is still reporting Failed. Any non-UpToDate is acceptable.
-prim_disk=$(on_node "$PRIMARY" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$prim_disk" == *"disk:UpToDate"* ]]; then
+prim_disk=$(status_disk_state "$RD" "$PRIMARY")
+if [[ "$prim_disk" == "UpToDate" ]]; then
     echo "FAIL: ${PRIMARY} disk still UpToDate despite EIO injection (got: ${prim_disk})"
     exit 1
 fi

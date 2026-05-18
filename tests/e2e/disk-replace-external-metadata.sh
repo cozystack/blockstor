@@ -488,8 +488,8 @@ echo "   7f: wait up to ${RECOVERY_WINDOW}s for ${N1} -> UpToDate"
 deadline=$(( $(date +%s) + RECOVERY_WINDOW ))
 recovered=false
 while (( $(date +%s) < deadline )); do
-    d=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$d" == *"UpToDate"* ]]; then
+    d=$(status_disk_state "$RD" "$N1")
+    if [[ "$d" == "UpToDate" ]]; then
         recovered=true
         break
     fi
@@ -512,8 +512,8 @@ if [[ "$pre_sha" != "$final_sha" ]]; then
 fi
 
 # Regression guard: peer must still be UpToDate.
-n2_final=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$n2_final" != *"UpToDate"* ]]; then
+n2_final=$(status_disk_state "$RD" "$N2")
+if [[ "$n2_final" != "UpToDate" ]]; then
     echo "FAIL: $N2 disk regressed during recipe (got: $n2_final)"
     exit 1
 fi

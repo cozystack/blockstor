@@ -222,11 +222,11 @@ for loop in $(seq 1 "$TOGGLE_LOOPS"); do
     # the next promote, so we wait for Diskless to settle first.
     deadline=$(( $(date +%s) + 30 ))
     while (( $(date +%s) < deadline )); do
-        d=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-        [[ "$d" == *"Diskless"* ]] && break
+        d=$(status_disk_state "$RD" "$N1")
+        [[ "$d" == "Diskless" ]] && break
         sleep 1
     done
-    echo "   $N1 settled to: $(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep 'disk:' | head -1 || echo '<gone>')"
+    echo "   $N1 settled to: $(status_disk_state "$RD" "$N1")"
 
     # diskless -> diskful: PUT toggle-disk/storage-pool/stand.
     http_code=$(curl -s -o /tmp/bitmap-drop-r2.json -w '%{http_code}' -m 30 -X PUT \
@@ -260,8 +260,8 @@ for loop in $(seq 1 "$TOGGLE_LOOPS"); do
             break
         fi
 
-        d=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-        if [[ "$d" == *"UpToDate"* ]]; then
+        d=$(status_disk_state "$RD" "$N1")
+        if [[ "$d" == "UpToDate" ]]; then
             loop_settled=true
             break
         fi
@@ -282,8 +282,8 @@ for loop in $(seq 1 "$TOGGLE_LOOPS"); do
     fi
 
     # Regression guard between loops: $N2 must still be UpToDate.
-    n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$n2_disk" != *"UpToDate"* ]]; then
+    n2_disk=$(status_disk_state "$RD" "$N2")
+    if [[ "$n2_disk" != "UpToDate" ]]; then
         echo "FAIL: $N2 disk regressed during toggle loop ${loop} (got: $n2_disk) — test setup contaminated"
         exit 1
     fi
@@ -320,9 +320,9 @@ deadline=$(( $(date +%s) + RECOVERY_WINDOW ))
 recovered=false
 trace=""
 while (( $(date +%s) < deadline )); do
-    d=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+    d=$(status_disk_state "$RD" "$N1")
     trace="${trace}|${d}"
-    if [[ "$d" == *"UpToDate"* ]]; then
+    if [[ "$d" == "UpToDate" ]]; then
         recovered=true
         break
     fi
@@ -340,8 +340,8 @@ if [[ "$recovered" != "true" ]]; then
 fi
 
 # Regression guard: $N2 must still be UpToDate after the recipe.
-n2_final=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$n2_final" != *"UpToDate"* ]]; then
+n2_final=$(status_disk_state "$RD" "$N2")
+if [[ "$n2_final" != "UpToDate" ]]; then
     echo "FAIL: $N2 disk regressed during recipe (got: $n2_final)"
     exit 1
 fi

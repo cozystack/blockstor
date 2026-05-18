@@ -142,22 +142,22 @@ for _ in $(seq 1 30); do
 done
 
 disk_state() {
-    on_node "$1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true
+    status_disk_state "$RD" "$1"
 }
 
 assert_uptodate_12() {
     local tag=$1 s1 s2 deadline
-    # Poll up to 15 s — `drbdsetup status` can transiently return
-    # nothing when the satellite reconciler is mid-`drbdadm adjust`
-    # (the device is briefly absent from the kernel list during the
-    # reconfigure window). A flaky single-shot read here would mask
-    # the real regression we care about, which is a *sustained*
-    # drop out of UpToDate on the diskful peers.
+    # Poll up to 15 s — Resource.Status can transiently report a
+    # different state when the satellite reconciler is mid-`drbdadm
+    # adjust` (the device is briefly absent from the kernel list
+    # during the reconfigure window). A flaky single-shot read here
+    # would mask the real regression we care about, which is a
+    # *sustained* drop out of UpToDate on the diskful peers.
     deadline=$(( $(date +%s) + 15 ))
     while (( $(date +%s) < deadline )); do
         s1=$(disk_state "$N1")
         s2=$(disk_state "$N2")
-        if [[ "$s1" == *"UpToDate"* && "$s2" == *"UpToDate"* ]]; then
+        if [[ "$s1" == "UpToDate" && "$s2" == "UpToDate" ]]; then
             echo "   [$tag] N1+N2 UpToDate OK"
             return 0
         fi

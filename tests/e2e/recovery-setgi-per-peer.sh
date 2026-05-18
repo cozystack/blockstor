@@ -157,9 +157,9 @@ while (( $(date +%s) < deadline )); do
     n_uptodate=0
     last_trace=""
     for node in "$N1" "$N2" "$N3"; do
-        ds=$(on_node "$node" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+        ds=$(status_disk_state "$RD" "$node")
         last_trace="${last_trace}${node}=${ds:-<gone>}; "
-        if [[ "$ds" == *"disk:UpToDate"* ]]; then
+        if [[ "$ds" == "UpToDate" ]]; then
             n_uptodate=$(( n_uptodate + 1 ))
         fi
     done
