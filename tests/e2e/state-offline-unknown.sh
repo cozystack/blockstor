@@ -202,37 +202,48 @@ if [[ "$last_known_disk" != "UpToDate" ]]; then
     exit 1
 fi
 
-# --- Step: isolate $N3 by killing pod FIRST, then preventing rebinding ----
+# --- Step: isolate $N3 by patching DS affinity FIRST, then killing pod ----
 #
 # The DaemonSet's blanket `tolerations: [{operator: Exists}]` makes taints
 # useless here (every taint is tolerated). Use a label-based eviction:
 # the DS gets patched to require absence of EVICT_LABEL, and the node
-# gets labelled. But ORDER MATTERS:
+# gets labelled. ORDER MATTERS:
 #
-#   1. FORCE-delete the pod (no grace, no preStop). If we patched the DS
-#      first, the DS would issue a *graceful* eviction — kubelet runs
-#      the satellite's preStop hook which `drbdadm down`s every resource,
-#      and the observer emits "device gone" events that SSA-apply onto
-#      the CRD's Status.Volumes[i].DiskState, blanking the last-known
-#      DiskState we're trying to preserve. Force-delete with grace=0
-#      bypasses preStop entirely (kubelet SIGKILLs the container) so
-#      the CRD keeps its last-observed DiskState intact.
+#   1. PATCH the DS template first to add a `EVICT_LABEL DoesNotExist`
+#      affinity requirement. At this point $N3 has no such label so the
+#      template still matches — the existing pod keeps running and the
+#      DS controller does NOT start a graceful eviction.
 #
-#   2. THEN patch the DS + label so the DS controller won't reconcile
-#      a fresh pod onto $N3.
-echo ">> delete satellite Pod on $N3 FIRST (force, no grace — bypass preStop)"
+#   2. LABEL $N3 with EVICT_LABEL=offline. Now $N3 fails the affinity
+#      requirement; the DS controller marks it for graceful eviction
+#      (the preStop hook would `drbdadm down` every resource and the
+#      observer would blank Status.Volumes[i].DiskState, losing the
+#      last-known DiskState we're trying to preserve).
+#
+#   3. IMMEDIATELY force-delete the pod (grace=0, no wait) so kubelet
+#      SIGKILLs the container before the DS controller's graceful
+#      eviction goroutine can fire its delete. Force-delete preserves
+#      the last-known DiskState in the CRD.
+#
+# After step 3 the DS controller's next reconcile sees no pod on $N3
+# AND the patched template excludes $N3 → no new pod is scheduled.
+# With the previous order (delete → label → patch) the DS controller
+# observed the pod gone with the OLD template still allowing $N3 and
+# raced ahead to schedule a fresh pod before the patch landed.
+
+echo ">> patch DS nodeAffinity to require absence of $EVICT_LABEL"
+kubectl -n "$NS" patch ds blockstor-satellite --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-","value":{"key":"'"${EVICT_LABEL}"'","operator":"DoesNotExist"}}]'
+
+echo ">> label $N3 with $EVICT_LABEL=offline so DS affinity excludes it"
+kubectl label node "$N3" "${EVICT_LABEL}=offline" --overwrite
+
+echo ">> force-delete satellite Pod on $N3 (no grace — bypass preStop, race the DS eviction)"
 sat_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
     -o "jsonpath={.items[?(@.spec.nodeName==\"${N3}\")].metadata.name}")
 if [[ -n "$sat_pod" ]]; then
     kubectl -n "$NS" delete pod "$sat_pod" --force --grace-period=0 --wait=false
 fi
-
-echo ">> label $N3 with $EVICT_LABEL=offline so DS affinity excludes it"
-kubectl label node "$N3" "${EVICT_LABEL}=offline" --overwrite
-
-echo ">> patch DS nodeAffinity to require absence of $EVICT_LABEL"
-kubectl -n "$NS" patch ds blockstor-satellite --type=json \
-    -p='[{"op":"add","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-","value":{"key":"'"${EVICT_LABEL}"'","operator":"DoesNotExist"}}]'
 
 # Confirm the DaemonSet refused to re-schedule (so heartbeats truly stop).
 sleep 8
