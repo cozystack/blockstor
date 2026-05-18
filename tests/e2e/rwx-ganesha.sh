@@ -84,6 +84,13 @@ if [[ "$phase" != "Bound" ]]; then
 fi
 
 echo ">> two Pods on $WORKER_1 + $WORKER_2 mount the PVC"
+# PodSecurity: the test namespace runs with PSA `restricted:latest`
+# enforcement. Run 28 deep-dive showed the 600s timeout was not NFS
+# slowness — it was PSA blocking pod admission outright (no
+# securityContext → violated runAsNonRoot / allowPrivilegeEscalation /
+# capabilities / seccompProfile). Set the full restricted-baseline
+# securityContext at both Pod and Container scope and the pods admit
+# immediately; 300s is plenty of headroom for NFS-Ganesha publish.
 for spec in "$P1:$WORKER_1" "$P2:$WORKER_2"; do
     name=${spec%:*}
     node=${spec#*:}
@@ -94,10 +101,19 @@ metadata: {name: $name}
 spec:
   nodeName: $node
   restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: w
       image: alpine:3
       command: ["sleep", "300"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: [ALL]
       volumeMounts:
         - {name: data, mountPath: /data}
   volumes:
@@ -106,12 +122,8 @@ spec:
 EOF
 done
 
-echo ">> wait both Pods Ready (600s)"
-# QEMU stand: NFS-Ganesha first-publish over piraeus stack is slow.
-# 300s repeatedly missed the wall by a handful of seconds on the
-# 7-stand QEMU setup; doubling avoids the flake without weakening
-# the readiness assertion.
-kubectl wait --for=condition=Ready --timeout=600s pod/"$P1" pod/"$P2"
+echo ">> wait both Pods Ready (300s)"
+kubectl wait --for=condition=Ready --timeout=300s pod/"$P1" pod/"$P2"
 
 MARK="rwx-$(date +%s)-$$"
 echo ">> write marker '$MARK' from $P1"

@@ -197,17 +197,19 @@ on_node "$NODE_A" bash -c "
     drbdadm secondary ${RD} 2>/dev/null || true
 "
 
-# Now throttle the resync rate via DRBD prop BEFORE adding the second
-# replica. With c-max-rate=256K, a 128 MiB dd payload takes ~500 s to
-# sync — comfortably wider than the 60-120 s polling envelope below.
-# 1M previously drained the writes in <60 s on faster QEMU stands and
-# the SyncTarget window closed before we could observe it.
-echo ">> set c-max-rate=256K on RD $RD (throttle the upcoming initial sync)"
-"${LINSTOR[@]}" resource-definition set-property "$RD" \
-    DrbdOptions/PeerDevice/c-max-rate 256K >/dev/null
-
 # Stage 2: add the second replica. The new peer comes up Inconsistent
 # and the kernel starts a real bitmap-driven sync against NODE_A.
+#
+# IMPORTANT (Run 28 deep-dive): we do NOT pre-set c-max-rate via
+# `linstor rd set-property` before resource create — that prop was
+# not carried into the first .res render on the SyncTarget side,
+# so the kernel launched the initial sync at the DRBD default
+# (~100 MiB/s) and drained the 128 MiB bitmap within seconds,
+# closing the SyncTarget observation window before we could poll.
+# Instead, we apply the throttle directly to the live kernel slot
+# via `drbdsetup peer-device-options` on both peers AFTER the
+# resource has surfaced in drbdsetup status (kernel slot exists
+# on both sides) but before identify_sync_target / the kill window.
 echo ">> add 2nd replica on $NODE_B (forces real initial sync)"
 "${LINSTOR[@]}" resource create "$NODE_B" "$RD" --storage-pool stand >/dev/null
 
@@ -227,6 +229,27 @@ while (( $(date +%s) < deadline )); do
     fi
     sleep 1
 done
+
+# Throttle the live initial-sync rate via drbdsetup on both peers.
+# With c-max-rate=256K the 128 MiB dirty bitmap takes ~500s to
+# drain — comfortable budget for the pod-kill / DaemonSet respawn
+# / drbdadm adjust cycle without the sync silently completing.
+# Resolve peer-node-ids from the kernel's own view (drbdsetup
+# status --verbose) — that's the authoritative source whether the
+# satellite reconciler has written the .res yet or not.
+echo ">> throttle initial sync via drbdsetup peer-device-options (c-max-rate=256K)"
+a_peer_id=$(on_node "$NODE_A" drbdsetup status "$RD" --verbose 2>/dev/null \
+    | grep -E "^[[:space:]]+${NODE_B}[[:space:]]+node-id:" | grep -oE 'node-id:[0-9]+' | head -1 | cut -d: -f2 || true)
+b_peer_id=$(on_node "$NODE_B" drbdsetup status "$RD" --verbose 2>/dev/null \
+    | grep -E "^[[:space:]]+${NODE_A}[[:space:]]+node-id:" | grep -oE 'node-id:[0-9]+' | head -1 | cut -d: -f2 || true)
+if [[ -n "$a_peer_id" ]]; then
+    on_node "$NODE_A" drbdsetup peer-device-options "$RD" "$a_peer_id" 0 \
+        --c-max-rate=256K 2>&1 || true
+fi
+if [[ -n "$b_peer_id" ]]; then
+    on_node "$NODE_B" drbdsetup peer-device-options "$RD" "$b_peer_id" 0 \
+        --c-max-rate=256K 2>&1 || true
+fi
 
 # identify_sync_target — the side whose LOCAL disk reads Inconsistent
 # during the initial sync is the SyncTarget; its peer (the side with

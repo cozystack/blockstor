@@ -92,11 +92,21 @@ md5_v1=$(on_node "$N1" bash -c "
 # wait-sync-resource` blocks until OutOfSyncKib==0 across every
 # volume of the RD. Without this barrier the secondary→primary flip
 # below races the in-flight resync packets and N2 reads zeros for
-# whichever volume hadn't yet caught up. The bare `|| true` keeps
-# the test forgiving if the kernel returns non-zero on an already-
-# in-sync resource (different DRBD-9 builds disagree on the exit
-# code for "nothing to wait for").
-on_node "$N1" timeout 60 drbdsetup wait-sync-resource "$RD" || true
+# whichever volume hadn't yet caught up.
+#
+# Run 28 deep-dive: the previous `|| true` mask hid real timeout
+# failures. If sync hangs (e.g. replication stalled, peer disk
+# gone) the test silently proceeds and N2 reads stale bytes — a
+# false PASS for a broken replication path. Capture the exit code
+# and fail loudly with a drbdsetup status dump instead.
+if ! on_node "$N1" timeout 60 drbdsetup wait-sync-resource "$RD"; then
+    echo "FAIL: wait-sync-resource timed out for $RD on $N1"
+    echo "--- drbdsetup status --verbose $RD on $N1 ---"
+    on_node "$N1" drbdsetup status --verbose "$RD" || true
+    echo "--- drbdsetup status --verbose $RD on $N2 ---"
+    on_node "$N2" drbdsetup status --verbose "$RD" || true
+    exit 1
+fi
 
 on_node "$N1" drbdadm secondary "$RD" || true
 

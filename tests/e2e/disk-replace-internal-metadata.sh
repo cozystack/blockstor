@@ -269,11 +269,30 @@ window_start=$(date +%s)
 # size. Current (diskless) capacity 130936, cannot attach smaller
 # (130872) disk` — the operator-recipe doc value (31) is upstream
 # DRBD-9's max but doesn't match blockstor's deployment shape.
+#
+# Run 28 deep-dive: pin DrbdOptions/SkipDisk=True on the $N1
+# Resource BEFORE the manual recipe so the satellite reconciler
+# doesn't race the operator. Without this, the reconciler observes
+# the Diskless state, decides to re-attach the loop device via its
+# own `drbdadm attach` path, and `drbdmeta create-md` fails with
+# `terminated with exit code 20` (Device or resource busy) because
+# the kernel already owns the lower disk. SkipDisk=True tells the
+# reconciler "this replica is intentionally detached, leave the
+# lower disk alone". The prop is cleared after `drbdadm attach`
+# below so normal reconciliation resumes.
+echo ">> pin DrbdOptions/SkipDisk=True on ${RD}.${N1} (block reconciler re-attach race)"
+kubectl patch "resource.blockstor.io.blockstor.io/${RD}.${N1}" --type=merge \
+    -p '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
+
 echo ">> recipe: drbdmeta create-md + drbdadm attach on $N1"
 on_node "$N1" bash -c "
     drbdmeta --force 0 v09 ${BACK_DEV} internal create-md 15
     drbdadm attach ${RD}
 "
+
+echo ">> clear DrbdOptions/SkipDisk on ${RD}.${N1} (resume normal reconciliation)"
+kubectl patch "resource.blockstor.io.blockstor.io/${RD}.${N1}" --type=merge \
+    -p '{"spec":{"props":{"DrbdOptions/SkipDisk":null}}}'
 
 # ---------- step 6: wait for N1 → UpToDate via bitmap resync ----------
 echo ">> wait up to ${RECOVERY_WINDOW}s for $N1 → UpToDate"
