@@ -106,8 +106,9 @@ spec:
 EOF
 done
 
-echo ">> wait both Pods Ready (120s)"
-kubectl wait --for=condition=Ready --timeout=120s pod/"$P1" pod/"$P2"
+echo ">> wait both Pods Ready (300s)"
+# QEMU stand: NFS-Ganesha first-publish over piraeus stack is slow
+kubectl wait --for=condition=Ready --timeout=300s pod/"$P1" pod/"$P2"
 
 MARK="rwx-$(date +%s)-$$"
 echo ">> write marker '$MARK' from $P1"

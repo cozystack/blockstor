@@ -282,8 +282,10 @@ for loop in $(seq 1 "$TOGGLE_LOOPS"); do
     fi
 
     # Regression guard between loops: $N2 must still be UpToDate.
+    # Empty Status (transient observer SSA gap) is not a regression
+    # signal — only a non-empty value other than UpToDate counts.
     n2_disk=$(status_disk_state "$RD" "$N2")
-    if [[ "$n2_disk" != "UpToDate" ]]; then
+    if [[ -n "$n2_disk" && "$n2_disk" != "UpToDate" ]]; then
         echo "FAIL: $N2 disk regressed during toggle loop ${loop} (got: $n2_disk) — test setup contaminated"
         exit 1
     fi

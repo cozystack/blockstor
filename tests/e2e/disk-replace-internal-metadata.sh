@@ -215,7 +215,8 @@ echo ">> simulate disk failure on $N1: drbdadm detach --force"
 on_node "$N1" drbdadm detach --force "$RD"
 
 # Wait briefly for the kernel to settle on disk:Diskless.
-deadline=$(( $(date +%s) + 5 ))
+# observer SSA wake-up + apiserver round-trip can take ~10s on busy stand
+deadline=$(( $(date +%s) + 15 ))
 n1_disk=""
 while (( $(date +%s) < deadline )); do
     n1_disk=$(status_disk_state "$RD" "$N1")

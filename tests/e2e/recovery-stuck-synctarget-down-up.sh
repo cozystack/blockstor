@@ -253,6 +253,18 @@ cleanup_iptables
 DRBD_PORT_SAVED=$DRBD_PORT
 DRBD_PORT=""
 
+# Run 26 cleanup: DRBD can reset peer-device-options when a connection
+# re-establishes after a partition heal. Re-apply the resync throttle
+# so the SyncTarget window stays wide enough for the down+up sequence.
+if [[ -n "$n1_peer_id" ]]; then
+    on_node "$N1" drbdsetup peer-device-options "${RD}" "${n1_peer_id}" 0 \
+        --c-max-rate="${RESYNC_RATE_KB}" --c-min-rate="${RESYNC_RATE_KB}" --resync-rate="${RESYNC_RATE_KB}" 2>&1 || true
+fi
+if [[ -n "$n2_peer_id" ]]; then
+    on_node "$N2" drbdsetup peer-device-options "${RD}" "${n2_peer_id}" 0 \
+        --c-max-rate="${RESYNC_RATE_KB}" --c-min-rate="${RESYNC_RATE_KB}" --resync-rate="${RESYNC_RATE_KB}" 2>&1 || true
+fi
+
 deadline=$(( $(date +%s) + 60 ))
 rep=""
 while (( $(date +%s) < deadline )); do

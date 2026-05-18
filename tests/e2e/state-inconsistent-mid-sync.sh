@@ -189,10 +189,11 @@ if [[ -z "$DEV_SRC_EARLY" ]]; then
     echo "FAIL: could not resolve /dev/drbdN for $RD on $NODE_A (stage 1)"
     exit 1
 fi
-echo ">> pre-write 512 MiB on $NODE_A ($DEV_SRC_EARLY) before adding 2nd replica"
+echo ">> pre-write 128 MiB on $NODE_A ($DEV_SRC_EARLY) before adding 2nd replica"
+# Bug 321 follow-up: smaller workload to stay under satellite memory budget on QEMU stand
 on_node "$NODE_A" bash -c "
     drbdadm primary --force ${RD} 2>/dev/null
-    dd if=/dev/urandom of=${DEV_SRC_EARLY} bs=1M count=512 conv=fdatasync status=none
+    dd if=/dev/urandom of=${DEV_SRC_EARLY} bs=1M count=128 conv=fdatasync status=none
     drbdadm secondary ${RD} 2>/dev/null || true
 "
 
