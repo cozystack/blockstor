@@ -1065,6 +1065,64 @@ to cover the gap. Track as Phase 11.5.a.
 
 **Effort**: ~1-2 weeks audit + expansion.
 
+#### 11.5.a — Status field audit (✅ DONE)
+
+Audit walked all `tests/e2e/*.sh` (~65 files). Headline finding: the
+schema is barely used by tests today. **34 of 60 test files (~57%)
+shell into the satellite pod and parse `drbdsetup status`** — but
+~25 of those bypass reads are already covered by the existing schema.
+Tests just don't know the fields exist.
+
+**Test-author cheatsheet (lowest-hanging fruit, no schema change)**:
+publish a "kubectl-instead-of-drbdsetup" reference. Most bypasses
+have a one-liner `kubectl get resource <rd>.<node> -o jsonpath=...`
+equivalent today.
+
+**Already-covered (tests bypass anyway)** — DiskState (~17 tests
+parse `disk:` token), Connection.Message (`connection:` token),
+ReplicationState (`replication:` token), OutOfSyncKib worst-case,
+DRBDNodeId/Port/Minor, DevicePath, CurrentGi/HistoryGi,
+StoragePool, AllocatedKib/UsableKib.
+
+**Real GAPs (P0)** — observer parses these tokens but doesn't surface:
+
+- `Resource.Status.Role` (Primary/Secondary/Unknown) — ~15 tests
+  parse `role:` token. Cluster-wide `InUse` is not a substitute.
+  Effort: ~30 LoC (API + observer resource-frame handler + CRD regen).
+- `Resource.Status.Quorum` (Yes/No/Unknown) + `Resource.Status.Suspended`
+  (No/Quorum/User/NoData/Fencing) — 3 recovery tests on critical path
+  (Bug 82 quorum-loss). Observer parses `quorum:` and `suspended:`
+  in `events2` resource frames.
+  Effort: ~50 LoC total.
+
+**Real GAPs (P1)** — partial bypass eliminated:
+
+- `Resource.Status.Connections[*].PeerDrbdNodeId` (*int32) —
+  6 tests parse `node-id:` adjacent to peer-name in
+  `drbdsetup status --verbose`. Effort: ~15 LoC.
+- `Resource.Status.Connections[*].PeerVolumes[*].PeerDiskState` —
+  `state-standalone-partition` parses peer-disk. Effort: ~40 LoC.
+
+**Real GAPs (P2)** — derivable but cheap to expose:
+
+- `Resource.Status.MayPromote` (bool) — DRBD's `may_promote:` flag.
+- `Resource.Status.Connections[*].PeerOutOfSyncKib` (*int64) — per-peer
+  out-of-sync (observer aggregates to worst-case today). ~80 LoC plus
+  observer refactor.
+
+**11.5.b implementation order**:
+
+1. Publish the kubectl-instead-of-drbdsetup cheatsheet
+   (`docs/test-status-cheatsheet.md`) — converts ~25 tests away from
+   `kubectl exec drbdsetup` with zero schema change.
+2. Add P0 fields (Role/Quorum/Suspended/MayPromote) — ~80 LoC.
+3. Migrate the 3 quorum tests + the 15 role tests to k8s-native
+   reads (deletes ~50 satellite-exec calls).
+4. Add P1 fields (PeerDrbdNodeId, PeerVolumes[].PeerDiskState) — ~55 LoC.
+5. Migrate remaining bypass tests where applicable.
+6. Defer per-peer `OutOfSyncKib` (P2 observer refactor) unless a
+   specific test demands it.
+
 ### 11.6 — Observer closed-loop recovery (DEFERRED, not P0)
 
 Initially listed in the DRBD audit as P0-2 / P0-3 (auto-reconnect on
@@ -1105,8 +1163,8 @@ demonstrated three times.
 | ID    | Name                                  | Priority | Depends on    | Effort |
 |-------|---------------------------------------|----------|---------------|--------|
 | 11.1  | Status-only allocator                 | DONE     | shipped in Bug 302 | —     |
-| 11.4.a| pkg/drbd gap audit                    | P1       | —             | 2d     |
-| 11.5.a| Status field audit (tests-driven)     | P1       | —             | 2d     |
+| 11.4.a| pkg/drbd gap audit                    | DONE     | —             | —      |
+| 11.5.a| Status field audit (tests-driven)     | DONE     | —             | —      |
 | 11.5.b| Status schema expansion + invariants  | P1       | 11.5.a        | 1-2w   |
 | 11.2  | Explicit reconciler FSM               | P1       | —             | 2w     |
 | 11.3  | No on-disk markers (Conditions)       | P1       | 11.2          | 1w     |
