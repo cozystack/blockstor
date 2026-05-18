@@ -182,7 +182,17 @@ wait_cluster_idle() {
 }
 
 # require_workers enforces that the cluster has at least N satellite
-# nodes Ready. Useful for scenarios that cannot run on a 2-node setup.
+# nodes Ready AND at least N satellite pods Ready (Bug 298). The pod-
+# readiness check guards against the previous-test-cascade pattern:
+# rolling-upgrade leaves a satellite pod stuck Terminating with DRBD
+# kernel state in a half-open Connecting slot. The Node row stays
+# Ready (kubelet/Talos is fine), so the bare `kubectl get nodes` check
+# would let the next test race ahead and silently observe only N-1
+# usable satellites — typically surfacing as "only 2/3 reached
+# UpToDate" or "destination never reached UpToDate" failures that
+# falsely blame the next test. Wait briefly for residual Terminating
+# pods to clear; bail with SKIP (not FAIL) if they don't, so the
+# test result reflects the actual cascade rather than masking it.
 require_workers() {
     local want=$1
     local got
@@ -191,6 +201,33 @@ require_workers() {
 
     if (( got < want )); then
         echo "SKIP: scenario needs $want satellite workers, found $got" >&2
+        exit 0
+    fi
+
+    # Bug 298: wait up to 30s for residual Terminating satellite pods
+    # from a prior scenario's cascade. A Terminating pod on a worker
+    # means DRBD on that node is unreachable to subsequent tests; the
+    # heartbeat watchdog will eventually flip the Node row OFFLINE and
+    # the test will start observing fewer healthy replicas than it
+    # placed. Catch this early with a SKIP so the failure attribution
+    # is correct.
+    local deadline=$(( $(date +%s) + 30 ))
+    local ready_pods=0
+    while (( $(date +%s) < deadline )); do
+        ready_pods=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+            -o 'jsonpath={range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name} {end}' 2>/dev/null \
+            | wc -w)
+        local total_pods
+        total_pods=$(kubectl -n "$NS" get pods -l app=blockstor-satellite --no-headers 2>/dev/null | wc -l)
+        if (( ready_pods >= want )) && (( ready_pods == total_pods )); then
+            return 0
+        fi
+        sleep 2
+    done
+
+    if (( ready_pods < want )); then
+        echo "SKIP: scenario needs $want Ready satellite pods, found $ready_pods" \
+             "(previous-test cascade — check for Terminating pods)" >&2
         exit 0
     fi
 }
