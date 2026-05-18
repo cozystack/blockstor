@@ -910,25 +910,19 @@ do, not how) — never copy structure. Prefer clean-room: one agent reads
 GPL for spec, a different agent implements Go from spec without seeing
 source.
 
-### 11.1 — Status-only allocator (P0)
+### 11.1 — Status-only allocator (✅ DONE — landed in Bug 302 series)
 
-**Today**: `Spec.DRBDNodeID/DRBDPort/DRBDMinor` are written by the
-controller's allocator during reconcile. This mutates Spec for runtime
-state — violates the k8s convention that Spec = desired, Status = actual.
-Forces a SSA field-owner contract on Spec that is genuinely hard to
-reason about (controller owns these Spec fields, satellite owns the
-rest).
+`Spec.DRBDNodeID/DRBDPort/DRBDMinor` no longer exist. The controller's
+`ensureDRBDIDs` writes `Status.DRBDNodeID/Port/Minor` via SSA under
+`controllerDRBDIDsFieldOwner`. Satellite reader (`waitForControllerAllocation`)
+already reads from Status (Bug 289's APIReader fall-through path).
+Dispatcher renderer reads from Status. REST mappers (`pkg/rest/resource_adjust.go`,
+etc.) operate on Status path. CRD schema places DRBD-IDs under
+`status:` block.
 
-**Target**: move DRBD-IDs to `Status.DRBDNodeID/DRBDPort/DRBDMinor`.
-Spec is immutable after creation (declarative intent only). The
-allocator becomes a Status SSA patch under `controllerDRBDIDsFieldOwner`,
-which it already is — only the field path moves.
-
-**Migration**: project is in active development, no migration cost.
-Drop the Spec fields, add Status fields, update CRD, update REST
-mappers, update satellite readers.
-
-**Effort**: ~3-5 days.
+The migration shipped under the Bug 302 commit series (`e94b2060f`)
+rather than an explicit "Phase 11.1" header. PLAN.md entry retained
+for historical context.
 
 ### 11.2 — Explicit reconciler state machine (P1)
 
@@ -1110,7 +1104,7 @@ demonstrated three times.
 
 | ID    | Name                                  | Priority | Depends on    | Effort |
 |-------|---------------------------------------|----------|---------------|--------|
-| 11.1  | Status-only allocator                 | P0       | —             | 3-5d   |
+| 11.1  | Status-only allocator                 | DONE     | shipped in Bug 302 | —     |
 | 11.4.a| pkg/drbd gap audit                    | P1       | —             | 2d     |
 | 11.5.a| Status field audit (tests-driven)     | P1       | —             | 2d     |
 | 11.5.b| Status schema expansion + invariants  | P1       | 11.5.a        | 1-2w   |
