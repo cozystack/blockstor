@@ -1069,14 +1069,6 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return nil
 	}
 
-	// Phase 11.2.b shadow: compute the FSM phase + expected action
-	// from the current Observation and log it for divergence triage.
-	// READ-ONLY: the historical apply path below is unchanged, and
-	// the FSM never drives a transition until Phase 11.2.c flips
-	// the switch. Probe errors fall through as zero-valued fields
-	// inside observeForFsm; no retries, no failures bubble up here.
-	r.logFsmShadow(ctx, dr, diskless)
-
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
