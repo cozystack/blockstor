@@ -68,7 +68,7 @@ NUM_RDS=10
 # Random ephemeral port for the controller port-forward — parallel
 # iters on the same host would collide on a fixed port.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward svc/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/recovery-port-collision-pf.log 2>&1 &
 PF_PID=$!
 
@@ -112,7 +112,14 @@ done
 # Phase 1: POST N resource-definitions in parallel. Background each
 # curl and wait — that's the realistic shape of a CI pipeline doing
 # `helm install` over a list of PVCs.
+#
+# Bug 308: `wait` with no argument waits for EVERY backgrounded job
+# in the current shell — including the `kubectl port-forward` started
+# above (PF_PID), which never exits. The whole test then hung in
+# Phase 1 until the per-scenario timeout fired (600s). Always wait
+# on the explicit PID set of the curl fan-out, never on PF_PID.
 echo ">> POST $NUM_RDS resource-definitions in parallel"
+pids=()
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
     curl -sf -X POST -m 10 \
@@ -120,11 +127,13 @@ for i in $(seq 1 "$NUM_RDS"); do
         -d "{\"resource_definition\":{\"name\":\"${rd}\"}}" \
         "${API}/v1/resource-definitions" \
         >/dev/null &
+    pids+=($!)
 done
-wait
+for pid in "${pids[@]}"; do wait "$pid"; done
 
 # Phase 2: POST N volume-definitions in parallel.
 echo ">> POST $NUM_RDS volume-definitions in parallel"
+pids=()
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
     curl -sf -X POST -m 10 \
@@ -132,13 +141,15 @@ for i in $(seq 1 "$NUM_RDS"); do
         -d '{"volume_definition":{"size_kib":65536}}' \
         "${API}/v1/resource-definitions/${rd}/volume-definitions" \
         >/dev/null &
+    pids+=($!)
 done
-wait
+for pid in "${pids[@]}"; do wait "$pid"; done
 
 # Phase 3: POST N autoplace requests in parallel. This is the
 # allocator's worst case — N RDs all reaching the controller
 # reconcile at the same instant.
 echo ">> POST $NUM_RDS autoplace requests in parallel"
+pids=()
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
     curl -sf -X POST -m 10 \
@@ -146,8 +157,9 @@ for i in $(seq 1 "$NUM_RDS"); do
         -d '{"select_filter":{"place_count":2}}' \
         "${API}/v1/resource-definitions/${rd}/autoplace" \
         >/dev/null &
+    pids+=($!)
 done
-wait
+for pid in "${pids[@]}"; do wait "$pid"; done
 
 # Phase 4: wait until every replica has Status.DRBDPort stamped.
 echo ">> wait up to 60s for every replica to receive a port"
