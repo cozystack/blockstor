@@ -37,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -241,119 +240,20 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	bldr := ctrl.NewControllerManagedBy(mgr).
+	err := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
-			builder.WithPredicates(
-				predicate.And(
-					nodeNamePredicate(r.Config.NodeName),
-					primaryWatchPredicate(),
-				),
-			)).
+			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource")
-
-	// Bug 318: second leg — the observer-trigger channel wakes
-	// this reconciler on kernel-state changes that produce no
-	// apiserver Spec write (peer flapping, role / disk / conn /
-	// repl frames). Each GenericEvent carries the local Resource
-	// object name; the EnqueueRequestForObject handler turns it
-	// straight into a reconcile.Request, no per-event mapping
-	// needed. Nil channel (unit-test path) short-circuits — the
-	// builder skips the raw-source registration entirely.
-	if r.Config.ReconcileTrigger != nil {
-		bldr = bldr.WatchesRawSource(
-			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
-		)
-	}
-
-	err := bldr.Complete(r)
+		Named("satellite-resource").
+		Complete(r)
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
 	return nil
-}
-
-// primaryWatchPredicate filters Resource events on the primary For
-// watch:
-//   - Drop pure observer Status noise (Volumes / Conditions /
-//     DrbdState / Connections / InUse / OutOfSync writes that
-//     don't bump Generation).
-//   - Pass Spec changes (Generation bump).
-//   - Pass controller-side allocator Status writes
-//     (Status.DRBDNodeID / Port / Minor transitions) — Bug 318:
-//     without this whitelist the satellite's
-//     `waitForControllerAllocation` gate never wakes after the
-//     controller's allocator stamp, because the Status PATCH does
-//     not bump Generation.
-//   - Pass Create / Delete / Generic events (always) so the
-//     observer-trigger channel and apiserver lifecycle events get
-//     through unchanged.
-//
-// Pair with `nodeNamePredicate` via `predicate.And(...)` so this
-// predicate ONLY filters events for the satellite's own Resources;
-// foreign-node events are filtered out by nodeNamePredicate first.
-func primaryWatchPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		CreateFunc:  func(_ event.CreateEvent) bool { return true },
-		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
-		GenericFunc: func(_ event.GenericEvent) bool { return true },
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldR, ok1 := e.ObjectOld.(*blockstoriov1alpha1.Resource)
-			newR, ok2 := e.ObjectNew.(*blockstoriov1alpha1.Resource)
-
-			if !ok1 || !ok2 {
-				// Unknown wire type — fail open so an upstream c-r
-				// change in event shape doesn't silently silence
-				// every Update.
-				return true
-			}
-
-			// Spec change → fire. Status subresource writes don't
-			// touch Generation, so this catches every operator-
-			// driven re-spec.
-			if oldR.Generation != newR.Generation {
-				return true
-			}
-
-			// Controller-allocator Status stamp → fire. The
-			// satellite's `waitForControllerAllocation` gate is
-			// load-bearing on these three fields; without the
-			// whitelist a Status PATCH that fills them in never
-			// wakes the reconciler and the recovery-down-reverses
-			// scenario hangs (Bug 318).
-			if !int32PtrEqual(oldR.Status.DRBDNodeID, newR.Status.DRBDNodeID) ||
-				!int32PtrEqual(oldR.Status.DRBDPort, newR.Status.DRBDPort) ||
-				!int32PtrEqual(oldR.Status.DRBDMinor, newR.Status.DRBDMinor) {
-				return true
-			}
-
-			// Pure observer Status update (Volumes / Conditions /
-			// DrbdState / Connections / InUse / OutOfSync). Drop —
-			// the observer-trigger channel covers any genuine wake-
-			// up need.
-			return false
-		},
-	}
-}
-
-// int32PtrEqual returns true when two *int32 pointers describe the
-// same value, treating both-nil as equal. Used by
-// primaryWatchPredicate to compare the allocator's DRBD-ID Status
-// fields between old/new event snapshots.
-func int32PtrEqual(left, right *int32) bool {
-	if left == nil && right == nil {
-		return true
-	}
-
-	if left == nil || right == nil {
-		return false
-	}
-
-	return *left == *right
 }
 
 // enqueueResourcesForRD maps a ResourceDefinition event to the local
