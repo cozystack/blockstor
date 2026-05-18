@@ -221,17 +221,30 @@ func (r *Reconciler) observeForFsm(ctx context.Context, dr *intent.DesiredResour
 	_, mdErr := os.Stat(mdMarkerPath)
 	obs.MetadataExists = dr.GetMetadataCreated() || mdErr == nil
 
-	if r.cfg.Adm != nil {
-		loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	// Phase 11.3 Stage 3: prefer the cached KernelLoaded Condition
+	// over the kernel probe. The observer is the authoritative
+	// pusher for the Condition — it stamps True on every events2
+	// `exists resource` and False on `destroy resource`, so the
+	// Condition tracks the kernel slot lifecycle without a syscall
+	// on the reconciler hot path. Fall back to the kernel-direct
+	// probe when the Condition is absent (cluster just upgraded
+	// from a pre-11.3 satellite, observer restarting and yet to
+	// re-stamp). Stage 4 / Phase 11.4 phases out the fallback after
+	// production burnin.
+	loaded := dr.GetKernelLoaded()
+	if !loaded && r.cfg.Adm != nil {
+		probe, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
 		if err == nil {
-			obs.KernelLoaded = loaded
+			loaded = probe
 		}
+	}
 
-		if obs.KernelLoaded {
-			disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
-			if err == nil {
-				obs.KernelHasDiskless = disklessVol
-			}
+	obs.KernelLoaded = loaded
+
+	if obs.KernelLoaded && r.cfg.Adm != nil {
+		disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+		if err == nil {
+			obs.KernelHasDiskless = disklessVol
 		}
 	}
 

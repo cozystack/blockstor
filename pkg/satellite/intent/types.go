@@ -71,6 +71,19 @@ type DesiredResource struct {
 	// `blkid -o export` probe inside `runAutoMkfs`. Phase 11.3
 	// Stage 2.
 	FilesystemFormatted bool
+
+	// KernelLoaded mirrors the `KernelLoaded` Status Condition on
+	// the parent Resource CRD. True means the observer's events2
+	// stream most recently saw an `exists resource <name>` frame
+	// (and no subsequent `destroy resource`) for this RD on this
+	// node — i.e. the DRBD kernel slot is loaded. The satellite
+	// reconciler's `observeForFsm` reads this to short-circuit the
+	// `drbdsetup status` round-trip inside the hot path. Hot-path
+	// optimisation only — the kernel-direct probe via Adm.IsLoaded
+	// remains the authoritative fallback when the Condition is
+	// absent (cluster just upgraded, observer restarting). Phase
+	// 11.3 Stage 3.
+	KernelLoaded bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -198,6 +211,19 @@ func (x *DesiredResource) GetFilesystemFormatted() bool {
 	}
 
 	return x.FilesystemFormatted
+}
+
+// GetKernelLoaded returns whether the parent Resource CRD carries a
+// `KernelLoaded=True` Status Condition — the cache flag the
+// satellite reconciler reads to short-circuit the kernel-side
+// `drbdsetup status` probe inside `observeForFsm`. Nil-safe.
+// Phase 11.3 Stage 3.
+func (x *DesiredResource) GetKernelLoaded() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.KernelLoaded
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

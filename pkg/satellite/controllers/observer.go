@@ -83,8 +83,24 @@ type observation struct {
 	// re-emits the cached values so writeStatus' SSA apply keeps
 	// the f:inUse / f:drbdState claims alive.
 	HasResource bool
-	Volumes     []volumeObservation
-	Connections []connectionObservation
+	// KernelLoaded carries the lifecycle signal for the
+	// `KernelLoaded` Status Condition (Phase 11.3 Stage 3). True on
+	// `exists resource` / `change resource` frames — the DRBD
+	// kernel slot is present. False on `destroy resource` — the
+	// slot is gone. Meaningful only when HasKernelLoaded is true;
+	// other event kinds (device, peer-device, connection) leave it
+	// at its zero value and the stamper is a no-op.
+	KernelLoaded bool
+	// HasKernelLoaded gates stamping: only resource-kind frames
+	// carry the slot-lifecycle signal, so non-resource events must
+	// not drive a Condition write. Without this gate, every
+	// connection / peer-device tick would re-stamp KernelLoaded
+	// from the volume-cache's zero value and either thrash the
+	// listMap entry on the apiserver or (worse) emit False frames
+	// the next reconcile would treat as "kernel slot gone".
+	HasKernelLoaded bool
+	Volumes         []volumeObservation
+	Connections     []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -230,6 +246,14 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 // translateResourceEvent extracts the resource-kind frame: just
 // the role transition (Primary → InUse=true). Helper for
 // translateEvent's switch so the gocyclo budget stays under 15.
+//
+// Phase 11.3 Stage 3: also carries the kernel-slot lifecycle
+// signal for the `KernelLoaded` Status Condition. `exists` (initial
+// flush after subscribe) and `change` (delta) → KernelLoaded=True;
+// `destroy` (slot torn down) → KernelLoaded=False. Always sets
+// HasKernelLoaded so handleObservation knows the stamper must
+// fire — other event kinds (device, peer-device, connection) don't
+// carry the slot lifecycle and must NOT drive a Condition write.
 func translateResourceEvent(ev drbd.Event) (observation, bool) {
 	name := ev.Fields["name"]
 	if name == "" {
@@ -237,12 +261,34 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 	}
 
 	return observation{
-		ResourceName: name,
-		InUse:        ev.Fields["role"] == drbdRolePrimary,
-		Role:         ev.Fields["role"],
-		Suspended:    normalizeSuspended(ev.Fields["suspended"]),
-		HasResource:  true,
+		ResourceName:    name,
+		InUse:           ev.Fields["role"] == drbdRolePrimary,
+		Role:            ev.Fields["role"],
+		Suspended:       normalizeSuspended(ev.Fields["suspended"]),
+		HasResource:     true,
+		KernelLoaded:    normalizeKernelLoaded(ev.Action),
+		HasKernelLoaded: true,
 	}, true
+}
+
+// normalizeKernelLoaded maps an events2 resource-kind verb to the
+// `KernelLoaded` Status Condition value. `exists` (initial sync at
+// subscribe time) and `change` (delta) mean the kernel slot is
+// loaded; `destroy` means the slot has gone away. Any other verb
+// (drbd-9 may grow new ones) is treated conservatively as "slot
+// gone" — better a transient False forcing the legacy probe path
+// than a stale True hiding a missing slot.
+//
+// Pure function — pinned by TestNormalizeKernelLoadedConditionPredicate
+// so a future drbd-9 verb addition surfaces as a test failure
+// rather than a silent regression.
+func normalizeKernelLoaded(action string) bool {
+	switch action {
+	case eventActionExists, eventActionChange, eventActionCreate:
+		return true
+	default:
+		return false
+	}
 }
 
 // translateDeviceEvent extracts the device-kind frame: per-volume
@@ -443,7 +489,24 @@ const (
 	// is removed via `drbdadm del-peer`. The observer uses this
 	// to prune the connection cache so stale StandAlone entries
 	// don't linger on view/resources after a replica delete.
+	// Phase 11.3 Stage 3 also reads this on resource-kind frames
+	// to flip the KernelLoaded Condition to False.
 	eventActionDestroy = "destroy"
+	// eventActionExists is the initial-flush verb drbdsetup emits
+	// at subscribe time for every kernel slot already present —
+	// the backfill mechanism for the KernelLoaded Condition on
+	// observer restart (Phase 11.3 Stage 3 step 5).
+	eventActionExists = "exists"
+	// eventActionChange is the delta verb on subsequent state
+	// transitions of an already-known kernel object. KernelLoaded
+	// stays True across change frames.
+	eventActionChange = "change"
+	// eventActionCreate is the "object newly appeared" verb
+	// (paired with exists for the same lifecycle slot — the
+	// kernel emits create when a slot first materialises after
+	// subscribe time). Treated the same as exists for the
+	// KernelLoaded signal.
+	eventActionCreate = "create"
 	// drbdDiskStateFailed is the DRBD-9 device disk_state token
 	// the kernel emits when the backing block device (LV / zvol /
 	// loopfile / disk hardware) starts returning I/O errors. Two
@@ -893,6 +956,26 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	// needs the kernel-state change to land in the reconcile queue,
 	// not the corresponding Status PATCH to commit.
 	o.emitReconcileTrigger(ev)
+
+	// Phase 11.3 Stage 3: stamp the KernelLoaded Condition off the
+	// resource-kind frame lifecycle. Gated on HasKernelLoaded so
+	// device / peer-device / connection events (which carry no slot
+	// signal) don't drive a Condition write. Done before
+	// writeStatus so a writeStatus NotFound (Resource CRD not yet
+	// created) doesn't suppress the Condition path — stampKernelLoaded
+	// silences NotFound the same way writeStatus does.
+	if ev.HasKernelLoaded {
+		stampErr := o.stampKernelLoaded(ctx, ev.ResourceName, ev.KernelLoaded)
+		switch {
+		case stampErr == nil:
+		case apierrors.IsNotFound(stampErr):
+			// Resource CRD not yet created — convergence-pending; the
+			// observer's 5-second resync ticker plus the next events2
+			// frame will re-stamp once the CRD lands.
+		default:
+			logger.Error(stampErr, "stamp KernelLoaded Condition", "resource", ev.ResourceName)
+		}
+	}
 
 	err := o.writeStatus(ctx, ev)
 	if err == nil {
@@ -1446,6 +1529,26 @@ const skipDiskPropValue = "True"
 // owned elsewhere) or silently re-apply on the next observer tick.
 const observerSkipDiskFieldOwner = "blockstor-satellite-skipdisk"
 
+// observerKernelLoadedFieldOwner is the distinct SSA field-manager
+// the observer uses to stamp `Status.Conditions[type=KernelLoaded]`
+// off the events2 stream. Distinct from metadataCreatedFieldOwner
+// and filesystemFormattedFieldOwner so the apiserver's listMap
+// merge on `type` keeps each Condition writer's claim isolated —
+// re-applying KernelLoaded never blanks the MetadataCreated /
+// FilesystemFormatted entries authored by their respective
+// stampers. Phase 11.3 Stage 3.
+const observerKernelLoadedFieldOwner = "blockstor-satellite-kernel-loaded"
+
+// kernelLoadedReasonLoaded / kernelLoadedReasonDestroyed are the
+// `Reason` values the observer stamps onto the KernelLoaded
+// Condition for the True / False states. Named constants because
+// the test file mirrors the strings and golangci's goconst would
+// otherwise flag the duplicate.
+const (
+	kernelLoadedReasonLoaded    = "KernelSlotLoaded"
+	kernelLoadedReasonDestroyed = "KernelSlotDestroyed"
+)
+
 // writeSkipDiskProp SSA-applies `Spec.Props["DrbdOptions/SkipDisk"]
 // = "True"` onto the matching Resource CRD. Uses a distinct
 // FieldOwner so the prop can be cleared by the operator's
@@ -1520,6 +1623,78 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 		client.ForceOwnership)
 	if err != nil {
 		return errors.Wrapf(err, "ssa apply Resource.Spec.Props SkipDisk %s", name)
+	}
+
+	return nil
+}
+
+// stampKernelLoaded SSA-patches the `KernelLoaded` Status Condition
+// onto the matching Resource CRD's Status.Conditions list. Mirrors
+// the shape of MetadataCreatedStamper / FilesystemFormattedStamper
+// but lives inline on the observer because the observer already
+// owns the apiserver Status write path for Resources — same
+// FieldOwner discipline, separate key (KernelLoaded vs
+// MetadataCreated / FilesystemFormatted) keeps each Condition
+// writer's claim isolated under SSA's listMap merge on `type`.
+//
+// `loaded=true` stamps `Status=True / Reason=KernelSlotLoaded`;
+// `loaded=false` stamps `Status=False / Reason=KernelSlotDestroyed`
+// — same Condition `type`, opposite `status`, so the apiserver
+// updates LastTransitionTime only on the genuine flip and leaves a
+// repeat True→True (or False→False) at the cached transition
+// timestamp. Phase 11.3 Stage 3.
+//
+// Idempotent — SSA's listMap merging on `type` means a repeat
+// patch with the same fields is a no-op at the apiserver level.
+// NotFound bubbles up so handleObservation can silence the
+// convergence-pending case (Resource CRD not yet created — the
+// 5-second resync ticker plus the next events2 frame re-stamp once
+// the CRD lands).
+func (o *ObserverRunnable) stampKernelLoaded(ctx context.Context, resourceName string, loaded bool) error {
+	if resourceName == "" {
+		return nil
+	}
+
+	name := k8s.Name(resourceName + "." + o.NodeName)
+
+	status := metav1.ConditionFalse
+	reason := kernelLoadedReasonDestroyed
+	message := "events2 destroy resource frame observed"
+
+	if loaded {
+		status = metav1.ConditionTrue
+		reason = kernelLoadedReasonLoaded
+		message = "events2 exists/change resource frame observed"
+	}
+
+	apply := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       resourceKind,
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               blockstoriov1alpha1.ConditionKernelLoaded,
+					Status:             status,
+					Reason:             reason,
+					Message:            message,
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+
+	// No ForceOwnership: SSA's listMap merge on `type` lets this
+	// writer own only the KernelLoaded entry. The MetadataCreated
+	// and FilesystemFormatted stampers keep their own entries
+	// alive under their own field-managers.
+	err := o.Client.Status().Patch(ctx, apply,
+		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
+		client.FieldOwner(observerKernelLoadedFieldOwner))
+	if err != nil {
+		return errors.Wrapf(err, "ssa KernelLoaded Condition on Resource %s", name)
 	}
 
 	return nil

@@ -828,6 +828,15 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	// runAutoMkfs is the double-mkfs safety net.
 	desired.FilesystemFormatted = meta.IsStatusConditionTrue(target.Status.Conditions, blockstoriov1alpha1.ConditionFilesystemFormatted)
 
+	// Phase 11.3 Stage 3: KernelLoaded is stamped by the observer
+	// off the events2 stream (`exists resource` → True, `destroy
+	// resource` → False). The satellite reconciler's observeForFsm
+	// reads it to skip the `drbdsetup status` probe on the hot
+	// path; the kernel-direct probe stays as fallback when the
+	// Condition is absent (cluster just upgraded, observer
+	// restarting).
+	desired.KernelLoaded = meta.IsStatusConditionTrue(target.Status.Conditions, blockstoriov1alpha1.ConditionKernelLoaded)
+
 	return desired, nil
 }
 

@@ -65,6 +65,18 @@ const ConditionMetadataCreated = "MetadataCreated"
 // Condition is absent. Phase 11.3 Stage 2.
 const ConditionFilesystemFormatted = "FilesystemFormatted"
 
+// ConditionKernelLoaded is True when the DRBD kernel slot for this
+// Resource is loaded (events2 `exists resource` has fired) and not
+// yet destroyed. Cached from the observer's events2 stream so the
+// reconciler's hot path can skip the `drbdsetup status` round-trip.
+//
+// SAFETY: like other Phase 11.3 Conditions, this is a hot-path
+// optimisation. A stale True value can only cause an extra adjust
+// (idempotent); a stale False causes the legacy probe path which
+// is correct but slow. The authoritative source remains the
+// kernel-direct probe (drbdsetup status / drbdmeta dump-md).
+const ConditionKernelLoaded = "KernelLoaded"
+
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
 // apply pass. The value is a comma-separated list of int32 volume

@@ -557,6 +557,95 @@ func TestObserveForFsmReadsMetadataExistsFromCondition(t *testing.T) {
 	}
 }
 
+// TestObserveForFsmReadsKernelLoadedFromCondition pins Phase 11.3
+// Stage 3's reader contract: when the DesiredResource carries
+// `KernelLoaded=true` (the observer-stamped Condition), the
+// Observation must resolve KernelLoaded=true WITHOUT calling
+// `drbdsetup status` — that's the whole point of the cache. The
+// FakeExec has no `drbdsetup status` expectation registered; the
+// test fails on the kernel probe firing because FakeExec would
+// return its zero-value response and the fallback would land on
+// loaded=false, contradicting the assertion.
+func TestObserveForFsmReadsKernelLoadedFromCondition(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	fx := storage.NewFakeExec()
+	// IMPORTANT: no `drbdsetup status` expectation. If the fast-path
+	// short-circuit regresses, the kernel probe fires and we land
+	// on FakeExec's zero-response → loaded=false → the assert below
+	// fails. The HasDisklessVolume probe DOES need an expectation
+	// because the fast path still runs it when KernelLoaded is
+	// true (it's a separate kernel call gated on KernelLoaded, not
+	// part of the IsLoaded round-trip we're skipping).
+	fx.Expect("drbdsetup status --verbose pvc-kl-cond",
+		storage.FakeResponse{Stdout: []byte("pvc-kl-cond role:Secondary\n  volume:0 disk:UpToDate\n")})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:         "pvc-kl-cond",
+		NodeName:     "n1",
+		KernelLoaded: true,
+	}
+
+	obs := rec.observeForFsm(context.Background(), dr, false)
+	if !obs.KernelLoaded {
+		t.Errorf("KernelLoaded = false, want true (Condition set, kernel probe must be skipped)")
+	}
+
+	// Sanity: the kernel-probe command line must NOT appear — its
+	// presence here would prove the fast-path didn't take effect.
+	for _, line := range fx.CommandLines() {
+		if line == "drbdsetup status pvc-kl-cond" {
+			t.Errorf("hot path called %q despite KernelLoaded Condition set", line)
+		}
+	}
+}
+
+// TestObserveForFsmFallsBackToKernelProbe pins the migration-
+// window fallback: when the DesiredResource carries
+// `KernelLoaded=false` (cluster just upgraded, observer restarting
+// and yet to re-stamp), observeForFsm MUST fall through to
+// `Adm.IsLoaded` and return whatever the kernel reports. Without
+// this fallback a freshly-upgraded cluster would think every
+// loaded slot was unloaded until the observer's first events2
+// frame caught up.
+func TestObserveForFsmFallsBackToKernelProbe(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	fx := storage.NewFakeExec()
+	// Kernel reports the slot present — fallback MUST honor this.
+	fx.Expect("drbdsetup status pvc-kl-probe",
+		storage.FakeResponse{Stdout: []byte("pvc-kl-probe role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdsetup status --verbose pvc-kl-probe",
+		storage.FakeResponse{Stdout: []byte("pvc-kl-probe role:Secondary\n  volume:0 disk:UpToDate\n")})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:         "pvc-kl-probe",
+		NodeName:     "n1",
+		KernelLoaded: false, // Condition absent / not yet stamped
+	}
+
+	obs := rec.observeForFsm(context.Background(), dr, false)
+	if !obs.KernelLoaded {
+		t.Errorf("KernelLoaded = false, want true (Condition absent → fallback to kernel probe)")
+	}
+}
+
 // TestObserveForFsmReadsMetadataExistsFromFileFallback pins the
 // belt-and-braces fallback for the migration window: a
 // pre-existing `.md-created` marker MUST still drive
