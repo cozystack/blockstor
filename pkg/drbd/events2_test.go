@@ -17,6 +17,7 @@ limitations under the License.
 package drbd_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -73,25 +74,18 @@ func TestParseEventChangeDeviceLine(t *testing.T) {
 	}
 }
 
-// TestParseEventInitialSyncMarker: `exists -` is the marker drbdsetup
-// emits once it has flushed the initial state. We surface it as
-// kind=marker so the consumer can flip "ready" without special-casing.
-func TestParseEventInitialSyncMarker(t *testing.T) {
-	ev, err := drbd.ParseEvent("exists -")
-	if err != nil {
-		t.Fatalf("ParseEvent: %v", err)
-	}
-
-	if ev.Action != "exists" {
-		t.Errorf("Action: got %q", ev.Action)
-	}
-
-	if ev.Kind != "-" {
-		t.Errorf("Kind: got %q, want -", ev.Kind)
-	}
-
-	if len(ev.Fields) != 0 {
-		t.Errorf("Fields: got %v, want empty", ev.Fields)
+// TestEvents2ParserSkipsExistsMarker: `exists -` is drbdsetup's
+// boundary marker between the initial-state flush and the live
+// event stream. The parser returns ErrStreamSyncMarker so the
+// Watcher filters it from the channel — emitting it as a kind=-
+// frame would fall through the satellite observer's switch as an
+// unhandled no-op (and, with future logging, spam every satellite
+// restart). Mirrors drbd-reactor's `exists -` filter; public
+// protocol behaviour.
+func TestEvents2ParserSkipsExistsMarker(t *testing.T) {
+	_, err := drbd.ParseEvent("exists -")
+	if !errors.Is(err, drbd.ErrStreamSyncMarker) {
+		t.Fatalf("ParseEvent(\"exists -\"): err = %v, want ErrStreamSyncMarker", err)
 	}
 }
 
@@ -140,7 +134,9 @@ func TestParseEventValueWithColon(t *testing.T) {
 
 // TestEventStreamReplay feeds a captured trace through the parser and
 // checks the event count + selected fields. Smoke test for the typical
-// "two-peer resource comes up" sequence.
+// "two-peer resource comes up" sequence. The `exists -` marker is
+// filtered (ErrStreamSyncMarker) so consumers don't see a no-op
+// frame between initial-state and live stream.
 func TestEventStreamReplay(t *testing.T) {
 	trace := strings.Join([]string{
 		"exists resource name:pvc-1 role:Secondary suspended:no",
@@ -156,22 +152,22 @@ func TestEventStreamReplay(t *testing.T) {
 	for _, line := range lines {
 		ev, err := drbd.ParseEvent(line)
 		if err != nil {
+			if errors.Is(err, drbd.ErrStreamSyncMarker) {
+				continue
+			}
+
 			t.Fatalf("line %q: %v", line, err)
 		}
 
 		got = append(got, ev)
 	}
 
-	if len(got) != 5 {
-		t.Errorf("len: got %d, want 5", len(got))
+	if len(got) != 4 {
+		t.Errorf("len: got %d, want 4 (exists - marker must be filtered)", len(got))
 	}
 
-	if got[3].Kind != "-" {
-		t.Errorf("got[3].Kind: got %q, want -", got[3].Kind)
-	}
-
-	if got[4].Action != "change" || got[4].Fields["disk"] != "Outdated" {
-		t.Errorf("got[4]: %+v", got[4])
+	if got[3].Action != "change" || got[3].Fields["disk"] != "Outdated" {
+		t.Errorf("got[3]: %+v", got[3])
 	}
 }
 
@@ -188,8 +184,8 @@ func TestWatcherStreamsEvents(t *testing.T) {
 	src := strings.NewReader(strings.Join([]string{
 		"exists resource name:pvc-1 role:Primary",
 		"change device name:pvc-1 minor:1000 disk:UpToDate",
-		"", // blank line — must be skipped, not abort the pipeline
-		"exists -",
+		"",         // blank line — must be skipped, not abort the pipeline
+		"exists -", // initial-sync marker — filtered at parser layer
 	}, "\n") + "\n")
 
 	w := drbd.NewWatcher(src)
@@ -204,8 +200,8 @@ func TestWatcherStreamsEvents(t *testing.T) {
 		got = append(got, ev)
 	}
 
-	if len(got) != 3 {
-		t.Fatalf("event count: got %d, want 3 (blank line must be skipped); %+v", len(got), got)
+	if len(got) != 2 {
+		t.Fatalf("event count: got %d, want 2 (blank line and exists - marker must be skipped); %+v", len(got), got)
 	}
 
 	if got[0].Action != "exists" || got[0].Kind != "resource" || got[0].Fields["name"] != "pvc-1" {
@@ -214,10 +210,6 @@ func TestWatcherStreamsEvents(t *testing.T) {
 
 	if got[1].Action != "change" || got[1].Fields["disk"] != "UpToDate" {
 		t.Errorf("event[1]: got %+v", got[1])
-	}
-
-	if got[2].Action != "exists" || got[2].Kind != "-" {
-		t.Errorf("event[2] (initial-sync marker): got %+v", got[2])
 	}
 }
 

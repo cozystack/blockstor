@@ -271,6 +271,42 @@ func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device s
 	return nil
 }
 
+// ForgetPeer clears a peer's GI / bitmap slot from this replica's
+// on-disk DRBD metadata via `drbdmeta <res>/<vol> v09 <device>
+// internal forget-peer <peer-node-id>`. Must run AFTER DelPeer
+// (which clears the kernel-side connection slot) on a per-volume
+// basis — DRBD-9 v09 metadata stores per-peer slots in the
+// per-volume metadata block, one slot per peer node-id.
+//
+// Why this matters: DelPeer only severs the kernel connection.
+// The on-disk slot keeps the peer's last-known GI and dirty
+// bitmap forever — eating one of the MaxPeers-1 metadata slots
+// `drbdadm create-md --max-peers=15` carved out at first
+// activation. After enough permanent-node-removal cycles the
+// resource exhausts its slot pool and the next replica add
+// fails with `drbdmeta create-md` running out of room. Calling
+// forget-peer in the per-node-removal path keeps the slot pool
+// recyclable.
+//
+// Idempotent on a slot that's already empty: drbdmeta exits zero
+// with a no-op warning. A missing metadata block (resource never
+// fully initialised) bubbles up as an error so the caller can
+// log and continue — the slot leakage we're trying to prevent
+// can't have accumulated on a resource that has no metadata to
+// begin with.
+func (a *Adm) ForgetPeer(ctx context.Context, resource string, volume int32, device string, peerNodeID int32) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+
+	_, err := a.exec.Run(ctx,
+		"drbdmeta", "--force", target, "v09", device, "internal",
+		"forget-peer", strconv.Itoa(int(peerNodeID)))
+	if err != nil {
+		return errors.Wrapf(err, "drbdmeta forget-peer %s --node-id %d", target, peerNodeID)
+	}
+
+	return nil
+}
+
 // DelPeer disconnects and forgets a peer node for the given resource.
 // Run this BEFORE rewriting the .res file with the peer removed —
 // drbdadm needs the peer's `on <peer>` block in the .res to resolve

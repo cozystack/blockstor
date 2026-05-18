@@ -67,12 +67,20 @@ type observation struct {
 // other fields are left as their zero values — mergeVolumes
 // stitches the per-volume picture together so SSA writes carry
 // the full known state.
+//
+// Quorum mirrors the `quorum:yes|no` field in events2 `device`
+// frames — the kernel's per-volume quorum view, finer-grained
+// than the node-wide `drbd.linbit.com/lost-quorum` taint.
+// HasQuorum gates merge: a frame without the field (older
+// kernels, peer-device frames) leaves the cached value alone.
 type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
 	CurrentUUID  string
 	OutOfSyncKib int64
 	HasSync      bool // true when this observation carried out-of-sync stats
+	Quorum       bool
+	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -199,11 +207,22 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		return out, true
 	}
 
-	out.Volumes = []volumeObservation{{
+	vol := volumeObservation{
 		VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
-	}}
+	}
+
+	// `quorum:yes|no` is emitted on every `device` frame on
+	// kernels that support per-volume quorum (drbd-9.0.9+). Absent
+	// on older kernels — leave HasQuorum=false so mergeVolumes
+	// preserves the cached value rather than racing it to zero.
+	if q, ok := ev.Fields["quorum"]; ok {
+		vol.Quorum = q == drbdQuorumYes
+		vol.HasQuorum = true
+	}
+
+	out.Volumes = []volumeObservation{vol}
 
 	return out, true
 }
@@ -329,6 +348,12 @@ const (
 	// detach, OR accept that the satellite re-attaches on the next
 	// reconcile (recoverable).
 	drbdDiskStateFailed = "Failed"
+	// drbdQuorumYes is the per-volume `quorum` token emitted in
+	// events2 `device` frames when the kernel considers the local
+	// replica quorate. Any other value (`no`, missing) means the
+	// volume has lost quorum — the CSI plugin's mount path keys
+	// off this signal.
+	drbdQuorumYes = "yes"
 )
 
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
@@ -743,6 +768,17 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservati
 		changed = true
 	}
 
+	// Quorum updates only when this frame actually carried the
+	// field (HasQuorum). Without the gate, a peer-device frame
+	// (which never carries quorum) would race the cached value to
+	// false and SSA would flip Status.Volumes[i].Quorum on every
+	// statistics tick.
+	if incoming.HasQuorum && (!merged.HasQuorum || merged.Quorum != incoming.Quorum) {
+		merged.Quorum = incoming.Quorum
+		merged.HasQuorum = true
+		changed = true
+	}
+
 	cache[incoming.VolumeNumber] = merged
 
 	return changed
@@ -1018,6 +1054,7 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 			DiskState:    v.DiskState,
 			CurrentGi:    v.CurrentUUID,
 			OutOfSyncKib: v.OutOfSyncKib,
+			Quorum:       v.Quorum,
 		})
 	}
 

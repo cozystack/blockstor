@@ -846,19 +846,72 @@ func (r *Reconciler) crossNodeClone(
 	return nil
 }
 
-// tearDownRemovedPeers runs `drbdadm del-peer` for every peer that
-// was in the previous .res but is no longer in the new desired set.
+// tearDownRemovedPeers runs `drbdadm del-peer` AND `drbdmeta
+// forget-peer` for every peer that was in the previous .res but
+// is no longer in the new desired set.
+//
 // `drbdadm adjust` only adds / reconfigures peers; the kernel's
-// connection slot for a dropped peer would otherwise stay alive in
-// StandAlone forever. del-peer needs the peer's `on <node>` block
-// still in the .res to resolve its node-id, so run it BEFORE
-// overwriting the file.
-func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string) error {
+// connection slot for a dropped peer would otherwise stay alive
+// in StandAlone forever. del-peer needs the peer's `on <node>`
+// block still in the .res to resolve its node-id, so run it
+// BEFORE overwriting the file.
+//
+// forget-peer clears the peer's per-peer GI / bitmap slot from
+// every diskful volume's on-disk metadata block. Without it,
+// DRBD-9 v09 metadata keeps the departed peer's slot occupied
+// for the lifetime of the resource — after enough node-replace
+// cycles the resource exhausts the MaxPeers-1 slot budget
+// `drbdadm create-md --max-peers=15` carved at first activation,
+// and the next replica add fails with drbdmeta running out of
+// room. Errors on individual forget-peer calls are logged and
+// not bubbled up: leaving a stale slot is a slow leak (recoverable
+// at any point in the future), while wedging the entire reconcile
+// on it would block the convergent steady-state path the dispatcher
+// drives. del-peer failures still bubble — those leak a live
+// kernel connection, which is a faster correctness issue.
+func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
 	removed := computeRemovedPeers(resPath, dr, r.cfg.NodeName)
-	for _, p := range removed {
-		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), p)
+	if len(removed) == 0 {
+		return nil
+	}
+
+	// Peer-name → node-id from the OLD .res. The desired bag may
+	// no longer carry the removed peer's `peer.<name>.node-id`
+	// entry (dispatcher already pruned the spec), so the .res
+	// file we're about to overwrite is the only stable source.
+	peerIDs := extractResFilePeerNodeIDs(resPath)
+
+	for _, peer := range removed {
+		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer)
 		if err != nil {
-			return errors.Wrapf(err, "del-peer %s from %s", p, dr.GetName())
+			return errors.Wrapf(err, "del-peer %s from %s", peer, dr.GetName())
+		}
+
+		// forget-peer is per-volume because v09 metadata lives in
+		// the per-volume block. Skip volumes without a device path
+		// (DISKLESS local replica — no metadata to clean) and
+		// peers without a resolvable node-id (.res malformed /
+		// races a brand-new resource being torn down before its
+		// peer ever rendered).
+		peerID, hasID := peerIDs[peer]
+		if !hasID {
+			continue
+		}
+
+		for volNum, device := range devices {
+			if device == "" {
+				continue
+			}
+
+			// forget-peer errors are non-fatal: a stale on-disk
+			// slot leaks one of the MaxPeers-1 budget entries but
+			// the resource keeps serving I/O. The next reconcile
+			// retries; if the leak persists, the eventual
+			// create-md exhaustion surfaces a louder error than
+			// any log line here could. del-peer errors still
+			// bubble (above) — those leak a live kernel
+			// connection, a faster correctness issue.
+			_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
 		}
 	}
 
@@ -927,6 +980,71 @@ func extractResFilePeers(body string) []string {
 	return peers
 }
 
+// extractResFilePeerNodeIDs parses the rendered .res file at
+// resPath and returns the peer-name → DRBD-node-id map encoded
+// in each `on <node> { ... node-id <N>; ... }` block. Used by
+// tearDownRemovedPeers to resolve the node-id for a peer that
+// was just dropped from the desired set: `drbdadm del-peer`
+// reads node-id from the (still-present) `on <peer>` block, but
+// `drbdmeta forget-peer` needs the raw integer, and we'd rather
+// pull it from the file we're about to overwrite than guess from
+// the desired bag (which the dispatcher may have already pruned).
+//
+// Missing file / unreadable / malformed block → empty map; the
+// caller skips forget-peer for that peer rather than emit a
+// bogus --node-id=0 collision against the local slot. Reads via
+// os.ReadFile so a transient I/O hiccup degrades to no-op
+// instead of wedging the reconcile.
+func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		return nil
+	}
+
+	out := map[string]int32{}
+
+	var currentPeer string
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+
+		// Block opener: `on <name> {`. Stash the name; the
+		// matching `node-id` line follows within the block.
+		if strings.HasPrefix(trimmed, "on ") {
+			rest := strings.TrimPrefix(trimmed, "on ")
+
+			head, _, ok := strings.Cut(rest, "{")
+			if !ok {
+				continue
+			}
+
+			currentPeer = strings.TrimSpace(head)
+
+			continue
+		}
+
+		// node-id line shape: `node-id <N>;` (writeOnBlock emits
+		// it as the second line of every on-block). Match
+		// `node-id ` prefix to dodge `<peer>.node-id` style
+		// option lines that might appear at the resource top
+		// level.
+		if currentPeer != "" && strings.HasPrefix(trimmed, "node-id ") {
+			rest := strings.TrimPrefix(trimmed, "node-id ")
+			rest = strings.TrimSuffix(rest, ";")
+			rest = strings.TrimSpace(rest)
+
+			id, parseErr := strconv.ParseInt(rest, 10, 32)
+			if parseErr == nil {
+				out[currentPeer] = int32(id)
+			}
+
+			currentPeer = ""
+		}
+	}
+
+	return out
+}
+
 // applyDRBD renders the .res file from dr's metadata and (re)applies
 // it via drbdadm. create-md runs only on first activation (we detect
 // "first" by absence of the .res file before this run); diskless
@@ -971,7 +1089,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
 
-	err = r.tearDownRemovedPeers(ctx, dr, resPath)
+	err = r.tearDownRemovedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
 	}

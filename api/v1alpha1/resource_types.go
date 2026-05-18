@@ -296,6 +296,19 @@ type ResourceVolumeStatus struct {
 	// progress bar without polling drbdsetup themselves.
 	// +optional
 	OutOfSyncKib int64 `json:"outOfSyncKib,omitempty"`
+
+	// quorum reports the DRBD-9 kernel's per-volume quorum view
+	// from the `quorum:yes|no` field in events2 `device` frames.
+	// true means the local replica has quorum and may serve I/O;
+	// false means the kernel has marked the volume quorum-lost
+	// (writes block / fail-fast depending on `on-no-quorum`
+	// policy). Per-volume is finer-grained than the node-wide
+	// `drbd.linbit.com/lost-quorum` Kubernetes taint: a node with
+	// quorum on one RD and no-quorum on another surfaces both
+	// states correctly. The CSI plugin's quorum-aware mount path
+	// (refusing to mount a no-quorum volume) reads this signal.
+	// +optional
+	Quorum bool `json:"quorum,omitempty"`
 }
 
 // +kubebuilder:object:root=true

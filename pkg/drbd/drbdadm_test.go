@@ -258,6 +258,42 @@ func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
 	}
 }
 
+// TestAdmForgetPeerInvokesDrbdmeta pins the on-disk slot
+// reclaim command shape: `drbdmeta --force <res>/<vol> v09
+// <device> internal forget-peer <peer-node-id>`.
+//
+// Without forget-peer, `drbdadm del-peer` only severs the kernel
+// connection; the metadata block still records the departed
+// peer's GI / bitmap slot. After enough permanent node-removal
+// cycles the v09 metadata layout exhausts its
+// `--max-peers=MaxPeers-1` slot pool and the next replica add
+// fails with drbdmeta refusing to allocate.
+//
+// Two invariants pinned:
+//
+//   - `<peer-node-id>` MUST be passed as the trailing positional
+//     argument (not `--node-id`). The forget-peer subcommand
+//     takes the node-id positionally; a regression that copied
+//     SetGi's `--node-id <N>` shape would surface as drbdmeta
+//     refusing the call with a usage error.
+//   - The `--force` flag MUST be present so drbdmeta accepts the
+//     mutation against in-use metadata (the resource is still
+//     loaded when forget-peer runs).
+func TestAdmForgetPeerInvokesDrbdmeta(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.ForgetPeer(t.Context(), "pvc-1", 0, "/dev/dm-3", 2)
+	if err != nil {
+		t.Fatalf("ForgetPeer: %v", err)
+	}
+
+	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal forget-peer 2"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
 // TestAdmResizeInvokesDrbdadm: Resize → `drbdadm resize --assume-clean <res>`.
 // --assume-clean skips re-syncing the new bytes (they're freshly
 // allocated zeros) — without it growing 3 replicas serialises on

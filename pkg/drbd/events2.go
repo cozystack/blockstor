@@ -45,12 +45,37 @@ type Event struct {
 	Fields map[string]string
 }
 
+// ErrStreamSyncMarker is the sentinel ParseEvent returns when the
+// line is the `exists -` marker drbdsetup emits at the boundary
+// between its initial-state flush and the live event stream. The
+// marker is a synchronisation breadcrumb for consumers that want
+// to flip a "ready" flag once initial state is fully delivered —
+// it carries no per-resource state, so the Watcher filters it from
+// the channel rather than emitting a kind=- frame that would fall
+// through the satellite observer's switch as an unhandled no-op.
+// Mirrors drbd-reactor's `exists -` filter (src/events.rs):
+// public protocol behaviour, pattern only — no upstream code
+// copied.
+var ErrStreamSyncMarker = errors.New("drbd: events2 stream-sync marker")
+
 // ParseEvent parses one drbdsetup events2 line. Returns an error for
 // blank or single-token lines so the caller can log and continue.
+// Returns ErrStreamSyncMarker on the `exists -` initial-state
+// boundary so Watch can skip it without emitting a no-op event.
 func ParseEvent(line string) (Event, error) {
 	parts := strings.Fields(line)
 	if len(parts) < eventMinTokens {
 		return Event{}, errors.Errorf("drbd: malformed events2 line %q", line)
+	}
+
+	// `exists -` is drbdsetup's marker between the initial-state
+	// dump and the live event stream. No per-resource fields; if it
+	// reached the observer's switch it would fall through as an
+	// unhandled event and (with future logging) spam a no-op line
+	// on every satellite restart. Filter at the parser layer so
+	// every consumer (Watcher, ad-hoc trace replays) benefits.
+	if parts[0] == "exists" && parts[1] == "-" {
+		return Event{}, ErrStreamSyncMarker
 	}
 
 	ev := Event{

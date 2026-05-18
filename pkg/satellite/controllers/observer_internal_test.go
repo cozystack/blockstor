@@ -1638,3 +1638,119 @@ func countCommand(cmds []string, line string) int {
 
 	return n
 }
+
+// TestObserverParsesQuorumFromEventsFrame pins the per-volume
+// quorum:yes|no extraction:
+//
+//   - translateDeviceEvent captures `quorum:yes|no` from device
+//     frames into volumeObservation.{Quorum, HasQuorum}. Older
+//     kernels omit the field entirely — HasQuorum=false must
+//     keep mergeVolumes from racing the cached value to zero
+//     when a peer-device frame (which never carries quorum)
+//     arrives.
+//
+//   - mergeVolumeInto promotes the cached value only when the
+//     incoming frame actually carried quorum, then surfaces
+//     Quorum=true|false on the merged volume snapshot.
+//
+// Pinned because the per-volume quorum signal is finer-grained
+// than the node-wide `drbd.linbit.com/lost-quorum` taint a CSI
+// plugin must consult: a node can hold quorum on one RD and have
+// lost it on another, and the CSI mount path needs the per-RD
+// truth, not the node-wide approximation.
+func TestObserverParsesQuorumFromEventsFrame(t *testing.T) {
+	cases := []struct {
+		name        string
+		quorumField string
+		hasField    bool
+		wantQuorum  bool
+		wantHas     bool
+	}{
+		{"quorum:yes => Quorum=true", "yes", true, true, true},
+		{"quorum:no  => Quorum=false", "no", true, false, true},
+		{"missing => HasQuorum=false (older kernel)", "", false, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := map[string]string{
+				"name":   "pvc-q",
+				"volume": "0",
+				"disk":   "UpToDate",
+			}
+			if tc.hasField {
+				fields["quorum"] = tc.quorumField
+			}
+
+			obs, ok := translateDeviceEvent(drbd.Event{
+				Action: "change",
+				Kind:   eventKindDevice,
+				Fields: fields,
+			})
+			if !ok {
+				t.Fatalf("translateDeviceEvent rejected %+v", fields)
+			}
+
+			if len(obs.Volumes) != 1 {
+				t.Fatalf("Volumes: got %d, want 1", len(obs.Volumes))
+			}
+
+			got := obs.Volumes[0]
+			if got.HasQuorum != tc.wantHas {
+				t.Errorf("HasQuorum: got %v, want %v", got.HasQuorum, tc.wantHas)
+			}
+
+			if got.Quorum != tc.wantQuorum {
+				t.Errorf("Quorum: got %v, want %v", got.Quorum, tc.wantQuorum)
+			}
+		})
+	}
+
+	// mergeVolumeInto then propagates the field through the
+	// per-resource cache so writeStatus' SSA payload carries it.
+	// The peer-device frame (no quorum) that follows must NOT
+	// flip the cached Quorum back to false.
+	o := &ObserverRunnable{}
+
+	deviceFrame := observation{
+		ResourceName: "pvc-q",
+		Volumes: []volumeObservation{{
+			VolumeNumber: 0,
+			DiskState:    "UpToDate",
+			Quorum:       true,
+			HasQuorum:    true,
+		}},
+	}
+	o.mergeVolumes(&deviceFrame)
+
+	if len(deviceFrame.Volumes) != 1 || !deviceFrame.Volumes[0].Quorum {
+		t.Fatalf("post-merge device frame: want Quorum=true; got %+v", deviceFrame.Volumes)
+	}
+
+	peerFrame := observation{
+		ResourceName: "pvc-q",
+		Volumes: []volumeObservation{{
+			VolumeNumber: 0,
+			OutOfSyncKib: 1024,
+			HasSync:      true,
+			// Quorum / HasQuorum unset (zero) — peer-device frames
+			// never carry the field; the cached true must survive.
+		}},
+	}
+	o.mergeVolumes(&peerFrame)
+
+	snap := o.snapshotFor("pvc-q")
+	if len(snap.Volumes) != 1 {
+		t.Fatalf("snapshot volumes: got %d, want 1", len(snap.Volumes))
+	}
+
+	if !snap.Volumes[0].Quorum {
+		t.Errorf("cached Quorum got %v, want true (peer-device frame must not clobber cached value)", snap.Volumes[0].Quorum)
+	}
+
+	// SSA payload carries the surfaced Quorum field.
+	out := buildObserverVolumeStatus(&snap, "")
+	if len(out) != 1 || !out[0].Quorum {
+		t.Errorf("buildObserverVolumeStatus: got %+v, want Quorum=true on volume 0", out)
+	}
+}
