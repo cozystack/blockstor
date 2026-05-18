@@ -205,6 +205,32 @@ type ResourceStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
+	// role is the kernel-reported DRBD-9 role on this node, parsed
+	// from the `role:` token in `drbdsetup events2` resource frames.
+	// Values mirror the DRBD-9 enum: `Primary` (open for write),
+	// `Secondary` (replication-only), `Unknown` (transient — kernel
+	// just attached, has not yet picked a role). Per-replica, in
+	// contrast to the cluster-wide `inUse` bool: a 3-replica RD has
+	// up to one Primary and two Secondaries, all on different nodes.
+	// ~15 e2e tests `grep role:` from `drbdsetup status`; surfacing
+	// it on Status lets them switch to a k8s-native read.
+	// +optional
+	Role string `json:"role,omitempty"`
+
+	// suspended is the kernel-reported reason for I/O suspension on
+	// this replica, parsed from the `suspended:` token in
+	// `drbdsetup events2` resource frames. Values mirror the DRBD-9
+	// enum: `No` (I/O serves normally), `Quorum` (quorum lost,
+	// `on-no-quorum=suspend-io` blocked the I/O queue), `User`
+	// (`drbdadm suspend-io` issued by operator), `NoData` (no
+	// UpToDate replica reachable, kernel is waiting for one),
+	// `Fencing` (resource-and-stonith fencing handler running).
+	// Paired with the per-volume `quorum` field for quorum-loss
+	// recovery tests — 3 e2e tests need this to distinguish a
+	// recoverable quorum suspend from a user/fencing suspend.
+	// +optional
+	Suspended string `json:"suspended,omitempty"`
+
 	// toggleDiskRetries counts how many times the satellite
 	// reconciler has failed mid-conversion while running the
 	// diskless→diskful chain (storage carve → drbdmeta create-md

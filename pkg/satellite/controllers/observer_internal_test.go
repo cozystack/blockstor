@@ -1754,3 +1754,205 @@ func TestObserverParsesQuorumFromEventsFrame(t *testing.T) {
 		t.Errorf("buildObserverVolumeStatus: got %+v, want Quorum=true on volume 0", out)
 	}
 }
+
+// TestObserverParsesRoleFromEventsFrame pins the resource-frame
+// `role:` → Status.Role surfacing path. ~15 e2e tests `grep role:`
+// from `drbdsetup status`; the Status field is the k8s-native
+// substitute. Three checks:
+//
+//  1. translateResourceEvent carries the raw role string onto
+//     `observation.Role` (Primary / Secondary / Unknown).
+//  2. mergeResource caches Role keyed by resource — a follow-up
+//     non-resource event must NOT clobber the cached value back to
+//     "", which would let SSA drop the f:role claim.
+//  3. snapshotFor's payload carries Role so writeStatus' SSA apply
+//     stakes the field; an idle resync must re-emit it.
+func TestObserverParsesRoleFromEventsFrame(t *testing.T) {
+	cases := []struct {
+		name     string
+		role     string
+		wantRole string
+	}{
+		{"primary", "Primary", "Primary"},
+		{"secondary", "Secondary", "Secondary"},
+		{"unknown surfaces literally", "Unknown", "Unknown"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, ok := translateResourceEvent(drbd.Event{
+				Kind:   eventKindResource,
+				Action: "change",
+				Fields: map[string]string{
+					"name": "pvc-role",
+					"role": tc.role,
+				},
+			})
+			if !ok {
+				t.Fatalf("translateResourceEvent rejected role=%q", tc.role)
+			}
+
+			if obs.Role != tc.wantRole {
+				t.Errorf("Role: got %q, want %q", obs.Role, tc.wantRole)
+			}
+		})
+	}
+
+	o := &ObserverRunnable{}
+
+	// 1. Primary transition caches Role=Primary.
+	primary := observation{
+		ResourceName: "pvc-role",
+		InUse:        true,
+		Role:         "Primary",
+		HasResource:  true,
+	}
+	o.mergeResource(&primary)
+
+	if primary.Role != "Primary" {
+		t.Fatalf("primary frame: Role got %q, want Primary", primary.Role)
+	}
+
+	// 2. Non-resource (connection-kind) event must re-emit cached
+	//    Role rather than racing it back to "".
+	connEvent := observation{
+		ResourceName: "pvc-role",
+		Connections: []connectionObservation{{
+			PeerNodeName: "peer-a",
+			Connected:    true,
+			Message:      "Connected",
+		}},
+	}
+	o.mergeResource(&connEvent)
+
+	if connEvent.Role != "Primary" {
+		t.Errorf("connection frame: Role re-emit got %q, want Primary", connEvent.Role)
+	}
+
+	// 3. Resyncloop snapshot must surface the cached Role so SSA
+	//    keeps the f:role claim alive on idle ticks.
+	snap := o.snapshotFor("pvc-role")
+	if snap.Role != "Primary" {
+		t.Errorf("snapshotFor: Role got %q, want Primary", snap.Role)
+	}
+
+	// 4. Secondary transition replaces the cached value.
+	secondary := observation{
+		ResourceName: "pvc-role",
+		InUse:        false,
+		Role:         "Secondary",
+		HasResource:  true,
+	}
+	o.mergeResource(&secondary)
+
+	if secondary.Role != "Secondary" {
+		t.Errorf("secondary frame: Role got %q, want Secondary", secondary.Role)
+	}
+
+	snap = o.snapshotFor("pvc-role")
+	if snap.Role != "Secondary" {
+		t.Errorf("snapshotFor after secondary: Role got %q, want Secondary", snap.Role)
+	}
+}
+
+// TestObserverParsesSuspendedFromEventsFrame pins the resource-frame
+// `suspended:` → Status.Suspended surfacing path. Three quorum
+// recovery tests need the value to distinguish a recoverable
+// quorum-suspend (`Quorum`) from a user/fencing suspend.
+//
+//  1. translateResourceEvent carries the raw suspended string.
+//  2. mergeResource caches Suspended and re-emits on non-resource
+//     events.
+//  3. A transition to Suspended=No (quorum returned) must replace
+//     the cached `Quorum` value, not be elided as zero-default.
+func TestObserverParsesSuspendedFromEventsFrame(t *testing.T) {
+	cases := []struct {
+		name          string
+		suspended     string
+		wantSuspended string
+	}{
+		{"no — I/O serving normally", "No", "No"},
+		{"quorum — recoverable suspend", "Quorum", "Quorum"},
+		{"user-issued drbdadm suspend-io", "User", "User"},
+		{"no UpToDate replica reachable", "NoData", "NoData"},
+		{"resource-and-stonith handler", "Fencing", "Fencing"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, ok := translateResourceEvent(drbd.Event{
+				Kind:   eventKindResource,
+				Action: "change",
+				Fields: map[string]string{
+					"name":      "pvc-susp",
+					"role":      "Secondary",
+					"suspended": tc.suspended,
+				},
+			})
+			if !ok {
+				t.Fatalf("translateResourceEvent rejected suspended=%q", tc.suspended)
+			}
+
+			if obs.Suspended != tc.wantSuspended {
+				t.Errorf("Suspended: got %q, want %q", obs.Suspended, tc.wantSuspended)
+			}
+		})
+	}
+
+	o := &ObserverRunnable{}
+
+	// 1. Cache `Quorum` from a resource frame.
+	quorumSusp := observation{
+		ResourceName: "pvc-susp",
+		Role:         "Secondary",
+		Suspended:    "Quorum",
+		HasResource:  true,
+	}
+	o.mergeResource(&quorumSusp)
+
+	if quorumSusp.Suspended != "Quorum" {
+		t.Fatalf("quorum frame: Suspended got %q, want Quorum", quorumSusp.Suspended)
+	}
+
+	// 2. Non-resource event must re-emit cached Suspended; without
+	//    this, SSA would strip the f:suspended claim on the next
+	//    apply.
+	peerDeviceEvent := observation{
+		ResourceName: "pvc-susp",
+		Connections: []connectionObservation{{
+			PeerNodeName:     "peer-a",
+			ReplicationState: "Established",
+		}},
+	}
+	o.mergeResource(&peerDeviceEvent)
+
+	if peerDeviceEvent.Suspended != "Quorum" {
+		t.Errorf("non-resource frame: Suspended re-emit got %q, want Quorum", peerDeviceEvent.Suspended)
+	}
+
+	// Snapshot for resyncOnce carries the cached field.
+	snap := o.snapshotFor("pvc-susp")
+	if snap.Suspended != "Quorum" {
+		t.Errorf("snapshotFor: Suspended got %q, want Quorum", snap.Suspended)
+	}
+
+	// 3. Quorum returns → kernel emits a resource frame with
+	//    suspended:No. HasResource=true so the cache MUST be
+	//    overwritten, not preserved.
+	quorumReturned := observation{
+		ResourceName: "pvc-susp",
+		Role:         "Secondary",
+		Suspended:    "No",
+		HasResource:  true,
+	}
+	o.mergeResource(&quorumReturned)
+
+	if quorumReturned.Suspended != "No" {
+		t.Errorf("quorum-returned frame: Suspended got %q, want No", quorumReturned.Suspended)
+	}
+
+	snap = o.snapshotFor("pvc-susp")
+	if snap.Suspended != "No" {
+		t.Errorf("snapshotFor after recovery: Suspended got %q, want No", snap.Suspended)
+	}
+}

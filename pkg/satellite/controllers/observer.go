@@ -46,6 +46,20 @@ type observation struct {
 	ResourceName string
 	InUse        bool
 	DrbdState    string
+	// Role mirrors the kernel-reported DRBD role from the events2
+	// resource-frame `role:` field — Primary/Secondary/Unknown.
+	// Carried alongside InUse (which is the bool collapsed form of
+	// the same signal); Role surfaces the per-replica enum onto
+	// Status so e2e tests can read role:Primary without shelling
+	// out to drbdsetup. Empty string on event kinds that don't
+	// carry the field — mergeResource gates updates on HasResource
+	// so cached Role survives connection/peer-device events.
+	Role string
+	// Suspended mirrors the kernel-reported `suspended:` field on
+	// resource frames — No/Quorum/User/NoData/Fencing. Distinguishes
+	// a recoverable quorum suspend (auto-clears when quorum returns)
+	// from a user-issued or fencing-handler suspend.
+	Suspended string
 	// HasResource marks observations that carry a fresh resource-
 	// kind frame (role transition → InUse, disk transition →
 	// DrbdState). mergeResource only updates its cache from
@@ -182,6 +196,8 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 	return observation{
 		ResourceName: name,
 		InUse:        ev.Fields["role"] == drbdRolePrimary,
+		Role:         ev.Fields["role"],
+		Suspended:    ev.Fields["suspended"],
 		HasResource:  true,
 	}, true
 }
@@ -408,10 +424,15 @@ type ObserverRunnable struct {
 
 // resourceObservation is the cached per-resource state observer
 // re-emits on every apply so SSA-merge doesn't drop InUse between
-// connection / peer-device events.
+// connection / peer-device events. Role and Suspended ride along
+// for the same reason: both come from the resource-kind frame, and
+// without caching the next non-resource event would strip f:role /
+// f:suspended off the observer's owner claim.
 type resourceObservation struct {
 	InUse     bool
 	DrbdState string
+	Role      string
+	Suspended string
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -568,6 +589,8 @@ func (o *ObserverRunnable) snapshotFor(name string) observation {
 	if r, ok := o.resCache[name]; ok {
 		out.InUse = r.InUse
 		out.DrbdState = r.DrbdState
+		out.Role = r.Role
+		out.Suspended = r.Suspended
 	}
 	o.resMu.Unlock()
 
@@ -596,11 +619,13 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	cur := o.resCache[ev.ResourceName]
 
 	// HasResource events (translateResourceEvent) carry an
-	// authoritative role transition. Update cached InUse only
-	// from these; other event kinds leave InUse at zero-value
-	// which would falsely clear the cache.
+	// authoritative role transition. Update cached InUse / Role /
+	// Suspended only from these; other event kinds leave the
+	// fields at zero-value which would falsely clear the cache.
 	if ev.HasResource {
 		cur.InUse = ev.InUse
+		cur.Role = ev.Role
+		cur.Suspended = ev.Suspended
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
@@ -615,9 +640,12 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	// Re-emit cached values so writeStatus' apply sees them every
 	// time, not just on the event kind that produced them. Without
 	// this, a connection event right after a role transition
-	// strips the f:inUse claim and the apiserver deletes the field.
+	// strips the f:inUse / f:role / f:suspended claims and the
+	// apiserver deletes the fields.
 	ev.InUse = cur.InUse
 	ev.DrbdState = cur.DrbdState
+	ev.Role = cur.Role
+	ev.Suspended = cur.Suspended
 }
 
 // handleObservation runs the per-event side-effects: the
@@ -897,6 +925,8 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 		Status: blockstoriov1alpha1.ResourceStatus{
 			InUse:       ev.InUse,
 			DrbdState:   ev.DrbdState,
+			Role:        ev.Role,
+			Suspended:   ev.Suspended,
 			Volumes:     buildObserverVolumeStatus(ev, storagePool),
 			Connections: buildObserverConnectionStatus(ev),
 		},
