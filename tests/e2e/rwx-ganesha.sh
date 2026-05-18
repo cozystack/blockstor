@@ -29,19 +29,21 @@ source "$SCRIPT_DIR/lib.sh"
 
 require_workers 2
 
-# Run 29 deep-dive: the RWX path is entirely piraeus' linstor-csi +
-# NFS-Ganesha sidecar — blockstor's code is not in the path here. On
-# stands where the piraeus-datastore stack isn't fully healthy (e.g.
-# csi-controller pod not Running, or no NFS-Ganesha sidecar), the test
-# times out waiting for Pods to become Ready and there's nothing to
-# fix on the blockstor side. Skip until piraeus is healthy. The check
-# probes for a Running CSI controller pod in the piraeus-datastore
-# namespace; if the namespace doesn't exist or no Running pod surfaces,
-# we skip.
-if ! kubectl get pods -n piraeus-datastore --no-headers 2>/dev/null \
-        | grep -E 'linstor-csi-controller|piraeus-operator-controller' \
-        | grep -q Running; then
-    echo "SKIP: piraeus-datastore CSI controller not Running — RWX path needs upstream piraeus health"
+# RWX-Ganesha publishes via piraeus' linstor-csi NFS-Ganesha path.
+# That requires the full piraeus HA stack healthy:
+#   linstor-affinity-controller, linstor-csi-controller,
+#   linstor-csi-node, ha-controller, operator (and ganesha-server
+#   exports). Skip if any required component isn't Running on the
+#   stand — the test would just time out on pod-Ready otherwise.
+required=(linstor-affinity-controller linstor-csi-controller linstor-csi-node ha-controller)
+missing=""
+for c in "${required[@]}"; do
+    if ! kubectl get pods -A --no-headers 2>/dev/null | grep -E "${c}.*Running" >/dev/null; then
+        missing="$missing $c"
+    fi
+done
+if [[ -n "$missing" ]]; then
+    echo "SKIP: piraeus components not Running:$missing"
     exit 0
 fi
 
