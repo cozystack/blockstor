@@ -650,20 +650,45 @@ func filterTieBreaker(diskless []apiv1.Resource) []apiv1.Resource {
 	return out
 }
 
-// setQuorum stamps DrbdOptions/Resource/quorum on the RD's prop bag.
-// Idempotent: returns early if the value is already what we want.
-// The satellite picks up the change on next dispatch and re-renders
-// the .res file with the new quorum policy.
+// setQuorum stamps DrbdOptions/Resource/quorum on the RD's prop bag
+// and, when quorum is `majority`, seeds the companion
+// `DrbdOptions/Resource/on-no-quorum=suspend-io` if the operator
+// hasn't pinned it. Idempotent: returns early if both props already
+// carry the values we want. The satellite picks up the change on
+// next dispatch and re-renders the .res file.
+//
+// Bug 297 (P1, data-loss class): without `on-no-quorum=suspend-io`,
+// DRBD-9 falls back to its built-in `io-error` policy. On quorum
+// loss the minority replica returns ENODATA / EIO from open(2) and
+// the kernel slot freezes in a state that survives partition heal —
+// `drbdadm primary` then fails on auto-promote and dd opens with
+// "No data available". `suspend-io` instead blocks I/O until quorum
+// returns, then the slot resumes cleanly with the freshly synced
+// data. The REST POST handler's `seedAutoQuorumDefaults` already
+// stamps this on POST-created RDs, but kubectl-apply on the CRD
+// directly (e2e tests, GitOps flows that bypass the REST surface)
+// never hit that path — so the seeding has to live on every code
+// path that produces an `quorum=majority` RD. The controller is
+// the right level: it sees every RD regardless of create path.
+//
+// Operator-supplied `on-no-quorum` wins — silently overriding an
+// explicit `io-error` would undo the same operator control that
+// `seedAutoQuorumDefaults` documents preserving (and the same
+// scenario 7.W01 the auto-quorum-disabled gate respects).
 //
 // Retries on conflict because the RD reconciler races against the
 // resource reconciler — both can write the RD spec under heavy
 // reconcile pressure (e.g. fan-out from a Watches event), and a
 // stale local copy hits "object has been modified" on Update.
 func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
-	const propKey = "DrbdOptions/Resource/quorum"
+	const (
+		quorumKey      = "DrbdOptions/Resource/quorum"
+		onNoQuorumKey  = "DrbdOptions/Resource/on-no-quorum"
+		onNoQuorumSeed = "suspend-io"
+	)
 
 	for range 3 {
-		if rd.Spec.Props != nil && rd.Spec.Props[propKey] == value {
+		if quorumPropsAlreadySet(rd, value, quorumKey, onNoQuorumKey) {
 			return nil
 		}
 
@@ -671,7 +696,16 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 			rd.Spec.Props = map[string]string{}
 		}
 
-		rd.Spec.Props[propKey] = value
+		rd.Spec.Props[quorumKey] = value
+
+		// Companion seeding only when quorum is enabled — the
+		// `quorum=off` path doesn't consult `on-no-quorum` and
+		// stamping it would create churn for no benefit.
+		if value == QuorumPolicyMajority {
+			if _, present := rd.Spec.Props[onNoQuorumKey]; !present {
+				rd.Spec.Props[onNoQuorumKey] = onNoQuorumSeed
+			}
+		}
 
 		err := r.Update(ctx, rd)
 		if err == nil {
@@ -692,6 +726,35 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 	return apierrors.NewConflict(
 		blockstoriov1alpha1.GroupVersion.WithResource("resourcedefinitions").GroupResource(),
 		rd.Name, nil)
+}
+
+// quorumPropsAlreadySet reports whether the RD's prop bag already
+// reflects the desired quorum value AND (for the `majority` branch)
+// either carries an operator-pinned `on-no-quorum` or has the seed
+// value we'd stamp. Used by setQuorum to short-circuit the Update
+// when nothing would change — keeps ResourceVersion stable and
+// avoids the conflict-retry storm a write-on-every-reconcile would
+// trigger under fan-out load.
+func quorumPropsAlreadySet(rd *blockstoriov1alpha1.ResourceDefinition, value, quorumKey, onNoQuorumKey string) bool {
+	if rd.Spec.Props == nil {
+		return false
+	}
+
+	if rd.Spec.Props[quorumKey] != value {
+		return false
+	}
+
+	if value != QuorumPolicyMajority {
+		// `quorum=off` doesn't consult `on-no-quorum` — desired
+		// state is purely the quorum value.
+		return true
+	}
+
+	// quorum is correct; companion seed is desired-state iff the
+	// operator hasn't already pinned an `on-no-quorum` value.
+	_, present := rd.Spec.Props[onNoQuorumKey]
+
+	return present
 }
 
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.

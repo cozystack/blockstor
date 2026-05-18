@@ -138,6 +138,172 @@ func TestSetQuorumReplacesExistingValue(t *testing.T) {
 	}
 }
 
+// TestSetQuorumSeedsOnNoQuorumForMajority pins the Bug 297 invariant:
+// when setQuorum stamps `majority`, it must also seed
+// `DrbdOptions/Resource/on-no-quorum=suspend-io` if the operator
+// hasn't pinned a value. Without this companion, DRBD-9 falls back
+// to its built-in `io-error` policy and the minority replica freezes
+// in an ENODATA state that survives partition heal — `drbdadm primary`
+// then fails on auto-promote and dd opens with "No data available"
+// (observed live on the network-partition.sh e2e). The REST POST
+// handler's seedAutoQuorumDefaults already stamps this on POST-created
+// RDs, but kubectl-apply on the CRD directly (e2e, GitOps) bypasses
+// that path — so the controller has to seed on every code path that
+// produces a `quorum=majority` RD.
+func TestSetQuorumSeedsOnNoQuorumForMajority(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		// Props intentionally nil — exercises the lazy-init branch
+		// AND the seed-from-empty path that the e2e network-partition
+		// reproducer hits (kubectl-applied RD with no REST-side seeding).
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	if err := rec.SetQuorum(context.Background(), rd, "majority"); err != nil {
+		t.Fatalf("SetQuorum: %v", err)
+	}
+
+	got := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Spec.Props["DrbdOptions/Resource/quorum"] != "majority" {
+		t.Errorf("quorum prop: got %q, want majority", got.Spec.Props["DrbdOptions/Resource/quorum"])
+	}
+
+	if got.Spec.Props["DrbdOptions/Resource/on-no-quorum"] != "suspend-io" {
+		t.Errorf("on-no-quorum prop: got %q, want suspend-io (Bug 297 seed)",
+			got.Spec.Props["DrbdOptions/Resource/on-no-quorum"])
+	}
+}
+
+// TestSetQuorumPreservesOperatorOnNoQuorum pins the "operator wins"
+// half of the Bug 297 fix: when the RD already carries an explicit
+// `DrbdOptions/Resource/on-no-quorum` value, setQuorum must leave it
+// alone. Silently overriding it would undo scenario 7.W01's manual
+// quorum-policy contract from the other direction. Mirrors the same
+// guarantee `seedAutoQuorumDefaults` documents on the REST path.
+func TestSetQuorumPreservesOperatorOnNoQuorum(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{
+				// Operator-pinned io-error — must survive.
+				"DrbdOptions/Resource/on-no-quorum": "io-error",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	if err := rec.SetQuorum(context.Background(), rd, "majority"); err != nil {
+		t.Fatalf("SetQuorum: %v", err)
+	}
+
+	got := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Spec.Props["DrbdOptions/Resource/on-no-quorum"] != "io-error" {
+		t.Errorf("on-no-quorum prop: got %q, want io-error (operator-pinned must survive)",
+			got.Spec.Props["DrbdOptions/Resource/on-no-quorum"])
+	}
+}
+
+// TestSetQuorumDoesNotSeedOnOffPolicy pins the narrow scope of the
+// Bug 297 seed: `on-no-quorum` is only consulted by DRBD-9 when
+// quorum is enabled. Stamping a value alongside `quorum=off` would
+// be noise and would churn ResourceVersion on every reconcile of a
+// 1-replica RD. Negative-space guard so a refactor that broadened
+// the seed scope would surface here.
+func TestSetQuorumDoesNotSeedOnOffPolicy(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	if err := rec.SetQuorum(context.Background(), rd, "off"); err != nil {
+		t.Fatalf("SetQuorum: %v", err)
+	}
+
+	got := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.Spec.Props["DrbdOptions/Resource/quorum"] != "off" {
+		t.Errorf("quorum prop: got %q, want off", got.Spec.Props["DrbdOptions/Resource/quorum"])
+	}
+
+	if _, present := got.Spec.Props["DrbdOptions/Resource/on-no-quorum"]; present {
+		t.Errorf("on-no-quorum stamped on off policy: got %q, want absent",
+			got.Spec.Props["DrbdOptions/Resource/on-no-quorum"])
+	}
+}
+
+// TestSetQuorumIdempotentWithSeed pins the Bug 297 idempotency
+// guarantee: once both `quorum=majority` and the seeded
+// `on-no-quorum=suspend-io` are present, a follow-up SetQuorum call
+// must NOT re-Update the RD. Without this, the reconciler would
+// churn ResourceVersion on every requeue and the conflict-retry
+// budget would burn against itself under fan-out load.
+func TestSetQuorumIdempotentWithSeed(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{
+				"DrbdOptions/Resource/quorum":       "majority",
+				"DrbdOptions/Resource/on-no-quorum": "suspend-io",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme}
+
+	pre := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, pre); err != nil {
+		t.Fatalf("get pre: %v", err)
+	}
+
+	if err := rec.SetQuorum(context.Background(), pre, "majority"); err != nil {
+		t.Fatalf("SetQuorum: %v", err)
+	}
+
+	post := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(context.Background(), types.NamespacedName{Name: "pvc-1"}, post); err != nil {
+		t.Fatalf("get post: %v", err)
+	}
+
+	if pre.ResourceVersion != post.ResourceVersion {
+		t.Errorf("ResourceVersion changed after no-op SetQuorum (Bug 297 idempotency): %s → %s",
+			pre.ResourceVersion, post.ResourceVersion)
+	}
+}
+
 // TestSetQuorumRetriesOnConflict pins the conflict-retry loop:
 // when the apiserver returns a Conflict error on Update (because
 // another reconciler bumped resourceVersion in flight), setQuorum
