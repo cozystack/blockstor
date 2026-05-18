@@ -1119,6 +1119,32 @@ func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 	return out
 }
 
+// renderResFile builds and writes the per-node .res file content-
+// idempotently. Bug 315 invariant: skips os.WriteFile when the
+// rendered body matches what's already on disk so drbdadm's config-
+// file-watcher does not see a spurious mtime bump. Pure file op —
+// no kernel interaction, no peer probes.
+//
+// Extracted from applyDRBD so the FSM dispatch path (Phase 11.2.c
+// Stage 2) can call the same writer the legacy chain uses without
+// forking the apply flow. devices is the volNumber → DevicePath map
+// applyStorage produced; buildResFile uses it as the disk path so a
+// loopfile-backed volume gets `disk /dev/loopN` rather than the
+// LVM-shaped guess.
+func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+	_ = ctx
+	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
+	if err != nil {
+		return errors.Wrapf(err, "build .res for %s", dr.GetName())
+	}
+	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
+	current, _ := os.ReadFile(resPath)
+	if bytes.Equal(current, []byte(body)) {
+		return nil
+	}
+	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
+}
+
 // applyDRBD renders the .res file from dr's metadata and (re)applies
 // it via drbdadm. create-md runs only on first activation (we detect
 // "first" by absence of the .res file before this run); diskless
@@ -1152,6 +1178,23 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// inside observeForFsm; no retries, no failures bubble up here.
 	r.logFsmShadow(ctx, dr, diskless)
 
+	// Phase 11.2.c Stage 2: shadow-with-action. Observe FSM phase;
+	// when phase==Unprovisioned and next action is renderRes,
+	// dispatch the helper. Legacy chain continues — the helper is
+	// content-idempotent so legacy's later renderResFile call is a
+	// no-op stat. This proves FSM dispatch wiring works end-to-end
+	// without forking the apply flow. Stage 3 will replace legacy
+	// gates one-by-one with FSM-owned implementations as they get
+	// refactored to standalone helpers.
+	if obs := r.observeForFsm(ctx, dr, diskless); ObservePhase(obs) == PhaseUnprovisioned {
+		if next := NextTransition(PhaseUnprovisioned, obs); next != nil && next.Action == ActionRenderRes {
+			if err := r.renderResFile(ctx, dr, devices); err != nil {
+				return errors.Wrapf(err, "fsm dispatch %s", next.Action)
+			}
+			fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)
+		}
+	}
+
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
@@ -1175,29 +1218,13 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	_, statErr := os.Stat(mdMarkerPath)
 	firstActivation := !dr.GetMetadataCreated() && os.IsNotExist(statErr)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
-	if err != nil {
-		return errors.Wrapf(err, "build .res for %s", dr.GetName())
-	}
-
-	err = r.tearDownRemovedPeers(ctx, dr, resPath, devices)
+	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
 	}
 
-	// Bug 315 (P0-5): content-idempotent write. Skip rewriting the .res
-	// file when the rendered body matches what's already on disk. This
-	// preserves the mtime so downstream observers (drbdadm config-file
-	// watchers, debugging diffs) don't see spurious churn on every
-	// reconcile when nothing material changed.
-	desired := []byte(body)
-	current, _ := os.ReadFile(resPath)
-
-	if !bytes.Equal(current, desired) {
-		err = os.WriteFile(resPath, desired, resFilePerm)
-		if err != nil {
-			return errors.Wrapf(err, "write %s", resPath)
-		}
+	if err := r.renderResFile(ctx, dr, devices); err != nil {
+		return err
 	}
 
 	// Bug 319 (root-cause fix for Bug 303): probe BEFORE any bring-up
