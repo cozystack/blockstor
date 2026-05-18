@@ -86,6 +86,24 @@ type ResourceReconciler struct {
 	// single-controller process. Different RDs still allocate in
 	// parallel.
 	allocMu sync.Map // RD name → *sync.Mutex
+
+	// clusterAllocMu serialises CROSS-RD allocation of cluster-scoped
+	// values (DRBD TCP port + minor). The per-RD `allocMu` only
+	// serialises replicas of the SAME RD; two DIFFERENT RDs racing
+	// to pick a fresh port both observe the same "taken set" because
+	// neither has committed yet, both pick the lowest free value,
+	// and both Status().Update succeed (each writes its own RD's
+	// status — Kubernetes optimistic concurrency is per-object,
+	// not cross-object). This is Bug 306: batch autoplace
+	// (parallel `rd create`+autoplace) produces RDs with colliding
+	// DRBD ports → satellite-side .res collision. Holding this mutex
+	// across {list taken → pick free → Status patch} on the parent
+	// RD makes the cross-RD allocation atomic in-process. Combined
+	// with APIReader-direct reads, this guarantees collision-free
+	// allocation under batch creation. Single-controller process
+	// (Deployment replicas=1 + leader election in HA) is the
+	// supported topology, so an in-process mutex is sufficient.
+	clusterAllocMu sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
@@ -860,12 +878,28 @@ func ptrEqI32(a, b *int32) bool {
 // Multi-volume RDs reserve drbdMinor..drbdMinor+N-1 (the .res
 // renderer emits volume k at base+k, so adjacent RDs must not land
 // in the middle of an already-claimed range).
+//
+// Bug 306: batch autoplace (parallel `rd create`+autoplace) races
+// here. Two DIFFERENT RDs reconciling concurrently both observe a
+// stale (cached) taken set, both pick the lowest free port, and
+// both Status().Update succeed because Kubernetes optimistic
+// concurrency is per-object — two RDs writing to their OWN statuses
+// don't conflict with each other. Result: both RDs end up with the
+// same DRBD port, the satellite-side .res files collide, neither
+// resource connects.
+//
+// The fix: hold `clusterAllocMu` across {APIReader-list taken →
+// pick free → Status().Update} so cross-RD allocation is strictly
+// serial in-process. APIReader bypasses the cache so the second
+// allocator observes the first one's committed write.
 func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *blockstoriov1alpha1.Resource) (int32, int32, error) {
 	rdName := target.Spec.ResourceDefinitionName
 
+	reader := r.apiReader()
+
 	var rd blockstoriov1alpha1.ResourceDefinition
 
-	err := r.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	err := reader.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// RD absent (unit-test fast path or rd-delete in flight).
@@ -877,6 +911,25 @@ func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *bloc
 			return r.ensureRDPortMinorWithoutRD(ctx, target)
 		}
 
+		return 0, 0, err
+	}
+
+	if rd.Status.DRBDPort != nil && rd.Status.DRBDMinor != nil {
+		return *rd.Status.DRBDPort, *rd.Status.DRBDMinor, nil
+	}
+
+	// Cross-RD allocation is racy without serialisation: two RDs
+	// reconciling at the same time both observe taken=∅, both pick
+	// the lowest free value, both Status().Update succeed (different
+	// objects, no conflict). Hold a process-wide mutex so cross-RD
+	// allocation is strictly serial. Re-check RD.Status after the
+	// lock — a racing allocator may have committed values between
+	// the early-return check above and the lock acquisition.
+	r.clusterAllocMu.Lock()
+	defer r.clusterAllocMu.Unlock()
+
+	err = reader.Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	if err != nil {
 		return 0, 0, err
 	}
 
@@ -899,7 +952,7 @@ func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *bloc
 		if errors.IsConflict(err) {
 			var fresh blockstoriov1alpha1.ResourceDefinition
 
-			fetchErr := r.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
+			fetchErr := reader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
 			if fetchErr != nil {
 				return 0, 0, fetchErr
 			}
@@ -913,6 +966,20 @@ func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *bloc
 	}
 
 	return port, minor, nil
+}
+
+// apiReader returns the uncached apiserver-direct client when
+// available, falling back to the cached client for tests that
+// construct ResourceReconciler{} directly without going through
+// SetupWithManager. The fallback is safe because the fake client
+// used in tests doesn't simulate informer-cache lag, so a single
+// reader satisfies both the production and test paths.
+func (r *ResourceReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+
+	return r.Client
 }
 
 // ensureRDPortMinorWithoutRD is the fallback used when the parent
@@ -1181,11 +1248,18 @@ func (r *ResourceReconciler) intersectRange(
 //
 // Excludes `selfRD` so an RD that's mid-allocation doesn't trip on
 // its own draft.
+//
+// Bug 306: uses APIReader (uncached) so cross-RD batch autoplace
+// observes freshly-committed sibling allocations instead of a stale
+// informer-cache snapshot. Combined with `clusterAllocMu` in
+// ensureRDPortMinor, this guarantees that the second concurrent
+// allocator sees the first one's port and picks a different one.
 func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD string) ([]int32, error) {
 	out := make([]int32, 0, 16)
+	reader := r.apiReader()
 
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
-	if err := r.List(ctx, &rdList); err != nil {
+	if err := reader.List(ctx, &rdList); err != nil {
 		return nil, err
 	}
 
@@ -1200,7 +1274,7 @@ func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD strin
 	}
 
 	var resList blockstoriov1alpha1.ResourceList
-	if err := r.List(ctx, &resList); err != nil {
+	if err := reader.List(ctx, &resList); err != nil {
 		return nil, err
 	}
 
@@ -1221,13 +1295,18 @@ func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD strin
 // multi-volume RD reserves N consecutive minors (the .res renderer
 // emits volume k at base+k), so we expand each base value to the
 // full range via the parent RD's VolumeDefinitions count.
+//
+// Bug 306: uses APIReader (uncached) for the same reason as
+// takenPortsCluster — cross-RD batch autoplace must observe
+// freshly-committed sibling allocations rather than a stale cache.
 func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
 	out := make([]int32, 0, 16)
+	reader := r.apiReader()
 
 	rdVolCounts := map[string]int{}
 
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
-	if err := r.List(ctx, &rdList); err != nil {
+	if err := reader.List(ctx, &rdList); err != nil {
 		return nil, err
 	}
 

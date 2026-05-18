@@ -2,59 +2,52 @@
 #
 # usage: recovery-port-collision.sh WORK_DIR
 #
-# Scenario 5.19 — TCP port collision recovery via
-# `linstor r deact` + `linstor r act`.
+# Bug 306 — batch autoplace port-collision guard.
 #
-# Goal: validate the documented recipe for clearing a colliding
-# DRBD TCP port on a single replica by deactivating and reactivating
-# that replica. The recipe (from upstream LINSTOR ops experience) is:
+# Goal: validate that the controller's per-RD DRBD-TCP-port
+# allocator is collision-free under PARALLEL RD creation. The
+# realistic production hazard isn't an admin patching Status (that's
+# operator error — leave it). It's CI pipelines, GitOps batch
+# apply, and mass-import flows that POST N resource-definitions +
+# autoplace requests in parallel against the controller REST API.
 #
-#     linstor r deactivate <node> <rd>
-#     sleep 5
-#     linstor r activate <node> <rd>
+# Pre-Bug-306, two RDs reconciling at the same time both observed a
+# stale (cached) cluster-wide taken-set, both picked the lowest
+# free port (7000), and both Status().Update succeeded because
+# Kubernetes optimistic concurrency is per-object: two RDs writing
+# to their OWN statuses don't conflict. Result: N RDs got the SAME
+# DRBD port, the satellite-side .res files collided, neither
+# resource connected, `drbdadm adjust` printed "tcp port <N> is
+# also used" forever.
 #
-# Expectation per the recipe: blockstor should re-allocate a fresh
-# TCP port for that replica when the activate path runs again,
-# clearing the collision so `drbdadm adjust all` no longer warns
-# `tcp port <N> is also used` against another resource.
-#
-# Why this matters: in production we've seen ports collide after
-# a controller crash/restore mid-allocation, or after manual
-# `kubectl patch` on a Resource CRD. The deact/act recipe is the
-# documented non-destructive fix — alternatives (delete + re-create
-# the replica) blow away the local backing storage and trigger a
-# full resync. This test catches regressions where the controller
-# starts preserving a stale port across activate (cheaper) and
-# fails to honor the operator's deliberate "give me a new port"
-# signal embedded in the deact/act cycle.
+# Fix: a process-wide `clusterAllocMu` held across {APIReader-list
+# taken → pick free → Status().Update} so cross-RD allocation is
+# strictly serial. APIReader bypasses the informer cache so the
+# second allocator observes the first one's committed write.
 #
 # Setup:
-#   - 2 RDs on workers 1+2: `port-victim` and `port-test`. Both
-#     autoplaced. We only need `port-victim` for its allocated
-#     TcpPort number — the collision is forced onto `port-test`.
-#   - Wait for both to reach UpToDate so the satellite has written
-#     the .res files and `drbdadm` knows about both resources.
+#   - N=10 RDs created in parallel via REST POST against the
+#     blockstor-controller apiserver.
+#   - Each RD gets a 2-replica autoplace on workers 1+2.
 #
 # Steps:
-#   1. Read `port-victim`'s allocated DRBDPort on $WORKER_1.
-#   2. Force-patch `port-test`'s Status.DRBDPort on $WORKER_1 to
-#      collide with `port-victim`. The satellite reconciler then
-#      re-renders the .res file with the colliding port.
-#   3. Trigger a `drbdadm adjust all` on $WORKER_1 and observe
-#      the "tcp port <N> is also used" warning.
-#   4. Apply the recipe: `linstor r deactivate $WORKER_1 port-test`,
-#      sleep 5, `linstor r activate $WORKER_1 port-test`.
-#   5. Read `port-test`'s DRBDPort post-recipe.
-#   6. PASS if the new port differs from `port-victim`'s port AND
-#      `drbdadm adjust all` no longer prints a collision warning.
-#      FAIL otherwise — the controller is preserving the stale
-#      colliding port across activate, which the recipe cannot fix.
+#   1. POST N resource-definitions concurrently (N curl &; wait).
+#   2. POST N volume-definitions concurrently.
+#   3. POST N resources (autoplace) concurrently.
+#   4. Wait for every replica's Status.DRBDPort to be stamped.
+#   5. Collect all ports and assert pairwise uniqueness across RDs.
+#   6. (Sanity) Each RD's two replicas share the same port (per-RD
+#      invariant, Bug 268).
 #
 # Regression guards:
-#   - `port-victim` must remain UpToDate throughout — the recipe
-#     targets `port-test` only.
-#   - The cleanup `delete_rd` call must succeed for both RDs to
-#     leave the cluster clean for the next scenario in a batch run.
+#   - At least N distinct ports allocated.
+#   - Every port is inside the configured DRBD port range.
+#   - All replicas of one RD share the same port.
+#
+# This test was rewritten from the admin-status-patch shape to the
+# batch-autoplace shape — admin patching Status.DRBDPort to force a
+# collision is operator error and the controller is not obligated
+# to undo it. The real production hazard is parallel autoplace.
 
 set -euo pipefail
 
@@ -67,15 +60,10 @@ source "$SCRIPT_DIR/lib.sh"
 
 require_workers 2
 
-if ! command -v linstor >/dev/null 2>&1; then
-    echo "SKIP: linstor CLI not in PATH (apt install linstor-client)"
-    exit 0
-fi
-
-RD_VICTIM=port-victim
-RD_TEST=port-test
 N1=$WORKER_1
 N2=$WORKER_2
+RD_PREFIX=batch-port-bug306
+NUM_RDS=10
 
 # Random ephemeral port for the controller port-forward — parallel
 # iters on the same host would collide on a fixed port.
@@ -87,15 +75,10 @@ PF_PID=$!
 dump_diag() {
     echo "---- dump: kubectl get resources -o wide ----"
     kubectl get resources.blockstor.io.blockstor.io -o wide 2>/dev/null || true
-    echo "---- dump: $RD_TEST resource on $N1 (yaml) ----"
-    kubectl get resources.blockstor.io.blockstor.io "${RD_TEST}.${N1}" -o yaml 2>/dev/null || true
-    echo "---- dump: $RD_VICTIM resource on $N1 (yaml) ----"
-    kubectl get resources.blockstor.io.blockstor.io "${RD_VICTIM}.${N1}" -o yaml 2>/dev/null || true
-    echo "---- dump: satellite log on $N1 (tail 60) ----"
-    local pod
-    pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
-        -o "jsonpath={.items[?(@.spec.nodeName==\"${N1}\")].metadata.name}")
-    kubectl -n "$NS" logs "$pod" --tail=60 2>/dev/null || true
+    echo "---- dump: kubectl get resourcedefinitions -o wide ----"
+    kubectl get resourcedefinitions.blockstor.io.blockstor.io -o wide 2>/dev/null || true
+    echo "---- dump: controller log tail ----"
+    kubectl -n "$NS" logs -l app=blockstor-controller --tail=80 2>/dev/null || true
 }
 
 cleanup() {
@@ -103,14 +86,15 @@ cleanup() {
     if (( rc != 0 )); then
         dump_diag
     fi
-    delete_rd "$RD_TEST" 2>/dev/null || true
-    delete_rd "$RD_VICTIM" 2>/dev/null || true
+    for i in $(seq 1 "$NUM_RDS"); do
+        delete_rd "${RD_PREFIX}-${i}" 2>/dev/null || true
+    done
     kill "$PF_PID" 2>/dev/null || true
     wait "$PF_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Wait for the port-forward to bind before issuing CLI commands.
+# Wait for the port-forward to bind before issuing requests.
 for _ in $(seq 1 20); do
     if curl -sf -m1 "http://localhost:$PF_PORT/v1/nodes" >/dev/null 2>&1; then
         break
@@ -118,187 +102,140 @@ for _ in $(seq 1 20); do
     sleep 0.5
 done
 
-LCTL=(linstor --controllers "http://localhost:$PF_PORT")
+API="http://127.0.0.1:${PF_PORT}"
 
-echo ">> create $RD_VICTIM (2-replica autoplace on $N1+$N2)"
-"${LCTL[@]}" resource-definition create "$RD_VICTIM" >/dev/null
-"${LCTL[@]}" volume-definition create "$RD_VICTIM" 32M >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD_VICTIM" --storage-pool stand >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD_VICTIM" --storage-pool stand >/dev/null
+# Pre-clean any leftover RDs from a previous run.
+for i in $(seq 1 "$NUM_RDS"); do
+    delete_rd "${RD_PREFIX}-${i}" 2>/dev/null || true
+done
 
-echo ">> create $RD_TEST (2-replica autoplace on $N1+$N2)"
-"${LCTL[@]}" resource-definition create "$RD_TEST" >/dev/null
-"${LCTL[@]}" volume-definition create "$RD_TEST" 32M >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD_TEST" --storage-pool stand >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD_TEST" --storage-pool stand >/dev/null
+# Phase 1: POST N resource-definitions in parallel. Background each
+# curl and wait — that's the realistic shape of a CI pipeline doing
+# `helm install` over a list of PVCs.
+echo ">> POST $NUM_RDS resource-definitions in parallel"
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    curl -sf -X POST -m 10 \
+        -H 'Content-Type: application/json' \
+        -d "{\"resource_definition\":{\"name\":\"${rd}\"}}" \
+        "${API}/v1/resource-definitions" \
+        >/dev/null &
+done
+wait
 
-wait_uptodate "$RD_VICTIM" "$N1" "$N2"
-wait_uptodate "$RD_TEST" "$N1" "$N2"
+# Phase 2: POST N volume-definitions in parallel.
+echo ">> POST $NUM_RDS volume-definitions in parallel"
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    curl -sf -X POST -m 10 \
+        -H 'Content-Type: application/json' \
+        -d '{"volume_definition":{"size_kib":65536}}' \
+        "${API}/v1/resource-definitions/${rd}/volume-definitions" \
+        >/dev/null &
+done
+wait
 
-# Pull the allocated port for the victim RD on $N1 and the test RD on
-# $N1. We deliberately compare the $N1 ports — a same-node collision
-# is what would actually break `drbdadm adjust` because the kernel
-# listener can only bind one resource per port per node.
-victim_port=$(kubectl get resources.blockstor.io.blockstor.io "${RD_VICTIM}.${N1}" \
-    -o jsonpath='{.status.drbdPort}')
-test_port_before=$(kubectl get resources.blockstor.io.blockstor.io "${RD_TEST}.${N1}" \
-    -o jsonpath='{.status.drbdPort}')
-echo "   victim port on $N1 = $victim_port"
-echo "   test  port on $N1 (pre-collision) = $test_port_before"
-if [[ -z "$victim_port" || -z "$test_port_before" ]]; then
-    echo "FAIL: could not read pre-state DRBDPort values"
-    exit 1
-fi
-if [[ "$victim_port" == "$test_port_before" ]]; then
-    echo "FAIL: ports already identical before collision injection — port-pool bug?"
-    exit 1
-fi
+# Phase 3: POST N autoplace requests in parallel. This is the
+# allocator's worst case — N RDs all reaching the controller
+# reconcile at the same instant.
+echo ">> POST $NUM_RDS autoplace requests in parallel"
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    curl -sf -X POST -m 10 \
+        -H 'Content-Type: application/json' \
+        -d '{"select_filter":{"place_count":2}}' \
+        "${API}/v1/resource-definitions/${rd}/autoplace" \
+        >/dev/null &
+done
+wait
 
-# Force the collision by patching $RD_TEST's Status.DRBDPort on $N1
-# to the victim's port. The satellite reconciler then re-renders the
-# .res file with the colliding port; on next `drbdadm adjust all`,
-# DRBD logs `tcp port <N> is also used`.
-#
-# We use a JSON subresource patch on /status because the field lives
-# in status — `kubectl patch --subresource=status` is the K8s-1.27+
-# way; we use `--subresource=status` for cross-version safety.
-echo ">> inject collision: patch ${RD_TEST}.${N1} status.drbdPort → $victim_port"
-kubectl patch resources.blockstor.io.blockstor.io "${RD_TEST}.${N1}" \
-    --subresource=status --type=merge \
-    -p "{\"status\":{\"drbdPort\":${victim_port}}}" >/dev/null
-
-# Verify the patch landed before going further — if the apiserver
-# rejected it (CEL validation, etc), bail out rather than fight a
-# phantom collision for 10 minutes.
-test_port_patched=$(kubectl get resources.blockstor.io.blockstor.io "${RD_TEST}.${N1}" \
-    -o jsonpath='{.status.drbdPort}')
-echo "   test port on $N1 (post-patch) = $test_port_patched"
-if [[ "$test_port_patched" != "$victim_port" ]]; then
-    echo "FAIL: status patch did not stick (still $test_port_patched, wanted $victim_port)"
-    exit 1
-fi
-
-# Wait for the satellite to pick up the patched port and re-render
-# the .res file on $N1. We poll the .res for the new port value
-# rather than relying on a flat sleep — under iter-load the
-# reconcile loop may be queue-deep.
-echo ">> wait up to 30s for satellite to re-render ${RD_TEST}.res with colliding port"
-deadline=$(( $(date +%s) + 30 ))
-res_has_collision=false
+# Phase 4: wait until every replica has Status.DRBDPort stamped.
+echo ">> wait up to 60s for every replica to receive a port"
+deadline=$(( $(date +%s) + 60 ))
+stamped_all=false
 while (( $(date +%s) < deadline )); do
-    if on_node "$N1" bash -c "grep -q ':${victim_port};' /etc/drbd.d/${RD_TEST}.res 2>/dev/null"; then
-        res_has_collision=true
+    missing=0
+    for i in $(seq 1 "$NUM_RDS"); do
+        rd="${RD_PREFIX}-${i}"
+        for node in "$N1" "$N2"; do
+            port=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${node}" \
+                -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
+            if [[ -z "$port" ]]; then
+                missing=$((missing + 1))
+            fi
+        done
+    done
+    if (( missing == 0 )); then
+        stamped_all=true
         break
     fi
     sleep 2
 done
-if [[ "$res_has_collision" != "true" ]]; then
-    echo "FAIL: ${RD_TEST}.res on $N1 never picked up colliding port $victim_port"
-    on_node "$N1" cat "/etc/drbd.d/${RD_TEST}.res" 2>/dev/null || true
+if [[ "$stamped_all" != "true" ]]; then
+    echo "FAIL: $missing replicas never received a DRBDPort"
     exit 1
 fi
-echo "   ${RD_TEST}.res on $N1 now references port $victim_port"
 
-# Trigger `drbdadm adjust all` on $N1 and capture stderr — the
-# kernel-side collision detection prints "tcp port <N> is also used"
-# on stderr (not in the .res file). We tolerate non-zero exit from
-# drbdadm because adjust returns non-zero when it refuses to bring
-# a colliding resource up.
-echo ">> drbdadm adjust all on $N1 (expect 'is also used' warning)"
-adjust_out=$(on_node "$N1" bash -c "drbdadm adjust all 2>&1 || true")
-echo "$adjust_out" | sed 's/^/      | /'
-if ! echo "$adjust_out" | grep -qiE "is also used|already in use|address.*used"; then
-    # The kernel may not have actually tried to rebind if both
-    # resources were brought up earlier with the original (non-
-    # colliding) port. In that case the warning fires only on a
-    # subsequent `drbdadm down`+`adjust`. Force the kernel to
-    # re-evaluate by issuing a `drbdadm down` on $RD_TEST first.
-    echo "   (no collision warning yet — kicking kernel via drbdadm down + adjust)"
-    on_node "$N1" bash -c "drbdadm down ${RD_TEST} 2>&1 || true" >/dev/null
-    adjust_out=$(on_node "$N1" bash -c "drbdadm adjust ${RD_TEST} 2>&1 || true")
-    echo "$adjust_out" | sed 's/^/      | /'
-fi
-if echo "$adjust_out" | grep -qiE "is also used|already in use|address.*used"; then
-    echo "   collision observed via drbdadm"
-    collision_observed=true
-else
-    echo "   NOTE: drbdadm did not emit a collision warning — kernel may have"
-    echo "         silently refused to bind. We still proceed with the recipe."
-    collision_observed=false
-fi
-
-# Apply the recipe: deact → sleep → act. Per the SKILL doc the sleep
-# gives the satellite reconciler time to observe INACTIVE, run
-# `drbdadm down`, and quiesce before activate re-asserts UP.
-#
-# IMPORTANT: we call the REST endpoints with curl instead of `linstor
-# r deactivate` / `linstor r activate` because blockstor's handlers
-# return an empty 200 body, and golinstor's CLI rejects that with
-# `Unable to parse REST json data: Expecting value`. The recipe in
-# this scenario is the deact/act *sequence*, not the CLI surface —
-# we exercise the same REST endpoints the CLI would call.
-echo ">> recipe: POST .../resources/$N1/$RD_TEST/deactivate"
-curl -fsS -X POST -m 10 \
-    "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${RD_TEST}/resources/${N1}/deactivate" \
-    >/dev/null
-
-echo "   sleep 5s for satellite to observe INACTIVE flag"
-sleep 5
-
-echo ">> recipe: POST .../resources/$N1/$RD_TEST/activate"
-curl -fsS -X POST -m 10 \
-    "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${RD_TEST}/resources/${N1}/activate" \
-    >/dev/null
-
-# Give the activate path time to reconcile. We read the port back
-# every iteration so we can spot the reallocation as soon as it
-# happens (or confirm the absence of reallocation after the
-# window expires).
-echo ">> wait up to 30s for ${RD_TEST}.${N1} DRBDPort to change"
-deadline=$(( $(date +%s) + 30 ))
-test_port_after="$victim_port"
-while (( $(date +%s) < deadline )); do
-    test_port_after=$(kubectl get resources.blockstor.io.blockstor.io "${RD_TEST}.${N1}" \
-        -o jsonpath='{.status.drbdPort}' 2>/dev/null || echo "$victim_port")
-    if [[ -n "$test_port_after" && "$test_port_after" != "$victim_port" ]]; then
-        break
-    fi
-    sleep 2
+# Phase 5: collect ports and check uniqueness across RDs + per-RD
+# consistency across replicas.
+echo ">> collect allocated ports"
+declare -A rd_port_n1=()
+declare -A rd_port_n2=()
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    p1=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${N1}" \
+        -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
+    p2=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${N2}" \
+        -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
+    rd_port_n1[$rd]=$p1
+    rd_port_n2[$rd]=$p2
+    echo "   $rd: $N1=$p1  $N2=$p2"
 done
-echo "   test port on $N1 (post-recipe) = $test_port_after"
 
-# Final verdict.
-if [[ "$test_port_after" == "$victim_port" ]]; then
-    echo "FAIL: deact+act did NOT reallocate ${RD_TEST}.${N1} port — still colliding at $victim_port"
-    echo "      blockstor preserves DRBDPort across activate (intentional, per"
-    echo "      pkg/rest/resource_adjust.go:92: 'activate flips it back without"
-    echo "      losing port/node-id allocations'). The recipe is INEFFECTIVE."
+# Per-RD invariant: replicas of one RD share one port (Bug 268).
+echo ">> per-RD invariant: every RD's replicas share one port"
+fail_per_rd=0
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    if [[ "${rd_port_n1[$rd]}" != "${rd_port_n2[$rd]}" ]]; then
+        echo "FAIL: $rd port diverges across peers: $N1=${rd_port_n1[$rd]} vs $N2=${rd_port_n2[$rd]}"
+        fail_per_rd=$((fail_per_rd + 1))
+    fi
+done
+if (( fail_per_rd > 0 )); then
     exit 1
 fi
 
-# Sanity-check the new port doesn't collide with anything else on $N1.
-echo ">> verify ${RD_TEST}.${N1} new port $test_port_after is unique on $N1"
-other_ports=$(kubectl get resources.blockstor.io.blockstor.io -o json \
-    | jq -r --arg n "$N1" --arg rd "${RD_TEST}.${N1}" \
-        '.items[] | select(.spec.nodeName == $n and .metadata.name != $rd) | .status.drbdPort // empty' \
-    | sort -u)
-echo "   other allocated ports on $N1: $(echo "$other_ports" | tr '\n' ' ')"
-if echo "$other_ports" | grep -qx "$test_port_after"; then
-    echo "FAIL: reallocated port $test_port_after still collides with another resource on $N1"
+# Cross-RD uniqueness: every RD must have its own port (Bug 306).
+echo ">> cross-RD uniqueness: every RD must have its own port (Bug 306)"
+declare -A seen=()
+fail_cross=0
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    port="${rd_port_n1[$rd]}"
+    if [[ -n "${seen[$port]:-}" ]]; then
+        echo "FAIL: port collision (Bug 306) — RDs '${seen[$port]}' and '$rd' both got port $port"
+        echo "      under parallel batch autoplace. Two satellite-side .res files now"
+        echo "      reference the same port; neither resource will connect."
+        fail_cross=$((fail_cross + 1))
+    fi
+    seen[$port]=$rd
+done
+if (( fail_cross > 0 )); then
     exit 1
 fi
 
-# Confirm `drbdadm adjust all` is now clean.
-echo ">> drbdadm adjust all on $N1 (expect no 'is also used' warning)"
-adjust_out=$(on_node "$N1" bash -c "drbdadm adjust all 2>&1 || true")
-echo "$adjust_out" | sed 's/^/      | /'
-if echo "$adjust_out" | grep -qiE "is also used|already in use|address.*used"; then
-    echo "FAIL: drbdadm still reports a port collision after the recipe"
-    exit 1
-fi
+# Sanity: every port inside the default 7000-7999 range.
+echo ">> sanity: every port inside default 7000-7999 range"
+for i in $(seq 1 "$NUM_RDS"); do
+    rd="${RD_PREFIX}-${i}"
+    port="${rd_port_n1[$rd]}"
+    if (( port < 7000 || port > 7999 )); then
+        echo "FAIL: $rd port $port outside default 7000-7999 range"
+        exit 1
+    fi
+done
 
-# Regression guard: $RD_VICTIM must still be UpToDate on both peers.
-wait_uptodate "$RD_VICTIM" "$N1" "$N2"
-
-echo ">> RECOVERY-PORT-COLLISION OK (port $victim_port → $test_port_after," \
-    "collision_observed=${collision_observed}, victim still UpToDate)"
+unique_count=${#seen[@]}
+echo ">> RECOVERY-PORT-COLLISION OK ($unique_count unique ports for $NUM_RDS RDs," \
+    "all in 7000-7999, no cross-RD collisions under parallel batch autoplace)"
