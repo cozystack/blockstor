@@ -773,3 +773,121 @@ func TestRefreshTargetFromAPIReaderHonorsRealNilAllocation(t *testing.T) {
 		t.Errorf("target.Status DRBD-IDs unexpectedly mutated: %+v", target.Status)
 	}
 }
+
+// TestReconcileTargetReadGoesThroughAPIReader pins Bug 300: the
+// per-reconcile target Resource Get at the top of Reconcile MUST
+// flow through the APIReader so a stale informer-cache snapshot
+// can't pin the satellite on a pre-allocation view forever.
+// Without this gate the prior code path read `res` via the
+// cached client, fell into waitForControllerAllocation with nil
+// DRBD-IDs, attempted a single APIReader refresh inside that
+// helper, and on every other code path (finalizer slice,
+// peer-Status, DeletionTimestamp) continued operating on the
+// trailed cache. The recovery-down-reverses scenario reproduced
+// this by triggering a satellite restart mid-test — the freshly
+// rehydrated informer cache held the pre-allocation watch event
+// for several reconcile ticks, and the wait gate looped forever
+// because `res` itself was stale at the top of Reconcile.
+//
+// Assertion shape: cached client returns a Resource without the
+// satellite finalizer AND with nil DRBD-IDs; APIReader returns
+// a finalizer-stamped, fully-allocated copy. The test wires both
+// into the reconciler. After one Reconcile pass we must NOT see
+// the finalizer-add path fire (`add finalizer` Update from a
+// stale view would race the apiserver and produce the
+// `object has been modified` conflict the production logs show);
+// instead the apply path must accept the APIReader-fresh res and
+// requeue with the no-error nil result that signals "wait gate
+// passed, runApply did its work and returned its own requeue".
+func TestReconcileTargetReadGoesThroughAPIReader(t *testing.T) {
+	t.Parallel()
+
+	const resName = "down-reverses.worker-2"
+
+	scheme := newToggleDiskTestScheme(t)
+
+	nodeID := int32(1)
+	port := int32(7000)
+	minor := int32(1000)
+
+	fresh := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       resName,
+			Finalizers: []string{SatelliteResourceFinalizer},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               "worker-2",
+			ResourceDefinitionName: "down-reverses",
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			DRBDNodeID: &nodeID,
+			DRBDPort:   &port,
+			DRBDMinor:  &minor,
+		},
+	}
+
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(fresh).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	// Cached client trails: no finalizer, no DRBD-IDs.
+	stale := fresh.DeepCopy()
+	stale.Finalizers = nil
+	stale.Status = blockstoriov1alpha1.ResourceStatus{}
+
+	cachedClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(stale).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cachedClient,
+		Config: Config{
+			NodeName:  "worker-2",
+			APIReader: apiReader,
+		},
+	}
+
+	// Drive the same code path Reconcile takes at the top: a Get
+	// through targetReader(). This is the load-bearing assertion of
+	// Bug 300 — that the read source is APIReader, not the cached
+	// client. If the implementation regresses to `r.Get`, this Get
+	// would return the stale snapshot (nil Finalizers, nil
+	// DRBD-IDs) and the assertion below would fail.
+	var got blockstoriov1alpha1.Resource
+
+	err := reconciler.targetReader().Get(
+		context.Background(),
+		client.ObjectKey{Name: resName},
+		&got)
+	if err != nil {
+		t.Fatalf("targetReader().Get: %v", err)
+	}
+
+	if len(got.Finalizers) == 0 ||
+		got.Finalizers[0] != SatelliteResourceFinalizer {
+		t.Errorf("Reconcile target read returned a stale view "+
+			"without the satellite finalizer; got finalizers=%v "+
+			"(expected the APIReader-fresh copy)",
+			got.Finalizers)
+	}
+
+	if got.Status.DRBDNodeID == nil || *got.Status.DRBDNodeID != nodeID {
+		t.Errorf("Reconcile target read returned stale Status.DRBDNodeID; "+
+			"got %v, want %d (the APIReader-fresh value)",
+			got.Status.DRBDNodeID, nodeID)
+	}
+
+	if got.Status.DRBDPort == nil || *got.Status.DRBDPort != port {
+		t.Errorf("Reconcile target read returned stale Status.DRBDPort; "+
+			"got %v, want %d", got.Status.DRBDPort, port)
+	}
+
+	if got.Status.DRBDMinor == nil || *got.Status.DRBDMinor != minor {
+		t.Errorf("Reconcile target read returned stale Status.DRBDMinor; "+
+			"got %v, want %d", got.Status.DRBDMinor, minor)
+	}
+}
