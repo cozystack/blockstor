@@ -105,20 +105,30 @@ fi
 
 # Step 4: poll for the reconciler to put it back. We require kernel
 # state to reappear within REVIVE_DEADLINE_SECS.
+#
+# Use a `revived` boolean instead of `revived_at == 0` because DRBD-9
+# sometimes leaves a half-torn slot visible to `drbdsetup status` for
+# the first second after `drbdadm down` — the wait loop would
+# legitimately observe kernel state and set `revived_at=0` (loop fired
+# in the same second as `t_down`), which the old sentinel collided
+# with the "never revived" branch. Test would then FAIL spuriously
+# even though the satellite was healthy.
 echo ">> wait <=${REVIVE_DEADLINE_SECS}s for reconciler to re-create ${RD} on ${N2}"
 t_down=$(date +%s)
+revived=0
 revived_at=0
 deadline=$(( t_down + REVIVE_DEADLINE_SECS ))
 while (( $(date +%s) < deadline )); do
     out=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null || true)
     if [[ -n "$out" && "$out" != *"No currently configured DRBD found"* ]]; then
+        revived=1
         revived_at=$(( $(date +%s) - t_down ))
         break
     fi
     sleep 1
 done
 
-if (( revived_at == 0 )); then
+if (( revived == 0 )); then
     echo "FAIL: reconciler did not revive ${RD} on ${N2} within ${REVIVE_DEADLINE_SECS}s"
     echo "      satellite logs (last 50 lines, ${N2}):"
     sat_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
@@ -130,9 +140,13 @@ echo "   kernel resource reappeared after ${revived_at}s"
 
 # Step 5: wait for the two peers to negotiate Connected + UpToDate.
 # The initial bitmap-exchange / adjust handshake is short on an
-# already-synced device — no data movement, just metadata.
+# already-synced device — no data movement, just metadata. Same
+# `connected==0/connected_at` two-variable pattern as Step 4 — see
+# its comment for why a single-int sentinel collides with the
+# legitimate "converged in zero seconds" case.
 echo ">> wait <=${UPTODATE_DEADLINE_SECS}s for ${RD} to reach Connected+UpToDate on both peers"
 deadline=$(( $(date +%s) + UPTODATE_DEADLINE_SECS ))
+connected=0
 connected_at=0
 while (( $(date +%s) < deadline )); do
     n1_conn=$(status_connection_state "$RD" "$N1" "$N2")
@@ -142,13 +156,14 @@ while (( $(date +%s) < deadline )); do
     if [[ ( "$n1_conn" == "Connected" || "$n1_conn" == "Established" ) \
           && ( "$n2_conn" == "Connected" || "$n2_conn" == "Established" ) \
           && "$n1_local_disk" == "UpToDate" && "$n2_local_disk" == "UpToDate" ]]; then
+        connected=1
         connected_at=$(( $(date +%s) - t_down ))
         break
     fi
     sleep 2
 done
 
-if (( connected_at == 0 )); then
+if (( connected == 0 )); then
     echo "FAIL: ${RD} did not reach Connected+UpToDate within ${UPTODATE_DEADLINE_SECS}s"
     echo "      ${N1} view:"; on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/      /' || true
     echo "      ${N2} view:"; on_node "$N2" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/      /' || true
