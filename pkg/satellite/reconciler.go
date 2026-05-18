@@ -23,7 +23,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1702,23 +1701,16 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 // to a single canonical regex anchored on the `(158)` errno + the
 // `Unknown resource` verb drbdadm-9 emits (verified verbatim
 // against `drbdadm adjust` on a slot-less resource).
+//
+// Phase 11.4.b P1: delegates to the package-level numeric exit-code
+// parser (`pkg/drbd.IsErrCode`) so future call sites can switch on
+// stable drbdsetup err numbers instead of duplicating ad-hoc string
+// regexes. Behaviour is preserved — the previous regex anchored on
+// `(158) Unknown resource` and the numeric predicate anchors on the
+// `(158)` errno; existing test fixtures cover both.
 func isUnknownResourceErr(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return drbd158ErrRegex.MatchString(err.Error())
+	return drbd.IsUnknownResourceErr(err)
 }
-
-// drbd158ErrRegex matches drbdadm-9's verbatim 158-error
-// stderr: `Failure: (158) Unknown resource`. The match is
-// case-sensitive and anchored on the parenthesised errno so
-// stray "unknown resource" diagnostics from unrelated callers
-// (drbdsetup detach, LINSTOR not-found, etc.) don't trigger
-// the up-fallback. Compiled once at package init via MustCompile
-// because a misspelled pattern is a build-time bug, not a
-// runtime concern.
-var drbd158ErrRegex = regexp.MustCompile(`\(158\) Unknown resource`)
 
 // seedInitialGi pre-stamps each diskful volume's freshly-created
 // DRBD metadata block with the GI the controller picked from an
