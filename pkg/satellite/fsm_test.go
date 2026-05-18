@@ -262,13 +262,13 @@ func TestNextTransitionSkipDisk(t *testing.T) {
 		}
 		tr := NextTransition(PhaseRunning, obs)
 		if tr == nil {
-			t.Fatalf("NextTransition(Running, SkipDisk=true) = nil, want noop")
+			t.Fatalf("NextTransition(Running, SkipDisk=true) = nil, want adjustSkipDisk")
 		}
 		if tr.To != PhaseSkipDisk {
 			t.Errorf("To = %q, want %q", tr.To, PhaseSkipDisk)
 		}
-		if tr.Action != ActionNoop {
-			t.Errorf("Action = %q, want %q", tr.Action, ActionNoop)
+		if tr.Action != ActionAdjustSkipDisk {
+			t.Errorf("Action = %q, want %q", tr.Action, ActionAdjustSkipDisk)
 		}
 	})
 
@@ -344,12 +344,13 @@ func TestFsmTransitionsHaveKnownActions(t *testing.T) {
 	t.Parallel()
 
 	known := map[string]struct{}{
-		ActionRenderRes:    {},
-		ActionCreateMd:     {},
-		ActionUp:           {},
-		ActionAdjust:       {},
-		ActionDecommission: {},
-		ActionNoop:         {},
+		ActionRenderRes:      {},
+		ActionCreateMd:       {},
+		ActionUp:             {},
+		ActionAdjust:         {},
+		ActionAdjustSkipDisk: {},
+		ActionDecommission:   {},
+		ActionNoop:           {},
 	}
 
 	for i, tr := range fsm {

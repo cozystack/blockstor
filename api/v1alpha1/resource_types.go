@@ -20,6 +20,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ConditionMetadataCreated is a Status Condition stamped by the
+// satellite after `drbdmeta create-md` succeeds on this node. It
+// caches the on-disk metadata state so the reconciler's
+// `firstActivation` predicate and the FSM shadow's
+// `Observation.MetadataExists` can be derived from the apiserver
+// view without round-tripping through the kernel.
+//
+// Authoritative source of truth remains kernel-side `drbdmeta
+// dump-md` (via `Adm.HasMD`) — this Condition is a cache. On
+// satellite startup, every Resource on this node whose Condition
+// is absent but whose kernel probe returns true gets the Condition
+// backfilled, closing the upgrade gap for clusters that pre-date
+// Phase 11.3 Stage 1.
+//
+// Migrates the legacy `<rd>.md-created` file marker
+// (`StateDir/<rd>.md-created`). The marker file is still written
+// for one release as belt-and-braces — both readers consult the
+// Condition first and fall back to the file presence when the
+// Condition is absent.
+const ConditionMetadataCreated = "MetadataCreated"
+
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
 // apply pass. The value is a comma-separated list of int32 volume

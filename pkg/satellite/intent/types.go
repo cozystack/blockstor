@@ -49,6 +49,15 @@ type DesiredResource struct {
 	// the RD has no explicit per-peer paths — the satellite then
 	// falls back to drbd-9's default single-host-pair render.
 	Connections []DesiredConnection
+
+	// MetadataCreated mirrors the `MetadataCreated` Status Condition
+	// on the parent Resource CRD. True means `drbdmeta create-md`
+	// has previously succeeded on this node for this RD; the
+	// satellite reconciler's `firstActivation` predicate flips false
+	// when this is set. Cache of on-disk metadata state — the
+	// authoritative source is the kernel-side `drbdmeta dump-md`
+	// probe (`Adm.HasMD`). Phase 11.3 Stage 1.
+	MetadataCreated bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -151,6 +160,18 @@ func (x *DesiredResource) GetConnections() []DesiredConnection {
 	}
 
 	return x.Connections
+}
+
+// GetMetadataCreated returns whether the parent Resource CRD carries
+// a `MetadataCreated=True` Status Condition — the cache flag the
+// satellite reconciler reads to short-circuit `firstActivation`.
+// Nil-safe.
+func (x *DesiredResource) GetMetadataCreated() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.MetadataCreated
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

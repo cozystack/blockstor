@@ -14,13 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Phase 11.2.b shadow mode: integrate the FSM lookup (defined in
-// fsm.go) into applyDRBD as observability-only. Both the existing
-// implicit-gate logic and the FSM run side by side; the FSM is
-// READ-ONLY and only logs the action it would have chosen. After a
-// few production reconciles we can compare expected-action against
-// the actual code path and confidently flip the switchover
-// (Phase 11.2.c).
+// Phase 11.2.b shadow mode + Phase 11.2.c Stage 1 agreement counter:
+// integrate the FSM lookup (defined in fsm.go) into applyDRBD as
+// observability-only. Both the existing implicit-gate logic and the
+// FSM run side by side; the FSM is READ-ONLY and only logs the action
+// it would have chosen, plus an agree/diverge counter for each call.
+// After a multi-day production soak we can compare expected-action
+// against the OLD applyDRBD path's deterministic action choice and
+// confidently flip the switchover (Phase 11.2.c).
 //
 // Constraints:
 //   - No behaviour change. Observation builders are pure reads
@@ -28,21 +29,147 @@ limitations under the License.
 //   - No retries, no sleeps. A failing probe falls through to a
 //     best-effort Observation and the shadow log notes the partial
 //     reading. The old reconciler logic is unaffected.
-//   - No coupling to the reconciler's branching structure: the
-//     shadow lives in a single observation block at the top of
-//     applyDRBD; everything below it is the unchanged historical
-//     path.
+//   - The agreement counter is cheap: a single expvar.Map.Add call
+//     per reconcile. expvar is concurrent-safe and lock-free for
+//     reads from /debug/vars.
+//   - computeLegacyAction is a pure function — same Observation in,
+//     same legacy-action out. Tests pin this so the counter never
+//     produces spurious "diverge" entries from non-determinism on
+//     the shadow side.
 
 package satellite
 
 import (
 	"context"
+	"expvar"
 	"os"
 	"path/filepath"
 
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// fsmShadowAgreeCount tracks per-reconcile agreement between the FSM-
+// suggested action and the OLD applyDRBD path's deterministic action
+// choice. Keys are `<expectedAction>:<agreement>` where agreement is
+// either "agree" or "diverge". One increment per logFsmShadow call.
+//
+// Exposed automatically under /debug/vars when the binary imports
+// net/http/pprof or net/http's DefaultServeMux is served. The
+// satellite binary currently exposes neither — wire-up for
+// /debug/vars on the c-r manager's metrics endpoint is a Phase
+// 11.2.c Stage 2 follow-up (see commit body). Tests read the map
+// directly via Get / expvar.Map.Do.
+//
+//nolint:gochecknoglobals // expvar maps are conventionally package-level.
+var fsmShadowAgreeCount = expvar.NewMap("blockstor_fsm_shadow")
+
+// recordFsmShadowAgreement bumps the agree/diverge counter for one
+// (expected, legacy) pair. Cheap: a single expvar.Map.Add — no
+// allocations on the hot path other than the key concat (small
+// stack-friendly strings).
+func recordFsmShadowAgreement(expectedAction, legacyAction string) {
+	agreement := "diverge"
+	if expectedAction == legacyAction {
+		agreement = "agree"
+	}
+
+	fsmShadowAgreeCount.Add(expectedAction+":"+agreement, 1)
+}
+
+// computeLegacyAction returns the logical action name the OLD
+// applyDRBD path would dispatch for `obs`. Deterministic: same
+// Observation → same action. Mirrors the gate chain in reconciler.go
+// applyDRBD (L1055-1158) → runApplyDRBDVerb (L1547-1553) →
+// runBringUpOrAdjust (L1578-1594) → runAdjust (L1642-1665).
+//
+// Branches in order:
+//
+//  1. Empty volumes (`len(dr.GetVolumes()) == 0`) → "noop". The
+//     legacy path returns early before any drbdadm verb runs.
+//     Observation alone cannot express "empty volumes" (the FSM
+//     never sees that DR), so this branch lives on Observation's
+//     SpecHasResource=false sentinel for the equivalent shape.
+//     Documented divergence: when SpecHasResource=true but volumes
+//     would be empty, the FSM still suggests renderRes — gate 1 of
+//     the 11.2.c plan, classified as KNOWN.
+//
+//  2. firstActivation && diskless && !diskfulFlip → "adjust"
+//     (skipMetadata, runApplyDRBDVerb→runAdjust); diskless replicas
+//     never run create-md. Reconciler L1146 gate inverts this.
+//
+//  3. firstActivation && !diskless → "createMd" (ensureMetadata
+//     fires before runApplyDRBDVerb). Reconciler L1146-1151.
+//
+//  4. diskfulFlip (Bug 319: kernel diskless, spec diskful, metadata
+//     absent) → "createMd". Reconciler L1134, L1146.
+//
+//  5. !firstActivation && !diskfulFlip → runBringUpOrAdjust:
+//     a. !isLoaded → "up" (Reconciler L1584-1590)
+//     b. isLoaded && skipDisk (prop or kernel-diskless coercion) →
+//     "adjustSkipDisk" (Reconciler L1661-1662)
+//     c. isLoaded && !skipDisk → "adjust" (Reconciler L1663-1665)
+//
+// firstActivation is approximated by `!MetadataExists && !diskless`
+// at this layer: the legacy `.md-created` marker file is the same
+// stat the Observation already does (observeForFsm L83-85). diskful
+// flip is approximated by `KernelLoaded && KernelHasDiskless &&
+// !SpecFlagsHasDiskless`.
+func computeLegacyAction(obs Observation) string {
+	// Gate 1: no resource → no work.
+	if !obs.SpecHasResource {
+		return ActionNoop
+	}
+
+	diskless := obs.SpecFlagsHasDiskless
+
+	// Approximation of `firstActivation := os.IsNotExist(.md-created
+	// marker)`: the marker is absent precisely when MetadataExists is
+	// false. For diskless replicas the legacy path skips the entire
+	// ensureMetadata branch (Reconciler L1146 `!diskless`), so
+	// firstActivation only matters when diskless=false.
+	firstActivation := !obs.MetadataExists && !diskless
+
+	// Diskful-flip recovery (the Bug-319 root-cause path): kernel
+	// loaded + currently diskless + spec flipped to diskful +
+	// metadata absent. Forces create-md re-entry regardless of the
+	// .md-created marker.
+	diskfulFlip := obs.KernelLoaded &&
+		obs.KernelHasDiskless &&
+		!obs.SpecFlagsHasDiskless &&
+		!obs.MetadataExists
+
+	// Gate 3 / 4: create-md fires when (firstActivation || flip) on
+	// a diskful spec.
+	if (firstActivation || diskfulFlip) && !diskless {
+		return ActionCreateMd
+	}
+
+	// Gate 5a: kernel slot absent on a not-first-activation pass →
+	// drbdadm up (Reconciler L1584-1590). Diskless replicas hit this
+	// same gate on cold start (firstActivation=true but the !diskless
+	// gate above skipped create-md, so we fall through here).
+	if !obs.KernelLoaded {
+		return ActionUp
+	}
+
+	// Gate 5b: kernel loaded + skip-disk pin (prop or kernel-diskless
+	// coercion from Bug 280). The legacy path coerces skipDisk=true
+	// whenever the kernel reports a Diskless volume on a loaded slot
+	// (Reconciler L1652-1657) — match that here so the counter
+	// agrees with production behaviour.
+	skipDisk := obs.SkipDiskProp
+	if !skipDisk && obs.KernelHasDiskless && !obs.SpecFlagsHasDiskless {
+		skipDisk = true
+	}
+
+	if skipDisk {
+		return ActionAdjustSkipDisk
+	}
+
+	// Gate 5c: kernel loaded, no skip-disk → plain drbdadm adjust.
+	return ActionAdjust
+}
 
 // observeForFsm builds an Observation snapshot for FSM shadow-mode
 // evaluation. Pure reads only: file stat on the .res / .md-created
@@ -80,9 +207,19 @@ func (r *Reconciler) observeForFsm(ctx context.Context, dr *intent.DesiredResour
 	_, resErr := os.Stat(resPath)
 	obs.ResFileExists = resErr == nil
 
+	// Phase 11.3 Stage 1: derive MetadataExists from the
+	// `MetadataCreated=True` Status Condition on the parent
+	// Resource CRD (carried in via dr.MetadataCreated). The
+	// on-disk `.md-created` marker is the migration-window
+	// fallback: a cluster upgraded from a pre-11.3 build may have
+	// the marker file but no Condition yet, and the FSM should
+	// still see MetadataExists=true so it doesn't suggest
+	// PhaseUnprovisioned → createMd against an already-created
+	// metadata block. Once the satellite's startup backfill
+	// stamps the Condition, the file fallback becomes redundant.
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 	_, mdErr := os.Stat(mdMarkerPath)
-	obs.MetadataExists = mdErr == nil
+	obs.MetadataExists = dr.GetMetadataCreated() || mdErr == nil
 
 	if r.cfg.Adm != nil {
 		loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
@@ -102,7 +239,11 @@ func (r *Reconciler) observeForFsm(ctx context.Context, dr *intent.DesiredResour
 }
 
 // logFsmShadow runs the FSM against the current Observation and
-// emits a single V(1) log line with the expected phase + action.
+// emits a single V(1) log line with the expected phase + action,
+// the legacy action the OLD applyDRBD path would dispatch, and
+// whether the two agree. Increments the fsmShadowAgreeCount expvar
+// counter exactly once per call.
+//
 // Pure observability: no return value, no side effects on the
 // reconciler. Safe to call before, after, or in parallel with the
 // historical apply path.
@@ -117,19 +258,23 @@ func (r *Reconciler) logFsmShadow(ctx context.Context, dr *intent.DesiredResourc
 	phase := ObservePhase(obs)
 	logger := log.FromContext(ctx).WithName("fsm-shadow").V(1)
 
-	if next := NextTransition(phase, obs); next != nil {
-		logger.Info("expected transition",
-			"resource", dr.GetName(),
-			"phase", string(phase),
-			"action", next.Action,
-			"to", string(next.To),
-		)
+	expectedAction := ActionNoop
+	nextPhase := phase
 
-		return
+	if next := NextTransition(phase, obs); next != nil {
+		expectedAction = next.Action
+		nextPhase = next.To
 	}
 
-	logger.Info("terminal phase (no transition)",
+	legacyAction := computeLegacyAction(obs)
+	recordFsmShadowAgreement(expectedAction, legacyAction)
+
+	logger.Info("FSM shadow",
 		"resource", dr.GetName(),
 		"phase", string(phase),
+		"expected", expectedAction,
+		"legacy", legacyAction,
+		"agreement", expectedAction == legacyAction,
+		"to", string(nextPhase),
 	)
 }

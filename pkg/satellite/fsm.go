@@ -70,6 +70,15 @@ const (
 	ActionAdjust       = "adjust"
 	ActionDecommission = "decommission"
 	ActionNoop         = "noop"
+	// ActionAdjustSkipDisk runs `drbdadm adjust --skip-disk` for
+	// operator-pinned resources (DrbdOptions/SkipDisk=True or
+	// satellite-observer SkipDisk-stamp). The pin tells DRBD not to
+	// attach the lower disk on this node, but net/peer config can
+	// still drift and must be re-applied — a literal noop here would
+	// freeze convergence inside the SkipDisk phase. Matches the
+	// legacy `runAdjust` → `AdjustSkipDisk` branch (reconciler.go
+	// L1661-1662).
+	ActionAdjustSkipDisk = "adjustSkipDisk"
 )
 
 // Observation is the union of inputs to FSM trigger evaluation.
@@ -136,8 +145,21 @@ var fsm = []Transition{
 
 	// SkipDisk operator pin overrides Running's adjust. Placed
 	// before the Running→Running adjust row so the pin wins.
-	{From: PhaseRunning, To: PhaseSkipDisk, Trigger: func(obs Observation) bool { return obs.SkipDiskProp }, Action: ActionNoop},
+	//
+	// Action is ActionAdjustSkipDisk, NOT ActionNoop: the pin tells
+	// DRBD not to attach the lower disk on this node, but net/peer
+	// config still has to converge — drbdadm adjust --skip-disk is
+	// the exact verb production runs for SkipDisk-pinned resources.
+	// A literal no-op here would freeze drift convergence inside the
+	// SkipDisk phase, matching the legacy `runAdjust` (reconciler.go
+	// L1642-1665) which always dispatches AdjustSkipDisk under the
+	// pin.
+	{From: PhaseRunning, To: PhaseSkipDisk, Trigger: func(obs Observation) bool { return obs.SkipDiskProp }, Action: ActionAdjustSkipDisk},
 	{From: PhaseSkipDisk, To: PhaseRunning, Trigger: func(obs Observation) bool { return !obs.SkipDiskProp }, Action: ActionAdjust},
+	// SkipDisk self-loop: pin still set, kernel still loaded. Same
+	// `adjust --skip-disk` verb as the entering-edge — keeps net/peer
+	// drift converging while the disk stays detached.
+	{From: PhaseSkipDisk, To: PhaseSkipDisk, Trigger: func(obs Observation) bool { return obs.SkipDiskProp && obs.KernelLoaded }, Action: ActionAdjustSkipDisk},
 
 	// Initial provisioning chain.
 	{From: PhaseUnprovisioned, To: PhaseMetadataPending, Trigger: func(obs Observation) bool { return obs.SpecHasResource && !obs.ResFileExists }, Action: ActionRenderRes},

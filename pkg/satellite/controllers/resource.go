@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -808,7 +809,18 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 		return nil, errors.Wrap(err, "resolve effective props")
 	}
 
-	return dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps), nil
+	desired := dispatcher.BuildDesired(target, peers, nodeList.Items, poolList.Items, rd, effectiveProps)
+
+	// Phase 11.3 Stage 1: carry the `MetadataCreated=True` Status
+	// Condition from the Resource CRD into the apply chain so the
+	// satellite reconciler's `firstActivation` predicate (and the
+	// FSM shadow's Observation.MetadataExists) can derive from the
+	// apiserver view without round-tripping through the kernel
+	// dump-md probe on every reconcile. The on-disk `.md-created`
+	// marker remains as a migration-window fallback.
+	desired.MetadataCreated = meta.IsStatusConditionTrue(target.Status.Conditions, blockstoriov1alpha1.ConditionMetadataCreated)
+
+	return desired, nil
 }
 
 // listPeerResources lists every Resource that belongs to the same

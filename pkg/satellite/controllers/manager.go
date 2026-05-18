@@ -171,6 +171,7 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 	}
 
 	wireCrossNodeFetcher(mgr, cfg)
+	wireMetadataCreatedStamper(mgr, cfg)
 
 	return mgr, nil
 }
@@ -274,5 +275,17 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+	})
+}
+
+// wireMetadataCreatedStamper injects the MetadataCreatedStamper into
+// the Apply chain so `ensureMetadata` can SSA-patch the
+// `MetadataCreated=True` Status Condition after `drbdmeta create-md`
+// succeeds. Mirrors `wireCrossNodeFetcher` — the stamper needs the
+// manager's cached client, which is why it lands here rather than at
+// NewReconciler time. Phase 11.3 Stage 1.
+func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetMetadataCreatedStamper(&MetadataCreatedStamper{
+		Client: mgr.GetClient(),
 	})
 }

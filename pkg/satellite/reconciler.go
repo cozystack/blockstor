@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
@@ -87,6 +88,17 @@ type ReconcilerConfig struct {
 	// needs the controller-runtime client only the manager owns.
 	CrossNodeFetcher CrossNodeFetcher
 
+	// MetadataCreatedStamper writes the `MetadataCreated=True`
+	// Status Condition onto the parent Resource CRD after
+	// `drbdmeta create-md` succeeds. nil → the satellite falls
+	// back to the legacy on-disk `<rd>.md-created` marker for
+	// firstActivation derivation (compatible with unit tests that
+	// don't wire an apiserver). The agent injects this
+	// post-manager construction via SetMetadataCreatedStamper —
+	// the implementation needs the controller-runtime client only
+	// the manager owns. Phase 11.3 Stage 1.
+	MetadataCreatedStamper MetadataCreatedStamper
+
 	// Exec runs auxiliary shell-outs the reconciler owns directly
 	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
 	// scenario 9.W14). Production wires `storage.RealExec`; tests
@@ -110,6 +122,21 @@ type CrossNodeFetcher interface {
 	// snapshot locally — the caller must decide whether to fall
 	// through to a blank create or surface the error.
 	Fetch(ctx context.Context, srcRD, snap string, vol int32) (io.ReadCloser, string, error)
+}
+
+// MetadataCreatedStamper abstracts the "stamp the
+// `MetadataCreated=True` Status Condition on a Resource CRD" verb.
+// Mirrors `CrossNodeFetcher`: the K8s SSA call lives in
+// pkg/satellite/controllers (where the cached client owns the
+// apiserver wire) while the satellite's apply chain stays free of
+// a controller-runtime client dependency. Phase 11.3 Stage 1.
+type MetadataCreatedStamper interface {
+	// StampMetadataCreated SSA-patches a `MetadataCreated=True`
+	// Condition onto Resource <resourceName>.Status.Conditions.
+	// Idempotent — repeat calls converge on the same Condition
+	// shape (LastTransitionTime moves forward on apiserver-side
+	// transition only, not on every patch).
+	StampMetadataCreated(ctx context.Context, resourceName string) error
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -197,6 +224,15 @@ func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
 // "set once, then read many" semantics.
 func (r *Reconciler) SetCrossNodeFetcher(f CrossNodeFetcher) {
 	r.cfg.CrossNodeFetcher = f
+}
+
+// SetMetadataCreatedStamper injects the MetadataCreated stamper
+// post-construction. Mirrors `SetCrossNodeFetcher`: the stamper
+// needs the controller-runtime manager's cached client which doesn't
+// exist at NewReconciler time. Safe to call before the first Apply.
+// Phase 11.3 Stage 1.
+func (r *Reconciler) SetMetadataCreatedStamper(s MetadataCreatedStamper) {
+	r.cfg.MetadataCreatedStamper = s
 }
 
 // StateDir returns the on-disk directory the reconciler uses for
@@ -1080,16 +1116,25 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
-	// firstActivation is "did create-md succeed previously?" — keyed
-	// off a separate marker file written AFTER create-md returns
-	// success. We can't gate on the .res-file existence: a previous
+	// firstActivation is "did create-md succeed previously?" —
+	// Phase 11.3 Stage 1 derives this from the
+	// `MetadataCreated=True` Status Condition on the parent
+	// Resource CRD (carried into the apply chain via
+	// dr.MetadataCreated). The on-disk `.md-created` marker is a
+	// belt-and-braces fallback for the migration window: if the
+	// Condition is absent but the marker file is present (cluster
+	// upgraded from a pre-11.3 build, Condition not yet
+	// backfilled), firstActivation still flips false so we don't
+	// re-run create-md on a metadata block that already exists.
+	//
+	// We can't gate on the .res-file existence alone: a previous
 	// reconcile that wrote the .res but failed `drbdadm create-md`
 	// (e.g. .res had a stale conflicting node-id from a race that
 	// later got fixed) would otherwise report firstActivation=false
 	// on every subsequent attempt → create-md is skipped → adjust
 	// reports "No valid meta data found" forever.
 	_, statErr := os.Stat(mdMarkerPath)
-	firstActivation := os.IsNotExist(statErr)
+	firstActivation := !dr.GetMetadataCreated() && os.IsNotExist(statErr)
 
 	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
 	if err != nil {
@@ -1353,6 +1398,24 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
 	if err != nil {
 		return errors.Wrapf(err, "write %s", mdMarkerPath)
+	}
+
+	// Phase 11.3 Stage 1: stamp the `MetadataCreated=True` Status
+	// Condition on the parent Resource CRD. Belt-and-braces with
+	// the file marker write above: future reconciles read the
+	// Condition first to derive `firstActivation`, falling back to
+	// the file presence only when the Condition is absent (cluster
+	// upgrade window before the satellite's startup backfill
+	// pass). The stamp failure does NOT fail the apply — the file
+	// marker is the transitional source of truth, so a transient
+	// apiserver hiccup here just defers Condition stamping to the
+	// next reconcile.
+	if r.cfg.MetadataCreatedStamper != nil {
+		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, dr.GetName())
+		if stampErr != nil {
+			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
+				"resource", dr.GetName())
+		}
 	}
 
 	// GI-seed is fresh-replica-only: it pre-stamps the per-peer
