@@ -96,8 +96,20 @@ spec:
             nodeSelectorTerms:
               - matchExpressions:
                   - {key: node-role.kubernetes.io/control-plane, operator: DoesNotExist}
-      # Allow the preStop hook below ~25s to drain DRBD before SIGTERM.
-      terminationGracePeriodSeconds: 30
+      # Bug 301: short grace period — no preStop drain. Earlier shapes
+      # tried `drbdadm down` / `drbdsetup down` to release DRBD-9
+      # connections before SIGTERM, but a peer wedged in `Connecting`
+      # leaves the kernel thread in uninterruptible-wait. Even
+      # `drbdsetup down --force` blocks on a netlink ack from that
+      # thread, so the container went D-state and the pod hung
+      # `Terminating` for 11+ minutes — long enough to break
+      # rolling-upgrade and any downstream tests that wait for DS
+      # rollout. DRBD kernel state is host-scoped (Talos extension), so
+      # it survives the pod regardless; the next satellite's
+      # cleanKernelState (Bug 285) sweeps it on startup. Letting SIGTERM
+      # / SIGKILL reap the pod within 10 s keeps the DS rollout
+      # unblocked, which matters more than a clean disconnect.
+      terminationGracePeriodSeconds: 10
       containers:
         - name: satellite
           image: __REGISTRY__/blockstor-satellite:dev
@@ -163,73 +175,21 @@ spec:
             failureThreshold: 3
           securityContext:
             privileged: true
-          # PreStop hook: gracefully release DRBD-9 connections
-          # before SIGTERM. Without this, `kubectl delete pod`
-          # (no --force) leaves drbd kernel state with stuck
-          # `Connecting` peers, and the kernel module is
-          # host-level on the Talos node so it persists across
-          # pod restarts.
-          #
-          # Bug 298: `drbdadm down <r>` runs the drbd-utils userspace
-          # wrapper which issues a graceful disconnect handshake per
-          # peer. If a peer is in `Connecting` state forever (peer
-          # satellite already gone, kernel waiting for an ACK that
-          # will never arrive), the handshake hangs in a kernel
-          # uninterruptible-wait — the `timeout 5` kills the wrapper
-          # process but the kernel thread keeps the slot. On the next
-          # iteration `drbdsetup status` may itself block reading
-          # /proc/drbd → the loop iterates zero times, container goes
-          # D-state, SIGTERM/SIGKILL can't reap it → pod stuck
-          # `Terminating` for 12+ minutes (Run 10 cascade: e2e3-worker-2
-          # stuck Terminating during rolling-upgrade, breaking
-          # state-offline-unknown and lifecycle-toggle-migrate
-          # downstream).
-          #
-          # Fix shape: kernel-direct `drbdsetup`. First force-disconnect
-          # each peer (range 0..7 covers the typical worker fan-out;
-          # invalid peer-ids return EINVAL silently). Force-disconnect
-          # discards pending I/O and tears the connection thread
-          # immediately — no handshake. Then `drbdsetup down <r>`
-          # (kernel-direct teardown of all minors for that resource;
-          # no .res-file dependency, no drbd-utils-wrapped graceful
-          # path). Each call bounded by a tight `timeout` so a single
-          # wedged slot can't burn the whole hook.
-          # Wrapped in `timeout 25` so the overall hook stays
-          # under terminationGracePeriodSeconds (30).
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/sh
-                  - -c
-                  # Bug 241: the previous shape piped `drbdsetup status
-                  # --json` through `python3`, which is not in the
-                  # satellite image (Bug 240's Debian-slim base ships
-                  # only drbd-utils/lvm2/zfs/cryptsetup userspace +
-                  # iptables). `2>/dev/null` swallowed the missing
-                  # interpreter so the for-loop iterated zero times.
-                  # Switch to pure POSIX: `drbdsetup status` without
-                  # --json prints resource names as the first token of
-                  # each unindented line; awk extracts them without
-                  # any interpreter dependency.
-                  - |
-                    set +e
-                    timeout 25 sh -c '
-                      for r in $(drbdsetup status 2>/dev/null \
-                          | awk "/^[^[:space:]]/ {print \$1; next}"); do
-                        # Bug 298: force-disconnect every plausible
-                        # peer-id first so a stuck Connecting thread
-                        # cannot block the down call. EINVAL on unused
-                        # peer-ids is normal and swallowed.
-                        for p in 0 1 2 3 4 5 6 7; do
-                          timeout 2 drbdsetup disconnect "$r" "$p" --force=yes 2>/dev/null || true
-                        done
-                        # Bug 298: kernel-direct down. Skips the
-                        # drbdadm graceful-disconnect handshake that
-                        # hangs on a stale peer.
-                        timeout 5 drbdsetup down "$r" 2>/dev/null || true
-                      done
-                    '
+          # Bug 301: no lifecycle.preStop. Earlier shapes (Bug 241 / Bug
+          # 298) tried `drbdsetup disconnect --force=yes` + `drbdsetup
+          # down` to drain DRBD before SIGTERM, but a peer wedged in
+          # `Connecting` parks the kernel thread in uninterruptible-wait
+          # and even `drbdsetup down --force` blocks on a netlink ack
+          # from that thread. The hook then wedged inside the container,
+          # SIGTERM/SIGKILL couldn't reap the D-state process, and the
+          # pod hung `Terminating` for 11+ minutes — long enough to
+          # break the DS rolling-update path of tests/e2e/rolling-
+          # upgrade.sh. DRBD kernel state is host-scoped (Talos
+          # extension) and survives the pod regardless, so skipping the
+          # in-pod drain costs nothing the host doesn't already own; the
+          # next satellite's cleanKernelState (Bug 285, commit
+          # a563b1f43) sweeps it on startup. SIGTERM → 10 s → SIGKILL
+          # now reliably tears the pod down inside the rollout budget.
           volumeMounts:
             - {name: dev, mountPath: /dev}
             - {name: modules, mountPath: /lib/modules, readOnly: true}
