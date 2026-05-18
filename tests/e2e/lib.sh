@@ -134,16 +134,18 @@ wait_role() {
 
 # wait_uptodate POD waits up to 180s for both replicas of $RD to reach
 # disk:UpToDate. Caller defines $RD and the two node names $PRIMARY,
-# $PEER before calling. Exits non-zero on timeout. Initial sync on a
-# fresh DRBD resource on a busy QEMU stand can take 60-120s; 180s is
-# the safety margin.
+# $PEER before calling. Optional 4th arg picks a non-default volume
+# number (defaults to 0 for back-compat with single-volume RDs). Exits
+# non-zero on timeout. Initial sync on a fresh DRBD resource on a busy
+# QEMU stand can take 60-120s; 180s is the safety margin.
 wait_uptodate() {
-    local rd=$1 primary=$2 peer=$3 deadline=$(( $(date +%s) + 180 ))
+    local rd=$1 primary=$2 peer=$3 vol=${4:-0}
+    local deadline=$(( $(date +%s) + 180 ))
 
     while (( $(date +%s) < deadline )); do
         local p1 p2
-        p1=$(status_disk_state "$rd" "$primary")
-        p2=$(status_disk_state "$rd" "$peer")
+        p1=$(status_disk_state "$rd" "$primary" "$vol")
+        p2=$(status_disk_state "$rd" "$peer" "$vol")
 
         if [[ "$p1" == "UpToDate" && "$p2" == "UpToDate" ]]; then
             return 0
@@ -152,7 +154,7 @@ wait_uptodate() {
         sleep 2
     done
 
-    echo "FAIL: $rd never reached UpToDate on both peers" >&2
+    echo "FAIL: $rd vol $vol never reached UpToDate on both peers" >&2
     return 1
 }
 

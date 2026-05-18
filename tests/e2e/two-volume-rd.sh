@@ -51,7 +51,17 @@ spec:
 EOF
 done
 
-wait_uptodate "$RD" "$N1" "$N2"
+# Multi-volume RD: wait_uptodate only inspects volumeNumber 0 by
+# default — without the per-volume check below, the test could race
+# ahead while vol-1 was still SyncTarget on N2, and the dd-write on
+# N1 vol-0 would land before N2 finished even attaching vol-1. Wait
+# explicitly for BOTH volumes on BOTH peers, then for the connection
+# itself to be Connected/Established so the network plumbing is also
+# settled before we exercise replication semantics.
+wait_uptodate "$RD" "$N1" "$N2" 0
+wait_uptodate "$RD" "$N1" "$N2" 1
+wait_connection_state "$RD" "$N1" "$N2" "Connected|Established"
+wait_connection_state "$RD" "$N2" "$N1" "Connected|Established"
 
 # Both volumes must show up in the rendered .res file and as distinct
 # DRBD devices on the satellite.
@@ -77,6 +87,17 @@ md5_v1=$(on_node "$N1" bash -c "
     dd if=/dev/urandom of=${DEV1} bs=4096 count=1 status=none oflag=direct
     dd if=${DEV1} bs=4096 count=1 status=none iflag=direct | md5sum | awk '{print \$1}'
 ")
+
+# Drain pending replication BEFORE demoting N1 — `drbdsetup
+# wait-sync-resource` blocks until OutOfSyncKib==0 across every
+# volume of the RD. Without this barrier the secondary→primary flip
+# below races the in-flight resync packets and N2 reads zeros for
+# whichever volume hadn't yet caught up. The bare `|| true` keeps
+# the test forgiving if the kernel returns non-zero on an already-
+# in-sync resource (different DRBD-9 builds disagree on the exit
+# code for "nothing to wait for").
+on_node "$N1" timeout 60 drbdsetup wait-sync-resource "$RD" || true
+
 on_node "$N1" drbdadm secondary "$RD" || true
 
 if [[ "$md5_v0" == "$md5_v1" ]]; then

@@ -233,8 +233,11 @@ fi
 
 # Sanity guard: $N2 must remain UpToDate throughout. If the detach
 # somehow flapped $N2 we'd misdiagnose post-recipe failures.
+# Empty Status (transient observer SSA gap during the drbdadm-detach
+# events2 storm) is not a regression signal — only a non-empty value
+# other than UpToDate counts. Mirrors recovery-bitmap-drop.sh:285-289.
 n2_disk=$(status_disk_state "$RD" "$N2")
-if [[ "$n2_disk" != "UpToDate" ]]; then
+if [[ -n "$n2_disk" && "$n2_disk" != "UpToDate" ]]; then
     echo "FAIL: $N2 unexpected disk-state after $N1 detach: $n2_disk"
     exit 1
 fi
