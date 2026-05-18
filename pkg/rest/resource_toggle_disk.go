@@ -387,11 +387,31 @@ func (s *Server) promoteMigrateDst(w http.ResponseWriter, r *http.Request, rdNam
 		return false
 	}
 
-	stampStoragePool(&dstRes, pool)
-	stampMigratingFrom(&dstRes, src)
-	dstRes.Flags = applyFlagMutation(dstRes.Flags, apiv1.ResourceFlagDiskless, false)
+	// Bug 298: route through PatchResourceSpec so a concurrent reconciler
+	// write (allocator stamping DRBDPort/NodeID, observer touching Status)
+	// can't 409 the migrate flip silently — without this the test's
+	// 300s `wait for UpToDate` ticks down because the DISKLESS flag was
+	// only cleared on the loser's wire-snapshot, never persisted.
+	// Idempotent re-validation of the DISKLESS precondition inside the
+	// retry closure: if the closure re-runs against a fresh snapshot
+	// where some other actor cleared DISKLESS between the outer Get and
+	// the inner mutate, we still want the migrate semantics to apply
+	// (stamp pool + migrating-from prop). Refuse only on a stale-state
+	// race where the resource has been hard-promoted to diskful + the
+	// migrating-from prop is absent.
+	err = s.Store.Resources().PatchResourceSpec(r.Context(), rdName, dst,
+		func(res *apiv1.Resource) error {
+			if !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) &&
+				(res.Props == nil || res.Props[MigratingFromProp] == "") {
+				return errors.New("destination became diskful mid-flight")
+			}
 
-	err = s.Store.Resources().Update(r.Context(), &dstRes)
+			stampStoragePool(res, pool)
+			stampMigratingFrom(res, src)
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, false)
+
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 

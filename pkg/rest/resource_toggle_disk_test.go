@@ -485,6 +485,73 @@ func TestMigrateDiskWithExistingDiskless(t *testing.T) {
 	}
 }
 
+// TestMigrateDiskBug298ExistingDisklessClearsFlag pins Bug 298:
+// when dst already exists with DISKLESS, the migrate handler MUST
+// persist the flag-clear through PatchResourceSpec (with retry on
+// 409) rather than a one-shot Update that loses to a concurrent
+// allocator write. The stored Resource on dst MUST end up with no
+// DISKLESS flag — that's the trigger for the satellite reconciler
+// to attach storage and start syncing. The Run-10 cascade surfaced
+// as "destination never reached UpToDate (got: disk:Diskless
+// client:yes)" precisely because the flag persisted past the REST
+// call.
+func TestMigrateDiskBug298ExistingDisklessClearsFlag(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-298"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name: "pvc-298", NodeName: "src-node",
+	}); err != nil {
+		t.Fatalf("seed src: %v", err)
+	}
+
+	// dst seeded DISKLESS — mirrors the two-step CLI flow:
+	//   linstor r c <dst> <rd> --drbd-diskless
+	//   linstor r td --migrate-from <src> -s <pool>
+	// The intent CRD lands first; the migrate REST call follows.
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name: "pvc-298", NodeName: "dst-node",
+		Flags: []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed dst: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-298/resources/dst-node/migrate-disk/src-node/zfs-thin",
+		nil)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	// The load-bearing assertion: DISKLESS gone, pool stamped,
+	// migrating-from prop set, all three persisted atomically.
+	got, err := st.Resources().Get(t.Context(), "pvc-298", "dst-node")
+	if err != nil {
+		t.Fatalf("Get dst: %v", err)
+	}
+
+	if slices.Contains(got.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("Bug 298 regression: DISKLESS flag still set after migrate-disk: %v",
+			got.Flags)
+	}
+
+	if got.Props["StorPoolName"] != "zfs-thin" {
+		t.Errorf("StorPoolName: got %q, want zfs-thin", got.Props["StorPoolName"])
+	}
+
+	if got.Props[MigratingFromProp] != "src-node" {
+		t.Errorf("MigratingFrom: got %q, want src-node",
+			got.Props[MigratingFromProp])
+	}
+}
+
 // TestMigrateDiskRefusesPrimaryInUse: an active Primary replica
 // can't be migrated implicitly — UG9 requires the operator to
 // demote the consumer first. 409 Conflict per writeError.
