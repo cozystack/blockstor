@@ -20,7 +20,9 @@ import (
 	"context"
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1551,4 +1553,375 @@ func countCommand(cmds []string, line string) int {
 	}
 
 	return n
+}
+
+// TestObserverReconnectsOnStandAlone (Bug 312, P0-2) pins the
+// closed-loop StandAlone recovery: when handleObservation sees a
+// `connection:StandAlone` frame from events2 it MUST shell out to
+// `drbdadm disconnect <rsc>:<peer>` and `drbdadm connect
+// <rsc>:<peer>` to drive a fresh handshake. The DRBD kernel cannot
+// self-recover from StandAlone — only an explicit reconnect verb
+// brings the peer back, and the observer is the only satellite-side
+// component reading per-peer connection state.
+func TestObserverReconnectsOnStandAlone(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-sa.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-sa",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+	adm := drbd.NewAdm(fx)
+
+	// events2 frame: peer n2 transitions to connection:StandAlone.
+	ev := &observation{
+		ResourceName: "pvc-sa",
+		Connections: []connectionObservation{
+			{PeerNodeName: "n2", Connected: false, Message: "StandAlone"},
+		},
+	}
+
+	o.handleObservation(context.Background(), adm, ev)
+
+	wantDisconnect := "drbdadm disconnect pvc-sa:n2"
+	wantConnect := "drbdadm connect pvc-sa:n2"
+
+	cmds := fx.CommandLines()
+	sawDisconnect := false
+	sawConnect := false
+
+	for _, line := range cmds {
+		if line == wantDisconnect {
+			sawDisconnect = true
+		}
+
+		if line == wantConnect {
+			sawConnect = true
+		}
+	}
+
+	if !sawDisconnect {
+		t.Errorf("expected %q in commands; got %v", wantDisconnect, cmds)
+	}
+
+	if !sawConnect {
+		t.Errorf("expected %q in commands; got %v", wantConnect, cmds)
+	}
+}
+
+// TestObserverRespectsReconnectCooldown (Bug 312, P0-2) pins the
+// cooldown gate: a second StandAlone frame for the same (resource,
+// peer) within reconnectCooldownInterval MUST NOT re-issue the
+// disconnect/connect pair. drbd-9's reconnect storms emit dozens of
+// connection-state frames per second; without this gate the
+// observer would shell out on every frame and starve the kernel
+// out of the recovery window.
+func TestObserverRespectsReconnectCooldown(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-cd.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-cd",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	// Frozen clock so cooldown is deterministic.
+	frozen := time.Now()
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+		Now:      func() time.Time { return frozen },
+	}
+	adm := drbd.NewAdm(fx)
+
+	mkFrame := func() *observation {
+		return &observation{
+			ResourceName: "pvc-cd",
+			Connections: []connectionObservation{
+				{PeerNodeName: "n2", Message: "StandAlone"},
+			},
+		}
+	}
+
+	// First frame triggers reconnect.
+	o.handleObservation(context.Background(), adm, mkFrame())
+
+	firstConnect := countCommand(fx.CommandLines(), "drbdadm connect pvc-cd:n2")
+	if firstConnect != 1 {
+		t.Fatalf("first frame: drbdadm connect count = %d, want 1", firstConnect)
+	}
+
+	// Second frame within cooldown MUST NOT trigger another reconnect.
+	o.handleObservation(context.Background(), adm, mkFrame())
+
+	secondConnect := countCommand(fx.CommandLines(), "drbdadm connect pvc-cd:n2")
+	if secondConnect != 1 {
+		t.Errorf("second frame within cooldown: drbdadm connect count = %d, want 1 (cooldown breached)",
+			secondConnect)
+	}
+
+	// Advance the clock past the cooldown; the next frame MUST
+	// re-fire — the cooldown is a passive check, not a permanent
+	// suppression.
+	o.Now = func() time.Time { return frozen.Add(reconnectCooldownInterval + time.Second) }
+	o.handleObservation(context.Background(), adm, mkFrame())
+
+	thirdConnect := countCommand(fx.CommandLines(), "drbdadm connect pvc-cd:n2")
+	if thirdConnect != 2 {
+		t.Errorf("third frame after cooldown expired: drbdadm connect count = %d, want 2",
+			thirdConnect)
+	}
+}
+
+// TestObserverSkipsReconnectWhenSkipDisk (Bug 312, P0-2) pins the
+// SkipDisk gate: when the operator (or the observer's own auto-
+// detach path) has stamped `DrbdOptions/SkipDisk=True` on the
+// Resource's Spec.Props, a StandAlone connection MUST NOT trigger
+// the closed-loop reconnect. SkipDisk is the operator's intent
+// signal — they're mid-runbook on this replica (failed lower disk,
+// manual discard-my-data flow, etc.) and any kernel-state-changing
+// verb the observer issues would race them.
+func TestObserverSkipsReconnectWhenSkipDisk(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-sd.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-sd",
+			NodeName:               "n1",
+			Props: map[string]string{
+				skipDiskPropKey: skipDiskPropValue,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+	adm := drbd.NewAdm(fx)
+
+	ev := &observation{
+		ResourceName: "pvc-sd",
+		Connections: []connectionObservation{
+			{PeerNodeName: "n2", Message: "StandAlone"},
+		},
+	}
+
+	o.handleObservation(context.Background(), adm, ev)
+
+	// Neither disconnect nor connect must fire.
+	for _, line := range fx.CommandLines() {
+		if line == "drbdadm disconnect pvc-sd:n2" || line == "drbdadm connect pvc-sd:n2" {
+			t.Errorf("SkipDisk-gated StandAlone triggered reconnect verb: %s (all cmds=%v)",
+				line, fx.CommandLines())
+		}
+	}
+}
+
+// TestObserverRecoversStuckSyncTarget (Bug 312, P0-3) pins the
+// stuck-SyncTarget watchdog: when a peer is in
+// `replication:SyncTarget` with a non-zero out-of-sync byte counter
+// that hasn't decreased within syncStallThreshold, the periodic
+// resyncOnce tick MUST shell out the disconnect/connect cycle. DRBD
+// 9 can silently wedge on a broken pipe under SyncTarget — bytes
+// stop flowing but the connection-state stays nominally up; only an
+// explicit reconnect drives the kernel's resync state machine
+// forward.
+func TestObserverRecoversStuckSyncTarget(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-stuck.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-stuck",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	frozen := time.Now()
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+		Now:      func() time.Time { return frozen },
+	}
+	adm := drbd.NewAdm(fx)
+
+	// Seed the caches as if a peer-device frame had landed with
+	// replication:SyncTarget + out-of-sync:524288. The first frame
+	// stamps lastProgressAt = frozen.
+	first := &observation{
+		ResourceName: "pvc-stuck",
+		Connections: []connectionObservation{
+			{PeerNodeName: "n2", ReplicationState: "SyncTarget"},
+		},
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, OutOfSyncKib: 524288, HasSync: true},
+		},
+	}
+
+	o.handleObservation(context.Background(), adm, first)
+
+	// Advance the clock past the stall threshold WITHOUT any
+	// out-of-sync decrease. The watchdog should now treat this
+	// peer as wedged.
+	o.Now = func() time.Time { return frozen.Add(syncStallThreshold + time.Second) }
+
+	o.resyncOnce(context.Background(), adm, logr.Discard())
+
+	wantConnect := "drbdadm connect pvc-stuck:n2"
+	if !cmdSeen(fx.CommandLines(), wantConnect) {
+		t.Errorf("expected %q after stall window; got %v", wantConnect, fx.CommandLines())
+	}
+
+	wantDisconnect := "drbdadm disconnect pvc-stuck:n2"
+	if !cmdSeen(fx.CommandLines(), wantDisconnect) {
+		t.Errorf("expected %q after stall window; got %v", wantDisconnect, fx.CommandLines())
+	}
+}
+
+// TestObserverDoesNotRecoverProgressingSyncTarget (Bug 312, P0-3)
+// is the negative control for the stuck-SyncTarget watchdog: when
+// the out-of-sync byte counter strictly DECREASES across frames,
+// the kernel's resync is making forward progress and the watchdog
+// MUST NOT fire. A false-positive here would tear down a healthy
+// resync mid-flight and force the kernel back into bitmap-replay
+// from the connect, which can re-inflate out-of-sync (Bug 8's
+// failure mode).
+func TestObserverDoesNotRecoverProgressingSyncTarget(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-prog.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-prog",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	frozen := time.Now()
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+		Now:      func() time.Time { return frozen },
+	}
+	adm := drbd.NewAdm(fx)
+
+	// First frame: SyncTarget with 524288 KiB out-of-sync.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-prog",
+		Connections: []connectionObservation{
+			{PeerNodeName: "n2", ReplicationState: "SyncTarget"},
+		},
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, OutOfSyncKib: 524288, HasSync: true},
+		},
+	})
+
+	// Advance the clock partway through the stall window and emit
+	// a second frame with a STRICTLY SMALLER out-of-sync — the
+	// kernel is shipping bytes, lastProgressAt resets.
+	o.Now = func() time.Time { return frozen.Add(syncStallThreshold / 2) }
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-prog",
+		Connections: []connectionObservation{
+			{PeerNodeName: "n2", ReplicationState: "SyncTarget"},
+		},
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, OutOfSyncKib: 262144, HasSync: true},
+		},
+	})
+
+	// Advance the clock past where the FIRST observation would have
+	// stalled — but the second frame reset progress, so the
+	// effective stall window hasn't elapsed yet from the kernel's
+	// last decrement.
+	o.Now = func() time.Time { return frozen.Add(syncStallThreshold + time.Second) }
+
+	o.resyncOnce(context.Background(), adm, logr.Discard())
+
+	// No reconnect must have fired — out-of-sync was decreasing.
+	for _, line := range fx.CommandLines() {
+		if line == "drbdadm connect pvc-prog:n2" || line == "drbdadm disconnect pvc-prog:n2" {
+			t.Errorf("progressing SyncTarget triggered reconnect: %s (cmds=%v)",
+				line, fx.CommandLines())
+		}
+	}
+}
+
+// cmdSeen is a small helper to check membership in the FakeExec
+// command transcript. Kept simple — slices.Contains works but the
+// helper reads cleaner in the assertion sites.
+func cmdSeen(cmds []string, want string) bool {
+	for _, line := range cmds {
+		if line == want {
+			return true
+		}
+	}
+
+	return false
 }
