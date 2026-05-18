@@ -177,6 +177,7 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		Client:   mgr.GetClient(),
 		Adm:      drbd.NewAdm(cfg.Exec),
 		NodeName: cfg.NodeName,
+		StateDir: cfg.Apply.StateDir(),
 	}).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register OrphanSweeperRunnable")

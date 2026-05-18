@@ -199,6 +199,28 @@ func (r *Reconciler) SetCrossNodeFetcher(f CrossNodeFetcher) {
 	r.cfg.CrossNodeFetcher = f
 }
 
+// StateDir returns the on-disk directory the reconciler uses for
+// per-resource `.res` files and state markers. The OrphanSweeperRunnable
+// consults it (Bug 299) to distinguish kernel-resident DRBD slots
+// blockstor itself provisioned (`<StateDir>/<rsc>.res` present —
+// `handleDelete` removes it only after a clean tear-down) from foreign
+// slots written by a co-resident DRBD manager (e.g. an upstream
+// piraeus / linstor-satellite running side-by-side on the same node).
+// Without this distinction the sweeper used to issue `drbdsetup down`
+// on every kernel slot that lacked a matching blockstor Resource CRD,
+// which on a piraeus-coexistence stand reliably tore down LINSTOR's
+// own resources between create and first-attach and surfaced as
+// "Failed to adjust DRBD resource …" / "Cannot resize volume, because
+// we have a non-UpToDate DRBD device" upstream.
+//
+// Empty string means "StateDir-based filtering disabled" — the sweeper
+// then sweeps purely on CRD presence, the legacy behaviour. Tests use
+// the empty default to keep assertions simple; production always
+// passes the real on-disk path from cmd/satellite.
+func (r *Reconciler) StateDir() string {
+	return r.cfg.StateDir
+}
+
 // Apply walks res and brings local storage in line with each item.
 // Each input gets a ResourceApplyResult — partial success is the norm
 // (one missing pool shouldn't sink the rest of a batch).

@@ -18,6 +18,8 @@ package controllers
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -160,6 +162,25 @@ type OrphanSweeperRunnable struct {
 	Client   client.Client
 	Adm      *drbd.Adm
 	NodeName string
+
+	// StateDir is the on-disk directory the satellite reconciler
+	// writes per-resource `.res` files into. The sweeper uses it
+	// to distinguish kernel-resident DRBD slots blockstor itself
+	// provisioned (`<StateDir>/<rsc>.res` present — handleDelete
+	// removes the file only after a clean tear-down) from foreign
+	// slots written by a co-resident DRBD manager (Bug 299:
+	// upstream piraeus / linstor-satellite running side-by-side on
+	// the same node). A kernel slot without a corresponding `.res`
+	// in StateDir is treated as foreign and never torn down, even
+	// when no blockstor Resource CRD names it.
+	//
+	// Empty string disables the filter — the sweeper then falls
+	// back to pure CRD-based classification, the pre-Bug-299
+	// behaviour. Production always passes the real on-disk path
+	// from the reconciler's StateDir(); tests typically leave it
+	// empty to keep fixtures simple (foreign-resource coexistence
+	// is exercised by TestSweeperLeavesForeignKernelSlotsAlone).
+	StateDir string
 
 	// Period overrides SweeperPeriod (test-only — production uses
 	// the default constant). A zero Period falls back to
@@ -347,12 +368,27 @@ const (
 )
 
 // classifyOrphan decides what to do with one kernel resource: keep
-// (matching local Resource CRD), defer (no CRD but the RD was
-// touched inside the grace window), or tear it down. Pulled out of
-// sweepOnce to bring the orchestration function back under the
-// gocyclo budget after the Bug 291 grace-window addition.
-func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration) (sweepDecision, time.Duration) {
+// (matching local Resource CRD, or — Bug 299 — a foreign kernel slot
+// blockstor never provisioned), defer (no CRD but the RD was touched
+// inside the grace window), or tear it down. Pulled out of sweepOnce
+// to bring the orchestration function back under the gocyclo budget
+// after the Bug 291 grace-window addition.
+//
+// Bug 299: stateDir is the path the satellite reconciler renders
+// `.res` files into. When non-empty, a kernel slot whose
+// `<stateDir>/<rsc>.res` file is missing is treated as foreign
+// (sweepKeep): blockstor never wrote the file, so the slot belongs
+// to a co-resident DRBD manager (upstream piraeus / linstor-satellite
+// on a coexistence stand) and tearing it down would race that
+// manager's own reconciler. Empty stateDir disables the filter —
+// callers that don't plumb StateDir (the legacy unit-test fixture)
+// keep the pre-fix CRD-only behaviour.
+func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]time.Time, now time.Time, grace time.Duration, stateDir string) (sweepDecision, time.Duration) {
 	if _, ok := owned[rsc]; ok {
+		return sweepKeep, 0
+	}
+
+	if stateDir != "" && !blockstorOwnsResFile(stateDir, rsc) {
 		return sweepKeep, 0
 	}
 
@@ -371,6 +407,34 @@ func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]tim
 	}
 
 	return sweepTearDown, age
+}
+
+// blockstorOwnsResFile reports whether `<stateDir>/<rsc>.res` exists
+// on disk. The reconciler writes this file when it first activates a
+// resource (Reconciler.applyDRBD → os.WriteFile) and removes it as
+// part of handleDelete's cleanup chain. Its presence is therefore a
+// reliable proxy for "this satellite owns this kernel slot": a
+// foreign DRBD manager (upstream piraeus / linstor-satellite) lives
+// under its own state directory (e.g. `/var/lib/linstor.d/`) and
+// would never write into blockstor's StateDir.
+//
+// Errors other than fs.ErrNotExist (permission denied, fs full,
+// transient I/O) are conservatively treated as "owned" — the sweeper
+// then falls through to the CRD-based classification and at worst
+// tears down a slot the reconciler immediately rebuilds, which is
+// recoverable. Treating them as "foreign" would mask real bugs by
+// silently disabling the safety net.
+func blockstorOwnsResFile(stateDir, rsc string) bool {
+	_, err := os.Stat(filepath.Join(stateDir, rsc+".res"))
+	if err == nil {
+		return true
+	}
+
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+
+	return true
 }
 
 // tearDownOrphans iterates the kernel-resource list and applies the
@@ -397,7 +461,7 @@ func (s *OrphanSweeperRunnable) tearDownOrphans(ctx context.Context, logger logr
 	var torn int
 
 	for _, rsc := range kernel {
-		decision, age := classifyOrphan(rsc, owned, rdAges, now, grace)
+		decision, age := classifyOrphan(rsc, owned, rdAges, now, grace, s.StateDir)
 
 		switch decision {
 		case sweepKeep:

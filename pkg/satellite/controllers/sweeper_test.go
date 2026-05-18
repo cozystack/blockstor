@@ -19,6 +19,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -185,6 +187,89 @@ func TestSweeperOnlyConsidersLocalResources(t *testing.T) {
 	want := "drbdsetup down pvc-xxx"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("sweeper did not down foreign-CRD orphan; want %q in %v", want, fx.CommandLines())
+	}
+}
+
+// TestSweeperLeavesForeignKernelSlotsAlone pins the Bug 299 invariant:
+// a kernel-resident DRBD slot that blockstor never provisioned (its
+// `.res` file is absent from the satellite's StateDir) MUST NOT be
+// torn down, even when no blockstor Resource CRD names it.
+//
+// On a piraeus / linstor-satellite coexistence stand the same DRBD
+// kernel module is shared between two managers. Without this filter
+// the sweeper used to issue `drbdsetup down` on every kernel slot
+// that lacked a matching blockstor CRD — silently destroying the
+// upstream manager's resources between create and first attach and
+// surfacing as "Failed to adjust DRBD resource …" / "Cannot resize
+// volume, because we have a non-UpToDate DRBD device" upstream.
+//
+// `<StateDir>/<rsc>.res` presence is the ownership proxy: the
+// reconciler writes the file on first activation (applyDRBD →
+// os.WriteFile) and removes it in handleDelete; a foreign manager
+// lives under its own state directory (e.g. `/var/lib/linstor.d/`)
+// and never writes into blockstor's StateDir.
+func TestSweeperLeavesForeignKernelSlotsAlone(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	// No Resource CRD AND no `.res` file in StateDir — the kernel
+	// slot belongs to a co-resident manager. The sweeper must leave
+	// it alone (sweepKeep, not sweepTearDown).
+	sweeper, fx := sweeperFixture(t, "n1",
+		"pvc-foreign role:Secondary\n  volume:0 disk:UpToDate\n",
+		nil)
+	sweeper.StateDir = stateDir
+
+	err := sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm down") || strings.HasPrefix(line, "drbdsetup down") {
+			t.Errorf("sweeper tore down foreign kernel slot (StateDir-managed proxy): %s; calls=%v",
+				line, fx.CommandLines())
+		}
+	}
+}
+
+// TestSweeperTearsDownOwnedOrphanWithStateDir pins the complement of
+// TestSweeperLeavesForeignKernelSlotsAlone: with StateDir set AND the
+// `<StateDir>/<rsc>.res` file present (blockstor wrote it; handleDelete
+// never finished — the force-strip aftermath the sweeper exists for),
+// the sweeper MUST still issue `drbdsetup down`. A regression here
+// would mean Bug 299 silently disabled the original orphan-recovery
+// path on every deployment that wires StateDir (i.e. production).
+func TestSweeperTearsDownOwnedOrphanWithStateDir(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	// blockstor's reconciler wrote this file on create; force-strip
+	// of the Resource CRD bypassed handleDelete so the file (and the
+	// kernel slot) survive. The sweeper must clean both up.
+	resPath := filepath.Join(stateDir, "pvc-owned.res")
+
+	err := os.WriteFile(resPath, []byte("resource pvc-owned { }\n"), 0o600)
+	if err != nil {
+		t.Fatalf("seed .res file: %v", err)
+	}
+
+	sweeper, fx := sweeperFixture(t, "n1",
+		"pvc-owned role:Secondary\n  volume:0 disk:Diskless\n",
+		nil)
+	sweeper.StateDir = stateDir
+
+	err = sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	want := "drbdsetup down pvc-owned"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("sweeper did not down owned orphan with .res present; want %q in %v",
+			want, fx.CommandLines())
 	}
 }
 
