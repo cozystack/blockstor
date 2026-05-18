@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -207,6 +208,25 @@ const applyFailureRequeue = 5 * time.Second
 // still giving the apiserver time to commit the Status patch.
 const peerAllocationRequeue = 2 * time.Second
 
+// activeDRBDRequeue is the periodic self-evaluation requeue applied
+// after a successful Apply on a DRBD-backed resource (Phase 11.7
+// safety net). The primary-watch predicate filters out pure
+// observer Status noise and the observer-trigger channel only fires
+// on lifecycle changes, so the reconciler no longer wakes for every
+// kernel statistics tick. This RequeueAfter is the belt-and-braces
+// re-eval that catches the rare case where the events2 stream missed
+// a frame (drbdsetup restart, kernel events2 stall) — without it the
+// reconciler could go arbitrarily long without re-checking a
+// long-lived active DRBD resource against its desired state.
+//
+// 10s is chosen to be:
+//   - long enough that steady-state idle resources don't generate
+//     pointless apiserver round-trips;
+//   - short enough that any divergence between desired and observed
+//     converges within a single user-visible scenario tick (e2e
+//     tests poll at 1-2 s and budget ~30 s per assertion).
+const activeDRBDRequeue = 10 * time.Second
+
 // resolveDeleteStoragePool picks the pool name the
 // satellite's DeleteVolume should route through. Phase 10.3
 // typed `Spec.StoragePool` wins; legacy `Props["StorPoolName"]`
@@ -240,20 +260,134 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	err := ctrl.NewControllerManagedBy(mgr).
+	bldr := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
-			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
+			builder.WithPredicates(
+				predicate.And(
+					nodeNamePredicate(r.Config.NodeName),
+					primaryWatchPredicate(),
+				),
+			)).
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource").
-		Complete(r)
+		Named("satellite-resource")
+
+	// Phase 11.7 second leg: the observer-trigger channel wakes
+	// this reconciler on kernel-state changes that produce no
+	// apiserver Spec write (peer flapping, role / disk / conn /
+	// repl frames). Each GenericEvent carries the local Resource
+	// object name; the EnqueueRequestForObject handler turns it
+	// straight into a reconcile.Request, no per-event mapping
+	// needed. Nil channel (unit-test path) short-circuits — the
+	// builder skips the raw-source registration entirely.
+	if r.Config.ReconcileTrigger != nil {
+		bldr = bldr.WatchesRawSource(
+			source.Channel(r.Config.ReconcileTrigger, &handler.EnqueueRequestForObject{}),
+		)
+	}
+
+	err := bldr.Complete(r)
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
 	return nil
+}
+
+// primaryWatchPredicate filters Resource events on the primary For
+// watch:
+//   - Drop pure observer Status noise (Volumes / Conditions /
+//     DrbdState / Connections / InUse / OutOfSync writes that
+//     don't bump Generation).
+//   - Pass Spec changes (Generation bump).
+//   - Pass controller-side allocator Status writes
+//     (Status.DRBDNodeID / Port / Minor transitions) — Phase 11.7:
+//     without this whitelist the satellite's
+//     `waitForControllerAllocation` gate never wakes after the
+//     controller's allocator stamp, because the Status PATCH does
+//     not bump Generation.
+//   - Pass Create / Delete / Generic events (always) so the
+//     observer-trigger channel and apiserver lifecycle events get
+//     through unchanged.
+//
+// Pair with `nodeNamePredicate` via `predicate.And(...)` so this
+// predicate ONLY filters events for the satellite's own Resources;
+// foreign-node events are filtered out by nodeNamePredicate first.
+//
+// Safe to ship in Phase 11.7 because:
+//  1. Status schema is now comprehensive (Phase 11.5.b P0+P1 landed
+//     Role/Suspended/Quorum/PeerNodeId/PeerDiskState) — observer no
+//     longer needs Reconcile-pulse writes to surface state.
+//  2. Tests migrated to k8s-native Status reads (Phase 11.5.b) — they
+//     depend on Status content, not on Reconcile firing on each
+//     Status write.
+//  3. .res file write is content-idempotent (Bug 315) — even if a
+//     stray Reconcile fires from a Spec event, identical Spec
+//     no-ops at the file layer.
+//  4. Observer-trigger channel (second leg) gives the reconciler
+//     wake-ups on observed kernel state that has no apiserver
+//     Spec correlate, so the predicate drop doesn't strand
+//     satellite-side recovery logic.
+func primaryWatchPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
+		GenericFunc: func(_ event.GenericEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldR, ok1 := e.ObjectOld.(*blockstoriov1alpha1.Resource)
+			newR, ok2 := e.ObjectNew.(*blockstoriov1alpha1.Resource)
+
+			if !ok1 || !ok2 {
+				// Unknown wire type — fail open so an upstream c-r
+				// change in event shape doesn't silently silence
+				// every Update.
+				return true
+			}
+
+			// Spec change → fire. Status subresource writes don't
+			// touch Generation, so this catches every operator-
+			// driven re-spec.
+			if oldR.Generation != newR.Generation {
+				return true
+			}
+
+			// Controller-allocator Status stamp → fire. The
+			// satellite's `waitForControllerAllocation` gate is
+			// load-bearing on these three fields; without the
+			// whitelist a Status PATCH that fills them in never
+			// wakes the reconciler and the recovery-down-reverses
+			// scenario hangs (lesson from Bug 318).
+			if !int32PtrEqual(oldR.Status.DRBDNodeID, newR.Status.DRBDNodeID) ||
+				!int32PtrEqual(oldR.Status.DRBDPort, newR.Status.DRBDPort) ||
+				!int32PtrEqual(oldR.Status.DRBDMinor, newR.Status.DRBDMinor) {
+				return true
+			}
+
+			// Pure observer Status update (Volumes / Conditions /
+			// DrbdState / Connections / InUse / OutOfSync). Drop —
+			// the observer-trigger channel covers any genuine wake-
+			// up need.
+			return false
+		},
+	}
+}
+
+// int32PtrEqual returns true when two *int32 pointers describe the
+// same value, treating both-nil as equal. Used by
+// primaryWatchPredicate to compare the allocator's DRBD-ID Status
+// fields between old/new event snapshots.
+func int32PtrEqual(left, right *int32) bool {
+	if left == nil && right == nil {
+		return true
+	}
+
+	if left == nil || right == nil {
+		return false
+	}
+
+	return *left == *right
 }
 
 // enqueueResourcesForRD maps a ResourceDefinition event to the local
@@ -352,6 +486,21 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// committed peer state.
 	if anyFailed {
 		return ctrl.Result{RequeueAfter: applyFailureRequeue}, nil
+	}
+
+	// Phase 11.7 safety net: schedule a periodic re-eval on
+	// active-DRBD resources. The primary-watch predicate drops
+	// pure observer Status noise and the observer-trigger channel
+	// only fires on lifecycle changes; combined, the reconciler no
+	// longer wakes on every kernel statistics tick. Without a
+	// belt-and-braces requeue, a missed events2 frame (drbdsetup
+	// restart, kernel stall) could leave the resource un-re-eval'd
+	// for arbitrarily long. Only fires on DRBD-stack RDs — pure
+	// STORAGE-only RDs have no kernel-state to drift against, so
+	// keeping them quiet preserves the predicate's no-op-on-idle
+	// property.
+	if rdNeedsDRBD(&rd) {
+		return ctrl.Result{RequeueAfter: activeDRBDRequeue}, nil
 	}
 
 	return ctrl.Result{}, nil

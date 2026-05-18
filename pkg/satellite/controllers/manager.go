@@ -25,11 +25,24 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 )
+
+// reconcileTriggerBuffer bounds the observer → reconciler trigger
+// channel. The producer is the ObserverRunnable's per-events2 frame
+// loop (resource / device / connection / peer-device kinds); the
+// consumer is the ResourceReconciler's WatchesRawSource input. A
+// reconnect-storm on a multi-peer RD can burst dozens of frames per
+// second; 64 leaves comfortable headroom for c-r's per-resource
+// debouncer to coalesce them before the channel backs up. Drops on
+// full are non-fatal — the observer's 5-second resync ticker is the
+// belt-and-braces re-emit, and c-r's RequeueAfter already covers any
+// dropped wake-up against the next Status frame.
+const reconcileTriggerBuffer = 64
 
 // scheme carries the runtime types this manager understands —
 // blockstor CRDs + the core Kubernetes types (Secrets for
@@ -118,6 +131,15 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		cfg.APIReader = mgr.GetAPIReader()
 	}
 
+	// Phase 11.7: thread the observer-trigger channel through
+	// Config so the ObserverRunnable (producer) and the
+	// ResourceReconciler (consumer via WatchesRawSource) share
+	// the same buffered channel. Production wires it here when
+	// the caller left the field nil; unit tests that construct
+	// reconcilers directly can supply their own channel or leave
+	// the field nil to short-circuit both ends.
+	ensureWiredDefaults(&cfg)
+
 	err = (&ResourceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup ResourceReconciler")
@@ -153,6 +175,23 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 	return mgr, nil
 }
 
+// ensureWiredDefaults populates the Config fields the satellite-side
+// reconcilers need at runtime when the caller of NewManager left them
+// unset. Today that's just the Phase 11.7 ReconcileTrigger channel — a
+// buffered `event.GenericEvent` channel the ObserverRunnable
+// produces onto and the ResourceReconciler consumes via
+// `WatchesRawSource(source.Channel(...))`. The channel is shared so
+// observer-driven kernel-state wake-ups land on the same reconcile
+// queue as the primary For watch. Unit tests that supply their own
+// channel keep it; tests that leave it nil opt both producer and
+// consumer out (the observer no-ops on a nil channel and
+// SetupWithManager skips the raw-source registration).
+func ensureWiredDefaults(cfg *Config) {
+	if cfg.ReconcileTrigger == nil {
+		cfg.ReconcileTrigger = make(chan event.GenericEvent, reconcileTriggerBuffer)
+	}
+}
+
 // addBackgroundRunnables wires the per-pod background loops
 // (events2 observer, heartbeat, orphan sweeper) into the manager.
 // Pulled out of NewManager to keep that function under the funlen
@@ -163,6 +202,11 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		Client:   mgr.GetClient(),
 		Exec:     cfg.Exec,
 		NodeName: cfg.NodeName,
+		// Phase 11.7: producer end of the observer-trigger channel.
+		// Fires on kernel-state changes (resource lifecycle, role,
+		// disk, conn, repl) so the ResourceReconciler wakes even
+		// when no apiserver write bumps Generation.
+		ReconcileTrigger: cfg.ReconcileTrigger,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add ObserverRunnable")
