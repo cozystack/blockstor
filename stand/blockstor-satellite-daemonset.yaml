@@ -17,6 +17,37 @@ metadata:
   name: blockstor-satellite
   namespace: blockstor-system
 ---
+# Bug 310: the satellite container's image-baked /etc/drbd.d/ hosts a
+# single drbd-utils default file (global_common.conf). Mounting a
+# hostPath at /etc/drbd.d/ to share rendered .res files with other
+# DRBD-aware pods would shadow that file. We re-introduce it from a
+# ConfigMap (subPath single-file mount, layered AFTER the hostPath
+# bind) so the container still has the global_common.conf drbdadm
+# expects on every parse. Contents are the upstream drbd-utils
+# trixie default (Bug 310 baseline; intentionally lean — no per-
+# resource directives leak into the global scope).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blockstor-satellite-drbd-conf
+  namespace: blockstor-system
+data:
+  global_common.conf: |
+    # blockstor satellite — global_common.conf shim (Bug 310).
+    # Kept minimal: per-resource tuning lives in the rendered .res
+    # files, not here. Mirrors the drbd-utils trixie default.
+    global {
+        usage-count no;
+        udev-always-use-vnr;
+    }
+    common {
+        handlers {}
+        startup {}
+        options {}
+        disk {}
+        net {}
+    }
+---
 # The satellite runs c-r reconcilers for ResourceDefinitions /
 # Resources / Snapshots / StoragePools and writes node-scoped Status
 # back via SSA — it needs full CRUD on blockstor.io CRDs and access
@@ -117,7 +148,14 @@ spec:
           args:
             # drbd's /etc/drbd.conf includes /etc/drbd.d/*.res, so the
             # satellite writes its rendered files where drbdadm
-            # actually looks for them.
+            # actually looks for them. Bug 310: the directory is now a
+            # hostPath bind (volume `drbd-cfg` below) so the rendered
+            # .res / .md-created / .mkfs.done state survives a satellite
+            # pod restart AND, more importantly, is visible to other
+            # DRBD-aware pods on the same node (piraeus-csi-nfs-server,
+            # drbd-reactor, ha-controller). Upstream LINSTOR shares
+            # exactly the same layout via /var/lib/linstor.d/; we keep
+            # the path drbd-utils expects out of the box.
             - --state-dir=/etc/drbd.d
             # Storage pools are declared via StoragePool CRDs in
             # stand/blockstor-storagepools.yaml (Phase 10.5 — the
@@ -196,6 +234,29 @@ spec:
             - {name: lvm-run, mountPath: /run/lvm}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
             - {name: pool, mountPath: /var/lib/blockstor-pool}
+            # Bug 310: host-shared /etc/drbd.d/ inside the container,
+            # backed by hostPath /var/lib/linstor.d/ on the node — the
+            # exact upstream LINSTOR layout. Rendered .res /
+            # .md-created / .mkfs.done state lives on the node so every
+            # DRBD-aware pod (drbd-reactor, piraeus-csi-nfs-server,
+            # ha-controller) reads the same view drbdadm reads. The
+            # bind from /var/lib/linstor.d/ to /etc/drbd.d/ is what
+            # lets `--state-dir=/etc/drbd.d` keep working — every e2e
+            # script that reads /etc/drbd.d/<rd>.res via `kubectl exec`
+            # continues to see the same path. /etc is read-only on
+            # Talos, so we cannot use /etc/drbd.d/ as the hostPath
+            # source.
+            - {name: drbd-cfg, mountPath: /etc/drbd.d}
+            # Re-introduce the image-baked global_common.conf via
+            # subPath, layered on top of the hostPath bind above —
+            # without it `drbdadm parse` warns on every invocation
+            # ("could not find /etc/drbd.d/global_common.conf"). The
+            # ConfigMap content is intentionally lean (drbd-utils
+            # trixie default minus the example handlers).
+            - name: drbd-global-conf
+              mountPath: /etc/drbd.d/global_common.conf
+              subPath: global_common.conf
+              readOnly: true
             # Bug 305: piraeus-operator's LinstorSatelliteConfiguration
             # registers a FILE_THIN pool named `pool` at
             # /var/lib/piraeus/file-thin (see stand/install-piraeus.sh).
@@ -252,3 +313,27 @@ spec:
         # PoolStatus diverges between piraeus (CRD writer) and
         # blockstor (provider runtime).
         - {name: piraeus-pool, hostPath: {path: /var/lib/piraeus/file-thin, type: DirectoryOrCreate}}
+        # Bug 310: host-shared DRBD config dir. Upstream LINSTOR puts
+        # rendered .res files on a hostPath so every DRBD-aware pod on
+        # the node (drbd-reactor, ha-controller, piraeus-csi-nfs-server)
+        # reads the same view drbdadm reads. We use the exact upstream
+        # host location (/var/lib/linstor.d/) so a coexisting piraeus-
+        # satellite — if anyone ever re-enables its controller — writes
+        # into the same directory, and to dodge Talos' read-only /etc.
+        # The mount target inside the container is /etc/drbd.d/ (the
+        # drbd-utils default include path) so e2e tooling that reads
+        # /etc/drbd.d/<rd>.res keeps working through the kubectl exec
+        # surface; the satellite's --state-dir still says /etc/drbd.d
+        # and the bind takes care of the host-side translation.
+        - {name: drbd-cfg, hostPath: {path: /var/lib/linstor.d, type: DirectoryOrCreate}}
+        # Bug 310: re-introduce the image-baked global_common.conf via
+        # subPath. The hostPath bind above empties /etc/drbd.d/ on
+        # first-ever start (DirectoryOrCreate); without this shim
+        # drbdadm logs a "no global_common.conf" warning on every
+        # invocation and any operator who reads the file out-of-band
+        # gets confused.
+        - name: drbd-global-conf
+          configMap:
+            name: blockstor-satellite-drbd-conf
+            items:
+              - {key: global_common.conf, path: global_common.conf}
