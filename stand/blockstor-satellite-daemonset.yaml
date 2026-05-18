@@ -196,6 +196,18 @@ spec:
             - {name: lvm-run, mountPath: /run/lvm}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
             - {name: pool, mountPath: /var/lib/blockstor-pool}
+            # Bug 305: piraeus-operator's LinstorSatelliteConfiguration
+            # registers a FILE_THIN pool named `pool` at
+            # /var/lib/piraeus/file-thin (see stand/install-piraeus.sh).
+            # blockstor's StoragePoolReconciler instantiates the FILE
+            # provider inside this container, so unless this hostPath is
+            # mounted here, every PoolStatus probe ENOENTs and the pool
+            # flips state=Faulty with 0 KiB free — linstor-csi then
+            # refuses to autoplace RWX PVCs against `pool` ("Not enough
+            # nodes fulfilling the auto-place criteria"). Mounting the
+            # same host directory piraeus's own satellite sees fixes the
+            # capacity report and unlocks rwx-ganesha.sh.
+            - {name: piraeus-pool, mountPath: /var/lib/piraeus/file-thin}
           resources:
             requests: {cpu: 50m, memory: 64Mi}
             limits: {cpu: 500m, memory: 256Mi}
@@ -234,3 +246,9 @@ spec:
         - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}
         - {name: state, hostPath: {path: /var/lib/blockstor-satellite, type: DirectoryOrCreate}}
         - {name: pool, hostPath: {path: /var/lib/blockstor-pool, type: DirectoryOrCreate}}
+        # Bug 305: shared with piraeus-satellite (LinstorSatellite-
+        # Configuration `pool` in stand/install-piraeus.sh). Both
+        # satellites must see the same directory or FILE_THIN
+        # PoolStatus diverges between piraeus (CRD writer) and
+        # blockstor (provider runtime).
+        - {name: piraeus-pool, hostPath: {path: /var/lib/piraeus/file-thin, type: DirectoryOrCreate}}
