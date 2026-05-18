@@ -168,9 +168,32 @@ spec:
           # (no --force) leaves drbd kernel state with stuck
           # `Connecting` peers, and the kernel module is
           # host-level on the Talos node so it persists across
-          # pod restarts. `drbdadm down --all` walks /etc/drbd.d
-          # in order; the per-resource 5s budget keeps a single
-          # half-hung connection from blocking the whole drain.
+          # pod restarts.
+          #
+          # Bug 298: `drbdadm down <r>` runs the drbd-utils userspace
+          # wrapper which issues a graceful disconnect handshake per
+          # peer. If a peer is in `Connecting` state forever (peer
+          # satellite already gone, kernel waiting for an ACK that
+          # will never arrive), the handshake hangs in a kernel
+          # uninterruptible-wait — the `timeout 5` kills the wrapper
+          # process but the kernel thread keeps the slot. On the next
+          # iteration `drbdsetup status` may itself block reading
+          # /proc/drbd → the loop iterates zero times, container goes
+          # D-state, SIGTERM/SIGKILL can't reap it → pod stuck
+          # `Terminating` for 12+ minutes (Run 10 cascade: e2e3-worker-2
+          # stuck Terminating during rolling-upgrade, breaking
+          # state-offline-unknown and lifecycle-toggle-migrate
+          # downstream).
+          #
+          # Fix shape: kernel-direct `drbdsetup`. First force-disconnect
+          # each peer (range 0..7 covers the typical worker fan-out;
+          # invalid peer-ids return EINVAL silently). Force-disconnect
+          # discards pending I/O and tears the connection thread
+          # immediately — no handshake. Then `drbdsetup down <r>`
+          # (kernel-direct teardown of all minors for that resource;
+          # no .res-file dependency, no drbd-utils-wrapped graceful
+          # path). Each call bounded by a tight `timeout` so a single
+          # wedged slot can't burn the whole hook.
           # Wrapped in `timeout 25` so the overall hook stays
           # under terminationGracePeriodSeconds (30).
           lifecycle:
@@ -184,19 +207,27 @@ spec:
                   # satellite image (Bug 240's Debian-slim base ships
                   # only drbd-utils/lvm2/zfs/cryptsetup userspace +
                   # iptables). `2>/dev/null` swallowed the missing
-                  # interpreter so the for-loop iterated zero times
-                  # and `drbdadm down` never ran on graceful
-                  # termination — silently undoing the whole point of
-                  # Bug 82. Switch to pure POSIX: `drbdsetup status`
-                  # without --json prints resource names as the first
-                  # token of each unindented line; awk extracts them
-                  # without any interpreter dependency.
+                  # interpreter so the for-loop iterated zero times.
+                  # Switch to pure POSIX: `drbdsetup status` without
+                  # --json prints resource names as the first token of
+                  # each unindented line; awk extracts them without
+                  # any interpreter dependency.
                   - |
                     set +e
                     timeout 25 sh -c '
                       for r in $(drbdsetup status 2>/dev/null \
                           | awk "/^[^[:space:]]/ {print \$1; next}"); do
-                        timeout 5 drbdadm down "$r" 2>/dev/null || true
+                        # Bug 298: force-disconnect every plausible
+                        # peer-id first so a stuck Connecting thread
+                        # cannot block the down call. EINVAL on unused
+                        # peer-ids is normal and swallowed.
+                        for p in 0 1 2 3 4 5 6 7; do
+                          timeout 2 drbdsetup disconnect "$r" "$p" --force=yes 2>/dev/null || true
+                        done
+                        # Bug 298: kernel-direct down. Skips the
+                        # drbdadm graceful-disconnect handshake that
+                        # hangs on a stale peer.
+                        timeout 5 drbdsetup down "$r" 2>/dev/null || true
                       done
                     '
           volumeMounts:
