@@ -1254,11 +1254,18 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// the auto-promote chain.
 	effectiveFirstActivation := firstActivation && !diskfulFlip
 
-	if (firstActivation || diskfulFlip) && !diskless {
-		err = r.ensureMetadata(ctx, dr, devices, mdMarkerPath, effectiveFirstActivation)
-		if err != nil {
-			return err
-		}
+	// Phase 11.2.c Stage 3a: fresh-replica first-activation routes
+	// through the dedicated createMetadata helper so Stage 3b can
+	// FSM-shadow-dispatch it (mirror of the renderResFile shadow
+	// landed in Stage 2). The diskless→diskful flip case (Bug 319)
+	// stays on the historical ensureMetadata(..., false) call —
+	// re-stamping metadata WITHOUT the fresh-replica GI-seed, since
+	// the kernel slot is already handshaken via the diskless path.
+	// Behaviour identical to the previous single ensureMetadata
+	// branch parameterised by effectiveFirstActivation.
+	err = r.maybeStampMetadata(ctx, dr, devices, mdMarkerPath, diskless, firstActivation, diskfulFlip)
+	if err != nil {
+		return err
 	}
 
 	err = r.runApplyDRBDVerb(ctx, dr, effectiveFirstActivation, diskfulFlip)
@@ -1515,6 +1522,55 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	}
 
 	return nil
+}
+
+// maybeStampMetadata is the create-md decision branch lifted out of
+// applyDRBD so the orchestrator stays under the gocyclo budget.
+// Routes the fresh-replica first-activation path through
+// createMetadata (Phase 11.2.c Stage 3a) and the diskless→diskful
+// flip path through ensureMetadata(..., firstActivation=false)
+// (Bug 319 invariant: re-stamp metadata WITHOUT GI-seed, since the
+// kernel slot is already handshaken via the diskless path).
+//
+// Pure dispatch — every reachable mutation is one of the two
+// helpers' existing side-effects. No-op when diskless, or when
+// neither firstActivation nor diskfulFlip fires.
+func (r *Reconciler) maybeStampMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string, diskless, firstActivation, diskfulFlip bool) error {
+	if diskless {
+		return nil
+	}
+
+	if firstActivation && !diskfulFlip {
+		return r.createMetadata(ctx, dr, devices)
+	}
+
+	if diskfulFlip {
+		return r.ensureMetadata(ctx, dr, devices, mdMarkerPath, false)
+	}
+
+	return nil
+}
+
+// createMetadata runs drbdadm create-md + per-peer drbdmeta set-gi
+// + writes the .md-created file marker + stamps the MetadataCreated
+// Condition. Idempotent re-entry: if drbdadm dump-md already shows
+// metadata, skips create-md but still seeds set-gi for any peer
+// slots without a matching GI line (Bug 319 invariant).
+//
+// Caller must have already verified firstActivation==true. The
+// helper does NOT re-check the gate — moving it inside would
+// change ordering vs adjust later in applyDRBD. The
+// MetadataCreated Status-Condition stamp lives INSIDE this helper
+// so the caller doesn't need to know about the stamper plumbing;
+// any per-call .md-created marker path math is also internal.
+//
+// Phase 11.2.c Stage 3a: pure extract, no behaviour change. Stage 3b
+// will FSM-shadow-dispatch this helper at the top of applyDRBD,
+// mirror of the renderResFile shadow landed in Stage 2.
+func (r *Reconciler) createMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
+
+	return r.ensureMetadata(ctx, dr, devices, mdMarkerPath, true)
 }
 
 // runAutoPromote orchestrates the first-activation seed:
