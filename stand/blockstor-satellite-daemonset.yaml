@@ -148,14 +148,16 @@ spec:
           args:
             # drbd's /etc/drbd.conf includes /etc/drbd.d/*.res, so the
             # satellite writes its rendered files where drbdadm
-            # actually looks for them. Bug 310: the directory is now a
-            # hostPath bind (volume `drbd-cfg` below) so the rendered
-            # .res / .md-created / .mkfs.done state survives a satellite
-            # pod restart AND, more importantly, is visible to other
-            # DRBD-aware pods on the same node (piraeus-csi-nfs-server,
-            # drbd-reactor, ha-controller). Upstream LINSTOR shares
-            # exactly the same layout via /var/lib/linstor.d/; we keep
-            # the path drbd-utils expects out of the box.
+            # actually looks for them. Bug 310 introduced a hostPath
+            # bind (volume `drbd-cfg` below) so the rendered .res /
+            # .md-created / .mkfs.done state survives a satellite pod
+            # restart and is visible to other DRBD-aware pods on the
+            # same node (drbd-reactor, ha-controller). Bug 325 then
+            # moved the host backing from /var/lib/linstor.d/ to
+            # /var/lib/blockstor-drbd.d/ so an upstream LINSTOR
+            # satellite (piraeus-operator) coexisting on the node
+            # writes into its own dir and drbdadm adjust no longer
+            # sees two .res files claiming the same /dev/drbd<minor>.
             - --state-dir=/etc/drbd.d
             # Storage pools are declared via StoragePool CRDs in
             # stand/blockstor-storagepools.yaml (Phase 10.5 — the
@@ -235,14 +237,18 @@ spec:
             - {name: state, mountPath: /var/lib/blockstor-satellite}
             - {name: pool, mountPath: /var/lib/blockstor-pool}
             # Bug 310: host-shared /etc/drbd.d/ inside the container,
-            # backed by hostPath /var/lib/linstor.d/ on the node — the
-            # exact upstream LINSTOR layout. Rendered .res /
-            # .md-created / .mkfs.done state lives on the node so every
-            # DRBD-aware pod (drbd-reactor, piraeus-csi-nfs-server,
-            # ha-controller) reads the same view drbdadm reads. The
-            # bind from /var/lib/linstor.d/ to /etc/drbd.d/ is what
-            # lets `--state-dir=/etc/drbd.d` keep working — every e2e
-            # script that reads /etc/drbd.d/<rd>.res via `kubectl exec`
+            # backed by a hostPath on the node so rendered .res /
+            # .md-created / .mkfs.done state lives on the node and
+            # every DRBD-aware pod (drbd-reactor, ha-controller) reads
+            # the same view drbdadm reads. Bug 325: that hostPath is
+            # now /var/lib/blockstor-drbd.d/ (not the upstream
+            # /var/lib/linstor.d/), so a coexisting piraeus-operator
+            # LINSTOR satellite does not share its .res state with us
+            # — the two stacks must own disjoint .res directories or
+            # drbdadm adjust trips on duplicate device-minor claims.
+            # The bind from /var/lib/blockstor-drbd.d/ to /etc/drbd.d/
+            # lets --state-dir=/etc/drbd.d keep working and every e2e
+            # script that reads /etc/drbd.d/<rd>.res via kubectl exec
             # continues to see the same path. /etc is read-only on
             # Talos, so we cannot use /etc/drbd.d/ as the hostPath
             # source.
@@ -313,19 +319,22 @@ spec:
         # PoolStatus diverges between piraeus (CRD writer) and
         # blockstor (provider runtime).
         - {name: piraeus-pool, hostPath: {path: /var/lib/piraeus/file-thin, type: DirectoryOrCreate}}
-        # Bug 310: host-shared DRBD config dir. Upstream LINSTOR puts
-        # rendered .res files on a hostPath so every DRBD-aware pod on
-        # the node (drbd-reactor, ha-controller, piraeus-csi-nfs-server)
-        # reads the same view drbdadm reads. We use the exact upstream
-        # host location (/var/lib/linstor.d/) so a coexisting piraeus-
-        # satellite — if anyone ever re-enables its controller — writes
-        # into the same directory, and to dodge Talos' read-only /etc.
-        # The mount target inside the container is /etc/drbd.d/ (the
-        # drbd-utils default include path) so e2e tooling that reads
-        # /etc/drbd.d/<rd>.res keeps working through the kubectl exec
-        # surface; the satellite's --state-dir still says /etc/drbd.d
-        # and the bind takes care of the host-side translation.
-        - {name: drbd-cfg, hostPath: {path: /var/lib/linstor.d, type: DirectoryOrCreate}}
+        # Bug 325: host-isolated DRBD config dir. The piraeus-operator
+        # LINSTOR satellite and blockstor's own satellite both run on
+        # this node and both render .res files. If they share a single
+        # host directory (/var/lib/linstor.d/) each .res for the same
+        # RD lands twice and drbdadm adjust scans both, sees two
+        # entries claiming the same /dev/drbd<minor>, and refuses any
+        # operation. The cascade: PVC attach hangs → kubelet never
+        # releases the VolumeAttachment → pv_controller surfaces
+        # "still attached to node" as VolumeFailedDelete during PV
+        # cleanup. Splitting the host path gives each stack its own
+        # .res scope. The container path stays /etc/drbd.d/ (the
+        # drbd-utils default include) so the satellite's
+        # --state-dir=/etc/drbd.d and every e2e script that reads
+        # /etc/drbd.d/<rd>.res via kubectl exec keep working — the
+        # bind just retargets the host side.
+        - {name: drbd-cfg, hostPath: {path: /var/lib/blockstor-drbd.d, type: DirectoryOrCreate}}
         # Bug 310: re-introduce the image-baked global_common.conf via
         # subPath. The hostPath bind above empties /etc/drbd.d/ on
         # first-ever start (DirectoryOrCreate); without this shim
