@@ -698,12 +698,39 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 
 		rd.Spec.Props[quorumKey] = value
 
+		// Bug 309: also stamp the typed slot. `effectiveprops.
+		// Resolve` copies `TypedDRBDOptionsToProps(Spec.DRBDOptions)`
+		// on top of `Spec.Props`, so the typed field wins on the
+		// dispatch path. Without this mirror write the CSI-initial
+		// `Spec.DRBDOptions.Resource.Quorum="off"` (stamped by
+		// `wireToCRDRDSpec` from the REST POST's pre-witness prop
+		// bag) overrides the reconciler's `Spec.Props[quorum]=
+		// majority`, the satellite renders `.res` with `quorum off`,
+		// and drbd-reactor's promoter refuses the resource with
+		// `quorum is 'off', but also fencing is 'dont-care'` —
+		// rwx-ganesha NFS sidecar can't promote, RWX Pods hang in
+		// ContainerCreating. Keeping the prop write so existing
+		// downstream readers (tests, golinstor wire) still see it.
+		if rd.Spec.DRBDOptions == nil {
+			rd.Spec.DRBDOptions = &blockstoriov1alpha1.DRBDOptions{}
+		}
+
+		if rd.Spec.DRBDOptions.Resource == nil {
+			rd.Spec.DRBDOptions.Resource = &blockstoriov1alpha1.DRBDResourceOptions{}
+		}
+
+		rd.Spec.DRBDOptions.Resource.Quorum = value
+
 		// Companion seeding only when quorum is enabled — the
 		// `quorum=off` path doesn't consult `on-no-quorum` and
 		// stamping it would create churn for no benefit.
 		if value == QuorumPolicyMajority {
 			if _, present := rd.Spec.Props[onNoQuorumKey]; !present {
 				rd.Spec.Props[onNoQuorumKey] = onNoQuorumSeed
+			}
+
+			if rd.Spec.DRBDOptions.Resource.OnNoQuorum == "" {
+				rd.Spec.DRBDOptions.Resource.OnNoQuorum = onNoQuorumSeed
 			}
 		}
 
@@ -728,19 +755,31 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 		rd.Name, nil)
 }
 
-// quorumPropsAlreadySet reports whether the RD's prop bag already
-// reflects the desired quorum value AND (for the `majority` branch)
-// either carries an operator-pinned `on-no-quorum` or has the seed
-// value we'd stamp. Used by setQuorum to short-circuit the Update
-// when nothing would change — keeps ResourceVersion stable and
-// avoids the conflict-retry storm a write-on-every-reconcile would
-// trigger under fan-out load.
+// quorumPropsAlreadySet reports whether the RD's prop bag AND the
+// typed `Spec.DRBDOptions.Resource` slot both already reflect the
+// desired quorum value AND (for the `majority` branch) either carry
+// an operator-pinned `on-no-quorum` or have the seed value we'd
+// stamp. Used by setQuorum to short-circuit the Update when nothing
+// would change — keeps ResourceVersion stable and avoids the
+// conflict-retry storm a write-on-every-reconcile would trigger
+// under fan-out load.
+//
+// Bug 309: must consult the typed slot too — `effectiveprops.
+// Resolve` lets typed override `Spec.Props`, so a stale typed value
+// (initial CSI POST) would mask the desired prop write and the
+// short-circuit would lie. Mirror writes happen in setQuorum.
 func quorumPropsAlreadySet(rd *blockstoriov1alpha1.ResourceDefinition, value, quorumKey, onNoQuorumKey string) bool {
 	if rd.Spec.Props == nil {
 		return false
 	}
 
 	if rd.Spec.Props[quorumKey] != value {
+		return false
+	}
+
+	if rd.Spec.DRBDOptions == nil ||
+		rd.Spec.DRBDOptions.Resource == nil ||
+		rd.Spec.DRBDOptions.Resource.Quorum != value {
 		return false
 	}
 
@@ -751,10 +790,14 @@ func quorumPropsAlreadySet(rd *blockstoriov1alpha1.ResourceDefinition, value, qu
 	}
 
 	// quorum is correct; companion seed is desired-state iff the
-	// operator hasn't already pinned an `on-no-quorum` value.
-	_, present := rd.Spec.Props[onNoQuorumKey]
+	// operator hasn't already pinned an `on-no-quorum` value. Check
+	// both the prop bag and the typed slot — either one being unset
+	// triggers a stamp.
+	if _, present := rd.Spec.Props[onNoQuorumKey]; !present {
+		return false
+	}
 
-	return present
+	return rd.Spec.DRBDOptions.Resource.OnNoQuorum != ""
 }
 
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.
