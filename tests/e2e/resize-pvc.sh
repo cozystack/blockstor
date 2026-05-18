@@ -128,7 +128,16 @@ spec:
       persistentVolumeClaim: {claimName: $PVC}
 EOF
 
-kubectl wait --for=condition=Ready --timeout=120s pod/"$POD"
+# 240s budget: mount/attach can hang on QEMU stand long enough to
+# clip the previous 120s wall. Dump kubectl describe pre-failure so
+# future investigations have signal about which step stalled.
+if ! kubectl wait --for=condition=Ready --timeout=240s pod/"$POD"; then
+    echo "--- kubectl describe pod/$POD (pre-failure diagnostics) ---"
+    kubectl describe pod/"$POD" || true
+    echo "--- kubectl get events (sorted) ---"
+    kubectl get events --sort-by=.lastTimestamp | tail -40 || true
+    exit 1
+fi
 
 echo ">> write 32 MiB random blob and capture md5 + filesystem size"
 kubectl exec "$POD" -- sh -c "dd if=/dev/urandom of=/data/blob bs=1M count=32 status=none && sync"

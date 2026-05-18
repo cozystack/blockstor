@@ -407,8 +407,11 @@ recovery_start=$(date +%s)
 # (N3 is the only candidate on a 3-node cluster) and start fresh.
 # Fresh state means no leftover bitmap → DRBD does an initial sync
 # from a peer → SyncTarget → UpToDate within the polling window.
-echo ">> wait up to 120s for ${RD} to be locally UpToDate on all 3 workers"
-deadline=$(( $(date +%s) + 120 ))
+echo ">> wait up to 240s for ${RD} to be locally UpToDate on all 3 workers"
+# 240s budget: zfs-thin reseed on QEMU stand exceeded the previous 120s
+# wall by only a few seconds; doubling the envelope keeps headroom for
+# slow nodes without changing what is being asserted.
+deadline=$(( $(date +%s) + 240 ))
 while (( $(date +%s) < deadline )); do
     d1=$(local_disk_state "$N1" "$RD")
     d2=$(local_disk_state "$N2" "$RD")
