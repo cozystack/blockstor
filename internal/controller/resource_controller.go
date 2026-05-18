@@ -153,6 +153,12 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// a DeletionTimestamp; the satellite reconciler then runs its
 	// teardown chain (with Bug 107's annotation-based volume-number
 	// fallback for the case where the RD CRD really is gone).
+	//
+	// Order matters: the orphan check runs BEFORE DRBD-ID allocation
+	// because allocating against a doomed Resource is wasted work
+	// (the Delete that follows would just clean it up) and the
+	// allocation's Status patch can change managedFields entries
+	// that the satellite-side delete chain has to undo.
 	orphaned, err := r.handleOrphan(ctx, &target)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -160,6 +166,43 @@ func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	if orphaned {
 		return ctrl.Result{}, nil
+	}
+
+	// Bug 302: allocate DRBD-IDs unconditionally on every live
+	// Resource Reconcile. The satellite's `waitForControllerAllocation`
+	// gate stalls until Status.DRBD{NodeID,Port,Minor} are non-nil,
+	// and gating allocation behind `runApply`'s long-tail housekeeping
+	// (seed-from-Gi, auto-diskful) left a window where transient
+	// errors deeper in the apply chain prevented allocation from
+	// landing — the satellite then waited forever. Pulling allocation
+	// out and running it as the FIRST live-Resource action makes the
+	// invariant the satellite depends on robust against every
+	// downstream branch.
+	//
+	// Idempotent on Status: `ensureDRBDIDs` is a no-op when every ID
+	// is already stamped, so re-reconcile bursts (RD watch fan-out,
+	// sibling watch fan-out, peer-changed bumps) don't churn the SSA
+	// owner or thrash the apiserver.
+	//
+	// Operate on a copy: ensureDRBDIDs re-fetches via APIReader and
+	// SSA-patches Status, which bumps the apiserver-side resource
+	// version. Downstream gates in runApply may issue Spec.Update()
+	// against the in-Reconcile target (auto-diskful promotion,
+	// seed-from-Gi stamping); using our top-of-Reconcile snapshot
+	// after a Status patch lands those Updates on a stale revision.
+	// Allocate against a deepcopy so the top-of-Reconcile target's
+	// resourceVersion stays valid for the downstream Spec writers;
+	// requeue when allocation actually mutated state so the next
+	// pass observes the fresh revision uniformly.
+	allocCopy := target.DeepCopy()
+
+	allocated, err := r.ensureDRBDIDs(ctx, allocCopy, nil)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if allocated {
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	return r.runApply(ctx, &target)
@@ -269,20 +312,15 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 		return ctrl.Result{}, err
 	}
 
-	// Allocate DRBD node-id (and port/minor on the first replica) and
-	// persist via Status before pushing to the satellite. node-id MUST
-	// be stable for the lifetime of the replica — re-numbering would
-	// re-map DRBD bitmaps and corrupt data on resync. If allocation
-	// changes Status we requeue so the next reconcile sees the
-	// committed value before dispatching.
-	allocated, err := r.ensureDRBDIDs(ctx, target, peers)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if allocated {
-		return ctrl.Result{Requeue: true}, nil
-	}
+	// Bug 302: DRBD-ID allocation moved to top-of-Reconcile (above the
+	// orphan gate) so it runs unconditionally on every Reconcile pass —
+	// the satellite's `waitForControllerAllocation` gate stalls until
+	// Status.DRBD{NodeID,Port,Minor} are non-nil, and gating allocation
+	// behind `runApply` left a window where a Resource that hit the
+	// orphan branch or short-circuited before `runApply` could never
+	// progress. `ensureDRBDIDs` is idempotent — when every ID is already
+	// stamped it returns mutated=false without touching the apiserver,
+	// so the early call has no fixed-state cost.
 
 	// Initial-sync skip seeding (Phase 8.1): on a freshly-added
 	// replica, pick the CurrentGi of an existing UpToDate peer and
