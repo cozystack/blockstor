@@ -346,6 +346,158 @@ func (a *Adm) DelPeer(ctx context.Context, resource, peerNode string) error {
 	return errors.Wrapf(err, "drbdadm del-peer %s", target)
 }
 
+// Verify runs `drbdadm verify <resource>` to schedule an online
+// data scan against peers. Out-of-sync blocks discovered during
+// the scan surface in subsequent peer-device events2 frames as
+// `out-of-sync:<KiB>`. Idempotent for already-verifying resources
+// (drbdadm exits zero with a warning). Operator-recovery tool —
+// no business-logic caller in the satellite, this exists so the
+// operator-recovery surface can be wired up without re-shelling
+// from arbitrary callers.
+func (a *Adm) Verify(ctx context.Context, resource string) error {
+	return a.run(ctx, "verify", resource)
+}
+
+// Invalidate runs `drbdadm invalidate <resource>` — marks local
+// data Inconsistent and forces a full resync from a peer. The
+// recovery counterpart to PrimaryForce: when the local replica
+// is suspected corrupt (silent bit-rot, lower-disk fsck reported
+// damage, etc.) the operator uses this to throw the local copy
+// away and pull a fresh one. Requires at least one UpToDate peer
+// — drbdadm refuses if no peer can be the resync source.
+func (a *Adm) Invalidate(ctx context.Context, resource string) error {
+	return a.run(ctx, "invalidate", resource)
+}
+
+// NewCurrentUUID runs `drbdadm new-current-uuid <resource>` —
+// bumps the current generation UUID. Used in split-brain recovery
+// (UG9 §7.4.1): after manually picking a survivor and connecting,
+// the operator stamps a fresh current-UUID on the survivor so
+// the other side recognises it as the new generation source on
+// the next handshake. No business-logic caller; pure operator
+// recovery tool.
+func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
+	return a.run(ctx, "new-current-uuid", resource)
+}
+
+// PauseSync runs `drbdadm pause-sync <resource>` — temporarily
+// halts an in-flight resync without tearing down the connection.
+// Used as an operator throttle: long initial-sync on a fresh
+// replica monopolises lower-disk + network I/O; the operator
+// pauses it during business hours and resumes it overnight.
+// Idempotent: an already-paused resource stays paused.
+func (a *Adm) PauseSync(ctx context.Context, resource string) error {
+	return a.run(ctx, "pause-sync", resource)
+}
+
+// ResumeSync runs `drbdadm resume-sync <resource>` — counterpart
+// to PauseSync. Lets a paused resync resume from its checkpoint;
+// no work is repeated.
+func (a *Adm) ResumeSync(ctx context.Context, resource string) error {
+	return a.run(ctx, "resume-sync", resource)
+}
+
+// Outdate runs `drbdadm outdate <resource>` — explicitly marks
+// the local replica's disk state as Outdated. Used in fencing
+// patterns (UG9 §7.6): an external fence agent observes that
+// this node lost quorum or got partitioned and stamps Outdated
+// so the kernel refuses to serve I/O until a peer brings it back
+// UpToDate via resync. No business-logic caller; the satellite
+// relies on automatic quorum-driven outdating today, but the
+// operator-recovery surface needs a manual override too.
+func (a *Adm) Outdate(ctx context.Context, resource string) error {
+	return a.run(ctx, "outdate", resource)
+}
+
+// ApplyAL runs `drbdadm apply-al <resource>` — manually applies
+// the on-disk activity log to the lower disk. Needed before
+// promote-after-crash when the kernel surfaces `ERR_NEED_APPLY_AL`
+// (drbdsetup exit 167): a dirty activity log from a non-clean
+// shutdown must be replayed onto the backing storage before the
+// resource can be promoted to Primary, otherwise stale extents
+// in the AL would be read as authoritative bytes.
+func (a *Adm) ApplyAL(ctx context.Context, resource string) error {
+	return a.run(ctx, "apply-al", resource)
+}
+
+// WipeMd runs `drbdmeta --force <res>/<vol> v09 <device> internal
+// wipe-md` — the deliberate-wipe counterpart to CreateMD. Zeroes
+// the metadata block on the lower disk so a subsequent CreateMD
+// starts from a clean slate. Operator-recovery use case: a
+// permanently-removed peer's lower disk is being recycled for a
+// new replica and the stale GI/bitmap state must be erased
+// before the new metadata is written.
+//
+// `--force` is required because the in-place mutation rejects
+// in-use metadata without it. Caller MUST guarantee the resource
+// is not currently loaded in the kernel; running wipe-md on a
+// live replica destroys the GI tuple the kernel needs and the
+// resource will refuse to come up afterwards.
+func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device string) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+
+	_, err := a.exec.Run(ctx,
+		"drbdmeta", "--force", target, "v09", device, "internal",
+		"wipe-md")
+	if err != nil {
+		return errors.Wrapf(err, "drbdmeta wipe-md %s", target)
+	}
+
+	return nil
+}
+
+// ShowGi runs `drbdmeta --force <res>/<vol> v09 <device> internal
+// show-gi` and returns the raw stdout — the on-disk generation
+// UUID tuple, peer slot table, and bitmap-UUID per peer. Used
+// for verification (compare against a peer's view to triage
+// split-brain) and as the source data for GetGi.
+//
+// Output shape (drbdmeta v09 show-gi):
+//
+//	+--<  Current data generation UUID  >-
+//	| 78A0DDDABCDEF000
+//	+--<  Bitmap's base data generation UUID  >-
+//	| 78A0DDDABCDEF000
+//	+--<  Historical generation UUIDs  >-
+//	| 0000000000000000
+//	...
+//
+// Callers wanting just the current UUID should prefer GetGi, which
+// returns the parsed scalar.
+func (a *Adm) ShowGi(ctx context.Context, resource string, volume int32, device string) ([]byte, error) {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+
+	out, err := a.exec.Run(ctx,
+		"drbdmeta", "--force", target, "v09", device, "internal",
+		"show-gi")
+	if err != nil {
+		return nil, errors.Wrapf(err, "drbdmeta show-gi %s", target)
+	}
+
+	return out, nil
+}
+
+// GetGi is the parsed counterpart to ShowGi — runs the same
+// `drbdmeta ... internal get-gi` subcommand (the terser variant
+// that emits just the GI tuple, suitable for scripted comparison)
+// and returns the trimmed string. The tuple shape is
+// `<current>:<bitmap>:<history0>:<history1>` matching the format
+// SetGi accepts, so callers can round-trip through SetGi after a
+// fix-up. Useful for split-brain triage: compare GetGi output on
+// each replica, pick a survivor, SetGi the others against it.
+func (a *Adm) GetGi(ctx context.Context, resource string, volume int32, device string) (string, error) {
+	target := fmt.Sprintf("%s/%d", resource, volume)
+
+	out, err := a.exec.Run(ctx,
+		"drbdmeta", "--force", target, "v09", device, "internal",
+		"get-gi")
+	if err != nil {
+		return "", errors.Wrapf(err, "drbdmeta get-gi %s", target)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
 // StatusResources runs `drbdsetup status` and returns the names of
 // every resource the local kernel currently owns. Used by the
 // orphan-diskless sweeper (Scenario 5.34) to cross-reference
