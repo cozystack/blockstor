@@ -239,10 +239,24 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
 // before they reach this controller.
+//
+// GenerationChangedPredicate is ANDed onto the primary `For`
+// watch so Status-only writes (the observer round-trip every
+// 5s + per-events2 frame) don't kick the reconciler. The CRD
+// has `subresources: { status: {} }`, so Status writes don't
+// bump Generation — only true Spec changes do. The sibling
+// Resource Watches are deliberately NOT filtered: some
+// lifecycle / recovery paths rely on peer Status updates to
+// re-enqueue the local Resource (Bug 313's regression).
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	err := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
-			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
+			builder.WithPredicates(
+				predicate.And(
+					nodeNamePredicate(r.Config.NodeName),
+					predicate.GenerationChangedPredicate{},
+				),
+			)).
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
