@@ -51,7 +51,15 @@ SIZE_BYTES=$((1024 * 1024))   # 1 MiB marker payload — large enough to
 
 BAD_STATES_RE='StandAlone|Connecting|NetworkFailure|BrokenPipe|Disconnecting|Timeout'
 PARTITION_TIMEOUT=30
-HEAL_TIMEOUT=30
+# Bug 307: Run 16 failed with both peers stuck `disk:Outdated
+# peer-disk:Outdated replication:Established` 30 s after iptables
+# removal. Root cause was a transient mid-suite satellite-pod restart
+# (Bug 305's DaemonSet roll added a hostPath mount) that left the
+# resource in a slow-heal state. DRBD-9 eventually converges, it just
+# needs more than 30 s on a QEMU stand under satellite-restart
+# pressure. 60 s mirrors the rest of the suite's heal-after-partition
+# budget (network-partition.sh uses 180 s for the analogous wait).
+HEAL_TIMEOUT=60
 
 BLOCKED_NODE=""
 BLOCKED_PORT=""
@@ -102,6 +110,33 @@ spec:
 EOF
 
 wait_uptodate "$RD" "$N1" "$N2"
+
+# Bug 307: `wait_uptodate` only checks the LOCAL `disk:` row on each
+# peer. It can return before the primary has confirmed its peer is
+# UpToDate from its own view — initial sync's bitmap-clear takes an
+# extra round-trip. Entering the iptables-drop window with the primary
+# still thinking `peer-disk:Inconsistent` causes DRBD to mark its own
+# disk Outdated on partition (no peer to verify against). After heal,
+# both sides flip to `disk:Outdated peer-disk:Outdated
+# replication:Established` and need 30+ s of bitmap-driven recovery.
+# Mirror the network-partition.sh idiom: wait for `peer-disk:UpToDate`
+# on both peers' views before isolating.
+echo ">> wait for peer-disk:UpToDate on both peers' views (stable pre-partition)"
+deadline=$(( $(date +%s) + 60 ))
+while (( $(date +%s) < deadline )); do
+    p1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep -c "peer-disk:UpToDate" || true)
+    p2=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep -c "peer-disk:UpToDate" || true)
+    if (( p1 >= 1 && p2 >= 1 )); then
+        break
+    fi
+    sleep 2
+done
+if (( p1 < 1 || p2 < 1 )); then
+    echo "FAIL: peer-disk:UpToDate not seen on both peers' views within 60s"
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/  N1: /' || true
+    on_node "$N2" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/  N2: /' || true
+    exit 1
+fi
 
 DEV=$(device_for_rd "$RD" "$N1")
 echo "   device on $N1 = $DEV"
