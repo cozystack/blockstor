@@ -20,8 +20,12 @@
 # resource entry without touching the Resource CRD. The next observer
 # tick (≤ 5s) sees the missing resource AND the CRD still says
 # "should be up here" — the reconciler must re-issue `drbdadm adjust`
-# to bring it back. By "30s" we leave a generous margin over the 5s
-# observer interval (5s tick + apply latency + adjust + WFC handshake).
+# to bring it back. By "60s" we leave a generous margin over the 5s
+# observer interval (5s tick + apply latency + adjust + WFC handshake);
+# the 30s budget tripped on transient allocator-side latency under
+# load even when the satellite revive path was healthy (root cause was
+# a stale c-r discovery cache producing `unknown field` warnings on
+# Status.DRBD{Port,Minor} writes from the controller).
 #
 # Bug 8 concern (from MEMORY.md): IsResourceSyncing gates some apply
 # paths to skip re-asserting kernel state while a SyncTarget is in
@@ -68,7 +72,7 @@ RD=down-reverses
 N1=$WORKER_1
 N2=$WORKER_2
 SIZE_KIB=65536
-REVIVE_DEADLINE_SECS=30
+REVIVE_DEADLINE_SECS=60
 UPTODATE_DEADLINE_SECS=60
 
 trap 'delete_rd "$RD"' EXIT

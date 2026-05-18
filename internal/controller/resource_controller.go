@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"sync"
 
@@ -48,13 +49,14 @@ import (
 // the controller no longer stamps it on new Resources.
 const resourceFinalizer = "blockstor.io.blockstor.io/resource"
 
-// controllerDRBDIDsFieldOwner is the SSA field-manager identity the
-// controller-side allocator uses when it writes Status.DRBD{NodeID,
-// Port,Minor}. Distinct from the satellite-side observer + reconciler
-// owners so the apiserver merges the three claims cleanly. Replacing
-// the old Status().Update path was necessary to stop the controller
-// from clobbering observer-owned fields (disk_state, in_use, etc).
-const controllerDRBDIDsFieldOwner = "blockstor-controller-drbd-ids"
+// (formerly `controllerDRBDIDsFieldOwner`: the SSA field-manager
+// identity the controller-side allocator used when it wrote
+// Status.DRBD{NodeID,Port,Minor}. Phase 11.x switched to a raw JSON
+// merge-patch — see `allocateAndApplyDRBDIDs` — so the SSA identity
+// is no longer needed. The constant is retired; the
+// satellite-observer field-managers remain disjoint from any future
+// controller writes because merge-patch sets ownership to the
+// requesting client without inheriting prior SSA claims.)
 
 // ResourceReconciler runs controller-side housekeeping on every
 // Resource: DRBD-ID allocation (port/minor), seed-from-Gi for
@@ -603,25 +605,48 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 		return false, nil
 	}
 
-	apply := &blockstoriov1alpha1.Resource{
+	// Raw JSON merge-patch on the status subresource, not SSA Apply.
+	// SSA validates the Patch payload against the apiserver's OpenAPI
+	// discovery schema; controller-runtime caches that schema once on
+	// startup and never refreshes it. After a CRD schema upgrade
+	// (e.g. adding `status.drbdMinor` / `status.drbdPort`) the cache
+	// keeps the OLD schema until the controller pod restarts — every
+	// SSA Apply against the new fields then logs
+	// `unknown field "status.drbdMinor"`. The apiserver still applies
+	// the patch (the warning is non-fatal) but the merge silently
+	// drops the fields the cache doesn't know about, so the
+	// allocator's writes vanish. A raw merge-patch goes straight to
+	// the apiserver with no discovery lookup, so it survives any CRD
+	// schema upgrade without a controller restart.
+	//
+	// Field-ownership note: a merge-patch doesn't claim SSA ownership
+	// on the three fields, but the satellite-side observer writes
+	// disjoint slots (`status.volumes[].diskState`, `connections`,
+	// `replicationState`), so there's no overlap to fight over. The
+	// pre-Phase-10 `Status().Update` clobbering bug is still avoided
+	// because merge-patch only writes the keys it carries.
+	patchTarget := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "Resource",
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: target.Name},
-		Status: blockstoriov1alpha1.ResourceStatus{
-			DRBDNodeID: target.Status.DRBDNodeID,
-			DRBDPort:   target.Status.DRBDPort,
-			DRBDMinor:  target.Status.DRBDMinor,
-		},
 	}
 
-	err = r.Status().Patch(ctx, apply,
-		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available
-		client.FieldOwner(controllerDRBDIDsFieldOwner),
-		client.ForceOwnership)
+	body := map[string]any{"status": map[string]any{
+		"drbdNodeId": target.Status.DRBDNodeID,
+		"drbdPort":   target.Status.DRBDPort,
+		"drbdMinor":  target.Status.DRBDMinor,
+	}}
+
+	patchBytes, err := json.Marshal(body)
 	if err != nil {
-		// SSA Patch on a Resource that was deleted between the Get
+		return false, err
+	}
+
+	err = r.Status().Patch(ctx, patchTarget, client.RawPatch(types.MergePatchType, patchBytes))
+	if err != nil {
+		// Patch on a Resource that was deleted between the Get
 		// above and now returns NotFound. Same race-window as the
 		// Get path — let the next event drive the next attempt.
 		if errors.IsNotFound(err) {
