@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -499,6 +500,79 @@ type ObserverRunnable struct {
 	// owner's f:inUse claim and the apiserver deletes the field.
 	resMu    sync.Mutex
 	resCache map[string]resourceObservation
+
+	// ReconcileTrigger is the channel the observer emits an
+	// `event.GenericEvent` onto whenever a kernel-state lifecycle
+	// change for a local Resource lands (Phase 11.7). The
+	// ResourceReconciler consumes it via
+	// `WatchesRawSource(source.Channel(...))` so satellite-side
+	// recovery decisions can wake on observed state even when no
+	// apiserver write bumps Generation. Nil disables the trigger
+	// (unit-test path).
+	ReconcileTrigger chan<- event.GenericEvent
+
+	// lifecycleMu / lifecycleCache hold the last-emitted-trigger
+	// signature per resource so emitReconcileTrigger only fires on
+	// kernel-state lifecycle changes (create/destroy/role/disk/
+	// conn/repl). Pure out-of-sync deltas (the dominant
+	// statistics-tick traffic) are suppressed — they re-fire at
+	// ~1Hz per peer and would defeat the primary-watch predicate's
+	// noise filter if every one woke the reconciler.
+	lifecycleMu    sync.Mutex
+	lifecycleCache map[string]lifecycleSignature
+}
+
+// lifecycleSignature is the compact per-resource fingerprint
+// emitReconcileTrigger compares to the cached value to decide
+// whether the new observation represents a kernel-state lifecycle
+// change worth waking the reconciler on. Out-of-sync deltas and
+// other statistics-tick values are intentionally NOT part of the
+// signature — they fire too often to be a useful trigger, and the
+// observer's 5-second resync ticker + the reconciler's
+// RequeueAfter cover any wake-up that would otherwise have come
+// from a missed statistics frame.
+type lifecycleSignature struct {
+	// Role, DrbdState, Suspended come from resource / device kind
+	// frames. Role transitions (Secondary → Primary) and disk-state
+	// transitions (UpToDate → Inconsistent, Failed → Diskless) are
+	// the load-bearing reconciler wake-ups.
+	Role      string
+	DrbdState string
+	Suspended string
+
+	// perVolume is keyed by VolumeNumber and carries each volume's
+	// DiskState + Quorum view. A per-volume DiskState transition
+	// matters for the multi-volume RD scenario (one volume
+	// flipping to Inconsistent while the other stays UpToDate).
+	PerVolume map[int32]volumeLifecycle
+
+	// perConnection is keyed by PeerNodeName and carries the
+	// per-peer connection / replication / peer-disk view. A peer
+	// flapping to StandAlone or a replication state transition
+	// (Established → SyncSource → Established) is a lifecycle
+	// event the reconciler must wake on.
+	PerConnection map[string]connectionLifecycle
+}
+
+// volumeLifecycle is the per-volume slice of lifecycleSignature.
+// Out-of-sync byte counts deliberately excluded — see comment on
+// lifecycleSignature.
+type volumeLifecycle struct {
+	DiskState string
+	Quorum    bool
+	HasQuorum bool
+}
+
+// connectionLifecycle is the per-peer slice of lifecycleSignature.
+type connectionLifecycle struct {
+	Connected        bool
+	Message          string
+	ReplicationState string
+	// peerDisk keyed by VolumeNumber. The peer's view of a
+	// volume's disk-state matters for partition recovery: a peer
+	// disk flipping to Outdated is the signal that triggers our
+	// auto-disconnect / fence path.
+	PeerDisk map[int32]string
 }
 
 // resourceObservation is the cached per-resource state observer
@@ -786,6 +860,26 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	o.mergeVolumes(ev)
 	o.mergeResource(ev)
 
+	// Phase 11.7: wake the ResourceReconciler on every kernel-state
+	// lifecycle change (resource lifecycle, role, disk, conn, repl).
+	// The satellite's recovery decisions depend on observed state
+	// but many of them (peer flapping to StandAlone, the local disk
+	// transitioning Failed → Diskless) generate no apiserver Spec
+	// writes — so Generation never bumps and the primary For watch
+	// sees nothing. The trigger channel closes that loop
+	// architecturally; the primary watch's Status whitelist on
+	// DRBDNodeID/Port/Minor handles controller-allocator stamps
+	// separately. Pure out-of-sync deltas (statistics ticks) are
+	// suppressed by emitReconcileTrigger's signature-compare —
+	// without that suppression the trigger fires at ~1Hz per peer
+	// and defeats the primary-watch predicate's noise filter.
+	//
+	// Done BEFORE writeStatus so an apiserver hiccup on Status SSA
+	// doesn't suppress the wake-up — the recovery decision only
+	// needs the kernel-state change to land in the reconcile queue,
+	// not the corresponding Status PATCH to commit.
+	o.emitReconcileTrigger(ev)
+
 	err := o.writeStatus(ctx, ev)
 	if err == nil {
 		return
@@ -796,6 +890,225 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	}
 
 	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
+}
+
+// emitReconcileTrigger sends a GenericEvent for the affected
+// Resource onto the observer-trigger channel so the
+// ResourceReconciler wakes on kernel-state lifecycle changes that
+// produce no apiserver Spec write (Phase 11.7).
+//
+// Lifecycle-only filter: the emit fires when the computed
+// lifecycle signature differs from the cached one. Pure
+// out-of-sync byte-delta updates do NOT change the signature, so
+// statistics ticks (~1Hz per peer) don't wake the reconciler.
+// Without this filter, every peer-device statistics frame would
+// defeat the primary-watch predicate's noise filter — the trigger
+// channel would re-add the very Reconcile noise the predicate
+// just removed.
+//
+// Non-blocking: a full channel is treated as "reconciler is already
+// behind, drop this wake-up" rather than back-pressuring the events2
+// loop. The observer's 5-second resync ticker re-emits cached state
+// onto Status so a coalesced wake-up still arrives within the same
+// window; reconciler's RequeueAfter covers any per-resource hand-off.
+//
+// The emitted object carries only `Name` — the ResourceReconciler's
+// SetupWithManager registers the channel as a raw source whose
+// handler enqueues the named Resource for reconciliation, no
+// per-event field inspection required.
+func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
+	if o.ReconcileTrigger == nil || ev == nil || ev.ResourceName == "" {
+		return
+	}
+
+	want := o.lifecycleSnapshotLocked(ev.ResourceName)
+
+	o.lifecycleMu.Lock()
+	if o.lifecycleCache == nil {
+		o.lifecycleCache = map[string]lifecycleSignature{}
+	}
+
+	cur, hadPrior := o.lifecycleCache[ev.ResourceName]
+
+	if hadPrior && lifecycleSignaturesEqual(cur, want) {
+		// No lifecycle change — pure statistics-tick (out-of-sync
+		// delta, idempotent re-fire). Drop the trigger; the
+		// primary-watch predicate's job is to keep noise off the
+		// reconcile queue and we must not undo it.
+		o.lifecycleMu.Unlock()
+
+		return
+	}
+
+	o.lifecycleCache[ev.ResourceName] = want
+	o.lifecycleMu.Unlock()
+
+	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+
+	trigger := event.GenericEvent{
+		Object: &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+		},
+	}
+
+	select {
+	case o.ReconcileTrigger <- trigger:
+	default:
+		// Channel full — reconciler is already behind. Drop this
+		// wake-up; the 5-second resync ticker plus c-r's
+		// per-resource debouncer guarantee a follow-up.
+	}
+}
+
+// lifecycleSnapshotLocked builds the current lifecycle signature for
+// resource `name` from the merged caches. Reads the resource /
+// volume / connection caches under their respective mutexes — does
+// NOT hold lifecycleMu (caller takes that after the snapshot so the
+// signature compare + cache write are atomic w.r.t. concurrent
+// emit calls).
+//
+// Out-of-sync byte counts are deliberately NOT folded into the
+// signature: peer-device statistics frames re-fire at ~1Hz and
+// would trigger a wake-up every second on a steady-state sync,
+// defeating the primary-watch predicate's noise filter.
+func (o *ObserverRunnable) lifecycleSnapshotLocked(name string) lifecycleSignature {
+	sig := lifecycleSignature{
+		PerVolume:     map[int32]volumeLifecycle{},
+		PerConnection: map[string]connectionLifecycle{},
+	}
+
+	o.resMu.Lock()
+	if r, ok := o.resCache[name]; ok {
+		sig.Role = r.Role
+		sig.DrbdState = r.DrbdState
+		sig.Suspended = r.Suspended
+	}
+	o.resMu.Unlock()
+
+	o.volMu.Lock()
+	if cache, ok := o.volCache[name]; ok {
+		for volNum, v := range cache {
+			sig.PerVolume[volNum] = volumeLifecycle{
+				DiskState: v.DiskState,
+				Quorum:    v.Quorum,
+				HasQuorum: v.HasQuorum,
+			}
+		}
+	}
+	o.volMu.Unlock()
+
+	o.connMu.Lock()
+	if peers, ok := o.connCache[name]; ok {
+		for peerName, c := range peers {
+			peerDisk := map[int32]string{}
+			for _, pv := range c.PeerVolumes {
+				peerDisk[pv.VolumeNumber] = pv.PeerDiskState
+			}
+
+			sig.PerConnection[peerName] = connectionLifecycle{
+				Connected:        c.Connected,
+				Message:          c.Message,
+				ReplicationState: c.ReplicationState,
+				PeerDisk:         peerDisk,
+			}
+		}
+	}
+	o.connMu.Unlock()
+
+	return sig
+}
+
+// lifecycleSignaturesEqual returns true when two signatures
+// describe the same kernel-state lifecycle. Used by
+// emitReconcileTrigger to suppress statistics-tick wake-ups: only
+// fields tracked by the signature shape participate, so an
+// out-of-sync byte delta does not flip the comparison.
+func lifecycleSignaturesEqual(left, right lifecycleSignature) bool {
+	if left.Role != right.Role ||
+		left.DrbdState != right.DrbdState ||
+		left.Suspended != right.Suspended {
+		return false
+	}
+
+	if !volumeLifecycleMapsEqual(left.PerVolume, right.PerVolume) {
+		return false
+	}
+
+	return connectionLifecycleMapsEqual(left.PerConnection, right.PerConnection)
+}
+
+// volumeLifecycleMapsEqual returns true when two per-volume
+// lifecycle maps describe the same volumes with identical
+// DiskState / Quorum view. Extracted from
+// lifecycleSignaturesEqual so the parent stays under the gocyclo
+// budget.
+func volumeLifecycleMapsEqual(left, right map[int32]volumeLifecycle) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for key, leftVol := range left {
+		rightVol, ok := right[key]
+		if !ok {
+			return false
+		}
+
+		if leftVol.DiskState != rightVol.DiskState ||
+			leftVol.Quorum != rightVol.Quorum ||
+			leftVol.HasQuorum != rightVol.HasQuorum {
+			return false
+		}
+	}
+
+	return true
+}
+
+// connectionLifecycleMapsEqual returns true when two per-peer
+// lifecycle maps describe the same peers with identical connection
+// / replication / per-volume peer-disk view. Extracted from
+// lifecycleSignaturesEqual so the parent stays under the gocyclo
+// budget.
+func connectionLifecycleMapsEqual(left, right map[string]connectionLifecycle) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for key, leftConn := range left {
+		rightConn, ok := right[key]
+		if !ok {
+			return false
+		}
+
+		if leftConn.Connected != rightConn.Connected ||
+			leftConn.Message != rightConn.Message ||
+			leftConn.ReplicationState != rightConn.ReplicationState {
+			return false
+		}
+
+		if !stringMapsEqual(leftConn.PeerDisk, rightConn.PeerDisk) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// stringMapsEqual returns true when two int32→string maps describe
+// the same key/value set. Helper for lifecycleSignaturesEqual's
+// per-connection PeerDisk compare.
+func stringMapsEqual(left, right map[int32]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+
+	for k, v := range left {
+		rv, ok := right[k]
+		if !ok || rv != v {
+			return false
+		}
+	}
+
+	return true
 }
 
 // mergeVolumes folds the per-volume cache so SSA writes carry the
