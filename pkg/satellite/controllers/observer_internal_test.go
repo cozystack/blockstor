@@ -1538,6 +1538,92 @@ func TestObserverSkipDiskIdempotentOnRepeatedFailedFrames(t *testing.T) {
 	}
 }
 
+// TestObserverDoesNotStampSkipDiskOnUpToDateToDiskless pins the
+// align-with-upstream cleanup (Bug 320): upstream LINSTOR's
+// StateSequenceDetector only stamps DrbdOptions/SkipDisk on the
+// Failed → Diskless transition. The defensive Bug 280 trigger
+// that also stamped on UpToDate → Diskless has been removed —
+// operator-driven `drbdadm detach --force` is the operator's
+// responsibility (set SkipDisk explicitly before detach, OR
+// accept satellite re-attach).
+//
+// Regression guard: feed UpToDate (priming the cache) then a
+// Diskless frame, assert NO SkipDisk prop write and NO detach
+// against the apiserver/exec. A reintroduction of the trigger
+// would flip this test red.
+func TestObserverDoesNotStampSkipDiskOnUpToDateToDiskless(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-op.n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-op",
+			NodeName:               "n1",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	o := &ObserverRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+	adm := drbd.NewAdm(fx)
+
+	// Frame 1: UpToDate primes the resCache.DrbdState. This is the
+	// "before" half of the transition the removed Bug 280 trigger
+	// used to gate on.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-op",
+		DrbdState:    "UpToDate",
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: "UpToDate"},
+		},
+	})
+
+	// Frame 2: Diskless arrives without an intermediate Failed
+	// step — mimics operator-driven `drbdadm detach --force`.
+	// With Bug 280 removed, this MUST NOT write SkipDisk.
+	o.handleObservation(context.Background(), adm, &observation{
+		ResourceName: "pvc-op",
+		DrbdState:    "Diskless",
+		Volumes: []volumeObservation{
+			{VolumeNumber: 0, DiskState: "Diskless"},
+		},
+	})
+
+	var got blockstoriov1alpha1.Resource
+
+	err := cli.Get(context.Background(), client.ObjectKey{Name: "pvc-op.n1"}, &got)
+	if err != nil {
+		t.Fatalf("get Resource: %v", err)
+	}
+
+	if v := got.Spec.Props[skipDiskPropKey]; v != "" {
+		t.Errorf("UpToDate→Diskless stamped SkipDisk (Bug 320 regression): Props[%q]=%q, want empty",
+			skipDiskPropKey, v)
+	}
+
+	// Sibling guard: the Failed-gated auto-detach must also NOT
+	// fire on the UpToDate→Diskless path (same branch in upstream
+	// StateSequenceDetector — Failed-only).
+	for _, line := range fx.CommandLines() {
+		if line == "drbdadm detach --force pvc-op" {
+			t.Errorf("UpToDate→Diskless triggered detach: cmds=%v",
+				fx.CommandLines())
+		}
+	}
+}
+
 // countCommand returns the number of times line appears in cmds.
 // Helper for the SkipDisk transition tests where the assertion is
 // "this command count did not grow across frames".

@@ -321,20 +321,14 @@ const (
 	// auto-recovery actions key off this state: drbdadm detach to
 	// stop bashing the dead device, and the SkipDisk prop write
 	// to pin the next adjust onto `--skip-disk` (scenario 5.11).
+	// Mirrors upstream LINSTOR's StateSequenceDetector which only
+	// stamps DrbdOptions/SkipDisk on Failed → Diskless; the
+	// operator-driven `drbdadm detach --force` path (UpToDate →
+	// Diskless directly) is the operator's responsibility — they
+	// must set DrbdOptions/SkipDisk explicitly before the manual
+	// detach, OR accept that the satellite re-attaches on the next
+	// reconcile (recoverable).
 	drbdDiskStateFailed = "Failed"
-	// drbdDiskStateDiskless is the DRBD-9 device disk_state token
-	// the kernel emits after a successful detach. Bug 280: an
-	// operator-driven `drbdadm detach --force` transitions
-	// UpToDate → Diskless directly (no Failed step), so the
-	// observer's Failed-gated SkipDisk stamp doesn't fire and the
-	// next reconcile re-attaches the disk via plain `drbdadm
-	// adjust`. We treat that transition as an explicit operator
-	// intent and stamp the same SkipDisk prop the Failed path uses.
-	drbdDiskStateDiskless = "Diskless"
-	// drbdDiskStateUpToDate is the steady-state token for a
-	// healthy diskful replica. Used as the "before" half of the
-	// Bug 280 transition gate.
-	drbdDiskStateUpToDate = "UpToDate"
 )
 
 // ObserverRunnable tails `drbdsetup events2` and writes the parsed
@@ -648,35 +642,6 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 			// silence policy as writeStatus.
 		default:
 			logger.Error(err, "set SkipDisk prop on Failed", "resource", ev.ResourceName)
-		}
-	}
-
-	// Bug 280 (P1): operator-driven `drbdadm detach --force`
-	// transitions UpToDate → Diskless directly without going
-	// through Failed, so the gate above doesn't fire. Without a
-	// SkipDisk stamp the next reconcile pass runs bare `drbdadm
-	// adjust` and re-attaches the lower disk before the operator
-	// can observe Diskless. Detect the transition by comparing
-	// the incoming DrbdState to the previously-cached value (the
-	// cache is written by mergeResource further down — read BEFORE
-	// that call lands so we still see the pre-event value).
-	if ev.DrbdState == drbdDiskStateDiskless && ev.ResourceName != "" {
-		o.resMu.Lock()
-		prev := o.resCache[ev.ResourceName].DrbdState
-		o.resMu.Unlock()
-
-		if prev == drbdDiskStateUpToDate {
-			err := o.writeSkipDiskProp(ctx, ev.ResourceName)
-			switch {
-			case err == nil:
-				logger.Info("set DrbdOptions/SkipDisk on operator-detached replica",
-					"resource", ev.ResourceName)
-			case apierrors.IsNotFound(err):
-				// Resource CRD not yet created — same silence policy.
-			default:
-				logger.Error(err, "set SkipDisk prop on operator-detach",
-					"resource", ev.ResourceName)
-			}
 		}
 	}
 
