@@ -17,12 +17,14 @@ limitations under the License.
 package satellite_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -61,6 +63,11 @@ var (
 	// being claimed by an internal handle.
 	errDrbdadmPrimaryStateChange = errors.New(
 		"drbdadm: State change failed: (-12) Device is held open by someone")
+	// errMkfsExt4Failed mirrors the wrapped-error shape RealExec
+	// returns when `mkfs.ext4` exits non-zero (Bug 311 multi-volume
+	// retry scenario: vol-1 mkfs trips a transient kernel error
+	// while vol-0 already succeeded).
+	errMkfsExt4Failed = errors.New("mkfs.ext4: superblock write failure")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -5164,5 +5171,334 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 
 	if len(results) != 1 || !results[0].GetOk() {
 		t.Errorf("expected Ok=true after up-fallback recovery; got results=%+v", results)
+	}
+}
+
+// fakeFilesystemStamper records every StampFilesystemFormatted call
+// so multi-volume mkfs tests can assert the Condition lands exactly
+// when every diskful volume of the RD has reached a filesystem
+// (freshly mkfs'd or adopted via blkid). Concurrency-safe to match
+// fakeMetadataStamper's contract.
+type fakeFilesystemStamper struct {
+	mu     sync.Mutex
+	calls  []string
+	stamps func(string) bool // optional: return true to fail the call
+}
+
+func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, resourceName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls = append(f.calls, resourceName)
+
+	if f.stamps != nil && f.stamps(resourceName) {
+		return os.ErrPermission
+	}
+
+	return nil
+}
+
+func (f *fakeFilesystemStamper) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+
+	return out
+}
+
+// TestApplyAutoMkfsMultiVolumeFormatsAllVolumes pins Bug 311 for the
+// NFS-Ganesha RWX scenario: a 2-volume RD with RD-level
+// `FileSystem/Type=ext4` MUST mkfs BOTH /dev/drbd<m> (vol-0) and
+// /dev/drbd<m+1> (vol-1). Companion of TestApplyAutoMkfsMultiVolumeMkfsBoth;
+// this variant additionally asserts the `.mkfs.done` marker lands
+// once all volumes finish, mirroring the "stamp only after all
+// volumes processed" contract.
+func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311m_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug311m",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 131072, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 307200, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "8000",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	want := []string{
+		"mkfs.ext4 /dev/drbd8000",
+		"mkfs.ext4 /dev/drbd8001",
+	}
+
+	for _, expected := range want {
+		found := false
+
+		for _, line := range cmds {
+			if strings.Contains(line, expected) {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("multi-volume RD: expected %q on command line; got %v", expected, cmds)
+		}
+	}
+
+	// `.mkfs.done` marker lands ONLY after every volume finishes —
+	// proves the runAutoMkfs loop completed without an early-exit on
+	// vol-0.
+	markerPath := filepath.Join(dir, "pvc-bug311m.mkfs.done")
+	if _, statErr := os.Stat(markerPath); statErr != nil {
+		t.Errorf(".mkfs.done marker: want present after both volumes formatted; got stat err %v", statErr)
+	}
+}
+
+// TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume pins the
+// per-volume blkid safety net for multi-volume RDs: vol-0 already
+// carries an ext4 filesystem (blkid -o export reports TYPE=ext4),
+// vol-1 is blank. runAutoMkfs MUST skip mkfs on vol-0 (adopting the
+// existing fs) and run mkfs on vol-1 only — mirrors upstream
+// LINSTOR's MkfsUtils.makeFileSystemOnMarked which short-circuits on
+// a non-empty hasFileSystem per VlmProviderObject.
+//
+// Without this contract a marker-loss scenario (operator removed
+// .mkfs.done, host rebuild) would wipe a populated vol-0 on the
+// retry pass — the very data-loss Bug 311's blkid layer prevents.
+func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311s_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	// vol-0 already has an ext4 filesystem. blkid -o export returns
+	// the canonical TYPE= line; runAutoMkfs's deviceHasFilesystem
+	// scans for any TYPE= prefix and treats it as "populated".
+	fx.Expect("blkid -o export /dev/drbd8500",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd8500\nTYPE=ext4\nUSAGE=filesystem\n")})
+	// vol-1 is blank: leave the blkid response unregistered so
+	// FakeExec returns empty stdout / nil err — deviceHasFilesystem
+	// finds no TYPE= prefix and falls through to mkfs.
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug311s",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 131072, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 307200, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "8500",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	// vol-0 (pre-formatted) MUST NOT see mkfs — that would wipe data.
+	for _, line := range cmds {
+		if strings.Contains(line, "mkfs.ext4 /dev/drbd8500") {
+			t.Errorf("pre-formatted vol-0 MUST NOT be re-mkfs'd; saw %q in %v", line, cmds)
+		}
+	}
+
+	// vol-1 (blank) MUST see mkfs — otherwise NFS-Ganesha can't
+	// mount the data partition.
+	sawVol1 := false
+
+	for _, line := range cmds {
+		if strings.Contains(line, "mkfs.ext4 /dev/drbd8501") {
+			sawVol1 = true
+
+			break
+		}
+	}
+
+	if !sawVol1 {
+		t.Errorf("blank vol-1 MUST be mkfs'd; got %v", cmds)
+	}
+
+	// Marker lands because every volume passed the "has filesystem"
+	// gate (vol-0 by adoption, vol-1 by fresh mkfs).
+	markerPath := filepath.Join(dir, "pvc-bug311s.mkfs.done")
+	if _, statErr := os.Stat(markerPath); statErr != nil {
+		t.Errorf(".mkfs.done marker: want present after mixed-state pass; got stat err %v", statErr)
+	}
+}
+
+// TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll pins the
+// "stamp only after ALL volumes processed" contract from Bug 311's
+// fix path. When vol-1's mkfs FAILS on the first pass, the
+// `FilesystemFormatted=True` Condition MUST NOT be stamped — the
+// marker file MUST also remain absent — so the next reconcile
+// retries. After the retry succeeds (vol-0 adopted via blkid,
+// vol-1 freshly mkfs'd), the stamp fires exactly once.
+//
+// Without this contract Bug 311 would resurface in a new shape:
+// a stamped Condition would short-circuit `needsAutoMkfsRetry` and
+// permanently skip vol-1, even though it never carried a filesystem.
+func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	// vol-1's mkfs trips a transient kernel error on the first pass.
+	// vol-0 succeeds (no canned err) and is then formatted.
+	fx.Expect("mkfs.ext4 /dev/drbd9001",
+		storage.FakeResponse{Err: errMkfsExt4Failed})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug311c",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 131072, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 307200, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "9000",
+				"auto-primary": "true",
+			},
+		},
+	}
+
+	// First pass: vol-0 mkfs OK, vol-1 mkfs FAILS. runAutoMkfs
+	// returns the wrapped error → marker NOT written → stamper NOT
+	// called. Apply records the per-resource failure but does not
+	// short-circuit the next reconcile.
+	_, _ = rec.Apply(t.Context(), dr)
+
+	mkfsMarker := filepath.Join(dir, "pvc-bug311c.mkfs.done")
+	if _, statErr := os.Stat(mkfsMarker); statErr == nil {
+		t.Fatalf(".mkfs.done marker MUST be absent when vol-1 mkfs failed; got present")
+	}
+
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Fatalf("FilesystemFormatted Condition MUST NOT be stamped while a volume mkfs is unfinished; got calls=%v", got)
+	}
+
+	// vol-0 was mkfs'd on the first pass — so on retry the blkid
+	// probe MUST adopt it (otherwise we'd wipe data). Inject the
+	// canonical TYPE= response for /dev/drbd9000 to mirror what a
+	// real blkid call would see after a successful mkfs.
+	//
+	// vol-1's canned mkfs error stays the same key; overwrite it with
+	// an empty success response so the retry can actually finish.
+	fx.Reset()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-bug311c_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311c_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311c_00000|131072\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311c_00001",
+		storage.FakeResponse{Stdout: []byte("pvc-bug311c_00001\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311c_00001",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311c_00001|307200\n")})
+	fx.Expect("blkid -o export /dev/drbd9000",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd9000\nTYPE=ext4\nUSAGE=filesystem\n")})
+	fx.Expect("mkfs.ext4 /dev/drbd9001", storage.FakeResponse{})
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (retry): %v", err)
+	}
+
+	// vol-0 must be adopted (no second mkfs); vol-1 must be mkfs'd
+	// exactly once on the retry.
+	cmds := fx.CommandLines()
+
+	for _, line := range cmds {
+		if strings.Contains(line, "mkfs.ext4 /dev/drbd9000") {
+			t.Errorf("vol-0 was already formatted on pass 1; retry MUST adopt via blkid, not re-mkfs; saw %q", line)
+		}
+	}
+
+	sawVol1Retry := false
+
+	for _, line := range cmds {
+		if strings.Contains(line, "mkfs.ext4 /dev/drbd9001") {
+			sawVol1Retry = true
+
+			break
+		}
+	}
+
+	if !sawVol1Retry {
+		t.Errorf("vol-1 MUST be mkfs'd on retry; got %v", cmds)
+	}
+
+	// Marker now lands (every volume reached a filesystem) and the
+	// stamper fires exactly once with the RD name.
+	if _, statErr := os.Stat(mkfsMarker); statErr != nil {
+		t.Errorf(".mkfs.done marker: want present after retry; got stat err %v", statErr)
+	}
+
+	gotCalls := stamper.Calls()
+	if len(gotCalls) != 1 || gotCalls[0] != "pvc-bug311c" {
+		t.Errorf("FilesystemFormatted Condition: want exactly one stamp for pvc-bug311c after retry; got %v", gotCalls)
 	}
 }
