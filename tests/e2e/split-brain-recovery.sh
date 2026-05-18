@@ -125,9 +125,9 @@ wait_uptodate "$RD" "$N1" "$N2"
 echo ">> promote $N1 to Primary"
 on_node "$N1" drbdadm primary "$RD"
 
-n1_role_before=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1)
+n1_role_before=$(status_role "$RD" "$N1")
 echo "   $N1 role pre-test: $n1_role_before"
-if [[ "$n1_role_before" != *"role:Primary"* ]]; then
+if [[ "$n1_role_before" != "Primary" ]]; then
     echo "FAIL: $N1 is not Primary before the split-brain provocation"
     exit 1
 fi
@@ -189,24 +189,18 @@ deadline=$(( $(date +%s) + 10 ))
 n1_state=""
 n2_state=""
 while (( $(date +%s) < deadline )); do
-    n1_state=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null \
-        | grep -E "connection:" | head -1 || true)
-    n2_state=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null \
-        | grep -E "connection:" | head -1 || true)
-    if [[ "$n1_state" != *"connection:Connected"* \
-       && "$n1_state" != *"connection:Established"* \
-       && "$n2_state" != *"connection:Connected"* \
-       && "$n2_state" != *"connection:Established"* ]]; then
+    n1_state=$(status_connection_state "$RD" "$N1" "$N2")
+    n2_state=$(status_connection_state "$RD" "$N2" "$N1")
+    if [[ "$n1_state" != "Connected" && "$n1_state" != "Established" \
+       && "$n2_state" != "Connected" && "$n2_state" != "Established" ]]; then
         break
     fi
     sleep 1
 done
-echo "   $N1 post-provocation: $n1_state"
-echo "   $N2 post-provocation: $n2_state"
-if [[ "$n1_state" == *"connection:Connected"* \
-   || "$n1_state" == *"connection:Established"* \
-   || "$n2_state" == *"connection:Connected"* \
-   || "$n2_state" == *"connection:Established"* ]]; then
+echo "   $N1 post-provocation: ->$N2=$n1_state"
+echo "   $N2 post-provocation: ->$N1=$n2_state"
+if [[ "$n1_state" == "Connected" || "$n1_state" == "Established" \
+   || "$n2_state" == "Connected" || "$n2_state" == "Established" ]]; then
     echo "FAIL: at least one side reconnected on its own — could not provoke split-brain"
     exit 1
 fi
@@ -248,24 +242,21 @@ deadline=$(( $(date +%s) + RECOVERY_WINDOW ))
 recovery_ok=false
 n1_lost_primary=false
 while (( $(date +%s) <= deadline )); do
-    n1_role=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
-    if [[ "$n1_role" != *"role:Primary"* ]]; then
+    n1_role=$(status_role "$RD" "$N1")
+    if [[ "$n1_role" != "Primary" ]]; then
         n1_lost_primary=true
         echo "   !! $N1 lost Primary role: $n1_role"
         break
     fi
 
-    n1_disk=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    n1_conn=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null \
-        | grep -oE "connection:[A-Za-z]+" | head -2 | tail -1 || true)
-    n2_conn=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null \
-        | grep -oE "connection:[A-Za-z]+" | head -2 | tail -1 || true)
+    n1_disk=$(status_disk_state "$RD" "$N1")
+    n2_disk=$(status_disk_state "$RD" "$N2")
+    n1_conn=$(status_connection_state "$RD" "$N1" "$N2")
+    n2_conn=$(status_connection_state "$RD" "$N2" "$N1")
 
-    if [[ "$n1_disk" == *"disk:UpToDate"* \
-       && "$n2_disk" == *"disk:UpToDate"* \
-       && ( "$n1_conn" == "connection:Established" || "$n1_conn" == "connection:Connected" ) \
-       && ( "$n2_conn" == "connection:Established" || "$n2_conn" == "connection:Connected" ) ]]; then
+    if [[ "$n1_disk" == "UpToDate" && "$n2_disk" == "UpToDate" \
+       && ( "$n1_conn" == "Established" || "$n1_conn" == "Connected" ) \
+       && ( "$n2_conn" == "Established" || "$n2_conn" == "Connected" ) ]]; then
         recovery_ok=true
         break
     fi

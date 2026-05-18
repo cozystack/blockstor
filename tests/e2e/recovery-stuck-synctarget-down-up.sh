@@ -156,15 +156,13 @@ read_done_pct() {
 }
 
 read_replication() {
-    local node=$1 rd=$2
-    on_node "$node" drbdsetup status "$rd" --verbose 2>/dev/null \
-        | grep -oE 'replication:[A-Za-z]+' | head -1 | cut -d: -f2 || true
+    local node=$1 rd=$2 peer=$3
+    status_replication_state "$rd" "$node" "$peer"
 }
 
 read_connection() {
-    local node=$1 rd=$2
-    on_node "$node" drbdsetup status "$rd" --verbose 2>/dev/null \
-        | grep -oE 'connection:[A-Za-z]+' | head -1 | cut -d: -f2 || true
+    local node=$1 rd=$2 peer=$3
+    status_connection_state "$rd" "$node" "$peer"
 }
 
 # satellite_pod_on resolves the satellite pod name on a node.
@@ -236,8 +234,8 @@ on_node "$N2" iptables -A OUTPUT -p tcp --dport "$DRBD_PORT" -j DROP
 deadline=$(( $(date +%s) + 30 ))
 cs=""
 while (( $(date +%s) < deadline )); do
-    cs=$(read_connection "$N1" "$RD")
-    if [[ "$cs" != "Connected" ]]; then break; fi
+    cs=$(read_connection "$N1" "$RD" "$N2")
+    if [[ "$cs" != "Connected" && "$cs" != "Established" ]]; then break; fi
     sleep 1
 done
 echo "   $N1 sees peer as: ${cs:-(unknown)}"
@@ -258,7 +256,7 @@ DRBD_PORT=""
 deadline=$(( $(date +%s) + 60 ))
 rep=""
 while (( $(date +%s) < deadline )); do
-    rep=$(read_replication "$N2" "$RD")
+    rep=$(read_replication "$N2" "$RD" "$N1")
     if [[ "$rep" == "SyncTarget" ]]; then break; fi
     sleep 1
 done
@@ -276,7 +274,7 @@ pct_at_stall=-1
 while (( $(date +%s) < deadline )); do
     pct=$(read_done_pct "$N2" "$RD")
     if (( pct >= 5 )); then pct_at_stall=$pct; break; fi
-    rep=$(read_replication "$N2" "$RD")
+    rep=$(read_replication "$N2" "$RD" "$N1")
     if [[ "$rep" != "SyncTarget" ]]; then
         echo "FAIL: sync left SyncTarget before reaching 5% (rep=$rep) — throttle ineffective?"
         exit 1
@@ -306,7 +304,7 @@ reps=()
 end=$(( $(date +%s) + STALL_OBSERVE_SECONDS ))
 while (( $(date +%s) < end )); do
     p=$(read_done_pct "$N2" "$RD")
-    r=$(read_replication "$N2" "$RD")
+    r=$(read_replication "$N2" "$RD" "$N1")
     samples+=("$p")
     reps+=("$r")
     sleep 3
@@ -402,7 +400,7 @@ rep_after=""
 resumed_at=0
 while (( $(date +%s) < deadline )); do
     pct_after=$(read_done_pct "$N2" "$RD")
-    rep_after=$(read_replication "$N2" "$RD")
+    rep_after=$(read_replication "$N2" "$RD" "$N1")
     # If we've left Sync* / Paused* entirely (Established) — sync
     # completed during the window. That's a successful resume.
     if [[ "$rep_after" == "Established" ]]; then
@@ -428,14 +426,14 @@ echo ">> wait <=${UPTODATE_DEADLINE_SECS}s for both peers UpToDate (throttled re
 deadline=$(( $(date +%s) + UPTODATE_DEADLINE_SECS ))
 d2=""
 while (( $(date +%s) < deadline )); do
-    p1=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null | grep -E 'replication:Established' | head -1 || true)
-    p2=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null | grep -E 'replication:Established' | head -1 || true)
-    d2=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null | grep -E 'disk:UpToDate' | head -1 || true)
-    if [[ -n "$p1" && -n "$p2" && -n "$d2" ]]; then break; fi
+    p1=$(status_replication_state "$RD" "$N1" "$N2")
+    p2=$(status_replication_state "$RD" "$N2" "$N1")
+    d2=$(status_disk_state "$RD" "$N2")
+    if [[ "$p1" == "Established" && "$p2" == "Established" && "$d2" == "UpToDate" ]]; then break; fi
     sleep 3
 done
-if [[ -z "$d2" ]]; then
-    echo "FAIL: $N2 never reached UpToDate"
+if [[ "$d2" != "UpToDate" ]]; then
+    echo "FAIL: $N2 never reached UpToDate (last d2=$d2 p1=$p1 p2=$p2)"
     on_node "$N2" drbdsetup status "$RD" --verbose || true
     exit 1
 fi

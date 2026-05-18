@@ -148,9 +148,8 @@ while (( $(date +%s) < deadline )); do
     placed=$(discover_diskful)
     if [[ -n "$placed" ]]; then
         read -r NODE_A <<<"$placed"
-        st=$(on_node "$NODE_A" drbdsetup status "$RD" 2>/dev/null \
-             | grep "disk:" | head -1 || true)
-        if [[ "$st" == *"disk:UpToDate"* ]]; then
+        st=$(status_disk_state "$RD" "$NODE_A")
+        if [[ "$st" == "UpToDate" ]]; then
             break
         fi
     fi
@@ -236,11 +235,12 @@ identify_sync_target() {
     for cand in "$a" "$b"; do
         local other
         if [[ "$cand" == "$a" ]]; then other=$b; else other=$a; fi
-        local st
-        st=$(on_node "$cand" drbdsetup status --verbose "$RD" 2>/dev/null | tr '\n' ' ' || true)
+        local local_disk repl
+        local_disk=$(status_disk_state "$RD" "$cand")
+        repl=$(status_replication_state "$RD" "$cand" "$other")
         # Local disk:Inconsistent + replication:SyncTarget → cand is the target
-        if echo "$st" | grep -q "disk:Inconsistent" \
-           && echo "$st" | grep -qE "replication:(SyncTarget|VerifyT|PausedSyncT)"; then
+        if [[ "$local_disk" == "Inconsistent" \
+              && "$repl" =~ ^(SyncTarget|VerifyT|PausedSyncT)$ ]]; then
             echo "$cand $other"
             return 0
         fi

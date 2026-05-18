@@ -109,9 +109,9 @@ echo "   marker md5 on $N1 = $md5_marker"
 # Confirm $N1 is Primary before we go anywhere near $N2 — if
 # write_random left it Secondary we'd misdiagnose a later
 # Primary-loss as a recovery-window regression.
-n1_role_before=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1)
+n1_role_before=$(status_role "$RD" "$N1")
 echo "   $N1 role pre-test: $n1_role_before"
-if [[ "$n1_role_before" != *"role:Primary"* ]]; then
+if [[ "$n1_role_before" != "Primary" ]]; then
     echo "FAIL: $N1 is not Primary before the StandAlone provocation"
     exit 1
 fi
@@ -154,17 +154,16 @@ on_node "$N2" bash -c "
 # any non-Connected sub-state (StandAlone / Unconnected / Connecting
 # / Outdated) — the recipe applies identically.
 deadline=$(( $(date +%s) + 8 ))
-n2_state=""
+n2_conn=""
 while (( $(date +%s) < deadline )); do
-    n2_state=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null \
-        | grep -E "connection:|disk:" | head -2 | tr '\n' ' ' || true)
-    if [[ "$n2_state" != *"connection:Connected"* ]]; then
+    n2_conn=$(status_connection_state "$RD" "$N2" "$N1")
+    if [[ "$n2_conn" != "Connected" && "$n2_conn" != "Established" ]]; then
         break
     fi
     sleep 1
 done
-echo "   $N2 post-provocation state: $n2_state"
-if [[ "$n2_state" == *"connection:Connected"* ]]; then
+echo "   $N2 post-provocation: ->$N1=$n2_conn disk=$(status_disk_state "$RD" "$N2")"
+if [[ "$n2_conn" == "Connected" || "$n2_conn" == "Established" ]]; then
     echo "FAIL: $N2 reconnected on its own — could not provoke StandAlone"
     exit 1
 fi
@@ -218,16 +217,16 @@ n2_uptodate=false
 n1_lost_primary=false
 n2_observed_states=""
 while (( $(date +%s) <= deadline )); do
-    n1_role=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
-    if [[ "$n1_role" != *"role:Primary"* ]]; then
+    n1_role=$(status_role "$RD" "$N1")
+    if [[ "$n1_role" != "Primary" ]]; then
         n1_lost_primary=true
         echo "   !! $N1 lost Primary role: $n1_role"
         break
     fi
 
-    n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+    n2_disk=$(status_disk_state "$RD" "$N2")
     n2_observed_states="${n2_observed_states}|${n2_disk}"
-    if [[ "$n2_disk" == *"disk:UpToDate"* ]]; then
+    if [[ "$n2_disk" == "UpToDate" ]]; then
         n2_uptodate=true
         break
     fi

@@ -247,6 +247,12 @@ while (( $(date +%s) < deadline )); do
     #     volume:0 minor:NNN disk:UpToDate ...
     #     <peer> node-id:M connection:Connecting role:Unknown
     #       volume:0 replication:Off peer-disk:DUnknown ...
+    #
+    # NOTE: this test is the LINSTOR<->kernel bridge — it specifically
+    # asserts that the observer-populated REST view (Level 2) AGREES
+    # with the kernel-direct view (Level 3). The drbdsetup parse below
+    # is intentional kernel-truth and must NOT be folded into
+    # status_connection_state(), which reads Level 2.
     drbd_raw=$(on_node "$PRIMARY" drbdsetup status "$RD" --verbose 2>/dev/null || true)
 
     # Parse: find the <peer-node-name> line(s) and the `connection:` token.

@@ -329,14 +329,16 @@ CRASHED+=("$IP_2" "$IP_3")
 wait "$RB2" 2>/dev/null || true
 wait "$RB3" 2>/dev/null || true
 
-# Wait for the surviving Primary to register quorum loss. DRBD
-# reports `quorum:no` in `drbdsetup status` once the kernel module
-# notices the peers vanish.
+# Wait for the surviving Primary to register quorum loss. Read from
+# Resource.Status (events2 observer, Phase 11.4.b / 11.5.b P0):
+# either Status.Volumes[0].Quorum=="false" or Status.Suspended
+# non-empty indicates the kernel has noticed the peers vanish.
 deadline=$(( $(date +%s) + 90 ))
 suspended=0
 while (( $(date +%s) < deadline )); do
-    if drbdsetup_on "$WORKER_1" status "$RD" 2>&1 \
-            | grep -qiE "quorum:no|may_promote:no|suspended"; then
+    q=$(status_volume_quorum "$RD" "$WORKER_1")
+    s=$(status_suspended "$RD" "$WORKER_1")
+    if [[ "$q" == "false" || -n "$s" ]]; then
         suspended=1
         break
     fi

@@ -183,15 +183,17 @@ on_node "$N1" drbdadm disconnect "$RD" 2>&1 || true
 DISCONNECTED=1
 
 # Wait up to 30s for the kernel on N1 to report suspended/quorum loss.
-# `drbdsetup status <rd>` is the canonical surface — the keywords we
-# tolerate are "quorum:no", "suspended", or "may_promote:no". Any of
-# them indicates the slot has crossed into the bug-82 trigger zone.
+# Read from Resource.Status (events2 observer surface, populated by
+# Phase 11.4.b / 11.5.b P0): either Status.Volumes[0].Quorum=="false"
+# or Status.Suspended non-empty indicates the slot has crossed into
+# the bug-82 trigger zone.
 echo "   wait up to 30s for N1 to observe quorum loss"
 deadline=$(( $(date +%s) + 30 ))
 saw_quorum_loss=0
 while (( $(date +%s) < deadline )); do
-    status_out=$(on_node "$N1" drbdsetup status "$RD" 2>&1 || true)
-    if echo "$status_out" | grep -qiE "quorum:no|suspended|may_promote:no"; then
+    q=$(status_volume_quorum "$RD" "$N1")
+    s=$(status_suspended "$RD" "$N1")
+    if [[ "$q" == "false" || -n "$s" ]]; then
         saw_quorum_loss=1
         break
     fi
@@ -203,6 +205,7 @@ if (( saw_quorum_loss != 1 )); then
     # Bug 82 was never reached. Bail out loud rather than declare
     # a false PASS.
     echo "FAIL: N1=$N1 never reported quorum loss after disconnect"
+    kubectl get resource "${RD}.${N1}" -o yaml 2>/dev/null | sed -n '/^status:/,$p' || true
     on_node "$N1" drbdsetup status "$RD" 2>&1 || true
     exit 1
 fi

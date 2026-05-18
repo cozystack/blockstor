@@ -172,9 +172,9 @@ echo "   marker md5 = $md5_marker"
 # Confirm $N1 is Primary before the disk-replace provocation — if
 # write_random somehow left it Secondary we'd misdiagnose a later
 # role flip as a recipe regression.
-n1_role_before=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1)
+n1_role_before=$(status_role "$RD" "$N1")
 echo "   $N1 role pre-recipe: $n1_role_before"
-if [[ "$n1_role_before" != *"role:Primary"* ]]; then
+if [[ "$n1_role_before" != "Primary" ]]; then
     echo "FAIL: $N1 is not Primary before the disk-replace provocation"
     exit 1
 fi
@@ -218,23 +218,22 @@ on_node "$N1" drbdadm detach --force "$RD"
 deadline=$(( $(date +%s) + 5 ))
 n1_disk=""
 while (( $(date +%s) < deadline )); do
-    n1_disk=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null \
-        | grep "disk:" | head -1 || true)
-    if [[ "$n1_disk" == *"disk:Diskless"* ]]; then
+    n1_disk=$(status_disk_state "$RD" "$N1")
+    if [[ "$n1_disk" == "Diskless" ]]; then
         break
     fi
     sleep 1
 done
 echo "   $N1 post-detach disk-state: $n1_disk"
-if [[ "$n1_disk" != *"disk:Diskless"* ]]; then
+if [[ "$n1_disk" != "Diskless" ]]; then
     echo "FAIL: $N1 did not transition to Diskless after detach (got: $n1_disk)"
     exit 1
 fi
 
 # Sanity guard: $N2 must remain UpToDate throughout. If the detach
 # somehow flapped $N2 we'd misdiagnose post-recipe failures.
-n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$n2_disk" != *"disk:UpToDate"* ]]; then
+n2_disk=$(status_disk_state "$RD" "$N2")
+if [[ "$n2_disk" != "UpToDate" ]]; then
     echo "FAIL: $N2 unexpected disk-state after $N1 detach: $n2_disk"
     exit 1
 fi
@@ -278,9 +277,8 @@ deadline=$(( $(date +%s) + RECOVERY_WINDOW ))
 n1_uptodate=false
 
 while (( $(date +%s) < deadline )); do
-    state=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null \
-        | grep "disk:" | head -1 || true)
-    if [[ "$state" == *"disk:UpToDate"* ]]; then
+    state=$(status_disk_state "$RD" "$N1")
+    if [[ "$state" == "UpToDate" ]]; then
         n1_uptodate=true
         break
     fi
@@ -299,8 +297,8 @@ echo "   $N1 reached UpToDate in $((window_end - window_start))s"
 # ---------- step 7: assertions ----------
 
 # (a) Both replicas UpToDate.
-n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-if [[ "$n2_disk" != *"disk:UpToDate"* ]]; then
+n2_disk=$(status_disk_state "$RD" "$N2")
+if [[ "$n2_disk" != "UpToDate" ]]; then
     echo "FAIL: $N2 not UpToDate post-recovery: $n2_disk"
     exit 1
 fi
@@ -323,9 +321,9 @@ if [[ "$res_sha_after" != "$res_sha_before" ]]; then
 fi
 
 # (d) N1 still Primary — recipe is local-disk-only, must not flip role.
-n1_role_after=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1)
+n1_role_after=$(status_role "$RD" "$N1")
 echo "   $N1 role post-recipe: $n1_role_after"
-if [[ "$n1_role_after" != *"role:Primary"* ]]; then
+if [[ "$n1_role_after" != "Primary" ]]; then
     echo "FAIL: $N1 lost Primary-ship across the disk-replace recipe"
     exit 1
 fi

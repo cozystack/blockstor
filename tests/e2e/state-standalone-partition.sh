@@ -185,17 +185,7 @@ echo ">> wait up to ${PARTITION_TIMEOUT}s for $N1's view of $N2 to flip non-Conn
 deadline=$(( $(date +%s) + PARTITION_TIMEOUT ))
 part_state=""
 while (( $(date +%s) < deadline )); do
-    drbd_raw=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true)
-    part_state=$(echo "$drbd_raw" | awk -v peer="$N2" '
-        $0 ~ "^[[:space:]]*"peer"[[:space:]]" {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /^connection:/) {
-                    split($i, a, ":")
-                    print a[2]
-                    exit
-                }
-            }
-        }')
+    part_state=$(status_connection_state "$RD" "$N1" "$N2")
     if [[ "$part_state" =~ ^($BAD_STATES_RE)$ ]]; then
         break
     fi
@@ -231,23 +221,12 @@ deadline=$(( $(date +%s) + HEAL_TIMEOUT ))
 heal_state=""
 heal_ok=false
 while (( $(date +%s) < deadline )); do
-    drbd_raw=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true)
-    heal_state=$(echo "$drbd_raw" | awk -v peer="$N2" '
-        $0 ~ "^[[:space:]]*"peer"[[:space:]]" {
-            for (i=1; i<=NF; i++) {
-                if ($i ~ /^connection:/) {
-                    split($i, a, ":")
-                    print a[2]
-                    exit
-                }
-            }
-        }')
-    n1_disk=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+    heal_state=$(status_connection_state "$RD" "$N1" "$N2")
+    n1_disk=$(status_disk_state "$RD" "$N1")
+    n2_disk=$(status_disk_state "$RD" "$N2")
 
     if [[ ( "$heal_state" == "Established" || "$heal_state" == "Connected" ) \
-          && "$n1_disk" == *"disk:UpToDate"* \
-          && "$n2_disk" == *"disk:UpToDate"* ]]; then
+          && "$n1_disk" == "UpToDate" && "$n2_disk" == "UpToDate" ]]; then
         heal_ok=true
         break
     fi

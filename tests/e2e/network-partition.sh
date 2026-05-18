@@ -76,10 +76,10 @@ done
 # checks the 2-replica pair, so adapt for 3 here.
 deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
-    s1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s2=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s3=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    if (( s1 >= 1 && s2 >= 1 && s3 >= 1 )); then
+    s1=$(status_disk_state "$RD" "$N1")
+    s2=$(status_disk_state "$RD" "$N2")
+    s3=$(status_disk_state "$RD" "$N3")
+    if [[ "$s1" == "UpToDate" && "$s2" == "UpToDate" && "$s3" == "UpToDate" ]]; then
         break
     fi
     sleep 2
@@ -113,30 +113,31 @@ on_node "$N1" iptables -A OUTPUT -p tcp --dport "$DRBD_PORT" -j DROP
 echo ">> wait up to 90s for $N1 to fence itself"
 # Bug 297: with `on-no-quorum=suspend-io` (the controller-seeded default
 # alongside `quorum=majority`), DRBD-9 SUSPENDS IO on quorum loss
-# rather than demoting the role. The kernel keeps `role:Primary` and
-# stamps `suspended:quorum` on the local row — same effect (no further
+# rather than demoting the role. The kernel keeps Role=Primary and
+# stamps Suspended=Quorum on the local row — same effect (no further
 # writes accepted on the minority side, no split-brain) but a
 # different state signature than the legacy `io-error` policy. Accept
-# either signal: `suspended:` flag present OR role no longer Primary.
+# either signal: Status.Suspended non-empty OR role no longer Primary.
+# Read from Resource.Status via Phase 11.5.b P0 helpers.
 deadline=$(( $(date +%s) + 90 ))
-n1_status=""
+n1_first_role=""
+n1_suspended=""
 
 while (( $(date +%s) < deadline )); do
-    n1_status=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true)
-    n1_first_role=$(echo "$n1_status" | grep "role:" | head -1 || true)
-    if [[ "$n1_first_role" != *"role:Primary"* ]] \
-        || echo "$n1_status" | grep -q "suspended:"; then
+    n1_first_role=$(status_role "$RD" "$N1")
+    n1_suspended=$(status_suspended "$RD" "$N1")
+    if [[ "$n1_first_role" != "Primary" || -n "$n1_suspended" ]]; then
         break
     fi
     sleep 2
 done
 
-n1_first_role=$(echo "$n1_status" | grep "role:" | head -1 || true)
-if [[ "$n1_first_role" == *"role:Primary"* ]] \
-    && ! echo "$n1_status" | grep -q "suspended:"; then
+if [[ "$n1_first_role" == "Primary" && -z "$n1_suspended" ]]; then
     echo "FAIL: $N1 stayed Primary AND unsuspended in a 1-vs-2 partition (split-brain risk)"
-    echo "----- last status -----"
-    echo "$n1_status"
+    echo "----- last Status (role=$n1_first_role suspended=$n1_suspended) -----"
+    kubectl get resource "${RD}.${N1}" -o yaml 2>/dev/null | sed -n '/^status:/,$p' || true
+    echo "----- drbdsetup dump -----"
+    on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true
     echo "-----------------------"
     exit 1
 fi
@@ -148,7 +149,7 @@ fi
 # and $N2's auto-promote on write fails ("multiple primaries not
 # allowed by config"), the post-heal read loop then sees $N1 still
 # holding the stale pre-partition md5.
-if [[ "$n1_first_role" == *"role:Primary"* ]]; then
+if [[ "$n1_first_role" == "Primary" ]]; then
     on_node "$N1" drbdadm secondary "$RD" 2>/dev/null || true
 fi
 
@@ -169,31 +170,49 @@ echo ">> wait up to 180s for $N1 to converge (peer-disk UpToDate, no suspended)"
 #
 # Wait on the PEER state instead. `drbdsetup status` omits the
 # `connection:` field once a peer is Connected — the presence of two
-# `role:` lines (one per peer) plus `peer-disk:UpToDate` on both is
-# the unambiguous "fully reconnected and resync done" signal. Also
-# assert `quorum:no` is gone and `suspended:` is absent on the local
-# row — both flags clear as soon as $N1 re-joins the majority.
+# `peer-disk:UpToDate` lines is the unambiguous "fully reconnected and
+# resync done" signal. Also assert Status.Volumes[0].Quorum=="true"
+# and Status.Suspended=="" on the local row — both flags clear as soon
+# as $N1 re-joins the majority (read via Phase 11.4.b / 11.5.b P0
+# helpers; the peer-disk count stays on drbdsetup pending Phase 11.5.b
+# P1 Connections[].PeerVolumes[].PeerDiskState).
 deadline=$(( $(date +%s) + 180 ))
 status=""
+n1_to_n2_conn=""
+n1_to_n3_conn=""
+n1_quorum=""
+n1_suspended=""
 
 while (( $(date +%s) < deadline )); do
+    # TODO(Phase 11.5.b P1): peer-disk view requires Connections[].PeerVolumes[].PeerDiskState.
+    # Until then keep the drbdsetup parse for `peer-disk:UpToDate` count.
     status=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true)
     peer_uptodate=$(echo "$status" | grep -c "peer-disk:UpToDate" || true)
+    n1_to_n2_conn=$(status_connection_state "$RD" "$N1" "$N2")
+    n1_to_n3_conn=$(status_connection_state "$RD" "$N1" "$N3")
+    n1_quorum=$(status_volume_quorum "$RD" "$N1")
+    n1_suspended=$(status_suspended "$RD" "$N1")
     if (( peer_uptodate >= 2 )) \
-        && ! echo "$status" | grep -q "connection:Connecting" \
-        && ! echo "$status" | grep -q "quorum:no" \
-        && ! echo "$status" | grep -q "suspended:"; then
+        && [[ "$n1_to_n2_conn" != "Connecting" && "$n1_to_n3_conn" != "Connecting" ]] \
+        && [[ "$n1_quorum" != "false" ]] \
+        && [[ -z "$n1_suspended" ]]; then
         break
     fi
     sleep 2
 done
 
 peer_uptodate=$(echo "$status" | grep -c "peer-disk:UpToDate" || true)
+n1_to_n2_conn=$(status_connection_state "$RD" "$N1" "$N2")
+n1_to_n3_conn=$(status_connection_state "$RD" "$N1" "$N3")
+n1_quorum=$(status_volume_quorum "$RD" "$N1")
+n1_suspended=$(status_suspended "$RD" "$N1")
 if (( peer_uptodate < 2 )) \
-    || echo "$status" | grep -q "connection:Connecting" \
-    || echo "$status" | grep -q "quorum:no" \
-    || echo "$status" | grep -q "suspended:"; then
+    || [[ "$n1_to_n2_conn" == "Connecting" || "$n1_to_n3_conn" == "Connecting" ]] \
+    || [[ "$n1_quorum" == "false" ]] \
+    || [[ -n "$n1_suspended" ]]; then
     echo "FAIL: $N1 did not re-converge after heal"
+    echo "    connections: ->$N2=$n1_to_n2_conn ->$N3=$n1_to_n3_conn"
+    echo "    quorum=$n1_quorum suspended=$n1_suspended peer-disk-uptodate=$peer_uptodate"
     echo "----- last status -----"
     echo "$status"
     echo "-----------------------"

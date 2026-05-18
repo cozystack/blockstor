@@ -428,8 +428,8 @@ fi
 
 # Primary on N1 must STILL be InUse / Primary — the recovery should
 # not have demoted N1 or otherwise interrupted the consumer mount.
-role_n1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
-if [[ "$role_n1" != *"role:Primary"* ]]; then
+role_n1=$(status_role "$RD" "$N1")
+if [[ "$role_n1" != "Primary" ]]; then
     echo "FAIL: ${N1} lost Primary role during recovery (got: $role_n1)"
     exit 1
 fi

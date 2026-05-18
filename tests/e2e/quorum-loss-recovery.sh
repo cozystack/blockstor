@@ -158,15 +158,15 @@ done
 echo ">> wait 3/3 UpToDate"
 deadline=$(( $(date +%s) + 180 ))
 while (( $(date +%s) < deadline )); do
-    s1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s2=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    s3=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep -c "disk:UpToDate" || true)
-    if (( s1 >= 1 && s2 >= 1 && s3 >= 1 )); then
+    s1=$(status_disk_state "$RD" "$N1")
+    s2=$(status_disk_state "$RD" "$N2")
+    s3=$(status_disk_state "$RD" "$N3")
+    if [[ "$s1" == "UpToDate" && "$s2" == "UpToDate" && "$s3" == "UpToDate" ]]; then
         break
     fi
     sleep 2
 done
-if (( s1 < 1 || s2 < 1 || s3 < 1 )); then
+if [[ "$s1" != "UpToDate" || "$s2" != "UpToDate" || "$s3" != "UpToDate" ]]; then
     echo "FAIL: ${RD} never reached 3/3 UpToDate (N1=$s1 N2=$s2 N3=$s3)"
     exit 1
 fi
@@ -223,17 +223,17 @@ on_node "$N1" iptables -A INPUT  -p tcp --dport "$DRBD_PORT" -j DROP
 on_node "$N1" iptables -A OUTPUT -p tcp --dport "$DRBD_PORT" -j DROP
 
 # --- step 4: wait for quorum-loss / I/O suspend on N1 ---------------
-# Markers we accept (any one is enough):
-#   - "quorum:no"          — DRBD 9 reports the policy decision
-#   - "may_promote:no"     — derived from quorum loss + 1-vs-2 split
-#   - "suspended-user"     — explicit suspend marker
-#   - "suspended:quorum"   — explicit quorum-suspend marker
+# Markers we accept (any one is enough), read from Resource.Status
+# (events2 observer surface, populated by Phase 11.4.b / 11.5.b P0):
+#   - Status.Volumes[0].Quorum=="false"  — DRBD 9 reports quorum loss
+#   - Status.Suspended non-empty          — I/O suspended (Quorum/User/...)
 echo ">> step 4: wait up to ${QUORUM_LOSS_DEADLINE}s for quorum loss on ${N1}"
 deadline=$(( $(date +%s) + QUORUM_LOSS_DEADLINE ))
 saw_quorum_loss=0
 while (( $(date +%s) < deadline )); do
-    status=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true)
-    if echo "$status" | grep -qiE "quorum:no|may_promote:no|suspended-user|suspended:quorum"; then
+    q=$(status_volume_quorum "$RD" "$N1")
+    s=$(status_suspended "$RD" "$N1")
+    if [[ "$q" == "false" || -n "$s" ]]; then
         saw_quorum_loss=1
         break
     fi
@@ -241,7 +241,9 @@ while (( $(date +%s) < deadline )); do
 done
 if (( saw_quorum_loss != 1 )); then
     echo "FAIL: ${N1} never reported quorum loss within ${QUORUM_LOSS_DEADLINE}s"
-    echo "---- last status on ${N1} ----"
+    echo "---- last Status on ${N1} ----"
+    kubectl get resource "${RD}.${N1}" -o yaml 2>/dev/null | sed -n '/^status:/,$p' || true
+    echo "---- last drbdsetup status on ${N1} ----"
     on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true
     exit 1
 fi
@@ -251,7 +253,7 @@ echo "   ${N1} reports quorum loss"
 # auto-demote the Primary side (depends on on-suspended-primary-
 # outdated policy). Pre-force role can be either Primary (suspended)
 # or Secondary — we capture it for the post-mortem trace.
-n1_role_pre=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+n1_role_pre=$(status_role "$RD" "$N1")
 echo "   pre-force role on ${N1}: ${n1_role_pre}"
 
 # --- step 5: operator force-promote on isolated N1 ------------------
@@ -269,10 +271,10 @@ if ! on_node "$N1" drbdadm primary --force "$RD"; then
     exit 1
 fi
 
-sleep 1
-n1_role_post=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+wait_role "$RD" "$N1" "Primary" 5 || true
+n1_role_post=$(status_role "$RD" "$N1")
 echo "   post-force role on ${N1}: ${n1_role_post}"
-if [[ "$n1_role_post" != *"role:Primary"* ]]; then
+if [[ "$n1_role_post" != "Primary" ]]; then
     echo "FAIL: ${N1} did not become Primary after drbdadm primary --force"
     exit 1
 fi
@@ -287,9 +289,9 @@ demoted=false
 demote_at=-1
 role_trace=""
 for i in $(seq 1 "$OBSERVE_WINDOW"); do
-    r=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+    r=$(status_role "$RD" "$N1")
     role_trace="${role_trace}|t${i}:${r}"
-    if [[ "$r" != *"role:Primary"* ]]; then
+    if [[ "$r" != "Primary" ]]; then
         demoted=true
         demote_at=$i
         echo "   !! ${N1} demoted at t=${i}s: ${r}"
@@ -347,13 +349,13 @@ echo ">> wait up to ${HEAL_DEADLINE}s for ${N1} to re-converge UpToDate"
 deadline=$(( $(date +%s) + HEAL_DEADLINE ))
 post_state=""
 while (( $(date +%s) < deadline )); do
-    post_state=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$post_state" == *"disk:UpToDate"* ]]; then
+    post_state=$(status_disk_state "$RD" "$N1")
+    if [[ "$post_state" == "UpToDate" ]]; then
         break
     fi
     sleep 2
 done
-if [[ "$post_state" != *"disk:UpToDate"* ]]; then
+if [[ "$post_state" != "UpToDate" ]]; then
     echo "FAIL: ${N1} did not re-converge to UpToDate after heal (last: ${post_state})"
     exit 1
 fi
@@ -369,9 +371,9 @@ echo "   ${N1} converged: ${post_state}"
 echo ">> step 9: assert no split-brain post-heal"
 prim_count=0
 for n in "$N1" "$N2" "$N3"; do
-    r=$(on_node "$n" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+    r=$(status_role "$RD" "$n")
     echo "   role on ${n}: ${r}"
-    if [[ "$r" == *"role:Primary"* ]]; then
+    if [[ "$r" == "Primary" ]]; then
         prim_count=$(( prim_count + 1 ))
     fi
 done

@@ -136,12 +136,12 @@ wait_uptodate "$RD" "$WORKER_1" "$WORKER_2"
 
 echo ">> sanity: $WORKER_1 Primary, $WORKER_2 Secondary, $WORKER_3 has no copy"
 on_node "$WORKER_1" drbdadm primary --force "$RD" 2>/dev/null || true
-sleep 2
-state1=$(on_node "$WORKER_1" drbdsetup status "$RD" 2>/dev/null | head -1 || true)
-case "$state1" in
-    *role:Primary*) ;;
-    *) echo "FAIL: $WORKER_1 not Primary after promote (got: $state1)"; exit 1;;
-esac
+wait_role "$RD" "$WORKER_1" "Primary" 10 || true
+state1=$(status_role "$RD" "$WORKER_1")
+if [[ "$state1" != "Primary" ]]; then
+    echo "FAIL: $WORKER_1 not Primary after promote (got: $state1)"
+    exit 1
+fi
 
 if kubectl get resource "$RD.$WORKER_3" >/dev/null 2>&1; then
     echo "FAIL: $RD.$WORKER_3 already exists before migration"
@@ -220,10 +220,10 @@ fi
 echo ">> wait up to 300s for $WORKER_3 UpToDate + $WORKER_2 Resource CRD gone"
 deadline=$(( $(date +%s) + 300 ))
 while (( $(date +%s) < deadline )); do
-    s3=$(on_node "$WORKER_3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
+    s3=$(status_disk_state "$RD" "$WORKER_3")
     w2_gone=no
     kubectl get resource "$RD.$WORKER_2" >/dev/null 2>&1 || w2_gone=yes
-    if [[ "$s3" == *"disk:UpToDate"* && "$w2_gone" == "yes" ]]; then
+    if [[ "$s3" == "UpToDate" && "$w2_gone" == "yes" ]]; then
         break
     fi
     sleep 3
@@ -232,7 +232,7 @@ done
 stop_watch
 
 # ---------- Assertions ----------
-if [[ "$s3" != *"disk:UpToDate"* ]]; then
+if [[ "$s3" != "UpToDate" ]]; then
     echo "FAIL: $WORKER_3 never reached UpToDate (got: $s3)"
     exit 1
 fi
@@ -243,11 +243,11 @@ if kubectl get resource "$RD.$WORKER_2" >/dev/null 2>&1; then
 fi
 
 # Primary must have stayed on $WORKER_1 throughout (we didn't touch it).
-final_role=$(on_node "$WORKER_1" drbdsetup status "$RD" 2>/dev/null | head -1 || true)
-case "$final_role" in
-    *role:Primary*) ;;
-    *) echo "FAIL: $WORKER_1 lost Primary role (got: $final_role)"; exit 1;;
-esac
+final_role=$(status_role "$RD" "$WORKER_1")
+if [[ "$final_role" != "Primary" ]]; then
+    echo "FAIL: $WORKER_1 lost Primary role (got: $final_role)"
+    exit 1
+fi
 
 # Redundancy invariant: minimum diskful count observed in the
 # watcher log must be >= 2 for EVERY sample. UG9 promises strict

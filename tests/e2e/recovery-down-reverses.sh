@@ -131,14 +131,13 @@ echo ">> wait <=${UPTODATE_DEADLINE_SECS}s for ${RD} to reach Connected+UpToDate
 deadline=$(( $(date +%s) + UPTODATE_DEADLINE_SECS ))
 connected_at=0
 while (( $(date +%s) < deadline )); do
-    n1_view=$(on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true)
-    n2_view=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null || true)
-    n1_conn=$(echo "$n1_view" | grep -oE 'connection:[A-Za-z]+' | head -1 | cut -d: -f2)
-    n2_conn=$(echo "$n2_view" | grep -oE 'connection:[A-Za-z]+' | head -1 | cut -d: -f2)
-    n2_local_disk=$(echo "$n2_view" | grep -E 'disk:UpToDate' | head -1 || true)
-    n1_local_disk=$(echo "$n1_view" | grep -E 'disk:UpToDate' | head -1 || true)
-    if [[ "$n1_conn" == "Connected" && "$n2_conn" == "Connected" \
-          && -n "$n1_local_disk" && -n "$n2_local_disk" ]]; then
+    n1_conn=$(status_connection_state "$RD" "$N1" "$N2")
+    n2_conn=$(status_connection_state "$RD" "$N2" "$N1")
+    n1_local_disk=$(status_disk_state "$RD" "$N1")
+    n2_local_disk=$(status_disk_state "$RD" "$N2")
+    if [[ ( "$n1_conn" == "Connected" || "$n1_conn" == "Established" ) \
+          && ( "$n2_conn" == "Connected" || "$n2_conn" == "Established" ) \
+          && "$n1_local_disk" == "UpToDate" && "$n2_local_disk" == "UpToDate" ]]; then
         connected_at=$(( $(date +%s) - t_down ))
         break
     fi

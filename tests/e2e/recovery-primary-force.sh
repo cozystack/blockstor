@@ -110,8 +110,8 @@ wait_uptodate "$RD" "$N1" "$N2"
 # Identify the Secondary side (without auto-primary prop, both
 # should be Secondary on settle — we pick N2 as the force-promote
 # target, then also promote N1 to exercise dual-Primary).
-n1_role=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1)
-n2_role=$(on_node "$N2" drbdsetup status "$RD" | grep "role:" | head -1)
+n1_role=$(status_role "$RD" "$N1")
+n2_role=$(status_role "$RD" "$N2")
 echo "   pre-test roles: $N1=$n1_role  $N2=$n2_role"
 
 # Cache satellite pods for log scanning later. Single-replica per
@@ -144,11 +144,11 @@ on_node "$N1" drbdadm primary --force "$RD" 2>&1 || true
 # assertion is "reconciler does not demote N2", which holds in
 # either single- or dual-Primary mode.
 sleep 1
-n1_role_post=$(on_node "$N1" drbdsetup status "$RD" | grep "role:" | head -1 || true)
-n2_role_post=$(on_node "$N2" drbdsetup status "$RD" | grep "role:" | head -1 || true)
+n1_role_post=$(status_role "$RD" "$N1")
+n2_role_post=$(status_role "$RD" "$N2")
 echo "   post-promote: $N1=$n1_role_post  $N2=$n2_role_post"
 
-if [[ "$n2_role_post" != *"role:Primary"* ]]; then
+if [[ "$n2_role_post" != "Primary" ]]; then
     echo "FAIL: $N2 did not become Primary after drbdadm primary --force"
     exit 1
 fi
@@ -163,10 +163,10 @@ demoted=false
 demote_at=-1
 role_trace=""
 for i in $(seq 1 "$OBSERVE_WINDOW"); do
-    r_n2=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
-    r_n1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
+    r_n2=$(status_role "$RD" "$N2")
+    r_n1=$(status_role "$RD" "$N1")
     role_trace="${role_trace}|t${i}:${r_n1}/${r_n2}"
-    if [[ "$r_n2" != *"role:Primary"* ]]; then
+    if [[ "$r_n2" != "Primary" ]]; then
         demoted=true
         demote_at=$i
         echo "   !! $N2 demoted at t=${i}s: $r_n2"

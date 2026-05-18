@@ -43,6 +43,95 @@ on_node() {
     kubectl -n "$NS" exec "$pod" -- "$@"
 }
 
+# ---- k8s-native readers (preferred over drbdsetup-status grep) ----
+#
+# Replaces `kubectl exec satellite -- drbdsetup status ... | grep ...`
+# bypass patterns with reads of Resource.Status, which the satellite-
+# side events2 observer already populates from the same kernel state.
+# See docs/test-status-cheatsheet.md for the full mapping table.
+
+# status_disk_state <rd> <node> [volNum=0] — local kernel disk state for
+# the named volume on the named node, as observed by the satellite and
+# reflected on Resource.Status. Returns "UpToDate"/"Inconsistent"/
+# "Outdated"/"Diskless"/"Failed"/"Negotiating"/"Attaching"/"Detaching",
+# or empty string if the Resource is missing or the volume not yet
+# observed. Prefer this over parsing `drbdsetup status | grep disk:`.
+status_disk_state() {
+    local rd=$1 node=$2 vol=${3:-0}
+    kubectl get resource "${rd}.${node}" -o json 2>/dev/null \
+        | jq -r --argjson v "${vol}" \
+            '.status.volumes[]? | select(.volumeNumber==$v) | .diskState // ""'
+}
+
+# wait_disk_state <rd> <node> <expected> [timeout=60] [volNum=0] — poll
+# Resource.Status until the given volume reaches the expected diskState
+# or timeout. Non-zero exit on timeout.
+wait_disk_state() {
+    local rd=$1 node=$2 expected=$3 timeout=${4:-60} vol=${5:-0}
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        if [[ "$(status_disk_state "$rd" "$node" "$vol")" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "wait_disk_state: $rd on $node vol $vol never reached $expected within ${timeout}s" >&2
+    return 1
+}
+
+# status_role <rd> <node> — local DRBD-9 role on this replica. Returns
+# "Primary" / "Secondary" / "Unknown" / "" (empty when the Resource is
+# missing or the observer has not yet stamped a value). Status.Role
+# shipped in commit a077afcf2 (Phase 11.5.b P0). Prefer this over
+# `on_node "$node" drbdsetup status "$rd" | grep role:` — same kernel
+# truth, no satellite-pod coupling.
+status_role() {
+    local rd=$1 node=$2
+    kubectl get resource "${rd}.${node}" -o jsonpath='{.status.role}' 2>/dev/null
+}
+
+# status_suspended <rd> <node> — DRBD-9 I/O-suspension reason on this
+# replica. Returns "" (= No, normal I/O), "Quorum", "User", "NoData",
+# or "Fencing". Status.Suspended shipped in commit a077afcf2
+# (Phase 11.5.b P0). Pair with status_volume_quorum() to distinguish
+# "kernel lost quorum on this volume" from "operator manually
+# suspended I/O". The pre-conversion bypass conflated
+# `quorum:no | suspended:* | may_promote:no` into one grep — after
+# conversion, pick the precise field the assertion needs.
+status_suspended() {
+    local rd=$1 node=$2
+    kubectl get resource "${rd}.${node}" -o jsonpath='{.status.suspended}' 2>/dev/null
+}
+
+# status_volume_quorum <rd> <node> [volNum=0] — per-volume kernel
+# quorum bool from events2 device frames. Returns "true" (has quorum)
+# / "false" / empty. Status.Volumes[].Quorum shipped in commit
+# 0cca4a942 (Phase 11.4.b P0). Per-volume, in contrast to the
+# coarser node-wide `drbd.linbit.com/lost-quorum` k8s taint.
+status_volume_quorum() {
+    local rd=$1 node=$2 vol=${3:-0}
+    kubectl get resource "${rd}.${node}" \
+        -o jsonpath="{.status.volumes[?(@.volumeNumber==${vol})].quorum}" 2>/dev/null
+}
+
+# wait_role <rd> <node> <expected> [timeout=30] — poll Resource.Status
+# until the local role reaches the expected value ("Primary" or
+# "Secondary") or timeout. Non-zero exit on timeout. Useful when the
+# test has just issued `drbdadm primary --force` and needs to wait for
+# the observer to stamp the new role before sampling it.
+wait_role() {
+    local rd=$1 node=$2 expected=$3 timeout=${4:-30}
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        if [[ "$(status_role "$rd" "$node")" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "wait_role: $rd on $node never reached role=$expected within ${timeout}s" >&2
+    return 1
+}
+
 # wait_uptodate POD waits up to 180s for both replicas of $RD to reach
 # disk:UpToDate. Caller defines $RD and the two node names $PRIMARY,
 # $PEER before calling. Exits non-zero on timeout. Initial sync on a
@@ -53,10 +142,10 @@ wait_uptodate() {
 
     while (( $(date +%s) < deadline )); do
         local p1 p2
-        p1=$(on_node "$primary" drbdsetup status "$rd" 2>/dev/null | grep "disk:" | head -1 || true)
-        p2=$(on_node "$peer"    drbdsetup status "$rd" 2>/dev/null | grep "disk:" | head -1 || true)
+        p1=$(status_disk_state "$rd" "$primary")
+        p2=$(status_disk_state "$rd" "$peer")
 
-        if [[ "$p1" == *"disk:UpToDate"* && "$p2" == *"disk:UpToDate"* ]]; then
+        if [[ "$p1" == "UpToDate" && "$p2" == "UpToDate" ]]; then
             return 0
         fi
 
@@ -64,6 +153,78 @@ wait_uptodate() {
     done
 
     echo "FAIL: $rd never reached UpToDate on both peers" >&2
+    return 1
+}
+
+# status_connection_state <rd> <node> <peer> — full kernel connection
+# state string as observed FROM `node` TOWARD `peer`: Connected /
+# Connecting / StandAlone / BrokenPipe / NetworkFailure / Timeout /
+# Established / Unconnected / Disconnecting / ProtocolError / TearDown /
+# WFConnection. Returns "" if the connection row hasn't been observed
+# yet (Resource missing or pre-events2). Prefer this over parsing
+# `drbdsetup status --verbose | grep -oE 'connection:[A-Za-z]+'`.
+status_connection_state() {
+    kubectl get resource "${1}.${2}" -o json 2>/dev/null \
+        | jq -r --arg p "${3}" \
+            '.status.connections[]? | select(.peerNodeName==$p) | .message // ""'
+}
+
+# status_connected <rd> <node> <peer> — derived bool ("true"/"false")
+# from the observer snapshot: true iff the (node,peer) connection is
+# Connected/Established at the kernel level. Useful when the test only
+# cares about "are they talking" rather than the exact state.
+status_connected() {
+    kubectl get resource "${1}.${2}" -o json 2>/dev/null \
+        | jq -r --arg p "${3}" \
+            '.status.connections[]? | select(.peerNodeName==$p) | .connected // false'
+}
+
+# status_replication_state <rd> <node> <peer> — per-peer DRBD-9
+# replication state machine: Established / SyncSource / SyncTarget /
+# PausedSyncS / PausedSyncT / VerifyS / VerifyT / Ahead / Behind / Off /
+# WFBitMapS / WFBitMapT / WFSyncUUID / StartingSync[ST]. Prefer this
+# over parsing `drbdsetup status --verbose | grep replication:`.
+status_replication_state() {
+    kubectl get resource "${1}.${2}" -o json 2>/dev/null \
+        | jq -r --arg p "${3}" \
+            '.status.connections[]? | select(.peerNodeName==$p) | .replicationState // ""'
+}
+
+# wait_connection_state <rd> <node> <peer> <want> [timeout=60] — poll
+# Resource.Status.connections until the (node,peer) connection's
+# `message` matches WANT, or timeout elapses. WANT may be a literal
+# ("Connected") or an alternation ("Connected|Established"). Non-zero
+# exit on timeout.
+wait_connection_state() {
+    local rd=$1 node=$2 peer=$3 want=$4 timeout=${5:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=""
+    while (( $(date +%s) < deadline )); do
+        cur=$(status_connection_state "$rd" "$node" "$peer")
+        if [[ "$cur" =~ ^(${want})$ ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_connection_state: ${rd}.${node}<->${peer} never reached '${want}' (last='${cur}') within ${timeout}s" >&2
+    return 1
+}
+
+# wait_replication_state <rd> <node> <peer> <want> [timeout=60] — poll
+# Resource.Status.connections until replicationState matches WANT, or
+# timeout elapses. WANT supports alternation, e.g. "SyncTarget|PausedSyncT".
+wait_replication_state() {
+    local rd=$1 node=$2 peer=$3 want=$4 timeout=${5:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=""
+    while (( $(date +%s) < deadline )); do
+        cur=$(status_replication_state "$rd" "$node" "$peer")
+        if [[ "$cur" =~ ^(${want})$ ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_replication_state: ${rd}.${node}<->${peer} never reached '${want}' (last='${cur}') within ${timeout}s" >&2
     return 1
 }
 

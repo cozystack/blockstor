@@ -115,9 +115,8 @@ wait_uptodate_3() {
         local ok=1
         for n in "$N1" "$N2" "$N3"; do
             local st
-            st=$(on_node "$n" drbdsetup status "$rd" 2>/dev/null \
-                 | grep "disk:" | head -1 || true)
-            if [[ "$st" != *"disk:UpToDate"* ]]; then
+            st=$(status_disk_state "$rd" "$n")
+            if [[ "$st" != "UpToDate" ]]; then
                 ok=0
                 break
             fi
@@ -210,11 +209,15 @@ PARTITION_ON=1
 echo ">> verify $N3 sees peer connections down"
 deadline=$(( $(date +%s) + 30 ))
 disconnected=0
+n3_to_n1=""
+n3_to_n2=""
 while (( $(date +%s) < deadline )); do
-    st=$(on_node "$N3" drbdsetup status --verbose "$RD" 2>/dev/null | tr '\n' ' ' || true)
-    # connection:Connecting OR NetworkFailure OR Timeout — anything
-    # that isn't Connected/Established proves the partition landed.
-    if echo "$st" | grep -qE "connection:(StandAlone|Connecting|Unconnected|NetworkFailure|Timeout|BrokenPipe)"; then
+    # Read Status.connections directly — anything that isn't
+    # Connected/Established proves the partition landed.
+    n3_to_n1=$(status_connection_state "$RD" "$N3" "$N1")
+    n3_to_n2=$(status_connection_state "$RD" "$N3" "$N2")
+    if [[ "$n3_to_n1" =~ ^(StandAlone|Connecting|Unconnected|NetworkFailure|Timeout|BrokenPipe)$ ]] \
+       || [[ "$n3_to_n2" =~ ^(StandAlone|Connecting|Unconnected|NetworkFailure|Timeout|BrokenPipe)$ ]]; then
         disconnected=1
         break
     fi
@@ -222,10 +225,11 @@ while (( $(date +%s) < deadline )); do
 done
 if (( disconnected == 0 )); then
     echo "FAIL: $N3 connection never left Connected within 30s of iptables drop"
+    echo "    last: ->$N1=$n3_to_n1 ->$N2=$n3_to_n2"
     on_node "$N3" drbdsetup status --verbose "$RD" || true
     exit 1
 fi
-echo "   $N3 partitioned from peers"
+echo "   $N3 partitioned from peers (->$N1=$n3_to_n1, ->$N2=$n3_to_n2)"
 
 # Write 256 MiB on Primary ($N1). The bytes land on $N1 and $N2
 # (still connected); $N3 misses them. write_random in lib.sh does
@@ -279,38 +283,32 @@ saw_established_after_sync=0
 deadline=$(( $(date +%s) + RESYNC_DEADLINE_SECS ))
 
 while (( $(date +%s) < deadline )); do
-    st=$(on_node "$N3" drbdsetup status --verbose "$RD" 2>/dev/null \
-         | tr '\n' ' ' || true)
-    # Match local disk state (`disk:Foo`, NOT peer-disk:Foo) by
-    # looking at the first disk: occurrence — drbdsetup status
-    # emits the local row first, then each peer.
-    local_disk=$(echo "$st" | grep -oE 'disk:[A-Za-z]+' | head -1 || true)
-    # Replication is per-peer; take whichever peer reports a
-    # non-Off/non-Established value. SyncTarget on N3 means at
-    # least one peer is acting as SyncSource right now. Both
-    # `grep` calls can return nonzero (empty match) which under
-    # `set -e` aborts the loop silently — wrap each with `|| true`
-    # AND wrap the whole pipeline in `|| true` so the outer
-    # assignment never propagates the failure.
-    # Use awk/sed instead of grep|grep|head — single-process pipelines
-    # avoid the `set -e + pipefail` trap where the inner grep finding
-    # zero matches aborts the whole script silently.
-    repl=$(printf '%s\n' "$st" | tr ' ' '\n' \
-           | awk -F: '/^replication:/ && $2 != "Off" && $2 != "Established" {print; exit}' \
-           || true)
-    repl_any=$(printf '%s\n' "$st" | tr ' ' '\n' \
-               | awk -F: '/^replication:/ {print; exit}' || true)
-    # Count Connected peers; awk on tokenised input.
-    est_peers=$(printf '%s\n' "$st" | tr ' ' '\n' \
-                | awk '/^connection:Connected$/ {n++} END {print n+0}' \
-                2>/dev/null || echo 0)
-    echo "   [t=$(( $(date +%s) - T_CONNECT ))s] $N3: $local_disk repl=${repl:-$repl_any} connected_peers=$est_peers"
+    # Local disk state via observer snapshot.
+    local_disk=$(status_disk_state "$RD" "$N3")
+    # Per-peer replication state from Status.connections; pick the peer
+    # reporting an active sync (non-Off, non-Established) for the
+    # SyncTarget detector, falling back to N1's value for logging.
+    repl_n1=$(status_replication_state "$RD" "$N3" "$N1")
+    repl_n2=$(status_replication_state "$RD" "$N3" "$N2")
+    repl=""
+    for r in "$repl_n1" "$repl_n2"; do
+        if [[ -n "$r" && "$r" != "Off" && "$r" != "Established" ]]; then
+            repl="$r"
+            break
+        fi
+    done
+    repl_any="${repl:-${repl_n1:-$repl_n2}}"
+    # Count Connected peers via observer .connected bool.
+    est_peers=0
+    [[ "$(status_connected "$RD" "$N3" "$N1")" == "true" ]] && est_peers=$((est_peers + 1))
+    [[ "$(status_connected "$RD" "$N3" "$N2")" == "true" ]] && est_peers=$((est_peers + 1))
+    echo "   [t=$(( $(date +%s) - T_CONNECT ))s] $N3: disk=${local_disk:-?} repl=${repl_any:-?} connected_peers=$est_peers"
     case "$local_disk" in
-        disk:Inconsistent|disk:Outdated) saw_inconsistent=1 ;;
-        disk:UpToDate) reached_uptodate=1 ;;
-        disk:Unknown|disk:DUnknown) saw_unknown=1 ;;
+        Inconsistent|Outdated) saw_inconsistent=1 ;;
+        UpToDate)              reached_uptodate=1 ;;
+        Unknown|DUnknown)      saw_unknown=1 ;;
     esac
-    if [[ "$repl" == "replication:SyncTarget" ]]; then
+    if [[ "$repl" == "SyncTarget" ]]; then
         saw_synctarget=1
     fi
     # End-of-resync: local UpToDate AND both peers Connected AND no
@@ -321,8 +319,8 @@ while (( $(date +%s) < deadline )); do
     # divergence-md5 verify below is what actually proves the resync
     # happened; if DRBD skipped the bitmap-replay entirely the md5
     # would mismatch and we'd catch it there.
-    if [[ "$local_disk" == "disk:UpToDate" ]] \
-       && [[ "$repl" != "replication:SyncTarget" ]] \
+    if [[ "$local_disk" == "UpToDate" ]] \
+       && [[ "$repl" != "SyncTarget" ]] \
        && (( est_peers >= 2 )); then
         saw_established_after_sync=1
         break

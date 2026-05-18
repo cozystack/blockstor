@@ -76,13 +76,13 @@ on_node "$N1" bash -c "
     drbdadm secondary ${RD}
 "
 
-# Snapshot the resync-state counters BEFORE adding the new replica.
-# DRBD's `cs:` field stays "Established" when no sync runs; any
-# entry into "SyncSource"/"SyncTarget" means a resync started
+# Snapshot the replication-state BEFORE adding the new replica.
+# DRBD's per-peer replication stays "Established" when no sync runs;
+# any entry into "SyncSource"/"SyncTarget" means a resync started
 # (which is what we're testing did NOT happen).
-echo ">> baseline cs counters on $N1"
-n1_before=$(on_node "$N1" drbdsetup status "$RD" --json | grep -o 'connection-state.*"' | head -1)
-echo "  $n1_before"
+echo ">> baseline replication state on $N1"
+n1_before=$(status_replication_state "$RD" "$N1" "$N2")
+echo "  $N1->$N2 replication=$n1_before"
 
 echo ">> add 3rd replica on $N3"
 cat <<EOF | kubectl apply -f -
@@ -98,14 +98,14 @@ EOF
 echo ">> wait up to 60s for $N3 to reach UpToDate"
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    state=$(on_node "$N3" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$state" == *"UpToDate"* ]]; then
+    state=$(status_disk_state "$RD" "$N3")
+    if [[ "$state" == "UpToDate" ]]; then
         break
     fi
     sleep 2
 done
 
-if [[ "$state" != *"UpToDate"* ]]; then
+if [[ "$state" != "UpToDate" ]]; then
     echo "FAIL: $N3 did not reach UpToDate in 60s (state: $state)"
     echo "    DRBD likely fell through to full initial-sync — GI seeding broken"
     on_node "$N3" drbdsetup status "$RD" || true
@@ -113,16 +113,19 @@ if [[ "$state" != *"UpToDate"* ]]; then
 fi
 
 # Cross-check: assert no SyncSource transition happened on the
-# existing peers. A full-sync would have left durable evidence in
-# events2 history — we use the "events2 --now" snapshot to confirm
-# current state shows no syncing.
+# existing peers. A full-sync would have shown up as SyncSource/
+# SyncTarget on the per-peer replication state; read it from the
+# observer-populated Status subresource instead of grepping drbdsetup.
 echo ">> verify no resync triggered on existing peers"
 for peer in "$N1" "$N2"; do
-    cs=$(on_node "$peer" drbdsetup status "$RD" 2>/dev/null | grep -E "(role|connection)" | head -2 || true)
-    if echo "$cs" | grep -qE "Sync(Source|Target)"; then
-        echo "FAIL: $peer entered $cs — initial-sync was NOT skipped"
-        exit 1
-    fi
+    for other in "$N1" "$N2" "$N3"; do
+        [[ "$peer" == "$other" ]] && continue
+        rs=$(status_replication_state "$RD" "$peer" "$other")
+        if [[ "$rs" =~ ^(SyncSource|SyncTarget|PausedSyncS|PausedSyncT|StartingSyncS|StartingSyncT|VerifyS|VerifyT)$ ]]; then
+            echo "FAIL: $peer->$other replication=$rs — initial-sync was NOT skipped"
+            exit 1
+        fi
+    done
 done
 
 echo ">> NO-RESYNC OK ($N3 UpToDate within 60s, no resync on $N1/$N2)"
