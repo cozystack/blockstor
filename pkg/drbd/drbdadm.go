@@ -187,6 +187,27 @@ func (a *Adm) Detach(ctx context.Context, resource string) error {
 	return a.run(ctx, "detach", "--force", resource)
 }
 
+// Attach binds the lower disk(s) named in the .res file to the
+// already-loaded kernel slot, transitioning a replica from
+// `disk:Diskless intentional` (i.e. brought up with no backing disk)
+// to diskful. This is the missing piece for the diskless→diskful
+// conversion path (`linstor r td --migrate-from`, `linstor r td
+// --diskful`): `drbdadm adjust` reconciles network/peer state and
+// resource options against the .res file, but for an intentionally-
+// diskless kernel slot it does NOT add the backing disk because the
+// kernel treats the current diskless state as deliberate. Only an
+// explicit `drbdadm attach` (which shells out to `drbdsetup attach`
+// per volume) crosses that boundary.
+//
+// Idempotent: calling Attach on a slot that's already diskful is a
+// no-op at the kernel level (the attach request finds the disk
+// already bound and returns success). Callers gate on
+// HasDisklessVolume so the no-op case still avoids the shell-out
+// cost.
+func (a *Adm) Attach(ctx context.Context, resource string) error {
+	return a.run(ctx, "attach", resource)
+}
+
 // Resize rescans the lower disk's size and tells DRBD to grow the
 // replicated volume to match. The lower disk (LV / zvol / dm-crypt
 // target) must already be the target size — this is a notify-only

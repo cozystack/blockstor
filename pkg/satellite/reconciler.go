@@ -980,6 +980,14 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return errors.Wrapf(err, "write %s", resPath)
 	}
 
+	// Bug 303: probe BEFORE any bring-up verbs whether we're crossing
+	// the intentional-diskless → diskful boundary (migrate-disk,
+	// `linstor r td --diskful`). The kernel treats an intentional-
+	// diskless slot's current state as deliberate, so `drbdadm adjust`
+	// will NOT attach the freshly-carved lower disk by itself; we'll
+	// follow up with an explicit `drbdadm attach` after adjust.
+	needsAttach := r.needsDisklessToDiskfulAttach(ctx, dr, diskless)
+
 	if firstActivation && !diskless {
 		err = r.runFirstActivation(ctx, dr, devices, mdMarkerPath)
 		if err != nil {
@@ -992,6 +1000,21 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return err
 	}
 
+	return r.finishDRBDApply(ctx, dr, diskless, firstActivation, needsAttach, resized, cloned)
+}
+
+// finishDRBDApply runs the post-adjust steps: explicit attach for
+// diskless→diskful crossings (Bug 303), pickup-time resize, and
+// the first-activation auto-primary seed. Extracted from applyDRBD
+// so the orchestrator stays under the project's gocyclo budget.
+func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, needsAttach, resized, cloned bool) error {
+	if needsAttach {
+		err := r.attachAfterDisklessFlip(ctx, dr)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -999,7 +1022,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// disk to resize but they still need their internal state to
 	// catch up; drbdadm resize handles that case too.
 	if resized {
-		err = r.cfg.Adm.Resize(ctx, dr.GetName())
+		err := r.cfg.Adm.Resize(ctx, dr.GetName())
 		if err != nil {
 			return errors.Wrapf(err, "resize %s", dr.GetName())
 		}
@@ -1019,10 +1042,69 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	_ = cloned
 
 	if autoPromote {
-		err = r.runAutoPromote(ctx, dr)
+		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// needsDisklessToDiskfulAttach probes whether the local kernel slot
+// is currently `disk:Diskless client:yes` (intentional diskless) on
+// a Resource whose spec has flipped to diskful. Bug 303: this is the
+// trigger for the explicit `drbdadm attach` follow-up — adjust
+// reconciles network/peer state and resource options against the
+// new .res file but does NOT cross the diskless→diskful boundary
+// for an intentional-diskless slot (the kernel treats the current
+// state as deliberate).
+//
+// Probe BEFORE any of the bring-up verbs run because adjust /
+// CreateMD / etc may shift kernel state mid-flight and we'd lose
+// the signal. Errors fall through to false: a netlink hiccup
+// shouldn't strand the apply chain, and the subsequent reconcile
+// pass (driven by Status updates / events2) will retry the attach
+// via the same probe.
+//
+// Returns false when:
+//   - the spec is still diskless (no boundary crossing),
+//   - the kernel slot isn't loaded (the bring-up path will Up the
+//     resource with the new .res, which DOES attach the disk
+//     because new-resource sees a disk path),
+//   - the kernel slot is loaded with no Diskless volume (already
+//     diskful — Attach would be a no-op anyway).
+func (r *Reconciler) needsDisklessToDiskfulAttach(ctx context.Context, dr *intent.DesiredResource, diskless bool) bool {
+	if diskless {
+		return false
+	}
+
+	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	if err != nil || !loaded {
+		return false
+	}
+
+	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+	if err != nil {
+		return false
+	}
+
+	return disklessVol
+}
+
+// attachAfterDisklessFlip runs `drbdadm attach` to cross the
+// intentional-diskless → diskful boundary. Bug 303: when the .res
+// file now carries the disk path (the dispatcher dropped the
+// Diskless host marker on the spec flag flip), create-md has stamped
+// fresh metadata on the newly-carved zvol/LV, and adjust has
+// reconciled the network half, the only step left is to explicitly
+// attach the lower disk — adjust skips this for an intentional-
+// diskless kernel slot. Idempotent: Attach on an already-diskful
+// slot is a kernel-level no-op.
+func (r *Reconciler) attachAfterDisklessFlip(ctx context.Context, dr *intent.DesiredResource) error {
+	err := r.cfg.Adm.Attach(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "attach %s after diskless→diskful flip", dr.GetName())
 	}
 
 	return nil
