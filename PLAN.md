@@ -881,6 +881,250 @@ fits naturally inside Phase 10's scope.
 
 ---
 
+## Phase 11 — Architectural refactor (post-hardening retrospective)
+
+After a long e2e hardening cycle (300+ bugs filed and fixed across the
+satellite, controller, REST, and dispatcher) several architectural rough
+edges have become visible. They are not blockers for production today,
+but addressing them would significantly simplify reasoning about the
+state machine, reduce flaky-test surface, and tighten the contract
+between observer and reconciler. This phase collects them as a
+prioritized refactor backlog.
+
+**Principle: stay event-driven and k8s-native.** We considered moving to
+upstream's request-based architecture (java satellite + REST). Rejected:
+upstream's centralized synchronous coordinator has well-known deadlock
+issues under partial-failure conditions. Our event-driven autonomous
+satellite is architecturally superior for failure isolation. The bugs we
+hit are *implementation maturity*, not *architectural choices*. Phase 11
+dozrevает реализацию, не меняет модель.
+
+**Legal constraint: Apache 2.0 only.** No copying of structure or code
+from GPL sources (`linstor-server` java, `drbd-utils`). Apache 2.0
+references that are safe to study and adapt:
+- `drbd-reactor` (Apache 2.0) — events2 parser, DRBD state enums
+- `linstor-csi` (Apache 2.0) — error envelope patterns
+- Public DRBD-9 protocol documentation + `drbdsetup`/`drbdadm` man pages
+GPL sources may be read for *behavioral understanding* only (what they
+do, not how) — never copy structure. Prefer clean-room: one agent reads
+GPL for spec, a different agent implements Go from spec without seeing
+source.
+
+### 11.1 — Status-only allocator (P0)
+
+**Today**: `Spec.DRBDNodeID/DRBDPort/DRBDMinor` are written by the
+controller's allocator during reconcile. This mutates Spec for runtime
+state — violates the k8s convention that Spec = desired, Status = actual.
+Forces a SSA field-owner contract on Spec that is genuinely hard to
+reason about (controller owns these Spec fields, satellite owns the
+rest).
+
+**Target**: move DRBD-IDs to `Status.DRBDNodeID/DRBDPort/DRBDMinor`.
+Spec is immutable after creation (declarative intent only). The
+allocator becomes a Status SSA patch under `controllerDRBDIDsFieldOwner`,
+which it already is — only the field path moves.
+
+**Migration**: project is in active development, no migration cost.
+Drop the Spec fields, add Status fields, update CRD, update REST
+mappers, update satellite readers.
+
+**Effort**: ~3-5 days.
+
+### 11.2 — Explicit reconciler state machine (P1)
+
+**Today**: state transitions are implicit gates:
+```go
+if firstActivation && !diskless { runFirstActivation() }   // → metadata + up + primary --force + mkfs
+if isLoaded && hasDisklessVolume && !flagsHaveDiskless { needsAttach = true }  // Bug 303 workaround
+if !isLoaded { runBringUpOrAdjust() }
+if 158 error { fall back to drbdadm up }
+// etc.
+```
+Hard to reason about. Bug 303 was an entire transition missing from the
+diagram (Running → MetadataPending on diskful flag flip), discovered
+only after `lifecycle-toggle-migrate` failed in production.
+
+**Target**: explicit FSM declared as data:
+```go
+type DRBDPhase string
+const (
+    PhaseUnprovisioned   DRBDPhase = "Unprovisioned"   // no .res, no metadata
+    PhaseMetadataPending DRBDPhase = "MetadataPending" // .res exists, metadata needed
+    PhaseMetadataReady   DRBDPhase = "MetadataReady"   // create-md OK, needs up
+    PhaseRunning         DRBDPhase = "Running"         // kernel up, any disk state
+    PhaseSkipDisk        DRBDPhase = "SkipDisk"        // operator-pinned pause
+    PhaseDecommissioning DRBDPhase = "Decommissioning"
+)
+
+type Transition struct {
+    From, To  DRBDPhase
+    Trigger   func(kernel, spec, status) bool   // precondition
+    Action    func(ctx, dr) error               // idempotent
+}
+
+var fsm = []Transition{
+    {Unprovisioned, MetadataPending, hasSpec && noRes,                renderResFile},
+    {MetadataPending, MetadataReady, hasResFile && noMetadata,        runCreateMd},
+    {MetadataReady, Running,         hasMetadata && notLoaded,        drbdadmUp},
+    {Running, Running,               kernelDriftFromSpec,             drbdadmAdjust},
+    {Running, MetadataPending,       diskFlagFlippedDisklessToDiskful, rerenderRes},
+    // ...
+}
+
+func reconcile(ctx, dr) error {
+    current := observePhase(dr)
+    for _, t := range fsm {
+        if t.From == current && t.Trigger(kernel, spec, status) {
+            return t.Action(ctx, dr)
+        }
+    }
+    return nil // terminal-good
+}
+```
+
+**Benefits**:
+- All transitions in one place, code review = reading a table.
+- Tests become table-driven: each transition gets `(input, expected action)` cases.
+- Coverage analysis trivially per-transition.
+- No more "missed-branch" bugs like Bug 303.
+- Foundation for adding new transitions (split-brain recovery, etc.) without breaking existing paths.
+
+**Effort**: ~2 weeks (refactor ~2000 lines of reconciler.go without
+breaking the 7-stand e2e suite).
+
+### 11.3 — No on-disk markers; state lives in CRD Status (P1)
+
+**Today**: state is split across 5 sources of truth:
+- CRD Spec (intent)
+- CRD Status (observed)
+- On-disk markers (`<rd>.md-created`, `<rd>.mkfs.done`, `<rd>.res`)
+- Kernel state (`drbdsetup status`)
+- Reconciler in-memory caches
+
+The `.md-created` marker was a known fragility — Bug 311 had to add a
+retry path because a transient promote/demote crash left the marker
+unwritten while metadata persisted.
+
+**Target**: two sources only — k8s API + kernel. Marker state migrates
+to `Status.Conditions`:
+- `MetadataCreated=true|false`
+- `FilesystemFormatted=true|false`
+- `KernelLoaded=true|false` (cached from last events2 frame)
+
+`.res` file stays (drbdadm requires it). Everything else moves to
+Status.
+
+**Effort**: ~1 week. Best done after 11.2 (state machine consumes the
+new Conditions directly).
+
+### 11.4 — Battle-tested `pkg/drbd` library (P1)
+
+**Today**: `pkg/drbd/drbdadm.go` has ~40-50% of the commands a
+production-grade DRBD wrapper needs. We've added `Adjust`, `Up`, `Down`,
+`SetupDown`, `IsLoaded`, `HasDisklessVolume`, `SetGI` etc. through 30+
+bug-driven additions. Missing: `verify`, `new-current-uuid`,
+`invalidate`, `pause-sync` / `resume-sync`, `reset-secondary`, etc.
+
+events2 parser in `observer.go` is in-house. drbd-reactor (Apache 2.0)
+has a battle-tested implementation we can study.
+
+**Target**:
+1. **Phase 11.4.a** — gap audit against `drbd-reactor` (events2 parsing
+   depth, state enums, error code maps). Pure research, no code.
+   Produces a TODO list. Track Bug 466 (Stage 1 research).
+2. **Phase 11.4.b** — implement the gap list. Group by area: events2
+   parser, error mapping (`158`, `125`, `10`, `11`, etc. — full
+   drbd-utils exit code table), missing drbdadm commands.
+3. **Phase 11.4.c** — extract `pkg/drbd/` into `github.com/cozystack/libdrbd-go`
+   when stable. Reusable across cozystack components (CSI driver,
+   future HA controller, etc.).
+
+**Effort**: ~3-4 weeks total across all sub-phases.
+
+### 11.5 — Status comprehensiveness + observability invariants (P1)
+
+**Today**: tests sometimes feel forced to bypass `Resource.Status` and
+poll `drbdsetup status` directly via `kubectl exec`. Symptom of Status
+not covering all kernel state the tests assert on. Forces a hidden
+contract: "tests valid only when observer's pulse is fast enough".
+
+**Target**: Status is the k8s API for DRBD state — first-class. Tests
+remain k8s-native (`kubectl get resource ...`). Implies:
+
+1. **Schema completeness** — Status covers everything kernel exposes:
+   - `Replication[peer].State` (SyncTarget, SyncSource, PausedSyncS, ...)
+   - `Replication[peer].OutOfSyncKiB`
+   - `Quorum` state
+   - `RoleHistory` + `LastTransition` timestamps
+   - `GenerationUUIDs` for forensics
+2. **Freshness invariant** — every events2 frame → Status SSA patch
+   within bounded time. Prometheus metric `observer_status_lag_ms`,
+   alert if P99 > 500ms.
+3. **No silent drops** — failed SSA patches retry; if still failing,
+   set `Condition Degraded=true`.
+4. **Liveness coupling** — if observer goroutine wedges,
+   `/healthz` returns unhealthy → kubelet restarts pod (Bug 207).
+
+**Audit step first**: which Status fields do `tests/e2e/*.sh` actually
+read? Which would tests prefer to read if available? Then expand Status
+to cover the gap. Track as Phase 11.5.a.
+
+**Effort**: ~1-2 weeks audit + expansion.
+
+### 11.6 — Observer closed-loop recovery (DEFERRED, not P0)
+
+Initially listed in the DRBD audit as P0-2 / P0-3 (auto-reconnect on
+`StandAlone`, stuck-`SyncTarget` watchdog). **Deferred** after upstream
+research: upstream LINSTOR deliberately does NOT auto-reconnect from
+`StandAlone` — that's a split-brain state requiring operator policy
+choice (`drbdadm connect --discard-my-data` vs alternative). Our prior
+attempt (Bug 312) was too aggressive and reverted.
+
+If we ever revisit: trigger thresholds must be conservative (60s+ flat
+SyncTarget, 60s+ cooldown per peer, never auto-connect from StandAlone
+without explicit operator opt-in via annotation). Lower priority than
+11.1-11.5.
+
+### 11.7 — Spec-only Reconcile predicate (DEFERRED until 11.5 lands)
+
+Bug 313 / 316 / 318 tried this three times — all reverted. Root cause:
+several e2e tests have hidden dependency on observer's Status writes
+re-triggering Reconcile (`state-inconsistent-mid-sync`, `two-volume-rd`,
+`recovery-down-reverses`). Fixing this requires:
+
+1. **Land 11.5 first** — tests can poll comprehensive Status.
+2. **Add `RequeueAfter: 10s`** as the safety-net wake-up (events2 is
+   primary, RequeueAfter covers the edge case where events2 misses a
+   frame or the satellite restarted mid-stream).
+3. **Add observer GenericEvent channel** for immediate wake on kernel
+   lifecycle (resource destroy, role flip, disk transition).
+4. **Then** apply the predicate filter (`GenerationChangedPredicate`
+   with DRBD-ID whitelist).
+
+These four must ship together — any subset causes regressions, as
+demonstrated three times.
+
+**Effort**: ~2 weeks coordinated change after 11.5.
+
+### Phase 11 priorities
+
+| ID    | Name                                  | Priority | Depends on    | Effort |
+|-------|---------------------------------------|----------|---------------|--------|
+| 11.1  | Status-only allocator                 | P0       | —             | 3-5d   |
+| 11.4.a| pkg/drbd gap audit                    | P1       | —             | 2d     |
+| 11.5.a| Status field audit (tests-driven)     | P1       | —             | 2d     |
+| 11.5.b| Status schema expansion + invariants  | P1       | 11.5.a        | 1-2w   |
+| 11.2  | Explicit reconciler FSM               | P1       | —             | 2w     |
+| 11.3  | No on-disk markers (Conditions)       | P1       | 11.2          | 1w     |
+| 11.4.b| pkg/drbd gap implementation           | P1       | 11.4.a        | 2-3w   |
+| 11.7  | Spec-only Reconcile predicate         | P2       | 11.5          | 2w     |
+| 11.4.c| libdrbd-go extraction                 | P2       | 11.4.b        | 1w     |
+| 11.6  | Closed-loop recovery (StandAlone/etc) | P3       | 11.2          | 1w     |
+
+Total: ~3 months of focused work.
+
+---
+
 ## Workflow
 
 ### Daily loop
