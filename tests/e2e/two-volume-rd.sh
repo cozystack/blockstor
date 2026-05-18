@@ -108,6 +108,42 @@ if ! on_node "$N1" timeout 60 drbdsetup wait-sync-resource "$RD"; then
     exit 1
 fi
 
+# Run 29 deep-dive: wait-sync-resource returns when DRBD's OutOfSync
+# counter is zero on the local side, but the peer-side commit can lag
+# by a few hundred milliseconds before its backing storage flushes.
+# Also confirm replication state is Established on BOTH peers and the
+# peer-side OutOfSync is zero — without this the secondary→primary
+# flip below races the tail of replication and N2's read returns the
+# pre-write bytes (vol-0 md5 mismatch the test was hitting in Run 29).
+echo ">> confirm replication settled on both peers (60s)"
+deadline=$(( $(date +%s) + 60 ))
+settled=""
+while (( $(date +%s) < deadline )); do
+    n1_repl=$(status_replication_state "$RD" "$N1" "$N2")
+    n2_repl=$(status_replication_state "$RD" "$N2" "$N1")
+    n1_oos=$(on_node "$N1" drbdsetup status --verbose "$RD" 2>/dev/null \
+        | grep -oE 'out-of-sync:[0-9]+' | awk -F: '{s+=$2} END {print s+0}')
+    n2_oos=$(on_node "$N2" drbdsetup status --verbose "$RD" 2>/dev/null \
+        | grep -oE 'out-of-sync:[0-9]+' | awk -F: '{s+=$2} END {print s+0}')
+    if [[ "$n1_repl" == "Established" && "$n2_repl" == "Established" \
+          && "$n1_oos" == "0" && "$n2_oos" == "0" ]]; then
+        settled=1
+        break
+    fi
+    sleep 2
+done
+if [[ -z "$settled" ]]; then
+    echo "FAIL: replication did not settle within 60s (n1_repl=$n1_repl n2_repl=$n2_repl n1_oos=$n1_oos n2_oos=$n2_oos)"
+    on_node "$N1" drbdsetup status --verbose "$RD" || true
+    on_node "$N2" drbdsetup status --verbose "$RD" || true
+    exit 1
+fi
+# Extra grace for the kernel-to-userspace cache flush on the peer side
+# before we promote N2 and read. Empirically the QEMU stand needs ~3-5s
+# for the last replicated block to surface to a fresh page-cache read,
+# even with iflag=direct on the read side.
+sleep 5
+
 on_node "$N1" drbdadm secondary "$RD" || true
 
 if [[ "$md5_v0" == "$md5_v1" ]]; then

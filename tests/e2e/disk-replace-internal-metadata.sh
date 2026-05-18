@@ -284,6 +284,25 @@ echo ">> pin DrbdOptions/SkipDisk=True on ${RD}.${N1} (block reconciler re-attac
 kubectl patch "resource.blockstor.io.blockstor.io/${RD}.${N1}" --type=merge \
     -p '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
 
+# Run 29 deep-dive: drbdmeta create-md was failing with exit 20 (Device
+# or resource busy) because the satellite reconciler hadn't yet
+# processed the SkipDisk=True patch — its adjust loop still had the
+# loop device wired into the kernel slot. Wait until the kernel slot
+# for $RD on $N1 is empty (or no `disk:` line remains) before invoking
+# drbdmeta, plus a grace pause for the kernel to actually release the
+# loop device.
+echo ">> wait for satellite to release backing device after SkipDisk patch (30s)"
+for _ in $(seq 1 30); do
+    sleep 1
+    # Either the kernel slot is gone (drbdsetup status returns empty)
+    # or the resource is up without a disk: line.
+    out=$(on_node "$N1" drbdsetup status "$RD" 2>&1 || true)
+    if [[ -z "$out" ]] || ! echo "$out" | grep -q "disk:"; then
+        break
+    fi
+done
+sleep 3  # extra grace for kernel to actually unmap the loop device
+
 echo ">> recipe: drbdmeta create-md + drbdadm attach on $N1"
 on_node "$N1" bash -c "
     drbdmeta --force 0 v09 ${BACK_DEV} internal create-md 15
