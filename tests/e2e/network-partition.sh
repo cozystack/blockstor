@@ -111,20 +111,45 @@ on_node "$N1" iptables -A INPUT -p tcp --dport "$DRBD_PORT" -j DROP
 on_node "$N1" iptables -A OUTPUT -p tcp --dport "$DRBD_PORT" -j DROP
 
 echo ">> wait up to 90s for $N1 to fence itself"
+# Bug 297: with `on-no-quorum=suspend-io` (the controller-seeded default
+# alongside `quorum=majority`), DRBD-9 SUSPENDS IO on quorum loss
+# rather than demoting the role. The kernel keeps `role:Primary` and
+# stamps `suspended:quorum` on the local row — same effect (no further
+# writes accepted on the minority side, no split-brain) but a
+# different state signature than the legacy `io-error` policy. Accept
+# either signal: `suspended:` flag present OR role no longer Primary.
 deadline=$(( $(date +%s) + 90 ))
-n1_role=""
+n1_status=""
 
 while (( $(date +%s) < deadline )); do
-    n1_role=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "role:" | head -1 || true)
-    if [[ "$n1_role" != *"role:Primary"* ]]; then
+    n1_status=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true)
+    n1_first_role=$(echo "$n1_status" | grep "role:" | head -1 || true)
+    if [[ "$n1_first_role" != *"role:Primary"* ]] \
+        || echo "$n1_status" | grep -q "suspended:"; then
         break
     fi
     sleep 2
 done
 
-if [[ "$n1_role" == *"role:Primary"* ]]; then
-    echo "FAIL: $N1 stayed Primary in a 1-vs-2 partition (split-brain risk)"
+n1_first_role=$(echo "$n1_status" | grep "role:" | head -1 || true)
+if [[ "$n1_first_role" == *"role:Primary"* ]] \
+    && ! echo "$n1_status" | grep -q "suspended:"; then
+    echo "FAIL: $N1 stayed Primary AND unsuspended in a 1-vs-2 partition (split-brain risk)"
+    echo "----- last status -----"
+    echo "$n1_status"
+    echo "-----------------------"
     exit 1
+fi
+
+# Bug 297: with suspend-io semantics $N1 stays Primary — we need to
+# explicitly demote it before $N2's write so the test's pre-heal
+# divergence sequence still produces a genuine new-data-on-majority
+# state. Without this the iptables drop leaves $N1 Primary-suspended
+# and $N2's auto-promote on write fails ("multiple primaries not
+# allowed by config"), the post-heal read loop then sees $N1 still
+# holding the stale pre-partition md5.
+if [[ "$n1_first_role" == *"role:Primary"* ]]; then
+    on_node "$N1" drbdadm secondary "$RD" 2>/dev/null || true
 fi
 
 echo ">> writing on majority side ($N2)"
