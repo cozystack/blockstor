@@ -1815,15 +1815,46 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 	}
 
 	if !loaded {
-		err = r.cfg.Adm.Up(ctx, dr.GetName())
-		if err != nil {
-			return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
-		}
-
-		return nil
+		return r.bringUpResource(ctx, dr)
 	}
 
 	return r.adjustResource(ctx, dr, diskfulFlip)
+}
+
+// bringUpResource runs `drbdadm up <name>` to load the kernel slot
+// from the rendered .res file. Caller has already ensured .res
+// exists (renderResFile) and create-md has run for diskful replicas
+// (createMetadata); this helper is the third bring-up verb in the
+// per-reconcile sequence, distinct from `adjustResource` which
+// reconciles already-loaded kernel state.
+//
+// Bug 319 re-entry: if the operator flipped Spec.Flags Diskless→
+// diskful but the on-disk `.md-created` marker (or
+// `MetadataCreated=True` Status Condition) says metadata was
+// already laid down, the kernel will refuse to up because there's
+// no metadata on the LV. Detection of that flip lives at the gate
+// level in applyDRBD (suppress firstActivation, force re-entry to
+// createMetadata) — bringUpResource itself is ONLY the
+// `drbdadm up <name>` invocation + error wrapping.
+//
+// The Bug-287 `(158) Unknown resource` fallback to `drbdadm up`
+// inside `runAdjust` is a distinct call site and intentionally
+// stays inline: it's the recovery verb in the half-torn
+// kernel-slot window, not the first-load path, and its error
+// wrap ("drbdadm up %s (after adjust 158 fallback)") needs to
+// preserve that context.
+//
+// Phase 11.2.c Stage 3c: pure extract, no behaviour change. Stage 3d
+// (or later) will FSM-shadow-dispatch this helper for ActionUp
+// transitions at the top of applyDRBD, mirror of the renderResFile
+// (Stage 2), createMetadata (Stage 3a), and adjustResource (Stage
+// 3b) shadows.
+func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredResource) error {
+	if err := r.cfg.Adm.Up(ctx, dr.GetName()); err != nil {
+		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
+	}
+
+	return nil
 }
 
 // adjustResource runs `drbdadm adjust <name>` with the right
