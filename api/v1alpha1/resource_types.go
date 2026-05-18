@@ -277,6 +277,58 @@ type ResourceConnectionStatus struct {
 	// Python CLI's `linstor v l` Repl column reads this.
 	// +optional
 	ReplicationState string `json:"replicationState,omitempty"`
+
+	// peerDrbdNodeId is the DRBD-9 node-id assigned to the peer in
+	// this resource's connection table. Read from `drbdsetup
+	// events2` connection-frame `peer-node-id` field. Six e2e
+	// tests today parse this value out of `drbdsetup status
+	// --verbose` adjacent to the peer-name — surfacing it on
+	// Status lets them switch to a k8s-native read. The peer's
+	// own Resource CRD also carries this number under
+	// `Status.DRBDNodeID`, so callers with the atomic-view luxury
+	// can cross-check; the field is retained here for ergonomics
+	// when only the local Resource is in hand.
+	// +optional
+	PeerDRBDNodeID *int32 `json:"peerDrbdNodeId,omitempty"`
+
+	// peerVolumes is the peer's view of each volume's disk state
+	// on this connection — read from `drbdsetup events2
+	// --statistics` peer-device frames' `peer-disk:<state>` token.
+	// Important under network-partition: the local replica's
+	// `Status.Volumes[i].DiskState` (UpToDate from this node's
+	// kernel) and the peer's view of the same volume
+	// (`DUnknown` from the peer's kernel) diverge. The
+	// state-standalone-partition.sh and network-partition.sh
+	// e2e tests assert against this divergence; without
+	// peerVolumes they shell into the satellite and grep
+	// drbdsetup. Keyed by volumeNumber.
+	// +optional
+	// +listType=map
+	// +listMapKey=volumeNumber
+	PeerVolumes []PeerVolumeStatus `json:"peerVolumes,omitempty" patchMergeKey:"volumeNumber" patchStrategy:"merge"`
+}
+
+// PeerVolumeStatus is the per-volume slice of a peer's view of one
+// connection: what the peer's kernel reports its replica's disk_state
+// to be. Distinct from the local-side `ResourceVolumeStatus.DiskState`
+// because under network-partition the two views diverge (local says
+// UpToDate, peer says DUnknown / Outdated). 8 e2e partition tests
+// parse this token out of `drbdsetup status --verbose`; the field
+// gives them a kubectl-native substitute.
+type PeerVolumeStatus struct {
+	// volumeNumber is the DRBD-9 volume number this peer-view entry
+	// describes. Matches the parent
+	// `ResourceDefinition.Spec.VolumeDefinitions[].VolumeNumber`.
+	VolumeNumber int32 `json:"volumeNumber"`
+
+	// peerDiskState is the peer's DRBD-9 disk_state for this volume
+	// — `UpToDate`, `Outdated`, `Inconsistent`, `Diskless`, or
+	// `DUnknown` (the local kernel cannot determine the peer's
+	// disk state, typical under partition). Mirrors the
+	// `peer-disk:<state>` token in `drbdsetup events2
+	// --statistics` peer-device frames.
+	// +optional
+	PeerDiskState string `json:"peerDiskState,omitempty"`
 }
 
 // ResourceVolumeStatus is the runtime state of one volume of a Resource.

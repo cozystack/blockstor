@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -97,6 +98,18 @@ type volumeObservation struct {
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
 }
 
+// peerVolumeObservation carries the peer's view of one volume's
+// disk_state on a specific connection — `peer-disk:<state>` from
+// events2 peer-device frames. Stitched onto
+// `connectionObservation.PeerVolumes` so it merges per-peer-per-
+// volume under the same listMap key on Status. Distinct from
+// volumeObservation because the data plane is different: this is
+// the PEER's view of our volume, not our local kernel's view.
+type peerVolumeObservation struct {
+	VolumeNumber  int32
+	PeerDiskState string
+}
+
 // connectionObservation carries one per-peer DRBD connection state.
 // Maps directly onto `ResourceStatus.Connections[i]` — the wire-side
 // `linstor r list --faulty` reads `Connected` to color disconnected
@@ -109,11 +122,25 @@ type volumeObservation struct {
 // peer's last-known state (typically StandAlone) lingers in
 // view/resources forever — `linstor r l` keeps showing the dead
 // peer as disconnected.
+//
+// PeerDRBDNodeID carries the DRBD-9 node-id assigned to the peer in
+// this resource's connection table (the events2 `peer-node-id`
+// field on connection / peer-device frames). nil means the frame
+// did not carry the field — mergeConnections preserves any cached
+// non-nil value rather than racing it to nil on partial frames.
+//
+// PeerVolumes carries the peer's view of this connection's volumes
+// (the `peer-disk:<state>` field on peer-device frames) keyed by
+// volume number. Stitched per-volume by mergeConnections so a
+// peer-device frame covering one volume doesn't blank the cached
+// view of the other.
 type connectionObservation struct {
 	PeerNodeName     string
 	Connected        bool
 	Message          string
 	ReplicationState string
+	PeerDRBDNodeID   *int32
+	PeerVolumes      []peerVolumeObservation
 
 	Removed bool
 }
@@ -174,9 +201,10 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 		return observation{
 			ResourceName: name,
 			Connections: []connectionObservation{{
-				PeerNodeName: peer,
-				Connected:    state == drbdStateConnected,
-				Message:      state,
+				PeerNodeName:   peer,
+				Connected:      state == drbdStateConnected,
+				Message:        state,
+				PeerDRBDNodeID: parsePeerNodeID(ev.Fields["peer-node-id"]),
 			}},
 		}, true
 	}
@@ -243,6 +271,26 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 	return out, true
 }
 
+// parsePeerNodeID parses the events2 `peer-node-id:<n>` token into
+// the DRBD-9 node-id range (0..15). Returns nil on empty input or
+// parse failure — the merge path treats nil as "frame didn't carry
+// the field" and preserves any cached non-nil value, so a partial
+// frame can't blank a previously-observed id.
+func parsePeerNodeID(raw string) *int32 {
+	if raw == "" {
+		return nil
+	}
+
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		return nil
+	}
+
+	id := int32(parsed) //nolint:gosec // drbd-9 peer-node-id range is 0..15, fits in int32
+
+	return &id
+}
+
 // translatePeerDeviceEvent extracts the peer-device frame from
 // `drbdsetup events2 --statistics`:
 //
@@ -250,10 +298,14 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 //	   conn-name:<peer> replication:<state> peer-disk:<state>
 //	   out-of-sync:<kib> ...
 //
-// Two pieces flow out: out-of-sync stats (for sync-progress %) and
+// Three pieces flow out: out-of-sync stats (for sync-progress %),
 // replication state (for the Python CLI's `linstor v l` Repl
-// column). Both go through their respective merge caches; the
-// observation produced here carries whichever the event provided.
+// column), and the peer's view of this volume's disk-state
+// (`peer-disk`, surfaced via `connectionObservation.PeerVolumes` so
+// the per-peer per-volume value lands on
+// `Status.Connections[i].PeerVolumes[j].PeerDiskState`). Each goes
+// through its own merge cache; the observation produced here
+// carries whichever the event provided.
 func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 	name := ev.Fields["name"]
 	volStr, hasVol := ev.Fields["volume"]
@@ -280,12 +332,39 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 		}
 	}
 
-	if peer := ev.Fields["conn-name"]; peer != "" {
+	peer := ev.Fields["conn-name"]
+	if peer != "" {
+		conn := connectionObservation{
+			PeerNodeName:   peer,
+			PeerDRBDNodeID: parsePeerNodeID(ev.Fields["peer-node-id"]),
+		}
+
 		if repl := ev.Fields["replication"]; repl != "" {
-			out.Connections = []connectionObservation{{
-				PeerNodeName:     peer,
-				ReplicationState: repl,
+			conn.ReplicationState = repl
+		}
+
+		// `peer-disk:<state>` is the peer's kernel-reported disk
+		// state for this connection's view of this volume —
+		// UpToDate / DUnknown / Outdated / Inconsistent / Diskless.
+		// Distinct from `disk:<state>` on device frames (which is
+		// this node's local kernel view); under partition the two
+		// views diverge, which is exactly what the partition e2e
+		// tests assert.
+		if pd := ev.Fields["peer-disk"]; pd != "" {
+			conn.PeerVolumes = []peerVolumeObservation{{
+				VolumeNumber:  int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+				PeerDiskState: pd,
 			}}
+		}
+
+		// Surface the connection only if it carries data beyond
+		// the bare PeerNodeName — without ReplicationState,
+		// PeerDiskState, or PeerDRBDNodeID, mergeConnections would
+		// re-emit the cached PeerNodeName with all other fields
+		// blank, racing the connection-kind frame's authoritative
+		// Connected/Message claim back to zero.
+		if conn.ReplicationState != "" || len(conn.PeerVolumes) > 0 || conn.PeerDRBDNodeID != nil {
+			out.Connections = []connectionObservation{conn}
 		}
 	}
 
@@ -771,6 +850,47 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	ev.Volumes = snapshot
 }
 
+// mergePeerVolumesInto folds the latest peer-device frame's
+// per-volume `peer-disk:<state>` view into the cached per-peer
+// slice. Returns the merged slice sorted by VolumeNumber so SSA
+// applies are deterministic (test stability + idempotent re-emit
+// during resync).
+//
+// Per-volume merge: an incoming PeerDiskState=="" leaves the
+// cached value alone (frame didn't carry the token). A non-empty
+// value updates the cached entry for that VolumeNumber, adding a
+// new entry if this is the first frame for that volume.
+func mergePeerVolumesInto(cached, incoming []peerVolumeObservation) []peerVolumeObservation {
+	byVol := map[int32]peerVolumeObservation{}
+	for _, peerVol := range cached {
+		byVol[peerVol.VolumeNumber] = peerVol
+	}
+
+	for _, peerVol := range incoming {
+		if peerVol.PeerDiskState == "" {
+			continue
+		}
+
+		entry := byVol[peerVol.VolumeNumber]
+		entry.VolumeNumber = peerVol.VolumeNumber
+		entry.PeerDiskState = peerVol.PeerDiskState
+		byVol[peerVol.VolumeNumber] = entry
+	}
+
+	if len(byVol) == 0 {
+		return nil
+	}
+
+	out := make([]peerVolumeObservation, 0, len(byVol))
+	for _, peerVol := range byVol {
+		out = append(out, peerVol)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].VolumeNumber < out[j].VolumeNumber })
+
+	return out
+}
+
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
 // to decide whether to emit a fresh Status snapshot.
@@ -837,10 +957,13 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 	}
 
 	// Field-wise merge so the two event-kinds (connection-kind sets
-	// Connected/Message; peer-device-kind sets ReplicationState)
-	// don't clobber each other's contributions. `Removed`
-	// (from `destroy connection`) drops the peer entirely so a
-	// deleted replica stops appearing in view/resources.
+	// Connected/Message; peer-device-kind sets ReplicationState +
+	// PeerVolumes) don't clobber each other's contributions.
+	// `Removed` (from `destroy connection`) drops the peer entirely
+	// so a deleted replica stops appearing in view/resources — and
+	// also removes its per-volume `peer-disk` view, so the partition
+	// e2e tests don't see a stale PeerDiskState lingering on a peer
+	// that has been del-peer'd.
 	for _, c := range ev.Connections {
 		if c.Removed {
 			delete(peers, c.PeerNodeName)
@@ -858,6 +981,24 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 
 		if c.ReplicationState != "" {
 			merged.ReplicationState = c.ReplicationState
+		}
+
+		// PeerDRBDNodeID arrives on both connection-kind and
+		// peer-device-kind frames. nil means "frame didn't carry
+		// the field" — preserve the cached value so a partial
+		// peer-device frame after a connection event doesn't
+		// blank the id.
+		if c.PeerDRBDNodeID != nil {
+			merged.PeerDRBDNodeID = c.PeerDRBDNodeID
+		}
+
+		// PeerVolumes merges per-volume so a peer-device frame
+		// covering volume 0 doesn't blank the cached peer-disk
+		// view of volume 1 on the same peer. Stitch by
+		// VolumeNumber into a per-peer map and re-emit a sorted
+		// slice deterministically (test predictability).
+		if len(c.PeerVolumes) > 0 {
+			merged.PeerVolumes = mergePeerVolumesInto(merged.PeerVolumes, c.PeerVolumes)
 		}
 
 		peers[c.PeerNodeName] = merged
@@ -1095,6 +1236,15 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 // observations onto Status.Connections. With listMapKey=peerNodeName
 // SSA merges per-peer — a single connection-changed event updates
 // just that peer's entry, leaving others untouched.
+//
+// PeerDRBDNodeID and PeerVolumes ride along for the Phase 11.5.b P1
+// surface: e2e tests can read `Status.Connections[i].peerDrbdNodeId`
+// and `…peerVolumes[j].peerDiskState` via kubectl instead of
+// shelling out to `drbdsetup status --verbose`. PeerDRBDNodeID is a
+// pointer so `omitempty` elides the field on observations that
+// never carried a `peer-node-id` token (older kernels, partial
+// frames) — keeping the SSA payload narrow and the field's
+// ownership claim conditional.
 func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.ResourceConnectionStatus {
 	if len(ev.Connections) == 0 {
 		return nil
@@ -1108,6 +1258,29 @@ func buildObserverConnectionStatus(ev *observation) []blockstoriov1alpha1.Resour
 			Connected:        c.Connected,
 			Message:          c.Message,
 			ReplicationState: c.ReplicationState,
+			PeerDRBDNodeID:   c.PeerDRBDNodeID,
+			PeerVolumes:      buildPeerVolumeStatus(c.PeerVolumes),
+		})
+	}
+
+	return out
+}
+
+// buildPeerVolumeStatus packs a connection's per-volume `peer-disk`
+// observations onto Status.Connections[i].PeerVolumes. Returns nil
+// (not an empty slice) when no peer-volume data has been observed
+// yet so the SSA payload's `omitempty` keeps the observer from
+// staking an empty-list claim on the listMap key.
+func buildPeerVolumeStatus(in []peerVolumeObservation) []blockstoriov1alpha1.PeerVolumeStatus {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make([]blockstoriov1alpha1.PeerVolumeStatus, 0, len(in))
+	for _, peerVol := range in {
+		out = append(out, blockstoriov1alpha1.PeerVolumeStatus{
+			VolumeNumber:  peerVol.VolumeNumber,
+			PeerDiskState: peerVol.PeerDiskState,
 		})
 	}
 

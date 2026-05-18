@@ -1956,3 +1956,311 @@ func TestObserverParsesSuspendedFromEventsFrame(t *testing.T) {
 		t.Errorf("snapshotFor after recovery: Suspended got %q, want No", snap.Suspended)
 	}
 }
+
+// TestObserverParsesPeerDrbdNodeIdFromConnectionFrame pins Phase
+// 11.5.b P1: the events2 `peer-node-id:<n>` token on connection-
+// kind frames flows onto
+// `connectionObservation.PeerDRBDNodeID` and from there onto
+// `Status.Connections[i].peerDrbdNodeId`. Six e2e tests today shell
+// into satellites and grep `drbdsetup status --verbose` for the
+// node-id adjacent to the peer-name; the kubectl-native surface
+// lets them switch. nil-handling matters: a partial frame without
+// the token (older drbd-9) must NOT blank a previously-observed id
+// on subsequent applies.
+func TestObserverParsesPeerDrbdNodeIdFromConnectionFrame(t *testing.T) {
+	cases := []struct {
+		name       string
+		peerNodeID string
+		wantNil    bool
+		wantID     int32
+	}{
+		{"peer-node-id:1 surfaces as *1", "1", false, 1},
+		{"peer-node-id:7 surfaces as *7", "7", false, 7},
+		{"missing peer-node-id surfaces as nil", "", true, 0},
+		{"unparseable peer-node-id surfaces as nil", "not-a-number", true, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := map[string]string{
+				"name":       "pvc-pnid",
+				"conn-name":  "worker-2",
+				"connection": "Connected",
+			}
+			if tc.peerNodeID != "" {
+				fields["peer-node-id"] = tc.peerNodeID
+			}
+
+			obs, ok := translateEvent(drbd.Event{
+				Action: "change",
+				Kind:   eventKindConnection,
+				Fields: fields,
+			})
+			if !ok {
+				t.Fatalf("translateEvent rejected connection frame: %+v", fields)
+			}
+
+			if len(obs.Connections) != 1 {
+				t.Fatalf("Connections: got %d, want 1", len(obs.Connections))
+			}
+
+			got := obs.Connections[0].PeerDRBDNodeID
+			switch {
+			case tc.wantNil && got != nil:
+				t.Errorf("PeerDRBDNodeID: got *%d, want nil", *got)
+			case !tc.wantNil && got == nil:
+				t.Errorf("PeerDRBDNodeID: got nil, want *%d", tc.wantID)
+			case !tc.wantNil && *got != tc.wantID:
+				t.Errorf("PeerDRBDNodeID: got *%d, want *%d", *got, tc.wantID)
+			}
+		})
+	}
+
+	// Cache survival: a connection-kind frame with peer-node-id:1
+	// must seed the cache; a follow-up peer-device-kind frame
+	// missing the token (parsePeerNodeID → nil) MUST NOT blank
+	// the cached id (mergeConnections preserves on nil).
+	o := &ObserverRunnable{}
+
+	connEv := observation{
+		ResourceName: "pvc-pnid",
+		Connections: []connectionObservation{{
+			PeerNodeName:   "worker-2",
+			Connected:      true,
+			Message:        "Connected",
+			PeerDRBDNodeID: ptrInt32(1),
+		}},
+	}
+	o.mergeConnections(&connEv)
+
+	peerDevWithoutID := observation{
+		ResourceName: "pvc-pnid",
+		Connections: []connectionObservation{{
+			PeerNodeName:     "worker-2",
+			ReplicationState: "Established",
+			// PeerDRBDNodeID intentionally nil.
+		}},
+	}
+	o.mergeConnections(&peerDevWithoutID)
+
+	snap := o.snapshotFor("pvc-pnid")
+	if len(snap.Connections) != 1 {
+		t.Fatalf("snapshot connections: got %d, want 1", len(snap.Connections))
+	}
+
+	gotID := snap.Connections[0].PeerDRBDNodeID
+	if gotID == nil || *gotID != 1 {
+		t.Errorf("post-merge cached PeerDRBDNodeID: got %v, want *1 (nil-incoming must not blank)", gotID)
+	}
+
+	// SSA payload carries the field via buildObserverConnectionStatus.
+	out := buildObserverConnectionStatus(&snap)
+	if len(out) != 1 || out[0].PeerDRBDNodeID == nil || *out[0].PeerDRBDNodeID != 1 {
+		t.Errorf("buildObserverConnectionStatus: got %+v, want PeerDRBDNodeID=*1", out)
+	}
+}
+
+// TestObserverParsesPeerDiskStateFromPeerDeviceFrame pins Phase
+// 11.5.b P1: the events2 `peer-disk:<state>` token on peer-device
+// frames flows onto a per-volume entry under
+// `Status.Connections[i].peerVolumes[j].peerDiskState`. The
+// state-standalone-partition.sh + network-partition.sh e2e tests
+// rely on this divergence under partition (local view UpToDate,
+// peer's view DUnknown). Three assertions:
+//
+//  1. translatePeerDeviceEvent threads `peer-disk:<state>` onto
+//     the connection's PeerVolumes by volume number.
+//  2. mergeConnections folds per-volume entries into the cache so
+//     two peer-device frames covering different volumes accumulate.
+//  3. buildObserverConnectionStatus emits the SSA-shaped
+//     Connections[i].PeerVolumes payload (sorted, deterministic).
+func TestObserverParsesPeerDiskStateFromPeerDeviceFrame(t *testing.T) {
+	cases := []struct {
+		name      string
+		peerDisk  string
+		wantState string
+	}{
+		{"UpToDate — healthy peer view", "UpToDate", "UpToDate"},
+		{"DUnknown — partition (local kernel can't tell)", "DUnknown", "DUnknown"},
+		{"Outdated — peer demoted post-rejoin", "Outdated", "Outdated"},
+		{"Inconsistent — peer mid-resync", "Inconsistent", "Inconsistent"},
+		{"Diskless — peer detached", "Diskless", "Diskless"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, ok := translatePeerDeviceEvent(drbd.Event{
+				Action: "change",
+				Kind:   eventKindPeerDevice,
+				Fields: map[string]string{
+					"name":         "pvc-pdisk",
+					"peer-node-id": "1",
+					"volume":       "0",
+					"conn-name":    "worker-2",
+					"peer-disk":    tc.peerDisk,
+				},
+			})
+			if !ok {
+				t.Fatalf("translatePeerDeviceEvent rejected peer-disk=%q", tc.peerDisk)
+			}
+
+			if len(obs.Connections) != 1 {
+				t.Fatalf("Connections: got %d, want 1", len(obs.Connections))
+			}
+
+			got := obs.Connections[0].PeerVolumes
+			if len(got) != 1 || got[0].VolumeNumber != 0 || got[0].PeerDiskState != tc.wantState {
+				t.Errorf("PeerVolumes: got %+v, want [{VolumeNumber:0 PeerDiskState:%q}]", got, tc.wantState)
+			}
+		})
+	}
+
+	// Multi-volume accumulation: two peer-device frames covering
+	// volume 0 then volume 1 on the same peer must end up with
+	// BOTH entries in the cache. A naive "replace the slice"
+	// strategy would lose volume 0 when volume 1 arrives.
+	o := &ObserverRunnable{}
+
+	volZero, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-pdisk",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "worker-2",
+			"peer-disk":    "UpToDate",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected volume 0 frame")
+	}
+
+	o.mergeConnections(&volZero)
+
+	volOne, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-pdisk",
+			"peer-node-id": "1",
+			"volume":       "1",
+			"conn-name":    "worker-2",
+			"peer-disk":    "DUnknown",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected volume 1 frame")
+	}
+
+	o.mergeConnections(&volOne)
+
+	snap := o.snapshotFor("pvc-pdisk")
+	if len(snap.Connections) != 1 {
+		t.Fatalf("snapshot connections: got %d, want 1", len(snap.Connections))
+	}
+
+	pvs := snap.Connections[0].PeerVolumes
+	if len(pvs) != 2 {
+		t.Fatalf("snapshot PeerVolumes: got %d entries, want 2 (both volumes preserved); %+v", len(pvs), pvs)
+	}
+
+	// Sorted by VolumeNumber for deterministic SSA payloads.
+	if pvs[0].VolumeNumber != 0 || pvs[0].PeerDiskState != "UpToDate" {
+		t.Errorf("PeerVolumes[0]: got %+v, want {VolumeNumber:0 PeerDiskState:UpToDate}", pvs[0])
+	}
+
+	if pvs[1].VolumeNumber != 1 || pvs[1].PeerDiskState != "DUnknown" {
+		t.Errorf("PeerVolumes[1]: got %+v, want {VolumeNumber:1 PeerDiskState:DUnknown}", pvs[1])
+	}
+
+	// SSA payload pass-through: buildObserverConnectionStatus must
+	// emit PeerVolumes onto the typed Status shape.
+	out := buildObserverConnectionStatus(&snap)
+	if len(out) != 1 {
+		t.Fatalf("buildObserverConnectionStatus: got %d entries, want 1", len(out))
+	}
+
+	gotPVs := out[0].PeerVolumes
+	if len(gotPVs) != 2 || gotPVs[0].PeerDiskState != "UpToDate" || gotPVs[1].PeerDiskState != "DUnknown" {
+		t.Errorf("buildObserverConnectionStatus PeerVolumes: got %+v, want vol0=UpToDate vol1=DUnknown", gotPVs)
+	}
+}
+
+// TestObserverDoesNotEmitPeerVolumeStateForDestroyedConnection pins
+// the post-`drbdadm del-peer` cleanup contract: once the kernel
+// emits `destroy connection` (the events2 verb after del-peer
+// resolves), the per-peer cache entry MUST go away wholesale.
+// Specifically, the per-volume `peer-disk` view this peer carried
+// must NOT linger as a stale PeerVolumes entry on Status — `linstor
+// r l` and the partition-recovery e2e tests would otherwise keep
+// reporting the deleted peer's last-known disk-state forever, and
+// network-partition.sh's "post-rejoin clean state" assertion would
+// fail.
+//
+// Stages:
+//  1. peer-device frame: volume 0 PeerDiskState=UpToDate seeds the
+//     cache.
+//  2. destroy connection frame: cache entry for the peer drops.
+//  3. snapshotFor + buildObserverConnectionStatus emit zero
+//     connections (no stale PeerVolumes left behind).
+func TestObserverDoesNotEmitPeerVolumeStateForDestroyedConnection(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// Stage 1: seed cache with a peer-disk view on volume 0.
+	seedEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-destroy",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "worker-2",
+			"peer-disk":    "UpToDate",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected seed frame")
+	}
+
+	o.mergeConnections(&seedEv)
+
+	snap := o.snapshotFor("pvc-destroy")
+	if len(snap.Connections) != 1 || len(snap.Connections[0].PeerVolumes) != 1 {
+		t.Fatalf("seed: snapshot must carry 1 connection with 1 PeerVolume; got %+v", snap.Connections)
+	}
+
+	// Stage 2: destroy connection — peer goes away.
+	destroyEv, ok := translateEvent(drbd.Event{
+		Action: eventActionDestroy,
+		Kind:   eventKindConnection,
+		Fields: map[string]string{
+			"name":      "pvc-destroy",
+			"conn-name": "worker-2",
+		},
+	})
+	if !ok {
+		t.Fatalf("translateEvent rejected destroy frame")
+	}
+
+	o.mergeConnections(&destroyEv)
+
+	// Stage 3: snapshot must have ZERO connections — no stale
+	// PeerVolumes from the dead peer.
+	snap = o.snapshotFor("pvc-destroy")
+	if len(snap.Connections) != 0 {
+		t.Errorf("post-destroy snapshot: got %d connections, want 0 (stale peer must be pruned); %+v",
+			len(snap.Connections), snap.Connections)
+	}
+
+	out := buildObserverConnectionStatus(&snap)
+	if len(out) != 0 {
+		t.Errorf("buildObserverConnectionStatus after destroy: got %d entries, want 0 (no stale PeerVolumes); %+v",
+			len(out), out)
+	}
+}
+
+// ptrInt32 is a tiny helper that returns a pointer to its int32
+// argument. Used by tests to seed optional `*int32` fields like
+// `PeerDRBDNodeID` without a one-shot named variable per case.
+func ptrInt32(v int32) *int32 { return &v }
