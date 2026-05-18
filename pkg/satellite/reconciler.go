@@ -991,41 +991,59 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	// Bug 303: probe BEFORE any bring-up verbs whether we're crossing
-	// the intentional-diskless → diskful boundary (migrate-disk,
-	// `linstor r td --diskful`). The kernel treats an intentional-
-	// diskless slot's current state as deliberate, so `drbdadm adjust`
-	// will NOT attach the freshly-carved lower disk by itself; we'll
-	// follow up with an explicit `drbdadm attach` after adjust.
-	needsAttach := r.needsDisklessToDiskfulAttach(ctx, dr, diskless)
+	// Bug 319 (root-cause fix for Bug 303): probe BEFORE any bring-up
+	// verbs whether the local kernel slot is `disk:Diskless client:yes`
+	// (intentional diskless) on a Spec that has flipped to diskful
+	// (`linstor r td --migrate-from`, `linstor r td --diskful`). The
+	// upstream LINSTOR pattern (`DrbdLayer.createMetaData` → `drbdadm
+	// adjust`) initialises metadata BEFORE every adjust and lets adjust
+	// cross the diskless→diskful boundary via drbd-utils' compare_volume
+	// (kern->disk=="none" + conf->disk="<path>" schedules attach_cmd).
+	//
+	// Match that pattern here: when the kernel reports a Diskless
+	// volume and Spec is now diskful, re-enter the create-md path on
+	// the now-present lower disk REGARDLESS of the .md-created marker.
+	// The previous Bug 303 workaround (explicit `drbdadm attach` AFTER
+	// adjust) papered over the missing create-md re-entry; removing it
+	// in favour of the upstream-aligned pipeline.
+	diskfulFlip := r.isDisklessToDiskfulFlip(ctx, dr, diskless)
 
-	if firstActivation && !diskless {
-		err = r.runFirstActivation(ctx, dr, devices, mdMarkerPath)
+	// Auto-promote (primary --force + auto-mkfs) and GI-seed are
+	// gated on firstActivation: a Spec flag flip from diskless to
+	// diskful is NOT a fresh activation — peers are already UpToDate,
+	// so a primary --force here would regenerate the local Current
+	// UUID out from under the cluster, and a GI-seed would corrupt
+	// the in-flight handshake. Suppress firstActivation on the flip
+	// so `ensureMetadata` skips GI-seed and `finishDRBDApply` skips
+	// the auto-promote chain.
+	effectiveFirstActivation := firstActivation && !diskfulFlip
+
+	if (firstActivation || diskfulFlip) && !diskless {
+		err = r.ensureMetadata(ctx, dr, devices, mdMarkerPath, effectiveFirstActivation)
 		if err != nil {
 			return err
 		}
 	}
 
-	err = r.runApplyDRBDVerb(ctx, dr, firstActivation)
+	err = r.runApplyDRBDVerb(ctx, dr, effectiveFirstActivation, diskfulFlip)
 	if err != nil {
 		return err
 	}
 
-	return r.finishDRBDApply(ctx, dr, diskless, firstActivation, needsAttach, resized, cloned)
+	return r.finishDRBDApply(ctx, dr, diskless, effectiveFirstActivation, resized, cloned)
 }
 
-// finishDRBDApply runs the post-adjust steps: explicit attach for
-// diskless→diskful crossings (Bug 303), pickup-time resize, and
-// the first-activation auto-primary seed. Extracted from applyDRBD
-// so the orchestrator stays under the project's gocyclo budget.
-func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, needsAttach, resized, cloned bool) error {
-	if needsAttach {
-		err := r.attachAfterDisklessFlip(ctx, dr)
-		if err != nil {
-			return err
-		}
-	}
-
+// finishDRBDApply runs the post-adjust steps: pickup-time resize and
+// the first-activation auto-primary seed. Extracted from applyDRBD so
+// the orchestrator stays under the project's gocyclo budget.
+//
+// Bug 319: an earlier revision called `drbdadm attach` here for the
+// diskless→diskful flip (Bug 303 workaround). That step is gone —
+// `ensureMetadata` now runs create-md on the new lower disk BEFORE
+// adjust, and drbd-utils' compare_volume schedules attach_cmd
+// automatically when kern->disk=="none" but conf->disk points at a
+// real path. Matches upstream LINSTOR's DrbdLayer pipeline.
+func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool) error {
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -1124,21 +1142,27 @@ func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
 	return os.IsNotExist(err)
 }
 
-// needsDisklessToDiskfulAttach probes whether the local kernel slot
-// is currently `disk:Diskless client:yes` (intentional diskless) on
-// a Resource whose spec has flipped to diskful. Bug 303: this is the
-// trigger for the explicit `drbdadm attach` follow-up — adjust
-// reconciles network/peer state and resource options against the
-// new .res file but does NOT cross the diskless→diskful boundary
-// for an intentional-diskless slot (the kernel treats the current
-// state as deliberate).
+// isDisklessToDiskfulFlip probes whether the local kernel slot is
+// currently `disk:Diskless client:yes` (intentional diskless) on a
+// Resource whose Spec has flipped to diskful (`linstor r td
+// --migrate-from`, `linstor r td --diskful`).
 //
-// Probe BEFORE any of the bring-up verbs run because adjust /
-// CreateMD / etc may shift kernel state mid-flight and we'd lose
-// the signal. Errors fall through to false: a netlink hiccup
-// shouldn't strand the apply chain, and the subsequent reconcile
-// pass (driven by Status updates / events2) will retry the attach
-// via the same probe.
+// Bug 319: this is the trigger for re-entering the create-md path
+// on a flag flip even when the satellite's .md-created marker is
+// already present (the previous diskless apply may not have written
+// it, but it may also have been written by a prior diskful incarnation
+// of the same name — we must re-stamp metadata on the newly-carved
+// lower disk either way). Upstream LINSTOR's DrbdLayer always runs
+// createMetaData before adjust on every reconcile pass; drb-utils'
+// compare_volume then schedules attach_cmd via the
+// kern->disk=="none" + conf->disk="<path>" diff. Matching that flow
+// is what makes the explicit Bug 303 `drbdadm attach` unnecessary.
+//
+// Probe BEFORE any bring-up verbs run because adjust / CreateMD /
+// etc may shift kernel state mid-flight and we'd lose the signal.
+// Errors fall through to false: a netlink hiccup shouldn't strand
+// the apply chain, and the next reconcile pass (driven by Status
+// updates / events2) will retry the probe.
 //
 // Returns false when:
 //   - the spec is still diskless (no boundary crossing),
@@ -1146,8 +1170,9 @@ func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
 //     resource with the new .res, which DOES attach the disk
 //     because new-resource sees a disk path),
 //   - the kernel slot is loaded with no Diskless volume (already
-//     diskful — Attach would be a no-op anyway).
-func (r *Reconciler) needsDisklessToDiskfulAttach(ctx context.Context, dr *intent.DesiredResource, diskless bool) bool {
+//     diskful — re-running create-md would be a HasMD-gated no-op
+//     but we skip the probe to avoid the shell-out cost).
+func (r *Reconciler) isDisklessToDiskfulFlip(ctx context.Context, dr *intent.DesiredResource, diskless bool) bool {
 	if diskless {
 		return false
 	}
@@ -1165,19 +1190,59 @@ func (r *Reconciler) needsDisklessToDiskfulAttach(ctx context.Context, dr *inten
 	return disklessVol
 }
 
-// attachAfterDisklessFlip runs `drbdadm attach` to cross the
-// intentional-diskless → diskful boundary. Bug 303: when the .res
-// file now carries the disk path (the dispatcher dropped the
-// Diskless host marker on the spec flag flip), create-md has stamped
-// fresh metadata on the newly-carved zvol/LV, and adjust has
-// reconciled the network half, the only step left is to explicitly
-// attach the lower disk — adjust skips this for an intentional-
-// diskless kernel slot. Idempotent: Attach on an already-diskful
-// slot is a kernel-level no-op.
-func (r *Reconciler) attachAfterDisklessFlip(ctx context.Context, dr *intent.DesiredResource) error {
-	err := r.cfg.Adm.Attach(ctx, dr.GetName())
+// ensureMetadata is the upstream-aligned create-md entry point. It
+// runs in two cases:
+//
+//  1. firstActivation: the resource has never had `.md-created`
+//     stamped (fresh diskful replica). Behaves exactly like the
+//     historical runFirstActivation — HasMD-gated CreateMD, marker
+//     write, GI-seed.
+//  2. diskless→diskful Spec flag flip (Bug 319): the resource was
+//     previously diskless on this node, the dispatcher just dropped
+//     the Diskless host marker, applyStorage carved a fresh
+//     zvol/LV, and the kernel still reports `disk:Diskless
+//     client:yes`. Re-enter create-md so the new lower disk has
+//     valid DRBD-9 metadata; drbdadm adjust then auto-attaches via
+//     drb-utils' compare_volume (kern->disk=="none" + conf->disk
+//     path diff). Skip the GI-seed: it's a fresh-replica
+//     optimisation, not relevant when the kernel slot is already
+//     handshaken with peers via the diskless path.
+//
+// Idempotent on both axes: HasMD short-circuits CreateMD when the
+// metadata block already exists (e.g. satellite restart between
+// CreateMD and marker write), and the marker write is a one-shot
+// OS truncate that doesn't churn on repeat.
+func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string, firstActivation bool) error {
+	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
 	if err != nil {
-		return errors.Wrapf(err, "attach %s after diskless→diskful flip", dr.GetName())
+		return errors.Wrapf(err, "dump-md %s", dr.GetName())
+	}
+
+	if !hasMD {
+		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
+		if err != nil {
+			return errors.Wrapf(err, "create-md %s", dr.GetName())
+		}
+	}
+
+	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "write %s", mdMarkerPath)
+	}
+
+	// GI-seed is fresh-replica-only: it pre-stamps the per-peer
+	// bitmap slots with a peer's UpToDate GI so the initial-sync
+	// handshake skips a full resync. On a diskless→diskful flip the
+	// kernel slot is already handshaken with peers via the diskless
+	// path — the GI-seed window has closed, and re-stamping the GI
+	// would corrupt the in-flight session.
+	if !firstActivation {
+		return nil
+	}
+
+	err = r.seedInitialGi(ctx, dr, devices)
+	if err != nil {
+		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
 	}
 
 	return nil
@@ -1354,12 +1419,12 @@ func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) boo
 //
 // Split out of applyDRBD so the orchestration function stays under
 // the gocyclo budget.
-func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredResource, firstActivation bool) error {
+func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredResource, firstActivation, diskfulFlip bool) error {
 	if firstActivation {
-		return r.runAdjust(ctx, dr)
+		return r.runAdjust(ctx, dr, diskfulFlip)
 	}
 
-	return r.runBringUpOrAdjust(ctx, dr)
+	return r.runBringUpOrAdjust(ctx, dr, diskfulFlip)
 }
 
 // runBringUpOrAdjust probes the kernel for the resource's slot via
@@ -1385,7 +1450,7 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 // the resource-absent signal) is bubbled up: we'd rather surface
 // a satellite-side failure than guess wrong and run the wrong
 // verb against half-known kernel state.
-func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredResource) error {
+func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredResource, diskfulFlip bool) error {
 	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "probe kernel state for %s", dr.GetName())
@@ -1400,7 +1465,7 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 		return nil
 	}
 
-	return r.runAdjust(ctx, dr)
+	return r.runAdjust(ctx, dr, diskfulFlip)
 }
 
 // runAdjust dispatches to the plain `drbdadm adjust` or the
@@ -1449,10 +1514,17 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 // fall back to `drbdadm up <rsc>` (which always issues
 // new-resource + new-minor + attach + connect), and let the next
 // reconcile re-converge.
-func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource) error {
+func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, diskfulFlip bool) error {
 	skipDisk := isSkipDiskEnabled(dr)
 
-	if !skipDisk {
+	// Bug 319: on the diskless→diskful Spec flag flip we DELIBERATELY
+	// want plain `drbdadm adjust` to attach the freshly create-md'd
+	// lower disk via drb-utils' compare_volume (kern->disk=="none" +
+	// conf->disk path diff schedules attach_cmd). Coercing
+	// `--skip-disk` here — which Bug 280's kernel probe would
+	// otherwise do because the kernel still reports Diskless — would
+	// suppress exactly the attach we just created the metadata for.
+	if !skipDisk && !diskfulFlip {
 		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
 		if probeErr == nil && diskless {
 			skipDisk = true
@@ -1540,52 +1612,6 @@ var drbd158ErrRegex = regexp.MustCompile(`\(158\) Unknown resource`)
 // Must be called between create-md (which writes the metadata
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
-// runFirstActivation runs the one-shot per-replica bring-up:
-// `drbdadm create-md`, drop the md-created marker file (so the
-// next reconcile sees firstActivation=false even across a
-// satellite restart), then seed initial-sync GI when the
-// controller has stamped a peer's UpToDate GI on the volume.
-// Pulled out of applyDRBD so the orchestration function stays
-// under the cyclomatic budget.
-//
-// SAFETY: `drbdadm create-md --force` wipes any existing metadata —
-// running it on a healthy replica would drop the local
-// generation-id / dirty-bitmap and effectively orphan the data
-// from the cluster. Before calling create-md we ask DRBD whether
-// metadata already exists (`drbdadm dump-md`). If it does, we
-// adopt it: skip create-md, write the marker so subsequent
-// reconciles see firstActivation=false, and continue to GI-seed
-// (which is itself a no-op when SeedFromGi is empty). This makes
-// the marker-file gate safe against accidental deletion / bare
-// satellite restarts that lose the marker.
-func (r *Reconciler) runFirstActivation(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string) error {
-	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "dump-md %s", dr.GetName())
-	}
-
-	if !hasMD {
-		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
-		if err != nil {
-			return errors.Wrapf(err, "create-md %s", dr.GetName())
-		}
-	}
-
-	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
-	if err != nil {
-		return errors.Wrapf(err, "write %s", mdMarkerPath)
-	}
-
-	// GI-seed is a no-op when the controller hasn't stamped a peer's
-	// CurrentGi on the volume (fresh-cluster case) and is idempotent
-	// when it has; safe to run even when we adopted existing metadata.
-	err = r.seedInitialGi(ctx, dr, devices)
-	if err != nil {
-		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
-	}
-
-	return nil
-}
 
 func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	// peerNodeIDs is the deterministic peer-name → DRBD node-id map

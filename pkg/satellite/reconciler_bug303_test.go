@@ -29,32 +29,29 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
 
-// Bug 303: `linstor r td --migrate-from <src>` (UG9 §"Migrating a
-// resource to another node") flips a Resource's Spec.Flags from
-// [DISKLESS] to [] AND stamps Spec.StoragePool. The satellite then
-// runs the diskful Apply chain: applyStorage carves the backing
-// zvol/LV, applyDRBD writes the .res file (now with `disk
-// /dev/zvol/...` instead of `disk none;`), runFirstActivation
-// stamps fresh DRBD-9 metadata on the new disk, and
-// runApplyDRBDVerb dispatches `drbdadm adjust`.
+// Bug 319 (root-cause fix for Bug 303): `linstor r td --migrate-from
+// <src>` (UG9 §"Migrating a resource to another node") flips a
+// Resource's Spec.Flags from [DISKLESS] to [] AND stamps
+// Spec.StoragePool. The satellite then runs the diskful Apply chain:
+// applyStorage carves the backing zvol/LV, applyDRBD writes the .res
+// file (now with `disk /dev/zvol/...` instead of `disk none;`), and
+// `ensureMetadata` stamps fresh DRBD-9 metadata on the new disk
+// BEFORE `drbdadm adjust` runs.
 //
-// But the kernel slot was previously brought up as
-// `disk:Diskless client:yes` (intentional diskless). `drbdadm
-// adjust` reconciles network/peer state and resource-level options
-// against the new .res, but the kernel treats an intentional-
-// diskless slot's current state as deliberate and adjust does NOT
-// cross the diskless→diskful boundary on its own. The replica
-// stays `disk:Diskless client:yes` forever; the
-// lifecycle-toggle-migrate e2e times out with "never reached
-// UpToDate".
+// Upstream LINSTOR's DrbdLayer pipeline is `createMetaData` →
+// `drbdadm adjust`. drb-utils' `adjust` then crosses the
+// diskless→diskful boundary on its own via compare_volume:
+// kern->disk=="none" + conf->disk pointing at a real path schedules
+// attach_cmd. Bug 303's earlier workaround (explicit `drbdadm
+// attach` AFTER adjust) papered over a satellite gate that prevented
+// create-md from running on the flip; Bug 319 lifts the gate and
+// removes the explicit attach.
 //
-// Fix: after the .res write + create-md + adjust, when the local
-// kernel slot is loaded AND HasDisklessVolume reports a Diskless
-// volume AND the spec is now diskful, run `drbdadm attach <rd>`
-// to explicitly cross the boundary. Idempotent: attach on an
-// already-diskful slot is a kernel-level no-op; the gate prevents
-// us shelling out in that case.
-func TestBug303AttachAfterIntentionalDisklessFlip(t *testing.T) {
+// This test pins the upstream-aligned shape: create-md MUST run on
+// the flip BEFORE adjust, and the explicit `drbdadm attach` MUST be
+// gone (the test that previously asserted attach is the bug being
+// fixed).
+func TestBug319CreateMDBeforeAdjustOnDisklessToDiskfulFlip(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
@@ -118,26 +115,50 @@ func TestBug303AttachAfterIntentionalDisklessFlip(t *testing.T) {
 
 	cmds := fx.CommandLines()
 
-	// Assert the explicit attach landed. Without the Bug 303 fix the
-	// satellite stops at `drbdadm adjust` and never crosses the
-	// diskless→diskful boundary, so this slice membership check is
-	// the load-bearing invariant.
-	if !slices.Contains(cmds, "drbdadm attach pvc-bug303") {
-		t.Errorf("expected `drbdadm attach pvc-bug303` after diskless→diskful flip; got: %v", cmds)
+	// Upstream-aligned invariant: `drbdadm create-md` MUST run on the
+	// diskless→diskful flip, BEFORE `drbdadm adjust`. drb-utils'
+	// compare_volume then schedules attach_cmd automatically from the
+	// kern->disk=="none" + conf->disk path diff. The Bug 303 fix
+	// papered over a missing create-md re-entry with an explicit
+	// `drbdadm attach`; Bug 319 lifts the gate so create-md is the
+	// load-bearing step.
+	createMDIdx := slices.IndexFunc(cmds, func(s string) bool {
+		return strings.HasPrefix(s, "drbdadm create-md") && strings.HasSuffix(s, "pvc-bug303")
+	})
+	if createMDIdx < 0 {
+		t.Errorf("expected `drbdadm create-md ... pvc-bug303` on the diskless→diskful flip; got: %v", cmds)
 	}
 
-	// Order matters: attach must run AFTER adjust. Adjust reconciles
-	// the .res file's network/peer state into the kernel; running
-	// attach before adjust risks attaching against a stale .res view
-	// of the peer mesh.
 	adjustIdx := slices.IndexFunc(cmds, func(s string) bool {
 		return strings.HasPrefix(s, "drbdadm adjust pvc-bug303")
 	})
-	attachIdx := slices.Index(cmds, "drbdadm attach pvc-bug303")
+	if adjustIdx < 0 {
+		t.Errorf("expected `drbdadm adjust pvc-bug303` on the flip; got: %v", cmds)
+	}
 
-	if adjustIdx >= 0 && attachIdx >= 0 && attachIdx < adjustIdx {
-		t.Errorf("attach must run AFTER adjust; got adjust@%d attach@%d in:\n%v",
-			adjustIdx, attachIdx, cmds)
+	if createMDIdx >= 0 && adjustIdx >= 0 && createMDIdx > adjustIdx {
+		t.Errorf("create-md must run BEFORE adjust (upstream DrbdLayer pipeline); "+
+			"got create-md@%d adjust@%d in:\n%v", createMDIdx, adjustIdx, cmds)
+	}
+
+	// Adjust must be the plain `drbdadm adjust` (not `--skip-disk`).
+	// `--skip-disk` would prevent the auto-attach that the
+	// kern->disk vs conf->disk diff in compare_volume schedules; the
+	// Bug 280 race-close that coerces `--skip-disk` when the kernel
+	// reports Diskless must NOT fire on the flip path.
+	if slices.Contains(cmds, "drbdadm adjust --skip-disk pvc-bug303") {
+		t.Errorf("plain `drbdadm adjust` expected on the flip — `--skip-disk` "+
+			"suppresses the auto-attach the create-md was for; got: %v", cmds)
+	}
+
+	// Bug 303's explicit attach is GONE — the upstream pipeline
+	// (create-md → adjust) does it via compare_volume's attach_cmd.
+	// Leaving the explicit attach in place would be a redundant
+	// shell-out at best and a race with the kernel's own attach
+	// completion at worst.
+	if slices.Contains(cmds, "drbdadm attach pvc-bug303") {
+		t.Errorf("explicit `drbdadm attach` must NOT run — adjust auto-attaches via "+
+			"drb-utils' compare_volume after create-md; got: %v", cmds)
 	}
 }
 
@@ -269,6 +290,127 @@ func TestBug303NoAttachWhenKernelAlreadyDiskful(t *testing.T) {
 	cmds := fx.CommandLines()
 	if slices.Contains(cmds, "drbdadm attach pvc-bug303-up") {
 		t.Errorf("attach must NOT run when kernel is already diskful; got: %v", cmds)
+	}
+}
+
+// TestApplyDRBDRunsCreateMdOnDisklessToDiskfulFlip pins the Bug 319
+// invariant against the marker-present case: even when `.md-created`
+// is already on disk from a prior incarnation (re-created RD with the
+// same name, satellite carrying over state, or any path that wrote
+// the marker before the resource went diskless), the diskless→
+// diskful flip MUST re-enter create-md so the freshly-carved lower
+// disk gets valid DRBD-9 metadata. The historical Bug 303 fix gated
+// create-md on `firstActivation` (i.e. marker absence) and so missed
+// this case entirely — `drbdadm adjust` would see kernel Diskless
+// and no metadata, refuse to attach, and the explicit attach
+// workaround would fail with "No valid meta data found".
+//
+// FakeExec assertion: `drbdadm create-md` MUST appear in the command
+// history BEFORE `drbdadm adjust`, regardless of marker state.
+func TestApplyDRBDRunsCreateMdOnDisklessToDiskfulFlip(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug319_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug319_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug319_00000|1048576\n")})
+
+	// Kernel reports intentional-Diskless — the shape after the
+	// previous diskless apply brought the slot up with `disk none`.
+	kernelDump := []byte(`pvc-bug319 role:Secondary
+  volume:0 disk:Diskless client:yes
+  n2 role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`)
+	fx.Expect("drbdsetup status pvc-bug319",
+		storage.FakeResponse{Stdout: kernelDump})
+	fx.Expect("drbdsetup status --verbose pvc-bug319",
+		storage.FakeResponse{Stdout: kernelDump})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Pre-stage `.md-created` so firstActivation reports false. The
+	// flip MUST still re-enter create-md via the diskful-flip gate
+	// (kernel probe), independent of the marker.
+	err := mkEmptyFile(dir + "/pvc-bug319.md-created")
+	if err != nil {
+		t.Fatalf("mkEmptyFile: %v", err)
+	}
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-bug319",
+		NodeName: "n1",
+		Flags:    []string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []string{"n2"},
+		DrbdOptions: map[string]string{
+			"port":            "7000",
+			"node-id":         "0",
+			"address":         "10.0.0.1",
+			"minor":           "1000",
+			"peer.n2.address": "10.0.0.2",
+			"peer.n2.node-id": "1",
+			"peer.n2.port":    "7000",
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("apply result not ok: %+v", results)
+	}
+
+	cmds := fx.CommandLines()
+
+	createMDIdx := slices.IndexFunc(cmds, func(s string) bool {
+		return strings.HasPrefix(s, "drbdadm create-md") && strings.HasSuffix(s, "pvc-bug319")
+	})
+	if createMDIdx < 0 {
+		t.Errorf("expected `drbdadm create-md ... pvc-bug319` on the flip even with "+
+			".md-created marker present; got: %v", cmds)
+	}
+
+	adjustIdx := slices.IndexFunc(cmds, func(s string) bool {
+		return strings.HasPrefix(s, "drbdadm adjust pvc-bug319")
+	})
+	if adjustIdx < 0 {
+		t.Errorf("expected `drbdadm adjust pvc-bug319` on the flip; got: %v", cmds)
+	}
+
+	if createMDIdx >= 0 && adjustIdx >= 0 && createMDIdx > adjustIdx {
+		t.Errorf("create-md must run BEFORE adjust on the flip; "+
+			"got create-md@%d adjust@%d in:\n%v", createMDIdx, adjustIdx, cmds)
+	}
+
+	if slices.Contains(cmds, "drbdadm attach pvc-bug319") {
+		t.Errorf("explicit `drbdadm attach` must NOT run (Bug 303 workaround removed); "+
+			"got: %v", cmds)
+	}
+
+	if slices.Contains(cmds, "drbdadm adjust --skip-disk pvc-bug319") {
+		t.Errorf("plain `drbdadm adjust` expected on the flip — `--skip-disk` "+
+			"suppresses the auto-attach the create-md was for; got: %v", cmds)
+	}
+
+	// Bug 319: primary --force MUST NOT run on a flag flip. The peer
+	// is already UpToDate; force-primary here would regenerate the
+	// local Current UUID out from under the cluster.
+	for _, c := range cmds {
+		if strings.HasPrefix(c, "drbdadm primary --force") {
+			t.Errorf("primary --force must NOT run on a diskless→diskful flip; "+
+				"got: %s in %v", c, cmds)
+		}
 	}
 }
 
