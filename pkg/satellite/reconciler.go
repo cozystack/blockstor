@@ -17,6 +17,7 @@ limitations under the License.
 package satellite
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -975,9 +976,19 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return err
 	}
 
-	err = os.WriteFile(resPath, []byte(body), resFilePerm)
-	if err != nil {
-		return errors.Wrapf(err, "write %s", resPath)
+	// Bug 315 (P0-5): content-idempotent write. Skip rewriting the .res
+	// file when the rendered body matches what's already on disk. This
+	// preserves the mtime so downstream observers (drbdadm config-file
+	// watchers, debugging diffs) don't see spurious churn on every
+	// reconcile when nothing material changed.
+	desired := []byte(body)
+	current, _ := os.ReadFile(resPath)
+
+	if !bytes.Equal(current, desired) {
+		err = os.WriteFile(resPath, desired, resFilePerm)
+		if err != nil {
+			return errors.Wrapf(err, "write %s", resPath)
+		}
 	}
 
 	// Bug 303: probe BEFORE any bring-up verbs whether we're crossing
