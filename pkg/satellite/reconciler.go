@@ -1779,7 +1779,7 @@ func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) boo
 // the gocyclo budget.
 func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredResource, firstActivation, diskfulFlip bool) error {
 	if firstActivation {
-		return r.runAdjust(ctx, dr, diskfulFlip)
+		return r.adjustResource(ctx, dr, diskfulFlip)
 	}
 
 	return r.runBringUpOrAdjust(ctx, dr, diskfulFlip)
@@ -1823,6 +1823,38 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 		return nil
 	}
 
+	return r.adjustResource(ctx, dr, diskfulFlip)
+}
+
+// adjustResource runs `drbdadm adjust <name>` with the right
+// SkipDisk coercion: bare adjust when neither the operator prop nor
+// kernel state asks for skip-disk, `--skip-disk` form when either
+// signal is present. The SkipDisk arm covers both Bug 280 (kernel
+// Diskless without operator prop) and operator-pinned downgrade
+// (scenario 5.11).
+//
+// Idempotent: `drbdadm adjust` is the canonical "make kernel state
+// match .res" call; safe to re-run. The caller has already ensured
+// .res exists (renderResFile) and create-md has run if
+// firstActivation (createMetadata). The Bug-287 fallback to
+// `drbdadm up` for the `(158) Unknown resource` race lives inside
+// the helper so callers don't have to know about the half-torn
+// kernel-slot window.
+//
+// Gate computation (SkipDisk prop check + kernel-Diskless probe)
+// stays inside the helper — it determines which variant to run and
+// the caller must not pass that decision. `diskfulFlip` is an
+// input (not an internal probe) because Bug 319 needs to suppress
+// the Diskless-probe-driven SkipDisk coercion on the
+// diskless→diskful transition where compare_volume must see the
+// kern->disk=="none" + conf->disk path diff to schedule attach_cmd.
+//
+// Phase 11.2.c Stage 3b: pure extract, no behaviour change. Stage 3c
+// (or later) will FSM-shadow-dispatch this helper for ActionAdjust
+// and ActionAdjustSkipDisk transitions at the top of applyDRBD,
+// mirror of the renderResFile (Stage 2) and createMetadata (Stage
+// 3a) shadows.
+func (r *Reconciler) adjustResource(ctx context.Context, dr *intent.DesiredResource, diskfulFlip bool) error {
 	return r.runAdjust(ctx, dr, diskfulFlip)
 }
 
