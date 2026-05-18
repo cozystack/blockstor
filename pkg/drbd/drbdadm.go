@@ -88,39 +88,6 @@ func (a *Adm) Adjust(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", resource)
 }
 
-// Connect issues `drbdadm connect <target>` to bring a quiesced peer
-// back into the handshake. `target` may be a bare resource name (all
-// peers) or the `<resource>:<peer-node>` form drbdadm uses to scope
-// a single peer slot. Idempotent — already-connected peers return
-// with a noisy warning we don't try to suppress here.
-//
-// Used by the observer's closed-loop StandAlone / stuck-SyncTarget
-// recovery: when the kernel sits in `connection:StandAlone` (or
-// `replication:SyncTarget` with the out-of-sync byte counter frozen),
-// the kernel can't self-recover without an explicit reconnect verb.
-// Pairs with Disconnect for the cycle the operator's runbook normally
-// drives manually; the observer fires it automatically under a
-// per-(resource,peer) cooldown so the closed loop can't degenerate
-// into a reconnect storm.
-func (a *Adm) Connect(ctx context.Context, target string) error {
-	return a.run(ctx, "connect", target)
-}
-
-// Disconnect issues `drbdadm disconnect <target>` to quiesce a peer
-// slot before a fresh handshake. Same target convention as Connect:
-// bare resource name covers every peer, `<resource>:<peer-node>`
-// scopes a single peer.
-//
-// In the observer's auto-recovery path we always run Disconnect
-// best-effort BEFORE Connect: a StandAlone peer's existing
-// connection state must be torn down or the follow-up `connect`
-// won't progress past the same wedged handshake. Already-disconnected
-// peers return non-zero; the caller swallows that — the operative
-// state we care about is post-Connect.
-func (a *Adm) Disconnect(ctx context.Context, target string) error {
-	return a.run(ctx, "disconnect", target)
-}
-
 // AdjustSkipDisk is the Failed-replica variant of Adjust that
 // appends drbd-utils' `--skip-disk` flag. Used after the observer
 // detected `disk:Failed` and stamped `DrbdOptions/SkipDisk=True`

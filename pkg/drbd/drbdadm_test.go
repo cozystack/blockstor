@@ -207,45 +207,6 @@ func TestAdmPropagatesError(t *testing.T) {
 
 var errFakeFailure = errors.New("drbdadm: simulated failure")
 
-// TestAdmConnectInvokesDrbdadm pins the observer's auto-recovery
-// reconnect verb: Connect("pvc-1:n2") → `drbdadm connect pvc-1:n2`.
-// The target form here is the per-peer slot the observer uses when
-// recovering a single StandAlone connection (a bare resource name
-// also works at the drbdadm level for all-peers reconnects, but the
-// observer always targets one peer at a time).
-func TestAdmConnectInvokesDrbdadm(t *testing.T) {
-	fx := storage.NewFakeExec()
-	adm := drbd.NewAdm(fx)
-
-	if err := adm.Connect(t.Context(), "pvc-1:n2"); err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-
-	want := "drbdadm connect pvc-1:n2"
-	if !slices.Contains(fx.CommandLines(), want) {
-		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
-	}
-}
-
-// TestAdmDisconnectInvokesDrbdadm pins the quiesce-half of the
-// observer's auto-recovery cycle: Disconnect("pvc-1:n2") →
-// `drbdadm disconnect pvc-1:n2`. Run best-effort BEFORE Connect so
-// the follow-up handshake starts from a torn-down slot rather than
-// the wedged StandAlone state that triggered the recovery.
-func TestAdmDisconnectInvokesDrbdadm(t *testing.T) {
-	fx := storage.NewFakeExec()
-	adm := drbd.NewAdm(fx)
-
-	if err := adm.Disconnect(t.Context(), "pvc-1:n2"); err != nil {
-		t.Fatalf("Disconnect: %v", err)
-	}
-
-	want := "drbdadm disconnect pvc-1:n2"
-	if !slices.Contains(fx.CommandLines(), want) {
-		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
-	}
-}
-
 // TestAdmDetachInvokesDrbdadm: Detach → `drbdadm detach --force <res>`.
 // --force is required because the disk is already in a transient
 // (Failed) state when this gets called; without it drbdadm refuses.

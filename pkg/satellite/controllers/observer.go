@@ -28,7 +28,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -54,15 +53,8 @@ type observation struct {
 	// re-emits the cached values so writeStatus' SSA apply keeps
 	// the f:inUse / f:drbdState claims alive.
 	HasResource bool
-	// ResourceRemoved marks `destroy resource <name>` frames the
-	// kernel emits after `drbdadm down` or `drbdsetup del-resource`.
-	// P0-4: handleObservation enqueues a Resource reconcile on this
-	// signal so the satellite's Spec-only predicate (P0-1) doesn't
-	// leave the resource wedged-down forever — the kernel-state
-	// mismatch is invisible to apiserver-watch-driven reconciles.
-	ResourceRemoved bool
-	Volumes         []volumeObservation
-	Connections     []connectionObservation
+	Volumes     []volumeObservation
+	Connections []connectionObservation
 }
 
 // volumeObservation carries per-volume DiskState + the
@@ -81,18 +73,6 @@ type volumeObservation struct {
 	CurrentUUID  string
 	OutOfSyncKib int64
 	HasSync      bool // true when this observation carried out-of-sync stats
-
-	// lastProgressAt tracks the most recent moment OutOfSyncKib
-	// actually decreased. resyncOnce's stuck-SyncTarget watchdog
-	// reads this to decide whether a peer in `replication:SyncTarget`
-	// is still making forward progress or has wedged on a broken
-	// connection. Updated by mergeVolumeInto whenever an incoming
-	// peer-device frame reports a strictly smaller out-of-sync byte
-	// counter than the cached value; held steady across frames that
-	// report the same or larger value (the kernel can briefly inflate
-	// out-of-sync during resync-paused windows, which is not progress
-	// but isn't a stall either).
-	lastProgressAt time.Time
 }
 
 // connectionObservation carries one per-peer DRBD connection state.
@@ -182,28 +162,13 @@ func translateEvent(ev drbd.Event) (observation, bool) {
 	return observation{}, false
 }
 
-// translateResourceEvent extracts the resource-kind frame: role
-// transitions (Primary → InUse=true) and `destroy resource` frames
-// (kernel slot gone, Spec-only predicate needs re-enqueue). Helper
-// for translateEvent's switch so the gocyclo budget stays under 15.
+// translateResourceEvent extracts the resource-kind frame: just
+// the role transition (Primary → InUse=true). Helper for
+// translateEvent's switch so the gocyclo budget stays under 15.
 func translateResourceEvent(ev drbd.Event) (observation, bool) {
 	name := ev.Fields["name"]
 	if name == "" {
 		return observation{}, false
-	}
-
-	// P0-4: `destroy resource <name>` arrives after the kernel
-	// frees the slot (operator `drbdadm down`, satellite teardown,
-	// or external SIGKILL of drbdsetup). We MUST surface it so
-	// handleObservation can push a GenericEvent onto the
-	// ReconcileTrigger channel — the Spec-only predicate from P0-1
-	// would otherwise leave a wedged-down resource invisible to the
-	// Resource reconciler until the next Spec change.
-	if ev.Action == eventActionDestroy {
-		return observation{
-			ResourceName:    name,
-			ResourceRemoved: true,
-		}, true
 	}
 
 	return observation{
@@ -342,24 +307,6 @@ const (
 	// else (`StandAlone`, `BrokenPipe`, `Connecting`, ...) lands
 	// in the Python CLI's `--faulty` set.
 	drbdStateConnected = "Connected"
-	// drbdStateStandAlone is the DRBD-9 connection-state the kernel
-	// settles into after either an explicit `drbdadm disconnect` or
-	// a handshake refusal it can't auto-recover from (split-brain,
-	// unrelated-data, peer protocol mismatch). The kernel does NOT
-	// automatically retry from this state — the observer's closed-
-	// loop recovery treats StandAlone as a request to drive a fresh
-	// `drbdadm disconnect ; drbdadm connect` cycle, gated by
-	// SkipDisk + per-(resource,peer) cooldown.
-	drbdStateStandAlone = "StandAlone"
-	// drbdReplStateSyncTarget is the DRBD-9 replication-state token
-	// meaning this replica is receiving bytes from a SyncSource peer.
-	// resyncOnce's watchdog promotes a SyncTarget peer to "wedged"
-	// when its out-of-sync byte counter sits flat for syncStallThreshold
-	// — DRBD's normal resync emits a strict decrease on every
-	// `--statistics` tick (~1Hz), so a flat counter under SyncTarget
-	// is positive evidence of a broken connection the kernel can't
-	// self-recover from.
-	drbdReplStateSyncTarget = "SyncTarget"
 	// drbdRolePrimary is the DRBD-9 role token meaning the
 	// replica is open for write. Maps to ResourceStatus.InUse.
 	drbdRolePrimary = "Primary"
@@ -438,55 +385,7 @@ type ObserverRunnable struct {
 	// owner's f:inUse claim and the apiserver deletes the field.
 	resMu    sync.Mutex
 	resCache map[string]resourceObservation
-
-	// reconnectMu guards reconnectCooldown; the cooldown map gates
-	// the observer's closed-loop StandAlone / stuck-SyncTarget
-	// recovery so a stuck peer doesn't get retried every event tick
-	// (events2 can burst dozens of frames during a reconnect storm).
-	reconnectMu       sync.Mutex
-	reconnectCooldown map[reconnectKey]time.Time
-
-	// Now is a clock injection point so tests can drive the cooldown
-	// gate deterministically without sleeping. Nil → use time.Now.
-	Now func() time.Time
-
-	// ReconcileTrigger is the channel ResourceReconciler is wired
-	// to via WatchesRawSource(source.Channel(...)). Each GenericEvent
-	// pushed here enqueues a Reconcile.Request for the resource it
-	// carries. P0-4: the observer publishes a trigger when
-	// `events2: destroy resource <name>` lands so the Spec-only
-	// predicate (P0-1) doesn't leave a wedged-down resource invisible
-	// to the reconciler — there is no apiserver Spec/Status change
-	// that would otherwise re-trigger it.
-	// Nil → no-op (the observer was constructed without the manager
-	// wiring, typical of unit tests that exercise handleObservation
-	// in isolation).
-	ReconcileTrigger chan<- event.GenericEvent
 }
-
-// reconnectKey scopes the observer's recovery cooldown to one
-// (resource, peer) pair. A StandAlone on peer-a doesn't block a
-// concurrent recovery attempt against peer-b on the same resource.
-type reconnectKey struct {
-	Resource string
-	Peer     string
-}
-
-// reconnectCooldownInterval is the per-(resource,peer) gap the
-// observer enforces between auto-recovery attempts. Sized to outlast
-// a single events2 burst (drbd-9 typically settles within a few
-// seconds after a `connect`); too short and the gate degenerates
-// into a reconnect storm under flap, too long and a genuine
-// transient peer-down extends the user-visible outage.
-const reconnectCooldownInterval = 10 * time.Second
-
-// syncStallThreshold is the inactivity window after which the
-// observer's resync-watchdog treats a SyncTarget connection as
-// wedged and fires an auto-reconnect. The kernel's normal resync
-// emits an `out-of-sync` decrement on every peer-device statistics
-// tick (~1Hz under --statistics); 20s of zero progress with a
-// non-zero out-of-sync byte counter is well past any healthy stall.
-const syncStallThreshold = 20 * time.Second
 
 // resourceObservation is the cached per-resource state observer
 // re-emits on every apply so SSA-merge doesn't drop InUse between
@@ -527,7 +426,7 @@ func (o *ObserverRunnable) Start(ctx context.Context) error {
 
 	adm := drbd.NewAdm(o.Exec)
 
-	go o.resyncLoop(ctx, adm)
+	go o.resyncLoop(ctx)
 
 	for ev := range observationsFrom(events) {
 		obs := ev
@@ -550,11 +449,8 @@ const observerResyncInterval = 5 * time.Second
 // resyncLoop ticks every observerResyncInterval and re-applies
 // every cached resource's full snapshot. Cheap — the SSA payload
 // is small, and the apiserver's "same fields, same values" merge
-// is a no-op on the wire. Also drives the stuck-SyncTarget watchdog
-// (P0-3): each tick scans cached volumes for SyncTarget peers whose
-// out-of-sync byte counter hasn't decreased within syncStallThreshold
-// and fires attemptReconnect against them.
-func (o *ObserverRunnable) resyncLoop(ctx context.Context, adm *drbd.Adm) {
+// is a no-op on the wire.
+func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 	logger := log.FromContext(ctx).WithName("observer-resync")
 
 	ticker := time.NewTicker(observerResyncInterval)
@@ -565,17 +461,14 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context, adm *drbd.Adm) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			o.resyncOnce(ctx, adm, logger)
+			o.resyncOnce(ctx, logger)
 		}
 	}
 }
 
 // resyncOnce snapshots both caches and re-applies each known
-// resource. Called by resyncLoop and unit-tested directly. Also
-// runs the stall-watchdog pass — for every (resource, peer) with a
-// peer-device showing `replication:SyncTarget` AND a flat out-of-sync
-// counter older than syncStallThreshold, fire attemptReconnect.
-func (o *ObserverRunnable) resyncOnce(ctx context.Context, adm *drbd.Adm, logger logr.Logger) {
+// resource. Called by resyncLoop and unit-tested directly.
+func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
 	names := o.cachedResourceNames()
 
 	for _, name := range names {
@@ -585,272 +478,16 @@ func (o *ObserverRunnable) resyncOnce(ctx context.Context, adm *drbd.Adm, logger
 		}
 
 		err := o.writeStatus(ctx, &obs)
-		if err != nil && !apierrors.IsNotFound(err) {
-			logger.Error(err, "resync Resource.Status", "resource", name)
-		}
-
-		o.scanStuckSyncTargets(ctx, adm, name)
-	}
-}
-
-// scanStuckSyncTargets is the P0-3 watchdog: for the named resource,
-// find every peer in `replication:SyncTarget` whose cached
-// out-of-sync byte counter hasn't moved in syncStallThreshold and
-// fire attemptReconnect. SyncTarget with a non-zero, FLAT out-of-sync
-// is the kernel saying "I should be receiving bytes from this peer
-// but I'm not" — `drbdadm disconnect ; connect` is the operator's
-// stock recovery, automated here under the same cooldown gate the
-// StandAlone path uses.
-func (o *ObserverRunnable) scanStuckSyncTargets(ctx context.Context, adm *drbd.Adm, resourceName string) {
-	// Snapshot the connection cache to enumerate SyncTarget peers
-	// without holding the lock across the (potentially blocking)
-	// attemptReconnect call.
-	o.connMu.Lock()
-
-	peers := o.connCache[resourceName]
-
-	syncTargetPeers := make([]string, 0, len(peers))
-
-	for _, c := range peers {
-		if c.ReplicationState == drbdReplStateSyncTarget {
-			syncTargetPeers = append(syncTargetPeers, c.PeerNodeName)
-		}
-	}
-	o.connMu.Unlock()
-
-	if len(syncTargetPeers) == 0 {
-		return
-	}
-
-	// Now check the volume cache for any volume on this resource
-	// whose lastProgressAt is older than syncStallThreshold AND
-	// whose OutOfSyncKib is non-zero. SyncTarget without
-	// out-of-sync data is a transitional kernel state we shouldn't
-	// fire on.
-	o.volMu.Lock()
-	now := o.now()
-
-	stalled := false
-
-	for _, vol := range o.volCache[resourceName] {
-		if !vol.HasSync || vol.OutOfSyncKib <= 0 {
+		if err == nil {
 			continue
 		}
 
-		if vol.lastProgressAt.IsZero() {
+		if apierrors.IsNotFound(err) {
 			continue
 		}
 
-		if now.Sub(vol.lastProgressAt) >= syncStallThreshold {
-			stalled = true
-
-			break
-		}
+		logger.Error(err, "resync Resource.Status", "resource", name)
 	}
-	o.volMu.Unlock()
-
-	if !stalled {
-		return
-	}
-
-	for _, peer := range syncTargetPeers {
-		o.attemptReconnect(ctx, adm, resourceName, peer)
-	}
-}
-
-// now returns the observer's wall-clock, honouring the test-only
-// Now injection point on ObserverRunnable. Centralised so the
-// cooldown gate and the progress-tracker can't drift apart.
-func (o *ObserverRunnable) now() time.Time {
-	if o.Now != nil {
-		return o.Now()
-	}
-
-	return time.Now()
-}
-
-// enqueueReconcileTrigger pushes a GenericEvent for the named
-// Resource onto the ReconcileTrigger channel so the Resource
-// reconciler runs against the freshest apiserver state. P0-4:
-// the only signal that wakes the reconciler in response to a
-// kernel-state mismatch the apiserver doesn't see (most
-// importantly `events2: destroy resource <name>` after an
-// operator's `drbdadm down`). Nil channel → no-op (the observer
-// was constructed without manager wiring, e.g. in unit tests).
-// Non-blocking send: if the buffered channel is full (a flurry of
-// destroy events against many resources at once), drop the event
-// — the next observer resync tick will re-emit a redundant
-// trigger anyway and the loss is purely an extra-reconcile latency.
-func (o *ObserverRunnable) enqueueReconcileTrigger(resourceName string) {
-	if o.ReconcileTrigger == nil || resourceName == "" {
-		return
-	}
-
-	name := k8s.Name(resourceName + "." + o.NodeName)
-
-	select {
-	case o.ReconcileTrigger <- event.GenericEvent{
-		Object: &blockstoriov1alpha1.Resource{
-			ObjectMeta: metav1.ObjectMeta{Name: name},
-		},
-	}:
-	default:
-		// Channel full — see doc above. The Resource reconciler's
-		// own watch / observer's 5s resync ticker still re-trigger
-		// reconciles, so missing one trigger here adds at most a
-		// few seconds of latency, not a permanent wedge.
-	}
-}
-
-// handleResourceRemoved is the P0-4 early-return path in
-// handleObservation: on `events2: destroy resource <name>` push a
-// reconcile trigger and tell the caller to bail. Returns true when
-// the observation was the destroy frame and downstream side-effects
-// must skip (no kernel state left to act on). Extracted from
-// handleObservation so the orchestrator's cyclop / funlen stay
-// inside the linter budgets.
-func (o *ObserverRunnable) handleResourceRemoved(ctx context.Context, ev *observation) bool {
-	if !ev.ResourceRemoved {
-		return false
-	}
-
-	logger := log.FromContext(ctx).WithName("observer")
-
-	o.enqueueReconcileTrigger(ev.ResourceName)
-	logger.Info("destroy resource → enqueued reconcile trigger",
-		"resource", ev.ResourceName)
-
-	return true
-}
-
-// reactToStandAlone scans the incoming observation's connection list
-// for `connection:StandAlone` frames and fires attemptReconnect on
-// each peer. Pulled out of handleObservation to keep its cyclomatic
-// budget under the linter's gate (gocyclo / cyclop max=15).
-func (o *ObserverRunnable) reactToStandAlone(ctx context.Context, adm *drbd.Adm, ev *observation) {
-	for _, c := range ev.Connections {
-		if c.Removed || c.Message != drbdStateStandAlone {
-			continue
-		}
-
-		o.attemptReconnect(ctx, adm, ev.ResourceName, c.PeerNodeName)
-	}
-}
-
-// attemptReconnect drives the closed-loop StandAlone /
-// stuck-SyncTarget recovery: `drbdadm disconnect <rsc>:<peer>` (best
-// effort, in case the slot is wedged in an intermediate state) then
-// `drbdadm connect <rsc>:<peer>` to force a fresh handshake.
-//
-// Gates:
-//
-//  1. SkipDisk prop. The operator's intent signal — the same prop
-//     the reconciler's `adjust --skip-disk` path keys off. When set,
-//     the operator is mid-runbook on this replica (failed lower disk,
-//     manual recovery in flight) and any kernel-state-changing verb
-//     the observer issues would race them. The lookup short-circuits
-//     on NotFound (Resource CRD not yet created, convergence-pending
-//     window) — treat that as "no prop set" so first-activation peers
-//     in StandAlone don't get stuck waiting on a CRD that's about to
-//     appear.
-//  2. Per-(resource,peer) cooldown. drbd-9 emits dozens of `change
-//     connection` frames during a flap; without this gate the
-//     observer would fire `drbdadm connect` on every frame and
-//     starve the kernel out of the recovery window. Sized to
-//     reconnectCooldownInterval (10s) — long enough for the kernel's
-//     handshake state machine to settle past the transient frames a
-//     successful connect emits, short enough that a genuine peer-down
-//     gets retried promptly.
-//
-// Split-brain markers are NOT explicitly inspected here. The kernel
-// communicates split-brain via the `connection:StandAlone` token
-// PLUS a log message — DRBD won't auto-reconnect until the operator
-// runs `drbdadm connect --discard-my-data <peer>:<rsc>`. The
-// observer's plain `drbdadm connect` is a no-op against a true
-// split-brain (the kernel rejects the handshake again immediately
-// and the cooldown gate keeps the retry rate bounded). Operator
-// policy: stamp SkipDisk while running the discard-my-data flow,
-// which closes the loop via gate #1.
-func (o *ObserverRunnable) attemptReconnect(ctx context.Context, adm *drbd.Adm, resourceName, peerNodeName string) {
-	logger := log.FromContext(ctx).WithName("observer-reconnect")
-
-	if resourceName == "" || peerNodeName == "" {
-		return
-	}
-
-	if o.skipDiskOnResource(ctx, resourceName) {
-		return
-	}
-
-	if !o.markReconnectAttempt(resourceName, peerNodeName) {
-		return
-	}
-
-	target := resourceName + ":" + peerNodeName
-
-	// Best-effort tear-down — a peer already StandAlone returns
-	// non-zero from drbdadm disconnect; that's fine, the kernel slot
-	// is already in the post-quiesce state we wanted.
-	disconnectErr := adm.Disconnect(ctx, target)
-	if disconnectErr != nil {
-		logger.V(1).Info("reconnect: disconnect non-fatal", "target", target, "err", disconnectErr)
-	}
-
-	connectErr := adm.Connect(ctx, target)
-	if connectErr != nil {
-		logger.Error(connectErr, "reconnect: connect failed", "target", target)
-
-		return
-	}
-
-	logger.Info("auto-reconnect issued", "resource", resourceName, "peer", peerNodeName)
-}
-
-// markReconnectAttempt stamps the cooldown for (resource, peer) and
-// returns whether the caller should proceed. Returns false when the
-// previous attempt for this key landed within reconnectCooldownInterval.
-// Pulled out of attemptReconnect so the lock-guarded check + update
-// is a single primitive a future tests-only helper can also reuse.
-func (o *ObserverRunnable) markReconnectAttempt(resourceName, peerNodeName string) bool {
-	o.reconnectMu.Lock()
-	defer o.reconnectMu.Unlock()
-
-	if o.reconnectCooldown == nil {
-		o.reconnectCooldown = map[reconnectKey]time.Time{}
-	}
-
-	key := reconnectKey{Resource: resourceName, Peer: peerNodeName}
-	now := o.now()
-
-	if last, inCooldown := o.reconnectCooldown[key]; inCooldown && now.Sub(last) < reconnectCooldownInterval {
-		return false
-	}
-
-	o.reconnectCooldown[key] = now
-
-	return true
-}
-
-// skipDiskOnResource reads `Spec.Props["DrbdOptions/SkipDisk"]` from
-// the apiserver for this satellite's Resource. Returns true when the
-// prop is set (operator-intent gate fires). NotFound is treated as
-// false — convergence-pending Resource CRDs shouldn't block
-// auto-recovery.
-func (o *ObserverRunnable) skipDiskOnResource(ctx context.Context, resourceName string) bool {
-	name := k8s.Name(resourceName + "." + o.NodeName)
-
-	var res blockstoriov1alpha1.Resource
-
-	err := o.Client.Get(ctx, client.ObjectKey{Name: name}, &res)
-	if err != nil {
-		// Anything we can't read → don't gate the recovery. The
-		// SkipDisk path is the operator's explicit intent signal;
-		// in its absence the observer's auto-recovery is the
-		// closed-loop the cluster relies on.
-		return false
-	}
-
-	return res.Spec.Props[skipDiskPropKey] == skipDiskPropValue
 }
 
 // cachedResourceNames returns the union of resource keys held by
@@ -994,10 +631,6 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm, ev *observation) {
 	logger := log.FromContext(ctx).WithName("observer")
 
-	if o.handleResourceRemoved(ctx, ev) {
-		return
-	}
-
 	if ev.DrbdState == drbdDiskStateFailed {
 		err := adm.Detach(ctx, ev.ResourceName)
 		if err != nil {
@@ -1046,15 +679,6 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 			}
 		}
 	}
-
-	// P0-2: scan the incoming Connections for `connection:StandAlone`
-	// and fire the closed-loop reconnect against each affected peer.
-	// Done BEFORE mergeConnections folds the cache so we react to
-	// what the kernel just told us, not the merged snapshot — the
-	// merge cache is the SSA wire-shape, not a state machine the
-	// observer drives off of. attemptReconnect itself enforces
-	// SkipDisk + cooldown gates.
-	o.reactToStandAlone(ctx, adm, ev)
 
 	// Connection observations arrive one peer at a time. SSA with the
 	// same FieldOwner replaces the full list each apply, so we
@@ -1108,10 +732,9 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	}
 
 	changed := false
-	now := o.now()
 
-	for i := range ev.Volumes {
-		if mergeVolumeInto(cache, &ev.Volumes[i], now) {
+	for _, incoming := range ev.Volumes {
+		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
 	}
@@ -1132,11 +755,8 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 
 // mergeVolumeInto folds `incoming` into `cache` for its volume key.
 // Returns true if any field actually changed — the caller uses that
-// to decide whether to emit a fresh Status snapshot. `now` is the
-// timestamp the resync-watchdog records on out-of-sync decreases;
-// taken as a parameter so the caller threads the observer's clock
-// through to support test-driven Now injection.
-func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservation, now time.Time) bool {
+// to decide whether to emit a fresh Status snapshot.
+func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservation) bool {
 	merged := cache[incoming.VolumeNumber]
 	merged.VolumeNumber = incoming.VolumeNumber
 
@@ -1152,24 +772,10 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming *volumeObservat
 		changed = true
 	}
 
-	if incoming.HasSync {
-		if !merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib {
-			// First observation OR an actual change in out-of-sync.
-			// We only treat a STRICT DECREASE as forward progress for
-			// the watchdog gate: that's the kernel acknowledging
-			// bytes shipped over the wire. An increase (resync paused
-			// then resumed against a different peer, or kernel
-			// re-inflating the dirty bitmap on a reconnect) doesn't
-			// count as progress, but also doesn't count as a stall
-			// — we just leave lastProgressAt alone.
-			if !merged.HasSync || incoming.OutOfSyncKib < merged.OutOfSyncKib {
-				merged.lastProgressAt = now
-			}
-
-			merged.OutOfSyncKib = incoming.OutOfSyncKib
-			merged.HasSync = true
-			changed = true
-		}
+	if incoming.HasSync && (!merged.HasSync || merged.OutOfSyncKib != incoming.OutOfSyncKib) {
+		merged.OutOfSyncKib = incoming.OutOfSyncKib
+		merged.HasSync = true
+		changed = true
 	}
 
 	cache[incoming.VolumeNumber] = merged
