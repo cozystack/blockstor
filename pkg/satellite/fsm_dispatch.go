@@ -50,13 +50,22 @@ func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredRe
 	case ActionRenderRes:
 		return r.renderResFile(ctx, dr, devices)
 	case ActionCreateMd:
-		// Mirror the legacy gates here as defense-in-depth: never
-		// fire create-md on a Diskless replica (no lower disk to
-		// stamp) and never on metadata that already exists
-		// (`create-md --force` would wipe operator-stamped GI +
-		// bitmap state). The legacy `firstActivation` gate stays at
-		// its current call site — this re-check belts-and-braces it.
-		if !obs.SpecHasResource || obs.MetadataExists || obs.SpecFlagsHasDiskless {
+		// Defense-in-depth gates:
+		//   - !SpecHasResource: Spec hasn't materialized yet
+		//   - MetadataExists: nothing to do, marker already stamped
+		//     (`create-md --force` would wipe operator-stamped GI +
+		//     bitmap state)
+		//   - SpecFlagsHasDiskless: never seed metadata on a Diskless
+		//     replica (no lower disk to stamp)
+		//   - KernelLoaded && KernelHasDiskless: diskful-flip path —
+		//     legacy routes through ensureMetadata(firstActivation=false)
+		//     (no GI-seed); the shadow's createMetadata calls
+		//     firstActivation=true which seeds GI via seedInitialGi
+		//     and corrupts the in-flight handshake. Stage 4 will own
+		//     the flip path end-to-end; for now defer to legacy.
+		if !obs.SpecHasResource || obs.MetadataExists ||
+			obs.SpecFlagsHasDiskless ||
+			(obs.KernelLoaded && obs.KernelHasDiskless) {
 			return nil
 		}
 

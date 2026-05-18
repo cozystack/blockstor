@@ -303,9 +303,29 @@ for _ in $(seq 1 30); do
 done
 sleep 3  # extra grace for kernel to actually unmap the loop device
 
+# Run 30 deep-dive: SkipDisk=True keeps the kernel slot ALIVE (just
+# without the backing disk), but the loop device is still held by
+# the kernel-side resource (drbdadm adjust --skip-disk doesn't tear
+# the slot down, it only detaches the disk). drbdmeta create-md
+# still fails with "Device or resource busy" on /dev/loop5 because
+# the kernel slot retains exclusive open on the loop device until
+# the slot is fully torn down. Force the slot down with `drbdadm
+# down` so the loop device is released, then re-create it with
+# `drbdadm up` after the manual attach succeeds.
+echo ">> drbdadm down $RD on $N1 to fully release the loop device"
+on_node "$N1" drbdadm down "$RD" || true
+for _ in $(seq 1 15); do
+    sleep 1
+    out=$(on_node "$N1" drbdsetup status "$RD" 2>&1 || true)
+    if [[ -z "$out" ]]; then
+        break
+    fi
+done
+
 echo ">> recipe: drbdmeta create-md + drbdadm attach on $N1"
 on_node "$N1" bash -c "
     drbdmeta --force 0 v09 ${BACK_DEV} internal create-md 15
+    drbdadm up ${RD}
     drbdadm attach ${RD}
 "
 

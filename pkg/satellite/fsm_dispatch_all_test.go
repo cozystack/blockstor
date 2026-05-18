@@ -169,6 +169,54 @@ func TestDispatchFsmActionCreateMdGatedByExistingMd(t *testing.T) {
 	}
 }
 
+// TestDispatchFsmActionCreateMdGatedOnDiskfulFlip pins the contract
+// that the shadow does NOT fire create-md when the kernel slot is
+// already loaded with a Diskless volume (the diskful-flip path).
+// Legacy ensureMetadata routes flip with firstActivation=false (no
+// GI-seed); the shadow's createMetadata would call
+// firstActivation=true → seedInitialGi → in-flight handshake
+// corruption (Run 30 lifecycle-toggle-migrate regression). The gate
+// must defer to legacy whenever KernelLoaded && KernelHasDiskless,
+// even though SpecFlagsHasDiskless=false would otherwise permit
+// seeding metadata on this peer.
+func TestDispatchFsmActionCreateMdGatedOnDiskfulFlip(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	dr, devices := dispatchFixtureDR("pvc-dispatch-md-diskful-flip")
+
+	// Diskful-flip shape: spec has the resource as diskful, but the
+	// kernel slot is already loaded with a Diskless volume — legacy
+	// must own the flip (firstActivation=false). MetadataExists=false
+	// since the flip rewrites lower disk + stamps fresh metadata via
+	// the legacy ensureMetadata path.
+	obs := Observation{
+		SpecHasResource:      true,
+		ResFileExists:        true,
+		MetadataExists:       false,
+		SpecFlagsHasDiskless: false,
+		KernelLoaded:         true,
+		KernelHasDiskless:    true,
+	}
+
+	err := rec.dispatchFsmAction(context.Background(), dr, devices, ActionCreateMd, obs)
+	if err != nil {
+		t.Fatalf("dispatchFsmAction(ActionCreateMd, diskfulFlip): %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm create-md") {
+			t.Errorf("Diskful-flip gate failed: create-md fired during diskful flip (would seed GI and corrupt in-flight handshake): %s", line)
+		}
+	}
+}
+
 // TestDispatchFsmActionAdjust pins the ActionAdjust arm of the
 // router: when the FSM observes PhaseRunning, the dispatcher MUST
 // shell out to `drbdadm adjust <name>` via the adjustResource
