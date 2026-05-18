@@ -1860,18 +1860,19 @@ func TestObserverParsesRoleFromEventsFrame(t *testing.T) {
 // recovery tests need the value to distinguish a recoverable
 // quorum-suspend (`Quorum`) from a user/fencing suspend.
 //
-//  1. translateResourceEvent carries the raw suspended string.
+//  1. translateResourceEvent carries the suspended string, with
+//     "No"/"no" collapsed to "" per Bug 322 (omitempty wire shape).
 //  2. mergeResource caches Suspended and re-emits on non-resource
 //     events.
-//  3. A transition to Suspended=No (quorum returned) must replace
-//     the cached `Quorum` value, not be elided as zero-default.
+//  3. A transition to Suspended=No (quorum returned) collapses to
+//     the empty string, overwriting the cached `Quorum` value.
 func TestObserverParsesSuspendedFromEventsFrame(t *testing.T) {
 	cases := []struct {
 		name          string
 		suspended     string
 		wantSuspended string
 	}{
-		{"no — I/O serving normally", "No", "No"},
+		{"no — I/O serving normally (Bug 322 collapse)", "No", ""},
 		{"quorum — recoverable suspend", "Quorum", "Quorum"},
 		{"user-issued drbdadm suspend-io", "User", "User"},
 		{"no UpToDate replica reachable", "NoData", "NoData"},
@@ -1938,7 +1939,9 @@ func TestObserverParsesSuspendedFromEventsFrame(t *testing.T) {
 
 	// 3. Quorum returns → kernel emits a resource frame with
 	//    suspended:No. HasResource=true so the cache MUST be
-	//    overwritten, not preserved.
+	//    overwritten, not preserved. Per Bug 322 "No" collapses to
+	//    "" so the omitempty wire shape drops the field entirely on
+	//    healthy resources.
 	quorumReturned := observation{
 		ResourceName: "pvc-susp",
 		Role:         "Secondary",
@@ -1947,13 +1950,13 @@ func TestObserverParsesSuspendedFromEventsFrame(t *testing.T) {
 	}
 	o.mergeResource(&quorumReturned)
 
-	if quorumReturned.Suspended != "No" {
-		t.Errorf("quorum-returned frame: Suspended got %q, want No", quorumReturned.Suspended)
+	if quorumReturned.Suspended != "" {
+		t.Errorf("quorum-returned frame: Suspended got %q, want \"\" (Bug 322 collapse)", quorumReturned.Suspended)
 	}
 
 	snap = o.snapshotFor("pvc-susp")
-	if snap.Suspended != "No" {
-		t.Errorf("snapshotFor after recovery: Suspended got %q, want No", snap.Suspended)
+	if snap.Suspended != "" {
+		t.Errorf("snapshotFor after recovery: Suspended got %q, want \"\" (Bug 322 collapse)", snap.Suspended)
 	}
 }
 
@@ -2264,3 +2267,32 @@ func TestObserverDoesNotEmitPeerVolumeStateForDestroyedConnection(t *testing.T) 
 // argument. Used by tests to seed optional `*int32` fields like
 // `PeerDRBDNodeID` without a one-shot named variable per case.
 func ptrInt32(v int32) *int32 { return &v }
+
+// TestNormalizeSuspended pins the Bug 322 contract: events2 emits
+// the literal "no" for healthy resources, but Status.Suspended has
+// omitempty in its JSON tag — a healthy resource must serialise
+// without a Suspended field at all. The helper collapses any
+// case-folded "no" to the empty string and passes every other
+// non-healthy value through unchanged (Quorum/User/NoData/Fencing).
+func TestNormalizeSuspended(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "lowercase no collapses to empty", in: "no", want: ""},
+		{name: "titlecase No collapses to empty", in: "No", want: ""},
+		{name: "empty stays empty", in: "", want: ""},
+		{name: "yes passes through", in: "yes", want: "yes"},
+		{name: "quorum passes through", in: "quorum", want: "quorum"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeSuspended(tc.in)
+			if got != tc.want {
+				t.Fatalf("normalizeSuspended(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

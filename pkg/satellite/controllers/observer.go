@@ -20,6 +20,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,19 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 )
+
+// normalizeSuspended collapses DRBD-9's literal "no"/"No" into the
+// empty string. The Resource API stores Suspended with omitempty so
+// healthy resources have no field at all; the events2 stream emits
+// "no" verbatim. Without this collapse, every healthy resource
+// stamps "no" and breaks the test contract / wire-shape (Bug 322).
+func normalizeSuspended(raw string) string {
+	if strings.EqualFold(raw, "no") {
+		return ""
+	}
+
+	return raw
+}
 
 // observation is the satellite-side translation of one parsed
 // `drbdsetup events2` line — the minimal shape the
@@ -226,7 +240,7 @@ func translateResourceEvent(ev drbd.Event) (observation, bool) {
 		ResourceName: name,
 		InUse:        ev.Fields["role"] == drbdRolePrimary,
 		Role:         ev.Fields["role"],
-		Suspended:    ev.Fields["suspended"],
+		Suspended:    normalizeSuspended(ev.Fields["suspended"]),
 		HasResource:  true,
 	}, true
 }
@@ -778,7 +792,7 @@ func (o *ObserverRunnable) mergeResource(ev *observation) {
 	if ev.HasResource {
 		cur.InUse = ev.InUse
 		cur.Role = ev.Role
-		cur.Suspended = ev.Suspended
+		cur.Suspended = normalizeSuspended(ev.Suspended)
 	}
 
 	// DrbdState flows from device-kind events (translateDeviceEvent
@@ -1380,7 +1394,7 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 			InUse:       ev.InUse,
 			DrbdState:   ev.DrbdState,
 			Role:        ev.Role,
-			Suspended:   ev.Suspended,
+			Suspended:   normalizeSuspended(ev.Suspended),
 			Volumes:     buildObserverVolumeStatus(ev, storagePool),
 			Connections: buildObserverConnectionStatus(ev),
 		},
