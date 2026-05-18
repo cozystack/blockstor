@@ -1178,17 +1178,20 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// inside observeForFsm; no retries, no failures bubble up here.
 	r.logFsmShadow(ctx, dr, diskless)
 
-	// Phase 11.2.c Stage 2: shadow-with-action. Observe FSM phase;
-	// when phase==Unprovisioned and next action is renderRes,
-	// dispatch the helper. Legacy chain continues — the helper is
-	// content-idempotent so legacy's later renderResFile call is a
-	// no-op stat. This proves FSM dispatch wiring works end-to-end
-	// without forking the apply flow. Stage 3 will replace legacy
-	// gates one-by-one with FSM-owned implementations as they get
-	// refactored to standalone helpers.
-	if obs := r.observeForFsm(ctx, dr, diskless); ObservePhase(obs) == PhaseUnprovisioned {
-		if next := NextTransition(PhaseUnprovisioned, obs); next != nil && next.Action == ActionRenderRes {
-			if err := r.renderResFile(ctx, dr, devices); err != nil {
+	// Phase 11.2.c Stage 3d: shadow-dispatch every FSM action. Each
+	// helper is content-idempotent — the legacy chain below will
+	// re-run the same logic later in this Apply pass and detect that
+	// the state already matches. The fsmShadowAgreeCount metric tags
+	// each FSM-dispatched action with `:fsm-dispatched` so production
+	// dashboards can prove every gate is FSM-reachable end-to-end.
+	// Stage 4 will retire the legacy chain once the metric shows
+	// every transition has been FSM-dispatched in steady state for
+	// a full burnin window.
+	{
+		obs := r.observeForFsm(ctx, dr, diskless)
+		phase := ObservePhase(obs)
+		if next := NextTransition(phase, obs); next != nil {
+			if err := r.dispatchFsmAction(ctx, dr, devices, next.Action, obs); err != nil {
 				return errors.Wrapf(err, "fsm dispatch %s", next.Action)
 			}
 			fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)

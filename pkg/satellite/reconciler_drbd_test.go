@@ -1594,7 +1594,14 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 		t.Errorf("retry must NOT re-run create-md (.res persists across abort, firstActivation=false); got %v", second)
 	}
 
-	if saw(second, "drbdadm adjust pvc-abort") != 1 {
+	// Phase 11.2.c Stage 3d: shadow-dispatch fires `drbdadm adjust`
+	// once via the FSM router and once via the legacy chain. Both
+	// calls are content-idempotent (drbdadm adjust on a converged
+	// kernel slot is a no-op against the kernel), so the doubled
+	// shell-out is harmless. Pin `>= 1` rather than `== 1` — the
+	// invariant we care about is "retry MUST re-run adjust", not
+	// "exactly once".
+	if saw(second, "drbdadm adjust pvc-abort") < 1 {
 		t.Errorf("retry must re-run drbdadm adjust to pick up where the abort left off; got %v", second)
 	}
 }
