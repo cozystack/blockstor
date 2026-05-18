@@ -142,30 +142,12 @@ type ResourceReconciler struct {
 // Finalizer-aware: stamps `SatelliteResourceFinalizer` on
 // every live Resource so kube-apiserver waits for our tear-down
 // before allowing the object to disappear.
-//
-// Bug 300: the cached client trails the apiserver during the
-// initial-create burst AND across satellite-restart cache-rehydrate
-// windows. The previous code paid for the trail with a single
-// APIReader fall-through inside waitForControllerAllocation — but
-// that ran only when every DRBD-ID was nil, leaving every other
-// stale-Status path (finalizer slice, peer Status, DeletionTimestamp)
-// reading from the trailing cache. The
-// recovery-down-reverses scenario hammered this: a Resource that
-// the cache pinned on a pre-allocation revision reconciles forever
-// because Reconcile.Get returns the stale snapshot and the
-// downstream gates re-fire the wait without ever consulting the
-// apiserver for the freshest version. Promote the target Get to the
-// uncached APIReader so every gate in this function operates on the
-// freshest revision the apiserver can hand back — peers already
-// flow through the APIReader via listPeerResources, and target's
-// happy-path Reconcile pays one extra direct apiserver round-trip
-// per reconcile, which is the price of correctness here.
 func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("resource", req.Name)
 
 	var res blockstoriov1alpha1.Resource
 
-	err := r.targetReader().Get(ctx, req.NamespacedName, &res)
+	err := r.Get(ctx, req.NamespacedName, &res)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -714,29 +696,6 @@ func (r *ResourceReconciler) listPeerResources(ctx context.Context, target *bloc
 // wired one in, falling back to the cached client for unit tests
 // that construct the reconciler directly. Mirrors `deleteReader`.
 func (r *ResourceReconciler) peerReader() client.Reader {
-	if r.Config.APIReader != nil {
-		return r.Config.APIReader
-	}
-
-	return r.Client
-}
-
-// targetReader is the read source for the per-reconcile target
-// Resource Get at the top of Reconcile. Bug 300: the c-r cached
-// client can trail the apiserver by minutes after a satellite
-// pod restart (the local informer rehydrates from a watch revision
-// the apiserver has since updated) or across a high-churn create
-// burst. The cache-trail manifests as `waitForControllerAllocation`
-// looping forever on a Resource whose Status the controller has
-// already stamped — kubectl gets the freshest revision, but the
-// satellite's reconcile loop sees nil DRBD-IDs because its informer
-// pinned a pre-allocation snapshot. Promoting the target read to
-// the uncached APIReader removes the trail-window entirely; the
-// extra round-trip is acceptable because Reconcile is already
-// gated by RequeueAfter backoffs (applyFailureRequeue = 5s) when
-// the apiserver hasn't yet committed the allocation. Falls back
-// to the cached client when APIReader isn't wired (unit tests).
-func (r *ResourceReconciler) targetReader() client.Reader {
 	if r.Config.APIReader != nil {
 		return r.Config.APIReader
 	}
