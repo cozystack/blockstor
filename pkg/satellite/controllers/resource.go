@@ -37,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -231,19 +230,6 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // reconciles. The predicate also fires on Delete events (the
 // CRD finalizer dance still needs us to clean up local state).
 //
-// P0-1: the `For` watch additionally filters out Status-only
-// updates via predicate.GenerationChangedPredicate. The
-// observer's Status SSA patches (DiskState, OutOfSyncKib,
-// Connections, …) and the satellite's own Status.Volumes /
-// Status.ToggleDiskRetries stamps used to re-fire Reconcile on
-// every observer tick — each pass re-rendered the .res and ran
-// `drbdadm adjust`, which during a SyncTarget can roll the
-// bitmap edge back and produce the state-auto-resync flake.
-// CRD has `subresources: { status: {} }` so `.Generation`
-// stays pinned across Status writes; only Spec / Metadata
-// changes increment it. Combined with the node-name predicate
-// the final filter is: same node AND Spec/Metadata changed.
-//
 // We additionally watch sibling Resources (same RD, different
 // node) via Watches — when a peer's Resource is created /
 // updated / deleted on another satellite, this satellite must
@@ -252,91 +238,22 @@ func resolveDeleteStoragePool(res *blockstoriov1alpha1.Resource) string {
 // Resource (peer hadn't been observed yet through the cache),
 // rendered a peer-less .res, and never re-rendered because
 // later peer events get filtered out by nodeNamePredicate
-// before they reach this controller. The sibling watch uses a
-// custom predicate that lets a peer's Spec change or its
-// Status.DRBDNodeID transition through (NodeID is what drives
-// the rendered peer block) but drops other Status-only updates.
-//
-// P0-4: WatchesRawSource(source.Channel(Config.ReconcileTrigger,
-// ...)) gives the observer a way to enqueue a Reconcile on
-// kernel-state events the apiserver doesn't see — most
-// importantly `events2: destroy resource <name>` after an
-// out-of-band `drbdadm down`. Without this hook the Spec-only
-// predicate above would leave that resource wedged-down
-// indefinitely. A nil channel disables the raw source registration
-// (unit tests construct the reconciler without the manager).
+// before they reach this controller.
 func (r *ResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	bld := ctrl.NewControllerManagedBy(mgr).
+	err := ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.Resource{},
-			builder.WithPredicates(
-				nodeNamePredicate(r.Config.NodeName),
-				predicate.GenerationChangedPredicate{},
-			)).
+			builder.WithPredicates(nodeNamePredicate(r.Config.NodeName))).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings),
-			builder.WithPredicates(siblingResourceChangedPredicate())).
+			handler.EnqueueRequestsFromMapFunc(r.enqueueLocalSiblings)).
 		Watches(&blockstoriov1alpha1.ResourceDefinition{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueResourcesForRD)).
-		Named("satellite-resource")
-
-	if r.Config.ReconcileTrigger != nil {
-		bld = bld.WatchesRawSource(source.Channel[client.Object](
-			r.Config.ReconcileTrigger,
-			&handler.EnqueueRequestForObject{},
-		))
-	}
-
-	err := bld.Complete(r)
+		Named("satellite-resource").
+		Complete(r)
 	if err != nil {
 		return errors.Wrap(err, "register ResourceReconciler")
 	}
 
 	return nil
-}
-
-// siblingResourceChangedPredicate keeps Spec-changes and
-// Status.DRBDNodeID transitions on peer Resources flowing into
-// the local satellite's reconcile (the dispatcher's peer-block
-// emission depends on both) while filtering Status-only updates
-// that don't change rendered output. Without this filter the
-// observer's per-tick Status SSA patches on every peer would
-// re-fire the local reconcile through enqueueLocalSiblings, which
-// is exactly the noise P0-1 set out to remove.
-func siblingResourceChangedPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		CreateFunc:  func(_ event.CreateEvent) bool { return true },
-		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
-		GenericFunc: func(_ event.GenericEvent) bool { return true },
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldRes, okOld := e.ObjectOld.(*blockstoriov1alpha1.Resource)
-			newRes, okNew := e.ObjectNew.(*blockstoriov1alpha1.Resource)
-
-			if !okOld || !okNew {
-				return true
-			}
-
-			if oldRes.Generation != newRes.Generation {
-				return true
-			}
-
-			return !equalDRBDNodeID(oldRes.Status.DRBDNodeID, newRes.Status.DRBDNodeID)
-		},
-	}
-}
-
-// equalDRBDNodeID is the nil-safe comparison for the optional
-// Status.DRBDNodeID field. Two nils equal; one nil one set differ;
-// otherwise dereference and compare.
-func equalDRBDNodeID(prev, next *int32) bool {
-	if prev == nil && next == nil {
-		return true
-	}
-
-	if prev == nil || next == nil {
-		return false
-	}
-
-	return *prev == *next
 }
 
 // enqueueResourcesForRD maps a ResourceDefinition event to the local

@@ -18,7 +18,6 @@ package controllers
 
 import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -66,20 +65,4 @@ type Config struct {
 	// empty so the probe server doesn't race port bindings between
 	// parallel runs.
 	HealthProbeBindAddress string
-
-	// ReconcileTrigger is the closed-loop re-enqueue path the
-	// observer uses to drive a Resource reconcile in response to a
-	// kernel-state event that doesn't update the apiserver — most
-	// importantly `events2: destroy resource <name>` after an
-	// operator `drbdadm down` (P0-4). Without this hook, the
-	// Resource reconciler is fully reactive to Spec/Status updates
-	// and the kernel-state mismatch is invisible: P0-1's
-	// `GenerationChangedPredicate` filters out the observer's Status
-	// SSA patches so a stale watch tick never re-triggers reconcile
-	// either. The recovery-down-reverses scenario then wedges
-	// indefinitely. NewManager allocates a buffered channel and
-	// shares it between ObserverRunnable and ResourceReconciler.
-	// Nil → no-op (unit tests that don't wire the observer skip the
-	// raw-source registration entirely).
-	ReconcileTrigger chan event.GenericEvent
 }

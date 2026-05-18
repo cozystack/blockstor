@@ -25,21 +25,11 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 )
-
-// reconcileTriggerBuffer caps the closed-loop trigger channel the
-// observer publishes onto and the Resource reconciler consumes via
-// WatchesRawSource. 64 absorbs a node-wide kernel-slot teardown
-// burst (every `drbdadm down all` resource emits a destroy event)
-// without backpressuring the events2 reader; the observer's send
-// path is non-blocking so overflow falls back on the 5s resync
-// tick to re-publish a redundant trigger.
-const reconcileTriggerBuffer = 64
 
 // scheme carries the runtime types this manager understands —
 // blockstor CRDs + the core Kubernetes types (Secrets for
@@ -54,30 +44,6 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(blockstoriov1alpha1.AddToScheme(scheme))
-}
-
-// ensureWiredDefaults fills in the manager-provided defaults on
-// Config that production wires from the live manager but unit tests
-// often leave nil:
-//
-//   - APIReader → mgr.GetAPIReader() (Bug 65: uncached re-reads on
-//     the finalizer-strip path so concurrent edits aren't clobbered)
-//   - ReconcileTrigger → fresh buffered channel (P0-4: closed-loop
-//     observer→reconciler signal for kernel-state mismatches the
-//     apiserver doesn't see, e.g. `events2: destroy resource`)
-//
-// Returns the patched Config. Pulled out of NewManager so the
-// orchestrator stays inside the funlen budget.
-func ensureWiredDefaults(cfg Config, mgr manager.Manager) Config {
-	if cfg.APIReader == nil {
-		cfg.APIReader = mgr.GetAPIReader()
-	}
-
-	if cfg.ReconcileTrigger == nil {
-		cfg.ReconcileTrigger = make(chan event.GenericEvent, reconcileTriggerBuffer)
-	}
-
-	return cfg
 }
 
 // NewManager constructs a controller-runtime manager wired
@@ -144,11 +110,13 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 		return nil, errors.Wrap(err, "create manager")
 	}
 
-	// Inject the manager's APIReader so reconcilers can bypass the
-	// informer cache for late-stage finalizer re-reads (Bug 65).
-	// Allocate the closed-loop observer→reconciler trigger channel
-	// (P0-4) at the same point. Both default to nil in unit tests.
-	cfg = ensureWiredDefaults(cfg, mgr)
+	// Inject the manager's APIReader so reconcilers can bypass
+	// the informer cache for late-stage finalizer re-reads (Bug
+	// 65). Falls back gracefully in tests where the field is
+	// left nil — see Config.APIReader.
+	if cfg.APIReader == nil {
+		cfg.APIReader = mgr.GetAPIReader()
+	}
 
 	err = (&ResourceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
@@ -192,10 +160,9 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 // inline chain tipped over the limit.
 func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 	err := mgr.Add(&ObserverRunnable{
-		Client:           mgr.GetClient(),
-		Exec:             cfg.Exec,
-		NodeName:         cfg.NodeName,
-		ReconcileTrigger: cfg.ReconcileTrigger,
+		Client:   mgr.GetClient(),
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
 	})
 	if err != nil {
 		return errors.Wrap(err, "add ObserverRunnable")
