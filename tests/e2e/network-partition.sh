@@ -133,20 +133,45 @@ md5_majority=$(write_random "$N2" "$DEV" "$SIZE_BYTES")
 echo ">> heal partition"
 cleanup_partition
 
-echo ">> wait up to 180s for $N1 to converge to UpToDate"
+echo ">> wait up to 180s for $N1 to converge (peer-disk UpToDate, no suspended)"
+# Bug 297: with `on-no-quorum=suspend-io` (now seeded by the controller
+# alongside `quorum=majority`), the LOCAL disk on $N1 stays disk:UpToDate
+# THROUGHOUT the partition — it's the same on-disk bytes, just suspended.
+# So `grep -m1 disk:` matched immediately on the very first poll, before
+# the kernel had reconnected and pulled the majority writes in. The
+# script then raced into read_md5 on a still-suspended device and tripped
+# ENODATA from open(2).
+#
+# Wait on the PEER state instead. `drbdsetup status` omits the
+# `connection:` field once a peer is Connected — the presence of two
+# `role:` lines (one per peer) plus `peer-disk:UpToDate` on both is
+# the unambiguous "fully reconnected and resync done" signal. Also
+# assert `quorum:no` is gone and `suspended:` is absent on the local
+# row — both flags clear as soon as $N1 re-joins the majority.
 deadline=$(( $(date +%s) + 180 ))
-s1=""
+status=""
 
 while (( $(date +%s) < deadline )); do
-    s1=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null | grep "disk:" | head -1 || true)
-    if [[ "$s1" == *"disk:UpToDate"* ]]; then
+    status=$(on_node "$N1" drbdsetup status "$RD" 2>/dev/null || true)
+    peer_uptodate=$(echo "$status" | grep -c "peer-disk:UpToDate" || true)
+    if (( peer_uptodate >= 2 )) \
+        && ! echo "$status" | grep -q "connection:Connecting" \
+        && ! echo "$status" | grep -q "quorum:no" \
+        && ! echo "$status" | grep -q "suspended:"; then
         break
     fi
     sleep 2
 done
 
-if [[ "$s1" != *"disk:UpToDate"* ]]; then
-    echo "FAIL: $N1 did not re-converge after heal (last state: $s1)"
+peer_uptodate=$(echo "$status" | grep -c "peer-disk:UpToDate" || true)
+if (( peer_uptodate < 2 )) \
+    || echo "$status" | grep -q "connection:Connecting" \
+    || echo "$status" | grep -q "quorum:no" \
+    || echo "$status" | grep -q "suspended:"; then
+    echo "FAIL: $N1 did not re-converge after heal"
+    echo "----- last status -----"
+    echo "$status"
+    echo "-----------------------"
     exit 1
 fi
 
