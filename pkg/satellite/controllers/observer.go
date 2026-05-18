@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -385,6 +386,16 @@ type ObserverRunnable struct {
 	// owner's f:inUse claim and the apiserver deletes the field.
 	resMu    sync.Mutex
 	resCache map[string]resourceObservation
+
+	// ReconcileTrigger is the channel the observer emits an
+	// `event.GenericEvent` onto whenever a kernel-state change
+	// for a local Resource lands (Bug 318). The
+	// ResourceReconciler consumes it via
+	// `WatchesRawSource(source.Channel(...))` so satellite-side
+	// recovery decisions can wake on observed state even when no
+	// apiserver write bumps Generation. Nil disables the trigger
+	// (unit-test path).
+	ReconcileTrigger chan<- event.GenericEvent
 }
 
 // resourceObservation is the cached per-resource state observer
@@ -689,6 +700,23 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	o.mergeVolumes(ev)
 	o.mergeResource(ev)
 
+	// Bug 318: wake the ResourceReconciler on every kernel-state
+	// change (resource lifecycle, role, disk, conn, repl). The
+	// satellite's recovery decisions depend on observed state but
+	// many of them (e.g. peer flapping to StandAlone, the local
+	// disk transitioning Failed → Diskless) generate no apiserver
+	// Spec writes — so Generation never bumps and the primary For
+	// watch sees nothing. The trigger channel closes that loop
+	// architecturally; the primary watch's Status whitelist on
+	// DRBDNodeID/Port/Minor handles controller-allocator stamps
+	// separately.
+	//
+	// Done BEFORE writeStatus so an apiserver hiccup on Status SSA
+	// doesn't suppress the wake-up — the recovery decision only
+	// needs the kernel-state change to land in the reconcile
+	// queue, not the corresponding Status PATCH to commit.
+	o.emitReconcileTrigger(ev)
+
 	err := o.writeStatus(ctx, ev)
 	if err == nil {
 		return
@@ -699,6 +727,43 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	}
 
 	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
+}
+
+// emitReconcileTrigger sends a GenericEvent for the affected
+// Resource onto the observer-trigger channel so the
+// ResourceReconciler wakes on kernel-state changes that produce no
+// apiserver Spec write (Bug 318).
+//
+// Non-blocking: a full channel is treated as "reconciler is already
+// behind, drop this wake-up" rather than back-pressuring the events2
+// loop. The observer's 5-second resync ticker re-emits cached state
+// onto Status so a coalesced wake-up still arrives within the same
+// window; reconciler's RequeueAfter covers any per-resource hand-off.
+//
+// The emitted object carries only `Name` — the ResourceReconciler's
+// SetupWithManager registers the channel as a raw source whose
+// handler enqueues the named Resource for reconciliation, no
+// per-event field inspection required.
+func (o *ObserverRunnable) emitReconcileTrigger(ev *observation) {
+	if o.ReconcileTrigger == nil || ev == nil || ev.ResourceName == "" {
+		return
+	}
+
+	name := k8s.Name(ev.ResourceName + "." + o.NodeName)
+
+	trigger := event.GenericEvent{
+		Object: &blockstoriov1alpha1.Resource{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+		},
+	}
+
+	select {
+	case o.ReconcileTrigger <- trigger:
+	default:
+		// Channel full — reconciler is already behind. Drop this
+		// wake-up; the 5-second resync ticker plus c-r's
+		// per-resource debouncer guarantee a follow-up.
+	}
 }
 
 // mergeVolumes folds the per-volume cache so SSA writes carry the

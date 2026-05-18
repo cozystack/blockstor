@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -65,4 +66,19 @@ type Config struct {
 	// empty so the probe server doesn't race port bindings between
 	// parallel runs.
 	HealthProbeBindAddress string
+
+	// ReconcileTrigger is the channel the ObserverRunnable emits
+	// `event.GenericEvent` onto whenever a kernel-state change for
+	// a local Resource lands (resource lifecycle, role, disk, conn,
+	// repl). The ResourceReconciler attaches it as an additional
+	// WatchesRawSource input so satellite-side recovery decisions
+	// (Bug 318) wake on observed state even when no apiserver write
+	// fires a Generation bump.
+	//
+	// Production wires it from `NewManager.ensureWiredDefaults`
+	// with a buffered channel of `reconcileTriggerBuffer` slots
+	// shared between the observer (producer) and the reconciler
+	// (consumer). Unit tests can leave it nil and the wiring
+	// short-circuits — neither Watches consumer nor producer fires.
+	ReconcileTrigger chan event.GenericEvent
 }
