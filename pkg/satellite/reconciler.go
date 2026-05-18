@@ -17,6 +17,7 @@ limitations under the License.
 package satellite
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -975,9 +976,21 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return err
 	}
 
-	err = os.WriteFile(resPath, []byte(body), resFilePerm)
-	if err != nil {
-		return errors.Wrapf(err, "write %s", resPath)
+	// P0-5: content-idempotent write. Skip the WriteFile syscall when
+	// the existing .res already matches the desired body byte-for-byte
+	// so mtime / sha256 stay pinned across noisy reconciles. Tests like
+	// `disk-replace-internal-metadata` assert the .res sha256 doesn't
+	// change across an operator's `drbdadm detach`+`drbdmeta create-md`
+	// +`drbdadm attach` recipe; a re-render on every reconcile would
+	// trip those checksums even though the rendered text is identical.
+	// A read failure (file not yet present) falls through to the
+	// WriteFile path — first-activation still writes normally.
+	current, readErr := os.ReadFile(resPath)
+	if readErr != nil || !bytes.Equal(current, []byte(body)) {
+		err = os.WriteFile(resPath, []byte(body), resFilePerm)
+		if err != nil {
+			return errors.Wrapf(err, "write %s", resPath)
+		}
 	}
 
 	// Bug 303: probe BEFORE any bring-up verbs whether we're crossing
