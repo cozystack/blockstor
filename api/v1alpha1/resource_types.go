@@ -41,6 +41,30 @@ import (
 // Condition is absent.
 const ConditionMetadataCreated = "MetadataCreated"
 
+// ConditionFilesystemFormatted is a Status Condition stamped by the
+// satellite after the RG-driven auto-mkfs path (scenario 9.W14)
+// reports every diskful volume of this Resource as carrying a
+// filesystem — either freshly mkfs'd or adopted via the per-volume
+// `blkid -o export` probe. Caches the "we already finished mkfs"
+// state so the reconciler's auto-mkfs fast path and the Bug 311
+// retry gate (`needsAutoMkfsRetry`) can short-circuit from the
+// apiserver view without a stat on the on-disk
+// `<rd>.mkfs.done` marker.
+//
+// SAFETY: the Condition is a hot-path optimisation, NOT the
+// double-mkfs safety net. The per-volume `blkid` probe inside
+// `runAutoMkfs` stays as the authoritative guard — re-running
+// mkfs on a populated filesystem silently destroys data, and a
+// stale / lost Condition must never let that happen. The blkid
+// probe sees an empty device only when it really is empty.
+//
+// Migrates the legacy `<rd>.mkfs.done` file marker
+// (`StateDir/<rd>.mkfs.done`). The marker file is still written
+// for one release as belt-and-braces — both readers consult the
+// Condition first and fall back to the file presence when the
+// Condition is absent. Phase 11.3 Stage 2.
+const ConditionFilesystemFormatted = "FilesystemFormatted"
+
 // ResourceAnnotationVolumeNumbers is the metadata.annotation key the
 // satellite reconciler stamps on a Resource CRD after every successful
 // apply pass. The value is a comma-separated list of int32 volume

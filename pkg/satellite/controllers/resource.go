@@ -820,6 +820,14 @@ func (r *ResourceReconciler) buildDesiredFromCRD(ctx context.Context, target *bl
 	// marker remains as a migration-window fallback.
 	desired.MetadataCreated = meta.IsStatusConditionTrue(target.Status.Conditions, blockstoriov1alpha1.ConditionMetadataCreated)
 
+	// Phase 11.3 Stage 2: same pattern for FilesystemFormatted —
+	// the auto-mkfs fast-path and Bug-311 retry predicate read this
+	// to short-circuit per-volume blkid probes from the apiserver
+	// view. The on-disk `.mkfs.done` marker remains as a
+	// migration-window fallback; the per-volume blkid probe inside
+	// runAutoMkfs is the double-mkfs safety net.
+	desired.FilesystemFormatted = meta.IsStatusConditionTrue(target.Status.Conditions, blockstoriov1alpha1.ConditionFilesystemFormatted)
+
 	return desired, nil
 }
 

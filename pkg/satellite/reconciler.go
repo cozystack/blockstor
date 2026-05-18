@@ -99,6 +99,20 @@ type ReconcilerConfig struct {
 	// the manager owns. Phase 11.3 Stage 1.
 	MetadataCreatedStamper MetadataCreatedStamper
 
+	// FilesystemFormattedStamper writes the
+	// `FilesystemFormatted=True` Status Condition onto the parent
+	// Resource CRD after `runAutoMkfs` reports every diskful
+	// volume as carrying a filesystem (freshly mkfs'd or adopted
+	// via blkid). nil → the satellite falls back to the legacy
+	// on-disk `<rd>.mkfs.done` marker for both the
+	// `needsAutoMkfsRetry` predicate and the `runAutoMkfs`
+	// fast-path (compatible with unit tests that don't wire an
+	// apiserver). The agent injects this post-manager construction
+	// via SetFilesystemFormattedStamper — the implementation needs
+	// the controller-runtime client only the manager owns. Phase
+	// 11.3 Stage 2.
+	FilesystemFormattedStamper FilesystemFormattedStamper
+
 	// Exec runs auxiliary shell-outs the reconciler owns directly
 	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
 	// scenario 9.W14). Production wires `storage.RealExec`; tests
@@ -137,6 +151,22 @@ type MetadataCreatedStamper interface {
 	// shape (LastTransitionTime moves forward on apiserver-side
 	// transition only, not on every patch).
 	StampMetadataCreated(ctx context.Context, resourceName string) error
+}
+
+// FilesystemFormattedStamper abstracts the "stamp the
+// `FilesystemFormatted=True` Status Condition on a Resource CRD"
+// verb. Mirrors `MetadataCreatedStamper`: the K8s SSA call lives
+// in pkg/satellite/controllers (where the cached client owns the
+// apiserver wire) while the satellite's apply chain stays free of
+// a controller-runtime client dependency. Phase 11.3 Stage 2.
+type FilesystemFormattedStamper interface {
+	// StampFilesystemFormatted SSA-patches a
+	// `FilesystemFormatted=True` Condition onto Resource
+	// <resourceName>.Status.Conditions. Idempotent — repeat calls
+	// converge on the same Condition shape (LastTransitionTime
+	// moves forward on apiserver-side transition only, not on
+	// every patch).
+	StampFilesystemFormatted(ctx context.Context, resourceName string) error
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -233,6 +263,15 @@ func (r *Reconciler) SetCrossNodeFetcher(f CrossNodeFetcher) {
 // Phase 11.3 Stage 1.
 func (r *Reconciler) SetMetadataCreatedStamper(s MetadataCreatedStamper) {
 	r.cfg.MetadataCreatedStamper = s
+}
+
+// SetFilesystemFormattedStamper injects the FilesystemFormatted
+// stamper post-construction. Mirrors `SetMetadataCreatedStamper`:
+// the stamper needs the controller-runtime manager's cached client
+// which doesn't exist at NewReconciler time. Safe to call before
+// the first Apply. Phase 11.3 Stage 2.
+func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper) {
+	r.cfg.FilesystemFormattedStamper = s
 }
 
 // StateDir returns the on-disk directory the reconciler uses for
@@ -1306,6 +1345,21 @@ func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
 		return false
 	}
 
+	// Phase 11.3 Stage 2: Condition first. When the dispatcher
+	// observed `FilesystemFormatted=True` on the Resource CRD, the
+	// auto-mkfs path has already finished for every diskful volume
+	// — no retry needed even if the file marker happened to be
+	// removed (host rebuild, operator `rm`). The per-volume blkid
+	// probe inside runAutoMkfs stays as the double-mkfs safety net,
+	// so a stale Condition cannot cause data loss; this read is a
+	// hot-path stat-skip.
+	if dr.GetFilesystemFormatted() {
+		return false
+	}
+
+	// Belt-and-braces file fallback: pre-11.3-Stage-2 clusters
+	// have populated `.mkfs.done` markers but no Condition stamped
+	// until the next reconcile.
 	markerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".mkfs.done")
 	_, err := os.Stat(markerPath)
 
@@ -1513,10 +1567,26 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 
 	markerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".mkfs.done")
 
+	// Phase 11.3 Stage 2: Condition-first fast-path. When the
+	// dispatcher already observed `FilesystemFormatted=True` on the
+	// Resource CRD, every diskful volume of this RD has already
+	// passed the auto-mkfs path (either freshly mkfs'd or adopted
+	// via blkid) and we can skip the per-volume blkid round-trip
+	// entirely. Belt-and-braces: a stale Condition still leaves the
+	// blkid probe per-volume below as the authoritative safety net
+	// against double-mkfs — but with the Condition set we never
+	// reach that branch.
+	if dr.GetFilesystemFormatted() {
+		return nil
+	}
+
 	_, statErr := os.Stat(markerPath)
 	if statErr == nil {
 		// Marker present → mkfs already ran on a previous activation.
-		// Re-running would wipe a populated filesystem.
+		// Re-running would wipe a populated filesystem. File-marker
+		// fallback for the migration window: clusters upgraded from
+		// pre-11.3 Stage 2 may have a populated marker but no
+		// Condition stamped yet.
 		return nil
 	}
 
@@ -1553,6 +1623,23 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	err := os.WriteFile(markerPath, nil, resFilePerm)
 	if err != nil {
 		return errors.Wrapf(err, "write %s", markerPath)
+	}
+
+	// Phase 11.3 Stage 2: stamp the `FilesystemFormatted=True` Status
+	// Condition on the parent Resource CRD. Belt-and-braces with the
+	// file marker write above: future reconciles read the Condition
+	// first to short-circuit the auto-mkfs path, falling back to the
+	// file presence only when the Condition is absent (cluster
+	// upgraded from a pre-11.3-Stage-2 build). Stamp failure does NOT
+	// fail the apply — the file marker is the transitional source of
+	// truth, so a transient apiserver hiccup here just defers
+	// Condition stamping to the next reconcile.
+	if r.cfg.FilesystemFormattedStamper != nil {
+		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName())
+		if stampErr != nil {
+			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
+				"resource", dr.GetName())
+		}
 	}
 
 	return nil

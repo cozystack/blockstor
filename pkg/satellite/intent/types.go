@@ -58,6 +58,19 @@ type DesiredResource struct {
 	// authoritative source is the kernel-side `drbdmeta dump-md`
 	// probe (`Adm.HasMD`). Phase 11.3 Stage 1.
 	MetadataCreated bool
+
+	// FilesystemFormatted mirrors the `FilesystemFormatted` Status
+	// Condition on the parent Resource CRD. True means the RG-driven
+	// auto-mkfs path (scenario 9.W14) has previously reported every
+	// diskful volume of this RD as carrying a filesystem on this
+	// node; the satellite reconciler's `needsAutoMkfsRetry` predicate
+	// and the `runAutoMkfs` fast-path skip the per-volume blkid
+	// probe when this is set. Hot-path optimisation — NOT the
+	// double-mkfs safety net. The authoritative guard against
+	// re-formatting a populated volume remains the per-volume
+	// `blkid -o export` probe inside `runAutoMkfs`. Phase 11.3
+	// Stage 2.
+	FilesystemFormatted bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -172,6 +185,19 @@ func (x *DesiredResource) GetMetadataCreated() bool {
 	}
 
 	return x.MetadataCreated
+}
+
+// GetFilesystemFormatted returns whether the parent Resource CRD
+// carries a `FilesystemFormatted=True` Status Condition — the cache
+// flag the satellite reconciler reads to short-circuit the
+// `needsAutoMkfsRetry` probe and the `runAutoMkfs` fast-path.
+// Nil-safe. Phase 11.3 Stage 2.
+func (x *DesiredResource) GetFilesystemFormatted() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.FilesystemFormatted
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

@@ -171,9 +171,19 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 	}
 
 	wireCrossNodeFetcher(mgr, cfg)
-	wireMetadataCreatedStamper(mgr, cfg)
+	wireConditionStampers(mgr, cfg)
 
 	return mgr, nil
+}
+
+// wireConditionStampers injects the satellite-side Status-Condition
+// stampers (Phase 11.3) onto the Apply chain. Each stamper owns a
+// distinct Condition `type` so SSA's listMap merge keeps the writers
+// orthogonal; bundling them in one helper keeps NewManager under
+// funlen budget.
+func wireConditionStampers(mgr manager.Manager, cfg Config) {
+	wireMetadataCreatedStamper(mgr, cfg)
+	wireFilesystemFormattedStamper(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -304,6 +314,17 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg Config) {
 // NewReconciler time. Phase 11.3 Stage 1.
 func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetMetadataCreatedStamper(&MetadataCreatedStamper{
+		Client: mgr.GetClient(),
+	})
+}
+
+// wireFilesystemFormattedStamper injects the FilesystemFormattedStamper
+// into the Apply chain so `runAutoMkfs` can SSA-patch the
+// `FilesystemFormatted=True` Status Condition after every diskful
+// volume reports a filesystem (freshly mkfs'd or adopted via blkid).
+// Mirrors `wireMetadataCreatedStamper`. Phase 11.3 Stage 2.
+func wireFilesystemFormattedStamper(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetFilesystemFormattedStamper(&FilesystemFormattedStamper{
 		Client: mgr.GetClient(),
 	})
 }
