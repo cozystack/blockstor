@@ -54,6 +54,13 @@ var (
 	errDrbdadmAdjust158 = errors.New("pvc-down158: Failure: (158) Unknown resource\n" +
 		"additional info from kernel:\nunknown resource\n" +
 		"Command 'drbdsetup new-minor pvc-down158 1000 0' terminated with exit code 10: exit status 1")
+	// errDrbdadmPrimaryStateChange mirrors the verbatim stderr drbdadm
+	// emits when `drbdadm primary --force` races the initial-sync
+	// handshake on a fresh diskful replica (Bug 311 reproducer):
+	// the kernel rejects the role flip while the disk is still
+	// being claimed by an internal handle.
+	errDrbdadmPrimaryStateChange = errors.New(
+		"drbdadm: State change failed: (-12) Device is held open by someone")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -4662,6 +4669,277 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "mkfs.") || strings.Contains(line, " mkfs.") {
 			t.Errorf("non-primary replica must skip mkfs; saw %q in %v", line, fx.CommandLines())
+		}
+	}
+}
+
+// TestApplyAutoMkfsRetryAfterMissedFirstActivation pins Bug 311 (P1):
+// when the first reconcile created the DRBD metadata (`.md-created`
+// marker written) but never managed to write `.mkfs.done` (e.g.
+// `drbdadm primary --force` raced the initial-sync handshake and
+// returned a transient error), the SECOND reconcile must still
+// perform the mkfs.
+//
+// The old auto-mkfs gate (`firstActivation && auto-primary`) made
+// the retry impossible: firstActivation flipped to false the
+// instant `.md-created` landed on disk, so the auto-promote
+// branch was permanently skipped and mkfs never ran. piraeus'
+// RWX (NFS-ganesha) PVC reproduced this every time — the data
+// volume on `/dev/drbd/by-res/<pvc>/1` reached UpToDate without
+// a filesystem and ganesha's `mount-recovery@<pvc>.service`
+// failed with `fsck.ext2: Bad magic number in super-block`.
+//
+// Simulating the failure mode end-to-end requires injecting a
+// failure into `drbdadm primary --force` on the first Apply pass
+// — but FakeExec's response lookup is by exact command line, so
+// we can flip the response between passes by `Reset`-ing and
+// re-`Expect`-ing. The second pass leaves the response empty
+// (success), and the test asserts mkfs fires.
+func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Inject a transient failure into `drbdadm primary --force` on
+	// the FIRST pass so runAutoPromote bails after create-md /
+	// `.md-created` but before mkfs. Mirrors the production race
+	// where primary --force returns "State change failed" because
+	// the initial-sync handshake hasn't completed.
+	fx.Expect("drbdadm primary --force pvc-bug311",
+		storage.FakeResponse{Err: errDrbdadmPrimaryStateChange})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug311",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "6000",
+				"auto-primary": "true",
+			},
+		},
+	}
+
+	// First Apply: primary --force fails → runAutoPromote returns an
+	// error → finishDRBDApply propagates it → Apply records the
+	// per-resource error but should have already written
+	// `.md-created` (runFirstActivation writes it before
+	// runApplyDRBDVerb / runAutoPromote even runs).
+	_, _ = rec.Apply(t.Context(), dr)
+
+	mdMarker := filepath.Join(dir, "pvc-bug311.md-created")
+	if _, statErr := os.Stat(mdMarker); statErr != nil {
+		t.Fatalf("Bug 311 precondition: .md-created should exist after first failed pass; got stat err %v", statErr)
+	}
+
+	mkfsMarker := filepath.Join(dir, "pvc-bug311.mkfs.done")
+	if _, statErr := os.Stat(mkfsMarker); statErr == nil {
+		t.Fatalf("Bug 311 precondition: .mkfs.done should be absent after first failed pass; got present")
+	}
+
+	// Second pass: clear the canned primary --force failure so the
+	// retry branch can actually finish. Assert mkfs runs on this
+	// pass even though firstActivation=false now (`.md-created`
+	// persisted from pass 1). `Reset` drops Calls/Stdins but keeps
+	// Responses, so we have to overwrite the failing entry with a
+	// success canned answer (empty stdout, nil err).
+	fx.Reset()
+	fx.Expect("drbdadm primary --force pvc-bug311", storage.FakeResponse{})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug311_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-bug311_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-bug311_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-bug311_00000|1048576\n")})
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (2nd, retry): %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	foundMkfs := false
+
+	for _, line := range cmds {
+		if strings.Contains(line, "mkfs.ext4") && strings.Contains(line, "/dev/drbd6000") {
+			foundMkfs = true
+
+			break
+		}
+	}
+
+	if !foundMkfs {
+		t.Errorf("Bug 311: second pass MUST re-run mkfs.ext4 on /dev/drbd6000; got %v", cmds)
+	}
+
+	// Ordering still must be primary --force < mkfs < secondary on
+	// the retry pass — same contract as the happy-path test.
+	posPrim, posMkfs, posSec := -1, -1, -1
+	for i, line := range cmds {
+		switch {
+		case posPrim < 0 && strings.Contains(line, "drbdadm primary --force pvc-bug311"):
+			posPrim = i
+		case posMkfs < 0 && strings.Contains(line, "mkfs.ext4 /dev/drbd6000"):
+			posMkfs = i
+		case posSec < 0 && strings.Contains(line, "drbdadm secondary pvc-bug311"):
+			posSec = i
+		}
+	}
+
+	if posPrim < 0 || posMkfs <= posPrim || posSec <= posMkfs {
+		t.Errorf("Bug 311 ordering: want primary --force < mkfs < secondary; got prim=%d mkfs=%d sec=%d in %v",
+			posPrim, posMkfs, posSec, cmds)
+	}
+
+	if _, statErr := os.Stat(mkfsMarker); statErr != nil {
+		t.Errorf("Bug 311: .mkfs.done marker should be present after successful retry; got stat err %v", statErr)
+	}
+}
+
+// TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume pins the per-volume
+// idempotency layer of the Bug 311 fix: a volume that already carries
+// a filesystem (TYPE= line in `blkid -o export <dev>` output) MUST
+// NOT be re-mkfs'd, even when the `.mkfs.done` marker is absent.
+// Mirrors upstream LINSTOR's MkfsUtils.makeFileSystemOnMarked which
+// short-circuits on a non-empty `hasFileSystem` result, and prevents
+// the retry path from wiping a populated filesystem on a marker-loss
+// scenario (operator removed /etc/drbd.d, host rebuild, etc.).
+func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-blkid_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Pretend the device already has an ext4 filesystem — blkid -o
+	// export returns the upstream-canonical TYPE= line.
+	fx.Expect("blkid -o export /dev/drbd6100",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd6100\nTYPE=ext4\nUSAGE=filesystem\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-blkid",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "6100",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	for _, line := range cmds {
+		if strings.HasPrefix(line, "mkfs.") || strings.Contains(line, " mkfs.") {
+			t.Errorf("blkid probe must skip mkfs on a populated volume; saw %q in %v", line, cmds)
+		}
+	}
+
+	// Marker still must be written: the volume was either freshly
+	// mkfs'd (in another test) or adopted (this test) — either way
+	// the resource has reached the "fs present" state and subsequent
+	// reconciles should fast-path past the runAutoMkfs body.
+	mkfsMarker := filepath.Join(dir, "pvc-blkid.mkfs.done")
+	if _, statErr := os.Stat(mkfsMarker); statErr != nil {
+		t.Errorf(".mkfs.done marker should be written after blkid adopts an existing fs; got stat err %v", statErr)
+	}
+}
+
+// TestApplyAutoMkfsMultiVolumeMkfsBoth pins NFS-ganesha-shaped RDs
+// (RWX PVC, 2 VolumeDefinitions, RD-level `FileSystem/Type=ext4`):
+// the satellite must run mkfs on every diskful volume the dispatcher
+// passed in — both /dev/drbd<minor> (vol 0, ganesha control) and
+// /dev/drbd<minor+1> (vol 1, data partition). Matches upstream
+// LINSTOR's MkfsUtils.makeFileSystemOnMarked which iterates every
+// VlmProviderObject. Bug 311 root cause: this iteration never ran
+// at all because the gate was tied to firstActivation.
+func TestApplyAutoMkfsMultiVolumeMkfsBoth(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-ganesha_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-ganesha",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 131072, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 307200, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "7000",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	want := []string{
+		"mkfs.ext4 /dev/drbd7000",
+		"mkfs.ext4 /dev/drbd7001",
+	}
+
+	for _, expected := range want {
+		found := false
+
+		for _, line := range cmds {
+			if strings.Contains(line, expected) {
+				found = true
+
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("multi-volume RWX RD: expected %q; got %v", expected, cmds)
 		}
 	}
 }

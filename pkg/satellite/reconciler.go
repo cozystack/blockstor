@@ -1037,8 +1037,9 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// Running `drbdadm primary --force` on each replica regenerates
 	// the Current UUID independently per node → peers see divergent
 	// UUIDs on first handshake → split-brain (StandAlone).
-	autoPromote := firstActivation && !diskless &&
+	autoPrimaryReplica := !diskless &&
 		dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue
+	autoPromote := firstActivation && autoPrimaryReplica
 	_ = cloned
 
 	if autoPromote {
@@ -1048,7 +1049,68 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		}
 	}
 
+	// Bug 311: the auto-mkfs path used to live ONLY inside
+	// runAutoPromote (above), wedged between `drbdadm primary --force`
+	// and `drbdadm secondary`. That coupling meant any transient
+	// failure in the promote/demote dance — primary --force racing the
+	// initial-sync handshake, secondary racing an in-flight Open —
+	// left `.mkfs.done` unwritten while `.md-created` persisted, so the
+	// next reconcile saw firstActivation=false, skipped the whole
+	// auto-promote branch, and mkfs never ran again. piraeus' NFS-
+	// ganesha multi-volume RD (RWX PVC, two VDs, `FileSystem/Type=ext4`
+	// on the RD) reproduced this every time: the resource bound but
+	// `/dev/drbd/by-res/<pvc>/1` had no filesystem and ganesha's
+	// `mount-recovery@<pvc>.service` failed with `fsck.ext2: Bad magic
+	// number in super-block`.
+	//
+	// The retry path runs ONLY when firstActivation has already
+	// happened (so we never double-promote a healthy fresh replica)
+	// AND the `.mkfs.done` marker is still missing AND the RD asks
+	// for a filesystem. It re-enters runAutoPromote which is
+	// idempotent: primary --force on an already-Primary slot is a
+	// kernel no-op, `runAutoMkfs` blkid-probes each device and skips
+	// volumes that already carry a filesystem, and `secondary`
+	// matches the regular post-mkfs demote. Once every diskful
+	// volume passes the blkid probe (either freshly-mkfs'd here or
+	// already populated from a previous attempt), runAutoMkfs writes
+	// the marker and this branch becomes a no-op for the rest of the
+	// resource's life.
+	if !autoPromote && autoPrimaryReplica && r.needsAutoMkfsRetry(dr) {
+		err := r.runAutoPromote(ctx, dr)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// needsAutoMkfsRetry probes whether an auto-primary replica must
+// re-enter the promote-mkfs-demote chain on a steady-state reconcile.
+// Returns true only when (a) the RD asks for a filesystem
+// (`FileSystem/Type` prop set), (b) the `.mkfs.done` marker is
+// absent, and (c) the satellite has both an Exec wrapper and a
+// StateDir wired (production always does; tests that omit them
+// disable auto-mkfs entirely, matching the runAutoMkfs no-Exec branch).
+//
+// The marker file is the same one `runAutoMkfs` drops after every
+// volume reaches a filesystem (either by mkfs or by adopting an
+// existing one via blkid). Reading the marker here is a cheap
+// fs.Stat — cheaper than re-running blkid on every volume just to
+// decide whether we need to do anything at all.
+func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
+	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) == "" {
+		return false
+	}
+
+	if r.cfg.Exec == nil || r.cfg.StateDir == "" {
+		return false
+	}
+
+	markerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".mkfs.done")
+	_, err := os.Stat(markerPath)
+
+	return os.IsNotExist(err)
 }
 
 // needsDisklessToDiskfulAttach probes whether the local kernel slot
@@ -1144,22 +1206,33 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 // 9.W14. The controller folds `FileSystem/Type` (and the optional
 // `FileSystem/MkfsParams`) from the RG's effective props into the
 // per-RD wire Props map; the satellite consumes them here on the
-// primary replica's first activation only.
+// primary replica.
 //
-// Idempotency lives in a per-RD `<rd>.mkfs.done` marker under
-// StateDir, sibling to `.md-created`. The marker is dropped AFTER
-// every volume's mkfs returns success, so a partial failure leaves
-// the resource in a state the next reconcile can retry. The marker
-// is deleted together with `.res` / `.md-created` in DeleteResource
-// so a re-created RD with the same name correctly mkfs-s again.
+// Idempotency has two layers:
+//
+//  1. A per-RD `<rd>.mkfs.done` marker under StateDir (sibling to
+//     `.md-created`) records the durable "we already finished mkfs
+//     for every diskful volume" state. Cheap stat-only fast path.
+//  2. Per-volume `blkid -o export /dev/drbd<minor>` probe (mirroring
+//     upstream LINSTOR's `MkfsUtils.hasFileSystem`). When a volume
+//     already carries a filesystem we skip mkfs on that volume and
+//     adopt the existing fs — exactly upstream's behaviour. This
+//     closes Bug 311: a previous reconcile that dropped `.md-created`
+//     but failed to write `.mkfs.done` (e.g. `drbdadm primary
+//     --force` raced the initial-sync handshake and returned a
+//     transient error) would otherwise permanently skip mkfs on
+//     subsequent passes, since firstActivation goes false. The new
+//     retry gate in finishDRBDApply re-enters this function; the
+//     blkid probe makes that retry safe even on a volume that was
+//     partially mkfs'd before the failure.
 //
 // SAFETY: mkfs on a populated filesystem silently destroys data. The
-// marker file is the only thing standing between scenario 9.W14 and
-// data loss on every Apply — losing the marker on a healthy resource
-// (manual `rm`, satellite disk wipe) would re-run mkfs on the second
-// Apply. We treat the marker as authoritative; recovery from a lost
-// marker requires the operator to either delete + recreate the RD or
-// touch the marker manually before the next reconcile.
+// blkid probe is what protects an already-formatted volume from
+// double-mkfs when the marker file is absent (manual `rm`, host
+// rebuild that wipes /etc/drbd.d). DeleteResource removes the marker
+// together with `.res` / `.md-created` so a re-created RD with the
+// same name correctly mkfs-s again — the blkid probe sees an empty
+// (freshly-carved) volume and lets mkfs run.
 func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource) error {
 	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
 	if fsType == "" {
@@ -1194,6 +1267,17 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	for _, vol := range dr.GetVolumes() {
 		device := fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber()))
 
+		if r.deviceHasFilesystem(ctx, device) {
+			// Volume already carries a filesystem. Two cases land here:
+			// (a) a previous reconcile mkfs'd this volume but crashed
+			// before writing the marker — adopt the fs and continue;
+			// (b) the operator manually formatted the device — same
+			// treatment. Matches upstream LINSTOR's MkfsUtils.
+			// makeFileSystemOnMarked which short-circuits on a
+			// non-empty hasFileSystem result.
+			continue
+		}
+
 		cmdArgs := append(slices.Clone(args), device)
 
 		_, err := r.cfg.Exec.Run(ctx, "mkfs."+fsType, cmdArgs...)
@@ -1208,6 +1292,43 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	}
 
 	return nil
+}
+
+// deviceHasFilesystem reports whether the given DRBD device already
+// carries a recognised filesystem. Wraps `blkid -o export <device>`
+// the same way upstream LINSTOR's MkfsUtils.hasFileSystem does:
+// presence of a `TYPE=` line in the export-format output means the
+// kernel's libblkid detected a known filesystem signature. blkid's
+// exit-2 (no signature found) is folded into the FakeExec /
+// RealExec "non-zero exit → wrapped error" contract; we treat that
+// as "no filesystem" rather than propagating the error because the
+// caller's only sensible response is exactly the same: skip mkfs on
+// a populated volume, run it on an empty one.
+//
+// A real I/O failure (device gone, kernel returned EIO) also lands
+// in the error branch, but the subsequent mkfs.<type> on the same
+// device would fail just as loudly with a more actionable message
+// ("No such file or directory" / "Input/output error"), so the
+// fall-through to mkfs preserves the failure mode operators
+// already expect.
+func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) bool {
+	out, err := r.cfg.Exec.Run(ctx, "blkid", "-o", "export", device)
+	if err != nil {
+		// Treat any blkid failure as "no recognised filesystem". The
+		// most common shape is exit-code 2 (no signature) which
+		// RealExec wraps into a generic error — the caller's only
+		// sensible reaction is to run mkfs, which is what the
+		// no-filesystem branch already does.
+		return false
+	}
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "TYPE=") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // runApplyDRBDVerb is the per-reconcile dispatch between the two
