@@ -516,3 +516,87 @@ func TestLogFsmShadowDoesNotMutate(t *testing.T) {
 		t.Errorf("StateDir gained %d entries after shadow log; expected 0", len(entries))
 	}
 }
+
+// TestObserveForFsmReadsMetadataExistsFromCondition pins Phase
+// 11.3 Stage 1's FSM shadow reader contract: with no on-disk
+// `.md-created` marker but the DesiredResource carrying the
+// `MetadataCreated=true` Condition flag, Observation.MetadataExists
+// must resolve true so the FSM doesn't suggest createMd against an
+// already-initialised metadata block.
+func TestObserveForFsmReadsMetadataExistsFromCondition(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Pre-create .res only — explicitly NO `.md-created` marker
+	// file. The only signal that metadata exists is the
+	// dr.MetadataCreated flag.
+	resPath := filepath.Join(dir, "pvc-cond-obs.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-cond-obs {}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-cond-obs", storage.FakeResponse{})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:            "pvc-cond-obs",
+		NodeName:        "n1",
+		MetadataCreated: true,
+	}
+
+	obs := rec.observeForFsm(context.Background(), dr, false)
+	if !obs.MetadataExists {
+		t.Errorf("MetadataExists = false, want true (Condition set, file absent)")
+	}
+}
+
+// TestObserveForFsmReadsMetadataExistsFromFileFallback pins the
+// belt-and-braces fallback for the migration window: a
+// pre-existing `.md-created` marker MUST still drive
+// Observation.MetadataExists=true even when the Condition flag is
+// absent (cluster upgraded from a pre-11.3 satellite, backfill not
+// yet stamped). Without this fallback the FSM would suggest
+// createMd → drbdmeta failure on every shadow probe until the
+// backfill catches up.
+func TestObserveForFsmReadsMetadataExistsFromFileFallback(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	resPath := filepath.Join(dir, "pvc-file-obs.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-file-obs {}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	mdMarker := filepath.Join(dir, "pvc-file-obs.md-created")
+	if err := os.WriteFile(mdMarker, nil, 0o600); err != nil {
+		t.Fatalf("seed .md-created: %v", err)
+	}
+
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-file-obs", storage.FakeResponse{})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:            "pvc-file-obs",
+		NodeName:        "n1",
+		MetadataCreated: false, // Condition NOT set
+	}
+
+	obs := rec.observeForFsm(context.Background(), dr, false)
+	if !obs.MetadataExists {
+		t.Errorf("MetadataExists = false, want true (file marker present, Condition absent → fallback active)")
+	}
+}

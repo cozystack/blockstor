@@ -262,6 +262,24 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		return errors.Wrap(err, "register DiscoveredStorageRunnable")
 	}
 
+	return registerMetadataCreatedBackfill(mgr, cfg)
+}
+
+// registerMetadataCreatedBackfill wires the Phase 11.3 Stage 1
+// startup backfill runnable. Pulled out of addBackgroundRunnables
+// to keep that function under the funlen budget — the bookkeeping
+// for one more runnable nudges it over the limit.
+func registerMetadataCreatedBackfill(mgr manager.Manager, cfg Config) error {
+	err := (&MetadataCreatedBackfillRunnable{
+		Client:   mgr.GetClient(),
+		Adm:      drbd.NewAdm(cfg.Exec),
+		Stamper:  &MetadataCreatedStamper{Client: mgr.GetClient()},
+		NodeName: cfg.NodeName,
+	}).RegisterWithManager(mgr)
+	if err != nil {
+		return errors.Wrap(err, "register MetadataCreatedBackfillRunnable")
+	}
+
 	return nil
 }
 
