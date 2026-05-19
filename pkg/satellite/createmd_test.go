@@ -146,9 +146,12 @@ func TestCreateMetadataIdempotentOnPreExistingMd(t *testing.T) {
 	}
 
 	// MetadataCreated Status Condition MUST be stamped exactly once
-	// per createMetadata invocation.
-	if got := stamper.calls; len(got) != 1 || got[0] != "pvc-md-adopt" {
-		t.Errorf("MetadataCreated stamper calls = %v, want [pvc-md-adopt]", got)
+	// per createMetadata invocation. Bug 344: stamper receives the
+	// per-node Resource CRD name (`<rd>.<node>`), not the RD-only
+	// name — the SSA patch targets `Resource` objects which are
+	// sharded per node.
+	if got := stamper.calls; len(got) != 1 || got[0] != "pvc-md-adopt.n1" {
+		t.Errorf("MetadataCreated stamper calls = %v, want [pvc-md-adopt.n1]", got)
 	}
 }
 

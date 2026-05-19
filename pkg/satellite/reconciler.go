@@ -1742,10 +1742,18 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	// apiserver hiccup here just defers Condition stamping to the
 	// next reconcile.
 	if r.cfg.MetadataCreatedStamper != nil {
-		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, dr.GetName())
+		// Why (Bug 344): the stamper SSA-patches a `Resource`
+		// object whose Name is the CRD object name. Real Resource
+		// CRDs are named `<rd>.<node>` (per-node sharding); passing
+		// the RD-only name made the apiserver return 404 on every
+		// stamp attempt, polluting ERROR logs since Phase 11.3
+		// Stage 1 (#489). Best-effort tolerated (file marker is the
+		// source of truth) so no functional regression, just noise.
+		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
+		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, resourceCRDName)
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
-				"resource", dr.GetName())
+				"resource", resourceCRDName)
 		}
 	}
 

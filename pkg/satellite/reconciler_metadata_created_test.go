@@ -126,8 +126,11 @@ func TestEnsureMetadataStampsCondition(t *testing.T) {
 		t.Fatalf("stamper called %d times, want exactly 1: %v", len(calls), calls)
 	}
 
-	if calls[0] != "pvc-stamp" {
-		t.Errorf("stamper called with %q, want %q", calls[0], "pvc-stamp")
+	// Bug 344: stamper receives the per-node Resource CRD name
+	// (`<rd>.<node>`), not the RD-only name — the SSA patch
+	// targets Resource objects which are sharded per node.
+	if calls[0] != "pvc-stamp.n1" {
+		t.Errorf("stamper called with %q, want %q", calls[0], "pvc-stamp.n1")
 	}
 
 	// Belt-and-braces: file marker still written on the same path.
