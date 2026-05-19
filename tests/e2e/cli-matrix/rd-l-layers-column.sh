@@ -75,12 +75,16 @@ layer_types=$(jq -r --arg rd "$RD" '
     [
         ( .[0].rsc_dfns[]? | select(.name==$rd) | .layer_data[]?.type ),
         ( .[0].resource_definitions[]? | select(.name==$rd) | .layer_data[]?.type ),
-        ( .[]? | select(.name==$rd) | .layer_data[]?.type )
+        ( .[]? | select(.name==$rd) | .layer_data[]?.type ),
+        # golinstor `--machine-readable` v0 wraps the apiserver array in
+        # an outer array → `[[{name,layer_data:[{type}]}]]`. The earlier
+        # probes only reach one level; add the double-array path.
+        ( .[0][]? | select(.name==$rd) | .layer_data[]?.type )
     ]
     | flatten
     | map(ascii_upcase)
     | unique
-    | .[]' <<<"$mr" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')
+    | .[]' <<<"$mr" | sort -u | tr '\n' ',' | sed 's/,$//')
 echo "   layer_data.type = '${layer_types}'"
 
 if [[ -z "$layer_types" ]]; then
