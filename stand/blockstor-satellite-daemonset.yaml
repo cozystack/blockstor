@@ -231,7 +231,23 @@ spec:
           # a563b1f43) sweeps it on startup. SIGTERM → 10 s → SIGKILL
           # now reliably tears the pod down inside the rollout budget.
           volumeMounts:
-            - {name: dev, mountPath: /dev}
+            # Bug 346: mountPropagation HostToContainer. The hostPath
+            # bind defaults to mountPropagation: None (rprivate), so
+            # host-side device nodes that appear AFTER container start
+            # — e.g. /dev/sda1 / /dev/sda9 stamped by `zpool create`
+            # via the kernel's GPT-rescan — do not propagate into the
+            # container. libzfs then opens /dev/sda1 to write the ZFS
+            # label, the inode isn't visible, and zpool aborts with
+            # `cannot label 'sda': failed to detect device partitions
+            # on '/dev/sda1': 19` (ENODEV). HostToContainer = MS_SLAVE
+            # in mount(8) terms: the container receives every host
+            # mount/inode-creation event under /dev but doesn't push
+            # any back up — exactly what zpool's partition-rescan
+            # path needs. Piraeus's satellite happens to work around
+            # this with sgdisk pre-create + zpool-at-partition-path,
+            # but blockstor wants the upstream `zpool create /dev/sda`
+            # one-shot to succeed too.
+            - {name: dev, mountPath: /dev, mountPropagation: HostToContainer}
             - {name: modules, mountPath: /lib/modules, readOnly: true}
             - {name: lvm-run, mountPath: /run/lvm}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
