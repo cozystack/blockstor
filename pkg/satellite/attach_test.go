@@ -489,6 +489,103 @@ func TestAttachExtendsExistingVGThin(t *testing.T) {
 	}
 }
 
+// TestWipeDeviceZeroesBothEnds pins the Bug 336 v2 contract: the
+// guaranteed-clean wipe MUST zero the first AND last 32 MiB of
+// the device, AND re-read the partition table via both
+// `blockdev --rereadpt` and `partprobe`. Without the
+// end-of-device zero, ZFS secondary labels survive and
+// `zpool create` then fails on stale partition entries
+// (sda1/sda9). Without partprobe, some kernels keep the stale
+// nodes despite BLKRRPART.
+//
+// Expected dd seek for a 16 GiB device: size 17179869184 B =
+// 16384 MiB; seek = 16384 - 32 = 16352.
+func TestWipeDeviceZeroesBothEnds(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("blockdev --getsize64 /dev/sda", storage.FakeResponse{
+		Stdout: []byte("17179869184\n"),
+	})
+
+	err := satellite.WipeDeviceForTest(t.Context(), fx, "/dev/sda")
+	if err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+
+	lines := strings.Join(fx.CommandLines(), "\n")
+
+	requireContains := []string{
+		"wipefs --all --force /dev/sda",
+		"dd if=/dev/zero of=/dev/sda bs=1M count=32 conv=fsync,notrunc status=none",
+		"dd if=/dev/zero of=/dev/sda bs=1M seek=16352 count=32 conv=fsync,notrunc status=none",
+		"blockdev --rereadpt /dev/sda",
+		"partprobe /dev/sda",
+	}
+	for _, want := range requireContains {
+		if !strings.Contains(lines, want) {
+			t.Errorf("Bug 336 v2: wipeDevice missing %q in commands:\n%s", want, lines)
+		}
+	}
+}
+
+// TestWipeDeviceHandlesTinyDevice pins the safety guard: when
+// the device is <= 64 MiB, the end-of-device zero MUST be
+// skipped — a seek of (size-32) MiB on a 32 MiB device would
+// land at byte 0, mid-superblock, or wrap negative on some
+// dd implementations.
+func TestWipeDeviceHandlesTinyDevice(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("blockdev --getsize64 /dev/loop0", storage.FakeResponse{
+		Stdout: []byte("33554432\n"), // 32 MiB
+	})
+
+	err := satellite.WipeDeviceForTest(t.Context(), fx, "/dev/loop0")
+	if err != nil {
+		t.Fatalf("wipe: %v", err)
+	}
+
+	for _, cmd := range fx.CommandLines() {
+		if strings.Contains(cmd, "seek=") {
+			t.Errorf("Bug 336 v2: tiny-device wipe must not seek beyond size: %s", cmd)
+		}
+	}
+}
+
+// TestWipeDeviceContinuesOnWipefsFailure pins the best-effort
+// chain semantics: a wipefs failure MUST NOT abort the wipe.
+// The dd zero-out is the load-bearing step — if wipefs trips
+// on an exotic signature the kernel doesn't recognise, the
+// subsequent dd must still run to give us a clean device.
+func TestWipeDeviceContinuesOnWipefsFailure(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("wipefs --all --force /dev/sda", storage.FakeResponse{
+		Err: errors.New("wipefs failed"),
+	})
+	fx.Expect("blockdev --getsize64 /dev/sda", storage.FakeResponse{
+		Stdout: []byte("17179869184\n"),
+	})
+
+	err := satellite.WipeDeviceForTest(t.Context(), fx, "/dev/sda")
+	if err != nil {
+		t.Fatalf("Bug 336 v2: wipe must not fail when only wipefs errored: %v", err)
+	}
+
+	// Assert dd still ran on both ends.
+	lines := strings.Join(fx.CommandLines(), "\n")
+	if !strings.Contains(lines, "dd if=/dev/zero of=/dev/sda bs=1M count=32") {
+		t.Errorf("Bug 336 v2: dd front-zero must run even when wipefs failed:\n%s", lines)
+	}
+
+	if !strings.Contains(lines, "dd if=/dev/zero of=/dev/sda bs=1M seek=16352") {
+		t.Errorf("Bug 336 v2: dd end-zero must run even when wipefs failed:\n%s", lines)
+	}
+}
+
 // TestAttachCreatesWhenPoolAbsent pins the negative of the
 // extend branch: when the probe (`zpool list <pool>`) exits
 // non-zero (pool absent), the satellite falls through to

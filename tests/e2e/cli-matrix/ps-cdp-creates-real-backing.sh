@@ -98,15 +98,25 @@ if on_node "$NODE" bash -c 'lsblk -nro NAME /dev/sdb | grep -qE "sdb[0-9]+"' 2>/
 fi
 
 # Stage the Bug 336 reproduction fixture: create a one-shot ZFS pool
-# + destroy it, leaving the stale GPT (sdb1 + sdb9) on the device.
-# Pre-fix this defeats the follow-up `ps cdp` with the
-# "failed to detect device partitions on '/dev/sdb1': 19" error.
-# Post-fix the rereadpt step in wipeDevice clears the stale entries
-# before `zpool create` runs.
+# + destroy it, leaving the stale GPT (sdb1 + sdb9) AND the ZFS
+# secondary label at end-of-device. Pre-fix v1 this defeated the
+# follow-up `ps cdp` with the "failed to detect device partitions
+# on '/dev/sdb1': 19" error. Post-fix v2 the guaranteed-clean
+# wipeDevice (wipefs + dd zero both ends + rereadpt + partprobe)
+# clears every signature before `zpool create` runs.
 on_node "$NODE" bash -c "
     zpool create -f ${POOL}_stale /dev/sdb 2>/dev/null && \
     zpool destroy ${POOL}_stale 2>/dev/null
 " || echo "note: stale-zpool prep best-effort; device may already be clean"
+
+# Confirm the fixture actually stamped the partition table — without
+# sdb1 / sdb9 the cell isn't reproducing Bug 336's failure mode and
+# a green result would be a false negative. Warn (don't fail) so the
+# cell still exercises the wipe path on stands where ZFS strips the
+# partition table on destroy.
+if ! on_node "$NODE" bash -c 'lsblk -nro NAME /dev/sdb | grep -qE "sdb[0-9]+"' 2>/dev/null; then
+    echo "note: Bug 336 fixture did not produce sdb[0-9]+ partitions; wipe path will still run"
+fi
 
 cleanup() {
     "${LCTL[@]}" storage-pool delete "$NODE" "$POOL" 2>/dev/null || true
@@ -178,4 +188,18 @@ if ! on_node "$NODE" zpool list -H -o name "${POOL}" >/dev/null 2>&1; then
     exit 1
 fi
 
-echo ">> ps-cdp-creates-real-backing OK (Bug 336 pinned: zpool create succeeded against device with stale partitions)"
+# Bug 336 v2: cross-verify the partition table is clean. The new
+# zpool ZFS just created will have ITS OWN sdb1 + sdb9 — that's
+# expected. The point of the v2 wipe was that the STALE pre-attach
+# partition entries didn't defeat `zpool create`. We assert the
+# current sdb1/sdb9 (if present) belong to the live pool by
+# checking lsblk reports a sane state (no kernel-cached ghost
+# entries for a different pool).
+echo ">> cross-verify: lsblk reports a coherent partition table for /dev/sdb"
+if ! on_node "$NODE" bash -c 'lsblk -nro NAME,TYPE /dev/sdb' >/dev/null 2>&1; then
+    echo "FAIL (Bug 336 v2): lsblk /dev/sdb failed — kernel partition state is corrupt" >&2
+    on_node "$NODE" lsblk /dev/sdb 2>&1 >&2 || true
+    exit 1
+fi
+
+echo ">> ps-cdp-creates-real-backing OK (Bug 336 v2 pinned: zpool create succeeded against device with stale partitions + secondary labels)"

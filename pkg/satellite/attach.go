@@ -18,6 +18,8 @@ package satellite
 
 import (
 	"context"
+	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/cockroachdb/errors"
@@ -185,48 +187,110 @@ func attachDevicePath(dev *apiv1.PhysicalDevice) string {
 	return dev.CurrentDevPath
 }
 
-// wipeDevice runs `wipefs --all --force <device>` to clear
-// every detected on-disk signature, then `blockdev --rereadpt
-// <device>` so the kernel drops any stale partition device
-// nodes left over from a previous pool create. Operators must
-// opt in via `AttachTo.Wipe=true` — without it, a device
-// carrying any signature would otherwise fail the kind-specific
-// create command (`vgcreate` refuses on existing PV signature,
-// etc).
+// wipeDevice guarantees the device is `zpool create` / `pvcreate`
+// -able when the operator opts in via `AttachTo.Wipe=true`.
 //
-// Bug 336: wipefs alone clears the GPT/MBR signature on the
-// parent disk but does NOT force the kernel to re-read its
-// partition table. On a device with stale ZFS-style partitions
-// (sda1 zfs_member + sda9 zfs_reserved from an aborted prior
-// attempt), the partition device nodes /dev/sda1 + /dev/sda9
-// persist in the kernel's BLKPG list even after wipefs returns,
-// and the follow-up `zpool create -f data /dev/sda` then fails:
+// Bug 336 v1 ran `wipefs --all --force` + `blockdev --rereadpt`.
+// That was insufficient — ZFS writes BOTH a primary label at LBA 0
+// and a secondary label near end-of-device. `wipefs` recognises
+// the front signatures most of the time but can miss the
+// secondary copy, and the kernel-cached child partition nodes
+// (sda1 zfs_member + sda9 zfs_reserved) survive across the wipe.
+// The follow-up `zpool create -f data /dev/sda` then fails:
 //
 //	cannot label 'sda': failed to detect device partitions
 //	on '/dev/sda1': 19
 //
-// `blockdev --rereadpt` issues the BLKRRPART ioctl so the
-// kernel drops the now-empty partition table and removes the
-// stale child nodes before the kind-specific create runs.
-// Best-effort — a non-zero exit on a device the kernel can't
-// reread (busy, in use by a peer) is logged via the returned
-// error so the caller can decide whether to bail; for a freshly-
-// wiped CDP target the call is expected to succeed.
+// User contract (P0): `linstor ps l` shows device → `linstor ps
+// cdp` MUST work. No probabilistic "wipefs should handle most
+// cases". Bug 336 v2 guarantees the device is create-able by:
+//
+//  1. wipefs --all --force — drop recognised signatures.
+//  2. dd zero first 32 MiB — kill GPT primary header, ZFS primary
+//     label, LVM PV header, mdraid superblock, anything at start.
+//  3. dd zero last 32 MiB — kill GPT secondary header, ZFS
+//     secondary label, anything mirrored at end of device.
+//  4. blockdev --rereadpt — kernel drops stale partition device
+//     nodes (sda1/sda9).
+//  5. partprobe — belt-and-braces re-read (some kernels need
+//     this in addition to BLKRRPART).
+//
+// This isn't beyond-upstream recovery: it automates exactly what
+// `zpool labelclear` + manual `wipefs` would do, so `ps cdp`
+// honours its contract.
+//
+// Best-effort tail: wipefs / blockdev / partprobe failures are
+// logged and the chain continues — the dd zero-out is the
+// load-bearing step and its failure aborts. A tiny device
+// (< 64 MiB) skips the end-zero step to avoid a negative seek.
 func wipeDevice(ctx context.Context, exec storage.Exec, devicePath string) error {
-	_, err := exec.Run(ctx, "wipefs", "--all", "--force", devicePath)
-	if err != nil {
-		return errors.Wrap(err, "wipefs")
+	// 1) wipefs known signatures. Log + continue on failure: the dd
+	// zero-out below is what actually guarantees the wipe.
+	if _, err := exec.Run(ctx, "wipefs", "--all", "--force", devicePath); err != nil {
+		slog.Default().Info("wipefs failed; continuing with dd zero-out",
+			"dev", devicePath, "err", err.Error())
 	}
 
-	// Bug 336: force the kernel to re-read the (now-empty)
-	// partition table so stale /dev/sdaN nodes from prior
-	// attempts disappear before the kind-specific create runs.
-	_, err = exec.Run(ctx, "blockdev", "--rereadpt", devicePath)
-	if err != nil {
-		return errors.Wrap(err, "blockdev --rereadpt")
+	// 2) zero first 32 MiB.
+	if _, err := exec.Run(ctx, "dd",
+		"if=/dev/zero", "of="+devicePath, "bs=1M", "count=32",
+		"conv=fsync,notrunc", "status=none"); err != nil {
+		return errors.Wrapf(err, "zero start of %s", devicePath)
+	}
+
+	// 3) zero last 32 MiB — query size, seek, write.
+	sizeMiB, ok := readDeviceSizeMiB(ctx, exec, devicePath)
+	if ok && sizeMiB > 64 { // safety: don't seek negative on tiny devices
+		seekMiB := sizeMiB - 32
+		if _, err := exec.Run(ctx, "dd",
+			"if=/dev/zero", "of="+devicePath, "bs=1M",
+			"seek="+strconv.FormatInt(seekMiB, 10),
+			"count=32", "conv=fsync,notrunc", "status=none"); err != nil {
+			return errors.Wrapf(err, "zero end of %s", devicePath)
+		}
+	}
+
+	// 4) drop stale partition device nodes. Non-fatal: partprobe
+	// below is the belt-and-braces.
+	if _, err := exec.Run(ctx, "blockdev", "--rereadpt", devicePath); err != nil {
+		slog.Default().Info("blockdev --rereadpt failed; relying on partprobe",
+			"dev", devicePath, "err", err.Error())
+	}
+
+	// 5) partprobe — belt-and-braces (some kernels need this in
+	// addition to BLKRRPART).
+	if _, err := exec.Run(ctx, "partprobe", devicePath); err != nil {
+		slog.Default().Info("partprobe failed; wipe completed via prior steps",
+			"dev", devicePath, "err", err.Error())
 	}
 
 	return nil
+}
+
+// readDeviceSizeMiB queries `blockdev --getsize64 <dev>` and
+// returns the device size in MiB. Returns (0, false) when the
+// probe fails or the output cannot be parsed — callers must
+// treat this as "skip end-of-device zero" rather than abort,
+// since the front-zero step has already neutralised the most
+// common signatures.
+func readDeviceSizeMiB(ctx context.Context, exec storage.Exec, devicePath string) (int64, bool) {
+	out, err := exec.Run(ctx, "blockdev", "--getsize64", devicePath)
+	if err != nil {
+		slog.Default().Info("blockdev --getsize64 failed; skipping end-of-device zero",
+			"dev", devicePath, "err", err.Error())
+
+		return 0, false
+	}
+
+	sz, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		slog.Default().Info("blockdev --getsize64 returned unparseable size; skipping end-of-device zero",
+			"dev", devicePath, "out", string(out))
+
+		return 0, false
+	}
+
+	return sz / (1024 * 1024), true
 }
 
 // attachLVMThick: pvcreate + vgcreate. Returns the
