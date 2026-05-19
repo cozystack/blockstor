@@ -31,6 +31,7 @@ import (
 	"strings"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
@@ -77,6 +78,18 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 	for i := range peers {
 		if peers[i].Spec.NodeName == target.Spec.NodeName {
+			continue
+		}
+
+		// Why: upstream LINSTOR's `DrbdResourceFileUtils.
+		// regenerateResFile` filters peers with `!Resource.Flags.
+		// INACTIVE` — a deactivated peer disappears from sibling
+		// .res files entirely (no `on { ... }` block, unlike
+		// Diskless which keeps `disk none`). Without this filter
+		// DRBD on the surviving siblings keeps dialling the
+		// deactivated peer and quorum semantics diverge from
+		// upstream. See Bug 350.
+		if slices.Contains(peers[i].Spec.Flags, apiv1.ResourceFlagInactive) {
 			continue
 		}
 

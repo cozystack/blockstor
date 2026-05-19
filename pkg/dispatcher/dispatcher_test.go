@@ -1292,3 +1292,74 @@ func newDisklessResource(rdName, node string, nodeID *int32) *blockstoriov1alpha
 
 	return r
 }
+
+// TestInactivePeerDroppedFromSiblings pins Bug 350: a peer flagged
+// INACTIVE (the wire-side marker `linstor r deactivate` stamps on the
+// deactivated replica) must disappear from every sibling's
+// DesiredResource.Peers — no `on { ... }` block, no
+// `peer.<name>.address` keys in drbdOpts. Upstream LINSTOR's
+// `DrbdResourceFileUtils.regenerateResFile` enforces the same filter
+// (`!Resource.Flags.INACTIVE`); blockstor's dispatcher used to skip
+// it, leaving the deactivated peer in sibling .res files. DRBD then
+// kept dialling the dead peer and quorum semantics diverged from
+// upstream.
+//
+// Contrast with DISKLESS, which keeps the `on { ... }` block (with
+// `disk none;`) — that path is exercised by other tests. INACTIVE is
+// the wholesale-drop case.
+func TestInactivePeerDroppedFromSiblings(t *testing.T) {
+	t.Parallel()
+
+	const rdName = "pvc-deactivate"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	id := func(v int32) *int32 { return &v }
+
+	// Target: n1 (active, has node-id 0).
+	target := newDiskfulResource(rdName, "n1", id(0))
+
+	// peer1: n2, active, has node-id 1. Must appear in target's
+	// DesiredResource.Peers and own a `peer.n2.*` block.
+	peer1 := newDiskfulResource(rdName, "n2", id(1))
+
+	// peer2: n3, INACTIVE (deactivated). Must be dropped wholesale —
+	// no entry in Peers, no `peer.n3.*` keys in drbdOpts.
+	peer2 := newDiskfulResource(rdName, "n3", id(2))
+	peer2.Spec.Flags = []string{"INACTIVE"}
+
+	got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{*peer1, *peer2}, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	// Peers: exactly n2; n3 must NOT be present.
+	if len(got.Peers) != 1 {
+		t.Fatalf("Peers: got %v, want exactly [n2] (INACTIVE n3 must be dropped)", got.Peers)
+	}
+
+	if got.Peers[0] != "n2" {
+		t.Errorf("Peers[0]=%q, want %q", got.Peers[0], "n2")
+	}
+
+	// drbdOpts must not carry any `peer.n3.*` keys — INACTIVE peer is
+	// dropped entirely, including its address/port/node-id entries.
+	for key := range got.DrbdOptions {
+		if len(key) >= len("peer.n3.") && key[:len("peer.n3.")] == "peer.n3." {
+			t.Errorf("drbdOpts carries %q for INACTIVE peer n3 — must be dropped wholesale", key)
+		}
+	}
+
+	// Sanity: n2's peer block IS present (we didn't accidentally drop
+	// the active peer too).
+	if _, ok := got.DrbdOptions["peer.n2.node-id"]; !ok {
+		t.Errorf("drbdOpts missing peer.n2.node-id — active peer must remain (drbdOpts=%v)", got.DrbdOptions)
+	}
+}
