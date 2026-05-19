@@ -1,0 +1,126 @@
+name: vd-resize-full-lifecycle
+description: |
+  P0 catcher for the full `linstor vd s` resize lifecycle as the
+  operator drives it from the CLI:
+
+    rd c → vd c 1G → r c --auto-place=2 → grow 1G→2G→4G → shrink-reject
+
+  The CLI-side contract is:
+    - each grow returns 0 AND VolumeDefinition.size_kib reflects the
+      new size (vd_size_kib assertion)
+    - all replicas converge back to UpToDate after each grow
+    - a shrink attempt (1G < current) MUST exit non-zero — DRBD cannot
+      shrink past metadata position, our REST must reject
+
+  The pod-side data-preservation check (md5 anchor across grows) lives
+  in the L6 cli-matrix cell tests/e2e/cli-matrix/vd-resize-full-lifecycle.sh
+  — the replay runner only drives the operator CLI; the cli-matrix
+  cell drives the full pod-attached path on the live stand.
+
+  If this YAML goes red, no fix in:
+    - pkg/rest/volume_definitions.go (size set + propagate)
+    - pkg/storage/{lvm,zfs}/*.go (provider resize)
+    - pkg/satellite/reconciler.go (drbdadm resize trigger)
+    - pkg/satellite/controllers/observer.go (size status reporting)
+  may be claimed closed until the lifecycle is green again.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-uptodate-1g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  # ---- Grow 1G → 2G ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: wait-uptodate-2g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 180
+
+  # ---- Grow 2G → 4G ----
+  - name: grow-4g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "4G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 4194304
+      timeout_s: 60
+  - name: wait-uptodate-4g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 180
+
+  # ---- Shrink MUST be rejected ----
+  # DRBD cannot shrink past the metadata position; upstream LINSTOR
+  # rejects this with STORAGE_POOL_CAPACITY_REDUCTION_FAILED. We
+  # assert non-zero exit on the CLI; size invariance is asserted via
+  # the follow-up vd_size_kib check still pointing at 4G.
+  - name: shrink-rejected
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "1G"]
+    expect_exit: 1
+  - name: size-unchanged-after-reject
+    cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 4194304
+      timeout_s: 10
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans

@@ -168,6 +168,31 @@ func (r *PhysicalDeviceReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if !poolReady {
+		// Bug 340: distinguish two "SP missing" cases.
+		//
+		//   (a) SP never observed yet (Phase != Attaching): the
+		//       CDP-creates-pool-and-attach race-matrix line 4
+		//       case. Requeue with the short back-off; the
+		//       StoragePoolReconciler's next pass lands the pool.
+		//
+		//   (b) SP was observed before (Phase == Attaching) and is
+		//       now gone: the operator ran `linstor sp d <node>
+		//       <pool>` to clean up a failed `ps cdp` attempt.
+		//       Without self-heal, AttachTo persists, the
+		//       reconciler loops "target StoragePool not yet
+		//       known; requeuing" every 10s forever, and the
+		//       device is stuck in Attaching — invisible to
+		//       `linstor ps l` (which filters Available only) and
+		//       un-re-usable without manual kubectl edit.
+		//
+		// We do NOT auto-wipe the device here — the operator may
+		// have started writes during the partial attach. Going
+		// back to Available is sufficient; the next `ps cdp` will
+		// re-trigger wipe via the explicit Spec.AttachTo.Wipe flag.
+		if dev.Status.Phase == blockstoriov1alpha1.PhysicalDevicePhaseAttaching {
+			return r.clearStaleAttachTo(ctx, &dev)
+		}
+
 		return r.handlePoolMissing(ctx, &dev)
 	}
 
@@ -437,6 +462,60 @@ func (r *PhysicalDeviceReconciler) handleDeviceMissing(ctx context.Context, dev 
 	}
 
 	logger.Info("PhysicalDevice has no DevicePath — DeviceMissing")
+
+	return ctrl.Result{}, nil
+}
+
+// clearStaleAttachTo implements the Bug 340 self-heal: when the
+// reconciler observes Spec.AttachTo set + Status.Phase=Attaching
+// (meaning the SP was observed at least once in a prior reconcile
+// pass) AND the target SP CRD is now gone, clear AttachTo,
+// transition the device back to Available, and strip our attach
+// finalizer so the next discovery tick / `linstor ps l` surfaces
+// the device as free.
+//
+// Triggers in practice when the operator runs `linstor sp d
+// <node> <pool>` to clean up a failed `ps cdp` attempt (Bug 336
+// stale-label fallout, ZFS create error, etc.). Without this the
+// PhysicalDevice CRD is stuck forever in Phase=Attaching with a
+// dangling Spec.AttachTo, invisible to `linstor ps l` and
+// un-re-usable without a manual `kubectl edit physicaldevices.
+// blockstor.io <name>`.
+//
+// We do NOT auto-wipe the device here — the operator may have
+// started writes during the partial attach. Going back to
+// Available is sufficient; the next `ps cdp` will re-trigger
+// wipe via the explicit Spec.AttachTo.Wipe flag.
+func (r *PhysicalDeviceReconciler) clearStaleAttachTo(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("physicaldevice", dev.Name)
+
+	missingPool := dev.Spec.AttachTo.StoragePoolName
+
+	// Clear AttachTo on the Spec subresource so the next reconcile
+	// short-circuits at the `dev.Spec.AttachTo == nil` check, and
+	// the discovery loop can republish the device as Available.
+	dev.Spec.AttachTo = nil
+	dev.Finalizers = slices.DeleteFunc(dev.Finalizers,
+		func(f string) bool { return f == PhysicalDeviceAttachFinalizer })
+
+	err := r.Update(ctx, dev)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "clear stale AttachTo")
+	}
+
+	// Drop any stale PoolMissing / DeviceMissing conditions and
+	// flip Phase back to Available so `linstor ps l` (which
+	// filters Available only) surfaces the device again.
+	meta.RemoveStatusCondition(&dev.Status.Conditions, physicalDeviceConditionPoolMissing)
+	dev.Status.Phase = blockstoriov1alpha1.PhysicalDevicePhaseAvailable
+
+	err = r.Status().Update(ctx, dev)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "reset Phase to Available after stale AttachTo clear")
+	}
+
+	logger.Info("cleared stale AttachTo; target StoragePool gone (Bug 340 self-heal)",
+		"missing-pool", missingPool)
 
 	return ctrl.Result{}, nil
 }

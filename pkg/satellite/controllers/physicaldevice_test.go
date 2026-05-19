@@ -281,6 +281,107 @@ func TestPhysicalDeviceReconcileStripsFinalizerOnDelete(t *testing.T) {
 	}
 }
 
+// TestPhysicalDeviceClearsAttachToOnMissingSP pins Bug 340.
+//
+// Reproduction from the production stand:
+//
+//  1. `linstor ps cdp` creates the SP CRD + sets
+//     PhysicalDevice.Spec.AttachTo pointing at SP.
+//  2. ps cdp fails downstream (e.g. Bug 336 v1 stale ZFS labels);
+//     SP ends in State=Error, PhysicalDevice in Phase=Attaching.
+//  3. Operator runs `linstor sp d <node> <pool>` to clean up the
+//     failed pool. SP CRD is deleted — BUT
+//     PhysicalDevice.Spec.AttachTo is NOT cleared by anyone.
+//  4. Satellite reconciler logs
+//     "target StoragePool not yet known; requeuing" every 10s
+//     forever. PhysicalDevice is stuck in Attaching, invisible to
+//     `linstor ps l` (which filters Available only).
+//  5. Operator cannot re-use the device until manually
+//     `kubectl edit physicaldevices.blockstor.io <name>` clears
+//     AttachTo.
+//
+// Fix: when satellite reconciler sees AttachTo set AND
+// Status.Phase=Attaching (meaning pool was observed at least once
+// before — distinguishes Bug 340 cleanup-cascade from the
+// race-matrix line-4 "pool not created yet" case where Phase is
+// still Available) AND the target SP CRD is gone, clear AttachTo
+// + transition to Available. Next `ps cdp` re-triggers attach.
+func TestPhysicalDeviceClearsAttachToOnMissingSP(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	// PhysicalDevice in mid-attach state: AttachTo set + Phase
+	// already flipped to Attaching (this is what the satellite
+	// stamps after passing the Step-4 race-matrix gate the first
+	// time the SP was observed). NO StoragePool CRD exists — it
+	// was just deleted by `linstor sp d`.
+	dev := &blockstoriov1alpha1.PhysicalDevice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "n1.wwn-0xDEADBEEF",
+			Labels:     map[string]string{blockstoriov1alpha1.PhysicalDeviceLabelNode: "n1"},
+			Finalizers: []string{controllers.PhysicalDeviceAttachFinalizer},
+		},
+		Spec: blockstoriov1alpha1.PhysicalDeviceSpec{
+			AttachTo: &blockstoriov1alpha1.AttachToPool{
+				StoragePoolName: "data",
+				ProviderKind:    "ZFS",
+				ZPoolName:       "data",
+			},
+		},
+		Status: blockstoriov1alpha1.PhysicalDeviceStatus{
+			NodeName:   "n1",
+			DevicePath: "/dev/disk/by-id/wwn-0xDEADBEEF",
+			Phase:      blockstoriov1alpha1.PhysicalDevicePhaseAttaching,
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(dev).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	reconciler := &controllers.PhysicalDeviceReconciler{
+		Client: cli,
+		Config: controllers.Config{
+			NodeName: "n1",
+			Apply:    newSatelliteReconcilerForTests(),
+			Exec:     storage.NewFakeExec(),
+		},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: "n1.wwn-0xDEADBEEF"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var got blockstoriov1alpha1.PhysicalDevice
+	if err := cli.Get(context.Background(), client.ObjectKey{Name: "n1.wwn-0xDEADBEEF"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	// (1) AttachTo MUST be cleared so the next `ps cdp` (or
+	// discovery republish) can re-claim the device.
+	if got.Spec.AttachTo != nil {
+		t.Errorf("Spec.AttachTo: got %+v, want nil after self-heal", got.Spec.AttachTo)
+	}
+
+	// (2) Phase MUST go back to Available so `linstor ps l`
+	// surfaces the device again.
+	if got.Status.Phase != blockstoriov1alpha1.PhysicalDevicePhaseAvailable {
+		t.Errorf("Phase: got %q, want %q", got.Status.Phase, blockstoriov1alpha1.PhysicalDevicePhaseAvailable)
+	}
+
+	// (3) Our attach finalizer MUST be stripped — without
+	// AttachTo there's no reason to guard the CRD anymore.
+	if slices.Contains(got.Finalizers, controllers.PhysicalDeviceAttachFinalizer) {
+		t.Errorf("attach finalizer still present after self-heal: %v", got.Finalizers)
+	}
+}
+
 // TestPhysicalDeviceReconcileReapsCRDAfterAttach pins Bug 91: a
 // successful attach end-to-end must (1) stamp the device's kname on
 // the target StoragePool's `StoragePoolAnnotationAttachedKNames`

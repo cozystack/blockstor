@@ -171,13 +171,6 @@ type UeventNotifier interface {
 	Events() <-chan uevent.Event
 }
 
-// NeedLeaderElection reports that this runnable does NOT need
-// leader election — every satellite must publish its own local
-// PhysicalDevices independently. Leader election would pick one
-// pod to enumerate every node's disks which is structurally
-// wrong (each host's block devices are opaque to peers).
-func (*PhysicalDeviceDiscoveryRunnable) NeedLeaderElection() bool { return false }
-
 // NewPhysicalDeviceDiscoveryRunnableFromConfig is the canonical
 // constructor that builds the runnable from a controllers.Config.
 // Lives here (rather than inline in manager.go) so the assignment
@@ -197,6 +190,13 @@ func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg Config)
 		Uevent:   cfg.UeventListener,
 	}
 }
+
+// NeedLeaderElection reports that this runnable does NOT need
+// leader election — every satellite must publish its own local
+// PhysicalDevices independently. Leader election would pick one
+// pod to enumerate every node's disks which is structurally
+// wrong (each host's block devices are opaque to peers).
+func (*PhysicalDeviceDiscoveryRunnable) NeedLeaderElection() bool { return false }
 
 // Start runs the discovery loop until ctx cancels. Errors during
 // individual scans are logged but never abort the loop — a

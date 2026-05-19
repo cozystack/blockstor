@@ -248,6 +248,55 @@ print(bad)")
             ! linstor_cli resource-definition list --resource-definitions "$rd" 2>/dev/null \
                 | grep -q "$rd"
             ;;
+        vd_size_kib)
+            # Verify VolumeDefinition.size_kib matches expected.
+            # Used by the volume-resize replay catcher to assert each
+            # `linstor vd s` actually mutated the stored size.
+            local rd vol expected actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            vol=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vol',0))" "$spec")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected_kib',0))" "$spec")
+            actual=$(VOL="$vol" linstor_cli --output-fmt=json volume-definition list --resource-definitions "$rd" 2>/dev/null \
+                | python3 -c "import json,sys,os
+try:
+    d=json.load(sys.stdin)
+    while isinstance(d, list) and d and isinstance(d[0], list):
+        d=d[0]
+    for it in d if isinstance(d, list) else []:
+        for v in it.get('vlm_dfns', []) or it.get('volume_definitions', []) or []:
+            if v.get('volume_number', v.get('vlm_nr', -1)) == int(os.environ['VOL']):
+                print(v.get('size_kib', v.get('sizeKib', 0)))
+                sys.exit(0)
+    print(0)
+except Exception:
+    print(0)" 2>/dev/null || echo 0)
+            [[ "$actual" == "$expected" ]]
+            ;;
+        pvc_capacity)
+            # PVC.Status.Capacity matches expected (e.g. "2Gi").
+            # Verifies the operator-visible size propagation through
+            # the CSI external-resizer.
+            local ns pvc expected actual
+            ns=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('namespace','default'))" "$spec")
+            pvc=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('pvc',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            actual=$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.capacity.storage}' 2>/dev/null || echo "")
+            [[ "$actual" == "$expected" ]]
+            ;;
+        pod_md5_invariant)
+            # md5sum of <path> inside <pod> matches expected. Used by
+            # the resize-lifecycle replay to assert data preservation
+            # across grow ops. Caller is expected to have already
+            # captured the baseline md5 at scenario start and threaded
+            # it through {{md5_pre}} substitution.
+            local ns pod path expected actual
+            ns=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('namespace','default'))" "$spec")
+            pod=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('pod',''))" "$spec")")
+            path=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('path',''))" "$spec")
+            expected=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")")
+            actual=$(kubectl -n "$ns" exec "$pod" -- sh -c "md5sum '$path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "")
+            [[ -n "$expected" && "$actual" == "$expected" ]]
+            ;;
         *)
             echo "    unknown assertion kind: $kind" >&2
             return 1
