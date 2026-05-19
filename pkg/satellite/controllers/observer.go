@@ -352,6 +352,49 @@ func parsePeerNodeID(raw string) *int32 {
 	return &id
 }
 
+// peerDeviceVolumeObservation extracts the per-volume sync-stats
+// slice for one peer-device events2 frame. Two paths feed the
+// cache:
+//
+//  1. The frame carries `out-of-sync:<kib>` — kernel-authoritative
+//     progress counter. Surface verbatim via HasSync=true.
+//  2. Bug 329: the frame carries `replication:Established` without
+//     an explicit out-of-sync (kernel only signals state change,
+//     no fresh counter). Synthesise OutOfSyncKib=0 so the merged
+//     cache stops emitting the stale "(NN%)" progress suffix in
+//     the REST view's State column (annotateSyncProgress reads
+//     OutOfSyncKib and short-circuits on <= 0).
+//
+// Why defensive clear on Established instead of trusting a later
+// out_of_sync:0 frame: drbd-9 emits the `replication:Established`
+// change and the final `out-of-sync:0` peer-device frame in
+// non-deterministic order, and the client-side aggregator
+// (python-linstor) snapshots the wire at any moment — without
+// the clear, a reader between the two frames sees stale "(NN%)"
+// on what the kernel already considers a settled replica.
+func peerDeviceVolumeObservation(ev drbd.Event, volNum int32) []volumeObservation {
+	if oosStr, ok := ev.Fields["out-of-sync"]; ok {
+		oos, err := strconv.ParseInt(oosStr, 10, 64)
+		if err == nil {
+			return []volumeObservation{{
+				VolumeNumber: volNum,
+				OutOfSyncKib: oos,
+				HasSync:      true,
+			}}
+		}
+	}
+
+	if ev.Fields["replication"] == drbdStateEstablished {
+		return []volumeObservation{{
+			VolumeNumber: volNum,
+			OutOfSyncKib: 0,
+			HasSync:      true,
+		}}
+	}
+
+	return nil
+}
+
 // translatePeerDeviceEvent extracts the peer-device frame from
 // `drbdsetup events2 --statistics`:
 //
@@ -382,16 +425,8 @@ func translatePeerDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	out := observation{ResourceName: name}
 
-	if oosStr, ok := ev.Fields["out-of-sync"]; ok {
-		oos, parseErr := strconv.ParseInt(oosStr, 10, 64)
-		if parseErr == nil {
-			out.Volumes = []volumeObservation{{
-				VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
-				OutOfSyncKib: oos,
-				HasSync:      true,
-			}}
-		}
-	}
+	//nolint:gosec // drbd-9 volume numbers fit in int32
+	out.Volumes = peerDeviceVolumeObservation(ev, int32(volNum))
 
 	peer := ev.Fields["conn-name"]
 	if peer != "" {
@@ -482,6 +517,16 @@ const (
 	// else (`StandAlone`, `BrokenPipe`, `Connecting`, ...) lands
 	// in the Python CLI's `--faulty` set.
 	drbdStateConnected = "Connected"
+	// drbdStateEstablished is the DRBD-9 per-peer replication-state
+	// token meaning "initial sync drained, replicating live writes".
+	// Distinct from `Connected` (which describes the connection-kind
+	// frame's connection state); `Established` appears on
+	// peer-device frames as the `replication:` field after a
+	// SyncSource/SyncTarget transition completes. Bug 329 keys off
+	// this state to clear cached OutOfSyncKib so the REST view's
+	// `annotateSyncProgress` stops decorating bare UpToDate with a
+	// stale "(NN%)" suffix.
+	drbdStateEstablished = "Established"
 	// drbdRolePrimary is the DRBD-9 role token meaning the
 	// replica is open for write. Maps to ResourceStatus.InUse.
 	drbdRolePrimary = "Primary"

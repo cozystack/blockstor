@@ -2296,3 +2296,240 @@ func TestNormalizeSuspended(t *testing.T) {
 		})
 	}
 }
+
+// TestObserverClearsOutOfSyncOnEstablishedFrame pins Bug 329.
+//
+// Reproduction: a third diskful replica is added to an existing
+// 2-replica RD. The kernel runs through SyncTarget (progress
+// frames carry decreasing `out-of-sync:<kib>`) and finally
+// transitions to `replication:Established`. The final Established
+// frame does NOT carry `out-of-sync` — only the replication state
+// changes.
+//
+// Pre-fix: mergeVolumes only updates the cached OutOfSyncKib when
+// the incoming frame carried HasSync=true. The Established frame
+// has HasSync=false, so the cached OutOfSyncKib from the last
+// SyncTarget progress frame survived. The REST view's
+// annotateSyncProgress decorator then read OutOfSyncKib > 0 and
+// stamped a `(NN%)` suffix onto the bare "UpToDate" — leaving
+// `linstor r l` State stuck on "UpToDate(100%)" indefinitely.
+//
+// Contract: once any peer flips to `replication:Established`, the
+// observer cache must drop OutOfSyncKib to 0 for every volume on
+// that resource. The kernel just told us replication is settled;
+// any non-zero cached progress is by definition stale.
+//
+// Defensive (not "trust the next out_of_sync:0 frame"): events2
+// emits `change resource` and `change peer-device` in
+// non-deterministic order. The client-side aggregator
+// (python-linstor) snapshots the wire at any moment — if it reads
+// between the Established frame and the (later) out_of_sync:0
+// frame, it would still see the stale `(NN%)`. The observer must
+// invariant-clear on Established.
+func TestObserverClearsOutOfSyncOnEstablishedFrame(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// Stage 1: SyncTarget progress frame (50% remaining).
+	syncTargetEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-329",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "node-b",
+			"replication":  "SyncTarget",
+			"out-of-sync":  "524288", // 512 MiB still to ship
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected SyncTarget frame")
+	}
+
+	o.mergeConnections(&syncTargetEv)
+	o.mergeVolumes(&syncTargetEv)
+	o.mergeResource(&syncTargetEv)
+
+	// Stage 2: progress frame (out-of-sync shrinks).
+	progressEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-329",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "node-b",
+			"replication":  "SyncTarget",
+			"out-of-sync":  "1024", // almost done
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected progress frame")
+	}
+
+	o.mergeConnections(&progressEv)
+	o.mergeVolumes(&progressEv)
+	o.mergeResource(&progressEv)
+
+	cached := o.snapshotFor("pvc-329")
+	if len(cached.Volumes) != 1 || cached.Volumes[0].OutOfSyncKib != 1024 {
+		t.Fatalf("stage 2 (progress): want cached OutOfSyncKib=1024, got %+v",
+			cached.Volumes)
+	}
+
+	// Stage 3: Established frame. No `out-of-sync` field — the
+	// kernel just told us replication is settled. Cached
+	// OutOfSyncKib must drop to 0.
+	establishedEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-329",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "node-b",
+			"replication":  "Established",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected Established frame")
+	}
+
+	o.mergeConnections(&establishedEv)
+	o.mergeVolumes(&establishedEv)
+	o.mergeResource(&establishedEv)
+
+	// Stage 4: device-kind frame stamps DiskState=UpToDate (the
+	// kernel's local view; arrives alongside / after Established).
+	uptodateEv, ok := translateDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{
+			"name":   "pvc-329",
+			"volume": "0",
+			"disk":   "UpToDate",
+		},
+	})
+	if !ok {
+		t.Fatalf("translateDeviceEvent rejected UpToDate frame")
+	}
+
+	o.mergeConnections(&uptodateEv)
+	o.mergeVolumes(&uptodateEv)
+	o.mergeResource(&uptodateEv)
+
+	final := o.snapshotFor("pvc-329")
+
+	if len(final.Volumes) != 1 {
+		t.Fatalf("final snapshot: Volumes len=%d, want 1: %+v",
+			len(final.Volumes), final.Volumes)
+	}
+
+	if final.Volumes[0].OutOfSyncKib != 0 {
+		t.Errorf("Bug 329: observer must clear OutOfSyncKib once "+
+			"replication:Established lands; got %d, want 0 "+
+			"(stale OutOfSyncKib makes annotateSyncProgress stamp "+
+			"'UpToDate(NN%%)' on the REST view indefinitely)",
+			final.Volumes[0].OutOfSyncKib)
+	}
+
+	if final.Volumes[0].DiskState != "UpToDate" {
+		t.Errorf("final snapshot: DiskState=%q, want UpToDate",
+			final.Volumes[0].DiskState)
+	}
+
+	if len(final.Connections) != 1 || final.Connections[0].ReplicationState != "Established" {
+		t.Errorf("final snapshot: ReplicationState not Established; "+
+			"got %+v", final.Connections)
+	}
+
+	// SSA payload check: buildObserverVolumeStatus must surface
+	// OutOfSyncKib=0 (the REST view's annotateSyncProgress reads
+	// this and short-circuits when the value is <= 0).
+	out := buildObserverVolumeStatus(&final, "")
+	if len(out) != 1 {
+		t.Fatalf("buildObserverVolumeStatus: got %d entries, want 1: %+v", len(out), out)
+	}
+
+	if out[0].OutOfSyncKib != 0 {
+		t.Errorf("Bug 329: SSA payload OutOfSyncKib=%d, want 0 "+
+			"(annotateSyncProgress in pkg/rest would stamp a stale "+
+			"'(NN%%)' suffix onto State otherwise)", out[0].OutOfSyncKib)
+	}
+}
+
+// TestObserverClearsOutOfSyncMultiVolumeOnEstablished pins the
+// multi-volume slice of Bug 329. An RD with two volumes (vol 0 +
+// vol 1) — both ride a single connection. When replication
+// settles into Established (one frame covers volume 0 only by
+// drbd-9 design), ALL volumes' OutOfSyncKib must drop to 0
+// because the Established state describes the connection-wide
+// replication, not just the frame's named volume. Without the
+// invariant, the operator sees one volume as "UpToDate" and the
+// other as "UpToDate(NN%)" indefinitely.
+func TestObserverClearsOutOfSyncMultiVolumeOnEstablished(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// Two volumes both mid-sync.
+	for _, vol := range []string{"0", "1"} {
+		ev, ok := translatePeerDeviceEvent(drbd.Event{
+			Action: "change",
+			Kind:   eventKindPeerDevice,
+			Fields: map[string]string{
+				"name":         "pvc-329-multi",
+				"peer-node-id": "1",
+				"volume":       vol,
+				"conn-name":    "node-b",
+				"replication":  "SyncTarget",
+				"out-of-sync":  "10000",
+			},
+		})
+		if !ok {
+			t.Fatalf("translatePeerDeviceEvent rejected SyncTarget frame vol=%s", vol)
+		}
+
+		o.mergeConnections(&ev)
+		o.mergeVolumes(&ev)
+		o.mergeResource(&ev)
+	}
+
+	// Established frame on volume 0 — by drbd-9 design, one
+	// frame per (volume, peer); the operator sees the connection
+	// as Established once ALL per-volume peer-device frames have
+	// settled. The observer's invariant: any Established frame on
+	// any volume of this resource means replication is settled at
+	// the connection layer, so clear all per-volume OutOfSyncKib.
+	for _, vol := range []string{"0", "1"} {
+		ev, ok := translatePeerDeviceEvent(drbd.Event{
+			Action: "change",
+			Kind:   eventKindPeerDevice,
+			Fields: map[string]string{
+				"name":         "pvc-329-multi",
+				"peer-node-id": "1",
+				"volume":       vol,
+				"conn-name":    "node-b",
+				"replication":  "Established",
+			},
+		})
+		if !ok {
+			t.Fatalf("translatePeerDeviceEvent rejected Established frame vol=%s", vol)
+		}
+
+		o.mergeConnections(&ev)
+		o.mergeVolumes(&ev)
+		o.mergeResource(&ev)
+	}
+
+	final := o.snapshotFor("pvc-329-multi")
+	if len(final.Volumes) != 2 {
+		t.Fatalf("final snapshot: want 2 volumes, got %d: %+v",
+			len(final.Volumes), final.Volumes)
+	}
+
+	for _, v := range final.Volumes {
+		if v.OutOfSyncKib != 0 {
+			t.Errorf("Bug 329 multi-vol: vol=%d OutOfSyncKib=%d, want 0",
+				v.VolumeNumber, v.OutOfSyncKib)
+		}
+	}
+}
