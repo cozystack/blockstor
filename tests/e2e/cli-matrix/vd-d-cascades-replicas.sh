@@ -121,21 +121,21 @@ rm -f "$err_file"
 # Bug 355 assertion: VD 0 gone, RD + VD 1 still alive
 # =====================================================================
 echo ">> [Bug 355] within 30s: vd l shows only volume 1; rd l still has $RD"
+# Why: blockstor's `--machine-readable volume-definition list` returns the
+# v1 schema (`[[{name, volume_definitions:[{volume_number, ...}]}]]`),
+# not upstream LINSTOR's v0 protobuf shape (`.rsc_dfns / .rsc_name /
+# .vlm_dfns / .vlm_nr`). The v0 filter against v1 data jq-errors with
+# `Cannot index array with string "rsc_dfns"` → 2>/dev/null swallows it
+# → `|| echo "-1"` fires → never converges. Match the existing v1 helpers
+# in tests/e2e/cli-matrix/lib.sh.
 deadline=$(( $(date +%s) + 30 ))
 ok=false
 while (( $(date +%s) < deadline )); do
     nvols=$("${LCTL[@]}" --machine-readable volume-definition list \
         --resource-definitions "$RD" 2>/dev/null \
         | jq -r --arg rd "$RD" '
-            [.[]? | .rsc_dfns[]? | select(.rsc_name==$rd) | .vlm_dfns[]? | .vlm_nr]
+            [.[]? | .[]? | select(.name==$rd) | .volume_definitions[]? | .volume_number]
             | length' 2>/dev/null || echo "-1")
-    # Some apiserver shapes flatten differently. Try a second probe.
-    if [[ "$nvols" == "-1" || -z "$nvols" ]]; then
-        nvols=$("${LCTL[@]}" --machine-readable volume-definition list 2>/dev/null \
-            | jq -r --arg rd "$RD" '
-                [.[]? | .rsc_dfns[]? | select(.rsc_name==$rd) | .vlm_dfns[]? | .vlm_nr]
-                | length' 2>/dev/null || echo "-1")
-    fi
     if [[ "$nvols" == "1" ]]; then
         ok=true
         break
