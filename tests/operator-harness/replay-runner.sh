@@ -52,6 +52,9 @@
 #   - sync_clean           wait until UpToDate without "(NN%)" suffix
 #   - resource_absent      wait until r d takes effect on a node
 #   - rd_absent            wait until rd is gone everywhere
+#   - vd_size_kib          VolumeDefinition.size_kib equals expected_kib
+#   - pvc_capacity         PVC.Status.Capacity.storage matches expected
+#   - pod_md5_invariant    md5sum of file inside pod matches expected baseline
 #
 # Invariants (post-teardown):
 #

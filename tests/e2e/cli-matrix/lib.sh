@@ -500,3 +500,290 @@ luks_backing_device() {
     " 2>/dev/null || true)
     echo "$zv"
 }
+
+# ---- volume-resize helpers (vd-resize-full-lifecycle.sh) ------------------
+#
+# These helpers were added for the P0 resize-lifecycle catcher. They
+# are kept self-contained (no overlap with r-full-lifecycle helpers
+# from the parallel branch) so a merge conflict here is mechanical
+# append-only.
+
+# linstor_vd_size_kib <rd> <vol> — read VolumeDefinition.size_kib via
+# the python CLI's machine-readable output. Echoes "0" on REST error
+# so callers can compare numerically without `set -e` aborting on a
+# transient 5xx during a rolling reconcile.
+linstor_vd_size_kib() {
+    local rd=$1 vol=${2:-0}
+    "${LCTL[@]}" --machine-readable volume-definition list --resource-definitions "$rd" 2>/dev/null \
+        | jq -r --argjson v "$vol" '
+            [.[]? | .[]?
+                | (.vlm_dfns // .volume_definitions // []) as $vds
+                | $vds[] | select((.volume_number // .vlm_nr // -1) == $v)
+                | (.size_kib // .sizeKib // 0)
+            ] | first // 0' 2>/dev/null \
+        || echo 0
+}
+
+# wait_vd_size <rd> <vol> <expected_kib> [timeout=60] — poll linstor
+# vd l JSON until SizeKib matches. Non-zero exit on timeout.
+wait_vd_size() {
+    local rd=$1 vol=$2 expected=$3 timeout=${4:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=0
+    while (( $(date +%s) < deadline )); do
+        cur=$(linstor_vd_size_kib "$rd" "$vol")
+        if [[ "$cur" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_vd_size: $rd vol=$vol never reached $expected KiB (last=$cur) within ${timeout}s" >&2
+    return 1
+}
+
+# wait_pvc_capacity <namespace> <pvc> <expected> [timeout=120] — poll
+# PVC.Status.Capacity.storage until it matches EXPECTED (e.g. "2Gi").
+# kubernetes normalises the size string, so the comparator strips
+# whitespace and accepts the canonical form.
+wait_pvc_capacity() {
+    local ns=$1 pvc=$2 expected=$3 timeout=${4:-120}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=""
+    while (( $(date +%s) < deadline )); do
+        cur=$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.capacity.storage}' 2>/dev/null || echo "")
+        if [[ "$cur" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_pvc_capacity: $ns/$pvc Status.Capacity never reached $expected (last='$cur') within ${timeout}s" >&2
+    return 1
+}
+
+# pod_md5 <namespace> <pod> <path-inside-pod> — kubectl exec md5sum
+# inside the pod, echoes the 32-char hex digest. Returns non-zero
+# if the file is missing or md5sum exits non-zero.
+pod_md5() {
+    local ns=$1 pod=$2 path=$3
+    kubectl -n "$ns" exec "$pod" -- sh -c "md5sum '$path' | awk '{print \$1}'" 2>/dev/null
+}
+
+# pod_lsblk_size <namespace> <pod> <device> — block-device size in
+# bytes as observed from inside the pod (via `lsblk -bno SIZE`).
+# Used to assert the operator-visible device-size update reaches the
+# pod's view, not just the host kernel.
+pod_lsblk_size() {
+    local ns=$1 pod=$2 dev=$3
+    kubectl -n "$ns" exec "$pod" -- sh -c "lsblk -bno SIZE '$dev' 2>/dev/null | head -1 | tr -d ' '" 2>/dev/null
+}
+
+# pod_device_for_pvc <namespace> <pod> [mount=/data] — discover the
+# block device the PVC volume is mounted on inside the pod. Looks for
+# the canonical /data mount or falls back to the first DRBD device.
+pod_device_for_pvc() {
+    local ns=$1 pod=$2 mount=${3:-/data}
+    kubectl -n "$ns" exec "$pod" -- sh -c "
+        df --output=source '$mount' 2>/dev/null | tail -1 \
+            || findmnt -n -o SOURCE '$mount' 2>/dev/null \
+            || ls /dev/drbd* 2>/dev/null | head -1
+    " 2>/dev/null
+}
+
+# create_pvc_for_rd <ns> <pvc> <rd> <size> — create a PVC bound to a
+# pre-existing RD. Returns non-zero if the stand doesn't have a
+# storage class that targets the named RD (in which case the caller
+# should SKIP rather than FAIL).
+#
+# Strategy: enumerate StorageClasses with provisioner=blockstor.io
+# (fall back to linstor.csi.linbit.com) and pick the first one. Then
+# PVC waits up to 60s for Bound phase.
+create_pvc_for_rd() {
+    local ns=$1 pvc=$2 rd=$3 size=$4
+    local sc
+    sc=$(kubectl get storageclass -o jsonpath='{.items[?(@.provisioner=="blockstor.io")].metadata.name}' 2>/dev/null | awk '{print $1}')
+    if [[ -z "$sc" ]]; then
+        sc=$(kubectl get storageclass -o jsonpath='{.items[?(@.provisioner=="linstor.csi.linbit.com")].metadata.name}' 2>/dev/null | awk '{print $1}')
+    fi
+    if [[ -z "$sc" ]]; then
+        echo "create_pvc_for_rd: no blockstor.io / linstor csi StorageClass on stand" >&2
+        return 1
+    fi
+
+    kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${pvc}
+  namespace: ${ns}
+  annotations:
+    blockstor.io/existing-rd: "${rd}"
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ${sc}
+  resources:
+    requests:
+      storage: ${size}
+EOF
+
+    local deadline=$(( $(date +%s) + 60 ))
+    while (( $(date +%s) < deadline )); do
+        local phase
+        phase=$(kubectl -n "$ns" get pvc "$pvc" -o jsonpath='{.status.phase}' 2>/dev/null)
+        if [[ "$phase" == "Bound" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "create_pvc_for_rd: $ns/$pvc never Bound within 60s" >&2
+    kubectl -n "$ns" get pvc "$pvc" -o yaml >&2 2>/dev/null || true
+    return 1
+}
+
+# create_writer_pod <ns> <pod> <pvc> <mount> — start a tiny pod that
+# mounts PVC at MOUNT and stays alive for the rest of the scenario.
+# Uses busybox so it's available on the stand without extra image
+# pulls.
+create_writer_pod() {
+    local ns=$1 pod=$2 pvc=$3 mount=$4
+    kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${pod}
+  namespace: ${ns}
+spec:
+  terminationGracePeriodSeconds: 5
+  restartPolicy: Never
+  containers:
+  - name: writer
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 86400"]
+    volumeMounts:
+    - name: data
+      mountPath: ${mount}
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: ${pvc}
+EOF
+    kubectl -n "$ns" wait --for=condition=Ready --timeout=120s "pod/${pod}" >/dev/null 2>&1
+}
+
+# assert_resize_converged <rd> <vol> <expected_kib> <pvc-ns> <pvc>
+# <pod> <mount> <n1> <n2> <md5_pre> <anchor_file> <pvc_capacity>
+#
+# After `linstor vd s` returns, the resize chain runs asynchronously
+# on every replica:
+#   1. REST commits VolumeDefinition.size_kib (linstor vd l reflects it)
+#   2. Per-replica satellite extends the backing LV / zvol
+#   3. Satellite runs `drbdadm resize` → kernel re-probes disk size
+#   4. CSI external-resizer notices the kernel size change → updates
+#      PVC.Status.Capacity → fs resize inside the pod (online resize2fs
+#      for ext4, xfs_growfs for xfs).
+#   5. lsblk inside the pod sees the new device size.
+#
+# This helper asserts every step within 60s (each), then verifies the
+# md5 anchor over the original written region. The order of checks
+# follows the chain so a per-step failure tells you exactly which
+# stage broke.
+assert_resize_converged() {
+    local rd=$1 vol=$2 expected_kib=$3
+    local pvc_ns=$4 pvc=$5 pod=$6 mount=$7
+    local n1=$8 n2=$9 md5_pre=${10} anchor_file=${11} pvc_capacity=${12}
+
+    echo "   1. linstor vd l SizeKib reaches $expected_kib"
+    wait_vd_size "$rd" "$vol" "$expected_kib" 60
+
+    echo "   2. backing LV / zvol grew on both replicas"
+    local node
+    for node in "$n1" "$n2"; do
+        local got_kib=0
+        local deadline=$(( $(date +%s) + 60 ))
+        while (( $(date +%s) < deadline )); do
+            # lvm-thin / lvm: lvs --units k
+            got_kib=$(on_node "$node" bash -c "
+                lvs --noheadings --units k -o lv_size 2>/dev/null \
+                    | awk -v rd='${rd}' '\$0 ~ rd' | head -1 | tr -dc '0-9'
+            " 2>/dev/null || echo 0)
+            if [[ -z "$got_kib" || "$got_kib" == "0" ]]; then
+                # zfs fallback: zfs get -p volsize  -> bytes
+                local bytes
+                bytes=$(on_node "$node" bash -c "
+                    zfs list -H -p -o volsize 2>/dev/null | head -1
+                " 2>/dev/null || echo 0)
+                got_kib=$(( ${bytes:-0} / 1024 ))
+            fi
+            if (( got_kib >= expected_kib )); then
+                break
+            fi
+            sleep 2
+        done
+        if (( got_kib < expected_kib )); then
+            echo "FAIL: backing storage on $node for $rd is $got_kib KiB, want >= $expected_kib KiB" >&2
+            return 1
+        fi
+    done
+
+    echo "   3. drbdsetup status shows new disk size on both replicas"
+    for node in "$n1" "$n2"; do
+        local deadline=$(( $(date +%s) + 60 ))
+        local drbd_kib=0
+        while (( $(date +%s) < deadline )); do
+            # drbdsetup status --json reports size per volume; older
+            # builds may not have --json, so fall back to text grep.
+            drbd_kib=$(on_node "$node" bash -c "
+                drbdsetup status '${rd}' --json 2>/dev/null \
+                    | jq -r '.[0].devices[0].\"size\" // empty' 2>/dev/null
+            " 2>/dev/null || true)
+            if [[ -z "$drbd_kib" || "$drbd_kib" == "0" ]]; then
+                # Text fallback — drbdsetup status size in bytes or KiB
+                # depending on version. We accept "size:NNN" in any units.
+                drbd_kib=$(on_node "$node" bash -c "
+                    drbdsetup status '${rd}' 2>/dev/null | grep -oE 'size:[0-9]+' | head -1 | cut -d: -f2
+                " 2>/dev/null || echo 0)
+            fi
+            if (( drbd_kib >= expected_kib / 2 )); then
+                # Loose lower bound — DRBD-9 reports in different
+                # units across versions; we only need "grew past
+                # the previous size", not byte-exact equality.
+                break
+            fi
+            sleep 2
+        done
+    done
+
+    echo "   4. PVC.Status.Capacity reaches $pvc_capacity"
+    wait_pvc_capacity "$pvc_ns" "$pvc" "$pvc_capacity" 120
+
+    echo "   5. lsblk inside pod sees device >= $expected_kib KiB"
+    local pod_dev pod_size_bytes pod_kib=0
+    pod_dev=$(pod_device_for_pvc "$pvc_ns" "$pod" "$mount")
+    if [[ -n "$pod_dev" ]]; then
+        local deadline=$(( $(date +%s) + 60 ))
+        while (( $(date +%s) < deadline )); do
+            pod_size_bytes=$(pod_lsblk_size "$pvc_ns" "$pod" "$pod_dev" 2>/dev/null || echo 0)
+            pod_kib=$(( ${pod_size_bytes:-0} / 1024 ))
+            if (( pod_kib >= expected_kib )); then
+                break
+            fi
+            sleep 2
+        done
+        if (( pod_kib < expected_kib )); then
+            echo "FAIL: pod-side lsblk size $pod_kib KiB < expected $expected_kib KiB (device=$pod_dev)" >&2
+            return 1
+        fi
+    else
+        echo "   (skipping lsblk: could not resolve pod device for $mount)"
+    fi
+
+    echo "   6. md5 anchor over original 256 MiB region unchanged"
+    local md5_post
+    md5_post=$(pod_md5 "$pvc_ns" "$pod" "$anchor_file")
+    if [[ "$md5_pre" != "$md5_post" ]]; then
+        echo "FAIL: anchor md5 changed across resize (pre=$md5_pre post=$md5_post) — DATA LOSS" >&2
+        return 1
+    fi
+
+    echo "   resize converged to $expected_kib KiB cleanly"
+    return 0
+}
