@@ -897,3 +897,107 @@ func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
 			witnessCount, post)
 	}
 }
+
+// TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne pins Bug 338:
+// stand-observed, user-reported. Starting from the steady state the
+// auto-witness path creates (2 diskful + 1 TIE_BREAKER), an operator
+// runs `linstor r d <one-of-diskful-nodes> <rd>` — a real delete,
+// not a toggle. The diskful Resource on that node is removed; the
+// reconciler MUST tear down the now-pointless TIE_BREAKER too.
+//
+// Pre-fix, Bug 104's keep-branch fires unconditionally for the
+// (diskful=1, witness present) shape and PRESERVES the witness.
+// That leaves the cluster at 1 diskful + 1 tiebreaker — a 2-voter
+// quorum with no real majority. The tiebreaker is now meaningless
+// (no peer to arbitrate between) and just noise on `linstor r l`.
+//
+// Per upstream LINSTOR CtrlAutoQuorumTask: when diskful count drops
+// below 2 AND there is no user-added diskless that could need a
+// witness to break a tie, tear down the tiebreaker. The single
+// remaining diskful runs with quorum=off (no peer to lose).
+//
+// Distinct from Bug 104 (toggle, NOT delete): Bug 104's path leaves
+// a non-witness diskless behind (1 diskful + 1 user-diskless +
+// 1 witness). The witness still has work to do as a third voter
+// there. Bug 338 has no user-diskless — only the lone diskful and
+// the now-orphaned witness.
+func TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// Steady state: n1 + n2 diskful, n3 TIE_BREAKER. This is what
+	// the production stand reported before the user ran `linstor r d`.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug338", NodeName: "n2",
+	}); err != nil {
+		t.Fatalf("seed n2 diskful: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug338", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed n3 witness: %v", err)
+	}
+
+	// User just ran `linstor r d n1 pvc-bug338`: the REST handler
+	// (or the cascade) already removed the n1 Resource from the
+	// store. The reconciler is now firing on the resulting state.
+	// Snapshot: n2 diskful + n3 tiebreaker.
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug338"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// Bug 338 invariant: the tiebreaker must be gone. Only the lone
+	// diskful Resource on n2 remains.
+	post, err := st.Resources().ListByDefinition(ctx, "pvc-bug338")
+	if err != nil {
+		t.Fatalf("list post-delete: %v", err)
+	}
+
+	if len(post) != 1 {
+		t.Fatalf("Bug 338: replica count = %d, want 1 (single diskful, no orphaned witness); entries=%v",
+			len(post), post)
+	}
+
+	if post[0].NodeName != "n2" {
+		t.Errorf("Bug 338: surviving replica on %s, want n2; entries=%v",
+			post[0].NodeName, post)
+	}
+
+	for _, f := range post[0].Flags {
+		if f == apiv1.ResourceFlagTieBreaker {
+			t.Errorf("Bug 338: surviving replica still carries TIE_BREAKER flag; flags=%v",
+				post[0].Flags)
+		}
+
+		if f == apiv1.ResourceFlagDiskless {
+			t.Errorf("Bug 338: surviving replica should be diskful, has DISKLESS; flags=%v",
+				post[0].Flags)
+		}
+	}
+}

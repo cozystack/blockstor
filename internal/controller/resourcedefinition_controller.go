@@ -263,6 +263,40 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	return r.setQuorum(ctx, rd, quorumPolicy(len(diskful), len(disklessAfter)))
 }
 
+// shouldKeepExistingWitness implements the keep-branch (Bug 104)
+// with the Bug 338 carve-out:
+//
+//   - diskful == 2: keep the witness — it's the third voter the
+//     auto-quorum invariant promises and the upstream LINSTOR
+//     shouldTieBreakerExist contract creates on its own.
+//
+//   - diskful == 1 AND a non-witness diskless is present: this is
+//     the post-`r td --diskless` shape Bug 104 protects. The witness
+//     IS still the third voter (1 diskful + 1 user-diskless + 1
+//     witness = 3 voters); dropping it would freeze the volume on
+//     the next partition.
+//
+//   - diskful == 1 AND NO non-witness diskless: Bug 338. The user
+//     ran `linstor r d <one-of-diskful>` and the witness is now
+//     orphaned. 1 diskful + 1 witness is a 2-voter quorum with no
+//     real majority — collapse the witness so the lone diskful
+//     runs cleanly under quorum=off.
+//
+//   - diskful >= 3: the cluster has a clear majority on its own; the
+//     witness is dead weight.
+func shouldKeepExistingWitness(diskful, nonWitnessDiskless, witnessUnnecessaryDiskfulCount int) bool {
+	if diskful >= witnessUnnecessaryDiskfulCount {
+		return false
+	}
+
+	if diskful == 2 {
+		return true
+	}
+
+	// diskful == 1 — keep only if a non-witness diskless co-exists.
+	return diskful == 1 && nonWitnessDiskless >= 1
+}
+
 // shouldTieBreakerExist decides whether the RD should carry an
 // auto-managed TIE_BREAKER witness. Splits into three complementary
 // branches, all gated on DrbdOptions/AutoAddQuorumTiebreaker
@@ -322,7 +356,7 @@ func shouldTieBreakerExist(
 	const witnessUnnecessaryDiskfulCount = 3
 
 	keepExistingWitness := len(witness) > 0 &&
-		len(diskful) >= 1 && len(diskful) < witnessUnnecessaryDiskfulCount
+		shouldKeepExistingWitness(len(diskful), nonWitnessDiskless, witnessUnnecessaryDiskfulCount)
 
 	// Bug 108: post-toggle race repair. The keep branch above
 	// preserves an existing witness across diskful→diskless; this

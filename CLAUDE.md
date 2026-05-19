@@ -23,6 +23,9 @@ A user-reported CLI bug is **not closed** until ALL of the following land in the
 
 **Before claiming a CLI bug fixed:** run `tests/operator-harness/replay-runner.sh <stand-name> <workflow.yaml>` on the live stand and verify PASS. Local unit tests are not sufficient — the bug repros were operator-CLI level, the fix MUST be validated at operator-CLI level.
 
+- If the fix touches `r c` / `r d` / `r td` / autoplace / tiebreaker paths, `cli-matrix/r-full-lifecycle.sh` MUST be run on stand and green. The lifecycle catcher is the ground-truth gate for that surface (user has reported regressions there 5+ times despite individual bug fixes).
+- If the fix touches `vd s` / volume size / DRBD resize / provider extend paths, `cli-matrix/vd-resize-full-lifecycle.sh` MUST be run on stand and green. The shrink-rejection contract `cli-matrix/vd-shrink-rejected.sh` and the L7 replay `replay/vd-resize-full-lifecycle.yaml` must also pass.
+
 ## Adding a new CLI verb or wire-shape change
 
 1. Refresh `docs/cli-parity-known-deltas.md` with any intentional new divergence (row id, command, delta_kind, accepted_until, why).
@@ -42,7 +45,7 @@ Copy the closest existing YAML and fill:
 - `teardown[]` — cleanup CLI invocations.
 - `invariants[]` — currently only `no_orphans` is implemented.
 
-Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
+Available `await.kind` values: `replica_count`, `disk_state`, `all_uptodate`, `replica_diskless`, `no_tiebreaker`, `sync_clean`, `resource_absent`, `rd_absent`, `vd_size_kib`, `pvc_capacity`, `pod_md5_invariant`. See the header comment of `tests/operator-harness/replay-runner.sh` for the contract.
 
 ## Running the harness
 

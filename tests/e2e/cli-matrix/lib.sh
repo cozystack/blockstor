@@ -192,6 +192,148 @@ wait_conns_ok() {
     wait_connection_state "$1" "$2" "$3" "Connected|Established" "${4:-60}"
 }
 
+# ---- replica-shape helpers (r-full-lifecycle.sh) --------------------------
+#
+# Used by the P0 lifecycle catcher to drive a chain of `r c / r d / r td`
+# verbs and assert each step's expected shape. Designed to be safe against
+# transient REST 5xx during a rolling reconcile (every helper tolerates an
+# empty JSON envelope and returns a sensible default).
+
+# die <msg> — single-line FAIL marker. Caller's `set -e` will already
+# kill the script on first non-zero exit; this is here for the cases
+# where the caller wants an explicit message before bailing.
+die() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
+# linstor_replica_count <rd> — total number of Resource CRDs for this RD,
+# including diskful, diskless, and TIE_BREAKER rows. The cli-matrix
+# cells previously hand-rolled this awk pattern; centralise it.
+linstor_replica_count() {
+    local rd=$1
+    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | awk -v rd="${rd}." '$1 ~ "^"rd {n++} END {print n+0}'
+}
+
+# linstor_diskful_nodes <rd> — bash-array-style line list of node names
+# that carry a diskful replica of $rd: Spec.Flags contains NEITHER
+# DISKLESS NOR TIE_BREAKER. One node per line; the caller does
+# `mapfile -t nodes < <(linstor_diskful_nodes "$rd")` or uses
+# `$(linstor_diskful_nodes "$rd")` for word-splitting.
+linstor_diskful_nodes() {
+    local rd=$1
+    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
+        | while read -r name; do
+            [[ -z "$name" ]] && continue
+            local flags
+            flags=$(kubectl get "resources.blockstor.io.blockstor.io/${name}" \
+                -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
+            if [[ "$flags" != *"DISKLESS"* ]] && [[ "$flags" != *"TIE_BREAKER"* ]]; then
+                # Strip "<rd>." prefix to leave just the node name.
+                echo "${name#${rd}.}"
+            fi
+        done
+}
+
+# linstor_diskful_count <rd> — same as linstor_diskful_nodes | wc -l,
+# but tolerant of leading/trailing whitespace.
+linstor_diskful_count() {
+    local rd=$1
+    linstor_diskful_nodes "$rd" | grep -cv '^$' || echo 0
+}
+
+# linstor_tiebreaker_node <rd> — name of the single node hosting the
+# TIE_BREAKER witness for this RD, or empty string if no tiebreaker
+# row exists. Lifecycle test uses this to pick the relocate target.
+linstor_tiebreaker_node() {
+    local rd=$1
+    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
+        | while read -r name; do
+            [[ -z "$name" ]] && continue
+            local flags
+            flags=$(kubectl get "resources.blockstor.io.blockstor.io/${name}" \
+                -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
+            if [[ "$flags" == *"TIE_BREAKER"* ]]; then
+                echo "${name#${rd}.}"
+                return 0
+            fi
+        done
+}
+
+# linstor_pick_free_node <rd> <exclude...> — pick a satellite node that
+# (a) is one of the WORKER_1..3 nodes discovered by the parent lib.sh
+# AND (b) has no Resource CRD for the given RD AND (c) is not in the
+# EXCLUDE list. Used by the relocate phase to find a fresh target.
+# Echoes the node name or empty string if none qualify.
+linstor_pick_free_node() {
+    local rd=$1
+    shift
+    local excl=("$@")
+    local candidates=("$WORKER_1" "$WORKER_2" "$WORKER_3")
+
+    local n e in_excl has_replica
+    for n in "${candidates[@]}"; do
+        [[ -z "$n" ]] && continue
+        in_excl=0
+        for e in "${excl[@]}"; do
+            if [[ "$n" == "$e" ]]; then
+                in_excl=1
+                break
+            fi
+        done
+        (( in_excl )) && continue
+        # Has a Resource CRD for this RD already?
+        if kubectl get "resources.blockstor.io.blockstor.io/${rd}.${n}" >/dev/null 2>&1; then
+            has_replica=1
+        else
+            has_replica=0
+        fi
+        if (( has_replica == 0 )); then
+            echo "$n"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# wait_replica_count <rd> <expected> [timeout=60] — poll until the total
+# Resource CRD count for $rd equals $expected (diskful + diskless +
+# TIE_BREAKER rows all count). Non-zero exit on timeout. Prints last
+# seen count to stderr.
+wait_replica_count() {
+    local rd=$1 expected=$2 timeout=${3:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=0
+    while (( $(date +%s) < deadline )); do
+        cur=$(linstor_replica_count "$rd")
+        if [[ "$cur" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_replica_count: ${rd} never reached count=${expected} (last=${cur}) within ${timeout}s" >&2
+    return 1
+}
+
+# wait_replica_absent <rd> <node> [timeout=30] — poll until no Resource
+# CRD exists for (rd, node). Used after `linstor r d <node> <rd>` so the
+# next phase can act on a known-clean shape.
+wait_replica_absent() {
+    local rd=$1 node=$2 timeout=${3:-30}
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        if ! kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_replica_absent: ${rd}.${node} still present within ${timeout}s" >&2
+    return 1
+}
+
 # ---- no-orphans invariant -------------------------------------------------
 #
 # After a cli-matrix cell tears down its RD, assert the cluster is

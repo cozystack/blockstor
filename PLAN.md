@@ -1328,6 +1328,42 @@ observer events2 → Status.DiskState` никем не assert'ился end-to-en
       Status.DiskState to Diskless within 30s — L6 cell
       `cli-matrix/r-td-diskless.sh`.
 
+**P0 lifecycle test:** `tests/e2e/cli-matrix/r-full-lifecycle.sh` MUST be green
+on every nightly Run. It exercises the full `r c → r d → r c → relocate →
+r td → r td --diskless` operator script. The user has reported regressions
+in this area five+ times despite individual bug fixes; the lifecycle test is
+the only ground truth. If it goes red, no fix in:
+
+- `pkg/rest/autoplace.go`
+- `internal/controller/resource_controller.go` (ensureTiebreaker)
+- `pkg/satellite/controllers/resource_toggle_disk.go`
+- `pkg/satellite/controllers/observer.go`
+
+may be claimed closed until lifecycle is green again. Companion L7
+artifact: `tests/operator-harness/replay/r-full-lifecycle.yaml`.
+
+**P0 resize lifecycle test:** `tests/e2e/cli-matrix/vd-resize-full-lifecycle.sh`
+MUST be green on every nightly Run. Exercises:
+
+- Initial create + write known data (256 MiB random with md5 anchor inside the pod)
+- Grow via `linstor vd s` (1G → 2G → 4G)
+- Per grow: backing LV / zvol extends on every replica, drbdadm resize
+  fires (drbdsetup status reflects the new size), fs resize inside pod,
+  PVC.Status.Capacity updates, pre-existing md5 anchor unchanged
+- Shrink attempt rejected with structured error (DRBD protocol
+  limitation — meta sits at offset N, shrinking below N destroys it)
+
+If it goes red, no fix in:
+
+- `pkg/rest/volume_definitions.go` (size set + propagate)
+- `pkg/storage/{lvm,zfs}/*.go` (provider resize)
+- `pkg/satellite/reconciler.go` (drbdadm resize trigger)
+- `pkg/satellite/controllers/observer.go` (size status reporting)
+
+may be claimed closed until lifecycle is green again. The negative-path
+companion is `tests/e2e/cli-matrix/vd-shrink-rejected.sh` and the L7
+replay catcher is `tests/operator-harness/replay/vd-resize-full-lifecycle.yaml`.
+
 **Process:**
 
 - Adding a new CLI verb or REST endpoint: **L6 cell required** before merge.
@@ -1395,7 +1431,8 @@ artifacts:
 with `cmd[]`, `expect_exit`, optional `await`), `teardown`, and
 `invariants`. Available `await.kind` values are documented in the
 header of `replay-runner.sh` (replica_count, disk_state, all_uptodate,
-replica_diskless, no_tiebreaker, sync_clean, resource_absent, rd_absent).
+replica_diskless, no_tiebreaker, sync_clean, resource_absent, rd_absent,
+vd_size_kib, pvc_capacity, pod_md5_invariant).
 
 ## Cost control
 

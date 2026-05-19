@@ -1,0 +1,151 @@
+name: r-full-lifecycle
+description: |
+  P0 mandatory catcher for the full Resource lifecycle: r c → r d → r c →
+  relocate → r td → r td --diskless. Mirrors the operator script the user
+  has reported regressions in five+ times. Exercises Bugs 327, 329, 330,
+  338, 339 in one chain.
+
+  Phases:
+    1. autoplace=2 → 2 diskful + auto-tiebreaker (3 rows total)
+    2. r d <diskful> → tiebreaker collapses; r c <same-node> → diskful
+       re-spawn (Bug 327 / 329 / 339 / 338)
+    3. r d + r c on the tiebreaker's old node → relocate, peers Established
+    4. r d every diskful → cluster collapses, 0 diskful left
+    5. r c <node> --diskless → spawn Diskless replica
+    6. r td <node> -s <pool> → flip diskless→diskful, converges UpToDate
+    7. r td --diskless → flip back to Diskless within 30s (Bug 330)
+
+  L6 companion: tests/e2e/cli-matrix/r-full-lifecycle.sh (richer
+  assertions, drbdsetup probe; this YAML covers what the
+  replay-runner.sh assertion-kinds support today).
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  # --- Phase 1: initial autoplace ---
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-autoplace-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  # --- Phase 2: same-node delete + re-create (Bug 338 + 327) ---
+  - name: r-d-node1
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+  - name: r-c-node1-bare
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 120
+
+  # --- Phase 3: relocate to node3 (replace node2) ---
+  - name: r-d-node2
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 60
+  - name: r-c-node3-relocate
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: UpToDate
+      timeout_s: 120
+  - name: wait-sync-clean
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: sync_clean
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  # --- Phase 4: delete every diskful ---
+  - name: r-d-node1-collapse
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+  - name: r-d-node3-collapse
+    cmd: ["resource", "delete", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+
+  # --- Phase 5: re-add as diskless ---
+  - name: r-c-node1-diskless
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+
+  # --- Phase 6: toggle diskless → diskful ---
+  - name: r-td-diskful
+    cmd: ["resource", "toggle-disk", "--storage-pool", "{{sp}}", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+
+  # --- Phase 7: toggle diskful → diskless (Bug 330) ---
+  - name: r-td-diskless-bug330
+    cmd: ["resource", "toggle-disk", "--diskless", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
