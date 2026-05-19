@@ -1247,6 +1247,32 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		}
 	}
 
+	// Bug 327 (P1, recurring — reported 5×): a bare `linstor r c <node>
+	// <rd>` (no `--diskless`, no `--storage-pool`) MUST produce a
+	// DISKFUL replica even when a TIE_BREAKER peer already lives on
+	// another node. The LINSTOR Python CLI posts a ResourceCreate body
+	// with only `resource.node_name` populated — no flags, no
+	// StorPoolName — relying on upstream CtrlRscCrtApiHelper to
+	// resolve the pool from the parent RG's `SelectFilter.StoragePool`
+	// (or a sibling diskful replica) before staging.
+	//
+	// The pre-fix handler persisted the wire body verbatim. The
+	// satellite then saw a Resource with no DISKLESS flag AND no
+	// StorPoolName → dispatcher fell through to `rd.Spec.Props["
+	// StorPoolName"]` (typically empty on RG-spawned RDs) → empty pool
+	// → satellite emitted `disk none;` and the DRBD slot came up
+	// Diskless even though the operator never asked for it.
+	//
+	// Fix: mirror upstream. When the request is a fresh create (Bug 260's
+	// witness-takeover path is the existing-Resource case, handled later
+	// by `createOrPromoteResource`), the new Resource is not explicitly
+	// DISKLESS, and no StorPoolName was pinned, resolve one before the
+	// store Create so the persisted CRD already carries a real pool.
+	// A TIE_BREAKER peer on another node MUST NOT leak its DISKLESS +
+	// TIEBREAKER flags into this spawn — we only stamp StorPoolName,
+	// never copy flags from peers.
+	s.resolveStorPoolForFreshCreate(r.Context(), rdName, &res)
+
 	out, ok := s.createOrPromoteResource(w, r, &res)
 	if !ok {
 		return nil, false
@@ -1611,6 +1637,51 @@ func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNo
 	}
 
 	return rg.SelectFilter.StoragePool, nil
+}
+
+// resolveStorPoolForFreshCreate implements the Bug 327 fix for the
+// fresh-create code path (no existing replica on the target node):
+// when the wire body carries no DISKLESS flag and no StorPoolName,
+// stamp `Spec.Props["StorPoolName"]` from the same fallback chain
+// upstream LINSTOR's CtrlRscCrtApiHelper uses — sibling diskful
+// replica first, parent RG `SelectFilter.StoragePool` second.
+//
+// Bug 327: a TIE_BREAKER peer on another node MUST NOT leak its
+// DISKLESS + TIE_BREAKER flags into a new diskful spawn elsewhere.
+// `r c <node>` with no `--diskless` flag creates a diskful replica
+// regardless of what the existing peers look like — we only mine
+// peers for their StorPoolName, never copy flags.
+//
+// Best-effort throughout. Any lookup failure is swallowed so the
+// downstream `createOrPromoteResource` still runs — its
+// `refuseResourceCreateOnUnknownPool` gate already returns a clean
+// 404 envelope when no pool can be reached at all, and the worst
+// outcome of swallowing is "Resource lands with empty pool" which
+// is the pre-fix status quo, not a regression.
+func (s *Server) resolveStorPoolForFreshCreate(ctx context.Context, rdName string, res *apiv1.Resource) {
+	// Explicit `--diskless` from the operator: honour intent and
+	// never stamp a pool. The dispatcher's diskless branch keeps
+	// `Spec.Props["StorPoolName"]` empty intentionally.
+	if containsResourceFlag(res.Flags, apiv1.ResourceFlagDiskless) {
+		return
+	}
+
+	// Operator pinned a pool with `--storage-pool` — pre-existing
+	// behaviour wins, no resolution needed.
+	if res.Props["StorPoolName"] != "" {
+		return
+	}
+
+	pool, err := s.resolveTakeoverStorPool(ctx, rdName, res.NodeName)
+	if err != nil || pool == "" {
+		return
+	}
+
+	if res.Props == nil {
+		res.Props = map[string]string{}
+	}
+
+	res.Props["StorPoolName"] = pool
 }
 
 // stripDisklessAndWitnessFlags walks `flags` and produces the post-promote
