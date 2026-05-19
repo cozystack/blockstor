@@ -1367,3 +1367,62 @@ func TestPhysicalStorageCreateAcceptsCLIWireShape(t *testing.T) {
 		t.Fatalf("Bug 326 regression: response still mentions 'unknown field': %s", body)
 	}
 }
+
+// TestPhysicalStorageCreateDefaultsWipeToTrue pins Bug 336:
+// `linstor ps cdp` is the operator's explicit "create-device-pool"
+// opt-in — they have already accepted that the satellite will
+// wipe and reuse the device. The REST handler MUST default
+// `Spec.AttachTo.Wipe=true` on the staged PhysicalDevice so the
+// satellite's Attach path runs wipefs + rereadpt before the
+// kind-specific create command. Without this default the
+// satellite trips on stale partition tables from prior failed
+// attempts and the pool stays at `State=Error` forever
+// (real-stand reproduction, e2e2-worker-1 /dev/sda).
+//
+// The Free=False guard at REST already protects against wiping a
+// device that the satellite knows carries signatures — so
+// defaulting Wipe=true here is safe; the only devices that reach
+// `Attach` with Wipe=true are ones discovery has stamped Free=True
+// at the time of the CDP call.
+func TestPhysicalStorageCreateDefaultsWipeToTrue(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/sda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "ZFS",
+			"pool_name": "data",
+			"device_paths": ["/dev/sda"],
+			"with_storage_pool": {"name": "data"}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	got, err := st.PhysicalDevices().Get(t.Context(), "n1-sda")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got.AttachTo == nil {
+		t.Fatalf("Bug 336: AttachTo must be set after `ps cdp`")
+	}
+
+	if !got.AttachTo.Wipe {
+		t.Errorf("Bug 336: REST handler must default AttachTo.Wipe=true for `ps cdp` so satellite cleans stale partition tables before zpool create; got Wipe=%v",
+			got.AttachTo.Wipe)
+	}
+}

@@ -279,3 +279,78 @@ func TestAttachRejectsMissingVG(t *testing.T) {
 		t.Errorf("Attach without VGName for LVM: want error, got nil")
 	}
 }
+
+// TestAttachWipeClearsPartitionTable pins Bug 336: a `Wipe=true`
+// attach against a device that carries a stale partition table
+// (left over from a previous failed pool create) MUST reread the
+// partition table after wipefs so the kernel drops the stale
+// partition devices BEFORE the kind-specific create command runs.
+//
+// Reproduction from the e2e2 stand: /dev/sda had ZFS-style stale
+// partitions (sda1 zfs_member + sda9 zfs_reserved) from a previous
+// `zpool create` attempt. wipefs cleared the GPT signature but the
+// partition device nodes /dev/sda1 + /dev/sda9 persisted in the
+// kernel's partition list. The follow-up `zpool create -f data
+// /dev/sda` then failed with:
+//
+//	cannot label 'sda': failed to detect device partitions on
+//	'/dev/sda1': 19
+//
+// The fix runs `blockdev --rereadpt <device>` after wipefs so the
+// kernel re-reads the now-empty partition table and drops the
+// stale child partition nodes before zpool / pvcreate tries to
+// inspect them. Order matters — running rereadpt before wipefs
+// or after the kind-specific create would still trip the failure.
+func TestAttachWipeClearsPartitionTable(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sda",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "data",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "data",
+			Wipe:            true,
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	wipeIdx := -1
+	rereadIdx := -1
+	createIdx := -1
+
+	for i, line := range calls {
+		switch {
+		case strings.HasPrefix(line, "wipefs --all --force"):
+			wipeIdx = i
+		case strings.HasPrefix(line, "blockdev --rereadpt"):
+			rereadIdx = i
+		case strings.HasPrefix(line, "zpool create"):
+			createIdx = i
+		}
+	}
+
+	if wipeIdx < 0 {
+		t.Fatalf("Bug 336: wipefs missing from attach commands: %v", calls)
+	}
+
+	if rereadIdx < 0 {
+		t.Fatalf("Bug 336: `blockdev --rereadpt` missing — stale partition table will defeat zpool create: %v", calls)
+	}
+
+	if createIdx < 0 {
+		t.Fatalf("Bug 336: zpool create missing: %v", calls)
+	}
+
+	if !(wipeIdx < rereadIdx && rereadIdx < createIdx) {
+		t.Errorf("Bug 336: ordering must be wipefs@%d < rereadpt@%d < zpool create@%d; got calls=%v",
+			wipeIdx, rereadIdx, createIdx, calls)
+	}
+}

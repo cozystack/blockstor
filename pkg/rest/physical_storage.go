@@ -619,6 +619,23 @@ func buildPoolPropsForAttach(attach *apiv1.PhysicalDeviceAttachTo, req *physical
 func buildAttachTo(req *physicalStorageCreateRequest) *apiv1.PhysicalDeviceAttachTo {
 	out := &apiv1.PhysicalDeviceAttachTo{
 		ProviderKind: req.ProviderKind,
+		// Bug 336: `linstor ps cdp` is the operator's explicit
+		// "create-device-pool" opt-in — they have already accepted
+		// the satellite will reuse the device. Default Wipe=true so
+		// the satellite-side Attach path runs wipefs + rereadpt
+		// BEFORE the kind-specific create command, clearing stale
+		// partition tables (and ZFS-style sda1/sda9 leftovers from
+		// prior aborted attempts) that would otherwise defeat
+		// `zpool create` with `failed to detect device partitions
+		// on '/dev/sdaN': 19`. The Free=False guard at the
+		// pickFreeDeviceForAttach step still protects against
+		// wiping a device the satellite knows carries an in-use
+		// signature; defaulting Wipe=true here only affects
+		// devices discovery has stamped Free=True at CDP time.
+		// Mirrors upstream LINSTOR's DevicePoolHandler.createZPool
+		// which relies on `zpool create -f` for the same intent but
+		// does NOT carry a separate Wipe consent flag.
+		Wipe: true,
 	}
 
 	if req.WithStoragePool != nil && req.WithStoragePool.Name != "" {

@@ -104,14 +104,44 @@ func attachDevicePath(dev *apiv1.PhysicalDevice) string {
 }
 
 // wipeDevice runs `wipefs --all --force <device>` to clear
-// every detected on-disk signature. Operators must opt in via
-// `AttachTo.Wipe=true` — without it, a device carrying any
-// signature would otherwise fail the kind-specific create
-// command (`vgcreate` refuses on existing PV signature, etc).
+// every detected on-disk signature, then `blockdev --rereadpt
+// <device>` so the kernel drops any stale partition device
+// nodes left over from a previous pool create. Operators must
+// opt in via `AttachTo.Wipe=true` — without it, a device
+// carrying any signature would otherwise fail the kind-specific
+// create command (`vgcreate` refuses on existing PV signature,
+// etc).
+//
+// Bug 336: wipefs alone clears the GPT/MBR signature on the
+// parent disk but does NOT force the kernel to re-read its
+// partition table. On a device with stale ZFS-style partitions
+// (sda1 zfs_member + sda9 zfs_reserved from an aborted prior
+// attempt), the partition device nodes /dev/sda1 + /dev/sda9
+// persist in the kernel's BLKPG list even after wipefs returns,
+// and the follow-up `zpool create -f data /dev/sda` then fails:
+//
+//	cannot label 'sda': failed to detect device partitions
+//	on '/dev/sda1': 19
+//
+// `blockdev --rereadpt` issues the BLKRRPART ioctl so the
+// kernel drops the now-empty partition table and removes the
+// stale child nodes before the kind-specific create runs.
+// Best-effort — a non-zero exit on a device the kernel can't
+// reread (busy, in use by a peer) is logged via the returned
+// error so the caller can decide whether to bail; for a freshly-
+// wiped CDP target the call is expected to succeed.
 func wipeDevice(ctx context.Context, exec storage.Exec, devicePath string) error {
 	_, err := exec.Run(ctx, "wipefs", "--all", "--force", devicePath)
 	if err != nil {
 		return errors.Wrap(err, "wipefs")
+	}
+
+	// Bug 336: force the kernel to re-read the (now-empty)
+	// partition table so stale /dev/sdaN nodes from prior
+	// attempts disappear before the kind-specific create runs.
+	_, err = exec.Run(ctx, "blockdev", "--rereadpt", devicePath)
+	if err != nil {
+		return errors.Wrap(err, "blockdev --rereadpt")
 	}
 
 	return nil
