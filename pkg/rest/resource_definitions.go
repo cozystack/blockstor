@@ -104,6 +104,15 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 
 			return
 		}
+
+		// Bug 349: `linstor rd l` renders the Layers column from
+		// `layer_data[].type`. The k8s store's `crdToWireRD` projection
+		// persists only Spec.LayerStack (the canonical source of truth
+		// for the composition); without re-synthesising layer_data on
+		// the read path the column collapses to empty. Mirror the same
+		// stamp on the per-RD GET so `linstor rd l --resource-definitions
+		// <name>` and `linstor rd s <name>` agree with the bulk list.
+		stampRDLayerDataFromStack(&rds[i])
 	}
 
 	writeJSON(w, http.StatusOK, rds)
@@ -133,7 +142,51 @@ func (s *Server) handleRDGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 349: re-synthesise layer_data from Spec.LayerStack on the
+	// per-RD GET path, matching the bulk-list handler above. See
+	// stampRDLayerDataFromStack for the projection rules.
+	stampRDLayerDataFromStack(&rd)
+
 	writeJSON(w, http.StatusOK, rd)
+}
+
+// stampRDLayerDataFromStack populates rd.LayerData from rd.LayerStack
+// when the wire field is empty. Bug 349 fix: the k8s store's
+// `crdToWireRD` projection persists only Spec.LayerStack (the canonical
+// source of truth), so the read-side rd.LayerData arrived empty and the
+// python-linstor CLI's `rd l` Layers column — which `,`-joins
+// `layer_data[].type` — rendered as blank. Synthesising the flat
+// `[{type:"DRBD"}, {type:"STORAGE"}]` array from the stored stack on
+// the wire boundary keeps the column populated without round-tripping
+// a redundant copy through every CRD.
+//
+// When rd.LayerStack itself is empty, fall back to the upstream LINSTOR
+// default (`DRBD,STORAGE`) — `inheritLayerStackFromRG` doesn't reach
+// pre-existing RDs created before the inheritance fix, and the CLI
+// would still render an empty cell for them otherwise.
+//
+// Idempotent: a non-nil rd.LayerData (e.g. populated by a future
+// satellite-side enrichment) is left untouched.
+func stampRDLayerDataFromStack(rd *apiv1.ResourceDefinition) {
+	if rd == nil {
+		return
+	}
+
+	if len(rd.LayerData) > 0 {
+		return
+	}
+
+	stack := rd.LayerStack
+	if len(stack) == 0 {
+		stack = apiv1.DefaultLayerStack()
+	}
+
+	out := make([]apiv1.ResourceLayer, 0, len(stack))
+	for _, kind := range stack {
+		out = append(out, apiv1.ResourceLayer{Type: kind})
+	}
+
+	rd.LayerData = out
 }
 
 // stampRDEffectiveProps populates rd.EffectiveProps with the merged
