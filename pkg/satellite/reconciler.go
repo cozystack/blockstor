@@ -1178,6 +1178,21 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// inside observeForFsm; no retries, no failures bubble up here.
 	r.logFsmShadow(ctx, dr, diskless)
 
+	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
+	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
+
+	// tearDownRemovedPeers MUST run before the FSM dispatch block:
+	// it reads the OLD .res to resolve node-ids for peers that have
+	// departed from the spec, and then issues del-peer / forget-peer
+	// for each one. The FSM dispatch's renderResFile preamble (Phase
+	// 11.2.c Stage 4 step 1) overwrites .res with the new peer set,
+	// so this tear-down step must observe the pre-render state to
+	// avoid leaking kernel connections and on-disk GI slots.
+	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
+	if err != nil {
+		return err
+	}
+
 	// Phase 11.2.c Stage 3d: shadow-dispatch every FSM action. Each
 	// helper is content-idempotent — the legacy chain below will
 	// re-run the same logic later in this Apply pass and detect that
@@ -1187,6 +1202,13 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// Stage 4 will retire the legacy chain once the metric shows
 	// every transition has been FSM-dispatched in steady state for
 	// a full burnin window.
+	//
+	// Phase 11.2.c Stage 4 step 1: the FSM dispatch path now owns
+	// renderResFile (legacy unconditional call below has been
+	// retired). dispatchFsmAction invokes renderResFile as a preamble
+	// for every action that consumes .res (createMd, up, adjust,
+	// adjustSkipDisk), and the ActionRenderRes arm continues to
+	// handle the cold-start PhaseUnprovisioned case.
 	{
 		obs := r.observeForFsm(ctx, dr, diskless)
 		phase := ObservePhase(obs)
@@ -1197,9 +1219,6 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 			fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)
 		}
 	}
-
-	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
-	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
 	// firstActivation is "did create-md succeed previously?" —
 	// Phase 11.3 Stage 1 derives this from the
@@ -1221,14 +1240,18 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	_, statErr := os.Stat(mdMarkerPath)
 	firstActivation := !dr.GetMetadataCreated() && os.IsNotExist(statErr)
 
-	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
-	if err != nil {
-		return err
-	}
-
-	if err := r.renderResFile(ctx, dr, devices); err != nil {
-		return err
-	}
+	// Phase 11.2.c Stage 4 step 1: legacy r.renderResFile call retired.
+	// Why: the FSM shadow-dispatch above now owns renderRes — it
+	// observes Phase==Unprovisioned (cold start) and dispatches
+	// r.renderResFile through ActionRenderRes, and for every later
+	// phase (MetadataPending / MetadataReady / Running) the dispatch
+	// runs renderResFile as a preamble inside dispatchFsmAction
+	// before the phase-specific action. The helper's Bug-315 content-
+	// idempotent write guarantees no churn on converged state.
+	// Removing the duplicate call here drops the idempotent
+	// stat+compare overhead one Apply pass spent twice. Other
+	// transitions (createMd, up, adjust) still run their legacy path
+	// below; those legacy gates retire one-by-one in step 2-4.
 
 	// Bug 319 (root-cause fix for Bug 303): probe BEFORE any bring-up
 	// verbs whether the local kernel slot is `disk:Diskless client:yes`

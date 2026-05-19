@@ -345,3 +345,128 @@ func TestFsmShadowAgreeCountIncrementsPerAction(t *testing.T) {
 		t.Errorf("renderRes:fsm-dispatched delta after first Apply = %d, want >= 1 (FSM did not dispatch renderRes)", got)
 	}
 }
+
+// TestApplyDRBDRendersResViaFsmDispatchOnly pins the Phase 11.2.c
+// Stage 4 step 1 contract: the FSM dispatch path is the sole writer
+// of the .res file. After the legacy unconditional r.renderResFile
+// call inside applyDRBD was retired, the dispatch path must still
+// observe peer-list drift on a subsequent Apply pass (PhaseRunning
+// with a fresh peer added to the spec) and rewrite the .res through
+// the renderResFile preamble inside dispatchFsmAction.
+//
+// A regression that gated renderResFile only on PhaseUnprovisioned
+// (cold start) would leave the .res stale on every Running pass
+// after the first one — peer additions / removals would never reach
+// drbdadm adjust, kernel state would diverge from spec, and the
+// e2e replica-add scenarios would flake.
+func TestApplyDRBDRendersResViaFsmDispatchOnly(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// adjustResource's runAdjust probes HasDisklessVolume via drbdsetup
+	// status; report a steady-state UpToDate volume so the SkipDisk
+	// coercion stays off and the bare `drbdadm adjust` arm runs.
+	fx.Expect("drbdsetup status --verbose pvc-stage4-step1-drift", storage.FakeResponse{
+		Stdout: []byte(`pvc-stage4-step1-drift node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-stage4-step1-drift_00000 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:          drbd.NewAdm(fx),
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr, devices := dispatchFixtureDR("pvc-stage4-step1-drift")
+
+	// Seed an OLD .res with the original single-peer layout so the
+	// drift case has something to overwrite. renderResFile is the
+	// authoritative writer, so this seed is also the canonical body
+	// for the initial peer set.
+	if err := rec.renderResFile(context.Background(), dr, devices); err != nil {
+		t.Fatalf("seed renderResFile: %v", err)
+	}
+
+	resPath := filepath.Join(dir, "pvc-stage4-step1-drift.res")
+
+	seeded, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("read seeded .res: %v", err)
+	}
+
+	// Simulate peer-list drift: spec now adds n3 with a fresh
+	// peer.* option bag. The FSM dispatch's renderResFile preamble
+	// inside dispatchFsmAction MUST rewrite the .res body so the
+	// new peer block lands on disk before the phase-specific action
+	// (createMd / up / adjust) runs.
+	dr.Peers = append(dr.Peers, "n3")
+	dr.DrbdOptions["peer.n3.address"] = "10.0.0.3"
+	dr.DrbdOptions["peer.n3.node-id"] = "2"
+	dr.DrbdOptions["peer.n3.port"] = "7000"
+
+	// Observation for PhaseRunning: spec exists, .res seeded,
+	// metadata stamped, kernel slot loaded. The FSM picks
+	// ActionAdjust for this shape. The Stage 4 step 1 preamble
+	// MUST still freshen the .res even though the dispatched action
+	// is adjust, not renderRes.
+	obs := Observation{
+		SpecHasResource: true,
+		ResFileExists:   true,
+		MetadataExists:  true,
+		KernelLoaded:    true,
+	}
+
+	if err := rec.dispatchFsmAction(context.Background(), dr, devices, ActionAdjust, obs); err != nil {
+		t.Fatalf("dispatchFsmAction(ActionAdjust): %v", err)
+	}
+
+	got, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("read drift .res: %v", err)
+	}
+
+	if string(got) == string(seeded) {
+		t.Fatalf(".res not refreshed by FSM dispatch preamble on drift; body matches pre-drift seed (peer n3 missing)")
+	}
+
+	if !strings.Contains(string(got), "on n3 {") {
+		t.Errorf("drift .res missing peer n3 block — preamble did not rewrite:\n%s", got)
+	}
+}
+
+// TestDispatchFsmActionNoopSkipsRenderPreamble pins the negative
+// side of the Stage 4 step 1 contract: ActionNoop and
+// ActionDecommission MUST NOT trigger the renderResFile preamble.
+// Noop callers expect a literal no-op (any disk write would be a
+// regression on the FSM's quiescent contract), and Decommission is
+// the delete path — re-rendering a .res while the resource is
+// being torn down would race the satellite's DeleteResource
+// cleanup of state-dir files.
+func TestDispatchFsmActionNoopSkipsRenderPreamble(t *testing.T) {
+	dir := t.TempDir()
+	rec := NewReconciler(ReconcilerConfig{
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr, devices := dispatchFixtureDR("pvc-stage4-step1-noop")
+	obs := Observation{SpecHasResource: true}
+
+	for _, action := range []string{ActionNoop, ActionDecommission} {
+		err := rec.dispatchFsmAction(context.Background(), dr, devices, action, obs)
+		if err != nil {
+			t.Errorf("dispatchFsmAction(%s): %v", action, err)
+		}
+
+		resPath := filepath.Join(dir, "pvc-stage4-step1-noop.res")
+		if _, statErr := os.Stat(resPath); statErr == nil {
+			t.Errorf("action %s wrote .res via preamble; expected no-op", action)
+
+			_ = os.Remove(resPath)
+		}
+	}
+}

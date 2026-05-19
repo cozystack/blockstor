@@ -45,7 +45,38 @@ import (
 // to mirror the legacy `firstActivation && !diskless && !MdExists`
 // invariant — defense-in-depth in case the FSM lookup ever drifts
 // from the legacy gate ordering.
+//
+// Phase 11.2.c Stage 4 step 1: renderResFile is invoked as a
+// preamble for every action that needs an up-to-date .res on disk
+// (createMd, up, adjust, adjustSkipDisk). This makes the FSM
+// dispatch the sole writer of .res — the legacy unconditional
+// renderResFile call inside applyDRBD's body has been retired.
+// renderResFile is content-idempotent (Bug 315), so a no-op preamble
+// pass when content is unchanged is a single stat+compare with no
+// mtime bump. The ActionRenderRes arm still exists for the cold-
+// start path where it is the only action (PhaseUnprovisioned →
+// MetadataPending). Decommission and Noop deliberately skip the
+// preamble: Decommission is delete-path territory (no need to
+// freshen .res for a resource being torn down) and Noop must remain
+// a true no-op.
 func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, action string, obs Observation) error {
+	// Phase 11.2.c Stage 4 step 1: renderResFile preamble for every
+	// action that consumes the .res file (createMd reads it via
+	// drbdadm dump-md; up/adjust/adjustSkipDisk re-load it into the
+	// kernel). The legacy unconditional renderResFile call inside
+	// applyDRBD's body has been retired — this preamble takes over
+	// that role and makes the FSM dispatch the sole writer of .res.
+	// renderResFile is content-idempotent (Bug 315) so the preamble
+	// is a stat+compare no-op when the rendered body already matches
+	// what is on disk. Skipped for Decommission (delete-path) and
+	// Noop (must remain a true no-op).
+	switch action {
+	case ActionCreateMd, ActionUp, ActionAdjust, ActionAdjustSkipDisk:
+		if err := r.renderResFile(ctx, dr, devices); err != nil {
+			return err
+		}
+	}
+
 	switch action {
 	case ActionRenderRes:
 		return r.renderResFile(ctx, dr, devices)
