@@ -107,10 +107,14 @@ echo ">> pick first free /dev/sdX on $NODE from linstor ps l"
 # and never crash on a stand whose disks are all already attached.
 DEV=$("${LCTL[@]}" --machine-readable physical-storage list 2>/dev/null \
     | jq -r --arg n "$NODE" '
-        ( .[]? // empty )
-        | .nodes[$n][]?
-        | .device // empty
-        | select(test("^/dev/sd[a-z]+$"))' \
+        # Why: golinstor wraps result in `[[{...}, {...}]]` (double
+        # array). Flatten with `.[]?[]?` so each inner element is an
+        # object {size, rotational, nodes:{<node>:[{device,...}]}}.
+        # Add try/catch around .nodes index to skip non-conforming
+        # entries without aborting the whole expression.
+        .[]?[]?
+        | try (.nodes[$n][]?.device) catch empty
+        | select(. != null and test("^/dev/sd[a-z]+$"))' \
     | head -1)
 if [[ -z "$DEV" ]]; then
     echo "SKIP: no free /dev/sdX on $NODE in linstor ps l (already all attached or no spare disks on stand)"
