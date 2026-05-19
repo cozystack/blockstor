@@ -1791,78 +1791,64 @@ func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) boo
 	return false
 }
 
-// runApplyDRBDVerb is the per-reconcile dispatch between the two
-// bring-up branches. First activation falls through to the SkipDisk-
-// aware `drbdadm adjust` (or `adjust --skip-disk`): the .res +
-// freshly-created metadata are the canonical bring-up path on master
-// and existing tests pin that behaviour. The kernel-state probe +
-// `drbdadm up` fallback (Bug 47 / scenario 5.32) only matters on
-// steady-state passes where an operator may have torn the kernel
-// slot down out-of-band — adjust on an absent slot fails with
-// `(158) Unknown resource` and the resource stays down forever.
+// runApplyDRBDVerb is the per-reconcile dispatch for the bring-up
+// chain. First activation falls through to the SkipDisk-aware
+// `drbdadm adjust` (or `adjust --skip-disk`): the .res + freshly-
+// created metadata are the canonical bring-up path on master and
+// existing tests pin that behaviour. Bug 319 (diskless→diskful
+// flip) also routes through this arm via `diskfulFlip=true` so the
+// compare_volume attach_cmd schedule has a chance to fire on a
+// freshly re-stamped lower disk — even though firstActivation is
+// false on the flip (metadata pre-existed from the diskless slot).
+//
+// The historical steady-state arm (`runBringUpOrAdjust` — kernel-
+// state probe + `drbdadm up` / `drbdadm adjust` dispatch) has been
+// retired in Phase 11.2.c Stage 4 step 3. The FSM shadow-dispatch
+// at the top of applyDRBD now owns ActionAdjust / ActionAdjust
+// SkipDisk for every non-firstActivation, non-flip pass. See the
+// inline Why-comment on the steady-state branch below.
 //
 // Split out of applyDRBD so the orchestration function stays under
 // the gocyclo budget.
 func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredResource, firstActivation, diskfulFlip bool) error {
-	if firstActivation {
+	// Bug 319 flip stays on the legacy adjustResource call until step
+	// 4 (retire createMetadata legacy) lands and the FSM owns the
+	// flip transition end-to-end. The flip routes here with
+	// firstActivation=false (metadata pre-existed from the diskless
+	// slot) but still needs `drbdadm adjust` to fire so drb-utils'
+	// compare_volume schedules attach_cmd on the freshly re-stamped
+	// lower disk. The diskfulFlip=true argument suppresses the Bug
+	// 280 kernel-Diskless → --skip-disk coercion inside runAdjust so
+	// the attach can land.
+	if firstActivation || diskfulFlip {
 		return r.adjustResource(ctx, dr, diskfulFlip)
 	}
 
-	return r.runBringUpOrAdjust(ctx, dr, diskfulFlip)
-}
-
-// runBringUpOrAdjust probes the kernel for the resource's slot via
-// `drbdsetup status <rsc>` and dispatches `drbdadm adjust` (or
-// `adjust --skip-disk` when SkipDisk is enabled, scenario 5.11) on
-// a loaded slot. The historical `!loaded → drbdadm up` arm has been
-// retired (Phase 11.2.c Stage 4 step 2) — see the inline Why-comment
-// below for the FSM dispatch path that now owns that case.
-//
-// Why this matters (Bug 47 / scenario 5.32): an operator's
-// `drbdadm down <rsc>` removes the kernel slot but leaves the
-// satellite's `.md-created` marker on disk. Without an explicit
-// `drbdadm up` path, every subsequent reconcile would retry
-// `drbdadm adjust` → `drbdsetup new-path` → `(158) Unknown resource`
-// forever and the resource would stay down until the satellite pod
-// restarts. The FSM shadow-dispatch at the top of applyDRBD now
-// observes Phase==MetadataReady (MetadataExists && !KernelLoaded)
-// and dispatches `ActionUp` → `r.bringUpResource` BEFORE this
-// function runs, closing that operator-down recovery loop.
-//
-// IsLoaded's "genuine" error path (unexpected exec failure, not
-// the resource-absent signal) is bubbled up: we'd rather surface
-// a satellite-side failure than guess wrong and run the wrong
-// verb against half-known kernel state.
-func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredResource, diskfulFlip bool) error {
-	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "probe kernel state for %s", dr.GetName())
-	}
-
-	if !loaded {
-		// Phase 11.2.c Stage 4 step 2: legacy r.bringUpResource call retired.
-		// Why: the FSM shadow-dispatch at the top of applyDRBD now owns
-		// ActionUp — when Phase==MetadataReady && KernelLoaded==false, the
-		// FSM dispatch invokes r.bringUpResource (with the renderResFile
-		// preamble landed in Stage 4 step 1 to keep .res fresh before the
-		// up). drbdadm up is naturally idempotent (already-loaded resources
-		// return success), so the previous double-fire was harmless but
-		// redundant. By the time runBringUpOrAdjust reaches this branch,
-		// the FSM has either:
-		//   (a) brought the kernel up successfully on this Apply pass (the
-		//       common case — but `loaded` here was probed BEFORE dispatch
-		//       fired, so the cached read may still see false; the next
-		//       reconcile observes the now-loaded slot and routes to
-		//       adjust), or
-		//   (b) errored out before runApplyDRBDVerb runs at all (dispatch
-		//       returns the error, applyDRBD bubbles up, we never get here).
-		// Step 3 will retire adjustResource; step 4 will retire createMd.
-		// Bug-287 `(158) Unknown resource` fallback inside runAdjust stays:
-		// distinct error-recovery path, not first-load.
-		return nil
-	}
-
-	return r.adjustResource(ctx, dr, diskfulFlip)
+	// Phase 11.2.c Stage 4 step 3: legacy runBringUpOrAdjust /
+	// r.adjustResource call retired on the steady-state arm.
+	//
+	// Why: the FSM shadow-dispatch at the top of applyDRBD owns
+	// ActionAdjust / ActionAdjustSkipDisk. The renderResFile preamble
+	// inside dispatchFsmAction's adjust arm (Stage 4 step 1) ensures
+	// .res is current before drbdadm adjust runs, so kernel state
+	// matches the declarative spec without a second pass through this
+	// site.
+	//
+	// drbdadm adjust is the canonical "make kernel match .res" verb —
+	// naturally idempotent (Bug-287 fallback inside runAdjust still
+	// re-attempts via drbdadm up on `(158) Unknown resource`). We do
+	// not add any additional closed-loop recovery here; DRBD-9's own
+	// resync / auto-promote logic owns post-adjust convergence, and
+	// the Bug 47 / scenario 5.32 operator-down recovery loop is
+	// closed by the FSM's Phase==MetadataReady → ActionUp transition
+	// (retired in step 2) which observes the unloaded slot ahead of
+	// any adjust attempt.
+	//
+	// Step 4 (retire createMetadata legacy) is the final step and
+	// will also collapse the firstActivation + diskfulFlip arms
+	// above into FSM dispatch once the ActionCreateMd → ActionAdjust
+	// transition is wired for the flip phase.
+	return nil
 }
 
 // bringUpResource runs `drbdadm up <name>` to load the kernel slot
@@ -1968,8 +1954,8 @@ func (r *Reconciler) adjustResource(ctx context.Context, dr *intent.DesiredResou
 // pre-Bug-280 behaviour) so a transient netlink hiccup doesn't
 // strand the reconciler.
 //
-// Bug 287 / scenario 5.32 race: even when the `runBringUpOrAdjust`
-// kernel probe reads as "loaded" (or when this path runs on first
+// Bug 287 / scenario 5.32 race: even when the FSM `KernelLoaded`
+// observation reads as true (or when this path runs on first
 // activation), the kernel slot can be torn down between the probe
 // and the `drbdadm adjust` shell-out — that's the half-torn window
 // right after an operator's `drbdadm down` finishes its kernel-side

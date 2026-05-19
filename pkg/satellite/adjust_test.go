@@ -18,6 +18,8 @@ package satellite
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -155,5 +157,125 @@ func TestAdjustResourceBareWithoutSkipDisk(t *testing.T) {
 	if slices.Contains(cmds, skipDiskCmd) {
 		t.Errorf("no SkipDisk signal: %q must not run (would suppress legitimate attach); got %v",
 			skipDiskCmd, cmds)
+	}
+}
+
+// TestApplyDRBDAdjustsViaFsmDispatchOnly pins Phase 11.2.c Stage 4
+// step 3: when applyDRBD runs against a loaded kernel slot, drbdadm
+// adjust fires exactly once — through FSM dispatch, not through a
+// legacy call inside runBringUpOrAdjust. The legacy path was removed
+// in Stage 4 step 3 (this commit).
+//
+// Observation shape: SpecHasResource=true, ResFileExists=true,
+// MetadataExists=true, KernelLoaded=true — Phase==Running. FSM picks
+// ActionAdjust. dispatchFsmAction runs renderResFile preamble (Stage
+// 4 step 1) + adjustResource. The legacy runApplyDRBDVerb's
+// !firstActivation arm is now a documented no-op (the firstActivation
+// arm still routes through adjustResource for Bug 319 — step 4 will
+// retire that), so the only `drbdadm adjust <name>` shell-out comes
+// from the FSM dispatch on a steady-state pass.
+//
+// A regression that re-added the legacy adjustResource call inside
+// runApplyDRBDVerb's !firstActivation branch would surface as TWO
+// `drbdadm adjust` calls on the same Apply pass.
+func TestApplyDRBDAdjustsViaFsmDispatchOnly(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:          drbd.NewAdm(fx),
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-stage4-step3-adjust",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+	devices := map[int32]string{0: "/dev/vg/pvc-stage4-step3-adjust_00000"}
+
+	// Seed a .res file so the FSM preamble's stat+compare path is
+	// covered (content-idempotent overwrite is a no-op when bodies
+	// match — Bug 315).
+	if err := rec.renderResFile(context.Background(), dr, devices); err != nil {
+		t.Fatalf("seed renderResFile: %v", err)
+	}
+
+	// Sanity check: the seeded .res is on disk before dispatch.
+	resPath := filepath.Join(dir, "pvc-stage4-step3-adjust.res")
+	if _, err := os.Stat(resPath); err != nil {
+		t.Fatalf("seeded .res missing: %v", err)
+	}
+
+	// Kernel reports the local volume as UpToDate — healthy
+	// steady-state. HasDisklessVolume returns false, so adjustResource
+	// falls through to bare `drbdadm adjust`.
+	fx2 := storage.NewFakeExec()
+	fx2.Expect("drbdsetup status --verbose pvc-stage4-step3-adjust", storage.FakeResponse{
+		Stdout: []byte(`pvc-stage4-step3-adjust node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-stage4-step3-adjust_00000 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+	rec.cfg.Adm = drbd.NewAdm(fx2)
+
+	// Phase==Running observation shape: spec present, .res on disk,
+	// metadata stamped, kernel slot loaded. NextTransition MUST return
+	// ActionAdjust for this shape (no SkipDisk prop, KernelLoaded);
+	// assert that here so a future FSM-table drift surfaces in this
+	// test rather than only downstream in the dispatch counter.
+	obs := Observation{
+		SpecHasResource: true,
+		ResFileExists:   true,
+		MetadataExists:  true,
+		KernelLoaded:    true,
+	}
+
+	phase := ObservePhase(obs)
+	if phase != PhaseRunning {
+		t.Fatalf("ObservePhase: got %q, want %q", phase, PhaseRunning)
+	}
+
+	next := NextTransition(phase, obs)
+	if next == nil || next.Action != ActionAdjust {
+		got := "nil"
+		if next != nil {
+			got = next.Action
+		}
+
+		t.Fatalf("NextTransition: got action %q, want %q", got, ActionAdjust)
+	}
+
+	if err := rec.dispatchFsmAction(context.Background(), dr, devices, ActionAdjust, obs); err != nil {
+		t.Fatalf("dispatchFsmAction(ActionAdjust): %v", err)
+	}
+
+	// Exactly ONE `drbdadm adjust <name>` MUST land on the FakeExec.
+	// More than one would mean the legacy adjustResource call inside
+	// runApplyDRBDVerb's !firstActivation arm was re-introduced (or a
+	// regression caused the dispatch to double-fire).
+	wantAdjust := "drbdadm adjust pvc-stage4-step3-adjust"
+	adjustCount := 0
+
+	for _, line := range fx2.CommandLines() {
+		if line == wantAdjust {
+			adjustCount++
+		}
+	}
+
+	if adjustCount != 1 {
+		t.Errorf("got %d %q calls, want exactly 1; calls=%v",
+			adjustCount, wantAdjust, fx2.CommandLines())
 	}
 }
