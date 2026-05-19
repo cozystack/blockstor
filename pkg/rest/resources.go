@@ -341,6 +341,17 @@ type rdFaultyStats struct {
 // the two halves of `?faulty=true`.
 const diskStateUpToDate = "UpToDate"
 
+// replicationStateSyncSource / replicationStateSyncTarget are the
+// two transient drbd-9 replication-state tokens promoted to literal
+// State-column values by Bug 348. Constants because the literal is
+// used both in the activeSyncReplicationState gate and as the
+// returned override token — one source of truth keeps the gate and
+// the rendered output from ever disagreeing.
+const (
+	replicationStateSyncSource = "SyncSource"
+	replicationStateSyncTarget = "SyncTarget"
+)
+
 // aggregateRDStats walks the flat per-replica resource list and
 // folds each entry into its parent-RD bucket. The Python CLI's
 // `--faulty` semantics work at RD granularity — "is this resource
@@ -502,6 +513,21 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 // users see e.g. `Inconsistent(45%)` instead of a stale `Inconsistent`
 // label that gives no progress feedback. UpToDate replicas are left
 // alone since the suffix would just be `(100%)`.
+//
+// Bug 348: when ANY peer's replication state is `SyncSource` or
+// `SyncTarget`, upstream LINSTOR's State column renders the literal
+// replication-state name — `SyncSource` on the source side,
+// `SyncTarget` on the target side — sourced directly from drbdsetup
+// events2's replication_state field. The operator-facing signal is
+// "this replica is actively sending / receiving data"; collapsing it
+// to `UpToDate(NN%)` (source) or `Inconsistent(NN%)` (target) hides
+// the directionality. Bug 331 closed Connecting / NetworkFailure
+// column shapes but missed the SyncSource / SyncTarget pair — this
+// override closes the gap. Only the SyncSource / SyncTarget pair is
+// promoted to a literal name; other replication states
+// (PausedSync*, VerifyS/T, Ahead, Behind, Off, WFBitMap*) fall
+// through to the legacy `(NN%)` annotation so existing progress
+// feedback is preserved.
 func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1.Volume {
 	if len(volumes) == 0 {
 		return volumes
@@ -511,6 +537,20 @@ func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1
 	copy(out, volumes)
 
 	for i := range out {
+		if syncLiteral := activeSyncReplicationState(out[i].State.ReplicationStates); syncLiteral != "" {
+			// Upstream-shaped State: literal replication-state token,
+			// no `(NN%)` suffix. Mirrors Java LINSTOR's behaviour
+			// where the replication_state wins over disk_state during
+			// the SyncSource / SyncTarget transient window. Once the
+			// peer reports `Established`, ReplicationStates carries
+			// Established (or no SyncSource / SyncTarget entry), and
+			// the loop falls through to the disk_state path below —
+			// so the column collapses cleanly back to `UpToDate`.
+			out[i].State.DiskState = syncLiteral
+
+			continue
+		}
+
 		size := sizes[out[i].VolumeNumber]
 		if size <= 0 || out[i].State.OutOfSyncKib <= 0 || out[i].State.DiskState == "" {
 			continue
@@ -522,6 +562,42 @@ func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1
 	}
 
 	return out
+}
+
+// activeSyncReplicationState returns `SyncSource` or `SyncTarget`
+// when at least one peer in the per-peer ReplicationStates map
+// reports one of those tokens. Returns the empty string when no
+// peer is actively syncing — the legacy `(NN%)` annotation path
+// then takes over. Source wins over target when both are present
+// in the same map (3+ replica topology where one peer is mid-sync
+// to us and another is mid-sync from us — vanishingly rare in
+// practice, but the deterministic preference keeps the column
+// stable across calls). Only `SyncSource` and `SyncTarget` qualify
+// here; PausedSync* / VerifyS/T / Ahead / Behind / Off / WFBitMap*
+// are intentionally NOT promoted to literals because upstream
+// LINSTOR's CLI renders them via a different code path and Bug 348
+// is scoped to the two transient sync states only.
+func activeSyncReplicationState(states map[string]apiv1.ReplicationState) string {
+	if len(states) == 0 {
+		return ""
+	}
+
+	var sawTarget bool
+
+	for _, state := range states {
+		switch state.ReplicationState {
+		case replicationStateSyncSource:
+			return replicationStateSyncSource
+		case replicationStateSyncTarget:
+			sawTarget = true
+		}
+	}
+
+	if sawTarget {
+		return replicationStateSyncTarget
+	}
+
+	return ""
 }
 
 // multiValueQuery returns the union of all values for a query

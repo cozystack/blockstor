@@ -1367,3 +1367,215 @@ func eligibleAffinityNodes(rs []apiv1.ResourceWithVolumes) []string {
 
 	return out
 }
+
+// TestAnnotateSyncProgressStateBug348 pins the upstream-shaped State
+// column for the SyncSource / SyncTarget transient window.
+//
+// Bug 348: blockstor used to render `linstor r l` during a sync
+// window as `UpToDate(NN%)` on the source side — visually plausible
+// (the data IS uptodate) but losing the operator-facing signal that
+// this replica is actively sending data. Upstream LINSTOR renders
+// the source side as `SyncSource` and the target as `SyncTarget`,
+// sourced directly from drbdsetup events2's replication_state field.
+// Bug 331 closed Connecting / NetworkFailure column shapes but
+// missed the SyncSource / SyncTarget pair — these cases pin the
+// closed shape so a future refactor cannot silently regress.
+//
+// The fix lives in annotateSyncProgress: when any peer's
+// Volume.State.ReplicationStates entry is `SyncSource` or
+// `SyncTarget`, the literal token wins over the `(NN%)` annotation.
+// When replication settles into `Established` (or the map is empty
+// because no peer is mid-sync), the legacy disk_state-with-progress
+// path takes over so existing tests stay green.
+func TestAnnotateSyncProgressStateBug348(t *testing.T) {
+	t.Parallel()
+
+	const sizeKib = int64(1024 * 1024) // 1 GiB
+
+	sizes := map[int32]int64{0: sizeKib}
+
+	type tc struct {
+		name string
+		in   apiv1.Volume
+		want string
+	}
+
+	cases := []tc{
+		{
+			name: "source side mid-sync renders SyncSource literal",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "UpToDate",
+					OutOfSyncKib: sizeKib / 2, // 50% out-of-sync
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "SyncSource"},
+					},
+				},
+			},
+			want: "SyncSource",
+		},
+		{
+			name: "target side mid-sync renders SyncTarget literal",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "Inconsistent",
+					OutOfSyncKib: sizeKib / 2,
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-a": {ReplicationState: "SyncTarget"},
+					},
+				},
+			},
+			want: "SyncTarget",
+		},
+		{
+			name: "both peers Established with UpToDate disk renders UpToDate clean",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "UpToDate",
+					OutOfSyncKib: 0,
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "Established"},
+					},
+				},
+			},
+			want: "UpToDate",
+		},
+		{
+			name: "Inconsistent with no replication-state info stays Inconsistent (no NN%)",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "Inconsistent",
+					OutOfSyncKib: 0, // no progress signal → no suffix
+				},
+			},
+			want: "Inconsistent",
+		},
+		{
+			name: "Inconsistent with progress but no replication-state still annotates legacy (NN%)",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "Inconsistent",
+					OutOfSyncKib: sizeKib / 4, // 75% synced
+				},
+			},
+			want: "Inconsistent(75%)",
+		},
+		{
+			name: "PausedSyncS falls through to legacy annotation (Bug 348 scope is SyncSource/SyncTarget only)",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "UpToDate",
+					OutOfSyncKib: sizeKib / 2,
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "PausedSyncS"},
+					},
+				},
+			},
+			want: "UpToDate(50%)",
+		},
+		{
+			name: "3-replica mixed: SyncSource peer wins over Established peer",
+			in: apiv1.Volume{
+				VolumeNumber: 0,
+				State: apiv1.VolumeState{
+					DiskState:    "UpToDate",
+					OutOfSyncKib: sizeKib / 2,
+					ReplicationStates: map[string]apiv1.ReplicationState{
+						"peer-b": {ReplicationState: "Established"},
+						"peer-c": {ReplicationState: "SyncSource"},
+					},
+				},
+			},
+			want: "SyncSource",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := annotateSyncProgress([]apiv1.Volume{c.in}, sizes)
+			if len(got) != 1 {
+				t.Fatalf("annotateSyncProgress returned %d volumes, want 1", len(got))
+			}
+
+			if got[0].State.DiskState != c.want {
+				t.Errorf("State.DiskState = %q, want %q (in=%+v)",
+					got[0].State.DiskState, c.want, c.in)
+			}
+		})
+	}
+}
+
+// TestActiveSyncReplicationState exercises the small helper in
+// isolation: source preference, target fallback, ignore-others, and
+// the nil-map fast path. Behaviour is locked here because Bug 348's
+// "literal token wins over (NN%)" gate funnels every replica through
+// this helper.
+func TestActiveSyncReplicationStateBug348(t *testing.T) {
+	t.Parallel()
+
+	type tc struct {
+		name   string
+		states map[string]apiv1.ReplicationState
+		want   string
+	}
+
+	cases := []tc{
+		{name: "nil map", states: nil, want: ""},
+		{name: "empty map", states: map[string]apiv1.ReplicationState{}, want: ""},
+		{
+			name: "single SyncSource peer",
+			states: map[string]apiv1.ReplicationState{
+				"b": {ReplicationState: "SyncSource"},
+			},
+			want: "SyncSource",
+		},
+		{
+			name: "single SyncTarget peer",
+			states: map[string]apiv1.ReplicationState{
+				"a": {ReplicationState: "SyncTarget"},
+			},
+			want: "SyncTarget",
+		},
+		{
+			name: "Established only — not promoted",
+			states: map[string]apiv1.ReplicationState{
+				"b": {ReplicationState: "Established"},
+			},
+			want: "",
+		},
+		{
+			name: "PausedSyncS not promoted — Bug 348 scope is the two literal tokens only",
+			states: map[string]apiv1.ReplicationState{
+				"b": {ReplicationState: "PausedSyncS"},
+			},
+			want: "",
+		},
+		{
+			name: "SyncSource wins over SyncTarget in the same map",
+			states: map[string]apiv1.ReplicationState{
+				"b": {ReplicationState: "SyncTarget"},
+				"c": {ReplicationState: "SyncSource"},
+			},
+			want: "SyncSource",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := activeSyncReplicationState(c.states); got != c.want {
+				t.Errorf("activeSyncReplicationState(%+v) = %q, want %q",
+					c.states, got, c.want)
+			}
+		})
+	}
+}
