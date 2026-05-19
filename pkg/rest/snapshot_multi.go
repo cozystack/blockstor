@@ -18,7 +18,11 @@ package rest
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
+
+	"github.com/cockroachdb/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
@@ -60,6 +64,15 @@ type multiSnapshotCreateEntry struct {
 // path matches upstream LINSTOR's `/v1/actions/snapshot/multi`
 // action shape. Per-entry errors land in the ApiCallRc envelope
 // rather than aborting the batch.
+//
+// b353: every entry in the batch is stamped with the same
+// crypto/rand-generated GroupID + SuspendIo=true so the
+// controller-side SnapshotReconciler gates phase advancement on
+// the UNION of every sibling's targeted nodes — a single
+// suspend-io broadcast spans the whole multi-RD batch, giving
+// cross-RD point-in-time consistency (DB + WAL on separate RDs
+// snapshot at the same instant rather than at independently
+// drifting per-RD suspend windows).
 func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Request) {
 	var body multiSnapshotCreateBody
 
@@ -73,20 +86,53 @@ func (s *Server) handleSnapshotCreateMulti(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	groupID, err := newSnapshotGroupID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "generate snapshot group id: "+err.Error())
+
+		return
+	}
+
 	results := make([]apiv1.APICallRc, 0, len(body.Snapshots))
 
 	for i := range body.Snapshots {
-		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i]))
+		results = append(results, s.createOneFromMulti(r.Context(), &body.Snapshots[i], groupID))
 	}
 
 	writeJSON(w, http.StatusCreated, results)
+}
+
+// newSnapshotGroupID returns a 128-bit hex group identifier
+// produced from crypto/rand. The value is opaque to the
+// controller (it only does string equality), so any
+// collision-resistant random encoding works — hex keeps the label
+// value DNS-1123-friendly (kubernetes label values reject `+/=`
+// that base64 would emit).
+func newSnapshotGroupID() (string, error) {
+	var buf [16]byte
+
+	_, err := rand.Read(buf[:])
+	if err != nil {
+		return "", errors.Wrap(err, "read crypto/rand")
+	}
+
+	return hex.EncodeToString(buf[:]), nil
 }
 
 // createOneFromMulti turns one multi-entry into the existing
 // per-snapshot create pipeline and packages the result as an
 // ApiCallRc. Validation failures + store errors all land in the
 // returned envelope rather than 4xx the whole batch.
-func (s *Server) createOneFromMulti(ctx context.Context, entry *multiSnapshotCreateEntry) apiv1.APICallRc {
+//
+// `groupID` is the crypto/rand-generated transactional-batch
+// handle stamped onto every entry's apiv1.Snapshot.GroupID. The
+// store-side wireToCRDSnapshot mirrors it onto the CRD's
+// Spec.GroupID + a metadata.label so the controller-side
+// SnapshotReconciler can list same-Group siblings via a label
+// selector. b353.
+func (s *Server) createOneFromMulti(
+	ctx context.Context, entry *multiSnapshotCreateEntry, groupID string,
+) apiv1.APICallRc {
 	if entry.ResourceName == "" || entry.Name == "" {
 		return apiv1.APICallRc{
 			RetCode: apiCallRcError,
@@ -101,6 +147,7 @@ func (s *Server) createOneFromMulti(ctx context.Context, entry *multiSnapshotCre
 		Props:             entry.Props,
 		Flags:             entry.Flags,
 		VolumeDefinitions: entry.VolumeDefs,
+		GroupID:           groupID,
 	}
 
 	err := s.hydrateSnapshotFromRD(ctx, &snap, entry.ResourceName)

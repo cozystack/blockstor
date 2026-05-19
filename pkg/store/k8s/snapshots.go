@@ -35,6 +35,14 @@ import (
 // LabelSnapshot is the label that lets us List snapshots by parent RD.
 const LabelSnapshot = "blockstor.io/snapshot-name"
 
+// LabelSnapshotGroupID is the label that lets the controller-side
+// SnapshotReconciler List sibling Snapshots in the same transactional
+// multi-RD batch (b353). Stamped by `wireToCRDSnapshot` whenever the
+// wire DTO carries a non-empty Spec.GroupID — empty GroupID means
+// "single-snap path" and the label is omitted entirely so the
+// b351 single-Snapshot orchestrator path stays unchanged.
+const LabelSnapshotGroupID = "blockstor.io/snapshot-group-id"
+
 type snapshots struct {
 	c ctrlclient.Client
 }
@@ -215,10 +223,19 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// cluster mid-snapshot.
 		preservedSuspendIo := existing.Spec.SuspendIo
 		preservedTakeSnapshot := existing.Spec.TakeSnapshot
+		// b353: GroupID is a transactional-batch handle stamped
+		// exactly once by handleSnapshotCreateMulti at Create time.
+		// A REST prop-patch (`linstor s set-property ...`) MUST NOT
+		// clobber it — losing GroupID mid-orchestration would
+		// silently demote the Snapshot to single-snap orchestration
+		// and break the cross-RD suspend-window invariant for its
+		// already-suspended siblings.
+		preservedGroupID := existing.Spec.GroupID
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
 		existing.Spec.SuspendIo = preservedSuspendIo
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
+		existing.Spec.GroupID = preservedGroupID
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
 		return s.c.Update(ctx, &existing)
@@ -365,13 +382,24 @@ func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 	// shape — the wire DTO doesn't carry these flags.
 	spec.SuspendIo = true
 
+	labels := map[string]string{
+		LabelResourceDefinition: in.ResourceName,
+		LabelSnapshot:           in.Name,
+	}
+
+	// b353: when the caller (handleSnapshotCreateMulti) stamped a
+	// GroupID on the wire DTO, mirror it as a label so the
+	// controller-side SnapshotReconciler can List sibling Snapshots
+	// in the same transactional batch by label selector instead of
+	// scanning the whole Snapshot collection on every Reconcile.
+	if in.GroupID != "" {
+		labels[LabelSnapshotGroupID] = in.GroupID
+	}
+
 	return &crdv1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: snapshotCRDName(in.ResourceName, in.Name),
-			Labels: map[string]string{
-				LabelResourceDefinition: in.ResourceName,
-				LabelSnapshot:           in.Name,
-			},
+			Name:        snapshotCRDName(in.ResourceName, in.Name),
+			Labels:      labels,
 			Annotations: cloneAnnotations(in.Annotations),
 		},
 		Spec: spec,
@@ -384,6 +412,7 @@ func wireToCRDSnapshotSpec(in *apiv1.Snapshot) crdv1alpha1.SnapshotSpec {
 		SnapshotName:           in.Name,
 		Nodes:                  in.Nodes,
 		Props:                  in.Props,
+		GroupID:                in.GroupID,
 	}
 
 	if len(in.VolumeDefinitions) > 0 {

@@ -47,6 +47,16 @@ type Snapshot struct {
 	SnapshotDefinitionProps map[string]string   `json:"snapshot_definition_props,omitempty"`
 	ResourceDefinitionProps map[string]string   `json:"resource_definition_props,omitempty"`
 	UUID                    string              `json:"uuid,omitempty"`
+
+	// GroupID, when non-empty, marks this Snapshot as a member of a
+	// transactional multi-RD batch — every Snapshot stamped with the
+	// same GroupID participates in a SINGLE suspend-io broadcast
+	// across the UNION of every sibling's targeted nodes. Bug 353:
+	// `linstor s create-multiple` stamps a crypto/rand UUID here
+	// before fanning the per-RD POST out to the store. Not surfaced
+	// to the upstream wire shape — golinstor ignores unknown JSON
+	// fields, so the new key flows through transparently.
+	GroupID string `json:"group_id,omitempty"`
 }
 
 // SnapshotVolumeDef is one volume slot inside a Snapshot. F20:

@@ -182,6 +182,13 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			"Nodes":                  true,
 			"Props":                  true,
 			"VolumeDefinitions":      true,
+			// b353: GroupID is wire-derived (set from
+			// apiv1.Snapshot.GroupID by wireToCRDSnapshotSpec).
+			// The Update path additionally preserves it as
+			// belt-and-suspenders so a REST prop-patch that
+			// omits the field doesn't silently demote a grouped
+			// Snapshot to the single-snap orchestrator mid-batch.
+			"GroupID": true,
 		},
 		// Bug 351: SuspendIo + TakeSnapshot are the
 		// controller-side orchestration's phase-flag pair. They

@@ -86,6 +86,33 @@ type SnapshotSpec struct {
 	// bytes.
 	// +optional
 	TakeSnapshot bool `json:"takeSnapshot,omitempty"`
+
+	// groupID, when non-empty, marks this Snapshot as a member of a
+	// transactional multi-RD batch — every Snapshot CRD stamped with
+	// the same GroupID participates in a SINGLE suspend-io broadcast
+	// across the UNION of every sibling's targeted nodes. Bug 353:
+	// `linstor s create-multiple` (POST /v1/actions/snapshot/multi)
+	// previously looped per-RD through the Bug-351 orchestrator and
+	// each Snapshot ran its own independent 3-phase suspend/take/
+	// resume — so per-RD suspend windows did not overlap and the
+	// cross-RD point-in-time consistency operators expect from a
+	// "group snapshot" (DB + WAL on separate RDs) was lost.
+	//
+	// Lifecycle (driven by the controller-side SnapshotReconciler):
+	//   1. apiserver stamps every batched Snapshot with the same
+	//      crypto/rand-generated GroupID + SuspendIo=true.
+	//   2. Controller gates phase advancement on the FULL group:
+	//      Phase 2 only fires when every sibling's every targeted
+	//      node has acked the suspend.
+	//   3. Phase 3 only fires when every sibling's every targeted
+	//      node is Ready — or any sibling node Failed=true, in
+	//      which case the abort cascade fires SuspendIo=false on
+	//      every sibling immediately.
+	//
+	// Empty GroupID is the single-snap path (Bug 351 behaviour
+	// preserved verbatim — siblings denominator collapses to self).
+	// +optional
+	GroupID string `json:"groupId,omitempty"`
 }
 
 // SnapshotVolumeRef is one volume slot inside a Snapshot.
