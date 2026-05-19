@@ -377,13 +377,33 @@ func isTerminalSnapshotFlag(flag string) bool {
 		flag == legacySnapshotFlagFailed
 }
 
-// isSnapshotSuccessful is true iff every diskful peer of the parent RD
-// has a per-node entry with non-zero CreateTimestamp. An empty
-// diskful peer set returns false — a 0-replica RD with a snapshot row
-// is a degenerate state the operator should investigate, not silently
+// isSnapshotSuccessful is true iff every node in the success denominator
+// has a per-node entry with non-zero CreateTimestamp.
+//
+// The denominator is:
+//
+//   - When `snap.Nodes` is non-empty (caller restricted the snap to a
+//     subset via `linstor snapshot create <rd> <snap> <node...>`):
+//     the intersection of `snap.Nodes` with the diskful peer set.
+//     Unlisted peers are never tasked, so their Snapshot-child never
+//     materialises and must not block the gate.
+//   - When `snap.Nodes` is empty (default broadcast fan-out): every
+//     diskful peer of the parent RD.
+//
+// An empty denominator returns false — a 0-replica RD with a snapshot
+// row, or a Spec.Nodes set that doesn't overlap any diskful peer, is a
+// degenerate state the operator should investigate, not silently
 // auto-mark as success.
+//
+// Why: user-reported Bug 352 — `linstor snapshot create <rd> <snap>
+// <single-node>` hung in Incomplete forever because the gate counted
+// every diskful peer, including those the caller had explicitly
+// excluded via the positional node arg. Mirrors upstream
+// CtrlSnapshotCrtApiCallHandler, which scopes per Spec.Nodes when
+// non-empty.
 func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) bool {
-	if len(diskful) == 0 {
+	denominator := successDenominator(snap, diskful)
+	if len(denominator) == 0 {
 		return false
 	}
 
@@ -398,13 +418,33 @@ func isSnapshotSuccessful(snap *apiv1.Snapshot, diskful map[string]struct{}) boo
 		reported[entry.NodeName] = struct{}{}
 	}
 
-	for node := range diskful {
+	for node := range denominator {
 		if _, ok := reported[node]; !ok {
 			return false
 		}
 	}
 
 	return true
+}
+
+// successDenominator computes the per-snapshot success denominator.
+// See `isSnapshotSuccessful` for the policy. Factored out so the test
+// suite can pin both branches (Spec.Nodes-scoped and broadcast) without
+// reaching into per-node bookkeeping.
+func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[string]struct{} {
+	if len(snap.Nodes) == 0 {
+		return diskful
+	}
+
+	out := make(map[string]struct{}, len(snap.Nodes))
+
+	for _, node := range snap.Nodes {
+		if _, ok := diskful[node]; ok {
+			out[node] = struct{}{}
+		}
+	}
+
+	return out
 }
 
 // diskfulPeerSet enumerates the Resources of an RD and returns the
