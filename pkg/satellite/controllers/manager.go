@@ -181,9 +181,15 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 // distinct Condition `type` so SSA's listMap merge keeps the writers
 // orthogonal; bundling them in one helper keeps NewManager under
 // funlen budget.
+//
+// Also wires the SkipDiskClearer (Bug 278). Lives here rather than in
+// its own helper so NewManager stays under the funlen budget — the
+// clearer is the same shape as the Stampers (one apiserver writer
+// per satellite-side reconciler hook).
 func wireConditionStampers(mgr manager.Manager, cfg Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
+	wireSkipDiskClearer(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -326,5 +332,18 @@ func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
 func wireFilesystemFormattedStamper(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetFilesystemFormattedStamper(&FilesystemFormattedStamper{
 		Client: mgr.GetClient(),
+	})
+}
+
+// wireSkipDiskClearer injects the SkipDiskClearer into the Apply chain
+// so `runAdjust` can release the observer's SSA claim on
+// Spec.Props[DrbdOptions/SkipDisk] when the kernel re-emerges healthy
+// after a defensive stamp (Bug 278: Talos kernel upgrade reattach).
+// Mirrors `wireMetadataCreatedStamper` — the clearer needs the
+// manager's cached client which doesn't exist at NewReconciler time.
+func wireSkipDiskClearer(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetSkipDiskClearer(&SkipDiskClearer{
+		Client:   mgr.GetClient(),
+		NodeName: cfg.NodeName,
 	})
 }

@@ -1644,9 +1644,9 @@ func (o *ObserverRunnable) writeSkipDiskProp(ctx context.Context, resourceName s
 	apply.SetGroupVersionKind(blockstoriov1alpha1.GroupVersion.WithKind(resourceKind))
 	apply.SetName(name)
 	apply.Object["spec"] = map[string]any{
-		"resourceDefinitionName": existing.Spec.ResourceDefinitionName,
-		"nodeName":               existing.Spec.NodeName,
-		"props": map[string]any{
+		specFieldResourceDefinitionName: existing.Spec.ResourceDefinitionName,
+		specFieldNodeName:               existing.Spec.NodeName,
+		specFieldProps: map[string]any{
 			skipDiskPropKey: skipDiskPropValue,
 		},
 	}

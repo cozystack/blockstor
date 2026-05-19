@@ -5742,3 +5742,206 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 		t.Errorf("FilesystemFormatted Condition: want exactly one stamp for pvc-bug311c after retry; got %v", gotCalls)
 	}
 }
+
+// fakeSkipDiskClearer records every ClearSkipDisk call so Bug 278
+// tests can assert the satellite invokes the SSA release when the
+// kernel re-emerges healthy after a defensive SkipDisk stamp.
+// Concurrency-safe to mirror the other fake-stamper contracts.
+type fakeSkipDiskClearer struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeSkipDiskClearer) ClearSkipDisk(_ context.Context, resourceName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls = append(f.calls, resourceName)
+
+	return nil
+}
+
+func (f *fakeSkipDiskClearer) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+
+	return out
+}
+
+// TestBug278AutoClearSkipDiskOnHealthyReattach pins the satellite-side
+// auto-clear path: after a kernel restart (Talos OS upgrade), the
+// satellite reattaches with the pre-upgrade SkipDisk stamp still on
+// Spec.Props. Without auto-clear the kernel-healthy slot keeps
+// dispatching `drbdadm adjust --skip-disk` forever — the lower disk
+// never re-attaches, the volume stays Diskless.
+//
+// Setup mirrors the production race shape:
+//   - Resource.Spec.Props["DrbdOptions/SkipDisk"]="True" (the
+//     pre-upgrade defensive stamp, observer-owned).
+//   - Kernel reports the local volume as disk:UpToDate with a real
+//     backing_dev path — the post-Talos-upgrade healthy reattach
+//     shape.
+//
+// Contract (after Bug 278 fix):
+//   - The reconciler MUST invoke SkipDiskClearer.ClearSkipDisk exactly
+//     once for the resource name.
+//   - The current pass still dispatches `drbdadm adjust --skip-disk`
+//     because the prop is still True in the in-flight DesiredResource
+//     view; the clear releases the observer's SSA claim so the NEXT
+//     dispatcher cycle re-resolves Spec.Props without SkipDisk.
+//
+// Why this isn't auto-recovery-beyond-upstream: SkipDisk on a healthy
+// slot is an artifact OF our defensive stamping (the observer's
+// writeSkipDiskProp under observerSkipDiskFieldOwner). Removing our
+// own stamp is symmetric with stamping it — not new behavior.
+// Operator-set SkipDisk (via `linstor r prop set ... SkipDisk=True`)
+// remains intact: the operator's apply uses the controller's
+// FieldOwner, so SSA's per-key merge keeps the operator's claim alive
+// when the clearer releases only its own owner's claim.
+func TestBug278AutoClearSkipDiskOnHealthyReattach(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug278_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	// Kernel reports the local volume as UpToDate with a real
+	// backing_dev — the healthy post-Talos-upgrade reattach shape.
+	// HasDisklessVolume returns false on this shape, which is the
+	// gate the Bug 278 auto-clear path keys off.
+	fx.Expect("drbdsetup status --verbose pvc-bug278", storage.FakeResponse{
+		Stdout: []byte(`pvc-bug278 node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-bug278_00000 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	clearer := &fakeSkipDiskClearer{}
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+	rec.SetSkipDiskClearer(clearer)
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug278",
+			NodeName: "n1",
+			// SkipDisk is the pre-Talos-upgrade defensive stamp the
+			// observer wrote on the Failed→Diskless transition before
+			// the kernel was restarted. After the kernel came back
+			// healthy the prop is still pinned on Spec.Props because
+			// the observer never owns the clear path — Bug 278 is the
+			// satellite-side reconciler adding the symmetric un-stamp
+			// path.
+			Props: map[string]string{"DrbdOptions/SkipDisk": "True"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Primary invariant: ClearSkipDisk fired exactly once for the
+	// resource. Without the auto-clear, calls is empty and the
+	// Talos-upgrade reattach loops on `adjust --skip-disk` forever.
+	calls := clearer.Calls()
+	if len(calls) != 1 || calls[0] != "pvc-bug278" {
+		t.Fatalf("expected exactly one ClearSkipDisk(\"pvc-bug278\"); got %v", calls)
+	}
+
+	// Sibling invariant: the current pass still dispatches
+	// `--skip-disk` because Spec.Props in the in-flight
+	// DesiredResource still has SkipDisk=True. The clear releases
+	// the observer's SSA claim so the NEXT dispatcher cycle
+	// re-resolves Spec.Props without the key and the next reconcile
+	// flips back to bare adjust. Coercing bare adjust here would
+	// race the still-active SkipDisk prop in the FSM and surface as
+	// a transient PhaseRunning/PhaseSkipDisk flip.
+	cmds := fx.CommandLines()
+	skipDiskCmd := "drbdadm adjust --skip-disk pvc-bug278"
+
+	if !slices.Contains(cmds, skipDiskCmd) {
+		t.Errorf("expected %q on the current pass (prop still pinned in DesiredResource view); got %v",
+			skipDiskCmd, cmds)
+	}
+}
+
+// TestBug278NoClearWhenKernelStillDiskless guards against an
+// over-eager auto-clear that would fire whenever SkipDisk is present
+// regardless of kernel state. The gate is "prop pinned AND kernel
+// healthy"; if the kernel is still Diskless (the genuine
+// post-Failed-detach steady state), the clear MUST NOT fire — the
+// stamp is doing its job (suppressing re-attach on the dead disk)
+// and clearing it would re-attempt the attach the observer just
+// detached for.
+func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-bug278-noclear_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	// Kernel reports the local volume as Diskless — the genuine
+	// post-Failed-detach state. HasDisklessVolume returns true, so
+	// the Bug 278 gate stays closed and the clearer is NOT invoked.
+	fx.Expect("drbdsetup status --verbose pvc-bug278-noclear", storage.FakeResponse{
+		Stdout: []byte(`pvc-bug278-noclear node-id:0 role:Secondary
+  volume:0 minor:1000 disk:Diskless backing_dev:none quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	clearer := &fakeSkipDiskClearer{}
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+	rec.SetSkipDiskClearer(clearer)
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-bug278-noclear",
+			NodeName: "n1",
+			Props:    map[string]string{"DrbdOptions/SkipDisk": "True"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The clearer MUST NOT fire — kernel still Diskless means the
+	// stamp is doing its job. A regression here would re-attempt
+	// the attach the observer just detached for.
+	if calls := clearer.Calls(); len(calls) != 0 {
+		t.Errorf("expected NO ClearSkipDisk calls when kernel is still Diskless; got %v", calls)
+	}
+}

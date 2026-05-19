@@ -113,6 +113,16 @@ type ReconcilerConfig struct {
 	// 11.3 Stage 2.
 	FilesystemFormattedStamper FilesystemFormattedStamper
 
+	// SkipDiskClearer releases the satellite's SSA claim on the
+	// `DrbdOptions/SkipDisk` Spec.Props key when the kernel
+	// re-emerges healthy (Bug 278: Talos kernel upgrade reattach).
+	// nil → auto-clear path is disabled (compatible with unit tests
+	// that don't wire an apiserver). The agent injects this
+	// post-manager construction via SetSkipDiskClearer — the
+	// implementation needs the controller-runtime client only the
+	// manager owns.
+	SkipDiskClearer SkipDiskClearer
+
 	// Exec runs auxiliary shell-outs the reconciler owns directly
 	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
 	// scenario 9.W14). Production wires `storage.RealExec`; tests
@@ -167,6 +177,35 @@ type FilesystemFormattedStamper interface {
 	// moves forward on apiserver-side transition only, not on
 	// every patch).
 	StampFilesystemFormatted(ctx context.Context, resourceName string) error
+}
+
+// SkipDiskClearer abstracts the "release the satellite's SSA claim
+// on Spec.Props[DrbdOptions/SkipDisk]" verb used by the Bug 278
+// auto-clear path. The clearer applies a Spec.Props document under
+// the same FieldOwner the observer used to stamp SkipDisk
+// defensively, but without the SkipDisk key — SSA's per-key map
+// merge releases that owner's claim and, when nobody else owns the
+// key, the apiserver deletes it from Spec.Props. The next
+// dispatcher cycle re-resolves the Spec without SkipDisk, the
+// reconciler's `isSkipDiskEnabled` gate flips false, and the next
+// `drbdadm adjust` re-attaches the kernel-healthy lower disk.
+//
+// Lives behind an interface so satellite.Reconciler stays free of
+// a controller-runtime client dependency — the K8s SSA call lives
+// in pkg/satellite/controllers (where the cached client owns the
+// apiserver wire). Mirrors MetadataCreatedStamper /
+// FilesystemFormattedStamper. Bug 278.
+type SkipDiskClearer interface {
+	// ClearSkipDisk SSA-applies Resource <resourceName>.Spec.Props
+	// without the SkipDisk key, under the observer's own
+	// FieldOwner. Idempotent — repeat calls converge on the
+	// "owner releases the key" state (the apiserver no-ops the
+	// second apply because the claim is already gone). NotFound
+	// on the Resource CRD is silently swallowed by the
+	// implementation: the convergence-pending case is the same as
+	// the observer's stamp path and surfacing it here would force
+	// every caller to re-implement the same silence.
+	ClearSkipDisk(ctx context.Context, resourceName string) error
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -272,6 +311,14 @@ func (r *Reconciler) SetMetadataCreatedStamper(s MetadataCreatedStamper) {
 // the first Apply. Phase 11.3 Stage 2.
 func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper) {
 	r.cfg.FilesystemFormattedStamper = s
+}
+
+// SetSkipDiskClearer injects the SkipDisk clearer post-construction.
+// Mirrors `SetMetadataCreatedStamper`: the clearer needs the
+// controller-runtime manager's cached client which doesn't exist at
+// NewReconciler time. Safe to call before the first Apply. Bug 278.
+func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
+	r.cfg.SkipDiskClearer = c
 }
 
 // StateDir returns the on-disk directory the reconciler uses for
@@ -2224,6 +2271,53 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
 		if probeErr == nil && diskless {
 			skipDisk = true
+		}
+	}
+
+	// Bug 278: Talos kernel upgrade leaves SkipDisk pinned from the
+	// pre-upgrade defensive stamp. Upstream LINSTOR's SkipDisk is
+	// operator-only; we stamped it defensively (Phase 11.3 territory
+	// — Failed→Diskless trigger in the observer) and now must
+	// un-stamp when the kernel re-emerges healthy after the satellite
+	// reattaches.
+	//
+	// Why this isn't "auto-recovery beyond upstream": SkipDisk on a
+	// healthy slot is an artifact OF our defensive stamping (the
+	// observer's writeSkipDiskProp under observerSkipDiskFieldOwner).
+	// Removing our own stamp is symmetric with stamping it — not new
+	// behavior. Operator-set SkipDisk (via `linstor r prop set ...
+	// SkipDisk=True` on the controller's FieldOwner) survives the
+	// SSA release because the observer's owner only ever claimed its
+	// own apply, not the operator's. DRBD's own resync /
+	// auto-promote logic owns post-adjust convergence; we do not
+	// add a closed-loop recovery here — the clear is a one-shot SSA
+	// release that lets the existing FSM transition
+	// (PhaseSkipDisk→PhaseRunning on !obs.SkipDiskProp) fire on the
+	// next reconcile.
+	//
+	// Gate: SkipDisk-from-prop AND kernel NOT in Diskless state
+	// (HasDisklessVolume==false). The diskful-flip arm doesn't
+	// reach this since `!skipDisk && !diskfulFlip` is the only path
+	// that flips skipDisk via the kernel probe — and we explicitly
+	// scope the clear to the "prop-set" origin so a freshly probed
+	// kernel-Diskless does NOT trigger a clear. We also gate on
+	// !diskfulFlip so the Bug 319 flip path (kernel still Diskless,
+	// SkipDisk prop unset) never enters the clear path.
+	if isSkipDiskEnabled(dr) && !diskfulFlip && r.cfg.SkipDiskClearer != nil {
+		diskless, probeErr := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+		if probeErr == nil && !diskless {
+			// Kernel reports the local volume as non-Diskless (UpToDate
+			// / Inconsistent / Outdated — all are "backing storage
+			// attached"). SkipDisk on the prop is an artifact of the
+			// pre-upgrade defensive stamp; release the observer's SSA
+			// claim so the next dispatcher cycle re-resolves Spec.Props
+			// without SkipDisk and the next reconcile dispatches plain
+			// `drbdadm adjust`.
+			//
+			// Best-effort: a clearer error doesn't strand the reconciler
+			// (the worst case is the same as not having the clearer at
+			// all — the prop stays pinned and the next pass re-tries).
+			_ = r.cfg.SkipDiskClearer.ClearSkipDisk(ctx, dr.GetName())
 		}
 	}
 
