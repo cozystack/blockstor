@@ -1247,9 +1247,95 @@ For each new function/endpoint:
 | L3 contract (oracle) | golinstor → both LINSTOR oracle and our server, JSON diff | minutes | per PR |
 | L4 integration (DRBD) | `make smoke` on talos+qemu stand | ~3 min | per PR |
 | L5 e2e | csi-sanity + piraeus-operator e2e on stand | ~30 min | nightly + pre-merge |
+| **L6 operator-CLI e2e (MANDATORY)** | real `linstor` CLI → REST → satellite → DRBD kernel; assert Status convergence on stand | ~5 min per matrix cell | every user-reported CLI bug + nightly matrix |
 
 Contract recordings live under `test/golden/`. Captured once from a real LINSTOR
 controller, replayed forever in CI.
+
+### L6 mandatory: operator-CLI e2e coverage (post-mortem of Bugs 326/327/328/329/330)
+
+**Background:** Bug-hunt waves v1–v40 (≈250 closed bugs) ловили REST-handler-level
+issues через unit tests + `tests/integration/group_*_test.go`. Реальный operator
+flow через **python-linstor CLI** покрыт только `tests/e2e/client-compat.sh`,
+а большинство `tests/e2e/*.sh` идёт через `kubectl` напрямую в apiserver, минуя
+python-CLI. Это объясняет recurring user-reported bugs (Bug 326 `vdo_enable` REST
+400, Bug 327 `r c` → wrong-direction Diskless, Bug 330 `r td --diskless` no-op,
+Bug 329 sync stuck `UpToDate(100%)`): unit/integration test возвращает 200 OK,
+но реальный pipeline `python-linstor → apiserver SSA → satellite cache lag →
+observer events2 → Status.DiskState` никем не assert'ился end-to-end.
+
+**Rule:** каждый user-reported operator-CLI bug закрывается **двумя** тестами:
+
+1. **L1 unit / L2 contract** — наша обычная mock-based проверка REST-handler /
+   wire shape.
+2. **L6 operator-CLI e2e** — shell-test в `tests/e2e/cli-matrix/<verb>-<shape>.sh`
+   который запускает реальный `linstor` CLI на стенде с реальным DRBD, ждёт
+   convergence (≤30s polling), и проверяет Status выходит в expected state
+   через **observer-stamped Status** или kernel-state probe (`drbdsetup status`)
+   — НЕ через "200 OK".
+
+**Matrix structure** (`tests/e2e/cli-matrix/`):
+
+- Cluster shapes (pre-built fixtures):
+  - `shape-2r` — 2-replica RD (worker-1 + worker-2)
+  - `shape-2r-tb` — 2-replica + auto-tiebreaker on worker-3
+  - `shape-3r` — 3-replica RD
+  - `shape-1r-2d` — 1 diskful + 2 diskless (CSI-style)
+  - `shape-flip` — 1 diskless about to become diskful (Bug 319 territory)
+- CLI verbs (cells):
+  - `r c <node> <rd>` (no flag) → must produce **diskful** replica
+  - `r c <node> <rd> --diskless` → must produce Diskless
+  - `r d <node> <rd>` → must remove replica + free minor + tear `.res`
+  - `r td --diskless <node> <rd>` → must flip Spec.Flags + Status converges
+  - `r td --storage-pool <sp> <node> <rd>` → Diskless → diskful flip
+  - `r c <rd> --auto-place=N -s <sp>` → N nodes picked, no "Not enough nodes"
+    when SP is available
+  - `ps cdp <provider> <node> <device>` → pool created, accepts upstream
+    OpenAPI body shape (vdo_enable, raid_level, lv/pv/vg/zpool args)
+  - `rd c / vd c / sp c / sp d / n d / n lost` happy-path + cleanup invariants
+- Negative cells: bogus node, bogus SP, conflicting flags — must fail with
+  proper LINSTOR-shaped envelope, not crash python-linstor parser.
+
+**Convergence assertions (mandatory):**
+
+- After every state-mutating CLI call, poll Status for ≤30s via
+  `kubectl get resources.blockstor.io -o jsonpath=...` until expected state.
+- Cross-check via `drbdsetup status` on the satellite pod when DRBD-state is
+  the contract (Diskless / UpToDate / SyncTarget transitions).
+- Assert NoOrphans invariant at scenario teardown: no leftover Resource CRDs,
+  no kernel slots, no LVM volumes, no `.res` files.
+
+**Closing existing bugs (P0 priority — must land before next refactor wave):**
+
+- [ ] Bug 326: `ps cdp` vdo_enable accept — **DONE** (commit `84276ad63`,
+      added regression test in `pkg/rest/physical_storage_test.go`).
+  - Still pending: L6 cell `cli-matrix/ps-cdp-zfs.sh` exercising the real
+    `linstor ps cdp` invocation on stand.
+- [ ] Bug 327: `r c <node> <rd>` on cluster with tiebreaker peer must produce
+      diskful — L6 cell `cli-matrix/r-c-on-shape-2r-tb.sh` (fixture: 2-replica
+      + tiebreaker, then `r d worker-2`, then `r c worker-2 <rd>`, assert
+      worker-2 lands UpToDate with `DRBD,STORAGE` layers — NOT Diskless).
+- [ ] Bug 328: autoplacer must find all matching nodes when SP State=Ok and
+      FreeCapacity>volSize — L6 cell `cli-matrix/r-c-autoplace-3r.sh` against
+      shape-3r with 3 healthy lvm-thin SPs.
+- [ ] Bug 329: DRBD sync must converge from `UpToDate(100%)` to clean
+      `UpToDate` — L6 cell `cli-matrix/sync-final-uptodate-transition.sh`
+      (poll until `replication:Established` AND no `(NN%)` suffix).
+- [ ] Bug 330: `r td --diskless` on diskful Resource must flip
+      Status.DiskState to Diskless within 30s — L6 cell
+      `cli-matrix/r-td-diskless.sh`.
+
+**Process:**
+
+- Adding a new CLI verb or REST endpoint: **L6 cell required** before merge.
+- Closing a user-reported CLI bug: **L6 cell required** as part of the same
+  commit. Without L6 the bug counts as not closed.
+- Nightly stand run: full L6 matrix on Run NN (extend
+  `/tmp/run14-dispatch.sh` scenario list).
+- Recurring bug pattern detection: if any L6 cell has been failing across
+  consecutive nightly runs, escalate to architectural review — likely an
+  un-extracted closed-loop recovery somewhere upstream of the affected
+  state machine.
 
 ## Cost control
 
