@@ -18,7 +18,6 @@ package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"slices"
 	"strconv"
 	"strings"
@@ -525,11 +524,10 @@ func (r *ResourceReconciler) recordPerResourceFailures(results []*intent.Resourc
 	return anyFailed
 }
 
-// stampPostApply runs the four best-effort post-apply stamps:
-// Status.Volumes (per-volume DevicePath), the stale-Status.Volumes
-// purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
-// and the Bug-39 toggle-disk retry counter. Each helper is
-// independently fallible — we log and move on so a transient
+// stampPostApply runs the three best-effort post-apply stamps:
+// Status.Volumes (per-volume DevicePath), the Bug-107 volume-numbers
+// annotation, and the Bug-39 toggle-disk retry counter. Each helper
+// is independently fallible — we log and move on so a transient
 // apiserver hiccup on one stamp doesn't suppress the others.
 func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
 	// Stamp per-volume DevicePath into Status.Volumes so
@@ -540,24 +538,6 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	err := r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
 		logger.Error(err, "stamp Status.Volumes")
-	}
-
-	// Bug 355 followup: prune `Status.Volumes[]` entries whose
-	// VolumeNumber is no longer present in the parent RD's
-	// VolumeDefinitions. The apiserver-side cascade already drops
-	// the entry from `Spec.Volumes` + the `volume-numbers`
-	// annotation, and `stampVolumeStatus` above re-applies only
-	// the desired volumes under its own field-owner — but
-	// observer.go's listMap claims on `diskState`/`currentGi` on
-	// the removed VolumeNumber keep the stale entry alive
-	// indefinitely (SSA only collapses a listMap entry when NO
-	// field-owner claims any subfield on it). A field-surgical
-	// JSON merge-patch on `status.volumes` rewrites the slice
-	// with only the desired entries; observer's next events2
-	// frame restamps `diskState` / `currentGi` on the survivors.
-	err = r.purgeStaleVolumeStatus(ctx, res, rd)
-	if err != nil {
-		logger.Error(err, "purge stale Status.Volumes")
 	}
 
 	// Bug 107: persist the parent RD's volume-number set onto the
@@ -643,100 +623,6 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 // apiserver merges the two slices cleanly under
 // `listMapKey=volumeNumber`.
 const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
-
-// purgeStaleVolumeStatus drops Status.Volumes entries whose
-// VolumeNumber is no longer present in the parent RD's
-// VolumeDefinitions. The apiserver-side `vd d` cascade removes the
-// VolumeDefinition (and the matching Spec.Volumes entry / Bug-107
-// volume-numbers annotation), but Status.Volumes[*] entries
-// authored by the observer's listMap field-owner persist: SSA only
-// collapses a listMap entry when NO field-owner claims any subfield
-// on it. The satellite-stamp owner (`volumeStatusFieldOwner`)
-// already releases its DevicePath claim on the missing entry, but
-// the observer's `DiskState` / `CurrentGi` claims on the same
-// `volumeNumber=N` key keep the entry alive indefinitely.
-//
-// Fix: when we detect any Status.Volumes entry whose VolumeNumber is
-// not in the desired set, issue a JSON merge-patch on
-// `status.volumes` that REPLACES the array with only the desired
-// survivors. JSON merge-patch is the only path that forcibly evicts
-// listMap entries regardless of SSA field-ownership. The brief
-// window before observer's next events2 frame restamps `diskState` /
-// `currentGi` on the survivors is tolerable — the alternative
-// (stale entry pinned forever) is worse for `linstor v l` and any
-// consumer iterating `Status.Volumes[]`.
-//
-// No-op when:
-//   - rd carries zero VolumeDefinitions (defensive — cascade in
-//     flight or RD freshly created; don't blank Status prematurely),
-//   - Status.Volumes is empty (nothing to purge),
-//   - every Status.Volumes entry is already in the desired set
-//     (steady state).
-func (r *ResourceReconciler) purgeStaleVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) error {
-	if len(res.Status.Volumes) == 0 {
-		return nil
-	}
-
-	if len(rd.Spec.VolumeDefinitions) == 0 {
-		// Defensive: an RD with zero VolumeDefinitions is either
-		// freshly created (volumes not yet authored) or mid-cascade
-		// to deletion (the parent RD finalizer will tear down the
-		// Resource). Don't nuke Status.Volumes here — the per-Resource
-		// delete path owns that teardown.
-		return nil
-	}
-
-	desired := make(map[int32]struct{}, len(rd.Spec.VolumeDefinitions))
-	for i := range rd.Spec.VolumeDefinitions {
-		desired[rd.Spec.VolumeDefinitions[i].VolumeNumber] = struct{}{}
-	}
-
-	survivors := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(res.Status.Volumes))
-
-	var hasStale bool
-
-	for i := range res.Status.Volumes {
-		if _, ok := desired[res.Status.Volumes[i].VolumeNumber]; !ok {
-			hasStale = true
-
-			continue
-		}
-
-		survivors = append(survivors, res.Status.Volumes[i])
-	}
-
-	if !hasStale {
-		return nil
-	}
-
-	// JSON merge-patch on the array path REPLACES the array
-	// wholesale. Field-surgical: every other Status field
-	// (DRBDPort, DRBDMinor, DRBDNodeID, Conditions, DrbdState,
-	// Connections, ...) survives untouched because merge-patch
-	// recurses through the parent object and only the keys we
-	// author are mutated.
-	survivorsJSON, err := json.Marshal(survivors)
-	if err != nil {
-		return errors.Wrap(err, "marshal Status.Volumes purge")
-	}
-
-	body := []byte(`{"status":{"volumes":` + string(survivorsJSON) + `}}`)
-
-	target := &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
-	}
-
-	err = r.Status().Patch(ctx, target, client.RawPatch(types.MergePatchType, body))
-	if err != nil {
-		return errors.Wrap(err, "merge-patch Status.Volumes purge")
-	}
-
-	// Reflect the write back onto the caller's copy so subsequent
-	// reads inside the same reconcile see the post-purge slice.
-	res.Status.Volumes = survivors
-
-	return nil
-}
 
 // stampVolumeNumbersAnnotation writes the parent RD's volume-number
 // set onto the Resource's metadata.annotations under
