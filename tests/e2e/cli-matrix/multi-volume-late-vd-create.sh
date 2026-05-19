@@ -67,7 +67,7 @@ echo ">> [Bug 332] rd c + vd c (vol-0)"
 "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
 
 echo ">> [Bug 332] r c --auto-place=3 -s $POOL"
-"${LCTL[@]}" resource create --auto-place=3 --storage-pool "$POOL" "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=3 --storage-pool="$POOL" "$RD" >/dev/null
 
 echo ">> wait up to 120s for vol-0 to reach UpToDate on all 3 replicas"
 deadline=$(( $(date +%s) + 120 ))

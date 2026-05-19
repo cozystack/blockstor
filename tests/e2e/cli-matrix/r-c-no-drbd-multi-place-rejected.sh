@@ -69,7 +69,7 @@ echo ">> [Bug 335] linstor r c $RD --auto-place=2 -l STORAGE -s $POOL (must be r
 err_file=$(mktemp)
 out_file=$(mktemp)
 set +e
-"${LCTL[@]}" resource create --auto-place=2 --layer-list storage --storage-pool "$POOL" "$RD" >"$out_file" 2>"$err_file"
+"${LCTL[@]}" resource create --auto-place=2 --layer-list storage --storage-pool="$POOL" "$RD" >"$out_file" 2>"$err_file"
 rc=$?
 set -e
 

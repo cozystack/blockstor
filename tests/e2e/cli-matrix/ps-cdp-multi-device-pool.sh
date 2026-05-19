@@ -106,7 +106,7 @@ err_file=$(mktemp)
 if ! "${LCTL[@]}" physical-storage create-device-pool \
         zfs "$NODE" "$DEV1" "$DEV2" \
         --pool-name "${POOL}" \
-        --storage-pool "${POOL}" \
+        --storage-pool="${POOL}" \
         2>"$err_file"; then
     rc=$?
     echo "FAIL (Bug 337): linstor ps cdp exited $rc" >&2
@@ -161,7 +161,7 @@ err_file=$(mktemp)
 if ! "${LCTL[@]}" physical-storage create-device-pool \
         zfs "$NODE" "$DEV3" \
         --pool-name "${POOL}" \
-        --storage-pool "${POOL}" \
+        --storage-pool="${POOL}" \
         2>"$err_file"; then
     rc=$?
     echo "FAIL (Bug 337 online-expand): linstor ps cdp exited $rc" >&2

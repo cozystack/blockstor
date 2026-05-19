@@ -63,8 +63,8 @@ N2=$WORKER_2
 echo ">> [Bug 278] 2-replica diskful RD on $N1+$N2"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 128M >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool stand >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool stand >/dev/null
+"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool=stand >/dev/null
+"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool=stand >/dev/null
 
 echo ">> wait for both diskful UpToDate"
 RD="$RD" wait_uptodate "$RD" "$N1" "$N2"

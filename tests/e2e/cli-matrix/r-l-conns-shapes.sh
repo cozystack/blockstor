@@ -107,7 +107,7 @@ assert_row() {
 echo ">> [331.A] healthy 3-replica shape"
 "${LCTL[@]}" resource-definition create "$RD_HEALTHY" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD_HEALTHY" 128M >/dev/null
-"${LCTL[@]}" resource create --auto-place=3 --storage-pool stand "$RD_HEALTHY" >/dev/null
+"${LCTL[@]}" resource create --auto-place=3 --storage-pool=stand "$RD_HEALTHY" >/dev/null
 
 for n in "$N1" "$N2" "$N3"; do
     wait_status_state "$RD_HEALTHY" "$n" "UpToDate" 180 0
@@ -208,8 +208,8 @@ assert_row "$RD_DISKLESS" "$N3" \
 echo ">> [331.C] 2-replica + auto-tiebreaker shape"
 "${LCTL[@]}" resource-definition create "$RD_TB" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD_TB" 64M >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD_TB" --storage-pool stand >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD_TB" --storage-pool stand >/dev/null
+"${LCTL[@]}" resource create "$N1" "$RD_TB" --storage-pool=stand >/dev/null
+"${LCTL[@]}" resource create "$N2" "$RD_TB" --storage-pool=stand >/dev/null
 
 RD="$RD_TB" wait_uptodate "$RD_TB" "$N1" "$N2"
 

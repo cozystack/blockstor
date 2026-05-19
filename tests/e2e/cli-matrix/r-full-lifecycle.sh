@@ -54,7 +54,7 @@ trap cleanup EXIT
 echo ">> Phase 1: rd c + vd c + r c --auto-place=2 -s $SP"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 512M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$SP" "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$SP" "$RD" >/dev/null
 
 # 3 rows: 2 diskful + 1 TIE_BREAKER (Bug 338's pre-condition shape).
 wait_replica_count "$RD" 3 90 \
@@ -203,7 +203,7 @@ n1_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n1}" \
 # Phase 6: toggle diskless → diskful (-s <pool> materialises backing)
 # =====================================================================
 echo ">> Phase 6: r td $n1 $RD -s $SP  (diskless→diskful)"
-"${LCTL[@]}" resource toggle-disk --storage-pool "$SP" "$n1" "$RD" >/dev/null
+"${LCTL[@]}" resource toggle-disk --storage-pool="$SP" "$n1" "$RD" >/dev/null
 # Diskful materialise + initial sync can take a while on a busy QEMU
 # stand. Use the 240s wait_status_state ceiling rather than the 60s
 # default.

@@ -61,7 +61,7 @@ trap cleanup EXIT
 echo ">> [Bug 327] shape-2r-tb: 2-replica RD on $N1+$N2 + auto-tiebreaker on $N3"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 128M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool stand "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool=stand "$RD" >/dev/null
 
 echo ">> wait both diskful replicas UpToDate (auto-tiebreaker on the 3rd node)"
 deadline=$(( $(date +%s) + 180 ))

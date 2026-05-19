@@ -54,14 +54,14 @@ N3=$WORKER_3
 echo ">> [Bug 329] 2-replica RD on $N1+$N2 (1 GiB so the sync window is observable)"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool stand >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool stand >/dev/null
+"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool=stand >/dev/null
+"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool=stand >/dev/null
 
 echo ">> wait for the initial pair UpToDate"
 RD="$RD" wait_uptodate "$RD" "$N1" "$N2"
 
 echo ">> add 3rd diskful replica on $N3 — Bug 329 trigger"
-"${LCTL[@]}" resource create "$N3" "$RD" --storage-pool stand >/dev/null
+"${LCTL[@]}" resource create "$N3" "$RD" --storage-pool=stand >/dev/null
 
 echo ">> wait up to 240s for $N3 sync to fully drain — bare 'UpToDate' AND replication 'Established'"
 if ! wait_sync_done "$RD" "$N3" "$N1" 240; then

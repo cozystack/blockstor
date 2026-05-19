@@ -64,7 +64,7 @@ echo ">> [Bug 333] set cluster passphrase"
 echo ">> [Bug 333] linstor rd c $RD -l drbd,luks,storage + vd c 64M + r c --auto-place=2"
 "${LCTL[@]}" resource-definition create "$RD" --layer-list drbd,luks,storage >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 64M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
 # Resolve the placed pair so we can wait_uptodate against the actual
 # nodes the autoplacer picked rather than $WORKER_1+$WORKER_2 by

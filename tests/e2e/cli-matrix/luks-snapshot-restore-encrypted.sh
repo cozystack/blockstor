@@ -73,7 +73,7 @@ echo ">> [Bug 333] set cluster passphrase"
 echo ">> [Bug 333] create source encrypted RD"
 "${LCTL[@]}" resource-definition create "$RD_SRC" --layer-list drbd,luks,storage >/dev/null
 "${LCTL[@]}" volume-definition create "$RD_SRC" 64M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD_SRC" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_SRC" >/dev/null
 
 # Resolve placed nodes.
 deadline=$(( $(date +%s) + 60 ))
@@ -133,7 +133,7 @@ echo ">> [Bug 333] linstor r c $RD_DST --auto-place=2"
 # Restore creates the target RD shell but does NOT auto-deploy
 # replicas — caller must place them. Same flow as the kubectl-
 # driven snapshot-restore-cross-node.sh.
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD_DST" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_DST" >/dev/null
 
 deadline=$(( $(date +%s) + 60 ))
 placed_dst=()

@@ -67,7 +67,7 @@ echo ">> [Bug 328] linstor rd c + vd c"
 
 echo ">> [Bug 328] linstor r c $RD --auto-place=3 -s $POOL"
 err_file=$(mktemp)
-if ! out=$("${LCTL[@]}" resource create --auto-place=3 --storage-pool "$POOL" "$RD" 2>"$err_file"); then
+if ! out=$("${LCTL[@]}" resource create --auto-place=3 --storage-pool="$POOL" "$RD" 2>"$err_file"); then
     rc=$?
     echo "FAIL (Bug 328 regression): auto-place=3 exited $rc" >&2
     echo "----- stderr -----" >&2

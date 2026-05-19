@@ -62,7 +62,7 @@ trap cleanup EXIT
 echo ">> [Bug 338] shape-2r-tb: 2-replica RD + auto-tiebreaker"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 256M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool stand "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool=stand "$RD" >/dev/null
 
 echo ">> wait for steady state: 2 diskful UpToDate + 1 TIE_BREAKER witness"
 deadline=$(( $(date +%s) + 180 ))

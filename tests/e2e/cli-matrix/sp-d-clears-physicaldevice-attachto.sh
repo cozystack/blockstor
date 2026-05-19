@@ -95,7 +95,7 @@ echo ">> [Bug 340] linstor ps cdp zfs $NODE /dev/sdb --pool-name ${POOL} --stora
 "${LCTL[@]}" physical-storage create-device-pool \
     zfs "$NODE" /dev/sdb \
     --pool-name "${POOL}" \
-    --storage-pool "${POOL}" \
+    --storage-pool="${POOL}" \
     2>/dev/null || echo "note: ps cdp returned non-zero — Bug 340 reproduces either way"
 
 # Step 2: even if ps cdp returned success, wait long enough for
@@ -163,7 +163,7 @@ on_node "$NODE" bash -c "
 if ! "${LCTL[@]}" physical-storage create-device-pool \
         zfs "$NODE" /dev/sdb \
         --pool-name "${POOL}" \
-        --storage-pool "${POOL}" \
+        --storage-pool="${POOL}" \
         2>/dev/null; then
     echo "FAIL (Bug 340): second ps cdp attempt rejected — device still stuck post-self-heal" >&2
     exit 1

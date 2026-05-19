@@ -59,7 +59,7 @@ echo ">> [Bug 334] linstor rd c + vd c"
 
 echo ">> [Bug 334] linstor r c $RD --auto-place=1 -l STORAGE -s $POOL"
 err_file=$(mktemp)
-if ! "${LCTL[@]}" resource create --auto-place=1 --layer-list storage --storage-pool "$POOL" "$RD" 2>"$err_file"; then
+if ! "${LCTL[@]}" resource create --auto-place=1 --layer-list storage --storage-pool="$POOL" "$RD" 2>"$err_file"; then
     rc=$?
     echo "FAIL: auto-place=1 with -l STORAGE exited $rc (should succeed)" >&2
     cat "$err_file" >&2

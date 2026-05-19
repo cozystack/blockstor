@@ -66,7 +66,7 @@ echo ">> [Bug 333] set cluster passphrase + create source encrypted RD"
 "${LCTL[@]}" encryption create-passphrase "$PASSPHRASE" >/dev/null 2>&1 || true
 "${LCTL[@]}" resource-definition create "$RD_SRC" --layer-list drbd,luks,storage >/dev/null
 "${LCTL[@]}" volume-definition create "$RD_SRC" 64M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD_SRC" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_SRC" >/dev/null
 
 deadline=$(( $(date +%s) + 60 ))
 placed_src=()
@@ -106,7 +106,7 @@ rm -f "$err_file"
 # automatically; others leave placement to the operator. Trigger
 # autoplace defensively and rely on the autoplace endpoint being
 # idempotent if the clone already placed replicas.
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD_DST" \
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_DST" \
     >/dev/null 2>&1 || true
 
 deadline=$(( $(date +%s) + 120 ))

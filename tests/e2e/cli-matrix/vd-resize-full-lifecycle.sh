@@ -93,7 +93,7 @@ run_resize_lifecycle() {
     echo ">> rd c + vd c 1G + r c --auto-place=2 -s $POOL"
     "${LCTL[@]}" resource-definition create "$RD" >/dev/null
     "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
-    "${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD" >/dev/null
+    "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
     # Resolve the placed pair (autoplacer chose which nodes — we wait
     # for the Resource CRDs to appear, then wait_uptodate on each).

@@ -81,24 +81,29 @@ echo ">> [Bug 326] linstor ps cdp zfs $NODE /dev/sdb --pool-name ${POOL}_zpool -
 # (Bug 89 contract). Same goes for `already absent` or
 # `no free PhysicalDevice` envelopes from a partially-cleaned prior
 # run. Only when exit 0 do we expect SP convergence in `sp l`.
+out_file=$(mktemp)
 err_file=$(mktemp)
 set +e
 "${LCTL[@]}" physical-storage create-device-pool \
         zfs "$NODE" /dev/sdb \
         --pool-name "${POOL}_zpool" \
-        --storage-pool "$POOL" \
-        2>"$err_file"
+        --storage-pool="$POOL" \
+        >"$out_file" 2>"$err_file"
 cdp_exit=$?
 set -e
-cdp_stderr=$(cat "$err_file")
-rm -f "$err_file"
+# linstor-client routes server-side ERROR envelopes to STDOUT, not
+# stderr, so we have to grep over both fds to reliably detect the
+# Bug 326 decoder-rejection envelope as well as Bug 89-class
+# SignatureFound/busy/absent envelopes.
+cdp_combined=$(cat "$out_file" "$err_file")
+rm -f "$out_file" "$err_file"
 
 # Bug 326 regression: REST decoder rejected vdo_enable wire-shape.
-if echo "$cdp_stderr" | grep -qiE "unknown field.*vdo_enable"; then
+if grep -qiE "unknown field.*vdo_enable" <<< "$cdp_combined"; then
     echo "FAIL (Bug 326 regression): REST decoder rejected vdo_enable" >&2
-    echo "----- stderr -----" >&2
-    echo "$cdp_stderr" >&2
-    echo "------------------" >&2
+    echo "----- combined output -----" >&2
+    echo "$cdp_combined" >&2
+    echo "---------------------------" >&2
     exit 1
 fi
 
@@ -107,17 +112,17 @@ if [[ "$cdp_exit" -ne 0 ]]; then
     # contract upheld (Bug 89 signature reject, busy device, idempotent
     # absent, etc.). Bug 326 still pinned because the body was
     # accepted by the decoder.
-    if echo "$cdp_stderr" | grep -qE "(SignatureFound|device .* is busy|already absent|no free PhysicalDevice)"; then
+    if grep -qE "(SignatureFound|device .* is busy|already absent|no free PhysicalDevice)" <<< "$cdp_combined"; then
         echo ">> ps-cdp-zfs-vdo_enable OK (Bug 326 pinned: vdo_enable accepted; exit $cdp_exit with structured envelope)" >&2
-        echo "----- stderr -----" >&2
-        echo "$cdp_stderr" >&2
-        echo "------------------" >&2
+        echo "----- combined output -----" >&2
+        echo "$cdp_combined" >&2
+        echo "---------------------------" >&2
         exit 0
     fi
     echo "FAIL: ps cdp exit $cdp_exit without recognised envelope" >&2
-    echo "----- stderr -----" >&2
-    echo "$cdp_stderr" >&2
-    echo "------------------" >&2
+    echo "----- combined output -----" >&2
+    echo "$cdp_combined" >&2
+    echo "---------------------------" >&2
     exit 1
 fi
 

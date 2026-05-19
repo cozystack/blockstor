@@ -54,7 +54,7 @@ fi
 echo ">> rd c + vd c 2G + r c --auto-place=2 -s $POOL"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 2G >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool "$POOL" "$RD" >/dev/null
+"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
 # Wait for both replicas to be placed before we attempt the shrink.
 # A shrink attempted while one side is still Inconsistent could

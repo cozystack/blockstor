@@ -136,7 +136,7 @@ err_file=$(mktemp)
 if ! "${LCTL[@]}" physical-storage create-device-pool \
         zfs "$NODE" /dev/sdb \
         --pool-name "${POOL}" \
-        --storage-pool "${POOL}" \
+        --storage-pool="${POOL}" \
         2>"$err_file"; then
     rc=$?
     echo "FAIL (Bug 336): linstor ps cdp exited $rc" >&2

@@ -69,7 +69,7 @@ echo ">> [Bug 333] linstor rd c $RD -l drbd,luks,storage + vd c 64M"
 
 echo ">> [Bug 333] linstor r c $RD --auto-place=3 -s $POOL"
 err_file=$(mktemp)
-if ! "${LCTL[@]}" resource create --auto-place=3 --storage-pool "$POOL" "$RD" 2>"$err_file"; then
+if ! "${LCTL[@]}" resource create --auto-place=3 --storage-pool="$POOL" "$RD" 2>"$err_file"; then
     rc=$?
     echo "FAIL (Bug 333): encrypted auto-place=3 exited $rc" >&2
     cat "$err_file" >&2
