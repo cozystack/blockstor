@@ -43,6 +43,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/satellite/controllers"
 	"github.com/cozystack/blockstor/pkg/storage"
+	"github.com/cozystack/blockstor/pkg/uevent"
 )
 
 func main() {
@@ -93,6 +94,32 @@ func run() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Optional: NETLINK_KOBJECT_UEVENT listener that wakes the
+	// PhysicalDeviceDiscoveryRunnable on every block-device
+	// mutation. The DaemonSet runs `privileged: true` so
+	// CAP_NET_ADMIN is implicit — but if the open fails for any
+	// reason (older kernel, non-standard runtime, dev binary
+	// running on a non-Linux host), log it and continue with pure-
+	// polling discovery. The udev path is an optimisation, not a
+	// correctness requirement.
+	//
+	// `ueventListener` is typed as the controllers interface (not
+	// the concrete *uevent.Listener) so the "open failed" path can
+	// leave it as a true interface-nil. Assigning a typed-nil
+	// *uevent.Listener into an interface variable produces a
+	// non-nil interface holding a nil pointer — the discovery
+	// runnable's `if p.Uevent != nil` guard would mis-fire and
+	// dereference the nil pointer when calling Events().
+	var ueventListener controllers.UeventNotifier
+
+	listener, ueventErr := uevent.New(ctx)
+	if ueventErr != nil {
+		logger.Warn("uevent listener unavailable; falling back to pure-polling PhysicalDevice discovery",
+			"err", ueventErr.Error())
+	} else {
+		ueventListener = listener
+	}
+
 	// Providers map starts empty — the c-r `StoragePoolReconciler`
 	// registers entries as it observes StoragePool CRDs (Phase 10.5
 	// retired the bootstrap-from-flags path; Phase 10.6 retired the
@@ -137,7 +164,7 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener),
 		HealthProbeBindAddress: probeAddr,
 		OnCacheSynced: func() {
 			logger.Info("satellite cache sync complete, marking ready")
@@ -184,13 +211,17 @@ func loadRESTConfig() (*rest.Config, error) {
 // The factory shape lets the agent stay ignorant of the readyState
 // + logger plumbing — it only sees the standard
 // satellite.ManagerFactory signature.
-func mgrFactory(ready *readyState, logger *slog.Logger) satellite.ManagerFactory {
+func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, controllers.Config{
 			NodeName:               nodeName,
 			Apply:                  rec,
 			Exec:                   storage.RealExec{},
 			HealthProbeBindAddress: probeAddr,
+			// Optional: nil when `uevent.New` failed at startup —
+			// PhysicalDeviceDiscoveryRunnable falls back to pure-
+			// polling discovery.
+			UeventListener: ueventListener,
 		})
 		if err != nil {
 			return nil, err //nolint:wrapcheck // controllers.NewManager already wraps

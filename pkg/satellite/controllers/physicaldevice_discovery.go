@@ -35,6 +35,7 @@ import (
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
+	"github.com/cozystack/blockstor/pkg/uevent"
 )
 
 // zvolKNamePattern matches ZFS volume devices' kernel names
@@ -53,12 +54,33 @@ func isZVOLKName(kname string) bool {
 }
 
 // PhysicalDeviceDiscoveryPeriod is the cadence at which the
-// satellite re-scans `lsblk` and publishes PhysicalDevice CRDs
-// for free block devices on this node. 60s matches the user-facing
-// expectation that `linstor ps l` shows freshly wiped disks "within
-// a minute" without flooding the apiserver with no-op writes on a
+// satellite re-scans `lsblk` and publishes PhysicalDevice CRDs for
+// free block devices on this node. Used to be 60 s — operators saw
+// `linstor ps l` lag up to a full minute after `zpool destroy +
+// wipefs` because the discovery loop was the only refresh path.
+//
+// With the udev fast-path (NETLINK_KOBJECT_UEVENT listener wired
+// below) every block-device mutation triggers an immediate re-scan
+// within milliseconds, so the periodic loop is now a safety net for
+// the niche cases the kernel doesn't emit for (loop devices in
+// nested namespaces) or where the listener missed a frame mid-
+// restart. 300 s strikes the balance: still inside any reasonable
+// operator's "show new disks soon" expectation if udev failed
+// silently, far enough apart to not flood the apiserver on a
 // quiescent host.
-const PhysicalDeviceDiscoveryPeriod = 60 * time.Second
+const PhysicalDeviceDiscoveryPeriod = 300 * time.Second
+
+// PhysicalDeviceUeventDebounce is the window the discovery loop
+// coalesces a burst of udev events into a single re-scan. A
+// `wipefs -a /dev/sdb` triggers `change` events on the parent
+// plus every partition kobject; `zpool destroy` plus the partition
+// table rewrite can emit half a dozen frames in <100 ms. Without
+// the debounce the satellite would run `lsblk` + signature probes
+// once per frame which is wasted work — the second scan would see
+// the same state as the first. 250 ms is long enough to coalesce
+// the burst, short enough that the operator-visible "wipefs to
+// `linstor ps l`" latency stays in the sub-second range.
+const PhysicalDeviceUeventDebounce = 250 * time.Millisecond
 
 // PhysicalDeviceDiscoveryFieldOwner is the SSA field-manager the
 // discovery runnable uses for its Status writes. Distinct from
@@ -119,6 +141,34 @@ type PhysicalDeviceDiscoveryRunnable struct {
 	// production uses the default constant). A zero Period falls
 	// back.
 	Period time.Duration
+
+	// Debounce overrides PhysicalDeviceUeventDebounce (test-only).
+	// Zero falls back to the constant. Tests pin a small value so
+	// the burst-coalesce assertion completes inside the unit-test
+	// budget without sleeping for 250 ms.
+	Debounce time.Duration
+
+	// Uevent is the optional listener that pushes udev events the
+	// discovery loop reacts to. Production wires it from
+	// `uevent.New(ctx)` at satellite startup; if the open fails
+	// (CAP_NET_ADMIN missing, container restriction, non-Linux
+	// build) the field stays nil and the runnable falls back to
+	// pure-polling discovery.
+	//
+	// Typed as the interface (rather than `*uevent.Listener`) so
+	// unit tests can inject a fake that supplies a buffered channel
+	// without opening a real netlink socket.
+	Uevent UeventNotifier
+}
+
+// UeventNotifier is the narrow interface the discovery runnable
+// consumes from the udev listener. Defining it here (rather than
+// taking the concrete `*uevent.Listener` type) lets unit tests
+// inject a fake that supplies a buffered channel without opening a
+// real netlink socket. The production implementation is
+// `*uevent.Listener`.
+type UeventNotifier interface {
+	Events() <-chan uevent.Event
 }
 
 // NeedLeaderElection reports that this runnable does NOT need
@@ -133,10 +183,25 @@ func (*PhysicalDeviceDiscoveryRunnable) NeedLeaderElection() bool { return false
 // transient apiserver / lsblk hiccup must not take the satellite
 // out of service. The first scan fires immediately so a freshly-
 // started satellite has its free disks visible within seconds.
+//
+// Two trigger sources feed the scan:
+//   - Ticker (PhysicalDeviceDiscoveryPeriod, default 300 s) is the
+//     safety net for shapes the kernel doesn't emit udev events
+//     for (loop devices in nested namespaces, container restarts
+//     mid-event).
+//   - Udev (NETLINK_KOBJECT_UEVENT, optional) is the fast path:
+//     every block-device mutation triggers a re-scan within
+//     milliseconds. Events are debounced (250 ms) so a burst from
+//     `wipefs -a` / `zpool destroy` collapses into one scan.
 func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 	period := p.Period
 	if period == 0 {
 		period = PhysicalDeviceDiscoveryPeriod
+	}
+
+	debounce := p.Debounce
+	if debounce == 0 {
+		debounce = PhysicalDeviceUeventDebounce
 	}
 
 	logger := log.FromContext(ctx).WithName("physicaldevice-discovery").WithValues("node", p.NodeName)
@@ -144,6 +209,16 @@ func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 	err := p.scanOnce(ctx, logger)
 	if err != nil {
 		logger.Error(err, "initial PhysicalDevice scan")
+	}
+
+	// trigger is the coalesced rescan signal. The udev goroutine
+	// (if a listener is wired) sends on it after a debounce window
+	// closes; the main loop selects on trigger OR the ticker so
+	// either source produces exactly one scan.
+	trigger := make(chan struct{}, 1)
+
+	if p.Uevent != nil {
+		go runUeventBridge(ctx, logger, p.Uevent.Events(), trigger, debounce)
 	}
 
 	ticker := time.NewTicker(period)
@@ -158,8 +233,93 @@ func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 			if err != nil {
 				logger.Error(err, "PhysicalDevice scan cycle")
 			}
+		case <-trigger:
+			err = p.scanOnce(ctx, logger)
+			if err != nil {
+				logger.Error(err, "PhysicalDevice scan cycle (udev)")
+			}
 		}
 	}
+}
+
+// runUeventBridge consumes the raw udev event stream and emits one
+// coalesced signal onto `trigger` per debounce window. Lives in its
+// own goroutine so the main scan loop doesn't have to interleave
+// timer + channel state.
+//
+// Algorithm:
+//   - On the first event in a quiescent period, arm a one-shot
+//     timer (`debounce` long) and remember an event arrived.
+//   - Every subsequent event resets the timer — a burst of events
+//     all extend the window, so the scan only fires once the
+//     kernel has stopped emitting frames for a full `debounce`.
+//   - On timer fire, send on `trigger` non-blocking. The
+//     consumer's channel buffer is 1, so a coalesced "scan needed"
+//     signal is never lost even if the scan loop is currently
+//     mid-scan.
+func runUeventBridge(ctx context.Context, logger logr.Logger, events <-chan uevent.Event, trigger chan<- struct{}, debounce time.Duration) {
+	// Timer starts stopped — we only arm it on the first event of
+	// each burst. Using a single reusable timer (rather than
+	// time.AfterFunc per event) keeps the allocator quiet during
+	// a `udevadm trigger` storm.
+	timer := time.NewTimer(debounce)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	armed := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				// Listener closed (ctx cancellation propagated).
+				// The main loop's own ctx.Done() branch will
+				// shut us down — bail to avoid spinning on a
+				// closed channel.
+				return
+			}
+
+			logger.V(2).Info("udev event", "action", event.Action, "kernel", event.Kernel, "devpath", event.Devpath)
+
+			armed = resetDebounceTimer(timer, debounce, armed)
+		case <-timer.C:
+			armed = false
+
+			select {
+			case trigger <- struct{}{}:
+			default:
+				// Scan already pending — coalesce into it.
+			}
+		}
+	}
+}
+
+// resetDebounceTimer (re)arms the debounce timer. Returns the new
+// `armed` state — true after the call. Centralises the
+// "stop-then-reset" dance required to safely re-arm a Go timer that
+// may have already fired or be mid-arm; getting the sequence wrong
+// either drains a non-existent C-value or leaks a stale wake-up.
+func resetDebounceTimer(timer *time.Timer, debounce time.Duration, armed bool) bool {
+	if armed {
+		if !timer.Stop() {
+			// Timer already fired — drain the channel so the
+			// next Reset doesn't immediately fire on the stale
+			// value. Use a non-blocking receive because the
+			// timer-fire branch of the main select may have
+			// already drained it.
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+
+	timer.Reset(debounce)
+
+	return true
 }
 
 // RegisterWithManager adds the runnable to mgr. Symmetrical with

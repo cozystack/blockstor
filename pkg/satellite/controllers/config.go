@@ -81,4 +81,16 @@ type Config struct {
 	// (consumer). Unit tests can leave it nil and the wiring
 	// short-circuits — neither Watches consumer nor producer fires.
 	ReconcileTrigger chan event.GenericEvent
+
+	// UeventListener is the optional source of kernel block-device
+	// uevents the PhysicalDeviceDiscoveryRunnable reacts to. The
+	// satellite's cmd/satellite/main.go opens
+	// `NETLINK_KOBJECT_UEVENT` and passes the listener here; if
+	// the syscall fails (CAP_NET_ADMIN missing, container
+	// restriction, non-Linux dev build), the field stays nil and
+	// the discovery loop runs in pure-polling mode. Unit tests can
+	// inject a fake notifier with a buffered channel so they can
+	// pin the burst-debounce / reacts-within-deadline behaviour
+	// without opening a real netlink socket.
+	UeventListener UeventNotifier
 }
