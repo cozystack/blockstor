@@ -253,3 +253,108 @@ assert_no_orphans() {
     fi
     return 0
 }
+
+# ---- LUKS / encryption helpers --------------------------------------------
+#
+# Shared by every luks-*.sh cell — keeps cryptsetup / passphrase-state
+# probing in one place so the CLI cells stay focused on the linstor
+# wire surface. All helpers tolerate transient errors (test passphrase,
+# missing device while satellite is mid-reconcile) and never `set -e`
+# their caller — they return non-zero on the negative case so the cell
+# can take its own action.
+
+# wait_luks_header_present <node> <device> [timeout=60] — poll
+# `cryptsetup luksDump <device>` on NODE until exit 0 (= LUKS1 or LUKS2
+# header detected on the backing block device). Used by every
+# luks-*-encrypted.sh cell after `linstor r c` returns 200 — the REST
+# call returns when the resource CRD is staged, but the kernel-side
+# luksFormat runs asynchronously on the satellite's first reconcile, so
+# we have to wait for the header to actually appear before we assert
+# anything about it. Non-zero exit on timeout. Prints the last luksDump
+# stderr to the caller's stderr for triage.
+wait_luks_header_present() {
+    local node=$1 dev=$2 timeout=${3:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local last=""
+    while (( $(date +%s) < deadline )); do
+        if last=$(on_node "$node" cryptsetup luksDump "$dev" 2>&1); then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_luks_header_present: ${node}:${dev} never produced a valid LUKS header within ${timeout}s" >&2
+    echo "  last luksDump output: $last" >&2
+    return 1
+}
+
+# assert_luks_passphrase_opens <node> <device> <passphrase> — verify
+# PASSPHRASE actually unlocks the LUKS header on DEVICE without
+# activating a mapper (`--test-passphrase`, idempotent). Run on every
+# replica of an encrypted RD so a Bug-175-class wire-injection / Bug-
+# 233-class wrong-passphrase regression is caught at the kernel level
+# rather than just at the REST envelope. Non-zero exit on failure.
+assert_luks_passphrase_opens() {
+    local node=$1 dev=$2 passphrase=$3
+    # NUL on stdin avoids leaking the passphrase via `ps -ef` argv and
+    # also avoids re-quoting headaches if the passphrase contains shell
+    # metachars (the e2e default has `!!` in it, which would trigger
+    # bash history expansion inside `bash -c` without the heredoc).
+    if ! printf '%s' "$passphrase" | on_node "$node" \
+            cryptsetup luksOpen --test-passphrase --key-file=- "$dev" 2>/dev/null; then
+        echo "assert_luks_passphrase_opens: passphrase does NOT open ${node}:${dev}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# cleanup_encryption_state — `linstor encryption delete-passphrase`,
+# ignoring not-found / no-passphrase-set errors. Called from EXIT
+# traps of cells that mutate the cluster passphrase state so the next
+# cell starts from a known-clean baseline. Falls back to a direct
+# DELETE on /v1/encryption/passphrase if the python CLI isn't shipping
+# the delete-passphrase subcommand on this stand (older clients).
+cleanup_encryption_state() {
+    if [[ -n "${LCTL_PORT:-}" ]]; then
+        # Prefer the REST verb directly — covers every linstor-client
+        # version. 204/404 both fine; we just want the state cleared.
+        curl -fsS -m 5 -X DELETE \
+            "http://127.0.0.1:${LCTL_PORT}/v1/encryption/passphrase" \
+            >/dev/null 2>&1 || true
+    fi
+    if [[ ${#LCTL[@]} -gt 0 ]]; then
+        "${LCTL[@]}" encryption delete-passphrase >/dev/null 2>&1 || true
+    fi
+}
+
+# luks_backing_device <rd> <node> [vol=0] — resolve the local backing
+# block device that holds the LUKS header for (RD, NODE, VOL). For
+# layer stack [LUKS,STORAGE] the header lives directly on the
+# provider's LV/zvol; for [DRBD,LUKS,STORAGE] the header still lives
+# on the LV (DRBD ships ciphertext between peers, see
+# drbd-luks-stack.sh comment). We discover the backing dev by reading
+# the .res file's `disk` line for the LUKS-mapper case, or by
+# `lvs`/`zfs list`-grep for the bare-storage case. Echo empty string
+# on failure so the caller can decide whether to retry or fail.
+luks_backing_device() {
+    local rd=$1 node=$2 vol=${3:-0}
+    # The .res file's `disk` directive points at /dev/mapper/<rd>-<vol>-luks
+    # for the DRBD,LUKS,STORAGE stack. The mapper, in turn, sits on top
+    # of the provider LV — we want the LV here (the LUKS header lives
+    # there, not on the mapper, which is the plaintext side).
+    local lv
+    lv=$(on_node "$node" bash -c "
+        # First try lvm-thin / lvm naming convention
+        lvs --noheadings -o lv_path 2>/dev/null \
+            | awk -v rd='${rd}' -v vol='_0' '\$0 ~ rd vol' | head -1 | tr -d ' '
+    " 2>/dev/null || true)
+    if [[ -n "$lv" ]]; then
+        echo "$lv"
+        return 0
+    fi
+    # ZFS fallback: zvol path under /dev/zvol/<pool>/<rd>_<vol>
+    local zv
+    zv=$(on_node "$node" bash -c "
+        find /dev/zvol -maxdepth 3 -name '${rd}_${vol}*' 2>/dev/null | head -1
+    " 2>/dev/null || true)
+    echo "$zv"
+}
