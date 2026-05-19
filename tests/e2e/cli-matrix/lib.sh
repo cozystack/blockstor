@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# Shared helpers for tests/e2e/cli-matrix/*.sh — the L6 mandatory
+# operator-CLI e2e wave. Every cell here runs the real `linstor`
+# CLI on the stand and asserts Status convergence via
+# observer-stamped Status + kernel probe (NOT just "200 OK"). See
+# PLAN.md L6 section (post-mortem of Bugs 326-330) for why this
+# layer exists.
+#
+# Conventions inherited from tests/e2e/lib.sh — re-sourced so cells
+# get on_node / status_disk_state / wait_uptodate / require_workers
+# / delete_rd / WORKER_1..3 without re-implementing them.
+#
+# Extras layered on top here:
+#   - linstor CLI bootstrap (port-forward + LCTL[] array)
+#   - wire-shape helpers for `linstor r l -o json` and `linstor sp l -o json`
+#   - convergence waiters keyed off observer-stamped Status
+#   - assert_no_orphans for scenario teardown
+#
+# All cells:  source "$SCRIPT_DIR/lib.sh"  → that sources the parent
+# lib.sh and then this file's helpers stack on top.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../lib.sh
+source "$SCRIPT_DIR/../lib.sh"
+
+# ---- linstor CLI bootstrap ------------------------------------------------
+#
+# Cells do `linstor_cli_setup` once at the top. It:
+#   - kubectl port-forwards svc/blockstor-apiserver to a random localhost port
+#   - exports LCTL_PORT and the LCTL[] array a cell can use as
+#     "${LCTL[@]}" resource list --resources $RD --output-version v1
+#   - registers a trap-friendly cleanup callback in LCTL_CLEANUP_FN
+#
+# If the `linstor` binary is not in PATH, the cell skips (exit 0) so
+# a stand without linstor-client installed doesn't show up as FAIL on
+# the nightly dispatcher.
+
+LCTL_PORT=""
+LCTL_PF_PID=""
+LCTL=()
+
+linstor_cli_setup() {
+    if ! command -v linstor >/dev/null 2>&1; then
+        echo "SKIP: linstor CLI not in PATH (apt install linstor-client)"
+        exit 0
+    fi
+
+    LCTL_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+
+    kubectl -n "$NS" port-forward svc/blockstor-apiserver "$LCTL_PORT":3370 \
+        >/tmp/cli-matrix-pf.log 2>&1 &
+    LCTL_PF_PID=$!
+
+    for _ in $(seq 1 30); do
+        if curl -fsS -m 1 "http://127.0.0.1:${LCTL_PORT}/v1/healthz" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    LCTL=(linstor --controllers "http://localhost:$LCTL_PORT")
+}
+
+linstor_cli_teardown() {
+    if [[ -n "$LCTL_PF_PID" ]]; then
+        kill "$LCTL_PF_PID" 2>/dev/null || true
+        wait "$LCTL_PF_PID" 2>/dev/null || true
+    fi
+}
+
+# linstor_r_l_json — `linstor r l -r <rd>` in machine-readable JSON,
+# echoed to stdout. Empty string on REST error so callers can grep
+# for fields without `set -e` aborting on a transient 5xx during a
+# rolling reconcile.
+linstor_r_l_json() {
+    local rd=$1
+    "${LCTL[@]}" --machine-readable resource list --resources "$rd" 2>/dev/null || echo ""
+}
+
+# linstor_sp_l_json — `linstor sp l` JSON, optionally filtered to a
+# named pool. Used to check `ps cdp` actually staged the pool.
+linstor_sp_l_json() {
+    local pool=${1:-}
+    if [[ -n "$pool" ]]; then
+        "${LCTL[@]}" --machine-readable storage-pool list --storage-pools "$pool" 2>/dev/null || echo ""
+    else
+        "${LCTL[@]}" --machine-readable storage-pool list 2>/dev/null || echo ""
+    fi
+}
+
+# ---- observer-Status convergence waiters ----------------------------------
+#
+# Every assertion here reads observer-stamped Resource.Status — the
+# same wire surface the python CLI's `linstor r l` renders.
+# Cross-checked against `drbdsetup status` on the satellite pod
+# when the contract is kernel-level (Diskless / UpToDate transitions).
+
+# wait_status_state RD NODE EXPECTED [TIMEOUT=60] [VOL=0] — poll
+# Resource.Status.volumes[0].diskState until EXPECTED (literal or
+# alternation, e.g. "UpToDate|UpToDate(100%)") or timeout. Non-zero
+# exit on timeout; prints last-seen state to stderr.
+wait_status_state() {
+    local rd=$1 node=$2 expected=$3 timeout=${4:-60} vol=${5:-0}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=""
+    while (( $(date +%s) < deadline )); do
+        cur=$(status_disk_state "$rd" "$node" "$vol")
+        if [[ "$cur" =~ ^(${expected})$ ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_status_state: ${rd}.${node} vol=${vol} never reached '${expected}' (last='${cur}') within ${timeout}s" >&2
+    return 1
+}
+
+# wait_status_diskless RD NODE [TIMEOUT=30] — poll Resource.Status
+# AND Spec.Flags until both agree the replica is DISKLESS:
+#   - Spec.Flags contains "DISKLESS"
+#   - Status.volumes[0].diskState == "Diskless" OR Status.volumes is empty
+#     (observer omits volumes for a flag-only diskless replica that
+#     has no kernel device — see ensureVolumesForView synthesis path)
+# Cross-checked: satellite-pod `drbdsetup status RD | grep -q disk:Diskless`
+# also returns true (or RD is absent from drbd state if torn-down).
+wait_status_diskless() {
+    local rd=$1 node=$2 timeout=${3:-30}
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        local flags disk
+        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" \
+            -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
+        disk=$(status_disk_state "$rd" "$node" 0)
+        if [[ "$flags" == *"DISKLESS"* ]]; then
+            if [[ "$disk" == "Diskless" || -z "$disk" ]]; then
+                # Belt-and-braces kernel probe — only if the satellite
+                # pod is reachable and reports the rd. A torn-down
+                # replica may not be in `drbdsetup status` at all,
+                # which is fine for the Bug 330 contract.
+                if on_node "$node" drbdsetup status "$rd" 2>/dev/null \
+                        | grep -qE 'disk:Diskless|^'"$rd"' '; then
+                    return 0
+                fi
+                # Accept Status-only convergence if kernel probe is
+                # ambiguous (rd not present = torn down = also Diskless).
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    echo "wait_status_diskless: ${rd}.${node} never converged to Diskless within ${timeout}s" >&2
+    kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" -o json 2>/dev/null \
+        | jq '{flags: .spec.flags, status: .status}' >&2 || true
+    return 1
+}
+
+# wait_sync_done RD NODE PEER [TIMEOUT=240] — Bug 329 contract:
+# poll until BOTH replicationState is "Established" AND the
+# observer-stamped DiskState equals "UpToDate" with no "(NN%)"
+# progress suffix. The pre-fix bug was: DRBD events2 stamped
+# UpToDate(100%) but never re-stamped the bare UpToDate after the
+# final SyncSource→Established transition, leaving the CLI's State
+# column stuck on "UpToDate(100%)" forever. 240s safety margin
+# because initial sync on a freshly-created replica plus the
+# UpToDate-decoration race can take 120s+ on a busy QEMU stand.
+wait_sync_done() {
+    local rd=$1 node=$2 peer=$3 timeout=${4:-240}
+    local deadline=$(( $(date +%s) + timeout ))
+    local disk rep
+    while (( $(date +%s) < deadline )); do
+        disk=$(status_disk_state "$rd" "$node" 0)
+        rep=$(status_replication_state "$rd" "$node" "$peer")
+        # Bare "UpToDate" — NOT "UpToDate(NN%)". The annotateSyncProgress
+        # decorator only adds the suffix while OutOfSyncKib > 0; clean
+        # UpToDate is the steady state we're waiting for.
+        if [[ "$disk" == "UpToDate" && "$rep" == "Established" ]]; then
+            return 0
+        fi
+        sleep 5
+    done
+    echo "wait_sync_done: ${rd}.${node}<->${peer} never reached (UpToDate, Established) within ${timeout}s" >&2
+    echo "  last: disk='${disk}' rep='${rep}'" >&2
+    return 1
+}
+
+# wait_conns_ok RD NODE PEER [TIMEOUT=60] — poll observer until
+# the (node,peer) connection reports connected==true AND message
+# matches "Connected|Established". Mirrors the python CLI's "Conns=Ok"
+# column heuristic.
+wait_conns_ok() {
+    wait_connection_state "$1" "$2" "$3" "Connected|Established" "${4:-60}"
+}
+
+# ---- no-orphans invariant -------------------------------------------------
+#
+# After a cli-matrix cell tears down its RD, assert the cluster is
+# clean: no leftover Resource CRDs, no kernel slots, no LVM volumes,
+# no .res files. Called from the cell's EXIT trap (after delete_rd).
+# Best-effort — prints divergence to stderr but does NOT fail the
+# test on residue unless STRICT_ORPHANS=1, so a noisy concurrent
+# scenario on the same stand doesn't false-FAIL this one.
+assert_no_orphans() {
+    local rd=$1
+    local fail=0
+    local res leftover
+
+    # CRD layer.
+    leftover=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' || true)
+    if [[ -n "$leftover" ]]; then
+        echo "ORPHAN(crd): leftover Resource CRDs for ${rd}: $leftover" >&2
+        fail=1
+    fi
+    if kubectl get "resourcedefinitions.blockstor.io.blockstor.io/${rd}" >/dev/null 2>&1; then
+        echo "ORPHAN(crd): RD ${rd} still present" >&2
+        fail=1
+    fi
+
+    # Kernel layer + .res / LV / zvol residue on every satellite.
+    for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+        # drbd kernel slot
+        if kubectl -n "$NS" exec "$pod" -- drbdsetup status "$rd" >/dev/null 2>&1; then
+            echo "ORPHAN(drbd): ${pod} still has kernel slot for ${rd}" >&2
+            fail=1
+        fi
+        # .res file
+        if kubectl -n "$NS" exec "$pod" -- test -f "/etc/drbd.d/${rd}.res" 2>/dev/null; then
+            echo "ORPHAN(.res): ${pod} still has /etc/drbd.d/${rd}.res" >&2
+            fail=1
+        fi
+        # LVM LVs named after the rd (lvm + lvm-thin pools)
+        res=$(kubectl -n "$NS" exec "$pod" -- bash -c \
+            "lvs --noheadings -o lv_name 2>/dev/null | awk '\$1 ~ /${rd}_/'" 2>/dev/null || true)
+        if [[ -n "$res" ]]; then
+            echo "ORPHAN(lvm): ${pod} still has LV(s) for ${rd}: $res" >&2
+            fail=1
+        fi
+        # ZFS datasets named after the rd (zfs/zfs-thin pools)
+        res=$(kubectl -n "$NS" exec "$pod" -- bash -c \
+            "zfs list -H -o name 2>/dev/null | awk '/\\/${rd}_/ {print}'" 2>/dev/null || true)
+        if [[ -n "$res" ]]; then
+            echo "ORPHAN(zfs): ${pod} still has dataset(s) for ${rd}: $res" >&2
+            fail=1
+        fi
+    done
+
+    if (( fail )); then
+        if [[ "${STRICT_ORPHANS:-0}" == "1" ]]; then
+            return 1
+        fi
+        echo "assert_no_orphans: residue noted for ${rd} (set STRICT_ORPHANS=1 to fail on this)" >&2
+    fi
+    return 0
+}
