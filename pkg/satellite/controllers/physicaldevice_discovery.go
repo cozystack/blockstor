@@ -178,6 +178,26 @@ type UeventNotifier interface {
 // wrong (each host's block devices are opaque to peers).
 func (*PhysicalDeviceDiscoveryRunnable) NeedLeaderElection() bool { return false }
 
+// NewPhysicalDeviceDiscoveryRunnableFromConfig is the canonical
+// constructor that builds the runnable from a controllers.Config.
+// Lives here (rather than inline in manager.go) so the assignment
+// of cfg.UeventListener → runnable.Uevent is in a single
+// place a unit test can drive. Bug 341: without this single
+// point of construction the assignment was silently dropped in
+// addBackgroundRunnables and the udev fast-path was a no-op in
+// production despite a healthy netlink listener.
+//
+// Production caller: manager.go addBackgroundRunnables. Test
+// callers exist in physicaldevice_discovery_uevent_bug341_test.go.
+func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg Config) *PhysicalDeviceDiscoveryRunnable {
+	return &PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     cfg.Exec,
+		NodeName: cfg.NodeName,
+		Uevent:   cfg.UeventListener,
+	}
+}
+
 // Start runs the discovery loop until ctx cancels. Errors during
 // individual scans are logged but never abort the loop — a
 // transient apiserver / lsblk hiccup must not take the satellite
@@ -217,8 +237,19 @@ func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 	// either source produces exactly one scan.
 	trigger := make(chan struct{}, 1)
 
+	// Bug 341: emit an explicit INFO log indicating which mode the
+	// discovery loop is running in. "udev fast-path active" vs
+	// "pure-polling discovery" appearing once in the satellite log
+	// removes the diagnostic ambiguity that cost us a stand
+	// session — operators can grep this single line to confirm
+	// the wiring rather than inferring it from event throughput.
 	if p.Uevent != nil {
+		logger.Info("udev fast-path active; subscribing to discovery trigger",
+			"debounce", debounce, "period", period)
+
 		go runUeventBridge(ctx, logger, p.Uevent.Events(), trigger, debounce)
+	} else {
+		logger.Info("pure-polling discovery (no udev listener wired)", "period", period)
 	}
 
 	ticker := time.NewTicker(period)
@@ -234,6 +265,8 @@ func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 				logger.Error(err, "PhysicalDevice scan cycle")
 			}
 		case <-trigger:
+			logger.V(1).Info("udev-triggered PhysicalDevice rescan starting")
+
 			err = p.scanOnce(ctx, logger)
 			if err != nil {
 				logger.Error(err, "PhysicalDevice scan cycle (udev)")
@@ -258,6 +291,8 @@ func (p *PhysicalDeviceDiscoveryRunnable) Start(ctx context.Context) error {
 //     signal is never lost even if the scan loop is currently
 //     mid-scan.
 func runUeventBridge(ctx context.Context, logger logr.Logger, events <-chan uevent.Event, trigger chan<- struct{}, debounce time.Duration) {
+	logger.Info("uevent bridge started", "debounce", debounce)
+
 	// Timer starts stopped — we only arm it on the first event of
 	// each burst. Using a single reusable timer (rather than
 	// time.AfterFunc per event) keeps the allocator quiet during
@@ -282,7 +317,10 @@ func runUeventBridge(ctx context.Context, logger logr.Logger, events <-chan ueve
 				return
 			}
 
-			logger.V(2).Info("udev event", "action", event.Action, "kernel", event.Kernel, "devpath", event.Devpath)
+			logger.V(1).Info("udev event received by bridge",
+				"action", event.Action,
+				"kernel", event.Kernel,
+				"devpath", event.Devpath)
 
 			armed = resetDebounceTimer(timer, debounce, armed)
 		case <-timer.C:
@@ -290,6 +328,7 @@ func runUeventBridge(ctx context.Context, logger logr.Logger, events <-chan ueve
 
 			select {
 			case trigger <- struct{}{}:
+				logger.V(1).Info("udev debounce window closed; discovery rescan triggered")
 			default:
 				// Scan already pending — coalesce into it.
 			}

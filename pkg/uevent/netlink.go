@@ -23,6 +23,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sys/unix"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // readBufferSize is the per-read buffer for netlink frames. A
@@ -113,6 +114,17 @@ func New(ctx context.Context) (*Listener, error) {
 		events: make(chan Event, eventBufferSize),
 	}
 
+	// Bug 341: emit an INFO marker on every successful open so the
+	// operator can grep the satellite log for "uevent listener
+	// started" and confirm the fast-path is live. Without this,
+	// "the listener silently no-op'd" looks identical in logs to
+	// "the listener is up but no events are flowing", and we
+	// burned hours diagnosing exactly that.
+	log.FromContext(ctx).Info("uevent listener started",
+		"fd", fd,
+		"group", netlinkGroupKernel,
+		"buffer", eventBufferSize)
+
 	go listener.run(ctx)
 
 	return listener, nil
@@ -133,6 +145,9 @@ func (l *Listener) Events() <-chan Event {
 // EINTR or short read MUST NOT take the listener out of service.
 func (l *Listener) run(ctx context.Context) {
 	defer close(l.events)
+
+	logger := log.FromContext(ctx).WithName("uevent-reader")
+	logger.Info("uevent reader goroutine running", "fd", l.fd)
 
 	// A goroutine that closes the FD on ctx cancellation. Read()
 	// blocks indefinitely on the netlink socket; the only portable
@@ -169,6 +184,16 @@ func (l *Listener) run(ctx context.Context) {
 		if !ok {
 			continue
 		}
+
+		// Bug 341: V(1) per-frame trace lets the operator bump
+		// log-verbosity once and see every uevent crossing the
+		// socket. Cheap to leave in production at V=0 (the
+		// logr.Discard short-circuits before any allocation).
+		logger.V(1).Info("uevent frame",
+			"action", event.Action,
+			"subsystem", event.Subsystem,
+			"kernel", event.Kernel,
+			"devname", event.Devname)
 
 		// Non-blocking send: if the consumer is slow, drop the
 		// event rather than back-pressuring the kernel's

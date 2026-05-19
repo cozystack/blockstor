@@ -117,6 +117,13 @@ func run() int {
 		logger.Warn("uevent listener unavailable; falling back to pure-polling PhysicalDevice discovery",
 			"err", ueventErr.Error())
 	} else {
+		// Bug 341: surface successful listener attach as an INFO log
+		// so the operator can confirm the fast-path on every
+		// satellite restart. Previously the success branch was
+		// silent, making the "listener is up" and "listener was
+		// never started" cases indistinguishable from logs alone.
+		logger.Info("uevent listener wired into PhysicalDevice discovery")
+
 		ueventListener = listener
 	}
 

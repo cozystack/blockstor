@@ -253,10 +253,19 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 		return errors.Wrap(err, "register StorageOrphanSweeperRunnable")
 	}
 
+	// Bug 341: cfg.UeventListener MUST be threaded into the runnable's
+	// Uevent field — without it the discovery loop falls back to
+	// pure-polling silently (no log signal in production), and
+	// operator-facing `linstor ps l` waits up to PhysicalDeviceDiscoveryPeriod
+	// (300 s) to refresh after a manual `wipefs`. The original
+	// commit added the field on the runnable + the cfg shape but
+	// forgot the assignment here, so the udev fast-path was a
+	// no-op in production despite a healthy netlink listener.
 	err = (&PhysicalDeviceDiscoveryRunnable{
 		Client:   mgr.GetClient(),
 		Exec:     cfg.Exec,
 		NodeName: cfg.NodeName,
+		Uevent:   cfg.UeventListener,
 	}).RegisterWithManager(mgr)
 	if err != nil {
 		return errors.Wrap(err, "register PhysicalDeviceDiscoveryRunnable")
