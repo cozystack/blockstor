@@ -29,20 +29,18 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
-// Bug 202 (P3) — `handleVDDelete` has the Bug 186 pre-Delete walk but
-// no Bug 174 post-Delete re-walk.
+// Bug 202 (P3) — `handleVDDelete` has the Bug 355 pre-Delete walk
+// but needed a Bug 174-style post-Delete re-walk too.
 //
-// Bug 186 added a pre-walk that refuses with 409 + FAIL_IN_USE when
-// any Resource of the parent RD references the dropped VolumeNumber
-// (an explicit Status.Volumes row OR — per `resourceReferencesVolume`
-// — any Resource on the RD whose Volumes slice is empty, since the
-// spec contract is "Resource has one Volume per VD"). The pre-walk
-// is check-then-write with no atomicity, so a concurrent
-// `r c <rd>.<node>` that slips between the pre-walk and the
-// store-level Delete persists a fresh Resource — implicit reference
-// per the spec contract — under a VD spec that's about to disappear.
-// Post-Delete the Resource is orphaned: it references a VolumeNumber
-// whose VD row no longer exists.
+// Bug 355 narrowed the pre-walk to refuse with 409 + FAIL_IN_USE
+// only when a Resource on the parent RD reports
+// `state.in_use == true` (DRBD Primary with a mounted consumer).
+// The pre-walk is check-then-write with no atomicity, so a
+// concurrent `r c <rd>.<node>` + Primary promotion that slips
+// between the pre-walk and the store-level Delete drops the VD
+// spec out from under a now-mounted Primary. Post-Delete the
+// Resource is orphaned: it references a VolumeNumber whose VD row
+// no longer exists, AND the Primary still has a mounted consumer.
 //
 // Self-heals via the satellite reconciler eventually (the VD-watch
 // re-applies the RD spec), hence P3 — but the wire-side `vd d` reply
@@ -50,10 +48,10 @@ import (
 // exact misleading-success signal Bug 174 closed for `n d` / `rg d`.
 //
 // Fix shape mirrors Bug 174 on `n d` / `rg d` / `sp d`: capture the
-// pre-Delete VD via Get, run Delete, re-walk the referencing
-// Resources, restore the captured VD via Create if a reference
-// appeared during the window, return the same 409 envelope the
-// pre-walk would have emitted.
+// pre-Delete VD via Get, run Delete, re-walk the in-use Resources,
+// restore the captured VD via Create if an in-use racer appeared
+// during the window, return the same 409 envelope the pre-walk
+// would have emitted.
 
 // TestBug202VDDeletePostWalkRollsBackOnRace pins the post-Delete walk
 // + rollback behaviour deterministically: a Resource that appears
@@ -97,14 +95,15 @@ func TestBug202VDDeletePostWalkRollsBackOnRace(t *testing.T) {
 	captured := &apiv1.VolumeDefinition{VolumeNumber: volNum, SizeKib: sizeKib}
 
 	// Simulate the post-Delete state: VD spec gone (the handler's
-	// store.Delete already ran), a racing `r c` already persisted a
-	// Resource with no Volume rows (implicit reference per the spec
-	// contract — see `resourceReferencesVolume`). The captured VD
-	// snapshot is what the handler held before its Delete; the
-	// rollback's job is to restore it.
+	// store.Delete already ran), a racing `r c` + Primary promotion
+	// already persisted an in-use Resource. The captured VD snapshot
+	// is what the handler held before its Delete; the rollback's job
+	// is to restore it. Bug 355 narrowed the gate to in-use only, so
+	// the racer MUST carry `state.in_use=true` for rollback to fire.
 	err := st.Resources().Create(ctx, &apiv1.Resource{
 		Name:     rdName,
 		NodeName: nodeName,
+		State:    apiv1.ResourceState{InUse: boolPtr(true)},
 	})
 	if err != nil {
 		t.Fatalf("seed racing Resource: %v", err)

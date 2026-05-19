@@ -754,16 +754,26 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 // shrink paths re-issue `vd d` on retry; the bare 404 used to crash
 // the Python CLI on its XML decoder fallback (see Bug 56 commentary).
 //
-// Bug 186 (P2): refuses with 409 + FAIL_IN_USE | MASK_ERROR when at
-// least one Resource on the parent RD still carries a Volume row for
-// the dropped VolumeNumber. Mirrors upstream LINSTOR's
-// CtrlVlmDfnDeleteApiCallHandler refusal pattern (Bug 92 /
-// Bug 174 envelope shape) — the previous behaviour silently dropped
-// the spec and pruned satellite-observed Volume rows off the
-// Resource CRDs, leaving no operator-visible signal that the delete
-// was unsafe. `?force=true` (and the body's `force` field for parity
-// with Bug 92 / W13) bypasses the refusal so the operator can drop
-// the spec out from under a stuck satellite.
+// Bug 355 (P2): refuses with 409 + FAIL_IN_USE | MASK_ERROR ONLY when
+// at least one Resource on the parent RD is observed in-use
+// (`state.in_use == true`, i.e. DRBD Primary with a mounted consumer).
+// Mirrors upstream LINSTOR's CtrlVlmDfnDeleteApiCallHandler:
+// `anyResourceInUsePrivileged` is the sole refusal cause; otherwise
+// upstream cascades markDeleted(vlm) per replica, markDeleted(vlmDfn),
+// and updateSatellites triggers per-node teardown. The mere existence
+// of Secondary replicas is NOT a refusal cause.
+//
+// Earlier Bug 186 hardening (task #329) refused on ANY referencing
+// Resource — stricter than upstream and broke `linstor vd d <rd> 0`
+// on every multi-replica RD. The surfaced Correction suggested
+// `?force=true`, a query parameter the REST handler honoured but
+// for which linstor-client offers no flag — the operator was left
+// with no escape hatch via the standard CLI.
+//
+// `?force=true` is preserved as a transport-level escape so curl
+// scripts can still bypass the refusal, but the surfaced Correction
+// now points at operator-actionable remedies (demote the Primary,
+// unmount the consumer) instead of the hidden flag.
 func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	force := isForce(r)
@@ -775,8 +785,8 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 186: pre-Delete walk of referencing Resources. Runs BEFORE
-	// the store-level Delete so a refused call leaves the VD spec and
+	// Bug 355: pre-Delete walk of in-use Resources. Runs BEFORE the
+	// store-level Delete so a refused call leaves the VD spec and
 	// every dependent Resource.Volumes row untouched — partial-state
 	// after a rejected DELETE would be a worse failure mode than the
 	// bug itself.
@@ -813,17 +823,18 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 202: post-Delete re-walk. A racing `r c` may have slipped
-	// between the Bug 186 pre-walk and the Delete above: the pre-walk
-	// saw an empty reference set, then the racing create persisted a
-	// Resource on the parent RD (implicit reference per the spec
-	// contract, see resourceReferencesVolume), then we dropped the
-	// VD spec out from under it. The post-walk catches that
-	// ordering, restores the captured VD via store Create, and
-	// surfaces the same 409 envelope the pre-walk would have
-	// emitted. Skipped on the explicit `?force=true` bypass (the
-	// operator opted in to the cascade) and on the capture-miss
-	// path (idempotent-delete replay — nothing to roll back to).
+	// Bug 202: post-Delete re-walk. A racing `r c <rd>.<node>` +
+	// Primary promotion may have slipped between the pre-walk and the
+	// Delete above: the pre-walk saw no in-use Resource, then the
+	// racing create + Primary promotion persisted, then we dropped the
+	// VD spec out from under a now-mounted Primary. The post-walk
+	// catches that ordering, restores the captured VD via store
+	// Create, and surfaces the same 409 envelope the pre-walk would
+	// have emitted. Narrowed alongside Bug 355: only an in-use racer
+	// rolls back; a Secondary-only racer is part of the upstream
+	// cascade. Skipped on the explicit `?force=true` bypass and on
+	// the capture-miss path (idempotent-delete replay — nothing to
+	// roll back to).
 	if !force && capturedOK && s.rollbackVDDeleteIfRaced(w, r, rd, vn, &captured) {
 		return
 	}
@@ -860,14 +871,21 @@ func (s *Server) captureVolumeDefinition(ctx context.Context, rd string, vn int3
 }
 
 // rollbackVDDeleteIfRaced runs the Bug 202 post-Delete re-walk.
-// If a Resource reference appeared between the pre-walk and the
-// Delete, restore the captured VD via store Create and write the
-// 409 envelope the pre-walk would have written. Returns true when
-// the rollback fired (HTTP error already written, caller must stop)
-// and false when the delete is safe to commit. Mirrors Bug 174's
-// `rollbackRGDeleteIfRaced` shape — same Bug 178 5xx envelope when
-// the restore Create itself fails so the operator gets an actionable
-// signal that the deleted primary may need manual restoration.
+// If a racing `r c <rd>.<node>` + Primary promotion landed between
+// the pre-walk and the Delete, restore the captured VD via store
+// Create and write the 409 envelope the pre-walk would have
+// written. Returns true when the rollback fired (HTTP error already
+// written, caller must stop) and false when the delete is safe to
+// commit. Mirrors Bug 174's `rollbackRGDeleteIfRaced` shape — same
+// Bug 178 5xx envelope when the restore Create itself fails so the
+// operator gets an actionable signal that the deleted primary may
+// need manual restoration.
+//
+// Bug 355: re-walk uses the same narrowed in-use signal as the
+// pre-walk. A Secondary-only racer is part of the upstream cascade
+// path and MUST NOT trigger rollback; only an in-use racer (Primary
+// + mounted consumer that appeared during the TOCTOU window) signals
+// "this delete is unsafe, restore the VD and refuse".
 func (s *Server) rollbackVDDeleteIfRaced(
 	w http.ResponseWriter,
 	r *http.Request,
@@ -875,14 +893,14 @@ func (s *Server) rollbackVDDeleteIfRaced(
 	vn int32,
 	captured *apiv1.VolumeDefinition,
 ) bool {
-	refs, err := s.resourcesReferencingVolume(r.Context(), rd, vn)
+	inUse, err := s.resourcesInUseOnDefinition(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return true
 	}
 
-	if len(refs) == 0 {
+	if len(inUse) == 0 {
 		return false
 	}
 
@@ -905,15 +923,15 @@ func (s *Server) rollbackVDDeleteIfRaced(
 		RetCode: apiCallRcError | apiCallRcFailInUse,
 		Message: fmt.Sprintf(
 			"Volume definition %d on resource definition %q cannot be "+
-				"deleted because resource replicas still reference it.",
-			vn, rd),
+				"deleted because the resource is in use on %s.",
+			vn, rd, strings.Join(inUse, ", ")),
 		Cause: fmt.Sprintf(
-			"%d resource replica(s) reference VolumeNumber %d on %q: %s",
-			len(refs), vn, rd, strings.Join(refs, ", ")),
-		Correc: "Delete the listed resource replicas first " +
-			"(`linstor r d <node> " + rd + "`), or pass `?force=true` " +
-			"to drop the volume definition anyway and accept the " +
-			"orphan replicas.",
+			"%d resource replica(s) on %q report in_use=true (DRBD "+
+				"Primary with a mounted consumer): %s",
+			len(inUse), rd, strings.Join(inUse, ", ")),
+		Correc: "Demote the Primary on the listed node(s) first " +
+			"(`linstor r role-demote " + rd + " <node>`) or unmount " +
+			"the consumer of the PVC backed by " + rd + ", then retry.",
 		ObjRefs: map[string]string{
 			objRefRscDfn: rd,
 			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
@@ -923,27 +941,44 @@ func (s *Server) rollbackVDDeleteIfRaced(
 	return true
 }
 
-// refuseVDDeleteIfReferenced runs the Bug 186 pre-Delete walk: any
-// Resource of the parent RD whose Volumes carry a row for the
-// dropped VolumeNumber is a live reference and must block the
-// delete. Returns true when the HTTP error has already been written
-// (the caller must stop processing) and false when the delete may
-// proceed.
+// refuseVDDeleteIfReferenced runs the Bug 355 pre-Delete walk:
+// refuses with 409 + FAIL_IN_USE only when at least one Resource on
+// the parent RD has its satellite-observed state reporting in_use=true
+// (DRBD Primary with a mounted consumer). Returns true when the HTTP
+// error has already been written (the caller must stop processing)
+// and false when the delete may proceed.
 //
-// Cause line names the referencing Resources sorted by NodeName so
-// the surfaced text is deterministic across cache iteration orders.
-// Wire shape mirrors Bug 92 (node delete in-use) and Bug 152 (sp
-// delete in-use) — 409 + FAIL_IN_USE | MASK_ERROR, Cause/Correction
-// pointing at the remedial commands.
+// Earlier Bug 186 hardening (task #329) refused on ANY Resource that
+// referenced the dropped VolumeNumber — stricter than upstream and
+// broke `linstor vd d <rd> 0` on every multi-replica RD because each
+// Secondary replica also carries a Volumes row for the dropped
+// VolumeNumber. Bug 355 narrows the gate to "in-use only" so the
+// cascade matches upstream's anyResourceInUsePrivileged refusal in
+// CtrlVlmDfnDeleteApiCallHandler; Secondaries (and unobserved
+// replicas with state.in_use == nil) are part of the upstream
+// cascade path and MUST NOT be a refusal cause.
+//
+// Cause line names the in-use Resources sorted by NodeName so the
+// surfaced text is deterministic across cache iteration orders. Wire
+// shape mirrors Bug 92 (node delete in-use) and Bug 152 (sp delete
+// in-use) — 409 + FAIL_IN_USE | MASK_ERROR. Correction points at the
+// operator-actionable remedies (demote the Primary, unmount the
+// consumer); the misleading `?force=true` suggestion the prior
+// envelope carried is intentionally absent — linstor-client has no
+// `--force` flag for `vd d`, so surfacing it gave the operator a
+// dead-end remedy.
+//
+// Name retained from the prior Bug 186 shape (the function is the
+// pre-Delete walk; "referenced" now means "in-use" specifically).
 func (s *Server) refuseVDDeleteIfReferenced(w http.ResponseWriter, r *http.Request, rd string, vn int32) bool {
-	refs, err := s.resourcesReferencingVolume(r.Context(), rd, vn)
+	inUse, err := s.resourcesInUseOnDefinition(r.Context(), rd)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return true
 	}
 
-	if len(refs) == 0 {
+	if len(inUse) == 0 {
 		return false
 	}
 
@@ -951,15 +986,15 @@ func (s *Server) refuseVDDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 		RetCode: apiCallRcError | apiCallRcFailInUse,
 		Message: fmt.Sprintf(
 			"Volume definition %d on resource definition %q cannot be "+
-				"deleted because resource replicas still reference it.",
-			vn, rd),
+				"deleted because the resource is in use on %s.",
+			vn, rd, strings.Join(inUse, ", ")),
 		Cause: fmt.Sprintf(
-			"%d resource replica(s) reference VolumeNumber %d on %q: %s",
-			len(refs), vn, rd, strings.Join(refs, ", ")),
-		Correc: "Delete the listed resource replicas first " +
-			"(`linstor r d <node> " + rd + "`), or pass `?force=true` " +
-			"to drop the volume definition anyway and accept the " +
-			"orphan replicas.",
+			"%d resource replica(s) on %q report in_use=true (DRBD "+
+				"Primary with a mounted consumer): %s",
+			len(inUse), rd, strings.Join(inUse, ", ")),
+		Correc: "Demote the Primary on the listed node(s) first " +
+			"(`linstor r role-demote " + rd + " <node>`) or unmount " +
+			"the consumer of the PVC backed by " + rd + ", then retry.",
 		ObjRefs: map[string]string{
 			objRefRscDfn: rd,
 			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
@@ -969,34 +1004,18 @@ func (s *Server) refuseVDDeleteIfReferenced(w http.ResponseWriter, r *http.Reque
 	return true
 }
 
-// resourcesReferencingVolume returns the sorted-by-NodeName list of
-// Resources on the parent RD that reference the given VolumeNumber.
-// Used by Bug 186's pre-Delete walk; sort order pinned so the
-// surfaced 409 envelope's Cause line is byte-identical across cache
-// iteration orders (the same trick node_lifecycle.go uses for the
-// in-use evacuate refusal).
+// resourcesInUseOnDefinition returns the sorted-by-NodeName list of
+// Resources on the parent RD whose satellite-observed state has
+// `in_use == true` (DRBD Primary with a mounted consumer). Used by
+// Bug 355's narrowed VD-delete refusal gate. Mirrors upstream
+// LINSTOR's `anyResourceInUsePrivileged` shape: only an active
+// Primary counts as in-use; Secondary replicas and unobserved
+// replicas (state.in_use == nil) do NOT.
 //
-// Two reference shapes count as live:
-//
-//  1. The Resource carries an explicit Volumes[] entry whose
-//     VolumeNumber matches `vn` — this is what the unit tests seed
-//     directly and what fully-converged Resources carry on the wire
-//     once the satellite has stamped Status.Volumes.
-//  2. The Resource has no Volumes[] rows yet — common in production
-//     while the satellite is mid-reconcile, on freshly-created
-//     diskless / TIE_BREAKER replicas, and any time DRBD hasn't
-//     advanced past `Unknown`. Upstream LINSTOR's
-//     CtrlVlmDfnDeleteApiCallHandler treats every Resource on the
-//     RD as an implicit reference to every VD on that RD — the
-//     spec contract says "Resource has one Volume per VD"; a missing
-//     Status.Volumes row means "not yet stamped", not "the spec
-//     doesn't reference it".
-//
-// The blanket shape (2) closes the live-cluster reproducer where
-// `vd d` slipped past the prune-only check because the satellite
-// hadn't filled in Status.Volumes yet — exactly the Bug 186 symptom
-// upstream LINSTOR's FAIL_IN_USE refusal exists to prevent.
-func (s *Server) resourcesReferencingVolume(ctx context.Context, rd string, vn int32) ([]string, error) {
+// Sort order pinned so the surfaced 409 envelope's Cause line is
+// byte-identical across cache iteration orders (the same trick
+// node_lifecycle.go uses for the in-use evacuate refusal).
+func (s *Server) resourcesInUseOnDefinition(ctx context.Context, rd string) ([]string, error) {
 	if s == nil || s.Store == nil {
 		return nil, nil
 	}
@@ -1006,36 +1025,18 @@ func (s *Server) resourcesReferencingVolume(ctx context.Context, rd string, vn i
 		return nil, err //nolint:wrapcheck // surfaced to writeStoreError
 	}
 
-	var refs []string
+	var inUse []string
 
 	for i := range resources {
-		if resourceReferencesVolume(&resources[i], vn) {
-			refs = append(refs, resources[i].NodeName)
+		res := &resources[i]
+		if res.State.InUse != nil && *res.State.InUse {
+			inUse = append(inUse, res.NodeName)
 		}
 	}
 
-	sort.Strings(refs)
+	sort.Strings(inUse)
 
-	return refs, nil
-}
-
-// resourceReferencesVolume returns true when the Resource is a live
-// reference to the (RD, VolumeNumber) pair under Bug 186's refusal
-// semantics. See resourcesReferencingVolume for the two reference
-// shapes (explicit Volume row OR implicit "spec contract" reference
-// while the satellite has not yet stamped Status.Volumes).
-func resourceReferencesVolume(rsc *apiv1.Resource, vn int32) bool {
-	if len(rsc.Volumes) == 0 {
-		return true
-	}
-
-	for i := range rsc.Volumes {
-		if rsc.Volumes[i].VolumeNumber == vn {
-			return true
-		}
-	}
-
-	return false
+	return inUse, nil
 }
 
 // pruneVolumesFromResources walks every Resource of the named RD

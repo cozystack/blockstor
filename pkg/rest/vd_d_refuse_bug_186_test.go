@@ -31,9 +31,9 @@ import (
 // referencing the volume.
 //
 // Upstream LINSTOR's CtrlVlmDfnDeleteApiCallHandler walks the
-// referencing Resources (via Volumes whose VolumeNumber matches the
-// dropped VD) and aborts with FAIL_IN_USE | MASK_ERROR if any
-// replica still carries the volume. Blockstor's pre-fix handler
+// referencing Resources via `anyResourceInUsePrivileged` and aborts
+// with FAIL_IN_USE | MASK_ERROR if any replica is observed in-use
+// (DRBD Primary with a mounted consumer). Blockstor's pre-fix handler
 // blindly called `Store.VolumeDefinitions().Delete` and pruned the
 // Volumes off each Resource afterwards (Bug 139 surfacing patch).
 // Net: the VD spec was dropped, the satellite-observed Volume rows
@@ -41,19 +41,30 @@ import (
 // nodes that were arguably mid-flight using the dropped volume —
 // no operator-visible signal that the delete was unsafe.
 //
+// Bug 355 follow-up: the initial Bug 186 hardening (task #329)
+// refused on ANY referencing Resource — stricter than upstream and
+// it broke `linstor vd d <rd> 0` on every multi-replica RD because
+// every Secondary replica also carried a Volumes row. Bug 355
+// narrowed the gate to "in-use only" (Primary + mounted consumer)
+// to match `anyResourceInUsePrivileged`. The wire shape (409 +
+// FAIL_IN_USE | MASK_ERROR + Cause/Correction) is preserved.
+//
 // Fix shape mirrors Bug 92 / Bug 174 envelope contract: 409 +
 // FAIL_IN_USE | MASK_ERROR, Message names the parent RD and VlmNr,
-// Cause lists the referencing Resources (sorted by NodeName so the
+// Cause lists the in-use Resources (sorted by NodeName so the
 // surfaced text is deterministic), Correction points at the
 // remedial commands. `?force=true` (and the body's `force` field
 // for completeness with Bug 92 / W13) bypasses the refusal so the
 // operator can drop the spec out from under a stuck satellite.
 
 // TestBug186VDDeleteRefusedWhenResourceReferences pins the wire
-// shape: when at least one Resource still carries the
-// (VolumeNumber=vn) Volume row, DELETE returns 409 +
-// FAIL_IN_USE | MASK_ERROR with the referencing Resources surfaced
-// in the envelope's Cause line.
+// shape: when at least one Resource on the parent RD reports
+// `state.in_use == true` (Primary with mounted consumer), DELETE
+// returns 409 + FAIL_IN_USE | MASK_ERROR with the in-use Resources
+// surfaced in the envelope's Cause line. Bug 355 narrowed the gate
+// from "any reference refuses" (the original Bug 186 task #329
+// shape) to "any in-use refuses" — Secondaries are now part of the
+// upstream cascade and MUST NOT show up in the refusal Cause.
 func TestBug186VDDeleteRefusedWhenResourceReferences(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
@@ -75,19 +86,32 @@ func TestBug186VDDeleteRefusedWhenResourceReferences(t *testing.T) {
 		t.Fatalf("seed VD: %v", err)
 	}
 
-	// Seed two Resources, each carrying a Status.Volumes row for the
-	// VD being dropped — both should surface in the refusal Cause.
-	for _, node := range []string{nodeA, nodeB} {
-		err := st.Resources().Create(ctx, &apiv1.Resource{
-			Name:     rdName,
-			NodeName: node,
-			Volumes: []apiv1.Volume{
-				{VolumeNumber: volNum, DevicePath: "/dev/fake/" + rdName + "_00000"},
-			},
-		})
-		if err != nil {
-			t.Fatalf("seed Resource %s/%s: %v", rdName, node, err)
-		}
+	// Bug 355: both Resources carry the Volume row, but ONLY nodeA
+	// is observed in-use (Primary). Pre-fix the refusal would have
+	// blamed both replicas; post-fix only the in-use Primary is the
+	// refusal cause.
+	err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     rdName,
+		NodeName: nodeA,
+		State:    apiv1.ResourceState{InUse: boolPtr(true)},
+		Volumes: []apiv1.Volume{
+			{VolumeNumber: volNum, DevicePath: "/dev/fake/" + rdName + "_00000"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed Primary Resource: %v", err)
+	}
+
+	err = st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     rdName,
+		NodeName: nodeB,
+		State:    apiv1.ResourceState{InUse: boolPtr(false)},
+		Volumes: []apiv1.Volume{
+			{VolumeNumber: volNum, DevicePath: "/dev/fake/" + rdName + "_00000"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed Secondary Resource: %v", err)
 	}
 
 	base, stop := startServerWithStore(t, st)
@@ -125,13 +149,18 @@ func TestBug186VDDeleteRefusedWhenResourceReferences(t *testing.T) {
 		t.Errorf("ret_code: got %#x, MASK_INFO bit set on a conflict envelope", rcs[0].RetCode)
 	}
 
-	// Cause / Details / Message MUST name both referencing nodes so
-	// the operator knows which Resources to drop first.
+	// Cause / Details / Message MUST name the in-use node so the
+	// operator knows where to `role-demote`. Bug 355: the Secondary
+	// node MUST NOT show up — surfacing it would re-introduce the
+	// "blame every replica" noise the prior envelope had.
 	hay := rcs[0].Message + "\n" + rcs[0].Cause + "\n" + rcs[0].Details + "\n" + rcs[0].Correc
-	for _, node := range []string{nodeA, nodeB} {
-		if !strings.Contains(hay, node) {
-			t.Errorf("envelope omits referencing node %q; envelope=%+v", node, rcs[0])
-		}
+	if !strings.Contains(hay, nodeA) {
+		t.Errorf("envelope omits in-use node %q; envelope=%+v", nodeA, rcs[0])
+	}
+
+	if strings.Contains(hay, nodeB) {
+		t.Errorf("envelope mentions Secondary node %q; only in-use nodes should be cited. envelope=%+v",
+			nodeB, rcs[0])
 	}
 
 	// Verify the VD spec survived the refusal — a stripped spec on a

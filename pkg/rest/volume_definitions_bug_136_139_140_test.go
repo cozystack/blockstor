@@ -325,14 +325,15 @@ func TestBug139VDDeleteRemovesVolumeFromViewProjection(t *testing.T) {
 		t.Fatalf("pre-delete view: got %+v, want 1 resource with 1 volume", pre)
 	}
 
-	// `?force=true` to bypass the Bug 186 in-use refusal — the seeded
-	// Resource carries a Volume row for VlmNr=0, which the new
-	// pre-Delete walk would (correctly) refuse with 409 + FAIL_IN_USE.
-	// Bug 139's invariant is about what happens AFTER the delete is
-	// permitted, so the force escape hatch is the right shape to keep
-	// the prune-on-success path covered.
+	// Bug 355: the pre-Delete walk now refuses only on
+	// `state.in_use == true` (DRBD Primary with mounted consumer).
+	// The seeded Resource is Secondary (state.in_use unset) so the
+	// cascade path runs normally — no `?force=true` needed. Bug 139's
+	// invariant is about what happens AFTER the delete is permitted,
+	// so the cascade path is the right shape to keep the prune-on-
+	// success path covered.
 	delResp := httpDelete(t,
-		fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/%d?force=true",
+		fmt.Sprintf("%s/v1/resource-definitions/%s/volume-definitions/%d",
 			base, rdName, volNum))
 	_ = delResp.Body.Close()
 
