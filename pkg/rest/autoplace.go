@@ -25,6 +25,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -232,6 +233,25 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 335: reject auto-place=N with N>1 on a non-replicated
+	// LayerStack. Without DRBD (the only block-replication layer
+	// blockstor currently ships) `place_count=2` would silently
+	// allocate two independent local volumes on two nodes — the data
+	// diverges on the first write and the operator only finds out
+	// much later.
+	//
+	// Three operator-actionable ways forward are listed in the error
+	// envelope: add DRBD to the layer list, drop the place_count to
+	// 1, or (TODO) wait for shared-LUN support.
+	//
+	// Gate runs after resolveAdditionalPlaceCount so the effective
+	// PlaceCount reflects `--auto-place +1` too: 1+1=2 on a STORAGE-
+	// only RD is the same data-divergence footgun as a literal
+	// `--auto-place 2`.
+	if !s.refuseAutoplaceMultiPlaceWithoutReplication(r.Context(), w, &rd, &filter) {
+		return
+	}
+
 	// snapshot-restore-resource stamps BlockstorRestoreFromSnapshot
 	// on the new RD. Without satellite-to-satellite zfs/thin send-recv
 	// (upstream's cross-node clone path), a replica landed on a node
@@ -268,6 +288,73 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRDAutoplaceDone,
 		Message: "Resource definition '" + rdName + "' auto-placed",
 	}})
+}
+
+// refuseAutoplaceMultiPlaceWithoutReplication is Bug 335's
+// data-divergence guard. Refuses an autoplace request whose effective
+// PlaceCount > 1 lands on a RD whose effective LayerStack carries no
+// replication layer (today: DRBD).
+//
+// Stand reproduction (pre-fix):
+//
+//	$ linstor r c test3 --auto-place=2 -l STORAGE -s stand
+//	→ 200 OK, 2 independent local volumes on 2 nodes
+//	→ first write to either replica diverges silently
+//
+// Effective layer stack is RD → RG → default (mirrors the read-side
+// resolver used by the dispatcher / controller). When everything is
+// empty we fall through to `["DRBD","STORAGE"]` so legacy RDs (and
+// every test that omits LayerStack) continue to pass — they DO have
+// replication by default and the gate must not fire on them.
+//
+// TODO(shared-lun): when shared-LUN active-active support lands
+// (likely thin LVM with lvmlockd, cooperative deactivate-others +
+// activate-on-one semantics for the rest), extend this gate to
+// permit multi-place with an explicit `--shared-lun` flag. Until
+// then, shared-LUN multi-place is unsupported and the safe default
+// is to reject the request loudly.
+//
+// Returns true when the caller may proceed (PlaceCount<=1 OR the
+// stack contains a replication layer), false when the HTTP error has
+// already been written.
+func (s *Server) refuseAutoplaceMultiPlaceWithoutReplication(ctx context.Context, w http.ResponseWriter, rd *apiv1.ResourceDefinition, filter *apiv1.AutoSelectFilter) bool {
+	if filter.PlaceCount <= 1 {
+		return true
+	}
+
+	stack := s.resolveAutoplaceLayerStack(ctx, rd)
+	if apiv1.ContainsReplicationLayer(stack) {
+		return true
+	}
+
+	writeError(w, http.StatusBadRequest,
+		"placeCount="+strconv.FormatInt(int64(filter.PlaceCount), 10)+
+			" with no replication layer (DRBD) would create independent local "+
+			"volumes whose data diverges on the first write. Either add DRBD to "+
+			"the layer list, drop the place_count to 1 (single local volume), or "+
+			"wait for shared-LUN multi-host support (currently unsupported).")
+
+	return false
+}
+
+// resolveAutoplaceLayerStack returns the effective LayerStack for the
+// autoplace handler's data-divergence gate. RD → RG → default mirrors
+// the same precedence the dispatcher and the controller-side
+// resolveRDLayerStack use, so the REST gate and the witness gate
+// (Bug 334) agree on what "no replication layer" means.
+func (s *Server) resolveAutoplaceLayerStack(ctx context.Context, rd *apiv1.ResourceDefinition) []string {
+	if rd != nil && len(rd.LayerStack) > 0 {
+		return rd.LayerStack
+	}
+
+	if rd != nil && rd.ResourceGroupName != "" {
+		rg, err := getRGWithCacheRetry(ctx, s.Store, rd.ResourceGroupName)
+		if err == nil && len(rg.SelectFilter.LayerStack) > 0 {
+			return rg.SelectFilter.LayerStack
+		}
+	}
+
+	return apiv1.DefaultLayerStack()
 }
 
 // refuseAutoplaceOnUnknownNodes is Bug 94's autoplace-side guard. The

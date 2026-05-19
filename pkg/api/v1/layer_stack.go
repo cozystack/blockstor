@@ -49,3 +49,26 @@ func LayerInStack(stack []string, kind string) bool {
 
 	return false
 }
+
+// ContainsReplicationLayer reports whether stack contains a
+// replication-capable layer. Today that's DRBD only — DRBD-9 is the
+// sole layer that ships block-level inter-node replication and the
+// quorum machinery (`quorum: majority` + TIE_BREAKER witnesses) the
+// rest of the codebase relies on.
+//
+// Used by Bug 334 (skip TIE_BREAKER spawn when LayerStack has no
+// replication layer — without DRBD there is no quorum machinery to
+// arbitrate) and Bug 335 (reject auto-place=N with N>1 on a
+// non-replicated LayerStack — N independent local volumes diverge
+// silently on the first write).
+//
+// TODO(shared-lun): when shared-LUN active-active support lands
+// (likely thin LVM with lvmlockd-cooperative active-on-one + deactivate-
+// others), the multi-place gate in pkg/rest/autoplace.go can extend
+// past this helper to permit multi-place with an explicit
+// `--shared-lun` flag. Replication-via-shared-storage is a different
+// kind of "replication layer"; we keep the predicate narrow to DRBD
+// until the shared-LUN code path actually exists.
+func ContainsReplicationLayer(stack []string) bool {
+	return LayerInStack(stack, LayerKindDRBD)
+}

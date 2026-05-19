@@ -194,6 +194,25 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return nil
 	}
 
+	// Bug 334: TIE_BREAKER is a DRBD-9 quorum primitive (1 diskless
+	// peer acting as a tie-breaker arbiter for `quorum: majority`
+	// decisions in 2-replica setups). Without DRBD in the effective
+	// LayerStack there is no quorum machinery to arbitrate — the
+	// witness would be a meaningless extra Resource CRD on a third
+	// node that surprises operators with phantom rows in
+	// `linstor r l` output. Skip the witness invariant outright.
+	//
+	// The check uses the resolved RD-or-parent-RG LayerStack so an RD
+	// that inherits `-l STORAGE` from its parent RG also skips the
+	// witness. Empty everywhere falls through to DefaultLayerStack()
+	// which contains DRBD, so the legacy "no LayerStack set" RDs that
+	// the rest of the codebase treats as DRBD-by-default keep their
+	// witness.
+	effectiveStack := r.resolveRDLayerStack(ctx, rd)
+	if !apiv1.ContainsReplicationLayer(effectiveStack) {
+		return nil
+	}
+
 	replicas, err := r.listReplicasDirect(ctx, rd.Name)
 	if err != nil {
 		return err
@@ -634,6 +653,55 @@ func (r *ResourceDefinitionReconciler) rollbackWitnessIfRDGone(ctx context.Conte
 	// outlive its parent — roll it back. Swallow ErrNotFound: a
 	// concurrent reconcile may have already done the cleanup.
 	_ = r.Store.Resources().Delete(ctx, rdName, witnessNode)
+}
+
+// resolveRDLayerStack returns the effective layer composition for
+// the RD by walking RD → RG → default. Mirrors the (unexported)
+// ResourceReconciler.resolveLayerStack but lives on the RD
+// reconciler so the witness gate (Bug 334) doesn't have to depend on
+// the resource-reconciler instance.
+//
+// Read order:
+//
+//  1. RD.Spec.LayerStack — the operator-set / REST-stamped value.
+//  2. Parent RG.Spec.SelectFilter.LayerStack — when the RD itself
+//     leaves the field empty.
+//  3. apiv1.DefaultLayerStack() — the upstream LINSTOR default,
+//     `["DRBD","STORAGE"]`. This is the load-bearing fallback for
+//     legacy RDs (and the entire pre-Phase-9 test suite) that never
+//     stamped a LayerStack: the witness invariant must continue to
+//     apply to them.
+//
+// Soft-fail on the RG lookup: if the parent RG can't be fetched (RG
+// vanished mid-cascade, transient apiserver hiccup), fall through to
+// the default rather than blocking the reconcile. The witness is
+// quorum-correctness, not quorum-safety — a brief over-creation
+// during an RG outage is cheaper than refusing to converge.
+func (r *ResourceDefinitionReconciler) resolveRDLayerStack(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) []string {
+	if rd == nil {
+		return apiv1.DefaultLayerStack()
+	}
+
+	if len(rd.Spec.LayerStack) > 0 {
+		return rd.Spec.LayerStack
+	}
+
+	if rd.Spec.ResourceGroupName == "" {
+		return apiv1.DefaultLayerStack()
+	}
+
+	reader := r.directOrCached()
+
+	var rg blockstoriov1alpha1.ResourceGroup
+	if err := reader.Get(ctx, client.ObjectKey{Name: rd.Spec.ResourceGroupName}, &rg); err != nil {
+		return apiv1.DefaultLayerStack()
+	}
+
+	if len(rg.Spec.SelectFilter.LayerStack) > 0 {
+		return rg.Spec.SelectFilter.LayerStack
+	}
+
+	return apiv1.DefaultLayerStack()
 }
 
 // filterTieBreaker returns the subset of diskless replicas that
