@@ -118,7 +118,16 @@ deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
     ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
         | jq -r --arg rd "$SRC" --arg s "$SNAP" '
-            [.items[]? | select(.spec.resourceDefinitionName==$rd) | select(.spec.snapshotName==$s) | .status.successful // false] | all' 2>/dev/null || echo "false")
+            # Why: Snapshot CRD shape is spec.nodes[] + status.nodeStatus[]
+            # {nodeName, ready}. Old `.status.successful` field does not
+            # exist; old check false-PASSed on `all` against empty array.
+            [.items[]?
+             | select(.spec.resourceDefinitionName==$rd)
+             | select(.spec.snapshotName==$s)
+             | (.nodes = (.spec.nodes // []))
+             | (.ready = ([.status.nodeStatus[]? | select(.ready==true) | .nodeName]))
+             | ((.nodes | length) > 0) and (.nodes - .ready | length == 0)
+            ] | length > 0 and all' 2>/dev/null || echo "false")
     [[ "$ok" == "true" ]] && break
     sleep 2
 done

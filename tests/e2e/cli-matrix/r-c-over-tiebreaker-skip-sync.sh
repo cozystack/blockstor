@@ -97,12 +97,12 @@ tieB=""
 while (( $(date +%s) < deadline )); do
     rows=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null)
     mapfile -t diskful < <(jq -r --arg rd "$RD" '
-        .[0].resources[]?
+        .[0][]?
         | select(.name==$rd)
         | select((.flags // []) | index("DISKLESS") | not)
         | .node_name' <<<"$rows")
     tieB=$(jq -r --arg rd "$RD" '
-        .[0].resources[]?
+        .[0][]?
         | select(.name==$rd)
         | select((.flags // []) | index("DISKLESS"))
         | .node_name' <<<"$rows" | head -1)
@@ -214,7 +214,7 @@ echo ">> [Bug 348] verify diskful peers report SyncSource (not UpToDate(NN%)) du
 # secondary. (If the cluster has no primary, drbdadm primary the
 # first diskful.)
 prim=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-    | jq -r --arg rd "$RD" '.[0].resources[]? | select(.name==$rd) | select(.layer_object?.drbd?.role=="Primary") | .node_name' \
+    | jq -r --arg rd "$RD" '.[0][]? | select(.name==$rd) | select(.layer_object?.drbd?.role=="Primary") | .node_name' \
     | head -1)
 if [[ -z "$prim" ]]; then
     on_node "${diskful[0]}" bash -c "drbdadm primary --force $RD 2>/dev/null" || true

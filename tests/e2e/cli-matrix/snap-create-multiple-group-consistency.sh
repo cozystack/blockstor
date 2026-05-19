@@ -161,18 +161,20 @@ echo ">> wait up to 90s for both snapshots Successful"
 deadline=$(( $(date +%s) + 90 ))
 all_ok=false
 while (( $(date +%s) < deadline )); do
+    # Why: CRD shape uses status.nodeStatus[].ready per spec.nodes[],
+    # not legacy status.successful. The all-of-empty false-PASS guard.
+    JQ_OK='
+        [.items[]?
+         | select(.spec.resourceDefinitionName==$rd)
+         | select(.spec.snapshotName==$s)
+         | ((.spec.nodes // []) as $want
+            | ([.status.nodeStatus[]? | select(.ready==true) | .nodeName]) as $have
+            | ($want | length) > 0 and (($want - $have) | length == 0))
+        ] | length > 0 and all'
     snap_a_ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
-        | jq -r --arg rd "$RD_A" --arg s "$SNAP" '
-            [.items[]?
-             | select(.spec.resourceDefinitionName==$rd)
-             | select(.spec.snapshotName==$s)
-             | .status.successful // false] | all' 2>/dev/null || echo "false")
+        | jq -r --arg rd "$RD_A" --arg s "$SNAP" "$JQ_OK" 2>/dev/null || echo "false")
     snap_b_ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
-        | jq -r --arg rd "$RD_B" --arg s "$SNAP" '
-            [.items[]?
-             | select(.spec.resourceDefinitionName==$rd)
-             | select(.spec.snapshotName==$s)
-             | .status.successful // false] | all' 2>/dev/null || echo "false")
+        | jq -r --arg rd "$RD_B" --arg s "$SNAP" "$JQ_OK" 2>/dev/null || echo "false")
     if [[ "$snap_a_ok" == "true" && "$snap_b_ok" == "true" ]]; then
         all_ok=true
         break

@@ -72,13 +72,20 @@ mr=$("${LCTL[@]}" --machine-readable resource-definition list --resource-definit
 # both shapes — blockstor's apiserver wraps results in a
 # top-level array, so the actual RD entry is one level deep.
 layer_types=$(jq -r --arg rd "$RD" '
+    # Why: jq `?` only suppresses missing-key/null-iter errors, NOT
+    # "Cannot index array with string". When the wire shape is
+    # `[[{...}]]` (golinstor v0 outer wrap), `.[0]` is an array and
+    # `.[0].rsc_dfns` raises a hard error that aborts the WHOLE
+    # expression — probe 4 (the correct one) never runs. Wrap each
+    # non-iterating probe in try/catch empty so each alternative is
+    # independent. Probe 3 also needs type=="object" guard so it
+    # does not select the inner array element by mistake.
     [
-        ( .[0].rsc_dfns[]? | select(.name==$rd) | .layer_data[]?.type ),
-        ( .[0].resource_definitions[]? | select(.name==$rd) | .layer_data[]?.type ),
-        ( .[]? | select(.name==$rd) | .layer_data[]?.type ),
-        # golinstor `--machine-readable` v0 wraps the apiserver array in
-        # an outer array → `[[{name,layer_data:[{type}]}]]`. The earlier
-        # probes only reach one level; add the double-array path.
+        ( try (.[0].rsc_dfns[]?) catch empty
+          | select(.name==$rd) | .layer_data[]?.type ),
+        ( try (.[0].resource_definitions[]?) catch empty
+          | select(.name==$rd) | .layer_data[]?.type ),
+        ( .[]? | select(type=="object" and .name==$rd) | .layer_data[]?.type ),
         ( .[0][]? | select(.name==$rd) | .layer_data[]?.type )
     ]
     | flatten

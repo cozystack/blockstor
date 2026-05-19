@@ -95,23 +95,30 @@ deadline=$(( $(date +%s) + 60 ))
 ok=false
 last_state=""
 while (( $(date +%s) < deadline )); do
-    # The CRD shape: each `Snapshots.blockstor.io.blockstor.io`
-    # row is per-(rd, snap, node). For a single-node request we
-    # expect exactly ONE row keyed by ($RD, $SNAP, $N1) reaching
-    # `Successful`. Read both Status.Successful and a state-like
-    # field if present.
+    # CRD shape: ONE Snapshot per (RD, snap). spec.nodes is the
+    # array of nodes; status.nodeStatus[] is per-node {nodeName,
+    # createTimestamp, ready}. Terminal failure surfaces in
+    # status.flags[] = ["FAILED"]. For Bug 352 we want every node
+    # in spec.nodes to appear in nodeStatus with ready=true AND
+    # no FAILED flag.
     rows=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
         | jq -c --arg rd "$RD" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)
              | select(.spec.snapshotName==$s)
-             | {node: .spec.nodeName, ok: (.status.successful // false), state: (.status.state // .status.phase // "")}]')
+             | {
+                 nodes: (.spec.nodes // []),
+                 nodeStatus: (.status.nodeStatus // []),
+                 failed: ((.status.flags // []) | index("FAILED") != null)
+               }]')
     last_state="$rows"
 
-    # "Successful" if every row is ok=true AND at least one row exists
     n_rows=$(jq 'length' <<<"$rows" 2>/dev/null || echo 0)
     if (( n_rows > 0 )); then
-        all_ok=$(jq 'all(.ok)' <<<"$rows" 2>/dev/null || echo "false")
+        # All requested nodes reported ready; no FAILED.
+        all_ok=$(jq '[.[] | (.failed | not) and ((.nodes|length) > 0) and
+            ([.nodes[]] - [.nodeStatus[] | select(.ready==true) | .nodeName] | length == 0)] | all' \
+            <<<"$rows" 2>/dev/null || echo "false")
         if [[ "$all_ok" == "true" ]]; then
             ok=true
             break
@@ -131,15 +138,15 @@ if ! $ok; then
     exit 1
 fi
 
-# Extra sanity: the snapshot must exist ONLY on $N1, NOT on $N2.
-# If blockstor created Snapshot children on both (ignoring the
-# node-list filter), that's a different bug — surface it.
+# Extra sanity: $N2 must NOT appear in spec.nodes of the snapshot.
+# If blockstor expanded the node-list to include $N2 (ignoring the
+# explicit single-node restriction), that's a different bug.
 n2_rows=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
     | jq -r --arg rd "$RD" --arg s "$SNAP" --arg n "$N2" '
         [.items[]?
          | select(.spec.resourceDefinitionName==$rd)
          | select(.spec.snapshotName==$s)
-         | select(.spec.nodeName==$n)] | length')
+         | select((.spec.nodes // []) | index($n))] | length')
 if [[ "${n2_rows:-0}" != "0" ]]; then
     echo "FAIL (Bug 352 sibling): snapshot CRD created on $N2 even though the request specified only $N1" >&2
     kubectl get snapshots.blockstor.io.blockstor.io -o yaml 2>&1 | head -80 >&2
