@@ -1812,23 +1812,22 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 }
 
 // runBringUpOrAdjust probes the kernel for the resource's slot via
-// `drbdsetup status <rsc>` and chooses the right drbdadm verb:
-//
-//   - kernel slot present → `drbdadm adjust` (or `adjust --skip-disk`
-//     when SkipDisk is enabled, scenario 5.11).
-//   - kernel slot absent  → `drbdadm up`, which performs
-//     new-resource + new-path + attach + connect in one go and is
-//     the only verb that bootstraps a missing slot from a valid
-//     .res + on-disk metadata. `drbdadm adjust` on an absent slot
-//     fails with `Failure: (158) Unknown resource` because adjust
-//     only reconciles already-loaded kernel state.
+// `drbdsetup status <rsc>` and dispatches `drbdadm adjust` (or
+// `adjust --skip-disk` when SkipDisk is enabled, scenario 5.11) on
+// a loaded slot. The historical `!loaded → drbdadm up` arm has been
+// retired (Phase 11.2.c Stage 4 step 2) — see the inline Why-comment
+// below for the FSM dispatch path that now owns that case.
 //
 // Why this matters (Bug 47 / scenario 5.32): an operator's
 // `drbdadm down <rsc>` removes the kernel slot but leaves the
-// satellite's `.md-created` marker on disk. Without this probe,
-// every subsequent reconcile retries `drbdadm adjust` →
-// `drbdsetup new-path` → `(158) Unknown resource` forever, and
-// the resource stays down until the satellite pod restarts.
+// satellite's `.md-created` marker on disk. Without an explicit
+// `drbdadm up` path, every subsequent reconcile would retry
+// `drbdadm adjust` → `drbdsetup new-path` → `(158) Unknown resource`
+// forever and the resource would stay down until the satellite pod
+// restarts. The FSM shadow-dispatch at the top of applyDRBD now
+// observes Phase==MetadataReady (MetadataExists && !KernelLoaded)
+// and dispatches `ActionUp` → `r.bringUpResource` BEFORE this
+// function runs, closing that operator-down recovery loop.
 //
 // IsLoaded's "genuine" error path (unexpected exec failure, not
 // the resource-absent signal) is bubbled up: we'd rather surface
@@ -1841,7 +1840,26 @@ func (r *Reconciler) runBringUpOrAdjust(ctx context.Context, dr *intent.DesiredR
 	}
 
 	if !loaded {
-		return r.bringUpResource(ctx, dr)
+		// Phase 11.2.c Stage 4 step 2: legacy r.bringUpResource call retired.
+		// Why: the FSM shadow-dispatch at the top of applyDRBD now owns
+		// ActionUp — when Phase==MetadataReady && KernelLoaded==false, the
+		// FSM dispatch invokes r.bringUpResource (with the renderResFile
+		// preamble landed in Stage 4 step 1 to keep .res fresh before the
+		// up). drbdadm up is naturally idempotent (already-loaded resources
+		// return success), so the previous double-fire was harmless but
+		// redundant. By the time runBringUpOrAdjust reaches this branch,
+		// the FSM has either:
+		//   (a) brought the kernel up successfully on this Apply pass (the
+		//       common case — but `loaded` here was probed BEFORE dispatch
+		//       fired, so the cached read may still see false; the next
+		//       reconcile observes the now-loaded slot and routes to
+		//       adjust), or
+		//   (b) errored out before runApplyDRBDVerb runs at all (dispatch
+		//       returns the error, applyDRBD bubbles up, we never get here).
+		// Step 3 will retire adjustResource; step 4 will retire createMd.
+		// Bug-287 `(158) Unknown resource` fallback inside runAdjust stays:
+		// distinct error-recovery path, not first-load.
+		return nil
 	}
 
 	return r.adjustResource(ctx, dr, diskfulFlip)

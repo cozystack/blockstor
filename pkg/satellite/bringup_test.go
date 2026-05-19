@@ -19,6 +19,8 @@ package satellite
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -123,5 +125,116 @@ func TestBringUpResourcePropagatesError(t *testing.T) {
 	// format mirrors the inline call site this helper replaced.
 	if !strings.Contains(err.Error(), "drbdadm up pvc-bringup-fail") {
 		t.Errorf("error wrap missing %q context: %v", "drbdadm up pvc-bringup-fail", err)
+	}
+}
+
+// TestApplyDRBDBringsUpViaFsmDispatchOnly pins the Stage 4 step 2
+// contract: when applyDRBD runs against an unloaded kernel slot with
+// fresh metadata, the FSM dispatch (not a legacy call inside
+// runBringUpOrAdjust) is the sole source of drbdadm up. The legacy
+// path was removed in Phase 11.2.c Stage 4 step 2.
+//
+// Observation shape: SpecHasResource=true, ResFileExists=true,
+// MetadataExists=true, KernelLoaded=false — Phase==MetadataReady.
+// FSM picks ActionUp. dispatchFsmAction runs renderResFile preamble
+// (Stage 4 step 1) + bringUpResource. The legacy
+// runBringUpOrAdjust's !loaded arm is now a documented no-op, so the
+// only `drbdadm up <name>` shell-out comes from the FSM dispatch.
+//
+// A regression that re-added the legacy bringUp call inside
+// runBringUpOrAdjust would surface as TWO `drbdadm up` calls on the
+// same Apply pass.
+func TestApplyDRBDBringsUpViaFsmDispatchOnly(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:          drbd.NewAdm(fx),
+		StateDir:     dir,
+		NodeName:     "n1",
+		LocalAddress: "10.0.0.1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-stage4-step2-up",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+	devices := map[int32]string{0: "/dev/vg/pvc-stage4-step2-up_00000"}
+
+	// Seed a .res file so the FSM preamble's stat+compare path is
+	// covered (content-idempotent overwrite is a no-op when bodies
+	// match — Bug 315).
+	if err := rec.renderResFile(context.Background(), dr, devices); err != nil {
+		t.Fatalf("seed renderResFile: %v", err)
+	}
+
+	// Sanity check: the seeded .res is on disk before dispatch.
+	resPath := filepath.Join(dir, "pvc-stage4-step2-up.res")
+	if _, err := os.Stat(resPath); err != nil {
+		t.Fatalf("seeded .res missing: %v", err)
+	}
+
+	// Reset the FakeExec call recorder so we only count shell-outs
+	// from the dispatch under test (renderResFile may have shelled
+	// out to lvs while computing volume paths).
+	fx = storage.NewFakeExec()
+	rec.cfg.Adm = drbd.NewAdm(fx)
+
+	// Phase==MetadataReady observation shape: spec present, .res on
+	// disk, metadata stamped, kernel slot NOT loaded. NextTransition
+	// MUST return ActionUp for this shape; assert that here so a
+	// future FSM-table drift surfaces in this test rather than only
+	// downstream in the dispatch counter.
+	obs := Observation{
+		SpecHasResource: true,
+		ResFileExists:   true,
+		MetadataExists:  true,
+		KernelLoaded:    false,
+	}
+
+	phase := ObservePhase(obs)
+	if phase != PhaseMetadataReady {
+		t.Fatalf("ObservePhase: got %q, want %q", phase, PhaseMetadataReady)
+	}
+
+	next := NextTransition(phase, obs)
+	if next == nil || next.Action != ActionUp {
+		got := "nil"
+		if next != nil {
+			got = next.Action
+		}
+
+		t.Fatalf("NextTransition: got action %q, want %q", got, ActionUp)
+	}
+
+	if err := rec.dispatchFsmAction(context.Background(), dr, devices, ActionUp, obs); err != nil {
+		t.Fatalf("dispatchFsmAction(ActionUp): %v", err)
+	}
+
+	// Exactly ONE `drbdadm up <name>` MUST land on the FakeExec.
+	// More than one would mean the legacy bringUpResource call
+	// inside runBringUpOrAdjust was re-introduced (or a regression
+	// caused the dispatch to double-fire).
+	wantUp := "drbdadm up pvc-stage4-step2-up"
+	upCount := 0
+
+	for _, line := range fx.CommandLines() {
+		if line == wantUp {
+			upCount++
+		}
+	}
+
+	if upCount != 1 {
+		t.Errorf("got %d %q calls, want exactly 1; calls=%v",
+			upCount, wantUp, fx.CommandLines())
 	}
 }
