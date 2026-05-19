@@ -68,6 +68,11 @@ var (
 	// retry scenario: vol-1 mkfs trips a transient kernel error
 	// while vol-0 already succeeded).
 	errMkfsExt4Failed = errors.New("mkfs.ext4: superblock write failure")
+	// errDrbdadmDumpMdNoMeta mirrors the verbatim stderr drbdadm
+	// emits when `dump-md <res>/<vol>` is run against a volume whose
+	// lower disk carries no on-disk DRBD-9 metadata block (the
+	// late-VD vol-1 case before its create-md fires). Bug 332.
+	errDrbdadmDumpMdNoMeta = errors.New("drbdadm: No valid meta data found")
 )
 
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
@@ -1819,6 +1824,234 @@ func TestApplyDRBDLateVDDoesNotPinDiskless(t *testing.T) {
 
 	if _, err := os.Stat(markerPath); err != nil {
 		t.Fatalf("md-created marker missing after VD-added pass: %v — late VD should run firstActivation", err)
+	}
+}
+
+// TestApplyDRBDAllocatesBackingForLateAddedVolume pins Bug 332
+// (regression of Bug 79): when an RD already has vol-0 UpToDate on
+// a 3-replica spec and `linstor vd c <rd> 1G` adds vol-1 to the
+// VolumeDefinitions[], the next reconcile pass MUST:
+//
+//   - (a) allocate the backing LV for vol-1 on each diskful replica
+//     (idempotent for vol-0),
+//   - (b) run `drbdadm create-md <rd>/1` per-volume so the new
+//     volume's lower disk carries valid DRBD-9 metadata before
+//     `drbdadm adjust` reads the slot,
+//   - (c) render .res with both `volume 0 { ... }` and
+//     `volume 1 { ... }` sub-blocks so the kernel new-minor for vol-1
+//     has a defined disk path, and
+//   - (d) NOT mark vol-1 "Unintentional Diskless".
+//
+// Bug 332 surface: Phase 11.3 Stage 1 introduced the per-RD
+// `MetadataCreated=True` Status Condition. The legacy
+// `firstActivation` predicate flips false on the second reconcile
+// pass (Condition cached on the parent CRD), so the create-md path
+// is short-circuited — but `drbdmeta create-md` is per-volume, not
+// per-RD. The new vol-1 has NO on-disk metadata; without a per-
+// volume re-entry into create-md, `drbdadm adjust` brings vol-1 up
+// as Diskless (kernel: "No valid meta data found") while
+// Spec.Flags lacks DISKLESS, surfacing as "Unintentional
+// Diskless" in `linstor r l`.
+//
+// The fix mirrors upstream LINSTOR DrbdLayer.adjustResource:
+// per-volume `hasMetaData` check, per-volume `createMd` for those
+// that lack it. Stays inside the upstream invariant — does not
+// add closed-loop recovery beyond the per-volume create-md gate.
+func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// vol-0 already exists on disk from the first activation pass:
+	// lvs probe reports the LV present (idempotency short-circuit).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-late_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late_00000|1048576\n")})
+
+	// vol-1 is NEW — lvs reports nothing, the satellite's CreateVolume
+	// flow then issues an lvcreate. After it lands, the next lvs
+	// query (issued by VolumeStatus to learn the device path) returns
+	// the freshly-created LV.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late_00001",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late_00001|1048576\n")})
+
+	// Per-volume HasMD probe (drbdadm dump-md <rd>/<vol>):
+	//   - vol-0: returns a parseable dump → HasMD=true → skip create-md
+	//   - vol-1: returns non-zero (no metadata) → HasMD=false → create-md
+	fx.Expect("drbdadm dump-md pvc-late/0",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
+	fx.Expect("drbdadm dump-md pvc-late/1",
+		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
+
+	// Per-volume create-md for vol-1 only — vol-0 keeps its existing
+	// GI + bitmap state untouched.
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.MaxPeers-1),
+		storage.FakeResponse{})
+
+	// Kernel slot already loaded (vol-0 is UpToDate from the
+	// first-activation pass). Phase==Running → FSM dispatches
+	// ActionAdjust. The non-empty status drives KernelLoaded=true.
+	fx.Expect("drbdsetup status pvc-late",
+		storage.FakeResponse{Stdout: []byte("pvc-late role:Secondary\n  volume:0 disk:UpToDate\n")})
+	// HasDisklessVolume probe (drbdsetup status --verbose): vol-0 is
+	// UpToDate, so no Diskless volume to coerce SkipDisk on.
+	fx.Expect("drbdsetup status --verbose pvc-late",
+		storage.FakeResponse{Stdout: []byte("pvc-late role:Secondary\n  volume:0 disk:UpToDate\n")})
+
+	// drbdadm adjust to converge kernel state with the new .res +
+	// freshly-stamped vol-1 metadata.
+	fx.Expect("drbdadm adjust pvc-late", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Pre-seed the steady state: .res file (single-volume) + md-created
+	// marker from the first-activation pass, mirroring what's on disk
+	// when the operator runs the late `vd c`.
+	resPath := filepath.Join(dir, "pvc-late.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-late {\n  on n1 {\n    volume 0 {\n    }\n  }\n}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "pvc-late.md-created"), nil, 0o600); err != nil {
+		t.Fatalf("seed md-created: %v", err)
+	}
+
+	// Second Apply: VolumeDefinitions has grown from [vol-0] to
+	// [vol-0, vol-1]. MetadataCreated=true (Condition cached on the
+	// parent Resource CRD). This is the exact shape the dispatcher
+	// hands to the satellite after `linstor vd c <rd> 1G` lands.
+	dr := []*intent.DesiredResource{
+		{
+			Name:            "pvc-late",
+			NodeName:        "n1",
+			MetadataCreated: true,
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply: expected Ok=true; got results=%+v", results)
+	}
+
+	calls := fx.CommandLines()
+
+	// (a) backing LV allocated for vol-1 (lvcreate fired once).
+	sawLVCreateVol1 := false
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "lvcreate") && strings.Contains(line, "pvc-late_00001") {
+			sawLVCreateVol1 = true
+
+			break
+		}
+	}
+
+	if !sawLVCreateVol1 {
+		t.Errorf("lvcreate for vol-1 missing — late-added volume has no backing storage; cmds=%v", calls)
+	}
+
+	// (b) per-volume create-md for vol-1 (the Bug 332 fix).
+	wantCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/1", drbd.MaxPeers-1)
+
+	var sawCreateMDVol1 bool
+
+	for _, line := range calls {
+		if line == wantCreateMD {
+			sawCreateMDVol1 = true
+
+			break
+		}
+	}
+
+	if !sawCreateMDVol1 {
+		t.Errorf("per-volume create-md for vol-1 missing — Bug 332 unfixed; want %q in %v", wantCreateMD, calls)
+	}
+
+	// vol-0's metadata MUST NOT be re-created (would wipe GI + bitmap
+	// → loses claim on replicated data). The per-volume HasMD probe
+	// returned true for vol-0, so create-md on vol-0 is forbidden.
+	forbiddenCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late/0", drbd.MaxPeers-1)
+	for _, line := range calls {
+		if line == forbiddenCreateMD {
+			t.Errorf("re-ran create-md on vol-0 despite HasMD=true (would wipe operator-stamped metadata): %v", calls)
+		}
+	}
+
+	rdScopedCreateMD := fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late", drbd.MaxPeers-1)
+	for _, line := range calls {
+		if line == rdScopedCreateMD {
+			t.Errorf("RD-scoped create-md ran (would wipe vol-0 metadata); per-volume scoping required: %v", calls)
+		}
+	}
+
+	// (c) .res rendered with both volume blocks (the dispatcher's
+	// VolumeDefinitions[] grew, so the renderer MUST include vol-1).
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		t.Fatalf("ReadFile .res: %v", err)
+	}
+
+	got := string(body)
+	for _, want := range []string{
+		"resource pvc-late {",
+		"volume 0 {",
+		"volume 1 {",
+		"disk /dev/vg/pvc-late_00000;",
+		"disk /dev/vg/pvc-late_00001;",
+		"device /dev/drbd1000 minor 1000;",
+		"device /dev/drbd1001 minor 1001;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in rendered .res:\n%s", want, got)
+		}
+	}
+
+	// (d) drbdadm adjust MUST fire — without it the kernel never
+	// picks up the new vol-1 metadata block. The per-volume create-md
+	// only stamps the lower disk; adjust loads the new volume into
+	// the kernel slot and brings it to UpToDate.
+	if !slices.Contains(calls, "drbdadm adjust pvc-late") {
+		t.Errorf("drbdadm adjust missing after per-volume create-md; vol-1 stays unloaded in kernel: %v", calls)
+	}
+
+	// Ordering invariant: per-volume create-md MUST run BEFORE adjust.
+	// If adjust fires before metadata is stamped, the kernel reads the
+	// new vol-1 slot as Diskless ("No valid meta data found") and the
+	// Unintentional Diskless regression resurfaces.
+	createMDIdx, adjustIdx := -1, -1
+
+	for i, line := range calls {
+		if line == wantCreateMD && createMDIdx < 0 {
+			createMDIdx = i
+		}
+
+		if line == "drbdadm adjust pvc-late" && adjustIdx < 0 {
+			adjustIdx = i
+		}
+	}
+
+	if createMDIdx >= 0 && adjustIdx >= 0 && createMDIdx > adjustIdx {
+		t.Errorf("per-volume create-md for vol-1 ran AFTER adjust (idx %d > %d) — adjust would see Diskless vol-1; cmds=%v",
+			createMDIdx, adjustIdx, calls)
 	}
 }
 

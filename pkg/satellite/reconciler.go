@@ -1146,6 +1146,71 @@ func extractResFilePeers(body string) []string {
 // bogus --node-id=0 collision against the local slot. Reads via
 // os.ReadFile so a transient I/O hiccup degrades to no-op
 // instead of wedging the reconcile.
+// hasLateAddedVolume reports whether the desired-state Volumes[]
+// includes at least one volume number that is NOT yet represented
+// as a `volume <N> {` block in the OLD .res file at resPath.
+//
+// Bug 332: the `linstor vd c <rd> 1G` flow grows VolumeDefinitions[]
+// after the RD has already passed first-activation. The dispatcher
+// hands the satellite a DesiredResource with the new volume in
+// Volumes[], but the on-disk .res still describes the smaller set —
+// so a strict greater-than on the rendered block count is the
+// late-VD signal. Returns false when the .res file is absent
+// (cold-start path; the existing firstActivation gate owns
+// metadata creation), when the file is unreadable (fail-safe to
+// "no late vol → no extra work"), or when the desired set matches
+// what's already rendered.
+//
+// Parser is intentionally simple: matches "volume <N> {" inside an
+// `on <node> {` block. False positives across multi-host blocks are
+// harmless — the helper de-duplicates by recording each volNumber
+// once across the file.
+func hasLateAddedVolume(resPath string, dr *intent.DesiredResource) bool {
+	if dr == nil {
+		return false
+	}
+
+	body, err := os.ReadFile(resPath)
+	if err != nil {
+		// No .res yet → cold start, existing firstActivation path
+		// will create metadata for every volume via the standard
+		// chain. Late-VD signal is "old file exists with fewer
+		// volumes", not "no file at all".
+		return false
+	}
+
+	rendered := map[int32]struct{}{}
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "volume ") {
+			continue
+		}
+
+		rest := strings.TrimPrefix(trimmed, "volume ")
+		head, _, ok := strings.Cut(rest, "{")
+
+		if !ok {
+			continue
+		}
+
+		num, parseErr := strconv.ParseInt(strings.TrimSpace(head), 10, 32)
+		if parseErr != nil {
+			continue
+		}
+
+		rendered[int32(num)] = struct{}{}
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		if _, ok := rendered[vol.GetVolumeNumber()]; !ok {
+			return true
+		}
+	}
+
+	return false
+}
+
 func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 	body, err := os.ReadFile(resPath)
 	if err != nil {
@@ -1268,6 +1333,34 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
+	}
+
+	// Bug 332 (regression of Bug 79): MetadataCreated=True is a per-RD
+	// hint but the actual drbdmeta create-md must run per-volume. When
+	// `vd c` adds a new volume to an existing RD (operator-observed
+	// repro on a 3-replica cluster after vol-0 reached UpToDate), the
+	// per-RD Condition is True so the legacy firstActivation predicate
+	// flips false — yet the new volume has no on-disk metadata, and
+	// the subsequent `drbdadm adjust` would bring it up as kernel
+	// disk:Diskless while Spec.Flags lacks DISKLESS (the verbatim
+	// "Unintentional Diskless" surface from `linstor r l`). Mirror
+	// upstream LINSTOR DrbdLayer.adjustResource: per-volume
+	// hasMetaData probe, per-volume createMd for those that lack it.
+	//
+	// Scope: NARROW to the "late-VD added" signal — desired Volumes[]
+	// count strictly exceeds the OLD .res's `volume N {` block count.
+	// Without this narrowing, the steady-state path would shell out
+	// `drbdadm dump-md` on every reconcile, perturbing existing tests
+	// that pin "no metadata work on retry" (e.g. mid-Apply abort
+	// scenarios) and adding shell cost on every converged pass.
+	// Skipped on diskless replicas (no lower disk to stamp) and on
+	// the diskless→diskful flip path (Bug 319 owns that re-stamp).
+	if !diskless && hasLateAddedVolume(resPath, dr) &&
+		!r.isDisklessToDiskfulFlip(ctx, dr, diskless) {
+		err = r.ensurePerVolumeMetadata(ctx, dr, devices, diskless)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Phase 11.2.c Stage 3d: shadow-dispatch every FSM action. Each
@@ -1622,6 +1715,81 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	err = r.seedInitialGi(ctx, dr, devices)
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
+	}
+
+	return nil
+}
+
+// ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
+// volume of `dr` that lacks it. Mirrors upstream LINSTOR's
+// DrbdLayer.adjustResource (satellite/.../DrbdLayer.java L702-723):
+// hasMetaData per-volume, createMd per-volume for the ones missing.
+//
+// Bug 332 (regression of Bug 79): the per-RD `MetadataCreated=True`
+// Status Condition (Phase 11.3 Stage 1) caches "this RD has had
+// create-md before". But the actual `drbdmeta create-md` is
+// per-volume — when `linstor vd c <rd> 1G` adds a new volume to an
+// existing RD, the Condition is True yet the new volume's lower
+// disk carries no metadata. Without this helper the subsequent
+// `drbdadm adjust` brings the new volume up as kernel disk:Diskless
+// while Spec.Flags lacks DISKLESS (the verbatim "Unintentional
+// Diskless" surface from `linstor r l`).
+//
+// Renders .res before probing so drbdadm dump-md / create-md can
+// resolve the new volume's lower disk path. renderResFile is
+// content-idempotent (Bug 315) so the redundant call when the FSM
+// dispatch's renderResFile preamble runs afterwards is a stat+
+// compare no-op.
+//
+// Per-volume scoping is the SAFETY invariant: a bare
+// `drbdadm create-md --force <rd>` would walk every volume and
+// wipe vol-0's existing GI + bitmap state (the W09 disk-replace
+// safety guard exists for exactly this reason). We pass
+// `<rd>/<volNumber>` so drbdadm targets only the missing volume.
+//
+// Callers MUST gate this on "the legacy firstActivation predicate
+// would skip create-md" (MetadataCreated=True OR `.md-created`
+// marker present). On a true first activation the existing
+// createMetadata path handles every volume via a single RD-scoped
+// call; running this helper in that branch duplicates work and
+// races the FSM dispatch's bring-up shape.
+//
+// Skipped on diskless replicas (no lower disk to stamp). Errors
+// bubble up — a stuck per-vol create-md must surface, not silently
+// degrade to Diskless.
+func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, diskless bool) error {
+	if diskless {
+		return nil
+	}
+
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	// Render .res first — drbdadm dump-md / create-md need an
+	// up-to-date .res to resolve the per-volume lower disk path.
+	// Content-idempotent on converged state.
+	err := r.renderResFile(ctx, dr, devices)
+	if err != nil {
+		return err
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
+
+		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+		if probeErr != nil {
+			return errors.Wrapf(probeErr, "dump-md %s", target)
+		}
+
+		if hasMD {
+			continue
+		}
+
+		createErr := r.cfg.Adm.CreateMD(ctx, target)
+		if createErr != nil {
+			return errors.Wrapf(createErr, "create-md %s", target)
+		}
 	}
 
 	return nil
