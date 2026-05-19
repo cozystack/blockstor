@@ -82,14 +82,49 @@ func (s *Server) registerPhysicalStorage(mux *http.ServeMux) {
 // physicalStorageCreateRequest mirrors upstream golinstor's
 // `PhysicalStorageCreate`. We accept only the subset blockstor
 // can interpret without VDO / RAID / SED — those upstream knobs
-// silently get ignored and the attach falls through to a plain
-// pool create. piraeus-operator only sets the simple subset, so
-// this lossy mapping is fine in practice.
+// are silently accepted and ignored so the wire shape stays
+// compatible with the LINSTOR CLI (`linstor physical-storage
+// create-device-pool`) and golinstor-based clients. The strict
+// JSON decoder (Bug 161 / Bug 197) rejects any unknown key, so
+// every field upstream's `PhysicalStorageCreate` defines MUST
+// appear here even if blockstor does not implement the feature
+// — otherwise `linstor ps cdp` hits a 400 "unknown field" right
+// at the CLI boundary (Bug 326).
 type physicalStorageCreateRequest struct {
 	DevicePaths     []string                          `json:"device_paths"`
 	ProviderKind    string                            `json:"provider_kind"`
 	PoolName        string                            `json:"pool_name,omitempty"`
 	WithStoragePool *physicalStorageCreatePoolDetails `json:"with_storage_pool,omitempty"`
+
+	// VDO knobs are accepted for wire compatibility with the
+	// upstream LINSTOR CLI but ignored — blockstor does not
+	// stack a VDO layer under pools yet. A caller that asks
+	// for VdoEnable=true gets an extra WARNING ApiCallRc in
+	// the 202 reply so the operator knows the request landed
+	// without VDO setup (Bug 326).
+	VdoEnable         *bool  `json:"vdo_enable,omitempty"`
+	VdoLogicalSizeKib *int64 `json:"vdo_logical_size_kib,omitempty"`
+	VdoSlabSizeKib    *int64 `json:"vdo_slab_size_kib,omitempty"`
+
+	// RAID / SED passthrough knobs from upstream's
+	// PhysicalStorageCreate envelope. Same accept-and-ignore
+	// rule: blockstor does not assemble RAID arrays or initialise
+	// SED on the satellite path, but the CLI may include the
+	// keys with default-zero values. Bug 326.
+	RaidLevel *string `json:"raid_level,omitempty"`
+	Sed       *bool   `json:"sed,omitempty"`
+
+	// Free-form tool arguments forwarded to pvcreate / lvcreate
+	// / vgcreate / zpool create by upstream LINSTOR. blockstor's
+	// satellite providers build their own command lines, so we
+	// drop these — but the CLI still serialises them as empty
+	// arrays when the operator omits the matching `--*-args`
+	// flag, and the strict decoder would reject the body
+	// otherwise. Bug 326.
+	LvCreateArguments    *[]string `json:"lv_create_arguments,omitempty"`
+	PvCreateArguments    *[]string `json:"pv_create_arguments,omitempty"`
+	VgCreateArguments    *[]string `json:"vg_create_arguments,omitempty"`
+	ZpoolCreateArguments *[]string `json:"zpool_create_arguments,omitempty"`
 }
 
 // physicalStorageCreatePoolDetails carries optional pool-side
@@ -182,8 +217,32 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 	// 10.7 cascade-delete contract.
 	_ = setStoragePoolOwnership(r.Context(), s.Client, target.Name, target.AttachTo.StoragePoolName)
 
-	writePhysicalStorageCreateAccepted(w, node)
+	writePhysicalStorageCreateAccepted(w, node, requestedVdoSetup(&req))
 }
+
+// requestedVdoSetup reports whether the caller asked the satellite to
+// stack a VDO layer under the new pool. blockstor accepts the upstream
+// `vdo_enable` knob for wire compatibility with the LINSTOR CLI but
+// does not implement a VDO provider; a true here triggers the extra
+// warning ApiCallRc entry so the operator knows the request landed
+// without VDO setup (Bug 326).
+func requestedVdoSetup(req *physicalStorageCreateRequest) bool {
+	return req.VdoEnable != nil && *req.VdoEnable
+}
+
+// physicalStorageVdoNotImplementedNotice is the Bug 326 advisory: the
+// LINSTOR CLI accepts `--vdo-enable` flags and forwards them on the
+// wire, but blockstor's satellite providers do not stack a VDO layer
+// under storage pools. We accept the flag for wire compatibility so
+// `linstor ps cdp` runs without a 400 "unknown field", but the
+// resulting pool is plain LVM / ZFS / FILE — no dedup, no compression.
+// Surfacing this as a WARNING ApiCallRc puts the message under the
+// python CLI's standard `WARNING:` log line so audit-log greppers
+// catch it alongside the existing wave2 6.W09 advisory.
+const physicalStorageVdoNotImplementedNotice = "WARNING: vdo_enable=true accepted for wire compatibility but ignored; " +
+	"blockstor does not stack a VDO layer under storage pools. " +
+	"The pool is created as plain " +
+	"LVM / LVM-thin / ZFS / FILE without dedup or compression."
 
 // decodePhysicalStorageCreateRequest pulls the upstream-LINSTOR
 // `PhysicalStorageCreate` envelope off the request, validates the
@@ -274,9 +333,14 @@ func writePhysicalStorageBusyDevice(w http.ResponseWriter, node string, dev *api
 // (golinstor, piraeus-operator) can poll for completion by waiting for
 // the matching PhysicalDevice CRD to disappear (success) or report
 // `Status.Phase=Failed`. Phase 10.7 + wave2 6.W09.
-func writePhysicalStorageCreateAccepted(w http.ResponseWriter, node string) {
+//
+// vdoRequested=true appends the Bug 326 "VDO not implemented" advisory
+// so callers that set `vdo_enable=true` learn the request landed
+// without VDO setup.
+func writePhysicalStorageCreateAccepted(w http.ResponseWriter, node string, vdoRequested bool) {
 	w.Header().Set("Location", "/v1/nodes/"+node+"/physical-storage")
-	writeJSON(w, http.StatusAccepted, []apiv1.APICallRc{
+
+	entries := []apiv1.APICallRc{
 		{
 			RetCode: maskInfo,
 			Message: "physical-storage attach accepted on node '" + node + "'",
@@ -285,7 +349,16 @@ func writePhysicalStorageCreateAccepted(w http.ResponseWriter, node string) {
 			RetCode: maskWarn,
 			Message: physicalStorageCDPRunbookNotice,
 		},
-	})
+	}
+
+	if vdoRequested {
+		entries = append(entries, apiv1.APICallRc{
+			RetCode: maskWarn,
+			Message: physicalStorageVdoNotImplementedNotice,
+		})
+	}
+
+	writeJSON(w, http.StatusAccepted, entries)
 }
 
 // setStoragePoolOwnership wires a PhysicalDevice CRD as an

@@ -1163,3 +1163,207 @@ func TestPhysicalStorageCreateExplicitPropsWinOverPoolName(t *testing.T) {
 			pool.Props["StorDriver/ZPool"], "explicit")
 	}
 }
+
+// TestPhysicalStorageCreateAcceptsVdoEnable pins Bug 326: the LINSTOR
+// CLI (`linstor ps cdp …`) serialises `vdo_enable` and the sibling
+// VDO knobs (`vdo_logical_size_kib`, `vdo_slab_size_kib`) into the
+// `PhysicalStorageCreate` envelope unconditionally — even when the
+// operator passes none of the `--vdo-*` flags the Python CLI fills
+// them with default-zero / default-false values. blockstor's strict
+// JSON decoder (Bug 161 / Bug 197) used to reject the body with
+// "unknown field 'vdo_enable'", blocking `linstor ps cdp` end-to-end
+// on real stands.
+//
+// The fix is wire-compat accept-and-ignore: blockstor does not stack
+// a VDO layer under storage pools, but it MUST accept the field so
+// the CLI round-trips. Three sub-cases cover the regression surface:
+//
+//   - omitted (backward compat with existing CLIs / piraeus-operator)
+//   - vdo_enable=false (the common path the CLI fills by default)
+//   - vdo_enable=true (caller actually wants VDO — we still accept
+//     but emit an extra WARNING ApiCallRc so the operator learns
+//     the request landed without VDO setup)
+//
+// All sibling VDO / RAID / SED / *_create_arguments knobs are
+// exercised alongside vdo_enable in the false-path case so the
+// strict decoder accepts the full upstream `PhysicalStorageCreate`
+// shape — drift on any of these wire keys would re-break the CLI.
+func TestPhysicalStorageCreateAcceptsVdoEnable(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantVDOWarn bool
+	}{
+		{
+			name: "omitted",
+			body: `{
+				"provider_kind": "ZFS",
+				"device_paths": ["/dev/sda"],
+				"with_storage_pool": {
+					"name": "data",
+					"props": {"StorDriver/ZPool": "data"}
+				}
+			}`,
+			wantVDOWarn: false,
+		},
+		{
+			name: "vdo_enable_false_with_siblings",
+			body: `{
+				"provider_kind": "ZFS",
+				"device_paths": ["/dev/sda"],
+				"vdo_enable": false,
+				"vdo_logical_size_kib": 0,
+				"vdo_slab_size_kib": 0,
+				"sed": false,
+				"raid_level": "",
+				"lv_create_arguments": [],
+				"pv_create_arguments": [],
+				"vg_create_arguments": [],
+				"zpool_create_arguments": [],
+				"with_storage_pool": {
+					"name": "data",
+					"props": {"StorDriver/ZPool": "data"}
+				}
+			}`,
+			wantVDOWarn: false,
+		},
+		{
+			name: "vdo_enable_true_emits_warning",
+			body: `{
+				"provider_kind": "ZFS",
+				"device_paths": ["/dev/sda"],
+				"vdo_enable": true,
+				"with_storage_pool": {
+					"name": "data",
+					"props": {"StorDriver/ZPool": "data"}
+				}
+			}`,
+			wantVDOWarn: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewInMemory()
+
+			if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+				Name:       "n1-sda",
+				NodeName:   "n1",
+				DevicePath: "/dev/sda",
+				Phase:      "Available",
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := httpPost(t, base+"/v1/physical-storage/n1", []byte(tc.body))
+			defer func() { _ = resp.Body.Close() }()
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("status: got %d, want 202; body=%s", resp.StatusCode, body)
+			}
+
+			if strings.Contains(string(body), "unknown field") {
+				t.Errorf("response body still contains 'unknown field' — Bug 326 regression: %s", body)
+			}
+
+			var entries []apiv1.APICallRc
+			if err := json.Unmarshal(body, &entries); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			var vdoWarn *apiv1.APICallRc
+
+			for i := range entries {
+				if strings.Contains(entries[i].Message, "vdo_enable=true") {
+					vdoWarn = &entries[i]
+
+					break
+				}
+			}
+
+			if tc.wantVDOWarn && vdoWarn == nil {
+				t.Errorf("vdo_enable=true must surface a VDO-not-implemented WARNING entry; got entries=%+v", entries)
+			}
+
+			if tc.wantVDOWarn && vdoWarn != nil {
+				const maskWarnBit = int64(0x0002_0000_0000)
+				if vdoWarn.RetCode&maskWarnBit == 0 {
+					t.Errorf("VDO advisory RetCode: got %#x, want maskWarn bit set so python-linstor prints it as WARNING", vdoWarn.RetCode)
+				}
+			}
+
+			if !tc.wantVDOWarn && vdoWarn != nil {
+				t.Errorf("unexpected VDO-not-implemented WARNING when vdo_enable was %q: %+v", tc.name, vdoWarn)
+			}
+
+			// The attach must still flip AttachTo regardless of the
+			// VDO knobs — the fields are accept-and-ignore.
+			got, err := st.PhysicalDevices().Get(t.Context(), "n1-sda")
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+
+			if got.AttachTo == nil {
+				t.Errorf("AttachTo: got nil, want set (VDO knobs must not block the attach)")
+			}
+		})
+	}
+}
+
+// TestPhysicalStorageCreateAcceptsCLIWireShape pins the real wire
+// shape the production LINSTOR CLI sends on `linstor ps cdp
+// --pool-name data --storage-pool data zfs <node> /dev/sda` — the
+// exact reproducer from the Bug 326 user report (stand dev-kvaps-1).
+// The body intentionally carries every knob the upstream
+// `PhysicalStorageCreate` envelope defines so the strict decoder
+// covers the full union of fields the CLI may serialise; a future
+// addition to the upstream envelope is the only way this test breaks.
+func TestPhysicalStorageCreateAcceptsCLIWireShape(t *testing.T) {
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-sda",
+		NodeName:   "n1",
+		DevicePath: "/dev/sda",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// This body mirrors the request golinstor 0.55.x emits for the
+	// exact CLI invocation in the Bug 326 report. The decoder must
+	// accept every key (none of them is `unknown field`).
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "ZFS",
+			"pool_name": "data",
+			"device_paths": ["/dev/sda"],
+			"with_storage_pool": {"name": "data"},
+			"vdo_enable": false,
+			"vdo_logical_size_kib": 0,
+			"vdo_slab_size_kib": 0,
+			"sed": false
+		}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("Bug 326 reproducer body must return 202, got %d: %s", resp.StatusCode, body)
+	}
+
+	if strings.Contains(string(body), "unknown field") {
+		t.Fatalf("Bug 326 regression: response still mentions 'unknown field': %s", body)
+	}
+}
