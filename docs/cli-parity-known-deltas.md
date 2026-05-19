@@ -15,31 +15,25 @@ Row IDs match the command-catalogue indexes used by `cli-parity-refresh.sh` (see
 
 | # | command | delta_kind | accepted_until | why |
 |---|---------|------------|----------------|-----|
-| 03 | `sp l` | WIRE_SHAPE | 2026-09-30 | F3 fix-list item; `DfltDisklessStorPool` auto-create + `SharedName` deferred — tracked in docs/cli-parity-audit-2026-05-14.md row 3. |
 | 04 | `sp l --show-props StorDriver/*` | WIRE_SHAPE | permanent | BLOCKSTOR_SUPERSET: BS surfaces extra `StorDriver/LvmVg`/`ThinPool` keys; client glob still matches → CLI render identical. Operator-visible parity OK. |
-| 05 | `rg l` | WIRE_SHAPE | 2026-09-30 | Default RG name is `dfltrscgrp` (lowercase) vs upstream `DfltRscGrp`. CSI provisioner currently set to lowercase via override; migration tracked in F5. |
-| 12 | `v l` | WIRE_SHAPE | 2026-09-30 | BS populates `device_path` (BLOCKSTOR_SUPERSET) but omits `state.storage_pool_name` and `minor_number`. F9 fix item. |
-| 13 | `v l --resources PARITY_RD` | WIRE_SHAPE | 2026-09-30 | Same root cause as #12. |
-| 18 | `controller version` | WIRE_SHAPE | permanent | Intentional version stamping: BS reports `1.33.2 git=blockstor`. Downstream tooling MUST NOT grep a hex git_hash from BS. |
+| 08 | `r l` (tiebreaker layers DRBD,STORAGE) | WIRE_SHAPE | 2026-12-31 | F10 residual: DRBD layer enrichment (`may_promote`, `promotion_score`, `node_id`, `al_*`) not yet stamped. Audit refresh 2026-05-19 reclassifies F10 as partial — `drbdtop`-style monitoring depends on it but CSI does not. |
+| 18 | `controller version` | WIRE_SHAPE | permanent | Intentional version stamping: BS reports `1.33.2+ git=blockstor`. Downstream tooling MUST NOT grep a hex git_hash from BS. |
 | 19 | `controller list-properties` | WIRE_SHAPE | 2026-09-30 | BS does not surface every default LINSTOR property; backlog tracked outside fix-list. |
 | 21 | `advise r` | MISSING_FEATURE | 2026-12-31 | Autoplace-advisor not implemented; CSI does not depend on it. Defer until advisor design firms up. |
 | 22 | `advise rd` | MISSING_FEATURE | 2026-12-31 | Same as #21. |
+| 50 | `node info` | WIRE_SHAPE | 2026-09-30 | Open until a satellite NodeStatus capability snapshot is wired into the CRD; advisory-only fields (`info.os`, `info.cpus`, `info.memory`) remain blank. |
 | 52 | `exos defaultUser` | MISSING_FEATURE | permanent | EXOS layer never supported by blockstor (out of scope; we do not target Seagate Exos hardware). |
-| 53 | `backup l` | MISSING_FEATURE | 2026-12-31 | Backup/restore subsystem (F20 fix item) deferred to follow-up wave. |
+| 53 | `backup l` | MISSING_FEATURE | 2026-12-31 | Backup/restore subsystem (F20 follow-up: orchestration only — DTO already lands). |
 | 54 | `schedule l` | MISSING_FEATURE | 2026-12-31 | Schedules subsystem deferred to follow-up wave. |
+| 55 | `key-value-store list` | WIRE_SHAPE | 2026-09-30 | BS exposes the KVS endpoints but the wire shape lacks `props.LinstorKvs/...` namespace nesting; CSI uses a flat key set so unblocked. |
 
 ## Open (block merge until addressed)
 
-These rows are **NOT** whitelisted on purpose — they appear in the audit but block any future refresh, so an open issue stays visible:
+These rows are **NOT** whitelisted on purpose — they appear in the audit but block any future refresh, so an open issue stays visible.
 
-- #07 `rd l --resource-definitions PARITY_RD` — filter ignored (BEHAVIOR_BUG, F6).
-- #10 / #11 `vd l` — empty rows (WIRE_SHAPE, F8).
-- #15 `controller list-properties` (when missing rows surface).
-- #16 `ps l` — physical-storage list empty (MISSING_FEATURE, F11).
-- #17 `err l` — error-reports empty (MISSING_FEATURE, F12).
-- #32 `r c --auto-place 99` — terse error vs upstream structured envelope (ERROR_TEXT, F13).
-- #33 `s d` idempotence — WARNING vs SUCCESS envelope (ERROR_TEXT, F14).
-- #40 `n c` create — no UUID + warning envelope (WIRE_SHAPE, F17).
-- #42 `r d` of non-existent pair — 500 vs 200 + WARNING (ERROR_TEXT, F15, CSI-blocking).
+(As of refresh 2026-05-19 the F1-F20 wave from 2026-05-14 closed every Open row from the original audit. New Open rows will populate here as `cli-parity-refresh.sh` discovers them on the stand.)
 
-If you fix any of those, drop the corresponding row from the open list and add it to the accepted table only if some residual divergence remains.
+## Refresh history
+
+- 2026-05-14 — original one-shot audit `docs/cli-parity-audit-2026-05-14.md`.
+- 2026-05-19 — refresh `docs/cli-parity-audit-2026-05-19-refresh.md`; F1-F20 closed (F10 partial residual remains as accepted delta #08); L7 harness `261d9e32f` lands re-runnable cli-parity-refresh.sh as the going-forward audit driver.
