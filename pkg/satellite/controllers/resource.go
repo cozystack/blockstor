@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"strconv"
 	"strings"
@@ -524,10 +525,11 @@ func (r *ResourceReconciler) recordPerResourceFailures(results []*intent.Resourc
 	return anyFailed
 }
 
-// stampPostApply runs the three best-effort post-apply stamps:
-// Status.Volumes (per-volume DevicePath), the Bug-107 volume-numbers
-// annotation, and the Bug-39 toggle-disk retry counter. Each helper
-// is independently fallible — we log and move on so a transient
+// stampPostApply runs the four best-effort post-apply stamps:
+// Status.Volumes (per-volume DevicePath), the stale-Status.Volumes
+// purge (Bug 355 followup), the Bug-107 volume-numbers annotation,
+// and the Bug-39 toggle-disk retry counter. Each helper is
+// independently fallible — we log and move on so a transient
 // apiserver hiccup on one stamp doesn't suppress the others.
 func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, results []*intent.ResourceApplyResult, anyFailed bool, logger logr.Logger) {
 	// Stamp per-volume DevicePath into Status.Volumes so
@@ -538,6 +540,27 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 	err := r.stampVolumeStatus(ctx, res, results)
 	if err != nil {
 		logger.Error(err, "stamp Status.Volumes")
+	}
+
+	// Bug 355 followup: surgically drop `Status.Volumes[]` entries
+	// whose VolumeNumber is no longer present in the parent RD's
+	// VolumeDefinitions. The apiserver-side `vd d` cascade already
+	// removed the entry from `Spec.Volumes` + the `volume-numbers`
+	// annotation, and `stampVolumeStatus` above only re-stamps the
+	// desired volumes under its own field-owner — but the observer's
+	// `SatelliteFieldOwner` claims on `diskState`/`currentGi` for the
+	// removed entry keep the listMap entry alive indefinitely (SSA
+	// only collapses a listMap entry when NO field-owner claims any
+	// subfield on it; observer's volCache never drops volume entries
+	// so the claim is permanent). We use JSON Patch `remove` with a
+	// `test` guard on the matching index so the removal is atomic
+	// against concurrent observer writes AND field-surgical: no other
+	// entry's subfields are touched. Wholesale array replacement
+	// (the original v1 attempt) races observer writes on surviving
+	// volumes and was reverted.
+	err = r.purgeStaleVolumeStatus(ctx, res, rd)
+	if err != nil {
+		logger.Error(err, "purge stale Status.Volumes")
 	}
 
 	// Bug 107: persist the parent RD's volume-number set onto the
@@ -623,6 +646,206 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 // apiserver merges the two slices cleanly under
 // `listMapKey=volumeNumber`.
 const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
+
+// purgeStaleVolumeStatus drops Status.Volumes entries whose
+// VolumeNumber is no longer present in the parent RD's
+// VolumeDefinitions. Bug 355 followup.
+//
+// Background: the apiserver-side `vd d` cascade removes the
+// VolumeDefinition (and the matching Spec.Volumes entry / Bug-107
+// volume-numbers annotation), but Status.Volumes[*] entries authored
+// by the observer's listMap field-owner persist. SSA only collapses
+// a listMap entry when NO field-owner claims any subfield on it. The
+// satellite-stamp owner (`volumeStatusFieldOwner`) already releases
+// its DevicePath claim on the missing entry by NOT including it in
+// the next Apply payload — but the observer's `DiskState` /
+// `CurrentGi` claims on the same `volumeNumber=N` key keep the entry
+// alive, and the observer's `volCache` never removes volume entries
+// (events2 frames only ever ADD entries — there is no `destroy
+// volume` frame on the satellite). The claim is therefore permanent
+// without an explicit purge.
+//
+// Approach: for each Status.Volumes entry whose VolumeNumber is not
+// in the desired set, emit a JSON Patch with a `test` op on
+// `/status/volumes/<idx>/volumeNumber` (atomic check that the index
+// still points at the same VolumeNumber) followed by a `remove` op
+// on `/status/volumes/<idx>` (surgically removes the single listMap
+// entry). The `test` op makes the patch atomic against concurrent
+// observer writes that might reorder the slice: if the index moved
+// the apiserver returns 409/422 and we drop the error — the next
+// reconcile retries.
+//
+// Why JSON Patch (not JSON merge-patch / SSA / strategic-merge
+// $patch:delete):
+//   - JSON merge-patch on the array path REPLACES the array wholesale
+//     and snapshot-stomps observer field-claims on the survivors —
+//     this was the v1 attempt (3471e4a84) which got reverted
+//     (1ec5d1499) because it raced observer writes and wiped fresh
+//     diskState/currentGi.
+//   - SSA Apply has no `delete` verb — releasing this owner's claims
+//     is not enough because observer still claims subfields.
+//   - Strategic merge `$patch:delete` requires server-side strategic
+//     merge support for the CRD which our codegen does not configure.
+//   - JSON Patch with `test`+`remove` on a numeric index is the
+//     narrowest field-surgical mechanism: only the targeted entry
+//     is touched; every other entry's subfields (and every other
+//     Status field) is untouched.
+//
+// Why this does NOT race `r deactivate`: `r deactivate` toggles
+// `Spec.Flags` (INACTIVE) — it does not touch Status.Volumes.
+//
+// No-op when:
+//   - Status.Volumes is empty (nothing to purge);
+//   - rd carries zero VolumeDefinitions (defensive — cascade in
+//     flight or freshly created RD; don't pre-blank Status, the
+//     per-Resource delete path owns that teardown);
+//   - every Status.Volumes entry's VolumeNumber is in the desired set
+//     (steady state).
+//
+// The `test`-op 409/422 path is logged at V(2) (debug) and swallowed
+// — the next reconcile will retry against the fresh slice ordering.
+// We never want a stale-prune retry to spin the reconciler.
+func (r *ResourceReconciler) purgeStaleVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	if len(res.Status.Volumes) == 0 {
+		return nil
+	}
+
+	if len(rd.Spec.VolumeDefinitions) == 0 {
+		// Defensive: an RD with zero VolumeDefinitions is either
+		// freshly created (volumes not yet authored) or mid-cascade
+		// to deletion (the parent RD finalizer will tear down the
+		// Resource). Don't nuke Status.Volumes here — the per-Resource
+		// delete path owns that teardown.
+		return nil
+	}
+
+	desired := desiredVolumeNumbers(rd)
+	stale, survivors := partitionStaleVolumeStatus(res.Status.Volumes, desired)
+
+	if len(stale) == 0 {
+		return nil
+	}
+
+	body, err := buildVolumeStatusPurgePatch(stale)
+	if err != nil {
+		return err
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: res.Name},
+	}
+
+	err = r.Status().Patch(ctx, target, client.RawPatch(types.JSONPatchType, body))
+	if err != nil {
+		// A 409/422 means the index→VolumeNumber mapping shifted
+		// since we read `res` — observer (or another owner) authored
+		// a concurrent write that reordered the slice. The next
+		// reconcile pass picks up the fresh ordering and retries. We
+		// deliberately don't wrap-and-return: a transient ordering
+		// race must not poison the rest of the post-apply chain.
+		if apierrors.IsConflict(err) || apierrors.IsInvalid(err) {
+			return nil
+		}
+
+		return errors.Wrap(err, "json-patch Status.Volumes purge")
+	}
+
+	// Reflect the write back onto the caller's copy so subsequent
+	// reads inside the same reconcile see the post-purge slice.
+	res.Status.Volumes = survivors
+
+	return nil
+}
+
+// jsonPatchOp keys used in every (test, remove) op pair the purge
+// emits. Extracted as constants so the goconst linter is satisfied
+// and so a future RFC 6902 helper rename happens in one place.
+const (
+	jsonPatchOpKey    = "op"
+	jsonPatchPathKey  = "path"
+	jsonPatchValueKey = "value"
+
+	jsonPatchOpTest   = "test"
+	jsonPatchOpRemove = "remove"
+)
+
+// staleVolumeStatus pairs a stale Status.Volumes index with the
+// VolumeNumber the JSON-Patch `test` op pins on it.
+type staleVolumeStatus struct {
+	index  int
+	volNum int32
+}
+
+// desiredVolumeNumbers returns the set of VolumeNumbers the parent
+// RD's VolumeDefinitions currently declare — i.e. every volume that
+// MUST survive in `Status.Volumes`.
+func desiredVolumeNumbers(rd *blockstoriov1alpha1.ResourceDefinition) map[int32]struct{} {
+	out := make(map[int32]struct{}, len(rd.Spec.VolumeDefinitions))
+	for i := range rd.Spec.VolumeDefinitions {
+		out[rd.Spec.VolumeDefinitions[i].VolumeNumber] = struct{}{}
+	}
+
+	return out
+}
+
+// partitionStaleVolumeStatus splits `status` into the stale entries
+// (VolumeNumber not in `desired` — JSON-Patch remove targets) and the
+// survivors (in original index order, suitable for caller-copy
+// reflection). The stale slice carries the ORIGINAL index of each
+// entry so the JSON-Patch document can target it by position.
+func partitionStaleVolumeStatus(status []blockstoriov1alpha1.ResourceVolumeStatus, desired map[int32]struct{}) ([]staleVolumeStatus, []blockstoriov1alpha1.ResourceVolumeStatus) {
+	var stale []staleVolumeStatus
+
+	survivors := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(status))
+
+	for i := range status {
+		if _, ok := desired[status[i].VolumeNumber]; !ok {
+			stale = append(stale, staleVolumeStatus{index: i, volNum: status[i].VolumeNumber})
+
+			continue
+		}
+
+		survivors = append(survivors, status[i])
+	}
+
+	return stale, survivors
+}
+
+// buildVolumeStatusPurgePatch renders the JSON-Patch document that
+// removes each stale `Status.Volumes` entry. Each entry gets a
+// (test, remove) pair so a concurrent reorder (observer writes) is
+// detected as a 409/422 rather than removing the wrong entry.
+//
+// Ops are emitted high-to-low: each `remove` shifts indices below
+// it down by one, so processing the highest index first keeps every
+// remaining index stable. Single-document atomicity at the apiserver
+// — all ops apply, or none.
+func buildVolumeStatusPurgePatch(stale []staleVolumeStatus) ([]byte, error) {
+	ops := make([]map[string]any, 0, len(stale)*2)
+
+	for i := range slices.Backward(stale) {
+		path := "/status/volumes/" + strconv.Itoa(stale[i].index)
+
+		ops = append(ops,
+			map[string]any{
+				jsonPatchOpKey:    jsonPatchOpTest,
+				jsonPatchPathKey:  path + "/volumeNumber",
+				jsonPatchValueKey: stale[i].volNum,
+			},
+			map[string]any{
+				jsonPatchOpKey:   jsonPatchOpRemove,
+				jsonPatchPathKey: path,
+			},
+		)
+	}
+
+	body, err := json.Marshal(ops)
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal Status.Volumes purge patch")
+	}
+
+	return body, nil
+}
 
 // stampVolumeNumbersAnnotation writes the parent RD's volume-number
 // set onto the Resource's metadata.annotations under

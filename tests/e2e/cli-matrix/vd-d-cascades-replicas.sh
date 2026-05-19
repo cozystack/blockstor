@@ -158,12 +158,32 @@ fi
 # =====================================================================
 # Per-node Resource.status.volumes must drop vol 0
 # =====================================================================
-echo ">> per-node Resource.status.volumes must drop volume 0 on both nodes"
+# Why a 120s poll (not a single-shot read): the apiserver-side
+# `vd d` cascade converges quickly (vd l flips within seconds), but
+# the per-node Status.Volumes purge runs in the satellite's
+# stampPostApply chain and only fires on the NEXT reconcile pass
+# after the Resource's Spec.Volumes update propagates through the
+# informer cache. Worst case is a backed-up workqueue (heavy cluster,
+# slow node) — observer's listMap claim on the removed entry keeps
+# the entry alive until the satellite's JSON-Patch purge runs, and a
+# single-shot read can race that. 120s tracks the worker-queue
+# back-pressure ceiling observed on the stand.
+echo ">> within 120s: per-node Resource.status.volumes must drop volume 0 on both nodes"
+deadline=$(( $(date +%s) + 120 ))
 for N in "$N1" "$N2"; do
+    while (( $(date +%s) < deadline )); do
+        vols=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
+            -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null || echo "")
+        if ! grep -qE '(^|[[:space:]])0([[:space:]]|$)' <<<"$vols"; then
+            break
+        fi
+        sleep 2
+    done
+
     vols=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
         -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null || echo "")
     if grep -qE '(^|[[:space:]])0([[:space:]]|$)' <<<"$vols"; then
-        echo "FAIL (Bug 355 deep): $RD.$N still has volume 0 in Status.Volumes 30s after vd d 0" >&2
+        echo "FAIL (Bug 355 deep): $RD.$N still has volume 0 in Status.Volumes 120s after vd d 0" >&2
         kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
         exit 1
     fi
