@@ -1426,3 +1426,101 @@ func TestPhysicalStorageCreateDefaultsWipeToTrue(t *testing.T) {
 			got.AttachTo.Wipe)
 	}
 }
+
+// TestPSCDPMultipleDevicesFlipAllAttaches pins Bug 337: a real-CLI
+// `linstor ps cdp ... zfs <node> /dev/sda /dev/sdb /dev/sdc`
+// must flip Spec.AttachTo on EVERY matching PhysicalDevice
+// (pointing at the same StoragePool), not just the first one.
+//
+// Pre-fix the REST handler ran a single-target picker that
+// returned the first free device and silently dropped the rest;
+// the satellite then attached only sda and the multi-device
+// pool the operator asked for never materialised. Post-fix the
+// picker returns the full slice and the handler iterates,
+// flipping AttachTo on each. The single StoragePool CRD is
+// created once outside the loop — the satellite's flat
+// per-device reconciler probes pool-exists on the host and
+// branches create-vs-extend so the per-device order of the
+// flips doesn't matter.
+func TestPSCDPMultipleDevicesFlipAllAttaches(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seeds := []*apiv1.PhysicalDevice{
+		{
+			Name:       "n1-sda",
+			NodeName:   "n1",
+			DevicePath: "/dev/sda",
+			Phase:      "Available",
+		},
+		{
+			Name:       "n1-sdb",
+			NodeName:   "n1",
+			DevicePath: "/dev/sdb",
+			Phase:      "Available",
+		},
+		{
+			Name:       "n1-sdc",
+			NodeName:   "n1",
+			DevicePath: "/dev/sdc",
+			Phase:      "Available",
+		},
+	}
+
+	for _, s := range seeds {
+		if err := st.PhysicalDevices().Create(ctx, s); err != nil {
+			t.Fatalf("seed %s: %v", s.Name, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1",
+		[]byte(`{
+			"provider_kind": "ZFS",
+			"pool_name": "multi",
+			"device_paths": ["/dev/sda", "/dev/sdb", "/dev/sdc"],
+			"with_storage_pool": {"name": "multi"}
+		}`))
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status: got %d, want 202", resp.StatusCode)
+	}
+
+	for _, name := range []string{"n1-sda", "n1-sdb", "n1-sdc"} {
+		got, err := st.PhysicalDevices().Get(ctx, name)
+		if err != nil {
+			t.Fatalf("Get %s: %v", name, err)
+		}
+
+		if got.AttachTo == nil {
+			t.Errorf("Bug 337: PhysicalDevice %s has no AttachTo — REST handler dropped this device from the multi-device cdp", name)
+
+			continue
+		}
+
+		if got.AttachTo.StoragePoolName != "multi" {
+			t.Errorf("Bug 337: %s.AttachTo.StoragePoolName: got %q, want multi", name, got.AttachTo.StoragePoolName)
+		}
+
+		if got.AttachTo.ZPoolName != "multi" {
+			t.Errorf("Bug 337: %s.AttachTo.ZPoolName: got %q, want multi", name, got.AttachTo.ZPoolName)
+		}
+
+		if got.AttachTo.ProviderKind != "ZFS" {
+			t.Errorf("Bug 337: %s.AttachTo.ProviderKind: got %q, want ZFS", name, got.AttachTo.ProviderKind)
+		}
+	}
+
+	// SP CRD must be created exactly once — not once per device.
+	pool, err := st.StoragePools().Get(ctx, "n1", "multi")
+	if err != nil {
+		t.Fatalf("Bug 337: SP CRD `multi` must be auto-created once: %v", err)
+	}
+
+	if pool.ProviderKind != "ZFS" {
+		t.Errorf("ProviderKind: got %q, want ZFS", pool.ProviderKind)
+	}
+}

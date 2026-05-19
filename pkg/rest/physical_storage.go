@@ -164,21 +164,21 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	target, busy := pickFreeDeviceForAttach(devs, req.DevicePaths)
+	targets, busy := pickFreeDeviceForAttach(devs, req.DevicePaths)
 	if busy != nil {
 		writePhysicalStorageBusyDevice(w, node, busy)
 
 		return
 	}
 
-	if target == nil {
+	if len(targets) == 0 {
 		writeError(w, http.StatusNotFound,
 			"no free PhysicalDevice on node "+node+" matches device_paths ["+strings.Join(req.DevicePaths, " ")+"]")
 
 		return
 	}
 
-	target.AttachTo = buildAttachTo(&req)
+	attach := buildAttachTo(&req)
 
 	// Phase 10.7 step 2 (controller-side pool create): if the
 	// target StoragePool CRD doesn't exist yet, create it from
@@ -191,31 +191,50 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 	// storagepool.yaml` — store.ErrAlreadyExists is treated as
 	// success (the existing CRD wins, the operator's intent
 	// rather than the CDP request's wins).
-	err = ensureStoragePoolForAttach(r.Context(), s.Store, node, target.AttachTo, &req)
+	//
+	// Bug 337: the pool CRD is created once outside the
+	// per-PhysicalDevice loop — every targeted device then flips
+	// `Spec.AttachTo` pointing at the SAME StoragePool. The
+	// satellite reconciler is flat-per-device (probes pool-exists
+	// on the host and branches create-vs-extend) so the order of
+	// the per-device flips doesn't matter; the first device that
+	// arrives at the satellite creates the pool and subsequent
+	// devices extend it via `zpool add` / `vgextend`.
+	err = ensureStoragePoolForAttach(r.Context(), s.Store, node, attach, &req)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	err = s.Store.PhysicalDevices().Update(r.Context(), target)
-	if err != nil {
-		writeStoreError(w, err)
+	for i := range targets {
+		target := &targets[i]
 
-		return
+		// Each device gets its own AttachTo pointer so a future
+		// per-device mutation (e.g. flipping Wipe off after the
+		// first attach succeeds) doesn't cascade across siblings.
+		attachCopy := *attach
+		target.AttachTo = &attachCopy
+
+		err = s.Store.PhysicalDevices().Update(r.Context(), target)
+		if err != nil {
+			writeStoreError(w, err)
+
+			return
+		}
+
+		// Stamp the PhysicalDevice as an OwnerReference child of the
+		// target StoragePool when the apiserver client is wired
+		// (production path). Cascade-delete on the StoragePool then
+		// reaps orphaned PhysicalDevices via Kubernetes GC — useful
+		// when an operator tears down a pool while some device
+		// attaches are stalled in `Phase=Failed`. Best-effort: an
+		// error here doesn't roll back the AttachTo flip; the
+		// satellite's reconciler still completes the attach and the
+		// missing OwnerReference is a recoverable papercut. Phase
+		// 10.7 cascade-delete contract.
+		_ = setStoragePoolOwnership(r.Context(), s.Client, target.Name, target.AttachTo.StoragePoolName)
 	}
-
-	// Stamp the PhysicalDevice as an OwnerReference child of the
-	// target StoragePool when the apiserver client is wired
-	// (production path). Cascade-delete on the StoragePool then
-	// reaps orphaned PhysicalDevices via Kubernetes GC — useful
-	// when an operator tears down a pool while some device
-	// attaches are stalled in `Phase=Failed`. Best-effort: an
-	// error here doesn't roll back the AttachTo flip; the
-	// satellite's reconciler still completes the attach and the
-	// missing OwnerReference is a recoverable papercut. Phase
-	// 10.7 cascade-delete contract.
-	_ = setStoragePoolOwnership(r.Context(), s.Client, target.Name, target.AttachTo.StoragePoolName)
 
 	writePhysicalStorageCreateAccepted(w, node, requestedVdoSetup(&req))
 }
@@ -437,36 +456,41 @@ func hasOwnerReference(refs []metav1.OwnerReference, uid types.UID) bool {
 	return false
 }
 
-// pickFreeDeviceForAttach finds the first PhysicalDevice whose
+// pickFreeDeviceForAttach finds every PhysicalDevice whose
 // `Status.DevicePath` (or `Status.CurrentDevPath`, as a fallback
 // since some operators pass volatile /dev/sdN paths) appears in
 // the requested device_paths list. Skips devices that are already
 // being attached or assigned. Returns (nil, nil) when no path
 // matches at all (handler maps to 404).
 //
-// Bug 89: when the matched device's Status.Conditions[Free]=False
+// Bug 89: when a matched device's Status.Conditions[Free]=False
 // (the satellite stamped it as carrying a signature / mounted
 // partition / LVM PV / ZFS / DRBD metadata), the function returns
 // (nil, busy) so the caller surfaces a 409 with the satellite's
 // own Reason/Message rather than silently accepting an attach
 // `linstor ps l` would have hidden. Without this, the list and
 // attach endpoints drift apart — the exact regression Bug 89
-// documents on the live stand.
+// documents on the live stand. The first busy device wins the
+// short-circuit report so the operator sees an explicit cause
+// rather than a partial multi-device commit.
 //
-// Note: the picker considers a Free=False entry as a TARGET match
-// (not a "no path matched" miss), so the user sees the explicit
-// busy reason instead of the generic 404. Ordering follows the
-// store's stable-sort-by-name; the first matched-but-busy device
-// wins the report. Multi-device pool requests trigger one
-// PhysicalDevice flip per device — piraeus-operator already
-// POSTs per-device in practice.
-func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) (*apiv1.PhysicalDevice, *apiv1.PhysicalDevice) {
+// Bug 337: returns the full list of matched-free devices so the
+// REST handler can flip `Spec.AttachTo` on EACH PhysicalDevice
+// pointing at the same StoragePool. The satellite reconciler is
+// flat-per-device (probe pool-exists, branch create-vs-extend)
+// so a `linstor ps cdp ... <node> /dev/sda /dev/sdb /dev/sdc`
+// invocation now spawns one zpool create + two zpool add ops
+// (in some order) instead of silently dropping sdb and sdc.
+func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) ([]apiv1.PhysicalDevice, *apiv1.PhysicalDevice) {
 	want := map[string]bool{}
 	for _, p := range paths {
 		want[p] = true
 	}
 
-	var busy *apiv1.PhysicalDevice
+	var (
+		targets []apiv1.PhysicalDevice
+		busy    *apiv1.PhysicalDevice
+	)
 
 	for i := range devs {
 		dev := &devs[i]
@@ -496,10 +520,14 @@ func pickFreeDeviceForAttach(devs []apiv1.PhysicalDevice, paths []string) (*apiv
 			continue
 		}
 
-		return dev, nil
+		targets = append(targets, *dev)
 	}
 
-	return nil, busy
+	if busy != nil {
+		return nil, busy
+	}
+
+	return targets, nil
 }
 
 // ensureStoragePoolForAttach creates a StoragePool CRD that

@@ -18,6 +18,7 @@ package satellite
 
 import (
 	"context"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -79,16 +80,97 @@ func Attach(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice) (
 		}
 	}
 
+	return attachOrExtend(ctx, exec, dev, devicePath)
+}
+
+// attachOrExtend dispatches the per-kind branch with the Bug 337
+// flat-reconcile probe: if the underlying VG/zpool already exists
+// on the host, extend it; otherwise create it. Split out of
+// `Attach` to keep that function under the gocyclo budget.
+//
+// Bug 337: PhysicalDevice attach is flat — each device →
+// independent reconcile. Pool create on the first observed
+// device, `zpool add` / `vgextend` on subsequent. No "is this
+// the first?" state tracking; the branch is purely a probe of
+// host state. This keeps the satellite stateless and makes
+// `linstor ps cdp` idempotent + online-expansion-friendly:
+// re-running ps cdp a week later with a new device just
+// extends the existing pool.
+//
+// See memory:feedback_ps_cdp_incremental for the design
+// rationale.
+func attachOrExtend(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
 	switch dev.AttachTo.ProviderKind {
 	case ProviderKindLVM:
+		if vgExists(ctx, exec, dev.AttachTo.VGName) {
+			return extendLVMThick(ctx, exec, dev, devicePath)
+		}
+
 		return attachLVMThick(ctx, exec, dev, devicePath)
 	case ProviderKindLVMThin:
+		if vgExists(ctx, exec, dev.AttachTo.VGName) {
+			return extendLVMThin(ctx, exec, dev, devicePath)
+		}
+
 		return attachLVMThin(ctx, exec, dev, devicePath)
 	case ProviderKindZFS, ProviderKindZFSThin:
+		if zpoolExists(ctx, exec, dev.AttachTo.ZPoolName) {
+			return extendZFS(ctx, exec, dev, devicePath)
+		}
+
 		return attachZFS(ctx, exec, dev, devicePath)
 	}
 
 	return AttachResult{}, errors.Errorf("Attach: unsupported provider kind %q", dev.AttachTo.ProviderKind)
+}
+
+// zpoolExists probes whether the named zpool is already imported
+// on the host. `zpool list <pool>` exits 0 with the pool name on
+// stdout if it exists, and exits 1 ("no such pool") otherwise.
+// Used by the Bug 337 flat reconcile branch to decide between
+// `zpool create` (first device) and `zpool add` (extend).
+//
+// We treat the pool as present only when the probe exits 0 AND
+// stdout contains the pool name — both signals are needed because
+// some test/fake exec layers default missing-command-expectation
+// to success-with-empty-stdout. Real `zpool list` on a missing
+// pool exits 1, so production behaviour is preserved.
+//
+// Empty pool name → false defensively.
+func zpoolExists(ctx context.Context, exec storage.Exec, pool string) bool {
+	if pool == "" {
+		return false
+	}
+
+	out, err := exec.Run(ctx, "zpool", "list", "-H", "-o", "name", pool)
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(out), pool)
+}
+
+// vgExists probes whether the named LVM volume group is already
+// known to the host. `vgs <vg>` exits 0 if the VG exists and 5
+// ("not found") otherwise. Used by the Bug 337 flat reconcile
+// branch to decide between `vgcreate` (first device) and
+// `vgextend` (extend).
+//
+// Same "exit 0 AND stdout mentions the VG" rule as zpoolExists —
+// see that helper for the rationale. Empty VG name → false
+// defensively.
+func vgExists(ctx context.Context, exec storage.Exec, vg string) bool {
+	if vg == "" {
+		return false
+	}
+
+	out, err := exec.Run(ctx, "vgs",
+		lvm.Args("--noheadings", "-o", "vg_name", vg)...)
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(out), vg)
 }
 
 // attachDevicePath picks the most stable device path the
@@ -233,6 +315,116 @@ func attachZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice
 		pool, devicePath)
 	if err != nil {
 		return AttachResult{}, errors.Wrap(err, "zpool create")
+	}
+
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: dev.AttachTo.ProviderKind,
+		Props: map[string]string{
+			propZPool: pool,
+		},
+	}, nil
+}
+
+// extendVG runs `pvcreate` + `vgextend` to fold `devicePath` into
+// an existing VG. Shared by extendLVMThick and extendLVMThin —
+// the thick path's caller is done after this, the thin path's
+// caller skips the thin-pool LV extend (see extendLVMThin
+// comment). Bug 337.
+//
+// Idempotent: `pvcreate --force --yes` on an existing PV emits
+// a warning but exits 0; `vgextend` on an already-member PV
+// no-ops with "Physical volume already belongs to this VG".
+func extendVG(ctx context.Context, exec storage.Exec, vg, devicePath string) error {
+	_, err := exec.Run(ctx, "pvcreate", lvm.Args("--force", "--yes", devicePath)...)
+	if err != nil {
+		return errors.Wrap(err, "pvcreate")
+	}
+
+	_, err = exec.Run(ctx, "vgextend", lvm.Args("--force", "--yes", vg, devicePath)...)
+	if err != nil {
+		return errors.Wrap(err, "vgextend")
+	}
+
+	return nil
+}
+
+// extendLVMThick extends an existing VG by adding `devicePath` as
+// a new PV. Mirrors the create branch's `pvcreate` + `vgextend`
+// invariants: both run with the upstream-LINSTOR filter so the
+// scan rejection stays applied. Bug 337 incremental-reconcile.
+func extendLVMThick(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
+	vg := dev.AttachTo.VGName
+	if vg == "" {
+		return AttachResult{}, errors.New("LVM extend requires VGName")
+	}
+
+	err := extendVG(ctx, exec, vg, devicePath)
+	if err != nil {
+		return AttachResult{}, err
+	}
+
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: ProviderKindLVM,
+		Props: map[string]string{
+			propLvmVG: vg,
+		},
+	}, nil
+}
+
+// extendLVMThin extends an existing thin-pool's backing VG by
+// adding `devicePath` as a new PV. The thin-pool LV itself is
+// NOT re-extended here — `lvextend` against a thin-pool would
+// also need a metadata-pool size negotiation that the upstream
+// `linstor ps cdp` path doesn't reach. The thin pool grows
+// implicitly via `lvextend --extents 100%FREE` when the satellite's
+// background autogrow kicks in or the operator runs `lvextend`
+// manually. Bug 337.
+func extendLVMThin(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
+	vg := dev.AttachTo.VGName
+	thin := dev.AttachTo.ThinPoolName
+
+	if vg == "" || thin == "" {
+		return AttachResult{}, errors.New("LVM_THIN extend requires both VGName and ThinPoolName")
+	}
+
+	err := extendVG(ctx, exec, vg, devicePath)
+	if err != nil {
+		return AttachResult{}, err
+	}
+
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: ProviderKindLVMThin,
+		Props: map[string]string{
+			propLvmVG:    vg,
+			propThinPool: thin,
+		},
+	}, nil
+}
+
+// extendZFS extends an existing zpool by adding `devicePath` as
+// a new top-level vdev. `zpool add -f <pool> <device>` is
+// idempotent on a device already part of the pool: ZFS returns
+// `/dev/sdX is part of active pool '<pool>'` and exits non-zero
+// — caller probes vdev membership before calling on a known-
+// member device, OR the next reconcile observes the already-
+// extended pool and the create branch never re-runs anyway.
+// Bug 337.
+//
+// `-f` is required for the same reason `zpool create -f` carries
+// it: a device with stale ZFS labels from a prior attempt would
+// otherwise refuse to be added.
+func extendZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
+	pool := dev.AttachTo.ZPoolName
+	if pool == "" {
+		return AttachResult{}, errors.New("ZFS extend requires ZPoolName")
+	}
+
+	_, err := exec.Run(ctx, "zpool", "add", "-f", pool, devicePath)
+	if err != nil {
+		return AttachResult{}, errors.Wrap(err, "zpool add")
 	}
 
 	return AttachResult{

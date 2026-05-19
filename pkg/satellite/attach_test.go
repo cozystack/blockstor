@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cockroachdb/errors"
+
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -352,5 +354,187 @@ func TestAttachWipeClearsPartitionTable(t *testing.T) {
 	if !(wipeIdx < rereadIdx && rereadIdx < createIdx) {
 		t.Errorf("Bug 336: ordering must be wipefs@%d < rereadpt@%d < zpool create@%d; got calls=%v",
 			wipeIdx, rereadIdx, createIdx, calls)
+	}
+}
+
+// TestAttachExtendsExistingZpool pins Bug 337's ZFS branch: when
+// `zpool list <pool>` exits 0 (pool already exists on the host),
+// the satellite-side attach issues `zpool add -f <pool> <device>`
+// to fold the new device into the existing pool instead of
+// `zpool create`. This is what makes `linstor ps cdp ... zfs
+// <node> /dev/sda /dev/sdb /dev/sdc` end up as a single multi-vdev
+// zpool rather than failing on the second device with
+// "pool already exists".
+func TestAttachExtendsExistingZpool(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	// Probe says pool exists.
+	fx.Expect("zpool list -H -o name data", storage.FakeResponse{Stdout: []byte("data\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sdb",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "data",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "data",
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "zpool create") {
+			t.Fatalf("Bug 337: zpool create MUST NOT run when pool already exists; calls=%v", calls)
+		}
+	}
+
+	if !slices.Contains(calls, "zpool add -f data /dev/sdb") {
+		t.Errorf("Bug 337: expected `zpool add -f data /dev/sdb`; calls=%v", calls)
+	}
+}
+
+// TestAttachExtendsExistingVG pins Bug 337's LVM branch: when
+// `vgs <vg>` exits 0 (VG exists), the satellite emits
+// `pvcreate` + `vgextend` instead of `pvcreate` + `vgcreate`.
+// The thin-pool variant is covered in TestAttachExtendsExistingVGThin.
+func TestAttachExtendsExistingVG(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	// vgs probe → pool exists.
+	probe := "vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg"
+	fx.Expect(probe, storage.FakeResponse{Stdout: []byte("  vg\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sdb",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "thick",
+			ProviderKind:    "LVM",
+			VGName:          "vg",
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "vgcreate ") {
+			t.Fatalf("Bug 337: vgcreate MUST NOT run when VG already exists; calls=%v", calls)
+		}
+	}
+
+	wantPv := "pvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force --yes /dev/sdb"
+	wantExtend := "vgextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force --yes vg /dev/sdb"
+
+	if !slices.Contains(calls, wantPv) {
+		t.Errorf("Bug 337: missing pvcreate in calls: %v", calls)
+	}
+
+	if !slices.Contains(calls, wantExtend) {
+		t.Errorf("Bug 337: missing vgextend in calls: %v", calls)
+	}
+}
+
+// TestAttachExtendsExistingVGThin pins Bug 337's LVM_THIN
+// branch: the thin-pool LV itself is NOT re-created (no
+// duplicate lvcreate --type thin-pool); only the backing VG
+// is extended with pvcreate + vgextend.
+func TestAttachExtendsExistingVGThin(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	probe := "vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg"
+	fx.Expect(probe, storage.FakeResponse{Stdout: []byte("  vg\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sdb",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "thin",
+			ProviderKind:    "LVM_THIN",
+			VGName:          "vg",
+			ThinPoolName:    "tp",
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "vgcreate ") {
+			t.Fatalf("Bug 337: vgcreate MUST NOT run when VG already exists; calls=%v", calls)
+		}
+
+		if strings.Contains(line, "--type thin-pool") {
+			t.Fatalf("Bug 337: lvcreate --type thin-pool MUST NOT re-run on extend; calls=%v", calls)
+		}
+	}
+
+	wantExtend := "vgextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force --yes vg /dev/sdb"
+	if !slices.Contains(calls, wantExtend) {
+		t.Errorf("Bug 337: missing vgextend in calls: %v", calls)
+	}
+}
+
+// TestAttachCreatesWhenPoolAbsent pins the negative of the
+// extend branch: when the probe (`zpool list <pool>`) exits
+// non-zero (pool absent), the satellite falls through to
+// `zpool create` — preserving Bug 336's wipefs+rereadpt
+// behaviour on the first device.
+func TestAttachCreatesWhenPoolAbsent(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	// Probe says pool does NOT exist.
+	fx.Expect("zpool list -H -o name fresh",
+		storage.FakeResponse{Err: errors.New("no such pool")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sda",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "fresh",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "fresh",
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "zpool add") {
+			t.Fatalf("Bug 337: zpool add MUST NOT run when pool is absent; calls=%v", calls)
+		}
+	}
+
+	found := false
+
+	for _, line := range calls {
+		if strings.HasPrefix(line, "zpool create -f") && strings.Contains(line, "fresh") {
+			found = true
+
+			break
+		}
+	}
+
+	if !found {
+		t.Errorf("Bug 337: missing zpool create on absent pool; calls=%v", calls)
 	}
 }

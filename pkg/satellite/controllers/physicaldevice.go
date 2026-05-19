@@ -203,6 +203,17 @@ func (r *PhysicalDeviceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // shared `Config.Apply`, and delete the CRD as the
 // delete-as-completion signal. Split out of Reconcile to keep
 // the latter under the funlen + gocyclo budgets.
+//
+// Bug 337: PhysicalDevice reconciler is flat — each device →
+// attach. Pool create on the first observed device, `zpool add`
+// / `vgextend` on subsequent. No "is this the first?" state
+// tracking; the branch is purely a probe of host state inside
+// `satellite.Attach`. This keeps the satellite stateless and
+// makes `linstor ps cdp` idempotent + online-expansion-friendly:
+// re-running ps cdp a week later with a new device just
+// extends the existing pool.
+//
+// See memory:feedback_ps_cdp_incremental for the design rationale.
 func (r *PhysicalDeviceReconciler) runAttach(ctx context.Context, dev *blockstoriov1alpha1.PhysicalDevice) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("physicaldevice", dev.Name)
 
