@@ -34,7 +34,7 @@ piraeus: ## install piraeus-operator + linstor-csi (NAME=<n>)
 oracle: ## install Java LINSTOR controller as in-cluster oracle (NAME=<n>)
 	@./stand/install-oracle.sh "$(WORK_DIR)"
 
-build-images: ## build + push blockstor/blockstor-satellite to localhost:5000 (shared across all stands)
+build-images: ## build + push blockstor/blockstor-apiserver/blockstor-satellite to localhost:5000 and pin image digests in .work/_factory/digest-*.txt (shared across all stands)
 	@./stand/build-images.sh
 
 blockstor: ## install blockstor CRDs + controller + satellites (NAME=<n>)

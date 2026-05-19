@@ -60,6 +60,29 @@ step() {
 step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
     || { echo "$NAME apply-crds FAIL" > "$RESULT"; exit 1; }
 
+# Re-apply Deployment / DaemonSet manifests with the freshly-pushed
+# image digests from `make build-images`. The manifests carry
+# `image: __REGISTRY__/<name>:dev` placeholders;
+# `stand/render-manifest.sh` rewrites them to
+# `image: <reg>/<name>@sha256:<digest>` reading digests from
+# .work/_factory/digest-<name>.txt — written by build-images.sh
+# after each `docker push`. Digest pinning makes every rebuild a
+# spec change, so `kubectl apply` triggers a real rolling update;
+# without it, Runs 26-35 silently ran against stale apiserver code
+# because the floating `:dev` tag never changed the Deployment
+# spec and containerd cache served up an old digest under
+# `imagePullPolicy: Always`.
+#
+# We don't call install-blockstor.sh here — its node-CR bootstrap
+# and per-component waits are redundant on a stand that's already
+# been installed; the rollout-status steps further down handle
+# waiting. We only need the manifest re-apply step.
+step "re-apply blockstor manifests (digest-pinned)" \
+    "$REPO_ROOT/stand/render-manifest.sh $WORK_DIR $REPO_ROOT/stand/blockstor-deploy.yaml | kubectl apply -f - 2>&1 | tail -3 &&
+     $REPO_ROOT/stand/render-manifest.sh $WORK_DIR $REPO_ROOT/stand/blockstor-apiserver-deploy.yaml | kubectl apply -f - 2>&1 | tail -3 &&
+     $REPO_ROOT/stand/render-manifest.sh $WORK_DIR $REPO_ROOT/stand/blockstor-satellite-daemonset.yaml | kubectl apply -f - 2>&1 | tail -3" \
+    || { echo "$NAME re-apply FAIL" > "$RESULT"; exit 1; }
+
 # Graceful pod delete: controller goes force (no DRBD state to drain),
 # satellites get the full terminationGracePeriodSeconds so the PreStop
 # hook can run `drbdadm down --all` and release every DRBD connection
@@ -68,9 +91,6 @@ step "apply CRDs" "kubectl apply -f $REPO_ROOT/config/crd/bases" \
 # half-open `Connecting` peer states forever, and the next iter's
 # `drbdsetup down` blocks waiting for the gone peer to ack. PreStop is
 # only invoked on normal termination, not on `--force --grace-period=0`.
-#
-# imagePullPolicy: Always on both objects ensures kubelet still
-# resolves :dev to the current digest on pod recreate.
 step "force-delete controller pod" "kubectl -n blockstor-system delete pod -l app=blockstor-controller --grace-period=0 --force --ignore-not-found 2>&1 | tail -2" \
     || { echo "$NAME rollout FAIL" > "$RESULT"; exit 1; }
 
