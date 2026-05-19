@@ -1692,32 +1692,56 @@ func (r *Reconciler) isDisklessToDiskfulFlip(ctx context.Context, dr *intent.Des
 }
 
 // ensureMetadata is the upstream-aligned create-md entry point. It
-// runs in two cases:
+// runs in three cases:
 //
 //  1. firstActivation: the resource has never had `.md-created`
 //     stamped (fresh diskful replica). Behaves exactly like the
 //     historical runFirstActivation — HasMD-gated CreateMD, marker
 //     write, GI-seed.
-//  2. diskless→diskful Spec flag flip (Bug 319): the resource was
-//     previously diskless on this node, the dispatcher just dropped
-//     the Diskless host marker, applyStorage carved a fresh
-//     zvol/LV, and the kernel still reports `disk:Diskless
-//     client:yes`. Re-enter create-md so the new lower disk has
-//     valid DRBD-9 metadata; drbdadm adjust then auto-attaches via
-//     drb-utils' compare_volume (kern->disk=="none" + conf->disk
-//     path diff). Skip the GI-seed: it's a fresh-replica
-//     optimisation, not relevant when the kernel slot is already
-//     handshaken with peers via the diskless path.
+//  2. diskless→diskful Spec flag flip with pre-existing metadata
+//     (Bug 319): the resource was previously diskful on this node,
+//     went diskless, and is now flipping back. The lower disk
+//     still carries a valid DRBD-9 superblock from the prior
+//     diskful incarnation, and the kernel slot is already
+//     handshaken with peers via the diskless path. Re-enter
+//     create-md as a no-op (HasMD=true), write the marker, SKIP
+//     the GI-seed — re-stamping the GI would corrupt the
+//     in-flight session.
+//  3. tieB→diskful promotion with fresh metadata (Bug 347): the
+//     resource was a tiebreaker on this node — no backing storage,
+//     no DRBD-9 superblock anywhere. `linstor r c <tieB-node>
+//     <rd>` drops the Diskless flag, applyStorage carves a fresh
+//     zvol/LV, HasMD returns false → CreateMD writes zero-GI
+//     metadata. Without the GI-seed the peer handshake sees a GI
+//     mismatch and triggers a full resync. Case 2's
+//     "slot-already-handshaken" reasoning does NOT apply here: the
+//     tiebreaker had no superblock to inherit GI from. Gate the
+//     seed on `metadataFreshlyCreated := !hasMD` (captured
+//     pre-CreateMD) so the seed runs whenever a new superblock
+//     just landed — fresh-first-replica AND tieB-promotion alike
+//     — and skips only when the kernel already had a valid GI to
+//     inherit.
 //
 // Idempotent on both axes: HasMD short-circuits CreateMD when the
 // metadata block already exists (e.g. satellite restart between
 // CreateMD and marker write), and the marker write is a one-shot
-// OS truncate that doesn't churn on repeat.
+// OS truncate that doesn't churn on repeat. firstActivation is
+// retained as a parameter for caller-side branching and dispatch
+// gating but no longer drives the GI-seed decision — the
+// pre-CreateMD HasMD probe is the more accurate signal.
 func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string, firstActivation bool) error {
 	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
 	if err != nil {
 		return errors.Wrapf(err, "dump-md %s", dr.GetName())
 	}
+
+	// Why (Bug 347): capture the "metadata is about to be freshly
+	// created" signal BEFORE CreateMD runs so we can gate the
+	// downstream GI-seed on it. `firstActivation` alone is too
+	// narrow — it's false on tieB→diskful even though the
+	// tiebreaker has no DRBD-9 superblock to inherit GI from, so
+	// the seed must still run to dodge a full resync.
+	metadataFreshlyCreated := !hasMD
 
 	if !hasMD {
 		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
@@ -1757,13 +1781,36 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		}
 	}
 
-	// GI-seed is fresh-replica-only: it pre-stamps the per-peer
-	// bitmap slots with a peer's UpToDate GI so the initial-sync
-	// handshake skips a full resync. On a diskless→diskful flip the
-	// kernel slot is already handshaken with peers via the diskless
-	// path — the GI-seed window has closed, and re-stamping the GI
-	// would corrupt the in-flight session.
-	if !firstActivation {
+	// GI-seed pre-stamps the per-peer bitmap slots with a peer's
+	// UpToDate GI so the initial-sync handshake skips a full resync.
+	// Gate combines `firstActivation` with `metadataFreshlyCreated`
+	// (i.e. `!hasMD` captured pre-CreateMD):
+	//
+	//   - firstActivation=true → ALWAYS seed. Either fresh replica
+	//     (CreateMD just ran, zero-GI superblock) OR adopted metadata
+	//     (W09 disk-replace recipe — Bug 319 invariant: stamp the
+	//     day0 GI tuple even when metadata adoption skipped CreateMD,
+	//     because the per-peer bitmap slots still need to declare
+	//     "in-sync from day0").
+	//   - firstActivation=false + metadataFreshlyCreated=true →
+	//     tieB→diskful promotion (Bug 347). The resource already has
+	//     `.md-created` from its tiebreaker incarnation (so
+	//     firstActivation is false), but the freshly-carved zvol/LV
+	//     gets a zero-GI superblock from CreateMD. MUST seed,
+	//     otherwise DRBD sees a GI mismatch with peers and triggers a
+	//     full resync.
+	//   - firstActivation=false + metadataFreshlyCreated=false →
+	//     Bug 319 diskless→diskful flip with pre-existing superblock.
+	//     Kernel slot already handshaken with peers via the diskless
+	//     path; re-seeding would corrupt the in-flight session.
+	//
+	// Why (Bug 347): the previous gate (`!firstActivation`) only ran
+	// seedInitialGi on firstActivation=true, which produced a full
+	// resync on every `linstor r c <tieB-node> <rd>` because tieB→
+	// diskful arrives with firstActivation=false + HasMD=false. The
+	// HasMD probe captures the "fresh superblock" signal that
+	// `firstActivation` alone cannot distinguish.
+	if !firstActivation && !metadataFreshlyCreated {
 		return nil
 	}
 
