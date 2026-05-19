@@ -2862,3 +2862,119 @@ func TestAutoplaceRGSelectFilterFallsThroughWhenNoRDProp(t *testing.T) {
 		t.Errorf("StorPoolName: got %q, want pool_rg", got[0].Props["StorPoolName"])
 	}
 }
+
+// TestAutoplaceBug328FindsAllMatchingNodes pins Bug 328: a stand-caught
+// regression where `linstor r c <rd> --auto-place=3 -s lvm-thin` failed
+// with "Not enough available nodes" even though `linstor n l` showed 3
+// SATELLITEs Online and `linstor sp l` showed all 3 carrying a 13 GiB
+// lvm-thin SP State=Ok. User-reported, blocker.
+//
+// Setup mirrors the operator's stand verbatim: 3 SATELLITE nodes,
+// 1 lvm-thin LVM_THIN SP per node with 13 GiB free, a "test2" RD with
+// a 1 GiB volume_definition, then the full REST flow:
+//
+//	POST /v1/resource-definitions/test2/autoplace
+//	{"select_filter": {"place_count": 3, "storage_pool": "lvm-thin"}}
+//
+// MUST return 200 with 3 Resources stamped — not 409 "Not enough
+// available nodes". The test goes through the full REST handler stack
+// (decode → merge → snapshot/clone defaults → placer) so any filter or
+// merge regression along the way is caught, not just the placer in
+// isolation.
+func TestAutoplaceBug328FindsAllMatchingNodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const (
+		kib    = int64(1)
+		mib    = 1024 * kib
+		gib    = 1024 * mib
+		volume = 1 * gib  // `linstor vd c test2 1G` → 1 GiB
+		free   = 13 * gib // `linstor sp l` shows 13 GiB free per node
+	)
+
+	for _, n := range []string{"e2e2-worker-1", "e2e2-worker-2", "e2e2-worker-3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n,
+			Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        n,
+			StoragePoolName: "lvm-thin",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    free,
+			State:           "Ok",
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	// `linstor rd c test2` — RD without an explicit RG (defaults to
+	// auto-created DfltRscGrp on the wire).
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "test2",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// `linstor vd c test2 1G` — 1 GiB VolumeDefinition. Drives the
+	// placer's capacity gate (Bug 35).
+	if err := st.VolumeDefinitions().Create(ctx, "test2", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      volume,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `linstor r c test2 --auto-place=3 -s lvm-thin` → autoplace POST.
+	body, _ := json.Marshal(apiv1.AutoPlaceRequest{
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount:  3,
+			StoragePool: "lvm-thin",
+		},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/test2/autoplace", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		// Read body so the failure message names the LINSTOR envelope's
+		// criteria bullets — that's what the operator sees on the CLI.
+		buf := make([]byte, 4096)
+		n, _ := resp.Body.Read(buf)
+		t.Fatalf("status: got %d, want 200; body=%s", resp.StatusCode, string(buf[:n]))
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "test2")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("resources: got %d, want 3 (one per matching node); %+v",
+			len(got), got)
+	}
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+
+		if r.Props["StorPoolName"] != "lvm-thin" {
+			t.Errorf("resource on %q: StorPoolName=%q, want lvm-thin",
+				r.NodeName, r.Props["StorPoolName"])
+		}
+	}
+
+	for _, want := range []string{"e2e2-worker-1", "e2e2-worker-2", "e2e2-worker-3"} {
+		if !on[want] {
+			t.Errorf("node %q not picked despite all criteria matching; placement=%+v",
+				want, got)
+		}
+	}
+}

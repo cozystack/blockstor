@@ -3388,5 +3388,158 @@ func TestPlaceWeightedScoringWireRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAutoPlaceFindsAllMatchingNodes pins Bug 328: when 3 Online
+// nodes each have a 13 GiB lvm-thin SP and the operator requests
+// auto-place=3 with -s lvm-thin for a 1 GiB RD, the placer MUST
+// return all 3 nodes — not "Not enough available nodes".
+//
+// User-reported, repeat-blocker: oversize SPs visibly present yet
+// rejected by the filter chain. Without this test the filter can
+// silently drop matching nodes whenever a future refactor moves
+// the cache-read or unit-parse path.
+//
+// Cluster shape mirrors the operator's `linstor n l` / `linstor sp l`
+// output verbatim: 3 satellites, 1 lvm-thin SP per node, FreeCapacity
+// = 13 GiB (in KiB, the wire/store unit). Volume size = 1 GiB (the
+// user's `linstor vd c test2 1G`). PlaceCount=3 + StoragePool=lvm-thin
+// matches `--auto-place=3 -s lvm-thin`.
+func TestAutoPlaceFindsAllMatchingNodes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		kib    = int64(1)
+		mib    = 1024 * kib
+		gib    = 1024 * mib
+		volume = 1 * gib  // `linstor vd c test2 1G` → 1 GiB
+		free   = 13 * gib // `linstor sp l` shows 13 GiB free per node
+	)
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"e2e2-worker-1", "e2e2-worker-2", "e2e2-worker-3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n,
+			Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        n,
+			StoragePoolName: "lvm-thin",
+			ProviderKind:    apiv1.StoragePoolKindLVMThin,
+			FreeCapacity:    free,
+			State:           "Ok",
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	// RD + 1 GiB VD — the volume the placer's capacity gate filters
+	// candidate pools against.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "test2",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "test2", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      volume,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	placed, want, err := placer.New(st).Place(ctx, "test2", &apiv1.AutoSelectFilter{
+		PlaceCount:  3,
+		StoragePool: "lvm-thin",
+	})
+	if err != nil {
+		t.Fatalf("Place returned error: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Fatalf("placed/want: got %d/%d, want 3/3 (all nodes match)", placed, want)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "test2")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("resources: got %d, want 3; %+v", len(got), got)
+	}
+
+	on := map[string]bool{}
+	for _, r := range got {
+		on[r.NodeName] = true
+
+		if r.Props["StorPoolName"] != "lvm-thin" {
+			t.Errorf("resource on %q: StorPoolName=%q, want lvm-thin",
+				r.NodeName, r.Props["StorPoolName"])
+		}
+	}
+
+	for _, n := range []string{"e2e2-worker-1", "e2e2-worker-2", "e2e2-worker-3"} {
+		if !on[n] {
+			t.Errorf("node %q not picked despite matching all criteria; placement=%+v", n, got)
+		}
+	}
+}
+
+// TestAutoPlaceMatchesProviderKindWithStorPoolName pins the by-name +
+// by-driver filter agreement: when the operator supplies `-s lvm-thin`
+// (a pool NAME), the placer must NOT mistake it for a provider kind
+// and reject pools whose ProviderKind is LVM_THIN. Bug 328 candidate:
+// any future refactor that conflates pool name with provider kind
+// (e.g. a stricter name normalisation, or a layer that lowercases
+// LVM_THIN → "lvm-thin" and compares against the pool name field)
+// would silently drop every matching pool.
+//
+// Setup: 3 nodes, each with one LVM_THIN-driver pool literally named
+// "lvm-thin" (mirroring the user's stand). place_count=3 with both
+// StoragePool="lvm-thin" AND ProviderList=["LVM_THIN"] set — the two
+// filters must agree, not contradict.
+func TestAutoPlaceMatchesProviderKindWithStorPoolName(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n,
+			Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			NodeName:        n,
+			StoragePoolName: "lvm-thin",                   // pool NAME
+			ProviderKind:    apiv1.StoragePoolKindLVMThin, // driver = LVM_THIN
+			FreeCapacity:    13 * 1024 * 1024,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", n, err)
+		}
+	}
+
+	placed, want, err := placer.New(st).Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{
+		PlaceCount:   3,
+		StoragePool:  "lvm-thin",
+		ProviderList: []string{apiv1.StoragePoolKindLVMThin},
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (name + driver filters agree)",
+			placed, want)
+	}
+}
+
 // Keep go-vet happy on unused symbols in the import set.
 var _ = context.Background
