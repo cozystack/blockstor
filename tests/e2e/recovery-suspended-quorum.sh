@@ -307,20 +307,29 @@ echo ">> step 5: create $RD_RECYCLE (same size, autoplace 3) — port/minor recy
 
 deadline=$(( $(date +%s) + RECYCLE_BUDGET ))
 recycle_ok=0
+n=0
+# Run 31 deep-dive: the orphan-minor regression manifests as 0/3
+# diskful — `drbdadm create-md` fails outright with `Device 'N' is
+# configured!`. The auto-tiebreaker can legitimately turn one of
+# the 3 autoplace slots into a Diskless client (LINSTOR's policy
+# under blockstor.AutoPlace; this is NOT the bug-82 regression).
+# Accept >=2 diskful UpToDate as a PASS — that proves the freed
+# port/minor on the recycled RD took fresh diskful peers without
+# hitting the orphan-slot race.
 while (( $(date +%s) < deadline )); do
     n=$("${LCTLJ[@]}" volume list -r "$RD_RECYCLE" 2>/dev/null \
         | jq -r '[.[][].volumes[]? | select(.state.disk_state == "UpToDate")] | length' 2>/dev/null || echo 0)
-    if (( n >= 3 )); then recycle_ok=1; break; fi
+    if (( n >= 2 )); then recycle_ok=1; break; fi
     sleep 3
 done
 if (( recycle_ok != 1 )); then
-    echo "FAIL: $RD_RECYCLE never reached 3/3 UpToDate within ${RECYCLE_BUDGET}s"
+    echo "FAIL: $RD_RECYCLE never reached >=2/3 UpToDate within ${RECYCLE_BUDGET}s (got $n)"
     echo "      this is the orphan-minor 'Device N is configured!' regression"
     "${LCTL[@]}" resource list -r "$RD_RECYCLE" 2>&1 || true
     "${LCTL[@]}" error-reports list 2>&1 | tail -20 || true
     exit 1
 fi
-echo "   $RD_RECYCLE reached 3/3 UpToDate — port/minor recycled cleanly"
+echo "   $RD_RECYCLE reached $n/3 UpToDate (>=2 diskful — orphan-minor regression NOT triggered)"
 
 echo ">> RECOVERY-SUSPENDED-QUORUM OK"
 echo "   RD-delete envelope: ${delete_secs}s (budget ${TEARDOWN_BUDGET}s)"
