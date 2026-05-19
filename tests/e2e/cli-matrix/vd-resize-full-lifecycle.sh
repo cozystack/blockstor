@@ -73,10 +73,18 @@ run_resize_lifecycle() {
     echo "============================================================"
 
     cleanup_resize() {
-        kubectl -n "$PVC_NS" delete pod "$POD_NAME" --wait=true --timeout=60s 2>/dev/null || true
-        kubectl -n "$PVC_NS" delete pvc "$PVC_NAME" --wait=true --timeout=60s 2>/dev/null || true
-        delete_rd "$RD"
-        assert_no_orphans "$RD"
+        # Why: trap fires after run_resize_lifecycle returns, so its
+        # `local` vars are out of scope under set -u. Default-expand
+        # so cleanup of a half-built state never crashes the cell
+        # before the real error is surfaced.
+        local _ns=${PVC_NS:-default}
+        local _pvc=${PVC_NAME:-}
+        local _pod=${POD_NAME:-}
+        local _rd=${RD:-}
+        [[ -n "$_pod" ]] && kubectl -n "$_ns" delete pod "$_pod" --wait=true --timeout=60s 2>/dev/null || true
+        [[ -n "$_pvc" ]] && kubectl -n "$_ns" delete pvc "$_pvc" --wait=true --timeout=60s 2>/dev/null || true
+        [[ -n "$_rd" ]] && delete_rd "$_rd"
+        [[ -n "$_rd" ]] && assert_no_orphans "$_rd"
     }
     # Per-pool cleanup runs at the end of this function (and on any
     # error via the EXIT trap below).
@@ -91,9 +99,17 @@ run_resize_lifecycle() {
     fi
 
     echo ">> rd c + vd c 1G + r c --auto-place=2 -s $POOL"
-    "${LCTL[@]}" resource-definition create "$RD" >/dev/null
-    "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
-    "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
+    # Why: linstor writes server-side ERROR envelopes to stdout (not
+    # stderr), so >/dev/null hides them. Capture and surface on
+    # failure so a silent fail like "no eligible nodes" doesn't
+    # masquerade as a downstream "autoplace did not stage" assert.
+    local _rc_out
+    _rc_out=$("${LCTL[@]}" resource-definition create "$RD" 2>&1) \
+        || { echo "FAIL: rd c $RD: $_rc_out" >&2; return 1; }
+    _rc_out=$("${LCTL[@]}" volume-definition create "$RD" 1G 2>&1) \
+        || { echo "FAIL: vd c $RD 1G: $_rc_out" >&2; return 1; }
+    _rc_out=$("${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" 2>&1) \
+        || { echo "FAIL: r c --auto-place=2 -s $POOL $RD: $_rc_out" >&2; return 1; }
 
     # Resolve the placed pair (autoplacer chose which nodes — we wait
     # for the Resource CRDs to appear, then wait_uptodate on each).
