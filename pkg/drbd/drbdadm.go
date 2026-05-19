@@ -380,6 +380,52 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 	return a.run(ctx, "new-current-uuid", resource)
 }
 
+// SuspendIO runs `drbdsetup suspend-io <resource>` — freezes the
+// resource's block-I/O path on the local satellite so a backing
+// snapshot (LVM-thin / ZFS / file) captures bytes at a stable
+// point. Mirrors upstream LINSTOR's CtrlSnapshotCrtApiCallHandler
+// suspend-io broadcast (controller/.../CtrlSnapshotCrtApiCallHandler.java
+// around setSuspendIo(true) → updateSatellites → ack); the
+// per-satellite SnapshotReconciler invokes this in Phase 1 of the
+// `suspend → take → resume` orchestration so two diskful replicas
+// don't capture divergent bytes while the application writer
+// streams traffic. Bug 351.
+//
+// Shells out to `drbdsetup` (NOT `drbdadm`) because suspend-io is
+// a kernel-direct operation: drbdadm would parse the .res file
+// before forwarding to drbdsetup, and we want the freeze to fire
+// even mid-config-rewrite. Idempotent on a freshly-suspended
+// resource — the kernel folds a second suspend-io into a no-op.
+func (a *Adm) SuspendIO(ctx context.Context, resource string) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "suspend-io", resource)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup suspend-io %s", resource)
+	}
+
+	return nil
+}
+
+// ResumeIO runs `drbdsetup resume-io <resource>` — the
+// counterpart to SuspendIO. MUST be called on every node the
+// controller broadcast SuspendIO to, even on the abort path: a
+// partially-acked suspend followed by no resume leaves the
+// remaining peers' I/O frozen forever (application traffic
+// hangs). The controller-side SnapshotReconciler unconditionally
+// flips Spec.SuspendIo=false on Phase 3 (or on any per-node
+// Failed) so this fires on every targeted node. Bug 351.
+//
+// Idempotent on a resource that's already running — the kernel
+// folds a second resume-io into a no-op, so a retry after a
+// crashed satellite never wedges anything.
+func (a *Adm) ResumeIO(ctx context.Context, resource string) error {
+	_, err := a.exec.Run(ctx, "drbdsetup", "resume-io", resource)
+	if err != nil {
+		return errors.Wrapf(err, "drbdsetup resume-io %s", resource)
+	}
+
+	return nil
+}
+
 // PauseSync runs `drbdadm pause-sync <resource>` — temporarily
 // halts an in-flight resync without tearing down the connection.
 // Used as an operator throttle: long initial-sync on a fresh

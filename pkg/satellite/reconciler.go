@@ -429,6 +429,54 @@ func (r *Reconciler) DeleteSnapshot(ctx context.Context, req *intent.DeleteSnaps
 	return &intent.DeleteSnapshotResponse{Ok: true}, nil
 }
 
+// SuspendResource freezes the local DRBD layer's I/O for `resName`
+// via `drbdsetup suspend-io`. Phase 1 of the Bug-351 snapshot
+// orchestration: every diskful peer suspend-io's the resource
+// before any of them runs the local provider.CreateSnapshot, so
+// the LV/zvol bytes the kernel captures reflect the same
+// point-in-time DRBD-block-stream cursor on every node.
+//
+// nil Adm (DRBD half disabled — unit tests of the storage path
+// without drbdadm wired) returns nil without erroring: the
+// orchestration only matters for replicated resources, and a
+// non-DRBD provider's `provider.CreateSnapshot` is already
+// point-in-time on its own.
+func (r *Reconciler) SuspendResource(ctx context.Context, resName string) error {
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	err := r.cfg.Adm.SuspendIO(ctx, resName)
+	if err != nil {
+		return errors.Wrapf(err, "suspend-io %s", resName)
+	}
+
+	return nil
+}
+
+// ResumeResource is the counterpart to SuspendResource. MUST be
+// called on every node SuspendResource fired on, even on the
+// abort path — a partially-suspended cluster with no follow-up
+// resume leaves application I/O hung forever. The controller-side
+// orchestration unconditionally flips Spec.SuspendIo=false on
+// terminal states (Phase 3 success / any per-node Failed) so this
+// fires on every targeted satellite.
+//
+// nil Adm short-circuits to nil for the same reason
+// SuspendResource does.
+func (r *Reconciler) ResumeResource(ctx context.Context, resName string) error {
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	err := r.cfg.Adm.ResumeIO(ctx, resName)
+	if err != nil {
+		return errors.Wrapf(err, "resume-io %s", resName)
+	}
+
+	return nil
+}
+
 // DeleteResource tears down a resource: drbdadm down (best-effort —
 // the kernel handles a missing one fine), DeleteVolume on every
 // requested volume_number through the named Provider, then remove

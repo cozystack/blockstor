@@ -239,6 +239,12 @@ func TestSnapshotReconcileMarksFailedOnTerminalError(t *testing.T) {
 
 	scheme := newSnapshotScheme(t)
 
+	// Bug 351: simulate the controller-side orchestrator having
+	// already advanced through Phase 1 (suspend-io acked) and
+	// stamped Phase 2 (TakeSnapshot=true). The satellite's
+	// terminal-error routing only fires from the take-snapshot
+	// branch; without TakeSnapshot=true the new orchestration
+	// short-circuits before reaching provider.CreateSnapshot.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
@@ -248,6 +254,7 @@ func TestSnapshotReconcileMarksFailedOnTerminalError(t *testing.T) {
 			ResourceDefinitionName: "pvc-missing",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
+			TakeSnapshot:           true,
 		},
 	}
 
@@ -318,6 +325,9 @@ func TestSnapshotReconcileKeepsIncompleteOnTransientError(t *testing.T) {
 
 	scheme := newSnapshotScheme(t)
 
+	// Bug 351: skip orchestration Phase 1/2 by stamping
+	// TakeSnapshot=true directly — the transient classification
+	// only fires from the take-snapshot branch.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
@@ -327,6 +337,7 @@ func TestSnapshotReconcileKeepsIncompleteOnTransientError(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
+			TakeSnapshot:           true,
 		},
 	}
 
@@ -658,6 +669,8 @@ func TestSnapshotReconcileStampsNodeStatusOnSuccess(t *testing.T) {
 
 	scheme := newSnapshotScheme(t)
 
+	// Bug 351: orchestration already advanced to Phase 2 — the
+	// satellite branch we exercise here is the take-snapshot step.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
@@ -667,6 +680,7 @@ func TestSnapshotReconcileStampsNodeStatusOnSuccess(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1", "n2"},
+			TakeSnapshot:           true,
 		},
 	}
 
@@ -762,6 +776,9 @@ func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
 	// and the assertion below would fire).
 	const seedTimestamp int64 = 1714000000
 
+	// Bug 351: orchestration already in Phase 2; the second pass
+	// observes Ready=true and short-circuits without re-running
+	// provider.CreateSnapshot or re-stamping the timestamp.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
@@ -771,6 +788,7 @@ func TestSnapshotReconcileNodeStatusIdempotentRestamp(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
+			TakeSnapshot:           true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{

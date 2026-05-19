@@ -203,7 +203,22 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 			return errors.Wrapf(err, "get Snapshot %s/%s", in.ResourceName, in.Name)
 		}
 
+		// Preserve the Bug-351 orchestration flags across REST
+		// prop-patch updates: they live on Spec but are NOT part
+		// of the wire DTO (the apiserver only stamps SuspendIo=true
+		// at Create time; the controller-side SnapshotReconciler
+		// flips them through their lifecycle). Without this
+		// preservation a `linstor s set-property <rd> <snap> <key>
+		// <val>` mid-orchestration would clobber the in-flight
+		// suspend/take state and either re-trigger the suspend
+		// broadcast or — worse — silently abandon a suspended
+		// cluster mid-snapshot.
+		preservedSuspendIo := existing.Spec.SuspendIo
+		preservedTakeSnapshot := existing.Spec.TakeSnapshot
+
 		existing.Spec = wireToCRDSnapshotSpec(in)
+		existing.Spec.SuspendIo = preservedSuspendIo
+		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
 		return s.c.Update(ctx, &existing)
@@ -338,6 +353,18 @@ func snapshotVolumesFromVDs(vds []crdv1alpha1.SnapshotVolumeRef) []apiv1.Snapsho
 }
 
 func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
+	spec := wireToCRDSnapshotSpec(in)
+	// Bug 351: every freshly-created Snapshot enters the
+	// controller-side orchestration's Phase 1 with
+	// Spec.SuspendIo=true. The satellite reconcilers see the
+	// flag, run `drbdsetup suspend-io <rd>`, and stamp
+	// Status.NodeStatus[].SuspendIoAcked; the controller-side
+	// SnapshotReconciler then advances through Phase 2
+	// (TakeSnapshot=true) and Phase 3 (clear both). The store-only
+	// stamp keeps the REST handler oblivious to the orchestration
+	// shape — the wire DTO doesn't carry these flags.
+	spec.SuspendIo = true
+
 	return &crdv1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: snapshotCRDName(in.ResourceName, in.Name),
@@ -347,7 +374,7 @@ func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 			},
 			Annotations: cloneAnnotations(in.Annotations),
 		},
-		Spec: wireToCRDSnapshotSpec(in),
+		Spec: spec,
 	}
 }
 

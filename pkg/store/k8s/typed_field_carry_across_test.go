@@ -183,7 +183,22 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			"Props":                  true,
 			"VolumeDefinitions":      true,
 		},
-		mustCarryAcross: map[string]bool{},
+		// Bug 351: SuspendIo + TakeSnapshot are the
+		// controller-side orchestration's phase-flag pair. They
+		// live on the CRD Spec but have NO wire counterpart on
+		// apiv1.Snapshot — the REST handler only stamps
+		// SuspendIo=true at Create-time via wireToCRDSnapshot
+		// (NOT wireToCRDSnapshotSpec), and the controller-side
+		// SnapshotReconciler flips them through their lifecycle.
+		// The store's Update path explicitly carries them across
+		// a wholesale Spec rebuild (preservedSuspendIo /
+		// preservedTakeSnapshot in snapshots.go::Update) so a
+		// REST prop-patch mid-orchestration doesn't clobber the
+		// in-flight suspend/take state.
+		mustCarryAcross: map[string]bool{
+			"SuspendIo":    true,
+			"TakeSnapshot": true,
+		},
 	},
 	"PhysicalDeviceSpec": {
 		kind: "PhysicalDeviceSpec (pkg/store/k8s/physicaldevices.go::wireToCRDPhysicalDeviceSpec)",

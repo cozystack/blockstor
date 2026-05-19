@@ -127,30 +127,147 @@ func (r *SnapshotReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-// handleCreate translates a Snapshot CRD into a CreateSnapshot
-// gRPC-shaped request and dispatches it to the existing
-// `Config.Apply.CreateSnapshot` body. Idempotent — re-running on
-// an existing snapshot is a no-op because the provider's
-// CreateSnapshot folds a pre-existing snapshot LV / dataset into
-// success via its lvExists / datasetExists pre-check (Bug 216).
-// The underlying tools (`lvcreate --snapshot`, `zfs snapshot`)
-// do NOT short-circuit on their own — they reject the second
-// invocation with "already exists", which without the pre-check
-// would loop the reconciler forever on an already-materialised
-// snapshot.
+// handleCreate dispatches the per-node half of the Bug-351
+// orchestrated snapshot lifecycle. The controller-side
+// `internal/controller/snapshot_controller.go` drives the
+// Spec.SuspendIo / Spec.TakeSnapshot flag transitions; each
+// satellite Reconcile observes the current Spec shape and acts on
+// it idempotently:
+//
+//   - Spec.SuspendIo=true, this-node SuspendIoAcked=false →
+//     call drbdsetup suspend-io for the parent RD, then stamp
+//     Status.NodeStatus[us].SuspendIoAcked=true. Holds the local
+//     DRBD I/O frozen until the controller flips SuspendIo=false.
+//   - Spec.SuspendIo=false, this-node SuspendIoAcked=true →
+//     call drbdsetup resume-io and clear SuspendIoAcked. This is
+//     the success (Phase 3) and abort (any node Failed) drain.
+//     Resume MUST happen even on abort, otherwise the application
+//     writer hangs forever on the still-frozen siblings.
+//   - Spec.TakeSnapshot=true, this-node Ready=false → dispatch
+//     the existing provider.CreateSnapshot path and stamp
+//     Status.NodeStatus[us] with Ready=true + the satellite-side
+//     CreateTimestamp. Idempotent — the provider's lvExists /
+//     datasetExists pre-check (Bug 216) folds an
+//     already-materialised snapshot into success.
+//   - Otherwise (already-in-target-state) → no-op. The Reconcile
+//     terminates without churning the apiserver.
 //
 // Failure routing — F18 (cli-parity for `linstor s l` State column):
 //   - Apply.CreateSnapshot returned Terminal=true ⇒ stamp
-//     Status.Flags=["FAILED"] on the Snapshot CRD and return without
-//     requeueing. crdToWireSnapshot surfaces that as `flags: ["FAILED"]`
-//     on /v1/view/snapshots, which the Python CLI maps to State="Failed".
-//   - Apply.CreateSnapshot returned Terminal=false (transient) ⇒ log
-//     and return with Requeue=true; controller-runtime's rate limiter
-//     handles back-off. Status stays empty so the wire view stays
-//     "Incomplete".
-//   - Apply.CreateSnapshot returned Ok=true ⇒ no-op, the observer
-//     reconciler stamps Status.NodeStatus on its own cadence.
+//     Status.Flags=["FAILED"] + Status.NodeStatus[us].Failed=true
+//     on the Snapshot CRD and return without requeueing.
+//     crdToWireSnapshot surfaces that as `flags: ["FAILED"]` on
+//     /v1/view/snapshots, which the Python CLI maps to
+//     State="Failed". The controller-side orchestrator reads the
+//     per-node Failed=true and flips Spec.SuspendIo=false so the
+//     suspended siblings drain.
+//   - Apply.CreateSnapshot returned Terminal=false (transient) ⇒
+//     log and return with Requeue=true; controller-runtime's rate
+//     limiter handles back-off. Status stays empty so the wire
+//     view stays "Incomplete".
+//   - Apply.CreateSnapshot returned Ok=true ⇒ Status.NodeStatus
+//     stamp lands, the controller flips Phase 3 once every node
+//     is Ready.
 func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	// Phase 1: parent RD I/O suspend. Per-node ack lives on
+	// Status.NodeStatus[us].SuspendIoAcked. Idempotent — the
+	// helper short-circuits when already acked.
+	if snap.Spec.SuspendIo && !perNodeStatusSuspendIoAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+		return r.handleSuspendPhase(ctx, snap)
+	}
+
+	// Phase 3 (resume): controller flipped Spec.SuspendIo=false
+	// after every diskful peer either succeeded or one of them
+	// Failed. Drain our local suspend regardless — see the
+	// "resume on abort" note on Spec.SuspendIo.
+	if !snap.Spec.SuspendIo && perNodeStatusSuspendIoAcked(snap.Status.NodeStatus, r.Config.NodeName) {
+		return r.handleResumePhase(ctx, snap)
+	}
+
+	// Phase 2: take the per-node snapshot. Gated on Spec.TakeSnapshot
+	// (controller stamps it once every targeted node has acked Phase
+	// 1) AND on this node not having already succeeded.
+	if !snap.Spec.TakeSnapshot {
+		// Suspend acked, but the controller hasn't promoted to
+		// take-snapshot yet — siblings still suspending. Wait.
+		return ctrl.Result{}, nil
+	}
+
+	if perNodeStatusReady(snap.Status.NodeStatus, r.Config.NodeName) {
+		// Already took our local snapshot; the controller is
+		// either still waiting on slow siblings or hasn't
+		// observed our Ready stamp yet. No-op.
+		return ctrl.Result{}, nil
+	}
+
+	return r.handleTakeSnapshotPhase(ctx, snap)
+}
+
+// handleSuspendPhase dispatches Phase 1 of the Bug-351
+// orchestration: drive `drbdsetup suspend-io` for the parent RD
+// and stamp Status.NodeStatus[us].SuspendIoAcked=true. A failed
+// suspend stamps the per-node Failed=true so the controller-side
+// orchestrator drains the siblings.
+func (r *SnapshotReconciler) handleSuspendPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	err := r.Config.Apply.SuspendResource(ctx, snap.Spec.ResourceDefinitionName)
+	if err != nil {
+		log.FromContext(ctx).Info("SuspendResource failed",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+		// Suspend failure is treated as terminal on this
+		// satellite — the kernel-side suspend-io is a no-op on
+		// an already-frozen resource, so a non-zero exit
+		// indicates either a missing kernel module or a
+		// permanently-broken resource, neither of which a
+		// retry would resolve.
+		stampErr := r.stampSnapshotPerNodeFailed(ctx, snap)
+		if stampErr != nil {
+			return ctrl.Result{}, stampErr
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	err = r.stampSnapshotPerNodeSuspendAcked(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Don't fall through: wait for the controller to flip
+	// Spec.TakeSnapshot once every node has acked.
+	return ctrl.Result{}, nil
+}
+
+// handleResumePhase dispatches Phase 3 of the orchestration:
+// `drbdsetup resume-io` after the controller flipped
+// Spec.SuspendIo=false. A failed resume requeues without
+// clearing the ack so the orchestrator keeps poking us until
+// the kernel actually accepts the unfreeze.
+func (r *SnapshotReconciler) handleResumePhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
+	err := r.Config.Apply.ResumeResource(ctx, snap.Spec.ResourceDefinitionName)
+	if err != nil {
+		log.FromContext(ctx).Info("ResumeResource failed",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	err = r.stampSnapshotPerNodeSuspendCleared(ctx, snap)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// handleTakeSnapshotPhase dispatches Phase 2 of the
+// orchestration: invoke `provider.CreateSnapshot` via the
+// satellite Reconciler and stamp Status.NodeStatus[us].Ready.
+// Routes the Ok/Terminal/Transient three-way verdict from
+// CreateSnapshotResponse the same way the pre-Bug-351 single-step
+// path did (Bug 106 / F18) — orchestration just gates when this
+// step runs.
+func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *blockstoriov1alpha1.Snapshot) (ctrl.Result, error) {
 	req := &intent.CreateSnapshotRequest{
 		ResourceName: snap.Spec.ResourceDefinitionName,
 		SnapshotName: snap.Spec.SnapshotName,
@@ -166,17 +283,9 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 	}
 
 	if resp.GetOk() {
-		// Bug 106: stamp the per-node success entry on
-		// Status.NodeStatus so the apiserver's
-		// `stampSnapshotSuccessful` derivation can flip the
-		// snapshot from "Incomplete" to "Successful" once every
-		// diskful peer reports back. Without this stamp the wire
-		// view's `snapshots[].create_timestamp` stays zero, the
-		// apiserver's success denominator never closes, and
-		// `linstor s l` hangs in `Incomplete` forever — even on a
-		// fully-materialised snapshot (the 3c593c5f7 fix shipped
-		// the apiserver-side derivation but bet on a stamp that
-		// no code path was actually writing).
+		// Bug 106: stamp Status.NodeStatus[us].Ready so the
+		// apiserver's success denominator can flip the snapshot
+		// from "Incomplete" to "Successful".
 		err = r.stampSnapshotPerNodeReady(ctx, snap, resp.CreateTimestampUnix)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -185,37 +294,222 @@ func (r *SnapshotReconciler) handleCreate(ctx context.Context, snap *blockstorio
 		return ctrl.Result{}, nil
 	}
 
-	logger := log.FromContext(ctx)
-	logger.Info("CreateSnapshot per-snapshot failure",
+	log.FromContext(ctx).Info("CreateSnapshot per-snapshot failure",
 		"snapshot", snap.Spec.SnapshotName,
 		"message", resp.GetMessage(),
 		"terminal", resp.GetTerminal())
 
 	if !resp.GetTerminal() {
-		// Transient — back off and try again. Returning Requeue
-		// (without an explicit backoff) lets controller-runtime's
-		// rate limiter apply its exponential schedule.
+		// Transient — back off and try again.
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Terminal failure — stamp Status.Flags=["FAILED"] so the
-	// wire surface goes from "Incomplete" to "Failed" and stops
-	// retrying. Idempotent: re-stamping on a Snapshot that
-	// already carries FAILED is a no-op.
-	if slices.Contains(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
-		return ctrl.Result{}, nil
-	}
-
-	snap.Status.Flags = append(snap.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed)
-
-	err = r.Status().Update(ctx, snap)
+	// Terminal failure — stamp FAILED + per-node Failed=true so
+	// the orchestrator drains the suspended siblings.
+	err = r.stampSnapshotPerNodeFailed(ctx, snap)
 	if err != nil {
-		// Could be a conflict against a concurrent NodeStatus
-		// patch — requeue so the next pass retries the stamp.
-		return ctrl.Result{}, errors.Wrap(err, "stamp Status.Flags=FAILED")
+		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// perNodeStatusSuspendIoAcked reports whether the NodeStatus
+// slice already carries our entry with SuspendIoAcked=true.
+// Mirrors perNodeStatusReady (Bug 106) but for the Phase-1
+// suspend-io ack lifecycle. The controller-side orchestrator
+// reads aggregated per-node SuspendIoAcked across every targeted
+// node to decide when to promote to Phase 2; this satellite-side
+// helper is the local short-circuit so a re-Reconcile after the
+// stamp already landed doesn't re-fire drbdsetup or churn the
+// Status subresource.
+func perNodeStatusSuspendIoAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string) bool {
+	for i := range entries {
+		if entries[i].NodeName != nodeName {
+			continue
+		}
+
+		return entries[i].SuspendIoAcked
+	}
+
+	return false
+}
+
+// stampSnapshotPerNodeSuspendAcked upserts our node's entry in
+// Status.NodeStatus with SuspendIoAcked=true after a successful
+// `drbdsetup suspend-io`. Conflict-retry shape matches
+// stampSnapshotPerNodeReady — sibling satellites race against us
+// on the same Status subresource as they each stamp their own
+// per-node ack. Idempotent: a re-stamp on an already-acked entry
+// short-circuits without firing a Status().Update.
+func (r *SnapshotReconciler) stampSnapshotPerNodeSuspendAcked(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	return r.upsertPerNodeStatusField(ctx, snap, func(entry *blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+		if entry.SuspendIoAcked {
+			return false
+		}
+
+		entry.SuspendIoAcked = true
+
+		return true
+	})
+}
+
+// stampSnapshotPerNodeSuspendCleared clears our node's
+// SuspendIoAcked back to false after a successful `drbdsetup
+// resume-io`. The controller-side orchestrator and the
+// satellite's own short-circuit both read SuspendIoAcked, so the
+// clear is what stops the Phase-3 resume loop from re-firing on
+// every Reconcile pass.
+func (r *SnapshotReconciler) stampSnapshotPerNodeSuspendCleared(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	return r.upsertPerNodeStatusField(ctx, snap, func(entry *blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+		if !entry.SuspendIoAcked {
+			return false
+		}
+
+		entry.SuspendIoAcked = false
+
+		return true
+	})
+}
+
+// stampSnapshotPerNodeFailed stamps both the global Status.Flags
+// FAILED marker and our node's Status.NodeStatus[].Failed=true so
+// the controller-side orchestrator (which reads aggregated per-node
+// Failed across every targeted node) can drive the abort+drain
+// path. Idempotent: a re-stamp on a Snapshot that already carries
+// FAILED + per-node Failed=true is a no-op.
+func (r *SnapshotReconciler) stampSnapshotPerNodeFailed(
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot,
+) error {
+	key := client.ObjectKeyFromObject(snap)
+
+	for attempt := range snapshotStatusUpdateRetries {
+		_ = attempt
+
+		var current blockstoriov1alpha1.Snapshot
+
+		err := r.Get(ctx, key, &current)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return errors.Wrap(err, "get Snapshot for FAILED stamp")
+		}
+
+		mutated := false
+
+		if !slices.Contains(current.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed) {
+			current.Status.Flags = append(current.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailed)
+			mutated = true
+		}
+
+		entryMutated := upsertPerNodeStatusInPlace(&current.Status.NodeStatus, r.Config.NodeName,
+			func(entry *blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
+				if entry.Failed {
+					return false
+				}
+
+				entry.Failed = true
+
+				return true
+			})
+		mutated = mutated || entryMutated
+
+		if !mutated {
+			return nil
+		}
+
+		err = r.Status().Update(ctx, &current)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return errors.Wrap(err, "stamp Status.Flags=FAILED + NodeStatus.Failed")
+		}
+	}
+
+	return errors.New("Status FAILED stamp conflicted out of retries")
+}
+
+// upsertPerNodeStatusField is the Status.NodeStatus
+// optimistic-lock loop shared by the SuspendIoAcked stampers. The
+// mutate fn receives a writable pointer to the per-node entry
+// (created on the fly when absent) and returns true iff it
+// actually changed something — if false, the loop short-circuits
+// without firing a Status().Update, mirroring
+// stampSnapshotPerNodeReady's idempotence guard.
+func (r *SnapshotReconciler) upsertPerNodeStatusField(
+	ctx context.Context,
+	snap *blockstoriov1alpha1.Snapshot,
+	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
+) error {
+	key := client.ObjectKeyFromObject(snap)
+
+	for attempt := range snapshotStatusUpdateRetries {
+		_ = attempt
+
+		var current blockstoriov1alpha1.Snapshot
+
+		err := r.Get(ctx, key, &current)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return errors.Wrap(err, "get Snapshot for NodeStatus stamp")
+		}
+
+		mutated := upsertPerNodeStatusInPlace(&current.Status.NodeStatus, r.Config.NodeName, mutate)
+		if !mutated {
+			return nil
+		}
+
+		err = r.Status().Update(ctx, &current)
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsConflict(err) {
+			return errors.Wrap(err, "stamp Status.NodeStatus")
+		}
+	}
+
+	return errors.New("Status.NodeStatus update conflicted out of retries")
+}
+
+// upsertPerNodeStatusInPlace finds the per-node entry for
+// `nodeName` (or appends a fresh one) and runs `mutate` against
+// it. Returns true iff the mutate fn reported a change. Mirrors
+// upsertPerNodeStatus (the Ready/CreateTimestamp variant) but
+// composable for the multiple Status bools the Bug-351
+// orchestration touches (SuspendIoAcked, Failed).
+func upsertPerNodeStatusInPlace(
+	entries *[]blockstoriov1alpha1.SnapshotPerNodeStatus,
+	nodeName string,
+	mutate func(*blockstoriov1alpha1.SnapshotPerNodeStatus) bool,
+) bool {
+	for i := range *entries {
+		if (*entries)[i].NodeName != nodeName {
+			continue
+		}
+
+		return mutate(&(*entries)[i])
+	}
+
+	fresh := blockstoriov1alpha1.SnapshotPerNodeStatus{NodeName: nodeName}
+	if !mutate(&fresh) {
+		return false
+	}
+
+	*entries = append(*entries, fresh)
+
+	return true
 }
 
 // stampSnapshotPerNodeReady upserts our node's entry in
@@ -309,20 +603,25 @@ func perNodeStatusReady(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nod
 }
 
 // upsertPerNodeStatus returns a copy of the NodeStatus slice with
-// our entry either replaced (matching NodeName found) or appended.
+// our entry either updated (matching NodeName found) or appended.
 // Preserves the existing slice order so concurrent siblings see a
-// stable view in the conflict-retry race.
+// stable view in the conflict-retry race. Bug 351: preserves the
+// pre-existing SuspendIoAcked / Failed bools on the replaced entry
+// — the take-snapshot stamp must not clobber the Phase-1 ack
+// (otherwise the controller-side orchestrator would see the ack
+// drop and mis-classify the snapshot as still mid-suspend).
 func upsertPerNodeStatus(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, nodeName string, createTimestamp int64) []blockstoriov1alpha1.SnapshotPerNodeStatus {
 	out := make([]blockstoriov1alpha1.SnapshotPerNodeStatus, 0, len(entries)+1)
 	replaced := false
 
 	for i := range entries {
 		if entries[i].NodeName == nodeName {
-			out = append(out, blockstoriov1alpha1.SnapshotPerNodeStatus{
-				NodeName:        nodeName,
-				Ready:           true,
-				CreateTimestamp: createTimestamp,
-			})
+			merged := entries[i]
+			merged.NodeName = nodeName
+			merged.Ready = true
+			merged.CreateTimestamp = createTimestamp
+
+			out = append(out, merged)
 
 			replaced = true
 

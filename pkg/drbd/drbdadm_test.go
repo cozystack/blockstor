@@ -560,3 +560,62 @@ func TestAdmHasDisklessVolumeFalsePeerDiskless(t *testing.T) {
 		t.Errorf("HasDisklessVolume(peer-disk:Diskless only): got true, want false")
 	}
 }
+
+// TestAdmSuspendIOInvokesDrbdsetup pins the Bug-351 freeze
+// command: SuspendIO → `drbdsetup suspend-io <res>`. Distinct
+// from drbdadm because suspend-io is a kernel-direct operation —
+// the per-snapshot orchestration MUST freeze even mid-.res-rewrite
+// (the controller writes Spec.SuspendIo=true and we shell out
+// before any config-file dance).
+func TestAdmSuspendIOInvokesDrbdsetup(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.SuspendIO(t.Context(), "pvc-1")
+	if err != nil {
+		t.Fatalf("SuspendIO: %v", err)
+	}
+
+	want := "drbdsetup suspend-io pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
+	}
+
+	// Regression guard: SuspendIO MUST NOT shell out to drbdadm.
+	// The whole reason this method targets drbdsetup directly is
+	// to skip drbdadm's .res-file lookup; a regression that fell
+	// back to drbdadm would defeat the controller-orchestrated
+	// freeze path the moment a snapshot lands mid-config-rewrite.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") {
+			t.Errorf("SuspendIO shelled out to drbdadm (defeats the kernel-direct freeze purpose): %s",
+				line)
+		}
+	}
+}
+
+// TestAdmResumeIOInvokesDrbdsetup pins ResumeIO →
+// `drbdsetup resume-io <res>`. Same kernel-direct rationale as
+// SuspendIO; the orchestration's Phase-3 resume MUST fire on
+// every targeted node even on the abort path or application I/O
+// hangs forever on the still-frozen siblings.
+func TestAdmResumeIOInvokesDrbdsetup(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.ResumeIO(t.Context(), "pvc-1")
+	if err != nil {
+		t.Fatalf("ResumeIO: %v", err)
+	}
+
+	want := "drbdsetup resume-io pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdadm ") {
+			t.Errorf("ResumeIO shelled out to drbdadm: %s", line)
+		}
+	}
+}
