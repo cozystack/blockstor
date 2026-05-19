@@ -1,0 +1,54 @@
+name: add-replica
+description: |
+  Grow a 2-replica RD to 3 replicas. Validates that adding a replica on
+  a previously-unused node converges to UpToDate without breaking the
+  existing replicas.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-c-node3-new
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 60
+  - name: wait-3r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

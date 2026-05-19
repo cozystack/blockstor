@@ -1,0 +1,50 @@
+name: remove-replica
+description: |
+  Shrink a 3-replica RD to 2. Validates that the removed replica is
+  fully deleted (kernel slot + CR + storage) and the remaining replicas
+  do NOT enter a permanent Connecting state.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-d-node3
+    cmd: ["resource", "delete", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

@@ -1,0 +1,58 @@
+name: toggle-disk-diskful
+description: |
+  Reverse of toggle-disk-diskless. Starts with 2 diskful + 1 diskless
+  replica, then flips the diskless one back to diskful via
+  `r toggle-disk --storage-pool <sp>`. The flipped replica MUST converge
+  to UpToDate.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-diskful-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-diskful-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-diskless-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 30
+  - name: wait-2-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 60
+  - name: r-td-diskful-node3
+    cmd: ["resource", "toggle-disk", "{{node3}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: UpToDate
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

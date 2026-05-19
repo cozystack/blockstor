@@ -1248,6 +1248,8 @@ For each new function/endpoint:
 | L4 integration (DRBD) | `make smoke` on talos+qemu stand | ~3 min | per PR |
 | L5 e2e | csi-sanity + piraeus-operator e2e on stand | ~30 min | nightly + pre-merge |
 | **L6 operator-CLI e2e (MANDATORY)** | real `linstor` CLI → REST → satellite → DRBD kernel; assert Status convergence on stand | ~5 min per matrix cell | every user-reported CLI bug + nightly matrix |
+| **L7 operator-replay harness (MANDATORY)** | YAML-described operator workflows + `cli-parity-refresh.sh` BS↔upstream diff | ~2 min per workflow, ~3 min parity refresh | every user-reported CLI bug + nightly |
+| L8 property-based fuzz (SKELETON) | randomized verb-sequence fuzzer; emits failing replay-YAML; shrinker | per-seed | nightly once impl lands |
 
 Contract recordings live under `test/golden/`. Captured once from a real LINSTOR
 controller, replayed forever in CI.
@@ -1336,6 +1338,63 @@ observer events2 → Status.DiskState` никем не assert'ился end-to-en
   consecutive nightly runs, escalate to architectural review — likely an
   un-extracted closed-loop recovery somewhere upstream of the affected
   state machine.
+
+### L7 mandatory: operator-replay harness + cli-parity refresh
+
+**Background:** L6 cells catch single-verb regressions but not full
+operator workflows, and the one-shot `docs/cli-parity-audit-2026-05-14.md`
+went stale within days. The L7 harness lives under
+`tests/operator-harness/` and turns both problems into re-runnable
+artifacts:
+
+- `tests/operator-harness/cli-parity-refresh.sh` runs the canonical
+  command catalogue against BS and an upstream LINSTOR controller in
+  parallel, classifies every row (PARITY / WIRE_SHAPE / ERROR_TEXT /
+  MISSING_FEATURE / CLI_BUG), and emits a fresh markdown table. Exits
+  non-zero if any new non-PARITY row appears that is NOT whitelisted
+  in `docs/cli-parity-known-deltas.md`.
+- `tests/operator-harness/replay/<workflow>.yaml` catalogues real
+  operator sequences (PVC lifecycle, add/remove replica, toggle-disk,
+  late-VD, autoplace-3, encrypted RD, etc.). Each Bug 326-335 has its
+  own catcher YAML.
+- `tests/operator-harness/replay-runner.sh <stand-name> <workflow.yaml>`
+  walks each step, polls until the per-step `await` assertion holds
+  (or times out), verifies invariants (NoOrphans) at teardown.
+- `tests/operator-harness/operator-fuzz.sh` is the L8 skeleton —
+  property-based fuzzer with a verb table that emits failing-seed
+  replay-YAML the user can promote into the catalogue. Fuzz loop is
+  follow-up work.
+
+**Rule:** every user-reported CLI bug closes with **three** artifacts:
+
+1. L1 unit / L2 contract (existing rule).
+2. L6 cli-matrix cell (existing rule).
+3. **L7 replay YAML** in `tests/operator-harness/replay/`. The YAML
+   captures the exact operator sequence that surfaced the bug + the
+   convergence assertion it must satisfy. Without it the bug is not
+   counted closed.
+
+**Nightly:**
+
+- `cli-parity-refresh.sh` runs once. Non-zero exit blocks merge until
+  the new delta is either fixed or accepted in `docs/cli-parity-known-deltas.md`.
+- Each replay YAML runs as its own scenario in the dispatch list.
+- L8 (when landed): a rotating seed runs `operator-fuzz.sh` and dumps
+  findings into a triage queue.
+
+**Adding a new CLI verb or wire-shape change:**
+
+- Refresh `docs/cli-parity-known-deltas.md` OR generate a fresh
+  `docs/cli-parity-audit-<date>.md` from `cli-parity-refresh.sh`.
+- If the verb behaviour is novel, add a replay YAML for the happy path
+  in the same commit.
+
+**Adding a new replay YAML:** copy the closest existing YAML; fill in
+`name`, `description`, `prerequisites.min_nodes`, the `steps[]` (each
+with `cmd[]`, `expect_exit`, optional `await`), `teardown`, and
+`invariants`. Available `await.kind` values are documented in the
+header of `replay-runner.sh` (replica_count, disk_state, all_uptodate,
+replica_diskless, no_tiebreaker, sync_clean, resource_absent, rd_absent).
 
 ## Cost control
 

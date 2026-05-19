@@ -1,0 +1,42 @@
+name: autoplace-3r
+description: |
+  Bug-328 catcher. With 3 Online nodes and 3 healthy storage pools
+  (State=Ok, FreeCapacity > volSize) the autoplacer MUST pick all 3
+  nodes for `r c --auto-place=3 -s <sp>`. Historically the placer
+  short-circuited at 2 even when capacity allowed 3.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-3
+    cmd: ["resource", "create", "--auto-place", "3", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 120
+  - name: wait-all-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

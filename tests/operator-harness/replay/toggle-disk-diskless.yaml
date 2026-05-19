@@ -1,0 +1,47 @@
+name: toggle-disk-diskless
+description: |
+  Bug-330 catcher. Take a 2-replica diskful RD, flip one replica to
+  diskless via `r toggle-disk --diskless`. Status.DiskState MUST land on
+  "Diskless" within 30s (matches the upstream LINSTOR contract).
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-td-diskless-node2
+    cmd: ["resource", "toggle-disk", "--diskless", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

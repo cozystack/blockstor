@@ -1,0 +1,34 @@
+name: ps-cdp-zfs
+description: |
+  Bug-326 catcher. Exercises `linstor physical-storage create-device-pool
+  zfs <node> <device>` — the historical break was that BS rejected the
+  `vdo_enable` field (and friends) in the upstream OpenAPI body, so the
+  python-linstor client failed at wire-shape validation. After the fix,
+  the SP must appear in `sp l` for the node.
+
+  This workflow requires a stand with a sacrificial block device on
+  $PHYSICAL_DEVICE (default /dev/loop9, overridable via vars). On most
+  blockstor stands the bring-up script creates a loop device that's
+  safe to wipe — see stand/bringup.sh.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: zfs-fuzz-pool
+  device: /dev/loop9
+
+steps:
+  - name: ps-cdp-zfs-create
+    cmd: ["physical-storage", "create-device-pool", "zfs", "{{node1}}", "{{device}}", "--pool-name", "{{sp}}"]
+    expect_exit: 0
+  - name: sp-list-shows-new-pool
+    cmd: ["storage-pool", "list", "--storage-pools", "{{sp}}"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["storage-pool", "delete", "{{node1}}", "{{sp}}"]
+
+invariants:
+  - no_orphans

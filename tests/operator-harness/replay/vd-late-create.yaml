@@ -1,0 +1,37 @@
+name: vd-late-create
+description: |
+  Bug-332 catcher. Run rd create → r create on 2 nodes → THEN vd create
+  (volume definition added AFTER replicas exist). Asserts vol-1 lands
+  UpToDate on all 2 nodes — used to crash with "Unintentional Diskless"
+  on the original Bug-79/332 family.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: late-vd-create
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

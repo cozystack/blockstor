@@ -1,0 +1,39 @@
+name: no-drbd-tiebreaker
+description: |
+  Bug-334 catcher. A STORAGE-only RD (no DRBD layer) MUST NOT auto-spawn
+  a TieBreaker replica — TieBreaker is a DRBD-specific construct and
+  spawning one on a non-DRBD RD historically left orphan Resource CRs.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd-storage-only
+    cmd: ["resource-definition", "create", "{{rd}}", "-l", "STORAGE"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1-storage
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-storage
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: no-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

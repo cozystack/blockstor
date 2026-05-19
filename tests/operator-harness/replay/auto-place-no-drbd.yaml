@@ -1,0 +1,41 @@
+name: auto-place-no-drbd
+description: |
+  Bug-335 catcher. An RD created with layer-list = STORAGE only (no
+  DRBD) MUST be rejected by `r c --auto-place` with a proper error
+  envelope. Historically BS silently created Diskless-DRBD replicas
+  that did not match the requested layer stack.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd-no-drbd
+    cmd: ["resource-definition", "create", "{{rd}}", "-l", "STORAGE"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-must-reject
+    # auto-place against a STORAGE-only layer stack on 2 nodes WITHOUT
+    # DRBD MUST either be accepted (single-replica STORAGE) OR rejected
+    # with a clear error — but NEVER silently coerce to DRBD. We pin
+    # the "reject" semantics matching upstream LINSTOR.
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 10
+  - name: no-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 10
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

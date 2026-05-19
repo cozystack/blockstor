@@ -1,0 +1,55 @@
+name: pvc-lifecycle
+description: |
+  Full PVC lifecycle exercising the canonical operator sequence:
+  rd create → vd create → r create --auto-place=2 → snapshot create →
+  resource delete → rd delete. Verifies NoOrphans at teardown.
+
+  Captures the most common day-1 CSI flow. Failure here means a basic
+  operator workflow regressed.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: create-snap
+    cmd: ["snapshot", "create", "{{rd}}", "{{rd}}-snap"]
+    expect_exit: 0
+  - name: delete-snap
+    cmd: ["snapshot", "delete", "{{rd}}", "{{rd}}-snap"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans

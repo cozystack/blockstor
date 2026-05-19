@@ -1,0 +1,71 @@
+name: r-c-with-tiebreaker-peer
+description: |
+  Bug-327 catcher. Cluster shape: 2 diskful replicas + 1 TieBreaker on
+  a third node. Operator drops one diskful (`r d <node>`) then
+  recreates with bare `r c <node> <rd>` (no flag). The recreated
+  replica MUST come up DISKFUL — NOT silently coerced to Diskless
+  because the TieBreaker is still resident on the same node.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: ensure-tiebreaker-node3
+    # tiebreaker auto-spawns on autoplace flows; we hand-create it on
+    # node3 to make the scenario deterministic regardless of auto-tb
+    # config.
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 30
+  - name: r-d-node2-diskful
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 60
+  - name: r-c-node2-bare
+    # No flag — operator expects diskful. Must NOT coerce to Diskless
+    # just because a tiebreaker is parked on node3.
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: UpToDate
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
