@@ -91,8 +91,14 @@ fi
 # NOT have demoted $N1 as a side-effect — that would mean the
 # toggle path is mistakenly mutating the sibling instead of the
 # target replica).
-n1_disk=$(status_disk_state "$RD" "$N1" 0)
-if [[ "$n1_disk" != "UpToDate" ]]; then
+# Why: wait_status_diskless above accepts disk=="" as success (a
+# flag-only diskless replica may legitimately have empty volumes
+# during observer convergence). If we probe $N1 in the same tick,
+# its observer may also still be mid-resync and report "". Give it
+# a 30s budget — sibling stay-UpToDate is a steady-state assertion,
+# not a transient one.
+if ! wait_disk_state "$RD" "$N1" "UpToDate" 30 0; then
+    n1_disk=$(status_disk_state "$RD" "$N1" 0)
     echo "FAIL (Bug 330 sibling regression): $N1 disk_state=$n1_disk after toggle on $N2 (want UpToDate)" >&2
     exit 1
 fi
