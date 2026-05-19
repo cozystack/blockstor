@@ -113,6 +113,34 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# ---------------------------------------------------------------------
+# operator-harness targets — shell-driven fuzz / replay against a live
+# stand. These do NOT spin up Kind; caller is responsible for BS_URL
+# and a working kubeconfig.
+# ---------------------------------------------------------------------
+
+# Knobs:
+#   SEED      reproducible PRNG seed (default: $(date +%s))
+#   STEPS     number of fuzz iterations (default: 100)
+#   STAND     informational stand label (default: dev-stand)
+#   WORK_DIR  where findings + traces land (default: .work/fuzz-<ts>)
+#   BS_URL    linstor controller URL (required by the script)
+FUZZ_SEED  ?= $(shell date +%s)
+FUZZ_STEPS ?= 100
+FUZZ_STAND ?= dev-stand
+FUZZ_WORK  ?= .work/fuzz-$(shell date +%s)
+
+.PHONY: fuzz
+fuzz: ## Run the operator-fuzz loop against a live stand (requires BS_URL).
+	@SEED=$(FUZZ_SEED) STEPS=$(FUZZ_STEPS) STAND=$(FUZZ_STAND) WORK_DIR=$(FUZZ_WORK) \
+		bash tests/operator-harness/operator-fuzz.sh
+
+.PHONY: fuzz-nightly
+fuzz-nightly: ## Run fuzz with a daily-rotating seed (suitable for nightly CI).
+	@SEED=$$(date +%Y%j) STEPS=$${STEPS:-200} STAND=$${STAND:-nightly} \
+		WORK_DIR=$${WORK_DIR:-.work/fuzz-nightly-$$(date +%Y%m%d)} \
+		bash tests/operator-harness/operator-fuzz.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	"$(GOLANGCI_LINT)" run

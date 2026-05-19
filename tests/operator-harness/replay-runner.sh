@@ -80,6 +80,9 @@
 # - All commands are MUST_PASS unless expect_exit overrides; failures
 #   abort the workflow (NOT just the step) so a partial cluster doesn't
 #   poison subsequent workflows.
+# - The bulk of the executor (run_step, await_assertion, yaml_*) lives in
+#   lib.sh so operator-fuzz.sh can share the same code path — both
+#   scripts read/execute the same step JSON.
 
 set -euo pipefail
 
@@ -103,6 +106,10 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 2
 fi
 
+HARNESS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=./lib.sh
+source "$HARNESS_DIR/lib.sh"
+
 # Discover worker nodes for {{node1..3}} substitution. The runner is happy
 # with 2 or 3 nodes; workflows that need more declare it via prerequisites
 # and the runner skips with a clear message.
@@ -113,60 +120,6 @@ mapfile -t WORKERS < <(
 NODE1="${WORKERS[0]:-}"
 NODE2="${WORKERS[1]:-}"
 NODE3="${WORKERS[2]:-}"
-
-linstor_cli() { linstor --controllers "$BS_URL" "$@"; }
-
-# ----------------------------------------------------------------------
-# YAML helpers (python3 + pyyaml inline)
-# ----------------------------------------------------------------------
-
-# yaml_get <file> <jsonpath-like> — returns scalar or JSON
-yaml_get() {
-    python3 - <<EOF
-import json, sys, yaml
-d = yaml.safe_load(open("$1"))
-path = "$2".split(".")
-cur = d
-for p in path:
-    if p == "":
-        continue
-    if isinstance(cur, list):
-        cur = cur[int(p)]
-    else:
-        cur = cur.get(p) if cur else None
-    if cur is None:
-        sys.exit(0)
-print(cur if isinstance(cur, (str, int, float, bool)) else json.dumps(cur))
-EOF
-}
-
-# yaml_steps <file> — dump steps[] as one JSON object per line
-yaml_steps() {
-    python3 - <<EOF
-import json, yaml
-d = yaml.safe_load(open("$1"))
-for s in d.get("steps", []):
-    print(json.dumps(s))
-EOF
-}
-
-yaml_teardown() {
-    python3 - <<EOF
-import json, yaml
-d = yaml.safe_load(open("$1"))
-for s in d.get("teardown", []):
-    print(json.dumps(s))
-EOF
-}
-
-yaml_invariants() {
-    python3 - <<EOF
-import yaml
-d = yaml.safe_load(open("$1"))
-for inv in d.get("invariants", []):
-    print(inv)
-EOF
-}
 
 # ----------------------------------------------------------------------
 # variable substitution
@@ -181,177 +134,12 @@ RD=${RD:-$DEFAULT_RD}
 SP=$(yaml_get "$WORKFLOW" "vars.sp")
 SP=${SP:-stand}
 
-substitute() {
-    local s=$1
-    s=${s//\{\{rd\}\}/$RD}
-    s=${s//\{\{sp\}\}/$SP}
-    s=${s//\{\{node1\}\}/$NODE1}
-    s=${s//\{\{node2\}\}/$NODE2}
-    s=${s//\{\{node3\}\}/$NODE3}
-    echo "$s"
-}
-
-# ----------------------------------------------------------------------
-# assertion polling
-# ----------------------------------------------------------------------
-
-# await_assertion <json> — poll until satisfied or timeout
-await_assertion() {
-    local spec=$1
-    local kind timeout_s deadline
-    kind=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('kind',''))" "$spec")
-    timeout_s=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('timeout_s',60))" "$spec")
-    deadline=$(( $(date +%s) + timeout_s ))
-
-    while (( $(date +%s) < deadline )); do
-        if check_assertion "$kind" "$spec"; then
-            return 0
-        fi
-        sleep 2
-    done
-    echo "    ASSERTION TIMEOUT: kind=$kind spec=$spec" >&2
-    return 1
-}
-
-check_assertion() {
-    local kind=$1 spec=$2
-    case "$kind" in
-        replica_count)
-            local rd min count
-            rd=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")
-            rd=$(substitute "$rd")
-            min=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('min',2))" "$spec")
-            count=$(linstor_cli --output-fmt=json resource list --resources "$rd" 2>/dev/null \
-                | python3 -c "import json,sys
-try:
-    d=json.load(sys.stdin)
-    # responses are usually [[{...}]] or [{...}]
-    while isinstance(d, list) and d and isinstance(d[0], list):
-        d=d[0]
-    print(len(d))
-except: print(0)")
-            [[ "$count" -ge "$min" ]]
-            ;;
-        disk_state)
-            local rd node expected actual
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
-            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
-            actual=$(kubectl get resource "${rd}.${node}" -o jsonpath='{.status.volumes[0].diskState}' 2>/dev/null || echo "")
-            [[ "$actual" == "$expected" ]]
-            ;;
-        all_uptodate)
-            local rd
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            # all volumes on all replicas must be UpToDate
-            local bad
-            bad=$(kubectl get resources.blockstor.io -o json 2>/dev/null \
-                | python3 -c "import json,sys
-d=json.load(sys.stdin)
-rd='$rd'
-bad=0
-for it in d.get('items',[]):
-    if it.get('spec',{}).get('resourceName')!=rd: continue
-    for v in it.get('status',{}).get('volumes',[]) or []:
-        if v.get('diskState')!='UpToDate': bad+=1
-print(bad)")
-            [[ "$bad" == "0" ]]
-            ;;
-        replica_diskless)
-            local rd node actual
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
-            actual=$(kubectl get resource "${rd}.${node}" -o jsonpath='{.status.volumes[0].diskState}' 2>/dev/null || echo "")
-            [[ "$actual" == "Diskless" ]]
-            ;;
-        no_tiebreaker)
-            local rd present
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -ci 'TieBreaker' || true)
-            [[ "$present" == "0" ]]
-            ;;
-        sync_clean)
-            local rd
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            # detect "(NN%)" suffix on any UpToDate line
-            ! linstor_cli resource list --resources "$rd" 2>/dev/null | grep -E 'UpToDate.*\([0-9]+%\)' >/dev/null
-            ;;
-        resource_absent)
-            local rd node
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
-            ! kubectl get resource "${rd}.${node}" >/dev/null 2>&1
-            ;;
-        rd_absent)
-            local rd
-            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            ! linstor_cli resource-definition list --resource-definitions "$rd" 2>/dev/null \
-                | grep -q "$rd"
-            ;;
-        *)
-            echo "    unknown assertion kind: $kind" >&2
-            return 1
-            ;;
-    esac
-}
-
-# ----------------------------------------------------------------------
-# step executor
-# ----------------------------------------------------------------------
-
-# run_step <json-step> — execute cmd; check expected exit; run await if any
-run_step() {
-    local step=$1
-    local name cmd_json expect_exit
-    name=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name','(unnamed)'))" "$step")
-    cmd_json=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('cmd',[])))" "$step")
-    expect_exit=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expect_exit',0))" "$step")
-
-    # Build argv from cmd[]
-    mapfile -t argv < <(python3 -c "import json,sys
-for a in json.loads(sys.argv[1]):
-    print(a)" "$cmd_json")
-
-    local subst=()
-    for a in "${argv[@]}"; do
-        subst+=("$(substitute "$a")")
-    done
-
-    echo "  -> step: $name :: linstor ${subst[*]}"
-    local rc=0
-    linstor_cli "${subst[@]}" >/tmp/replay-out.$$ 2>/tmp/replay-err.$$ || rc=$?
-    if [[ "$rc" != "$expect_exit" ]]; then
-        echo "    FAIL: expected exit $expect_exit, got $rc" >&2
-        sed 's/^/    stderr: /' /tmp/replay-err.$$ >&2 || true
-        rm -f /tmp/replay-out.$$ /tmp/replay-err.$$
-        return 1
-    fi
-    rm -f /tmp/replay-out.$$ /tmp/replay-err.$$
-
-    # await?
-    local await_json
-    await_json=$(python3 -c "import json,sys
-s=json.loads(sys.argv[1]).get('await')
-print(json.dumps(s) if s else '')" "$step")
-    if [[ -n "$await_json" ]]; then
-        await_assertion "$await_json" || return 1
-    fi
-}
-
 # ----------------------------------------------------------------------
 # invariants
 # ----------------------------------------------------------------------
 
 invariant_no_orphans() {
-    local prefix=${RD}
-    local leftover_crds leftover_drbd
-    leftover_crds=$(kubectl get resources.blockstor.io -o name 2>/dev/null \
-        | grep -c "$prefix" || true)
-    if [[ "$leftover_crds" -gt 0 ]]; then
-        echo "  INVARIANT FAIL: $leftover_crds Resource CRD(s) for $prefix still present" >&2
-        return 1
-    fi
-    return 0
+    assert_no_orphans "$RD"
 }
 
 # ----------------------------------------------------------------------
