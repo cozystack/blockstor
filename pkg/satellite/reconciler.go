@@ -693,6 +693,26 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 // StoragePool empty) hit the no-op short-circuit at the top.
 func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.DesiredResource, diskless bool) (map[int32]string, bool, bool, error) {
 	if diskless {
+		// Bug 330 (P1, real stand): `linstor r td --diskless` returned
+		// REST SUCCESS but `linstor r l` kept reporting the replica as
+		// `UpToDate`. Root cause: the reconciler had no detach path —
+		// the FSM dispatched plain `drbdadm adjust` against the loaded
+		// slot, and drbd-utils' compare_volume does NOT cross the
+		// kern->disk=<path> → conf->disk="none" boundary on its own
+		// (the inverse of the Bug 319 attach direction). Without an
+		// explicit `drbdadm detach`, the kernel never releases the
+		// lower disk, and reclaimVolumesForDiskless below would then
+		// destroy the LV out from under a still-attached DRBD slot.
+		//
+		// Match upstream LINSTOR's DrbdLayer.deactivateVolume sequence:
+		// detach BEFORE the storage layer reclaims the backing volume.
+		// detachIfStillAttached is a no-op when the kernel has already
+		// dropped to Diskless on its own (idempotent re-entry on a
+		// satellite restart mid-toggle).
+		if err := r.detachIfStillAttached(ctx, dr); err != nil {
+			return nil, false, false, err
+		}
+
 		err := r.reclaimVolumesForDiskless(ctx, dr)
 		if err != nil {
 			return nil, false, false, err
@@ -702,6 +722,63 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 	}
 
 	return r.applyStorage(ctx, dr)
+}
+
+// detachIfStillAttached invokes `drbdadm detach --force <rd>` when
+// the kernel slot is currently loaded with a non-Diskless local
+// volume. This is the satellite's response to `linstor r td
+// --diskless` on a previously-diskful replica (Bug 330).
+//
+// Probe order matters: IsLoaded → HasDisklessVolume. A slot that
+// isn't loaded at all (never brought up, or torn down by an earlier
+// DeleteResource) has nothing to detach; a slot already reporting
+// disk:Diskless has converged to the target state and re-issuing
+// detach would be a no-op shell-out but still costs a netlink
+// round-trip on every reconcile pass.
+//
+// Probe errors fall through to a best-effort detach: a transient
+// netlink hiccup shouldn't strand the toggle — the kernel will
+// either accept the detach (state already matches) or surface a
+// real error the caller wraps. The detach itself runs with --force
+// so the kernel doesn't block on outstanding I/O references when
+// the satellite has already declared the replica diskless at the
+// REST layer.
+//
+// Why not gate inside the FSM transition table: the FSM currently
+// models Spec→Phase but not the diskful→Diskless intra-Running flip
+// as a distinct edge (the Bug 319 diskless→diskful flip is the
+// only intra-Running transition wired today). Detach is wired here
+// at the storage-layer entry point so it runs BEFORE the LV is
+// reclaimed, which is the load-bearing ordering constraint. A
+// future Phase will retire this in favour of a proper FSM
+// ActionDetach + Phase transition.
+func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.DesiredResource) error {
+	if r.cfg.Adm == nil {
+		return nil
+	}
+
+	loaded, err := r.cfg.Adm.IsLoaded(ctx, dr.GetName())
+	if err != nil || !loaded {
+		// Slot absent / netlink hiccup → nothing to detach; the LV
+		// reclaim path is safe to proceed without a detach.
+		return nil //nolint:nilerr // probe failure is "no-op" by design
+	}
+
+	disklessVol, err := r.cfg.Adm.HasDisklessVolume(ctx, dr.GetName())
+	if err == nil && disklessVol {
+		// Kernel has already converged to Diskless (operator-driven
+		// detach, prior reconcile pass, or a peer-driven event). No
+		// further work — re-issuing detach is harmless but the
+		// shell-out cost adds up on every reconcile of a steady-
+		// state diskless replica.
+		return nil
+	}
+
+	if detachErr := r.cfg.Adm.Detach(ctx, dr.GetName()); detachErr != nil {
+		return errors.Wrapf(detachErr, "detach %s on diskless toggle", dr.GetName())
+	}
+
+	return nil
 }
 
 // reclaimVolumesForDiskless iterates the DesiredResource's volumes
