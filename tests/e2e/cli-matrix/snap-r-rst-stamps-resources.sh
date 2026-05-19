@@ -124,22 +124,20 @@ while (( $(date +%s) < deadline )); do
 done
 
 # ---- Trigger: snapshot resource restore ----------------------------------
-echo ">> [Bug 354 trigger] linstor s r rst --from-resource $SRC --from-snapshot $SNAP --to-resource $TGT --node-name $N1,$N2"
-# Some linstor-client versions parse --node-name as a repeatable
-# flag, some as comma-separated. Try both.
+echo ">> [Bug 354 trigger] linstor s r rst --from-resource $SRC --from-snapshot $SNAP --to-resource $TGT $N1 $N2"
+# Why: upstream `linstor s r rst` grammar takes node names as positional
+# trailing args (`[node_name ...]`), NOT a --node-name flag. golinstor
+# maps the positional list to JSON body's `nodes`, which the apiserver's
+# snapshotRestoreRequest unmarshals. The earlier --node-name attempt was
+# rejected client-side with "unrecognized arguments" → the new
+# placeRestoredResources code path was never exercised.
 if ! _out=$("${LCTL[@]}" snapshot resource restore \
         --from-resource "$SRC" \
         --from-snapshot "$SNAP" \
         --to-resource "$TGT" \
-        --node-name "$N1" --node-name "$N2" 2>&1); then
-    if ! _out=$("${LCTL[@]}" snapshot resource restore \
-            --from-resource "$SRC" \
-            --from-snapshot "$SNAP" \
-            --to-resource "$TGT" \
-            --node-name "$N1,$N2" 2>&1); then
-        echo "FAIL: snapshot resource restore returned non-zero: $_out" >&2
-        exit 1
-    fi
+        "$N1" "$N2" 2>&1); then
+    echo "FAIL: snapshot resource restore returned non-zero: $_out" >&2
+    exit 1
 fi
 
 # Confirm the RD was created (this part already works — Bug 354

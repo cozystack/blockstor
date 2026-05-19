@@ -80,8 +80,11 @@ wait_uptodate "$RD" "$N1" "$N2"
 # =====================================================================
 # Trigger: snapshot create with explicit single-node restriction
 # =====================================================================
-echo ">> [Bug 352 trigger] linstor snapshot create $RD $SNAP $N1  (single-node form)"
-_out=$("${LCTL[@]}" snapshot create "$RD" "$SNAP" "$N1" 2>&1) \
+echo ">> [Bug 352 trigger] linstor snapshot create $N1 $RD $SNAP  (single-node form)"
+# Why: upstream CLI grammar is `[node...] <rd> <snap>` (positional node first,
+# then RD, then snapshot name). The earlier `<rd> <snap> <node>` shape made
+# argparse bind RD as node and snap as RD → 404 before the apiserver gate.
+_out=$("${LCTL[@]}" snapshot create "$N1" "$RD" "$SNAP" 2>&1) \
     || { echo "FAIL: snapshot create returned non-zero: $_out" >&2; exit 1; }
 
 # =====================================================================
