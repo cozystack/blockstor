@@ -98,15 +98,19 @@ fi
 
 # ---- pick first free /dev/sdX on $NODE -----------------------------------
 #
-# `linstor ps l` returns Available devices keyed by node. Pick the
-# first /dev/sdX (skip nvme / md / loop — we want the canonical
-# direct-attach disk path operators use).
+# `linstor ps l` returns devices grouped by size/rotational; node names
+# nested under `.nodes`. Pick the first /dev/sdX (skip nvme / md / loop
+# — we want the canonical direct-attach disk path operators use).
 echo ">> pick first free /dev/sdX on $NODE from linstor ps l"
+# Why: wire schema is `[{size, rotational, nodes:{<node>:[{device,...}]}}]`
+# — `.[0]` may be `[]` when no spare devices, so guard with `// empty`
+# and never crash on a stand whose disks are all already attached.
 DEV=$("${LCTL[@]}" --machine-readable physical-storage list 2>/dev/null \
     | jq -r --arg n "$NODE" '
-        .[0].physical_devices[$n][]?
-        | select(.device_path|test("^/dev/sd[a-z]+$"))
-        | .device_path' \
+        ( .[]? // empty )
+        | .nodes[$n][]?
+        | .device // empty
+        | select(test("^/dev/sd[a-z]+$"))' \
     | head -1)
 if [[ -z "$DEV" ]]; then
     echo "SKIP: no free /dev/sdX on $NODE in linstor ps l (already all attached or no spare disks on stand)"
