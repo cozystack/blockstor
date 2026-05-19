@@ -34,6 +34,7 @@ A cell counts as **FAIL** if either leg times out, the `linstor` CLI exits non-z
 |---|---|---|
 | `ps-cdp-zfs-vdo_enable.sh` | 326 | `linstor ps cdp ... zfs` accepts wire body with `vdo_enable` + sibling VDO/RAID fields without 400. |
 | `r-c-on-shape-2r-tb.sh` | 327 | After deleting a diskful replica and re-creating it on a cluster that already carries a TIE_BREAKER witness on another node, the new replica is **diskful** (DRBD,STORAGE layers, UpToDate) — NOT Diskless. |
+| `r-d-then-r-c-stuck.sh` | 339 | After `r d <node> <rd>` + bare `r c <node> <rd>` on the SAME node, the recreated replica must converge to UpToDate AND peer connections (both directions) must reach Connected/Established within 90s — no stuck `Connecting` / `StandAlone` / `WFBitMap*`. Standalone catcher for the stuck-state pattern reported as task #532. |
 | `r-c-autoplace-3r.sh` | 328 | `linstor r c <rd> --auto-place=3 -s lvm-thin` succeeds on a 3-node cluster with healthy lvm-thin SPs; no "Not enough nodes" string on stderr. |
 | `sync-final-uptodate-transition.sh` | 329 | After a 3rd replica is added to a 2-replica RD, the new replica's State converges from `UpToDate(NN%)` to a bare `UpToDate` AND replication state reaches `Established`. |
 | `r-td-diskless.sh` | 330 | `linstor r td --diskless <node> <rd>` on a diskful replica flips Spec.Flags + Status.DiskState to Diskless within 30s, and `drbdsetup status` on the satellite confirms `disk:Diskless`. |
