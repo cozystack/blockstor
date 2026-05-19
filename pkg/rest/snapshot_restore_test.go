@@ -587,3 +587,260 @@ func TestSnapshotRestoreConflict(t *testing.T) {
 		t.Errorf("status: got %d, want 409 (target RD already exists)", resp.StatusCode)
 	}
 }
+
+// TestSnapshotRestoreBug354StampsResourcesOnExplicitNodes pins the
+// explicit `--node-name` branch of `linstor s r rst`: when the wire
+// body carries a `nodes` list, the handler MUST stamp one Resource
+// CRD per node so satellites have something to reconcile. Pre-fix,
+// snapshotRestoreRequest.Nodes was declared but never read in
+// materializeRestoredRD — the target RD landed in the store but no
+// Resources were created, the BlockstorRestoreFromSnapshot prop
+// marker was dead code, and the restored RD stayed an empty shell.
+func TestSnapshotRestoreBug354StampsResourcesOnExplicitNodes(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Source RD with a diskful replica on n1 so the handler can
+	// resolve a real StorPoolName when stamping the restored
+	// Resources (mirrors the production layout: snapshots are
+	// only taken of diskful replicas).
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-src", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "zpool"},
+	}); err != nil {
+		t.Fatalf("seed source resource: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		Nodes:        []string{"n1", "n2"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-restored",
+		FromSnapshot: "snap-1",
+		Nodes:        []string{"n1", "n2"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored Resources: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("Resource CRDs stamped: got %d, want 2 (one per --node-name)", len(got))
+	}
+
+	// Verify both requested nodes received a Resource, in any order.
+	placed := map[string]apiv1.Resource{}
+	for _, res := range got {
+		placed[res.NodeName] = res
+	}
+
+	for _, want := range []string{"n1", "n2"} {
+		res, ok := placed[want]
+		if !ok {
+			t.Errorf("no Resource stamped on node %q", want)
+
+			continue
+		}
+
+		if res.Name != "pvc-restored" {
+			t.Errorf("Resource.Name on %s: got %q, want %q", want, res.Name, "pvc-restored")
+		}
+
+		// StorPoolName must be inherited from the source RD's first
+		// diskful replica so the satellite stages the clone on the
+		// same provider (zfs send/recv and dd/lvm aren't interchangeable).
+		if pool := res.Props["StorPoolName"]; pool != "zpool" {
+			t.Errorf("Resource on %s StorPoolName: got %q, want %q", want, pool, "zpool")
+		}
+	}
+}
+
+// TestSnapshotRestoreBug354AcceptsNodeNamesAlias verifies that the
+// older `node_names` wire alias is accepted as well as the upstream
+// `nodes` shape. linstor-csi clone shim and some legacy callers
+// emit `node_names` — the handler must canonicalise both into the
+// same per-node Resource-stamp loop.
+func TestSnapshotRestoreBug354AcceptsNodeNamesAlias(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		Nodes:        []string{"n1"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `node_names` alias (no `nodes` field).
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-restored",
+		FromSnapshot: "snap-1",
+		NodeNames:    []string{"n1"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored Resources: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("Resource CRDs stamped: got %d, want 1 (one per node_names entry)", len(got))
+	}
+
+	if got[0].NodeName != "n1" {
+		t.Errorf("Resource.NodeName: got %q, want %q", got[0].NodeName, "n1")
+	}
+}
+
+// TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty exercises the
+// empty-nodes branch: no `--node-name` arguments → the handler looks
+// up the source RD's parent ResourceGroup and auto-places against the
+// RG's SelectFilter.PlaceCount. Mirrors upstream LINSTOR's behaviour
+// when `linstor s r rst --to-resource X` runs without explicit nodes.
+//
+// Pre-fix the empty-nodes branch was a silent no-op alongside the
+// broken explicit-nodes branch — the new RD landed with zero
+// Resources regardless of how the operator invoked the CLI.
+func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// Parent RG with place_count=2 — the new RD inherits the RG
+	// via the source RD, so the empty-nodes branch must place
+	// exactly 2 Resources via the placer.
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name: "rg-1",
+		SelectFilter: apiv1.AutoSelectFilter{
+			PlaceCount: 2,
+		},
+	}); err != nil {
+		t.Fatalf("seed RG: %v", err)
+	}
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "pvc-src",
+		ResourceGroupName: "rg-1",
+	}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	// Two candidate ZFS pools, one each on the snapshot's nodes.
+	// constrainAutoplaceToSnapshotNodes restricts placement to the
+	// snapshot's local nodes (no send-recv yet), so the placer
+	// must find exactly these two candidates.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "zpool-" + n, NodeName: n,
+			ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 10 * 1024 * 1024,
+		}); err != nil {
+			t.Fatalf("seed candidate pool on %s: %v", n, err)
+		}
+	}
+
+	// Source resource pins the source provider to ZFS_THIN so
+	// resolveCloneSourceProviderKind returns it and the placer
+	// only considers ZFS_THIN candidates.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-src", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "zpool-n1"},
+	}); err != nil {
+		t.Fatalf("seed source resource: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		Nodes:        []string{"n1", "n2"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Empty Nodes / NodeNames — explicit autoplace fallback.
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-restored",
+		FromSnapshot: "snap-1",
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201", resp.StatusCode)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored Resources: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("Resource CRDs stamped: got %d, want %d (inherited from RG place_count)",
+			len(got), 2)
+	}
+
+	// Both replicas must land on the snapshot's nodes (no
+	// cross-node clone until send-recv lands).
+	wantNodes := map[string]bool{"n1": false, "n2": false}
+	for _, res := range got {
+		if _, ok := wantNodes[res.NodeName]; !ok {
+			t.Errorf("placed off snapshot node set: got %q", res.NodeName)
+
+			continue
+		}
+
+		wantNodes[res.NodeName] = true
+	}
+
+	for n, placed := range wantNodes {
+		if !placed {
+			t.Errorf("expected a replica on snapshot node %q, none placed", n)
+		}
+	}
+}
