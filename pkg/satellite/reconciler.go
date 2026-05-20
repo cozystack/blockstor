@@ -1605,6 +1605,18 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	autoPromote := firstActivation && autoPrimaryReplica
 	_ = cloned
 
+	log.FromContext(ctx).Info("BUG311_DEBUG finishDRBDApply",
+		"resource", dr.GetName(),
+		"diskless", diskless,
+		"firstActivation", firstActivation,
+		"autoPrimary_prop", dr.GetDrbdOptions()["auto-primary"],
+		"autoPrimaryReplica", autoPrimaryReplica,
+		"autoPromote", autoPromote,
+		"FileSystem/Type", dr.GetProps()["FileSystem/Type"],
+		"needsAutoMkfsRetry", r.needsAutoMkfsRetry(dr),
+		"filesystemFormatted", dr.GetFilesystemFormatted(),
+	)
+
 	if autoPromote {
 		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
