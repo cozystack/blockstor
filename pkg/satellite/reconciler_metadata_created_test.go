@@ -103,7 +103,7 @@ func TestEnsureMetadataStampsCondition(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -177,7 +177,7 @@ func TestApplyDRBDDerivesFirstActivationFromCondition(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -252,7 +252,7 @@ func TestApplyDRBDFallsBackToFileWhenConditionAbsent(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",

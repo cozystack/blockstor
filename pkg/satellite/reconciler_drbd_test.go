@@ -99,7 +99,7 @@ func TestApplyWritesResFile(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -185,7 +185,7 @@ func TestApplyMultiVolumeRDRendersOneResourceWithVolumes(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "fast"},
 				{VolumeNumber: 1, SizeKib: 2 * 1024 * 1024, StoragePool: "slow"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -2142,7 +2142,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 		{
 			Name:     "pvc-seed",
 			NodeName: "n1",
-			Peers:    []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			Volumes: []*intent.DesiredVolume{
 				{
 					VolumeNumber: 0,
@@ -2268,7 +2268,7 @@ func TestApplyFirstActivationDiskReplaceInternalMetadata(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7900",
 				"node-id":         "0",
@@ -2397,7 +2397,7 @@ func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7901",
 				"node-id":         "0",
@@ -2578,7 +2578,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 				{
 					Name:     "pvc-zskip",
 					NodeName: "n1",
-					Peers:    []string{"n2"},
+					Peers: []intent.DesiredPeer{{Name: "n2"}},
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: tc.poolName},
 					},
@@ -2679,7 +2679,7 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 		{
 			Name:     "pvc-race",
 			NodeName: "n1",
-			Peers:    []string{"n2", "n3"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
@@ -2908,7 +2908,7 @@ func TestApplyDefersAdjustDuringSyncTarget(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -3040,7 +3040,7 @@ func TestApplyDefersAdjustDuringPausedSyncS(t *testing.T) {
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 					},
-					Peers: []string{"n2"},
+					Peers: []intent.DesiredPeer{{Name: "n2"}},
 					DrbdOptions: map[string]string{
 						"port":            "7000",
 						"node-id":         "0",
@@ -3180,7 +3180,7 @@ func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -3351,7 +3351,7 @@ func TestReconcilerRespectsOperatorDisconnect(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7100",
 				"node-id":         "0",
@@ -3522,7 +3522,7 @@ func TestOperatorDisconnectSurvives30sWindow(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7200",
 				"node-id":         "0",
@@ -3717,7 +3717,7 @@ func TestApplyRendersExternalMetaDiskPath(t *testing.T) {
 					MetaPool: "ssd-meta",
 				},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -3830,7 +3830,7 @@ func TestApplyRoutesMetaToSeparatePoolScenario5W05(t *testing.T) {
 					MetaPool:    metaPool,
 				},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4209,7 +4209,7 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2", "n3"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4408,7 +4408,7 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{"n2"},
+			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -5253,7 +5253,7 @@ func TestApplyResFileUsesKernelHostnameNotLINSTORName(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []string{peerLinstor},
+			Peers: []intent.DesiredPeer{{Name: peerLinstor}},
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
