@@ -19,3 +19,7 @@
 # Anchored with leading `/` so the rule matches only the binary
 # at the repo root, not the cmd/linstor-trace-recorder/ source dir.
 /linstor-trace-recorder
+
+# Test side-effects
+.claude/
+pkg/satellite/pvc-dispatch-adjust.res
