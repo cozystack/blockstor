@@ -461,6 +461,39 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
 	if rdNeedsDRBD(&rd) {
+		// Bug 342 v4: deterministic UID-mismatch eviction BEFORE
+		// the allocation gate. A rapid `r d <peer>` + `r c <peer>`
+		// produces a new peer Resource CR with a fresh
+		// metadata.uid while the dispatcher's .res-driven diff
+		// sees the same peer-name set and skips del-peer. The
+		// kernel slot for the old incarnation (with its stale GI
+		// epoch + PSK) wedges the new peer in Connecting forever.
+		// Comparing the peer's current UID against the local
+		// Status.AppliedPeerUIDs baseline catches that race
+		// deterministically — no timing dependency on kernel
+		// state observation, no Phase 2 vs Phase 3 scheduling
+		// races. Returned `evicted` map ({peerName: newUID}) gets
+		// stamped onto Status.AppliedPeerUIDs so subsequent
+		// reconciles don't re-evict the same peer in a loop.
+		evicted, evictErr := r.Config.Apply.EvictPeersByUIDMismatch(
+			ctx,
+			rd.Name,
+			desiredPeersFromCRDs(peers),
+			res.Status.AppliedPeerUIDs,
+			volNumsOf(&rd),
+			nil, // devices unknown at this layer; forget-peer falls back to nodeID skip
+		)
+		if evictErr != nil {
+			logger.Error(evictErr, "EvictPeersByUIDMismatch failed; continuing")
+		}
+
+		if len(evicted) > 0 {
+			if stampErr := r.stampAppliedPeerUIDs(ctx, res, evicted); stampErr != nil {
+				logger.Error(stampErr, "stampAppliedPeerUIDs failed; will retry next reconcile",
+					"evicted", evicted)
+			}
+		}
+
 		// Bug 342 v3: prune zombie kernel slots BEFORE the
 		// allocation gate. The gate short-circuits the entire
 		// Apply chain when ANY peer's Status.DRBDNodeID is nil,
@@ -1158,6 +1191,57 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 	}
 
 	return out
+}
+
+// desiredPeersFromCRDs converts the peer Resource CR slice into the
+// intent.DesiredPeer slice the Bug 342 v4 UID-mismatch eviction
+// expects. Carries Name + DRBD node-id (from Status; may be 0 during
+// the allocation window) + metadata.uid (always present). The local
+// satellite's own Resource is NOT included — drbdsetup show enumerates
+// remote peers only.
+func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.DesiredPeer {
+	out := make([]intent.DesiredPeer, 0, len(peers))
+
+	for i := range peers {
+		p := &peers[i]
+		entry := intent.DesiredPeer{
+			Name:        p.Spec.NodeName,
+			ResourceUID: string(p.UID),
+		}
+
+		if p.Status.DRBDNodeID != nil {
+			entry.NodeID = *p.Status.DRBDNodeID
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
+}
+
+// stampAppliedPeerUIDs merges `evicted` (peerName -> newUID pairs the
+// satellite just acted on) into res.Status.AppliedPeerUIDs and writes
+// the Status sub-resource. Conflict retries are handled by the caller's
+// next reconcile pass — a stale stamp is recoverable, a wedged kernel
+// slot is not, so we don't block the reconcile path on this Update.
+func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *blockstoriov1alpha1.Resource, evicted map[string]string) error {
+	if len(evicted) == 0 {
+		return nil
+	}
+
+	if res.Status.AppliedPeerUIDs == nil {
+		res.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
+	}
+
+	for name, uid := range evicted {
+		res.Status.AppliedPeerUIDs[name] = uid
+	}
+
+	if err := r.Status().Update(ctx, res); err != nil {
+		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
+	}
+
+	return nil
 }
 
 // volNumsOf extracts the volume-number set from

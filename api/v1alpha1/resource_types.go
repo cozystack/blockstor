@@ -304,6 +304,30 @@ type ResourceStatus struct {
 	// surfaced via a `ToggleDiskFailed` condition once exceeded.
 	// +optional
 	ToggleDiskRetries int32 `json:"toggleDiskRetries,omitempty"`
+
+	// appliedPeerUids records each peer Resource CR's metadata.uid at
+	// the time of the last successful `drbdadm adjust` on this node.
+	// Keyed by peer node name. Diff against the current K8s sibling
+	// UIDs catches the "same node name, new identity" race (Bug 342:
+	// `linstor r d X` immediately followed by `linstor r c X` in a
+	// sub-second window leaves the DRBD kernel slot bound to the OLD
+	// incarnation's PSK seed / handshake state — the new K8s Resource
+	// has the same name but a brand-new UID, the satellite never sees
+	// the diff via the .res-file-based primitive, and the new
+	// incarnation wedges forever in Connecting).
+	//
+	// The satellite reads this off the local Resource at the top of
+	// every apply pass, computes the three-source diff (this map vs
+	// K8s desired vs `drbdsetup show` kernel state), runs
+	// `drbdadm del-peer` + `drbdmeta forget-peer` for every UID
+	// mismatch, then re-stamps the map after `drbdadm adjust` succeeds.
+	//
+	// Empty on first reconcile and after a Status restore (etcd backup
+	// / LINSTOR-takeover migration). The satellite's adoption-mode
+	// gate trusts the live kernel state as the baseline in that case
+	// and stamps current UIDs without touching connections.
+	// +optional
+	AppliedPeerUIDs map[string]string `json:"appliedPeerUids,omitempty"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection

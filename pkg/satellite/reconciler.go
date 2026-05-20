@@ -1197,7 +1197,7 @@ func computeRemovedPeers(resPath string, dr *intent.DesiredResource, localNode s
 	want := make(map[string]struct{}, len(dr.GetPeers())+1)
 	want[localNode] = struct{}{}
 
-	for _, p := range dr.GetPeers() {
+	for _, p := range dr.GetPeerNames() {
 		want[p] = struct{}{}
 	}
 
@@ -2596,7 +2596,7 @@ func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResour
 		}
 	}
 
-	for _, peer := range dr.GetPeers() {
+	for _, peer := range dr.GetPeerNames() {
 		peerID, ok := peerNodeIDs[peer]
 		if !ok {
 			// Controller-side allocator hasn't stamped this peer's
@@ -2649,7 +2649,7 @@ func localNodeIDFromOpts(dr *intent.DesiredResource) (int32, bool) {
 // but correct).
 func peerNodeIDsFromOpts(dr *intent.DesiredResource) map[string]int32 {
 	opts := dr.GetDrbdOptions()
-	peers := dr.GetPeers()
+	peers := dr.GetPeerNames()
 
 	out := make(map[string]int32, len(peers))
 
@@ -2769,7 +2769,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 		Diskless: isDiskless(dr.GetFlags()),
 	})
 
-	for _, peer := range dr.GetPeers() {
+	for _, peer := range dr.GetPeerNames() {
 		peerPort, _ := strconv.Atoi(opts["peer."+peer+".port"])
 		peerNodeID, _ := strconv.Atoi(opts["peer."+peer+".node-id"])
 
