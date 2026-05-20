@@ -104,15 +104,32 @@ on_node "$N1" drbdadm primary --force "$RD" 2>/dev/null || true
 # =====================================================================
 # Phase 2: continuous writer on Primary (anchor md5 captured below)
 # =====================================================================
-echo ">> Phase 2: seed deterministic ${SIZE_MIB} MiB pattern on $N1, then start writer"
-on_node "$N1" bash -c "
+# Why iflag=count_bytes + blockdev --getsize64:
+#   DRBD reserves a few KiB at the end of the backing volume for
+#   internal metadata, so the exposed /dev/drbdN device is slightly
+#   smaller than the nominal volume-definition size (e.g. a 64 MiB
+#   VD on FILE_THIN exposes ~63.93 MiB through DRBD). A naive
+#   `dd bs=1M count=$SIZE_MIB` overshoots that boundary and ENOSPC
+#   fires on the last partial MiB — a false-FAIL that has nothing
+#   to do with the snapshot-orchestration contract this cell pins.
+#   We therefore read the device's actual byte size and feed dd via
+#   count_bytes so the write stops exactly at the DRBD boundary.
+echo ">> Phase 2: seed deterministic random pattern on $N1 (DRBD-fit bytes), then start writer"
+seed_out=$(on_node "$N1" bash -c "
     set -e
     dev=\$(readlink -f /dev/drbd/by-res/$RD/0 2>/dev/null || true)
     if [ -z \"\$dev\" ]; then
         dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     fi
-    dd if=/dev/urandom of=\$dev bs=1M count=$SIZE_MIB conv=fsync status=none
-" || { echo "FAIL: seed write on $N1" >&2; exit 1; }
+    if [ -z \"\$dev\" ] || [ ! -b \"\$dev\" ]; then
+        echo \"no DRBD block device for $RD on \$(hostname)\" >&2
+        exit 2
+    fi
+    bytes=\$(blockdev --getsize64 \"\$dev\")
+    echo \"seed-dev=\$dev seed-bytes=\$bytes\" >&2
+    dd if=/dev/urandom of=\"\$dev\" bs=1M iflag=count_bytes count=\"\$bytes\" conv=fsync
+" 2>&1) || { echo "FAIL: seed write on $N1:" >&2; echo "$seed_out" >&2; exit 1; }
+echo "$seed_out"
 
 # Wait for DRBD to ship the seed to $N2 before taking the snap, so
 # the cross-node md5 check has a baseline that already converged.
