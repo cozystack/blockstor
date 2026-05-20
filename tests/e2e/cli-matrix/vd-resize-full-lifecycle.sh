@@ -113,8 +113,11 @@ run_resize_lifecycle() {
 
     # Resolve the placed pair. --auto-place=2 stages 2 diskful peers
     # + (optionally) a TieBreaker diskless on the 3rd node — filter to
-    # diskful only via Spec.Diskful=true so the tiebreaker row doesn't
-    # bump the count and force a stale-state FAIL.
+    # diskful only so the tiebreaker row doesn't bump the count and
+    # force a stale-state FAIL. There is no Spec.Diskful field on the
+    # Resource CR — diskful = Spec.Flags contains NEITHER "DISKLESS"
+    # NOR "TIE_BREAKER" (see lib.sh linstor_diskful_nodes for the
+    # canonical kubectl-loop variant).
     local deadline placed_nodes=()
     deadline=$(( $(date +%s) + 90 ))
     while (( $(date +%s) < deadline )); do
@@ -123,7 +126,9 @@ run_resize_lifecycle() {
                 | jq -r --arg rd "$RD" '
                     .items[]?
                     | select(.spec.resourceDefinitionName==$rd)
-                    | select((.spec.diskful // false)==true)
+                    | select(((.spec.flags // [])
+                        | map(select(.=="DISKLESS" or .=="TIE_BREAKER"))
+                        | length) == 0)
                     | .spec.nodeName'
         )
         if (( ${#placed_nodes[@]} >= 2 )); then break; fi

@@ -67,8 +67,11 @@ _rc_out=$("${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$R
 # spuriously succeed on the in-memory CRD before the satellite
 # observes it — we want the steady-state rejection, not a race.
 # --auto-place=2 stages 2 diskful peers + (optionally) a TieBreaker
-# diskless on the 3rd node. Filter to diskful only — Spec.Diskful=true
-# — so a TieBreaker placement (Bug 334 / Phase 11.6) doesn't count.
+# diskless on the 3rd node. Filter to diskful only so a TieBreaker
+# placement (Bug 334 / Phase 11.6) doesn't count. There is no
+# Spec.Diskful field on the Resource CR — diskful = Spec.Flags
+# contains NEITHER "DISKLESS" NOR "TIE_BREAKER" (see lib.sh
+# linstor_diskful_nodes for the canonical kubectl-loop variant).
 deadline=$(( $(date +%s) + 90 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
@@ -77,7 +80,9 @@ while (( $(date +%s) < deadline )); do
             | jq -r --arg rd "$RD" '
                 .items[]?
                 | select(.spec.resourceDefinitionName==$rd)
-                | select((.spec.diskful // false)==true)
+                | select(((.spec.flags // [])
+                    | map(select(.=="DISKLESS" or .=="TIE_BREAKER"))
+                    | length) == 0)
                 | .spec.nodeName'
     )
     if (( ${#placed_nodes[@]} >= 2 )); then break; fi
