@@ -2139,10 +2139,22 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	// truth, so a transient apiserver hiccup here just defers
 	// Condition stamping to the next reconcile.
 	if r.cfg.FilesystemFormattedStamper != nil {
-		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, dr.GetName())
+		// Bug 344 (regression of Bug 311 followup #501): the stamper
+		// SSA-patches a `Resource` object whose Name is the CRD object
+		// name. Real Resource CRDs are named `<rd>.<node>` (per-node
+		// sharding); passing the RD-only name made the apiserver
+		// return 404 on every stamp attempt, so `FilesystemFormatted`
+		// never landed on the Condition list and the cli-matrix
+		// `rwx-ganesha-data-vol-mkfs` cell's Condition-assertion FAIL
+		// reproduced even after the unit-test-level retry path landed.
+		// Mirror the Bug 344 fix in maybeStampMetadata's caller.
+		// Best-effort tolerated (file marker is the source of truth)
+		// so no functional regression on a transient apiserver hiccup.
+		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
+		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, resourceCRDName)
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
-				"resource", dr.GetName())
+				"resource", resourceCRDName)
 		}
 	}
 

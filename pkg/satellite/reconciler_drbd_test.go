@@ -5738,8 +5738,12 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 	}
 
 	gotCalls := stamper.Calls()
-	if len(gotCalls) != 1 || gotCalls[0] != "pvc-bug311c" {
-		t.Errorf("FilesystemFormatted Condition: want exactly one stamp for pvc-bug311c after retry; got %v", gotCalls)
+	// Bug 344 (regression of #501): the stamper SSA-patches a `Resource`
+	// CRD whose Name is `<rd>.<node>`. Mirror the
+	// MetadataCreatedStamper caller-side fix so the apiserver finds
+	// the per-replica object rather than 404-ing on the bare RD name.
+	if len(gotCalls) != 1 || gotCalls[0] != "pvc-bug311c.n1" {
+		t.Errorf("FilesystemFormatted Condition: want exactly one stamp for pvc-bug311c.n1 after retry; got %v", gotCalls)
 	}
 }
 
