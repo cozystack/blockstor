@@ -120,19 +120,16 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 		// peer. Forget-peer needs a node-id; prefer the kernel's
 		// observation, fall back to the dispatcher's.
 		//
-		// Bug 342 v8 (narrow scope): only the -1 sentinel check
-		// below is needed. Do NOT broaden the slot preference to
-		// take slot.NodeID==0 — when the satellite's drbdsetup
-		// show parse for an inbound peer hasn't fully populated
-		// node-id (transient state during fresh-peer handshake),
-		// the slot map can report 0 erroneously while the
-		// dispatcher's peer.NodeID has the correct value from
-		// controller-side allocation. Keep the original
-		// `slot.NodeID != 0` filter so we don't overwrite a good
-		// dispatcher-side id with a transient kernel zero.
+		// Bug 342 v8: DRBD node-ids are 0..31; 0 is valid. Use -1
+		// as the "not allocated" sentinel (set by
+		// `desiredPeersFromCRDs` when `Status.DRBDNodeID == nil`).
+		// Kernel slot presence in the map (`ok == true`) means the
+		// node-id IS known regardless of value (could legitimately
+		// be 0), so we always prefer the kernel-observed id when
+		// the slot exists.
 		nodeID := peer.NodeID
 
-		if slot, ok := slots[peer.Name]; ok && slot.NodeID != 0 {
+		if slot, ok := slots[peer.Name]; ok {
 			nodeID = slot.NodeID
 		}
 
