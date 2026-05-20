@@ -536,6 +536,22 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
+	// Bug 342 v4 adoption baseline: after a fully-successful apply,
+	// refresh Status.AppliedPeerUIDs with the current peer UIDs.
+	// This stamps the initial baseline on fresh CRDs (no prior
+	// Status), refreshes the baseline on steady-state reconciles
+	// (idempotent — no-op when applied == current), and provides
+	// the comparison anchor that EvictPeersByUIDMismatch needs
+	// next time a peer's UID changes. Skipping on anyFailed because
+	// a partial apply leaves kernel state we shouldn't attest to.
+	if !anyFailed && rdNeedsDRBD(&rd) {
+		baseline := currentPeerUIDs(peers)
+
+		if stampErr := r.stampAppliedPeerUIDs(ctx, res, baseline); stampErr != nil {
+			logger.Error(stampErr, "post-apply AppliedPeerUIDs refresh failed; will retry next reconcile")
+		}
+	}
+
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
 	// peer's Status caught up). Returning nil here would let c-r
@@ -1214,6 +1230,34 @@ func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.Desired
 		}
 
 		out = append(out, entry)
+	}
+
+	return out
+}
+
+// currentPeerUIDs returns the current peer name → metadata.uid map
+// for the post-apply baseline refresh. Empty UIDs (informer cache
+// trail / fresh CRD just hit apiserver) are excluded — stamping ""
+// would later evaluate as "no baseline" indistinguishably from
+// adoption case and short-circuit eviction.
+func currentPeerUIDs(peers []blockstoriov1alpha1.Resource) map[string]string {
+	if len(peers) == 0 {
+		return nil
+	}
+
+	out := make(map[string]string, len(peers))
+
+	for i := range peers {
+		p := &peers[i]
+		if p.Spec.NodeName == "" || p.UID == "" {
+			continue
+		}
+
+		out[p.Spec.NodeName] = string(p.UID)
+	}
+
+	if len(out) == 0 {
+		return nil
 	}
 
 	return out
