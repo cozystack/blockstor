@@ -1234,9 +1234,18 @@ func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.Desired
 
 	for i := range peers {
 		p := &peers[i]
+		// Bug 342 v8: -1 sentinel for "controller hasn't allocated
+		// DRBDNodeID yet". DRBD node-ids are 0..31 in the on-wire
+		// protocol, so 0 is a perfectly valid allocation and CANNOT
+		// be used as the "missing" marker. The dispatcher already
+		// uses -1 (see nodeIDOf); align the satellite side. Without
+		// this, a peer that was allocated node-id 0 looks identical
+		// to a peer the allocator hasn't touched, and the UID-evict
+		// path (peer_identity_cleanup.go) defers indefinitely.
 		entry := intent.DesiredPeer{
 			Name:        p.Spec.NodeName,
 			ResourceUID: string(p.UID),
+			NodeID:      -1,
 		}
 
 		if p.Status.DRBDNodeID != nil {
