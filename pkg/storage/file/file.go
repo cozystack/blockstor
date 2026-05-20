@@ -300,21 +300,6 @@ func (p *Provider) CreateSnapshot(ctx context.Context, snap storage.Snapshot) er
 		return nil
 	}
 
-	// Bug 351 (FILE_THIN cross-node consistency): the snapshot
-	// orchestrator calls drbdadm suspend-io on the DRBD layer above
-	// this provider, which stops new bios into /dev/drbdN but leaves
-	// already-issued bios and the loopback layer's page cache for
-	// srcPath in flight. Without an explicit sync of the FS hosting
-	// the .img, `cp --reflink` clones on-disk blocks and misses dirty
-	// pages — divergent bytes across replicas. `sync -f srcPath`
-	// flushes the entire filesystem holding the source .img,
-	// guaranteeing the loop driver's buffered writes have landed
-	// before the CoW clone is taken.
-	_, err = p.exec.Run(ctx, "sync", "-f", srcPath)
-	if err != nil {
-		return errors.Wrapf(err, "sync -f %s", srcPath)
-	}
-
 	_, err = p.exec.Run(ctx, "cp", "--reflink=auto", srcPath, dstPath)
 	if err != nil {
 		return errors.Wrapf(err, "cp --reflink %s → %s", srcPath, dstPath)
