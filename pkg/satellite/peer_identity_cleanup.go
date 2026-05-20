@@ -119,17 +119,9 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 		// UID mismatch — force-evict the kernel slot for this
 		// peer. Forget-peer needs a node-id; prefer the kernel's
 		// observation, fall back to the dispatcher's.
-		//
-		// Bug 342 v8: DRBD node-ids are 0..31; 0 is valid. Use -1
-		// as the "not allocated" sentinel (set by
-		// `desiredPeersFromCRDs` when `Status.DRBDNodeID == nil`).
-		// Kernel slot presence in the map (`ok == true`) means the
-		// node-id IS known regardless of value (could legitimately
-		// be 0), so we always prefer the kernel-observed id when
-		// the slot exists.
 		nodeID := peer.NodeID
 
-		if slot, ok := slots[peer.Name]; ok {
+		if slot, ok := slots[peer.Name]; ok && slot.NodeID != 0 {
 			nodeID = slot.NodeID
 		}
 
@@ -145,13 +137,7 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 		// this reconcile is safe: the next one (after kernel
 		// loads OR allocation lands) will see the same UID
 		// mismatch and try again with a resolvable node-id.
-		//
-		// Bug 342 v8: compare against -1 sentinel (set by
-		// desiredPeersFromCRDs). Previously the comparison was
-		// `nodeID == 0`, which incorrectly treated allocated
-		// node-id 0 as "missing" and deferred indefinitely —
-		// causing the Phase 3 r-full-lifecycle wedge.
-		if nodeID < 0 {
+		if nodeID == 0 {
 			logger.Info("UID mismatch detected but peer node-id unresolved — deferring eviction",
 				"peer", peer.Name,
 				"oldUID", last,
