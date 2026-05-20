@@ -29,9 +29,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
@@ -1162,10 +1165,35 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		r.APIReader = mgr.GetAPIReader()
 	}
 
+	// Bug 342: filter Resource watch events down to Spec / Create /
+	// Delete changes. Without this, every satellite-side Status patch
+	// (Conn state, replication state, peer info, per-volume disk
+	// state — dozens per Resource per second when DRBD is settling)
+	// triggers a full RD reconcile that runs ensureTiebreaker. Diag
+	// evidence on bug342 stand shows 20-50 reconciles per second
+	// during Phase 3 r d/r c churn, starving the Resource
+	// reconciler's workqueue and producing a stale APIReader view
+	// (`replicas=2 diskful=1 witness=1` while apiserver actually has
+	// 3 Resources). The tiebreaker only cares about Spec.Flags + the
+	// set of Resources (which Create/Delete already cover), so
+	// suppressing Status-only updates eliminates the hot loop
+	// without losing correctness.
+	resourceEventFilter := predicate.Funcs{
+		CreateFunc: func(_ event.CreateEvent) bool { return true },
+		DeleteFunc: func(_ event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Generation bump = Spec change. Status-only patches
+			// keep Generation steady.
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&blockstoriov1alpha1.ResourceDefinition{}).
 		Watches(&blockstoriov1alpha1.Resource{},
-			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForResource)).
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForResource),
+			builder.WithPredicates(resourceEventFilter)).
 		Named("resourcedefinition").
 		Complete(r)
 }
