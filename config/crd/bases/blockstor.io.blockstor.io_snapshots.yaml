@@ -50,6 +50,33 @@ spec:
           spec:
             description: spec defines the desired state of Snapshot
             properties:
+              groupId:
+                description: |-
+                  groupID, when non-empty, marks this Snapshot as a member of a
+                  transactional multi-RD batch — every Snapshot CRD stamped with
+                  the same GroupID participates in a SINGLE suspend-io broadcast
+                  across the UNION of every sibling's targeted nodes. Bug 353:
+                  `linstor s create-multiple` (POST /v1/actions/snapshot/multi)
+                  previously looped per-RD through the Bug-351 orchestrator and
+                  each Snapshot ran its own independent 3-phase suspend/take/
+                  resume — so per-RD suspend windows did not overlap and the
+                  cross-RD point-in-time consistency operators expect from a
+                  "group snapshot" (DB + WAL on separate RDs) was lost.
+
+                  Lifecycle (driven by the controller-side SnapshotReconciler):
+                    1. apiserver stamps every batched Snapshot with the same
+                       crypto/rand-generated GroupID + SuspendIo=true.
+                    2. Controller gates phase advancement on the FULL group:
+                       Phase 2 only fires when every sibling's every targeted
+                       node has acked the suspend.
+                    3. Phase 3 only fires when every sibling's every targeted
+                       node is Ready — or any sibling node Failed=true, in
+                       which case the abort cascade fires SuspendIo=false on
+                       every sibling immediately.
+
+                  Empty GroupID is the single-snap path (Bug 351 behaviour
+                  preserved verbatim — siblings denominator collapses to self).
+                type: string
               nodes:
                 description: |-
                   nodes are the satellites the snapshot should live on. Empty means
@@ -68,6 +95,48 @@ spec:
               snapshotName:
                 description: snapshotName is the user-facing snapshot identifier.
                 type: string
+              suspendIo:
+                description: |-
+                  suspendIo, when true, signals every satellite that hosts a
+                  diskful replica of the parent ResourceDefinition to call
+                  `drbdsetup suspend-io <rd>` before taking the local backing
+                  snapshot. Bug 351: two diskful replicas snapshotting
+                  independently would otherwise capture divergent bytes while
+                  the application writer's traffic is still streaming through
+                  DRBD; suspending I/O on every peer first freezes the
+                  replicated block stream at a single, common point so the
+                  per-node LV / zvol snapshots all reflect the same
+                  point-in-time bytes.
+
+                  Lifecycle (driven by the controller-side SnapshotReconciler):
+                    1. apiserver creates Snapshot CRD with SuspendIo=true,
+                       TakeSnapshot=false. Satellites stamp
+                       Status.NodeStatus[].SuspendIoAcked once their suspend-io
+                       call returns.
+                    2. Once every targeted node has acked, the controller stamps
+                       Spec.TakeSnapshot=true. Satellites then dispatch
+                       provider.CreateSnapshot and stamp Status.NodeStatus[].Ready.
+                    3. Once every targeted node is Ready (or any has Failed=true),
+                       the controller flips Spec.SuspendIo=false and satellites
+                       issue `drbdsetup resume-io <rd>`.
+
+                  Resume-on-failure is mandatory — a partially-acked suspend
+                  followed by an abort MUST still resume I/O on the nodes that
+                  did ack, otherwise application I/O hangs forever. The
+                  controller's abort path clears SuspendIo unconditionally.
+                type: boolean
+              takeSnapshot:
+                description: |-
+                  takeSnapshot, when true, signals each satellite that has
+                  already acked the suspend-io barrier (see SuspendIo above) to
+                  dispatch the local provider.CreateSnapshot. The flag is
+                  stamped by the controller-side SnapshotReconciler once every
+                  targeted node's Status.NodeStatus[].SuspendIoAcked is true —
+                  the two-step `suspend → take → resume` shape mirrors upstream
+                  LINSTOR's CtrlSnapshotCrtApiCallHandler 3-phase flow so the
+                  per-node backing snapshots all reflect the same point-in-time
+                  bytes.
+                type: boolean
               volumeDefinitions:
                 description: volumeDefinitions records the size of each volume captured.
                 items:
@@ -169,9 +238,30 @@ spec:
                     createTimestamp:
                       format: int64
                       type: integer
+                    failed:
+                      description: |-
+                        failed is stamped true when the local satellite hit a
+                        terminal failure while either suspending I/O, taking the
+                        per-node snapshot, or resuming I/O. The controller-side
+                        SnapshotReconciler treats any Failed=true entry as an abort
+                        signal: it flips Spec.SuspendIo=false immediately so the
+                        already-suspended siblings resume rather than wait
+                        indefinitely on the doomed node, and stamps the parent
+                        Snapshot's Status.Flags with FAILED. Bug 351.
+                      type: boolean
                     nodeName:
                       type: string
                     ready:
+                      type: boolean
+                    suspendIoAcked:
+                      description: |-
+                        suspendIoAcked is stamped true by the local satellite once
+                        `drbdsetup suspend-io <rd>` has returned for the parent
+                        ResourceDefinition. The controller-side SnapshotReconciler
+                        gates the Phase-2 `TakeSnapshot` transition on every targeted
+                        node having acked. Cleared back to false when the controller
+                        flips Spec.SuspendIo=false and the satellite issues
+                        `drbdsetup resume-io <rd>`. Bug 351.
                       type: boolean
                   required:
                   - nodeName

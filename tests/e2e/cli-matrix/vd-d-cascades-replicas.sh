@@ -192,12 +192,23 @@ done
 # =====================================================================
 # Surviving volume 1 stays UpToDate (RD is functional post-vd-d)
 # =====================================================================
-echo ">> volume 1 stays UpToDate on both nodes post-cascade"
+# Why a 60s poll (not single-shot): observer events2 re-emission lag
+# after the JSON-Patch prune of volume 0 — surviving volume 1's
+# diskState briefly reads "" until the next events2 frame re-stamps
+# UpToDate. Race-free read requires polling, not a one-shot check.
+echo ">> within 60s: volume 1 stays UpToDate on both nodes post-cascade"
 for N in "$N1" "$N2"; do
-    s=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
-        -o jsonpath='{.status.volumes[?(@.volumeNumber==1)].diskState}' 2>/dev/null || echo "")
+    deadline=$(( $(date +%s) + 60 ))
+    s=""
+    while (( $(date +%s) < deadline )); do
+        s=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
+            -o jsonpath='{.status.volumes[?(@.volumeNumber==1)].diskState}' 2>/dev/null || echo "")
+        if [[ "$s" == "UpToDate" ]]; then break; fi
+        sleep 2
+    done
     if [[ "$s" != "UpToDate" ]]; then
         echo "FAIL (Bug 355 deep): volume 1 on $N is diskState=$s (want UpToDate) post-cascade" >&2
+        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
         exit 1
     fi
 done
