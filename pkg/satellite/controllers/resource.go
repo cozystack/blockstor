@@ -538,18 +538,31 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
 	// Bug 342 v4 adoption baseline: after a fully-successful apply,
-	// refresh Status.AppliedPeerUIDs with the current peer UIDs.
-	// This stamps the initial baseline on fresh CRDs (no prior
-	// Status), refreshes the baseline on steady-state reconciles
-	// (idempotent — no-op when applied == current), and provides
-	// the comparison anchor that EvictPeersByUIDMismatch needs
-	// next time a peer's UID changes. Skipping on anyFailed because
-	// a partial apply leaves kernel state we shouldn't attest to.
+	// stamp Status.AppliedPeerUIDs for peers that have no baseline
+	// yet (fresh CRD / restore / migration path). Does NOT overwrite
+	// existing baselines — that's the eviction path's responsibility
+	// (Bug 342 v6): if applied[peer] is already set to an OLD UID,
+	// the EvictPeersByUIDMismatch may have deferred eviction this
+	// reconcile (peer node-id unresolvable). Overwriting the baseline
+	// here with current peer UIDs would mask the pending mismatch
+	// — next reconcile would see applied == current and never try
+	// the eviction again, leaving the stale kernel slot forever.
+	// Only EvictPeersByUIDMismatch should change an existing
+	// baseline, AFTER actually completing del-peer + forget-peer.
 	if !anyFailed && rdNeedsDRBD(&rd) {
-		baseline := currentPeerUIDs(peers)
+		full := currentPeerUIDs(peers)
+		missing := make(map[string]string, len(full))
 
-		if stampErr := r.stampAppliedPeerUIDs(ctx, res, baseline); stampErr != nil {
-			logger.Error(stampErr, "post-apply AppliedPeerUIDs refresh failed; will retry next reconcile")
+		for name, uid := range full {
+			if _, ok := res.Status.AppliedPeerUIDs[name]; !ok {
+				missing[name] = uid
+			}
+		}
+
+		if len(missing) > 0 {
+			if stampErr := r.stampAppliedPeerUIDs(ctx, res, missing); stampErr != nil {
+				logger.Error(stampErr, "post-apply AppliedPeerUIDs baseline stamp failed; will retry next reconcile")
+			}
 		}
 	}
 
