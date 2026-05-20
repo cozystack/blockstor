@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1264,24 +1265,55 @@ func currentPeerUIDs(peers []blockstoriov1alpha1.Resource) map[string]string {
 }
 
 // stampAppliedPeerUIDs merges `evicted` (peerName -> newUID pairs the
-// satellite just acted on) into res.Status.AppliedPeerUIDs and writes
-// the Status sub-resource. Conflict retries are handled by the caller's
-// next reconcile pass — a stale stamp is recoverable, a wedged kernel
-// slot is not, so we don't block the reconcile path on this Update.
+// satellite just acted on) into Status.AppliedPeerUIDs and writes the
+// Status sub-resource.
+//
+// The cached `res` from controller-runtime watch may trail apiserver
+// by hundreds of milliseconds; a direct Update(ctx, res) using its
+// stale ResourceVersion races every concurrent reconcile and returns
+// 409 Conflict. RetryOnConflict with an APIReader-fresh Get inside
+// the retry loop is the canonical fix: re-read fresh, mutate, write,
+// retry if another writer landed first. Without this the AppliedPeerUIDs
+// map stays empty forever on hot Resources (catcher cells touch the
+// CRD dozens of times per second) and Bug 342 v4 silently no-ops.
 func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *blockstoriov1alpha1.Resource, evicted map[string]string) error {
 	if len(evicted) == 0 {
 		return nil
 	}
 
-	if res.Status.AppliedPeerUIDs == nil {
-		res.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
+	reader := client.Reader(r.Client)
+	if r.Config.APIReader != nil {
+		reader = r.Config.APIReader
 	}
 
-	for name, uid := range evicted {
-		res.Status.AppliedPeerUIDs[name] = uid
-	}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh blockstoriov1alpha1.Resource
 
-	if err := r.Status().Update(ctx, res); err != nil {
+		if getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh); getErr != nil {
+			return getErr
+		}
+
+		if fresh.Status.AppliedPeerUIDs == nil {
+			fresh.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
+		}
+
+		changed := false
+
+		for name, uid := range evicted {
+			if fresh.Status.AppliedPeerUIDs[name] != uid {
+				fresh.Status.AppliedPeerUIDs[name] = uid
+				changed = true
+			}
+		}
+
+		if !changed {
+			return nil
+		}
+
+		return r.Status().Update(ctx, &fresh)
+	})
+
+	if err != nil {
 		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
 	}
 
