@@ -166,8 +166,22 @@ func (a *Agent) Run(ctx context.Context) error {
 // Runnable share it.
 func (a *Agent) newReconciler() *Reconciler {
 	return NewReconciler(ReconcilerConfig{
-		Providers:    a.cfg.Providers,
-		Adm:          drbd.NewAdm(storage.RealExec{}),
+		Providers: a.cfg.Providers,
+		Adm:       drbd.NewAdm(storage.RealExec{}),
+		// Bug 311 regression (#501 reopen): the reconciler's auto-mkfs
+		// path (`runAutoMkfs`) and the Bug-311 retry predicate
+		// (`needsAutoMkfsRetry`) early-exit when `cfg.Exec == nil` —
+		// the unit-test no-op branch. Production agents previously
+		// omitted Exec entirely, so every RD with `FileSystem/Type`
+		// set landed UpToDate without a filesystem and the satellite
+		// silently skipped both the legacy `firstActivation` path
+		// (autoPromote->runAutoMkfs early-exits on nil Exec) and the
+		// retry gate (`needsAutoMkfsRetry` returns false on nil Exec).
+		// piraeus' NFS-Ganesha multi-volume RD reproduced this every
+		// time; `linstor r l` reported UpToDate while `blkid` saw
+		// nothing on /dev/drbd<m+vol>. Wire RealExec so the production
+		// path matches what the unit tests have always covered.
+		Exec:         storage.RealExec{},
 		Cryptsetup:   luks.NewCryptsetup(storage.RealExec{}),
 		StateDir:     a.cfg.StateDir,
 		NodeName:     a.cfg.NodeName,
