@@ -4248,12 +4248,40 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 	// can prove a NEW adjust fired, not just the leftover from pass 1.
 	pass1Cmds := append([]string{}, fx.CommandLines()...)
 
+	// Bug 342: reconcilePeers now reads kernel state via `drbdsetup
+	// show -j` instead of the legacy .res-file diff. Seed the fake
+	// exec with a kernel snapshot that mirrors the pass-1 topology
+	// (n2 + n3 connected with peer-device on vol 0) so Pass 1 of
+	// the new diff sees the slots the test expects to tear down.
+	fx.Responses["drbdsetup show -j pvc-67"] = storage.FakeResponse{
+		Stdout: []byte(`[{
+			"_name": "pvc-67",
+			"_my_node_id": 0,
+			"connections": [
+				{
+					"peer_node_id": 1,
+					"_peer_node_name": "n2",
+					"net": {"shared-secret": ""},
+					"connection": "Connected",
+					"peer_devices": [{"volume_nr": 0, "peer-disk-state": "UpToDate"}]
+				},
+				{
+					"peer_node_id": 2,
+					"_peer_node_name": "n3",
+					"net": {"shared-secret": ""},
+					"connection": "Connected",
+					"peer_devices": [{"volume_nr": 0, "peer-disk-state": "UpToDate"}]
+				}
+			]
+		}]`),
+	}
+
 	// Pass 2: simulate `linstor r d n2 pvc-67` + tiebreaker retirement
 	// — the dispatcher now pushes the same DesiredResource but with
 	// Peers=[] (single-replica topology). Satellite MUST re-render
 	// .res to drop both `on n2 {}` and `on n3 {}` blocks, and MUST
-	// invoke `drbdadm adjust pvc-67` so the kernel runs del-peer for
-	// the retired node-ids.
+	// invoke `drbdadm del-peer` (Pass 1 of reconcilePeers) for each
+	// dropped peer.
 	_, err = rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
 			Name:     "pvc-67",

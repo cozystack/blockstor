@@ -113,6 +113,16 @@ type ReconcilerConfig struct {
 	// 11.3 Stage 2.
 	FilesystemFormattedStamper FilesystemFormattedStamper
 
+	// AppliedPeerUIDsStamper writes the
+	// Resource.Status.AppliedPeerUIDs map onto the parent Resource
+	// CRD after `reconcilePeers` + adjust succeed. Bug 342: closes
+	// the "same node name, new identity" race that the .res-file-
+	// based primitive missed. nil disables the stamper entirely —
+	// the satellite falls through to Pass-3 zombie probe + UID-only
+	// diff for protection (slower but correct). The agent injects
+	// this post-manager construction via SetAppliedPeerUIDsStamper.
+	AppliedPeerUIDsStamper AppliedPeerUIDsStamper
+
 	// SkipDiskClearer releases the satellite's SSA claim on the
 	// `DrbdOptions/SkipDisk` Spec.Props key when the kernel
 	// re-emerges healthy (Bug 278: Talos kernel upgrade reattach).
@@ -220,6 +230,16 @@ type Reconciler struct {
 
 	mu             sync.Mutex
 	resourceToPool map[string]string
+
+	// adoptOnce records (rd, node) pairs that have been observed by
+	// reconcilePeers at least once since this satellite process
+	// started. Read by firstReconcileAfterBoot to decide whether
+	// to jitter the adoption-mode Status patch (Bug 342 adoption
+	// path). In-memory only — a pod restart counts as fresh boot
+	// (the jitter applies again, which is correct: all RDs hit
+	// adoption-mode in lockstep again after restart).
+	adoptOnceMu sync.Mutex
+	adoptOnce   map[string]struct{}
 }
 
 // NewReconciler constructs a Reconciler from cfg.
@@ -311,6 +331,16 @@ func (r *Reconciler) SetMetadataCreatedStamper(s MetadataCreatedStamper) {
 // the first Apply. Phase 11.3 Stage 2.
 func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper) {
 	r.cfg.FilesystemFormattedStamper = s
+}
+
+// SetAppliedPeerUIDsStamper injects the AppliedPeerUIDs stamper
+// post-construction. Mirrors `SetMetadataCreatedStamper`. The stamper
+// closes the Bug 342 loop by recording each peer's UID at the time of
+// the last successful adjust, so subsequent reconciles can detect
+// "same name, new identity" and force del-peer + forget-peer before
+// the kernel zombie wedges the new incarnation.
+func (r *Reconciler) SetAppliedPeerUIDsStamper(s AppliedPeerUIDsStamper) {
+	r.cfg.AppliedPeerUIDsStamper = s
 }
 
 // SetSkipDiskClearer injects the SkipDisk clearer post-construction.
@@ -1092,155 +1122,6 @@ func (r *Reconciler) crossNodeClone(
 	return nil
 }
 
-// tearDownRemovedPeers runs `drbdadm del-peer` AND `drbdmeta
-// forget-peer` for every peer that was in the previous .res but
-// is no longer in the new desired set.
-//
-// `drbdadm adjust` only adds / reconfigures peers; the kernel's
-// connection slot for a dropped peer would otherwise stay alive
-// in StandAlone forever. del-peer needs the peer's `on <node>`
-// block still in the .res to resolve its node-id, so run it
-// BEFORE overwriting the file.
-//
-// forget-peer clears the peer's per-peer GI / bitmap slot from
-// every diskful volume's on-disk metadata block. Without it,
-// DRBD-9 v09 metadata keeps the departed peer's slot occupied
-// for the lifetime of the resource — after enough node-replace
-// cycles the resource exhausts the MaxPeers-1 slot budget
-// `drbdadm create-md --max-peers=15` carved at first activation,
-// and the next replica add fails with drbdmeta running out of
-// room. Errors on individual forget-peer calls are logged and
-// not bubbled up: leaving a stale slot is a slow leak (recoverable
-// at any point in the future), while wedging the entire reconcile
-// on it would block the convergent steady-state path the dispatcher
-// drives. del-peer failures still bubble — those leak a live
-// kernel connection, which is a faster correctness issue.
-func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.DesiredResource, resPath string, devices map[int32]string) error {
-	removed := computeRemovedPeers(resPath, dr, r.cfg.NodeName)
-	if len(removed) == 0 {
-		return nil
-	}
-
-	// Peer-name → node-id from the OLD .res. The desired bag may
-	// no longer carry the removed peer's `peer.<name>.node-id`
-	// entry (dispatcher already pruned the spec), so the .res
-	// file we're about to overwrite is the only stable source.
-	peerIDs := extractResFilePeerNodeIDs(resPath)
-
-	for _, peer := range removed {
-		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer)
-		if err != nil {
-			return errors.Wrapf(err, "del-peer %s from %s", peer, dr.GetName())
-		}
-
-		// forget-peer is per-volume because v09 metadata lives in
-		// the per-volume block. Skip volumes without a device path
-		// (DISKLESS local replica — no metadata to clean) and
-		// peers without a resolvable node-id (.res malformed /
-		// races a brand-new resource being torn down before its
-		// peer ever rendered).
-		peerID, hasID := peerIDs[peer]
-		if !hasID {
-			continue
-		}
-
-		for volNum, device := range devices {
-			if device == "" {
-				continue
-			}
-
-			// forget-peer errors are non-fatal: a stale on-disk
-			// slot leaks one of the MaxPeers-1 budget entries but
-			// the resource keeps serving I/O. The next reconcile
-			// retries; if the leak persists, the eventual
-			// create-md exhaustion surfaces a louder error than
-			// any log line here could. del-peer errors still
-			// bubble (above) — those leak a live kernel
-			// connection, a faster correctness issue.
-			_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
-		}
-	}
-
-	return nil
-}
-
-// computeRemovedPeers diffs the previously-rendered .res file against
-// the new desired peer set. Returns peer node names that were present
-// before but are NOT in the new layout. Empty when the .res file
-// doesn't exist (first apply) or when the read fails — we'd rather
-// skip the del-peer pass than wedge the reconcile.
-func computeRemovedPeers(resPath string, dr *intent.DesiredResource, localNode string) []string {
-	body, err := os.ReadFile(resPath)
-	if err != nil {
-		return nil
-	}
-
-	old := extractResFilePeers(string(body))
-	if len(old) == 0 {
-		return nil
-	}
-
-	want := make(map[string]struct{}, len(dr.GetPeers())+1)
-	want[localNode] = struct{}{}
-
-	for _, p := range dr.GetPeerNames() {
-		want[p] = struct{}{}
-	}
-
-	var removed []string
-
-	for _, p := range old {
-		if _, keep := want[p]; !keep {
-			removed = append(removed, p)
-		}
-	}
-
-	return removed
-}
-
-// extractResFilePeers parses an `on <node> {` block list out of a
-// rendered .res file. We don't need a full DRBD parser — only the
-// peer node-name set, which writeOnBlock emits as `  on <name> {`.
-func extractResFilePeers(body string) []string {
-	var peers []string
-
-	for line := range strings.SplitSeq(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "on ") {
-			continue
-		}
-
-		rest := strings.TrimPrefix(trimmed, "on ")
-
-		head, _, ok := strings.Cut(rest, "{")
-		if !ok {
-			continue
-		}
-
-		name := strings.TrimSpace(head)
-		if name != "" {
-			peers = append(peers, name)
-		}
-	}
-
-	return peers
-}
-
-// extractResFilePeerNodeIDs parses the rendered .res file at
-// resPath and returns the peer-name → DRBD-node-id map encoded
-// in each `on <node> { ... node-id <N>; ... }` block. Used by
-// tearDownRemovedPeers to resolve the node-id for a peer that
-// was just dropped from the desired set: `drbdadm del-peer`
-// reads node-id from the (still-present) `on <peer>` block, but
-// `drbdmeta forget-peer` needs the raw integer, and we'd rather
-// pull it from the file we're about to overwrite than guess from
-// the desired bag (which the dispatcher may have already pruned).
-//
-// Missing file / unreadable / malformed block → empty map; the
-// caller skips forget-peer for that peer rather than emit a
-// bogus --node-id=0 collision against the local slot. Reads via
-// os.ReadFile so a transient I/O hiccup degrades to no-op
-// instead of wedging the reconcile.
 // hasLateAddedVolume reports whether the desired-state Volumes[]
 // includes at least one volume number that is NOT yet represented
 // as a `volume <N> {` block in the OLD .res file at resPath.
@@ -1418,14 +1299,16 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
 	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
-	// tearDownRemovedPeers MUST run before the FSM dispatch block:
-	// it reads the OLD .res to resolve node-ids for peers that have
-	// departed from the spec, and then issues del-peer / forget-peer
-	// for each one. The FSM dispatch's renderResFile preamble (Phase
-	// 11.2.c Stage 4 step 1) overwrites .res with the new peer set,
-	// so this tear-down step must observe the pre-render state to
-	// avoid leaking kernel connections and on-disk GI slots.
-	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
+	// reconcilePeers runs BEFORE the FSM dispatch block: passes 1+2+3
+	// (kernel-not-in-K8s / UID mismatch / zombie-slot probe) plus the
+	// adoption-mode gate need the pre-render kernel state, and the
+	// FSM dispatch's renderResFile preamble overwrites .res with the
+	// new peer set. Bug 342 replaced the legacy .res-file-based
+	// tearDownRemovedPeers with this three-source diff because the
+	// .res primitive missed "same name, new identity" (sub-second
+	// `r d X` + `r c X` left a kernel zombie slot bound to the old
+	// incarnation's PSK/handshake state).
+	err := r.reconcilePeers(ctx, dr, devices)
 	if err != nil {
 		return err
 	}
@@ -2445,6 +2328,20 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	}
 
 	if err == nil {
+		// Bug 342: stamp the per-peer UID baseline AFTER adjust
+		// succeeds so a subsequent r-d-then-r-c on a peer can be
+		// detected via UID mismatch (Pass 2 of reconcilePeers).
+		// Best-effort — a stamper failure is logged but does not
+		// fail the apply chain: the on-disk + kernel state is the
+		// authoritative reconcile signal; missing Status just
+		// degrades the next reconcile to Pass-3 zombie probe.
+		expected := indexExpectedPeers(dr.GetPeers())
+		if stampErr := r.stampAppliedPeerUIDs(ctx, dr, expected); stampErr != nil {
+			log.FromContext(ctx).Error(stampErr,
+				"stamp AppliedPeerUIDs after adjust; will retry next reconcile",
+				"rd", dr.GetName())
+		}
+
 		return nil
 	}
 
