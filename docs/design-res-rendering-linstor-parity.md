@@ -501,9 +501,19 @@ This is fine for Bug 77 (skip-sync at first-activation) because the algorithm re
 - Bug 87 (peer-node-id allocation race) hits because the per-Resource observation isn't atomic across the cluster — RscDfn-level GI doesn't exist in blockstor.
 - Future cross-cluster GI propagation (e.g. snapshot ship + restore preserving GI) needs an RD-level anchor blockstor doesn't have.
 
-**Trade-off acknowledged**: per-Resource is K8s-native (each satellite owns its Status), but loses LINSTOR's single-source GI anchor. **If migration parity matters more than current semantics**, add `RD.Status.AuthoritativeCurrentGi` as a controller-stamped aggregate (picks the highest CurrentGi from all UpToDate peers, refreshed periodically) — operators querying "what GI does this RD have" get one answer.
+**Trade-off acknowledged**: per-Resource is K8s-native (each satellite owns its Status), loses LINSTOR's single-source GI anchor.
 
-Decision: defer to v2 — Bug 77 works today, the LINSTOR-symmetric anchor is nice-to-have not blocker.
+**Decision (2026-05-20)**: keep current per-Resource approach. Rationale:
+
+1. **Physical accuracy** — DRBD itself stores GI per-replica in on-disk metadata. blockstor's per-Resource model reflects this directly; LINSTOR's `VD.CurrentGi` is an abstraction over physical reality (single number summarising N actual states).
+2. **Drift detection** — N independent observations let us notice when `node1`'s GI diverged from `node2`'s. LINSTOR cannot detect this from `VD.CurrentGi` alone — by design it can't represent disagreement.
+3. **K8s-native ownership** — each satellite writes only its own `Resource.Status`, zero cross-node write contention. RD-level aggregator would introduce a controller-mediated stamper hop just to mirror LINSTOR.
+4. **Bug 77 works today** — skip-sync reads from any UpToDate peer's `Resource.Status.Volumes[].CurrentGi`. "First UpToDate" peer selection is arbitrary but correct (UpToDate ⇒ GI is consistent across UpToDate peers by DRBD's own invariant).
+5. **Aggregator adds complexity for marginal gain** — operators query `kubectl get resources -l rd=<name>` and see N rows with consistent GI when healthy, or divergent GI when drifted. That's strictly more information than a single LINSTOR field.
+
+**Rejected**: `RD.Status.AuthoritativeCurrentGi` controller-aggregator. Would mirror LINSTOR's API at the cost of (a) extra reconciler, (b) opacity (single number hides drift), (c) write contention against observer's Status writes. Not worth the surface.
+
+**Cross-cluster snapshot ship**: when blockstor needs to carry GI across clusters (snapshot recv on a new cluster's RD), the shipper reads from any UpToDate source-peer's `Resource.Status.Volumes[].CurrentGi`. Same selection rule as Bug 77's skip-sync. No anchor needed in metadata.
 
 ## Where LINSTOR stores `shared-secret` (PSK)
 
