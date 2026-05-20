@@ -66,18 +66,26 @@ _rc_out=$("${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$R
 # A shrink attempted while one side is still Inconsistent could
 # spuriously succeed on the in-memory CRD before the satellite
 # observes it — we want the steady-state rejection, not a race.
+# --auto-place=2 stages 2 diskful peers + (optionally) a TieBreaker
+# diskless on the 3rd node. Filter to diskful only — Spec.Diskful=true
+# — so a TieBreaker placement (Bug 334 / Phase 11.6) doesn't count.
 deadline=$(( $(date +%s) + 90 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
-            | awk -v rd="$RD." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
+        kubectl get resources.blockstor.io.blockstor.io -o json 2>/dev/null \
+            | jq -r --arg rd "$RD" '
+                .items[]?
+                | select(.spec.resourceDefinitionName==$rd)
+                | select((.spec.diskful // false)==true)
+                | .spec.nodeName'
     )
-    if (( ${#placed_nodes[@]} == 2 )); then break; fi
+    if (( ${#placed_nodes[@]} >= 2 )); then break; fi
     sleep 2
 done
-if (( ${#placed_nodes[@]} != 2 )); then
-    echo "FAIL: autoplace did not stage 2 replicas" >&2
+if (( ${#placed_nodes[@]} < 2 )); then
+    echo "FAIL: autoplace did not stage 2 diskful replicas (got ${#placed_nodes[@]})" >&2
+    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>&1 | grep "^${RD}\\." >&2
     exit 1
 fi
 wait_uptodate "$RD" "${placed_nodes[0]}" "${placed_nodes[1]}"

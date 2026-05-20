@@ -63,7 +63,7 @@ linstor_cli_setup
 RD=cli-matrix-snap-lifecycle
 SNAP1=snap-multi
 SNAP2=snap-single
-SIZE_MIB=256
+SIZE_MIB=64
 
 N1=$WORKER_1
 N2=$WORKER_2

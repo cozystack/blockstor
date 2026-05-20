@@ -111,20 +111,26 @@ run_resize_lifecycle() {
     _rc_out=$("${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" 2>&1) \
         || { echo "FAIL: r c --auto-place=2 -s $POOL $RD: $_rc_out" >&2; return 1; }
 
-    # Resolve the placed pair (autoplacer chose which nodes — we wait
-    # for the Resource CRDs to appear, then wait_uptodate on each).
+    # Resolve the placed pair. --auto-place=2 stages 2 diskful peers
+    # + (optionally) a TieBreaker diskless on the 3rd node — filter to
+    # diskful only via Spec.Diskful=true so the tiebreaker row doesn't
+    # bump the count and force a stale-state FAIL.
     local deadline placed_nodes=()
     deadline=$(( $(date +%s) + 90 ))
     while (( $(date +%s) < deadline )); do
         mapfile -t placed_nodes < <(
-            kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
-                | awk -v rd="$RD." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
+            kubectl get resources.blockstor.io.blockstor.io -o json 2>/dev/null \
+                | jq -r --arg rd "$RD" '
+                    .items[]?
+                    | select(.spec.resourceDefinitionName==$rd)
+                    | select((.spec.diskful // false)==true)
+                    | .spec.nodeName'
         )
-        if (( ${#placed_nodes[@]} == 2 )); then break; fi
+        if (( ${#placed_nodes[@]} >= 2 )); then break; fi
         sleep 2
     done
-    if (( ${#placed_nodes[@]} != 2 )); then
-        echo "FAIL: autoplace did not stage 2 replicas for $RD" >&2
+    if (( ${#placed_nodes[@]} < 2 )); then
+        echo "FAIL: autoplace did not stage 2 diskful replicas for $RD (got ${#placed_nodes[@]})" >&2
         return 1
     fi
     local N1="${placed_nodes[0]}"
