@@ -441,6 +441,17 @@ func peerSetsAgree(expected map[string]intent.DesiredPeer, actual map[string]drb
 		if len(vols) > 0 && !slot.HasAnyPeerDeviceConfigured(vols) {
 			return false, "peer_device_absent:" + name
 		}
+
+		// Bug 342 v2: a Connecting/StandAlone slot is the exact wedge
+		// shape this reconciler exists to clean up — adopting it would
+		// stamp the stale-incarnation UID as baseline and block both
+		// Pass 2 (UID-mismatch teardown) and Pass 3 (zombie probe)
+		// from ever firing. Decline adoption so the caller falls
+		// through to the normal three-pass diff where Pass 3 tears
+		// the slot down after zombieGrace.
+		if slot.IsConnectingOrStandalone() {
+			return false, "peer_not_established:" + name + "=" + slot.ConnectionState
+		}
 	}
 
 	return true, ""

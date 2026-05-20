@@ -814,6 +814,73 @@ func TestPeerSetsAgree_PeerDeviceMissing_False(t *testing.T) {
 
 // Bug 342: name set, node-ids and per-vol peer-device presence all
 // match → adoption can stamp UIDs without disrupting connections.
+// Bug 342 v2: a Connecting/StandAlone slot is the wedge shape we're
+// trying to clean up. Adoption must decline so the three-pass diff
+// (specifically Pass 3 zombie probe) gets a chance to tear it down.
+// Before the v2 fix, peerSetsAgree returned true on this input and
+// reconcilePeers short-circuited via adoption — leaving the stale
+// kernel slot in place and causing Phase-3 relocate to wedge on
+// `disk='' rep='Off'` forever.
+func TestPeerSetsAgree_ConnectingSlot_False(t *testing.T) {
+	t.Parallel()
+
+	expected := map[string]intent.DesiredPeer{
+		"n2": {Name: "n2", NodeID: 1},
+		"n3": {Name: "n3", NodeID: 2},
+	}
+	actual := map[string]drbd.KernelSlot{
+		"n2": {
+			Name: "n2", NodeID: 1, ConnectionState: "Connected",
+			PeerDevicesByVolNum: map[int32]drbd.KernelPeerDevice{
+				0: {VolumeNumber: 0, Configured: true},
+			},
+		},
+		"n3": {
+			Name: "n3", NodeID: 2, ConnectionState: "Connecting",
+			PeerDevicesByVolNum: map[int32]drbd.KernelPeerDevice{
+				0: {VolumeNumber: 0, Configured: true},
+			},
+		},
+	}
+
+	ok, reason := peerSetsAgree(expected, actual, []int32{0})
+	if ok {
+		t.Fatalf("peerSetsAgree: Connecting slot must decline adoption; got ok=true")
+	}
+
+	if reason == "" || !strings.Contains(reason, "peer_not_established") {
+		t.Errorf("peerSetsAgree: decline reason must mention peer_not_established; got %q", reason)
+	}
+}
+
+// Bug 342 v2: same intent as TestPeerSetsAgree_ConnectingSlot_False
+// but for the StandAlone case — the kernel may park a stale slot in
+// StandAlone after a netsplit. Adoption must still decline.
+func TestPeerSetsAgree_StandAloneSlot_False(t *testing.T) {
+	t.Parallel()
+
+	expected := map[string]intent.DesiredPeer{
+		"n2": {Name: "n2", NodeID: 1},
+	}
+	actual := map[string]drbd.KernelSlot{
+		"n2": {
+			Name: "n2", NodeID: 1, ConnectionState: "StandAlone",
+			PeerDevicesByVolNum: map[int32]drbd.KernelPeerDevice{
+				0: {VolumeNumber: 0, Configured: true},
+			},
+		},
+	}
+
+	ok, reason := peerSetsAgree(expected, actual, []int32{0})
+	if ok {
+		t.Fatalf("peerSetsAgree: StandAlone slot must decline adoption; got ok=true")
+	}
+
+	if reason == "" || !strings.Contains(reason, "peer_not_established") {
+		t.Errorf("peerSetsAgree: decline reason must mention peer_not_established; got %q", reason)
+	}
+}
+
 func TestPeerSetsAgree_AllAgree_True(t *testing.T) {
 	t.Parallel()
 
