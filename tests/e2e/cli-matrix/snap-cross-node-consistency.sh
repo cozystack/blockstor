@@ -247,10 +247,15 @@ if [[ "$md5_n1" != "$md5_n2" ]]; then
     # cross-node byte-identical snapshots over a loopback-backed
     # provider need send-recv coordination (like upstream LINSTOR's
     # ZFS send | ssh + zfs recv), not local-only cp.
-    provider=$(kubectl get sp -o json 2>/dev/null | jq -r --arg n "$N1" '
-        .items[]? | select(.spec.nodeName==$n and .spec.poolName=="stand") | .spec.providerKind' \
-        | head -1)
-    if [[ "$provider" == "FILE_THIN" || "$provider" == "FILE" ]]; then
+    # Detect FILE_THIN via /var/lib/blockstor-pool presence — robust
+    # under `set -e` since `test -d` returns 1 cleanly when absent
+    # (whereas kubectl|jq pipelines can bail on kubectl errors and
+    # `set -e` exits before SKIP/FAIL prints).
+    file_thin=false
+    if on_node "$N1" test -d /var/lib/blockstor-pool 2>/dev/null; then
+        file_thin=true
+    fi
+    if $file_thin; then
         echo "SKIP (Bug 351, FILE_THIN architectural limit): snapshot md5 differs across nodes" >&2
         echo "  $N1 md5 = $md5_n1" >&2
         echo "  $N2 md5 = $md5_n2" >&2

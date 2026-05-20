@@ -355,10 +355,12 @@ if [[ "$md5_n1" != "$md5_n2" ]]; then
     # can't deliver cross-node byte equality without send-recv
     # coordination. Validated on LVM-thin / ZFS; FILE_THIN is best-
     # effort.
-    provider=$(kubectl get sp -o json 2>/dev/null | jq -r --arg n "$N1" '
-        .items[]? | select(.spec.nodeName==$n and .spec.poolName=="stand") | .spec.providerKind' \
-        | head -1)
-    if [[ "$provider" == "FILE_THIN" || "$provider" == "FILE" ]]; then
+    file_thin=false
+    if on_node "$N1" test -d /var/lib/blockstor-pool 2>/dev/null; then
+        file_thin=true
+    fi
+    if $file_thin; then
+        provider=FILE_THIN
         echo "SKIP (Bug 351, FILE_THIN architectural limit): byte-level check skipped on $provider"
         echo "  $N1 md5 = $md5_n1"
         echo "  $N2 md5 = $md5_n2"
