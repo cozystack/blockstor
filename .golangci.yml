@@ -210,6 +210,13 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/rest/
+      # pkg/drbd/drbdsetup_show.go mirrors drbd-utils' on-the-wire JSON
+      # shape (`drbdsetup show -j`) which uses snake_case with leading
+      # underscores on private-implementation fields. The JSON tags
+      # MUST match verbatim or the parser breaks on real-world output.
+      - linters:
+          - tagliatelle
+        path: pkg/drbd/drbdsetup_show
       # cmd/{controller,satellite}/main.go is kubebuilder manager scaffold —
       # don't lint its boilerplate (TODOs, function length, globals, inline
       # err checks, wsl).

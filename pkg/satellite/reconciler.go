@@ -220,6 +220,19 @@ type Reconciler struct {
 
 	mu             sync.Mutex
 	resourceToPool map[string]string
+
+	// seenStuckAt is the in-memory debounce table for the Bug 342
+	// v3 proactive kernel cleanup (Pass 3 stuck-slot probe). Keyed
+	// by "<rd>/<peerName>"; value is the first wall-clock time the
+	// satellite observed that slot in the Connecting / StandAlone
+	// state with no peer-device configured. Subsequent reconciles
+	// compare time.Since(first) against the configurable grace
+	// before tearing the slot down; any reconcile where the slot
+	// is no longer stuck clears the entry so the timer resets on
+	// the next healthy probe. Lives in process memory only — a
+	// satellite restart resets the table, at worst delaying
+	// recovery by `grace` (default 30s).
+	seenStuckAt map[string]time.Time
 }
 
 // NewReconciler constructs a Reconciler from cfg.
@@ -235,6 +248,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 	return &Reconciler{
 		cfg:            cfg,
 		resourceToPool: map[string]string{},
+		seenStuckAt:    map[string]time.Time{},
 	}
 }
 

@@ -461,6 +461,29 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// for the controller to stamp Status.DRBDNodeID/Port/Minor would
 	// block apply forever — they never come.
 	if rdNeedsDRBD(&rd) {
+		// Bug 342 v3: prune zombie kernel slots BEFORE the
+		// allocation gate. The gate short-circuits the entire
+		// Apply chain when ANY peer's Status.DRBDNodeID is nil,
+		// which is exactly the state a Phase-3 relocate lands in
+		// — and the kernel-side slot from the previous incarnation
+		// (Connecting / StandAlone with no peer-device) would
+		// survive the entire wait window otherwise. Kernel-state
+		// cleanup doesn't need peer DRBDNodeID allocation, only
+		// the current expected peer-name set. Non-fatal: a Pass-1
+		// del-peer failure logs and falls through to the gate so
+		// the next reconcile retries; the safety net is best-
+		// effort by design.
+		pruneErr := r.Config.Apply.PruneStaleKernelSlots(
+			ctx,
+			rd.Name,
+			expectedPeerNamesFor(res, peers),
+			volNumsOf(&rd),
+			nil, // devices unknown at this layer; forget-peer skipped per-vol
+		)
+		if pruneErr != nil {
+			logger.Error(pruneErr, "PruneStaleKernelSlots failed; continuing to allocation gate")
+		}
+
 		if waitResult, waitOK := r.waitForControllerAllocation(ctx, res, peers, logger); !waitOK {
 			return waitResult, nil
 		}
@@ -1114,6 +1137,43 @@ func rdNeedsDRBD(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	}
 
 	return slices.Contains(stack, "DRBD")
+}
+
+// expectedPeerNamesFor returns the peer-node-name set the Bug 342 v3
+// kernel-slot prune compares against `drbdsetup show -j`. The local
+// satellite's own node is NOT a peer from the kernel's view —
+// drbdsetup enumerates remote peers only — so this filter drops
+// `target.Spec.NodeName`. Returns nil-safe empty slice when peers
+// is empty.
+func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) []string {
+	out := make([]string, 0, len(peers))
+
+	for i := range peers {
+		name := peers[i].Spec.NodeName
+		if name == "" || name == target.Spec.NodeName {
+			continue
+		}
+
+		out = append(out, name)
+	}
+
+	return out
+}
+
+// volNumsOf extracts the volume-number set from
+// `rd.Spec.VolumeDefinitions`. The Bug 342 v3 Pass-3 stuck-slot
+// probe needs the set to query the kernel's peer-device
+// registration table (a connection slot with no peer-device for ANY
+// volume is the zombie signature). Returns nil-safe empty slice
+// when VolumeDefinitions is empty.
+func volNumsOf(rd *blockstoriov1alpha1.ResourceDefinition) []int32 {
+	out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+
+	for i := range rd.Spec.VolumeDefinitions {
+		out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+	}
+
+	return out
 }
 
 // waitForControllerAllocation gates the apply path on the
