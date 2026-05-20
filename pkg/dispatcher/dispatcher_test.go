@@ -1345,8 +1345,8 @@ func TestInactivePeerDroppedFromSiblings(t *testing.T) {
 		t.Fatalf("Peers: got %v, want exactly [n2] (INACTIVE n3 must be dropped)", got.Peers)
 	}
 
-	if got.Peers[0].Name != "n2" {
-		t.Errorf("Peers[0].Name=%q, want %q", got.Peers[0].Name, "n2")
+	if got.Peers[0] != "n2" {
+		t.Errorf("Peers[0]=%q, want %q", got.Peers[0], "n2")
 	}
 
 	// drbdOpts must not carry any `peer.n3.*` keys — INACTIVE peer is

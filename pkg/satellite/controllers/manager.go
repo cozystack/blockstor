@@ -190,7 +190,6 @@ func wireConditionStampers(mgr manager.Manager, cfg Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
 	wireSkipDiskClearer(mgr, cfg)
-	wireAppliedPeerUIDsStamper(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -336,17 +335,6 @@ func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
 // Mirrors `wireMetadataCreatedStamper`. Phase 11.3 Stage 2.
 func wireFilesystemFormattedStamper(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetFilesystemFormattedStamper(&FilesystemFormattedStamper{
-		Client: mgr.GetClient(),
-	})
-}
-
-// wireAppliedPeerUIDsStamper injects the AppliedPeerUIDsStamper into
-// the Apply chain so `runAdjust` can SSA-patch Status.AppliedPeerUIDs
-// after a successful adjust. Mirrors `wireMetadataCreatedStamper` —
-// the stamper needs the manager's cached client which doesn't exist
-// at NewReconciler time.
-func wireAppliedPeerUIDsStamper(mgr manager.Manager, cfg Config) {
-	cfg.Apply.SetAppliedPeerUIDsStamper(&AppliedPeerUIDsStamper{
 		Client: mgr.GetClient(),
 	})
 }

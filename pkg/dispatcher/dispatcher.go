@@ -26,7 +26,6 @@ package dispatcher
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -140,7 +139,7 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 // assembleDesired packages the per-replica wire payload. Pulled out
 // of BuildDesired so the caller stays under the funlen budget.
 func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition, dropped []string, drbdOpts, effectiveProps map[string]string) *intent.DesiredResource {
-	desiredPeers := buildDesiredPeers(dropped, peers)
+	_ = peers // peers info already folded into drbdOpts via addPeerEntries
 
 	wireProps := mergeEffectiveProps(target.Spec.Props, effectiveProps, drbdOpts)
 
@@ -189,79 +188,16 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return &intent.DesiredResource{
-		Name:            target.Spec.ResourceDefinitionName,
-		NodeName:        target.Spec.NodeName,
-		Flags:           target.Spec.Flags,
-		Props:           wireProps,
-		Peers:           desiredPeers,
-		Volumes:         buildVolumes(rd, target),
-		DrbdOptions:     drbdOpts,
-		LayerStack:      layerStack,
-		Connections:     connectionsFromRD(rd),
-		AppliedPeerUIDs: copyAppliedPeerUIDs(target.Status.AppliedPeerUIDs),
+		Name:        target.Spec.ResourceDefinitionName,
+		NodeName:    target.Spec.NodeName,
+		Flags:       target.Spec.Flags,
+		Props:       wireProps,
+		Peers:       dropped,
+		Volumes:     buildVolumes(rd, target),
+		DrbdOptions: drbdOpts,
+		LayerStack:  layerStack,
+		Connections: connectionsFromRD(rd),
 	}
-}
-
-// buildDesiredPeers walks the dropped peer-name list (already sorted
-// + INACTIVE-filtered by BuildDesired) and joins each name against
-// the peer Resource CR set to produce one DesiredPeer per entry:
-// (name, peer DRBD node-id, peer Resource metadata.uid). The UID is
-// the Bug 342 signal — the satellite stamps it onto
-// Resource.Status.AppliedPeerUIDs after every successful adjust so
-// the next reconcile can detect "same name, new identity" and force
-// del-peer + forget-peer before adjust re-registers.
-//
-// Order matches `dropped` — callers that built drbdOpts off of
-// dropped see the same name sequence here. Peers whose Resource CR
-// is missing from `peers` (race window where the .res renderer
-// reads addPeerEntries' output but the CR was deleted in-flight)
-// land as zero-value entries (empty UID); the satellite's
-// reconcilePeers treats empty UID as "no known identity" — same
-// shape as the rollout window before Status.AppliedPeerUIDs is
-// backfilled.
-func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) []intent.DesiredPeer {
-	if len(dropped) == 0 {
-		return nil
-	}
-
-	byName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
-	for i := range peers {
-		byName[peers[i].Spec.NodeName] = &peers[i]
-	}
-
-	out := make([]intent.DesiredPeer, 0, len(dropped))
-
-	for _, name := range dropped {
-		entry := intent.DesiredPeer{Name: name}
-
-		if p, ok := byName[name]; ok {
-			if id := nodeIDOf(p); id >= 0 {
-				entry.NodeID = id
-			}
-
-			entry.ResourceUID = string(p.UID)
-		}
-
-		out = append(out, entry)
-	}
-
-	return out
-}
-
-// copyAppliedPeerUIDs returns a defensive copy of the Status map so
-// the dispatcher's output doesn't alias the apiserver client's
-// cached Resource (a downstream mutation would race the cache).
-// nil-safe; returns nil for the empty case so the satellite's
-// adoption-mode gate `len(applied) == 0` keeps its meaning.
-func copyAppliedPeerUIDs(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return nil
-	}
-
-	out := make(map[string]string, len(src))
-	maps.Copy(out, src)
-
-	return out
 }
 
 // drbdEncryptionPassphraseKey is the legacy per-RD shape the

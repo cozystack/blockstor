@@ -49,7 +49,7 @@ func dispatchFixtureDR(name string) (*intent.DesiredResource, map[int32]string) 
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers: []string{"n2"},
 		DrbdOptions: map[string]string{
 			"port":            "7000",
 			"node-id":         "0",
@@ -402,7 +402,7 @@ func TestApplyDRBDRendersResViaFsmDispatchOnly(t *testing.T) {
 	// inside dispatchFsmAction MUST rewrite the .res body so the
 	// new peer block lands on disk before the phase-specific action
 	// (createMd / up / adjust) runs.
-	dr.Peers = append(dr.Peers, intent.DesiredPeer{Name: "n3"})
+	dr.Peers = append(dr.Peers, "n3")
 	dr.DrbdOptions["peer.n3.address"] = "10.0.0.3"
 	dr.DrbdOptions["peer.n3.node-id"] = "2"
 	dr.DrbdOptions["peer.n3.port"] = "7000"

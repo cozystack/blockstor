@@ -210,12 +210,6 @@ linters:
       - linters:
           - tagliatelle
         path: pkg/rest/
-      # pkg/drbd/drbdsetup_show.go models drbd-utils' `drbdsetup show -j`
-      # output verbatim — snake_case + leading-underscore fields are the
-      # wire format upstream emits. Renaming them would prevent unmarshal.
-      - linters:
-          - tagliatelle
-        path: pkg/drbd/drbdsetup_show
       # cmd/{controller,satellite}/main.go is kubebuilder manager scaffold —
       # don't lint its boilerplate (TODOs, function length, globals, inline
       # err checks, wsl).

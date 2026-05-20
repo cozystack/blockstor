@@ -36,8 +36,8 @@ import (
 // (the legacy chain handles them), for the explicit "no-op" action
 // (FSM says nothing to do), and for actions the FSM can't safely
 // double-fire on (ActionDecommission — delete-path territory the
-// legacy chain still owns through reconcilePeers + the dedicated
-// DeleteResource pipeline).
+// legacy chain still owns through tearDownRemovedPeers and the
+// dedicated DeleteResource pipeline).
 //
 // Phase 11.2.c Stage 3d: shadow-dispatches every action. The helpers
 // are content-idempotent so re-running the same work via the legacy
