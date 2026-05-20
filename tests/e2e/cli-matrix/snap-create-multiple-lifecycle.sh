@@ -379,6 +379,12 @@ read_counter() {
             lvchange -an \"\$lv\" 2>/dev/null || true
             exit 0
         fi
+        # FILE_THIN snapshot — .img sibling at /var/lib/blockstor-pool
+        img=\$(ls /var/lib/blockstor-pool/${rd}_${SNAP}_*.img 2>/dev/null | head -1)
+        if [ -n \"\$img\" ]; then
+            head -c 8 \"\$img\" 2>/dev/null | xxd -p
+            exit 0
+        fi
         echo ''
     " 2>/dev/null
 }

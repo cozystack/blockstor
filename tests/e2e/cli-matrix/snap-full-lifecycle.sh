@@ -328,6 +328,12 @@ probe_md5() {
             lvchange -an \"\$lv\" 2>/dev/null || true
             exit 0
         fi
+        # FILE_THIN snapshot — .img sibling next to live backing
+        img=\$(ls /var/lib/blockstor-pool/${RD}_${SNAP1}_*.img 2>/dev/null | head -1)
+        if [ -n \"\$img\" ]; then
+            md5sum \"\$img\" | awk '{print \$1}'
+            exit 0
+        fi
         echo ''
     " 2>/dev/null
 }

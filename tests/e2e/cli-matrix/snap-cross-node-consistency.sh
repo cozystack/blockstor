@@ -183,7 +183,12 @@ echo ">> md5sum the snapshot backing on $N1 + $N2 and compare"
 
 probe_md5() {
     local node=$1
-    # Try ZFS: zfs send the snapshot to stdout, md5 the bytes
+    # Provider-aware: probe ZFS, LVM-thin, and FILE_THIN backings.
+    # Why FILE_THIN matters here: stand's `stand` storage pool is
+    # provisioned with provider FILE_THIN (StorDriver/FileDir =
+    # /var/lib/blockstor-pool), so `cp --reflink` snapshots land as
+    # /var/lib/blockstor-pool/<rd>_<snap>_<volnum>.img — neither
+    # `zfs list -t snapshot` nor `lvs` see anything.
     local md5
     md5=$(on_node "$node" bash -c "
         # ZFS snapshot — find any dataset with this snap name
@@ -202,6 +207,12 @@ probe_md5() {
             dd if=\"\$dev\" bs=1M count=$SIZE_MIB status=none 2>/dev/null \
                 | md5sum | awk '{print \$1}'
             lvchange -an \"\$lv\" 2>/dev/null || true
+            exit 0
+        fi
+        # FILE_THIN snapshot — .img sibling next to live backing
+        img=\$(ls /var/lib/blockstor-pool/${RD}_${SNAP}_*.img 2>/dev/null | head -1)
+        if [ -n \"\$img\" ]; then
+            md5sum \"\$img\" | awk '{print \$1}'
             exit 0
         fi
         echo ''
