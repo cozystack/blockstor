@@ -380,7 +380,7 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 	return a.run(ctx, "new-current-uuid", resource)
 }
 
-// SuspendIO runs `drbdsetup suspend-io <resource>` — freezes the
+// SuspendIO runs `drbdadm suspend-io <resource>` — freezes the
 // resource's block-I/O path on the local satellite so a backing
 // snapshot (LVM-thin / ZFS / file) captures bytes at a stable
 // point. Mirrors upstream LINSTOR's CtrlSnapshotCrtApiCallHandler
@@ -391,21 +391,23 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 // don't capture divergent bytes while the application writer
 // streams traffic. Bug 351.
 //
-// Shells out to `drbdsetup` (NOT `drbdadm`) because suspend-io is
-// a kernel-direct operation: drbdadm would parse the .res file
-// before forwarding to drbdsetup, and we want the freeze to fire
-// even mid-config-rewrite. Idempotent on a freshly-suspended
-// resource — the kernel folds a second suspend-io into a no-op.
+// Why drbdadm not drbdsetup: drbdsetup's `suspend-io` subcommand
+// takes a minor number or `/dev/drbdN` path, not a resource name —
+// passing a resource name yields `exit 20: Cannot determine minor
+// device number of device '<res>'`. drbdadm resolves the resource
+// name to its kernel minor via the local .res file and forwards to
+// drbdsetup correctly. Idempotent on a freshly-suspended resource
+// — the kernel folds a second suspend-io into a no-op.
 func (a *Adm) SuspendIO(ctx context.Context, resource string) error {
-	_, err := a.exec.Run(ctx, "drbdsetup", "suspend-io", resource)
+	_, err := a.exec.Run(ctx, "drbdadm", "suspend-io", resource)
 	if err != nil {
-		return errors.Wrapf(err, "drbdsetup suspend-io %s", resource)
+		return errors.Wrapf(err, "drbdadm suspend-io %s", resource)
 	}
 
 	return nil
 }
 
-// ResumeIO runs `drbdsetup resume-io <resource>` — the
+// ResumeIO runs `drbdadm resume-io <resource>` — the
 // counterpart to SuspendIO. MUST be called on every node the
 // controller broadcast SuspendIO to, even on the abort path: a
 // partially-acked suspend followed by no resume leaves the
@@ -414,13 +416,17 @@ func (a *Adm) SuspendIO(ctx context.Context, resource string) error {
 // flips Spec.SuspendIo=false on Phase 3 (or on any per-node
 // Failed) so this fires on every targeted node. Bug 351.
 //
+// Why drbdadm not drbdsetup: same as SuspendIO above — drbdsetup
+// resume-io takes a kernel minor, not a resource name. drbdadm
+// resolves res→minor via .res file and forwards to drbdsetup.
+//
 // Idempotent on a resource that's already running — the kernel
 // folds a second resume-io into a no-op, so a retry after a
 // crashed satellite never wedges anything.
 func (a *Adm) ResumeIO(ctx context.Context, resource string) error {
-	_, err := a.exec.Run(ctx, "drbdsetup", "resume-io", resource)
+	_, err := a.exec.Run(ctx, "drbdadm", "resume-io", resource)
 	if err != nil {
-		return errors.Wrapf(err, "drbdsetup resume-io %s", resource)
+		return errors.Wrapf(err, "drbdadm resume-io %s", resource)
 	}
 
 	return nil

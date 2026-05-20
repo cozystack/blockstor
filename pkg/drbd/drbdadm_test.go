@@ -561,13 +561,16 @@ func TestAdmHasDisklessVolumeFalsePeerDiskless(t *testing.T) {
 	}
 }
 
-// TestAdmSuspendIOInvokesDrbdsetup pins the Bug-351 freeze
-// command: SuspendIO → `drbdsetup suspend-io <res>`. Distinct
-// from drbdadm because suspend-io is a kernel-direct operation —
-// the per-snapshot orchestration MUST freeze even mid-.res-rewrite
-// (the controller writes Spec.SuspendIo=true and we shell out
-// before any config-file dance).
-func TestAdmSuspendIOInvokesDrbdsetup(t *testing.T) {
+// TestAdmSuspendIOInvokesDrbdadm pins the Bug-351 freeze
+// command: SuspendIO → `drbdadm suspend-io <res>`.
+//
+// Why drbdadm not drbdsetup: drbdsetup's `suspend-io` takes a
+// kernel minor or `/dev/drbdN` path, not a resource name —
+// passing a resource name yields `exit 20: Cannot determine
+// minor device number of device '<res>'` on a real satellite.
+// drbdadm resolves the resource name to its kernel minor via
+// the local .res file and forwards to drbdsetup correctly.
+func TestAdmSuspendIOInvokesDrbdadm(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
@@ -576,30 +579,28 @@ func TestAdmSuspendIOInvokesDrbdsetup(t *testing.T) {
 		t.Fatalf("SuspendIO: %v", err)
 	}
 
-	want := "drbdsetup suspend-io pvc-1"
+	want := "drbdadm suspend-io pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
 
-	// Regression guard: SuspendIO MUST NOT shell out to drbdadm.
-	// The whole reason this method targets drbdsetup directly is
-	// to skip drbdadm's .res-file lookup; a regression that fell
-	// back to drbdadm would defeat the controller-orchestrated
-	// freeze path the moment a snapshot lands mid-config-rewrite.
+	// Regression guard: SuspendIO MUST NOT shell out to drbdsetup
+	// directly with the resource name — that's the bug we just
+	// fixed (drbdsetup needs a minor, not a resource name).
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm ") {
-			t.Errorf("SuspendIO shelled out to drbdadm (defeats the kernel-direct freeze purpose): %s",
+		if strings.HasPrefix(line, "drbdsetup suspend-io ") {
+			t.Errorf("SuspendIO shelled out to drbdsetup directly (Bug 351 regression — exit 20 on resource name): %s",
 				line)
 		}
 	}
 }
 
-// TestAdmResumeIOInvokesDrbdsetup pins ResumeIO →
-// `drbdsetup resume-io <res>`. Same kernel-direct rationale as
-// SuspendIO; the orchestration's Phase-3 resume MUST fire on
+// TestAdmResumeIOInvokesDrbdadm pins ResumeIO →
+// `drbdadm resume-io <res>`. Same drbdadm-resolves-minor rationale
+// as SuspendIO; the orchestration's Phase-3 resume MUST fire on
 // every targeted node even on the abort path or application I/O
 // hangs forever on the still-frozen siblings.
-func TestAdmResumeIOInvokesDrbdsetup(t *testing.T) {
+func TestAdmResumeIOInvokesDrbdadm(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
@@ -608,14 +609,14 @@ func TestAdmResumeIOInvokesDrbdsetup(t *testing.T) {
 		t.Fatalf("ResumeIO: %v", err)
 	}
 
-	want := "drbdsetup resume-io pvc-1"
+	want := "drbdadm resume-io pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm ") {
-			t.Errorf("ResumeIO shelled out to drbdadm: %s", line)
+		if strings.HasPrefix(line, "drbdsetup resume-io ") {
+			t.Errorf("ResumeIO shelled out to drbdsetup directly: %s", line)
 		}
 	}
 }
