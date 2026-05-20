@@ -125,6 +125,27 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 			nodeID = slot.NodeID
 		}
 
+		// Bug 342 v5: when neither the kernel-observed slot nor
+		// the K8s-allocated peer NodeID is available, DEFER
+		// eviction to a future reconcile. A del-peer without
+		// matching forget-peer drops the kernel connection but
+		// leaves stale per-volume GI/bitmap metadata; the
+		// subsequent new-peer handshake (after the relocated
+		// peer brings DRBD up with a fresh GI epoch) exposes
+		// the mismatch and the LOCAL stable peer regresses its
+		// own disk_state to Inconsistent / Outdated. Skipping
+		// this reconcile is safe: the next one (after kernel
+		// loads OR allocation lands) will see the same UID
+		// mismatch and try again with a resolvable node-id.
+		if nodeID == 0 {
+			logger.Info("UID mismatch detected but peer node-id unresolved — deferring eviction",
+				"peer", peer.Name,
+				"oldUID", last,
+				"newUID", peer.ResourceUID)
+
+			continue
+		}
+
 		logger.Info("UID mismatch — evicting kernel slot for re-incarnated peer",
 			"peer", peer.Name,
 			"oldUID", last,
