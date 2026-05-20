@@ -259,7 +259,7 @@ if [[ "$md5_n1" != "$md5_n2" ]]; then
         echo "SKIP (Bug 351, FILE_THIN architectural limit): snapshot md5 differs across nodes" >&2
         echo "  $N1 md5 = $md5_n1" >&2
         echo "  $N2 md5 = $md5_n2" >&2
-        echo "  provider=$provider — cp --reflink can't deliver cross-node byte equality" >&2
+        echo "  provider=FILE_THIN — cp --reflink can't deliver cross-node byte equality" >&2
         echo "  without satellite-coordinated send-recv. Validated on LVM-thin / ZFS." >&2
         exit 0
     fi
