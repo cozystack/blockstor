@@ -102,28 +102,17 @@ fi
 echo "   diskful nodes: ${diskful_nodes[*]}"
 
 echo ">> wait up to 180s for vol-0 AND vol-1 to reach UpToDate on both replicas"
-# Initial sync of a 768 MiB total RD on a busy QEMU stand takes time;
-# add headroom over the single-volume catchers' 90s.
-deadline=$(( $(date +%s) + 180 ))
-all_up=false
-while (( $(date +%s) < deadline )); do
-    # 2 replicas × 2 volumes = 4 disk_state strings, all UpToDate.
-    states=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '[.[][]? | .vlms[]? | .state.disk_state // "Unknown"] | join(",")' \
-        2>/dev/null || echo "")
-    count_uptodate=$(awk -F, '{ for (i=1;i<=NF;i++) if ($i=="UpToDate") n++ } END { print n+0 }' <<<"$states")
-    if (( count_uptodate == 4 )); then
-        all_up=true
-        break
-    fi
-    sleep 3
+# Why: use lib.sh helper that reads the Resource CRD's
+# `.status.volumes[].diskState` (the same jsonpath every other catcher
+# uses) instead of rolling a jq over LINSTOR's machine-readable output
+# whose schema doesn't have `.vlms[].state.disk_state` — the legacy
+# upstream v0 path the cell tried jq'ing through never resolves on
+# blockstor's v1 shape, so the gate was permanently FAILing.
+for node in "${diskful_nodes[@]}"; do
+    for vol in 0 1; do
+        wait_status_state "$RD" "$node" UpToDate 180 "$vol"
+    done
 done
-
-if [[ "$all_up" != "true" ]]; then
-    echo "FAIL: vol-0 + vol-1 did not reach UpToDate on both replicas within 180s" >&2
-    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -30 >&2
-    exit 1
-fi
 
 # Resolve the DRBD minor for vol-0 from the .res file on any diskful
 # replica. vol-1's device is minor+1 by construction (the satellite
