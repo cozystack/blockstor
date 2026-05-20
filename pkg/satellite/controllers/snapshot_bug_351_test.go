@@ -55,7 +55,7 @@ func newBug351Scheme(t *testing.T) *runtime.Scheme {
 
 // TestSnapshotReconcileBug351SuspendsAndAcks pins Phase 1: when
 // the controller-side orchestrator stamps Spec.SuspendIo=true, the
-// satellite reconciler MUST call `drbdsetup suspend-io <rd>`
+// satellite reconciler MUST call `drbdadm suspend-io <rd>`
 // against the parent RD and stamp
 // Status.NodeStatus[us].SuspendIoAcked=true.
 //
@@ -87,8 +87,8 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 		Build()
 
 	fx := storage.NewFakeExec()
-	// drbdsetup suspend-io exit 0.
-	fx.Expect("drbdsetup suspend-io pvc-1", storage.FakeResponse{Stdout: []byte("")})
+	// drbdadm suspend-io exit 0.
+	fx.Expect("drbdadm suspend-io pvc-1", storage.FakeResponse{Stdout: []byte("")})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{},
@@ -111,8 +111,8 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	// drbdsetup suspend-io MUST have fired against the parent RD.
-	want := "drbdsetup suspend-io pvc-1"
+	// drbdadm suspend-io MUST have fired against the parent RD.
+	want := "drbdadm suspend-io pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
@@ -213,7 +213,7 @@ func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 	}
 
 	// Phase 2 MUST NOT re-fire suspend-io (already acked).
-	if slices.Contains(fx.CommandLines(), "drbdsetup suspend-io pvc-1") {
+	if slices.Contains(fx.CommandLines(), "drbdadm suspend-io pvc-1") {
 		t.Errorf("Phase 2 re-fired suspend-io after Status ack")
 	}
 
@@ -238,7 +238,7 @@ func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 // TestSnapshotReconcileBug351ResumesWhenSuspendCleared pins
 // Phase 3: when the controller-side orchestrator flips
 // Spec.SuspendIo=false (success path OR abort path), the
-// satellite MUST call `drbdsetup resume-io <rd>` and clear its
+// satellite MUST call `drbdadm resume-io <rd>` and clear its
 // SuspendIoAcked stamp. Without this drain a partial-success or
 // abort leaves application I/O hung forever on the still-frozen
 // siblings.
@@ -276,7 +276,7 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 		Build()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdsetup resume-io pvc-1", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdadm resume-io pvc-1", storage.FakeResponse{Stdout: []byte("")})
 
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{},
@@ -299,7 +299,7 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	want := "drbdsetup resume-io pvc-1"
+	want := "drbdadm resume-io pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("missing %q in calls: %v", want, fx.CommandLines())
 	}
@@ -327,7 +327,7 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 }
 
 // TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError
-// pins the abort path: if `drbdsetup suspend-io` fails, the
+// pins the abort path: if `drbdadm suspend-io` fails, the
 // satellite MUST stamp Status.Flags=["FAILED"] +
 // Status.NodeStatus[us].Failed=true so the orchestrator drains
 // the suspended siblings rather than waiting indefinitely for an
@@ -357,9 +357,9 @@ func TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError(t *testing.T) {
 		Build()
 
 	fx := storage.NewFakeExec()
-	// drbdsetup suspend-io fails — simulates a missing kernel
+	// drbdadm suspend-io fails — simulates a missing kernel
 	// module or a permanently-broken resource.
-	fx.Expect("drbdsetup suspend-io pvc-1", storage.FakeResponse{
+	fx.Expect("drbdadm suspend-io pvc-1", storage.FakeResponse{
 		Err: errBug351SuspendBroken,
 	})
 
@@ -406,7 +406,7 @@ func TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError(t *testing.T) {
 	}
 }
 
-var errBug351SuspendBroken = bug351Error("drbdsetup suspend-io: kernel module not loaded")
+var errBug351SuspendBroken = bug351Error("drbdadm suspend-io: kernel module not loaded")
 
 // bug351Error is a typed wrapper so the table-driven assertion
 // can distinguish "expected failure" from a real storage stack
