@@ -358,6 +358,151 @@ The "Applied peer UIDs" comment block makes the Bug 342 adoption history visible
 
 If Bug 342 needs to ship before P0a completes, adoption-mode degrades gracefully: PSK check skipped (`Spec.Auth.SecretRef == nil` → treat as "no PSK enforcement"), Bug 342 still closed for non-PSK case.
 
+## Operator interface — `linstor [c|rg|rd|r] [lp|sp|dp]` props parity
+
+LINSTOR exposes a 4-level property hierarchy with consistent CLI shape:
+
+| Level | Set | List | Delete |
+|-------|-----|------|--------|
+| Controller (cluster-wide defaults) | `linstor c sp <key> <value>` | `linstor c lp` | `linstor c dp <key>` |
+| ResourceGroup | `linstor rg sp <rg> <key> <value>` | `linstor rg lp <rg>` | `linstor rg dp <rg> <key>` |
+| ResourceDefinition | `linstor rd sp <rd> <key> <value>` | `linstor rd lp <rd>` | `linstor rd dp <rd> <key>` |
+| Resource (per-node) | `linstor r sp <node> <rd> <key> <value>` | `linstor r lp <node> <rd>` | `linstor r dp <node> <rd> <key>` |
+
+Resolution chain (most-specific wins): `Resource → RD → RG → Controller → renderer default`. Same chain as LINSTOR's `linstor r lp --effective`.
+
+Property namespaces (LINSTOR's, must mirror for parity):
+- `DrbdOptions/Net/<key>` → `net { <key> <value>; }` block in .res
+- `DrbdOptions/Resource/<key>` → `options { <key> <value>; }` block in .res  (e.g. `on-no-quorum`, `quorum`)
+- `DrbdOptions/Disk/<key>` → `volume.disk { <key> <value>; }` per-volume block
+- `DrbdOptions/Handlers/<key>` → `handlers { <key> "<cmd>"; }` block (less common)
+- `DrbdOptions/PeerDevice/<key>` → `connection.volume { <key> <value>; }` (rare)
+- `Aux/<key>` → operator-facing labels (already partial in blockstor)
+
+### blockstor schema for the 4 levels
+
+**Controller-level**: a singleton CRD `ControllerProperties` (or annotations on a well-known ConfigMap) — most-static, controller reads once on startup, watches for changes:
+
+```go
+// api/v1alpha1/controllerproperties_types.go (new)
+type ControllerPropertiesSpec struct {
+    DrbdOptions map[string]string `json:"drbdOptions,omitempty"`  // keys = "Net/cram-hmac-alg", "Resource/quorum", etc.
+    Props       map[string]string `json:"props,omitempty"`         // generic props (e.g. Aux/*)
+}
+```
+
+**RG / RD / Resource**: already have `Spec.DrbdOptions` and `Spec.Props` bags — extend renderer to traverse the chain.
+
+### REST handlers to land/extend
+
+| Verb | Path | Status |
+|------|------|--------|
+| GET | `/v1/controller/properties` | ⚠️ partial (`linstor c lp` works for some keys) |
+| POST | `/v1/controller/properties` | ❌ — needs full set/delete |
+| GET | `/v1/resource-groups/{rg}/properties` | ⚠️ partial |
+| POST | `/v1/resource-groups/{rg}/properties` | ⚠️ |
+| GET | `/v1/resource-definitions/{rd}/properties` | ⚠️ partial |
+| POST | `/v1/resource-definitions/{rd}/properties` | ⚠️ |
+| GET | `/v1/resource-definitions/{rd}/resources/{node}/properties` | ⚠️ |
+| POST | `/v1/resource-definitions/{rd}/resources/{node}/properties` | ⚠️ |
+| GET | `/v1/resource-definitions/{rd}/resources/{node}/properties?effective=true` | ❌ — returns resolved view across the chain |
+
+### Resolution logic
+
+Renderer in `pkg/satellite/render/` (or wherever it lives) calls a single helper:
+
+```go
+// pkg/satellite/intent/props.go (new)
+func ResolveDrbdOption(localRes *v1alpha1.Resource, rd *v1alpha1.RD,
+    rg *v1alpha1.RG, ctrl *v1alpha1.ControllerProperties,
+    namespace, key string) (value string, source string) {
+    // namespace = "Net" | "Resource" | "Disk" | ...
+    // key = "cram-hmac-alg" | "quorum" | ...
+
+    full := namespace + "/" + key
+    if v, ok := localRes.Spec.DrbdOptions[full]; ok { return v, "resource" }
+    if v, ok := rd.Spec.DrbdOptions[full];      ok { return v, "rd" }
+    if v, ok := rg.Spec.DrbdOptions[full];      ok { return v, "rg" }
+    if v, ok := ctrl.Spec.DrbdOptions[full];    ok { return v, "controller" }
+    return rendererDefault(namespace, key)
+}
+```
+
+Dispatcher builds `DesiredResource.DrbdOptions` by calling this for every known key — satellite no longer reads RG/RD/Ctrl at render time, only Resource + the pre-resolved bag.
+
+### Quorum toggle UX
+
+The most operationally critical use of this interface is enabling/disabling quorum:
+
+```
+# Disable quorum on a single RD (e.g. for single-replica testing)
+linstor rd sp my-pvc DrbdOptions/Resource/quorum off
+linstor rd sp my-pvc DrbdOptions/Resource/on-no-quorum io-error
+
+# Re-enable cluster-wide quorum (default)
+linstor c sp DrbdOptions/Resource/quorum majority
+linstor c sp DrbdOptions/Resource/on-no-quorum suspend-io
+```
+
+Renderer immediately reflects on next reconcile → satellite renders new .res → `drbdadm adjust` applies live (DRBD-9 supports quorum-policy hot-swap).
+
+### Test plan additions
+
+| Test | Coverage |
+|------|---------|
+| `TestResolveDrbdOption_FullChain` | Resource > RD > RG > Controller > default, every level overrides correctly |
+| `TestResolveDrbdOption_AbsentEverywhere_RendererDefault` | falls through to baked-in renderer default |
+| `TestREST_ControllerProperties_GETPOST_Roundtrip` | set via POST, GET reads back |
+| `TestREST_ResourceProperties_EffectiveView` | `?effective=true` resolves chain |
+| `TestRenderer_PropPropagation` | golden test — set `DrbdOptions/Net/timeout` at RG, expect .res to have `timeout 1500` |
+| `TestRenderer_PropOverride_ResourceWinsOverRD` | conflicting values resolve in favor of Resource |
+| `TestQuorumToggle_LiveAdjust` | toggle quorum=off → adjust runs, drbdsetup shows no-quorum policy, writes succeed on single replica |
+| `TestUnknownDrbdOptionKey_PassThrough` | unknown key (forward-compat for new DRBD versions) — renderer emits as-is, doesn't reject |
+
+### CLI parity audit cell
+
+`tests/e2e/cli-matrix/c-rd-r-properties-parity.sh` — exercises full set/list/delete at every level + asserts effective resolution. Catcher cell that would FAIL today since most REST handlers are partial.
+
+## How blockstor stores DRBD CurrentGi (compared to LINSTOR)
+
+LINSTOR stores `CurrentGi` per-VolumeDefinition (one row for the whole RD, shared by all replicas) in DB column `LAYER_DRBD_VOLUME_DEFINITIONS.CURRENT_GI`. It's the canonical "what the next replica should bootstrap from" anchor.
+
+blockstor stores per-Resource per-Volume: `Resource.Status.Volumes[].CurrentGi` (`api/v1alpha1/resource_types.go:405`). Each satellite stamps from `drbdsetup events2` observation.
+
+**Semantics differ**:
+- LINSTOR: `VD.CurrentGi` = "truth across all replicas" (single source)
+- blockstor: `Resource.Status.Volumes[].CurrentGi` = "observed by this satellite" (N-way replicated observation)
+
+This is fine for Bug 77 (skip-sync at first-activation) because the algorithm reads CurrentGi from any UpToDate peer and seeds the new replica via `drbdmeta set-gi`. But it's **NOT** symmetric to LINSTOR:
+- Bug 87 (peer-node-id allocation race) hits because the per-Resource observation isn't atomic across the cluster — RscDfn-level GI doesn't exist in blockstor.
+- Future cross-cluster GI propagation (e.g. snapshot ship + restore preserving GI) needs an RD-level anchor blockstor doesn't have.
+
+**Trade-off acknowledged**: per-Resource is K8s-native (each satellite owns its Status), but loses LINSTOR's single-source GI anchor. **If migration parity matters more than current semantics**, add `RD.Status.AuthoritativeCurrentGi` as a controller-stamped aggregate (picks the highest CurrentGi from all UpToDate peers, refreshed periodically) — operators querying "what GI does this RD have" get one answer.
+
+Decision: defer to v2 — Bug 77 works today, the LINSTOR-symmetric anchor is nice-to-have not blocker.
+
+## Where LINSTOR stores `shared-secret` (PSK)
+
+DB table `LAYER_DRBD_RESOURCE_DEFINITIONS`, column `SECRET VARCHAR(20) NOT NULL`. Plain text (not encrypted at rest). 20 chars base64 → ~120 bits entropy.
+
+Generated in `controller/src/main/java/com/linbit/linstor/layer/resource/RscDrbdLayerHelper.java`:
+```java
+@Nullable String secret = drbdRscDfnPayload.sharedSecret;
+if (secret == null) {
+    secret = cryptoProvider.createSecretGenerator().generateDrbdSharedSecret();
+}
+drbdRscDfnData.setSecret(secret);
+```
+
+Used by:
+- `ConfFileBuilder.java` — renders into `.res` as `shared-secret "<value>";`
+- `CtrlAuthenticator.java` — also used for satellite/controller handshake (not just DRBD peer)
+
+**blockstor equivalent**: K8s Secret in same namespace as RD, referenced via `RD.Spec.Auth.SecretRef` (already in P0a of the rendering design). Advantages over LINSTOR's plain-text-in-DB:
+- RBAC scoping (operators who can `kubectl get rd` may not have access to `kubectl get secret`)
+- Encryption-at-rest if etcd is so configured
+- Auto-rotation through standard cert-manager / external-secrets workflows
+
 ## Open questions
 
 1. **Secret rotation cadence**: do we auto-rotate periodically (e.g. yearly) or only on operator request? LINSTOR doesn't auto-rotate; staying compat says operator-request-only. Default = operator-request, opt-in flag for auto.
