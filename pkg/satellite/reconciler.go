@@ -1141,31 +1141,6 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 	// file we're about to overwrite is the only stable source.
 	peerIDs := extractResFilePeerNodeIDs(resPath)
 
-	// Bug 342 v15: PeerDiskless snapshot — the application-level
-	// record of "was this peer's prior incarnation DISKLESS /
-	// TIE_BREAKER?" stamped by the controllers layer continuously
-	// while the peer was alive. We read it HERE (peer is now gone
-	// from the desired set) to discriminate the cleanup strategy:
-	//
-	//   - was-diskless / was-tiebreaker (true)  → run `drbdmeta
-	//     forget-peer` to clear the stale GI / bitmap slot, so a
-	//     replacement diskful peer can handshake fresh. Closes
-	//     Phase 3 of bug342 r-full-lifecycle (TIE_BREAKER →
-	//     diskful relocate).
-	//
-	//   - was-diskful (false) → skip forget-peer and rely on
-	//     DRBD-9 adjust + UUID compare. Closes the Phase 2
-	//     same-node delete+recreate footgun: forget-peer on a
-	//     diskful slot wipes the bitmap mid-handshake and wedges
-	//     the new replica at `Unconnected` / `StandAlone` (the
-	//     v8 / v9 / v10 / v12c failure mode).
-	//
-	//   - missing entry (peer existed before the v15 stamper
-	//     landed, or Status was wiped by a restore) → default to
-	//     TRUE (run forget-peer). A stale-slot wipe is cheap; a
-	//     missed wipe wedges the relocate forever. The safer bet.
-	peerDiskless := dr.GetPeerDiskless()
-
 	for _, peer := range removed {
 		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer)
 		if err != nil {
@@ -1180,28 +1155,6 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// peer ever rendered).
 		peerID, hasID := peerIDs[peer]
 		if !hasID {
-			continue
-		}
-
-		wasDiskless, known := peerDiskless[peer]
-		if !known {
-			// Default-to-true safety net for the rollout window
-			// + Status-restore path. Warn once per departed peer
-			// so the gap shows up in logs without flooding the
-			// hot reconcile path with INFO noise.
-			wasDiskless = true
-
-			log.FromContext(ctx).Info("Bug 342 v15: PeerDiskless entry missing for departed peer; defaulting to forget-peer (safer bet)",
-				"resource", dr.GetName(),
-				"peer", peer)
-		}
-
-		if !wasDiskless {
-			// Was diskful → DRBD-9 adjust + UUID compare handles
-			// the fresh handshake on the next reconcile. Skipping
-			// forget-peer here is the v15 discriminator's whole
-			// purpose: closing the v8/v9/v10/v12c regression that
-			// wedged Phase 2 same-node delete+recreate.
 			continue
 		}
 
