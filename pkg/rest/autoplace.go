@@ -2095,6 +2095,17 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
 	}
 
+	// Bug 342 v10: REST 2-phase delete wiring intentionally NOT
+	// activated here until satellite-side Phase 2 (FSM extension
+	// with ActionForgetPeer + ACK annotation stamping) lands. The
+	// DELETING flag constant and waitForPeerDeletionAcks helper are
+	// in place (pkg/api/v1/node.go, pkg/rest/peer_delete_sync.go)
+	// but not yet wired — without satellite ACKs the wait would
+	// time out at 15s per r d call, regressing test latency without
+	// closing the bug. Phase 2+3 of v10 land in a fresh session;
+	// the groundwork is forward-compatible.
+	_ = existing // silence unused-variable warning if Phase 2 isn't here yet
+
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
