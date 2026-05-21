@@ -190,6 +190,7 @@ func wireConditionStampers(mgr manager.Manager, cfg Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
 	wireSkipDiskClearer(mgr, cfg)
+	wireClearedPeersStamper(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -349,5 +350,19 @@ func wireSkipDiskClearer(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetSkipDiskClearer(&SkipDiskClearer{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+	})
+}
+
+// wireClearedPeersStamper injects the ClearedPeersStamper into the
+// Apply chain so `tearDownRemovedPeers` can record per-peer cleanup
+// ACKs on Resource.Status.ClearedPeers. The stamper needs both the
+// cached client (for the Status().Update write) and the manager's
+// APIReader (for the RetryOnConflict-inner Get against a stamper
+// that may race observer Status SSA patches on hot Resources). Issue
+// 342 v12c.
+func wireClearedPeersStamper(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetClearedPeersStamper(&ClearedPeersStamper{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
 	})
 }
