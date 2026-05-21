@@ -125,6 +125,19 @@ func (r *ResourceDefinitionReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, err
 	}
 
+	// Issue 342 v12c: reap per-peer pending-cleanup markers stamped
+	// by the REST handleResourceDelete handler once every online
+	// surviving Resource of this RD has ACK'd via
+	// Status.ClearedPeers. Stale markers (>10s) are also reaped so
+	// the allocator gate's escape hatch fires on its own schedule
+	// and never wedges a follow-up `r c <same-node>` indefinitely.
+	err = r.reapPendingPeerCleanup(ctx, &rd)
+	if err != nil {
+		log.Error(err, "reap pending-peer-cleanup", "rd", rd.Name)
+
+		return ctrl.Result{}, err
+	}
+
 	// Bug 148: stamp the per-volume resize-pending annotation on
 	// every Resource whose `status.volumes[n].usableKib` lags the
 	// RD's `spec.volumeDefinitions[].sizeKib`. The REST handler
