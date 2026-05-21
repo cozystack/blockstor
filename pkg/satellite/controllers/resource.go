@@ -549,21 +549,6 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	// the eviction again, leaving the stale kernel slot forever.
 	// Only EvictPeersByUIDMismatch should change an existing
 	// baseline, AFTER actually completing del-peer + forget-peer.
-	//
-	// Bug 342 v9: ALSO drop AppliedPeerUIDs entries for peers that
-	// no longer exist in the current peer set. Without this, the
-	// flow `Phase 1: w2 TIE_BREAKER → Phase 2: witness collapse
-	// (w2 deleted) → Phase 3: r c w2 (new diskful incarnation)`
-	// leaves applied[w2]=OLD_TIE_BREAKER_UID in place even though
-	// Phase 2's tearDownRemovedPeers already cleaned the kernel
-	// slot. When the new diskful w2 arrives in Phase 3 with a
-	// fresh UID, EvictPeersByUIDMismatch trips a SPURIOUS eviction
-	// (mismatch detected against the stale baseline) that tears
-	// down the legitimate in-flight handshake mid-stream —
-	// producing the `disk='' rep='Off'` wedge. The cleanup is safe:
-	// peers that depart genuinely are already cleaned by
-	// tearDownRemovedPeers in the apply chain; the AppliedPeerUIDs
-	// entry serves no further purpose once the peer is gone.
 	if !anyFailed && rdNeedsDRBD(&rd) {
 		full := currentPeerUIDs(peers)
 		missing := make(map[string]string, len(full))
@@ -574,17 +559,9 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 			}
 		}
 
-		var stale []string
-
-		for name := range res.Status.AppliedPeerUIDs {
-			if _, alive := full[name]; !alive {
-				stale = append(stale, name)
-			}
-		}
-
-		if len(missing) > 0 || len(stale) > 0 {
-			if syncErr := r.syncAppliedPeerUIDs(ctx, res, missing, stale); syncErr != nil {
-				logger.Error(syncErr, "post-apply AppliedPeerUIDs sync failed; will retry next reconcile")
+		if len(missing) > 0 {
+			if stampErr := r.stampAppliedPeerUIDs(ctx, res, missing); stampErr != nil {
+				logger.Error(stampErr, "post-apply AppliedPeerUIDs baseline stamp failed; will retry next reconcile")
 			}
 		}
 	}
@@ -1351,75 +1328,6 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 
 	if err != nil {
 		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
-	}
-
-	return nil
-}
-
-// syncAppliedPeerUIDs merges newly-observed peer UIDs in `missing`
-// into Status.AppliedPeerUIDs AND removes entries listed in `stale`
-// (peers that have departed the current peer set). Combined into one
-// Status sub-resource write to halve apiserver traffic versus two
-// separate stamp/delete passes.
-//
-// Bug 342 v9: the stale removal closes the spurious-eviction window.
-// Without it, AppliedPeerUIDs accumulates orphan entries (e.g. a
-// witness Resource that the controller collapsed during Phase 2), and
-// the next `r c <same-name>` in Phase 3 trips a UID mismatch against
-// an entry whose owner is long gone. `EvictPeersByUIDMismatch` then
-// fires del-peer + forget-peer mid-handshake of the legitimate new
-// incarnation, producing the `disk='' rep='Off'` wedge.
-func (r *ResourceReconciler) syncAppliedPeerUIDs(
-	ctx context.Context,
-	res *blockstoriov1alpha1.Resource,
-	missing map[string]string,
-	stale []string,
-) error {
-	if len(missing) == 0 && len(stale) == 0 {
-		return nil
-	}
-
-	reader := client.Reader(r.Client)
-	if r.Config.APIReader != nil {
-		reader = r.Config.APIReader
-	}
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var fresh blockstoriov1alpha1.Resource
-
-		if getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh); getErr != nil {
-			return getErr
-		}
-
-		if fresh.Status.AppliedPeerUIDs == nil && len(missing) > 0 {
-			fresh.Status.AppliedPeerUIDs = make(map[string]string, len(missing))
-		}
-
-		changed := false
-
-		for name, uid := range missing {
-			if fresh.Status.AppliedPeerUIDs[name] != uid {
-				fresh.Status.AppliedPeerUIDs[name] = uid
-				changed = true
-			}
-		}
-
-		for _, name := range stale {
-			if _, ok := fresh.Status.AppliedPeerUIDs[name]; ok {
-				delete(fresh.Status.AppliedPeerUIDs, name)
-				changed = true
-			}
-		}
-
-		if !changed {
-			return nil
-		}
-
-		return r.Status().Update(ctx, &fresh)
-	})
-
-	if err != nil {
-		return errors.Wrap(err, "sync Resource.Status.AppliedPeerUIDs")
 	}
 
 	return nil
