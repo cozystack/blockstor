@@ -267,37 +267,61 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 }
 
 // shouldKeepExistingWitness implements the keep-branch (Bug 104)
-// with the Bug 338 carve-out:
+// updated by Bug 342 to mirror upstream LINSTOR's behaviour:
 //
 //   - diskful == 2: keep the witness — it's the third voter the
 //     auto-quorum invariant promises and the upstream LINSTOR
 //     shouldTieBreakerExist contract creates on its own.
 //
-//   - diskful == 1 AND a non-witness diskless is present: this is
-//     the post-`r td --diskless` shape Bug 104 protects. The witness
-//     IS still the third voter (1 diskful + 1 user-diskless + 1
-//     witness = 3 voters); dropping it would freeze the volume on
-//     the next partition.
-//
-//   - diskful == 1 AND NO non-witness diskless: Bug 338. The user
-//     ran `linstor r d <one-of-diskful>` and the witness is now
-//     orphaned. 1 diskful + 1 witness is a 2-voter quorum with no
-//     real majority — collapse the witness so the lone diskful
-//     runs cleanly under quorum=off.
+//   - diskful == 1 (with or without a non-witness diskless): keep
+//     the witness alive. The historical Bug-104 carve-out only kept
+//     the witness when a non-witness diskless co-existed (the
+//     post-`r td --diskless` shape, third voter for majority). Bug
+//     342 broadens that to also keep the witness when the user ran
+//     `linstor r d <one-of-diskful>` and only the lone diskful
+//     remains. Pre-Bug-342, blockstor collapsed the witness here
+//     (the "Bug 338 carve-out"); upstream LINSTOR does NOT — it
+//     keeps the TIE_BREAKER row alive so the surviving Resource's
+//     dispatcher pass still renders a peer block
+//     (`on <witness-node> { disk none; ... }` + a `connection`
+//     block) in the .res file. Without that peer block the rendered
+//     .res shrinks to a single-host shape with no `connection { ... }`
+//     entries, which orphans the kernel-side peer slots on the
+//     surviving diskful node. When `r c <node>` later re-spawns a
+//     diskful peer, the surviving kernel rejects the handshake
+//     (slot pinned to the prior incarnation) and the pair wedges in
+//     Connecting/StandAlone forever. Keeping the witness preserves
+//     the peer-name set across the diskful-shrink, matching the
+//     v16 empirical baseline captured against piraeus LINSTOR
+//     v1.32.3 on the same hardware/kernel. Quorum policy still
+//     follows `quorumPolicy(diskful, diskless)` — drops to `off` in
+//     the diskful=1 + witness-only case (no real majority); the
+//     surviving diskful runs single-node, the witness is just a
+//     held-open .res peer slot waiting for the next `r c <node>` to
+//     restore the 2-diskful + 1-witness steady state.
 //
 //   - diskful >= 3: the cluster has a clear majority on its own; the
-//     witness is dead weight.
-func shouldKeepExistingWitness(diskful, nonWitnessDiskless, witnessUnnecessaryDiskfulCount int) bool {
+//     witness is dead weight and gets collapsed.
+//
+//   - diskful == 0: caller branch (the create-branch ladder in
+//     `shouldTieBreakerExist`) already returns false on this path;
+//     `removeWitnesses` reaps the orphan witness when the entire RD
+//     winds down to 0 diskful (e.g. Phase 4 of r-full-lifecycle —
+//     `r d` every diskful in turn).
+func shouldKeepExistingWitness(diskful, witnessUnnecessaryDiskfulCount int) bool {
 	if diskful >= witnessUnnecessaryDiskfulCount {
 		return false
 	}
 
-	if diskful == 2 {
-		return true
-	}
-
-	// diskful == 1 — keep only if a non-witness diskless co-exists.
-	return diskful == 1 && nonWitnessDiskless >= 1
+	// Bug 342: diskful == 1 — keep the witness regardless of whether a
+	// non-witness diskless co-exists. The witness's job in this state
+	// is no longer "third voter for majority" (1+1 can't form a
+	// majority) — it's "preserve the peer-name set in the rendered
+	// .res so the kernel-side slot survives the diskful→1 transition
+	// and the eventual `r c <node>` re-handshake succeeds". Mirrors
+	// upstream LINSTOR CtrlRscAutoTieBreakerHelper, which never
+	// deletes the witness row across diskful churn.
+	return diskful == 1 || diskful == 2
 }
 
 // shouldTieBreakerExist decides whether the RD should carry an
@@ -359,7 +383,7 @@ func shouldTieBreakerExist(
 	const witnessUnnecessaryDiskfulCount = 3
 
 	keepExistingWitness := len(witness) > 0 &&
-		shouldKeepExistingWitness(len(diskful), nonWitnessDiskless, witnessUnnecessaryDiskfulCount)
+		shouldKeepExistingWitness(len(diskful), witnessUnnecessaryDiskfulCount)
 
 	// Bug 108: post-toggle race repair. The keep branch above
 	// preserves an existing witness across diskful→diskless; this
