@@ -45,7 +45,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -249,118 +248,7 @@ func (r *Reconciler) observeForFsm(ctx context.Context, dr *intent.DesiredResour
 		}
 	}
 
-	// 342-v10: enumerate peers carrying Spec.Flags=[DELETING].
-	// The dispatcher propagates the flag via DesiredPeer.IsDeleting
-	// (BuildDesired reads peer.Spec.Flags). Skip the local peer
-	// even if it ever appears in the list — Decommissioning (with
-	// SpecHasDeletionTS=true) owns the local-delete path, never
-	// ActionForgetPeer.
-	obs.PeersDeleting = collectPeersDeleting(ctx, r, dr)
-
 	return obs
-}
-
-// collectPeersDeleting resolves each DELETING peer's NodeID
-// using the priority order documented on PeerDeletionIntent:
-// (1) peer.NodeID (from peer.Status.DRBDNodeID via dispatcher),
-// (2) kernel `drbdsetup show` slot, (3) the on-disk .res file's
-// `on <peer> { node-id N; }` block. Drops peers that resolve to
-// no node-id — next reconcile retries; node-id 0 is a valid DRBD
-// slot id so a negative sentinel signals "unresolved".
-func collectPeersDeleting(ctx context.Context, r *Reconciler, dr *intent.DesiredResource) []PeerDeletionIntent {
-	deleting := filterDeletingPeers(dr.GetPeers(), r.cfg.NodeName)
-	if len(deleting) == 0 {
-		return nil
-	}
-
-	// Kernel-side node-id resolution (priority 2). Cheap on the
-	// hot path only when there IS at least one DELETING peer.
-	var slots map[string]drbd.KernelSlot
-	if r.cfg.Adm != nil {
-		slots, _ = r.cfg.Adm.Show(ctx, dr.GetName())
-	}
-
-	// .res-file fallback (priority 3). Read once for the whole
-	// peer batch.
-	var resNodeIDs map[string]int32
-	if r.cfg.StateDir != "" {
-		resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
-		resNodeIDs = extractResFilePeerNodeIDs(resPath)
-	}
-
-	out := make([]PeerDeletionIntent, 0, len(deleting))
-
-	for _, p := range deleting {
-		nodeID := resolvePeerDeletionNodeID(p, slots, resNodeIDs)
-		if nodeID < 0 {
-			// Defer — next reconcile retries with hopefully a
-			// resolved id. Avoids the v8 footgun of del-peer
-			// without forget-peer.
-			continue
-		}
-
-		out = append(out, PeerDeletionIntent{
-			Name:   p.Name,
-			NodeID: nodeID,
-		})
-	}
-
-	if len(out) == 0 {
-		return nil
-	}
-
-	return out
-}
-
-// filterDeletingPeers returns the subset of `peers` whose
-// IsDeleting flag is set, excluding the local satellite's own
-// name and unnamed entries. Local delete goes through
-// PhaseDecommissioning, not ActionForgetPeer.
-func filterDeletingPeers(peers []intent.DesiredPeer, localNode string) []intent.DesiredPeer {
-	if len(peers) == 0 {
-		return nil
-	}
-
-	out := make([]intent.DesiredPeer, 0, len(peers))
-
-	for _, p := range peers {
-		if !p.IsDeleting {
-			continue
-		}
-
-		if p.Name == "" || p.Name == localNode {
-			continue
-		}
-
-		out = append(out, p)
-	}
-
-	return out
-}
-
-// resolvePeerDeletionNodeID walks the three-source priority
-// chain (dispatcher → kernel → .res file) and returns the first
-// non-negative match, or -1 when none resolved. Pulled out of
-// collectPeersDeleting to keep both helpers below the gocyclo
-// budget.
-func resolvePeerDeletionNodeID(p intent.DesiredPeer, slots map[string]drbd.KernelSlot, resNodeIDs map[string]int32) int32 {
-	nodeID := int32(-1)
-
-	if p.NodeID >= 0 {
-		nodeID = p.NodeID
-	}
-
-	if slot, ok := slots[p.Name]; ok {
-		nodeID = slot.NodeID
-	}
-
-	if nodeID < 0 {
-		if id, ok := resNodeIDs[p.Name]; ok {
-			nodeID = id
-		}
-	}
-
-	return nodeID
 }
 
 // logFsmShadow runs the FSM against the current Observation and

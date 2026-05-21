@@ -29,7 +29,6 @@ import (
 	"context"
 
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // dispatchFsmAction routes a FSM-recommended Action to its
@@ -60,8 +59,6 @@ import (
 // preamble: Decommission is delete-path territory (no need to
 // freshen .res for a resource being torn down) and Noop must remain
 // a true no-op.
-//
-//nolint:cyclop // declarative router; each case is one arm of the FSM action enum
 func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, action string, obs Observation) error {
 	// Phase 11.2.c Stage 4 step 1: renderResFile preamble for every
 	// action that consumes the .res file (createMd reads it via
@@ -118,78 +115,9 @@ func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredRe
 		// owns tearDownRemovedPeers + storage cleanup via the
 		// dedicated DeleteResource pipeline. Skip in shadow.
 		return nil
-	case ActionForgetPeer:
-		return r.dispatchForgetPeer(ctx, dr, devices, obs)
 	case ActionNoop:
 		return nil
 	default:
 		return nil
 	}
-}
-
-// dispatchForgetPeer runs `drbdadm del-peer` + `drbdmeta
-// forget-peer` per (peer, volume) for every entry in
-// obs.PeersDeleting, then stamps the peer-forget ACK annotation
-// on the local Resource CRD so the REST handler's
-// waitForPeerDeletionAcks loop unblocks. 342-v10 Phase 2.
-//
-// Best-effort throughout: del-peer / forget-peer errors are
-// logged but do not bubble — the REST handler's 15s timeout is
-// the upper bound on the wait, and the next reconcile retries.
-// The ACK stamp is also best-effort; a missing stamp falls back
-// to the pre-v10 behaviour (REST waits 15s then proceeds with a
-// warning).
-func (r *Reconciler) dispatchForgetPeer(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, obs Observation) error {
-	logger := log.FromContext(ctx).WithName("forget-peer").WithValues("rd", dr.GetName())
-
-	if r.cfg.Adm == nil || len(obs.PeersDeleting) == 0 {
-		return nil
-	}
-
-	for _, peer := range obs.PeersDeleting {
-		if peer.NodeID < 0 {
-			continue
-		}
-
-		if err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer.Name); err != nil {
-			logger.Info("del-peer failed (non-fatal)",
-				"peer", peer.Name,
-				"err", err.Error())
-		}
-
-		for volNum, device := range devices {
-			if device == "" {
-				continue
-			}
-
-			if err := r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peer.NodeID); err != nil {
-				logger.Info("forget-peer failed (non-fatal)",
-					"peer", peer.Name,
-					"vol", volNum,
-					"nodeID", peer.NodeID,
-					"err", err.Error())
-			}
-		}
-
-		// Stamp the peer-forget ACK annotation so the REST
-		// handler can unblock. Stamper nil under unit-test wiring
-		// — the FSM helpers still run del-peer/forget-peer (the
-		// kernel-side outcome) and the lack of an apiserver write
-		// degrades to "REST waits the full 15s timeout".
-		//
-		// Resource CRD name is `<rd>.<node>` (per-node sharding);
-		// matches the same shape Phase 11.3 MetadataCreated
-		// stamper uses (see reconciler.go::resourceCRDName).
-		if r.cfg.PeerForgetAckStamper != nil {
-			resourceCRDName := dr.GetName() + "." + r.cfg.NodeName
-			stampErr := r.cfg.PeerForgetAckStamper.StampPeerForgetAck(ctx, resourceCRDName, peer.Name)
-			if stampErr != nil {
-				logger.Info("peer-forget ACK stamp failed (non-fatal)",
-					"peer", peer.Name,
-					"err", stampErr.Error())
-			}
-		}
-	}
-
-	return nil
 }
