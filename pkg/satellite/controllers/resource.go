@@ -483,6 +483,7 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 			res.Status.AppliedPeerUIDs,
 			volNumsOf(&rd),
 			nil, // devices unknown at this layer; forget-peer falls back to nodeID skip
+			rd.Annotations,
 		)
 		if evictErr != nil {
 			logger.Error(evictErr, "EvictPeersByUIDMismatch failed; continuing")
