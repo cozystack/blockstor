@@ -1323,6 +1323,75 @@ func TestResourceDeleteRegularReplicaSkipsSuppression(t *testing.T) {
 	}
 }
 
+// TestResourceDeleteStampsPeerRespawningAnnotation pins Bug 342
+// Fix B Option 2: every successful per-replica `r d` writes
+// `blockstor.io/peer-respawning-<node>` onto the parent RD with a
+// future RFC3339Nano deadline. The satellite's
+// `tearDownRemovedPeers` reads this annotation on the next
+// reconcile to SKIP `drbdmeta forget-peer` for the named peer
+// while the deadline is in the future — without this, the
+// Phase-2-style sub-second `r d` + `r c` same-node respawn wipes
+// per-volume v09 GI / bitmap metadata and wedges the new
+// incarnation's slot in Connecting / DUnknown forever.
+//
+// The stamp is per-PEER (key carries the node name) so a chain of
+// deletes against different nodes accumulates independent
+// deadlines instead of overwriting a single global key.
+func TestResourceDeleteStampsPeerRespawningAnnotation(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-respawn"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-respawn", NodeName: "n2",
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	before := time.Now()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-respawn/resources/n2")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-respawn")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	key := apiv1.PeerRespawningAnnotationKey("n2")
+
+	raw, ok := rd.Annotations[key]
+	if !ok || raw == "" {
+		t.Fatalf("peer-respawning annotation missing on %q; annotations=%v", key, rd.Annotations)
+	}
+
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t.Fatalf("annotation value %q is not RFC3339Nano: %v", raw, err)
+	}
+
+	// Deadline must land in (now, now + window]. A regression that
+	// stamps "0001-01-01" or "now()" would let the satellite
+	// forget-peer immediately, defeating the fix.
+	if !deadline.After(before) {
+		t.Errorf("annotation deadline %v is not after request start %v", deadline, before)
+	}
+
+	if deadline.After(before.Add(2 * peerRespawningWindow)) {
+		t.Errorf("annotation deadline %v is far beyond the configured window from %v", deadline, before)
+	}
+}
+
 // TestResourceDeleteBumpsSiblingPeers pins Bug 67's core invariant:
 // when `linstor r d <node> <rd>` drops one peer, every SURVIVING
 // sibling Resource of the same RD gets `blockstor.io/peer-changed`
