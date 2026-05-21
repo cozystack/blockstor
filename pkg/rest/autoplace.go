@@ -2095,16 +2095,32 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
 	}
 
-	// Bug 342 v10: REST 2-phase delete wiring intentionally NOT
-	// activated here until satellite-side Phase 2 (FSM extension
-	// with ActionForgetPeer + ACK annotation stamping) lands. The
-	// DELETING flag constant and waitForPeerDeletionAcks helper are
-	// in place (pkg/api/v1/node.go, pkg/rest/peer_delete_sync.go)
-	// but not yet wired — without satellite ACKs the wait would
-	// time out at 15s per r d call, regressing test latency without
-	// closing the bug. Phase 2+3 of v10 land in a fresh session;
-	// the groundwork is forward-compatible.
-	_ = existing // silence unused-variable warning if Phase 2 isn't here yet
+	// 342-v10 Phase 1+2+3: 2-phase delete handshake. Stamp
+	// `DELETING` on the doomed Resource so siblings' satellite
+	// FSM observes it and runs ActionForgetPeer (del-peer +
+	// forget-peer + stamp peer-forget ACK annotation). Bump
+	// peer-changed siblings BEFORE the physical Delete so the
+	// satellites wake to see DELETING. Then waitForPeerDeletionAcks
+	// blocks for up to peerDeleteAckTimeout (15s) until every
+	// online sibling has stamped the ACK. The pre-Delete bump is
+	// the wake; the post-Delete bump (further below) is the final
+	// adjust convergence after the peer Resource is gone.
+	//
+	// Idempotence guard: if the existing Resource already carries
+	// DELETING (e.g. CSI retry on a stuck delete), skip the
+	// re-stamp / re-bump / re-wait — the satellite has already
+	// been notified.
+	if getErr == nil && !slices.Contains(existing.Flags, apiv1.ResourceFlagDeleting) {
+		_ = s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node, func(live *apiv1.Resource) error {
+			if !slices.Contains(live.Flags, apiv1.ResourceFlagDeleting) {
+				live.Flags = append(live.Flags, apiv1.ResourceFlagDeleting)
+			}
+
+			return nil
+		})
+		s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
+		s.waitForPeerDeletionAcks(r.Context(), rdName, node)
+	}
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
