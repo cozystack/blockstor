@@ -48,6 +48,17 @@ type DesiredPeer struct {
 	// not yet been backfilled — the diff path treats empty as
 	// "no known UID" and falls through to adoption-mode.
 	ResourceUID string
+	// IsDeleting (Bug 342 v10) is true when the peer Resource has
+	// `Spec.Flags` containing `DELETING` — REST `r d <peer>` has
+	// stamped the doomed Resource for deletion but has not yet
+	// physically removed it from the store. Satellite FSM uses
+	// this as the trigger for ActionForgetPeer (del-peer +
+	// forget-peer + stamp peer-forget ACK annotation). The peer
+	// stays in the DesiredPeer list while DELETING is set so the
+	// FSM observation can enumerate it; the next reconcile (after
+	// REST's Phase 2 physical Delete) sees it removed entirely and
+	// tearDownRemovedPeers handles the .res rewrite.
+	IsDeleting bool
 }
 
 // DesiredResource is the satellite-facing apply payload for one

@@ -234,12 +234,21 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	for _, name := range dropped {
 		entry := intent.DesiredPeer{Name: name}
 
-		if p, ok := byName[name]; ok {
-			if id := nodeIDOf(p); id >= 0 {
+		if peer, ok := byName[name]; ok {
+			if id := nodeIDOf(peer); id >= 0 {
 				entry.NodeID = id
 			}
 
-			entry.ResourceUID = string(p.UID)
+			entry.ResourceUID = string(peer.UID)
+			// 342-v10: peer carries the REST-stamped DELETING
+			// flag while waiting for the satellite FSM
+			// ActionForgetPeer ACK. The dispatcher propagates the
+			// signal verbatim so the satellite's observeForFsm can
+			// translate it into PeerDeletionIntent without an extra
+			// apiserver read.
+			if slices.Contains(peer.Spec.Flags, apiv1.ResourceFlagDeleting) {
+				entry.IsDeleting = true
+			}
 		}
 
 		out = append(out, entry)

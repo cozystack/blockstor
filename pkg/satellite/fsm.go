@@ -59,6 +59,19 @@ const (
 	PhaseDecommissioning DRBDPhase = "Decommissioning"
 )
 
+// PeerDeletionIntent (342-v10) carries one peer's identity into
+// ActionForgetPeer dispatch. Name is the peer node name; NodeID is
+// the DRBD-9 node-id resolved from (in priority order)
+// peer.Status.DRBDNodeID, kernel `drbdsetup show`, or the rendered
+// .res file. NodeID is negative when no resolver succeeded — the
+// FSM transition skips such peers this reconcile (next reconcile
+// retries; node-id 0 is a valid DRBD slot id, so a separate
+// sentinel is required).
+type PeerDeletionIntent struct {
+	Name   string
+	NodeID int32
+}
+
 // Logical action names returned by Transition.Action. Kept as
 // constants so consumers (and tests) can refer to them without
 // string-literal duplication. Real wiring of action→func lives in
@@ -70,6 +83,15 @@ const (
 	ActionAdjust       = "adjust"
 	ActionDecommission = "decommission"
 	ActionNoop         = "noop"
+	// ActionForgetPeer (342-v10) runs `drbdadm del-peer` +
+	// `drbdmeta forget-peer` against every peer in
+	// Observation.PeersDeleting and stamps a peer-forget ACK
+	// annotation on the local Resource so the REST handler's
+	// waitForPeerDeletionAcks loop can unblock. Triggered by the
+	// peer carrying Spec.Flags=[DELETING] (REST 2-phase delete
+	// Phase 1). Self-loop on PhaseRunning — kernel slot stays
+	// loaded, only the per-peer state changes.
+	ActionForgetPeer = "forgetPeer"
 	// ActionAdjustSkipDisk runs `drbdadm adjust --skip-disk` for
 	// operator-pinned resources (DrbdOptions/SkipDisk=True or
 	// satellite-observer SkipDisk-stamp). The pin tells DRBD not to
@@ -109,6 +131,14 @@ type Observation struct {
 	// (UpToDate/Inconsistent/Diskless/…). Reserved for future
 	// triggers; not consulted by current transitions.
 	StatusDiskState string
+	// PeersDeleting (342-v10) — peer Resources of the same RD
+	// whose Spec.Flags contains DELETING (REST 2-phase delete
+	// Phase 1 stamp). ActionForgetPeer iterates this list to run
+	// del-peer + forget-peer per peer and stamps the per-peer ACK
+	// annotation the REST handler waits for. Empty in steady
+	// state; non-empty only during the few-second window between
+	// REST's flag stamp and the physical Resources().Delete.
+	PeersDeleting []PeerDeletionIntent
 }
 
 // Transition is one edge of the FSM. Triggers are pure functions of
@@ -177,6 +207,21 @@ var fsm = []Transition{
 	{From: PhaseRunning, To: PhaseMetadataPending, Trigger: func(obs Observation) bool {
 		return obs.KernelLoaded && obs.KernelHasDiskless && !obs.SpecFlagsHasDiskless && !obs.MetadataExists
 	}, Action: ActionCreateMd},
+	// 342-v10 ForgetPeer (PhaseRunning self-loop with side-effect):
+	// peer Resources of the same RD carry Spec.Flags=[DELETING] —
+	// REST 2-phase delete Phase 1 has stamped them but not yet
+	// physically removed. Satellite must run del-peer +
+	// forget-peer per peer and stamp the peer-forget ACK
+	// annotation BEFORE the new incarnation lands and attempts a
+	// DRBD handshake against the stale kernel slot.
+	//
+	// Placed BEFORE the PhaseRunning → PhaseRunning ActionAdjust
+	// self-loop because NextTransition returns the first match.
+	// Guard: KernelLoaded — del-peer / forget-peer are no-ops if
+	// the kernel slot isn't even loaded (no peer to forget).
+	{From: PhaseRunning, To: PhaseRunning, Trigger: func(obs Observation) bool {
+		return obs.KernelLoaded && len(obs.PeersDeleting) > 0
+	}, Action: ActionForgetPeer},
 	// Default Running self-loop: kernel is loaded and no other row
 	// matched, so issue a routine adjust to converge config drift.
 	{From: PhaseRunning, To: PhaseRunning, Trigger: func(obs Observation) bool { return obs.KernelLoaded }, Action: ActionAdjust},
