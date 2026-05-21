@@ -218,3 +218,16 @@ func IsAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // key for tests so a regression that renamed the key on one side
 // would fail to compile here.
 const AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation
+
+// ReapPendingPeerCleanup exposes the v12c reaper helper so tests can
+// drive it directly without wiring the full RD Reconcile flow.
+func (r *ResourceDefinitionReconciler) ReapPendingPeerCleanup(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
+	return r.reapPendingPeerCleanup(ctx, rd)
+}
+
+// PendingPeerCleanupGateActive exposes the allocator-side gate
+// predicate so tests can pin the marker→gate decision without
+// instantiating the full ensureDRBDIDs chain.
+func PendingPeerCleanupGateActive(rd *blockstoriov1alpha1.ResourceDefinition, nodeName string) bool {
+	return pendingPeerCleanupGateActive(rd, nodeName)
+}
