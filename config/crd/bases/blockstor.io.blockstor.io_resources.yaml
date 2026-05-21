@@ -559,6 +559,43 @@ spec:
                 description: inUse is whether DRBD reports the resource as primary
                   anywhere.
                 type: boolean
+              peerDiskless:
+                additionalProperties:
+                  type: boolean
+                description: |-
+                  peerDiskless is the last-known DISKLESS / TIE_BREAKER state per
+                  peer node name. Stamped continuously while the peer is alive
+                  (every reconcile pass that observes peer Resources) and read by
+                  `tearDownRemovedPeers` to discriminate the post-departure cleanup
+                  strategy at the moment the peer is GONE:
+
+                    - was DISKLESS or TIE_BREAKER (true)  → run `drbdmeta
+                      forget-peer` to clear the stale GI / bitmap slot the
+                      DISKLESS / TIE_BREAKER incarnation left behind. A new
+                      diskful peer landing on the same name (`r d <node>` + `r c
+                      <node>` Phase-3 relocate) cannot reconcile with the
+                      leftover slot via `drbdadm adjust` because there is no
+                      compatible UUID lineage to compare against.
+
+                    - was diskful (false) → skip `forget-peer` and rely on
+                      DRBD-9's `adjust` + UUID compare to handle the new
+                      incarnation. `forget-peer` on a diskful slot wipes the
+                      bitmap mid-handshake and wedges Phase-2 same-node
+                      delete+recreate at `Unconnected` / `StandAlone` (the v8 /
+                      v9 / v10 / v12c failure mode).
+
+                  The entry persists past peer departure so the tear-down path
+                  can read it; the upsert is one-way (we never rewrite the entire
+                  map). A peer that re-appears overwrites its own entry on the
+                  next reconcile. The map is monotonic in name-set growth, but
+                  the bytes-per-entry are small enough that the leak is
+                  negligible compared to the correctness it buys.
+
+                  Empty on first reconcile and after a Status restore — the
+                  tear-down path defaults to "true" (run forget-peer) in that
+                  case as the safer bet: a stale slot wipe is cheap, a missed
+                  wipe wedges the relocate. Bug 342 v15.
+                type: object
               role:
                 description: |-
                   role is the kernel-reported DRBD-9 role on this node, parsed
