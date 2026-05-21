@@ -123,19 +123,6 @@ type ReconcilerConfig struct {
 	// manager owns.
 	SkipDiskClearer SkipDiskClearer
 
-	// ClearedPeersStamper writes an entry into
-	// `Resource.Status.ClearedPeers[<departedPeer>] = now()` after
-	// `tearDownRemovedPeers` finishes del-peer + forget-peer for
-	// that peer. nil → the ACK side of the issue-342 v12c protocol
-	// is skipped (compatible with unit tests that don't wire an
-	// apiserver); the satellite still tears down the kernel slot,
-	// only the controller-side gate doesn't get its ACK and falls
-	// through on the 10s escape hatch. The agent injects this
-	// post-manager construction via SetClearedPeersStamper — the
-	// implementation needs the controller-runtime cached client
-	// only the manager owns.
-	ClearedPeersStamper ClearedPeersStamper
-
 	// Exec runs auxiliary shell-outs the reconciler owns directly
 	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
 	// scenario 9.W14). Production wires `storage.RealExec`; tests
@@ -190,24 +177,6 @@ type FilesystemFormattedStamper interface {
 	// moves forward on apiserver-side transition only, not on
 	// every patch).
 	StampFilesystemFormatted(ctx context.Context, resourceName string) error
-}
-
-// ClearedPeersStamper abstracts the "stamp the per-peer ACK entry on
-// Resource.Status.ClearedPeers" verb the satellite uses to confirm
-// that del-peer + forget-peer for a departed peer have completed.
-// Lives behind an interface so satellite.Reconciler stays free of a
-// controller-runtime client dependency — the K8s SSA call lives in
-// pkg/satellite/controllers (where the cached client owns the
-// apiserver wire). Mirrors MetadataCreatedStamper /
-// FilesystemFormattedStamper. Issue 342 v12c.
-type ClearedPeersStamper interface {
-	// StampClearedPeer SSA-patches an entry into
-	// Resource <resourceName>.Status.ClearedPeers under
-	// `departedPeer` with `stamp` as the RFC3339Nano value.
-	// Idempotent — repeat calls with the same args converge on the
-	// same map entry (the apiserver doesn't fire a transition
-	// notification on a no-op patch).
-	StampClearedPeer(ctx context.Context, resourceName, departedPeer, stamp string) error
 }
 
 // SkipDiskClearer abstracts the "release the satellite's SSA claim
@@ -364,15 +333,6 @@ func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper)
 // NewReconciler time. Safe to call before the first Apply. Bug 278.
 func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
 	r.cfg.SkipDiskClearer = c
-}
-
-// SetClearedPeersStamper injects the ClearedPeers ACK stamper
-// post-construction. Mirrors `SetMetadataCreatedStamper`: the
-// stamper needs the manager's cached client which doesn't exist at
-// NewReconciler time. Safe to call before the first Apply.
-// Issue 342 v12c.
-func (r *Reconciler) SetClearedPeersStamper(s ClearedPeersStamper) {
-	r.cfg.ClearedPeersStamper = s
 }
 
 // StateDir returns the on-disk directory the reconciler uses for
@@ -1181,17 +1141,6 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 	// file we're about to overwrite is the only stable source.
 	peerIDs := extractResFilePeerNodeIDs(resPath)
 
-	// Issue 342 v12c: track which peer names completed the
-	// del-peer (and per-volume forget-peer attempts) without a
-	// del-peer error. Stamp Resource.Status.ClearedPeers for those
-	// after the loop so the RD controller's reaper can confirm the
-	// kernel-slot teardown actually happened on this satellite.
-	// Per-volume forget-peer errors are intentionally swallowed
-	// inside the inner loop (pre-existing invariant — see comment
-	// below) so they do NOT prevent the ACK; the only way to skip
-	// the stamp is a del-peer error or a missing kernel node-id.
-	var cleared []string
-
 	for _, peer := range removed {
 		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer)
 		if err != nil {
@@ -1206,13 +1155,6 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// peer ever rendered).
 		peerID, hasID := peerIDs[peer]
 		if !hasID {
-			// No node-id resolvable → forget-peer would be
-			// indeterminate; still consider the kernel slot
-			// torn down (del-peer succeeded). Stamp ClearedPeers
-			// so the controller's gate doesn't wait forever on
-			// the ACK for a peer whose .res was malformed.
-			cleared = append(cleared, peer)
-
 			continue
 		}
 
@@ -1230,27 +1172,6 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 			// bubble (above) — those leak a live kernel
 			// connection, a faster correctness issue.
 			_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
-		}
-
-		cleared = append(cleared, peer)
-	}
-
-	// Issue 342 v12c: ACK the controller-side pending markers.
-	// nil stamper (unit tests without apiserver wiring) → skip
-	// silently. Failure to stamp is non-fatal — the next reconcile
-	// retries and the controller's 10s escape hatch unwedges any
-	// allocator that's been waiting for an ACK that never lands.
-	if r.cfg.ClearedPeersStamper != nil && len(cleared) > 0 {
-		resourceName := dr.GetName() + "." + r.cfg.NodeName
-		stamp := time.Now().UTC().Format(time.RFC3339Nano)
-
-		for _, peer := range cleared {
-			stampErr := r.cfg.ClearedPeersStamper.StampClearedPeer(ctx, resourceName, peer, stamp)
-			if stampErr != nil {
-				log.FromContext(ctx).Error(stampErr,
-					"stamp ClearedPeer — will retry next reconcile",
-					"resource", resourceName, "peer", peer)
-			}
 		}
 	}
 
