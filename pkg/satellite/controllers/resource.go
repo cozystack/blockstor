@@ -488,8 +488,25 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 			logger.Error(evictErr, "EvictPeersByUIDMismatch failed; continuing")
 		}
 
-		if len(evicted) > 0 {
-			if stampErr := r.stampAppliedPeerUIDs(ctx, res, evicted); stampErr != nil {
+		// Bug 342 v15: snapshot every peer's current
+		// DISKLESS/TIE_BREAKER flag state into Status.PeerDiskless
+		// alongside any UID-eviction stamp. The snapshot is the
+		// only application-level record of "was this peer's prior
+		// incarnation diskless?" that survives the peer Resource's
+		// physical deletion — the dispatcher's .res-driven
+		// `tearDownRemovedPeers` reads it AFTER the peer is gone
+		// to decide whether `drbdmeta forget-peer` is required
+		// (was-diskless → yes, was-diskful → no). Stamping happens
+		// continuously while the peer is alive so the value is
+		// always fresh at the moment of departure. The map is
+		// upsert-only — once a peer departs, its entry remains so
+		// the tear-down path can read it; a peer that returns
+		// overwrites its own entry on the next reconcile.
+		diskless := currentPeerDiskless(peers)
+
+		if len(evicted) > 0 || len(diskless) > 0 {
+			stampErr := r.stampAppliedPeerUIDs(ctx, res, evicted, diskless)
+			if stampErr != nil {
 				logger.Error(stampErr, "stampAppliedPeerUIDs failed; will retry next reconcile",
 					"evicted", evicted)
 			}
@@ -560,7 +577,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		}
 
 		if len(missing) > 0 {
-			if stampErr := r.stampAppliedPeerUIDs(ctx, res, missing); stampErr != nil {
+			// Bug 342 v15: PeerDiskless snapshot already stamped
+			// pre-apply (proactive on every reconcile); pass nil
+			// here so we don't double-stamp and re-trigger an
+			// apiserver round-trip when only the UID baseline
+			// needs filling in.
+			stampErr := r.stampAppliedPeerUIDs(ctx, res, missing, nil)
+			if stampErr != nil {
 				logger.Error(stampErr, "post-apply AppliedPeerUIDs baseline stamp failed; will retry next reconcile")
 			}
 		}
@@ -1277,9 +1300,60 @@ func currentPeerUIDs(peers []blockstoriov1alpha1.Resource) map[string]string {
 	return out
 }
 
+// currentPeerDiskless returns the current peer node-name → "is
+// DISKLESS or TIE_BREAKER" map for the Bug 342 v15 PeerDiskless
+// snapshot. Used by `stampAppliedPeerUIDs` callers to feed the
+// continuous-while-alive observation of each peer's diskful /
+// diskless / tiebreaker incarnation state. The map is read by
+// `tearDownRemovedPeers` at the moment the peer is GONE to
+// discriminate the post-departure cleanup strategy: was-diskful
+// → skip forget-peer (DRBD-9 adjust handles fresh UUID handshake),
+// was-diskless / was-tiebreaker → run forget-peer (clears the stale
+// GI / bitmap slot the witness incarnation left behind).
+//
+// The local satellite's own Resource is excluded — drbdsetup show
+// enumerates remote peers only, and the tear-down path doesn't ever
+// look up the local name. Empty Spec.NodeName entries are
+// defensively dropped (informer-cache trail for a brand-new
+// Resource whose Spec hasn't fully landed).
+func currentPeerDiskless(peers []blockstoriov1alpha1.Resource) map[string]bool {
+	if len(peers) == 0 {
+		return nil
+	}
+
+	out := make(map[string]bool, len(peers))
+
+	for i := range peers {
+		p := &peers[i]
+		if p.Spec.NodeName == "" {
+			continue
+		}
+
+		diskless := slices.Contains(p.Spec.Flags, apiv1.ResourceFlagDiskless) ||
+			slices.Contains(p.Spec.Flags, apiv1.ResourceFlagTieBreaker)
+		out[p.Spec.NodeName] = diskless
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
 // stampAppliedPeerUIDs merges `evicted` (peerName -> newUID pairs the
-// satellite just acted on) into Status.AppliedPeerUIDs and writes the
-// Status sub-resource.
+// satellite just acted on) into Status.AppliedPeerUIDs AND merges
+// `peerDiskless` (peerName -> wasDiskless-or-TieBreaker bool) into
+// Status.PeerDiskless, then writes the Status sub-resource in a single
+// atomic Update. Both maps are upsert-only — existing entries for
+// departed peers are LEFT INTACT so `tearDownRemovedPeers` (Bug 342
+// v15) can read the last-known diskless state of a peer that has
+// since vanished from the apiserver. The leak is one bool per
+// peer-name that ever existed, which is well within the Status
+// budget given the cluster sizes blockstor targets.
+//
+// Either map may be empty; the function short-circuits when BOTH
+// are empty (avoiding an unnecessary apiserver round-trip).
 //
 // The cached `res` from controller-runtime watch may trail apiserver
 // by hundreds of milliseconds; a direct Update(ctx, res) using its
@@ -1289,8 +1363,8 @@ func currentPeerUIDs(peers []blockstoriov1alpha1.Resource) map[string]string {
 // retry if another writer landed first. Without this the AppliedPeerUIDs
 // map stays empty forever on hot Resources (catcher cells touch the
 // CRD dozens of times per second) and Bug 342 v4 silently no-ops.
-func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *blockstoriov1alpha1.Resource, evicted map[string]string) error {
-	if len(evicted) == 0 {
+func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *blockstoriov1alpha1.Resource, evicted map[string]string, peerDiskless map[string]bool) error {
+	if len(evicted) == 0 && len(peerDiskless) == 0 {
 		return nil
 	}
 
@@ -1302,20 +1376,36 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh blockstoriov1alpha1.Resource
 
-		if getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh); getErr != nil {
+		getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh)
+		if getErr != nil {
 			return getErr
-		}
-
-		if fresh.Status.AppliedPeerUIDs == nil {
-			fresh.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
 		}
 
 		changed := false
 
-		for name, uid := range evicted {
-			if fresh.Status.AppliedPeerUIDs[name] != uid {
-				fresh.Status.AppliedPeerUIDs[name] = uid
-				changed = true
+		if len(evicted) > 0 {
+			if fresh.Status.AppliedPeerUIDs == nil {
+				fresh.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
+			}
+
+			for name, uid := range evicted {
+				if fresh.Status.AppliedPeerUIDs[name] != uid {
+					fresh.Status.AppliedPeerUIDs[name] = uid
+					changed = true
+				}
+			}
+		}
+
+		if len(peerDiskless) > 0 {
+			if fresh.Status.PeerDiskless == nil {
+				fresh.Status.PeerDiskless = make(map[string]bool, len(peerDiskless))
+			}
+
+			for name, diskless := range peerDiskless {
+				if existing, ok := fresh.Status.PeerDiskless[name]; !ok || existing != diskless {
+					fresh.Status.PeerDiskless[name] = diskless
+					changed = true
+				}
 			}
 		}
 
@@ -1325,9 +1415,8 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 
 		return r.Status().Update(ctx, &fresh)
 	})
-
 	if err != nil {
-		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
+		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs / PeerDiskless")
 	}
 
 	return nil
