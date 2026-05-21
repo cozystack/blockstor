@@ -2095,24 +2095,16 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
 	}
 
-	// Issue 342 v12c: REST stamps a per-peer pending-cleanup marker
-	// on the parent RD AFTER the physical Delete succeeds. The
-	// satellite-side `tearDownRemovedPeers` runs del-peer +
-	// forget-peer for the departed peer (already in place for the
-	// peer-set diff case) and stamps Resource.Status.ClearedPeers
-	// once the cleanup completes. The RD reconciler drops the
-	// marker once every online survivor has ACK'd. The Resource
-	// controller's `ensureDRBDIDs` allocator gate observes the
-	// marker on the new-incarnation Resource side and refuses
-	// allocation until the marker clears, holding off the
-	// sub-second `r c <same-node>` DRBD handshake until siblings
-	// have torn down the old kernel slot.
-	//
-	// Best-effort: failure to stamp does NOT roll back the Delete.
-	// A missed marker degrades cleanly to the pre-v12c behaviour
-	// (sibling cleanup still runs via the existing peer-set diff;
-	// only the synchronisation gate is lost).
-	_ = existing // existing already consumed above for TIE_BREAKER lookup
+	// Bug 342 v10: REST 2-phase delete wiring intentionally NOT
+	// activated here until satellite-side Phase 2 (FSM extension
+	// with ActionForgetPeer + ACK annotation stamping) lands. The
+	// DELETING flag constant and waitForPeerDeletionAcks helper are
+	// in place (pkg/api/v1/node.go, pkg/rest/peer_delete_sync.go)
+	// but not yet wired — without satellite ACKs the wait would
+	// time out at 15s per r d call, regressing test latency without
+	// closing the bug. Phase 2+3 of v10 land in a fresh session;
+	// the groundwork is forward-compatible.
+	_ = existing // silence unused-variable warning if Phase 2 isn't here yet
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
@@ -2149,18 +2141,6 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// this apiserver replica reflects it. See
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
-
-	// Issue 342 v12c: stamp the per-peer pending-cleanup marker on
-	// the parent RD BEFORE the sibling peer-changed bump so that
-	// when each survivor reconciles in response to PeerChanged it
-	// already sees the marker in the RD Annotations — closes the
-	// race where the survivor's `tearDownRemovedPeers` would
-	// complete and stamp ClearedPeers, then the RD reconciler
-	// would observe the ACK and reap the marker, all before the
-	// REST handler had a chance to stamp it. Best-effort: failure
-	// degrades to pre-v12c (no allocator gate, but peer-set diff
-	// cleanup still runs).
-	s.stampPendingPeerCleanup(r.Context(), rdName, node)
 
 	// Bug 67: notify surviving sibling Resources of the peer change so
 	// the satellite reconcilers re-derive their peer set without the
@@ -2243,45 +2223,6 @@ func (s *Server) bumpPeerChangedOnSiblings(ctx context.Context, rdName, removedN
 
 			return nil
 		})
-	}
-}
-
-// stampPendingPeerCleanup writes the per-peer pending-cleanup
-// marker onto the parent RD's Annotations after a peer-replica
-// Delete succeeds. Key is `<PendingPeerCleanupAnnotationPrefix><peer>`
-// and value is the current wall-clock time in RFC3339Nano. Issue 342
-// v12c — see PendingPeerCleanupAnnotationPrefix doc-comment for the
-// end-to-end protocol.
-//
-// Idempotent: a re-stamp always wins (later operator intent overrides
-// earlier). NotFound on the parent RD is swallowed — a concurrent
-// rd-delete cascade is the most common reason and the caller doesn't
-// care. Best-effort throughout: any other error degrades to pre-v12c
-// behaviour (the existing peer-set diff cleanup still runs at
-// satellites; only the allocator gate is skipped this round).
-func (s *Server) stampPendingPeerCleanup(ctx context.Context, rdName, departedNode string) {
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	key := apiv1.PendingPeerCleanupAnnotationPrefix + departedNode
-
-	// PatchResourceDefinitionSpec retries on conflict and re-fetches
-	// the live RD per attempt, so a concurrent tiebreaker-suppression
-	// stamp on the same RD (TIE_BREAKER delete path above) converges
-	// rather than overwriting each other.
-	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
-		if rd.Annotations == nil {
-			rd.Annotations = map[string]string{}
-		}
-
-		rd.Annotations[key] = stamp
-
-		return nil
-	})
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		// Swallow: best-effort. Pre-v12c behaviour still works
-		// (sibling cleanup still runs via the peer-set diff). The
-		// only effect of a missed stamp is the allocator gate not
-		// firing on a sub-second `r c <same-node>` follow-up.
-		_ = err
 	}
 }
 
