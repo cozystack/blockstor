@@ -520,6 +520,32 @@ func (r *ResourceReconciler) lookupRD(ctx context.Context, name string) (*blocks
 // Status update is rejected by Kube's optimistic concurrency check
 // and the next reconcile picks the next free port.
 func (r *ResourceReconciler) ensureDRBDIDs(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) (bool, error) {
+	// Issue 342 v12c: allocator gate. If the parent RD carries an
+	// active pending-peer-cleanup marker for THIS Resource's node
+	// (a sub-second `r d $node` then `r c $node` is in flight),
+	// hold off allocation so the new replica doesn't bring DRBD up
+	// against a sibling kernel slot the satellite is still tearing
+	// down. The 10-second stale-window escape hatch matches the RD
+	// reconciler's reapPendingPeerCleanup behaviour so both sides
+	// converge to the same "give up and proceed" decision under a
+	// wedged satellite. nil RD (transient apiserver miss) → don't
+	// gate; let the rest of ensureDRBDIDs decide.
+	gateRD, gateErr := r.lookupRD(ctx, target.Spec.ResourceDefinitionName)
+	if gateErr != nil {
+		return false, gateErr
+	}
+
+	if pendingPeerCleanupGateActive(gateRD, target.Spec.NodeName) {
+		// Return (false, nil) so the caller treats this as
+		// "no mutation, no error" — same shape as the
+		// already-allocated branch. Reconcile's caller hits the
+		// usual `if allocated { Requeue: true }` short-circuit
+		// and re-runs after the controller-runtime default
+		// backoff; the next pass observes the marker cleared
+		// (P4 reap) and proceeds with allocation.
+		return false, nil
+	}
+
 	// Serialise allocation across replicas of the same RD. The
 	// APIReader-direct read alone doesn't fix the race — two
 	// goroutines can both observe taken=[] simultaneously and

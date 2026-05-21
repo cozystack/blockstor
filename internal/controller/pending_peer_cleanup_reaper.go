@@ -37,6 +37,41 @@ import (
 // side observes the timeout first. Issue 342 v12c.
 const PendingPeerCleanupStaleWindow = 10 * time.Second
 
+// pendingPeerCleanupGateActive reports whether the parent RD carries
+// an active per-peer pending-cleanup marker for `nodeName`. The Resource
+// controller's `ensureDRBDIDs` consults this BEFORE acquiring the
+// per-RD allocation mutex: an active marker means a sub-second
+// `r d $node` then `r c $node` is in flight, and bringing the new
+// replica's DRBD up against siblings still holding the OLD kernel
+// slot would wedge the handshake — better to short-circuit allocation
+// until siblings finish their del-peer + forget-peer pass and the RD
+// reconciler reaps the marker.
+//
+// A marker older than PendingPeerCleanupStaleWindow is treated as
+// inactive (escape hatch) — matches the symmetrical timeout in
+// reapPendingPeerCleanup so both sides agree on when to give up on
+// the ACK and proceed. Issue 342 v12c.
+func pendingPeerCleanupGateActive(rd *blockstoriov1alpha1.ResourceDefinition, nodeName string) bool {
+	if rd == nil || len(rd.Annotations) == 0 {
+		return false
+	}
+
+	value, ok := rd.Annotations[apiv1.PendingPeerCleanupAnnotationPrefix+nodeName]
+	if !ok {
+		return false
+	}
+
+	stamped, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		// Unparseable marker → treat as inactive. A bad value
+		// is worth a single allocation pass under the
+		// pre-v12c behaviour rather than an indefinite gate.
+		return false
+	}
+
+	return time.Since(stamped) < PendingPeerCleanupStaleWindow
+}
+
 // reapPendingPeerCleanup drops PendingPeerCleanupAnnotationPrefix
 // markers from rd.Annotations when one of two conditions holds for
 // each marker:
