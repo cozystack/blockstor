@@ -79,38 +79,30 @@ wait_status_state "$RD" "${diskful_nodes[1]}" UpToDate 120 \
 # Phase 2: same-node delete + re-create
 # =====================================================================
 n1="${diskful_nodes[0]}"
-echo ">> Phase 2: r d $n1 $RD  (Bug 342 trigger — witness must stay alive)"
+echo ">> Phase 2: r d $n1 $RD  (Bug 338 trigger — should collapse tiebreaker)"
 "${LCTL[@]}" resource delete "$n1" "$RD" >/dev/null
 
 wait_replica_absent "$RD" "$n1" 60 \
     || die "Phase 2: ${RD}.${n1} CRD never disappeared after r d"
 
-# Bug 342 contract (replaces Bug 338's collapse contract): after the
-# diskful→1 transition the TIE_BREAKER witness MUST remain alive so
-# the surviving Resource's rendered .res keeps the witness peer block
-# (`on <witness> { disk none; }` + `connection { ... }`). Without
-# that, the rendered .res shrinks to single-host shape, the kernel
-# slot for the witness orphans, and the next `r c` wedges in
-# Connecting/StandAlone forever. Mirrors upstream LINSTOR's
-# CtrlRscAutoTieBreakerHelper (v16 baseline against piraeus v1.32.3
-# on the same hardware/kernel/ZFS pool confirmed the upstream PASS).
-echo ">> Phase 2: assert witness persists across diskful-shrink (Bug 342)"
+# Bug 338 contract: 1 surviving diskful, no tiebreaker.
+echo ">> Phase 2: wait up to 30s for tiebreaker to collapse"
 deadline=$(( $(date +%s) + 30 ))
-preserved=false
+collapsed=false
 while (( $(date +%s) < deadline )); do
     remaining=$(linstor_replica_count "$RD")
-    tb=$(linstor_tiebreaker_node "$RD")
-    # Expected post-shrink shape: 2 rows (1 surviving diskful + the
-    # preserved TIE_BREAKER witness). Witness node must NOT be empty.
-    if [[ "$remaining" == "2" ]] && [[ -n "$tb" ]]; then
-        preserved=true
-        break
+    if [[ "$remaining" == "1" ]]; then
+        # Confirm the lone row is the surviving diskful (not the tiebreaker).
+        if [[ -z "$(linstor_tiebreaker_node "$RD")" ]]; then
+            collapsed=true
+            break
+        fi
     fi
     sleep 2
 done
-if [[ "$preserved" != "true" ]]; then
+if [[ "$collapsed" != "true" ]]; then
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -20 >&2
-    die "Phase 2 (Bug 342): witness did not persist (expected 2 rows + tiebreaker present within 30s)"
+    die "Phase 2 (Bug 338): tiebreaker did not collapse to single diskful within 30s"
 fi
 
 # Re-create on the SAME node — bare form, no --diskless, no --storage-pool.
