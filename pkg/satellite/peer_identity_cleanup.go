@@ -18,12 +18,10 @@ package satellite
 
 import (
 	"context"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -65,14 +63,6 @@ import (
 // DRBDNodeID allocation; it operates on metadata.uid + the kernel's
 // already-known node-id from `drbdsetup show`.
 //
-// Bug 342 Fix B-extended: when `rdAnnotations` carries a
-// `apiv1.PeerRespawningAnnotationKey(<peer>)` whose deadline is still
-// in the future, defer the eviction. The operator is mid-`r d` +
-// `r c` and tearing down the slot now would wipe per-volume v09
-// GI/bitmap metadata before the new incarnation hands off. The same
-// gate already protects tearDownRemovedPeers; this is the second
-// forget-peer caller attempt #15 missed.
-//
 // Returns a `cleaned` map of {peerName: newResourceUID} pairs that
 // the controller layer MUST then patch into
 // res.Status.AppliedPeerUIDs so subsequent reconciles don't re-evict
@@ -89,7 +79,6 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 	appliedPeerUIDs map[string]string,
 	vols []int32,
 	devices map[int32]string,
-	rdAnnotations map[string]string,
 ) (map[string]string, error) {
 	if r.cfg.Adm == nil {
 		return nil, nil
@@ -109,8 +98,6 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 		slots = nil
 	}
 
-	now := time.Now()
-
 	var cleaned map[string]string
 
 	for _, peer := range desiredPeers {
@@ -126,30 +113,6 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 		if !hasLast || last == peer.ResourceUID {
 			// No prior baseline (rollout window / first
 			// apply) OR baseline matches — nothing to evict.
-			continue
-		}
-
-		// Bug 342 Fix B-extended: REST stamps
-		// `apiv1.PeerRespawningAnnotationKey(<peer>)` on the parent
-		// RD whenever `r d <peer> <rd>` lands. While the RFC3339Nano
-		// deadline is in the future, the operator's intent is "this
-		// peer is coming back on the same node sub-second from now"
-		// — running del-peer + forget-peer right now would wipe the
-		// per-volume v09 GI/bitmap metadata BEFORE the new
-		// incarnation hands off, identical to the C2 root cause that
-		// tearDownRemovedPeers' fix targets. Defer eviction; the next
-		// reconcile (after the deadline OR after the new peer's
-		// Status.DRBDNodeID lands) will retry. tearDownRemovedPeers
-		// already honours the same annotation — we mirror the gate
-		// here because the UID-mismatch path is a SECOND forget-peer
-		// caller that the original Fix B missed.
-		if peerRespawnPending(rdAnnotations, peer.Name, now) {
-			logger.Info("UID mismatch but peer-respawn annotation present — deferring eviction",
-				"peer", peer.Name,
-				"oldUID", last,
-				"newUID", peer.ResourceUID,
-				"deadline", rdAnnotations[apiv1.PeerRespawningAnnotationKey(peer.Name)])
-
 			continue
 		}
 
