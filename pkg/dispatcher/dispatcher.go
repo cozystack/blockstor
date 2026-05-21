@@ -199,6 +199,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		LayerStack:      layerStack,
 		Connections:     connectionsFromRD(rd),
 		AppliedPeerUIDs: copyAppliedPeerUIDs(target.Status.AppliedPeerUIDs),
+		PeerDiskless:    copyPeerDiskless(target.Status.PeerDiskless),
 	}
 }
 
@@ -244,6 +245,24 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 
 		out = append(out, entry)
 	}
+
+	return out
+}
+
+// copyPeerDiskless returns a defensive copy of Status.PeerDiskless
+// for the dispatcher's DesiredResource output so the downstream
+// satellite tear-down path doesn't alias the apiserver client's
+// cached Resource map (a downstream mutation would race the cache).
+// nil-safe; returns nil for the empty case so the satellite's
+// `tearDownRemovedPeers` default-to-true gate keeps its meaning.
+// Bug 342 v15.
+func copyPeerDiskless(src map[string]bool) map[string]bool {
+	if len(src) == 0 {
+		return nil
+	}
+
+	out := make(map[string]bool, len(src))
+	maps.Copy(out, src)
 
 	return out
 }

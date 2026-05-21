@@ -75,6 +75,32 @@ type DesiredResource struct {
 	// touching connections.
 	AppliedPeerUIDs map[string]string
 
+	// PeerDiskless mirrors the local Resource's
+	// Status.PeerDiskless map — the Bug 342 v15 snapshot of "was
+	// each peer's prior incarnation DISKLESS / TIE_BREAKER (true)
+	// or diskful (false)". Stamped continuously by the controllers
+	// layer while each peer is alive, then read by the satellite's
+	// `tearDownRemovedPeers` at the moment a peer departs to
+	// discriminate the cleanup strategy:
+	//
+	//   - was-diskless / was-tiebreaker (true)  → run `drbdmeta
+	//     forget-peer` to clear the stale GI / bitmap slot, so a
+	//     replacement diskful peer can handshake fresh (closes
+	//     Phase 3 of bug342 r-full-lifecycle).
+	//
+	//   - was-diskful (false) → skip forget-peer and rely on
+	//     DRBD-9 adjust + UUID compare (closes the Phase 2
+	//     same-node delete+recreate footgun that wedged v8/v9/v10/
+	//     v12c).
+	//
+	// Map is monotonic by name-set (entries persist past peer
+	// departure), so the tear-down path always sees the
+	// last-known value. Empty during the rollout window when the
+	// satellite is upgraded but Status has not yet been backfilled
+	// — the tear-down path defaults to "true" (run forget-peer) in
+	// that case as the safer bet.
+	PeerDiskless map[string]bool
+
 	// LayerStack is the resolved composition (["DRBD","STORAGE"]
 	// = default; ["LUKS","STORAGE"] = no DRBD; ["STORAGE"] =
 	// single-replica local mode). Empty == default.
@@ -224,6 +250,18 @@ func (x *DesiredResource) GetAppliedPeerUIDs() map[string]string {
 	}
 
 	return x.AppliedPeerUIDs
+}
+
+// GetPeerDiskless returns the local Resource's last-known
+// per-peer DISKLESS / TIE_BREAKER snapshot (from
+// Status.PeerDiskless). Nil-safe. See `Bug 342 v15` in
+// `tearDownRemovedPeers` for the discriminator semantics.
+func (x *DesiredResource) GetPeerDiskless() map[string]bool {
+	if x == nil {
+		return nil
+	}
+
+	return x.PeerDiskless
 }
 
 // GetDrbdOptions returns the resolved DRBD options bag.
