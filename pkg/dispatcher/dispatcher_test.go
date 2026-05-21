@@ -1516,3 +1516,96 @@ func TestBug342DiskfulShrinkRetainsPeerBlock(t *testing.T) {
 			got.Peers)
 	}
 }
+
+// TestBuildDesiredCopiesRDAnnotations pins the Bug 342 Fix B Option
+// 2 plumbing: the parent RD's metadata.annotations must land
+// verbatim in DesiredResource.RDAnnotations so the satellite-side
+// `tearDownRemovedPeers` can read the per-peer
+// `blockstor.io/peer-respawning-<node>` stamp the REST handler
+// wrote at `r d` time. A regression that dropped the field would
+// silently re-enable the Phase-2 forget-peer storm.
+//
+// Defensive copy: mutating the returned map MUST NOT leak back
+// onto the apiserver cache the dispatcher's caller passed in.
+func TestBuildDesiredCopiesRDAnnotations(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-respawn",
+			Annotations: map[string]string{
+				"blockstor.io/peer-respawning-n2": "2099-01-01T00:00:00Z",
+				"unrelated-key":                   "kept",
+			},
+		},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-respawn-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-respawn",
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if got.RDAnnotations["blockstor.io/peer-respawning-n2"] != "2099-01-01T00:00:00Z" {
+		t.Errorf("peer-respawning annotation missing or wrong: got %v", got.RDAnnotations)
+	}
+
+	if got.RDAnnotations["unrelated-key"] != "kept" {
+		t.Errorf("unrelated annotation must round-trip: got %v", got.RDAnnotations)
+	}
+
+	// Defensive copy: mutating the returned map must NOT touch
+	// the source RD's annotations (apiserver cache aliasing
+	// would race other reconcilers reading the same RD).
+	got.RDAnnotations["spoof"] = "v"
+
+	if _, leaked := rd.Annotations["spoof"]; leaked {
+		t.Errorf("RDAnnotations is not a defensive copy — mutation leaked back to rd.Annotations: %v", rd.Annotations)
+	}
+}
+
+// TestBuildDesiredNilRDAnnotations pins the nil-safe branch: an RD
+// with no annotations produces a nil RDAnnotations map (not a
+// zero-length non-nil), matching the documented contract on
+// DesiredResource.RDAnnotations. A regression that returned a
+// non-nil empty map would still work but trip nil-checks
+// downstream.
+func TestBuildDesiredNilRDAnnotations(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bare"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	target := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bare-n1"},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-bare",
+			NodeName:               "n1",
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if got.RDAnnotations != nil {
+		t.Errorf("RDAnnotations must be nil for an RD without annotations; got %v", got.RDAnnotations)
+	}
+}
