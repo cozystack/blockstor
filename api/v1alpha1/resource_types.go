@@ -328,37 +328,6 @@ type ResourceStatus struct {
 	// and stamps current UIDs without touching connections.
 	// +optional
 	AppliedPeerUIDs map[string]string `json:"appliedPeerUids,omitempty"`
-
-	// clearedPeers records each peer node-name → RFC3339Nano
-	// timestamp at the moment the local satellite's
-	// `tearDownRemovedPeers` finished `drbdadm del-peer` +
-	// `drbdmeta forget-peer` for that departed peer. Bug 342 v12c.
-	//
-	// The RD controller compares this map (across every online
-	// surviving Resource of the parent RD) against the parent RD's
-	// `blockstor.io/pending-peer-cleanup-<peer>` Annotation
-	// timestamp the REST `r d` handler stamps just after the
-	// physical Delete: when EVERY online survivor's
-	// ClearedPeers[peer] is at least as new as the pending
-	// timestamp, the controller drops the Annotation. The
-	// allocator gate on `ensureDRBDIDs` reads the Annotation; an
-	// `r c <same-node>` arriving while the marker is still set
-	// requeues without allocating, holding off the satellite's
-	// new-incarnation DRBD handshake until siblings have cleaned
-	// up the old kernel slot.
-	//
-	// Stamped only on FULL success of cleanup for that peer name
-	// (the per-peer del-peer call returned no error AND every
-	// per-volume forget-peer attempt was issued). A partial
-	// cleanup leaves the entry absent so the RD controller's
-	// timestamp comparison treats the sibling as still-pending
-	// and the 10-second escape hatch in the allocator gate fires.
-	//
-	// Map key is the departed peer's node name; value is the
-	// stamp time, NOT the pending-cleanup deadline — the RD
-	// controller does the "ACK >= request" comparison.
-	// +optional
-	ClearedPeers map[string]string `json:"clearedPeers,omitempty"`
 }
 
 // ResourceConnectionStatus is the state of one DRBD peer connection
