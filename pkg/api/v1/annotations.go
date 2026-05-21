@@ -90,6 +90,30 @@ const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 // the dispatcher / Python CLI (they ignore unknown keys).
 const PeerChangedAnnotation = "blockstor.io/peer-changed"
 
+// PendingPeerCleanupAnnotationPrefix names the per-peer pending-cleanup
+// marker the REST `handleResourceDelete` handler stamps on the parent
+// RD just after the physical Resources().Delete completes. Full key
+// shape: `blockstor.io/pending-peer-cleanup-<departedNode>` with an
+// RFC3339Nano timestamp as the value.
+//
+// Issue 342 v12c: closes the kernel-slot relocate race. The REST handler
+// stamps the marker before bumping sibling PeerChanged. Satellite
+// `tearDownRemovedPeers` runs `drbdadm del-peer` + `drbdmeta forget-peer`
+// for the departed peer and stamps the corresponding ACK timestamp on
+// its local Resource.Status.ClearedPeers. The RD reconciler watches the
+// markers and drops them once every online sibling Resource of the same
+// RD has ACK'd the cleanup. The Resource controller's `ensureDRBDIDs`
+// allocator gate observes the marker and refuses to allocate a fresh
+// DRBD-NodeID for an `r c <same-node>` arriving sub-second after the
+// `r d` — until the marker clears or the 10-second escape hatch fires,
+// the new replica stays out of the satellite's apply path.
+//
+// Stamped per-peer rather than as a single peer-set blob so concurrent
+// `r d <a>` / `r d <b>` calls don't race the same annotation entry.
+// Each marker survives an RD reconcile cycle independently; the
+// controller's cleanup pass strips them in any order.
+const PendingPeerCleanupAnnotationPrefix = "blockstor.io/pending-peer-cleanup-"
+
 // RDSpawnShortfallAnnotation is stamped on a ResourceDefinition when
 // `rg spawn` placed strictly fewer replicas than the parent RG's
 // PlaceCount asked for — i.e. the partial-fail path where 2 of 3
