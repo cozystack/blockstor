@@ -121,16 +121,6 @@ type DesiredResource struct {
 	// absent (cluster just upgraded, observer restarting). Phase
 	// 11.3 Stage 3.
 	KernelLoaded bool
-
-	// RDAnnotations carries the parent ResourceDefinition's
-	// metadata.annotations into the satellite apply chain. The
-	// dispatcher populates it as a defensive copy of rd.Annotations
-	// at BuildDesired time. Bug 342 Fix B Option 2: the satellite's
-	// `tearDownRemovedPeers` reads the per-peer
-	// `apiv1.PeerRespawningAnnotationKey(node)` entry and SKIPS
-	// `drbdmeta forget-peer` while the RFC3339Nano deadline is in
-	// the future. nil-safe (empty == no respawn intent recorded).
-	RDAnnotations map[string]string
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -301,18 +291,6 @@ func (x *DesiredResource) GetKernelLoaded() bool {
 	}
 
 	return x.KernelLoaded
-}
-
-// GetRDAnnotations returns the parent RD's annotations map the
-// dispatcher copied into the desired payload. Nil-safe; returns
-// nil when the RD had no annotations (or the dispatcher omitted
-// them). Bug 342 Fix B Option 2 — see DesiredResource.RDAnnotations.
-func (x *DesiredResource) GetRDAnnotations() map[string]string {
-	if x == nil {
-		return nil
-	}
-
-	return x.RDAnnotations
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply
