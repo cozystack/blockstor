@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/luks"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
@@ -1141,6 +1142,24 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 	// file we're about to overwrite is the only stable source.
 	peerIDs := extractResFilePeerNodeIDs(resPath)
 
+	// Bug 342 Fix B Option 2: REST stamps a per-peer
+	// `apiv1.PeerRespawningAnnotationKey(<peer>)` on the parent RD
+	// whenever an `r d <peer> <rd>` lands. The value is an
+	// RFC3339Nano deadline; while the deadline is in the future the
+	// satellite SKIPS `drbdmeta forget-peer` for that peer (still
+	// runs `del-peer` — the runtime kernel connection MUST be
+	// severed regardless of intent). Without this skip, a Phase-2-
+	// style sub-second `r d` + `r c` same-node respawn wipes the
+	// per-volume v09 GI / bitmap metadata on the surviving siblings
+	// before the new incarnation lands; the kernel slot wedges in
+	// Connecting / DUnknown forever. Genuinely departed peers (node
+	// decommission, autoplacer eviction) hit the satellite either
+	// before the stamp or after the deadline — in both cases the
+	// full del-peer + forget-peer fires and the MaxPeers-1 slot is
+	// reclaimed.
+	annotations := dr.GetRDAnnotations()
+	now := time.Now()
+
 	for _, peer := range removed {
 		err := r.cfg.Adm.DelPeer(ctx, dr.GetName(), peer)
 		if err != nil {
@@ -1155,6 +1174,17 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 		// peer ever rendered).
 		peerID, hasID := peerIDs[peer]
 		if !hasID {
+			continue
+		}
+
+		if peerRespawnPending(annotations, peer, now) {
+			log.FromContext(ctx).Info(
+				"tearDownRemovedPeers: skipping forget-peer (respawn pending)",
+				"resource", dr.GetName(),
+				"peer", peer,
+				"deadline", annotations[apiv1.PeerRespawningAnnotationKey(peer)],
+			)
+
 			continue
 		}
 
@@ -1176,6 +1206,33 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 	}
 
 	return nil
+}
+
+// peerRespawnPending reports whether the parent RD's annotations
+// carry a `blockstor.io/peer-respawning-<peer>` entry whose
+// RFC3339Nano deadline is still in the future at `now`. Returns
+// false for missing keys, empty values, unparseable timestamps, or
+// expired deadlines — in every "I don't know" case we fall through
+// to the normal forget-peer path so a stale or malformed stamp
+// can't permanently leak a v09 metadata slot.
+//
+// Bug 342 Fix B Option 2.
+func peerRespawnPending(annotations map[string]string, peer string, now time.Time) bool {
+	if len(annotations) == 0 {
+		return false
+	}
+
+	raw, ok := annotations[apiv1.PeerRespawningAnnotationKey(peer)]
+	if !ok || raw == "" {
+		return false
+	}
+
+	deadline, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return false
+	}
+
+	return now.Before(deadline)
 }
 
 // computeRemovedPeers diffs the previously-rendered .res file against
