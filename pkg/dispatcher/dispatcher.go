@@ -199,29 +199,7 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		LayerStack:      layerStack,
 		Connections:     connectionsFromRD(rd),
 		AppliedPeerUIDs: copyAppliedPeerUIDs(target.Status.AppliedPeerUIDs),
-		RDAnnotations:   copyRDAnnotations(rd),
 	}
-}
-
-// copyRDAnnotations returns a defensive copy of the parent RD's
-// metadata.annotations so the dispatcher's output doesn't alias the
-// apiserver client's cached object (downstream mutation would race
-// the cache). nil-safe — returns nil when rd is nil or carries no
-// annotations.
-//
-// Bug 342 Fix B Option 2: the satellite's `tearDownRemovedPeers`
-// reads the per-peer `apiv1.PeerRespawningAnnotationKey(node)` key
-// off this map to decide whether to skip `drbdmeta forget-peer` on
-// a same-node respawn (REST stamped the annotation at `r d` time).
-func copyRDAnnotations(rd *blockstoriov1alpha1.ResourceDefinition) map[string]string {
-	if rd == nil || len(rd.Annotations) == 0 {
-		return nil
-	}
-
-	out := make(map[string]string, len(rd.Annotations))
-	maps.Copy(out, rd.Annotations)
-
-	return out
 }
 
 // buildDesiredPeers walks the dropped peer-name list (already sorted
