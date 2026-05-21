@@ -53,6 +53,19 @@ const (
 	autoTiebreakerSuppressionWindow         = 5 * time.Minute
 )
 
+// peerRespawningWindow is the wall-clock duration the satellite's
+// `tearDownRemovedPeers` skips `drbdmeta forget-peer` for a peer
+// whose `r d` was recently stamped. 30s covers the e2e
+// r-full-lifecycle Phase 2 r d → r c gap (sub-second in CI, a few
+// seconds for human operators) without indefinitely deferring the
+// genuine-departure forget-peer that reclaims the per-volume v09
+// MaxPeers-1 budget slot. The deadline is monotonic-wall: a later
+// stamp always wins, so a rapid `r d` storm extends the window
+// rather than queueing.
+//
+// Bug 342 Fix B Option 2 — see `apiv1.PeerRespawningAnnotationPrefix`.
+const peerRespawningWindow = 30 * time.Second
+
 // registerAutoplace wires `POST /v1/resource-definitions/{rd}/autoplace` and
 // the per-resource list/POST/DELETE used by linstor-csi for explicit placement.
 //
@@ -2142,6 +2155,24 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
+	// Bug 342 Fix B Option 2: stamp a per-peer respawning annotation
+	// on the parent RD so the satellite's `tearDownRemovedPeers`
+	// skips `drbdmeta forget-peer` for this peer for the next
+	// `peerRespawningWindow`. Without this, a Phase-2-style
+	// `r d <node>` immediately followed by `r c <node>` wipes the
+	// per-volume v09 GI/bitmap metadata on the surviving siblings
+	// before the new incarnation lands — the kernel slot wedges in
+	// Connecting / DUnknown forever. del-peer (the runtime severance)
+	// is NOT skipped — it must always run so the new incarnation's
+	// handshake starts fresh. See `apiv1.PeerRespawningAnnotationPrefix`
+	// for the full design context.
+	//
+	// Best-effort: failure to stamp must not block the operator-
+	// requested delete; worst case the satellite runs forget-peer as
+	// before and Phase 2 stays wedged (which is the pre-fix
+	// behaviour, so no regression).
+	_ = s.stampPeerRespawning(r.Context(), rdName, node)
+
 	// Bug 67: notify surviving sibling Resources of the peer change so
 	// the satellite reconcilers re-derive their peer set without the
 	// dropped replica. The satellite's controller-runtime watch is
@@ -2251,6 +2282,47 @@ func (s *Server) stampTiebreakerSuppression(ctx context.Context, rdName string) 
 		}
 
 		rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation] = deadline
+
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+
+	return err //nolint:wrapcheck // best-effort, caller swallows
+}
+
+// stampPeerRespawning writes the per-peer
+// `PeerRespawningAnnotationKey(node)` onto the parent RD with a
+// `now + peerRespawningWindow` deadline. The satellite-side
+// `tearDownRemovedPeers` reads the annotation and SKIPS
+// `drbdmeta forget-peer` for the named peer while the deadline is
+// in the future — `drbdadm del-peer` still runs so the runtime
+// connection is severed regardless of intent.
+//
+// Idempotent: a fresh stamp always wins (later operator intent
+// extends the window). NotFound on the parent RD is swallowed — a
+// concurrent RD-delete cascade is the most common reason and the
+// caller (best-effort cascade) doesn't care.
+//
+// Bug 342 Fix B Option 2. See `apiv1.PeerRespawningAnnotationPrefix`
+// for the full design context.
+func (s *Server) stampPeerRespawning(ctx context.Context, rdName, node string) error {
+	deadline := time.Now().Add(peerRespawningWindow).UTC().Format(time.RFC3339Nano)
+	key := apiv1.PeerRespawningAnnotationKey(node)
+
+	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — re-fetches
+	// the live RD on every conflict so a racing RD-modify or r-conn
+	// upsert on the same RD converges with the peer-respawning
+	// annotation instead of being lost by a stale-wire-snapshot
+	// replay. NotFound is still treated as "fine, RD already gone"
+	// — the caller (best-effort cascade) doesn't care.
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+		if rd.Annotations == nil {
+			rd.Annotations = map[string]string{}
+		}
+
+		rd.Annotations[key] = deadline
 
 		return nil
 	})
