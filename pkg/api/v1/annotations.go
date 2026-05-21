@@ -90,6 +90,52 @@ const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 // the dispatcher / Python CLI (they ignore unknown keys).
 const PeerChangedAnnotation = "blockstor.io/peer-changed"
 
+// PeerRespawningAnnotationPrefix is the per-peer key prefix the REST
+// `handleResourceDelete` handler stamps on the parent RD whenever a
+// per-replica `r d <node> <rd>` succeeds. The full annotation key is
+// `blockstor.io/peer-respawning-<node>`; the value is an RFC3339Nano
+// wall-clock deadline (typically now + PeerRespawningWindow).
+//
+// Bug 342 C2: blockstor's `pkg/satellite/reconciler.go::
+// tearDownRemovedPeers` unconditionally issues `drbdadm del-peer` +
+// `drbdmeta forget-peer` for every peer that disappears from the .res
+// between two reconciles. For the Phase-2 r d / r c same-node
+// respawn sequence (operator-driven re-place on the same node within
+// sub-second), `forget-peer` wipes the per-volume v09 GI / bitmap
+// metadata for the slot. When the new incarnation comes up the
+// surviving peer cannot reconcile its slot against the now-cleared
+// metadata — the slot wedges in `Connecting` / `peer-disk:DUnknown`
+// forever. Upstream LINSTOR avoids this via its `Flags.DELETE` /
+// `Flags.DRBD_DELETE` lifecycle (the peer Resource record stays
+// alive across the delete-recreate so the satellite-side teardown
+// gates on the flag, not on a pure peer-name diff).
+//
+// Blockstor's narrower mitigation: REST stamps the per-peer key
+// when an `r d` lands, satellite reads the parent RD's Annotations
+// and SKIPS the per-volume `forget-peer` for that peer while the
+// deadline is in the future (still runs `del-peer` — the runtime
+// connection MUST be severed regardless of intent). Genuinely-
+// departed peers (node decommission, autoplacer eviction) reach the
+// satellite either before the stamp or after the deadline expires —
+// in both cases the full del-peer + forget-peer fires.
+//
+// A future sweeper can prune expired entries; until then subsequent
+// reconciles just see expired annotations and ignore them.
+//
+// Defined here (rather than in pkg/rest or pkg/satellite) so the
+// REST writer (`stampPeerRespawning`) and the satellite reader (in
+// `tearDownRemovedPeers`) share a single source of truth without
+// either package importing the other — pkg/api/v1 is the neutral,
+// dependency-free shared layer both already import.
+const PeerRespawningAnnotationPrefix = "blockstor.io/peer-respawning-"
+
+// PeerRespawningAnnotationKey returns the full RD annotation key for
+// a given peer node name. Centralised so the REST stamper and the
+// satellite reader cannot drift on the format.
+func PeerRespawningAnnotationKey(node string) string {
+	return PeerRespawningAnnotationPrefix + node
+}
+
 // RDSpawnShortfallAnnotation is stamped on a ResourceDefinition when
 // `rg spawn` placed strictly fewer replicas than the parent RG's
 // PlaceCount asked for — i.e. the partial-fail path where 2 of 3
