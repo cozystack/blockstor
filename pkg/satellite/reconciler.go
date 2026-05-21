@@ -123,6 +123,14 @@ type ReconcilerConfig struct {
 	// manager owns.
 	SkipDiskClearer SkipDiskClearer
 
+	// PeerForgetAckStamper writes the per-peer ACK annotation onto
+	// the local Resource CRD after ActionForgetPeer completes
+	// (342-v10). nil → the FSM action still runs del-peer +
+	// forget-peer but the REST waiter sees no ACK and falls back
+	// to its 15s timeout. The agent injects this post-manager
+	// construction via SetPeerForgetAckStamper.
+	PeerForgetAckStamper PeerForgetAckStamper
+
 	// Exec runs auxiliary shell-outs the reconciler owns directly
 	// (currently: `mkfs.<type>` for the RG-driven auto-mkfs path,
 	// scenario 9.W14). Production wires `storage.RealExec`; tests
@@ -206,6 +214,29 @@ type SkipDiskClearer interface {
 	// the observer's stamp path and surfacing it here would force
 	// every caller to re-implement the same silence.
 	ClearSkipDisk(ctx context.Context, resourceName string) error
+}
+
+// PeerForgetAckStamper abstracts the "stamp the per-peer ACK
+// annotation onto the local Resource CRD after ActionForgetPeer
+// completes" verb (342-v10). The REST handler's
+// waitForPeerDeletionAcks loop polls for the annotation key
+// `blockstor.io/peer-forget-acked.<peerName>` on every online
+// sibling and unblocks the physical Resources().Delete once
+// every reachable satellite has stamped it.
+//
+// Lives behind an interface so satellite.Reconciler stays free of
+// a controller-runtime client dependency. Mirrors the existing
+// MetadataCreatedStamper / FilesystemFormattedStamper /
+// SkipDiskClearer pattern — implementation in
+// pkg/satellite/controllers/peer_forget_ack_stamper.go owns the
+// apiserver write via the cached client.
+type PeerForgetAckStamper interface {
+	// StampPeerForgetAck patches an annotation
+	// `blockstor.io/peer-forget-acked.<peerName>` with an
+	// RFC3339Nano timestamp onto the local Resource CRD for
+	// `resourceName`. Idempotent — repeat calls keep refreshing
+	// the value; the REST waiter only checks for presence.
+	StampPeerForgetAck(ctx context.Context, resourceName, peerName string) error
 }
 
 // Reconciler turns a controller-pushed DesiredResource set into local
@@ -333,6 +364,15 @@ func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper)
 // NewReconciler time. Safe to call before the first Apply. Bug 278.
 func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
 	r.cfg.SkipDiskClearer = c
+}
+
+// SetPeerForgetAckStamper injects the 342-v10 peer-forget ACK
+// annotation stamper post-construction. Mirrors
+// `SetSkipDiskClearer`: the stamper needs the controller-runtime
+// manager's cached client which doesn't exist at NewReconciler
+// time. Safe to call before the first Apply.
+func (r *Reconciler) SetPeerForgetAckStamper(s PeerForgetAckStamper) {
+	r.cfg.PeerForgetAckStamper = s
 }
 
 // StateDir returns the on-disk directory the reconciler uses for

@@ -351,6 +351,7 @@ func TestFsmTransitionsHaveKnownActions(t *testing.T) {
 		ActionAdjustSkipDisk: {},
 		ActionDecommission:   {},
 		ActionNoop:           {},
+		ActionForgetPeer:     {},
 	}
 
 	for i, tr := range fsm {

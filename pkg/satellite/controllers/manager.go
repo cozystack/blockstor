@@ -190,6 +190,7 @@ func wireConditionStampers(mgr manager.Manager, cfg Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
 	wireSkipDiskClearer(mgr, cfg)
+	wirePeerForgetAckStamper(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -349,5 +350,17 @@ func wireSkipDiskClearer(mgr manager.Manager, cfg Config) {
 	cfg.Apply.SetSkipDiskClearer(&SkipDiskClearer{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+	})
+}
+
+// wirePeerForgetAckStamper injects the PeerForgetAckStamper into the
+// Apply chain so the FSM's ActionForgetPeer arm can JSON-merge patch
+// the per-peer ACK annotation onto the local Resource CRD. The REST
+// handler's waitForPeerDeletionAcks loop polls for these annotations
+// over the 2-phase delete window (342-v10). Mirrors
+// `wireMetadataCreatedStamper`.
+func wirePeerForgetAckStamper(mgr manager.Manager, cfg Config) {
+	cfg.Apply.SetPeerForgetAckStamper(&PeerForgetAckStamper{
+		Client: mgr.GetClient(),
 	})
 }
