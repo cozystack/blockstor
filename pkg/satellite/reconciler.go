@@ -1557,7 +1557,21 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// the in-flight handshake. Suppress firstActivation on the flip
 	// so `ensureMetadata` skips GI-seed and `finishDRBDApply` skips
 	// the auto-promote chain.
-	effectiveFirstActivation := firstActivation && !diskfulFlip
+	//
+	// Bug 356: the "peers are already UpToDate" assumption breaks for
+	// the solo-replica case — a single-replica RD with one DISKLESS
+	// peer that gets toggled to diskful has zero peers in the
+	// desired list, so there is no peer UUID to inherit and no
+	// in-flight handshake to corrupt. Without the auto-promote, DRBD
+	// sits in Inconsistent forever (no sync source). Re-enable
+	// firstActivation when diskfulFlip happens against an empty peer
+	// set so runAutoPromote runs `drbdadm primary --force` and the
+	// lone diskful slot transitions Inconsistent → UpToDate. Mirrors
+	// upstream LINSTOR's `DrbdLayer.adjustResource` force-primary
+	// unconditional on the mkfs path (peers may not be reachable
+	// yet; --force is safe under quorum=majority on a 1-node cluster).
+	soloDiskfulFlip := diskfulFlip && len(dr.GetPeerNames()) == 0
+	effectiveFirstActivation := firstActivation && (!diskfulFlip || soloDiskfulFlip)
 
 	// Phase 11.2.c Stage 3a: fresh-replica first-activation routes
 	// through the dedicated createMetadata helper so Stage 3b can
