@@ -101,16 +101,31 @@ echo "   diskful pair: $uptodate_pair  tiebreaker: $tb_node"
 # invariant is "the tiebreaker collapses regardless of which diskful
 # leaves".
 DELETE_NODE=$(echo "$uptodate_pair" | awk '{print $1}')
-echo ">> linstor r d $DELETE_NODE $RD  (Bug 338 trigger: real delete, not toggle)"
-err_file=$(mktemp)
-if ! "${LCTL[@]}" resource delete "$DELETE_NODE" "$RD" 2>"$err_file"; then
-    rc=$?
-    echo "FAIL: r d exited $rc" >&2
-    cat "$err_file" >&2
-    rm -f "$err_file"
+
+# Bug 342: r d on a diskful Resource is now toggle-disk-remove (CRD
+# survives with DISKLESS flag), not physical Delete. To exercise the
+# Bug 338 "tiebreaker collapses when diskful drops below 2" contract
+# we need to ACTUALLY remove the peer — that requires a SECOND r d
+# call which hits the already-DISKLESS branch and physically deletes
+# the CRD.
+echo ">> linstor r d $DELETE_NODE $RD  (Bug 342 1st call: toggle diskful → DISKLESS)"
+"${LCTL[@]}" resource delete "$DELETE_NODE" "$RD" >/dev/null 2>&1 || {
+    echo "FAIL: 1st r d (toggle-to-diskless) exited non-zero" >&2
     exit 1
-fi
-rm -f "$err_file"
+}
+
+# Wait for the Resource to transition to DISKLESS in Spec before the
+# second r d, so the second hit deterministically takes the
+# already-DISKLESS branch (physical Delete) rather than racing the
+# Spec patch.
+wait_status_diskless "$RD" "$DELETE_NODE" 60 \
+    || die "Phase 1: ${DELETE_NODE} never transitioned to Diskless after 1st r d"
+
+echo ">> linstor r d $DELETE_NODE $RD  (Bug 342 2nd call: physical Delete from already-DISKLESS branch)"
+"${LCTL[@]}" resource delete "$DELETE_NODE" "$RD" >/dev/null 2>&1 || {
+    echo "FAIL: 2nd r d (physical Delete) exited non-zero" >&2
+    exit 1
+}
 
 echo ">> wait up to 30s for tiebreaker on $tb_node to be collapsed"
 deadline=$(( $(date +%s) + 30 ))
