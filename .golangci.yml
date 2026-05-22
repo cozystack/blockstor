@@ -272,6 +272,47 @@ linters:
           - varnamelen
           - mnd
         path: test/
+      # Production-code packages use `Bug NNN:` markers as a deliberate
+      # cross-reference index into the project's bug tracker (the comments
+      # document WHY a workaround exists and point at the underlying issue).
+      # godox would flag them as stray TODO/BUG/FIXME — disable ONLY godox
+      # for these paths; every other linter still applies.
+      - linters:
+          - godox
+        path: cmd/apiserver/
+      - linters:
+          - godox
+        path: pkg/api/v1/
+      - linters:
+          - godox
+        path: pkg/drbd/
+      - linters:
+          - godox
+        path: pkg/luks/
+      - linters:
+          - godox
+        path: pkg/storage/
+      - linters:
+          - godox
+        path: pkg/store/
+      - linters:
+          - godox
+        path: pkg/uevent/
+      - linters:
+          - godox
+        path: tests/contract/
+      - linters:
+          - godox
+        path: pkg/rest/
+      - linters:
+          - godox
+        path: pkg/satellite/
+      - linters:
+          - godox
+        path: pkg/dispatcher/
+      - linters:
+          - godox
+        path: pkg/version/
 formatters:
   enable:
     - gofmt
