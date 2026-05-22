@@ -19,9 +19,9 @@ limitations under the License.
 // /v1/controller/version so that golinstor clients can negotiate.
 package version
 
-// Build-time identity of this binary. Project is a const because the
-// binary's own name never changes; Version / GitCommit are vars so the
-// container build can stamp them via `-ldflags -X` (Bug 169).
+// Project names the binary. It is a const because the binary's own name
+// never changes; Version / GitCommit are vars so the container build can
+// stamp them via `-ldflags -X` (Bug 169).
 const Project = "blockstor"
 
 // Version / GitCommit identify the blockstor build. Defaults are
@@ -29,6 +29,8 @@ const Project = "blockstor"
 // them via `go build -ldflags "-X .../version.Version=<tag> -X
 // .../version.GitCommit=<sha>"`. `-ldflags -X` only works against
 // package-level string vars, never consts.
+//
+//nolint:gochecknoglobals // ldflags-injected build identity, see comment above
 var (
 	Version   = "0.0.0-dev"
 	GitCommit = "unknown"
@@ -87,6 +89,8 @@ const (
 // rewrites via `-ldflags -X .../version.LinstorBuildTime=$(date -u
 // +%FT%TZ)`. Parses cleanly as time.RFC3339 so contract tests don't
 // gate on the exact value.
+//
+//nolint:gochecknoglobals // ldflags-injected build identity, see comment above
 var (
 	LinstorGitHash   = "blockstor"
 	LinstorBuildTime = "2026-01-01T00:00:00+00:00"

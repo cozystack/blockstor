@@ -88,6 +88,14 @@ const (
 	// scenario doc is explicit: manual snapshots are NOT counted
 	// against the Keep budget.
 	LabelAutoSnapshot = "blockstor.io/auto-snapshot"
+
+	// labelResourceDefinition tags the Snapshot CRD with the parent RD
+	// name so the prune step can match by RD without a full Spec walk.
+	labelResourceDefinition = "blockstor.io/resource-definition"
+
+	// labelTrueValue is the Kubernetes-canonical truthy string used for
+	// boolean labels (Kubernetes labels are strings).
+	labelTrueValue = "true"
 )
 
 // Clock is the time source the runnable consumes. Production wires
@@ -277,9 +285,9 @@ func (r *AutoSnapshotRunnable) createAutoSnapshot(
 		ObjectMeta: metav1.ObjectMeta{
 			Name: rd.Name + "." + snapName,
 			Labels: map[string]string{
-				"blockstor.io/resource-definition": rd.Name,
-				"blockstor.io/snapshot-name":       snapName,
-				LabelAutoSnapshot:                  "true",
+				labelResourceDefinition:      rd.Name,
+				"blockstor.io/snapshot-name": snapName,
+				LabelAutoSnapshot:            labelTrueValue,
 			},
 		},
 		Spec: blockstoriov1alpha1.SnapshotSpec{
@@ -388,8 +396,8 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 	var snapList blockstoriov1alpha1.SnapshotList
 
 	err := r.Client.List(ctx, &snapList, client.MatchingLabels{
-		"blockstor.io/resource-definition": rd.Name,
-		LabelAutoSnapshot:                  "true",
+		labelResourceDefinition: rd.Name,
+		LabelAutoSnapshot:       labelTrueValue,
 	})
 	if err != nil {
 		return errors.Wrap(err, "list auto-snapshots")

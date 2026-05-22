@@ -629,7 +629,8 @@ func parseVolumeName(name string) (string, int32, bool) {
 		return "", 0, false
 	}
 
-	return name[:idx], int32(n), true
+	// suffix is `volNumberDigits` digits (<=99999), so int->int32 is lossless.
+	return name[:idx], int32(n), true //nolint:gosec // bounded by volNumberDigits=5
 }
 
 // volNumberDigits is the fixed-width digit count blockstor uses for

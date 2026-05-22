@@ -474,7 +474,7 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 		// same VG; we don't manage them through DeleteVolume
 		// so the sweeper skips them. Volume LVs have type '-'
 		// (thick) or 'V' (thin virtual).
-		if len(attr) == 0 {
+		if attr == "" {
 			continue
 		}
 
@@ -516,7 +516,8 @@ func parseLVName(name string) (string, int32, bool) {
 		return "", 0, false
 	}
 
-	return name[:idx], int32(n), true
+	// suffix is `lvNumberDigits` digits (<=99999), so int->int32 is lossless.
+	return name[:idx], int32(n), true //nolint:gosec // bounded by lvNumberDigits=5
 }
 
 // lvNumberDigits is the fixed-width volume-number suffix length —
