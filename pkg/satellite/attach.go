@@ -364,16 +364,71 @@ func attachLVMThin(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDe
 	}, nil
 }
 
+// hostMountNamespaceCommand controls how the satellite reaches the
+// host's mount namespace for pool-creating zpool subcommands. The
+// production value (`nsenter -t 1 -m`) hops into PID 1's mount
+// namespace, which is where the host's devtmpfs lives — necessary
+// because the container's /dev is a private devtmpfs instance and
+// the kernel's per-partition mknod doesn't propagate into it before
+// zpool's internal open() fires (Bug 359, see attachZFS).
+//
+// Exposed as a package var so unit tests can substitute a no-op
+// prefix and assert the resulting command line directly; production
+// callers MUST NOT mutate it.
+var hostMountNamespaceCommand = []string{"nsenter", "-t", "1", "-m", "--"}
+
+// runHostZpool runs `zpool <args...>` in the host's mount namespace.
+// Use this for any zpool subcommand that allocates or removes a
+// top-level vdev partition (`create`, `add`, `replace`); pure
+// probes (`list`, `get`, `import -l` cache reads) are unaffected
+// by the partition-node race and stay on the container-local
+// exec.Run path.
+//
+// Returns the captured stdout + nil on success, or stdout + wrapped
+// error on failure (mirrors exec.Run's contract so callers do not
+// need to special-case nsenter failure modes — a missing nsenter
+// binary surfaces the same shape of error as a missing zpool one).
+func runHostZpool(ctx context.Context, exec storage.Exec, args ...string) ([]byte, error) {
+	cmd := append([]string{}, hostMountNamespaceCommand...)
+	cmd = append(cmd, "zpool")
+	cmd = append(cmd, args...)
+
+	return exec.Run(ctx, cmd[0], cmd[1:]...)
+}
+
 // attachZFS: zpool create. The pool name on disk matches the
 // LINSTOR pool name to keep cross-host import predictable; the
 // PhysicalDevice's StableID-derived path is the single vdev.
+//
+// Bug 359: `zpool create` is dispatched into the host's mount
+// namespace via nsenter — see runHostZpool for the rationale.
+// The satellite container's /dev devtmpfs is a private mount
+// (kubelet provides every privileged container with its own
+// /dev), and there is no udevd inside the container to keep
+// it in sync with the kernel's BLKPG events. zpool create
+// stamps a GPT on /dev/sda (creating sda1+sda9 in the kernel),
+// then tries to open(/dev/sda1) to write the ZFS label — and
+// the partition device node has not yet appeared in the
+// container's /dev, so the open fails with ENODEV (errno 19):
+//
+//	cannot label 'sda': failed to detect device partitions
+//	on '/dev/sda1': 19
+//
+// Even with `mountPropagation: HostToContainer` (Bug 346) the
+// container's /dev is a distinct devtmpfs instance, so kernel-
+// initiated mknod on the host's /dev does not reach into the
+// container fast enough. Running zpool in the host's mount
+// namespace sidesteps this entirely: the host's devtmpfs is
+// updated synchronously by the kernel, so zpool's internal
+// open() succeeds on the first try.
 func attachZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
 	pool := dev.AttachTo.ZPoolName
 	if pool == "" {
 		return AttachResult{}, errors.New("ZFS attach requires ZPoolName")
 	}
 
-	_, err := exec.Run(ctx, "zpool", "create", "-f",
+	_, err := runHostZpool(ctx, exec,
+		"create", "-f",
 		"-O", "compression=off",
 		"-O", "atime=off",
 		pool, devicePath)
@@ -480,13 +535,19 @@ func extendLVMThin(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDe
 // `-f` is required for the same reason `zpool create -f` carries
 // it: a device with stale ZFS labels from a prior attempt would
 // otherwise refuse to be added.
+//
+// Bug 359: `zpool add` allocates a new top-level vdev partition
+// on `devicePath` and therefore triggers the same /dev partition-
+// node race as `zpool create`. Dispatched via runHostZpool so the
+// kernel's devtmpfs update is visible to the zpool process — see
+// the attachZFS docstring for the full rationale.
 func extendZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice, devicePath string) (AttachResult, error) {
 	pool := dev.AttachTo.ZPoolName
 	if pool == "" {
 		return AttachResult{}, errors.New("ZFS extend requires ZPoolName")
 	}
 
-	_, err := exec.Run(ctx, "zpool", "add", "-f", pool, devicePath)
+	_, err := runHostZpool(ctx, exec, "add", "-f", pool, devicePath)
 	if err != nil {
 		return AttachResult{}, errors.Wrap(err, "zpool add")
 	}

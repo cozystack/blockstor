@@ -138,11 +138,18 @@ func TestAttachZFSIssuesZpoolCreate(t *testing.T) {
 
 	// Match a substring rather than the exact string to keep the
 	// test robust against future flag tweaks (the load-bearing
-	// part is "zpool create -f rpool /dev/...").
+	// parts are the nsenter host-mount-ns hop + "zpool create -f"
+	// + the pool name).
+	//
+	// Bug 359: `zpool create` is dispatched via `nsenter -t 1 -m`
+	// so it runs in the host's mount namespace — the container's
+	// private /dev devtmpfs does not see the kernel's partition
+	// mknod fast enough for zpool's internal open() to find
+	// /dev/sda1 (see attach.go::runHostZpool).
 	found := false
 
 	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "zpool create -f") && strings.Contains(line, "rpool") {
+		if strings.HasPrefix(line, "nsenter -t 1 -m -- zpool create -f") && strings.Contains(line, "rpool") {
 			found = true
 
 			break
@@ -150,7 +157,7 @@ func TestAttachZFSIssuesZpoolCreate(t *testing.T) {
 	}
 
 	if !found {
-		t.Errorf("missing zpool create; calls=%v", fx.CommandLines())
+		t.Errorf("missing nsenter-wrapped zpool create; calls=%v", fx.CommandLines())
 	}
 }
 
@@ -334,7 +341,11 @@ func TestAttachWipeClearsPartitionTable(t *testing.T) {
 			wipeIdx = i
 		case strings.HasPrefix(line, "blockdev --rereadpt"):
 			rereadIdx = i
-		case strings.HasPrefix(line, "zpool create"):
+		// Bug 359: zpool create runs via nsenter into the host's
+		// mount namespace; tolerate both forms so the assertion
+		// stays anchored on the load-bearing "zpool create" verb.
+		case strings.HasPrefix(line, "zpool create"),
+			strings.HasPrefix(line, "nsenter -t 1 -m -- zpool create"):
 			createIdx = i
 		}
 	}
@@ -389,13 +400,20 @@ func TestAttachExtendsExistingZpool(t *testing.T) {
 	calls := fx.CommandLines()
 
 	for _, line := range calls {
-		if strings.HasPrefix(line, "zpool create") {
+		// Bug 359: both the legacy direct form and the nsenter-
+		// wrapped form must be rejected — pool-already-exists is
+		// supposed to short-circuit to extend, regardless of the
+		// host-namespace dispatcher.
+		if strings.HasPrefix(line, "zpool create") ||
+			strings.HasPrefix(line, "nsenter -t 1 -m -- zpool create") {
 			t.Fatalf("Bug 337: zpool create MUST NOT run when pool already exists; calls=%v", calls)
 		}
 	}
 
-	if !slices.Contains(calls, "zpool add -f data /dev/sdb") {
-		t.Errorf("Bug 337: expected `zpool add -f data /dev/sdb`; calls=%v", calls)
+	// Bug 359: zpool add is dispatched via nsenter so the host's
+	// devtmpfs is visible to libzpool's partition-node open().
+	if !slices.Contains(calls, "nsenter -t 1 -m -- zpool add -f data /dev/sdb") {
+		t.Errorf("Bug 337/359: expected `nsenter -t 1 -m -- zpool add -f data /dev/sdb`; calls=%v", calls)
 	}
 }
 
@@ -616,15 +634,23 @@ func TestAttachCreatesWhenPoolAbsent(t *testing.T) {
 	calls := fx.CommandLines()
 
 	for _, line := range calls {
-		if strings.HasPrefix(line, "zpool add") {
+		// Bug 359: tolerate both the legacy and nsenter-wrapped
+		// forms — pool-absent must NEVER trigger an extend path
+		// regardless of how the dispatcher reaches the host.
+		if strings.HasPrefix(line, "zpool add") ||
+			strings.HasPrefix(line, "nsenter -t 1 -m -- zpool add") {
 			t.Fatalf("Bug 337: zpool add MUST NOT run when pool is absent; calls=%v", calls)
 		}
 	}
 
 	found := false
 
+	// Bug 359: zpool create is dispatched into the host's mount
+	// namespace via nsenter so the kernel-driven /dev mknod for
+	// freshly-created partitions is visible to libzpool's open()
+	// (see attach.go::runHostZpool).
 	for _, line := range calls {
-		if strings.HasPrefix(line, "zpool create -f") && strings.Contains(line, "fresh") {
+		if strings.HasPrefix(line, "nsenter -t 1 -m -- zpool create -f") && strings.Contains(line, "fresh") {
 			found = true
 
 			break
@@ -632,6 +658,165 @@ func TestAttachCreatesWhenPoolAbsent(t *testing.T) {
 	}
 
 	if !found {
-		t.Errorf("Bug 337: missing zpool create on absent pool; calls=%v", calls)
+		t.Errorf("Bug 337/359: missing nsenter-wrapped zpool create on absent pool; calls=%v", calls)
+	}
+}
+
+// TestAttachZFSDispatchedViaHostMountNamespace pins Bug 359: any
+// pool-creating zpool subcommand emitted by Attach MUST be
+// prefixed with the host-mount-namespace hop so the kernel's
+// per-partition mknod (done in devtmpfs synchronously when the
+// kernel re-reads the partition table) is visible to libzpool's
+// open() of /dev/sdX1.
+//
+// Reproduction on e2e3 stand 2026-05-22:
+//
+//	$ linstor ps cdp --pool-name data --storage-pool data zfs e2e3-worker-1 /dev/sda
+//	SUCCESS: physical-storage attach accepted on node 'e2e3-worker-1'
+//	$ linstor sp l                                    # 30s later
+//	data  e2e3-worker-1  ZFS  data  -  -  False  Error  ...
+//	pool backing storage missing on node e2e3-worker-1:
+//	storage pool data is not present
+//
+// Satellite log (pre-fix):
+//
+//	zpool create -f -O compression=off -O atime=off data /dev/sda:
+//	cannot label 'sda': failed to detect device partitions on
+//	'/dev/sda1': 19
+//
+// The container's /dev is a private devtmpfs instance — even with
+// `mountPropagation: HostToContainer` from Bug 346 the kernel's
+// devtmpfs mknod fires on the host's /dev and is not propagated
+// into the container before zpool's libefi open() runs. nsenter
+// into PID 1's mount namespace puts zpool on the host's devtmpfs,
+// which the kernel keeps in sync synchronously.
+//
+// This test asserts: (a) Attach with Wipe=true ends with a
+// zpool create that is prefixed by `nsenter -t 1 -m --`, and
+// (b) extend likewise wraps `zpool add`. Both must hold for
+// the operator-facing `ps cdp` contract — SUCCESS implies the
+// backing pool exists on the host.
+func TestAttachZFSDispatchedViaHostMountNamespace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("create path", func(t *testing.T) {
+		t.Parallel()
+
+		fx := storage.NewFakeExec()
+		// Probe says pool absent → Attach falls through to attachZFS.
+		fx.Expect("zpool list -H -o name data",
+			storage.FakeResponse{Err: errors.New("no such pool")})
+
+		dev := &apiv1.PhysicalDevice{
+			DevicePath: "/dev/sda",
+			AttachTo: &apiv1.PhysicalDeviceAttachTo{
+				StoragePoolName: "data",
+				ProviderKind:    "ZFS",
+				ZPoolName:       "data",
+				Wipe:            true,
+			},
+		}
+
+		_, err := satellite.Attach(t.Context(), fx, dev)
+		if err != nil {
+			t.Fatalf("Attach: %v", err)
+		}
+
+		calls := fx.CommandLines()
+
+		// Concrete contract: the create command MUST start with the
+		// nsenter prefix. A bare `zpool create` would re-trip the
+		// "failed to detect device partitions on '/dev/sda1': 19"
+		// race observed on the stand.
+		want := "nsenter -t 1 -m -- zpool create -f -O compression=off -O atime=off data /dev/sda"
+		if !slices.Contains(calls, want) {
+			t.Fatalf("Bug 359: missing host-namespace dispatched zpool create.\n want: %q\n got: %v", want, calls)
+		}
+
+		// Sanity: no bare `zpool create` (i.e. not nsenter-wrapped)
+		// must have leaked through. A future refactor that bypasses
+		// runHostZpool will re-introduce the partition-node race.
+		for _, line := range calls {
+			if strings.HasPrefix(line, "zpool create") {
+				t.Fatalf("Bug 359: bare `zpool create` dispatched; must go via nsenter; calls=%v", calls)
+			}
+		}
+	})
+
+	t.Run("extend path", func(t *testing.T) {
+		t.Parallel()
+
+		fx := storage.NewFakeExec()
+		// Probe says pool already present → Attach takes the extend
+		// branch via extendZFS, which now also dispatches via nsenter.
+		fx.Expect("zpool list -H -o name data",
+			storage.FakeResponse{Stdout: []byte("data\n")})
+
+		dev := &apiv1.PhysicalDevice{
+			DevicePath: "/dev/sdb",
+			AttachTo: &apiv1.PhysicalDeviceAttachTo{
+				StoragePoolName: "data",
+				ProviderKind:    "ZFS",
+				ZPoolName:       "data",
+			},
+		}
+
+		_, err := satellite.Attach(t.Context(), fx, dev)
+		if err != nil {
+			t.Fatalf("Attach: %v", err)
+		}
+
+		calls := fx.CommandLines()
+
+		want := "nsenter -t 1 -m -- zpool add -f data /dev/sdb"
+		if !slices.Contains(calls, want) {
+			t.Fatalf("Bug 359: missing host-namespace dispatched zpool add.\n want: %q\n got: %v", want, calls)
+		}
+
+		for _, line := range calls {
+			if strings.HasPrefix(line, "zpool add") {
+				t.Fatalf("Bug 359: bare `zpool add` dispatched; must go via nsenter; calls=%v", calls)
+			}
+		}
+	})
+}
+
+// TestAttachZFSSurfacesZpoolCreateFailure pins the contract that
+// when the host-namespace zpool create errors (pool didn't
+// materialise on disk), Attach MUST return the wrapped error
+// rather than silently succeeding. The pre-fix bug returned
+// SUCCESS to the REST `ps cdp` caller even though the satellite-
+// side zpool create failed — leaving the SP CRD in `State=Error`
+// indefinitely with no way for the operator to retry.
+func TestAttachZFSSurfacesZpoolCreateFailure(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("zpool list -H -o name data",
+		storage.FakeResponse{Err: errors.New("no such pool")})
+	// Simulate the e2e3-stand failure: zpool create exit 1 with
+	// the canonical "failed to detect device partitions" stderr.
+	fx.Expect("nsenter -t 1 -m -- zpool create -f -O compression=off -O atime=off data /dev/sda",
+		storage.FakeResponse{Err: errors.New(
+			"zpool create -f -O compression=off -O atime=off data /dev/sda: " +
+				"cannot label 'sda': failed to detect device partitions on '/dev/sda1': 19")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sda",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "data",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "data",
+			Wipe:            true,
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err == nil {
+		t.Fatalf("Bug 359: zpool create failure MUST propagate to caller; got nil error")
+	}
+
+	if !strings.Contains(err.Error(), "zpool create") {
+		t.Errorf("Bug 359: error must mention zpool create; got %v", err)
 	}
 }
