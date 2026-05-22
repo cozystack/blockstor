@@ -266,3 +266,207 @@ jobs:
 
             Resume from inside: `breakpoint resume`. Otherwise the breakpoint
             exits 10 minutes after the last SSH session disconnects.
+
+  e2e-stand:
+    name: E2E (stand, real-DRBD)
+    # Real-DRBD Talos+QEMU stand e2e. Gated by the `e2e-stand` label so
+    # it stays opt-in until proven stable on the runner pool; promote to
+    # always-on once the wall-time / flake profile is well understood.
+    #
+    # Runner: same Oracle pool the kind-based `e2e` job uses
+    # (oracle-vm-24cpu-96gb-x86-64) — 24 vCPU / 96 GB RAM with KVM
+    # nested-virt available on /dev/kvm. The job preflights /dev/kvm
+    # and fails fast if soft-emulation would be the fallback (a Talos
+    # boot on TCG would blow well past the 90-minute budget).
+    #
+    # Scope (happy-path slice, per the approved design plan):
+    #   - 1 cluster: 1 control-plane + 3 workers, Talos v1.10.5,
+    #     extensions drbd+zfs, 8 GB extra disk per worker (slimmed
+    #     from dev-stand default of 16 GB to keep total disk pressure
+    #     low on the runner — only 3 scenarios run before tear-down)
+    #   - 3 scenarios: no-drbd, toggle-disk, tiebreaker. Sequential.
+    #   - Always-on tear-down via `make down` in `if: always()`.
+    #
+    # Wall-time budget: ~45-75 min (Talos boot ~10 min cached / ~20
+    # min cold, blockstor+pools install ~5 min, 3 scenarios ~10-20
+    # min each). 90-minute timeout-minutes cap.
+    runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'e2e-stand') && 'oracle-vm-24cpu-96gb-x86-64' || 'ubuntu-latest' }}
+    needs: [detect-changes, lint, unit-test]
+    if: |
+      contains(github.event.pull_request.labels.*.name, 'e2e-stand') &&
+      needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      checks: write
+    env:
+      STAND_NAME: ci-e2e
+      EXTRA_DISK_SIZE_MB: "8192"
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      # Preflight: /dev/kvm must be writable. The stand boots Talos
+      # under qemu-kvm; soft-emulation (TCG) would push a 4-worker
+      # cluster boot past the 90-minute budget. Fail fast with a clear
+      # diagnostic so the runner pool issue is obvious in the log.
+      - name: Probe /dev/kvm
+        run: |
+          set -e
+          if [[ ! -w /dev/kvm ]]; then
+            echo "FAIL: /dev/kvm not writable on this runner."
+            echo "      Stand boot requires KVM nested-virt; soft-emulation"
+            echo "      would blow the 90-min job budget. Check runner pool."
+            ls -l /dev/kvm 2>&1 || echo "/dev/kvm absent entirely"
+            exit 1
+          fi
+          echo "OK: /dev/kvm writable"
+          ls -l /dev/kvm
+
+      - name: Install QEMU + talosctl + jq + dnsmasq-base
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils ovmf jq dnsmasq-base \
+            iproute2 bridge-utils curl ca-certificates
+          # talosctl release matches stand/up.sh TALOS_VERSION default.
+          TALOS_VERSION=v1.10.5
+          curl -fL "https://github.com/siderolabs/talos/releases/download/${TALOS_VERSION}/talosctl-linux-amd64" \
+            -o /tmp/talosctl
+          chmod +x /tmp/talosctl
+          sudo mv /tmp/talosctl /usr/local/bin/talosctl
+          talosctl version --client
+
+      # Cache the Talos Image Factory artifacts (schematic id, kernel,
+      # initrd, installer) across runs. Key on Talos version + sha256
+      # of the extension list so a Talos bump or extension change
+      # cleanly invalidates the cache.
+      - name: Cache Talos factory artifacts
+        uses: actions/cache@2f8e54208210a422b2efd51efaa6bd6d7ca8920f # v3.4.3
+        with:
+          path: .work/_factory
+          key: talos-factory-v1.10.5-drbd-zfs
+
+      # Local Docker registry the stand pushes blockstor/apiserver/
+      # satellite images to. Talos VMs reach it via the bridge gateway
+      # (.1 of the cluster CIDR); see stand/up.sh registry-mirror patch.
+      - name: Start local Docker registry
+        run: |
+          docker run -d -p 5000:5000 --restart=always \
+            --name registry registry:2
+          # Give it a moment to start accepting pushes.
+          for i in 1 2 3 4 5; do
+            if curl -sf http://localhost:5000/v2/ >/dev/null; then
+              echo "registry up"; break
+            fi
+            sleep 1
+          done
+
+      - name: Build images (controller + apiserver + satellite)
+        run: make build-images
+
+      - name: Bring up Talos+QEMU stand
+        run: |
+          make up NAME="$STAND_NAME" EXTRA_DISK_SIZE_MB="$EXTRA_DISK_SIZE_MB"
+
+      - name: Install blockstor on stand
+        run: make blockstor NAME="$STAND_NAME"
+
+      - name: Provision storage pools (zfs + lvm-thin)
+        run: make pools NAME="$STAND_NAME" TYPE=both
+
+      - name: E2E scenario — no-drbd
+        run: make e2e NAME="$STAND_NAME" SCENARIO=no-drbd
+
+      - name: E2E scenario — toggle-disk
+        run: make e2e NAME="$STAND_NAME" SCENARIO=toggle-disk
+
+      - name: E2E scenario — tiebreaker
+        run: make e2e NAME="$STAND_NAME" SCENARIO=tiebreaker
+
+      # Diagnostics on failure: cluster-info dump + dmesg per node.
+      # KUBECONFIG / TALOSCONFIG land under .work/$STAND_NAME by the
+      # stand Makefile convention.
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          DIAG=.work/${STAND_NAME}/diagnostics
+          mkdir -p "$DIAG"
+          export KUBECONFIG=".work/${STAND_NAME}/kubeconfig"
+          export TALOSCONFIG=".work/${STAND_NAME}/talosconfig"
+          kubectl cluster-info dump --all-namespaces \
+            --output-directory="$DIAG/cluster-info" >/dev/null 2>&1
+          kubectl get pods -A -o wide > "$DIAG/pods.txt" 2>&1
+          kubectl get nodes -o wide > "$DIAG/nodes.txt" 2>&1
+          kubectl -n blockstor-system get all -o wide \
+            > "$DIAG/blockstor-system.txt" 2>&1
+          kubectl get resources.blockstor.io.blockstor.io -A -o yaml \
+            > "$DIAG/resources.yaml" 2>&1
+          kubectl get resourcedefinitions.blockstor.io.blockstor.io -A -o yaml \
+            > "$DIAG/resourcedefinitions.yaml" 2>&1
+          # Per-node dmesg via talosctl (best-effort: talos may be
+          # wedged itself on a bad boot).
+          for node in $(talosctl config info -o yaml 2>/dev/null \
+              | awk '/nodes:/{f=1;next} /endpoints:/{f=0} f{gsub(/[- ]/,"");print}'); do
+            talosctl -n "$node" dmesg > "$DIAG/dmesg-${node}.txt" 2>&1 || true
+            talosctl -n "$node" logs -k > "$DIAG/kernel-${node}.txt" 2>&1 || true
+          done
+          ls -la "$DIAG"
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-stand-diagnostics
+          path: .work/${{ env.STAND_NAME }}/diagnostics
+          if-no-files-found: warn
+
+      # SSH breakpoint mirroring the kind-based e2e job (lines 241-268
+      # above). Identical wiring, distinct check-run-name so a parallel
+      # breakpoint from the kind job doesn't clobber this one.
+      - name: Breakpoint on E2E (stand) failure
+        if: |
+          failure() &&
+          vars.BREAKPOINT_ENDPOINT != ''
+        uses: cozystack/breakpoint-action@a6f3a6f87be398ad63b6577351e3398e53f578e4
+        with:
+          mode: pause-idle
+          endpoint: ${{ vars.BREAKPOINT_ENDPOINT }}
+          authorized-users: androndo, Arsolitt, IvanHunters, kvaps, lexfrei, lllamnyp, mattia-eleuteri, matthieu-robin, myasnikovdaniil, sircthulhu, tym83
+          check-run-name: "Breakpoint Open (e2e-stand)"
+          github-token: ${{ github.token }}
+          check-run-summary-template: |
+            ## 🔴 SSH breakpoint open — paused for debug (e2e-stand)
+
+            ```
+            {endpoint}
+            ```
+
+            Inspect the real-DRBD Talos stand:
+            ```
+            export KUBECONFIG=.work/ci-e2e/kubeconfig
+            export TALOSCONFIG=.work/ci-e2e/talosconfig
+            kubectl get pods -A
+            kubectl -n blockstor-system get resources.blockstor.io.blockstor.io -A
+            talosctl -n <node> dmesg | tail -100
+            ```
+
+            Resume from inside: `breakpoint resume`. Otherwise the breakpoint
+            exits 10 minutes after the last SSH session disconnects.
+
+      # Always tear the stand down so we don't leak qemu/dnsmasq onto
+      # the runner. The runner pool is ephemeral, but `make down` also
+      # frees the bridge / pid files in case any subsequent step on
+      # the same runner needs them.
+      - name: Tear down stand
+        if: always()
+        run: make down NAME="$STAND_NAME" || true
