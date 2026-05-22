@@ -41,10 +41,15 @@ import (
 // `props.CurStltConnName` both default to it.
 const DefaultNetInterfaceName = "default"
 
-// resolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
+// ResolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
 // the POST body omits a NetInterface address. Tests swap this for a
-// deterministic stub via Server.lookupHost.
-type resolveHostFunc func(ctx context.Context, host string) ([]string, error)
+// deterministic stub via Server.SetResolveHost; production wires
+// defaultResolveHost.
+type ResolveHostFunc func(ctx context.Context, host string) ([]string, error)
+
+// resolveHostFunc is the package-internal alias kept for symmetry with
+// the historical unexported name; new code SHOULD use ResolveHostFunc.
+type resolveHostFunc = ResolveHostFunc
 
 // defaultResolveHost wraps net.DefaultResolver.LookupHost — the
 // production resolver. Hoisted into a package-level var so tests can
@@ -867,6 +872,7 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 	force := isForce(r)
+	ctx := r.Context()
 
 	// Bug 179: `?force=true` cascade-deletes every referencing
 	// Resource + StoragePool CRD before dropping the Node — same
@@ -874,7 +880,7 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	// force-delete would leave orphan SP CRDs pointing at a deleted
 	// Node, which is precisely the symptom Bug 179 closed.
 	if force {
-		err := s.cascadeOrphansForLostNode(r.Context(), name)
+		err := s.cascadeOrphansForLostNode(ctx, name)
 		if err != nil {
 			writeStoreError(w, err)
 
@@ -891,10 +897,10 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 			return s.refuseNodeDeleteIfReferenced(w, r, name)
 		},
 		capture: func() (apiv1.Node, bool) {
-			return s.captureNode(r.Context(), name)
+			return s.captureNode(ctx, name)
 		},
 		remove: func() error {
-			return s.Store.Nodes().Delete(r.Context(), name)
+			return s.Store.Nodes().Delete(ctx, name)
 		},
 		rolledBackIfRaced: func(captured apiv1.Node, capturedOK bool) bool {
 			if force || !capturedOK {
@@ -1120,7 +1126,7 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
 	resources, err := s.Store.Resources().List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "list resources")
 	}
 
 	var refs []string

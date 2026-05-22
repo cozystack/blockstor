@@ -147,22 +147,11 @@ type Server struct {
 // handleNodeCreate. Returns the previous value so tests can restore
 // it. Production code never calls this; defaultResolveHost is used
 // when the field is nil.
-func (s *Server) SetResolveHost(fn resolveHostFunc) resolveHostFunc {
+func (s *Server) SetResolveHost(fn ResolveHostFunc) ResolveHostFunc {
 	prev := s.resolveHost
 	s.resolveHost = fn
 
 	return prev
-}
-
-// lookupHost dispatches to s.resolveHost if set, else the package
-// default. Hoisted off-handler so the production handler stays
-// readable and the test seam is explicit.
-func (s *Server) lookupHost(ctx context.Context, host string) ([]string, error) {
-	if s.resolveHost != nil {
-		return s.resolveHost(ctx, host)
-	}
-
-	return defaultResolveHost(ctx, host)
 }
 
 // NeedLeaderElection reports whether the server requires leader election.
@@ -248,6 +237,17 @@ func (s *Server) Start(ctx context.Context) error {
 
 		return errors.Wrap(err, "REST server failed")
 	}
+}
+
+// lookupHost dispatches to s.resolveHost if set, else the package
+// default. Hoisted off-handler so the production handler stays
+// readable and the test seam is explicit.
+func (s *Server) lookupHost(ctx context.Context, host string) ([]string, error) {
+	if s.resolveHost != nil {
+		return s.resolveHost(ctx, host)
+	}
+
+	return defaultResolveHost(ctx, host)
 }
 
 // buildMux registers every endpoint on a fresh ServeMux. Pulled out
@@ -803,7 +803,7 @@ func (h *headRecorder) Header() http.Header {
 }
 
 func (h *headRecorder) Write(b []byte) (int, error) {
-	return h.body.Write(b)
+	return h.body.Write(b) //nolint:wrapcheck // bytes.Buffer.Write always returns nil; ResponseWriter contract requires the int + error
 }
 
 func (h *headRecorder) WriteHeader(code int) {

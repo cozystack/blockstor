@@ -223,43 +223,68 @@ func attachDevicePath(dev *apiv1.PhysicalDevice) string {
 // logged and the chain continues — the dd zero-out is the
 // load-bearing step and its failure aborts. A tiny device
 // (< 64 MiB) skips the end-zero step to avoid a negative seek.
+
+// wipeZeroSpanMiB is the MiB count zeroed at the start and end of a
+// device by wipeDevice. 32 MiB covers every on-disk superblock /
+// signature footprint blockstor cares about (filesystems, LUKS, LVM)
+// while staying small enough that the end-of-device seek is fast.
+const wipeZeroSpanMiB = 32
+
+// wipeMinDeviceSizeForEndZeroMiB is the minimum device size (MiB) at
+// which wipeDevice still zeroes the tail. 2×span avoids negative-seek
+// math on devices barely larger than the span itself.
+const wipeMinDeviceSizeForEndZeroMiB = 2 * wipeZeroSpanMiB
+
+// mibBytes is the byte count in one mebibyte; used to convert bytes
+// to MiB inside readDeviceSizeMiB.
+const mibBytes = 1024 * 1024
+
 func wipeDevice(ctx context.Context, exec storage.Exec, devicePath string) error {
+	wipeSpanCount := strconv.Itoa(wipeZeroSpanMiB)
+
 	// 1) wipefs known signatures. Log + continue on failure: the dd
 	// zero-out below is what actually guarantees the wipe.
-	if _, err := exec.Run(ctx, "wipefs", "--all", "--force", devicePath); err != nil {
+	_, err := exec.Run(ctx, "wipefs", "--all", "--force", devicePath)
+	if err != nil {
 		slog.Default().Info("wipefs failed; continuing with dd zero-out",
 			"dev", devicePath, "err", err.Error())
 	}
 
-	// 2) zero first 32 MiB.
-	if _, err := exec.Run(ctx, "dd",
-		"if=/dev/zero", "of="+devicePath, "bs=1M", "count=32",
-		"conv=fsync,notrunc", "status=none"); err != nil {
+	// 2) zero first wipeZeroSpanMiB MiB.
+	_, err = exec.Run(ctx, "dd",
+		"if=/dev/zero", "of="+devicePath, "bs=1M", "count="+wipeSpanCount,
+		"conv=fsync,notrunc", "status=none")
+	if err != nil {
 		return errors.Wrapf(err, "zero start of %s", devicePath)
 	}
 
-	// 3) zero last 32 MiB — query size, seek, write.
+	// 3) zero last wipeZeroSpanMiB MiB — query size, seek, write.
 	sizeMiB, ok := readDeviceSizeMiB(ctx, exec, devicePath)
-	if ok && sizeMiB > 64 { // safety: don't seek negative on tiny devices
-		seekMiB := sizeMiB - 32
-		if _, err := exec.Run(ctx, "dd",
+
+	if ok && sizeMiB > wipeMinDeviceSizeForEndZeroMiB { // safety: don't seek negative on tiny devices
+		seekMiB := sizeMiB - wipeZeroSpanMiB
+
+		_, err = exec.Run(ctx, "dd",
 			"if=/dev/zero", "of="+devicePath, "bs=1M",
 			"seek="+strconv.FormatInt(seekMiB, 10),
-			"count=32", "conv=fsync,notrunc", "status=none"); err != nil {
+			"count="+wipeSpanCount, "conv=fsync,notrunc", "status=none")
+		if err != nil {
 			return errors.Wrapf(err, "zero end of %s", devicePath)
 		}
 	}
 
 	// 4) drop stale partition device nodes. Non-fatal: partprobe
 	// below is the belt-and-braces.
-	if _, err := exec.Run(ctx, "blockdev", "--rereadpt", devicePath); err != nil {
+	_, err = exec.Run(ctx, "blockdev", "--rereadpt", devicePath)
+	if err != nil {
 		slog.Default().Info("blockdev --rereadpt failed; relying on partprobe",
 			"dev", devicePath, "err", err.Error())
 	}
 
 	// 5) partprobe — belt-and-braces (some kernels need this in
 	// addition to BLKRRPART).
-	if _, err := exec.Run(ctx, "partprobe", devicePath); err != nil {
+	_, err = exec.Run(ctx, "partprobe", devicePath)
+	if err != nil {
 		slog.Default().Info("partprobe failed; wipe completed via prior steps",
 			"dev", devicePath, "err", err.Error())
 	}
@@ -282,7 +307,7 @@ func readDeviceSizeMiB(ctx context.Context, exec storage.Exec, devicePath string
 		return 0, false
 	}
 
-	sz, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	sizeBytes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
 	if err != nil {
 		slog.Default().Info("blockdev --getsize64 returned unparseable size; skipping end-of-device zero",
 			"dev", devicePath, "out", string(out))
@@ -290,7 +315,7 @@ func readDeviceSizeMiB(ctx context.Context, exec storage.Exec, devicePath string
 		return 0, false
 	}
 
-	return sz / (1024 * 1024), true
+	return sizeBytes / mibBytes, true
 }
 
 // attachLVMThick: pvcreate + vgcreate. Returns the

@@ -68,18 +68,6 @@ func (p *orderingProvider) DeleteVolume(_ context.Context, _ storage.Volume) err
 	return nil
 }
 
-// deletesSnapshot returns a copy of the recorded step values so the
-// test can assert ordering without holding the provider's mutex.
-func (p *orderingProvider) deletesSnapshot() []int32 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	out := make([]int32, len(p.deletes))
-	copy(out, p.deletes)
-
-	return out
-}
-
 func (p *orderingProvider) ResizeVolume(_ context.Context, _ storage.Volume) error { return nil }
 
 func (p *orderingProvider) VolumeStatus(_ context.Context, vol storage.Volume) (storage.VolumeStatus, error) {
@@ -92,6 +80,18 @@ func (p *orderingProvider) DeleteSnapshot(_ context.Context, _ storage.Snapshot)
 
 func (p *orderingProvider) RestoreVolumeFromSnapshot(_ context.Context, _ storage.Volume, _ storage.Snapshot) error {
 	return nil
+}
+
+// deletesSnapshot returns a copy of the recorded step values so the
+// test can assert ordering without holding the provider's mutex.
+func (p *orderingProvider) deletesSnapshot() []int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]int32, len(p.deletes))
+	copy(out, p.deletes)
+
+	return out
 }
 
 // newDeleteRaceFixture wires a fake-client Resource with a

@@ -162,7 +162,7 @@ func TestAutoSnapshotFiveIntervalsProduceFiveSnapshots(t *testing.T) {
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		err := r.Tick(context.Background())
 		if err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
@@ -236,7 +236,7 @@ func TestAutoSnapshotKeepPrunesOldestBeyondBudget(t *testing.T) {
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
@@ -299,7 +299,7 @@ func TestAutoSnapshotManualSnapshotsNotPruned(t *testing.T) {
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
@@ -370,7 +370,7 @@ func TestAutoSnapshotRunEveryDisabledSkipsRD(t *testing.T) {
 	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
@@ -406,7 +406,7 @@ func TestAutoSnapshotKeepZeroDisablesPrune(t *testing.T) {
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
 	// 15 ticks across 15 intervals — well past the default Keep=10.
-	for i := 0; i < 15; i++ {
+	for i := range 15 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}
@@ -437,7 +437,7 @@ func TestAutoSnapshotDefaultKeepIs10(t *testing.T) {
 	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
 
 	// 12 ticks → 12 created, 2 pruned, 10 retained.
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		if err := r.Tick(context.Background()); err != nil {
 			t.Fatalf("Tick #%d: %v", i, err)
 		}

@@ -20,8 +20,10 @@ import (
 	"context"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/cozystack/blockstor/pkg/drbd"
 	"github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -39,7 +41,7 @@ import (
 // its stale GI epoch + PSK + endpoint mapping, survives the new
 // `drbdadm adjust` — the new <peer> brings up fresh DRBD with a new
 // GI epoch, handshake fails (incompatible epochs), the slot wedges
-// in Connecting forever (the `disk='' rep='Off'` symptom).
+// in Connecting forever (the `disk=” rep='Off'` symptom).
 //
 // State-based detection (v3 PruneStaleKernelSlots Pass 3) can in
 // principle clean this up after the 30s zombie grace, but it depends
@@ -77,11 +79,15 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 	rdName string,
 	desiredPeers []intent.DesiredPeer,
 	appliedPeerUIDs map[string]string,
-	vols []int32,
+	_ []int32,
 	devices map[int32]string,
 ) (map[string]string, error) {
 	if r.cfg.Adm == nil {
-		return nil, nil
+		// No drbdadm wired (unit-test fast path). Caller treats a
+		// nil cleaned-map as no-op; surface a sentinel so the
+		// signature stays informative without nudging callers
+		// (production wiring always sets cfg.Adm).
+		return nil, nil //nolint:nilnil // intentional no-op signal for tests
 	}
 
 	logger := log.FromContext(ctx).WithValues("rd", rdName, "v4uidevict", true)
@@ -101,80 +107,14 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 	var cleaned map[string]string
 
 	for _, peer := range desiredPeers {
-		if peer.ResourceUID == "" {
-			// Peer's UID not yet known to the dispatcher
-			// (informer cache trail / fresh CRD just hit
-			// apiserver). Skip — next reconcile will retry
-			// with a populated UID.
+		evicted, err := r.evictOnePeerByUIDMismatch(ctx, logger, rdName, peer,
+			appliedPeerUIDs, slots, devices)
+		if err != nil {
+			return cleaned, err
+		}
+
+		if !evicted {
 			continue
-		}
-
-		last, hasLast := appliedPeerUIDs[peer.Name]
-		if !hasLast || last == peer.ResourceUID {
-			// No prior baseline (rollout window / first
-			// apply) OR baseline matches — nothing to evict.
-			continue
-		}
-
-		// UID mismatch — force-evict the kernel slot for this
-		// peer. Forget-peer needs a node-id; prefer the kernel's
-		// observation, fall back to the dispatcher's.
-		nodeID := peer.NodeID
-
-		if slot, ok := slots[peer.Name]; ok && slot.NodeID != 0 {
-			nodeID = slot.NodeID
-		}
-
-		// Bug 342 v5: when neither the kernel-observed slot nor
-		// the K8s-allocated peer NodeID is available, DEFER
-		// eviction to a future reconcile. A del-peer without
-		// matching forget-peer drops the kernel connection but
-		// leaves stale per-volume GI/bitmap metadata; the
-		// subsequent new-peer handshake (after the relocated
-		// peer brings DRBD up with a fresh GI epoch) exposes
-		// the mismatch and the LOCAL stable peer regresses its
-		// own disk_state to Inconsistent / Outdated. Skipping
-		// this reconcile is safe: the next one (after kernel
-		// loads OR allocation lands) will see the same UID
-		// mismatch and try again with a resolvable node-id.
-		if nodeID == 0 {
-			logger.Info("UID mismatch detected but peer node-id unresolved — deferring eviction",
-				"peer", peer.Name,
-				"oldUID", last,
-				"newUID", peer.ResourceUID)
-
-			continue
-		}
-
-		logger.Info("UID mismatch — evicting kernel slot for re-incarnated peer",
-			"peer", peer.Name,
-			"oldUID", last,
-			"newUID", peer.ResourceUID,
-			"nodeID", nodeID)
-
-		if err := r.cfg.Adm.DelPeer(ctx, rdName, peer.Name); err != nil {
-			return cleaned, errors.Wrapf(err, "drbdadm del-peer %s:%s", peer.Name, rdName)
-		}
-
-		// forget-peer is per-volume because v09 metadata lives
-		// in the per-volume block. Skip volumes without a device
-		// path (DISKLESS local replica — no metadata to clean).
-		// Skip when nodeID is zero (no resolvable id — leaves a
-		// slow-leak slot, recoverable later).
-		if nodeID != 0 {
-			for volNum, device := range devices {
-				if device == "" {
-					continue
-				}
-
-				if forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, volNum, device, nodeID); forgetErr != nil {
-					logger.Info("EvictPeersByUIDMismatch: forget-peer failed (non-fatal)",
-						"peer", peer.Name,
-						"vol", volNum,
-						"nodeID", nodeID,
-						"err", forgetErr.Error())
-				}
-			}
 		}
 
 		if cleaned == nil {
@@ -185,4 +125,99 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 	}
 
 	return cleaned, nil
+}
+
+// evictOnePeerByUIDMismatch performs the per-peer half of
+// EvictPeersByUIDMismatch: classify whether the peer needs eviction,
+// resolve the kernel-side node-id (preferring the kernel's
+// observation), and run del-peer + per-volume forget-peer when so.
+//
+// Returns (true, nil) when this peer was evicted and the caller
+// should record it in `cleaned`; (false, nil) when the peer was
+// skipped (no UID known yet / no prior baseline / baseline matches
+// / node-id unresolved); (false, err) on a fatal del-peer error.
+// Pulled out of EvictPeersByUIDMismatch so the orchestrator stays
+// under the gocyclo budget; the cascade is byte-identical.
+func (r *Reconciler) evictOnePeerByUIDMismatch(
+	ctx context.Context,
+	logger logr.Logger,
+	rdName string,
+	peer intent.DesiredPeer,
+	appliedPeerUIDs map[string]string,
+	slots map[string]drbd.KernelSlot,
+	devices map[int32]string,
+) (bool, error) {
+	if peer.ResourceUID == "" {
+		// Peer's UID not yet known to the dispatcher (informer
+		// cache trail / fresh CRD just hit apiserver). Skip —
+		// next reconcile will retry with a populated UID.
+		return false, nil
+	}
+
+	last, hasLast := appliedPeerUIDs[peer.Name]
+	if !hasLast || last == peer.ResourceUID {
+		// No prior baseline (rollout window / first apply) OR
+		// baseline matches — nothing to evict.
+		return false, nil
+	}
+
+	// UID mismatch — force-evict the kernel slot for this peer.
+	// Forget-peer needs a node-id; prefer the kernel's observation,
+	// fall back to the dispatcher's.
+	nodeID := peer.NodeID
+
+	if slot, ok := slots[peer.Name]; ok && slot.NodeID != 0 {
+		nodeID = slot.NodeID
+	}
+
+	// Bug 342 v5: when neither the kernel-observed slot nor the
+	// K8s-allocated peer NodeID is available, DEFER eviction to a
+	// future reconcile. A del-peer without matching forget-peer
+	// drops the kernel connection but leaves stale per-volume
+	// GI/bitmap metadata; the subsequent new-peer handshake (after
+	// the relocated peer brings DRBD up with a fresh GI epoch)
+	// exposes the mismatch and the LOCAL stable peer regresses its
+	// own disk_state to Inconsistent / Outdated. Skipping this
+	// reconcile is safe: the next one (after kernel loads OR
+	// allocation lands) will see the same UID mismatch and try
+	// again with a resolvable node-id.
+	if nodeID == 0 {
+		logger.Info("UID mismatch detected but peer node-id unresolved — deferring eviction",
+			"peer", peer.Name,
+			"oldUID", last,
+			"newUID", peer.ResourceUID)
+
+		return false, nil
+	}
+
+	logger.Info("UID mismatch — evicting kernel slot for re-incarnated peer",
+		"peer", peer.Name,
+		"oldUID", last,
+		"newUID", peer.ResourceUID,
+		"nodeID", nodeID)
+
+	err := r.cfg.Adm.DelPeer(ctx, rdName, peer.Name)
+	if err != nil {
+		return false, errors.Wrapf(err, "drbdadm del-peer %s:%s", peer.Name, rdName)
+	}
+
+	// forget-peer is per-volume because v09 metadata lives in the
+	// per-volume block. Skip volumes without a device path
+	// (DISKLESS local replica — no metadata to clean).
+	for volNum, device := range devices {
+		if device == "" {
+			continue
+		}
+
+		forgetErr := r.cfg.Adm.ForgetPeer(ctx, rdName, volNum, device, nodeID)
+		if forgetErr != nil {
+			logger.Info("EvictPeersByUIDMismatch: forget-peer failed (non-fatal)",
+				"peer", peer.Name,
+				"vol", volNum,
+				"nodeID", nodeID,
+				"err", forgetErr.Error())
+		}
+	}
+
+	return true, nil
 }

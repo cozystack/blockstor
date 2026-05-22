@@ -1765,14 +1765,14 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 
 	out := make([]blockstoriov1alpha1.ResourceVolumeStatus, 0, len(ev.Volumes))
 
-	for _, v := range ev.Volumes {
+	for _, vol := range ev.Volumes {
 		out = append(out, blockstoriov1alpha1.ResourceVolumeStatus{
-			VolumeNumber: v.VolumeNumber,
+			VolumeNumber: vol.VolumeNumber,
 			StoragePool:  storagePool,
-			DiskState:    v.DiskState,
-			CurrentGi:    v.CurrentUUID,
-			OutOfSyncKib: v.OutOfSyncKib,
-			Quorum:       v.Quorum,
+			DiskState:    vol.DiskState,
+			CurrentGi:    vol.CurrentUUID,
+			OutOfSyncKib: vol.OutOfSyncKib,
+			Quorum:       vol.Quorum,
 		})
 	}
 

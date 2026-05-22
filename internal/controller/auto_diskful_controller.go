@@ -97,7 +97,7 @@ func (r *AutoDiskfulReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	rd, err := r.Store.ResourceDefinitions().Get(ctx, req.Name)
 	if err != nil {
 		// RD already gone; nothing to time.
-		return ctrl.Result{}, nil //nolint:nilerr
+		return ctrl.Result{}, nil //nolint:nilerr // RD-not-found is success — caller doesn't requeue
 	}
 
 	minutes, placeCount, skip, err := r.evaluateConfig(ctx, &rd)
@@ -116,7 +116,7 @@ func (r *AutoDiskfulReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	diskful, candidates := splitDiskfulAndCandidates(replicas)
 
-	if int32(len(diskful)) >= placeCount {
+	if int32(len(diskful)) >= placeCount { //nolint:gosec // len of an in-memory slice fits int32
 		// Cluster is back at full diskful health — clear the timer.
 		return ctrl.Result{}, r.stripDeadlineIfPresent(ctx, &rd)
 	}
@@ -152,11 +152,7 @@ func (r *AutoDiskfulReconciler) evaluateConfig(ctx context.Context, rd *apiv1.Re
 		return 0, 0, true, nil
 	}
 
-	placeCount, ok, err := r.placeCountForRD(ctx, rd)
-	if err != nil {
-		return 0, 0, true, err
-	}
-
+	placeCount, ok := r.placeCountForRD(ctx, rd)
 	if !ok || placeCount <= 0 {
 		return 0, 0, true, nil
 	}
@@ -249,19 +245,19 @@ func (r *AutoDiskfulReconciler) resolveAutoDiskfulMinutes(ctx context.Context, r
 // RG SelectFilter. An RD without an RG has no target; the second
 // return value reflects "found" so the caller can no-op cleanly
 // without confusing "0" with "not configured".
-func (r *AutoDiskfulReconciler) placeCountForRD(ctx context.Context, rd *apiv1.ResourceDefinition) (int32, bool, error) {
+func (r *AutoDiskfulReconciler) placeCountForRD(ctx context.Context, rd *apiv1.ResourceDefinition) (int32, bool) {
 	if rd.ResourceGroupName == "" {
-		return 0, false, nil
+		return 0, false
 	}
 
 	rg, err := r.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
 	if err != nil {
 		// Soft-fail: RG might be deleting concurrently; the next
 		// reconcile retries.
-		return 0, false, nil //nolint:nilerr
+		return 0, false
 	}
 
-	return int32(rg.SelectFilter.PlaceCount), true, nil
+	return int32(rg.SelectFilter.PlaceCount), true
 }
 
 // promoteOne picks the first non-tiebreaker DISKLESS replica that
@@ -349,22 +345,8 @@ func (r *AutoDiskfulReconciler) stampDeadline(ctx context.Context, rd *apiv1.Res
 	// is nil (unit tests using in-memory store only), fall back to
 	// the Store path which round-trips the annotation through the
 	// same surface the K8s store would.
-	if r.Client != nil {
-		var crd blockstoriov1alpha1.ResourceDefinition
-
-		err := r.Get(ctx, client.ObjectKey{Name: rd.Name}, &crd)
-		if err == nil {
-			if crd.Annotations == nil {
-				crd.Annotations = map[string]string{}
-			}
-
-			crd.Annotations[apiv1.AutoDiskfulDeadlineAnnotation] = deadline.Format(time.RFC3339)
-
-			updateErr := r.Update(ctx, &crd)
-			if updateErr == nil {
-				return nil
-			}
-		}
+	if r.stampDeadlineViaCRD(ctx, rd.Name, deadline) {
+		return nil
 	}
 
 	if rd.Annotations == nil {
@@ -376,6 +358,29 @@ func (r *AutoDiskfulReconciler) stampDeadline(ctx context.Context, rd *apiv1.Res
 	return r.Store.ResourceDefinitions().Update(ctx, rd)
 }
 
+// stampDeadlineViaCRD updates the annotation through the typed K8s
+// CRD client. Returns true on success; any failure (no Client, Get
+// error, Update error) yields false so the caller falls back to the
+// Store path.
+func (r *AutoDiskfulReconciler) stampDeadlineViaCRD(ctx context.Context, rdName string, deadline time.Time) bool {
+	if r.Client == nil {
+		return false
+	}
+
+	var crd blockstoriov1alpha1.ResourceDefinition
+	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+		return false
+	}
+
+	if crd.Annotations == nil {
+		crd.Annotations = map[string]string{}
+	}
+
+	crd.Annotations[apiv1.AutoDiskfulDeadlineAnnotation] = deadline.Format(time.RFC3339)
+
+	return r.Update(ctx, &crd) == nil
+}
+
 // stripDeadlineIfPresent is a no-op when the annotation isn't set,
 // so the dominant "cluster healthy" path stays write-free.
 func (r *AutoDiskfulReconciler) stripDeadlineIfPresent(ctx context.Context, rd *apiv1.ResourceDefinition) error {
@@ -383,25 +388,36 @@ func (r *AutoDiskfulReconciler) stripDeadlineIfPresent(ctx context.Context, rd *
 		return nil
 	}
 
-	if r.Client != nil {
-		var crd blockstoriov1alpha1.ResourceDefinition
-
-		err := r.Get(ctx, client.ObjectKey{Name: rd.Name}, &crd)
-		if err == nil {
-			if _, present := crd.Annotations[apiv1.AutoDiskfulDeadlineAnnotation]; present {
-				delete(crd.Annotations, apiv1.AutoDiskfulDeadlineAnnotation)
-
-				updateErr := r.Update(ctx, &crd)
-				if updateErr == nil {
-					return nil
-				}
-			}
-		}
+	if r.stripDeadlineViaCRD(ctx, rd.Name) {
+		return nil
 	}
 
 	delete(rd.Annotations, apiv1.AutoDiskfulDeadlineAnnotation)
 
 	return r.Store.ResourceDefinitions().Update(ctx, rd)
+}
+
+// stripDeadlineViaCRD deletes the annotation through the typed K8s
+// CRD client. Returns true on success or when the annotation is
+// already absent on the CRD; any failure yields false so the caller
+// falls back to the Store path.
+func (r *AutoDiskfulReconciler) stripDeadlineViaCRD(ctx context.Context, rdName string) bool {
+	if r.Client == nil {
+		return false
+	}
+
+	var crd blockstoriov1alpha1.ResourceDefinition
+	if err := r.Get(ctx, client.ObjectKey{Name: rdName}, &crd); err != nil {
+		return false
+	}
+
+	if _, present := crd.Annotations[apiv1.AutoDiskfulDeadlineAnnotation]; !present {
+		return true
+	}
+
+	delete(crd.Annotations, apiv1.AutoDiskfulDeadlineAnnotation)
+
+	return r.Update(ctx, &crd) == nil
 }
 
 // now defers to the injected clock or wall time. The injection point

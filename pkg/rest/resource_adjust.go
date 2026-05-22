@@ -94,7 +94,7 @@ func (s *Server) registerResourceLifecycle(mux *http.ServeMux) {
 // against a collision. Operators opt in only when they actively want
 // the port to be reshuffled.
 func (s *Server) handleResourceActivate(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Query().Get("reallocate-port") == "true" {
+	if queryFlag(r, "reallocate-port") {
 		rdName := r.PathValue("rd")
 		node := r.PathValue("node")
 

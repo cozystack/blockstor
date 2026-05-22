@@ -182,7 +182,7 @@ type UeventNotifier interface {
 //
 // Production caller: manager.go addBackgroundRunnables. Test
 // callers exist in physicaldevice_discovery_uevent_bug341_test.go.
-func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg Config) *PhysicalDeviceDiscoveryRunnable {
+func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg *Config) *PhysicalDeviceDiscoveryRunnable {
 	return &PhysicalDeviceDiscoveryRunnable{
 		Client:   cli,
 		Exec:     cfg.Exec,
@@ -604,11 +604,37 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 	// Status.StableID for CRD-name determinism only.
 	devicePath := "/dev/" + row.KName
 	currentDevPath := "/dev/" + row.KName
-
 	rotational := row.Rotational
 
 	desiredStatus := buildDiscoveryStatus(p.NodeName, stableID, devicePath, currentDevPath, row, &rotational, free, reason, message)
 
+	existing, ok := p.upsertDeviceCRD(ctx, logger, name)
+	if !ok {
+		return "", false
+	}
+
+	existing.Status = desiredStatus
+
+	err := p.Client.Status().Update(ctx, existing)
+	if err != nil {
+		logger.Error(err, "update PhysicalDevice status", "name", name)
+
+		return "", false
+	}
+
+	return name, true
+}
+
+// upsertDeviceCRD ensures the PhysicalDevice CRD exists for `name`
+// and that its NodeName label matches the local satellite. Returns
+// the live object ready for a Status().Update, or (nil, false) on
+// any apiserver error (already logged by the caller's logr). Pulled
+// out of publishDeviceWithReason so the parent stays under the
+// funlen budget; the get-or-create + label-sync chain has nothing
+// device-specific in it.
+func (p *PhysicalDeviceDiscoveryRunnable) upsertDeviceCRD(
+	ctx context.Context, logger logr.Logger, name string,
+) (*blockstoriov1alpha1.PhysicalDevice, bool) {
 	var existing blockstoriov1alpha1.PhysicalDevice
 
 	err := p.Client.Get(ctx, client.ObjectKey{Name: name}, &existing)
@@ -627,7 +653,7 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 		if err != nil && !apierrors.IsAlreadyExists(err) {
 			logger.Error(err, "create PhysicalDevice", "name", name)
 
-			return "", false
+			return nil, false
 		}
 
 		// Re-fetch for the status update so we have the apiserver-
@@ -637,12 +663,12 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 		if err != nil {
 			logger.Error(err, "re-get after Create", "name", name)
 
-			return "", false
+			return nil, false
 		}
 	case err != nil:
 		logger.Error(err, "get PhysicalDevice", "name", name)
 
-		return "", false
+		return nil, false
 	}
 
 	// Ensure the node label is set on existing CRDs that may have
@@ -658,20 +684,11 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 		if err != nil {
 			logger.Error(err, "update PhysicalDevice labels", "name", name)
 
-			return "", false
+			return nil, false
 		}
 	}
 
-	existing.Status = desiredStatus
-
-	err = p.Client.Status().Update(ctx, &existing)
-	if err != nil {
-		logger.Error(err, "update PhysicalDevice status", "name", name)
-
-		return "", false
-	}
-
-	return name, true
+	return &existing, true
 }
 
 // buildDiscoveryStatus assembles the Status subresource the

@@ -65,8 +65,8 @@ func startServerCustom(t *testing.T, srv *Server) (string, func()) {
 	// scenario's "DNS fails → 400" path) override this via
 	// Server.SetResolveHost before calling startServerCustom.
 	if srv.resolveHost == nil {
-		srv.SetResolveHost(func(_ context.Context, host string) ([]string, error) {
-			return []string{"127.0.0.1"}, nil //nolint:nilerr // hermetic stub
+		srv.SetResolveHost(func(_ context.Context, _ string) ([]string, error) {
+			return []string{"127.0.0.1"}, nil
 		})
 	}
 

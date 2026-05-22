@@ -515,6 +515,7 @@ func (s *Server) handlePassphraseModify(w http.ResponseWriter, r *http.Request) 
 	// port verbatim so create/modify share one validation contract.
 	if want == "" {
 		writeError(w, http.StatusBadRequest, "new_passphrase is required: modify must specify a non-empty new value")
+
 		return
 	}
 

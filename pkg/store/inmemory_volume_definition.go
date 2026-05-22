@@ -114,18 +114,19 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := vdKey{rdName, volumeNumber}
+	key := vdKey{rdName, volumeNumber}
 
-	vd, ok := s.m[k]
+	vd, ok := s.m[key]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
-	if err := mutate(&vd); err != nil {
+	err := mutate(&vd)
+	if err != nil {
 		return errors.Wrapf(err, "patch volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
-	s.m[k] = vd
+	s.m[key] = vd
 
 	return nil
 }

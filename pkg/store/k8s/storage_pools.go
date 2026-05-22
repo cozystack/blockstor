@@ -32,6 +32,13 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// Upstream LINSTOR's StoragePool.State enumerates "Ok" / "Faulty" / "Error";
+// blockstor only emits the first two today (PoolMissing → Faulty, else Ok).
+const (
+	storagePoolStateOk     = "Ok"
+	storagePoolStateFaulty = "Faulty"
+)
+
 // storagePools implements store.StoragePoolStore against the StoragePool CRD.
 type storagePools struct {
 	c ctrlclient.Client
@@ -302,12 +309,12 @@ func crdToWireStoragePool(crd *crdv1alpha1.StoragePool) apiv1.StoragePool {
 	// pool still rendered as Ok in `linstor sp l`. Synthesise an
 	// ERROR-severity reports[] entry whenever PoolMissing=true so the
 	// CLI sees the real state. Bug 83.
-	state := "Ok"
+	state := storagePoolStateOk
 
 	var reports []apiv1.APICallRc
 
 	if crd.Status.PoolMissing {
-		state = "Faulty"
+		state = storagePoolStateFaulty
 		reports = []apiv1.APICallRc{poolMissingReport(crd.Spec.NodeName, poolName)}
 	}
 

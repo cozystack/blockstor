@@ -220,7 +220,7 @@ func loadRESTConfig() (*rest.Config, error) {
 // satellite.ManagerFactory signature.
 func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
-		mgr, err := controllers.NewManager(restCfg, controllers.Config{
+		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
 			NodeName:               nodeName,
 			Apply:                  rec,
 			Exec:                   storage.RealExec{},

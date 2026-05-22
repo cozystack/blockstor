@@ -271,7 +271,8 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(bytes.NewReader(rawBody))
 	dec.DisallowUnknownFields()
 
-	if decErr := dec.Decode(&envelope); decErr != nil {
+	decErr := dec.Decode(&envelope)
+	if decErr != nil {
 		writeDecodeError(w, decErr)
 
 		return
@@ -297,7 +298,8 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
 	// satellite reconciler doesn't hot-loop on `drbdadm create-md`
 	// failures. See validateVDSize for the bounds rationale.
-	if sizeErr := validateVDSize(vd.SizeKib); sizeErr != nil {
+	sizeErr := validateVDSize(vd.SizeKib)
+	if sizeErr != nil {
 		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
 
 		return
@@ -366,7 +368,8 @@ func vdCreateVolumeNumberExplicit(raw []byte) bool {
 
 	var envelope map[string]json.RawMessage
 
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	err := json.Unmarshal(raw, &envelope)
+	if err != nil {
 		return false
 	}
 
@@ -374,7 +377,8 @@ func vdCreateVolumeNumberExplicit(raw []byte) bool {
 	if inner, ok := envelope["volume_definition"]; ok {
 		var innerObj map[string]json.RawMessage
 
-		if err := json.Unmarshal(inner, &innerObj); err != nil {
+		err := json.Unmarshal(inner, &innerObj)
+		if err != nil {
 			return false
 		}
 
@@ -445,6 +449,17 @@ const minVolumeDefinitionSizeKib int64 = 4 * 1024
 // retry loop.
 const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
 
+// ErrVolumeSizeBelowMinimum is the sentinel for Bug 155's lower-bound
+// rejection (size_kib < minVolumeDefinitionSizeKib). Wrapped with
+// %w + a sizeKib / bound detail by validateVDSize; static-error
+// requirement is err113.
+var ErrVolumeSizeBelowMinimum = errors.New("size_kib below minimum")
+
+// ErrVolumeSizeAboveMaximum is the sentinel for Bug 155's upper-bound
+// rejection (size_kib > maxVolumeDefinitionSizeKib). See
+// ErrVolumeSizeBelowMinimum for the rationale.
+var ErrVolumeSizeAboveMaximum = errors.New("size_kib above maximum")
+
 // validateVDSize returns nil when the requested size_kib is within
 // the accepted bounds [minVolumeDefinitionSizeKib,
 // maxVolumeDefinitionSizeKib] (Bug 155). Otherwise it returns a
@@ -453,16 +468,16 @@ const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
 func validateVDSize(sizeKib int64) error {
 	if sizeKib < minVolumeDefinitionSizeKib {
 		return fmt.Errorf(
-			"size_kib=%d below minimum %d KiB (DRBD reserves ~32 KiB of "+
+			"%w: size_kib=%d below minimum %d KiB (DRBD reserves ~32 KiB of "+
 				"metadata per peer; backing layers add alignment on top)",
-			sizeKib, minVolumeDefinitionSizeKib,
+			ErrVolumeSizeBelowMinimum, sizeKib, minVolumeDefinitionSizeKib,
 		)
 	}
 
 	if sizeKib > maxVolumeDefinitionSizeKib {
 		return fmt.Errorf(
-			"size_kib=%d above maximum %d KiB (DRBD's per-device hard ceiling)",
-			sizeKib, maxVolumeDefinitionSizeKib,
+			"%w: size_kib=%d above maximum %d KiB (DRBD's per-device hard ceiling)",
+			ErrVolumeSizeAboveMaximum, sizeKib, maxVolumeDefinitionSizeKib,
 		)
 	}
 
@@ -492,6 +507,7 @@ func writeVDSizeRejection(w http.ResponseWriter, rd string, vn int32, sizeKib in
 			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
 		},
 	}})
+
 	_ = sizeKib // retained for future audit-log fields
 }
 
@@ -1079,14 +1095,14 @@ func (s *Server) pruneVolumesFromResources(ctx context.Context, rd string, vn in
 
 			dropped := false
 
-			for j := range live.Volumes {
-				if live.Volumes[j].VolumeNumber == vn {
+			for idx := range live.Volumes {
+				if live.Volumes[idx].VolumeNumber == vn {
 					dropped = true
 
 					continue
 				}
 
-				out = append(out, live.Volumes[j])
+				out = append(out, live.Volumes[idx])
 			}
 
 			if !dropped {

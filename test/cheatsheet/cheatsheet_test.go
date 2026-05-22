@@ -44,7 +44,7 @@ func repoRoot(t *testing.T) string {
 	}
 
 	d := filepath.Dir(here)
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
 			return d
 		}

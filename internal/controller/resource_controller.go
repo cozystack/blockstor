@@ -49,6 +49,12 @@ import (
 // the controller no longer stamps it on new Resources.
 const resourceFinalizer = "blockstor.io.blockstor.io/resource"
 
+// takenPortsCluster / takenMinorsCluster pre-allocate this many slots
+// for the result slice — sized to cover a typical small cluster (5-10
+// RDs × 1-2 vols) without re-growing while not over-allocating for the
+// single-RD common case.
+const takenAllocsInitialCap = 16
+
 // (formerly `controllerDRBDIDsFieldOwner`: the SSA field-manager
 // identity the controller-side allocator used when it wrote
 // Status.DRBD{NodeID,Port,Minor}. Phase 11.x switched to a raw JSON
@@ -790,7 +796,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 			continue
 		}
 
-		if volumeDiskState(&peers[i], volumeNumber) != "UpToDate" {
+		if volumeDiskState(&peers[i], volumeNumber) != string(drbd.DiskStateUpToDate) {
 			continue
 		}
 
@@ -972,25 +978,43 @@ func (r *ResourceReconciler) ensureRDPortMinor(ctx context.Context, target *bloc
 
 	err = r.Status().Update(ctx, &rd)
 	if err != nil {
+		if !errors.IsConflict(err) {
+			return 0, 0, err
+		}
+
 		// On conflict, a sibling reconcile already stamped values.
 		// Re-fetch and return whatever they committed.
-		if errors.IsConflict(err) {
-			var fresh blockstoriov1alpha1.ResourceDefinition
+		freshPort, freshMinor, ok, fetchErr := r.reloadCommittedPortMinor(ctx, reader, rdName)
+		if fetchErr != nil {
+			return 0, 0, fetchErr
+		}
 
-			fetchErr := reader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh)
-			if fetchErr != nil {
-				return 0, 0, fetchErr
-			}
-
-			if fresh.Status.DRBDPort != nil && fresh.Status.DRBDMinor != nil {
-				return *fresh.Status.DRBDPort, *fresh.Status.DRBDMinor, nil
-			}
+		if ok {
+			return freshPort, freshMinor, nil
 		}
 
 		return 0, 0, err
 	}
 
 	return port, minor, nil
+}
+
+// reloadCommittedPortMinor re-reads the RD after a Status().Update
+// conflict and returns the sibling-committed (port, minor) pair when
+// both are stamped. `ok=false` means the sibling stamped neither yet
+// (race lost the way that doesn't have a stamped winner), in which
+// case the caller surfaces the original conflict error.
+func (r *ResourceReconciler) reloadCommittedPortMinor(ctx context.Context, reader client.Reader, rdName string) (int32, int32, bool, error) {
+	var fresh blockstoriov1alpha1.ResourceDefinition
+	if err := reader.Get(ctx, client.ObjectKey{Name: rdName}, &fresh); err != nil {
+		return 0, 0, false, err
+	}
+
+	if fresh.Status.DRBDPort != nil && fresh.Status.DRBDMinor != nil {
+		return *fresh.Status.DRBDPort, *fresh.Status.DRBDMinor, true, nil
+	}
+
+	return 0, 0, false, nil
 }
 
 // apiReader returns the uncached apiserver-direct client when
@@ -1280,7 +1304,7 @@ func (r *ResourceReconciler) intersectRange(
 // ensureRDPortMinor, this guarantees that the second concurrent
 // allocator sees the first one's port and picks a different one.
 func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD string) ([]int32, error) {
-	out := make([]int32, 0, 16)
+	out := make([]int32, 0, takenAllocsInitialCap)
 	reader := r.apiReader()
 
 	var rdList blockstoriov1alpha1.ResourceDefinitionList
@@ -1325,7 +1349,7 @@ func (r *ResourceReconciler) takenPortsCluster(ctx context.Context, selfRD strin
 // takenPortsCluster — cross-RD batch autoplace must observe
 // freshly-committed sibling allocations rather than a stale cache.
 func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD string) ([]int32, error) {
-	out := make([]int32, 0, 16)
+	out := make([]int32, 0, takenAllocsInitialCap)
 	reader := r.apiReader()
 
 	rdVolCounts := map[string]int{}

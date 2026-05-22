@@ -108,7 +108,8 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 		return errors.Wrapf(ErrNotFound, "resource group %q", name)
 	}
 
-	if err := mutate(&rg); err != nil {
+	err := mutate(&rg)
+	if err != nil {
 		return errors.Wrapf(err, "patch ResourceGroup %q", name)
 	}
 

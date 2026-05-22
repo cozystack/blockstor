@@ -27,6 +27,11 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// storPoolPropKey is the LINSTOR-wire property name pinning a Resource
+// to a specific storage pool. Mirrors upstream LINSTOR (`StorPoolName`
+// — CamelCase per the REST contract).
+const storPoolPropKey = "StorPoolName"
+
 // snapshotRestoreRequest is the JSON body upstream linstor expects on
 // the restore endpoint. The snapshot name has two wire dialects:
 //
@@ -280,7 +285,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 //
 // The Nodes / NodeNames request fields are aliased — callers may use
 // either; we normalise to one canonical list before iterating.
-func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, srcRD *apiv1.ResourceDefinition, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest) error {
+func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, srcRD, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest) error {
 	nodes := canonicalRestoreNodeList(req)
 
 	if len(nodes) > 0 {
@@ -357,7 +362,7 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 		}
 
 		if pool != "" {
-			res.Props = map[string]string{"StorPoolName": pool}
+			res.Props = map[string]string{storPoolPropKey: pool}
 		}
 
 		err := s.Store.Resources().Create(ctx, &res)

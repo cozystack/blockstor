@@ -599,16 +599,17 @@ func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
 // but RDs still pointing at it) can never arise.
 func (s *Server) handleRGDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("rg")
+	ctx := r.Context()
 
 	(&deleteWithRollback[apiv1.ResourceGroup]{
 		refuseIfReferenced: func() bool {
 			return s.refuseRGDeleteIfReferenced(w, r, name)
 		},
 		capture: func() (apiv1.ResourceGroup, bool) {
-			return s.captureResourceGroup(r.Context(), name)
+			return s.captureResourceGroup(ctx, name)
 		},
 		remove: func() error {
-			return s.Store.ResourceGroups().Delete(r.Context(), name)
+			return s.Store.ResourceGroups().Delete(ctx, name)
 		},
 		rolledBackIfRaced: func(captured apiv1.ResourceGroup, capturedOK bool) bool {
 			if !capturedOK {

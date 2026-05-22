@@ -17,6 +17,7 @@ limitations under the License.
 package version
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"runtime"
@@ -102,7 +103,7 @@ func readVendoredOpenAPIVersion() (string, error) {
 
 	content, err := os.ReadFile(specPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read %s: %w", specPath, err)
 	}
 
 	// `info:` block — match `  version: <semver>` immediately after
@@ -155,7 +156,7 @@ func readVersionSource() (string, error) {
 
 	content, err := os.ReadFile(versionFile)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read %s: %w", versionFile, err)
 	}
 
 	return string(content), nil

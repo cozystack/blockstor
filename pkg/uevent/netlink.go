@@ -94,23 +94,23 @@ type Listener struct {
 // typically exec but `pkg/storage` shells out to lsblk / pvs /
 // zpool / drbdmeta on every scan.
 func New(ctx context.Context) (*Listener, error) {
-	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_KOBJECT_UEVENT)
+	sockFD, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_KOBJECT_UEVENT)
 	if err != nil {
 		return nil, errors.Wrap(err, "socket(AF_NETLINK, NETLINK_KOBJECT_UEVENT)")
 	}
 
-	err = unix.Bind(fd, &unix.SockaddrNetlink{
+	err = unix.Bind(sockFD, &unix.SockaddrNetlink{
 		Family: unix.AF_NETLINK,
 		Groups: netlinkGroupKernel,
 	})
 	if err != nil {
-		_ = unix.Close(fd)
+		_ = unix.Close(sockFD)
 
 		return nil, errors.Wrap(err, "bind netlink uevent socket")
 	}
 
 	listener := &Listener{
-		fd:     fd,
+		fd:     sockFD,
 		events: make(chan Event, eventBufferSize),
 	}
 
@@ -121,7 +121,7 @@ func New(ctx context.Context) (*Listener, error) {
 	// "the listener is up but no events are flowing", and we
 	// burned hours diagnosing exactly that.
 	log.FromContext(ctx).Info("uevent listener started",
-		"fd", fd,
+		"fd", sockFD,
 		"group", netlinkGroupKernel,
 		"buffer", eventBufferSize)
 
@@ -156,6 +156,7 @@ func (l *Listener) run(ctx context.Context) {
 	// loop falls through to the ctx.Err() check.
 	go func() {
 		<-ctx.Done()
+
 		_ = unix.Close(l.fd)
 	}()
 

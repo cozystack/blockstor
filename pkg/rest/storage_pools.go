@@ -161,6 +161,7 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 	force := isForce(r)
+	ctx := r.Context()
 
 	(&deleteWithRollback[apiv1.StoragePool]{
 		refuseIfReferenced: func() bool {
@@ -180,10 +181,10 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 			return s.refuseSPDeleteIfReferenced(w, r, node, pool)
 		},
 		capture: func() (apiv1.StoragePool, bool) {
-			return s.captureStoragePool(r.Context(), node, pool)
+			return s.captureStoragePool(ctx, node, pool)
 		},
 		remove: func() error {
-			return s.Store.StoragePools().Delete(r.Context(), node, pool)
+			return s.Store.StoragePools().Delete(ctx, node, pool)
 		},
 		rolledBackIfRaced: func(captured apiv1.StoragePool, capturedOK bool) bool {
 			// `?force=true` callers opt past this check too.
@@ -350,7 +351,7 @@ func (s *Server) rollbackSPDeleteIfRaced(w http.ResponseWriter, r *http.Request,
 func (s *Server) referencingResources(ctx context.Context, node, pool string) ([]string, error) {
 	all, err := s.Store.Resources().List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "list resources")
 	}
 
 	var refs []string
@@ -362,10 +363,11 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 
 		matched := false
 
-		for _, v := range all[i].Volumes {
-			if v.StoragePool == pool {
+		for j := range all[i].Volumes {
+			vol := &all[i].Volumes[j]
+			if vol.StoragePool == pool {
 				refs = append(refs,
-					all[i].Name+"/"+strconv.FormatInt(int64(v.VolumeNumber), 10))
+					all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
 
 				matched = true
 

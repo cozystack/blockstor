@@ -465,7 +465,7 @@ func TestAutoDiskfulDisabledByZeroProp(t *testing.T) {
 	st := store.NewInMemory()
 
 	rd := seedAutoDiskfulFixture(t, ctx, st,
-		2, "" /* no ctrl prop */, "" /* no rd prop */, /* feature disabled */
+		2, "" /* no ctrl prop */, "", /* no rd prop */ /* feature disabled */
 		[]string{"n1"},
 		[]string{"n2"},
 	)

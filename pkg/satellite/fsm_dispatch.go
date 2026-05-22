@@ -72,7 +72,8 @@ func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredRe
 	// Noop (must remain a true no-op).
 	switch action {
 	case ActionCreateMd, ActionUp, ActionAdjust, ActionAdjustSkipDisk:
-		if err := r.renderResFile(ctx, dr, devices); err != nil {
+		err := r.renderResFile(ctx, dr, devices)
+		if err != nil {
 			return err
 		}
 	}

@@ -136,18 +136,19 @@ func (s *inMemoryResources) PatchResourceSpec(_ context.Context, rdName, node st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := rKey{rdName, node}
+	key := rKey{rdName, node}
 
-	r, ok := s.m[k]
+	r, ok := s.m[key]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
 
-	if err := mutate(&r); err != nil {
+	err := mutate(&r)
+	if err != nil {
 		return errors.Wrapf(err, "patch resource %q on node %q", rdName, node)
 	}
 
-	s.m[k] = r
+	s.m[key] = r
 
 	return nil
 }
@@ -156,12 +157,12 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := rKey{rdName, node}
-	if _, exists := s.m[k]; !exists {
+	key := rKey{rdName, node}
+	if _, exists := s.m[key]; !exists {
 		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
 
-	delete(s.m, k)
+	delete(s.m, key)
 
 	return nil
 }

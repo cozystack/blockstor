@@ -143,7 +143,7 @@ func lvHasRestoreIncompleteTag(ctx context.Context, ex storage.Exec, vg, lvName 
 		return false
 	}
 
-	for _, tag := range strings.Split(strings.TrimSpace(string(out)), ",") {
+	for tag := range strings.SplitSeq(strings.TrimSpace(string(out)), ",") {
 		if strings.TrimSpace(tag) == RestoreIncompleteTag {
 			return true
 		}

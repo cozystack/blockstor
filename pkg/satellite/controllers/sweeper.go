@@ -257,25 +257,8 @@ func (s *OrphanSweeperRunnable) Start(ctx context.Context) error {
 	// orphan classification cannot mis-fire against a half-warm
 	// cache. ctx propagation in sweepOnce ensures a shutdown still
 	// aborts any in-flight drbdsetup call.
-	err := s.sweepOnce(ctx, logger)
-	if err != nil {
-		logger.Error(err, "initial sweep")
-	}
-
-	ticker := time.NewTicker(period)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			err := s.sweepOnce(ctx, logger)
-			if err != nil {
-				logger.Error(err, "sweep cycle")
-			}
-		}
-	}
+	return runPeriodicTick(ctx, period, logger, s.sweepOnce,
+		"initial sweep", "sweep cycle")
 }
 
 // RegisterWithManager adds the sweeper to mgr alongside the
