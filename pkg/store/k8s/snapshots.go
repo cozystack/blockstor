@@ -118,57 +118,6 @@ func (s *snapshots) Get(ctx context.Context, rdName, snapName string) (apiv1.Sna
 	return crdToWireSnapshot(&crd, parent), nil
 }
 
-// getParentRD fetches the parent ResourceDefinition for a Snapshot,
-// returning nil + the not-found error when the parent has already
-// been deleted (orphan Snapshot — the view layer still has to render
-// the snapshot row without panicking on nil-deref).
-func (s *snapshots) getParentRD(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
-	if rdName == "" {
-		return nil, nil //nolint:nilnil // empty name == no parent to look up
-	}
-
-	var rd crdv1alpha1.ResourceDefinition
-
-	err := s.c.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil //nolint:nilnil // orphan snapshot — no parent
-		}
-
-		return nil, errors.Wrapf(err, "get parent RD %q for Snapshot", rdName)
-	}
-
-	return &rd, nil
-}
-
-// collectParentRDs batches the parent-RD lookups for a List call so
-// the view of 50 snapshots-on-the-same-RD doesn't trigger 50 separate
-// API server GETs. Missing parents (orphan Snapshots) silently
-// produce a nil entry in the map — the wire-shape conversion folds
-// nil into empty maps.
-func (s *snapshots) collectParentRDs(
-	ctx context.Context, snaps []crdv1alpha1.Snapshot,
-) (map[string]*crdv1alpha1.ResourceDefinition, error) {
-	out := make(map[string]*crdv1alpha1.ResourceDefinition, len(snaps))
-
-	for i := range snaps {
-		rdName := snaps[i].Spec.ResourceDefinitionName
-
-		if _, seen := out[rdName]; seen {
-			continue
-		}
-
-		rd, err := s.getParentRD(ctx, rdName)
-		if err != nil {
-			return nil, err
-		}
-
-		out[rdName] = rd
-	}
-
-	return out, nil
-}
-
 func (s *snapshots) Create(ctx context.Context, in *apiv1.Snapshot) error {
 	if in == nil {
 		return errors.New("nil Snapshot")
@@ -255,6 +204,57 @@ func (s *snapshots) Delete(ctx context.Context, rdName, snapName string) error {
 	}
 
 	return nil
+}
+
+// getParentRD fetches the parent ResourceDefinition for a Snapshot,
+// returning nil + the not-found error when the parent has already
+// been deleted (orphan Snapshot — the view layer still has to render
+// the snapshot row without panicking on nil-deref).
+func (s *snapshots) getParentRD(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
+	if rdName == "" {
+		return nil, nil //nolint:nilnil // empty name == no parent to look up
+	}
+
+	var rd crdv1alpha1.ResourceDefinition
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil //nolint:nilnil // orphan snapshot — no parent
+		}
+
+		return nil, errors.Wrapf(err, "get parent RD %q for Snapshot", rdName)
+	}
+
+	return &rd, nil
+}
+
+// collectParentRDs batches the parent-RD lookups for a List call so
+// the view of 50 snapshots-on-the-same-RD doesn't trigger 50 separate
+// API server GETs. Missing parents (orphan Snapshots) silently
+// produce a nil entry in the map — the wire-shape conversion folds
+// nil into empty maps.
+func (s *snapshots) collectParentRDs(
+	ctx context.Context, snaps []crdv1alpha1.Snapshot,
+) (map[string]*crdv1alpha1.ResourceDefinition, error) {
+	out := make(map[string]*crdv1alpha1.ResourceDefinition, len(snaps))
+
+	for i := range snaps {
+		rdName := snaps[i].Spec.ResourceDefinitionName
+
+		if _, seen := out[rdName]; seen {
+			continue
+		}
+
+		rd, err := s.getParentRD(ctx, rdName)
+		if err != nil {
+			return nil, err
+		}
+
+		out[rdName] = rd
+	}
+
+	return out, nil
 }
 
 // crdToWireSnapshot converts the Snapshot CRD into the wire DTO.

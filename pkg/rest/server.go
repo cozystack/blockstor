@@ -154,17 +154,6 @@ func (s *Server) SetResolveHost(fn resolveHostFunc) resolveHostFunc {
 	return prev
 }
 
-// lookupHost dispatches to s.resolveHost if set, else the package
-// default. Hoisted off-handler so the production handler stays
-// readable and the test seam is explicit.
-func (s *Server) lookupHost(ctx context.Context, host string) ([]string, error) {
-	if s.resolveHost != nil {
-		return s.resolveHost(ctx, host)
-	}
-
-	return defaultResolveHost(ctx, host)
-}
-
 // NeedLeaderElection reports whether the server requires leader election.
 // REST is read-mostly today and safe to run on every replica; once we
 // introduce write-paths that need a single leader we'll change this to true.
@@ -248,6 +237,17 @@ func (s *Server) Start(ctx context.Context) error {
 
 		return errors.Wrap(err, "REST server failed")
 	}
+}
+
+// lookupHost dispatches to s.resolveHost if set, else the package
+// default. Hoisted off-handler so the production handler stays
+// readable and the test seam is explicit.
+func (s *Server) lookupHost(ctx context.Context, host string) ([]string, error) {
+	if s.resolveHost != nil {
+		return s.resolveHost(ctx, host)
+	}
+
+	return defaultResolveHost(ctx, host)
 }
 
 // buildMux registers every endpoint on a fresh ServeMux. Pulled out
