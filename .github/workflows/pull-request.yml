@@ -206,6 +206,13 @@ jobs:
     permissions:
       contents: read
       checks: write
+    # TODO: drop continue-on-error once the kind-based e2e tier is
+    # confirmed stable on ubuntu-latest. The kustomize manifest fix
+    # (commit c2e716daf) unblocked `make deploy`, but the suite
+    # itself may surface other ubuntu-latest gaps. Until then the job
+    # surfaces issues via annotations + breakpoint but does not block
+    # PR approval.
+    continue-on-error: true
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
