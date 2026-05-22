@@ -2082,12 +2082,59 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	// Look up flags before delete so we know whether to stamp the
-	// suppression annotation. A NotFound at this stage is fine —
-	// the Delete call below folds the missing replica into the
-	// idempotent 200 + warn envelope.
+	// Look up the Resource before any destructive action. The flag
+	// inspection drives the Bug 342 toggle-vs-Delete branch decision
+	// below and the legacy tiebreaker-suppression stamp on the
+	// witness path.
 	existing, getErr := s.Store.Resources().Get(r.Context(), rdName, node)
-	if getErr == nil && slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+	if getErr != nil {
+		if errors.Is(getErr, store.ErrNotFound) {
+			// Bug 56 idempotent envelope, Bug 67 no-bump on no-op,
+			// Bug 124 informer-cache drain — unchanged semantics
+			// from the pre-Bug-342 single-Delete-call path.
+			s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnRscNotFound,
+				Message: "resource already absent: " + rdName + " on " + node,
+			}})
+
+			return
+		}
+
+		writeStoreError(w, getErr)
+
+		return
+	}
+
+	// Bug 342: route diskful `r d` through toggle-disk-to-diskless
+	// instead of physical Resource Delete. Upstream LINSTOR's REST
+	// DelRsc on a diskful Resource is internally a toggle-disk-remove
+	// — Resource entry survives, dispatcher continues rendering the
+	// peer as `disk none` in every .res file, kernel slot lives
+	// across the detach so `r c` (which createOrPromoteResource
+	// already handles as diskless→diskful promote) just flips the
+	// one .res line back. The pre-Bug-342 physical-Delete path tore
+	// the peer out of every .res, triggered satellite-side
+	// `del-peer + forget-peer`, and wedged the next `r c` in
+	// Connecting/StandAlone because the kernel had to handshake a
+	// brand-new node-id against peers that had forgotten it.
+	//
+	// Branch matrix:
+	//   TIE_BREAKER → physical Delete + stampTiebreakerSuppression.
+	//     The witness lifecycle is controller-owned; an explicit
+	//     operator `r d witness-node` request means "really remove".
+	//   already DISKLESS (non-witness) → physical Delete. There is
+	//     no diskful state to convert from; operator intent is full
+	//     peer removal. Satellite's EvictPeersByUIDMismatch path
+	//     handles the kernel-slot teardown.
+	//   DISKFUL (non-witness) → toggle-disk-to-diskless. Keep CRD,
+	//     stamp DISKLESS flag. Satellite detaches local backing;
+	//     dispatcher renders peer with `disk none` for this node.
+	tieBreaker := slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker)
+	alreadyDiskless := slices.Contains(existing.Flags, apiv1.ResourceFlagDiskless)
+
+	if tieBreaker {
 		// Best-effort. Failure to stamp must not block the
 		// operator-requested delete; the worst case without
 		// the annotation is "auto-witness comes back in 5
@@ -2095,32 +2142,18 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
 	}
 
-	// Bug 342 v10: REST 2-phase delete wiring intentionally NOT
-	// activated here until satellite-side Phase 2 (FSM extension
-	// with ActionForgetPeer + ACK annotation stamping) lands. The
-	// DELETING flag constant and waitForPeerDeletionAcks helper are
-	// in place (pkg/api/v1/node.go, pkg/rest/peer_delete_sync.go)
-	// but not yet wired — without satellite ACKs the wait would
-	// time out at 15s per r d call, regressing test latency without
-	// closing the bug. Phase 2+3 of v10 land in a fresh session;
-	// the groundwork is forward-compatible.
-	_ = existing // silence unused-variable warning if Phase 2 isn't here yet
+	if !tieBreaker && !alreadyDiskless {
+		s.toggleResourceToDiskless(w, r, rdName, node)
+
+		return
+	}
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			// Bug 56 idempotent envelope. Bug 67: a no-op DELETE
-			// must NOT bump sibling annotations — only a REAL drop
-			// changes the peer set the survivors render into .res.
-			// Spurious bumps on the CSI retry path would churn the
-			// satellite reconciler loop (every replay = one more
-			// drbdadm adjust on every survivor) and confuse audit
-			// tooling that watches `blockstor.io/peer-changed`.
-			//
-			// Bug 124: still drain the local cache on the no-op
-			// branch — a retry-after-success-on-sibling-replica
-			// can land here while this replica's informer cache
-			// still has the row.
+			// Race between Get above and Delete here (concurrent
+			// finalizer-strip or cascade); fold to the same
+			// idempotent envelope as the initial NotFound branch.
 			s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
@@ -2142,24 +2175,43 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// pkg/rest/cache_invalidation.go.
 	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
 
-	// Bug 67: notify surviving sibling Resources of the peer change so
-	// the satellite reconcilers re-derive their peer set without the
-	// dropped replica. The satellite's controller-runtime watch is
-	// scoped by `nodeNamePredicate` to its OWN Resource CRDs, so a
-	// peer-Resource Delete on another node never wakes the local
-	// reconciler — bumping an annotation on each survivor is the
-	// minimal-cost event the local watch DOES see. Best-effort: a
-	// failure here does NOT roll the delete back (the row is already
-	// gone) — the next user-initiated event or full reconcile sync
-	// will eventually converge. Order of operations is deliberately
-	// "delete first, bump second" so a survivor that reconciles on
-	// the annotation event observes the post-delete Resource list,
-	// not the racing pre-delete state.
+	// Bug 67: notify surviving sibling Resources of the peer change
+	// so satellite reconcilers re-derive their peer set without the
+	// dropped replica. Order ("delete first, bump second") ensures a
+	// reconciler woken by the annotation observes post-delete state.
 	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
+	}})
+}
+
+// toggleResourceToDiskless is the Bug 342 diskful-`r d` path: stamp
+// the DISKLESS flag via PatchResourceSpec (Bug 281 optimistic-lock
+// retry shape) so the Resource CRD survives, then bump siblings'
+// peer-changed annotation so cross-node satellite reconcilers wake
+// up deterministically. Mirrors handleResourceToggleDiskToDiskless
+// on the Spec mutation side; the wire envelope matches the legacy
+// physical-delete reply so CSI/golinstor callers see no shape drift.
+func (s *Server) toggleResourceToDiskless(w http.ResponseWriter, r *http.Request, rdName, node string) {
+	patchErr := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, true)
+
+			return nil
+		})
+	if patchErr != nil {
+		writeStoreError(w, patchErr)
+
+		return
+	}
+
+	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
+		Message: "resource toggled to diskless: " + rdName + " on " + node,
 	}})
 }
 
