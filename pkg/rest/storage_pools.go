@@ -161,6 +161,7 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 	force := isForce(r)
+	ctx := r.Context()
 
 	(&deleteWithRollback[apiv1.StoragePool]{
 		refuseIfReferenced: func() bool {
@@ -180,10 +181,10 @@ func (s *Server) handleNodeStoragePoolDelete(w http.ResponseWriter, r *http.Requ
 			return s.refuseSPDeleteIfReferenced(w, r, node, pool)
 		},
 		capture: func() (apiv1.StoragePool, bool) {
-			return s.captureStoragePool(r.Context(), node, pool)
+			return s.captureStoragePool(ctx, node, pool)
 		},
 		remove: func() error {
-			return s.Store.StoragePools().Delete(r.Context(), node, pool)
+			return s.Store.StoragePools().Delete(ctx, node, pool)
 		},
 		rolledBackIfRaced: func(captured apiv1.StoragePool, capturedOK bool) bool {
 			// `?force=true` callers opt past this check too.

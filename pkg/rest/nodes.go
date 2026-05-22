@@ -867,6 +867,7 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 	force := isForce(r)
+	ctx := r.Context()
 
 	// Bug 179: `?force=true` cascade-deletes every referencing
 	// Resource + StoragePool CRD before dropping the Node — same
@@ -874,7 +875,7 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 	// force-delete would leave orphan SP CRDs pointing at a deleted
 	// Node, which is precisely the symptom Bug 179 closed.
 	if force {
-		err := s.cascadeOrphansForLostNode(r.Context(), name)
+		err := s.cascadeOrphansForLostNode(ctx, name)
 		if err != nil {
 			writeStoreError(w, err)
 
@@ -891,10 +892,10 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 			return s.refuseNodeDeleteIfReferenced(w, r, name)
 		},
 		capture: func() (apiv1.Node, bool) {
-			return s.captureNode(r.Context(), name)
+			return s.captureNode(ctx, name)
 		},
 		remove: func() error {
-			return s.Store.Nodes().Delete(r.Context(), name)
+			return s.Store.Nodes().Delete(ctx, name)
 		},
 		rolledBackIfRaced: func(captured apiv1.Node, capturedOK bool) bool {
 			if force || !capturedOK {
