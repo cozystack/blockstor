@@ -58,8 +58,13 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
+        # Binary path is `/controller` (set by Dockerfile's controller
+        # stage: COPY --from=builder /workspace/controller .) — not
+        # the kubebuilder default `/manager`. Container name stays
+        # `manager` for the kustomize patches in config/default that
+        # match on it.
       - command:
-        - /manager
+        - /controller
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
