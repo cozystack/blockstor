@@ -79,35 +79,25 @@ wait_status_state "$RD" "${diskful_nodes[1]}" UpToDate 120 \
 # Phase 2: same-node delete + re-create
 # =====================================================================
 n1="${diskful_nodes[0]}"
-echo ">> Phase 2: r d $n1 $RD  (Bug 338 trigger — should collapse tiebreaker)"
+echo ">> Phase 2: r d $n1 $RD  (toggle-disk-remove → Resource transitions to DISKLESS, Bug 342)"
 "${LCTL[@]}" resource delete "$n1" "$RD" >/dev/null
 
-wait_replica_absent "$RD" "$n1" 60 \
-    || die "Phase 2: ${RD}.${n1} CRD never disappeared after r d"
-
-# Bug 338 contract: 1 surviving diskful, no tiebreaker.
-echo ">> Phase 2: wait up to 30s for tiebreaker to collapse"
-deadline=$(( $(date +%s) + 30 ))
-collapsed=false
-while (( $(date +%s) < deadline )); do
-    remaining=$(linstor_replica_count "$RD")
-    if [[ "$remaining" == "1" ]]; then
-        # Confirm the lone row is the surviving diskful (not the tiebreaker).
-        if [[ -z "$(linstor_tiebreaker_node "$RD")" ]]; then
-            collapsed=true
-            break
-        fi
-    fi
-    sleep 2
-done
-if [[ "$collapsed" != "true" ]]; then
-    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -20 >&2
-    die "Phase 2 (Bug 338): tiebreaker did not collapse to single diskful within 30s"
-fi
+# Bug 342: upstream LINSTOR's r d on a diskful Resource is toggle-disk-
+# remove — the Resource CRD survives with the DISKLESS flag stamped,
+# the satellite detaches local backing, and the kernel slot survives.
+# Pre-Bug-342 expectation was `wait_replica_absent` because blockstor
+# physically deleted the CRD; that wedged subsequent `r c` in
+# Connecting/StandAlone (see bug_342_FINAL_root_cause memory).
+wait_status_diskless "$RD" "$n1" 60 \
+    || die "Phase 2: ${RD}.${n1} never transitioned to Diskless after r d"
 
 # Re-create on the SAME node — bare form, no --diskless, no --storage-pool.
-# Bug 327 contract: must come back diskful, not Diskless.
-echo ">> Phase 2: r c $n1 $RD  (Bug 327 trigger — bare form must yield diskful)"
+# Bug 327 contract: must come back diskful, not Diskless. Bug 342:
+# createOrPromoteResource handles the diskless→diskful promote path
+# already (the now-DISKLESS Resource from `r d` above is the input);
+# the satellite flips one line of the .res file from `disk none` back
+# to `disk /dev/<...>` and the kernel slot resumes without renegotiation.
+echo ">> Phase 2: r c $n1 $RD  (Bug 327/342 trigger — bare form must promote DISKLESS→diskful)"
 "${LCTL[@]}" resource create "$n1" "$RD" >/dev/null
 
 wait_status_state "$RD" "$n1" UpToDate 120 \
@@ -143,16 +133,32 @@ done
 [[ -n "$n_to_evict" ]] \
     || die "Phase 3: no second diskful node to evict (have ${diskful_phase3[*]:-none})"
 
-echo ">> Phase 3: r d $n_to_evict $RD  (relocate prep)"
+echo ">> Phase 3: r d $n_to_evict $RD  (relocate prep — Bug 342 toggle to DISKLESS)"
 "${LCTL[@]}" resource delete "$n_to_evict" "$RD" >/dev/null
-wait_replica_absent "$RD" "$n_to_evict" 60 \
-    || die "Phase 3: ${RD}.${n_to_evict} CRD never disappeared"
+# Bug 342: as in Phase 2, r d on diskful transitions the Resource to
+# DISKLESS — CRD survives. The relocate semantics still work because
+# the new diskful replica is on a different node (typically the
+# tiebreaker's old slot or a previously-untouched worker).
+wait_status_diskless "$RD" "$n_to_evict" 60 \
+    || die "Phase 3: ${RD}.${n_to_evict} never transitioned to Diskless after r d"
 
-# Pick a fresh target that doesn't currently host a replica — typically
-# the node where the tiebreaker had been spawned in Phase 1 / Phase 2.
-relocate_node=$(linstor_pick_free_node "$RD" "$n1")
+# Pick a target that doesn't currently host a DISKFUL replica — under
+# the Bug 342 semantics the just-deleted node still has a DISKLESS
+# Resource so `linstor_pick_free_node` (which checks ANY CRD presence)
+# would refuse it. Walk WORKER_1..3 by hand, exclude $n1 (still
+# diskful) and $n_to_evict (now diskless on purpose), and take the
+# remaining worker — typically the one where the tiebreaker had been
+# spawned. createOrPromoteResource on the next line handles the
+# TIE_BREAKER-takeover path (Bug 260).
+relocate_node=""
+for w in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
+    if [[ "$w" != "$n1" && "$w" != "$n_to_evict" ]]; then
+        relocate_node="$w"
+        break
+    fi
+done
 [[ -n "$relocate_node" ]] \
-    || die "Phase 3: no free node to relocate onto (workers: $WORKER_1 $WORKER_2 $WORKER_3)"
+    || die "Phase 3: no relocate target found (workers: $WORKER_1 $WORKER_2 $WORKER_3, n1=$n1, n_to_evict=$n_to_evict)"
 
 echo ">> Phase 3: r c $relocate_node $RD  (diskful on the tiebreaker's old node)"
 "${LCTL[@]}" resource create "$relocate_node" "$RD" >/dev/null
@@ -170,12 +176,12 @@ wait_sync_done "$RD" "$relocate_node" "$n1" 240 \
 # =====================================================================
 # Phase 4: delete every diskful — cluster collapses cleanly
 # =====================================================================
-echo ">> Phase 4: r d every diskful"
+echo ">> Phase 4: r d every diskful (Bug 342: each transitions to DISKLESS)"
 mapfile -t diskful_phase4 < <(linstor_diskful_nodes "$RD")
 for n in "${diskful_phase4[@]}"; do
     "${LCTL[@]}" resource delete "$n" "$RD" >/dev/null
-    wait_replica_absent "$RD" "$n" 60 \
-        || die "Phase 4: ${RD}.${n} CRD never disappeared after r d"
+    wait_status_diskless "$RD" "$n" 60 \
+        || die "Phase 4: ${RD}.${n} never transitioned to Diskless after r d"
 done
 
 # Give the controller a moment to tear any leftover tiebreaker witness.
