@@ -320,6 +320,14 @@ linters:
       - linters:
           - gosec
         path: cmd/linstor-trace-recorder/
+      # pkg/storage/file/diskfree.go does an int64(stat.Bsize)
+      # conversion that is a no-op on Linux (Bsize int64) but
+      # required on macOS (Bsize uint32). unconvert can't see the
+      # cross-platform shape, so the conversion is flagged as
+      # unnecessary on Linux builds.
+      - linters:
+          - unconvert
+        path: pkg/storage/file/diskfree\.go
       # peer_delete_sync.go contains Bug 342 v10 plumbing (per-peer
       # forget-peer ACK annotations) that's staged on the satellite side
       # but not yet called from the REST handler. The unused-code is
