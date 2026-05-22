@@ -1,0 +1,253 @@
+name: Pull Request
+
+# Single consolidated CI pipeline for PRs. Fires on every PR open/push and
+# runs lint, unit tests, contract tests, and e2e in parallel. The e2e job
+# carries an opt-in SSH breakpoint (label-gated) so maintainers can attach
+# to a wedged sandbox and resume the workflow with `breakpoint resume`.
+#
+# Runner topology:
+#   - lint, unit-test, contract → GitHub-hosted `ubuntu-latest` (ephemeral).
+#   - e2e → self-hosted (needs KVM/large RAM for kind+blockstor sandbox).
+#     Adjust the `runs-on:` label to match the ephemeral runner pool once
+#     ARC / namespace.so / equivalent is wired up.
+#
+# Repository variables (Settings → Secrets and variables → Actions → Variables):
+#   - BREAKPOINT_ENDPOINT (required for the breakpoint step; if unset, the
+#     step is skipped — forks cannot reach the rendezvous server anyway
+#     because variables are not exposed in fork-PR workflows).
+#
+# Labels that change behaviour:
+#   - debug   → opens an SSH breakpoint on e2e failure (paused 20m for first
+#               attach, then 10m idle-timeout after the last disconnect).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Cancel in-flight runs for the same PR when a new push arrives — saves
+# runner minutes on rapid force-push iterations.
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  detect-changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            code:
+              - '!docs/**'
+              - '!**/*.md'
+              - '!.github/ISSUE_TEMPLATE/**'
+              - '!LICENSE'
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Check linter configuration
+        run: make lint-config
+      - name: Run linter
+        run: make lint
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Running tests
+        run: |
+          go mod tidy
+          make test
+
+  contract:
+    name: Contract tests
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Clone
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Build contract image
+        run: |
+          docker build -t blockstor-drbd-contract:local \
+            -f tests/contract/Dockerfile tests/contract/
+      - name: Contract tests
+        run: |
+          go test -tags=contract -count=1 -timeout=5m -v ./tests/contract/... \
+            | tee contract.log
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: contract-logs
+          path: contract.log
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Clone
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+      - name: Install linstor-client (python-linstor)
+        # The harness shells out to the upstream linstor CLI to exercise
+        # wire-shape compatibility — exactly what unit tests cannot do.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linstor-client python3-linstor
+      - name: Install envtest binaries
+        # controller-runtime's envtest needs kube-apiserver + etcd
+        # binaries. setup-envtest pins the version matching our
+        # controller-runtime release.
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          echo "KUBEBUILDER_ASSETS=$(setup-envtest use --print path 1.34.x)" >> "$GITHUB_ENV"
+      - name: go mod tidy
+        run: go mod tidy
+      - name: Build (ensures harness compiles)
+        run: go build ./...
+      - name: Integration tests
+        run: |
+          go test -tags=integration -count=1 -timeout=15m ./tests/integration/... | tee integration.log
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-logs
+          path: |
+            integration.log
+            /tmp/envtest-*.log
+
+  e2e:
+    name: E2E
+    # Swap the label below to your ephemeral runner pool when ARC is up
+    # (e.g. `[self-hosted, blockstor-e2e]` or a buildjet/namespace label).
+    # The job needs KVM access for the kind cluster; GitHub-hosted runners
+    # currently work for the simple kind-based e2e but real-DRBD QEMU
+    # scenarios require nested virtualisation.
+    runs-on: [self-hosted]
+    needs: [detect-changes, lint, unit-test]
+    if: needs.detect-changes.outputs.code == 'true'
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Running Test e2e
+        run: |
+          go mod tidy
+          make test-e2e
+
+      # Open an SSH breakpoint to the failing e2e runner so maintainers
+      # can attach, inspect kind/blockstor state, and resume with
+      # `breakpoint resume`. Gated by the `debug` label — set it on the PR
+      # to opt in. Forks can't reach the rendezvous server because
+      # repository variables are not exposed to fork-PR workflows; the
+      # step is silently skipped in that case.
+      #
+      # Uses cozystack/breakpoint-action (fork of namespacelabs/breakpoint-action)
+      # pinned by SHA. The fork adds pause-idle mode (initial grace period
+      # for the first SSH connection, idle-aware exit afterwards), endpoint
+      # output, and a dedicated Check Run "Breakpoint Open" that carries
+      # the SSH endpoint in output.summary while the breakpoint is paused.
+      - name: Breakpoint on E2E failure
+        if: |
+          failure() &&
+          vars.BREAKPOINT_ENDPOINT != '' &&
+          contains(github.event.pull_request.labels.*.name, 'debug')
+        # cozystack/breakpoint-action v2-cozy.1
+        # mode: pause-idle defaults: grace-period=20m, idle-timeout=10m
+        uses: cozystack/breakpoint-action@a6f3a6f87be398ad63b6577351e3398e53f578e4
+        with:
+          mode: pause-idle
+          endpoint: ${{ vars.BREAKPOINT_ENDPOINT }}
+          authorized-users: androndo, Arsolitt, IvanHunters, kvaps, lexfrei, lllamnyp, mattia-eleuteri, matthieu-robin, myasnikovdaniil, sircthulhu, tym83
+          check-run-name: "Breakpoint Open"
+          github-token: ${{ github.token }}
+          check-run-summary-template: |
+            ## 🔴 SSH breakpoint open — paused for debug
+
+            ```
+            {endpoint}
+            ```
+
+            Inspect the e2e sandbox:
+            ```
+            kubectl get pods -A
+            kind get clusters
+            ```
+
+            Resume from inside: `breakpoint resume`. Otherwise the breakpoint
+            exits 10 minutes after the last SSH session disconnects.

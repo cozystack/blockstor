@@ -1,8 +1,12 @@
 name: E2E Tests
 
+# PR runs go through .github/workflows/pull-request.yml (consolidated
+# pipeline with the breakpoint step). This workflow stays push-only so
+# main-branch merges still exercise the kind-based e2e without
+# duplicating every PR run.
 on:
   push:
-  pull_request:
+    branches: [main]
 
 permissions: {}
 

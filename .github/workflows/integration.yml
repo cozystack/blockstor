@@ -11,9 +11,11 @@ name: Integration tests
 # Runs on every PR. Target wall-clock < 5 minutes for the whole suite.
 
 on:
+  # PR runs go through .github/workflows/pull-request.yml (consolidated
+  # pipeline with the breakpoint step). Push-only here so main-branch
+  # merges still exercise the envtest harness.
   push:
     branches: [main]
-  pull_request:
 
 permissions: {}
 
