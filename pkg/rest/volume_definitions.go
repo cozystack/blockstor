@@ -1095,14 +1095,14 @@ func (s *Server) pruneVolumesFromResources(ctx context.Context, rd string, vn in
 
 			dropped := false
 
-			for j := range live.Volumes {
-				if live.Volumes[j].VolumeNumber == vn {
+			for idx := range live.Volumes {
+				if live.Volumes[idx].VolumeNumber == vn {
 					dropped = true
 
 					continue
 				}
 
-				out = append(out, live.Volumes[j])
+				out = append(out, live.Volumes[idx])
 			}
 
 			if !dropped {

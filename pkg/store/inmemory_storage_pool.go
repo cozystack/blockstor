@@ -235,9 +235,9 @@ func (s *inMemoryStoragePools) PatchStoragePoolSpec(_ context.Context, node, poo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := spKey{node, pool}
+	key := spKey{node, pool}
 
-	sp, ok := s.m[k]
+	sp, ok := s.m[key]
 	if !ok {
 		return errors.Wrapf(ErrNotFound, "storage pool %q on node %q", pool, node)
 	}
@@ -247,7 +247,7 @@ func (s *inMemoryStoragePools) PatchStoragePoolSpec(_ context.Context, node, poo
 		return errors.Wrapf(err, "patch storage pool %q on node %q", pool, node)
 	}
 
-	s.m[k] = sp
+	s.m[key] = sp
 
 	return nil
 }

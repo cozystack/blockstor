@@ -351,7 +351,7 @@ func (s *Server) rollbackSPDeleteIfRaced(w http.ResponseWriter, r *http.Request,
 func (s *Server) referencingResources(ctx context.Context, node, pool string) ([]string, error) {
 	all, err := s.Store.Resources().List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "list resources")
 	}
 
 	var refs []string
@@ -363,10 +363,11 @@ func (s *Server) referencingResources(ctx context.Context, node, pool string) ([
 
 		matched := false
 
-		for _, v := range all[i].Volumes {
-			if v.StoragePool == pool {
+		for j := range all[i].Volumes {
+			vol := &all[i].Volumes[j]
+			if vol.StoragePool == pool {
 				refs = append(refs,
-					all[i].Name+"/"+strconv.FormatInt(int64(v.VolumeNumber), 10))
+					all[i].Name+"/"+strconv.FormatInt(int64(vol.VolumeNumber), 10))
 
 				matched = true
 

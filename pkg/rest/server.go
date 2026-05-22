@@ -147,7 +147,7 @@ type Server struct {
 // handleNodeCreate. Returns the previous value so tests can restore
 // it. Production code never calls this; defaultResolveHost is used
 // when the field is nil.
-func (s *Server) SetResolveHost(fn resolveHostFunc) resolveHostFunc {
+func (s *Server) SetResolveHost(fn ResolveHostFunc) ResolveHostFunc {
 	prev := s.resolveHost
 	s.resolveHost = fn
 
@@ -803,7 +803,7 @@ func (h *headRecorder) Header() http.Header {
 }
 
 func (h *headRecorder) Write(b []byte) (int, error) {
-	return h.body.Write(b)
+	return h.body.Write(b) //nolint:wrapcheck // bytes.Buffer.Write always returns nil; ResponseWriter contract requires the int + error
 }
 
 func (h *headRecorder) WriteHeader(code int) {

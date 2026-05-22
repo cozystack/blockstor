@@ -243,7 +243,9 @@ func (r *recorder) write(method, path string, reqBody []byte, status int, respBo
 	// filepath.Base belt-and-braces against any path-traversal
 	// chars that snuck through sanitisePath (filenames already have
 	// `/` stripped, but gosec G703 wants the explicit guard).
-	err = os.WriteFile(filepath.Join(r.outDir, filepath.Base(name)), out, fileMode)
+	target := filepath.Join(r.outDir, filepath.Base(name))
+
+	err = os.WriteFile(target, out, fileMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "write trace: %v\n", err)
 		os.Exit(1)

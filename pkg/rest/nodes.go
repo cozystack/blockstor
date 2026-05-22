@@ -41,10 +41,15 @@ import (
 // `props.CurStltConnName` both default to it.
 const DefaultNetInterfaceName = "default"
 
-// resolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
+// ResolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
 // the POST body omits a NetInterface address. Tests swap this for a
-// deterministic stub via Server.lookupHost.
-type resolveHostFunc func(ctx context.Context, host string) ([]string, error)
+// deterministic stub via Server.SetResolveHost; production wires
+// defaultResolveHost.
+type ResolveHostFunc func(ctx context.Context, host string) ([]string, error)
+
+// resolveHostFunc is the package-internal alias kept for symmetry with
+// the historical unexported name; new code SHOULD use ResolveHostFunc.
+type resolveHostFunc = ResolveHostFunc
 
 // defaultResolveHost wraps net.DefaultResolver.LookupHost — the
 // production resolver. Hoisted into a package-level var so tests can
@@ -1121,7 +1126,7 @@ func (s *Server) rollbackNodeDeleteIfRaced(w http.ResponseWriter, r *http.Reques
 func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, error) {
 	resources, err := s.Store.Resources().List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "list resources")
 	}
 
 	var refs []string

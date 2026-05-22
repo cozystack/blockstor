@@ -281,14 +281,7 @@ func crdToWireSnapshot(
 
 	if parent != nil {
 		out.ResourceDefinitionProps = parent.Spec.Props
-
-		vdPropsByNumber = make(map[int32]map[string]string, len(parent.Spec.VolumeDefinitions))
-		for i := range parent.Spec.VolumeDefinitions {
-			vd := &parent.Spec.VolumeDefinitions[i]
-			if len(vd.Props) > 0 {
-				vdPropsByNumber[vd.VolumeNumber] = vd.Props
-			}
-		}
+		vdPropsByNumber = vdPropsMap(parent)
 	}
 
 	// Surface Status.Flags on the wire so the Python CLI's
@@ -302,49 +295,81 @@ func crdToWireSnapshot(
 	}
 
 	if len(crd.Spec.VolumeDefinitions) > 0 {
-		out.VolumeDefinitions = make([]apiv1.SnapshotVolumeDef, 0, len(crd.Spec.VolumeDefinitions))
-		for i := range crd.Spec.VolumeDefinitions {
-			out.VolumeDefinitions = append(out.VolumeDefinitions, apiv1.SnapshotVolumeDef{
-				VolumeNumber:          crd.Spec.VolumeDefinitions[i].VolumeNumber,
-				SizeKib:               crd.Spec.VolumeDefinitions[i].SizeKib,
-				VolumeDefinitionProps: vdPropsByNumber[crd.Spec.VolumeDefinitions[i].VolumeNumber],
-			})
+		out.VolumeDefinitions = wireVolumeDefinitions(crd.Spec.VolumeDefinitions, vdPropsByNumber)
+	}
+
+	out.Snapshots = wirePerNodeSnapshots(crd)
+
+	return out
+}
+
+// vdPropsMap indexes the parent RD's per-volume Props by volume number
+// so crdToWireSnapshot can attach them to each SnapshotVolumeDef.
+func vdPropsMap(parent *crdv1alpha1.ResourceDefinition) map[int32]map[string]string {
+	out := make(map[int32]map[string]string, len(parent.Spec.VolumeDefinitions))
+
+	for i := range parent.Spec.VolumeDefinitions {
+		vd := &parent.Spec.VolumeDefinitions[i]
+		if len(vd.Props) > 0 {
+			out[vd.VolumeNumber] = vd.Props
 		}
 	}
 
+	return out
+}
+
+// wireVolumeDefinitions builds the on-wire snapshot volume-definition
+// list, attaching the parent RD's per-volume Props.
+func wireVolumeDefinitions(
+	vds []crdv1alpha1.SnapshotVolumeRef,
+	vdPropsByNumber map[int32]map[string]string,
+) []apiv1.SnapshotVolumeDef {
+	out := make([]apiv1.SnapshotVolumeDef, 0, len(vds))
+
+	for i := range vds {
+		out = append(out, apiv1.SnapshotVolumeDef{
+			VolumeNumber:          vds[i].VolumeNumber,
+			SizeKib:               vds[i].SizeKib,
+			VolumeDefinitionProps: vdPropsByNumber[vds[i].VolumeNumber],
+		})
+	}
+
+	return out
+}
+
+// wirePerNodeSnapshots renders the per-node `snapshots[]` payload.
+// Prefers satellite-reported Status.NodeStatus when present; otherwise
+// synthesises one entry per Spec.Nodes target so the wire shape stays
+// non-empty between CreateSnapshot and the first satellite ack
+// (linstor-csi's ListSnapshots hard-fails on an empty list).
+func wirePerNodeSnapshots(crd *crdv1alpha1.Snapshot) []apiv1.SnapshotPerNode {
 	switch {
 	case len(crd.Status.NodeStatus) > 0:
-		out.Snapshots = make([]apiv1.SnapshotPerNode, 0, len(crd.Status.NodeStatus))
+		out := make([]apiv1.SnapshotPerNode, 0, len(crd.Status.NodeStatus))
 		for i := range crd.Status.NodeStatus {
-			out.Snapshots = append(out.Snapshots, apiv1.SnapshotPerNode{
+			out = append(out, apiv1.SnapshotPerNode{
 				SnapshotName:    crd.Spec.SnapshotName,
 				NodeName:        crd.Status.NodeStatus[i].NodeName,
 				CreateTimestamp: crd.Status.NodeStatus[i].CreateTimestamp,
 				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
 			})
 		}
+
+		return out
 	case len(crd.Spec.Nodes) > 0:
-		// Status.NodeStatus is satellite-reported and lands after the
-		// satellite reconciler picks up the new Snapshot CRD. The
-		// REST shim's view of "where the snapshot landed" needs to
-		// be visible immediately after CreateSnapshot — linstor-csi
-		// hard-fails ListSnapshots with "missing snapshots" when
-		// the per-node Snapshots[] is empty. Synthesise one
-		// SnapshotPerNode entry per Spec.Nodes target so the wire
-		// shape matches upstream LINSTOR's "all replicas have a
-		// SnapshotNode entry once the controller commits the
-		// definition" semantic.
-		out.Snapshots = make([]apiv1.SnapshotPerNode, 0, len(crd.Spec.Nodes))
+		out := make([]apiv1.SnapshotPerNode, 0, len(crd.Spec.Nodes))
 		for _, node := range crd.Spec.Nodes {
-			out.Snapshots = append(out.Snapshots, apiv1.SnapshotPerNode{
+			out = append(out, apiv1.SnapshotPerNode{
 				SnapshotName:    crd.Spec.SnapshotName,
 				NodeName:        node,
 				SnapshotVolumes: snapshotVolumesFromVDs(crd.Spec.VolumeDefinitions),
 			})
 		}
+
+		return out
 	}
 
-	return out
+	return nil
 }
 
 // snapshotVolumesFromVDs derives the per-node `snapshot_volumes[]`
