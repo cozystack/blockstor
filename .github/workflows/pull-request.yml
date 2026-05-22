@@ -190,29 +190,22 @@ jobs:
 
   e2e:
     name: E2E
-    # GitHub-hosted runner. kind-based e2e (Tier 4 in the test strategy)
-    # runs fine on ubuntu-latest without nested virtualisation. Real-
-    # DRBD QEMU scenarios (.work/<stand> with Talos VMs) need KVM and
-    # ~50 GB RAM, so they stay manual on dedicated bare-metal stands —
-    # see stand/Makefile + reference_blockstor_stand.md.
-    #
-    # When the ephemeral self-hosted runner pool (ARC / namespace.so /
-    # equivalent) is wired up, swap the label to that pool's identifier
-    # and bring real-DRBD scenarios online here too.
-    runs-on: ubuntu-latest
+    # Runner selection mirrors cozystack/cozystack: a labelled `debug` PR
+    # lands on a long-lived `self-hosted` runner so the breakpoint step
+    # below has somewhere stable to attach SSH; regular PRs land on the
+    # CNCF-provided Oracle pool (24 CPU / 96 GB / x86-64) which has
+    # enough headroom for kind + real-DRBD QEMU stands (Talos VMs in
+    # .work/<stand>, ~50 GB RAM, KVM nested virt). The pool labels are
+    # org-wide on cozystack, so no extra setup is required here. Swap
+    # to oracle-vm-32cpu-128gb-x86-64 if a future scenario needs more
+    # RAM/CPU.
+    runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
-    timeout-minutes: 60
+    timeout-minutes: 180
     permissions:
       contents: read
       checks: write
-    # TODO: drop continue-on-error once the kind-based e2e tier is
-    # confirmed stable on ubuntu-latest. The kustomize manifest fix
-    # (commit c2e716daf) unblocked `make deploy`, but the suite
-    # itself may surface other ubuntu-latest gaps. Until then the job
-    # surfaces issues via annotations + breakpoint but does not block
-    # PR approval.
-    continue-on-error: true
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
