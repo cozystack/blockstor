@@ -373,7 +373,16 @@ func attachZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice
 		return AttachResult{}, errors.New("ZFS attach requires ZPoolName")
 	}
 
+	// `-m none` skips the implicit `mkdir /<pool>` zpool tries on
+	// successful create. On Talos the rootfs is read-only and the
+	// mkdir fails — but only AFTER the pool has been stamped on
+	// disk and imported, so the CLI returns non-zero, blockstor
+	// rolls back the SP CRD, and the next reconcile finds the
+	// pool already imported and bails with EEXIST. blockstor uses
+	// `zfs create -V` volume datasets only, so a non-existent
+	// `/<pool>` mountpoint is never load-bearing.
 	_, err := exec.Run(ctx, "zpool", "create", "-f",
+		"-m", "none",
 		"-O", "compression=off",
 		"-O", "atime=off",
 		pool, devicePath)

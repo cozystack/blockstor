@@ -114,6 +114,13 @@ spec:
       # from the .res file). Pod IP equals node IP under hostNetwork,
       # which the satellite Hello flow advertises as its endpoint.
       hostNetwork: true
+      # hostIPC mirrors piraeus's satellite. The LVM userland (lvmlockd
+      # /etc.) and libzfs both rely on host-shared SysV/POSIX IPC for
+      # whole-host coordination; without hostIPC the satellite has its
+      # own IPC namespace and can deadlock or skip locks the host-side
+      # tools assume are global. Same Talos layout where piraeus's
+      # `linstor-satellite.nodeN` DaemonSet sets this and works.
+      hostIPC: true
       # ClusterFirstWithHostNet keeps cluster DNS resolution working
       # under hostNetwork — without it the satellite can't resolve
       # `blockstor-controller.blockstor-system.svc`.
@@ -231,25 +238,30 @@ spec:
           # a563b1f43) sweeps it on startup. SIGTERM → 10 s → SIGKILL
           # now reliably tears the pod down inside the rollout budget.
           volumeMounts:
-            # Bug 346: mountPropagation HostToContainer. The hostPath
-            # bind defaults to mountPropagation: None (rprivate), so
-            # host-side device nodes that appear AFTER container start
-            # — e.g. /dev/sda1 / /dev/sda9 stamped by `zpool create`
-            # via the kernel's GPT-rescan — do not propagate into the
-            # container. libzfs then opens /dev/sda1 to write the ZFS
-            # label, the inode isn't visible, and zpool aborts with
-            # `cannot label 'sda': failed to detect device partitions
-            # on '/dev/sda1': 19` (ENODEV). HostToContainer = MS_SLAVE
-            # in mount(8) terms: the container receives every host
-            # mount/inode-creation event under /dev but doesn't push
-            # any back up — exactly what zpool's partition-rescan
-            # path needs. Piraeus's satellite happens to work around
-            # this with sgdisk pre-create + zpool-at-partition-path,
-            # but blockstor wants the upstream `zpool create /dev/sda`
-            # one-shot to succeed too.
-            - {name: dev, mountPath: /dev, mountPropagation: HostToContainer}
+            # Bug 359: plain bind mount of host /dev — no
+            # mountPropagation. With `mountPropagation: HostToContainer`
+            # (Bug 346 attempt) the kubelet still hands the container a
+            # private devtmpfs instance and the kernel's mknod for
+            # partition nodes (sda1, sda9) from `zpool create`'s
+            # GPT-rescan lands in the host's devtmpfs only — libzfs's
+            # immediate open(/dev/sda1) aborts with ENODEV. The piraeus
+            # satellite ships /dev as a bare `hostPath: {path: /dev,
+            # type: Directory}` and inherits the host's devtmpfs
+            # directly (one inode table shared with the host kernel),
+            # which is what makes `zpool create /dev/sda` survive the
+            # rescan on the same Talos layout. Mirror that. The
+            # `type: Directory` lives on the volume definition below.
+            - {name: dev, mountPath: /dev}
             - {name: modules, mountPath: /lib/modules, readOnly: true}
             - {name: lvm-run, mountPath: /run/lvm}
+            # Bug 359: host's udev runtime DB. libzfs / libblkid look up
+            # partition metadata (PARTUUID, fs signatures, holders) via
+            # /run/udev/data/b<MAJ>:<MIN>. Without this mount the
+            # satellite container sees an empty udev DB and partition
+            # rescan after `zpool create`'s GPT stamp returns no data,
+            # which libzfs treats as "partition not present" and aborts.
+            # Piraeus's satellite ships this as ro; we do the same.
+            - {name: run-udev, mountPath: /run/udev, readOnly: true}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
             - {name: pool, mountPath: /var/lib/blockstor-pool}
             # Bug 310: host-shared /etc/drbd.d/ inside the container,
@@ -324,9 +336,10 @@ spec:
         # the upstream image + a /etc/drbd-reactor.d ConfigMap mount;
         # no other DaemonSet plumbing change is needed.
       volumes:
-        - {name: dev, hostPath: {path: /dev}}
+        - {name: dev, hostPath: {path: /dev, type: Directory}}
         - {name: modules, hostPath: {path: /lib/modules}}
         - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}
+        - {name: run-udev, hostPath: {path: /run/udev, type: Directory}}
         - {name: state, hostPath: {path: /var/lib/blockstor-satellite, type: DirectoryOrCreate}}
         - {name: pool, hostPath: {path: /var/lib/blockstor-pool, type: DirectoryOrCreate}}
         # Bug 305: shared with piraeus-satellite (LinstorSatellite-
