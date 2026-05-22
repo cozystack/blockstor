@@ -11,11 +11,9 @@ name: Integration tests
 # Runs on every PR. Target wall-clock < 5 minutes for the whole suite.
 
 on:
-  # PR runs go through .github/workflows/pull-request.yml (consolidated
-  # pipeline with the breakpoint step). Push-only here so main-branch
-  # merges still exercise the envtest harness.
   push:
     branches: [main]
+  pull_request:
 
 permissions: {}
 
@@ -40,12 +38,27 @@ jobs:
       - name: Install linstor-client (python-linstor)
         # The harness shells out to the upstream linstor CLI to exercise
         # wire-shape compatibility — exactly what unit tests cannot do.
-        # linstor-client / python-linstor aren't packaged in the default
-        # Ubuntu repos (LINBIT publishes them only on the LINBIT PPA and
-        # PyPI); pip is the runner-friendly path.
+        #
+        # Install path rationale (validated against ubuntu:24.04 / noble):
+        #   - apt: LINBIT only ships debs for Debian (bookworm/bullseye/
+        #     buster/trixie) and the LINBIT PPA, neither covers noble.
+        #     `apt-get install linstor-client` → "Unable to locate package".
+        #   - PyPI: only `python-linstor` is published. `linstor-client`
+        #     and the bare `linstor` name are NOT on PyPI — pip exits with
+        #     "No matching distribution found".
+        #   - GitHub tarball: works, but v1.27.1's setup.py has a typo
+        #     (missing comma joins `python3-setuptools` + `python-linstor`
+        #     into one malformed requirement). `--no-deps` sidesteps it;
+        #     `python-linstor` + `argcomplete` are installed explicitly
+        #     beforehand so the runtime dep set stays correct.
+        # Pin v1.27.1 to match `linstor_client.VERSION` the integration
+        # harness asserts on (tests/integration/group_h_test.go).
         run: |
-          python3 -m pip install --break-system-packages --upgrade linstor-client python-linstor
-          linstor --version | head -1
+          python3 -m pip install --break-system-packages --upgrade \
+            python-linstor==1.27.1 argcomplete
+          python3 -m pip install --break-system-packages --no-deps \
+            https://github.com/LINBIT/linstor-client/archive/refs/tags/v1.27.1.tar.gz
+          linstor --version
 
       - name: Install envtest binaries
         # controller-runtime's envtest needs kube-apiserver + etcd
