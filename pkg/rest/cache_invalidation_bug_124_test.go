@@ -167,10 +167,14 @@ func (l *laggingRDs) Delete(ctx context.Context, name string) error {
 	lag := l.lag
 	inner := l.inner
 
+	// Bug 124 test helper: detached goroutine survives the request
+	// context cancel, so propagate a fresh non-cancellable context
+	// derived from the caller's value chain (contextcheck-friendly).
+	bgCtx := context.WithoutCancel(ctx)
 	go func() {
 		time.Sleep(lag)
 
-		_ = inner.Delete(context.Background(), name)
+		_ = inner.Delete(bgCtx, name)
 	}()
 
 	return nil
