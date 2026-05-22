@@ -111,7 +111,7 @@ func (s *Server) handleResourceToggleDisk(w http.ResponseWriter, r *http.Request
 	// the reconciler does that itself as the last step of the
 	// rollback so an external observer sees DISKLESS reappear only
 	// AFTER drbdadm down + storage Delete succeed.
-	if r.URL.Query().Get("cancel") == "true" {
+	if queryFlag(r, "cancel") {
 		err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
 			func(res *apiv1.Resource) error {
 				res.ToggleDiskCancel = true

@@ -78,7 +78,7 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 	// their VDs inlined under `volume_definitions`. Without this
 	// handling, `vd l` renders an empty table even when VDs exist
 	// (the Python CLI never falls back to per-RD GETs).
-	if r.URL.Query().Get("with_volume_definitions") == "true" {
+	if queryFlag(r, "with_volume_definitions") {
 		for i := range rds {
 			vds, vdErr := s.Store.VolumeDefinitions().List(r.Context(), rds[i].Name)
 			if vdErr != nil {

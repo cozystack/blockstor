@@ -30,6 +30,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 )
 
@@ -165,7 +166,7 @@ func isToggleDiskInFlight(res *blockstoriov1alpha1.Resource) bool {
 
 	for i := range res.Status.Volumes {
 		v := &res.Status.Volumes[i]
-		if v.DiskState != "UpToDate" {
+		if v.DiskState != string(drbd.DiskStateUpToDate) {
 			allUpToDate = false
 
 			break

@@ -264,7 +264,17 @@ func (s *Server) handleNodeEvacuateMulti(w http.ResponseWriter, r *http.Request)
 // stdlib, not in every call site (goconst flags package-wide
 // `"true"` repetition above its threshold).
 func isForce(r *http.Request) bool {
-	v, _ := strconv.ParseBool(r.URL.Query().Get("force"))
+	return queryFlag(r, "force")
+}
+
+// queryFlag centralises every `?<name>=true` boolean-toggle check
+// in the REST surface. Routed through strconv.ParseBool so the
+// literal `"true"` lives in stdlib (goconst flags package-wide
+// `"true"` repetition above its threshold). Callers: isForce,
+// handleResourceActivate (?reallocate-port), handleRDsList
+// (?with_volume_definitions), handleResourceToggleDisk (?cancel).
+func queryFlag(r *http.Request, name string) bool {
+	v, _ := strconv.ParseBool(r.URL.Query().Get(name))
 
 	return v
 }
