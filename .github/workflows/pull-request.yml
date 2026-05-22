@@ -17,8 +17,11 @@ name: Pull Request
 #     because variables are not exposed in fork-PR workflows).
 #
 # Labels that change behaviour:
-#   - debug   → opens an SSH breakpoint on e2e failure (paused 20m for first
-#               attach, then 10m idle-timeout after the last disconnect).
+#   - debug   → pins the e2e job to a self-hosted runner so a maintainer can
+#               attach via the host (kubectl/docker on the runner host
+#               directly, no SSH dance through the rendezvous server). The
+#               breakpoint step itself fires on every e2e failure regardless
+#               of label — it just needs BREAKPOINT_ENDPOINT to be set.
 
 on:
   pull_request:
@@ -222,10 +225,13 @@ jobs:
 
       # Open an SSH breakpoint to the failing e2e runner so maintainers
       # can attach, inspect kind/blockstor state, and resume with
-      # `breakpoint resume`. Gated by the `debug` label — set it on the PR
-      # to opt in. Forks can't reach the rendezvous server because
-      # repository variables are not exposed to fork-PR workflows; the
-      # step is silently skipped in that case.
+      # `breakpoint resume`. Fires on every e2e failure (no label opt-in)
+      # — the rationale is that an e2e failure already burned the runner
+      # minutes and a maintainer almost always wants to inspect the wedged
+      # cluster before tear-down. Forks can't reach the rendezvous server
+      # because repository variables are not exposed to fork-PR workflows;
+      # the step is silently skipped in that case (BREAKPOINT_ENDPOINT
+      # comes through empty).
       #
       # Uses cozystack/breakpoint-action (fork of namespacelabs/breakpoint-action)
       # pinned by SHA. The fork adds pause-idle mode (initial grace period
@@ -235,8 +241,7 @@ jobs:
       - name: Breakpoint on E2E failure
         if: |
           failure() &&
-          vars.BREAKPOINT_ENDPOINT != '' &&
-          contains(github.event.pull_request.labels.*.name, 'debug')
+          vars.BREAKPOINT_ENDPOINT != ''
         # cozystack/breakpoint-action v2-cozy.1
         # mode: pause-idle defaults: grace-period=20m, idle-timeout=10m
         uses: cozystack/breakpoint-action@a6f3a6f87be398ad63b6577351e3398e53f578e4
