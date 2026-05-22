@@ -178,7 +178,13 @@ DOCKER_BUILD_ARGS = --build-arg GIT_HASH=$(GIT_HASH) --build-arg BUILD_TIME=$(BU
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build $(DOCKER_BUILD_ARGS) -t ${IMG} .
+	# --target controller pins the multi-stage build to the distroless
+	# nonroot stage that ships /controller. Without it docker picks
+	# the last stage (satellite, debian:trixie-slim, no USER
+	# directive) and `make deploy` would land a root-running image
+	# under a Pod that kustomize stamps with `runAsNonRoot: true`,
+	# producing the e2e CreateContainerConfigError failure.
+	$(CONTAINER_TOOL) build --target controller $(DOCKER_BUILD_ARGS) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
