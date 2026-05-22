@@ -241,7 +241,11 @@ linstor_diskful_nodes() {
 # but tolerant of leading/trailing whitespace.
 linstor_diskful_count() {
     local rd=$1
-    linstor_diskful_nodes "$rd" | grep -cv '^$' || echo 0
+    # awk emits exactly one number — no double-emission like the
+    # previous `grep -cv '^$' || echo 0` pattern, which on empty
+    # input printed "0" from grep AND another "0" from the `||`
+    # fallback, yielding `"0\n0"` and breaking `[[ $v == "0" ]]`.
+    linstor_diskful_nodes "$rd" | awk 'NF{c++} END{print c+0}'
 }
 
 # linstor_tiebreaker_node <rd> — name of the single node hosting the
