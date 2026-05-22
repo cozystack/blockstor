@@ -445,6 +445,17 @@ const minVolumeDefinitionSizeKib int64 = 4 * 1024
 // retry loop.
 const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
 
+// ErrVolumeSizeBelowMinimum is the sentinel for Bug 155's lower-bound
+// rejection (size_kib < minVolumeDefinitionSizeKib). Wrapped with
+// %w + a sizeKib / bound detail by validateVDSize; static-error
+// requirement is err113.
+var ErrVolumeSizeBelowMinimum = errors.New("size_kib below minimum")
+
+// ErrVolumeSizeAboveMaximum is the sentinel for Bug 155's upper-bound
+// rejection (size_kib > maxVolumeDefinitionSizeKib). See
+// ErrVolumeSizeBelowMinimum for the rationale.
+var ErrVolumeSizeAboveMaximum = errors.New("size_kib above maximum")
+
 // validateVDSize returns nil when the requested size_kib is within
 // the accepted bounds [minVolumeDefinitionSizeKib,
 // maxVolumeDefinitionSizeKib] (Bug 155). Otherwise it returns a
@@ -453,16 +464,16 @@ const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
 func validateVDSize(sizeKib int64) error {
 	if sizeKib < minVolumeDefinitionSizeKib {
 		return fmt.Errorf(
-			"size_kib=%d below minimum %d KiB (DRBD reserves ~32 KiB of "+
+			"%w: size_kib=%d below minimum %d KiB (DRBD reserves ~32 KiB of "+
 				"metadata per peer; backing layers add alignment on top)",
-			sizeKib, minVolumeDefinitionSizeKib,
+			ErrVolumeSizeBelowMinimum, sizeKib, minVolumeDefinitionSizeKib,
 		)
 	}
 
 	if sizeKib > maxVolumeDefinitionSizeKib {
 		return fmt.Errorf(
-			"size_kib=%d above maximum %d KiB (DRBD's per-device hard ceiling)",
-			sizeKib, maxVolumeDefinitionSizeKib,
+			"%w: size_kib=%d above maximum %d KiB (DRBD's per-device hard ceiling)",
+			ErrVolumeSizeAboveMaximum, sizeKib, maxVolumeDefinitionSizeKib,
 		)
 	}
 
