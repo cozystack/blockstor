@@ -142,25 +142,8 @@ func (d *DiscoveredStorageRunnable) Start(ctx context.Context) error {
 
 	logger := log.FromContext(ctx).WithName("discovered-storage").WithValues("node", d.NodeName)
 
-	err := d.tick(ctx, logger)
-	if err != nil {
-		logger.Error(err, "initial discovered-storage tick")
-	}
-
-	ticker := time.NewTicker(period)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			err = d.tick(ctx, logger)
-			if err != nil {
-				logger.Error(err, "discovered-storage tick")
-			}
-		}
-	}
+	return runPeriodicTick(ctx, period, logger, d.tick,
+		"initial discovered-storage tick", "discovered-storage tick")
 }
 
 // RegisterWithManager adds the runnable to mgr. Symmetrical with
