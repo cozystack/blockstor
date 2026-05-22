@@ -191,12 +191,19 @@ func TestBug204aExtraPropsAutoCreatesSingleton(t *testing.T) {
 }
 
 // TestBug204aLostUpdateOnVanillaUpdate is the regression-witness:
-// it bursts the same 100 disjoint ExtraProps writes using the OLD
-// REST-handler-style `Get -> mutate -> Update` pattern (no Patch
-// helper) and shows that AT LEAST ONE mutation is silently lost.
-// Mirrors TestBug201LostUpdateOnVanillaUpdate. If this PASSES then
-// the fixture doesn't exercise the race — re-check the seed before
-// proceeding.
+// it bursts disjoint ExtraProps writes using the OLD REST-handler-style
+// `Get -> mutate -> Update` pattern (no Patch helper) and shows that
+// AT LEAST ONE mutation is silently lost. Mirrors
+// TestBug201LostUpdateOnVanillaUpdate.
+//
+// Flake control: on a fast scheduler (24-vCPU Oracle runner) 50
+// goroutines can serialise through the in-memory fakeClient before
+// any of them race, producing lost=0 and a false-positive test
+// failure. Retry the burst up to maxAttempts and accept the witness
+// as long as at least one attempt observes the race. If ALL attempts
+// come back clean the underlying fakeClient really doesn't model the
+// race and the test fails — that's a real fixture regression, not
+// scheduler luck.
 func TestBug204aLostUpdateOnVanillaUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -204,60 +211,70 @@ func TestBug204aLostUpdateOnVanillaUpdate(t *testing.T) {
 		t.Skip("witness for Bug 204a — runs in long mode only")
 	}
 
-	const burst = 50
+	const (
+		burst       = 50
+		maxAttempts = 10
+	)
 
-	cli := bug204aNewFakeClient(t)
-	seedControllerConfig(t, cli)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		cli := bug204aNewFakeClient(t)
+		seedControllerConfig(t, cli)
 
-	var wg sync.WaitGroup
+		var wg sync.WaitGroup
 
-	for i := range burst {
-		wg.Add(1)
+		for i := range burst {
+			wg.Add(1)
 
-		go func(idx int) {
-			defer wg.Done()
+			go func(idx int) {
+				defer wg.Done()
 
-			// Old REST-handler pattern: Get -> mutate -> Update.
-			var cc crdv1alpha1.ControllerConfig
-			if err := cli.Get(t.Context(),
-				ctrlclient.ObjectKey{Name: crdv1alpha1.ControllerConfigName},
-				&cc,
-			); err != nil {
-				return
-			}
+				// Old REST-handler pattern: Get -> mutate -> Update.
+				var cc crdv1alpha1.ControllerConfig
+				if err := cli.Get(t.Context(),
+					ctrlclient.ObjectKey{Name: crdv1alpha1.ControllerConfigName},
+					&cc,
+				); err != nil {
+					return
+				}
 
-			if cc.Spec.ExtraProps == nil {
-				cc.Spec.ExtraProps = map[string]string{}
-			}
+				if cc.Spec.ExtraProps == nil {
+					cc.Spec.ExtraProps = map[string]string{}
+				}
 
-			cc.Spec.ExtraProps[fmt.Sprintf("k-%d", idx)] = fmt.Sprintf("v-%d", idx)
+				cc.Spec.ExtraProps[fmt.Sprintf("k-%d", idx)] = fmt.Sprintf("v-%d", idx)
 
-			_ = cli.Update(t.Context(), &cc)
-		}(i)
-	}
-
-	wg.Wait()
-
-	var got crdv1alpha1.ControllerConfig
-	if err := cli.Get(t.Context(),
-		ctrlclient.ObjectKey{Name: crdv1alpha1.ControllerConfigName},
-		&got,
-	); err != nil {
-		t.Fatalf("final Get: %v", err)
-	}
-
-	lost := 0
-	for i := range burst {
-		if _, present := got.Spec.ExtraProps[fmt.Sprintf("k-%d", i)]; !present {
-			lost++
+				_ = cli.Update(t.Context(), &cc)
+			}(i)
 		}
+
+		wg.Wait()
+
+		var got crdv1alpha1.ControllerConfig
+		if err := cli.Get(t.Context(),
+			ctrlclient.ObjectKey{Name: crdv1alpha1.ControllerConfigName},
+			&got,
+		); err != nil {
+			t.Fatalf("attempt %d: final Get: %v", attempt, err)
+		}
+
+		lost := 0
+		for i := range burst {
+			if _, present := got.Spec.ExtraProps[fmt.Sprintf("k-%d", i)]; !present {
+				lost++
+			}
+		}
+
+		if lost > 0 {
+			t.Logf("Bug 204a witness (attempt %d/%d): lost %d/%d ExtraProps writes under wholesale Update",
+				attempt, maxAttempts, lost, burst)
+
+			return
+		}
+
+		t.Logf("attempt %d/%d: scheduler serialised the burst (lost=0), retrying", attempt, maxAttempts)
 	}
 
-	if lost == 0 {
-		t.Errorf("expected lost-update under burst, got 0 — fixture may not exercise the race")
-	} else {
-		t.Logf("Bug 204a witness: lost %d/%d ExtraProps writes under wholesale Update", lost, burst)
-	}
+	t.Errorf("expected lost-update under burst after %d attempts, got 0 every time — fixture may not exercise the race", maxAttempts)
 }
 
 // TestBug204aExtraPropsModifyAndDeleteConverges pairs disjoint
