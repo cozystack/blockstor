@@ -228,39 +228,27 @@ n1_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n1}" \
 # =====================================================================
 echo ">> Phase 6: r td $n1 $RD -s $SP  (diskless→diskful)"
 "${LCTL[@]}" resource toggle-disk --storage-pool="$SP" "$n1" "$RD" >/dev/null
+# Bug 356 fix: solo-replica diskful flip now triggers auto-promote
+# (drbdadm primary --force) so the lone diskful slot transitions
+# Inconsistent → UpToDate without needing a sync source. 240s ceiling
+# accommodates QEMU-stand metadata create + attach + primary cycle.
+wait_status_state "$RD" "$n1" UpToDate 240 \
+    || die "Phase 6: ${n1} never reached UpToDate after r td -s $SP"
 
-# The diskful materialisation MUST stamp Spec.Flags without DISKLESS;
-# this is the wire-level contract checked here. Status convergence
-# to UpToDate is asserted in the Phase 6b block below.
-sleep 5
 post_toggle_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 [[ "$post_toggle_flags" != *"DISKLESS"* ]] \
     || die "Phase 6: ${n1} Spec.Flags='$post_toggle_flags' still contains DISKLESS after toggle to diskful"
 
-# Phase 6b: single-replica DISKLESS→diskful promote never reaches
-# UpToDate because blockstor's satellite does not invoke
-# `drbdadm primary --force` / `new-current-uuid --clear-bitmap` for
-# the lone-survivor case (no peer with data → DRBD has no sync
-# source). This is a pre-existing satellite-side bug, orthogonal to
-# Bug 342 — confirmed by an isolated `r c --diskless` + `r td -s SP`
-# repro that wedges in Inconsistent on a fresh RD with no prior
-# Phase 1-5 history. Tracked separately.
-#
-# The toggle-disk wire contract (Spec.Flags drops DISKLESS) IS
-# validated above; only the satellite Status convergence is skipped.
-echo ">> Phase 6b: Status convergence to UpToDate SKIPPED (pre-existing satellite single-replica initial-sync gap; see task notes for separate followup)"
-
 # =====================================================================
 # Phase 7: toggle diskful → diskless (Bug 330)
 # =====================================================================
-# Phase 7 depends on Phase 6 having converged to UpToDate before
-# the diskful→diskless flip; with Phase 6b's known wedge in
-# Inconsistent the toggle here would race with the still-running
-# attach. Skipped behind the same followup.
-echo ">> Phase 7: SKIPPED (depends on Phase 6 convergence)"
+echo ">> Phase 7: r td --diskless $n1 $RD  (Bug 330 trigger)"
+"${LCTL[@]}" resource toggle-disk --diskless "$n1" "$RD" >/dev/null
+wait_status_diskless "$RD" "$n1" 60 \
+    || die "Phase 7 (Bug 330): ${n1} never reached Diskless within 60s after r td --diskless"
 
 # =====================================================================
 # Cleanup (handled by EXIT trap) + invariant.
 # =====================================================================
-echo ">> PASS: full lifecycle (Bug 327/329/338/339/342 pinned in one chain; Phase 6b/7 deferred)"
+echo ">> PASS: full lifecycle (Bug 327/329/330/338/339/342/356 pinned in one chain)"
