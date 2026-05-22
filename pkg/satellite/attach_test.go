@@ -725,10 +725,13 @@ func TestAttachZFSDispatchedViaHostMountNamespace(t *testing.T) {
 		calls := fx.CommandLines()
 
 		// Concrete contract: the create command MUST start with the
-		// nsenter prefix. A bare `zpool create` would re-trip the
-		// "failed to detect device partitions on '/dev/sda1': 19"
-		// race observed on the stand.
-		want := "nsenter -t 1 -m -- zpool create -f -O compression=off -O atime=off data /dev/sda"
+		// nsenter prefix AND carry `-m none` (Talos host root is RO
+		// — without this zpool tries to mkdir /<pool> and fails AFTER
+		// the pool is already stamped on disk, leaving a half-committed
+		// state). A bare `zpool create` would re-trip the "failed to
+		// detect device partitions on '/dev/sda1': 19" race observed
+		// on the stand.
+		want := "nsenter -t 1 -m -- zpool create -f -m none -O compression=off -O atime=off data /dev/sda"
 		if !slices.Contains(calls, want) {
 			t.Fatalf("Bug 359: missing host-namespace dispatched zpool create.\n want: %q\n got: %v", want, calls)
 		}
@@ -796,9 +799,9 @@ func TestAttachZFSSurfacesZpoolCreateFailure(t *testing.T) {
 		storage.FakeResponse{Err: errors.New("no such pool")})
 	// Simulate the e2e3-stand failure: zpool create exit 1 with
 	// the canonical "failed to detect device partitions" stderr.
-	fx.Expect("nsenter -t 1 -m -- zpool create -f -O compression=off -O atime=off data /dev/sda",
+	fx.Expect("nsenter -t 1 -m -- zpool create -f -m none -O compression=off -O atime=off data /dev/sda",
 		storage.FakeResponse{Err: errors.New(
-			"zpool create -f -O compression=off -O atime=off data /dev/sda: " +
+			"zpool create -f -m none -O compression=off -O atime=off data /dev/sda: " +
 				"cannot label 'sda': failed to detect device partitions on '/dev/sda1': 19")})
 
 	dev := &apiv1.PhysicalDevice{

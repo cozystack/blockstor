@@ -427,8 +427,18 @@ func attachZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice
 		return AttachResult{}, errors.New("ZFS attach requires ZPoolName")
 	}
 
+	// `-m none`: do not mount the pool's root dataset. Without this
+	// zpool tries to `mkdir /<pool-name>` on the host's rootfs,
+	// which is read-only on Talos (siderolabs/zfs system extension
+	// host) and would make `zpool create` exit non-zero AFTER
+	// stamping the pool successfully — observed on the e2e3 stand
+	// after the Bug 359 nsenter dispatch: "cannot mount '/data':
+	// failed to create mountpoint: Read-only file system". Blockstor
+	// never operates on the dataset's mounted directory anyway —
+	// satellite-side resource creation goes through `zfs create -V`
+	// volume datasets which never need a pool-root mount.
 	_, err := runHostZpool(ctx, exec,
-		"create", "-f",
+		"create", "-f", "-m", "none",
 		"-O", "compression=off",
 		"-O", "atime=off",
 		pool, devicePath)

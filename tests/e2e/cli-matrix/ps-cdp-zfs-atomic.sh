@@ -112,16 +112,26 @@ if kubectl -n "$NS" exec "$SAT_POD" -- bash -c "zpool list -H -o name | xargs -I
 fi
 
 DEV=/dev/sda
+PD_NAME="${NODE}.sda"
 
 cleanup() {
+    # Drop the operator-side `Spec.AttachTo` so the satellite stops
+    # reconciling the PhysicalDevice while we wipe the disk underneath
+    # it. Without this the satellite races us with its own wipe +
+    # zpool-add loop and the partprobe / wipefs in cleanup hits "Device
+    # or resource busy" intermittently.
+    kubectl patch physicaldevice "${PD_NAME}" --type=json \
+        -p='[{"op":"remove","path":"/spec/attachTo"}]' 2>/dev/null || true
+
     "${LCTL[@]}" storage-pool delete "$NODE" "$POOL" 2>/dev/null || true
+
     # nsenter into the host mount namespace for the zpool destroy:
     # the same partition-node race (Bug 359) that defeats `zpool create`
     # inside the container also makes `zpool destroy` flaky on stand
     # cleanup. We do this via on_node so the cleanup is still subject
     # to the satellite pod's privileged context.
     on_node "$NODE" bash -c "
-        nsenter -t 1 -m -- zpool destroy ${POOL} 2>/dev/null
+        nsenter -t 1 -m -- zpool destroy '${POOL}' 2>/dev/null
         wipefs -af ${DEV} >/dev/null 2>&1
         dd if=/dev/zero of=${DEV} bs=1M count=32 conv=fsync,notrunc status=none >/dev/null 2>&1
         sz=\$(blockdev --getsize64 ${DEV} 2>/dev/null || echo 0)
@@ -132,9 +142,58 @@ cleanup() {
         blockdev --rereadpt ${DEV} >/dev/null 2>&1
         partprobe ${DEV} >/dev/null 2>&1
     " || true
+
     linstor_cli_teardown
 }
 trap cleanup EXIT
+
+# ---- Pre-flight: bring the PhysicalDevice to Free + AttachTo-empty ------
+#
+# A previous test run can leave the PhysicalDevice with `Spec.AttachTo`
+# pointing at a deleted SP and `status.conditions[Free]=False` due to
+# leftover ZFS signatures. `linstor ps cdp` would then reject the
+# request with "no free PhysicalDevice on node ... matches device_paths".
+# This isn't a regression of Bug 359 itself, but it's a side effect of
+# the recovery path the operator is supposed to use (the SP State=Error
+# cause text tells the operator to re-run ps cdp).
+#
+# Strip any leftover AttachTo and wait up to 30s for the satellite
+# discoverer to refresh status.conditions[Free]=True via the udev
+# fast-path. SKIP the cell if the device never becomes Free —
+# something upstream of this cell is holding the disk.
+kubectl patch physicaldevice "${PD_NAME}" --type=json \
+    -p='[{"op":"remove","path":"/spec/attachTo"}]' 2>/dev/null || true
+
+echo ">> [Bug 359] pre-flight: ensure ${PD_NAME} is Free=True"
+deadline=$(( $(date +%s) + 90 ))
+free_status=""
+attempts=0
+while (( $(date +%s) < deadline )); do
+    free_status=$(kubectl get physicaldevice "${PD_NAME}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Free")].status}' 2>/dev/null \
+        || echo "")
+    if [[ "$free_status" == "True" ]]; then
+        break
+    fi
+    # Aggressively re-wipe so the satellite's next discovery poll
+    # sees a clean device. The udev fast-path (Bug 341) re-enqueues
+    # PhysicalDevice discovery on `change` uevents — wipefs + rereadpt
+    # generates exactly such events.
+    on_node "$NODE" bash -c "
+        nsenter -t 1 -m -- zpool destroy '${POOL}' >/dev/null 2>&1 || true
+        wipefs -af ${DEV} >/dev/null 2>&1 || true
+        dd if=/dev/zero of=${DEV} bs=1M count=32 conv=fsync,notrunc status=none >/dev/null 2>&1 || true
+        blockdev --rereadpt ${DEV} >/dev/null 2>&1 || true
+    " >/dev/null 2>&1 || true
+    attempts=$((attempts+1))
+    sleep 5
+done
+if [[ "$free_status" != "True" ]]; then
+    echo "SKIP: ${PD_NAME} never reached Free=True (got '$free_status' after ${attempts} wipe-retry cycles) — something else is holding ${DEV}"
+    kubectl get physicaldevice "${PD_NAME}" -o yaml 2>&1 | head -30
+    exit 0
+fi
+echo "   ${PD_NAME} is Free=True"
 
 # ---- Pre-stage Bug 359 reproduction fixture ----------------------------
 #
@@ -144,19 +203,16 @@ trap cleanup EXIT
 # with "failed to detect device partitions on '/dev/sda1': 19". Post-fix
 # the nsenter-wrapped zpool create runs in the host's mount namespace
 # and the partition-node race is gone.
-echo ">> [Bug 359] pre-stage stale ZFS GPT on $DEV ($NODE)"
-on_node "$NODE" bash -c "
-    nsenter -t 1 -m -- zpool destroy ${POOL} 2>/dev/null
-    nsenter -t 1 -m -- zpool destroy ${POOL}_stale 2>/dev/null
-    wipefs -af ${DEV} >/dev/null 2>&1 || true
-    # Stamp + destroy creates the canonical zfs-style sda1/sda9 layout
-    # without leaving the pool present. Best-effort: a ZFS-on-Linux
-    # `zpool destroy` strips most labels but leaves the GPT entries
-    # and the secondary label near end-of-device — that's precisely
-    # the failure trigger pre-fix.
-    nsenter -t 1 -m -- zpool create -f ${POOL}_stale ${DEV} 2>/dev/null
-    nsenter -t 1 -m -- zpool destroy ${POOL}_stale 2>/dev/null
-" || echo "note: pre-stage best-effort; device may already carry stale labels"
+#
+# NOTE: We do not pre-stage a stale-GPT fixture here. The Bug 359 race
+# fires on a CLEAN /dev/sda when zpool stamps its own brand-new GPT
+# (sda1+sda9) — the partition node mknod is what races with libzpool's
+# open(/dev/sda1) inside the container. The legacy "stale ZFS GPT
+# survived wipefs" path is already covered by
+# ps-cdp-creates-real-backing.sh (Bug 336). Pre-staging here would
+# only flip the PhysicalDevice to Free=False and the REST handler
+# would reject the request with `[SignatureFound] device ... is busy`,
+# which is correct behaviour — not Bug 359's failure mode.
 
 # Confirm the fixture stamped the partition table. The cell is
 # strictly more useful when the fixture lands, but we don't fail
@@ -203,7 +259,7 @@ while (( $(date +%s) < deadline )); do
     sleep 2
 done
 if (( cur_free == 0 )); then
-    echo "FAIL (Bug 359 / Phase 1): SP $POOL free_capacity=0 after 60s — `ps cdp` reported SUCCESS but pool not materialised" >&2
+    echo "FAIL (Bug 359 / Phase 1): SP $POOL free_capacity=0 after 60s — 'ps cdp' reported SUCCESS but pool not materialised" >&2
     "${LCTL[@]}" storage-pool list --storage-pools "$POOL" --nodes "$NODE" 2>&1 | tail -20 >&2
     echo "----- satellite log (last 200) -----" >&2
     kubectl -n "$NS" logs "$SAT_POD" --tail=200 2>/dev/null \
@@ -284,7 +340,7 @@ if [[ "$sp_state" != "true" ]]; then
 fi
 echo "   Phase 3 mid: SP correctly reports poolMissing=true"
 
-echo ">> [Phase 3] recover via `linstor ps cdp` against the same device"
+echo ">> [Phase 3] recover via 'linstor ps cdp' against the same device"
 err3=$(mktemp)
 out3=$(mktemp)
 if ! "${LCTL[@]}" physical-storage create-device-pool \
