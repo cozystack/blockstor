@@ -1138,7 +1138,10 @@ func (s *Server) applyBug156AutoTiebreakerOptOut(
 // decision happens out-of-band in the controller — the REST handler
 // can't suppress it inline.
 func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) error {
-	const propKey = "DrbdOptions/AutoAddQuorumTiebreaker"
+	const (
+		propKey      = "DrbdOptions/AutoAddQuorumTiebreaker"
+		propValueOff = "false"
+	)
 
 	// Bug 205: typed-Patch via PatchResourceDefinitionSpec — the
 	// closure re-runs on every conflict against the live RD, so
@@ -1146,7 +1149,7 @@ func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) e
 	// add) converge with the tiebreaker opt-out instead of being
 	// lost by a stale-wire-snapshot replay.
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(live *apiv1.ResourceDefinition) error {
-		if live.Props != nil && live.Props[propKey] == "false" {
+		if live.Props != nil && live.Props[propKey] == propValueOff {
 			return nil
 		}
 
@@ -1154,7 +1157,7 @@ func (s *Server) stampAutoTiebreakerOptOut(ctx context.Context, rdName string) e
 			live.Props = map[string]string{}
 		}
 
-		live.Props[propKey] = "false"
+		live.Props[propKey] = propValueOff
 
 		return nil
 	})

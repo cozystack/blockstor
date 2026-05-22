@@ -269,6 +269,7 @@ func TestToggleDiskIncrementsRetriesOnFailure(t *testing.T) {
 // away with a half-carved LV on disk).
 type recordingDeleteProvider struct {
 	flakyCreateProvider
+
 	deleted int32
 }
 
