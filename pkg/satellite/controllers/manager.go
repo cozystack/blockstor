@@ -79,13 +79,10 @@ func init() {
 // so tests can validate the registration + filter-predicate
 // plumbing independently of the agent's gRPC-server-still-
 // running mainline.
-func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
-	if cfg.NodeName == "" {
-		return nil, errors.New("controllers: NodeName is required")
-	}
-
-	if cfg.Apply == nil {
-		return nil, errors.New("controllers: Apply is required")
+func NewManager(restCfg *rest.Config, cfg *Config) (manager.Manager, error) {
+	err := validateConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// Bug 285: bound the manager's stop sequence so a wedged
@@ -138,29 +135,29 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 	// the caller left the field nil; unit tests that construct
 	// reconcilers directly can supply their own channel or leave
 	// the field nil to short-circuit both ends.
-	ensureWiredDefaults(&cfg)
+	ensureWiredDefaults(cfg)
 
-	err = (&ResourceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = (&ResourceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup ResourceReconciler")
 	}
 
-	err = (&ResourceDefinitionReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = (&ResourceDefinitionReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup ResourceDefinitionReconciler")
 	}
 
-	err = (&SnapshotReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = (&SnapshotReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup SnapshotReconciler")
 	}
 
-	err = (&StoragePoolReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = (&StoragePoolReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup StoragePoolReconciler")
 	}
 
-	err = (&PhysicalDeviceReconciler{Config: cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
+	err = (&PhysicalDeviceReconciler{Config: *cfg, Client: mgr.GetClient()}).SetupWithManager(mgr)
 	if err != nil {
 		return nil, errors.Wrap(err, "setup PhysicalDeviceReconciler")
 	}
@@ -176,6 +173,22 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 	return mgr, nil
 }
 
+// validateConfig sanity-checks the NewManager input — keeps the
+// constructor itself under the funlen budget by hoisting the
+// three-required-field gate out of band.
+func validateConfig(cfg *Config) error {
+	switch {
+	case cfg == nil:
+		return errors.New("controllers: Config is required")
+	case cfg.NodeName == "":
+		return errors.New("controllers: NodeName is required")
+	case cfg.Apply == nil:
+		return errors.New("controllers: Apply is required")
+	}
+
+	return nil
+}
+
 // wireConditionStampers injects the satellite-side Status-Condition
 // stampers (Phase 11.3) onto the Apply chain. Each stamper owns a
 // distinct Condition `type` so SSA's listMap merge keeps the writers
@@ -186,7 +199,7 @@ func NewManager(restCfg *rest.Config, cfg Config) (manager.Manager, error) {
 // its own helper so NewManager stays under the funlen budget — the
 // clearer is the same shape as the Stampers (one apiserver writer
 // per satellite-side reconciler hook).
-func wireConditionStampers(mgr manager.Manager, cfg Config) {
+func wireConditionStampers(mgr manager.Manager, cfg *Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
 	wireSkipDiskClearer(mgr, cfg)
@@ -214,7 +227,7 @@ func ensureWiredDefaults(cfg *Config) {
 // Pulled out of NewManager to keep that function under the funlen
 // budget — Scenario 5.34 added the third runnable and the
 // inline chain tipped over the limit.
-func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
+func addBackgroundRunnables(mgr manager.Manager, cfg *Config) error {
 	err := mgr.Add(&ObserverRunnable{
 		Client:   mgr.GetClient(),
 		Exec:     cfg.Exec,
@@ -289,7 +302,7 @@ func addBackgroundRunnables(mgr manager.Manager, cfg Config) error {
 // startup backfill runnable. Pulled out of addBackgroundRunnables
 // to keep that function under the funlen budget — the bookkeeping
 // for one more runnable nudges it over the limit.
-func registerMetadataCreatedBackfill(mgr manager.Manager, cfg Config) error {
+func registerMetadataCreatedBackfill(mgr manager.Manager, cfg *Config) error {
 	err := (&MetadataCreatedBackfillRunnable{
 		Client:   mgr.GetClient(),
 		Adm:      drbd.NewAdm(cfg.Exec),
@@ -309,7 +322,7 @@ func registerMetadataCreatedBackfill(mgr manager.Manager, cfg Config) error {
 // fetcher needs the manager's cached client, which is why it ships
 // here rather than at NewReconciler time. Pulled out of NewManager
 // to keep that function under the funlen budget.
-func wireCrossNodeFetcher(mgr manager.Manager, cfg Config) {
+func wireCrossNodeFetcher(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetCrossNodeFetcher(&SnapshotFetcher{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
@@ -322,7 +335,7 @@ func wireCrossNodeFetcher(mgr manager.Manager, cfg Config) {
 // succeeds. Mirrors `wireCrossNodeFetcher` — the stamper needs the
 // manager's cached client, which is why it lands here rather than at
 // NewReconciler time. Phase 11.3 Stage 1.
-func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
+func wireMetadataCreatedStamper(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetMetadataCreatedStamper(&MetadataCreatedStamper{
 		Client: mgr.GetClient(),
 	})
@@ -333,7 +346,7 @@ func wireMetadataCreatedStamper(mgr manager.Manager, cfg Config) {
 // `FilesystemFormatted=True` Status Condition after every diskful
 // volume reports a filesystem (freshly mkfs'd or adopted via blkid).
 // Mirrors `wireMetadataCreatedStamper`. Phase 11.3 Stage 2.
-func wireFilesystemFormattedStamper(mgr manager.Manager, cfg Config) {
+func wireFilesystemFormattedStamper(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetFilesystemFormattedStamper(&FilesystemFormattedStamper{
 		Client: mgr.GetClient(),
 	})
@@ -345,7 +358,7 @@ func wireFilesystemFormattedStamper(mgr manager.Manager, cfg Config) {
 // after a defensive stamp (Bug 278: Talos kernel upgrade reattach).
 // Mirrors `wireMetadataCreatedStamper` — the clearer needs the
 // manager's cached client which doesn't exist at NewReconciler time.
-func wireSkipDiskClearer(mgr manager.Manager, cfg Config) {
+func wireSkipDiskClearer(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetSkipDiskClearer(&SkipDiskClearer{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
