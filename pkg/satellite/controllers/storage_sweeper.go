@@ -214,79 +214,124 @@ func (s *StorageOrphanSweeperRunnable) sweepOnce(ctx context.Context, logger log
 	var deleted int
 
 	for poolName, provider := range providers {
-		lister, ok := provider.(storage.VolumeLister)
-		if !ok {
-			// Provider can't enumerate (or backend kind doesn't
-			// support it); silently skip — the contract is opt-in.
-			continue
-		}
-
-		refs, err := lister.ListVolumeNames(ctx)
-		if err != nil {
-			// Per-pool failure shouldn't sink the whole sweep —
-			// log and try the next pool. A real backend outage
-			// will surface on the next tick (and on real
-			// reconciles).
-			logger.Error(err, "list volumes on pool", "pool", poolName)
-
-			continue
-		}
-
-		for _, ref := range refs {
-			ref.PoolName = poolName
-
-			if _, ok := owned[ownedKey(ref.ResourceName, ref.VolumeNumber)]; ok {
-				continue
-			}
-
-			// Wildcard match — a Resource CRD exists for this RD on
-			// this node but the parent RD has already been deleted
-			// (cascade out-of-order). The satellite finalizer is
-			// still responsible for cleanup; don't race it.
-			if _, ok := owned[ownedKey(ref.ResourceName, -1)]; ok {
-				continue
-			}
-
-			if !hasStoragePrefix(ref.ResourceName) {
-				// Operator-owned volume that happens to share the
-				// pool. Leave it alone — see prefix allowlist
-				// rationale.
-				continue
-			}
-
-			if limit >= 0 && deleted >= limit {
-				logger.Info("storage sweep rate-limit hit; deferring remainder",
-					"limit", limit, "pool", poolName,
-					"deferred_resource", ref.ResourceName,
-					"deferred_volume", ref.VolumeNumber)
-
-				return nil
-			}
-
-			logger.Info("orphan storage volume detected; running DeleteVolume",
-				"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
-
-			delErr := provider.DeleteVolume(ctx, storage.Volume{
-				PoolName:     poolName,
-				ResourceName: ref.ResourceName,
-				VolumeNumber: ref.VolumeNumber,
-			})
-			if delErr != nil {
-				// Per-volume failure shouldn't abort the cycle —
-				// next tick retries. We DON'T bump `deleted` so
-				// the rate-limit budget reflects successful
-				// reaps only.
-				logger.Error(delErr, "DeleteVolume on orphan",
-					"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
-
-				continue
-			}
-
-			deleted++
+		stop := s.sweepPool(ctx, logger, poolName, provider, owned, limit, &deleted)
+		if stop {
+			return nil
 		}
 	}
 
 	return nil
+}
+
+// sweepPool reaps orphan volumes on one pool. Returns true when the
+// per-cycle rate-limit budget is exhausted and the caller should
+// stop iterating remaining pools; false when the pool was processed
+// (with any errors logged). Pulled out of sweepOnce so the parent
+// stays under the gocyclo budget; the per-volume orphan-classification
+// chain has nothing pool-routing-specific in it.
+func (s *StorageOrphanSweeperRunnable) sweepPool(
+	ctx context.Context,
+	logger logr.Logger,
+	poolName string,
+	provider storage.Provider,
+	owned map[string]struct{},
+	limit int,
+	deleted *int,
+) bool {
+	lister, ok := provider.(storage.VolumeLister)
+	if !ok {
+		// Provider can't enumerate (or backend kind doesn't
+		// support it); silently skip — the contract is opt-in.
+		return false
+	}
+
+	refs, err := lister.ListVolumeNames(ctx)
+	if err != nil {
+		// Per-pool failure shouldn't sink the whole sweep — log
+		// and try the next pool. A real backend outage will
+		// surface on the next tick (and on real reconciles).
+		logger.Error(err, "list volumes on pool", "pool", poolName)
+
+		return false
+	}
+
+	for _, ref := range refs {
+		ref.PoolName = poolName
+
+		stop := s.reapIfOrphan(ctx, logger, poolName, provider, owned, limit, deleted, ref)
+		if stop {
+			return true
+		}
+	}
+
+	return false
+}
+
+// reapIfOrphan classifies a single (pool, resource, volume) row and
+// runs DeleteVolume when it's a satellite-owned orphan past the
+// allowlist gate. Returns true when the per-cycle rate-limit budget
+// has been hit and the caller should stop scanning the rest of the
+// pool. Pulled out of sweepPool so that loop body stays under the
+// funlen / gocyclo budgets; the classification cascade is identical
+// to the inlined version.
+func (s *StorageOrphanSweeperRunnable) reapIfOrphan(
+	ctx context.Context,
+	logger logr.Logger,
+	poolName string,
+	provider storage.Provider,
+	owned map[string]struct{},
+	limit int,
+	deleted *int,
+	ref storage.VolumeRef,
+) bool {
+	if _, ok := owned[ownedKey(ref.ResourceName, ref.VolumeNumber)]; ok {
+		return false
+	}
+
+	// Wildcard match — a Resource CRD exists for this RD on this
+	// node but the parent RD has already been deleted (cascade
+	// out-of-order). The satellite finalizer is still responsible
+	// for cleanup; don't race it.
+	if _, ok := owned[ownedKey(ref.ResourceName, -1)]; ok {
+		return false
+	}
+
+	if !hasStoragePrefix(ref.ResourceName) {
+		// Operator-owned volume that happens to share the pool.
+		// Leave it alone — see prefix allowlist rationale.
+		return false
+	}
+
+	if limit >= 0 && *deleted >= limit {
+		logger.Info("storage sweep rate-limit hit; deferring remainder",
+			"limit", limit, "pool", poolName,
+			"deferred_resource", ref.ResourceName,
+			"deferred_volume", ref.VolumeNumber)
+
+		return true
+	}
+
+	logger.Info("orphan storage volume detected; running DeleteVolume",
+		"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
+
+	delErr := provider.DeleteVolume(ctx, storage.Volume{
+		PoolName:     poolName,
+		ResourceName: ref.ResourceName,
+		VolumeNumber: ref.VolumeNumber,
+	})
+	if delErr != nil {
+		// Per-volume failure shouldn't abort the cycle — next tick
+		// retries. We DON'T bump `deleted` so the rate-limit budget
+		// reflects successful reaps only.
+		logger.Error(delErr, "DeleteVolume on orphan",
+			"pool", poolName, "resource", ref.ResourceName, "volume", ref.VolumeNumber)
+
+		return false
+	}
+
+	*deleted++
+
+	return false
 }
 
 // shouldSkip mirrors OrphanSweeperRunnable.shouldSkip — checks the
