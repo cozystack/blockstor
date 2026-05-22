@@ -40,9 +40,12 @@ jobs:
       - name: Install linstor-client (python-linstor)
         # The harness shells out to the upstream linstor CLI to exercise
         # wire-shape compatibility — exactly what unit tests cannot do.
+        # linstor-client / python-linstor aren't packaged in the default
+        # Ubuntu repos (LINBIT publishes them only on the LINBIT PPA and
+        # PyPI); pip is the runner-friendly path.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends linstor-client python3-linstor
+          python3 -m pip install --break-system-packages --upgrade linstor-client python-linstor
+          linstor --version | head -1
 
       - name: Install envtest binaries
         # controller-runtime's envtest needs kube-apiserver + etcd

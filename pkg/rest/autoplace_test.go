@@ -1386,12 +1386,18 @@ func TestResourceDeleteBumpsSiblingPeers(t *testing.T) {
 		}
 	}
 
-	// Deleted replica is gone — Get must surface NotFound. The
-	// store contract precludes annotating a row that no longer
-	// exists; this guard pins that the bump path doesn't somehow
-	// resurrect the dropped Resource as a stub.
-	if _, err := st.Resources().Get(ctx, "pvc-3way", "w2"); err == nil {
-		t.Errorf("deleted replica w2 still present after DELETE")
+	// Bug 342: r d on a diskful Resource is toggle-disk-remove, not
+	// physical Delete. The CRD survives with the DISKLESS flag
+	// stamped; the satellite detaches local backing while keeping
+	// the kernel slot. Pin that the deleted replica IS still in the
+	// store AND now carries DISKLESS.
+	w2, err := st.Resources().Get(ctx, "pvc-3way", "w2")
+	if err != nil {
+		t.Fatalf("Bug 342: deleted-then-toggled replica w2 unexpectedly absent: %v", err)
+	}
+
+	if !slices.Contains(w2.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("Bug 342: w2.Flags=%v missing DISKLESS after r d (expected toggle-disk-remove)", w2.Flags)
 	}
 }
 
@@ -1664,10 +1670,17 @@ func TestResourceDeleteBumpsAllSurvivorsScenario4W19(t *testing.T) {
 		}
 	}
 
-	// The deleted node itself must be gone — the bump path must
-	// not resurrect it as a stub just to carry the annotation.
-	if _, err := st.Resources().Get(ctx, "pvc-w19", "n3"); err == nil {
-		t.Errorf("deleted replica n3 still present after DELETE")
+	// Bug 342: r d on a diskful Resource is toggle-disk-remove. n3
+	// survives in the store with DISKLESS stamped; the bump path on
+	// the survivors must still produce a peer-changed timestamp
+	// (verified above), but n3 itself remains as a DISKLESS peer.
+	n3, err := st.Resources().Get(ctx, "pvc-w19", "n3")
+	if err != nil {
+		t.Fatalf("Bug 342: deleted-then-toggled replica n3 unexpectedly absent: %v", err)
+	}
+
+	if !slices.Contains(n3.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("Bug 342: n3.Flags=%v missing DISKLESS after r d (expected toggle-disk-remove)", n3.Flags)
 	}
 }
 
