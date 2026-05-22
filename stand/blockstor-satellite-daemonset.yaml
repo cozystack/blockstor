@@ -114,6 +114,13 @@ spec:
       # from the .res file). Pod IP equals node IP under hostNetwork,
       # which the satellite Hello flow advertises as its endpoint.
       hostNetwork: true
+      # hostIPC mirrors piraeus's satellite. The LVM userland (lvmlockd
+      # /etc.) and libzfs both rely on host-shared SysV/POSIX IPC for
+      # whole-host coordination; without hostIPC the satellite has its
+      # own IPC namespace and can deadlock or skip locks the host-side
+      # tools assume are global. Same Talos layout where piraeus's
+      # `linstor-satellite.nodeN` DaemonSet sets this and works.
+      hostIPC: true
       # ClusterFirstWithHostNet keeps cluster DNS resolution working
       # under hostNetwork — without it the satellite can't resolve
       # `blockstor-controller.blockstor-system.svc`.
@@ -247,6 +254,14 @@ spec:
             - {name: dev, mountPath: /dev}
             - {name: modules, mountPath: /lib/modules, readOnly: true}
             - {name: lvm-run, mountPath: /run/lvm}
+            # Bug 359: host's udev runtime DB. libzfs / libblkid look up
+            # partition metadata (PARTUUID, fs signatures, holders) via
+            # /run/udev/data/b<MAJ>:<MIN>. Without this mount the
+            # satellite container sees an empty udev DB and partition
+            # rescan after `zpool create`'s GPT stamp returns no data,
+            # which libzfs treats as "partition not present" and aborts.
+            # Piraeus's satellite ships this as ro; we do the same.
+            - {name: run-udev, mountPath: /run/udev, readOnly: true}
             - {name: state, mountPath: /var/lib/blockstor-satellite}
             - {name: pool, mountPath: /var/lib/blockstor-pool}
             # Bug 310: host-shared /etc/drbd.d/ inside the container,
@@ -324,6 +339,7 @@ spec:
         - {name: dev, hostPath: {path: /dev, type: Directory}}
         - {name: modules, hostPath: {path: /lib/modules}}
         - {name: lvm-run, hostPath: {path: /run/lvm, type: DirectoryOrCreate}}
+        - {name: run-udev, hostPath: {path: /run/udev, type: Directory}}
         - {name: state, hostPath: {path: /var/lib/blockstor-satellite, type: DirectoryOrCreate}}
         - {name: pool, hostPath: {path: /var/lib/blockstor-pool, type: DirectoryOrCreate}}
         # Bug 305: shared with piraeus-satellite (LinstorSatellite-
