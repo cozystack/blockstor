@@ -182,7 +182,7 @@ type UeventNotifier interface {
 //
 // Production caller: manager.go addBackgroundRunnables. Test
 // callers exist in physicaldevice_discovery_uevent_bug341_test.go.
-func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg Config) *PhysicalDeviceDiscoveryRunnable {
+func NewPhysicalDeviceDiscoveryRunnableFromConfig(cli client.Client, cfg *Config) *PhysicalDeviceDiscoveryRunnable {
 	return &PhysicalDeviceDiscoveryRunnable{
 		Client:   cli,
 		Exec:     cfg.Exec,

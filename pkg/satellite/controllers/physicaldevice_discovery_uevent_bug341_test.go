@@ -274,7 +274,7 @@ func TestNewPhysicalDeviceDiscoveryRunnableFromConfigThreadsUevent_Bug341(t *tes
 		UeventListener: notifier,
 	}
 
-	runnable := controllers.NewPhysicalDeviceDiscoveryRunnableFromConfig(nil, cfg)
+	runnable := controllers.NewPhysicalDeviceDiscoveryRunnableFromConfig(nil, &cfg)
 
 	if runnable == nil {
 		t.Fatal("NewPhysicalDeviceDiscoveryRunnableFromConfig returned nil")
