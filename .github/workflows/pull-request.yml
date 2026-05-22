@@ -155,10 +155,11 @@ jobs:
           linstor --version
       - name: Install envtest binaries
         # controller-runtime's envtest needs kube-apiserver + etcd
-        # binaries. setup-envtest pins the version matching our
-        # controller-runtime release.
+        # binaries. We track the release branch matching our
+        # controller-runtime (v0.23.x). `@latest` would resolve to
+        # the v0.24.x submodule, which requires Go >= 1.26.
         run: |
-          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.23
           echo "KUBEBUILDER_ASSETS=$(setup-envtest use --print path 1.34.x)" >> "$GITHUB_ENV"
       - name: go mod tidy
         run: go mod tidy
