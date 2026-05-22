@@ -184,6 +184,24 @@ for n in "${diskful_phase4[@]}"; do
         || die "Phase 4: ${RD}.${n} never transitioned to Diskless after r d"
 done
 
+# Bug 342: under the new semantics every diskful Resource is now
+# DISKLESS (CRD survives the toggle). To fully tear the cluster down
+# — which Phase 5's `r c --diskless` precondition requires — issue
+# a SECOND `r d` per node so the now-DISKLESS Resource hits the
+# already-DISKLESS branch in handleResourceDelete (which physically
+# deletes the CRD; matches the operator-intent "fully remove this
+# peer entry, there is no diskful state left to convert from").
+mapfile -t all_remaining < <(kubectl get resources.blockstor.io.blockstor.io \
+    --no-headers 2>/dev/null \
+    | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' \
+    | sed "s/^${RD}\\.//")
+for n in "${all_remaining[@]}"; do
+    [[ -z "$n" ]] && continue
+    "${LCTL[@]}" resource delete "$n" "$RD" >/dev/null
+    wait_replica_absent "$RD" "$n" 60 \
+        || die "Phase 4: ${RD}.${n} second r d (already-DISKLESS path) never physically removed CRD"
+done
+
 # Give the controller a moment to tear any leftover tiebreaker witness.
 sleep 10
 diskful_left=$(linstor_diskful_count "$RD")
