@@ -57,12 +57,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-    # TODO: drop continue-on-error once the existing lint debt (~15
-    # findings across contextcheck, funcorder, err113,
-    # embeddedstructfieldcheck, goconst) is cleared. The job still
-    # runs and surfaces every new finding via annotations — it just
-    # doesn't fail the PR check until the backlog is zero.
-    continue-on-error: true
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -139,14 +133,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    # TODO: drop continue-on-error once linstor-client / python-linstor
-    # have a runner-friendly install path. PyPI publishes the package
-    # but `pip install linstor-client` rejects on GitHub-hosted ubuntu-
-    # latest with "No matching distribution found" (Python wheel /
-    # platform tag mismatch). LINBIT also has a PPA, but it lacks
-    # noble builds. Until the install is unblocked the job runs +
-    # surfaces the breakage but does not fail the PR.
-    continue-on-error: true
     steps:
       - name: Clone
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -157,14 +143,16 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install linstor-client (python-linstor)
-        # The harness shells out to the upstream linstor CLI to exercise
-        # wire-shape compatibility — exactly what unit tests cannot do.
-        # linstor-client / python-linstor aren't packaged in the default
-        # Ubuntu repos (LINBIT publishes them only on the LINBIT PPA and
-        # PyPI); pip is the runner-friendly path.
+        # See .github/workflows/integration.yml for the install path
+        # rationale; this mirrors that step so PR runs match push runs.
+        # Pin v1.27.1 to match `linstor_client.VERSION` the integration
+        # harness asserts on (tests/integration/group_h_test.go).
         run: |
-          python3 -m pip install --break-system-packages --upgrade linstor-client python-linstor
-          linstor --version | head -1
+          python3 -m pip install --break-system-packages --upgrade \
+            python-linstor==1.27.1 argcomplete
+          python3 -m pip install --break-system-packages --no-deps \
+            https://github.com/LINBIT/linstor-client/archive/refs/tags/v1.27.1.tar.gz
+          linstor --version
       - name: Install envtest binaries
         # controller-runtime's envtest needs kube-apiserver + etcd
         # binaries. setup-envtest pins the version matching our
