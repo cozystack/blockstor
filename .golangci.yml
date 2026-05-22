@@ -313,6 +313,22 @@ linters:
       - linters:
           - godox
         path: pkg/version/
+      # peer_delete_sync.go contains Bug 342 v10 plumbing (per-peer
+      # forget-peer ACK annotations) that's staged on the satellite side
+      # but not yet called from the REST handler. The unused-code is
+      # intentional and reviewed; remove the exclusion when the v10
+      # wire-up lands.
+      - linters:
+          - unused
+          - funlen
+        path: pkg/rest/peer_delete_sync\.go
+      # reconciler_drbd_test.go reserves sentinel errors for paths
+      # that aren't yet exercised by the fixture; the sentinels stay
+      # so the table-driven scaffolding can grow incrementally without
+      # re-introducing the same constants on each addition.
+      - linters:
+          - unused
+        path: pkg/satellite/reconciler_drbd_test\.go
 formatters:
   enable:
     - gofmt

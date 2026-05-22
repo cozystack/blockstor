@@ -59,15 +59,18 @@ var (
 
 	// drbdadm's `'<rsc>' not defined in your config` — the .res-less
 	// failure mode; distinct from 158, must NOT fire up.
+	//nolint:revive,staticcheck // verbatim drbdadm stderr; capitalization + trailing punct required
 	errFixtNotDefined = errors.New("'pvc-x' not defined in your config (for this host).")
 
 	// "no resources defined!" from drbdadm when /etc/drbd.d is
 	// empty — also NOT 158.
+	//nolint:revive,staticcheck // verbatim drbdadm stderr
 	errFixtNoResources = errors.New("no resources defined!")
 
 	// errno other than 158 paired with "Unknown resource" — e.g.
 	// drbdadm-9's (10) Unknown resource for a different failure
 	// mode. The anchored regex MUST reject this.
+	//nolint:staticcheck // verbatim drbdadm stderr; capitalization required
 	errFixtErrno10 = errors.New("Failure: (10) Unknown resource: exit status 1")
 )
 

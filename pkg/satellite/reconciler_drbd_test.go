@@ -4519,7 +4519,7 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 	// forbidden-verb checks below can exclude pass 1's expected
 	// `drbdadm create-md` (one-shot metadata write — fine on first
 	// activation, forbidden anywhere else).
-	steadyCmds := []string{}
+	steadyCmds := make([]string, 0, len(fx.CommandLines())*len(cases))
 
 	for i, tc := range cases {
 		fx.Reset()

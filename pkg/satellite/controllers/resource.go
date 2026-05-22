@@ -1256,14 +1256,14 @@ func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.Desired
 	out := make([]intent.DesiredPeer, 0, len(peers))
 
 	for i := range peers {
-		p := &peers[i]
+		peer := &peers[i]
 		entry := intent.DesiredPeer{
-			Name:        p.Spec.NodeName,
-			ResourceUID: string(p.UID),
+			Name:        peer.Spec.NodeName,
+			ResourceUID: string(peer.UID),
 		}
 
-		if p.Status.DRBDNodeID != nil {
-			entry.NodeID = *p.Status.DRBDNodeID
+		if peer.Status.DRBDNodeID != nil {
+			entry.NodeID = *peer.Status.DRBDNodeID
 		}
 
 		out = append(out, entry)
@@ -1327,7 +1327,7 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 
 		getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh)
 		if getErr != nil {
-			return getErr
+			return errors.Wrap(getErr, "re-read resource")
 		}
 
 		if fresh.Status.AppliedPeerUIDs == nil {

@@ -79,11 +79,15 @@ func (r *Reconciler) EvictPeersByUIDMismatch(
 	rdName string,
 	desiredPeers []intent.DesiredPeer,
 	appliedPeerUIDs map[string]string,
-	vols []int32,
+	_ []int32,
 	devices map[int32]string,
 ) (map[string]string, error) {
 	if r.cfg.Adm == nil {
-		return nil, nil
+		// No drbdadm wired (unit-test fast path). Caller treats a
+		// nil cleaned-map as no-op; surface a sentinel so the
+		// signature stays informative without nudging callers
+		// (production wiring always sets cfg.Adm).
+		return nil, nil //nolint:nilnil // intentional no-op signal for tests
 	}
 
 	logger := log.FromContext(ctx).WithValues("rd", rdName, "v4uidevict", true)

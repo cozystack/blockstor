@@ -817,11 +817,12 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 		// detachIfStillAttached is a no-op when the kernel has already
 		// dropped to Diskless on its own (idempotent re-entry on a
 		// satellite restart mid-toggle).
-		if err := r.detachIfStillAttached(ctx, dr); err != nil {
+		err := r.detachIfStillAttached(ctx, dr)
+		if err != nil {
 			return nil, false, false, err
 		}
 
-		err := r.reclaimVolumesForDiskless(ctx, dr)
+		err = r.reclaimVolumesForDiskless(ctx, dr)
 		if err != nil {
 			return nil, false, false, err
 		}

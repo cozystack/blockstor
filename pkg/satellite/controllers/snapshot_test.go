@@ -287,7 +287,7 @@ func TestSnapshotReconcileMarksFailedOnTerminalError(t *testing.T) {
 	}
 
 	// Terminal failures MUST NOT requeue — they're dead-letter.
-	if result.Requeue || result.RequeueAfter > 0 {
+	if !result.IsZero() {
 		t.Errorf("terminal failure should NOT requeue; got %+v", result)
 	}
 
@@ -376,7 +376,7 @@ func TestSnapshotReconcileKeepsIncompleteOnTransientError(t *testing.T) {
 	}
 
 	// Transient failures MUST requeue so the next pass retries.
-	if !result.Requeue && result.RequeueAfter == 0 {
+	if result.IsZero() {
 		t.Errorf("transient failure should requeue; got %+v", result)
 	}
 

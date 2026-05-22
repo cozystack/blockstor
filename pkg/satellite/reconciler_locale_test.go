@@ -75,6 +75,7 @@ func TestApplyLUKSOpenAlreadyExistsNonEnglishLocale(t *testing.T) {
 	fx.Expect(
 		"cryptsetup luksOpen /dev/vg/pvc-luks-de_00000 pvc-luks-de-0-luks --key-file -",
 		storage.FakeResponse{
+			//nolint:revive,err113 // verbatim de_DE cryptsetup stderr; locale fidelity required
 			Err: errors.New("Gerät pvc-luks-de-0-luks existiert bereits."),
 		})
 
