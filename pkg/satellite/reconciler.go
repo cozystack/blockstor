@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -291,9 +292,7 @@ func (r *Reconciler) SnapshotProviders() map[string]storage.Provider {
 	defer r.mu.Unlock()
 
 	out := make(map[string]storage.Provider, len(r.cfg.Providers))
-	for k, v := range r.cfg.Providers {
-		out[k] = v
-	}
+	maps.Copy(out, r.cfg.Providers)
 
 	return out
 }
@@ -406,7 +405,7 @@ func (r *Reconciler) CreateSnapshot(ctx context.Context, req *intent.CreateSnaps
 	})
 	if err != nil {
 		terminal := errors.Is(err, storage.ErrTerminal) || errors.Is(err, storage.ErrNotFound)
-		//nolint:nilerr // per-resource errors land in Ok=false; gRPC error reserved for transport faults
+
 		return &intent.CreateSnapshotResponse{Ok: false, Terminal: terminal, Message: err.Error()}, nil
 	}
 
@@ -883,7 +882,8 @@ func (r *Reconciler) detachIfStillAttached(ctx context.Context, dr *intent.Desir
 		return nil
 	}
 
-	if detachErr := r.cfg.Adm.Detach(ctx, dr.GetName()); detachErr != nil {
+	detachErr := r.cfg.Adm.Detach(ctx, dr.GetName())
+	if detachErr != nil {
 		return errors.Wrapf(detachErr, "detach %s on diskless toggle", dr.GetName())
 	}
 
@@ -1335,8 +1335,8 @@ func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 
 		// Block opener: `on <name> {`. Stash the name; the
 		// matching `node-id` line follows within the block.
-		if strings.HasPrefix(trimmed, "on ") {
-			rest := strings.TrimPrefix(trimmed, "on ")
+		if after, ok := strings.CutPrefix(trimmed, "on "); ok {
+			rest := after
 
 			head, _, ok := strings.Cut(rest, "{")
 			if !ok {
@@ -1384,15 +1384,19 @@ func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 // LVM-shaped guess.
 func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	_ = ctx
+
 	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
+
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
+
 	current, _ := os.ReadFile(resPath)
 	if bytes.Equal(current, []byte(body)) {
 		return nil
 	}
+
 	return errors.Wrapf(os.WriteFile(resPath, []byte(body), resFilePerm), "write %s", resPath)
 }
 
@@ -1490,11 +1494,14 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// handle the cold-start PhaseUnprovisioned case.
 	{
 		obs := r.observeForFsm(ctx, dr, diskless)
+
 		phase := ObservePhase(obs)
 		if next := NextTransition(phase, obs); next != nil {
-			if err := r.dispatchFsmAction(ctx, dr, devices, next.Action, obs); err != nil {
+			err := r.dispatchFsmAction(ctx, dr, devices, next.Action, obs)
+			if err != nil {
 				return errors.Wrapf(err, "fsm dispatch %s", next.Action)
 			}
+
 			fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)
 		}
 	}
@@ -1850,6 +1857,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		// Stage 1 (#489). Best-effort tolerated (file marker is the
 		// source of truth) so no functional regression, just noise.
 		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
+
 		stampErr := r.cfg.MetadataCreatedStamper.StampMetadataCreated(ctx, resourceCRDName)
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp MetadataCreated Condition; will retry next reconcile",
@@ -2179,6 +2187,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		// Best-effort tolerated (file marker is the source of truth)
 		// so no functional regression on a transient apiserver hiccup.
 		resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
+
 		stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemFormatted(ctx, resourceCRDName)
 		if stampErr != nil {
 			log.FromContext(ctx).Error(stampErr, "stamp FilesystemFormatted Condition; will retry next reconcile",
@@ -2315,7 +2324,8 @@ func (r *Reconciler) runApplyDRBDVerb(ctx context.Context, dr *intent.DesiredRes
 // (Stage 2), createMetadata (Stage 3a), and adjustResource (Stage
 // 3b) shadows.
 func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredResource) error {
-	if err := r.cfg.Adm.Up(ctx, dr.GetName()); err != nil {
+	err := r.cfg.Adm.Up(ctx, dr.GetName())
+	if err != nil {
 		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
 	}
 

@@ -409,7 +409,7 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 	})
 
 	excess := len(snapList.Items) - keep
-	for i := 0; i < excess; i++ {
+	for i := range excess {
 		snap := &snapList.Items[i]
 		if !snap.DeletionTimestamp.IsZero() {
 			// Already being deleted — skip the redundant Delete

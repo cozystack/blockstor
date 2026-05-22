@@ -2142,7 +2142,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 		{
 			Name:     "pvc-seed",
 			NodeName: "n1",
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:    []intent.DesiredPeer{{Name: "n2"}},
 			Volumes: []*intent.DesiredVolume{
 				{
 					VolumeNumber: 0,
@@ -2319,7 +2319,7 @@ func TestApplyFirstActivationDiskReplaceInternalMetadata(t *testing.T) {
 	// order is a regression of the upstream recipe — and adjust before
 	// create-md would fail in production with "No valid meta data
 	// found" on the freshly-allocated lower disk.
-	if !(lvcreate < createMD && createMD < adjust) {
+	if lvcreate >= createMD || createMD >= adjust {
 		t.Errorf("ordering: lvcreate@%d → create-md@%d → adjust@%d (want strictly ascending); calls=%v",
 			lvcreate, createMD, adjust, calls)
 	}
@@ -2578,7 +2578,7 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 				{
 					Name:     "pvc-zskip",
 					NodeName: "n1",
-					Peers: []intent.DesiredPeer{{Name: "n2"}},
+					Peers:    []intent.DesiredPeer{{Name: "n2"}},
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: tc.poolName},
 					},
@@ -2679,7 +2679,7 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 		{
 			Name:     "pvc-race",
 			NodeName: "n1",
-			Peers: []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			Peers:    []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},

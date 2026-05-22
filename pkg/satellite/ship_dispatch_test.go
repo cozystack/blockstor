@@ -217,6 +217,7 @@ func (*fakeNonShipperProvider) VolumeStatus(_ context.Context, vol storage.Volum
 func (*fakeNonShipperProvider) CreateSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return nil
 }
+
 func (*fakeNonShipperProvider) DeleteSnapshot(_ context.Context, _ storage.Snapshot) error {
 	return nil
 }

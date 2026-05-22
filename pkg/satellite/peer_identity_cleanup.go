@@ -41,7 +41,7 @@ import (
 // its stale GI epoch + PSK + endpoint mapping, survives the new
 // `drbdadm adjust` — the new <peer> brings up fresh DRBD with a new
 // GI epoch, handshake fails (incompatible epochs), the slot wedges
-// in Connecting forever (the `disk='' rep='Off'` symptom).
+// in Connecting forever (the `disk=” rep='Off'` symptom).
 //
 // State-based detection (v3 PruneStaleKernelSlots Pass 3) can in
 // principle clean this up after the 30s zombie grace, but it depends

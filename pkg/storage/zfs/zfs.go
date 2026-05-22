@@ -183,7 +183,7 @@ func (p *Provider) VolumeStatus(ctx context.Context, vol storage.Volume) (storag
 		"-o", "name,volsize,used",
 		p.volumeDataset(vol))
 	if err != nil {
-		return storage.VolumeStatus{State: stateNotProvisioned}, nil //nolint:nilerr // missing == not provisioned
+		return storage.VolumeStatus{State: stateNotProvisioned}, nil
 	}
 
 	line := strings.TrimSpace(string(out))
@@ -572,7 +572,8 @@ func (p *Provider) ListVolumeNames(ctx context.Context) ([]storage.VolumeRef, er
 	refs := make([]storage.VolumeRef, 0)
 
 	prefix := p.cfg.Pool + "/"
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

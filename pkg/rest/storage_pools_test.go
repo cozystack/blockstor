@@ -1600,6 +1600,7 @@ func TestViewStoragePoolsFaultyStampsReports(t *testing.T) {
 		t.Errorf("message %q missing pool name", rc.Message)
 	}
 }
+
 // TestSPModifyOverridePropsLands pins Bug 85's core wire contract:
 // `PUT /v1/nodes/{node}/storage-pools/{pool}` accepts the python-linstor
 // `storage_pool_modify` body `{override_props: {...}}` and merges the

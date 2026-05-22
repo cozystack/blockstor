@@ -1325,7 +1325,8 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh blockstoriov1alpha1.Resource
 
-		if getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh); getErr != nil {
+		getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh)
+		if getErr != nil {
 			return getErr
 		}
 
@@ -1348,7 +1349,6 @@ func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *bloc
 
 		return r.Status().Update(ctx, &fresh)
 	})
-
 	if err != nil {
 		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
 	}

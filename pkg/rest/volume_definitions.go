@@ -271,7 +271,8 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(bytes.NewReader(rawBody))
 	dec.DisallowUnknownFields()
 
-	if decErr := dec.Decode(&envelope); decErr != nil {
+	decErr := dec.Decode(&envelope)
+	if decErr != nil {
 		writeDecodeError(w, decErr)
 
 		return
@@ -297,7 +298,8 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
 	// satellite reconciler doesn't hot-loop on `drbdadm create-md`
 	// failures. See validateVDSize for the bounds rationale.
-	if sizeErr := validateVDSize(vd.SizeKib); sizeErr != nil {
+	sizeErr := validateVDSize(vd.SizeKib)
+	if sizeErr != nil {
 		writeVDSizeRejection(w, rd, vd.VolumeNumber, vd.SizeKib, sizeErr)
 
 		return
@@ -366,7 +368,8 @@ func vdCreateVolumeNumberExplicit(raw []byte) bool {
 
 	var envelope map[string]json.RawMessage
 
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	err := json.Unmarshal(raw, &envelope)
+	if err != nil {
 		return false
 	}
 
@@ -374,7 +377,8 @@ func vdCreateVolumeNumberExplicit(raw []byte) bool {
 	if inner, ok := envelope["volume_definition"]; ok {
 		var innerObj map[string]json.RawMessage
 
-		if err := json.Unmarshal(inner, &innerObj); err != nil {
+		err := json.Unmarshal(inner, &innerObj)
+		if err != nil {
 			return false
 		}
 
@@ -503,6 +507,7 @@ func writeVDSizeRejection(w http.ResponseWriter, rd string, vn int32, sizeKib in
 			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
 		},
 	}})
+
 	_ = sizeKib // retained for future audit-log fields
 }
 

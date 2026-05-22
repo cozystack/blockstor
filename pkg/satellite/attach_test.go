@@ -351,7 +351,7 @@ func TestAttachWipeClearsPartitionTable(t *testing.T) {
 		t.Fatalf("Bug 336: zpool create missing: %v", calls)
 	}
 
-	if !(wipeIdx < rereadIdx && rereadIdx < createIdx) {
+	if wipeIdx >= rereadIdx || rereadIdx >= createIdx {
 		t.Errorf("Bug 336: ordering must be wipefs@%d < rereadpt@%d < zpool create@%d; got calls=%v",
 			wipeIdx, rereadIdx, createIdx, calls)
 	}

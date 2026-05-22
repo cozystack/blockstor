@@ -108,7 +108,8 @@ func (s *inMemoryResourceDefinitions) PatchResourceDefinitionSpec(_ context.Cont
 		return errors.Wrapf(ErrNotFound, "resource definition %q", name)
 	}
 
-	if err := mutate(&rd); err != nil {
+	err := mutate(&rd)
+	if err != nil {
 		return errors.Wrapf(err, "patch resource definition %q", name)
 	}
 

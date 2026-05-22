@@ -121,7 +121,8 @@ func (s *inMemoryVolumeDefinitions) PatchVolumeDefinitionSpec(_ context.Context,
 		return errors.Wrapf(ErrNotFound, "volume %d on resource definition %q", volumeNumber, rdName)
 	}
 
-	if err := mutate(&vd); err != nil {
+	err := mutate(&vd)
+	if err != nil {
 		return errors.Wrapf(err, "patch volume %d on resource definition %q", volumeNumber, rdName)
 	}
 

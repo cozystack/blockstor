@@ -143,7 +143,8 @@ func (s *inMemoryResources) PatchResourceSpec(_ context.Context, rdName, node st
 		return errors.Wrapf(ErrNotFound, "resource %q on node %q", rdName, node)
 	}
 
-	if err := mutate(&r); err != nil {
+	err := mutate(&r)
+	if err != nil {
 		return errors.Wrapf(err, "patch resource %q on node %q", rdName, node)
 	}
 

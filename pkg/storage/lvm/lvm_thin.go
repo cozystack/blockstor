@@ -455,7 +455,7 @@ func listLVMVolumes(ctx context.Context, ex storage.Exec, vg string) ([]storage.
 
 	refs := make([]storage.VolumeRef, 0)
 
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

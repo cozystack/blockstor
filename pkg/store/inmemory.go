@@ -263,7 +263,8 @@ func (s *inMemoryNodes) PatchProps(_ context.Context, name string, mutate func(m
 		node.Props = map[string]string{}
 	}
 
-	if err := mutate(node.Props); err != nil {
+	err := mutate(node.Props)
+	if err != nil {
 		return errors.Wrapf(err, "patch Props of node %q", name)
 	}
 
@@ -289,7 +290,8 @@ func (s *inMemoryNodes) PatchNodeSpec(_ context.Context, name string, mutate fun
 		return errors.Wrapf(ErrNotFound, "node %q", name)
 	}
 
-	if err := mutate(&node); err != nil {
+	err := mutate(&node)
+	if err != nil {
 		return errors.Wrapf(err, "patch Node %q", name)
 	}
 
