@@ -12,9 +12,11 @@ name: Contract tests
 # Linux-only — the harness skips on other GOOS values.
 
 on:
+  # PR runs go through .github/workflows/pull-request.yml (consolidated
+  # pipeline with the breakpoint step). Push-only here so main-branch
+  # merges still exercise contract tests.
   push:
     branches: [main]
-  pull_request:
 
 permissions: {}
 

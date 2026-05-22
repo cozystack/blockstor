@@ -701,17 +701,31 @@ func TestResourceDeleteSuccessUsesInfoMaskNotWarn(t *testing.T) {
 			rc[0].RetCode, maskWarn)
 	}
 
-	if !strings.Contains(rc[0].Message, "resource deleted") {
-		t.Errorf("message: got %q, want 'resource deleted' marker", rc[0].Message)
+	// Bug 342: success-path message now distinguishes "deleted" (the
+	// TIE_BREAKER / already-DISKLESS physical-Delete branches) from
+	// "toggled to diskless" (the diskful toggle-disk-remove branch).
+	// Either marker confirms a real success-path reply; the only
+	// thing the contract pins is that it's NOT the warn "already
+	// absent" idempotent shape.
+	msg := rc[0].Message
+	if !strings.Contains(msg, "resource deleted") && !strings.Contains(msg, "resource toggled to diskless") {
+		t.Errorf("message: got %q, want 'resource deleted' or 'resource toggled to diskless' marker", msg)
 	}
 
-	// Belt + braces: the row really left the store, not just the
-	// envelope. Without this, a buggy handler that always emitted
-	// the success envelope without calling Delete would pass the
-	// status/mask checks while leaking entries on every CSI retry.
-	_, err := st.Resources().Get(ctx, "pvc-live", "n1")
-	if err == nil {
-		t.Errorf("replica still present after DELETE; want it gone")
+	// Bug 342: belt + braces. The seeded replica had no DISKLESS
+	// flag, so the handler took the toggle-disk-remove branch; the
+	// row survives in the store with DISKLESS stamped. Pin the new
+	// contract — a buggy handler that always emitted the success
+	// envelope without touching the store would still fail this:
+	// either the row would be gone (NotFound) or the flag wouldn't
+	// be set.
+	res, err := st.Resources().Get(ctx, "pvc-live", "n1")
+	if err != nil {
+		t.Fatalf("Bug 342: replica unexpectedly absent after toggle-disk-remove: %v", err)
+	}
+
+	if !slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("Bug 342: post-toggle Flags=%v missing DISKLESS", res.Flags)
 	}
 }
 
