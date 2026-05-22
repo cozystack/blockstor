@@ -190,12 +190,16 @@ jobs:
 
   e2e:
     name: E2E
-    # Swap the label below to your ephemeral runner pool when ARC is up
-    # (e.g. `[self-hosted, blockstor-e2e]` or a buildjet/namespace label).
-    # The job needs KVM access for the kind cluster; GitHub-hosted runners
-    # currently work for the simple kind-based e2e but real-DRBD QEMU
-    # scenarios require nested virtualisation.
-    runs-on: [self-hosted]
+    # GitHub-hosted runner. kind-based e2e (Tier 4 in the test strategy)
+    # runs fine on ubuntu-latest without nested virtualisation. Real-
+    # DRBD QEMU scenarios (.work/<stand> with Talos VMs) need KVM and
+    # ~50 GB RAM, so they stay manual on dedicated bare-metal stands —
+    # see stand/Makefile + reference_blockstor_stand.md.
+    #
+    # When the ephemeral self-hosted runner pool (ARC / namespace.so /
+    # equivalent) is wired up, swap the label to that pool's identifier
+    # and bring real-DRBD scenarios online here too.
+    runs-on: ubuntu-latest
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
     timeout-minutes: 60
