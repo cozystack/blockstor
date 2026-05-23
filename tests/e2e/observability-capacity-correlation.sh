@@ -66,7 +66,12 @@ FILL_RD_SIZE_KIB=$((2 * 1024 * 1024))
 # Target: ≥95% of the pool's total_capacity used.
 TARGET_USED_PCT=95
 # Maximum number of fill RDs we'll create — guards against runaway loops.
-MAX_FILL_RDS=8
+# 10 (was 8): the satellite container has a 512 MiB RSS cap and dd is
+# occasionally OOM-killed (exit 137) mid-write, leaving the last RD
+# only partially consuming its budgeted size. Two extra slots give the
+# fill loop enough headroom to reach the <681 MiB target despite the
+# occasional short write.
+MAX_FILL_RDS=10
 # How long to wait for PVC describe events to surface.
 PVC_EVENT_TIMEOUT=60
 # Tolerance between LINSTOR and `lvs` free-capacity views.
@@ -94,6 +99,59 @@ LCTL=(linstor --controllers "http://127.0.0.1:$PF_PORT")
 
 # Track RDs we spawned so cleanup can find them even on early exit.
 SPAWNED_RDS=()
+
+# Ensure the `lvm-thin` backing storage exists on $FILL_NODE before we
+# query its capacity. Workers in shared e2e stands lose LV state across
+# reboots (LVM activation needs udev, which the satellite container
+# doesn't have, so LVs created by install-pools.sh don't reappear on
+# node restart). Other scenarios (lifecycle-toggle-retry, etc.) also
+# tear down the VG/LV pair as part of their fault injection. Mirror
+# the lvcreate dance from stand/install-pools.sh so the test is
+# self-sufficient regardless of stand state. Idempotent: skips when
+# the thin pool LV already exists.
+seed_lvm_thin() {
+    local node=$1
+    echo ">> seed lvm-thin backing storage on $node (idempotent)"
+    on_node "$node" bash -c '
+        set +e
+        # /dev/sdb is the LVM device on the stand (install-pools.sh:
+        # LVM_DEV defaults to /dev/sdb when TYPE=both was provisioned).
+        if ! vgs blockstor-lvm >/dev/null 2>&1; then
+            wipefs -af /dev/sdb 2>/dev/null
+            vgcreate -y blockstor-lvm /dev/sdb || exit 1
+        fi
+        if lvs blockstor-lvm/thin >/dev/null 2>&1; then
+            echo "   blockstor-lvm/thin already exists"
+            exit 0
+        fi
+        # Same flags install-pools.sh uses — no udev in the satellite
+        # container, so disable udev_sync/udev_rules and skip the wipe
+        # signatures step that goes through the missing /dev node.
+        CFG="activation{udev_sync=0 udev_rules=0}"
+        lvcreate --config "$CFG" -y -Wn -Zn -L 1G  blockstor-lvm -n thin_meta || exit 1
+        lvcreate --config "$CFG" -y -Wn -Zn -L 13G blockstor-lvm -n thin      || exit 1
+        lvconvert --config "$CFG" -y -Wn -Zn --type thin-pool \
+            --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin         || exit 1
+        echo "   blockstor-lvm/thin created"
+    '
+}
+
+# Wait until LINSTOR reports a non-empty total_capacity for the target
+# pool — the satellite refreshes pool reports every ~10s after the LV
+# appears, and `sp list` returns empty fields until that cycle lands.
+wait_pool_ready() {
+    local node=$1 pool=$2 timeout=${3:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        local total
+        total=$(pool_total_kib "$node" "$pool")
+        if [[ -n "$total" && "$total" -gt 0 ]]; then
+            return 0
+        fi
+        sleep 3
+    done
+    return 1
+}
 
 cleanup() {
     set +e
@@ -181,17 +239,43 @@ EOF
     fi
 
     # dd /dev/urandom into the device to allocate every extent.
-    # bs=4M for throughput; oflag=direct so we bypass the satellite's
-    # page cache (otherwise lvs Data% lags the dd commit).
+    # bs=1M (not 4M): the satellite container is capped at 512 MiB RSS
+    # and a 4 MiB block buffer + urandom kernel work pushed dd OOM
+    # (exit 137) mid-fill, leaving stale half-written LVs whose extents
+    # then ghost-reclaimed on the next reconcile and made the pool free
+    # report oscillate. 1 MiB is the size used elsewhere in this suite
+    # (recovery-stuck-synctarget.sh, state-inconsistent-mid-sync.sh).
+    # oflag=direct bypasses page cache so lvs Data% sees the commit
+    # immediately. conv=fdatasync forces metadata flush before close
+    # so the satellite's lvs poll sees the final state.
     local mib=$(( size_kib / 1024 ))
     echo "   $rd → $dev: dd ${mib} MiB of urandom"
     if ! on_node "$FILL_NODE" bash -c \
-        "dd if=/dev/urandom of=${dev} bs=4M count=${mib} \
-            iflag=fullblock oflag=direct status=none 2>&1 || true"; then
+        "dd if=/dev/urandom of=${dev} bs=1M count=${mib} \
+            iflag=fullblock oflag=direct conv=fdatasync status=none 2>&1 || true"; then
         echo "   dd into $dev failed (likely pool-full); continuing"
     fi
     return 0
 }
+
+# Self-seed lvm-thin on $FILL_NODE if the stand lost it (worker reboot,
+# prior fault-injection test that nuked the VG, etc.). The function is
+# idempotent — a working pool is left alone. Without this the test
+# FAILs at the baseline `linstor sp list` lookup below: the StoragePool
+# CRD exists (applied by install-pools.sh's blockstor-storagepools.yaml)
+# but its FreeCapacity/TotalCapacity are empty because the satellite's
+# pool report sees "pool backing storage missing".
+if [[ "$FILL_POOL" == "lvm-thin" ]]; then
+    if ! seed_lvm_thin "$FILL_NODE"; then
+        echo "FAIL: could not seed lvm-thin backing storage on $FILL_NODE"
+        exit 1
+    fi
+    if ! wait_pool_ready "$FILL_NODE" "$FILL_POOL" 60; then
+        echo "FAIL: $FILL_POOL on $FILL_NODE never reported non-empty capacity after seed"
+        "${LCTL[@]}" sp list || true
+        exit 1
+    fi
+fi
 
 # Pool baseline (KiB).
 TOTAL_KIB=$(pool_total_kib "$FILL_NODE" "$FILL_POOL")
