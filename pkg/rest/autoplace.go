@@ -2172,47 +2172,22 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.postDeleteCoordination(r.Context(), rdName, node)
+	// Bug 124: wait for the local informer cache to observe the
+	// per-replica drop so the very next `r l` / `view/resources` on
+	// this apiserver replica reflects it. See
+	// pkg/rest/cache_invalidation.go.
+	s.waitForResourceDeletionVisible(r.Context(), rdName, node)
+
+	// Bug 67: notify surviving sibling Resources of the peer change
+	// so satellite reconcilers re-derive their peer set without the
+	// dropped replica. Order ("delete first, bump second") ensures a
+	// reconciler woken by the annotation observes post-delete state.
+	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
 	}})
-}
-
-// postDeleteCoordination runs the three cross-replica coordination
-// steps that follow a successful physical `Store.Resources().Delete`
-// on the `r d` path:
-//
-//  1. **Bug 124 cache drain.** Wait for the local informer cache to
-//     observe the per-replica drop so the very next `r l` /
-//     `view/resources` on this apiserver replica reflects it. See
-//     pkg/rest/cache_invalidation.go.
-//  2. **Bug 67 peer-changed bump.** Stamp `PeerChangedAnnotation`
-//     on every surviving sibling so its satellite wakes and
-//     re-derives the peer set without the dropped replica.
-//  3. **Spec §4.2 / §6 ACK gate.** Block until every reachable
-//     surviving sibling has stamped the per-peer ACK annotation,
-//     proving its satellite ran `drbdadm del-peer` (+ `drbdmeta
-//     forget-peer` for diskful local) against the doomed peer's
-//     kernel slot. Without this gate, a sub-second `linstor rd ap`
-//     autoplacing the same RD races the cleanup: the new replica's
-//     re-allocated `node-id` can collide with the departed peer's
-//     still-occupied metadata slot, and DRBD-9 refuses the
-//     handshake (`Peer presented a node_id of X instead of Y` /
-//     stuck-Connecting) until the slot is forgotten — exactly the
-//     symptom the `tests/e2e/recovery-node-id-mismatch.sh` test
-//     catches.
-//
-// Hoisted out of `handleResourceDelete` to keep the handler under
-// the funlen budget; the bumper + the ACK wait are independent
-// best-effort calls (timeouts and errors are absorbed inside) so
-// failures here never poison the operator's already-successful
-// physical Delete reply.
-func (s *Server) postDeleteCoordination(ctx context.Context, rdName, node string) {
-	s.waitForResourceDeletionVisible(ctx, rdName, node)
-	s.bumpPeerChangedOnSiblings(ctx, rdName, node)
-	s.waitForPeerDeletionAcks(ctx, rdName, node)
 }
 
 // toggleResourceToDiskless is the Bug 342 diskful-`r d` path: stamp

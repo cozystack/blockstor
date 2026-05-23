@@ -44,11 +44,23 @@ var peerDeleteAckTimeout = 15 * time.Second
 //nolint:gochecknoglobals // tunable
 var peerDeletePollInterval = 250 * time.Millisecond
 
-// peerForgetAckAnnotationPrefix mirrors `apiv1.PeerForgetAckAnnotationPrefix`
-// for in-package use. Defined as a constant in `pkg/api/v1` so the satellite
-// stamper (`pkg/satellite/controllers/peer_forget_ack_stamper.go`) and the
-// REST poller (this file) share a single source of truth. Spec §4.2 / §6.
-const peerForgetAckAnnotationPrefix = apiv1.PeerForgetAckAnnotationPrefix
+// peerForgetAckAnnotationPrefix names the per-peer ACK key the
+// satellite stamps after completing ActionForgetPeer for a given peer
+// name. Full key shape: `blockstor.io/peer-forget-acked.<peerNode>`
+// with an RFC3339Nano timestamp as the value. The REST handler's
+// waitForPeerDeletionAcks polls the key for presence as the implicit
+// confirmation that del-peer + forget-peer + AppliedPeerUIDs entry
+// drop have completed against the OLD peer incarnation.
+//
+// Why an annotation rather than the AppliedPeerUIDs-absence signal
+// from the original v10 design: the pkg/api/v1.Resource type the
+// Store materialises does not carry Status.AppliedPeerUIDs (that
+// field lives only on the K8s CRD via api/v1alpha1). Annotations
+// ARE round-tripped through Store and already serve as the channel
+// for cross-satellite signals (Bug 67 PeerChangedAnnotation), so
+// reusing the same transport keeps the v10 fix additive — no Store
+// schema change.
+const peerForgetAckAnnotationPrefix = "blockstor.io/peer-forget-acked."
 
 // waitForPeerDeletionAcks blocks until every online sibling Resource
 // of `rdName` has stamped a peer-forget ACK annotation for
@@ -155,31 +167,18 @@ func (s *Server) waitForPeerDeletionAcks(ctx context.Context, rdName, removedNod
 	}
 }
 
-// isNodeOnline returns true ONLY when the named Node carries an
-// explicit `ConnectionStatus == ONLINE`. Anything else — missing
-// node row, lookup error, blank ConnectionStatus, OFFLINE,
-// CONNECTING — is treated as "not online enough to wait for an ACK
-// from its satellite", and the ACK loop skips the row.
-//
-// Why "strict ONLINE" rather than "anything-but-OFFLINE": the ACK
-// is stamped by a satellite that is reconciling locally; a satellite
-// that has not yet checked in (blank ConnectionStatus pre-first-
-// heartbeat) cannot stamp the annotation, and waiting 15s for an
-// ACK that can never land is the same operational outcome as the
-// OFFLINE skip. Tests inject Node rows without stamping
-// ConnectionStatus (no live satellite) — pre-fix shape treated them
-// as online, dragging unit-test runtime up to the full
-// `peerDeleteAckTimeout`. Production satellites always stamp
-// ConnectionStatus=ONLINE on every successful reconcile loop, so
-// the strict check matches the only state from which an ACK can
-// originate.
+// isNodeOnline returns true when the named Node is currently reachable.
+// Treats lookup errors and missing nodes as "online" (best-effort: the
+// REST caller would rather wait briefly and time out than skip a node
+// that might in fact be reachable). Only an explicit
+// `ConnectionStatus == OFFLINE` triggers the skip path.
 func isNodeOnline(ctx context.Context, nodes store.NodeStore, nodeName string) bool {
 	node, err := nodes.Get(ctx, nodeName)
 	if err != nil {
-		return false
+		return true
 	}
 
-	return node.ConnectionStatus == apiv1.NodeTypeOnline
+	return node.ConnectionStatus != apiv1.NodeTypeOffline
 }
 
 // siblingHasPeerForgetAck returns true when the sibling Resource
