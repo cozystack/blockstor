@@ -273,6 +273,48 @@ func TestSweeperTearsDownOwnedOrphanWithStateDir(t *testing.T) {
 	}
 }
 
+// TestSweeperTearsDownOwnedOrphanWithOnlyDotOwnedMarker pins the
+// Bug 432 invariant: when `.res` has been wiped (force-strip aftermath,
+// satellite crash mid-write, e2e harness preflight `rm -f
+// /etc/drbd.d/*.res /etc/drbd.d/*.md-created`) but the `.owned`
+// ownership marker survives, the sweeper MUST still recognise the
+// kernel slot as blockstor-managed and issue `drbdsetup down`. The
+// pre-fix sweeper would mis-classify this as a foreign (piraeus)
+// slot (Bug 299) and leave it in place forever, pinning the
+// minor/port for every subsequent RD that wants them (the
+// satellite-utils-smoke + 9-test cascade in Run 52).
+func TestSweeperTearsDownOwnedOrphanWithOnlyDotOwnedMarker(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+
+	// `.res` is GONE (harness preflight `rm -f *.res`) but `.owned`
+	// survives (suffix isn't matched by the rm glob). The sweeper
+	// must treat the slot as blockstor-owned and tear it down.
+	ownedPath := filepath.Join(stateDir, "pvc-owned.owned")
+
+	err := os.WriteFile(ownedPath, nil, 0o600)
+	if err != nil {
+		t.Fatalf("seed .owned marker: %v", err)
+	}
+
+	sweeper, fx := sweeperFixture(t, "n1",
+		"pvc-owned role:Secondary\n  volume:0 disk:Diskless\n",
+		nil)
+	sweeper.StateDir = stateDir
+
+	err = sweeper.sweepOnce(t.Context(), logr.Discard())
+	if err != nil {
+		t.Fatalf("sweepOnce: %v", err)
+	}
+
+	want := "drbdsetup down pvc-owned"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("sweeper did not down orphan with only .owned marker present; want %q in %v",
+			want, fx.CommandLines())
+	}
+}
+
 // TestSweeperRespectsRateLimit pins the bound on per-cycle
 // destruction: with 20 kernel orphans and MaxDownPerCycle=2 the
 // sweeper MUST stop after 2 downs and defer the rest to the next

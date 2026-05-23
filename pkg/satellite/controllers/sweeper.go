@@ -392,32 +392,53 @@ func classifyOrphan(rsc string, owned map[string]struct{}, rdAges map[string]tim
 	return sweepTearDown, age
 }
 
-// blockstorOwnsResFile reports whether `<stateDir>/<rsc>.res` exists
-// on disk. The reconciler writes this file when it first activates a
-// resource (Reconciler.applyDRBD → os.WriteFile) and removes it as
-// part of handleDelete's cleanup chain. Its presence is therefore a
-// reliable proxy for "this satellite owns this kernel slot": a
-// foreign DRBD manager (upstream piraeus / linstor-satellite) lives
-// under its own state directory (e.g. `/var/lib/linstor.d/`) and
-// would never write into blockstor's StateDir.
+// blockstorOwnsResFile reports whether blockstor previously
+// provisioned a kernel slot for `rsc`, by checking for either of two
+// ownership markers in stateDir:
+//
+//  1. `<rsc>.res` — written by Reconciler.applyDRBD on every reconcile
+//     and removed in DeleteResource.
+//  2. `<rsc>.owned` — written by Reconciler.applyDRBD (Bug 432)
+//     IMMEDIATELY when blockstor first takes ownership of the slot,
+//     before any drbdadm verbs run. Removed in DeleteResource together
+//     with `.res`/`.md-created`/`.mkfs.done`.
+//
+// The `.owned` marker survives aggressive cleanup paths that wipe
+// `*.res` (force-strip, satellite crash mid-write, harness preflight
+// `rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created`). Without it the
+// sweeper would mis-classify a force-stripped slot as "foreign" (Bug
+// 432 cascade: satellite-utils-smoke + 9 subsequent tests all FAIL on
+// the same stand because the leaked kernel slot pins minor/port and
+// new RDs never reach UpToDate).
+//
+// A foreign DRBD manager (upstream piraeus / linstor-satellite on a
+// coexistence stand) writes into its own state directory and never
+// touches either marker in blockstor's StateDir, so coexistence
+// (Bug 299) is preserved: a kernel slot with NEITHER `.res` NOR
+// `.owned` is still left alone.
 //
 // Errors other than fs.ErrNotExist (permission denied, fs full,
-// transient I/O) are conservatively treated as "owned" — the sweeper
-// then falls through to the CRD-based classification and at worst
-// tears down a slot the reconciler immediately rebuilds, which is
-// recoverable. Treating them as "foreign" would mask real bugs by
-// silently disabling the safety net.
+// transient I/O) on the first probe are conservatively treated as
+// "owned" — the sweeper then falls through to the CRD-based
+// classification and at worst tears down a slot the reconciler
+// immediately rebuilds, which is recoverable. Treating them as
+// "foreign" would mask real bugs by silently disabling the safety net.
 func blockstorOwnsResFile(stateDir, rsc string) bool {
-	_, err := os.Stat(filepath.Join(stateDir, rsc+".res"))
-	if err == nil {
-		return true
+	for _, suffix := range []string{".res", ".owned"} {
+		_, err := os.Stat(filepath.Join(stateDir, rsc+suffix))
+		if err == nil {
+			return true
+		}
+
+		if !errors.Is(err, os.ErrNotExist) {
+			// Non-ENOENT (EACCES, ENOSPC, EIO) — conservatively
+			// treat as owned to keep the safety net live. See
+			// function doc.
+			return true
+		}
 	}
 
-	if errors.Is(err, os.ErrNotExist) {
-		return false
-	}
-
-	return true
+	return false
 }
 
 // tearDownOrphans iterates the kernel-resource list and applies the

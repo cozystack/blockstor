@@ -745,8 +745,11 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 		// `.md-created` behind would make a re-created RD with the
 		// same name see firstActivation=false on its first apply,
 		// skip create-md, and fail drbdadm adjust with
-		// "No valid meta data found".
-		for _, suffix := range []string{".res", ".md-created", ".mkfs.done"} {
+		// "No valid meta data found". `.owned` (Bug 432) is the
+		// sweeper's ownership marker — must be removed AFTER the
+		// kernel slot is gone so a concurrent sweeper tick sees a
+		// clean post-state (kernel + marker both absent).
+		for _, suffix := range []string{".res", ".md-created", ".mkfs.done", ".owned"} {
 			err := os.Remove(filepath.Join(r.cfg.StateDir, req.GetName()+suffix))
 			if err != nil && !os.IsNotExist(err) {
 				return &intent.DeleteResourceResponse{
@@ -1676,6 +1679,48 @@ func extractResFilePeerNodeIDs(resPath string) map[string]int32 {
 	return out
 }
 
+// stampOwnershipMarker writes an empty `<StateDir>/<rsc>.owned` file
+// to claim the kernel slot for blockstor before any drbdadm verb
+// runs. The OrphanSweeper uses the marker's presence as a robust
+// signal that blockstor provisioned (or attempted to provision) this
+// slot — robust even after aggressive cleanup paths wipe the other
+// state files (force-strip, satellite crash mid-write, e2e harness
+// preflight `rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created`).
+//
+// Bug 432 cascade: without this marker the sweeper would mis-classify
+// a force-stripped slot as a foreign (piraeus) coexistence slot
+// (Bug 299 guard) and leave the leaked slot in place forever. The
+// pinned minor/port then prevented every subsequent RD from reaching
+// UpToDate, surfacing as the satellite-utils-smoke + 9-test cascade
+// observed in Run 52.
+//
+// The marker is content-empty (presence is the whole signal),
+// removed in DeleteResource together with the rest of the per-
+// resource state files. Idempotent: a pre-existing marker from a
+// previous reconcile pass is silently re-stamped. Skipped on empty
+// StateDir (unit-test fixtures that wire no on-disk state).
+func (r *Reconciler) stampOwnershipMarker(name string) error {
+	if r.cfg.StateDir == "" {
+		return nil
+	}
+
+	ownedPath := filepath.Join(r.cfg.StateDir, name+".owned")
+
+	// O_CREATE only — never truncate, never error if it already
+	// exists. We don't care about content; presence is the signal.
+	f, err := os.OpenFile(ownedPath, os.O_CREATE|os.O_WRONLY, resFilePerm)
+	if err != nil {
+		return errors.Wrapf(err, "stamp ownership marker %s", ownedPath)
+	}
+
+	err = f.Close()
+	if err != nil {
+		return errors.Wrapf(err, "close ownership marker %s", ownedPath)
+	}
+
+	return nil
+}
+
 // renderResFile builds and writes the per-node .res file content-
 // idempotently. Bug 315 invariant: skips os.WriteFile when the
 // rendered body matches what's already on disk so drbdadm's config-
@@ -1694,6 +1739,19 @@ func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResour
 	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
+	}
+
+	// Bug 432: stamp the ownership marker every time we render
+	// `.res`. The marker survives aggressive cleanup paths that
+	// wipe `*.res` so the OrphanSweeper can still classify the
+	// kernel slot as blockstor-managed and tear it down. Stamped
+	// before the content-idempotent body check so a re-stamp also
+	// happens on steady-state reconciles where `.res` is unchanged
+	// — closing the window between a previous-pass `.owned` wipe
+	// (e.g. by harness or operator) and the next change to `.res`.
+	err = r.stampOwnershipMarker(dr.GetName())
+	if err != nil {
+		return err
 	}
 
 	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
@@ -1749,6 +1807,13 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// 11.2.c Stage 4 step 1) overwrites .res with the new peer set,
 	// so this tear-down step must observe the pre-render state to
 	// avoid leaking kernel connections and on-disk GI slots.
+	//
+	// Bug 432: the `.owned` ownership marker is stamped by
+	// renderResFile (called as the FSM dispatch preamble below) on
+	// every reconcile pass, so the sweeper can recognise this kernel
+	// slot as blockstor-managed even after aggressive cleanup paths
+	// (force-strip, harness preflight `rm -f *.res *.md-created`,
+	// satellite crash mid-write) have wiped the other state files.
 	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
