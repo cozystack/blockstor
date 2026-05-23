@@ -530,6 +530,78 @@ func TestAdmHasDisklessVolumeFalseAbsentSlot(t *testing.T) {
 	}
 }
 
+// TestAdmHasDisklessVolumeTrueDetaching pins the Bug 280 follow-up
+// case: there is a sub-second window after `drbdadm detach --force`
+// where the kernel reports `disk:Detaching` rather than
+// `disk:Diskless`. A reconcile that probes the kernel during this
+// window must still coerce the adjust onto `--skip-disk` — plain
+// `drbdadm adjust` here would schedule attach_cmd via drbd-utils'
+// compare_volume (kern->disk=="none" + conf->disk=<path>) and
+// race the operator's detach, re-attaching the disk before any
+// external poll can observe Diskless.
+//
+// Regression: the original Bug 280 fix only matched `disk:Diskless`
+// and explicitly skipped `disk:Detaching` as "transient" — but
+// transient is exactly when the race window is open, not a reason
+// to ignore it. The e2e5 disk-replace-internal-metadata scenario
+// caught this empirically: `drbdadm detach --force` would fire,
+// then 15 s later the test's poll would still see `UpToDate`
+// because a reconcile probed during the Detaching window, missed
+// the signal, and re-attached.
+func TestAdmHasDisklessVolumeTrueDetaching(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-detaching", storage.FakeResponse{
+		Stdout: []byte(`pvc-detaching node-id:0 role:Primary suspended:no force-io-failures:no
+  volume:0 minor:1003 disk:Detaching backing_dev:/dev/loop8 quorum:yes blocked:no
+      worker-2 node-id:1 connection:Connected role:Secondary congested:no
+      ap-in-flight:0 rs-in-flight:0
+    volume:0 replication:Established peer-disk:UpToDate resync-suspended:no
+`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-detaching")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+	}
+
+	if !diskless {
+		t.Errorf("HasDisklessVolume(mid-Detaching): got false, want true (would re-attach via plain adjust during detach race window)")
+	}
+}
+
+// TestAdmHasDisklessVolumeTrueFailed pins the Failed-disk arm:
+// when the lower disk returned an I/O error the kernel transitions
+// to `disk:Failed` before settling on `disk:Diskless`. The observer
+// stamps `DrbdOptions/SkipDisk=True` on Failed→Diskless, but until
+// that prop write propagates the kernel probe is the only safety
+// net. Plain `drbdadm adjust` on a Failed lower disk would attempt
+// a re-attach that DRBD refuses (or worse, succeeds against a
+// corrupt-but-not-yet-Failed disk); coerce to `--skip-disk` until
+// the operator clears the prop.
+func TestAdmHasDisklessVolumeTrueFailed(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose pvc-failed", storage.FakeResponse{
+		Stdout: []byte(`pvc-failed node-id:0 role:Primary suspended:no force-io-failures:no
+  volume:0 minor:1004 disk:Failed backing_dev:/dev/loop9 quorum:yes blocked:no
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	diskless, err := adm.HasDisklessVolume(t.Context(), "pvc-failed")
+	if err != nil {
+		t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+	}
+
+	if !diskless {
+		t.Errorf("HasDisklessVolume(Failed): got false, want true (Failed lower disk must coerce skip-disk)")
+	}
+}
+
 // TestAdmHasDisklessVolumeFalsePeerDiskless pins the per-peer
 // distinction: when the local volume is UpToDate but a PEER reports
 // peer-disk:Diskless (e.g., the operator detached the OTHER replica,
@@ -558,6 +630,52 @@ func TestAdmHasDisklessVolumeFalsePeerDiskless(t *testing.T) {
 
 	if diskless {
 		t.Errorf("HasDisklessVolume(peer-disk:Diskless only): got true, want false")
+	}
+}
+
+// TestAdmHasDisklessVolumeFalsePeerDetachingOrFailed pins the
+// per-peer distinction for the Detaching / Failed arms added in
+// the Bug 280 follow-up: when the local replica is UpToDate but
+// a PEER reports peer-disk:Detaching (operator just detached the
+// OTHER replica) or peer-disk:Failed (peer's lower disk died),
+// HasDisklessVolume must NOT trip. The local disk is healthy and
+// the next reconcile must run plain `drbdadm adjust` to converge
+// peer state — coercing skip-disk here would freeze the local
+// disk-level reconfig and trap the local replica's view of the
+// peer's transition (e.g., demoting peer to TIE_BREAKER) behind
+// the prop-clear, which never comes because nobody set the prop.
+func TestAdmHasDisklessVolumeFalsePeerDetachingOrFailed(t *testing.T) {
+	cases := []struct {
+		name    string
+		peerSt  string
+		resName string
+	}{
+		{name: "peer-detaching", peerSt: "Detaching", resName: "pvc-peer-detaching"},
+		{name: "peer-failed", peerSt: "Failed", resName: "pvc-peer-failed"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := storage.NewFakeExec()
+			fx.Expect("drbdsetup status --verbose "+tc.resName, storage.FakeResponse{
+				Stdout: []byte(`` + tc.resName + ` node-id:0 role:Primary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/loop6 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:` + tc.peerSt + `
+`),
+			})
+
+			adm := drbd.NewAdm(fx)
+
+			diskless, err := adm.HasDisklessVolume(t.Context(), tc.resName)
+			if err != nil {
+				t.Fatalf("HasDisklessVolume: unexpected error %v", err)
+			}
+
+			if diskless {
+				t.Errorf("HasDisklessVolume(peer-disk:%s only): got true, want false (local is UpToDate)", tc.peerSt)
+			}
+		})
 	}
 }
 
