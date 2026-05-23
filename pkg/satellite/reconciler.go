@@ -2389,12 +2389,17 @@ func (r *Reconciler) adjustResource(ctx context.Context, dr *intent.DesiredResou
 //
 // Probe the kernel directly via `HasDisklessVolume`: the kernel is
 // the authority on the disk's current state, independent of any
-// apiserver cache trail. When the kernel reports Diskless on a
-// slot that's already loaded (so we're past first activation), we
-// coerce the adjust onto `--skip-disk` regardless of the prop's
-// cache visibility. The operator's SkipDisk-stamp is a hint that
-// will catch up via the apiserver; the kernel probe closes the
-// race window in the meantime.
+// apiserver cache trail. When the kernel reports a not-attached
+// state (Diskless, Detaching, or Failed) on a slot that's already
+// loaded (so we're past first activation), we coerce the adjust
+// onto `--skip-disk` regardless of the prop's cache visibility.
+// The operator's SkipDisk-stamp is a hint that will catch up via
+// the apiserver; the kernel probe closes the race window in the
+// meantime. The Detaching arm closes a sub-second race window
+// where `drbdsetup status` lags `drbdadm detach --force`'s kernel
+// transition by reporting `disk:Detaching` rather than
+// `disk:Diskless`, which the old probe missed and the next
+// reconcile re-attached through.
 //
 // Errors from the probe fall through to the prop-only gate (the
 // pre-Bug-280 behaviour) so a transient netlink hiccup doesn't

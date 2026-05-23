@@ -654,12 +654,14 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 }
 
 // HasDisklessVolume reports whether any of the named resource's
-// volumes are currently in disk:Diskless state in the kernel. Used
+// volumes are currently in a "not-attached" disk state in the
+// kernel — specifically `Diskless`, `Detaching`, or `Failed`. Used
 // by the reconciler's runAdjust dispatch to detect the Bug 280
 // race window:
 //
 //   - Operator runs `drbdadm detach --force <rsc>` against the
-//     satellite shell. The kernel emits `change device disk:Diskless`
+//     satellite shell. The kernel transitions UpToDate →
+//     Detaching → Diskless and emits `change device disk:Diskless`
 //     on its events2 stream.
 //   - The observer's UpToDate→Diskless gate writes
 //     `DrbdOptions/SkipDisk=True` onto Spec.Props and the kernel's
@@ -674,8 +676,8 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 // `HasDisklessVolume` lets runAdjust probe the kernel directly
 // — the kernel is the authority on the disk's current state,
 // independent of any apiserver cache trail. When the kernel reports
-// Diskless we coerce the adjust onto `--skip-disk` regardless of
-// what the prop view says. Safe because:
+// a not-attached state we coerce the adjust onto `--skip-disk`
+// regardless of what the prop view says. Safe because:
 //
 //   - The first-activation path goes through `drbdadm up`, not
 //     adjust; this probe is only consulted by runAdjust, so a
@@ -690,11 +692,37 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 //     connections/peers half still adjusts), so an over-zealous
 //     coerce-to-SkipDisk wouldn't break anything either.
 //
+// Why include `Detaching` (Bug 280 follow-up):
+//   - There is a sub-second window after `drbdadm detach --force`
+//     where `drbdsetup status` reports `disk:Detaching` rather
+//     than `disk:Diskless`. A reconcile that probes during this
+//     window would otherwise miss the signal, fall through to
+//     plain `drbdadm adjust`, and re-attach via drbd-utils'
+//     compare_volume(kern->disk=="none" + conf->disk=<path>) →
+//     attach_cmd, racing the operator's recipe and flipping the
+//     replica back to UpToDate before any external poll can see
+//     Diskless. Detaching is unambiguously "kernel is mid-tear-
+//     down of the disk binding" — there is no legitimate reason
+//     to schedule attach_cmd in this state.
+//
+// Why include `Failed`:
+//   - The observer already stamps SkipDisk on Failed → Diskless,
+//     but until that prop write propagates the kernel probe is
+//     the only safety net. A `Failed` lower disk is by definition
+//     not safe to reattach via plain adjust — coerce to
+//     `--skip-disk` until the operator clears the prop or replaces
+//     the disk.
+//
+// `Attaching` is intentionally NOT included: it's a transient
+// state on the way INTO UpToDate, so we're already past the
+// detach window. Coercing skip-disk there would be a benign
+// no-op for the disk portion but adds nothing of value.
+//
 // Convention (matches IsLoaded):
 //   - non-zero exit from drbdsetup → false + nil (slot absent;
 //     not our race window)
 //   - parses each indented volume line (`disk:<state>`) and returns
-//     true on the first match for `disk:Diskless`.
+//     true on the first match for any of the not-attached states.
 func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, error) {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose", resource)
 	if err != nil {
@@ -707,25 +735,34 @@ func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, err
 	}
 
 	// `drbdsetup status --verbose` emits one block per resource;
-	// per-volume lines are indented and carry `disk:<state>`.
-	// `disk:Diskless` is the post-detach steady state; we don't
-	// match transient `disk:Detaching` / `disk:Attaching` because
-	// the kernel may bounce through those during a healthy reconcile
-	// and we'd false-trip the SkipDisk coerce.
+	// per-volume lines are indented and carry `disk:<state>`. The
+	// not-attached states are `Diskless` (steady state post-detach),
+	// `Detaching` (sub-second transient during `drbdadm detach
+	// --force`), and `Failed` (lower disk returned I/O errors —
+	// observer is about to stamp SkipDisk but we can't wait for
+	// the prop trail).
+	notAttached := []string{"disk:Diskless", "disk:Detaching", "disk:Failed"}
+
 	for line := range strings.SplitSeq(string(out), "\n") {
-		if !strings.Contains(line, "disk:Diskless") {
-			continue
-		}
+		for _, token := range notAttached {
+			if !strings.Contains(line, token) {
+				continue
+			}
 
-		// Skip `peer-disk:Diskless` lines — that's the remote
-		// peer's disk state, not ours. The local-disk line carries
-		// the `disk:` token without the `peer-` prefix.
-		if strings.Contains(line, "peer-disk:Diskless") &&
-			!strings.Contains(line, " disk:Diskless") {
-			continue
-		}
+			// Skip `peer-disk:<state>` lines — that's the remote
+			// peer's disk state, not ours. The local-disk line
+			// carries the `disk:` token without the `peer-` prefix;
+			// match on a leading space (' disk:') to disambiguate
+			// from `peer-disk:`.
+			peerToken := "peer-" + token
 
-		return true, nil
+			if strings.Contains(line, peerToken) &&
+				!strings.Contains(line, " "+token) {
+				continue
+			}
+
+			return true, nil
+		}
 	}
 
 	return false, nil
