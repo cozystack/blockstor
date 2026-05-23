@@ -641,6 +641,141 @@ func TestParseVolumeNumbersTolerantOfMalformedEntries(t *testing.T) {
 	}
 }
 
+// TestLookupVolumeNumbersFallsBackToStatusVolumes pins the Tier-3
+// fix: when both the parent RD Get and the
+// `blockstor.io/volume-numbers` annotation miss (the rolling-deploy
+// window where a Resource is deleted after the observer stamped
+// Status.Volumes but before the first apply stamped the annotation),
+// `lookupVolumeNumbers` MUST fall back to the observer-recorded
+// `Status.Volumes[].VolumeNumber` so the per-volume DeleteVolume loop
+// still finds the backing storage.
+func TestLookupVolumeNumbersFallsBackToStatusVolumes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-tier3-status"
+		rdName = "pvc-tier3-status"
+	)
+
+	scheme := newToggleDiskTestScheme(t)
+
+	// NO annotation stamped (apply never completed); NO RD seeded
+	// (cascade-delete already removed it). Only the observer-stamped
+	// Status.Volumes remains.
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName + "." + node},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               node,
+			ResourceDefinitionName: rdName,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+				{VolumeNumber: 0},
+				{VolumeNumber: 1},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{NodeName: node},
+	}
+
+	got, err := reconciler.lookupVolumeNumbers(context.Background(), res)
+	if err != nil {
+		t.Fatalf("lookupVolumeNumbers: %v", err)
+	}
+
+	want := []int32{0, 1}
+	if !slices.Equal(got, want) {
+		t.Errorf("lookupVolumeNumbers via Status.Volumes fallback = %v, want %v", got, want)
+	}
+}
+
+// TestHandleDeleteStripsFinalizerOnAllThreeSourcesMiss pins the
+// Tier-3 finalizer-strip deadlock fix: when a Resource is deleted
+// while its RD, the `volume-numbers` annotation, AND Status.Volumes
+// are ALL missing (genuinely-zero-volume resource, or every trace of
+// the volumes is gone), `handleDelete` MUST strip the
+// satellite-resource finalizer rather than requeue forever. Without
+// the fix the Resource wedges in Terminating and pollutes subsequent
+// tests.
+func TestHandleDeleteStripsFinalizerOnAllThreeSourcesMiss(t *testing.T) {
+	t.Parallel()
+
+	const (
+		node   = "n-tier3-miss"
+		rdName = "pvc-tier3-miss"
+	)
+
+	scheme := newToggleDiskTestScheme(t)
+
+	now := metav1.Now()
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              rdName + "." + node,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{SatelliteResourceFinalizer},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			NodeName:               node,
+			ResourceDefinitionName: rdName,
+		},
+		// No annotation, no Status.Volumes, and (below) no RD seeded.
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(res).
+		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		Build()
+
+	// Real satellite Reconciler with no providers/Adm — DeleteResource
+	// against an empty volume set must be a safe no-op.
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{NodeName: node})
+
+	reconciler := &ResourceReconciler{
+		Client: cli,
+		Config: Config{
+			NodeName:  node,
+			Apply:     rec,
+			Exec:      storage.NewFakeExec(),
+			APIReader: cli,
+		},
+	}
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: res.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	var after blockstoriov1alpha1.Resource
+
+	err = cli.Get(context.Background(), client.ObjectKey{Name: res.Name}, &after)
+	if apierrors.IsNotFound(err) {
+		// Finalizer stripped → fake apiserver finalised the delete.
+		return
+	}
+
+	if err != nil {
+		t.Fatalf("post-Reconcile Get: %v", err)
+	}
+
+	if slices.Contains(after.Finalizers, SatelliteResourceFinalizer) {
+		t.Errorf("Tier-3 regression: satellite finalizer survived handleDelete "+
+			"when RD + annotation + Status.Volumes all missing; Resource would "+
+			"wedge in Terminating forever (finalizers=%v)", after.Finalizers)
+	}
+}
+
 // TestRefreshTargetFromAPIReaderUnstucksWaitWhenCacheTrails pins
 // Bug 289: the controller-side allocator has already stamped
 // Status.DRBDNodeID / DRBDPort / DRBDMinor, but the satellite's c-r
