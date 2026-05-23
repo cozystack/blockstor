@@ -159,10 +159,10 @@ curl -fsS -XPUT -H'Content-Type: application/json' \
     -d '{"override_props":{"DrbdOptions/AutoAddQuorumTiebreaker":"false"}}' >/dev/null
 curl -fsS -XPOST -H'Content-Type: application/json' \
     "http://localhost:$PF_PORT/v1/resource-definitions/$RD/resources" \
-    -d "[{\"name\":\"$RD\",\"node_name\":\"$WORKER_1\",\"props\":{\"StorPoolName\":\"$POOL_NAME\"}}]" >/dev/null
+    -d "[{\"resource\":{\"node_name\":\"$WORKER_1\",\"props\":{\"StorPoolName\":\"$POOL_NAME\"}}}]" >/dev/null
 curl -fsS -XPOST -H'Content-Type: application/json' \
     "http://localhost:$PF_PORT/v1/resource-definitions/$RD/resources" \
-    -d "[{\"name\":\"$RD\",\"node_name\":\"$WORKER_3\",\"props\":{\"StorPoolName\":\"$POOL_NAME\"}}]" >/dev/null
+    -d "[{\"resource\":{\"node_name\":\"$WORKER_3\",\"props\":{\"StorPoolName\":\"$POOL_NAME\"}}}]" >/dev/null
 
 wait_uptodate "$RD" "$WORKER_1" "$WORKER_3"
 
