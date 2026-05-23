@@ -463,13 +463,36 @@ func (s *Server) upsertNodeAndDiskless(w http.ResponseWriter, r *http.Request, n
 
 	// Upstream LINSTOR auto-provisions a `DfltDisklessStorPool`
 	// per satellite at node-register time. CLI parity audit row #3.
-	// Pre-existing pool of the same name is left alone (ErrAlreadyExists
-	// is the no-op signal); any other error must NOT fail Node Create.
-	_ = s.Store.StoragePools().Create(r.Context(), &apiv1.StoragePool{
+	// Pre-existing pool of the same name is the idempotent no-op
+	// (ErrAlreadyExists / IsAlreadyExists). Any other error MUST
+	// surface — Bug 59 was a silent `_ =` here that swallowed CEL
+	// validation rejections from the k8s store, leaving every cluster
+	// with no DfltDisklessStorPool CRDs at all. Downstream RD creation
+	// then failed to find the pool and `n c` looked successful while
+	// the cluster was in a broken half-registered state.
+	createErr := s.Store.StoragePools().Create(r.Context(), &apiv1.StoragePool{
 		StoragePoolName: DfltDisklessStorPoolName,
 		NodeName:        n.Name,
 		ProviderKind:    apiv1.StoragePoolKindDiskless,
 	})
+	if createErr != nil && !errors.Is(createErr, store.ErrAlreadyExists) {
+		writeJSON(w, http.StatusInternalServerError, []apiv1.APICallRc{{
+			RetCode: apiCallRcError,
+			Message: "Node '" + n.Name + "' was registered but the " +
+				"per-satellite '" + DfltDisklessStorPoolName + "' pool " +
+				"could not be auto-created.",
+			Cause: createErr.Error(),
+			Correc: "Inspect the controller logs and retry `linstor node create " +
+				n.Name + "`; the operation is idempotent and will re-run " +
+				"the pool creation.",
+			ObjRefs: map[string]string{
+				objRefNode:     n.Name,
+				objRefStorPool: DfltDisklessStorPoolName,
+			},
+		}})
+
+		return false
+	}
 
 	return true
 }

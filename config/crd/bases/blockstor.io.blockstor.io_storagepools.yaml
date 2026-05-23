@@ -24,10 +24,20 @@ spec:
           node-bound CRD in the project follows: `metadata.name == <pool>.<node>`.
           Keeping the composite key encoded in the name lets operators grep for
           `<node>.` across kinds (Resource, Snapshot, StoragePool) and find every
-          resource bound to one satellite at once. The rule fires on both Create
-          and Update; the REST layer (`pkg/rest/storage_pools.go`) also rejects
-          non-canonical bodies with a friendlier 400 message so callers don't
-          have to parse the k8s 422 Invalid envelope.
+          resource bound to one satellite at once.
+
+          The match is case-insensitive (`lowerAscii()` on both sides) because
+          k8s metadata.Name is RFC-1123 (lowercase only) while LINSTOR identifiers
+          preserve their CamelCase spelling on the wire. Upstream's well-known
+          `DfltDisklessStorPool` is the canonical example — we must be able to
+          store it under metadata.name `dfltdisklessstorpool.<node>` while keeping
+          `spec.poolName == "DfltDisklessStorPool"` for byte-equal comparisons in
+          the satellite's provider registry (Bug 59).
+
+          The rule fires on both Create and Update; the REST layer
+          (`pkg/rest/storage_pools.go`) also rejects non-canonical bodies with a
+          friendlier 400 message so callers don't have to parse the k8s 422
+          Invalid envelope.
         properties:
           apiVersion:
             description: |-
@@ -190,10 +200,10 @@ spec:
         - spec
         type: object
         x-kubernetes-validations:
-        - message: metadata.name must equal <spec.poolName>.<spec.nodeName>
+        - message: metadata.name must equal <spec.poolName>.<spec.nodeName> (case-insensitive)
           optionalOldSelf: true
-          rule: oldSelf.hasValue() || self.metadata.name == self.spec.poolName + '.'
-            + self.spec.nodeName
+          rule: oldSelf.hasValue() || self.metadata.name.lowerAscii() == (self.spec.poolName
+            + '.' + self.spec.nodeName).lowerAscii()
     served: true
     storage: true
     subresources:

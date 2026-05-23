@@ -886,6 +886,136 @@ func TestNodeCreateAutoCreatesDfltDisklessStorPool(t *testing.T) {
 	}
 }
 
+// TestNodeCreateDfltDisklessStorPoolIdempotent pins the Bug 59 contract:
+// re-POSTing /v1/nodes for the same node MUST stay a 201 success rather
+// than a 500 — the `DfltDisklessStorPool` Create() returns
+// ErrAlreadyExists on the second pass and the handler must treat that
+// as the no-op signal it always was. Without the carve-out the
+// piraeus / cozystack operator-loop hot-spins (every reconcile tick
+// reposts the node and would see a fresh 500).
+func TestNodeCreateDfltDisklessStorPoolIdempotent(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+	})
+
+	for i := range 2 {
+		resp := httpPost(t, base+"/v1/nodes", body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("attempt %d POST /v1/nodes status: got %d, want 201",
+				i+1, resp.StatusCode)
+		}
+	}
+
+	// Exactly one DfltDisklessStorPool row must exist after two
+	// idempotent Creates — the second pass must not have spawned a
+	// duplicate row nor erased the first.
+	pools, err := st.StoragePools().ListByNode(context.Background(), "n1")
+	if err != nil {
+		t.Fatalf("list pools on n1: %v", err)
+	}
+
+	var count int
+
+	for i := range pools {
+		if pools[i].StoragePoolName == DfltDisklessStorPoolName &&
+			pools[i].ProviderKind == apiv1.StoragePoolKindDiskless {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("DfltDisklessStorPool row count on n1: got %d, want 1; pools=%+v",
+			count, pools)
+	}
+}
+
+// TestNodeCreateDfltDisklessStorPoolErrorSurfaces pins the Bug 59
+// fix: when the StoragePool store's Create() returns an error that is
+// NOT ErrAlreadyExists (e.g. a CEL validation rejection from the
+// k8s apiserver, a context-canceled mid-flight, etc.), the handler
+// MUST refuse the Node create with a 500 envelope so the operator
+// learns the cluster is in a broken half-registered state. The
+// original silent `_ =` swallow left every cluster with zero
+// DfltDisklessStorPool CRDs while `n c` looked like a success.
+func TestNodeCreateDfltDisklessStorPoolErrorSurfaces(t *testing.T) {
+	failErr := errors.New("cel validation rejected: metadata.name must equal pool+node")
+	st := &bug59SPCreateStore{
+		Store:  store.NewInMemory(),
+		spsErr: failErr,
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(apiv1.Node{
+		Name: "n1",
+		Type: apiv1.NodeTypeSatellite,
+	})
+
+	resp := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("POST /v1/nodes status: got %d, want 500", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("envelope entries: got %d, want 1; got=%+v", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("RetCode does not carry apiCallRcError bit: %d", rcs[0].RetCode)
+	}
+
+	if !strings.Contains(rcs[0].Message, DfltDisklessStorPoolName) {
+		t.Errorf("Message must mention the pool name; got=%q", rcs[0].Message)
+	}
+
+	if !strings.Contains(rcs[0].Cause, "cel validation rejected") {
+		t.Errorf("Cause must carry the underlying error; got=%q", rcs[0].Cause)
+	}
+}
+
+// bug59SPCreateStore wraps an in-memory Store but forces every
+// StoragePool Create() to return a fixed error — emulates the
+// k8s-apiserver CEL rejection / 5xx the Bug 59 silent-swallow used to
+// hide.
+type bug59SPCreateStore struct {
+	store.Store
+
+	spsErr error
+}
+
+func (b *bug59SPCreateStore) StoragePools() store.StoragePoolStore {
+	return &bug59SPStore{
+		StoragePoolStore: b.Store.StoragePools(),
+		err:              b.spsErr,
+	}
+}
+
+type bug59SPStore struct {
+	store.StoragePoolStore
+
+	err error
+}
+
+func (b *bug59SPStore) Create(_ context.Context, _ *apiv1.StoragePool) error {
+	return b.err
+}
+
 // TestNodeCreateReturnsConnectionWarning pins cli-parity-audit row #40:
 // upstream LINSTOR's `n c` returns a 2-entry ApiCallRc envelope on
 // the wire — a SUCCESS for the controller-side record, then a WARNING
