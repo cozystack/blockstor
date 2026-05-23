@@ -31,11 +31,15 @@ import (
 // fakeLosetup pre-loads the FakeExec so it answers the two losetup
 // invocations every CreateVolume / VolumeStatus path issues: a
 // `losetup -j <path>` lookup (returns empty = no existing loop) and
-// the `losetup --find --show <path>` attach (returns /dev/loop42).
+// the `losetup --find --show --direct-io=on <path>` attach (returns
+// /dev/loop42). The --direct-io=on flag was added as a P0 data-
+// integrity fix for the DRBD-on-FILE_THIN path (e2e6
+// drbd-luks-stack failover): without DIO, DRBD writes route through
+// the loop driver's page cache and never flush to the backing .img.
 // dev is the device the caller wants the fake to surface.
 func fakeLosetup(fx *storage.FakeExec, path, dev string) {
 	fx.Expect("losetup -j "+path, storage.FakeResponse{})
-	fx.Expect("losetup --find --show "+path, storage.FakeResponse{Stdout: []byte(dev + "\n")})
+	fx.Expect("losetup --find --show --direct-io=on "+path, storage.FakeResponse{Stdout: []byte(dev + "\n")})
 }
 
 // TestKindThick: thick provider declares LINSTOR's `FILE` kind.
