@@ -9,11 +9,20 @@
 # CSI shim with an auto-generated transient snapshot name.
 #
 # Setup:
-#   - source RD with known data on $N1 + $N2
+#   - source RD with known data on $N1 + $N2 (ZFS_THIN — see below)
 #   - call /v1/resource-definitions/{rd}/clone with a target name
 # Expected:
 #   - target RD exists
 #   - target's data == source's data (md5 match)
+#
+# Why ZFS_THIN: the satellite-side clone path materialises the new
+# replica from a backing-storage-native copy (`zfs clone` on ZFS_THIN,
+# `lvcreate --snapshot` on LVM_THIN, or an .img cp on FILE_THIN). The
+# FILE_THIN path on `stand` writes the clone image through the host
+# page cache and has the DRBD-on-loopfile write-loss interaction
+# documented in pkg/storage/file/file.go's attach() (Bug LUKS-failover,
+# commit f06830296). ZFS_THIN's `zfs clone` is byte-perfect by
+# construction.
 
 set -euo pipefail
 
@@ -28,13 +37,14 @@ require_workers 2
 
 RD_SRC=e2e-clone-src
 RD_DST=e2e-clone-dst
+STORPOOL=${STORPOOL:-zfs-thin}
 N1=$WORKER_1
 N2=$WORKER_2
 
 trap 'delete_rd "$RD_SRC"; delete_rd "$RD_DST"' EXIT
 
-echo ">> apply source RD"
-rd_apply "$RD_SRC" "$N1" "$N2"
+echo ">> apply source RD (pool=${STORPOOL})"
+rd_apply "$RD_SRC" "$N1" "$N2" 65536 "$STORPOOL"
 wait_uptodate "$RD_SRC" "$N1" "$N2"
 
 DEV=$(device_for_rd "$RD_SRC" "$N1")
@@ -56,7 +66,7 @@ rest_post "/v1/resource-definitions/${RD_SRC}/snapshot-restore-resource" \
     "{\"to_resource\":\"${RD_DST}\",\"snapshot_name\":\"${SNAP}\"}"
 
 rest_post "/v1/resource-definitions/${RD_DST}/autoplace" \
-    "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"stand\"}}"
+    "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"${STORPOOL}\"}}"
 
 RD=$RD_DST
 wait_uptodate "$RD_DST" "$N1" "$N2"
