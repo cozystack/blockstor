@@ -25,25 +25,27 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage"
 )
 
-// kernelCleanupFixture is the standard `drbdsetup show -j pvc-1`
+// kernelCleanupFixture is the standard `drbdsetup status -j pvc-1`
 // fixture: worker-1 healthy (Connected, one peer-device), worker-2
 // stuck (Connecting, no peer-device — the Bug 342 signature). Pass-1
 // tests strip one of these from `expectedPeerNames`; Pass-3 tests
-// keep both expected and drive the debounce timer.
+// keep both expected and drive the debounce timer. Field shape matches
+// real drbd-utils `status -j` output (connections[].name /
+// .connection-state / .peer-node-id / .peer_devices[].volume).
 const kernelCleanupFixture = `[
   {
-    "_name": "pvc-1",
+    "name": "pvc-1",
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-1",
-        "connection": "Connected",
-        "peer_devices": [ { "volume_nr": 0 } ]
+        "peer-node-id": 1,
+        "name": "worker-1",
+        "connection-state": "Connected",
+        "peer_devices": [ { "volume": 0 } ]
       },
       {
-        "peer_node_id": 2,
-        "_peer_node_name": "worker-2",
-        "connection": "Connecting",
+        "peer-node-id": 2,
+        "name": "worker-2",
+        "connection-state": "Connecting",
         "peer_devices": []
       }
     ]
@@ -51,13 +53,13 @@ const kernelCleanupFixture = `[
 ]`
 
 // newKernelCleanupReconciler builds a Reconciler wired to a FakeExec
-// pre-loaded with the show fixture. Each test gets its own FakeExec
+// pre-loaded with the status fixture. Each test gets its own FakeExec
 // so command-line assertions don't bleed across cases.
 func newKernelCleanupReconciler(t *testing.T) (*Reconciler, *storage.FakeExec) {
 	t.Helper()
 
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte(kernelCleanupFixture),
 	})
 
@@ -128,10 +130,10 @@ func TestPruneStaleKernelSlots_Pass3DebouncesStuckSlot(t *testing.T) {
 	r.seenStuckAt[key] = time.Now().Add(-2 * defaultStuckSlotGrace)
 	r.mu.Unlock()
 
-	// Re-register the show fixture — FakeExec consumed the canned
+	// Re-register the status fixture — FakeExec consumed the canned
 	// response on the first call.
 	fx.Reset()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte(kernelCleanupFixture),
 	})
 
@@ -187,26 +189,26 @@ func TestPruneStaleKernelSlots_Pass3HealthyClearsDebounce(t *testing.T) {
 	// with a peer-device — healthy. The debounce entry must clear.
 	const healthyFixture = `[
   {
-    "_name": "pvc-1",
+    "name": "pvc-1",
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-1",
-        "connection": "Connected",
-        "peer_devices": [ { "volume_nr": 0 } ]
+        "peer-node-id": 1,
+        "name": "worker-1",
+        "connection-state": "Connected",
+        "peer_devices": [ { "volume": 0 } ]
       },
       {
-        "peer_node_id": 2,
-        "_peer_node_name": "worker-2",
-        "connection": "Connected",
-        "peer_devices": [ { "volume_nr": 0 } ]
+        "peer-node-id": 2,
+        "name": "worker-2",
+        "connection-state": "Connected",
+        "peer_devices": [ { "volume": 0 } ]
       }
     ]
   }
 ]`
 
 	fx.Reset()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte(healthyFixture),
 	})
 
@@ -234,11 +236,11 @@ func TestPruneStaleKernelSlots_Pass3HealthyClearsDebounce(t *testing.T) {
 // TestPruneStaleKernelSlots_NoKernelSlotsIsNoop: when drbdsetup
 // reports no resource (kernel module loaded but slot absent — the
 // post-down / pre-up steady state), the prune must succeed with no
-// shell-outs beyond the show probe. Also clears any stale debounce
+// shell-outs beyond the status probe. Also clears any stale debounce
 // state so a future re-up starts from a clean timer.
 func TestPruneStaleKernelSlots_NoKernelSlotsIsNoop(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte("[]"),
 	})
 
@@ -256,10 +258,10 @@ func TestPruneStaleKernelSlots_NoKernelSlotsIsNoop(t *testing.T) {
 		t.Fatalf("PruneStaleKernelSlots: %v", err)
 	}
 
-	// Only the show probe, nothing else.
+	// Only the status probe, nothing else.
 	cmds := fx.CommandLines()
-	if len(cmds) != 1 || cmds[0] != "drbdsetup show -j pvc-1" {
-		t.Errorf("expected only the show probe, got: %v", cmds)
+	if len(cmds) != 1 || cmds[0] != "drbdsetup status -j pvc-1" {
+		t.Errorf("expected only the status probe, got: %v", cmds)
 	}
 
 	if _, ok := r.seenStuckAt["pvc-1/worker-2"]; ok {

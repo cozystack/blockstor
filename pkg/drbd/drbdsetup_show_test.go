@@ -33,35 +33,41 @@ import (
 // channel split doesn't change the match semantics.
 var errShowResourceAbsent = errors.New("drbdsetup exited non-zero")
 
-// sampleShowTwoPeers is a fabricated `drbdsetup show -j pvc-1`
-// fixture with two peer connections: worker-1 (Connected, one
-// peer-device on volume 0) and worker-2 (Connecting, no peer-device
-// — the Bug 342 zombie signature).
+// sampleShowTwoPeers is a `drbdsetup status -j pvc-1` fixture with two
+// peer connections: worker-1 (Connected, one peer-device on volume 0)
+// and worker-2 (Connecting, no peer-device — the Bug 342 zombie
+// signature). The field shape is captured verbatim from a real
+// satellite (`kubectl exec ds/blockstor-satellite -- drbdsetup status
+// -j <res>` on the QEMU stand, drbd-utils 9.x): peer name is
+// `connections[].name`, peer node-id is `connections[].peer-node-id`,
+// connection state is `connections[].connection-state`, and the
+// per-volume peer-device array nests under `peer_devices[].volume`.
+// The previous fabricated fixture used `_peer_node_name` / `connection`
+// / `peer_node_id` / `volume_nr`, none of which exist in real output —
+// which is exactly why PruneStaleKernelSlots was dead code (Bug B).
 const sampleShowTwoPeers = `[
   {
-    "_name": "pvc-1",
-    "_my_node_id": 0,
-    "_this_host": {
-      "node_id": 0,
-      "volumes": [
-        { "volume_nr": 0 }
-      ]
-    },
+    "name": "pvc-1",
+    "node-id": 0,
+    "role": "Secondary",
+    "devices": [
+      { "volume": 0, "minor": 20000, "disk-state": "UpToDate" }
+    ],
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-1",
-        "net": {},
-        "connection": "Connected",
+        "peer-node-id": 1,
+        "name": "worker-1",
+        "connection-state": "Connected",
+        "peer-role": "Secondary",
         "peer_devices": [
-          { "volume_nr": 0, "peer-disk-state": "UpToDate" }
+          { "volume": 0, "replication-state": "Established", "peer-disk-state": "UpToDate" }
         ]
       },
       {
-        "peer_node_id": 2,
-        "_peer_node_name": "worker-2",
-        "net": {},
-        "connection": "Connecting",
+        "peer-node-id": 2,
+        "name": "worker-2",
+        "connection-state": "Connecting",
+        "peer-role": "Unknown",
         "peer_devices": []
       }
     ]
@@ -74,7 +80,7 @@ const sampleShowTwoPeers = `[
 // presence set.
 func TestAdmShowParsesTwoPeers(t *testing.T) {
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte(sampleShowTwoPeers),
 	})
 	adm := drbd.NewAdm(fx)
@@ -152,7 +158,7 @@ func TestAdmShowAbsentResourceReturnsNilNil(t *testing.T) {
 			// before substring matching; carry the verbatim
 			// drbd-utils message on Stdout while pairing with
 			// the err113-friendly static sentinel error.
-			fx.Expect("drbdsetup show -j pvc-x", storage.FakeResponse{
+			fx.Expect("drbdsetup status -j pvc-x", storage.FakeResponse{
 				Stdout: []byte(tc.stderr),
 				Err:    errShowResourceAbsent,
 			})
@@ -192,7 +198,7 @@ func TestAdmShowBlankAndMalformedDegradeToNil(t *testing.T) {
 			t.Parallel()
 
 			fx := storage.NewFakeExec()
-			fx.Expect("drbdsetup show -j pvc-z", storage.FakeResponse{
+			fx.Expect("drbdsetup status -j pvc-z", storage.FakeResponse{
 				Stdout: []byte(tc.stdout),
 			})
 
@@ -208,22 +214,22 @@ func TestAdmShowBlankAndMalformedDegradeToNil(t *testing.T) {
 	}
 }
 
-// TestAdmShowSkipsNamelessSlots — drbd-utils pre-9.x emits
-// connections without `_peer_node_name`. The v3 prune keys on peer
-// name to cross-reference K8s expected peers, so nameless slots are
-// useless and must be filtered out.
+// TestAdmShowSkipsNamelessSlots — a connection still mid-negotiation
+// can surface with an empty `name`. The v3 prune keys on peer name to
+// cross-reference K8s expected peers, so nameless slots are useless and
+// must be filtered out.
 func TestAdmShowSkipsNamelessSlots(t *testing.T) {
 	const namelessFixture = `[
   {
     "connections": [
-      { "peer_node_id": 1, "_peer_node_name": "", "connection": "Connecting", "peer_devices": [] },
-      { "peer_node_id": 2, "_peer_node_name": "worker-2", "connection": "Connected", "peer_devices": [ { "volume_nr": 0 } ] }
+      { "peer-node-id": 1, "name": "", "connection-state": "Connecting", "peer_devices": [] },
+      { "peer-node-id": 2, "name": "worker-2", "connection-state": "Connected", "peer_devices": [ { "volume": 0 } ] }
     ]
   }
 ]`
 
 	fx := storage.NewFakeExec()
-	fx.Expect("drbdsetup show -j pvc-1", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-1", storage.FakeResponse{
 		Stdout: []byte(namelessFixture),
 	})
 

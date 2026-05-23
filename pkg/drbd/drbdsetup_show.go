@@ -26,13 +26,23 @@ import (
 
 // KernelSlot is the satellite-facing view of one peer connection slot
 // the DRBD kernel currently holds for a resource. Captured at probe
-// time by Adm.Show via `drbdsetup show -j <rd>`. Consumed by the Bug
+// time by Adm.Show via `drbdsetup status -j <rd>`. Consumed by the Bug
 // 342 v3 proactive prune in pkg/satellite/kernel_cleanup.go: two
 // state-only passes (peer-not-expected and stuck-Connecting/StandAlone-
 // with-no-peer-device) drive `drbdadm del-peer` + `drbdmeta forget-peer`
 // without touching the previously-rendered .res file (which may not
 // exist on a fresh satellite-pod for a relocated replica — the Bug 342
 // root scenario).
+//
+// We probe `drbdsetup status -j`, NOT `drbdsetup show -j`. The latter
+// dumps only the static *configuration* (peer names, node-ids, backing
+// disks) and carries no `connection-state` field and no per-volume
+// peer-device runtime — so the Pass-3 stuck-slot probe (which keys on
+// Connecting/StandAlone + missing peer-device) had nothing to act on and
+// the prune was dead code. `status -j` is the runtime view: it reports
+// `connections[].connection-state`, `connections[].name`,
+// `connections[].peer-node-id` and `connections[].peer_devices[].volume`,
+// which is exactly the KernelSlot shape.
 //
 // We model only the fields the v3 prune actually consumes; drbd-utils
 // adds tail fields freely and a strict full-shape parser would break
@@ -51,10 +61,10 @@ type KernelSlot struct {
 	// when clearing the per-volume metadata slot.
 	NodeID int32
 
-	// ConnectionState is the `.connections[].connection` token from
-	// drbdsetup show -j: "Connected", "Connecting", "StandAlone",
-	// "BrokenPipe", "NetworkFailure", "Timeout", etc. The Pass-3
-	// stuck-slot probe only acts on Connecting / StandAlone.
+	// ConnectionState is the `.connections[].connection-state` token
+	// from drbdsetup status -j: "Connected", "Connecting",
+	// "StandAlone", "BrokenPipe", "NetworkFailure", "Timeout", etc.
+	// The Pass-3 stuck-slot probe only acts on Connecting / StandAlone.
 	ConnectionState string
 
 	// PeerDevicesByVolNum is a presence set of volume numbers the
@@ -105,32 +115,41 @@ func (s *KernelSlot) HasAnyPeerDeviceConfigured(volumes []int32) bool {
 	return false
 }
 
-// drbdsetupShowRoot is the top-level shape of `drbdsetup show -j <rd>`.
-// drbd-utils emits one array element per resource named on the
+// drbdsetupStatusRoot is the top-level shape of `drbdsetup status -j
+// <rd>`. drbd-utils emits one array element per resource named on the
 // command line; the satellite always invokes with a single resource,
 // so we read the first element only.
-type drbdsetupShowRoot []drbdsetupShowResource
+type drbdsetupStatusRoot []drbdsetupStatusResource
 
-// drbdsetupShowResource is one resource block from drbdsetup show -j.
-// We model only the fields the v3 prune consumes.
-type drbdsetupShowResource struct {
-	Connections []drbdsetupShowConnection `json:"connections"`
+// drbdsetupStatusResource is one resource block from drbdsetup status
+// -j. We model only the fields the v3 prune consumes.
+type drbdsetupStatusResource struct {
+	Connections []drbdsetupStatusConnection `json:"connections"`
 }
 
-// drbdsetupShowConnection is one peer connection slot.
-type drbdsetupShowConnection struct {
-	PeerNodeID    int32                     `json:"peer_node_id"`
-	PeerName      string                    `json:"_peer_node_name"`
-	ConnectionStr string                    `json:"connection"`
-	PeerDevices   []drbdsetupShowPeerDevice `json:"peer_devices"`
+// drbdsetupStatusConnection is one peer connection slot, as emitted by
+// `drbdsetup status -j`. Field names mirror the verbatim drbd-utils
+// JSON: `peer-node-id`, `name`, `connection-state`, and a nested
+// `peer_devices` array (note the underscore — that one key is snake_case
+// while its siblings are kebab-case in drbd-utils' output).
+type drbdsetupStatusConnection struct {
+	PeerNodeID    int32                       `json:"peer-node-id"`
+	PeerName      string                      `json:"name"`
+	ConnectionStr string                      `json:"connection-state"`
+	PeerDevices   []drbdsetupStatusPeerDevice `json:"peer_devices"`
 }
 
-type drbdsetupShowPeerDevice struct {
-	VolumeNumber int32 `json:"volume_nr"`
+type drbdsetupStatusPeerDevice struct {
+	VolumeNumber int32 `json:"volume"`
 }
 
-// Show runs `drbdsetup show -j <resource>` and parses the output into
-// a map keyed by peer node name.
+// Show runs `drbdsetup status -j <resource>` and parses the output
+// into a map keyed by peer node name.
+//
+// Despite the name (kept for caller stability), this probes
+// `status -j`, not `show -j`: only the status output carries the
+// runtime `connection-state` and per-volume peer-device data the
+// Bug 342 v3 prune reasons about. `show -j` is config-only.
 //
 // Tolerant of:
 //   - resource not present in kernel (drbdsetup non-zero with
@@ -142,7 +161,7 @@ type drbdsetupShowPeerDevice struct {
 //
 //nolint:nilnil // nil map IS the empty-result signal; sentinel error would force callers to branch on errors.Is without value.
 func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot, error) {
-	out, err := a.exec.Run(ctx, "drbdsetup", "show", "-j", resource)
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", "-j", resource)
 	if err != nil {
 		// "No currently configured DRBD found" / "Unknown resource"
 		// / "no resources defined" are the verbatim drbd-utils
@@ -155,7 +174,7 @@ func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot,
 			return nil, nil
 		}
 
-		return nil, errors.Wrapf(err, "drbdsetup show -j %s", resource)
+		return nil, errors.Wrapf(err, "drbdsetup status -j %s", resource)
 	}
 
 	return parseShowJSON(out), nil
@@ -171,7 +190,7 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 		return nil
 	}
 
-	var root drbdsetupShowRoot
+	var root drbdsetupStatusRoot
 
 	err := json.Unmarshal([]byte(body), &root)
 	if err != nil {
@@ -187,10 +206,10 @@ func parseShowJSON(out []byte) map[string]KernelSlot {
 
 	for i := range res.Connections {
 		c := &res.Connections[i]
-		// Skip nameless slots — drbd-utils versions before
-		// `_peer_node_name` emit only the node-id. The v3 prune
-		// keys on peer-name to cross-reference K8s expected
-		// peers, so an entry with no name is useless to us.
+		// Skip nameless slots — a connection still mid-negotiation can
+		// surface with an empty `name`. The v3 prune keys on peer-name
+		// to cross-reference K8s expected peers, so an entry with no
+		// name is useless to us.
 		if c.PeerName == "" {
 			continue
 		}
