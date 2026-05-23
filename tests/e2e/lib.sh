@@ -238,11 +238,21 @@ device_for_rd() {
 
 # write_random NODE DEV BYTES — write urandom to the device, return md5.
 # BYTES is rounded up to a 4096-byte block (direct I/O alignment).
+#
+# Talos guard: on no-udev systems an `open(2)` against a missing
+# `/dev/drbd<N>` silently creates a regular file in tmpfs and dd
+# writes into THAT instead of the kernel's DRBD device. Tests then
+# observe a false PASS because the read-back hash matches what was
+# just written to tmpfs. The `test -b` guard ABORTs the test instead
+# so a regression in EnsureDeviceNode (pkg/drbd/devnode.go) surfaces
+# loudly. Returns exit 2 (distinct from dd's exit 1) so test-runner
+# logs make the failure mode unambiguous.
 write_random() {
     local node=$1 dev=$2 bytes=$3
     local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
+        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
         dd if=/dev/urandom of=${dev} bs=4096 count=${blocks} status=none oflag=direct
         dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
@@ -250,11 +260,16 @@ write_random() {
 
 # read_md5 NODE DEV BYTES — read first BYTES of DEV, return md5.
 # Same alignment rules as write_random.
+#
+# Talos guard: same rationale as write_random above. A missing
+# `/dev/drbd<N>` would let dd read all-zeros from a tmpfs regular file
+# and return a deterministic-but-wrong hash. Abort instead.
 read_md5() {
     local node=$1 dev=$2 bytes=$3
     local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
+        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
         dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
 }
