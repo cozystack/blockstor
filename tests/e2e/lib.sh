@@ -437,6 +437,87 @@ wait_cluster_idle() {
     return 0
 }
 
+# reset_cluster_state forces the cluster back to a clean slate between
+# back-to-back e2e scenarios run by stand/run-scenarios-only.sh.
+#
+# Unlike wait_cluster_idle (which only *waits* and never mutates), this
+# actively tears down leftover state the way stand/iter.sh does between
+# dev-loop iterations: it deletes every RD, force-strips stuck
+# satellite-resource finalizers, runs `drbdsetup down` for any kernel-
+# resident DRBD resource on every satellite, wipes per-resource
+# .res / .md-created markers, and removes orphan regular-file
+# /dev/drbd<N> entries.
+#
+# Why this is needed: the batch dispatcher (run-scenarios-only.sh)
+# previously ran scenarios back-to-back with NO inter-scenario cleanup.
+# A test that crashed mid-flight (or force-deleted satellites) left
+# orphan kernel slots, stale .res files, and stuck finalizers behind —
+# wedging every subsequent scenario into a cascade of false FAILs
+# (Run 54: 7+ cascade victims). Calling this between scenarios gives
+# each one the same clean cluster that `make iter` does.
+#
+# The .owned markers are deliberately left in place — they record which
+# StoragePool owns a backing device and are not per-RD scratch state.
+# Best-effort throughout: every step swallows its own errors so a
+# partially-wedged cluster still gets maximally cleaned. Returns the
+# exit status of the final delete_all_rds convergence wait so the
+# caller can log (but not necessarily fail on) a stand that won't drain.
+reset_cluster_state() {
+    local timeout=${1:-90}
+
+    echo ">> reset_cluster_state: begin $(date -Iseconds)"
+
+    # 1. Strip stuck satellite-resource finalizers BEFORE the RD wipe.
+    #    If a previous scenario force-deleted its satellite pods, nothing
+    #    is left to clear the finalizer and `kubectl delete` would hang.
+    #    Patching finalizers=[] makes the subsequent delete_all_rds
+    #    actually complete instead of blocking on the apiserver.
+    kubectl get resources.blockstor.io.blockstor.io -o name 2>/dev/null \
+        | xargs -r -I{} kubectl patch {} --type=merge \
+            -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    kubectl get resourcedefinitions.blockstor.io.blockstor.io -o name 2>/dev/null \
+        | xargs -r -I{} kubectl patch {} --type=merge \
+            -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+
+    # 2. Tear down RDs / Resources / Snapshots and wait for the CRD layer
+    #    + per-RD kernel teardown (delete_rd runs drbdsetup down + .res /
+    #    .md-created removal for each enumerated RD) to converge.
+    local rc=0
+    delete_all_rds "$timeout" || rc=$?
+
+    # 3. Sweep any DRBD resource the kernel still holds that delete_all_rds
+    #    couldn't enumerate (its owning RD was already gone, so delete_rd
+    #    never named it). `drbdsetup down` operates directly on kernel
+    #    state and doesn't need a .res file. Wipe per-resource .res /
+    #    .md-created markers too; leave .owned markers alone.
+    for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+        timeout 30 kubectl -n "$NS" exec "$pod" -- bash -c '
+            for r in $(drbdsetup status --json 2>/dev/null \
+                | python3 -c "import json,sys; print(\" \".join(r[\"name\"] for r in json.load(sys.stdin)))" 2>/dev/null); do
+                timeout 5 drbdsetup down "$r" 2>/dev/null || true
+            done
+            rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true
+        ' 2>/dev/null || true
+    done
+
+    # 4. Wipe residual /dev/drbd<N> entries that are REGULAR FILES (not
+    #    block devices) — a previous scenario's `dd of=/dev/drbdN` that
+    #    raced ahead of the kernel uevent leaves a regular file that then
+    #    blocks devtmpfs from auto-creating the real block node. Preserve
+    #    genuine block-device entries (the kernel owns those).
+    for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+        timeout 15 kubectl -n "$NS" exec "$pod" -- bash -c '
+            for f in /dev/drbd*; do
+                [ -e "$f" ] && [ -f "$f" ] && [ ! -b "$f" ] && rm -f "$f"
+            done
+            true
+        ' 2>/dev/null || true
+    done
+
+    echo ">> reset_cluster_state: done $(date -Iseconds) (delete_all_rds rc=$rc)"
+    return $rc
+}
+
 # require_workers enforces that the cluster has at least N satellite
 # nodes Ready AND at least N satellite pods Ready (Bug 298). The pod-
 # readiness check guards against the previous-test-cascade pattern:

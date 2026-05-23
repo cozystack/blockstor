@@ -61,7 +61,21 @@ if [ "$pool_count" -lt 1 ]; then
     echo "pool-check (post-provision): storagepools=$pool_count" >> "$RESULTS"
 fi
 
+# reset_cluster_state (tests/e2e/lib.sh) is the shared inter-scenario
+# cleanup. We source lib.sh inside a subshell per call so its
+# `set -euo pipefail` doesn't leak into this dispatcher — the loop
+# below deliberately runs without `set -e` so one scenario's FAIL
+# doesn't abort the whole batch.
+LIB="$PWD/tests/e2e/lib.sh"
+reset_between_scenarios() {
+    # KUBECONFIG is already exported above; lib.sh reads it + $NS.
+    ( set +e; source "$LIB"; reset_cluster_state 120 ) >> "$RESULTS" 2>&1 || true
+}
+
+scenario_count=${#SCENARIOS[@]}
+scenario_idx=0
 for sc in "${SCENARIOS[@]}"; do
+    scenario_idx=$((scenario_idx + 1))
     # L6 cli-matrix cells are referenced as `cli-matrix/<cell>` so
     # SCENARIO=<that> resolves to ./tests/e2e/cli-matrix/<cell>.sh
     # via stand/Makefile's `./tests/e2e/$${SCENARIO}.sh`. The slash
@@ -80,6 +94,17 @@ for sc in "${SCENARIOS[@]}"; do
         fi
     fi
     echo "=== END $(date -Iseconds) $sc ===" >> "$RESULTS"
+
+    # Inter-scenario cleanup: reset the cluster to a clean slate so the
+    # next scenario doesn't inherit orphan kernel slots / stale .res
+    # files / stuck finalizers left behind by this one (Run 54 cascades).
+    # Skip after the final scenario — nothing follows, so it's wasted
+    # work and only delays the results file.
+    if (( scenario_idx < scenario_count )); then
+        echo "=== CLEANUP $(date -Iseconds) after $sc ===" >> "$RESULTS"
+        reset_between_scenarios
+        echo "=== CLEANUP-DONE $(date -Iseconds) after $sc ===" >> "$RESULTS"
+    fi
 done
 
 echo "all-scenarios-done: $(date -Iseconds)" >> "$RESULTS"
