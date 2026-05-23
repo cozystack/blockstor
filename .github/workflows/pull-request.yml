@@ -290,7 +290,16 @@ jobs:
     # Wall-time budget: ~45-75 min (Talos boot ~10 min cached / ~20
     # min cold, blockstor+pools install ~5 min, 3 scenarios ~10-20
     # min each). 90-minute timeout-minutes cap.
-    runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'e2e-stand') && 'oracle-vm-24cpu-96gb-x86-64' || 'ubuntu-latest' }}
+    # Runner: self-hosted Talos-host with KVM and DRBD module preloaded.
+    # The CNCF Oracle pool runner does NOT expose /dev/kvm (verified 2026-
+    # 05-22), and GitHub-hosted ubuntu-latest does not ship the DRBD
+    # kernel module. The only realistic place to run real Talos+QEMU+
+    # DRBD e2e is the blockstor dev stand, which already has KVM,
+    # registered DRBD module, and provisioning scripts. Register the
+    # stand as a self-hosted runner (one-time setup, see docs/CI-RUNNER-
+    # SETUP.md) with the `e2e-stand` label; the job is gated on the
+    # `e2e-stand` PR label so only labelled PRs claim the runner.
+    runs-on: [self-hosted, e2e-stand]
     needs: [detect-changes, lint, unit-test]
     if: |
       contains(github.event.pull_request.labels.*.name, 'e2e-stand') &&
