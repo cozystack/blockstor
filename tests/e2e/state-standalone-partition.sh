@@ -30,6 +30,23 @@
 # `Connected` as healthy; alternatively assert via NEGATION (no
 # StandAlone/Connecting/NetworkFailure/BrokenPipe present on the
 # peer line).
+#
+# Why ZFS_THIN: this scenario asserts byte-perfect equality of a marker
+# payload across a partition/heal cycle on the Primary. On the default
+# `stand` pool (FILE_THIN, sparse .img + losetup) the marker round-trip
+# races the DRBD-on-loopfile write-path interaction documented in
+# pkg/storage/file/file.go's attach() (commit f06830296): fresh-attach
+# gets LO_FLAGS_DIRECT_IO but pre-existing loops survive satellite
+# restart with DIO=0, and a sibling reconcile during the partition
+# window can invalidate the loop driver's page cache, exposing stale
+# .img bytes when read_md5 reads back through DRBD. Run 52 surfaced
+# this as `marker drift on worker-1` after the satellite roll for
+# commit 43ba5a44c (mknod /dev/drbd<N>) landed mid-suite, leaving a
+# residue-DIO loop on N1. ZFS-backed zvols have no host-side page-cache
+# layer between DRBD and the backing dataset — byte-perfect by
+# construction. Mirrors commit 6585a8754 which migrated the other
+# byte-integrity scenarios (clone, snapshot-restore-cross-node) off
+# FILE_THIN onto ZFS_THIN for the same reason.
 
 set -euo pipefail
 
@@ -43,6 +60,7 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 2
 
 RD=e2e-5-10-standalone-partition
+STORPOOL=${STORPOOL:-zfs-thin}
 N1=$WORKER_1
 N2=$WORKER_2
 SIZE_BYTES=$((1024 * 1024))   # 1 MiB marker payload — large enough to
@@ -98,7 +116,7 @@ metadata: {name: ${RD}.${N1}}
 spec:
   resourceDefinitionName: ${RD}
   nodeName: ${N1}
-  props: {StorPoolName: stand}
+  props: {StorPoolName: ${STORPOOL}}
 ---
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: Resource
@@ -106,7 +124,7 @@ metadata: {name: ${RD}.${N2}}
 spec:
   resourceDefinitionName: ${RD}
   nodeName: ${N2}
-  props: {StorPoolName: stand}
+  props: {StorPoolName: ${STORPOOL}}
 EOF
 
 wait_uptodate "$RD" "$N1" "$N2"
