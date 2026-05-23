@@ -281,7 +281,7 @@ func TestApplyDRBDAdjustsViaFsmDispatchOnly(t *testing.T) {
 }
 
 // TestAdjustResourceUsesSkipNetOnStandAlonePeer pins the W12 +
-// network-partition guard: when `drbdsetup show -j` reports any peer
+// network-partition guard: when `drbdsetup status -j` reports any peer
 // in `StandAlone` (operator-initiated disconnect — the W12 victim
 // recipe pre-amble + the iptables-partition wedge case), runAdjust
 // MUST dispatch `drbdadm adjust --skip-net` rather than plain
@@ -303,17 +303,17 @@ func TestAdjustResourceUsesSkipNetOnStandAlonePeer(t *testing.T) {
 `),
 	})
 
-	fx.Expect("drbdsetup show -j pvc-w12-victim", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-w12-victim", storage.FakeResponse{
 		Stdout: []byte(`[
   {
     "name": "pvc-w12-victim",
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-2",
-        "connection": "StandAlone",
+        "peer-node-id": 1,
+        "name": "worker-2",
+        "connection-state": "StandAlone",
         "peer_devices": [
-          {"volume_nr": 0}
+          {"volume": 0}
         ]
       }
     ]
@@ -378,17 +378,17 @@ func TestAdjustResourceSkipsBothNetAndDiskOnDoubleSignal(t *testing.T) {
 `),
 	})
 
-	fx.Expect("drbdsetup show -j pvc-double-skip", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-double-skip", storage.FakeResponse{
 		Stdout: []byte(`[
   {
     "name": "pvc-double-skip",
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-2",
-        "connection": "StandAlone",
+        "peer-node-id": 1,
+        "name": "worker-2",
+        "connection-state": "StandAlone",
         "peer_devices": [
-          {"volume_nr": 0}
+          {"volume": 0}
         ]
       }
     ]
@@ -442,7 +442,7 @@ func TestAdjustResourceSkipsBothNetAndDiskOnDoubleSignal(t *testing.T) {
 }
 
 // TestAdjustResourceBareWhenAllPeersConnected pins the steady-state
-// regression guard: when `drbdsetup show -j` reports all peer slots
+// regression guard: when `drbdsetup status -j` reports all peer slots
 // in `Connected` (or any non-StandAlone state), runAdjust MUST fall
 // back to plain `drbdadm adjust`. A regression that always coerced
 // `--skip-net` on the presence of a Show response would strand
@@ -460,17 +460,17 @@ func TestAdjustResourceBareWhenAllPeersConnected(t *testing.T) {
 `),
 	})
 
-	fx.Expect("drbdsetup show -j pvc-all-connected", storage.FakeResponse{
+	fx.Expect("drbdsetup status -j pvc-all-connected", storage.FakeResponse{
 		Stdout: []byte(`[
   {
     "name": "pvc-all-connected",
     "connections": [
       {
-        "peer_node_id": 1,
-        "_peer_node_name": "worker-2",
-        "connection": "Connected",
+        "peer-node-id": 1,
+        "name": "worker-2",
+        "connection-state": "Connected",
         "peer_devices": [
-          {"volume_nr": 0}
+          {"volume": 0}
         ]
       }
     ]

@@ -27,7 +27,7 @@ import (
 
 // TestExpectedPeerNamesFor_FiltersLocalAndEmpty pins the contract
 // the Bug 342 v3 wire site relies on: the local satellite's own node
-// MUST be filtered out (drbdsetup show -j enumerates remote peers
+// MUST be filtered out (drbdsetup status -j enumerates remote peers
 // only — leaving the local name in would always trigger Pass-1
 // "unexpected peer" against the local kernel slot, which doesn't
 // exist), and empty-name entries must be dropped defensively.
