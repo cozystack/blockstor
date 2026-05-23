@@ -156,6 +156,22 @@ step "drbdsetup down stale resources on satellites" \
         timeout 30 kubectl -n blockstor-system exec \$p -- bash -c 'for r in \$(drbdsetup status --json 2>/dev/null | python3 -c \"import json,sys; print(\\\" \\\".join(r[\\\"name\\\"] for r in json.load(sys.stdin)))\" 2>/dev/null); do timeout 5 drbdsetup down \$r 2>/dev/null || true; done; rm -f /etc/drbd.d/*.res /etc/drbd.d/*.md-created 2>/dev/null || true' 2>&1 | sed \"s|^|\$p: |\" || true;
     done"
 
+# Wipe residual /dev/drbd<N> entries that are REGULAR FILES (not block
+# devices). They show up when a previous scenario's `dd of=/dev/drbdN`
+# raced ahead of the DRBD kernel module's `device_create()` uevent — dd
+# happily creates a regular file at the missing path, and from then on
+# devtmpfs refuses to auto-create the actual block-device node over the
+# existing entry. The next scenario's wait_uptodate sees Status.diskState
+# = UpToDate (kernel-side state is fine), then write_random's dd appends
+# to the stale regular file, and `blockdev --getsize64` returns 0 KiB
+# (ENOIOCTL on a regular file) → "device size 0 KiB" test failure.
+# Block-device entries are preserved — the DRBD kernel module owns those
+# and removing them would force a uevent storm at the next adjust.
+step "wipe stale /dev/drbd<N> regular files on satellites" \
+    "kubectl -n blockstor-system get pod -l app=blockstor-satellite -o name | while read p; do
+        timeout 15 kubectl -n blockstor-system exec \$p -- bash -c 'for f in /dev/drbd*; do [ -e \"\$f\" ] && [ -f \"\$f\" ] && [ ! -b \"\$f\" ] && rm -f \"\$f\"; done; true' 2>&1 | sed \"s|^|\$p: |\" || true;
+    done"
+
 step "e2e:$SCENARIO" "make e2e NAME=$NAME SCENARIO=$SCENARIO"
 rc=$?
 
