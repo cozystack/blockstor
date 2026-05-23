@@ -219,6 +219,13 @@ type OrphanSweeperRunnable struct {
 	// to simulate the DRBD-stuck-state hang without needing a real
 	// drbdsetup process. Production callers must leave this nil.
 	setupDownFn func(ctx context.Context, resource string) error
+
+	// isLoadedFn is a test-only hook for the per-orphan kernel-slot
+	// probe the .res GC runs before unlinking a stale file. Defaults
+	// to s.Adm.IsLoaded when unset. Tests use it to simulate a slot
+	// that is (or is not) loaded from the stale .res without a real
+	// drbdsetup process. Production callers must leave this nil.
+	isLoadedFn func(ctx context.Context, resource string) (bool, error)
 }
 
 // NeedLeaderElection returns false. Every satellite must run its
@@ -312,10 +319,6 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 		return errors.Wrap(err, "list kernel resources")
 	}
 
-	if len(kernel) == 0 {
-		return nil
-	}
-
 	owned, err := s.listOwnedResourceNames(ctx)
 	if err != nil {
 		return errors.Wrap(err, "list local Resource CRDs")
@@ -334,7 +337,20 @@ func (s *OrphanSweeperRunnable) sweepOnce(ctx context.Context, logger logr.Logge
 		rdAges = nil
 	}
 
-	s.tearDownOrphans(ctx, logger, kernel, owned, rdAges)
+	// Kernel-slot teardown first: the classified, rate-limited path
+	// downs orphan slots (force-strip aftermath). It needs a non-empty
+	// kernel to have anything to do.
+	if len(kernel) > 0 {
+		s.tearDownOrphans(ctx, logger, kernel, owned, rdAges)
+	}
+
+	// Orphan .res GC runs UNCONDITIONALLY of kernel emptiness: a stale
+	// `<rd>.res` on disk wedges `drbdadm adjust` for an unrelated RD via
+	// a device-minor collision (exit 10) even when the stale RD's own
+	// kernel slot was never loaded. Runs AFTER tearDownOrphans so any
+	// slot that path already downed reads as not-loaded here and the GC
+	// just unlinks the file without a redundant `drbdsetup down`.
+	s.sweepOrphanResFiles(ctx, logger, owned, rdAges)
 
 	return nil
 }
