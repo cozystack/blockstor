@@ -1264,6 +1264,173 @@ func TestApplyLUKSResizeChainsThroughMapper(t *testing.T) {
 	}
 }
 
+// TestApplyLUKSConvergeResizeAfterCrashRecovery pins the
+// convergence-path resize trigger: when a prior reconcile widened
+// the underlying LV but the satellite never reached `cryptsetup
+// resize` (process killed mid-flight, OOM, evict + reschedule), the
+// next pass observes Spec.SizeKib == status.UsableKib, so the
+// applyStorage `resized` predicate goes false and the legacy code
+// path skipped LUKS resize forever — pinning the mapper at the old
+// size and starving DRBD's view of the grown disk.
+//
+// The fix probes the mapper vs underlying device with
+// `blockdev --getsize64`: if the underlying outgrew the mapper by
+// more than the 1 MiB drift tolerance, fire cryptsetup resize even
+// though applyStorage didn't grow anything this pass. The OR-chain
+// in applyOne then folds the LUKS-grew bool back into the resized
+// signal so `drbdadm resize` also fires.
+//
+// Repro on a real stand: e2e6 with FILE_THIN pool, the file was
+// truncated to 128 MiB out-of-band, the REST resize to 128 MiB
+// returned 200 OK, and the satellite then never re-fired cryptsetup
+// resize because vol.SizeKib already matched the file size — the
+// mapper stayed at 48 MiB while the file held 128 MiB.
+func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// LV already exists at spec size — storage layer is in sync.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-conv_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-luks-conv_00000\n")})
+	// VolumeStatus reports the LV already at 2 GiB — matches Spec —
+	// so applyStorage's grow predicate goes false, resized=false.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-conv_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-conv_00000|2097152\n")})
+	// isLuks succeeds → already formatted.
+	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-conv_00000",
+		storage.FakeResponse{})
+	// luksOpen returns "already exists" — mapper held over from a
+	// previous reconcile.
+	fx.Expect("cryptsetup luksOpen /dev/vg/pvc-luks-conv_00000 pvc-luks-conv-0-luks --key-file -",
+		storage.FakeResponse{Err: errLUKSOpenAlready})
+	// Drift probe: underlying device is at 2 GiB.
+	fx.Expect("blockdev --getsize64 /dev/vg/pvc-luks-conv_00000",
+		storage.FakeResponse{Stdout: []byte("2147483648\n")})
+	// Mapper still at 1 GiB - LUKS-header — stuck small from a
+	// previous reconcile that crashed after applyStorage but
+	// before cryptsetup resize. The 16 MiB carve-out below
+	// matches LUKS2's default header size.
+	fx.Expect("blockdev --getsize64 /dev/mapper/pvc-luks-conv-0-luks",
+		storage.FakeResponse{Stdout: []byte("1056964608\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+		Exec:       fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-luks-conv",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	saw := func(needle string) bool {
+		for _, line := range fx.CommandLines() {
+			if strings.Contains(line, needle) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	// Storage layer must NOT have run lvextend — the LV is already
+	// at spec size on this reconcile pass.
+	if saw("lvextend") {
+		t.Errorf("storage layer must NOT extend (already at spec); got %v", fx.CommandLines())
+	}
+
+	// The convergence path MUST run cryptsetup resize: the mapper is
+	// still stuck small from a prior partial reconcile. Without this
+	// the mapper would stay at the old size forever (no further
+	// resized=true event ever fires).
+	if !saw("cryptsetup resize pvc-luks-conv-0-luks") {
+		t.Errorf("convergence path must run cryptsetup resize when mapper lags underlying; got %v",
+			fx.CommandLines())
+	}
+
+	// AND drbdadm resize must follow — applyOne ORs luksGrew into
+	// resized so DRBD's lower-disk re-read fires too. The `--assume-
+	// clean` flag is the resize.go-wrapper-applied default — we
+	// substring-match to avoid pinning the exact arg shape.
+	if !saw("drbdadm resize") || !saw("pvc-luks-conv") {
+		t.Errorf("convergence path must chain into drbdadm resize; got %v",
+			fx.CommandLines())
+	}
+}
+
+// TestApplyLUKSConvergeNoOpWhenMapperMatches: counterpart of the
+// crash-recovery test above — when the mapper is already at the
+// expected size (steady state, every reconcile after the first), the
+// drift probe MUST report no drift and cryptsetup resize MUST NOT
+// fire. Without this guard every reconcile would shell out to
+// cryptsetup once per volume.
+func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-luks-steady_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-luks-steady_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-luks-steady_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-luks-steady_00000|1048576\n")})
+	fx.Expect("cryptsetup isLuks /dev/vg/pvc-luks-steady_00000",
+		storage.FakeResponse{})
+	fx.Expect("cryptsetup luksOpen /dev/vg/pvc-luks-steady_00000 pvc-luks-steady-0-luks --key-file -",
+		storage.FakeResponse{Err: errLUKSOpenAlready})
+	// Both probes report sizes that differ only by the LUKS header
+	// (16 MiB) — steady-state, no drift.
+	fx.Expect("blockdev --getsize64 /dev/vg/pvc-luks-steady_00000",
+		storage.FakeResponse{Stdout: []byte("1073741824\n")})
+	fx.Expect("blockdev --getsize64 /dev/mapper/pvc-luks-steady-0-luks",
+		storage.FakeResponse{Stdout: []byte("1056964608\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": thin},
+		Adm:        drbd.NewAdm(fx),
+		StateDir:   dir,
+		NodeName:   "n1",
+		Cryptsetup: luks.NewCryptsetup(fx),
+		Exec:       fx,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-luks-steady",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "cryptsetup resize") {
+			t.Errorf("steady state must NOT run cryptsetup resize (no drift); got %s", line)
+		}
+		if strings.Contains(line, "drbdadm resize") {
+			t.Errorf("steady state must NOT run drbdadm resize (no grow); got %s", line)
+		}
+	}
+}
+
 // TestApplyAutoPrimarySeedFiresOnceOnFirstActivation: with the
 // `auto-primary=true` DRBD option set on first Apply, the satellite
 // must run `drbdadm primary --force` followed by `drbdadm secondary`
