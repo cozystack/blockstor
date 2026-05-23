@@ -18,8 +18,10 @@ package satellite
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -169,3 +171,188 @@ func (f *fakeMetadataStamperInternal) StampMetadataCreated(_ context.Context, re
 	f.calls = append(f.calls, resourceName)
 	return nil
 }
+
+// sequencedFakeExec wraps storage.FakeExec to deliver a sequence of
+// canned responses for the same command line on successive calls.
+// FakeExec keys responses by cmdline — fine for one-shot stubs but
+// not for the create-md collision-recovery test which needs call #1
+// to fail and call #2 to succeed against the SAME command line.
+type sequencedFakeExec struct {
+	fx       *storage.FakeExec
+	seqKey   string
+	seqResps []storage.FakeResponse
+	seqHits  int
+}
+
+func (s *sequencedFakeExec) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	key := name
+	if len(args) > 0 {
+		key += " " + strings.Join(args, " ")
+	}
+
+	if key == s.seqKey && s.seqHits < len(s.seqResps) {
+		resp := s.seqResps[s.seqHits]
+		s.seqHits++
+
+		// Forward the call into the underlying FakeExec so
+		// CommandLines() still records it for assertion.
+		_, _ = s.fx.Run(ctx, name, args...)
+
+		return resp.Stdout, resp.Err
+	}
+
+	return s.fx.Run(ctx, name, args...) //nolint:wrapcheck // test helper, errors are canned
+}
+
+func (s *sequencedFakeExec) RunWithStdin(ctx context.Context, _ io.Reader, name string, args ...string) ([]byte, error) {
+	return s.Run(ctx, name, args...)
+}
+
+// TestCreateMDWithCollisionRecoveryFreesForeignZombie pins the
+// recovery path for the multi-volume-RD collision documented in
+// `blockstor_drbd_stuck_state`: a zombie kernel slot from a
+// torn-down test (or a `drbdsetup down` blocked by a D-state lvs
+// holding the device open inside __drbd_make_request) still owns
+// the minor the allocator just handed to a new RD's vol-1. Without
+// recovery, `drbdadm create-md` fails with `Device '<minor>' is
+// configured!` and the new RD wedges on Inconsistent forever.
+//
+// Recovery sequence under test:
+//  1. CreateMD fails with the configured-device error.
+//  2. Wrapper parses the minor, looks up the owner via
+//     drbdsetup status --verbose.
+//  3. Confirms owner != self (safety guard against tearing down
+//     our own freshly-loaded slot in a HasMD/CreateMD race).
+//  4. drbdsetup down the zombie.
+//  5. Retries CreateMD; second call succeeds.
+//
+// The fake exec replays the production error verbatim — a
+// regression that changes the error parser or the status output
+// shape immediately fails this test instead of silently reverting
+// to the manual-reboot recovery this fix replaces.
+func TestCreateMDWithCollisionRecoveryFreesForeignZombie(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	// drbdsetup status --verbose tells the recovery code that
+	// minor 20001 is owned by a foreign resource. Use a name
+	// distinct from selfRD so the safety guard greenlights the
+	// teardown.
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+		`cli-matrix-multi-life-b node-id:0 role:Secondary suspended:user
+  volume:0 minor:20001 disk:UpToDate backing_dev:/dev/loop6 quorum:yes
+`)})
+
+	// drbdsetup down on the zombie succeeds. Empty stdout + nil
+	// err is the canned default from NewFakeExec; no Expect needed.
+
+	// First create-md call: fails with the configured-device error
+	// carrying minor 20001. Second call: succeeds. sequencedFakeExec
+	// delivers them in order.
+	seq := &sequencedFakeExec{
+		fx:     fx,
+		seqKey: "drbdadm create-md --force --max-peers=15 e2e-twovol",
+		seqResps: []storage.FakeResponse{
+			{Err: drbdFakeConfiguredDeviceErr(20001)},
+			{},
+		},
+	}
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm: drbd.NewAdm(seq),
+	})
+
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	if err != nil {
+		t.Fatalf("createMDWithCollisionRecovery: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	// Recovery must (a) detect collision, (b) drbdsetup down the
+	// zombie, (c) retry create-md.
+	var sawDown, sawRetry bool
+
+	createMDCount := 0
+	for _, line := range calls {
+		if strings.HasPrefix(line, "drbdadm create-md") {
+			createMDCount++
+			if createMDCount == 2 {
+				sawRetry = true
+			}
+		}
+
+		if line == "drbdsetup down cli-matrix-multi-life-b" {
+			sawDown = true
+		}
+	}
+
+	if !sawDown {
+		t.Errorf("expected drbdsetup down on zombie cli-matrix-multi-life-b; calls=%v", calls)
+	}
+
+	if !sawRetry {
+		t.Errorf("expected second drbdadm create-md after recovery; calls=%v", calls)
+	}
+}
+
+// TestCreateMDWithCollisionRecoveryRefusesSelfTearDown pins the
+// safety guard: when the kernel slot owning the colliding minor is
+// OUR OWN resource (a HasMD/CreateMD race where the legacy path
+// already loaded the slot between probe and shell-out), the
+// recovery code MUST NOT issue `drbdsetup down` against it — that
+// would destroy our own freshly-loaded metadata. Surface the
+// original create-md error instead so the higher idempotent path
+// re-runs HasMD and short-circuits.
+func TestCreateMDWithCollisionRecoveryRefusesSelfTearDown(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	configuredErr := drbdFakeConfiguredDeviceErr(20000)
+	fx.Expect("drbdadm create-md --force --max-peers=15 e2e-twovol",
+		storage.FakeResponse{Err: configuredErr})
+
+	// drbdsetup status reports the offending minor is held by
+	// `e2e-twovol` itself — the in-flight resource we are
+	// initialising.
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+		`e2e-twovol node-id:0 role:Secondary
+  volume:0 minor:20000 disk:UpToDate backing_dev:/dev/loop5
+`)})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm: drbd.NewAdm(fx),
+	})
+
+	err := rec.createMDWithCollisionRecovery(context.Background(), "e2e-twovol", "e2e-twovol")
+	if err == nil {
+		t.Fatalf("createMDWithCollisionRecovery: expected error on self-owned collision, got nil")
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdsetup down ") {
+			t.Errorf("recovery tore down our own kernel slot: %s", line)
+		}
+	}
+}
+
+// drbdFakeConfiguredDeviceErr returns an error whose message
+// matches the real drbdadm create-md collision shape (`Device
+// '<minor>' is configured!`). Used by the recovery-path unit tests
+// to drive the failure branch of CreateMD without depending on a
+// real drbdmeta binary.
+func drbdFakeConfiguredDeviceErr(minor int32) error {
+	return fakeConfiguredDeviceErr(minor)
+}
+
+// fakeConfiguredDeviceErr is the unexported leaf so the test
+// keeps a single source of truth for the wire-shape literal.
+type fakeConfiguredDeviceError struct{ minor int32 }
+
+func (e fakeConfiguredDeviceError) Error() string {
+	return "drbdadm create-md: Device '" +
+		strconvI32(e.minor) +
+		"' is configured!\nCommand 'drbdmeta ... create-md ... --force' terminated with exit code 20: exit status 20"
+}
+
+func fakeConfiguredDeviceErr(minor int32) error { return fakeConfiguredDeviceError{minor: minor} }
+
+func strconvI32(v int32) string { return strconv.FormatInt(int64(v), 10) }

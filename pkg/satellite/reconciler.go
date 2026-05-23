@@ -1952,7 +1952,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	metadataFreshlyCreated := !hasMD
 
 	if !hasMD {
-		err = r.cfg.Adm.CreateMD(ctx, dr.GetName())
+		err = r.createMDWithCollisionRecovery(ctx, dr.GetName(), dr.GetName())
 		if err != nil {
 			return errors.Wrapf(err, "create-md %s", dr.GetName())
 		}
@@ -2097,13 +2097,91 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 			continue
 		}
 
-		createErr := r.cfg.Adm.CreateMD(ctx, target)
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
 		}
 	}
 
 	return nil
+}
+
+// createMDWithCollisionRecovery wraps Adm.CreateMD with a one-shot
+// recovery path for the "Device '<minor>' is configured!" failure
+// mode. The collision fires when the kernel already owns the target
+// minor for a different DRBD resource — typically a zombie slot left
+// behind by a torn-down RD whose `drbdsetup down` was blocked by a
+// process stuck in D-state inside the DRBD path (the
+// `blockstor_drbd_stuck_state` pattern). The cluster-wide minor
+// allocator only sees CRD-tracked minors and cannot observe these
+// kernel-only zombies, so multi-volume RDs that need consecutive
+// minors (`vol-0=base, vol-1=base+1, …`) deterministically collide on
+// the satellite that hosts the orphan.
+//
+// Recovery is best-effort and conservative:
+//  1. Parse the offending minor out of the drbdmeta error.
+//  2. Resolve the kernel resource currently owning that minor.
+//  3. Confirm the owner is NOT one of OUR volumes for `selfRD` —
+//     refusing to tear down our own in-flight metadata work. selfRD
+//     is the parent RD name; `<selfRD>/<volNum>` targets are not
+//     visible in drbdsetup status (which keys by RD), so the safety
+//     check compares the kernel owner to selfRD itself.
+//  4. `drbdsetup down` the stale resource. Failure here is non-fatal
+//     (lvs holding the device open in D-state means only a node
+//     reboot can recover — see blockstor_drbd_stuck_state); we still
+//     surface the original create-md error in that case.
+//  5. Retry CreateMD exactly once. Any second collision indicates
+//     a transient kernel state we cannot resolve from userspace and
+//     bubbles up to the reconciler's normal requeue path.
+//
+// `target` is the drbdadm-style `<rd>[/<volNum>]` argument the caller
+// would have passed to Adm.CreateMD directly. `selfRD` is the bare
+// parent RD name used by the safety-check above; for a single-volume
+// CreateMD call (`target=="<rd>"`) the two are equal.
+func (r *Reconciler) createMDWithCollisionRecovery(ctx context.Context, selfRD, target string) error {
+	err := r.cfg.Adm.CreateMD(ctx, target)
+	if err == nil {
+		return nil
+	}
+
+	minor, ok := drbd.ParseConfiguredDeviceMinor(err)
+	if !ok {
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	owner, lookupErr := r.cfg.Adm.ResourceOwningMinor(ctx, minor)
+	if lookupErr != nil || owner == "" {
+		// No kernel owner (or probe failed) → cannot identify the
+		// zombie. Surface the original create-md error so the
+		// reconciler's retry budget still observes the failure.
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	if owner == selfRD {
+		// The colliding minor is ours. This means a previous
+		// reconcile pass already brought the resource up; the
+		// caller's HasMD probe race-lost to the legacy chain. Do
+		// NOT tear down our own kernel slot — surface the original
+		// error so the higher-level idempotent path handles it.
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	log.FromContext(ctx).Info("create-md collided with foreign kernel slot; attempting recovery",
+		"resource", selfRD, "target", target, "minor", minor, "stale", owner)
+
+	downErr := r.cfg.Adm.SetupDown(ctx, owner)
+	if downErr != nil {
+		// Best-effort: the zombie is genuinely stuck (D-state
+		// holder, see blockstor_drbd_stuck_state). Surface the
+		// original create-md error — the operator gets the
+		// actionable "node X needs reboot" signal upstream.
+		log.FromContext(ctx).Info("collision-recovery drbdsetup down failed",
+			"stale", owner, "err", downErr.Error())
+
+		return err //nolint:wrapcheck // caller wraps with create-md context
+	}
+
+	return r.cfg.Adm.CreateMD(ctx, target) //nolint:wrapcheck // caller wraps with create-md context
 }
 
 // maybeStampMetadata is the create-md decision branch lifted out of

@@ -738,3 +738,160 @@ func TestAdmResumeIOInvokesDrbdadm(t *testing.T) {
 		}
 	}
 }
+
+// errCreateMdConfiguredCollisionReal is the verbatim drbdadm
+// create-md error string captured from the e2e2 stand:
+// `two-volume-rd.sh` failing because `cli-matrix-multi-life-b`
+// zombie kernel slot owned minor 20001 (held open by an lvs
+// process stuck in D-state inside __drbd_make_request).
+var errCreateMdConfiguredCollisionReal = errors.New("drbdadm create-md: drbdadm create-md --force " +
+	"--max-peers=15 e2e-twovol: You want me to create a v09 style " +
+	"flexible-size internal meta data block.\nThere appears to be a " +
+	"v09 flexible-size internal meta data block already in place on " +
+	"/dev/loop8 at byte offset 67104768\nDo you really want to overwrite " +
+	"the existing meta-data?\n*** confirmation forced via --force " +
+	"option ***\ninitializing bitmap (32 KB) to all zero\n# Output " +
+	"might be stale, since minor 20001 is attached\nDevice '20001' is " +
+	"configured!\nCommand 'drbdmeta 20001 v09 /dev/loop9 internal " +
+	"create-md 15 --force' terminated with exit code 20: exit status 20")
+
+var (
+	errCreateMdUnrelated     = errors.New("drbdadm adjust: unknown resource pvc-1")
+	errCreateMdPartialMarker = errors.New("device '20001' is something-else")
+	errCreateMdNonNumeric    = errors.New("device 'foo' is configured")
+)
+
+// TestParseConfiguredDeviceMinorMatchesRealErrorShape pins the
+// drbdmeta create-md collision error shape: when the kernel already
+// owns the target minor for a different resource, drbdmeta surfaces
+// `Device '<N>' is configured!` (typically immediately before
+// `Command 'drbdmeta <N> ... terminated with exit code 20`). The
+// reconciler's create-md recovery path keys off this exact substring
+// to identify the offending minor and free it via drbdsetup down.
+//
+// Without this guard a regression that changes the parser (e.g.
+// case-folding, regex tweak) would silently make the create-md path
+// stop self-healing collisions and revert to the manual-reboot
+// recovery this fix replaces.
+func TestParseConfiguredDeviceMinorMatchesRealErrorShape(t *testing.T) {
+	minor, ok := drbd.ParseConfiguredDeviceMinor(errCreateMdConfiguredCollisionReal)
+	if !ok {
+		t.Fatalf("ParseConfiguredDeviceMinor: ok=false on real error shape")
+	}
+
+	if minor != 20001 {
+		t.Errorf("ParseConfiguredDeviceMinor: got %d, want 20001", minor)
+	}
+}
+
+// TestParseConfiguredDeviceMinorRejectsNonMatch pins the dominant
+// negative case: every OTHER drbdadm error (unknown resource, .res
+// parse error, transient netlink hiccup) must NOT trigger the
+// collision-recovery path. Returning a false-positive minor here
+// would make the reconciler issue `drbdsetup down` against an
+// unrelated kernel slot and break healthy resources.
+func TestParseConfiguredDeviceMinorRejectsNonMatch(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"nil", nil},
+		{"unrelated", errCreateMdUnrelated},
+		{"partial-marker", errCreateMdPartialMarker},
+		{"non-numeric", errCreateMdNonNumeric},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ok := drbd.ParseConfiguredDeviceMinor(tc.err)
+			if ok {
+				t.Errorf("ParseConfiguredDeviceMinor: ok=true on %q", tc.err)
+			}
+		})
+	}
+}
+
+// TestAdmResourceOwningMinorFindsZombie pins the inverse-lookup the
+// create-md collision-recovery path needs: given a minor that the
+// kernel already owns, name the resource holding it. The parser
+// must:
+//   - track the most recent column-0 resource line,
+//   - match the indented `minor:<N>` token exactly (space-bounded so
+//     `minor:200` doesn't accidentally fire on `minor:20001`),
+//   - return the paired resource name.
+func TestAdmResourceOwningMinorFindsZombie(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// Real-shape drbdsetup status --verbose output from the e2e2
+	// stand: `cli-matrix-multi-life-b` is the zombie owning minor
+	// 20001 that blocks new RDs reusing that slot. Multi-resource
+	// listing ensures the parser correctly tracks the current
+	// resource-block boundary across multiple column-0 lines.
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+		`cli-matrix-multi-life-b node-id:0 role:Secondary suspended:user
+    force-io-failures:no
+  volume:0 minor:20001 disk:UpToDate backing_dev:/dev/loop6 quorum:yes
+      blocked:upper
+
+pvc-healthy node-id:0 role:Secondary suspended:no
+  volume:0 minor:20000 disk:UpToDate backing_dev:/dev/loop5 quorum:yes
+`)})
+
+	adm := drbd.NewAdm(fx)
+
+	owner, err := adm.ResourceOwningMinor(t.Context(), 20001)
+	if err != nil {
+		t.Fatalf("ResourceOwningMinor: %v", err)
+	}
+
+	if owner != "cli-matrix-multi-life-b" {
+		t.Errorf("ResourceOwningMinor(20001): got %q, want %q", owner, "cli-matrix-multi-life-b")
+	}
+}
+
+// TestAdmResourceOwningMinorRejectsPrefixOverlap pins the
+// space-bounded match: a kernel slot with `minor:200` must NOT be
+// returned when the caller asks about minor 2 (or any other prefix
+// overlap). Without strict bounding the recovery path would
+// `drbdsetup down` an unrelated resource on every fresh allocation.
+func TestAdmResourceOwningMinorRejectsPrefixOverlap(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{Stdout: []byte(
+		`pvc-aaa node-id:0 role:Secondary
+  volume:0 minor:20001 disk:UpToDate backing_dev:/dev/loop5
+`)})
+
+	adm := drbd.NewAdm(fx)
+
+	owner, err := adm.ResourceOwningMinor(t.Context(), 2)
+	if err != nil {
+		t.Fatalf("ResourceOwningMinor: %v", err)
+	}
+
+	if owner != "" {
+		t.Errorf("ResourceOwningMinor(2) on minor:20001 listing: got %q, want \"\"", owner)
+	}
+}
+
+// TestAdmResourceOwningMinorEmptyKernel pins the no-resources path:
+// drbdsetup exits non-zero with `No currently configured DRBD found.`
+// when the kernel has nothing loaded. The lookup must return
+// "" + nil (not an error) so the recovery path treats the empty
+// kernel as "no owner, fall through to the original create-md
+// error".
+func TestAdmResourceOwningMinorEmptyKernel(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status --verbose", storage.FakeResponse{
+		Stdout: []byte("No currently configured DRBD found.\n"),
+		Err:    errFakeFailure,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	owner, err := adm.ResourceOwningMinor(t.Context(), 20001)
+	if err != nil {
+		t.Fatalf("ResourceOwningMinor empty: unexpected error %v", err)
+	}
+
+	if owner != "" {
+		t.Errorf("ResourceOwningMinor empty: got %q, want \"\"", owner)
+	}
+}

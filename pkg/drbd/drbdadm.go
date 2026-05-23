@@ -19,6 +19,7 @@ package drbd
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -803,6 +804,113 @@ func (a *Adm) HasDisklessVolume(ctx context.Context, resource string) (bool, err
 	}
 
 	return false, nil
+}
+
+// ParseConfiguredDeviceMinor inspects an error returned by `drbdadm
+// create-md` (or `drbdsetup new-minor`) and, when the failure was caused
+// by the kernel already owning that minor for a different resource,
+// returns the offending minor number and ok=true. Otherwise returns
+// (-1, false).
+//
+// Drbdmeta surfaces this as the line `Device '<minor>' is configured!`
+// (typically immediately before `Command 'drbdmeta <minor> ... create-md
+// ...' terminated with exit code 20`). This collision is the kernel's
+// safety guard: it refuses to overwrite metadata for a minor currently
+// attached to another in-flight DRBD resource.
+//
+// In production the collision happens when a foreign or zombie kernel
+// slot from a torn-down test (or a stuck `drbdsetup down` from a
+// `blockstor_drbd_stuck_state` D-state holder) still owns the minor the
+// allocator just handed to a new multi-volume RD. The allocator scans
+// CRD-tracked minors but cannot see kernel-only zombies, so
+// LowestFreeMinor returns a value that collides with the orphan on the
+// satellite's local node. The caller pairs this signal with
+// `ResourceOwningMinor` to identify the zombie and a best-effort
+// `drbdsetup down` to free it before retrying.
+func ParseConfiguredDeviceMinor(err error) (int32, bool) {
+	if err == nil {
+		return -1, false
+	}
+
+	const marker = "Device '"
+
+	_, rest, ok := strings.Cut(err.Error(), marker)
+	if !ok {
+		return -1, false
+	}
+
+	num, tail, ok := strings.Cut(rest, "'")
+	if !ok {
+		return -1, false
+	}
+
+	// Pattern continues "... is configured!" — confirm to avoid
+	// false positives on unrelated `Device '...'` strings.
+	if !strings.HasPrefix(tail, " is configured") {
+		return -1, false
+	}
+
+	minor, parseErr := strconv.ParseInt(num, 10, 32)
+	if parseErr != nil {
+		return -1, false
+	}
+
+	return int32(minor), true
+}
+
+// ResourceOwningMinor returns the kernel-resident DRBD resource name
+// that currently owns the given device minor, or "" + nil when no
+// kernel slot holds it (steady state on a freshly-rebooted node).
+//
+// Parses `drbdsetup status --verbose` which emits one resource block
+// at column 0 followed by indented per-volume lines that include
+// `minor:<N>`. The function pairs the most recent column-0 resource
+// name with each indented `minor:<N>` token: when the requested minor
+// matches, the paired resource name wins.
+//
+// Used by the create-md collision recovery path: when CreateMD fails
+// with "Device '<minor>' is configured!" (see ParseConfiguredDeviceMinor),
+// the caller asks who owns the minor and, if that owner is NOT the
+// resource being initialised, best-effort `drbdsetup down`s it to free
+// the minor and retries create-md.
+func (a *Adm) ResourceOwningMinor(ctx context.Context, minor int32) (string, error) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", "--verbose")
+	if err != nil {
+		// `No currently configured DRBD found.` — kernel has no
+		// resources, so no minor is owned. Surface "" + nil.
+		if strings.Contains(string(out), "No currently configured DRBD") ||
+			strings.Contains(err.Error(), "No currently configured DRBD") {
+			return "", nil
+		}
+
+		return "", errors.Wrap(err, "drbdsetup status --verbose")
+	}
+
+	needle := fmt.Sprintf("minor:%d", minor)
+
+	var currentResource string
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		// Column-0 line opens a new resource block.
+		if line != "" && line[0] != ' ' && line[0] != '\t' &&
+			!strings.HasPrefix(strings.TrimSpace(line), "#") {
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				currentResource = fields[0]
+			}
+
+			continue
+		}
+
+		// Indented volume line — look for the minor token. Use a
+		// space-bounded match so `minor:200` doesn't accidentally
+		// fire on `minor:20001`.
+		if slices.Contains(strings.Fields(line), needle) {
+			return currentResource, nil
+		}
+	}
+
+	return "", nil
 }
 
 // run is the single shell-out site so every drbdadm error gets
