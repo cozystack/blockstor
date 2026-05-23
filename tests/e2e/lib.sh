@@ -467,6 +467,32 @@ reset_cluster_state() {
 
     echo ">> reset_cluster_state: begin $(date -Iseconds)"
 
+    # 0. Force-sweep satellite pods stuck Terminating.
+    #    rolling-upgrade restarts the satellite DaemonSet; under back-to-
+    #    back execution a satellite pod can wedge in Terminating for tens
+    #    of minutes — a kubelet/containerd stuck-stop, NOT a finalizer
+    #    block (the pod carries no finalizer), so the finalizer-strip in
+    #    step 1 cannot clear it. A dead-but-present pod makes the next
+    #    scenario (e.g. satellite-utils-smoke) exec into it and fail every
+    #    probe. Scope strictly to app=blockstor-satellite so we never nuke
+    #    healthy workloads, and only force-delete pods whose
+    #    deletionTimestamp is older than 30s (genuine graceful shutdowns
+    #    finish well within that). Idempotent: a no-op when nothing is
+    #    Terminating.
+    local now_epoch sweep_pod sweep_dt sweep_age
+    now_epoch=$(date +%s)
+    while read -r sweep_pod sweep_dt; do
+        [ -n "$sweep_pod" ] || continue
+        [ -n "$sweep_dt" ] && [ "$sweep_dt" != "<none>" ] || continue
+        sweep_age=$(( now_epoch - $(date -d "$sweep_dt" +%s 2>/dev/null || echo "$now_epoch") ))
+        if (( sweep_age >= 30 )); then
+            echo ">> reset_cluster_state: force-deleting stuck-Terminating satellite pod $sweep_pod (Terminating ${sweep_age}s)"
+            kubectl -n "$NS" delete pod "$sweep_pod" \
+                --grace-period=0 --force >/dev/null 2>&1 || true
+        fi
+    done < <(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' 2>/dev/null)
+
     # 1. Strip stuck satellite-resource finalizers BEFORE the RD wipe.
     #    If a previous scenario force-deleted its satellite pods, nothing
     #    is left to clear the finalizer and `kubectl delete` would hang.
