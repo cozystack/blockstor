@@ -466,8 +466,22 @@ _wait_port_forward() {
 
 # rd_apply applies a 2-replica RD with given size onto the named pair
 # of workers. Used by scenarios that don't need the full apply boilerplate.
+#
+# Default pool is `stand` (FILE_THIN, sparse .img + losetup) because the
+# majority of scenarios exercise control-plane / DRBD behaviour and do
+# not care about the backing-storage byte-perfect contract. Tests that
+# write payload bytes and read them back on a different replica MUST
+# opt into ZFS_THIN (set STORPOOL=zfs-thin or pass POOL as 5th arg) —
+# DRBD-on-loopfile has a known kernel write-path interaction that, while
+# mitigated by --direct-io=on on fresh attach (commit f06830296),
+# still bites on residue loop attachments (DIO=0 surviving satellite
+# restart) and on snapshot-restore / clone paths whose fresh-attach
+# timing differs from the live-write path. ZFS-backed zvols are the
+# architecturally correct substrate for byte-integrity scenarios.
+#
+# Override via STORPOOL env var or rd_apply RD P1 P2 SIZE POOL.
 rd_apply() {
-    local rd=$1 primary=$2 peer=$3 size=${4:-65536}
+    local rd=$1 primary=$2 peer=$3 size=${4:-65536} pool=${5:-${STORPOOL:-stand}}
     cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: ResourceDefinition
@@ -482,7 +496,7 @@ metadata: {name: ${rd}.${primary}}
 spec:
   resourceDefinitionName: ${rd}
   nodeName: ${primary}
-  props: {StorPoolName: stand}
+  props: {StorPoolName: ${pool}}
 ---
 apiVersion: blockstor.io.blockstor.io/v1alpha1
 kind: Resource
@@ -490,6 +504,6 @@ metadata: {name: ${rd}.${peer}}
 spec:
   resourceDefinitionName: ${rd}
   nodeName: ${peer}
-  props: {StorPoolName: stand}
+  props: {StorPoolName: ${pool}}
 EOF
 }
