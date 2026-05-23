@@ -65,6 +65,37 @@ const AutoDiskfulPropKey = "DrbdOptions/auto-diskful"
 // reserved here so both consumers stay in sync.
 const AutoDiskfulAllowCleanupPropKey = "DrbdOptions/auto-diskful-allow-cleanup"
 
+// PeerForgetAckAnnotationPrefix is the per-peer ACK annotation key the
+// satellite stamps on its OWN Resource CRD after `tearDownRemovedPeers`
+// has issued `drbdadm del-peer` + `drbdmeta forget-peer` for a peer
+// node that just departed from the desired peer set. Full annotation
+// key shape: `blockstor.io/peer-forget-acked.<peerNodeName>`; the
+// value is the RFC3339Nano wall-clock timestamp of the ACK.
+//
+// The REST handler's `waitForPeerDeletionAcks` polls every surviving
+// sibling Resource for this key as the cluster-wide signal that the
+// del-peer + forget-peer cleanup has finished against the doomed peer.
+// Without this gate, a fresh `linstor rd ap` autoplacing the same RD
+// right after `linstor r d <node>` can race the cleanup: the new
+// replica's `node-id` may be re-allocated to the same integer the
+// departed peer held, and DRBD-9 refuses to handshake a fresh peer
+// over a metadata slot that still carries the previous peer's
+// bitmap (the classic "node_id mismatch" / stuck-Connecting symptom).
+//
+// Spec-tracked: §4.2 "Two-phase delete" and §6 "Three-replica `n lost`
+// + autoplace edge case" of the DRBD node-id allocation behavioural
+// specification. The ACK is the controller-visible half of the
+// two-phase delete: phase 1 is "mark and broadcast", phase 2 is the
+// satellite's del-peer/forget-peer + ACK, after which the controller
+// is free to physically drop the doomed Resource CRD and let the
+// allocator reuse its `node-id`.
+//
+// Lives in pkg/api/v1 so both the REST handler (`pkg/rest/
+// peer_delete_sync.go`) and the satellite stamper (`pkg/satellite/
+// controllers/peer_forget_ack_stamper.go`) share a single source of
+// truth without either package importing the other.
+const PeerForgetAckAnnotationPrefix = "blockstor.io/peer-forget-acked."
+
 // PeerChangedAnnotation is stamped by the REST `handleResourceDelete`
 // handler on every SURVIVING sibling Resource CRD when one peer of an
 // RD is dropped. The annotation value is an RFC3339Nano timestamp the
