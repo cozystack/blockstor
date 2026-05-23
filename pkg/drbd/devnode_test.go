@@ -38,7 +38,7 @@ func TestEnsureDeviceNode_WipesRegularFile(t *testing.T) {
 	skipUnlessRoot(t)
 
 	minor := pickMinor(t)
-	path := drbd.DRBDDevicePath(minor)
+	path := drbd.DevicePath(minor)
 
 	t.Cleanup(func() { _ = os.Remove(path) })
 
@@ -50,7 +50,8 @@ func TestEnsureDeviceNode_WipesRegularFile(t *testing.T) {
 		t.Fatalf("seed regular file: %v", err)
 	}
 
-	if err := drbd.EnsureDeviceNode(minor); err != nil {
+	err = drbd.EnsureDeviceNode(minor)
+	if err != nil {
 		t.Fatalf("EnsureDeviceNode(%d): %v", minor, err)
 	}
 
@@ -64,13 +65,14 @@ func TestEnsureDeviceNode_CreatesMissingPath(t *testing.T) {
 	skipUnlessRoot(t)
 
 	minor := pickMinor(t)
-	path := drbd.DRBDDevicePath(minor)
+	path := drbd.DevicePath(minor)
 
 	t.Cleanup(func() { _ = os.Remove(path) })
 
 	// Path absent — don't seed anything.
 
-	if err := drbd.EnsureDeviceNode(minor); err != nil {
+	err := drbd.EnsureDeviceNode(minor)
+	if err != nil {
 		t.Fatalf("EnsureDeviceNode(%d): %v", minor, err)
 	}
 
@@ -86,12 +88,13 @@ func TestEnsureDeviceNode_IdempotentOnCorrectDevice(t *testing.T) {
 	skipUnlessRoot(t)
 
 	minor := pickMinor(t)
-	path := drbd.DRBDDevicePath(minor)
+	path := drbd.DevicePath(minor)
 
 	t.Cleanup(func() { _ = os.Remove(path) })
 
 	// First call: create the device.
-	if err := drbd.EnsureDeviceNode(minor); err != nil {
+	err := drbd.EnsureDeviceNode(minor)
+	if err != nil {
 		t.Fatalf("EnsureDeviceNode first call: %v", err)
 	}
 
@@ -106,7 +109,8 @@ func TestEnsureDeviceNode_IdempotentOnCorrectDevice(t *testing.T) {
 	}
 
 	// Second call: must be a no-op.
-	if err := drbd.EnsureDeviceNode(minor); err != nil {
+	err = drbd.EnsureDeviceNode(minor)
+	if err != nil {
 		t.Fatalf("EnsureDeviceNode second call: %v", err)
 	}
 
@@ -148,13 +152,30 @@ func assertBlockDevice(t *testing.T, path string, minor int) {
 		t.Fatal("assertBlockDevice: Sys() is not *syscall.Stat_t")
 	}
 
-	gotMajor := int(stat.Rdev>>8) & 0xfff
-	gotMinor := int(stat.Rdev)&0xff | (int(stat.Rdev>>12) & 0xffffff00)
+	gotMajor, gotMinor := decodeRdev(uint64(stat.Rdev))
 
 	if gotMajor != drbd.DRBDMajor || gotMinor != minor {
 		t.Errorf("assertBlockDevice: rdev=%d:%d, want %d:%d",
 			gotMajor, gotMinor, drbd.DRBDMajor, minor)
 	}
+}
+
+// decodeRdev unpacks a Linux dev_t into its (major, minor) components —
+// inverse of mkdevForTest below. Pulled into its own helper so the
+// extraction shifts are named and asserts read cleanly.
+func decodeRdev(rdev uint64) (int, int) {
+	const (
+		majShiftLo = 8
+		majMaskLo  = 0xfff
+		minMaskLo  = 0xff
+		minShiftHi = 12
+		minMaskHi  = 0xffffff00
+	)
+
+	major := int(rdev>>majShiftLo) & majMaskLo
+	minor := int(rdev)&minMaskLo | (int(rdev>>minShiftHi) & minMaskHi)
+
+	return major, minor
 }
 
 // skipUnlessRoot is the test-suite gate: EnsureDeviceNode requires
@@ -182,36 +203,52 @@ func skipUnlessRoot(t *testing.T) {
 // pick something well outside that so a developer running tests on a
 // machine with live DRBD resources doesn't have their state stomped.
 //
-// 60000+ is well above any production DRBD allocation pattern we've
-// seen and well below the 65535 minor cap. Each test gets a distinct
-// minor via t.Name's hash so parallel runs don't collide either.
+// testMinorBase + hash(name) ∈ 60000..64999 — well above any
+// production DRBD allocation pattern we've seen and well below the
+// 65535 minor cap. Each test gets a distinct minor via t.Name's hash
+// so parallel runs don't collide either.
 func pickMinor(t *testing.T) int {
 	t.Helper()
+
+	const (
+		testMinorBase = 60000
+		testMinorSpan = 5000
+		hashPrime     = 31
+	)
 
 	// Cheap deterministic hash over t.Name so parallel tests use
 	// distinct minors. Not cryptographic — collision is acceptable
 	// because the cleanup t.Cleanup unlinks after.
 	h := 0
 	for _, c := range t.Name() {
-		h = h*31 + int(c)
+		h = h*hashPrime + int(c)
 	}
 
 	if h < 0 {
 		h = -h
 	}
 
-	return 60000 + (h % 5000)
+	return testMinorBase + (h % testMinorSpan)
 }
 
 // mkdevForTest duplicates pkg/drbd's internal mkdev so the canMknod
 // probe doesn't reach across the package boundary. Kept local so the
 // production API doesn't leak the helper.
 func mkdevForTest(major, minor int) uint64 {
-	maj := uint64(major) //nolint:gosec // small positive constants
-	mn := uint64(minor)  //nolint:gosec // small positive constants
+	const (
+		majShiftLo = 8
+		majShiftHi = 32
+		minShiftHi = 12
+		majMaskLo  = 0xfff
+		minMaskLo  = 0xff
+		minMaskHi  = 0xffffff00
+	)
 
-	return ((maj & 0xfff) << 8) |
-		(mn & 0xff) |
-		((mn & 0xffffff00) << 12) |
-		((maj &^ 0xfff) << 32)
+	maj := uint64(major)
+	mn := uint64(minor)
+
+	return ((maj & majMaskLo) << majShiftLo) |
+		(mn & minMaskLo) |
+		((mn & minMaskHi) << minShiftHi) |
+		((maj &^ majMaskLo) << majShiftHi)
 }
