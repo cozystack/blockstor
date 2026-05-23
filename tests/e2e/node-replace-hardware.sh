@@ -81,21 +81,28 @@ cleanup() {
     fi
 
     # Strip the affinity patch + the eviction label so the DaemonSet
-    # re-spawns the satellite. Doing this BEFORE delete_rd lets the
-    # satellite-side teardown actually run against any replica we
-    # placed on WORKER_3 (otherwise the finalizer hangs and the next
-    # scenario observes residue).
+    # re-spawns the satellite. Doing this before the pool re-apply +
+    # delete_rd lets the satellite-side teardown actually run against
+    # any replica we placed on WORKER_3 (otherwise the finalizer hangs
+    # and the next scenario observes residue).
     kubectl -n "$NS" patch ds blockstor-satellite --type=json \
         -p='[{"op":"remove","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/1"}]' \
         2>/dev/null || true
     kubectl label node "$WORKER_3" "${EVICT_LABEL}-" 2>/dev/null || true
 
-    delete_rd "$RD" 2>/dev/null || true
-
-    # Re-bootstrap the WORKER_3 Node CRD if step-2 didn't run (early
-    # failure path) — mirrors node-lost.sh's cleanup so the next test
-    # in the batch sees a usable 3-node cluster. The stand's per-node
-    # `stand` pool is also re-applied so resource creates work again.
+    # Re-bootstrap the WORKER_3 Node CRD + ALL per-node pools the stand
+    # provisions — mirrors node-lost.sh's cleanup so the next test in
+    # the batch sees a usable 3-node cluster. `n lost` cascade-deletes
+    # EVERY per-node StoragePool CRD (stand/lvm-thin/zfs-thin), so all
+    # three shapes must be reasserted, not just `stand`. Reference for
+    # the exact CRD shapes: stand/install-pools.sh +
+    # stand/blockstor-storagepools.yaml. Re-applying only `stand` left
+    # WORKER_3 without lvm-thin/zfs-thin and cascaded into the downstream
+    # tests (Run 54 trigger).
+    #
+    # ORDER MATTERS: re-apply the pools BEFORE delete_rd so the
+    # satellite-side teardown of any replica we placed on WORKER_3 runs
+    # against re-registered pools instead of hanging on a missing pool.
     local ip
     ip=$(kubectl get node "$WORKER_3" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || true)
     if [[ -n "$ip" ]]; then
@@ -117,8 +124,33 @@ spec:
   providerKind: FILE_THIN
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata: {name: lvm-thin.${WORKER_3}}
+spec:
+  nodeName: $WORKER_3
+  poolName: lvm-thin
+  providerKind: LVM_THIN
+  props:
+    StorDriver/LvmVg: blockstor-lvm
+    StorDriver/ThinPool: thin
+---
+apiVersion: blockstor.io.blockstor.io/v1alpha1
+kind: StoragePool
+metadata: {name: zfs-thin.${WORKER_3}}
+spec:
+  nodeName: $WORKER_3
+  poolName: zfs-thin
+  providerKind: ZFS_THIN
+  props:
+    StorDriver/ZPoolThin: blockstor-zfs
 EOF
     fi
+
+    # Now tear down the test RD. With the pools re-registered above the
+    # satellite finalizer can complete against a live pool registration.
+    delete_rd "$RD" 2>/dev/null || true
 
     # Wait briefly for the satellite Pod to come back so the next
     # test in the batch sees a Ready WORKER_3.
