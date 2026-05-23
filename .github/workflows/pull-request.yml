@@ -367,8 +367,18 @@ jobs:
       # Local Docker registry the stand pushes blockstor/apiserver/
       # satellite images to. Talos VMs reach it via the bridge gateway
       # (.1 of the cluster CIDR); see stand/up.sh registry-mirror patch.
+      #
+      # Idempotent: on a self-hosted runner the host may already have a
+      # `registry` container from a parallel dev-stand run on the same
+      # box (the blockstor dev stand keeps one alive permanently). If
+      # one is already serving :5000, reuse it. Only create a fresh
+      # container if nothing is on the port.
       - name: Start local Docker registry
         run: |
+          if curl -sf http://localhost:5000/v2/ >/dev/null; then
+            echo "registry already up on :5000 — reusing"
+            exit 0
+          fi
           docker run -d -p 5000:5000 --restart=always \
             --name registry registry:2
           # Give it a moment to start accepting pushes.
