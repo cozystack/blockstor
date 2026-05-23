@@ -54,15 +54,17 @@ kubectl -n blockstor-system port-forward svc/blockstor-apiserver "$PF_PORT":3370
 PF_PID=$!
 
 cleanup() {
+    # Route through the lib `delete_rd` cascade rather than just
+    # `linstor rd delete` + `kubectl delete rd`. The lib helper also
+    # walks the per-node Resource CRDs and the snapshot chain, so a
+    # stuck satellite finalizer on `cc-autoplace.<node>` (Run 53)
+    # doesn't leak past EXIT and trip the next scenario's post-state
+    # invariants. Falling back to bare kubectl-delete left the
+    # `cc-autoplace.e2e3-worker-{1,2,3}` Resource CRDs behind even
+    # after the owning RD was gone, surfacing as a phantom
+    # `linstor r l not empty` failure attribution.
     for rd in "$RD_LATE_VD" "$RD_AUTOPLACE" "$RD_HAPPY"; do
-        "${LCTL[@]}" resource-definition delete "$rd" >/dev/null 2>&1 || true
-    done
-    # Belt-and-braces: a stuck satellite finalizer would leave the
-    # Resource CRDs behind even after `rd delete` returns success.
-    # `kubectl delete --ignore-not-found` is harmless against an
-    # already-gone object and clears any straggler.
-    for rd in "$RD_LATE_VD" "$RD_AUTOPLACE" "$RD_HAPPY"; do
-        kubectl delete resourcedefinition "$rd" --ignore-not-found >/dev/null 2>&1 || true
+        delete_rd "$rd" 2>/dev/null || true
     done
     kill "$PF_PID" 2>/dev/null || true
 }
