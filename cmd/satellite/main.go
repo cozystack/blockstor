@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log/slog"
 	"os"
@@ -133,21 +134,40 @@ func run() int {
 	// gRPC `ApplyStoragePools` fallback).
 	providers := map[string]storage.Provider{}
 
-	// Wipe stale .res files from previous incarnations of this
-	// satellite process. Each pod restart should hand drbdadm a
-	// clean slate — the c-r reconciler will re-render every
-	// Resource CRD on this node shortly after startup.
-	cleanStateDir(stateDir, logger)
+	// Cold-start kernel reconciliation. ORDER MATTERS and the two
+	// steps share one decision: which kernel resources are *healthy*
+	// (carry recoverable local data or a live peer) and must survive
+	// the restart untouched.
+	//
+	// Bug (P0 production safety): a satellite pod restart (rolling
+	// upgrade, OOM, node drain) must NOT tear down replicas that are
+	// running fine. The previous unconditional `drbdsetup down` +
+	// `.res` wipe ripped down a HEALTHY replica that happened to be
+	// mid-initial-sync (local disk Inconsistent as SyncTarget); the
+	// teardown then raced the reconciler queue and the replica never
+	// re-adjusted. Upstream LINSTOR's DrbdLayer never downs kernel
+	// state just because the agent restarted — it relies on `drbdadm
+	// adjust` to reconcile. We do the same: reap only genuine orphans
+	// (no usable local disk AND no healthy connection) and leave every
+	// UpToDate / SyncTarget / SyncSource / Established / Consistent /
+	// Outdated replica for the reconciler to adjust.
+	healthy := healthyKernelResources(ctx, logger)
 
-	// Best-effort: tear down every DRBD resource the kernel
-	// still has loaded from the previous satellite incarnation.
-	// Without this, a reconcile that re-allocates a node-id
-	// (e.g. the dispatcher picked a different id after a peer
-	// joined / left) hits "peer node id cannot be my own node
-	// id" because the old node-id is still pinned in kernel
-	// state. The c-r reconciler re-renders + `drbdadm adjust`s
-	// every Resource shortly after, so a transient down is safe.
-	cleanKernelState(ctx, logger)
+	// Tear down only the kernel resources that are NOT in the healthy
+	// set. Without this, a reconcile that re-allocates a node-id
+	// (e.g. the dispatcher picked a different id after a peer joined /
+	// left) would hit "peer node id cannot be my own node id" on a
+	// genuinely orphaned slot — but a live replica's node-id is
+	// reconciled by `drbdadm adjust`, not by a destructive down.
+	cleanKernelState(ctx, logger, healthy)
+
+	// Wipe stale .res files, but PRESERVE the ones backing a healthy
+	// kernel resource. The c-r reconciler re-renders every Resource
+	// CRD on this node shortly after startup, but a surviving kernel
+	// resource needs its .res in place until that first render so an
+	// interim `drbdadm adjust` has something to read. Orphan .res
+	// files (no matching live kernel resource) are still wiped.
+	cleanStateDir(stateDir, healthy, logger)
 
 	restCfg, err := loadRESTConfig()
 	if err != nil {
@@ -250,13 +270,17 @@ func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controlle
 	}
 }
 
-// cleanStateDir wipes every *.res file in dir on satellite startup.
-// The c-r reconciler re-renders every Resource CRD on this node
-// shortly after startup, so the contents are reproducible — we
-// don't persist satellite-side state across restarts. Best-effort:
-// log and continue on errors so a single missing dir doesn't stall
-// the whole startup.
-func cleanStateDir(dir string, logger *slog.Logger) {
+// cleanStateDir wipes stale *.res files in dir on satellite startup,
+// PRESERVING the ones that back a still-healthy kernel resource (keyed
+// by the `<resource>.res` naming convention the dispatcher renders).
+// The c-r reconciler re-renders every Resource CRD on this node shortly
+// after startup, so wiped contents are reproducible — but a surviving
+// kernel resource needs its .res in place until that first render. P0
+// safety: wiping the .res of a healthy mid-sync replica left `drbdadm
+// adjust` with nothing to read and contributed to the teardown race.
+// Best-effort: log and continue on errors so a single missing dir
+// doesn't stall the whole startup.
+func cleanStateDir(dir string, healthy map[string]struct{}, logger *slog.Logger) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		// Missing dir is fine — the satellite's first Apply will
@@ -278,6 +302,15 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 			continue
 		}
 
+		// Preserve the .res of a healthy kernel resource. The
+		// dispatcher renders one file per resource as
+		// `<resourceName>.res`, so strip the suffix to recover the
+		// resource name and check it against the healthy set.
+		resName := strings.TrimSuffix(name, ".res")
+		if _, ok := healthy[resName]; ok {
+			continue
+		}
+
 		path := filepath.Join(dir, name)
 		if err := os.Remove(path); err != nil {
 			logger.Warn("clean state-dir entry", "path", path, "err", err)
@@ -293,15 +326,27 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 	}
 }
 
-// cleanKernelState detaches every DRBD resource the kernel still
-// holds from the previous satellite incarnation. Best-effort:
-// failures are logged + ignored. The c-r reconciler will re-render
-// and `drbdadm adjust` each Resource CRD shortly after.
+// cleanKernelState detaches the genuinely-orphaned DRBD resources the
+// kernel still holds from the previous satellite incarnation. Resources
+// in the `healthy` set are LEFT ALONE — the c-r reconciler re-renders
+// and `drbdadm adjust`s every Resource CRD shortly after, which is the
+// non-destructive way to reconcile a stale node-id on a live replica.
+// Best-effort: failures are logged + ignored.
 //
-// Why: a reconcile cycle that re-allocates a node-id (different
-// dispatcher run after a peer left/joined) hits `peer node id cannot
-// be my own node id` because the kernel still has the old id pinned
-// for that resource. Dropping kernel state clears that.
+// P0 safety (cold-start kernel handling): the previous version downed
+// *every* kernel resource unconditionally. A satellite restart during
+// initial-sync (rolling upgrade) therefore tore down a healthy replica
+// that was mid-sync, and the recovery then raced the reconciler queue
+// so the replica never re-adjusted. Upstream LINSTOR's DrbdLayer never
+// downs kernel state purely because the agent restarted; we now mirror
+// that and reap only true orphans.
+//
+// Why orphans still need reaping: a reconcile cycle that re-allocates a
+// node-id (different dispatcher run after a peer left/joined) hits
+// `peer node id cannot be my own node id` when a *dead* slot still pins
+// the old node-id. A live replica's node-id is reconciled by adjust, so
+// only orphan slots — no usable local disk AND no healthy peer — are
+// downed here.
 //
 // Bug 274 (P1): bounded ctx — a wedged DRBD kernel (stuck-state
 // pattern documented in `memory/blockstor_drbd_stuck_state.md`)
@@ -309,17 +354,10 @@ func cleanStateDir(dir string, logger *slog.Logger) {
 // reaches `/readyz`, K8s rollout stalls, and the pod restart loop
 // reproduces the same hang.
 //
-// Bug 285 (P1): cleanStateDir() above wipes /etc/drbd.d/*.res
-// before this runs, which made the previous `drbdadm down all`
-// shape a no-op — drbdadm needs the .res file to enumerate
-// resources, and after the wipe it just prints "no resources
-// defined". The orphan kernel state then survives every restart
-// and the next reconcile's `drbdsetup new-minor` fails with
-// "Minor or volume exists already". Switch to enumeration via
-// `drbdsetup status` (kernel-state, no .res files needed) and
-// per-resource `drbdsetup down <name>` calls with their own
-// short timeout so one wedged resource doesn't starve the rest.
-func cleanKernelState(ctx context.Context, logger *slog.Logger) {
+// Bug 285 (P1): enumerate via `drbdsetup status` (kernel-state, no
+// .res files needed) and `drbdsetup down <name>` per resource with its
+// own short timeout so one wedged resource doesn't starve the rest.
+func cleanKernelState(ctx context.Context, logger *slog.Logger, healthy map[string]struct{}) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
@@ -334,7 +372,26 @@ func cleanKernelState(ctx context.Context, logger *slog.Logger) {
 		return
 	}
 
-	logger.Info("detaching stale kernel resources", "resources", names)
+	var orphans []string
+
+	for _, name := range names {
+		if _, ok := healthy[name]; ok {
+			continue
+		}
+
+		orphans = append(orphans, name)
+	}
+
+	if len(orphans) == 0 {
+		logger.Info("cold-start: all kernel resources healthy, leaving for reconciler to adjust",
+			"resources", names)
+
+		return
+	}
+
+	logger.Info("cold-start: tearing down orphan kernel resources (healthy ones preserved)",
+		"orphans", orphans,
+		"all", names)
 
 	// Per-resource timeout: one stuck resource must not starve the
 	// rest. 5 s is generous for a healthy `drbdsetup down` and short
@@ -342,7 +399,7 @@ func cleanKernelState(ctx context.Context, logger *slog.Logger) {
 	// orphans before bailing.
 	const perResourceTimeout = 5 * time.Second
 
-	for _, name := range names {
+	for _, name := range orphans {
 		downCtx, downCancel := context.WithTimeout(ctx, perResourceTimeout)
 		out, err := exec.CommandContext(downCtx, "drbdsetup", "down", name).CombinedOutput()
 		downCancel()
@@ -404,4 +461,170 @@ func listKernelResources(ctx context.Context) ([]string, error) {
 	}
 
 	return names, nil
+}
+
+// healthyKernelResources returns the set of resource names the local
+// DRBD kernel holds that are HEALTHY and must survive a satellite
+// restart untouched. A resource is healthy when it carries recoverable
+// local data (any volume with a disk-state other than
+// Diskless/Failed/DUnknown) OR has a live peer connection
+// (Connected, or a SyncSource/SyncTarget/Established replication-state).
+//
+// This is the conservative gate for the P0 cold-start safety fix: the
+// reconciler will `drbdadm adjust` every Resource CRD on this node
+// shortly after startup, so cold-start should only reap genuine
+// orphans. SyncTarget-during-initial-sync (local disk Inconsistent) is
+// the canonical replica this protects — it is healthy and recovering,
+// and a destructive down would lose the in-flight sync and race the
+// reconciler queue.
+//
+// Best-effort: any probe failure for a resource omits it from the
+// healthy set (treated as not-known-healthy). That is the conservative
+// direction relative to the *old* behaviour for orphans (still reaped),
+// but note a transient `drbdsetup status -j` failure on a genuinely
+// healthy resource would leave it eligible for teardown — acceptable
+// because the per-resource probe is a local kernel call that does not
+// fail in practice, and the alternative (assume-healthy-on-error) would
+// let real orphans survive forever, reproducing Bug 285.
+func healthyKernelResources(ctx context.Context, logger *slog.Logger) map[string]struct{} {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	names, err := listKernelResources(ctx)
+	if err != nil {
+		logger.Info("cold-start health probe: drbdsetup status (best-effort)", "err", err.Error())
+
+		return nil
+	}
+
+	if len(names) == 0 {
+		return nil
+	}
+
+	healthy := make(map[string]struct{}, len(names))
+
+	for _, name := range names {
+		ok, perr := resourceIsHealthy(ctx, name)
+		if perr != nil {
+			logger.Info("cold-start health probe failed; treating as orphan",
+				"resource", name,
+				"err", perr.Error())
+
+			continue
+		}
+
+		if ok {
+			healthy[name] = struct{}{}
+		}
+	}
+
+	return healthy
+}
+
+// statusVolume / statusConnection / statusPeerDevice / statusResource
+// model the subset of `drbdsetup status -j <res>` the cold-start health
+// gate reasons about: local per-volume disk-state and per-connection
+// runtime. Field names are the verbatim drbd-utils JSON keys.
+type statusVolume struct {
+	DiskState string `json:"disk-state"`
+}
+
+type statusPeerDevice struct {
+	ReplicationState string `json:"replication-state"`
+}
+
+type statusConnection struct {
+	ConnectionState string             `json:"connection-state"`
+	PeerDevices     []statusPeerDevice `json:"peer_devices"`
+}
+
+type statusResource struct {
+	Devices     []statusVolume     `json:"devices"`
+	Connections []statusConnection `json:"connections"`
+}
+
+// resourceIsHealthy probes one resource via `drbdsetup status -j` and
+// classifies it. Returns true when the resource carries recoverable
+// local data or has a live peer — see healthyKernelResources for the
+// policy rationale.
+func resourceIsHealthy(ctx context.Context, name string) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(probeCtx, "drbdsetup", "status", "-j", name).CombinedOutput()
+	if err != nil {
+		// "Unknown resource" / "No currently configured DRBD" means
+		// the resource vanished between the enumerate and the probe —
+		// not healthy, but not an error worth surfacing.
+		text := string(out)
+		if strings.Contains(text, "Unknown resource") ||
+			strings.Contains(text, "No currently configured DRBD") {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "drbdsetup status -j %s: %s", name, strings.TrimSpace(text))
+	}
+
+	var root []statusResource
+	if jerr := json.Unmarshal(out, &root); jerr != nil {
+		return false, errors.Wrapf(jerr, "parse drbdsetup status -j %s", name)
+	}
+
+	if len(root) == 0 {
+		return false, nil
+	}
+
+	return resourceHealthyFromStatus(&root[0]), nil
+}
+
+// resourceHealthyFromStatus is the pure-data classifier, split out so
+// it can be unit-tested against captured JSON without exec.
+//
+// Healthy when EITHER:
+//   - any local volume has recoverable data — disk-state is something
+//     other than Diskless/Failed/DUnknown (i.e. UpToDate, Consistent,
+//     Outdated, Inconsistent, Negotiating, Attaching), OR
+//   - any peer connection is live — Connected, or a peer-device whose
+//     replication-state indicates an active session
+//     (Established / SyncSource / SyncTarget / and the other resync
+//     phases). A live peer means the reconciler's adjust can finish the
+//     handshake; tearing it down would flap a working connection.
+func resourceHealthyFromStatus(res *statusResource) bool {
+	for i := range res.Devices {
+		switch res.Devices[i].DiskState {
+		case "", "Diskless", "Failed", "DUnknown":
+			// No recoverable local data on this volume.
+		default:
+			return true
+		}
+	}
+
+	for i := range res.Connections {
+		c := &res.Connections[i]
+		if c.ConnectionState == "Connected" {
+			return true
+		}
+
+		for j := range c.PeerDevices {
+			if replicationStateIsLive(c.PeerDevices[j].ReplicationState) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// replicationStateIsLive reports whether a peer-device replication-state
+// indicates an active replication session that the reconciler should be
+// allowed to finish rather than have torn down at cold start. Off — the
+// "no active session" sentinel — and the empty string are the only
+// not-live values.
+func replicationStateIsLive(s string) bool {
+	switch s {
+	case "", "Off":
+		return false
+	default:
+		return true
+	}
 }

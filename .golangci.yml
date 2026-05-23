@@ -219,13 +219,19 @@ linters:
         path: pkg/drbd/drbdsetup_show
       # cmd/{controller,satellite}/main.go is kubebuilder manager scaffold —
       # don't lint its boilerplate (TODOs, function length, globals, inline
-      # err checks, wsl).
+      # err checks, wsl). tagliatelle/goconst/mnd are excluded too: the
+      # cold-start kernel-safety probe mirrors drbd-utils' `drbdsetup
+      # status -j` JSON shape (kebab/snake keys that MUST match verbatim)
+      # and uses small inline state-string literals + per-probe timeouts.
       - linters:
           - funlen
           - gochecknoglobals
           - godox
           - gocritic
+          - goconst
+          - mnd
           - noinlineerr
+          - tagliatelle
           - wsl_v5
           - cyclop
           - gocyclo
