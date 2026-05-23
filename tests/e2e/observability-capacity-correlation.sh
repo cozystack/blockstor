@@ -57,6 +57,18 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 0
 fi
 
+# Prerequisite: this scenario re-points piraeus's bundled linstor-csi at
+# blockstor's apiserver via LinstorCluster.spec.externalController. That
+# CRD is installed only by stand/install-piraeus.sh; a pure-blockstor
+# stand (make up + make blockstor) has no piraeus, so every later
+# `kubectl get/patch linstorcluster` would error under `set -e` and the
+# scenario would hard-FAIL. SKIP instead — the prerequisite is absent,
+# not broken.
+if ! kubectl get crd linstorclusters.piraeus.io >/dev/null 2>&1; then
+    echo "SKIP: LinstorCluster CRD (piraeus.io) absent — run stand/install-piraeus.sh to enable"
+    exit 0
+fi
+
 # Scenario knobs
 FILL_POOL=${FILL_POOL:-lvm-thin}
 FILL_NODE=$WORKER_1
