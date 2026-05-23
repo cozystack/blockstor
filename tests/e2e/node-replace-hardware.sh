@@ -51,7 +51,11 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 RD=test-replace-hw
-TAINT_KEY=blockstor.io/replace-hw-test
+# The DaemonSet blanket-tolerates every taint (`operator: Exists`), so
+# a NoSchedule taint cannot keep the satellite Pod off $WORKER_3. Use a
+# label-based eviction the way state-offline-unknown.sh does: patch the
+# DS to require absence of $EVICT_LABEL, then label the node.
+EVICT_LABEL=blockstor.io/replace-hw-test
 POOL_NAME=stand
 
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
@@ -76,9 +80,15 @@ cleanup() {
         dump_diag
     fi
 
-    # Untaint so the DaemonSet replays the satellite Pod onto WORKER_3
-    # whether the test passed or failed.
-    kubectl taint nodes "$WORKER_3" "${TAINT_KEY}:NoSchedule-" 2>/dev/null || true
+    # Strip the affinity patch + the eviction label so the DaemonSet
+    # re-spawns the satellite. Doing this BEFORE delete_rd lets the
+    # satellite-side teardown actually run against any replica we
+    # placed on WORKER_3 (otherwise the finalizer hangs and the next
+    # scenario observes residue).
+    kubectl -n "$NS" patch ds blockstor-satellite --type=json \
+        -p='[{"op":"remove","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/1"}]' \
+        2>/dev/null || true
+    kubectl label node "$WORKER_3" "${EVICT_LABEL}-" 2>/dev/null || true
 
     delete_rd "$RD" 2>/dev/null || true
 
@@ -166,16 +176,70 @@ curl -fsS -XPOST -H'Content-Type: application/json' \
 
 wait_uptodate "$RD" "$WORKER_1" "$WORKER_3"
 
-echo ">> taint $WORKER_3 to keep the DaemonSet from re-spawning the satellite"
-kubectl taint nodes "$WORKER_3" "${TAINT_KEY}=true:NoSchedule" --overwrite
+echo ">> simulate permanent failure: isolate $WORKER_3 so the DS stops re-spawning the satellite"
+# ORDER MATTERS (copied from state-offline-unknown.sh §"isolate $N3"):
+#   1. PATCH the DS template FIRST so the affinity gate exists before
+#      the eviction label appears. At this point $WORKER_3 has no
+#      label so the existing pod keeps running.
+#   2. LABEL $WORKER_3 — DS controller now marks it for eviction.
+#   3. IMMEDIATELY force-delete the pod (grace=0) so kubelet SIGKILLs
+#      the container before the DS controller's graceful eviction
+#      goroutine fires its own delete. Force-delete bypasses the
+#      preStop hook, which is what we want: a "permanent hardware
+#      failure" leaves no time for an orderly drbdadm down.
+echo ">> patch DS nodeAffinity to require absence of $EVICT_LABEL"
+kubectl -n "$NS" patch ds blockstor-satellite --type=json \
+    -p='[{"op":"add","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/-","value":{"key":"'"${EVICT_LABEL}"'","operator":"DoesNotExist"}}]'
 
-echo ">> simulate permanent failure: evict satellite Pod on $WORKER_3"
+echo ">> label $WORKER_3 with $EVICT_LABEL=offline so DS affinity excludes it"
+kubectl label node "$WORKER_3" "${EVICT_LABEL}=offline" --overwrite
+
+echo ">> force-delete satellite Pod on $WORKER_3 (no grace — bypass preStop, race the DS eviction)"
 sat_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
     -o "jsonpath={.items[?(@.spec.nodeName==\"${WORKER_3}\")].metadata.name}")
 if [[ -n "$sat_pod" ]]; then
     kubectl -n "$NS" delete pod "$sat_pod" --force --grace-period=0 --wait=false
 fi
-sleep 5
+
+# Confirm the DS really refused to re-spawn the pod — otherwise
+# heartbeats keep flowing and the controller's watchdog will never
+# flip ConnectionStatus=OFFLINE, and `n lost` 409s in step 1 with
+# "satellite is still reporting as ONLINE".
+sleep 8
+new_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+    -o "jsonpath={.items[?(@.spec.nodeName==\"${WORKER_3}\")].metadata.name}" 2>/dev/null || true)
+if [[ -n "$new_pod" ]]; then
+    pod_phase=$(kubectl -n "$NS" get pod -n "$NS" "$new_pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    echo "FAIL: DaemonSet re-spawned satellite pod $new_pod on $WORKER_3 (phase=$pod_phase) despite affinity patch"
+    exit 1
+fi
+
+# Wait for the controller's heartbeat watchdog to flip $WORKER_3 to
+# ConnectionStatus=OFFLINE. `linstor n lost` is gated by this — it
+# refuses with HTTP 409 ("Node cannot be lost while its satellite is
+# still reporting as ONLINE") as long as the controller believes the
+# satellite is reachable. Budget: 40 s heartbeat grace + 5 s watchdog
+# requeue + apiserver/SSA slack on a busy QEMU stand.
+OFFLINE_TIMEOUT=75
+echo ">> wait up to ${OFFLINE_TIMEOUT}s for $WORKER_3 ConnectionStatus=OFFLINE"
+deadline=$(( $(date +%s) + OFFLINE_TIMEOUT ))
+got_offline=0
+conn=""
+while (( $(date +%s) < deadline )); do
+    conn=$(curl -fsS "http://localhost:$PF_PORT/v1/nodes" 2>/dev/null \
+        | jq -r --arg n "$WORKER_3" '.[] | select(.name == $n) | .connection_status // ""')
+    if [[ "$conn" == "OFFLINE" ]]; then
+        got_offline=1
+        break
+    fi
+    sleep 3
+done
+if (( got_offline == 0 )); then
+    echo "FAIL: $WORKER_3 never flipped ConnectionStatus=OFFLINE within ${OFFLINE_TIMEOUT}s (got '$conn')"
+    echo "      \`linstor n lost\` will 409 in step 1 — see drbd-troubleshooting docs."
+    exit 1
+fi
+echo "   $WORKER_3 ConnectionStatus=OFFLINE — safe to call \`n lost\`"
 
 # ===========================================================
 # STEP 1: linstor node lost <old>
@@ -244,10 +308,24 @@ fi
 # STEP 4: linstor r c <rd> --auto-place
 #         (= re-spawn the missing replica on the fresh hardware)
 # ===========================================================
-# Untaint the kube-node so the satellite DS can rebind — without
+# Un-isolate the kube-node so the satellite DS can rebind — without
 # this the autoplace's selection is fine but the kernel-side
 # resource-create on $WORKER_3 has no satellite to apply onto.
-kubectl taint nodes "$WORKER_3" "${TAINT_KEY}:NoSchedule-" 2>/dev/null || true
+kubectl -n "$NS" patch ds blockstor-satellite --type=json \
+    -p='[{"op":"remove","path":"/spec/template/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms/0/matchExpressions/1"}]' \
+    2>/dev/null || true
+kubectl label node "$WORKER_3" "${EVICT_LABEL}-" 2>/dev/null || true
+
+# Wait briefly for the satellite Pod to come back; without a Ready
+# satellite the kernel-side resource-create on $WORKER_3 has nothing
+# to apply onto and the new replica never reaches UpToDate.
+deadline=$(( $(date +%s) + 60 ))
+while (( $(date +%s) < deadline )); do
+    ready=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o "jsonpath={.items[?(@.spec.nodeName==\"${WORKER_3}\")].status.containerStatuses[0].ready}" 2>/dev/null || true)
+    [[ "$ready" == "true" ]] && break
+    sleep 2
+done
 
 echo ">> STEP 4: POST /v1/resource-definitions/$RD/autoplace (refill to 2 diskful)"
 http4=$(curl -sS -o /tmp/replace-hw-4.out -w '%{http_code}' \
