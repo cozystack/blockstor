@@ -1629,44 +1629,90 @@ func (r *ResourceReconciler) deleteReader() client.Reader {
 	return r.Client
 }
 
-// lookupVolumeNumbers reads the parent RD and returns its
-// VolumeDefinitions' numbers. The satellite's DeleteResource uses
-// the list to drop matching LVs / loopfiles.
+// lookupVolumeNumbers resolves the per-RD volume-number set the
+// satellite's DeleteResource walks to drop matching LVs / loopfiles.
+// It tries three sources in descending order of authority:
 //
-// Bug 107: when `linstor rd delete` cascade-deletes the parent RD
-// CRD via owner refs, the satellite's `handleDelete` runs AFTER the
-// RD is already gone. The RD Get returns NotFound, but we still need
-// to feed `DeleteResource` the volume-number set so the per-volume
-// `provider.DeleteVolume` loop actually unlinks the backing storage.
-// Fall back to the `blockstor.io/volume-numbers` annotation that
-// `stampVolumeNumbersAnnotation` writes on every successful apply.
+//  1. The parent RD's VolumeDefinitions (the source of truth while
+//     the RD CRD still exists).
+//  2. The `blockstor.io/volume-numbers` annotation that
+//     `stampVolumeNumbersAnnotation` writes on every successful apply
+//     (Bug 107: `linstor rd delete` cascade-deletes the parent RD via
+//     owner refs, so by the time `handleDelete` runs the RD Get
+//     returns NotFound — but we still need the volume set to unlink
+//     the backing storage).
+//  3. The observer-stamped `Status.Volumes[].VolumeNumber`. The
+//     observer records these very early (on the first `drbdsetup
+//     events2` frame), well before the controller-side apply has a
+//     chance to stamp the annotation. This covers the rolling-deploy
+//     race: a Resource deleted inside the window after the satellite
+//     observed its volumes but before its first successful apply
+//     stamped the annotation has a missing RD AND a missing
+//     annotation, yet Status.Volumes still names every volume.
 //
-// The fallback is best-effort: an annotation parse miss (corrupted
-// value, never-applied resource) returns nil, and the per-volume
-// loop in DeleteResource no-ops. That's the pre-Bug-107 behaviour
-// and matches the contract that DeleteVolume on a missing volume is
-// already idempotent.
+// Tier 3 (finalizer-strip deadlock): when ALL THREE sources miss,
+// the resource genuinely never had any volumes provisioned (or every
+// trace of them is gone), so the apply chain is trivially complete —
+// `DeleteResource` against an empty volume set is a safe no-op
+// (`drbdadm down` runs unconditionally; the per-volume DeleteVolume
+// loop iterates zero times). We log loudly and return nil so
+// `handleDelete` proceeds to strip the finalizer rather than
+// requeueing forever and wedging the Resource in Terminating.
 func (r *ResourceReconciler) lookupVolumeNumbers(ctx context.Context, res *blockstoriov1alpha1.Resource) ([]int32, error) {
 	var rd blockstoriov1alpha1.ResourceDefinition
 
 	err := r.Get(ctx, client.ObjectKey{Name: res.Spec.ResourceDefinitionName}, &rd)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// Cascade-delete path — RD CRD vanished before we got
-			// here. Fall back to the annotation we stamped on the
-			// last successful apply.
-			return parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]), nil
+	if err == nil {
+		out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
+		for i := range rd.Spec.VolumeDefinitions {
+			out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
 		}
 
+		return out, nil
+	}
+
+	if !apierrors.IsNotFound(err) {
 		return nil, errors.Wrap(err, "get parent RD for delete")
 	}
 
-	out := make([]int32, 0, len(rd.Spec.VolumeDefinitions))
-	for i := range rd.Spec.VolumeDefinitions {
-		out = append(out, rd.Spec.VolumeDefinitions[i].VolumeNumber)
+	// Source 2: the annotation stamped on the last successful apply.
+	if nums := parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers]); len(nums) > 0 {
+		return nums, nil
 	}
 
-	return out, nil
+	// Source 3: the observer-stamped Status.Volumes. Covers the
+	// rolling-deploy race where the delete fires before the first
+	// apply stamped the annotation.
+	if nums := volumeNumbersFromStatus(res); len(nums) > 0 {
+		return nums, nil
+	}
+
+	// All three sources miss — strip the finalizer anyway (the apply
+	// chain is a trivially-complete no-op). Log loudly so operators
+	// can correlate with the rolling-deploy / never-applied window.
+	log.FromContext(ctx).Info(
+		"lookupVolumeNumbers: RD, annotation, and Status.Volumes all empty — "+
+			"treating delete as a no-op and stripping finalizer to avoid Terminating deadlock",
+		"resource", res.Name,
+		"resourceDefinition", res.Spec.ResourceDefinitionName)
+
+	return nil, nil
+}
+
+// volumeNumbersFromStatus extracts the observer-stamped volume
+// numbers from Resource.Status.Volumes. Returns nil when the
+// observer has not recorded any volumes yet.
+func volumeNumbersFromStatus(res *blockstoriov1alpha1.Resource) []int32 {
+	if len(res.Status.Volumes) == 0 {
+		return nil
+	}
+
+	out := make([]int32, 0, len(res.Status.Volumes))
+	for i := range res.Status.Volumes {
+		out = append(out, res.Status.Volumes[i].VolumeNumber)
+	}
+
+	return out
 }
 
 // nodeNamePredicate filters events down to objects whose
