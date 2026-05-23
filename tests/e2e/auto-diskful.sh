@@ -73,6 +73,13 @@ EOF
 
 wait_uptodate "$RD" "$N1" "$N2"
 
+# The DISKLESS replica on $N3 must be Connected to BOTH diskful peers
+# before we promote it: `drbdadm primary` on a diskless node needs a
+# live connection to an UpToDate peer, otherwise it fails with
+# exit 17 "Need access to UpToDate data" (race observed under load).
+wait_connection_state "$RD" "$N3" "$N1" "Connected|Established"
+wait_connection_state "$RD" "$N3" "$N2" "Connected|Established"
+
 # Drive InUse on $N3 by promoting it.
 on_node "$N3" drbdadm primary "$RD"
 
