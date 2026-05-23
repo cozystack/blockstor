@@ -279,3 +279,241 @@ func TestApplyDRBDAdjustsViaFsmDispatchOnly(t *testing.T) {
 			adjustCount, wantAdjust, fx2.CommandLines())
 	}
 }
+
+// TestAdjustResourceUsesSkipNetOnStandAlonePeer pins the W12 +
+// network-partition guard: when `drbdsetup show -j` reports any peer
+// in `StandAlone` (operator-initiated disconnect — the W12 victim
+// recipe pre-amble + the iptables-partition wedge case), runAdjust
+// MUST dispatch `drbdadm adjust --skip-net` rather than plain
+// `drbdadm adjust`. Plain adjust would re-issue `drbdsetup connect`
+// and undo the operator's disconnect within ~1 s, breaking the
+// split-brain recovery recipe and any test that needs StandAlone to
+// survive a reconcile.
+func TestAdjustResourceUsesSkipNetOnStandAlonePeer(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	// Kernel reports local UpToDate (so SkipDisk does not fire) AND
+	// the peer connection slot in StandAlone (operator just ran
+	// `drbdadm disconnect` / `drbdsetup disconnect --force=yes`).
+	fx.Expect("drbdsetup status --verbose pvc-w12-victim", storage.FakeResponse{
+		Stdout: []byte(`pvc-w12-victim node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-w12-victim_00000 quorum:yes
+      worker-2 node-id:1 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+`),
+	})
+
+	fx.Expect("drbdsetup show -j pvc-w12-victim", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "pvc-w12-victim",
+    "connections": [
+      {
+        "peer_node_id": 1,
+        "_peer_node_name": "worker-2",
+        "connection": "StandAlone",
+        "peer_devices": [
+          {"volume_nr": 0}
+        ]
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-w12-victim",
+		NodeName: "n1",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	skipNetCmd := "drbdadm adjust --skip-net pvc-w12-victim"
+	bareCmd := "drbdadm adjust pvc-w12-victim"
+
+	if !slices.Contains(cmds, skipNetCmd) {
+		t.Errorf("StandAlone peer: expected %q in commands; got %v", skipNetCmd, cmds)
+	}
+
+	if slices.Contains(cmds, bareCmd) {
+		t.Errorf("StandAlone peer: bare %q must not run (would re-connect operator-disconnected peer); got %v",
+			bareCmd, cmds)
+	}
+}
+
+// TestAdjustResourceSkipsBothNetAndDiskOnDoubleSignal pins the
+// composite case: kernel reports Diskless (Bug 280 SkipDisk coercion
+// path fires) AND a peer in StandAlone (W12 SkipNet guard fires).
+// runAdjust MUST dispatch `drbdadm adjust --skip-net --skip-disk`,
+// preserving both invariants — the disk stays detached AND the
+// peer connection stays StandAlone.
+func TestAdjustResourceSkipsBothNetAndDiskOnDoubleSignal(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	fx.Expect("drbdsetup status --verbose pvc-double-skip", storage.FakeResponse{
+		Stdout: []byte(`pvc-double-skip node-id:0 role:Secondary
+  volume:0 minor:1000 disk:Diskless backing_dev:none quorum:yes
+      worker-2 node-id:1 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+`),
+	})
+
+	fx.Expect("drbdsetup show -j pvc-double-skip", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "pvc-double-skip",
+    "connections": [
+      {
+        "peer_node_id": 1,
+        "_peer_node_name": "worker-2",
+        "connection": "StandAlone",
+        "peer_devices": [
+          {"volume_nr": 0}
+        ]
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-double-skip",
+		NodeName: "n1",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	doubleSkip := "drbdadm adjust --skip-net --skip-disk pvc-double-skip"
+	skipDiskOnly := "drbdadm adjust --skip-disk pvc-double-skip"
+	skipNetOnly := "drbdadm adjust --skip-net pvc-double-skip"
+	bare := "drbdadm adjust pvc-double-skip"
+
+	if !slices.Contains(cmds, doubleSkip) {
+		t.Errorf("Diskless + StandAlone peer: expected %q in commands; got %v",
+			doubleSkip, cmds)
+	}
+
+	for _, forbidden := range []string{skipDiskOnly, skipNetOnly, bare} {
+		if slices.Contains(cmds, forbidden) {
+			t.Errorf("Diskless + StandAlone peer: %q must not run (drops one of two guards); got %v",
+				forbidden, cmds)
+		}
+	}
+}
+
+// TestAdjustResourceBareWhenAllPeersConnected pins the steady-state
+// regression guard: when `drbdsetup show -j` reports all peer slots
+// in `Connected` (or any non-StandAlone state), runAdjust MUST fall
+// back to plain `drbdadm adjust`. A regression that always coerced
+// `--skip-net` on the presence of a Show response would strand
+// new-peer-add work (the freshly-rendered .res declares a peer that
+// the kernel doesn't have yet, and only `drbdadm adjust` issues the
+// `drbdsetup new-peer` + `connect` to materialise it).
+func TestAdjustResourceBareWhenAllPeersConnected(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	fx.Expect("drbdsetup status --verbose pvc-all-connected", storage.FakeResponse{
+		Stdout: []byte(`pvc-all-connected node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-all-connected_00000 quorum:yes
+      worker-2 node-id:1 connection:Connected role:Secondary
+    volume:0 replication:Established peer-disk:UpToDate
+`),
+	})
+
+	fx.Expect("drbdsetup show -j pvc-all-connected", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "pvc-all-connected",
+    "connections": [
+      {
+        "peer_node_id": 1,
+        "_peer_node_name": "worker-2",
+        "connection": "Connected",
+        "peer_devices": [
+          {"volume_nr": 0}
+        ]
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-all-connected",
+		NodeName: "n1",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	bareCmd := "drbdadm adjust pvc-all-connected"
+	skipNetCmd := "drbdadm adjust --skip-net pvc-all-connected"
+
+	if !slices.Contains(cmds, bareCmd) {
+		t.Errorf("all peers Connected: expected bare %q in commands; got %v", bareCmd, cmds)
+	}
+
+	if slices.Contains(cmds, skipNetCmd) {
+		t.Errorf("all peers Connected: %q must not run (would strand new-peer-add work); got %v",
+			skipNetCmd, cmds)
+	}
+}

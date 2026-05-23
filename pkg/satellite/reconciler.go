@@ -2604,14 +2604,9 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		}
 	}
 
-	var err error
+	skipNet := r.shouldSkipNetOnAdjust(ctx, dr.GetName())
 
-	if skipDisk {
-		err = r.cfg.Adm.AdjustSkipDisk(ctx, dr.GetName())
-	} else {
-		err = r.cfg.Adm.Adjust(ctx, dr.GetName())
-	}
-
+	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
 		return nil
 	}
@@ -2631,6 +2626,74 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 	}
 
 	return errors.Wrapf(err, "adjust %s", dr.GetName())
+}
+
+// dispatchAdjust picks the right `drbdadm adjust` variant for the
+// observed (skipDisk, skipNet) signal combination and shells out.
+// Pulled out of runAdjust so the orchestration stays under gocyclo.
+func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDisk, skipNet bool) error {
+	switch {
+	case skipDisk && skipNet:
+		return r.cfg.Adm.AdjustSkipNetSkipDisk(ctx, resource) //nolint:wrapcheck // caller wraps
+	case skipDisk:
+		return r.cfg.Adm.AdjustSkipDisk(ctx, resource) //nolint:wrapcheck // caller wraps
+	case skipNet:
+		return r.cfg.Adm.AdjustSkipNet(ctx, resource) //nolint:wrapcheck // caller wraps
+	default:
+		return r.cfg.Adm.Adjust(ctx, resource) //nolint:wrapcheck // caller wraps
+	}
+}
+
+// shouldSkipNetOnAdjust probes the kernel for operator-initiated
+// `StandAlone` peer connection slots. When any peer is in
+// `StandAlone`, the caller dispatches `drbdadm adjust --skip-net`
+// rather than plain adjust — preserving the operator's manual
+// disconnect across the reconcile.
+//
+// W12 + network-partition guard: when the operator runs
+// `drbdadm disconnect <rd>` or `drbdsetup disconnect --force=yes <rd>
+// <peerID>` (the documented split-brain recovery recipe + the
+// iptables-partition test pre-amble), the affected peer's kernel
+// connection state becomes `StandAlone` — a state the kernel will
+// NOT recover from on its own (it requires operator action:
+// `drbdadm connect` or one of the --discard-my-data variants).
+//
+// blockstor's observer-trigger channel wakes the reconciler on the
+// connection-state change, the reconciler runs `drbdadm adjust`,
+// and adjust's net-attach pass re-issues `drbdsetup connect` —
+// undoing the operator's disconnect within ~1 s. That kills both
+// the W12 recipe (the subsequent `drbdadm -- --discard-my-data
+// connect` fails with `(125) Device has a net-config`) and any
+// split-brain provocation a test wants to set up.
+//
+// Upstream LINSTOR sidesteps this by only invoking adjust when
+// `drbdadm list-adjustable` reports a config difference (DrbdLayer
+// .java L181-185 + L1207-1209). DRBD 9.22 ships without
+// list-adjustable, so we use the equivalent kernel-state probe:
+// if any peer's connection slot is currently in StandAlone, treat
+// this reconcile as operator-controlled and append `--skip-net` to
+// adjust. Disk-level drift convergence (volume resize, SkipDisk
+// prop changes) still runs; net-attach is left for the operator to
+// restore via `drbdadm connect`.
+//
+// Best-effort: a probe error returns false so adjust falls through
+// to the existing full-adjust path (failing closed would freeze
+// adjust on any transient drbdsetup hiccup). The probe is
+// per-resource, so a healthy peer on a multi-peer RD still gets
+// reconnected when its own slot is in Connecting/Timeout/etc.
+func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string) bool {
+	slots, probeErr := r.cfg.Adm.Show(ctx, resource)
+	if probeErr != nil {
+		return false
+	}
+
+	for _, slot := range slots {
+		if slot.ConnectionState == string(drbd.ConnectionStateStandAlone) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isUnknownResourceErr reports whether a drbdadm error is the

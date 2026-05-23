@@ -106,6 +106,43 @@ func (a *Adm) AdjustSkipDisk(ctx context.Context, resource string) error {
 	return a.run(ctx, "adjust", "--skip-disk", resource)
 }
 
+// AdjustSkipNet is the operator-controlled-disconnect variant of
+// Adjust that appends drbd-utils' `--skip-net` flag. Used when the
+// reconciler detects a peer in operator-initiated StandAlone (the
+// `drbdadm disconnect` / `drbdsetup disconnect --force=yes` state)
+// AND .res content has not changed since the last apply — i.e. this
+// reconcile is observer-trigger-driven, not Spec-driven. Plain
+// `drbdadm adjust` would re-issue `drbdsetup connect` and undo the
+// operator's disconnect within ~1 s, defeating split-brain recovery
+// recipes (scenario 5.W12) and other manual-intervention paths that
+// rely on StandAlone surviving long enough to run subsequent commands.
+//
+// The `--skip-net` flag tells drbdadm to leave the connection slots
+// alone and only reconcile disk-level state. Mirrors upstream
+// LINSTOR's `listAdjustable`-gated adjust dispatch, which simply
+// doesn't call adjust at all when nothing in the .res differs from
+// kernel.
+//
+// Operator restores connectivity with the documented W12 recipe
+// (`drbdadm connect <rd>` or `drbdadm -- --discard-my-data connect
+// <rd>`); after that the kernel reports Connected again, the next
+// observer-triggered reconcile sees no StandAlone peer, and the
+// full Adjust path resumes for any subsequent drift convergence.
+func (a *Adm) AdjustSkipNet(ctx context.Context, resource string) error {
+	return a.run(ctx, "adjust", "--skip-net", resource)
+}
+
+// AdjustSkipNetSkipDisk runs `drbdadm adjust --skip-net --skip-disk`.
+// The combination fires when both signals are active: a SkipDisk pin
+// (operator prop or kernel-Diskless coercion) AND a peer in operator-
+// initiated StandAlone. Each flag's invariant still holds — disk
+// attachment is left alone (SkipDisk), connection slots are left alone
+// (SkipNet) — so the only reconcile work that lands is options /
+// volume-shape drift; the safe-rest of adjust's idempotent passes.
+func (a *Adm) AdjustSkipNetSkipDisk(ctx context.Context, resource string) error {
+	return a.run(ctx, "adjust", "--skip-net", "--skip-disk", resource)
+}
+
 // CreateMD initialises on-disk metadata for the resource. We always use
 // --force: a freshly-allocated LV may carry leftover signature bytes
 // from its previous tenant, and DRBD bails without --force.
