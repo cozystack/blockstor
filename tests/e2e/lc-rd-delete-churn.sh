@@ -50,14 +50,6 @@ kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":337
     >/tmp/lc-rd-churn-pf.log 2>&1 &
 PF_PID=$!
 
-# Capture dmesg cursor on every satellite at start, so the post-loop
-# scan only counts warnings produced during this test.
-declare -A DMESG_BASELINE
-for node in $WORKER_1 $WORKER_2 $WORKER_3; do
-    [[ -n "$node" ]] || continue
-    DMESG_BASELINE[$node]=$(on_node "$node" bash -c "dmesg -T 2>/dev/null | wc -l" || echo 0)
-done
-
 dump_diag() {
     echo "---- dump: kubectl get events -n blockstor-system ----"
     kubectl get events -n blockstor-system --sort-by=.lastTimestamp | tail -40 || true
@@ -92,6 +84,30 @@ for _ in $(seq 1 30); do
 done
 
 LCTL=(linstor --controllers "http://localhost:$PF_PORT")
+
+# Self-defending pre-test wipe: this scenario's post-loop invariant is
+# `linstor r l empty`, so ANY leakage from a previously-run scenario
+# (cc-autoplace.* from client-compat.sh, e2e-clone-src from clone.sh,
+# e2e-affinity-controller from affinity-controller.sh, …) would get
+# blamed on this test. Run the wipe BEFORE the dmesg baseline so the
+# baseline accounts for any teardown noise the wipe itself produces,
+# and BEFORE the churn loop so the loop starts on a clean slate.
+delete_all_rds 90 || {
+    echo "FAIL: stand not idle at test start, cannot trust post-state invariants"
+    kubectl get resourcedefinitions.blockstor.io.blockstor.io 2>/dev/null || true
+    kubectl get resources.blockstor.io.blockstor.io 2>/dev/null || true
+    exit 1
+}
+
+# Capture dmesg cursor on every satellite AFTER the pre-test wipe so
+# any teardown noise the wipe itself produced is below the baseline.
+# The post-loop scan then counts only warnings produced during the
+# churn iters proper.
+declare -A DMESG_BASELINE
+for node in $WORKER_1 $WORKER_2 $WORKER_3; do
+    [[ -n "$node" ]] || continue
+    DMESG_BASELINE[$node]=$(on_node "$node" bash -c "dmesg -T 2>/dev/null | wc -l" || echo 0)
+done
 
 # Collect ports allocated per RD — verify each freed after delete.
 declare -A ALLOCATED_PORT
