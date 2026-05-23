@@ -31,11 +31,33 @@ import (
 // when they create the device nodes on systems running udev.
 const DRBDMajor = 147
 
-// DRBDDevicePath returns the canonical `/dev/drbd<minor>` path the
-// kernel exports the resource's block device at. Used by EnsureDeviceNode
+// devNodeMode is the permission mode mknod applies to a freshly-created
+// `/dev/drbd<minor>`. 0660 mirrors the upstream `udev/65-drbd.rules`
+// `MODE="0660"` directive and matches what systemd-udevd would create
+// on a real-udev node — root can read/write, the disk group (which
+// the CSI plugin runs as) can read/write, everyone else has no access.
+const devNodeMode = 0o660
+
+// Linux dev_t encoding constants — see kernel's
+// include/linux/kdev_t.h. major lives in bits 8..19 (low 12 bits) +
+// bits 32..43 (high 12 bits, used only for ext'd-major devices);
+// minor lives in bits 0..7 + bits 20..31. For DRBD's fixed major 147
+// + minor 0..65535 the extended bits are unused, but the full
+// encoding makes the helper safe if either range expands.
+const (
+	devMajorShiftLo = 8  // bits 8..19 carry the low 12 major bits
+	devMinorShiftHi = 12 // bits 20..31 carry the high minor bits
+	devMajorShiftHi = 32 // bits 32..43 carry the extended major bits
+	devMajorLowMask = 0xfff
+	devMinorLowMask = 0xff
+	devMinorHiMask  = 0xffffff00
+)
+
+// DevicePath returns the canonical `/dev/drbd<minor>` path the kernel
+// exports the resource's block device at. Used by EnsureDeviceNode
 // and by callers that need to refer to the device path without
 // duplicating the format string.
-func DRBDDevicePath(minor int) string {
+func DevicePath(minor int) string {
 	return fmt.Sprintf("/dev/drbd%d", minor)
 }
 
@@ -76,7 +98,7 @@ func DRBDDevicePath(minor int) string {
 // itself is atomic at the syscall layer (kernel inode allocation is
 // serialised).
 func EnsureDeviceNode(minor int) error {
-	path := DRBDDevicePath(minor)
+	path := DevicePath(minor)
 
 	info, err := os.Stat(path)
 
@@ -91,7 +113,8 @@ func EnsureDeviceNode(minor int) error {
 		// remove and recreate. os.Remove is safe on block devices
 		// (it unlink(2)s the inode reference; the kernel-side
 		// minor is unaffected and a fresh mknod re-binds the path).
-		if rmErr := os.Remove(path); rmErr != nil {
+		rmErr := os.Remove(path)
+		if rmErr != nil {
 			return errors.Wrapf(rmErr, "ensure %s: remove stale %s", path, describeStat(info))
 		}
 
@@ -107,17 +130,19 @@ func EnsureDeviceNode(minor int) error {
 	// both the file-type (S_IFBLK) and permissions in one int — Linux
 	// mknod(2) reads the permission bits and the type bits from the
 	// same value. The umask applies, so we always follow up with an
-	// explicit chmod to get the literal 0660 we asked for regardless
-	// of the inherited umask.
-	mode := uint32(syscall.S_IFBLK | 0o660)
+	// explicit chmod to get the literal devNodeMode we asked for
+	// regardless of the inherited umask.
+	mode := uint32(syscall.S_IFBLK | devNodeMode)
 	dev := mkdev(DRBDMajor, minor)
 
-	if err := syscall.Mknod(path, mode, int(dev)); err != nil { //nolint:gosec // dev fits in int for minor<<8 + major encoding within DRBD's 0..65535 minor range
+	err = syscall.Mknod(path, mode, int(dev)) //nolint:gosec // dev encodes major=147 + minor<=65535; int conversion never truncates
+	if err != nil {
 		return errors.Wrapf(err, "ensure %s: mknod b %d %d", path, DRBDMajor, minor)
 	}
 
-	if err := os.Chmod(path, 0o660); err != nil {
-		return errors.Wrapf(err, "ensure %s: chmod 0660", path)
+	err = os.Chmod(path, devNodeMode)
+	if err != nil {
+		return errors.Wrapf(err, "ensure %s: chmod %#o", path, devNodeMode)
 	}
 
 	return nil
@@ -140,7 +165,7 @@ func isCorrectBlockDevice(info os.FileInfo, minor int) bool {
 
 	wantRdev := mkdev(DRBDMajor, minor)
 
-	return uint64(stat.Rdev) == wantRdev //nolint:unconvert // Rdev type varies by arch (uint32 vs uint64)
+	return uint64(stat.Rdev) == wantRdev //nolint:gosec // Rdev type varies by arch (uint32 on some platforms); uint64 cast is safe
 }
 
 // mkdev encodes a (major, minor) pair into the Linux kernel's dev_t
@@ -157,10 +182,10 @@ func mkdev(major, minor int) uint64 {
 	maj := uint64(major) //nolint:gosec // major is a small positive constant (147)
 	mn := uint64(minor)  //nolint:gosec // minor is non-negative (allocator pool starts at 1000)
 
-	return ((maj & 0xfff) << 8) |
-		(mn & 0xff) |
-		((mn & 0xffffff00) << 12) |
-		((maj &^ 0xfff) << 32)
+	return ((maj & devMajorLowMask) << devMajorShiftLo) |
+		(mn & devMinorLowMask) |
+		((mn & devMinorHiMask) << devMinorShiftHi) |
+		((maj &^ devMajorLowMask) << devMajorShiftHi)
 }
 
 // describeStat returns a short human-readable form of the file type at

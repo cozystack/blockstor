@@ -2750,7 +2750,8 @@ func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 			continue
 		}
 
-		if err := drbd.EnsureDeviceNode(minor); err != nil {
+		err := drbd.EnsureDeviceNode(minor)
+		if err != nil {
 			log.FromContext(ctx).Error(err, "ensure /dev/drbd device node",
 				"resource", dr.GetName(),
 				"volume", vol.GetVolumeNumber(),
