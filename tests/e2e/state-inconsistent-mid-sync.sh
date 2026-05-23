@@ -199,8 +199,21 @@ if [[ -z "$DEV_SRC_EARLY" ]]; then
 fi
 echo ">> pre-write 128 MiB on $NODE_A ($DEV_SRC_EARLY) before adding 2nd replica"
 # Bug 321 follow-up: smaller workload to stay under satellite memory budget on QEMU stand.
+#
+# mknod-fix fallout (commit 43ba5a44c): /dev/drbd<N> is now a real block
+# device (was a tmpfs regular file on no-udev systems pre-fix). A single
+# satellite-fresh-spawn resource defaults to Secondary; dd into a
+# Secondary DRBD device returns EROFS ("Read-only file system"). Stage 1
+# is a sole-replica RD, so we must run `drbdadm primary --force` (no
+# peer has data → kernel refuses non-forced promotion) before any write.
+# Suppressing stderr but not the exit code masks transient promotion
+# failures — let stderr surface and check for success explicitly. The
+# `test -b` block-device guard matches lib.sh::write_random and aborts
+# if EnsureDeviceNode regressed and left a regular file in place.
 on_node "$NODE_A" bash -c "
-    drbdadm primary --force ${RD} 2>/dev/null
+    set -e
+    drbdadm primary --force ${RD}
+    test -b ${DEV_SRC_EARLY} || { echo \"ABORT: ${DEV_SRC_EARLY} is not a block device — \$(stat -c '%F' ${DEV_SRC_EARLY} 2>/dev/null || echo missing)\" >&2; exit 2; }
     dd if=/dev/urandom of=${DEV_SRC_EARLY} bs=1M count=128 conv=fdatasync status=none
 "
 # Capture md5 of the first 128 MiB on $NODE_A so we can verify the second
