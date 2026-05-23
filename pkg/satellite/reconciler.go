@@ -114,6 +114,22 @@ type ReconcilerConfig struct {
 	// 11.3 Stage 2.
 	FilesystemFormattedStamper FilesystemFormattedStamper
 
+	// PeerForgetAckStamper writes the per-peer ACK annotation
+	// `blockstor.io/peer-forget-acked.<peerNodeName>` onto the local
+	// Resource CRD after `tearDownRemovedPeers` has issued del-peer +
+	// forget-peer for a departing peer. The REST handler's
+	// `waitForPeerDeletionAcks` polls this annotation as the
+	// cluster-wide signal that the kernel-side cleanup for the
+	// doomed peer has completed before the controller is free to
+	// physically reap the CRD and let the allocator reuse the
+	// `node-id`. nil → ACK stamping is disabled (compatible with
+	// unit tests that don't wire an apiserver). The agent injects
+	// this post-manager construction via SetPeerForgetAckStamper —
+	// the implementation needs the controller-runtime client only
+	// the manager owns. Spec §4.2 / §6 of the DRBD node-id
+	// allocation behavioural specification.
+	PeerForgetAckStamper PeerForgetAckStamper
+
 	// SkipDiskClearer releases the satellite's SSA claim on the
 	// `DrbdOptions/SkipDisk` Spec.Props key when the kernel
 	// re-emerges healthy (Bug 278: Talos kernel upgrade reattach).
@@ -178,6 +194,34 @@ type FilesystemFormattedStamper interface {
 	// moves forward on apiserver-side transition only, not on
 	// every patch).
 	StampFilesystemFormatted(ctx context.Context, resourceName string) error
+}
+
+// PeerForgetAckStamper abstracts the "stamp the per-peer ACK
+// annotation `blockstor.io/peer-forget-acked.<peerNodeName>` on a
+// Resource CRD" verb the satellite invokes after
+// `tearDownRemovedPeers` runs del-peer + forget-peer for a departing
+// peer. Mirrors `MetadataCreatedStamper` / `FilesystemFormattedStamper`:
+// the K8s call lives in pkg/satellite/controllers (where the cached
+// client owns the apiserver wire) while the satellite's apply chain
+// stays free of a controller-runtime client dependency.
+//
+// Spec §4.2 + §6: the ACK is the controller-visible half of the
+// two-phase delete protocol. Without it, a fresh `linstor rd ap`
+// autoplacing right after `linstor r d <node>` races the
+// del-peer/forget-peer cleanup and produces stuck-Connecting
+// DRBD-9 peers because the new replica's `node-id` collides with the
+// departed peer's still-occupied metadata slot.
+type PeerForgetAckStamper interface {
+	// StampPeerForgetAck patches a single annotation
+	// `blockstor.io/peer-forget-acked.<peerNodeName>` onto Resource
+	// <resourceName>.metadata.annotations with the current
+	// wall-clock RFC3339Nano timestamp. Idempotent — a repeat call
+	// for the same peer simply re-advances the timestamp; the REST
+	// poller only cares about presence, not value. NotFound on the
+	// Resource CRD is silently swallowed by the implementation:
+	// concurrent cascade-deletes are the most common cause and the
+	// caller (the satellite reconciler) doesn't care.
+	StampPeerForgetAck(ctx context.Context, resourceName, peerNodeName string) error
 }
 
 // SkipDiskClearer abstracts the "release the satellite's SSA claim
@@ -332,6 +376,15 @@ func (r *Reconciler) SetFilesystemFormattedStamper(s FilesystemFormattedStamper)
 // NewReconciler time. Safe to call before the first Apply. Bug 278.
 func (r *Reconciler) SetSkipDiskClearer(c SkipDiskClearer) {
 	r.cfg.SkipDiskClearer = c
+}
+
+// SetPeerForgetAckStamper injects the PeerForgetAck stamper
+// post-construction. Mirrors `SetMetadataCreatedStamper`: the stamper
+// needs the controller-runtime manager's cached client which doesn't
+// exist at NewReconciler time. Safe to call before the first Apply.
+// Spec §4.2 / §6.
+func (r *Reconciler) SetPeerForgetAckStamper(s PeerForgetAckStamper) {
+	r.cfg.PeerForgetAckStamper = s
 }
 
 // StateDir returns the on-disk directory the reconciler uses for
@@ -1458,29 +1511,51 @@ func (r *Reconciler) tearDownRemovedPeers(ctx context.Context, dr *intent.Desire
 
 		// forget-peer is per-volume because v09 metadata lives in
 		// the per-volume block. Skip volumes without a device path
-		// (DISKLESS local replica — no metadata to clean) and
-		// peers without a resolvable node-id (.res malformed /
-		// races a brand-new resource being torn down before its
-		// peer ever rendered).
-		peerID, hasID := peerIDs[peer]
-		if !hasID {
-			continue
+		// (DISKLESS local replica — no metadata to clean per spec
+		// §4.1 disk gate) and peers without a resolvable node-id
+		// (.res malformed / races a brand-new resource being torn
+		// down before its peer ever rendered).
+		if peerID, hasID := peerIDs[peer]; hasID {
+			for volNum, device := range devices {
+				if device == "" {
+					continue
+				}
+
+				// forget-peer errors are non-fatal: a stale on-disk
+				// slot leaks one of the MaxPeers-1 budget entries but
+				// the resource keeps serving I/O. The next reconcile
+				// retries; if the leak persists, the eventual
+				// create-md exhaustion surfaces a louder error than
+				// any log line here could. del-peer errors still
+				// bubble (above) — those leak a live kernel
+				// connection, a faster correctness issue.
+				_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
+			}
 		}
 
-		for volNum, device := range devices {
-			if device == "" {
-				continue
-			}
-
-			// forget-peer errors are non-fatal: a stale on-disk
-			// slot leaks one of the MaxPeers-1 budget entries but
-			// the resource keeps serving I/O. The next reconcile
-			// retries; if the leak persists, the eventual
-			// create-md exhaustion surfaces a louder error than
-			// any log line here could. del-peer errors still
-			// bubble (above) — those leak a live kernel
-			// connection, a faster correctness issue.
-			_ = r.cfg.Adm.ForgetPeer(ctx, dr.GetName(), volNum, device, peerID)
+		// Stamp the per-peer ACK annotation on this satellite's
+		// local Resource CRD so the REST handler's
+		// `waitForPeerDeletionAcks` poller observes the cleanup as
+		// complete. Spec §4.2 (phase 2 ACK) + §6 (three-replica
+		// re-place edge case): without this signal a fresh
+		// `linstor rd ap` autoplacing the same `node-id` races the
+		// del-peer/forget-peer cleanup and produces stuck-Connecting
+		// peers because the new replica handshakes against a
+		// metadata slot that still carries the previous peer's
+		// bitmap. Resource name is `<rd>.<node>` per the CRD
+		// naming convention. Best-effort: a stamper failure logs at
+		// the implementation layer and falls through — the REST
+		// handler's 15s deadline absorbs the missed ACK by
+		// proceeding to physical Delete with the pre-fix
+		// annotation-bump fallback. ACK fires for both diskful and
+		// diskless local replicas — the REST poller only needs to
+		// know the kernel-side cleanup (del-peer at minimum) ran
+		// against the doomed peer's slot, and del-peer ran above
+		// for both disk modes (per spec §4.1, diskless local skips
+		// the forget-peer half but still owns del-peer).
+		if r.cfg.PeerForgetAckStamper != nil {
+			resourceName := dr.GetName() + "." + r.cfg.NodeName
+			_ = r.cfg.PeerForgetAckStamper.StampPeerForgetAck(ctx, resourceName, peer)
 		}
 	}
 

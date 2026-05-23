@@ -564,19 +564,114 @@ func buildNodeLostRefusalCorrection(hasRefs bool) string {
 }
 
 // cascadeOrphansForLostNode walks Resources + StoragePools and
-// deletes every row whose NodeName matches the lost node. NotFound
-// from a per-child Delete is swallowed (a child that already
-// vanished — race with a parallel cascade or a previous partial
-// teardown — must not fail the whole `node lost` call; the parent
-// handler is itself idempotent for this exact reason). The first
-// non-NotFound error short-circuits the cascade so the operator
-// sees an actionable signal before the Node row vanishes.
+// deletes every row whose NodeName matches the lost node.
+//
+// Spec §4.2 / §6 — two-phase delete for the Resource orphans:
+//
+//  1. **Mark and broadcast.** For every Resource hosted on the lost
+//     node, stamp `DELETE` on `Spec.Flags` (idempotent — repeat is a
+//     no-op) and bump the `PeerChangedAnnotation` on every surviving
+//     sibling so its satellite reconciler wakes. The doomed Resource
+//     row is still present in the store and still listed in each
+//     satellite's peer set, but it now carries the `DELETE` flag —
+//     spec §2.1 / §7.7 require that a flagged-but-not-yet-reaped
+//     replica still occupies its `node-id` for allocator purposes,
+//     so a same-second `linstor rd ap` cannot race a re-place onto
+//     the still-occupied slot.
+//  2. **Confirm and reap.** Wait briefly for every reachable
+//     surviving sibling to stamp the per-peer ACK annotation
+//     (`blockstor.io/peer-forget-acked.<lost-node>`), which the
+//     satellite writes after `tearDownRemovedPeers` has issued
+//     `drbdadm del-peer` + `drbdmeta forget-peer` against the lost
+//     peer's kernel slot. THEN physically Delete the Resource row.
+//
+// Without this protocol, the pre-fix path hard-deleted the Resource
+// CRD before the survivors had any chance to react: the survivors'
+// satellites lost the DELETE-flag signal that triggers `forget-peer`
+// in their per-peer cleanup loop, the kernel-side peer slot survived
+// with the lost node's bitmap, and a subsequent autoplace (re-placing
+// the missing replica back on a freshly reincarnated node — or on a
+// surviving node that the placer reuses) collided with the
+// not-yet-forgotten slot. Visible symptom: stuck `Connecting` on
+// every surviving DRBD-9 peer until manual `forget-peer` was issued.
+// See `tests/e2e/recovery-node-id-mismatch.sh`.
+//
+// Best-effort throughout — the spec's "phase 1 ACK timeout" path
+// folds to the old hard-delete behaviour rather than refusing the
+// operator's `n lost` (which would brick a genuine permanent-loss
+// recovery). NotFound from a per-child Delete is swallowed (a child
+// that already vanished — race with a parallel cascade or a previous
+// partial teardown — must not fail the whole `node lost` call; the
+// parent handler is itself idempotent for this exact reason). The
+// first non-NotFound error short-circuits the cascade so the
+// operator sees an actionable signal before the Node row vanishes.
+//
+// StoragePool cleanup is unchanged — they have no peer-coordination
+// story; the satellite has them via `discoveredStorage` only on the
+// host that owns them, and that host is the lost one.
 func (s *Server) cascadeOrphansForLostNode(ctx context.Context, name string) error {
 	resources, err := s.Store.Resources().List(ctx)
 	if err != nil {
 		return err //nolint:wrapcheck // surfaced via writeStoreError
 	}
 
+	// Phase 1: mark every doomed Resource with the DELETE flag and
+	// bump siblings so their satellite reconcilers wake. The
+	// `DELETE` flag is the spec §4.2 "visible to surviving peers in
+	// a flagged-for-deletion state" signal; the satellite-side
+	// dispatcher's existing `INACTIVE`-skip path is the model — a
+	// flagged peer drops out of the survivors' `.res` peer block
+	// list, which triggers `computeRemovedPeers` → `del-peer` +
+	// `forget-peer` + ACK stamp on the next satellite reconcile.
+	type doomedRD struct {
+		rdName       string
+		resourceName string
+	}
+
+	var doomed []doomedRD
+
+	for i := range resources {
+		if resources[i].NodeName != name {
+			continue
+		}
+
+		// The Store's apiv1.Resource.Name carries the RD identifier
+		// (the store keys by (rdName, nodeName) — Name doubles as
+		// rdName here, matching what `bumpPeerChangedOnSiblings`
+		// passes through to `ListByDefinition`). Tests seed
+		// Resource{Name: "rd-a", NodeName: "lost-node"} which is
+		// the same shape the regular `r d` path uses.
+		rdName := resources[i].Name
+		doomed = append(doomed, doomedRD{rdName: rdName, resourceName: rdName})
+
+		flagErr := s.flagResourceDeleted(ctx, rdName, name)
+		if flagErr != nil && !errors.Is(flagErr, store.ErrNotFound) {
+			// Best-effort: a flag-stamp failure on one resource
+			// must not abort the whole cascade. The fall-through
+			// physical Delete below still runs, degrading to
+			// pre-spec behaviour for THAT row only (siblings catch
+			// up on the next event).
+			continue
+		}
+
+		// Wake every surviving sibling on every other node so its
+		// satellite reconciler picks up the flagged peer and runs
+		// del-peer + forget-peer + ACK stamp.
+		s.bumpPeerChangedOnSiblings(ctx, rdName, name)
+	}
+
+	// Phase 1 ACK gate: wait briefly for every reachable surviving
+	// sibling per doomed Resource to stamp its per-peer ACK
+	// annotation. Bounded by `peerDeleteAckTimeout` — on miss we
+	// fall through to physical Delete with the pre-spec behaviour
+	// rather than blocking the operator's `n lost` indefinitely.
+	for _, d := range doomed {
+		s.waitForPeerDeletionAcks(ctx, d.rdName, name)
+	}
+
+	// Phase 2: physical Delete. Idempotent on NotFound — a
+	// concurrent cascade or finalizer race may have reaped the
+	// row already.
 	for i := range resources {
 		if resources[i].NodeName != name {
 			continue
@@ -598,6 +693,31 @@ func (s *Server) cascadeOrphansForLostNode(ctx context.Context, name string) err
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err //nolint:wrapcheck // surfaced via writeStoreError
 		}
+	}
+
+	return nil
+}
+
+// flagResourceDeleted stamps the upstream-LINSTOR `DELETE` flag onto
+// a doomed Resource's `Spec.Flags` so surviving siblings observe the
+// "flagged for deletion" state before the row physically vanishes.
+// Spec §4.2 phase 1. Idempotent — repeat calls converge on the same
+// flag set (the `applyFlagMutation` helper de-duplicates entries).
+//
+// `rdName` doubles as the Resource's wire Name in the in-memory store
+// (the satellite-side CRD shape `metadata.name == <rd>.<node>` is
+// flattened at the store boundary — `ResourceStore.PatchResourceSpec`
+// keys by (rdName, nodeName) and apiv1.Resource carries `Name=rdName`
+// alone).
+func (s *Server) flagResourceDeleted(ctx context.Context, rdName, nodeName string) error {
+	err := s.Store.Resources().PatchResourceSpec(ctx, rdName, nodeName,
+		func(res *apiv1.Resource) error {
+			res.Flags = applyFlagMutation(res.Flags, rscFlagDelete, true)
+
+			return nil
+		})
+	if err != nil {
+		return errors.Wrapf(err, "patch Spec.Flags with DELETE on %s/%s", rdName, nodeName)
 	}
 
 	return nil

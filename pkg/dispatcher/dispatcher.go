@@ -94,6 +94,28 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 			continue
 		}
 
+		// Spec §4.2 (DRBD node-id realloc behavioural specification):
+		// a peer flagged `DELETE` (or `DRBD_DELETE`) is the
+		// controller's phase-1 "mark and broadcast" signal that this
+		// replica is on its way out. The dispatcher drops it from the
+		// rendered `.res` so the next satellite reconcile's
+		// `computeRemovedPeers` diff sees it as removed and fires
+		// `drbdadm del-peer` + `drbdmeta forget-peer` (for diskful
+		// local replicas) against its kernel slot — releasing the
+		// peer-slot metadata so the allocator can safely re-issue
+		// the same numeric `node-id` to a fresh replica without
+		// DRBD-9 refusing the handshake on stale bitmap data
+		// (spec §4.3 "wrong day-0 bitmap"). The flagged Resource
+		// row is still present in the controller's model and still
+		// counts as "in use" for the lowest-free allocator (spec
+		// §7.7) — only after the controller physically reaps the
+		// row does the node-id become free for reuse, by which
+		// point every surviving satellite has ACKed the cleanup.
+		if slices.Contains(peers[i].Spec.Flags, "DELETE") ||
+			slices.Contains(peers[i].Spec.Flags, "DRBD_DELETE") {
+			continue
+		}
+
 		if id := nodeIDOf(&peers[i]); id >= 0 {
 			idOf[peers[i].Spec.NodeName] = id
 		}

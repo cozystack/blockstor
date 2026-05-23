@@ -203,6 +203,7 @@ func wireConditionStampers(mgr manager.Manager, cfg *Config) {
 	wireMetadataCreatedStamper(mgr, cfg)
 	wireFilesystemFormattedStamper(mgr, cfg)
 	wireSkipDiskClearer(mgr, cfg)
+	wirePeerForgetAckStamper(mgr, cfg)
 }
 
 // ensureWiredDefaults populates the Config fields the satellite-side
@@ -362,5 +363,21 @@ func wireSkipDiskClearer(mgr manager.Manager, cfg *Config) {
 	cfg.Apply.SetSkipDiskClearer(&SkipDiskClearer{
 		Client:   mgr.GetClient(),
 		NodeName: cfg.NodeName,
+	})
+}
+
+// wirePeerForgetAckStamper injects the PeerForgetAckStamper into the
+// Apply chain so `tearDownRemovedPeers` can stamp the per-peer
+// `blockstor.io/peer-forget-acked.<peerNode>` annotation onto the
+// local Resource CRD after `del-peer` + `forget-peer` finish for a
+// departing peer. The REST handler's `waitForPeerDeletionAcks` polls
+// this annotation as the cluster-wide signal that the kernel-side
+// cleanup has completed, gating the controller's physical reap of
+// the doomed Resource CRD. Mirrors `wireMetadataCreatedStamper` —
+// the stamper needs the manager's cached client which doesn't exist
+// at NewReconciler time. Spec §4.2 / §6.
+func wirePeerForgetAckStamper(mgr manager.Manager, cfg *Config) {
+	cfg.Apply.SetPeerForgetAckStamper(&PeerForgetAckStamper{
+		Client: mgr.GetClient(),
 	})
 }
