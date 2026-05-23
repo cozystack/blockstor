@@ -117,6 +117,32 @@ var _ = Describe("CEL naming-convention validation", func() {
 
 			Expect(k8sClient.Create(ctx, sp)).To(HaveOccurred())
 		})
+
+		// Bug 59: upstream LINSTOR's well-known `DfltDisklessStorPool`
+		// is CamelCase on the wire. k8s metadata.Name is RFC-1123
+		// (lowercase only). The CEL rule must compare both sides
+		// case-insensitively so the lowercased metadata.name maps to
+		// the CamelCase spec.poolName without a 422 rejection.
+		// Without this carve-out the controller's
+		// `upsertNodeAndDiskless` silently fails to provision the
+		// per-satellite diskless pool and downstream RD placement
+		// breaks (the n c looks like a 201 but no pool CRD exists).
+		It("accepts a lowercased metadata.name with CamelCase spec.poolName (Bug 59)", func() {
+			name := "dfltdisklessstorpool.w1"
+
+			defer cleanupSP(name)
+
+			sp := &blockstoriov1alpha1.StoragePool{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+				Spec: blockstoriov1alpha1.StoragePoolSpec{
+					NodeName:     "w1",
+					PoolName:     "DfltDisklessStorPool",
+					ProviderKind: "DISKLESS",
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, sp)).To(Succeed())
+		})
 	})
 
 	Context("Resource.metadata.name", func() {
