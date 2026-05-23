@@ -397,9 +397,36 @@ echo "   $N1 reached UpToDate in $((window_end - window_start))s"
 # ---------- step 7: assertions ----------
 
 # (a) Both replicas UpToDate.
-n2_disk=$(status_disk_state "$RD" "$N2")
+#
+# Post-recovery observer-SSA race: $N1 walking Diskless → Inconsistent →
+# SyncTarget → UpToDate emits a burst of events2 frames on BOTH peers
+# (the peer-disk transitions on $N2 mirror the local-disk transitions
+# on $N1). The observer batches these into Status SSA applies — and a
+# pre-Status snapshot loaded by an in-flight reconcile-driven Status
+# write can momentarily clear Status.Volumes[].diskState back to ""
+# (empty / null in JSON) when re-stamped under our FieldOwner. Empty
+# Status here is NOT a regression — the kernel reports disk:UpToDate
+# throughout (verified via `drbdsetup status`), only the apiserver
+# projection has a sub-second observability gap. Mirrors the pattern
+# at line 257-262 (`n1 detach` events2 storm) and
+# recovery-bitmap-drop.sh:285-289.
+#
+# Poll until $N2 reports a non-empty UpToDate, with the same 15s
+# window the $N1 recovery wait uses. A persistent empty value past
+# the window WOULD be a regression (the observer SSA stalled), so
+# we still time-bound the poll rather than ignoring the gap entirely.
+deadline=$(( $(date +%s) + RECOVERY_WINDOW ))
+n2_disk=""
+while (( $(date +%s) < deadline )); do
+    n2_disk=$(status_disk_state "$RD" "$N2")
+    if [[ "$n2_disk" == "UpToDate" ]]; then
+        break
+    fi
+    sleep 1
+done
 if [[ "$n2_disk" != "UpToDate" ]]; then
-    echo "FAIL: $N2 not UpToDate post-recovery: $n2_disk"
+    echo "FAIL: $N2 not UpToDate post-recovery within ${RECOVERY_WINDOW}s (last: '$n2_disk')"
+    on_node "$N2" drbdsetup status "$RD" || true
     exit 1
 fi
 
