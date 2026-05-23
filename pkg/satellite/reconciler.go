@@ -618,13 +618,22 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 		return res
 	}
 
-	devices, err = r.maybeLUKS(ctx, dr, diskless, devices, resized)
+	devices, luksGrew, err := r.maybeLUKS(ctx, dr, diskless, devices, resized)
 	if err != nil {
 		res.Ok = false
 		res.Message = err.Error()
 
 		return res
 	}
+
+	// LUKS layer may have driven a convergent resize even when the
+	// storage layer did not (Bug LUKS-RESIZE-CONVERGE crash-recovery
+	// path: prior reconcile widened the LV but the satellite restart
+	// happened before cryptsetup-resize fired, so this reconcile sees
+	// storage already at spec — resized=false — but the mapper is
+	// still small). Fold the LUKS signal into the resize bool so the
+	// downstream `drbdadm resize` fires.
+	resized = resized || luksGrew
 
 	// Skip DRBD when the layer_stack explicitly omits it. Empty
 	// layer_stack defaults to ["DRBD","STORAGE"] so legacy clients
@@ -647,13 +656,15 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 // maybeLUKS conditionally layers cryptsetup over the raw storage
 // devices when the layer stack names "LUKS". Returns the (possibly
-// rewritten) volume → device map for the next layer. Skips entirely
-// for diskless replicas — they never open the underlying disk. When
-// the storage layer just grew (resized=true), also runs cryptsetup
-// resize so the mapper picks up the new size before DRBD's resize.
-func (r *Reconciler) maybeLUKS(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string, resized bool) (map[int32]string, error) {
+// rewritten) volume → device map and a bool reporting whether the
+// LUKS layer just grew the dm-crypt mapper (so the caller can
+// chain a downstream `drbdadm resize` even when the storage layer
+// didn't change this reconcile — see Bug LUKS-RESIZE-CONVERGE).
+// Skips entirely for diskless replicas — they never open the
+// underlying disk.
+func (r *Reconciler) maybeLUKS(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string, resized bool) (map[int32]string, bool, error) {
 	if diskless || !needsLUKS(dr.GetLayerStack()) {
-		return devices, nil
+		return devices, false, nil
 	}
 
 	return r.applyLUKS(ctx, dr, devices, resized)
@@ -675,59 +686,172 @@ func needsLUKS(stack []string) bool {
 // applyLUKS formats (first activation only) and opens every volume's
 // raw device under /dev/mapper/<rd>-<volnum>, returning the new
 // volNumber→DevicePath map for downstream layers (DRBD or direct
-// consumer). When resized=true, also runs cryptsetup resize on each
-// open mapper so the encrypted device picks up the grown LV size.
+// consumer) and a bool reporting whether the dm-crypt mapper just
+// grew during this reconcile (so the caller can chain a downstream
+// `drbdadm resize` even when the storage layer didn't change).
+//
+// Resize trigger: cryptsetup resize fires when EITHER the storage
+// layer just grew this reconcile (resized=true from applyStorage)
+// OR the dm-crypt mapper was opened on a previous reconcile pass
+// AND the underlying device has grown since (Bug LUKS-RESIZE-
+// CONVERGE). The second trigger is the convergence path: if a prior
+// reconcile widened the LV but the satellite crashed / lost its
+// scheduler tick before reaching the cryptsetup-resize step, the
+// `vol.SizeKib > status.UsableKib` predicate goes false on the next
+// pass — applyStorage finds nothing to grow — and `resized` stays
+// false. Without the convergence path the LUKS mapper would stay
+// pinned at the old size forever, starving every consumer above it.
+//
+// To avoid an unconditional cryptsetup-resize shell-out on every
+// steady-state reconcile (would spawn ~3 children per reconcile per
+// volume), we only run resize when Open returned ErrAlreadyOpen
+// (mapper carried over from a previous Apply) AND blockdev reports
+// the underlying device is larger than the mapper. A fresh Open
+// (Format-then-Open path) always lines up with the underlying size
+// out of cryptsetup luksFormat's geometry so the probe is skipped.
 //
 // Passphrase source for this slice: dr.Props["LuksPassphrase"]. The
 // controller folds it in from the RD's `DrbdOptions/Encryption/passphrase`
 // prop via the resolver. Empty passphrase fails the apply — explicit
 // rather than silently creating an unencrypted volume.
-func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, error) {
+func (r *Reconciler) applyLUKS(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, resized bool) (map[int32]string, bool, error) {
 	if r.cfg.Cryptsetup == nil {
-		return nil, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
+		return nil, false, errors.New("LUKS in layer stack but no cryptsetup wrapper configured")
 	}
 
 	pass := dr.GetProps()["LuksPassphrase"]
 	if pass == "" {
-		return nil, errors.New("LUKS in layer stack but Props.LuksPassphrase empty")
+		return nil, false, errors.New("LUKS in layer stack but Props.LuksPassphrase empty")
 	}
 
 	out := make(map[int32]string, len(devices))
 	key := []byte(pass)
+	mapperGrew := false
 
 	for vol, dev := range devices {
 		dmName := luksMapperName(dr.GetName(), vol)
 
 		err := r.cfg.Cryptsetup.Format(ctx, dev, key)
 		if err != nil {
-			return nil, errors.Wrapf(err, "luks format %s", dev)
+			return nil, false, errors.Wrapf(err, "luks format %s", dev)
 		}
 
-		err = r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
-		if err != nil {
-			// EEXIST is expected on every reconcile after the first —
-			// the device is already opened. Classify via the typed
-			// luks.ErrAlreadyOpen sentinel so we are immune to
-			// cryptsetup output locale (Bug 215): the prior English-
-			// only substring match silently failed on de_DE / fr_FR /
-			// ru_RU satellites and would have triggered a luksFormat
-			// retry against an already-formatted device.
-			if !errors.Is(err, luks.ErrAlreadyOpen) {
-				return nil, errors.Wrapf(err, "luks open %s -> %s", dev, dmName)
-			}
+		openErr := r.cfg.Cryptsetup.Open(ctx, dev, dmName, key)
+		alreadyOpen := errors.Is(openErr, luks.ErrAlreadyOpen)
+
+		if openErr != nil && !alreadyOpen {
+			// Non-EEXIST open failure: bubble. EEXIST is the every-
+			// reconcile-after-first idempotent path — classified via
+			// the typed luks.ErrAlreadyOpen sentinel so we are immune
+			// to cryptsetup output locale (Bug 215): the prior
+			// English-only substring match silently missed de_DE /
+			// fr_FR / ru_RU satellites and would have triggered a
+			// luksFormat retry against an already-formatted device.
+			return nil, false, errors.Wrapf(openErr, "luks open %s -> %s", dev, dmName)
 		}
 
-		if resized {
+		mapperPath := luks.DevicePath(dmName)
+
+		// Decide whether to invoke cryptsetup resize. Two triggers:
+		//
+		//  1. resized=true from applyStorage — the LV/zvol/file just
+		//     grew this reconcile. The mapper must catch up before
+		//     DRBD's own resize fires.
+		//
+		//  2. The mapper carried over from a previous Apply
+		//     (alreadyOpen=true) AND the underlying device is now
+		//     larger than the mapper. Covers the crash-recovery path
+		//     and any other reason applyStorage's grow predicate
+		//     skipped this reconcile while the mapper still lags.
+		//
+		// On a fresh Open (no EEXIST) the dm-crypt geometry matches
+		// the underlying device by definition — luksOpen sizes the
+		// mapper from the device on every fresh attach — so we skip
+		// the probe + resize to keep steady-state reconciles cheap.
+		needResize := resized
+		if !needResize && alreadyOpen && r.luksMapperBehindUnderlying(ctx, dev, mapperPath) {
+			needResize = true
+		}
+
+		if needResize {
 			err = r.cfg.Cryptsetup.Resize(ctx, dmName, key)
 			if err != nil {
-				return nil, errors.Wrapf(err, "luks resize %s", dmName)
+				return nil, false, errors.Wrapf(err, "luks resize %s", dmName)
 			}
+
+			mapperGrew = true
 		}
 
-		out[vol] = luks.DevicePath(dmName)
+		out[vol] = mapperPath
 	}
 
-	return out, nil
+	return out, mapperGrew, nil
+}
+
+// luksMapperBehindUnderlying reports whether the dm-crypt mapper at
+// mapperPath is currently sized smaller than the underlying device
+// at devicePath, accounting for the LUKS header carve-out.
+//
+// LUKS2 reserves a 16 MiB header by default (cryptsetup 2.x — older
+// LUKS1 reserves ~2 MiB; older LUKS2 builds 4 MiB). The mapper is
+// ALWAYS smaller than the underlying by at least that header amount,
+// so a naive `underlying > mapper` comparison fires on every healthy
+// LUKS device. We use a 32 MiB tolerance: anything beyond that gap
+// is a real grow that the mapper hasn't picked up.
+//
+// Both probes shell out to `blockdev --getsize64`. Probe failures
+// (Exec nil in unit tests, blockdev missing on a minimal image,
+// transient EBUSY mid-attach) fall through to (false, nil): no probe
+// → no convergence push, and the resized=true fast path still works
+// for fresh resize-pending events. This mirrors the "best-effort
+// drift detection" pattern used by readDeviceSizeMiB elsewhere in
+// this file.
+func (r *Reconciler) luksMapperBehindUnderlying(ctx context.Context, devicePath, mapperPath string) bool {
+	if r.cfg.Exec == nil {
+		return false
+	}
+
+	devSize, ok := readDeviceSizeBytes(ctx, r.cfg.Exec, devicePath)
+	if !ok {
+		return false
+	}
+
+	mapperSize, ok := readDeviceSizeBytes(ctx, r.cfg.Exec, mapperPath)
+	if !ok {
+		return false
+	}
+
+	// 32 MiB covers the largest possible LUKS2 header (16 MiB default,
+	// some LUKS2 variants 4 MiB with extended secondary header) with
+	// margin for cryptsetup's per-volume alignment rounding. A real
+	// resize grows the underlying by at least an FS block (≥4 KiB) but
+	// in practice operator-driven resizes move at least one MiB at a
+	// time; 32 MiB is conservative without missing any real grow.
+	// False negatives only delay the next reconcile's resize; false
+	// positives cost one idempotent cryptsetup resize.
+	const luksHeaderToleranceBytes int64 = 32 << 20 // 32 MiB
+
+	return devSize > mapperSize+luksHeaderToleranceBytes
+}
+
+// readDeviceSizeBytes is the byte-precision counterpart of
+// readDeviceSizeMiB used by the attach-wipe path. Pulled out so the
+// LUKS-mapper drift probe can compare to the underlying device at
+// byte granularity (a MiB-rounded comparison would lose any sub-MiB
+// header carve-out and surface as a false-positive resize loop on
+// every reconcile).
+func readDeviceSizeBytes(ctx context.Context, exec storage.Exec, devicePath string) (int64, bool) {
+	out, err := exec.Run(ctx, "blockdev", "--getsize64", devicePath)
+	if err != nil {
+		return 0, false
+	}
+
+	sizeBytes, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+
+	return sizeBytes, true
 }
 
 // luksMapperName picks the dm-crypt name for an (rd, vol) pair. The
