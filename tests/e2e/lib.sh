@@ -318,6 +318,84 @@ delete_rd() {
     done
 }
 
+# delete_all_rds wipes EVERY ResourceDefinition / Resource / Snapshot
+# CRD on the cluster, then waits up to `timeout` seconds for the stand
+# to converge to idle. Pre-test self-defence helper: scenarios that
+# assert post-state invariants (`linstor r l` empty, no orphan ZVOLs,
+# zero dmesg warnings) MUST call this at the top so leakage from
+# previously-run scenarios (cc-autoplace.* from client-compat.sh,
+# e2e-clone-src from clone.sh, e2e-affinity-controller from
+# affinity-controller.sh, …) doesn't get blamed on the current run.
+#
+# Unlike per-test `delete_rd <name>` traps — which fire only on EXIT
+# and skip resources whose owning RD was already torn down by an
+# earlier failure — this enumerates the live CRDs and feeds each into
+# `delete_rd` so the satellite-side kernel teardown (drbdsetup down +
+# .res / .md-created / .owned removal) runs for every leaked slot.
+#
+# Honours the same "NEVER force-strip finalizers" pin as the cascade
+# tests: each `delete_rd` waits for cascade with a 30s timeout. If
+# anything is still present after `timeout`, logs to stderr and
+# returns non-zero so the caller can dump_diag + exit rather than
+# silently masking the prior-test bug.
+delete_all_rds() {
+    local timeout=${1:-90}
+
+    # Enumerate first; iterate by name so an empty list is a no-op.
+    local rds
+    rds=$(kubectl get resourcedefinitions.blockstor.io.blockstor.io \
+        --no-headers 2>/dev/null | awk '{print $1}')
+    if [[ -n "$rds" ]]; then
+        echo ">> delete_all_rds: pre-test wipe of: $(echo "$rds" | tr '\n' ' ')"
+        local rd
+        for rd in $rds; do
+            delete_rd "$rd" 2>/dev/null || true
+        done
+    fi
+
+    # Mop up any stray Resource / Snapshot CRDs whose owning RD was
+    # already gone (so the loop above didn't touch them). delete_rd
+    # only matches by RD prefix, so a hand-leaked `foo.node` without
+    # a `foo` RD slips past it.
+    local res
+    res=$(kubectl get resources.blockstor.io.blockstor.io \
+        --no-headers 2>/dev/null | awk '{print $1}')
+    if [[ -n "$res" ]]; then
+        echo ">> delete_all_rds: orphan Resource sweep: $(echo "$res" | tr '\n' ' ')"
+        echo "$res" | xargs -r kubectl delete --wait=true --timeout=30s \
+            resources.blockstor.io.blockstor.io 2>/dev/null || true
+    fi
+    local snaps
+    snaps=$(kubectl get snapshots.blockstor.io.blockstor.io \
+        --no-headers 2>/dev/null | awk '{print $1}')
+    if [[ -n "$snaps" ]]; then
+        echo "$snaps" | xargs -r kubectl delete --wait=true --timeout=30s \
+            snapshots.blockstor.io.blockstor.io 2>/dev/null || true
+    fi
+
+    # Wait until the kernel + CRD state converges.
+    local deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) < deadline )); do
+        local crd_count
+        crd_count=$( {
+            kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null
+        } | grep -cv '^$' || true )
+
+        if [[ "$crd_count" == "0" ]]; then
+            return 0
+        fi
+
+        sleep 2
+    done
+
+    echo "delete_all_rds: cluster still has CRDs after ${timeout}s:" >&2
+    kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null >&2 || true
+    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null >&2 || true
+    return 1
+}
+
 # wait_cluster_idle waits until the stand is back to a clean slate
 # between back-to-back e2e scenarios on the same cluster — no
 # blockstor CRDs for resources / RDs / snapshots, and no kernel-side
