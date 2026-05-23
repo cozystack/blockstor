@@ -277,6 +277,37 @@ func (r *SnapshotReconciler) handleTakeSnapshotPhase(ctx context.Context, snap *
 		req.VolumeNumbers = append(req.VolumeNumbers, snap.Spec.VolumeDefinitions[i].VolumeNumber)
 	}
 
+	// P0 fix for stale-snapshot bug: `drbdsetup suspend-io` (Phase 1)
+	// quiesces NEW writes at the DRBD layer but does NOT issue a
+	// writeback barrier to the backing zvol / loop / LV. Without an
+	// explicit flush, in-flight dirty pages sit in the kernel page
+	// cache while provider.CreateSnapshot fires below — the captured
+	// snap (and any clone / `zfs send | recv` payload derived from
+	// it) ends up carrying empty / stale content. Empirical: 256 KiB
+	// urandom written through /dev/drbdN shows only ~16 KiB
+	// `used` on the ZFS zvol after the snapshot, and clone.sh /
+	// snapshot-restore-cross-node.sh / snap-ship-cross-node.sh
+	// fail with md5 mismatch.
+	//
+	// Mirrors upstream LINSTOR's `Controller/.../snapshot/*`
+	// step that fsyncs the backing device between suspend-io and
+	// the storage-layer snapshot. Best-effort: per-device failures
+	// don't abort the snapshot — degraded flush still beats no
+	// flush, and a stripped-down satellite environment (kernel
+	// without BLKFLSBUF, hostpath sandboxing) shouldn't block the
+	// snapshot from running.
+	err := r.Config.Apply.FlushBackingDevices(ctx, snap.Spec.ResourceDefinitionName, req.VolumeNumbers)
+	if err != nil {
+		// FlushBackingDevices itself returns nil on best-effort
+		// per-device failures; a non-nil return signals a hard
+		// programming error (panic-equivalent). Surface it as a
+		// transient requeue rather than wedging the orchestration.
+		log.FromContext(ctx).Info("FlushBackingDevices failed",
+			"snapshot", snap.Spec.SnapshotName, "error", err.Error())
+
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	resp, err := r.Config.Apply.CreateSnapshot(ctx, req)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "CreateSnapshot")
