@@ -2713,7 +2713,50 @@ func (r *Reconciler) bringUpResource(ctx context.Context, dr *intent.DesiredReso
 		return errors.Wrapf(err, "drbdadm up %s", dr.GetName())
 	}
 
+	// Talos / minimal-distro fix: no udev daemon means DRBD's bundled
+	// udev rules never fire and `/dev/drbd<minor>` is never created
+	// after `drbdadm up`. The CSI publish path, e2e tests, and any
+	// `drbdadm primary` consumer that opens the device via plain
+	// open(2) would otherwise create a regular file in tmpfs at that
+	// path and silently land all I/O in tmpfs (never touching DRBD
+	// or the backing zvol/loop/lvm). EnsureDeviceNode is the
+	// satellite-side replacement for the missing udev rule: idempotent,
+	// safe on real-udev nodes (no-op when path is already correct).
+	ensureDeviceNodes(ctx, dr)
+
 	return nil
+}
+
+// ensureDeviceNodes invokes drbd.EnsureDeviceNode for every kernel
+// minor the resource owns, derived from the DrbdOptions["minor"] base
+// + per-volume offset (mirrors buildResVolumes' minor allocation). A
+// per-volume failure is logged and otherwise swallowed: the next
+// reconcile re-attempts, and a transient EPERM / I/O hiccup must not
+// strand the bring-up path. Real /dev/drbd<N> creation is best-effort
+// — if the satellite can't mknod (e.g. the container lacks CAP_MKNOD),
+// the consumer's open will fail loudly rather than silently writing to
+// a tmpfs file.
+func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
+	baseMinor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
+
+	for _, vol := range dr.GetVolumes() {
+		minor := baseMinor + int(vol.GetVolumeNumber())
+		if minor <= 0 {
+			// Base minor unset (DesiredResource may carry no minor
+			// when the controller hasn't allocated one yet — pre-first-
+			// activation). Skip: the bring-up that just succeeded can't
+			// have been about THIS volume, the kernel didn't get a
+			// minor to bind to.
+			continue
+		}
+
+		if err := drbd.EnsureDeviceNode(minor); err != nil {
+			log.FromContext(ctx).Error(err, "ensure /dev/drbd device node",
+				"resource", dr.GetName(),
+				"volume", vol.GetVolumeNumber(),
+				"minor", minor)
+		}
+	}
 }
 
 // adjustResource runs `drbdadm adjust <name>` with the right
@@ -2867,6 +2910,16 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 
 	err := r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
 	if err == nil {
+		// Talos / minimal-distro fix: same rationale as bringUpResource.
+		// Adjust may have added a new volume (multi-volume scenario 6.5)
+		// or flipped a diskless replica diskful (Bug 319) — both create
+		// a new kernel minor on this node. Without udev the matching
+		// /dev/drbd<minor> never appears; consumers then open the path
+		// via open(2) and the kernel creates a regular file in tmpfs.
+		// EnsureDeviceNode is idempotent on already-correct nodes so
+		// covering the steady-state-adjust path here costs nothing.
+		ensureDeviceNodes(ctx, dr)
+
 		return nil
 	}
 
@@ -2880,6 +2933,8 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		if upErr != nil {
 			return errors.Wrapf(upErr, "drbdadm up %s (after adjust 158 fallback)", dr.GetName())
 		}
+
+		ensureDeviceNodes(ctx, dr)
 
 		return nil
 	}
