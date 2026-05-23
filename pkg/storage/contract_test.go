@@ -203,9 +203,11 @@ func TestNamingContract_FILE(t *testing.T) {
 	wantPath := filepath.Join(dir, "pvc-42_00007.img")
 
 	fx := storage.NewFakeExec()
-	// Wire the losetup pair so CreateVolume can complete.
+	// Wire the losetup pair so CreateVolume can complete. The attach
+	// uses --direct-io=on as a P0 fix for the DRBD-on-FILE_THIN write-
+	// loss path (e2e6 drbd-luks-stack failover md5 mismatch).
 	fx.Expect("losetup -j "+wantPath, storage.FakeResponse{})
-	fx.Expect("losetup --find --show "+wantPath, storage.FakeResponse{Stdout: []byte("/dev/loop99\n")})
+	fx.Expect("losetup --find --show --direct-io=on "+wantPath, storage.FakeResponse{Stdout: []byte("/dev/loop99\n")})
 
 	p := file.NewProvider(file.Config{Dir: dir}, fx)
 
@@ -224,7 +226,7 @@ func TestNamingContract_FILE(t *testing.T) {
 			wantAlloc, fx.CommandLines())
 	}
 
-	wantAttach := "losetup --find --show " + wantPath
+	wantAttach := "losetup --find --show --direct-io=on " + wantPath
 	if !slices.Contains(fx.CommandLines(), wantAttach) {
 		t.Errorf("file (thick) losetup drift: want %q, got %v",
 			wantAttach, fx.CommandLines())
@@ -239,7 +241,7 @@ func TestNamingContract_FILEThin(t *testing.T) {
 
 	fx := storage.NewFakeExec()
 	fx.Expect("losetup -j "+wantPath, storage.FakeResponse{})
-	fx.Expect("losetup --find --show "+wantPath, storage.FakeResponse{Stdout: []byte("/dev/loop99\n")})
+	fx.Expect("losetup --find --show --direct-io=on "+wantPath, storage.FakeResponse{Stdout: []byte("/dev/loop99\n")})
 
 	p := file.NewProvider(file.Config{Dir: dir, Thin: true}, fx)
 

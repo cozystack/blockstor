@@ -620,6 +620,20 @@ func (p *Provider) volumePathByResource(rd string, vol int32) string {
 // is one — `--find --show` always allocates a fresh dev, which on
 // reconcile-heavy paths would leak hundreds of loop nodes pointing
 // at the same backing file.
+//
+// Why --direct-io=on (P0 data-integrity fix, e2e6 drbd-luks-stack):
+// Without DIO the loop driver routes writes through the host page
+// cache, but DRBD's lower-disk bio path bypasses the loop's cache
+// flush semantics — writes from the DRBD device land in the loop's
+// page cache and never flush to the underlying .img file. Symptom:
+// `dd of=/dev/drbdN oflag=direct conv=fsync` returns success, drbd
+// reports disk:UpToDate, but the backing .img stays sparse (no
+// blocks allocated past the satellite-side create-md range). On
+// failover the receiving peer reads zeros from its mapper (LUKS
+// stack) or zeros from its LV (no-LUKS stack), and md5 mismatches.
+// Enabling LO_FLAGS_DIRECT_IO on the loop makes DRBD's writes flow
+// straight to the file via O_DIRECT, restoring the persistence
+// contract DRBD's `meta-data IO uses: blk-bio` log line implies.
 func (p *Provider) attach(ctx context.Context, path string) (string, error) {
 	dev, err := p.lookupLoop(ctx, path)
 	if err != nil {
@@ -627,12 +641,17 @@ func (p *Provider) attach(ctx context.Context, path string) (string, error) {
 	}
 
 	if dev != "" {
+		// Ensure DIO is on even for a pre-existing loop attachment
+		// (satellite restart re-uses the previous loop device).
+		// losetup is a no-op when DIO is already on.
+		_, _ = p.exec.Run(ctx, "losetup", "--direct-io=on", dev)
+
 		return dev, nil
 	}
 
-	out, err := p.exec.Run(ctx, "losetup", "--find", "--show", path)
+	out, err := p.exec.Run(ctx, "losetup", "--find", "--show", "--direct-io=on", path)
 	if err != nil {
-		return "", errors.Wrapf(err, "losetup --find --show %s", path)
+		return "", errors.Wrapf(err, "losetup --find --show --direct-io=on %s", path)
 	}
 
 	dev = strings.TrimSpace(string(out))
