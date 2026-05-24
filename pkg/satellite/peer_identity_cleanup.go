@@ -162,26 +162,11 @@ func (r *Reconciler) evictOnePeerByUIDMismatch(
 	}
 
 	// UID mismatch — force-evict the kernel slot for this peer.
-	// Forget-peer needs a node-id; prefer the kernel's observation,
-	// fall back to the dispatcher's.
-	nodeID := peer.NodeID
-
-	if slot, ok := slots[peer.Name]; ok && slot.NodeID != 0 {
-		nodeID = slot.NodeID
-	}
-
-	// Bug 342 v5: when neither the kernel-observed slot nor the
-	// K8s-allocated peer NodeID is available, DEFER eviction to a
-	// future reconcile. A del-peer without matching forget-peer
-	// drops the kernel connection but leaves stale per-volume
-	// GI/bitmap metadata; the subsequent new-peer handshake (after
-	// the relocated peer brings DRBD up with a fresh GI epoch)
-	// exposes the mismatch and the LOCAL stable peer regresses its
-	// own disk_state to Inconsistent / Outdated. Skipping this
-	// reconcile is safe: the next one (after kernel loads OR
-	// allocation lands) will see the same UID mismatch and try
-	// again with a resolvable node-id.
-	if nodeID == 0 {
+	// forget-peer needs a node-id; resolvePeerNodeIDForEviction
+	// applies the Bug 342 C3 resolution order (kernel slot wins, else
+	// K8s-allocated id incl. a valid 0, else unresolved -> defer).
+	nodeID, resolved := resolvePeerNodeIDForEviction(peer, slots)
+	if !resolved {
 		logger.Info("UID mismatch detected but peer node-id unresolved — deferring eviction",
 			"peer", peer.Name,
 			"oldUID", last,
@@ -220,4 +205,38 @@ func (r *Reconciler) evictOnePeerByUIDMismatch(
 	}
 
 	return true, nil
+}
+
+// resolvePeerNodeIDForEviction picks the DRBD node-id forget-peer must
+// target when evicting a re-incarnated peer (Bug 342 C3). Resolution
+// order:
+//  1. kernel-observed slot (drbdsetup show) ALWAYS wins when present —
+//     the zombie v09 metadata slot is bound to the id the kernel still
+//     holds, which may differ from the K8s-side allocation after a
+//     relocate. Presence is the map-lookup `ok`; a slot legitimately
+//     holding node-id 0 is real and must NOT be skipped (the pre-C3
+//     `slot.NodeID != 0` guard wrongly dropped it).
+//  2. else the dispatcher's K8s-side id when allocated (peer.NodeID !=
+//     nil, including a valid 0).
+//  3. else genuinely unresolved (nil pointer AND no kernel slot) ->
+//     (0,false): the caller DEFERS. A del-peer without a matching
+//     forget-peer drops the connection but leaves stale per-volume
+//     GI/bitmap metadata, and the next handshake regresses the LOCAL
+//     stable peer to Inconsistent/Outdated.
+//
+// Why pointer-nil and not `nodeID == 0`: an allocated id 0 is a
+// legitimate value (LowestFreeNodeID hands out 0 for the first or a
+// freed slot). The pre-C3 `nodeID == 0` test conflated that valid id 0
+// with "unresolved" and deferred eviction forever — the exact stall
+// behind the re-spawned-worker wedge.
+func resolvePeerNodeIDForEviction(peer intent.DesiredPeer, slots map[string]drbd.KernelSlot) (int32, bool) {
+	if slot, ok := slots[peer.Name]; ok {
+		return slot.NodeID, true
+	}
+
+	if peer.NodeID != nil {
+		return *peer.NodeID, true
+	}
+
+	return 0, false
 }

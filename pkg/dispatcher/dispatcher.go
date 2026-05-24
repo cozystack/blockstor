@@ -71,10 +71,23 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// We ONLY emit peers whose id is allocated; an unallocated peer
 	// is skipped this round and will reappear once the controller
 	// reconciles its Status and the parent RD requeues.
-	idOf := map[string]int32{}
+	//
+	// Bug 342 C3: the map value is *int32, not int32, so an ABSENT
+	// key (peer/target whose id the controller hasn't stamped yet)
+	// is distinguishable from a key legitimately holding node-id 0.
+	// A plain map[string]int32 Go-zero-defaulted an absent key to 0,
+	// so an unresolved local node rendered `node-id 0` and the
+	// satellite ran `drbdsetup new-peer <rd> 0 --_name=<self>` →
+	// `peer node id cannot be my own node id (exit 10)`, colliding
+	// with whichever peer legitimately owned id 0. We now omit
+	// unresolved replicas entirely and emit a real id (incl. 0) only
+	// when one is persisted — mirroring the nodeIDOf()==-1 skip
+	// contract end-to-end.
+	idOf := map[string]*int32{}
 
 	if id := nodeIDOf(target); id >= 0 {
-		idOf[target.Spec.NodeName] = id
+		v := id
+		idOf[target.Spec.NodeName] = &v
 	}
 
 	for i := range peers {
@@ -95,7 +108,8 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 		}
 
 		if id := nodeIDOf(&peers[i]); id >= 0 {
-			idOf[peers[i].Spec.NodeName] = id
+			v := id
+			idOf[peers[i].Spec.NodeName] = &v
 		}
 	}
 
@@ -109,9 +123,16 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 	slices.Sort(dropped)
 
+	// Bug 342 C3: idValue distinguishes a persisted id (incl. 0)
+	// from an absent/unresolved one. The satellite's
+	// waitForControllerAllocation gate guarantees the local node's
+	// id is set before this runs; idValue's false branch (->0) is
+	// the defence-in-depth path for any caller that bypasses the
+	// gate — the satellite then refuses the malformed config rather
+	// than burning `node-id 0` into the kernel.
 	drbdOpts := map[string]string{
 		"port":    strconv.Itoa(port),
-		"node-id": strconv.Itoa(int(idOf[target.Spec.NodeName])),
+		"node-id": strconv.Itoa(int(idValue(idOf, target.Spec.NodeName))),
 		// PrefNic on the target's pool (storage pool prop) overrides
 		// the default placeholder so DRBD binds replication to the
 		// requested interface. Empty fallback → satellite picks its
@@ -127,8 +148,9 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// there until something opens for write. The seed flag is
 	// harmless on subsequent reconciles — satellite Reconciler runs
 	// primary --force only on firstActivation.
-	if !slices.Contains(target.Spec.Flags, "DISKLESS") &&
-		idOf[target.Spec.NodeName] == lowestDiskfulID(target, peers) {
+	if selfID, ok := idLookup(idOf, target.Spec.NodeName); ok &&
+		!slices.Contains(target.Spec.Flags, "DISKLESS") &&
+		selfID == lowestDiskfulID(target, peers) {
 		drbdOpts["auto-primary"] = boolPropTrue
 	}
 
@@ -234,12 +256,18 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 	for _, name := range dropped {
 		entry := intent.DesiredPeer{Name: name}
 
-		if p, ok := byName[name]; ok {
-			if id := nodeIDOf(p); id >= 0 {
-				entry.NodeID = id
+		if peerCR, ok := byName[name]; ok {
+			// Bug 342 C3: store the pointer (nil = unallocated, never
+			// a spurious 0). EvictPeersByUIDMismatch keys its
+			// defer-vs-fire decision on this being nil, so a peer
+			// legitimately on node-id 0 now triggers eviction instead
+			// of being deferred forever.
+			if id := nodeIDOf(peerCR); id >= 0 {
+				v := id
+				entry.NodeID = &v
 			}
 
-			entry.ResourceUID = string(p.UID)
+			entry.ResourceUID = string(peerCR.UID)
 		}
 
 		out = append(out, entry)
@@ -335,6 +363,36 @@ func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
 	return *r.Status.DRBDNodeID
 }
 
+// idLookup reports the persisted DRBD node-id for a replica name in
+// the BuildDesired-scoped idOf map, distinguishing a key that is
+// ABSENT (controller hasn't stamped the id yet) from one legitimately
+// holding node-id 0. Bug 342 C3: the prior map[string]int32 form
+// Go-zero-defaulted an absent key to 0, which rendered an unresolved
+// local node as `node-id 0` and collided with whichever peer truly
+// owned id 0 — the `peer node id cannot be my own node id (exit 10)`
+// wedge on luks-autoplace. Returns (id, true) when present, (0, false)
+// when absent.
+func idLookup(idOf map[string]*int32, name string) (int32, bool) {
+	p, ok := idOf[name]
+	if !ok || p == nil {
+		return 0, false
+	}
+
+	return *p, true
+}
+
+// idValue is the value-form of idLookup for call sites that have
+// already guaranteed the key is present (the satellite allocation
+// gate for the local node; the `dropped` filter for peers). The
+// false branch returns 0 only as a last-ditch fallback — callers
+// that reach it on a genuinely-unresolved key produce a config the
+// satellite will refuse rather than burn id 0 into the kernel.
+func idValue(idOf map[string]*int32, name string) int32 {
+	v, _ := idLookup(idOf, name)
+
+	return v
+}
+
 // readDRBDPort returns the per-replica TCP port. Upstream LINSTOR
 // allocates the port from the hosting node's range, not the RD's, so
 // each replica owns its own value. Fallback to derivePort is the
@@ -375,7 +433,7 @@ func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
 // on the DesiredResource's drbd_options map. Pulled out of
 // BuildDesired to keep the latter under the funlen budget — this
 // owns the per-peer fan-out plus the port/address lookups.
-func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]int32) {
+func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blockstoriov1alpha1.Resource, nodes []blockstoriov1alpha1.Node, pools []blockstoriov1alpha1.StoragePool, fallbackPort int, idOf map[string]*int32) {
 	peerByName := make(map[string]*blockstoriov1alpha1.Resource, len(peers))
 	for i := range peers {
 		peerByName[peers[i].Spec.NodeName] = &peers[i]
@@ -392,7 +450,10 @@ func addPeerEntries(drbdOpts map[string]string, dropped []string, peers []blocks
 		}
 
 		drbdOpts["peer."+peer+".port"] = strconv.Itoa(peerPort)
-		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idOf[peer]))
+		// Bug 342 C3: dropped is already filtered to peers with a
+		// resolved id, so idValue always hits here; the helper keeps
+		// the absent->0 collision impossible if the filter ever drifts.
+		drbdOpts["peer."+peer+".node-id"] = strconv.Itoa(int(idValue(idOf, peer)))
 		drbdOpts["peer."+peer+".address"] = peerAddressWithPrefNic(peer, peerPool, nodes, pools)
 
 		// Surface the peer's DISKLESS flag so the satellite's .res

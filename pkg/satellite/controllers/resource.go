@@ -1248,8 +1248,9 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 
 // desiredPeersFromCRDs converts the peer Resource CR slice into the
 // intent.DesiredPeer slice the Bug 342 v4 UID-mismatch eviction
-// expects. Carries Name + DRBD node-id (from Status; may be 0 during
-// the allocation window) + metadata.uid (always present). The local
+// expects. Carries Name + DRBD node-id (from Status; nil during
+// the allocation window, never a spurious 0) + metadata.uid (always
+// present). The local
 // satellite's own Resource is NOT included — drbdsetup show enumerates
 // remote peers only.
 func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.DesiredPeer {
@@ -1262,8 +1263,13 @@ func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.Desired
 			ResourceUID: string(peer.UID),
 		}
 
+		// Bug 342 C3: copy the pointer (nil stays nil = unallocated;
+		// non-nil incl. 0 = a real allocated id). Dereferencing into
+		// an int32 here would have made id 0 indistinguishable from
+		// unallocated downstream in EvictPeersByUIDMismatch.
 		if peer.Status.DRBDNodeID != nil {
-			entry.NodeID = *peer.Status.DRBDNodeID
+			nid := *peer.Status.DRBDNodeID
+			entry.NodeID = &nid
 		}
 
 		out = append(out, entry)

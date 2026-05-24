@@ -36,11 +36,16 @@ type DesiredPeer struct {
 	// Name is the peer's node name. Mirrors .res `on <name> {`.
 	Name string
 	// NodeID is the peer's DRBD-9 node-id, mirrors .res `node-id N`.
-	// Sourced from the peer Resource's Status.DRBDNodeID. Zero when
-	// the controller-side allocator has not yet stamped — callers
-	// should skip the peer entirely in that case (the dispatcher
-	// already does, via nodeIDOf returning -1).
-	NodeID int32
+	// Sourced from the peer Resource's Status.DRBDNodeID. Bug 342 C3:
+	// pointer-typed so a genuinely-unallocated peer (nil) is
+	// distinguishable from a peer legitimately allocated node-id 0
+	// (LowestFreeNodeID hands out 0 for the first/freed slot). A plain
+	// int32 zero-value collided with the valid id 0 and made
+	// EvictPeersByUIDMismatch defer eviction forever / the dispatcher
+	// emit `new-peer ... 0`. nil == not yet stamped: callers MUST skip
+	// the peer (omit from the rendered .res, defer eviction); non-nil
+	// (incl. 0) == a real id callers act on.
+	NodeID *int32
 	// ResourceUID is the peer Resource CR's metadata.uid (Bug 342).
 	// Stable for the lifetime of the K8s object; changes only when
 	// the Resource is deleted and re-created. Empty during the
