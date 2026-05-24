@@ -68,7 +68,11 @@ if (( ok_nodes < 2 )); then
 fi
 
 echo ">> [Bug 333] set cluster passphrase"
-"${LCTL[@]}" encryption create-passphrase "$PASSPHRASE" >/dev/null 2>&1 || true
+"${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" >/dev/null 2>&1 || true
+# LUKS-layered RDs additionally require the controller property
+# DrbdOptions/EncryptPassphrase, else rd-create is rejected with
+# "LUKS layer requires DrbdOptions/EncryptPassphrase to be set first".
+"${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "$PASSPHRASE" >/dev/null 2>&1 || true
 
 echo ">> [Bug 333] create source encrypted RD"
 "${LCTL[@]}" resource-definition create "$RD_SRC" --layer-list drbd,luks,storage >/dev/null

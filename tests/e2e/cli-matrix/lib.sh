@@ -453,22 +453,39 @@ assert_luks_passphrase_opens() {
     return 0
 }
 
-# cleanup_encryption_state — `linstor encryption delete-passphrase`,
-# ignoring not-found / no-passphrase-set errors. Called from EXIT
-# traps of cells that mutate the cluster passphrase state so the next
-# cell starts from a known-clean baseline. Falls back to a direct
-# DELETE on /v1/encryption/passphrase if the python CLI isn't shipping
-# the delete-passphrase subcommand on this stand (older clients).
+# cleanup_encryption_state — reset the cluster passphrase to "unset"
+# so the next cell starts from a known-clean baseline. Called from EXIT
+# traps of cells that mutate the passphrase state.
+#
+# The passphrase is Secret-backed (pkg/rest/encryption.go: the
+# controller stores it in the `blockstor-cluster-passphrase` Secret,
+# or the one named by ControllerConfig.Spec.PassphraseSecretRef) and
+# the apiserver exposes ONLY GET/POST/PATCH/PUT on
+# /v1/encryption/passphrase — there is no DELETE route, and the python
+# linstor-client has no `delete-passphrase` subcommand. So the old
+# REST-DELETE / CLI-delete attempts were both no-ops (405 / unknown
+# subcommand): the first luks cell set the passphrase and every later
+# `create-passphrase` then failed with "passphrase already set". The
+# reliable, route-independent reset is to delete the backing Secret.
 cleanup_encryption_state() {
+    # Resolve the passphrase Secret name (custom ref or default).
+    local secret
+    secret=$(kubectl -n "$NS" get controllerconfigs.blockstor.io.blockstor.io \
+        -o jsonpath='{.items[0].spec.passphraseSecretRef}' 2>/dev/null || true)
+    [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
+    kubectl -n "$NS" delete secret "$secret" --ignore-not-found >/dev/null 2>&1 || true
+    # Clear the LUKS-layer controller property too, so a leftover key
+    # from a prior cell doesn't leak into the next one's RD create.
+    if [[ ${#LCTL[@]} -gt 0 ]]; then
+        "${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "" \
+            >/dev/null 2>&1 || true
+    fi
+    # Best-effort REST attempt kept for stands that DO ship a delete
+    # path; a harmless 405/404 no-op otherwise.
     if [[ -n "${LCTL_PORT:-}" ]]; then
-        # Prefer the REST verb directly — covers every linstor-client
-        # version. 204/404 both fine; we just want the state cleared.
         curl -fsS -m 5 -X DELETE \
             "http://127.0.0.1:${LCTL_PORT}/v1/encryption/passphrase" \
             >/dev/null 2>&1 || true
-    fi
-    if [[ ${#LCTL[@]} -gt 0 ]]; then
-        "${LCTL[@]}" encryption delete-passphrase >/dev/null 2>&1 || true
     fi
 }
 

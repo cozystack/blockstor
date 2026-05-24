@@ -19,7 +19,7 @@
 #      → forces the controller process to drop its
 #        passphraseUnlocked flag; the Secret on disk still holds
 #        the hash, but the process must re-derive on next request.
-#   3. linstor encryption enter-passphrase <pw>
+#   3. linstor encryption enter-passphrase --passphrase <pw>
 #      → must succeed without "encryption locked" / "wrong passphrase"
 #   4. GET /v1/encryption/passphrase status reports unlocked again
 #
@@ -50,7 +50,7 @@ trap cleanup EXIT
 cleanup_encryption_state
 
 echo ">> [Bug 333] step 1: create-passphrase (baseline)"
-if ! "${LCTL[@]}" encryption create-passphrase "$PASSPHRASE" >/dev/null 2>&1; then
+if ! "${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" >/dev/null 2>&1; then
     echo "FAIL: pre-flight create-passphrase failed" >&2
     exit 1
 fi
@@ -81,7 +81,7 @@ linstor_cli_setup
 
 echo ">> [Bug 333] step 3: linstor encryption enter-passphrase"
 err_file=$(mktemp)
-if ! out=$("${LCTL[@]}" encryption enter-passphrase "$PASSPHRASE" 2>"$err_file"); then
+if ! out=$("${LCTL[@]}" encryption enter-passphrase --passphrase "$PASSPHRASE" 2>"$err_file"); then
     rc=$?
     echo "FAIL (Bug 333): enter-passphrase after restart exited $rc" >&2
     echo "----- stderr -----" >&2

@@ -6,9 +6,9 @@
 #
 # Audit gap: Bug 129 / 165 / 172 / 196 pinned the
 # /v1/encryption/passphrase wire surface via unit tests, but the
-# python-CLI surface (`linstor encryption create-passphrase <pw>`
-# → POST + envelope decode) was never exercised end-to-end on a
-# real stand. Bug 175 (LUKS shell-injection RCE) and Bug 233
+# python-CLI surface (`linstor encryption create-passphrase
+# --passphrase <pw>` → POST + envelope decode) was never exercised
+# end-to-end on a real stand. Bug 175 (LUKS shell-injection RCE) and Bug 233
 # (passphrase wire) closed the security side via unit tests only.
 # This cell drives the real `linstor encryption create-passphrase`
 # subcommand against the operator's apiserver and asserts:
@@ -50,7 +50,7 @@ cleanup_encryption_state
 
 echo ">> [Bug 333] linstor encryption create-passphrase"
 err_file=$(mktemp)
-if ! out=$("${LCTL[@]}" encryption create-passphrase "$PASSPHRASE" 2>"$err_file"); then
+if ! out=$("${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" 2>"$err_file"); then
     rc=$?
     echo "FAIL (Bug 333): create-passphrase exited $rc" >&2
     echo "----- stderr -----" >&2

@@ -66,10 +66,17 @@ if (( ok_nodes < 2 )); then
 fi
 
 echo ">> [Bug 333] set cluster passphrase via real CLI"
-if ! "${LCTL[@]}" encryption create-passphrase "$PASSPHRASE" >/dev/null 2>&1; then
+if ! "${LCTL[@]}" encryption create-passphrase --passphrase "$PASSPHRASE" >/dev/null 2>&1; then
     echo "FAIL: pre-flight create-passphrase failed" >&2
     exit 1
 fi
+
+# A LUKS-layered RD additionally requires the controller property
+# DrbdOptions/EncryptPassphrase (the LUKS layer reads the per-volume
+# key material from it); the cluster passphrase alone is not enough —
+# rd-create is rejected with "LUKS layer requires
+# DrbdOptions/EncryptPassphrase to be set first".
+"${LCTL[@]}" controller set-property DrbdOptions/EncryptPassphrase "$PASSPHRASE" >/dev/null 2>&1 || true
 
 echo ">> [Bug 333] linstor rd c $RD -l drbd,luks,storage"
 err_file=$(mktemp)
