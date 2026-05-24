@@ -103,14 +103,18 @@ if ! "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" 2>
 fi
 rm -f "$err_file"
 
-echo ">> [Bug 333] wait for 2 Resource CRDs to land"
+echo ">> [Bug 333] wait for 2 diskful Resource CRDs to land"
+# auto-place=2 stages 2 diskful replicas; the autoplacer additionally
+# adds a DISKLESS TIE_BREAKER witness to satisfy DRBD quorum, so the
+# raw Resource-CRD count is 3 (2 diskful + 1 tiebreaker). Count only
+# diskful replicas via linstor_diskful_nodes (Spec.Flags has neither
+# DISKLESS nor TIE_BREAKER) -- same convention the other autoplace
+# cells use -- so the tiebreaker does not skew the assertion and the
+# downstream luksDump checks never target a backing-less witness.
 deadline=$(( $(date +%s) + 60 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
-    mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
-            | awk -v rd="$RD." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
-    )
+    mapfile -t placed_nodes < <(linstor_diskful_nodes "$RD")
     if (( ${#placed_nodes[@]} == 2 )); then
         break
     fi
@@ -118,10 +122,11 @@ while (( $(date +%s) < deadline )); do
 done
 
 if (( ${#placed_nodes[@]} != 2 )); then
-    echo "FAIL: autoplace did not stage 2 Resource CRDs within 60s (got ${#placed_nodes[@]})" >&2
+    echo "FAIL: autoplace did not stage 2 diskful Resource CRDs within 60s (got ${#placed_nodes[@]})" >&2
+    echo "   all replicas: $(linstor_replica_count "$RD"), tiebreaker: $(linstor_tiebreaker_node "$RD")" >&2
     exit 1
 fi
-echo "   placed on: ${placed_nodes[*]}"
+echo "   placed (diskful) on: ${placed_nodes[*]}"
 
 N1="${placed_nodes[0]}"
 N2="${placed_nodes[1]}"
