@@ -38,13 +38,25 @@ import (
 	"github.com/cozystack/blockstor/pkg/satellite"
 )
 
-// poolMissingRequeue is the back-off the reconciler waits for
+// poolMissingRequeue caps the back-off the reconciler waits for
 // the target StoragePool CRD to land when an attach request
 // references a pool that doesn't exist yet. Short enough that a
 // CDP-creates-pool-and-attach race resolves in seconds; long
 // enough that we don't spin if the operator never applies the
-// pool. Phase 10.7 race-handling matrix line 4.
+// pool. Phase 10.7 race-handling matrix line 4. Bug 358 made this
+// the *cap* of an exponential back-off (see poolMissingInitialRequeue)
+// so a never-arriving pool stops hammering the apiserver — the
+// observer's diskState Status patches share the same client and a
+// fixed 10 s spin floods APF enough to starve them.
 const poolMissingRequeue = 10 * time.Second
+
+// poolMissingInitialRequeue is the first back-off the reconciler
+// uses on a freshly-observed missing pool. Subsequent passes double
+// it (1s → 2s → 4s → … capped at poolMissingRequeue) so the common
+// CDP-create race still resolves in ~a second while a pool that never
+// lands quickly settles onto the 10 s cap instead of a tight spin.
+// Bug 358.
+const poolMissingInitialRequeue = time.Second
 
 // poolMissingTimeout caps how long the reconciler keeps
 // requeuing for a missing target StoragePool before giving up
@@ -556,12 +568,46 @@ func (r *PhysicalDeviceReconciler) handlePoolMissing(ctx context.Context, dev *b
 		if err != nil {
 			return ctrl.Result{}, errors.Wrap(err, "stamp PoolMissing condition")
 		}
+
+		cond = meta.FindStatusCondition(dev.Status.Conditions, physicalDeviceConditionPoolMissing)
 	}
 
-	logger.Info("target StoragePool not yet known; requeuing",
-		"pool", dev.Spec.AttachTo.StoragePoolName)
+	requeue := poolMissingBackoff(cond)
 
-	return ctrl.Result{RequeueAfter: poolMissingRequeue}, nil
+	logger.Info("target StoragePool not yet known; requeuing",
+		"pool", dev.Spec.AttachTo.StoragePoolName,
+		"requeueAfter", requeue)
+
+	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// poolMissingBackoff computes the exponential back-off for the next
+// missing-pool requeue from how long the PoolMissing condition has
+// existed: 1s → 2s → 4s → … doubling each elapsed initial-interval,
+// capped at poolMissingRequeue. Bug 358 — a fixed 10 s spin against a
+// never-arriving pool floods the apiserver enough to APF-starve the
+// observer's diskState Status patches; ramping the interval keeps the
+// common CDP-create race fast while a permanent miss settles onto the
+// cap. The condition's LastTransitionTime is preserved across discovery
+// ticks (see preserveAttachLifecycle) so this elapsed measure is stable
+// and the poolMissingTimeout above eventually fires.
+func poolMissingBackoff(cond *metav1.Condition) time.Duration {
+	if cond == nil {
+		return poolMissingInitialRequeue
+	}
+
+	elapsed := time.Since(cond.LastTransitionTime.Time)
+
+	requeue := poolMissingInitialRequeue
+	for step := poolMissingInitialRequeue; step <= elapsed && requeue < poolMissingRequeue; step += poolMissingInitialRequeue {
+		requeue *= 2
+	}
+
+	if requeue > poolMissingRequeue {
+		requeue = poolMissingRequeue
+	}
+
+	return requeue
 }
 
 // targetPoolExists returns true when a StoragePool CRD named

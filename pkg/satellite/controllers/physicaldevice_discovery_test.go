@@ -19,6 +19,7 @@ package controllers_test
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -358,6 +359,123 @@ func TestReconcilerSkipsAttachInFlight(t *testing.T) {
 	err = cli.Get(t.Context(), client.ObjectKey{Name: "n1.wwn-0xstuck"}, &got)
 	if err != nil {
 		t.Fatalf("CRD with AttachTo set should survive prune: %v", err)
+	}
+}
+
+// TestDiscoveryPreservesReconcilerConditions pins Bug 358: a
+// discovery rescan of a device whose Spec.AttachTo is set MUST NOT
+// clobber the PhysicalDeviceReconciler-owned PoolMissing condition or
+// the reconciler-driven Phase. The old `existing.Status =
+// desiredStatus` wholesale-replace wiped the condition every tick,
+// re-anchoring its LastTransitionTime so poolMissingTimeout never
+// fired — the missing-pool reconcile spun forever and the resulting
+// apiserver write flood starved the events2 diskState observer.
+func TestDiscoveryPreservesReconcilerConditions(t *testing.T) {
+	t.Parallel()
+
+	scheme := newStoragePoolScheme(t)
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&blockstoriov1alpha1.PhysicalDevice{}).
+		Build()
+
+	fx := storage.NewFakeExec()
+
+	// Tick 1: publish a clean free device so the CRD exists with a
+	// discovery-owned Free condition + the stable name discovery derives.
+	cleanRow := lsblkRow("sdb", "sdb", "2000398934016", "", "disk", "", "0xWWN-B", "DISK_B", "SN-B", "0", "sata") + "\n"
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{Stdout: []byte(cleanRow)})
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdmeta 0 v09 /dev/sdb internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+	fx.Expect("wipefs -n /dev/sdb", storage.FakeResponse{Stdout: []byte("")})
+
+	runnable := &controllers.PhysicalDeviceDiscoveryRunnable{
+		Client:   cli,
+		Exec:     fx,
+		NodeName: "n1",
+	}
+
+	err := controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard())
+	if err != nil {
+		t.Fatalf("scanOnce tick 1: %v", err)
+	}
+
+	var list blockstoriov1alpha1.PhysicalDeviceList
+	if err = cli.List(t.Context(), &list); err != nil {
+		t.Fatalf("list after tick 1: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Fatalf("after tick 1: got %d CRDs, want 1", len(list.Items))
+	}
+
+	dev := &list.Items[0]
+
+	// Simulate the PhysicalDeviceReconciler: operator set Spec.AttachTo
+	// for a pool that doesn't exist, the reconciler stamped a
+	// PoolMissing condition (timestamped 30 min ago — past the 10 min
+	// timeout) and flipped Phase=Attaching.
+	dev.Spec.AttachTo = &blockstoriov1alpha1.AttachToPool{
+		StoragePoolName: "ghost-pool",
+		ProviderKind:    "ZFS",
+	}
+	if err = cli.Update(t.Context(), dev); err != nil {
+		t.Fatalf("set AttachTo: %v", err)
+	}
+
+	// Truncate to seconds: the apiserver (and the fake client) store
+	// metav1.Time at RFC3339 second precision, so the round-tripped
+	// value drops sub-second digits. Anchoring at second granularity
+	// keeps the "did the timestamp survive unchanged" assertion exact.
+	anchor := metav1.NewTime(time.Now().Add(-30 * time.Minute).Truncate(time.Second))
+	dev.Status.Phase = blockstoriov1alpha1.PhysicalDevicePhaseAttaching
+	dev.Status.Conditions = append(dev.Status.Conditions, metav1.Condition{
+		Type:               "PoolMissing",
+		Status:             metav1.ConditionTrue,
+		Reason:             "TargetStoragePoolNotFound",
+		Message:            "ghost",
+		LastTransitionTime: anchor,
+	})
+	if err = cli.Status().Update(t.Context(), dev); err != nil {
+		t.Fatalf("stamp PoolMissing: %v", err)
+	}
+
+	// Tick 2: same device still in lsblk → discovery republishes it.
+	fx.Reset()
+	fx.Expect(lsblkCmdLine, storage.FakeResponse{Stdout: []byte(cleanRow)})
+	fx.Expect(pvsCmdLine, storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zpool list -PHv", storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("drbdmeta 0 v09 /dev/sdb internal dump-md", storage.FakeResponse{Err: errNoDRBDMeta})
+	fx.Expect("wipefs -n /dev/sdb", storage.FakeResponse{Stdout: []byte("")})
+
+	if err = controllers.ScanOnceForTest(t.Context(), runnable, logr.Discard()); err != nil {
+		t.Fatalf("scanOnce tick 2: %v", err)
+	}
+
+	var got blockstoriov1alpha1.PhysicalDevice
+	if err = cli.Get(t.Context(), client.ObjectKey{Name: dev.Name}, &got); err != nil {
+		t.Fatalf("get after tick 2: %v", err)
+	}
+
+	pm := findCondition(got.Status.Conditions, "PoolMissing")
+	if pm == nil {
+		t.Fatalf("PoolMissing condition wiped by discovery: %+v", got.Status.Conditions)
+	}
+
+	if !pm.LastTransitionTime.Equal(&anchor) {
+		t.Errorf("PoolMissing LastTransitionTime re-anchored: got %v, want %v (the timeout would never fire)",
+			pm.LastTransitionTime, anchor)
+	}
+
+	if got.Status.Phase != blockstoriov1alpha1.PhysicalDevicePhaseAttaching {
+		t.Errorf("Phase clobbered by discovery: got %q, want Attaching (Bug-340 self-heal needs it)", got.Status.Phase)
+	}
+
+	// Discovery's own Free condition must still be present alongside.
+	if findCondition(got.Status.Conditions, "Free") == nil {
+		t.Errorf("Free condition lost in the merge: %+v", got.Status.Conditions)
 	}
 }
 

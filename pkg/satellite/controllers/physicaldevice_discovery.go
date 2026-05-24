@@ -613,6 +613,27 @@ func (p *PhysicalDeviceDiscoveryRunnable) publishDeviceWithReason(ctx context.Co
 		return "", false
 	}
 
+	// Bug 358: discovery owns the lsblk-derived Status fields and the
+	// `Free` condition, but it MUST NOT clobber the reconciler-owned
+	// attach-lifecycle state. The PhysicalDeviceReconciler stamps a
+	// `PoolMissing` (or `DeviceMissing`) condition whose
+	// LastTransitionTime is the wall-clock anchor `handlePoolMissing`
+	// uses to bound the `poolMissingTimeout` requeue window, and it
+	// drives Phase (Attaching / Failed) for the Bug-340 self-heal.
+	//
+	// The old `existing.Status = desiredStatus` wholesale-replaced the
+	// slice, wiping those conditions every discovery tick. The
+	// reconciler then re-stamped PoolMissing with a fresh
+	// LastTransitionTime, perpetually re-anchoring the clock so the
+	// timeout never fired — the missing-pool reconcile requeued every
+	// poolMissingRequeue forever, and the resulting apiserver write
+	// flood starved the events2 observer's diskState Status patches.
+	//
+	// Preserve the reconciler's conditions + Phase when an attach is in
+	// flight (Spec.AttachTo set). Merge the discovery `Free` condition
+	// into the surviving slice instead of replacing it.
+	preserveAttachLifecycle(existing, &desiredStatus)
+
 	existing.Status = desiredStatus
 
 	err := p.Client.Status().Update(ctx, existing)
@@ -724,6 +745,45 @@ func buildDiscoveryStatus(nodeName, stableID, devicePath, currentDevPath string,
 				Message:            message,
 			},
 		},
+	}
+}
+
+// preserveAttachLifecycle carries the PhysicalDeviceReconciler-owned
+// attach-lifecycle state (Bug 358) from the live CRD onto the
+// discovery-built `desiredStatus` so the discovery Status().Update
+// never wipes it. Without this, the reconciler's PoolMissing /
+// DeviceMissing conditions (whose LastTransitionTime is the
+// poolMissingTimeout anchor) get clobbered every discovery tick,
+// re-anchoring the timeout clock so the missing-pool requeue never
+// self-terminates.
+//
+// Only acts when an attach is in flight (Spec.AttachTo set) — a free
+// device with no AttachTo has no reconciler-owned state to keep, and
+// the discovery-built Available phase + Free condition are
+// authoritative. The discovery `Free` condition is always merged in;
+// the reconciler-owned conditions are appended ahead of it so SSA-less
+// Update keeps both.
+func preserveAttachLifecycle(existing *blockstoriov1alpha1.PhysicalDevice, desired *blockstoriov1alpha1.PhysicalDeviceStatus) {
+	if existing.Spec.AttachTo == nil {
+		return
+	}
+
+	// Keep the reconciler-driven Phase (Attaching / Failed). Discovery
+	// always proposes Available; overwriting Attaching would break the
+	// Bug-340 clearStaleAttachTo self-heal, and overwriting Failed would
+	// re-arm an attach the reconciler already gave up on.
+	if existing.Status.Phase != "" && existing.Status.Phase != blockstoriov1alpha1.PhysicalDevicePhaseAvailable {
+		desired.Phase = existing.Status.Phase
+	}
+
+	// Carry forward the reconciler-owned conditions verbatim (preserving
+	// their LastTransitionTime anchors). The discovery `Free` condition
+	// already sits in desired.Conditions; merge the others ahead of it.
+	for i := range existing.Status.Conditions {
+		c := existing.Status.Conditions[i]
+		if c.Type == physicalDeviceConditionPoolMissing || c.Type == physicalDeviceConditionDeviceMissing {
+			desired.Conditions = append([]metav1.Condition{c}, desired.Conditions...)
+		}
 	}
 }
 

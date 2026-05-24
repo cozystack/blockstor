@@ -681,6 +681,19 @@ func (r *Reconciler) DeleteResource(ctx context.Context, req *intent.DeleteResou
 	var downMsg string
 
 	if r.cfg.Adm != nil {
+		// Bug 358 Step 3: force-resume I/O before `drbdadm down`. A
+		// snapshot whose suspend-io was never matched by a resume-io
+		// (force-deleted Snapshot CRD, controller crash between Phase 1
+		// and Phase 3) leaves the device `suspended:user` with wedged
+		// D-state writers pinning it open. `drbdadm down` then fails
+		// "Device is held open" and the kernel slot leaks past CRD
+		// deletion (issue 288 minor-leak). resume-io is idempotent —
+		// the kernel folds it into a no-op on a non-suspended device —
+		// so this is safe to fire unconditionally. Best-effort: a
+		// "not configured" failure (resource unknown to the kernel)
+		// is the no-op case and must not abort teardown.
+		_ = r.cfg.Adm.ResumeIO(ctx, req.GetName())
+
 		// Try `drbdadm down` first — it's the canonical teardown
 		// path and exercises drbd-utils' full graceful sequence
 		// (Secondary → Detach → Disconnect → Down).
