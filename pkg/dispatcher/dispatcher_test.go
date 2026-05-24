@@ -1253,6 +1253,35 @@ func TestAutoPrimaryGatedOnAllPeerNodeIDs(t *testing.T) {
 			t.Errorf("sole diskful n1 must stamp auto-primary=true regardless of diskless witness id, got %q", got)
 		}
 	})
+
+	t.Run("relocate-fresh-lowest-id-must-not-force-primary-when-peer-has-data", func(t *testing.T) {
+		t.Parallel()
+
+		// Relocate scenario: an existing diskful peer (nOld, id=1)
+		// already holds data (Status DiskState=UpToDate). A fresh
+		// replica (nNew, id=0) is created on a freed node — it wins
+		// the lowest-node-id election but MUST NOT force-primary: that
+		// would mint an unrelated Current UUID and wedge the handshake
+		// in StandAlone. The fresh replica must instead SyncTarget from
+		// the data-bearing peer.
+		nNew := newDiskfulResource(rdName, "n-new", id(0))
+		nOld := newDiskfulResource(rdName, "n-old", id(1))
+		nOld.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{
+			{VolumeNumber: 0, DiskState: "UpToDate"},
+		}
+
+		fromNew := dispatcher.BuildDesired(nNew, []blockstoriov1alpha1.Resource{*nOld}, nil, nil, rd, nil)
+		if got, ok := fromNew.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("fresh lowest-id relocate target must NOT stamp auto-primary while peer n-old is UpToDate, got %q", got)
+		}
+
+		// The existing data-bearing peer (higher id) also never seeds —
+		// it's not the lowest, and it already has data anyway.
+		fromOld := dispatcher.BuildDesired(nOld, []blockstoriov1alpha1.Resource{*nNew}, nil, nil, rd, nil)
+		if got, ok := fromOld.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("data-bearing peer n-old must not stamp auto-primary, got %q", got)
+		}
+	})
 }
 
 // newDiskfulResource is a one-shot Resource builder for the Bug-80
