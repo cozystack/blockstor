@@ -2142,6 +2142,27 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	_ = cloned
 
 	if autoPromote {
+		// Bug 342 force-promote gate (kernel-truth, race-free): the
+		// dispatcher's `auto-primary` election + its anyDiskfulPeerHasData
+		// suppressor reads peer CRD Status.DiskState, which the apiserver
+		// cache can leave stale/empty for a freshly-recreated peer right
+		// after `r d` then `r c` (relocate / same-node recreate). When
+		// the stamp leaks through, `drbdadm primary --force` mints an
+		// unrelated Current UUID, the data-bearing peer declines the
+		// handshake (`uuid_compare()=unrelated-data` → `Unrelated data,
+		// aborting!`), and the new replica wedges StandAlone.
+		//
+		// By finishDRBDApply time the .res has been adjusted+connected,
+		// so the peer's disk state is observable directly from the
+		// kernel. If any connected peer already exposes committed data,
+		// SKIP the force-primary — the fresh replica stays Inconsistent
+		// and SyncTargets from that peer (full resync, data-safe). A
+		// genuinely-fresh RD (no peer with data) finds nothing and still
+		// force-primaries, preserving the Bug 77 first-replica seed.
+		if r.cfg.Adm.AnyConnectedPeerHasData(ctx, dr.GetName()) {
+			return nil
+		}
+
 		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
 			return err

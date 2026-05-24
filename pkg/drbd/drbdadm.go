@@ -727,6 +727,66 @@ func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool)
 	return *status[0].NodeID, true
 }
 
+// AnyConnectedPeerHasData probes `drbdsetup status <res> --json` and
+// reports whether ANY peer connection currently exposes committed data
+// — a peer-device in `peer-disk-state` UpToDate / Consistent / Outdated.
+//
+// Bug 342 force-promote gate: the satellite calls this immediately
+// before `drbdadm primary --force` on a fresh replica's first
+// activation. Force-primary mints a brand-new Current UUID; if a peer
+// already holds the real data + UUID (the relocate / physical-`r d`-
+// then-`r c` case) the peer then declines the GI handshake
+// (`uuid_compare()=unrelated-data` → `Unrelated data, aborting!`) and
+// the new replica wedges StandAlone. When this returns true the
+// satellite SKIPS the force-primary so the fresh replica stays
+// Inconsistent and SyncTargets from the data-bearing peer (full resync,
+// always data-safe).
+//
+// This is the RACE-FREE backstop to the dispatcher's CRD-status gate
+// (anyDiskfulPeerHasData): the .res has already been adjusted+connected
+// by the time finishDRBDApply runs, so the peer's disk state is
+// observable directly from the kernel — immune to the apiserver
+// cache-trail that can leave a freshly-recreated replica's peer Status
+// looking empty/Inconsistent at BuildDesired time.
+//
+// Conservative: returns false on any probe/parse failure (kernel slot
+// absent, status non-zero, malformed JSON) so a genuinely-fresh RD
+// — where no peer has data and the probe legitimately finds nothing —
+// still force-primaries (Bug 77 / first-replica seed preserved). The
+// only states that gate the promote are the three committed-data ones;
+// a fresh, never-promoted peer reports Inconsistent (or no connection
+// yet) and does NOT block.
+func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	for _, conn := range status[0].Connections {
+		for _, pd := range conn.PeerDevices {
+			switch DiskState(pd.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
+				return true
+			case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+				DiskStateFailed, DiskStateNegotiating, DiskStateInconsistent,
+				DiskStateDUnknown:
+				// No committed data on this peer-device; keep scanning.
+			default:
+				// Unknown/empty state — treat as "no data".
+			}
+		}
+	}
+
+	return false
+}
+
 // HasDisklessVolume reports whether any of the named resource's
 // volumes are currently in a "not-attached" disk state in the
 // kernel — specifically `Diskless`, `Detaching`, or `Failed`. Used

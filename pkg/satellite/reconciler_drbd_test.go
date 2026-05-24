@@ -1523,6 +1523,64 @@ func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 	}
 }
 
+// TestApplyAutoPrimarySkippedWhenConnectedPeerHasData (Bug 342
+// force-promote gate) pins the kernel-truth backstop: even when the
+// dispatcher leaked `auto-primary=true` onto a fresh replica (the
+// CRD-status race after `r d` then `r c`), the satellite MUST NOT run
+// `drbdadm primary --force` if the kernel reports a connected peer that
+// already holds committed data (peer-disk-state UpToDate). Forcing
+// primary there mints an unrelated Current UUID and wedges the
+// handshake in StandAlone. The fresh replica must stay Inconsistent and
+// SyncTarget from the peer instead.
+func TestApplyAutoPrimarySkippedWhenConnectedPeerHasData(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-relo_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// The force-promote gate probes `drbdsetup status <rd> --json`. Hand
+	// back a connection whose peer-device is UpToDate so the gate fires.
+	fx.Expect("drbdsetup status pvc-relo --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":0,"connections":[{"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}]`)})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:        "pvc-relo",
+			NodeName:    "n1",
+			PeerHasData: true,
+			Peers:       []intent.DesiredPeer{{Name: "n2"}},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "primary --force") {
+			t.Errorf("force-primary must be skipped when a connected peer has data: %s", line)
+		}
+
+		if strings.Contains(line, "set-gi") {
+			t.Errorf("no GI seed when a peer has data (PeerHasData gate): %s", line)
+		}
+	}
+}
+
 // TestDeleteResourceClosesLUKSMapper: when the satellite tears down a
 // LUKS-encrypted resource, it must `cryptsetup luksClose` the mapper
 // BEFORE DeleteVolume removes the underlying LV — otherwise the

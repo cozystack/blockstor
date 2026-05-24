@@ -147,6 +147,13 @@ type drbdsetupStatusConnection struct {
 
 type drbdsetupStatusPeerDevice struct {
 	VolumeNumber int32 `json:"volume"`
+	// PeerDiskState is the peer's kernel-reported disk state for this
+	// volume (`peer-disk-state` in drbdsetup status -j). UpToDate /
+	// Consistent / Outdated mean the peer holds committed data; the
+	// Bug 342 force-promote gate (AnyConnectedPeerHasData) reads it to
+	// refuse `drbdadm primary --force` on a fresh replica when a
+	// connected peer already has data.
+	PeerDiskState string `json:"peer-disk-state"`
 }
 
 // Show runs `drbdsetup status -j <resource>` and parses the output
