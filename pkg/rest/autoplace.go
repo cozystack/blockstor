@@ -2086,9 +2086,8 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
 	// Look up the Resource before any destructive action. The flag
-	// inspection drives the Bug 342 toggle-vs-Delete branch decision
-	// below and the legacy tiebreaker-suppression stamp on the
-	// witness path.
+	// inspection drives the legacy tiebreaker-suppression stamp on
+	// the witness path.
 	existing, getErr := s.Store.Resources().Get(r.Context(), rdName, node)
 	if getErr != nil {
 		if errors.Is(getErr, store.ErrNotFound) {
@@ -2110,32 +2109,34 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 342: route diskful `r d` through toggle-disk-to-diskless
-	// instead of physical Resource Delete. Upstream LINSTOR's REST
-	// DelRsc on a diskful Resource is internally a toggle-disk-remove
-	// — Resource entry survives, dispatcher continues rendering the
-	// peer as `disk none` in every .res file, kernel slot lives
-	// across the detach so `r c` (which createOrPromoteResource
-	// already handles as diskless→diskful promote) just flips the
-	// one .res line back. The pre-Bug-342 physical-Delete path tore
-	// the peer out of every .res, triggered satellite-side
-	// `del-peer + forget-peer`, and wedged the next `r c` in
-	// Connecting/StandAlone because the kernel had to handshake a
-	// brand-new node-id against peers that had forgotten it.
+	// `r d` physically removes the replica for ALL replica kinds —
+	// diskful, diskless, and tiebreaker — matching upstream LINSTOR
+	// `linstor resource delete`. The satellite resource controller's
+	// finalizer-driven handleDelete tears DRBD down on the node
+	// (drbdadm down), surviving siblings run del-peer + forget-peer
+	// to reclaim the bitmap slot (tearDownRemovedPeers, woken by
+	// bumpPeerChangedOnSiblings below), DeleteVolume frees the
+	// backing storage (ZVOL/LV/file — diskful has real backing,
+	// diskless/tiebreaker resolve to an empty pool and skip it), then
+	// the satellite strips its finalizer and the CRD is finalised.
 	//
-	// Branch matrix:
-	//   TIE_BREAKER → physical Delete + stampTiebreakerSuppression.
-	//     The witness lifecycle is controller-owned; an explicit
-	//     operator `r d witness-node` request means "really remove".
-	//   already DISKLESS (non-witness) → physical Delete. There is
-	//     no diskful state to convert from; operator intent is full
-	//     peer removal. Satellite's EvictPeersByUIDMismatch path
-	//     handles the kernel-slot teardown.
-	//   DISKFUL (non-witness) → toggle-disk-to-diskless. Keep CRD,
-	//     stamp DISKLESS flag. Satellite detaches local backing;
-	//     dispatcher renders peer with `disk none` for this node.
+	// History (Bug 342): a previous revision rerouted a diskful `r d`
+	// to a toggle-disk-to-diskless (CRD survived with a DISKLESS
+	// flag, never deleted) to mask a relocate wedge — a fresh node-id
+	// handshaking against peers that had already forgotten the slot
+	// landed in Connecting/StandAlone. That wedge is now closed by
+	// the node-id-occupied invariant (the departed replica's id stays
+	// occupied via the survivors' observed PeerDRBDNodeID until the
+	// kernel confirms forget, so a subsequent relocate gets a fresh
+	// id), so the toggle mask is obsolete and physical delete is safe
+	// again. The `r td` / toggle-disk command path
+	// (handleResourceToggleDiskToDiskless) is unaffected — it still
+	// toggles; only `r d` deletes.
+	//
+	// TIE_BREAKER still gets the auto-tiebreaker-suppression stamp so
+	// the RD-level reconciler doesn't immediately re-stamp a fresh
+	// witness the next time `ensureTiebreaker` fires.
 	tieBreaker := slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker)
-	alreadyDiskless := slices.Contains(existing.Flags, apiv1.ResourceFlagDiskless)
 
 	if tieBreaker {
 		// Best-effort. Failure to stamp must not block the
@@ -2143,12 +2144,6 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		// the annotation is "auto-witness comes back in 5
 		// seconds" — annoying, but not data-loss.
 		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
-	}
-
-	if !tieBreaker && !alreadyDiskless {
-		s.toggleResourceToDiskless(w, r, rdName, node)
-
-		return
 	}
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
@@ -2187,34 +2182,6 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
-	}})
-}
-
-// toggleResourceToDiskless is the Bug 342 diskful-`r d` path: stamp
-// the DISKLESS flag via PatchResourceSpec (Bug 281 optimistic-lock
-// retry shape) so the Resource CRD survives, then bump siblings'
-// peer-changed annotation so cross-node satellite reconcilers wake
-// up deterministically. Mirrors handleResourceToggleDiskToDiskless
-// on the Spec mutation side; the wire envelope matches the legacy
-// physical-delete reply so CSI/golinstor callers see no shape drift.
-func (s *Server) toggleResourceToDiskless(w http.ResponseWriter, r *http.Request, rdName, node string) {
-	patchErr := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
-		func(res *apiv1.Resource) error {
-			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, true)
-
-			return nil
-		})
-	if patchErr != nil {
-		writeStoreError(w, patchErr)
-
-		return
-	}
-
-	s.bumpPeerChangedOnSiblings(r.Context(), rdName, node)
-
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
-		Message: "resource toggled to diskless: " + rdName + " on " + node,
 	}})
 }
 

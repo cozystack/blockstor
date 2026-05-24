@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"slices"
 	"testing"
 	"time"
 
@@ -376,40 +375,20 @@ func TestBug124ResourceDeleteIndividualInvalidates(t *testing.T) {
 		t.Fatalf("DELETE status: got %d, want 200", delResp.StatusCode)
 	}
 
-	// Bug 342: r d on a diskful Resource is toggle-disk-remove, not
-	// physical Delete. Both rows remain in the view; worker-1 now
-	// carries DISKLESS. The Bug 124 cache-invalidation contract is
-	// still exercised: the post-DELETE GET must reflect worker-1's
-	// DISKLESS flag immediately (would be a stale "no DISKLESS"
-	// under a cache-lag regression).
+	// `r d` physically removes the replica. The Bug 124
+	// cache-invalidation contract: the post-DELETE GET must drop
+	// worker-1 from the view immediately (would still show 2 rows
+	// under a cache-lag regression). worker-2 survives untouched.
 	rows := getViewResources(t, base)
-	if len(rows) != 2 {
-		t.Errorf("post-delete view rows: got %d (%+v), want 2 (worker-1 DISKLESS + worker-2 diskful)",
+	if len(rows) != 1 {
+		t.Errorf("post-delete view rows: got %d (%+v), want 1 (worker-1 removed, worker-2 survives)",
 			len(rows), rowNames(rows))
 
 		return
 	}
 
-	var w1, w2 *apiv1.ResourceWithVolumes
-	for i := range rows {
-		switch rows[i].NodeName {
-		case "dev-kvaps-worker-1":
-			w1 = &rows[i]
-		case "dev-kvaps-worker-2":
-			w2 = &rows[i]
-		}
-	}
-
-	if w1 == nil || w2 == nil {
-		t.Fatalf("post-delete view missing one of the rows; got %+v", rowNames(rows))
-	}
-
-	if !slices.Contains(w1.Flags, apiv1.ResourceFlagDiskless) {
-		t.Errorf("Bug 124 + Bug 342 cache invalidation: w1.Flags=%v missing DISKLESS immediately after DELETE (cache lag regression)", w1.Flags)
-	}
-
-	if slices.Contains(w2.Flags, apiv1.ResourceFlagDiskless) {
-		t.Errorf("Bug 342: w2 (sibling) erroneously carries DISKLESS after DELETE on w1; w2.Flags=%v", w2.Flags)
+	if rows[0].NodeName != "dev-kvaps-worker-2" {
+		t.Errorf("post-delete view should keep only worker-2; got %+v", rowNames(rows))
 	}
 }
 

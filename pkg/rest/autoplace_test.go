@@ -18,6 +18,7 @@ package rest
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -1209,6 +1210,93 @@ func TestResourceDeleteMissing(t *testing.T) {
 	}
 }
 
+// TestResourceDeletePhysicallyRemovesAllReplicaKinds pins the
+// restored `r d` contract: a single DELETE physically removes the
+// replica — the Resource CRD is gone afterwards — for every replica
+// kind (diskful, diskless, tiebreaker), matching upstream LINSTOR.
+//
+// Regression guard against the reverted Bug-342-v17 hack that
+// rerouted a diskful `r d` to a toggle-disk-to-diskless (the CRD
+// survived with a DISKLESS flag, never deleted). That mask is now
+// obsolete: the node-id-occupied invariant closes the relocate wedge
+// it used to hide, so physical delete is safe again. The `r td` /
+// toggle-disk command path is covered separately and must still
+// toggle rather than delete.
+func TestResourceDeletePhysicallyRemovesAllReplicaKinds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		node  string
+		flags []string
+	}{
+		{name: "diskful", node: "n-diskful", flags: nil},
+		{name: "diskless", node: "n-diskless", flags: []string{apiv1.ResourceFlagDiskless}},
+		{
+			name:  "tiebreaker",
+			node:  "n-tb",
+			flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := store.NewInMemory()
+			ctx := t.Context()
+
+			rd := "pvc-del-" + tc.name
+			if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd}); err != nil {
+				t.Fatalf("seed RD: %v", err)
+			}
+
+			// Seed a surviving sibling so the delete isn't the last
+			// row (mirrors a real multi-replica RD) and so the path
+			// exercises the sibling bump.
+			if err := st.Resources().Create(ctx, &apiv1.Resource{Name: rd, NodeName: "survivor"}); err != nil {
+				t.Fatalf("seed survivor: %v", err)
+			}
+
+			if err := st.Resources().Create(ctx, &apiv1.Resource{
+				Name: rd, NodeName: tc.node, Flags: tc.flags,
+			}); err != nil {
+				t.Fatalf("seed target: %v", err)
+			}
+
+			base, stop := startServerWithStore(t, st)
+			defer stop()
+
+			resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/"+tc.node)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status: got %d, want 200", resp.StatusCode)
+			}
+
+			var rc []apiv1.APICallRc
+			if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+				t.Fatalf("decode ApiCallRc envelope: %v", err)
+			}
+
+			if len(rc) == 0 || !strings.Contains(rc[0].Message, "resource deleted") {
+				t.Errorf("envelope: got %+v, want a 'resource deleted' marker (physical delete)", rc)
+			}
+
+			// Contract: the CRD must be GONE, not toggled to DISKLESS.
+			if _, err := st.Resources().Get(ctx, rd, tc.node); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("r d should physically remove %s replica; got err=%v (want ErrNotFound)",
+					tc.name, err)
+			}
+
+			// The surviving sibling stays put.
+			if _, err := st.Resources().Get(ctx, rd, "survivor"); err != nil {
+				t.Errorf("survivor must remain after deleting %s replica: %v", tc.name, err)
+			}
+		})
+	}
+}
+
 // TestAutoplaceBadJSON: malformed body → 400. Pinned because
 // linstor-csi calls this on every CreateVolume; a regression that
 // flipped a decoder error to 500 would loop the csi retry path.
@@ -1386,18 +1474,13 @@ func TestResourceDeleteBumpsSiblingPeers(t *testing.T) {
 		}
 	}
 
-	// Bug 342: r d on a diskful Resource is toggle-disk-remove, not
-	// physical Delete. The CRD survives with the DISKLESS flag
-	// stamped; the satellite detaches local backing while keeping
-	// the kernel slot. Pin that the deleted replica IS still in the
-	// store AND now carries DISKLESS.
-	w2, err := st.Resources().Get(ctx, "pvc-3way", "w2")
-	if err != nil {
-		t.Fatalf("Bug 342: deleted-then-toggled replica w2 unexpectedly absent: %v", err)
-	}
-
-	if !slices.Contains(w2.Flags, apiv1.ResourceFlagDiskless) {
-		t.Errorf("Bug 342: w2.Flags=%v missing DISKLESS after r d (expected toggle-disk-remove)", w2.Flags)
+	// `r d` on a diskful Resource physically removes the replica
+	// (matching upstream LINSTOR). The CRD is gone; the satellite
+	// tears DRBD down, survivors reclaim the bitmap slot, and the
+	// backing storage is freed. Pin that the deleted replica is
+	// no longer in the store.
+	if _, err := st.Resources().Get(ctx, "pvc-3way", "w2"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("r d should physically remove w2; got err=%v (want ErrNotFound)", err)
 	}
 }
 
@@ -1670,17 +1753,11 @@ func TestResourceDeleteBumpsAllSurvivorsScenario4W19(t *testing.T) {
 		}
 	}
 
-	// Bug 342: r d on a diskful Resource is toggle-disk-remove. n3
-	// survives in the store with DISKLESS stamped; the bump path on
-	// the survivors must still produce a peer-changed timestamp
-	// (verified above), but n3 itself remains as a DISKLESS peer.
-	n3, err := st.Resources().Get(ctx, "pvc-w19", "n3")
-	if err != nil {
-		t.Fatalf("Bug 342: deleted-then-toggled replica n3 unexpectedly absent: %v", err)
-	}
-
-	if !slices.Contains(n3.Flags, apiv1.ResourceFlagDiskless) {
-		t.Errorf("Bug 342: n3.Flags=%v missing DISKLESS after r d (expected toggle-disk-remove)", n3.Flags)
+	// `r d` on a diskful Resource physically removes the replica.
+	// The survivors must still produce a peer-changed timestamp
+	// (verified above), and n3 itself is gone from the store.
+	if _, err := st.Resources().Get(ctx, "pvc-w19", "n3"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("r d should physically remove n3; got err=%v (want ErrNotFound)", err)
 	}
 }
 
