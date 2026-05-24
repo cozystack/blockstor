@@ -2141,28 +2141,17 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	autoPromote := firstActivation && autoPrimaryReplica
 	_ = cloned
 
-	if autoPromote {
-		// Bug 342 force-promote gate (kernel-truth, race-free): the
-		// dispatcher's `auto-primary` election + its anyDiskfulPeerHasData
-		// suppressor reads peer CRD Status.DiskState, which the apiserver
-		// cache can leave stale/empty for a freshly-recreated peer right
-		// after `r d` then `r c` (relocate / same-node recreate). When
-		// the stamp leaks through, `drbdadm primary --force` mints an
-		// unrelated Current UUID, the data-bearing peer declines the
-		// handshake (`uuid_compare()=unrelated-data` → `Unrelated data,
-		// aborting!`), and the new replica wedges StandAlone.
-		//
-		// By finishDRBDApply time the .res has been adjusted+connected,
-		// so the peer's disk state is observable directly from the
-		// kernel. If any connected peer already exposes committed data,
-		// SKIP the force-primary — the fresh replica stays Inconsistent
-		// and SyncTargets from that peer (full resync, data-safe). A
-		// genuinely-fresh RD (no peer with data) finds nothing and still
-		// force-primaries, preserving the Bug 77 first-replica seed.
-		if r.cfg.Adm.AnyConnectedPeerHasData(ctx, dr.GetName()) {
-			return nil
-		}
+	if autoPromote && !r.shouldForcePromote(ctx, dr) {
+		// Bug 342 force-promote gate fired: a data-bearing peer exists,
+		// so SKIP `drbdadm primary --force`. The fresh replica stays
+		// Inconsistent and SyncTargets from the peer (full resync,
+		// data-safe). Returning here also skips the mkfs-retry below —
+		// correct, since the replica adopts the peer's filesystem via
+		// the resync rather than formatting locally.
+		return nil
+	}
 
+	if autoPromote {
 		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
 			return err
@@ -2641,6 +2630,72 @@ func (r *Reconciler) createMetadata(ctx context.Context, dr *intent.DesiredResou
 //
 // Pulled out of applyDRBD so the orchestration function stays under
 // the project's gocyclo budget.
+// shouldForcePromote is the Bug 342 force-promote gate. It returns true
+// only when `drbdadm primary --force` is data-safe on this fresh
+// replica — i.e. NO other replica already holds committed data. Forcing
+// primary mints a brand-new Current UUID; doing so when a peer already
+// owns the real data + UUID makes the peer decline the GI handshake
+// (`uuid_compare()=unrelated-data` → `Unrelated data, aborting!`) and
+// wedges this replica StandAlone (the relocate / physical-`r d`-then-
+// `r c` case). The safe alternative is "no force → Inconsistent →
+// SyncTarget from the peer" (full resync).
+//
+// Two independent signals, EITHER of which vetoes the promote:
+//
+//  1. dr.PeerHasData — the dispatcher's view of peer CRD
+//     Status.DiskState (UpToDate/Consistent/Outdated). Fast, but the
+//     apiserver cache can lag a freshly-recreated peer, so it can miss.
+//  2. A bounded kernel-truth probe (drbdsetup status --json): the .res
+//     was adjusted+connected before this runs, but the peer-connect
+//     handshake is async, so the peer's disk state may not be visible
+//     the instant we probe. Poll briefly so a peer that is about to
+//     connect with data is seen BEFORE we force-primary — this closes
+//     the connect-timing race the dispatcher gate alone can't (the
+//     dmesg evidence showed force-primary firing ~0.5s before the peer
+//     handshake landed).
+//
+// A genuinely-fresh RD has no peer with data: PeerHasData is false and
+// the kernel probe finds nothing (peers fresh/Inconsistent or just a
+// diskless tiebreaker), so this returns true and the Bug 77
+// first-replica seed still force-primaries. When the replica has no
+// configured peers at all (true solo, e.g. Bug 356 diskless→diskful
+// flip on a 1-node RD) we skip the wait entirely and promote at once.
+func (r *Reconciler) shouldForcePromote(ctx context.Context, dr *intent.DesiredResource) bool {
+	if dr.GetPeerHasData() {
+		return false
+	}
+
+	// No peers configured → sole replica, nothing to sync from, promote
+	// immediately (no wait — there is no connection to ever establish).
+	if len(dr.GetPeerNames()) == 0 {
+		return true
+	}
+
+	// Bounded kernel-truth wait: give the async peer handshake a chance
+	// to surface a data-bearing peer-disk before we commit to forcing
+	// primary. ~6s ceiling (12 × 500ms) comfortably exceeds the observed
+	// adjust→handshake latency while staying well under the reconcile
+	// budget. The instant ANY connected peer exposes committed data we
+	// veto; if the window elapses with no data peer, the RD is genuinely
+	// fresh and we proceed.
+	for range 12 {
+		if r.cfg.Adm.AnyConnectedPeerHasData(ctx, dr.GetName()) {
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			// Context cancelled — be conservative and DON'T force
+			// (full resync is always safe; a missed promote retries
+			// on the next reconcile).
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	return true
+}
+
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
 	err := r.cfg.Adm.PrimaryForce(ctx, dr.GetName())
 	if err != nil {
