@@ -734,6 +734,23 @@ func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockst
 		return false, nil
 	}
 
+	// Bug 342 / seed-GI data-integrity gate: the day0 skip-sync seed
+	// is ONLY valid when the RD is genuinely day0 — no existing
+	// data-bearing (UpToDate/Consistent/Outdated) diskful peer. When a
+	// data peer already exists (the relocate / physical `r d` then
+	// `r c` recreate case) a fresh diskful replica MUST come up
+	// Inconsistent and SyncTarget from that peer (full resync), NOT
+	// adopt a seeded GI: stamping the peer's evolved Current UUID would
+	// let DRBD skip the resync against a replica that holds ZERO data,
+	// and a stale/missing stamp would drop the satellite into the
+	// synthetic day0 fallback whose GI is unrelated to the survivor →
+	// `uuid_compare()=unrelated-data` → StandAlone. Refuse to stamp any
+	// SeedFromGi in that case; the satellite's resolveSeedGi enforces
+	// the same gate race-free from observed peer state.
+	if anyDataBearingDiskfulPeer(peers, target.Name) {
+		return false, nil
+	}
+
 	mutated := false
 
 	for _, vd := range rd.Spec.VolumeDefinitions {
@@ -819,6 +836,48 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 	})
 
 	return volumeCurrentGi(&candidates[0], volumeNumber)
+}
+
+// anyDataBearingDiskfulPeer reports whether any diskful PEER (excluding
+// the target itself) already holds committed data, observed via
+// Status.Volumes[].DiskState. UpToDate, Consistent, and Outdated all
+// mean the peer carries real data with a real Current UUID — a fresh
+// local replica must SyncTarget from it (full resync) rather than skip
+// sync via a seeded GI. Mirrors dispatcher.anyDiskfulPeerHasData so the
+// controller-side seed gate and the satellite-side resolveSeedGi gate
+// agree on the same "day0 vs data-peer-exists" discriminator. Diskless
+// peers never count (no backing data to seed from).
+func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName string) bool {
+	for i := range peers {
+		if peers[i].Name == targetName {
+			continue
+		}
+
+		if slices.Contains(peers[i].Spec.Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		for j := range peers[i].Status.Volumes {
+			switch drbd.DiskState(peers[i].Status.Volumes[j].DiskState) {
+			case drbd.DiskStateUpToDate,
+				drbd.DiskStateConsistent,
+				drbd.DiskStateOutdated:
+				return true
+			case drbd.DiskStateDiskless,
+				drbd.DiskStateAttaching,
+				drbd.DiskStateDetaching,
+				drbd.DiskStateFailed,
+				drbd.DiskStateNegotiating,
+				drbd.DiskStateInconsistent,
+				drbd.DiskStateDUnknown:
+				// No committed data we can seed from; keep scanning.
+			default:
+				// Unknown/empty state — treat as "no data".
+			}
+		}
+	}
+
+	return false
 }
 
 // volumeCurrentGi returns the CurrentGi for the given volume number

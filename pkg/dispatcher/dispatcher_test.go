@@ -1253,6 +1253,110 @@ func TestAutoPrimaryGatedOnAllPeerNodeIDs(t *testing.T) {
 			t.Errorf("sole diskful n1 must stamp auto-primary=true regardless of diskless witness id, got %q", got)
 		}
 	})
+
+	t.Run("relocate-fresh-lowest-id-must-not-force-primary-when-peer-has-data", func(t *testing.T) {
+		t.Parallel()
+
+		// Bug 356 relocate scenario: an existing diskful peer (n-old,
+		// id=1) already holds data (Status DiskState=UpToDate). A fresh
+		// replica (n-new, id=0) is created on a freed node — it wins
+		// the lowest-node-id election but MUST NOT force-primary: that
+		// would mint an unrelated Current UUID and wedge the handshake
+		// in StandAlone. The fresh replica must instead SyncTarget from
+		// the data-bearing peer.
+		nNew := newDiskfulResource(rdName, "n-new", id(0))
+		nOld := newDiskfulResource(rdName, "n-old", id(1))
+		nOld.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{
+			{VolumeNumber: 0, DiskState: "UpToDate"},
+		}
+
+		fromNew := dispatcher.BuildDesired(nNew, []blockstoriov1alpha1.Resource{*nOld}, nil, nil, rd, nil)
+		if got, ok := fromNew.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("fresh lowest-id relocate target must NOT stamp auto-primary while peer n-old is UpToDate, got %q", got)
+		}
+
+		if !fromNew.PeerHasData {
+			t.Errorf("fresh relocate target must observe PeerHasData=true (n-old UpToDate)")
+		}
+
+		// The existing data-bearing peer (higher id) also never seeds —
+		// it's not the lowest, and it already has data anyway.
+		fromOld := dispatcher.BuildDesired(nOld, []blockstoriov1alpha1.Resource{*nNew}, nil, nil, rd, nil)
+		if got, ok := fromOld.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("data-bearing peer n-old must not stamp auto-primary, got %q", got)
+		}
+	})
+}
+
+// TestPeerHasDataGatesSeed pins the seed-GI data-integrity signal the
+// dispatcher threads into DesiredResource.PeerHasData: it must be true
+// iff a diskful peer reports committed data (UpToDate/Consistent/
+// Outdated), and false for a genuinely-fresh RD (peers fresh /
+// Inconsistent / no DiskState) so the satellite's day0 skip-sync stays
+// enabled. The satellite's resolveSeedGi refuses every GI seed when
+// this is true (fresh replica must SyncTarget from the data peer).
+func TestPeerHasDataGatesSeed(t *testing.T) {
+	t.Parallel()
+
+	const rdName = "pvc-seed-gate"
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	id := func(v int32) *int32 { return &v }
+
+	withState := func(r *blockstoriov1alpha1.Resource, state string) *blockstoriov1alpha1.Resource {
+		r.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{
+			{VolumeNumber: 0, DiskState: state},
+		}
+
+		return r
+	}
+
+	cases := []struct {
+		name      string
+		peerState string
+		diskless  bool
+		want      bool
+	}{
+		{name: "fresh-no-diskstate", peerState: "", want: false},
+		{name: "fresh-inconsistent", peerState: "Inconsistent", want: false},
+		{name: "data-uptodate", peerState: "UpToDate", want: true},
+		{name: "data-consistent", peerState: "Consistent", want: true},
+		{name: "data-outdated", peerState: "Outdated", want: true},
+		{name: "diskless-uptodate-ignored", peerState: "UpToDate", diskless: true, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := newDiskfulResource(rdName, "n-new", id(0))
+
+			var peer *blockstoriov1alpha1.Resource
+			if tc.diskless {
+				peer = newDisklessResource(rdName, "n-old", id(1))
+			} else {
+				peer = newDiskfulResource(rdName, "n-old", id(1))
+			}
+
+			if tc.peerState != "" {
+				withState(peer, tc.peerState)
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{*peer}, nil, nil, rd, nil)
+			if got.PeerHasData != tc.want {
+				t.Errorf("PeerHasData=%v, want %v (peer state %q diskless=%v)",
+					got.PeerHasData, tc.want, tc.peerState, tc.diskless)
+			}
+		})
+	}
 }
 
 // newDiskfulResource is a one-shot Resource builder for the Bug-80

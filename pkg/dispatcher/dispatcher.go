@@ -159,9 +159,26 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// there until something opens for write. The seed flag is
 	// harmless on subsequent reconciles — satellite Reconciler runs
 	// primary --force only on firstActivation.
+	//
+	// Bug 356: gate on "no existing diskful peer already holds data".
+	// The seed-primary is the INITIAL-sync source for a brand-new RD
+	// where every diskful replica is fresh. On a relocate (physical
+	// `r d` of one diskful + fresh `r c` on another node) the new
+	// replica may win the lowest-node-id election (the freed slot's id
+	// is the lowest free), but an existing diskful peer already carries
+	// the real data + Current UUID. Forcing `primary --force` on the
+	// fresh replica then regenerates an UNRELATED Current UUID, the
+	// existing peer declines the handshake ("Current UUID of peer does
+	// not match my exposed UUID" / "Unrelated data, aborting!"), and
+	// the relocate target wedges in StandAlone. Suppress auto-primary
+	// whenever any diskful peer reports data so the fresh replica comes
+	// up Inconsistent and SyncTargets from the peer. Only a genuinely
+	// fresh RD — no diskful peer with data — runs the force-primary
+	// seed.
 	if selfID, ok := idLookup(idOf, target.Spec.NodeName); ok &&
 		!slices.Contains(target.Spec.Flags, "DISKLESS") &&
-		selfID == lowestDiskfulID(target, peers) {
+		selfID == lowestDiskfulID(target, peers) &&
+		!anyDiskfulPeerHasData(peers) {
 		drbdOpts["auto-primary"] = boolPropTrue
 	}
 
@@ -232,6 +249,11 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		LayerStack:      layerStack,
 		Connections:     connectionsFromRD(rd),
 		AppliedPeerUIDs: copyAppliedPeerUIDs(target.Status.AppliedPeerUIDs),
+		// Bug 342 / seed-GI safety: tell the satellite whether a
+		// data-bearing diskful peer already exists so resolveSeedGi
+		// refuses any GI seed (day0 OR controller SeedFromGi) on a
+		// fresh replica that must SyncTarget from that peer instead.
+		PeerHasData: anyDiskfulPeerHasData(peers),
 	}
 }
 
@@ -587,6 +609,49 @@ func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1
 	}
 
 	return ""
+}
+
+// anyDiskfulPeerHasData reports whether any diskful PEER already holds
+// committed data, observed via Status.Volumes[].DiskState. UpToDate,
+// Consistent, and Outdated all mean the peer carries real data with a
+// real Current UUID — a fresh local replica must SyncTarget from it
+// rather than force-primary or day0-seed (either of which would mint /
+// stamp an unrelated UUID and wedge the handshake in StandAlone). A
+// fresh, never-promoted replica reports Inconsistent (or no DiskState
+// at all until the observer reports), so a genuinely-fresh RD passes
+// this gate and still gets its day0 skip-sync + force-primary seed.
+//
+// Diskless peers never count: they have no backing data to seed from.
+// Used both to suppress the seed-primary on a relocate (BuildDesired's
+// auto-primary election) AND to gate the day0/peer GI-seed in the
+// satellite (threaded via DesiredResource.PeerHasData → resolveSeedGi).
+func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
+	for i := range peers {
+		if slices.Contains(peers[i].Spec.Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		for j := range peers[i].Status.Volumes {
+			switch drbd.DiskState(peers[i].Status.Volumes[j].DiskState) {
+			case drbd.DiskStateUpToDate,
+				drbd.DiskStateConsistent,
+				drbd.DiskStateOutdated:
+				return true
+			case drbd.DiskStateDiskless,
+				drbd.DiskStateAttaching,
+				drbd.DiskStateDetaching,
+				drbd.DiskStateFailed,
+				drbd.DiskStateNegotiating,
+				drbd.DiskStateInconsistent,
+				drbd.DiskStateDUnknown:
+				// No committed data we can seed from; keep scanning.
+			default:
+				// Unknown/empty state — treat as "no data".
+			}
+		}
+	}
+
+	return false
 }
 
 // lowestDiskfulID picks the smallest allocated node-id among the

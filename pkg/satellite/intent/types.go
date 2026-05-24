@@ -126,6 +126,29 @@ type DesiredResource struct {
 	// absent (cluster just upgraded, observer restarting). Phase
 	// 11.3 Stage 3.
 	KernelLoaded bool
+
+	// PeerHasData is the dispatcher's observation that at least one
+	// diskful PEER already holds committed data (a volume in
+	// UpToDate/Consistent/Outdated — see dispatcher.anyDiskfulPeerHasData,
+	// read fresh off the peers' Status.Volumes[].DiskState every
+	// reconcile). The satellite's resolveSeedGi consults this to
+	// REFUSE any GI seed (day0 synthetic OR controller-supplied
+	// SeedFromGi) on a fresh diskful replica when a data-bearing peer
+	// exists: seeding a GI in that case would let DRBD skip the
+	// initial resync against a peer whose evolved Current UUID is
+	// unrelated to the synthetic seed → `uuid_compare()=unrelated-data`
+	// → StandAlone (the relocate / physical-r-d-then-r-c case). With a
+	// data peer present the only data-safe action is "no seed →
+	// Inconsistent → SyncTarget from the peer" (full resync). When no
+	// diskful peer holds data (genuinely-fresh RD) this is false and
+	// the Bug 77 day0 skip-sync stays enabled.
+	//
+	// Read fresh from peer CRD Status on EVERY reconcile, so the
+	// satellite decision is self-sufficient and does NOT race a
+	// controller stamp landing in time (the SeedFromGi write-race that
+	// could otherwise drop the satellite back to the unsafe day0
+	// fallback).
+	PeerHasData bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -296,6 +319,19 @@ func (x *DesiredResource) GetKernelLoaded() bool {
 	}
 
 	return x.KernelLoaded
+}
+
+// GetPeerHasData returns whether the dispatcher observed at least one
+// diskful peer already holding committed data (UpToDate/Consistent/
+// Outdated). resolveSeedGi reads this to refuse any GI seed on a fresh
+// replica that must instead full-resync (SyncTarget) from the peer.
+// Nil-safe.
+func (x *DesiredResource) GetPeerHasData() bool {
+	if x == nil {
+		return false
+	}
+
+	return x.PeerHasData
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply

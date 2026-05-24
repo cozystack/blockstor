@@ -3268,7 +3268,7 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 			continue
 		}
 
-		seed, ok := r.resolveSeedGi(dr.GetName(), vol)
+		seed, ok := r.resolveSeedGi(dr.GetName(), vol, dr.GetPeerHasData())
 		if !ok {
 			continue
 		}
@@ -3454,7 +3454,33 @@ func peerNodeIDsFromOpts(dr *intent.DesiredResource) map[string]int32 {
 //     initial-sync on first connect, which is the only safe
 //     behaviour when the backing storage may carry pre-existing
 //     bytes the peer doesn't have.
-func (r *Reconciler) resolveSeedGi(resourceName string, vol *intent.DesiredVolume) (string, bool) {
+//
+// Bug 342 / seed-GI data-integrity gate (peerHasData): the whole
+// seed-GI optimisation — skip the full initial-sync by stamping a GI
+// the peer already agrees with — is ONLY data-safe when the RD is
+// genuinely day0: no existing diskful peer holds committed data
+// anywhere. When ANY diskful peer reports data (peerHasData, observed
+// fresh off the peers' Status.Volumes[].DiskState every reconcile by
+// dispatcher.anyDiskfulPeerHasData), REFUSE every seed — the
+// controller-supplied SeedFromGi (copied from a peer's evolved Current
+// UUID) AND the synthetic day0 fallback alike. A fresh replica with a
+// data-bearing peer MUST come up Inconsistent and SyncTarget from that
+// peer (full resync, adopt the peer's GI); seeding ANY GI here lets
+// DRBD's handshake skip the resync against a peer whose Current UUID is
+// unrelated to the seed → `uuid_compare()=unrelated-data` → permanent
+// StandAlone (the relocate / physical `r d` then `r c` case).
+//
+// Race-free: the decision reads peerHasData (recomputed by the
+// dispatcher on every reconcile from live peer status), NOT a
+// controller stamp that must land in Spec.SeedFromGi in time. Even if
+// the controller never stamps SeedFromGi, a fresh replica with a data
+// peer takes the safe "no seed → Inconsistent → SyncTarget" path here,
+// never the unsafe day0 fallback.
+func (r *Reconciler) resolveSeedGi(resourceName string, vol *intent.DesiredVolume, peerHasData bool) (string, bool) {
+	if peerHasData {
+		return "", false
+	}
+
 	if seed := vol.GetSeedFromGi(); seed != "" {
 		return seed, true
 	}

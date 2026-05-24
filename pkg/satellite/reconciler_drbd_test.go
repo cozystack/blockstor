@@ -2678,6 +2678,61 @@ func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
 	}
 }
 
+// TestApplyFreshReplicaWithDataPeerSkipsSeed (Bug 342 / seed-GI gate)
+// pins the data-integrity rule: a FRESH diskful replica on a thin/ZFS
+// provider — where the Bug 77 day0 skip-sync would normally fire —
+// MUST NOT seed any GI when a data-bearing peer already exists
+// (DesiredResource.PeerHasData=true, the relocate / physical `r d`
+// then `r c` recreate case). With no seed the replica comes up
+// Inconsistent and SyncTargets from the peer (full resync, data-safe),
+// instead of skip-syncing against a peer whose evolved Current UUID is
+// unrelated to the synthetic day0 → `uuid_compare()=unrelated-data` →
+// StandAlone. This is RACE-FREE: it holds even though SeedFromGi is
+// empty (controller stamp never landed), because the gate reads the
+// dispatcher-observed PeerHasData, not the controller stamp.
+func TestApplyFreshReplicaWithDataPeerSkipsSeed(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/pvc-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("zfs list -H -p -o name,volsize,used tank/pvc-relocate_00000",
+		storage.FakeResponse{Stdout: []byte("tank/pvc-relocate_00000\t1073741824\t512\n")})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{
+			"zfs-thin1": zfs.NewProvider(zfs.Config{Pool: "tank", Thin: true}, fx),
+		},
+		Adm:      drbd.NewAdm(fx),
+		StateDir: dir,
+		NodeName: "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:        "pvc-relocate",
+			NodeName:    "n1",
+			PeerHasData: true, // dispatcher saw an UpToDate diskful peer
+			Peers:       []intent.DesiredPeer{{Name: "n2"}},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "zfs-thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "set-gi") {
+			t.Errorf("seeded a GI on a fresh replica with a data-bearing peer (PeerHasData) — must SyncTarget instead: %s", line)
+		}
+	}
+}
+
 // TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS (Bug 77 fix)
 // pins the upstream-LINSTOR `DrbdLayerUtils.skipInitSync` behaviour:
 // when a fresh RD activates on a backing provider that is guaranteed
