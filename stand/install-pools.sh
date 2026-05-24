@@ -3,13 +3,16 @@
 # usage: install-pools.sh WORK_DIR [TYPE]
 #
 # Creates real-disk storage pools on every worker node:
-#   TYPE=zfs   → zpool create blockstor-zfs /dev/sdb on each worker
-#   TYPE=lvm   → vgcreate blockstor-lvm /dev/sdb + lvcreate -T -L 14G
-#                blockstor-lvm/thin
-#   TYPE=both  → both, on /dev/sdb (zfs) + /dev/sdc (lvm)
+#   TYPE=zfs   → zpool create blockstor-zfs on the spare disk
+#   TYPE=lvm   → vgcreate blockstor-lvm + thin pool on the spare disk
+#   TYPE=both  → both: first spare disk = zfs, second spare disk = lvm
+#
+# Backing devices are auto-detected per node (see pick_device below);
+# the root OS disk is always excluded and a single-type re-run never
+# steals the other driver's disk.
 #
 # Default TYPE=both. Idempotent: each step skips if the pool already
-# exists.
+# exists and recreates a destroyed VG (clearing stale dm nodes first).
 #
 # Re-applies the satellite DaemonSet with --zfs-pool-name=blockstor-zfs
 # and/or --lvm-pool-name=blockstor-lvm so the controller's StoragePool
@@ -25,20 +28,99 @@ export KUBECONFIG="$WORK_DIR/kubeconfig"
 NS=blockstor-system
 
 # Talos qemu attaches extra disks as /dev/sda, /dev/sdb (vda is the
-# root). zfs gets the first, lvm-thin the second when both are
-# requested; single-type stands use the first available.
-ZFS_DEV=${ZFS_DEV:-/dev/sda}
-LVM_DEV=${LVM_DEV:-/dev/sdb}
+# root OS disk). zfs takes the first spare disk, lvm-thin the second
+# when both are requested.
+#
+# Device selection is auto-detected per worker, never hard-coded: the
+# old code set LVM_DEV=/dev/sda for single-type (TYPE=lvm) runs, but on
+# a `both`-provisioned stand /dev/sda is the zfs_member disk — so
+# `make pools TYPE=lvm` clobbered the live ZFS pool instead of touching
+# the spare LVM disk. We now enumerate the real spare disks per node
+# and skip any disk already claimed by the other driver.
+#
+# spare_disks_on <pod>: prints candidate whole-disk paths (one per
+# line, sorted), excluding the OS disk and loop/cdrom devices.
+#
+# The satellite container's mount namespace has no partition mounted at
+# `/` (its rootfs is an overlay), so we can't find the OS disk by the
+# `/` mountpoint. Instead we mark a disk as the OS disk if any of its
+# partitions is mounted OR carries a vfat (EFI) signature — on the
+# Talos qemu stand that uniquely identifies vda. PKNAME maps each
+# partition to its parent disk.
+spare_disks_on() {
+    local pod=$1
+    kubectl -n "$NS" exec "$pod" -- sh -c '
+        os_disks=$(lsblk -nro NAME,FSTYPE,MOUNTPOINT,PKNAME \
+            | awk "(\$3!=\"\" || \$2==\"vfat\") && \$4!=\"\" {print \$4}" \
+            | sort -u)
+        lsblk -nrdo NAME,TYPE | awk -v os="$os_disks" "
+            BEGIN { n=split(os, a, \"\n\"); for (i=1;i<=n;i++) skip[a[i]]=1 }
+            \$2==\"disk\" && \$1!~/^loop/ && \$1!~/^sr/ && !(\$1 in skip) { print \"/dev/\"\$1 }
+        " | sort
+    '
+}
 
-if [[ "$TYPE" == "zfs" || "$TYPE" == "lvm" ]]; then
-    # single-type stand: both pool drivers default to the first
-    # extra disk (since only one was provisioned).
-    ZFS_DEV=/dev/sda
-    LVM_DEV=/dev/sda
-fi
+# disk_owner <pod> <dev>: classify a whole disk by scanning the disk
+# AND all of its child partitions for a pool signature. Prints "zfs"
+# (any descendant is zfs_member), "lvm" (any descendant is LVM2_member),
+# or "free". The earlier version only read the whole-disk fstype, which
+# is empty for a partitioned zfs disk (the zfs_member sig lives on
+# /dev/sda1, not /dev/sda) — that bug made `make pools TYPE=lvm` pick
+# the zfs disk /dev/sda and wipefs its GPT.
+disk_owner() {
+    local pod=$1 dev=$2
+    kubectl -n "$NS" exec "$pod" -- lsblk -nro FSTYPE "$dev" 2>/dev/null \
+        | awk '
+            /zfs_member/ { z=1 }
+            /LVM2_member/ { l=1 }
+            END { if (z) print "zfs"; else if (l) print "lvm"; else print "free" }
+        '
+}
+
+# pick_device <pod> <slot>: choose the backing device for slot=zfs or
+# slot=lvm. With TYPE=both the first spare is zfs, the second is lvm.
+# With a single driver, prefer a disk already owned by the requested
+# driver (idempotent re-provision), else a free disk; never a disk
+# owned by the other driver (so a single-type re-run on a both-stand
+# never clobbers the foreign pool).
+pick_device() {
+    local pod=$1 slot=$2
+    local -a spares
+    mapfile -t spares < <(spare_disks_on "$pod")
+    if (( ${#spares[@]} == 0 )); then
+        echo "ERROR: no spare disk on $pod (only root + loop/cdrom)" >&2
+        return 1
+    fi
+    if [[ "$TYPE" == "both" ]]; then
+        if [[ "$slot" == "zfs" ]]; then
+            echo "${spares[0]}"
+        else
+            echo "${spares[1]:-${spares[0]}}"
+        fi
+        return 0
+    fi
+    local dev owner free=""
+    for dev in "${spares[@]}"; do
+        owner=$(disk_owner "$pod" "$dev")
+        if [[ "$owner" == "$slot" ]]; then
+            echo "$dev"            # already this driver's disk — reuse it
+            return 0
+        fi
+        if [[ "$owner" == "free" && -z "$free" ]]; then
+            free="$dev"            # remember first free disk as fallback
+        fi
+    done
+    if [[ -n "$free" ]]; then
+        echo "$free"
+        return 0
+    fi
+    echo "ERROR: no $slot or free spare disk on $pod (all owned by the other driver)" >&2
+    return 1
+}
 
 create_zfs() {
     local pod=$1
+    local ZFS_DEV=$2
     kubectl -n "$NS" exec "$pod" -- bash -c "
         if zpool list blockstor-zfs >/dev/null 2>&1; then
             echo 'zpool blockstor-zfs already exists'
@@ -64,10 +146,26 @@ create_zfs() {
 
 create_lvm() {
     local pod=$1
+    local LVM_DEV=$2
     kubectl -n "$NS" exec "$pod" -- bash -c "
         set -e
         if ! vgs blockstor-lvm >/dev/null 2>&1; then
-            wipefs -af ${LVM_DEV}
+            # A destructive lvm-thin scenario (vgremove + pvremove) can
+            # leave the VG gone yet stale state still pinning the
+            # backing device / blocking vgcreate:
+            #   - device-mapper nodes (blockstor--lvm-thin*) → 'in use'
+            #   - a leftover /dev/blockstor-lvm/ directory with dangling
+            #     symlinks (no udev to clean it) → vgcreate aborts with
+            #     '/dev/blockstor-lvm: already exists in filesystem'
+            # Tear both down, then scrub any residual PV/fs signature so
+            # vgcreate starts from a clean disk. All best-effort so an
+            # already-clean device is a no-op.
+            for dm in \$(dmsetup ls 2>/dev/null | awk '/^blockstor--lvm/{print \$1}'); do
+                dmsetup remove \"\$dm\" 2>/dev/null || true
+            done
+            rm -rf /dev/blockstor-lvm 2>/dev/null || true
+            pvremove -ff -y ${LVM_DEV} 2>/dev/null || true
+            wipefs -af ${LVM_DEV} 2>/dev/null || true
             vgcreate -y blockstor-lvm ${LVM_DEV}
         fi
         if lvs blockstor-lvm/thin >/dev/null 2>&1; then
@@ -94,14 +192,21 @@ for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name); do
 
     case "$TYPE" in
     zfs)
-        create_zfs "$pod"
+        zdev=$(pick_device "$pod" zfs)
+        echo "   zfs device: $zdev"
+        create_zfs "$pod" "$zdev"
         ;;
     lvm)
-        create_lvm "$pod"
+        ldev=$(pick_device "$pod" lvm)
+        echo "   lvm device: $ldev"
+        create_lvm "$pod" "$ldev"
         ;;
     both)
-        create_zfs "$pod"
-        create_lvm "$pod"
+        zdev=$(pick_device "$pod" zfs)
+        ldev=$(pick_device "$pod" lvm)
+        echo "   zfs device: $zdev   lvm device: $ldev"
+        create_zfs "$pod" "$zdev"
+        create_lvm "$pod" "$ldev"
         ;;
     *)
         echo "unknown TYPE: $TYPE (want zfs/lvm/both)" >&2

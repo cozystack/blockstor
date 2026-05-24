@@ -540,6 +540,54 @@ reset_cluster_state() {
         ' 2>/dev/null || true
     done
 
+    # 5. Reassert the lvm-thin backing VG on any worker where it went
+    #    missing. lifecycle-toggle-retry.sh deliberately destroys the
+    #    `blockstor-lvm` VG to provoke an lvcreate failure and restores
+    #    it in its own EXIT trap — but if that scenario is killed
+    #    mid-flight (timeout, force-deleted satellite, dispatcher crash)
+    #    the trap never runs, leaving the VG gone (and stale dm nodes /
+    #    a dangling /dev/blockstor-lvm dir) on that worker. Every later
+    #    lvm-thin scenario then fails with poolMissing. Centralising the
+    #    recreation here makes recovery independent of any one trap.
+    #    Mirrors stand/install-pools.sh create_lvm (same dm/dir/PV scrub
+    #    and udev-less activation flags); the backing device is the
+    #    spare disk that is free or already lvm-owned (never the zfs
+    #    disk). No-op when the VG already exists.
+    for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
+        timeout 60 kubectl -n "$NS" exec "$pod" -- bash -c '
+            vgs blockstor-lvm >/dev/null 2>&1 && exit 0
+            # pick the lvm backing disk: a whole "disk" (not loop/cdrom,
+            # not the OS disk identified by a mounted/vfat partition)
+            # that is free or already LVM2_member, never zfs_member.
+            os_disks=$(lsblk -nro NAME,FSTYPE,MOUNTPOINT,PKNAME \
+                | awk "(\$3!=\"\" || \$2==\"vfat\") && \$4!=\"\" {print \$4}" | sort -u)
+            dev=""
+            for d in $(lsblk -nrdo NAME,TYPE | awk -v os="$os_disks" "
+                    BEGIN { n=split(os,a,\"\n\"); for(i=1;i<=n;i++) skip[a[i]]=1 }
+                    \$2==\"disk\" && \$1!~/^loop/ && \$1!~/^sr/ && !(\$1 in skip) {print \$1}"); do
+                own=$(lsblk -nro FSTYPE /dev/$d 2>/dev/null \
+                    | awk "/zfs_member/{z=1} /LVM2_member/{l=1} END{print (z?\"zfs\":(l?\"lvm\":\"free\"))}")
+                if [ "$own" = "lvm" ]; then dev=/dev/$d; break; fi
+                if [ "$own" = "free" ] && [ -z "$dev" ]; then dev=/dev/$d; fi
+            done
+            [ -n "$dev" ] || { echo "reset_cluster_state: no lvm spare disk on $(hostname)" >&2; exit 0; }
+            echo "reset_cluster_state: recreating blockstor-lvm on $dev"
+            for dm in $(dmsetup ls 2>/dev/null | awk "/^blockstor--lvm/{print \$1}"); do
+                dmsetup remove "$dm" 2>/dev/null || true
+            done
+            rm -rf /dev/blockstor-lvm 2>/dev/null || true
+            pvremove -ff -y "$dev" 2>/dev/null || true
+            wipefs -af "$dev" 2>/dev/null || true
+            vgcreate -y blockstor-lvm "$dev" || exit 0
+            CFG="activation{udev_sync=0 udev_rules=0}"
+            lvcreate --config "$CFG" -y -Wn -Zn -L 1G  blockstor-lvm -n thin_meta || exit 0
+            lvcreate --config "$CFG" -y -Wn -Zn -L 13G blockstor-lvm -n thin      || exit 0
+            lvconvert --config "$CFG" -y -Wn -Zn --type thin-pool \
+                --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin || exit 0
+            echo "reset_cluster_state: blockstor-lvm/thin recreated"
+        ' 2>/dev/null || true
+    done
+
     echo ">> reset_cluster_state: done $(date -Iseconds) (delete_all_rds rc=$rc)"
     return $rc
 }
