@@ -27,11 +27,7 @@ package intent
 
 // DesiredPeer carries one peer Resource's identity into the satellite
 // apply chain. Name + NodeID were always present (the .res renderer
-// needs them); ResourceUID is Bug 342: the satellite stamps it onto
-// Resource.Status.AppliedPeerUIDs after every successful adjust so
-// the next reconcile can detect "same name, new identity" (peer was
-// re-created sub-second after a delete) and force del-peer +
-// forget-peer before the new incarnation's adjust runs.
+// needs them).
 type DesiredPeer struct {
 	// Name is the peer's node name. Mirrors .res `on <name> {`.
 	Name string
@@ -40,19 +36,11 @@ type DesiredPeer struct {
 	// pointer-typed so a genuinely-unallocated peer (nil) is
 	// distinguishable from a peer legitimately allocated node-id 0
 	// (LowestFreeNodeID hands out 0 for the first/freed slot). A plain
-	// int32 zero-value collided with the valid id 0 and made
-	// EvictPeersByUIDMismatch defer eviction forever / the dispatcher
-	// emit `new-peer ... 0`. nil == not yet stamped: callers MUST skip
-	// the peer (omit from the rendered .res, defer eviction); non-nil
-	// (incl. 0) == a real id callers act on.
+	// int32 zero-value collided with the valid id 0 and made the
+	// dispatcher emit `new-peer ... 0`. nil == not yet stamped:
+	// callers MUST skip the peer (omit from the rendered .res);
+	// non-nil (incl. 0) == a real id callers act on.
 	NodeID *int32
-	// ResourceUID is the peer Resource CR's metadata.uid (Bug 342).
-	// Stable for the lifetime of the K8s object; changes only when
-	// the Resource is deleted and re-created. Empty during the
-	// rollout window when the satellite is upgraded but Status has
-	// not yet been backfilled — the diff path treats empty as
-	// "no known UID" and falls through to adoption-mode.
-	ResourceUID string
 }
 
 // DesiredResource is the satellite-facing apply payload for one
@@ -67,18 +55,6 @@ type DesiredResource struct {
 	Volumes     []*DesiredVolume
 	Peers       []DesiredPeer
 	DrbdOptions map[string]string
-
-	// AppliedPeerUIDs mirrors the local Resource's
-	// Status.AppliedPeerUIDs map. The satellite's reconcilePeers
-	// reads this off the apiserver view to compute the three-source
-	// diff against K8s desired (Peers) + kernel actual (drbdsetup
-	// show) — see Bug 342. Empty during the rollout window when the
-	// satellite is upgraded but Status has not yet been backfilled
-	// (or after etcd restore / LINSTOR-takeover migration) — the
-	// reconcilePeers gate then runs adoption-mode: trust the live
-	// kernel state as baseline and stamp current UIDs without
-	// touching connections.
-	AppliedPeerUIDs map[string]string
 
 	// LayerStack is the resolved composition (["DRBD","STORAGE"]
 	// = default; ["LUKS","STORAGE"] = no DRBD; ["STORAGE"] =
@@ -215,7 +191,7 @@ func (x *DesiredResource) GetVolumes() []*DesiredVolume {
 	return x.Volumes
 }
 
-// GetPeers returns the full DesiredPeer list (name + node-id + UID).
+// GetPeers returns the full DesiredPeer list (name + node-id).
 // Nil-safe. Callers that only need names should use GetPeerNames() —
 // it's faster (no allocation) and reads more clearly at the call site.
 func (x *DesiredResource) GetPeers() []DesiredPeer {
@@ -242,16 +218,6 @@ func (x *DesiredResource) GetPeerNames() []string {
 	}
 
 	return out
-}
-
-// GetAppliedPeerUIDs returns the local Resource's last-known
-// peer-UID map (from Status.AppliedPeerUIDs). Nil-safe.
-func (x *DesiredResource) GetAppliedPeerUIDs() map[string]string {
-	if x == nil {
-		return nil
-	}
-
-	return x.AppliedPeerUIDs
 }
 
 // GetDrbdOptions returns the resolved DRBD options bag.

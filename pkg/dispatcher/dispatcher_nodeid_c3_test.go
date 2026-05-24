@@ -145,8 +145,8 @@ func TestBuildDesiredOmitsUnresolvedPeer(t *testing.T) {
 // TestBuildDesiredPeerNodeIDZeroPropagates pins that a peer
 // legitimately on node-id 0 (e.g. after the local node relocated to a
 // higher id) is rendered with peer.<name>.node-id 0 AND carries a
-// non-nil DesiredPeer.NodeID so the satellite's EvictPeersByUIDMismatch
-// can act on it instead of deferring forever.
+// non-nil DesiredPeer.NodeID so downstream consumers can tell a real
+// id 0 apart from an unallocated peer (Bug 342 C3 zero-vs-nil).
 func TestBuildDesiredPeerNodeIDZeroPropagates(t *testing.T) {
 	rdName := "pvc-c3-peer0"
 	targetID := int32(1)

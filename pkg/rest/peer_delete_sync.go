@@ -49,25 +49,21 @@ var peerDeletePollInterval = 250 * time.Millisecond
 // name. Full key shape: `blockstor.io/peer-forget-acked.<peerNode>`
 // with an RFC3339Nano timestamp as the value. The REST handler's
 // waitForPeerDeletionAcks polls the key for presence as the implicit
-// confirmation that del-peer + forget-peer + AppliedPeerUIDs entry
-// drop have completed against the OLD peer incarnation.
+// confirmation that del-peer + forget-peer have completed against
+// the OLD peer incarnation.
 //
-// Why an annotation rather than the AppliedPeerUIDs-absence signal
-// from the original v10 design: the pkg/api/v1.Resource type the
-// Store materialises does not carry Status.AppliedPeerUIDs (that
-// field lives only on the K8s CRD via api/v1alpha1). Annotations
-// ARE round-tripped through Store and already serve as the channel
-// for cross-satellite signals (Bug 67 PeerChangedAnnotation), so
-// reusing the same transport keeps the v10 fix additive — no Store
-// schema change.
+// An annotation is the chosen ACK transport because annotations are
+// round-tripped through Store and already serve as the channel for
+// cross-satellite signals (Bug 67 PeerChangedAnnotation), so reusing
+// the same transport keeps the fix additive — no Store schema change.
 const peerForgetAckAnnotationPrefix = "blockstor.io/peer-forget-acked."
 
 // waitForPeerDeletionAcks blocks until every online sibling Resource
 // of `rdName` has stamped a peer-forget ACK annotation for
 // `removedNode` — confirming the satellite FSM has run
-// ActionForgetPeer (del-peer + forget-peer + drop AppliedPeerUIDs
-// entry) against the doomed peer. Returns when all ACKs land OR the
-// peerDeleteAckTimeout deadline fires.
+// ActionForgetPeer (del-peer + forget-peer) against the doomed
+// peer. Returns when all ACKs land OR the peerDeleteAckTimeout
+// deadline fires.
 //
 // Bug 342 v10: matches upstream LINSTOR's behaviour of blocking the
 // REST call until satellites confirm peer cleanup, without copying

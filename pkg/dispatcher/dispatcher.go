@@ -26,7 +26,6 @@ package dispatcher
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -239,16 +238,15 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 	}
 
 	return &intent.DesiredResource{
-		Name:            target.Spec.ResourceDefinitionName,
-		NodeName:        target.Spec.NodeName,
-		Flags:           target.Spec.Flags,
-		Props:           wireProps,
-		Peers:           desiredPeers,
-		Volumes:         buildVolumes(rd, target),
-		DrbdOptions:     drbdOpts,
-		LayerStack:      layerStack,
-		Connections:     connectionsFromRD(rd),
-		AppliedPeerUIDs: copyAppliedPeerUIDs(target.Status.AppliedPeerUIDs),
+		Name:        target.Spec.ResourceDefinitionName,
+		NodeName:    target.Spec.NodeName,
+		Flags:       target.Spec.Flags,
+		Props:       wireProps,
+		Peers:       desiredPeers,
+		Volumes:     buildVolumes(rd, target),
+		DrbdOptions: drbdOpts,
+		LayerStack:  layerStack,
+		Connections: connectionsFromRD(rd),
 		// Bug 342 / seed-GI safety: tell the satellite whether a
 		// data-bearing diskful peer already exists so resolveSeedGi
 		// refuses any GI seed (day0 OR controller SeedFromGi) on a
@@ -260,20 +258,14 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 // buildDesiredPeers walks the dropped peer-name list (already sorted
 // + INACTIVE-filtered by BuildDesired) and joins each name against
 // the peer Resource CR set to produce one DesiredPeer per entry:
-// (name, peer DRBD node-id, peer Resource metadata.uid). The UID is
-// the Bug 342 signal — the satellite stamps it onto
-// Resource.Status.AppliedPeerUIDs after every successful adjust so
-// the next reconcile can detect "same name, new identity" and force
-// del-peer + forget-peer before adjust re-registers.
+// (name, peer DRBD node-id).
 //
 // Order matches `dropped` — callers that built drbdOpts off of
 // dropped see the same name sequence here. Peers whose Resource CR
 // is missing from `peers` (race window where the .res renderer
 // reads addPeerEntries' output but the CR was deleted in-flight)
-// land as zero-value entries (empty UID); the satellite's
-// reconcilePeers treats empty UID as "no known identity" — same
-// shape as the rollout window before Status.AppliedPeerUIDs is
-// backfilled.
+// land as name-only entries (nil node-id); the .res renderer omits
+// peers without an allocated node-id.
 func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) []intent.DesiredPeer {
 	if len(dropped) == 0 {
 		return nil
@@ -291,36 +283,16 @@ func buildDesiredPeers(dropped []string, peers []blockstoriov1alpha1.Resource) [
 
 		if peerCR, ok := byName[name]; ok {
 			// Bug 342 C3: store the pointer (nil = unallocated, never
-			// a spurious 0). EvictPeersByUIDMismatch keys its
-			// defer-vs-fire decision on this being nil, so a peer
-			// legitimately on node-id 0 now triggers eviction instead
-			// of being deferred forever.
+			// a spurious 0) so a peer legitimately on node-id 0 is
+			// distinguishable from an unallocated peer downstream.
 			if id := nodeIDOf(peerCR); id >= 0 {
 				v := id
 				entry.NodeID = &v
 			}
-
-			entry.ResourceUID = string(peerCR.UID)
 		}
 
 		out = append(out, entry)
 	}
-
-	return out
-}
-
-// copyAppliedPeerUIDs returns a defensive copy of the Status map so
-// the dispatcher's output doesn't alias the apiserver client's
-// cached Resource (a downstream mutation would race the cache).
-// nil-safe; returns nil for the empty case so the satellite's
-// adoption-mode gate `len(applied) == 0` keeps its meaning.
-func copyAppliedPeerUIDs(src map[string]string) map[string]string {
-	if len(src) == 0 {
-		return nil
-	}
-
-	out := make(map[string]string, len(src))
-	maps.Copy(out, src)
 
 	return out
 }

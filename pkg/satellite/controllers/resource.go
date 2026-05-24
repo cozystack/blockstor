@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -481,10 +480,6 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 
 	r.stampPostApply(ctx, res, &rd, results, anyFailed, logger)
 
-	if !anyFailed && rdNeedsDRBD(&rd) {
-		r.stampAppliedPeerUIDsBaseline(ctx, res, peers, logger)
-	}
-
 	// Apply chain surfaces per-resource errors via results (e.g.
 	// drbdadm adjust failing on a stale .res rendered before the
 	// peer's Status caught up). Returning nil here would let c-r
@@ -513,12 +508,21 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 	return ctrl.Result{}, nil
 }
 
-// prepareDRBDApply runs the DRBD-only pre-apply sequence: peer UID
-// mismatch eviction (Bug 342 v4), stale kernel slot prune
-// (Bug 342 v3), and the controller-allocation wait gate. Returns
-// (result, false) when the caller should bail out and let the
-// requeue handle it; (zero, true) when apply can proceed. Pulled
-// out of runApply so it stays under the gocognit budget.
+// prepareDRBDApply runs the DRBD-only pre-apply sequence: stale
+// kernel slot prune (Bug 342 v3) and the controller-allocation wait
+// gate. Returns (result, false) when the caller should bail out and
+// let the requeue handle it; (zero, true) when apply can proceed.
+// Pulled out of runApply so it stays under the gocognit budget.
+//
+// The peer re-incarnation race the old UID-mismatch eviction path
+// guarded against is now covered by the controller-side node-id
+// occupancy invariant (collectTakenNodeIDs unions every sibling's
+// observed Status.Connections[].PeerDRBDNodeID, so a lingering
+// kernel slot keeps its node-id reserved until the kernel-confirmed
+// forget drops it) PLUS the kernel-observed reclaim (orphan sweeper
+// + tearDownRemovedPeers del-peer/forget-peer on the .res diff). A
+// re-incarnated peer therefore gets the NEXT free node-id and never
+// collides with the predecessor's surviving slot.
 func (r *ResourceReconciler) prepareDRBDApply(
 	ctx context.Context,
 	res *blockstoriov1alpha1.Resource,
@@ -526,39 +530,6 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	peers []blockstoriov1alpha1.Resource,
 	logger logr.Logger,
 ) (ctrl.Result, bool) {
-	// Bug 342 v4: deterministic UID-mismatch eviction BEFORE the
-	// allocation gate. A rapid `r d <peer>` + `r c <peer>` produces
-	// a new peer Resource CR with a fresh metadata.uid while the
-	// dispatcher's .res-driven diff sees the same peer-name set and
-	// skips del-peer. The kernel slot for the old incarnation (with
-	// its stale GI epoch + PSK) wedges the new peer in Connecting
-	// forever. Comparing the peer's current UID against the local
-	// Status.AppliedPeerUIDs baseline catches that race
-	// deterministically — no timing dependency on kernel state
-	// observation, no Phase 2 vs Phase 3 scheduling races. Returned
-	// `evicted` map ({peerName: newUID}) gets stamped onto
-	// Status.AppliedPeerUIDs so subsequent reconciles don't
-	// re-evict the same peer in a loop.
-	evicted, evictErr := r.Config.Apply.EvictPeersByUIDMismatch(
-		ctx,
-		rd.Name,
-		desiredPeersFromCRDs(peers),
-		res.Status.AppliedPeerUIDs,
-		volNumsOf(rd),
-		nil, // devices unknown at this layer; forget-peer falls back to nodeID skip
-	)
-	if evictErr != nil {
-		logger.Error(evictErr, "EvictPeersByUIDMismatch failed; continuing")
-	}
-
-	if len(evicted) > 0 {
-		stampErr := r.stampAppliedPeerUIDs(ctx, res, evicted)
-		if stampErr != nil {
-			logger.Error(stampErr, "stampAppliedPeerUIDs failed; will retry next reconcile",
-				"evicted", evicted)
-		}
-	}
-
 	// Bug 342 v3: prune zombie kernel slots BEFORE the allocation
 	// gate. The gate short-circuits the entire Apply chain when
 	// ANY peer's Status.DRBDNodeID is nil, which is exactly the
@@ -582,39 +553,6 @@ func (r *ResourceReconciler) prepareDRBDApply(
 	}
 
 	return r.waitForControllerAllocation(ctx, res, peers, logger)
-}
-
-// stampAppliedPeerUIDsBaseline writes the Bug 342 v4 adoption
-// baseline after a fully-successful apply on a DRBD-stack RD: for
-// every peer that has NO entry in Status.AppliedPeerUIDs yet
-// (fresh CRD / restore / migration path), stamp the current UID.
-// Does NOT overwrite existing baselines — that's the eviction
-// path's responsibility (Bug 342 v6). Pulled out of runApply so
-// the orchestrator stays under the gocyclo budget; the
-// best-effort logging contract is unchanged.
-func (r *ResourceReconciler) stampAppliedPeerUIDsBaseline(
-	ctx context.Context,
-	res *blockstoriov1alpha1.Resource,
-	peers []blockstoriov1alpha1.Resource,
-	logger logr.Logger,
-) {
-	full := currentPeerUIDs(peers)
-	missing := make(map[string]string, len(full))
-
-	for name, uid := range full {
-		if _, ok := res.Status.AppliedPeerUIDs[name]; !ok {
-			missing[name] = uid
-		}
-	}
-
-	if len(missing) == 0 {
-		return
-	}
-
-	stampErr := r.stampAppliedPeerUIDs(ctx, res, missing)
-	if stampErr != nil {
-		logger.Error(stampErr, "post-apply AppliedPeerUIDs baseline stamp failed; will retry next reconcile")
-	}
 }
 
 // recordPerResourceFailures logs each per-resource Apply failure and
@@ -1244,122 +1182,6 @@ func expectedPeerNamesFor(target *blockstoriov1alpha1.Resource, peers []blocksto
 	}
 
 	return out
-}
-
-// desiredPeersFromCRDs converts the peer Resource CR slice into the
-// intent.DesiredPeer slice the Bug 342 v4 UID-mismatch eviction
-// expects. Carries Name + DRBD node-id (from Status; nil during
-// the allocation window, never a spurious 0) + metadata.uid (always
-// present). The local
-// satellite's own Resource is NOT included — drbdsetup show enumerates
-// remote peers only.
-func desiredPeersFromCRDs(peers []blockstoriov1alpha1.Resource) []intent.DesiredPeer {
-	out := make([]intent.DesiredPeer, 0, len(peers))
-
-	for i := range peers {
-		peer := &peers[i]
-		entry := intent.DesiredPeer{
-			Name:        peer.Spec.NodeName,
-			ResourceUID: string(peer.UID),
-		}
-
-		// Bug 342 C3: copy the pointer (nil stays nil = unallocated;
-		// non-nil incl. 0 = a real allocated id). Dereferencing into
-		// an int32 here would have made id 0 indistinguishable from
-		// unallocated downstream in EvictPeersByUIDMismatch.
-		if peer.Status.DRBDNodeID != nil {
-			nid := *peer.Status.DRBDNodeID
-			entry.NodeID = &nid
-		}
-
-		out = append(out, entry)
-	}
-
-	return out
-}
-
-// currentPeerUIDs returns the current peer name → metadata.uid map
-// for the post-apply baseline refresh. Empty UIDs (informer cache
-// trail / fresh CRD just hit apiserver) are excluded — stamping ""
-// would later evaluate as "no baseline" indistinguishably from
-// adoption case and short-circuit eviction.
-func currentPeerUIDs(peers []blockstoriov1alpha1.Resource) map[string]string {
-	if len(peers) == 0 {
-		return nil
-	}
-
-	out := make(map[string]string, len(peers))
-
-	for i := range peers {
-		p := &peers[i]
-		if p.Spec.NodeName == "" || p.UID == "" {
-			continue
-		}
-
-		out[p.Spec.NodeName] = string(p.UID)
-	}
-
-	if len(out) == 0 {
-		return nil
-	}
-
-	return out
-}
-
-// stampAppliedPeerUIDs merges `evicted` (peerName -> newUID pairs the
-// satellite just acted on) into Status.AppliedPeerUIDs and writes the
-// Status sub-resource.
-//
-// The cached `res` from controller-runtime watch may trail apiserver
-// by hundreds of milliseconds; a direct Update(ctx, res) using its
-// stale ResourceVersion races every concurrent reconcile and returns
-// 409 Conflict. RetryOnConflict with an APIReader-fresh Get inside
-// the retry loop is the canonical fix: re-read fresh, mutate, write,
-// retry if another writer landed first. Without this the AppliedPeerUIDs
-// map stays empty forever on hot Resources (catcher cells touch the
-// CRD dozens of times per second) and Bug 342 v4 silently no-ops.
-func (r *ResourceReconciler) stampAppliedPeerUIDs(ctx context.Context, res *blockstoriov1alpha1.Resource, evicted map[string]string) error {
-	if len(evicted) == 0 {
-		return nil
-	}
-
-	reader := client.Reader(r.Client)
-	if r.Config.APIReader != nil {
-		reader = r.Config.APIReader
-	}
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var fresh blockstoriov1alpha1.Resource
-
-		getErr := reader.Get(ctx, client.ObjectKeyFromObject(res), &fresh)
-		if getErr != nil {
-			return errors.Wrap(getErr, "re-read resource")
-		}
-
-		if fresh.Status.AppliedPeerUIDs == nil {
-			fresh.Status.AppliedPeerUIDs = make(map[string]string, len(evicted))
-		}
-
-		changed := false
-
-		for name, uid := range evicted {
-			if fresh.Status.AppliedPeerUIDs[name] != uid {
-				fresh.Status.AppliedPeerUIDs[name] = uid
-				changed = true
-			}
-		}
-
-		if !changed {
-			return nil
-		}
-
-		return r.Status().Update(ctx, &fresh)
-	})
-	if err != nil {
-		return errors.Wrap(err, "stamp Resource.Status.AppliedPeerUIDs")
-	}
-
-	return nil
 }
 
 // volNumsOf extracts the volume-number set from

@@ -186,12 +186,12 @@ const (
 	// not yet physically removed from the store. Siblings observe
 	// the flag via the existing peer-Resource read path; the satellite
 	// FSM treats it as the trigger for ActionForgetPeer
-	// (del-peer + forget-peer + drop AppliedPeerUIDs[name]). The
-	// REST handler waits for every online sibling's AppliedPeerUIDs
-	// to drop the peer name (the implicit ACK) before calling the
-	// physical Resources().Delete — matches upstream LINSTOR's
-	// 2-phase delete-then-notify-then-prune handshake without
-	// copying GPL code.
+	// (del-peer + forget-peer). The REST handler waits for every
+	// online sibling to stamp a peer-forget ACK annotation (the
+	// implicit ACK) before calling the physical Resources().Delete —
+	// matches upstream LINSTOR's 2-phase
+	// delete-then-notify-then-prune handshake without copying GPL
+	// code.
 	ResourceFlagDeleting = "DELETING"
 )
 
