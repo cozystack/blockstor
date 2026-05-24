@@ -352,7 +352,16 @@ func (s *Server) handlePassphraseEnter(w http.ResponseWriter, r *http.Request) {
 
 	s.passphraseUnlocked.Store(true)
 
-	w.WriteHeader(http.StatusOK)
+	// Bug 359: python-linstor / golinstor unconditionally json-decode
+	// every non-204 2xx response, so a bare WriteHeader(200) with no
+	// body crashes `linstor encryption enter-passphrase` with "Unable
+	// to parse REST json data". Emit the same ApiCallRc envelope the
+	// sibling create/modify handlers (and upstream LINSTOR) return so
+	// the CLI renders a clean operator-visible success line.
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "Master passphrase entered",
+	}})
 }
 
 // decodePassphraseEnterBody implements the Bug 173 dual-shape decode
