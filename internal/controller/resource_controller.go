@@ -1627,6 +1627,15 @@ func (r *ResourceReconciler) EnsureDRBDIDsForTest(ctx context.Context, target *b
 	return r.ensureDRBDIDs(ctx, target, peers)
 }
 
+// CollectTakenNodeIDsForTest exposes the per-RD occupied node-id set
+// builder (own Status.DRBDNodeID ∪ observed PeerDRBDNodeID across
+// siblings) so the Bug 342 union invariant can be pinned directly
+// without driving a full reconcile. The result is unordered; callers
+// should sort before comparing.
+func (r *ResourceReconciler) CollectTakenNodeIDsForTest(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
+	return r.collectTakenNodeIDs(ctx, target)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 //
 // We Watch ResourceDefinitions and sibling Resources too:
@@ -1684,11 +1693,42 @@ func (r *ResourceReconciler) allocateNodeIDLocked(ctx context.Context, target *b
 	return id, nil
 }
 
-// collectTakenNodeIDs returns the DRBDNodeIDs already assigned to
-// sibling Resources of the same RD, reading directly from the
-// apiserver (no informer cache) to avoid the stale-read race that
-// otherwise lets two concurrent reconciles both pick the lowest
-// free id.
+// collectTakenNodeIDs returns the DRBD node-ids that are OCCUPIED
+// for target's RD, reading directly from the apiserver (no informer
+// cache) to avoid the stale-read race that otherwise lets two
+// concurrent reconciles both pick the lowest free id.
+//
+// Bug 342 (CRITICAL, data-correctness): node-id space is per-RD (the
+// DRBD-9 connection mesh). The occupied set is the UNION of two
+// observation sources, both grounded in kernel-confirmed truth:
+//
+//	(a) every live sibling Resource's own Status.DRBDNodeID, and
+//	(b) every observed peer node-id any sibling still reports under
+//	    Status.Connections[].PeerDRBDNodeID.
+//
+// (b) is the load-bearing addition. When a replica is deleted
+// (`r d <node>`) its Resource CRD — and its Status.DRBDNodeID — go
+// away promptly, but the surviving peers keep a live DRBD-9 kernel
+// connection slot bound to the departed peer's node-id until each
+// runs `drbdadm del-peer` + `drbdmeta forget-peer` to reclaim the
+// bitmap slot. The observer keeps PeerDRBDNodeID populated for
+// exactly that window: it is sourced from live `drbdsetup status -j`
+// / `events2` and drops out only on the `destroy connection` frame,
+// which the kernel emits once the slot is truly forgotten.
+//
+// Treating those observed peer ids as occupied guarantees a
+// new/relocated replica is never handed a node-id whose predecessor
+// bitmap slot still exists in any peer's kernel — DRBD-9 refuses to
+// handshake a fresh peer over such a slot, so reusing it would wedge
+// the new replica in Connecting/disk:” forever (Bug 342). Once the
+// slot is reclaimed and the connection drops out of every sibling's
+// Status, the id frees up again.
+//
+// Tradeoff (acceptable): if a forget-peer is stuck, or a sibling is
+// offline with a stale Status still listing the id, that id stays
+// occupied longer — id-burn is bounded toward drbd.MaxPeers=16. This
+// is conservative and self-healing; strictly better than the
+// permanent wedge a premature reuse causes.
 func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *blockstoriov1alpha1.Resource) ([]int32, error) {
 	// Fall back to the cached client when APIReader hasn't been
 	// wired — tests construct `ResourceReconciler{}` directly with
@@ -1707,7 +1747,10 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 		return nil, err
 	}
 
-	taken := make([]int32, 0, len(resList.Items))
+	// Dedup so the union of own-ids and observed-peer-ids doesn't
+	// hand LowestFreeNodeID a slice with repeats (functionally
+	// harmless, but keeps the taken set minimal and inspectable).
+	occupied := make(map[int32]struct{}, len(resList.Items))
 
 	for i := range resList.Items {
 		res := &resList.Items[i]
@@ -1720,9 +1763,25 @@ func (r *ResourceReconciler) collectTakenNodeIDs(ctx context.Context, target *bl
 			continue
 		}
 
+		// (a) the sibling's own allocated node-id.
 		if res.Status.DRBDNodeID != nil {
-			taken = append(taken, *res.Status.DRBDNodeID)
+			occupied[*res.Status.DRBDNodeID] = struct{}{}
 		}
+
+		// (b) every peer node-id this sibling still observes as a
+		// live kernel connection slot — including zombie slots of a
+		// departed peer whose Resource is already gone but whose
+		// forget-peer hasn't completed.
+		for j := range res.Status.Connections {
+			if id := res.Status.Connections[j].PeerDRBDNodeID; id != nil {
+				occupied[*id] = struct{}{}
+			}
+		}
+	}
+
+	taken := make([]int32, 0, len(occupied))
+	for id := range occupied {
+		taken = append(taken, id)
 	}
 
 	return taken, nil
