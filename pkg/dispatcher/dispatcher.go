@@ -123,22 +123,33 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 
 	slices.Sort(dropped)
 
-	// Bug 342 C3: idValue distinguishes a persisted id (incl. 0)
-	// from an absent/unresolved one. The satellite's
-	// waitForControllerAllocation gate guarantees the local node's
-	// id is set before this runs; idValue's false branch (->0) is
-	// the defence-in-depth path for any caller that bypasses the
-	// gate — the satellite then refuses the malformed config rather
-	// than burning `node-id 0` into the kernel.
 	drbdOpts := map[string]string{
-		"port":    strconv.Itoa(port),
-		"node-id": strconv.Itoa(int(idValue(idOf, target.Spec.NodeName))),
+		"port": strconv.Itoa(port),
 		// PrefNic on the target's pool (storage pool prop) overrides
 		// the default placeholder so DRBD binds replication to the
 		// requested interface. Empty fallback → satellite picks its
 		// pod IP at .res render time.
 		"address": prefNicAddress(target.Spec.NodeName, targetPoolName(target), nodes, pools),
 		"minor":   strconv.Itoa(minor),
+	}
+
+	// Bug 360 PREVENTION: emit the local `node-id` ONLY when the
+	// controller has actually allocated one for this node (idOf holds
+	// the key, sourced from Status.DRBDNodeID via nodeIDOf). When the
+	// id is unresolved we OMIT the key entirely rather than rendering
+	// `node-id 0` — node-id 0 is a legitimate allocation
+	// (LowestFreeNodeID hands out 0 for the first/freed slot), so a
+	// zero-defaulted unresolved node is INDISTINGUISHABLE from a real
+	// id-0 once it is written into DrbdOptions. The satellite's
+	// first-activation gate (refuseUnresolvedLocalNodeID) refuses to
+	// render .res / run create-md / up while the key is absent, so
+	// neither the kernel slot NOR the on-disk v09 metadata is ever
+	// burned with a bogus id 0. Bug 342 C3 left this as a "satellite
+	// refuses the malformed config" promise but still rendered an
+	// ambiguous `node-id 0`; omitting the key is what makes that
+	// promise enforceable.
+	if id, ok := idLookup(idOf, target.Spec.NodeName); ok {
+		drbdOpts["node-id"] = strconv.Itoa(int(id))
 	}
 
 	// Pick a single replica to seed initial Primary. Use the lowest

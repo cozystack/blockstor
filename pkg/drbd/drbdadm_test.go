@@ -895,3 +895,61 @@ func TestAdmResourceOwningMinorEmptyKernel(t *testing.T) {
 		t.Errorf("ResourceOwningMinor empty: got %q, want \"\"", owner)
 	}
 }
+
+// TestAdmKernelMyNodeIDParsesSelfNodeID (Bug 360): KernelMyNodeID
+// parses the resource object's top-level `node-id` from
+// `drbdsetup status <res> --json` — the kernel's OWN my-node-id
+// burned into the slot at `drbdadm up` time. This is the field the
+// self-heal compares against the controller-allocated id to decide
+// whether the slot must be torn down and re-`up`d.
+func TestAdmKernelMyNodeIDParsesSelfNodeID(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-1","node-id":2,"role":"Secondary","suspended":false,"devices":[],"connections":[]}]`),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	id, ok := adm.KernelMyNodeID(t.Context(), "pvc-1")
+	if !ok {
+		t.Fatalf("KernelMyNodeID: ok=false, want true")
+	}
+
+	if id != 2 {
+		t.Errorf("KernelMyNodeID: got %d, want 2", id)
+	}
+}
+
+// TestAdmKernelMyNodeIDAbsentSlot (Bug 360): an empty JSON array
+// (kernel has no slot for the resource) yields ok=false so the
+// self-heal declines to act — the first `drbdadm up` will load the
+// correct id directly, nothing to recreate.
+func TestAdmKernelMyNodeIDAbsentSlot(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte("[]\n"),
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	if _, ok := adm.KernelMyNodeID(t.Context(), "pvc-1"); ok {
+		t.Errorf("KernelMyNodeID absent: ok=true, want false")
+	}
+}
+
+// TestAdmKernelMyNodeIDStatusError (Bug 360): a non-zero drbdsetup
+// exit (no configured DRBD / netlink hiccup) yields ok=false rather
+// than acting on a guess.
+func TestAdmKernelMyNodeIDStatusError(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte("No currently configured DRBD found.\n"),
+		Err:    errFakeFailure,
+	})
+
+	adm := drbd.NewAdm(fx)
+
+	if _, ok := adm.KernelMyNodeID(t.Context(), "pvc-1"); ok {
+		t.Errorf("KernelMyNodeID error: ok=true, want false")
+	}
+}

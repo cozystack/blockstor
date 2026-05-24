@@ -1331,6 +1331,18 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 			},
 			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
 			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+			// Bug 360: an already-converged resource (this is a
+			// crash-recovery convergence pass) always carries the
+			// controller-allocated local node-id — the dispatcher
+			// only omits it pre-allocation, which a previously-resized
+			// resource is well past. Without it the Bug 360 first-
+			// activation gate (correctly) defers the whole DRBD path.
+			DrbdOptions: map[string]string{
+				"port":    "7000",
+				"node-id": "0",
+				"address": "10.0.0.1",
+				"minor":   "1000",
+			},
 		},
 	})
 	if err != nil {

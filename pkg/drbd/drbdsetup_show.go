@@ -122,8 +122,14 @@ func (s *KernelSlot) HasAnyPeerDeviceConfigured(volumes []int32) bool {
 type drbdsetupStatusRoot []drbdsetupStatusResource
 
 // drbdsetupStatusResource is one resource block from drbdsetup status
-// -j. We model only the fields the v3 prune consumes.
+// -j. We model only the fields the v3 prune and the Bug 360 my-node-id
+// self-heal consume.
 type drbdsetupStatusResource struct {
+	// NodeID is the kernel slot's OWN my-node-id, burned in at
+	// `drbdadm up`/`new-resource` time. Bug 360 reads it to detect a
+	// slot whose my-id diverged from the controller-allocated id.
+	// Pointer so an absent key is distinguishable from a literal 0.
+	NodeID      *int32                      `json:"node-id"`
 	Connections []drbdsetupStatusConnection `json:"connections"`
 }
 

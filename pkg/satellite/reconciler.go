@@ -1802,6 +1802,36 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return nil
 	}
 
+	// Bug 360 PREVENTION: refuse the entire first-activation — and
+	// every other .res-consuming verb (createMd, up, adjust) — while
+	// the controller has NOT yet allocated this node's DRBD node-id.
+	// The dispatcher omits the `node-id` key from DrbdOptions when the
+	// local Status.DRBDNodeID is still nil, so an absent key is the
+	// unambiguous "unresolved" signal (a present "0" is a legitimate
+	// allocation from LowestFreeNodeID and must be honoured).
+	//
+	// Why this gate exists even though waitForControllerAllocation
+	// already gates runApply: that controller-side gate protects the
+	// normal reconcile, but it has been observed to let a premature
+	// Apply through during the auto-place initial-create burst (stale
+	// informer cache / sibling-Watches-driven reconcile before the
+	// local Status patch lands). If create-md runs with my-node-id 0
+	// it burns TWO artifacts: the kernel slot my-id (self-healed by
+	// reconcileKernelMyNodeID) AND — irrecoverably without data loss —
+	// the on-disk v09 metadata, which records `node-id 0`. After the
+	// kernel slot is later fixed, `drbdsetup attach` then fails
+	// `(119) ambiguous node id: meta-data 0, config 2` forever and the
+	// replica is stuck Diskless. The only safe cure is to NEVER let
+	// create-md/up run before the allocated id is known — hence this
+	// requeue-until-allocated gate in front of all bring-up verbs.
+	err := refuseUnresolvedLocalNodeID(dr)
+	if err != nil {
+		log.FromContext(ctx).Info("Bug 360: deferring DRBD bring-up until controller allocates local node-id",
+			"resource", dr.GetName())
+
+		return err
+	}
+
 	// Phase 11.2.b shadow: compute the FSM phase + expected action
 	// from the current Observation and log it for divergence triage.
 	// READ-ONLY: the historical apply path below is unchanged, and
@@ -1827,7 +1857,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// slot as blockstor-managed even after aggressive cleanup paths
 	// (force-strip, harness preflight `rm -f *.res *.md-created`,
 	// satellite crash mid-write) have wiped the other state files.
-	err := r.tearDownRemovedPeers(ctx, dr, resPath, devices)
+	err = r.tearDownRemovedPeers(ctx, dr, resPath, devices)
 	if err != nil {
 		return err
 	}
@@ -1876,18 +1906,14 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// for every action that consumes .res (createMd, up, adjust,
 	// adjustSkipDisk), and the ActionRenderRes arm continues to
 	// handle the cold-start PhaseUnprovisioned case.
-	{
-		obs := r.observeForFsm(ctx, dr, diskless)
-
-		phase := ObservePhase(obs)
-		if next := NextTransition(phase, obs); next != nil {
-			err := r.dispatchFsmAction(ctx, dr, devices, next.Action, obs)
-			if err != nil {
-				return errors.Wrapf(err, "fsm dispatch %s", next.Action)
-			}
-
-			fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)
-		}
+	// Bug 360 self-heal + FSM shadow-dispatch. Extracted into
+	// healAndDispatchFsm so applyDRBD stays under the gocyclo budget;
+	// the self-heal MUST run before the dispatch (it `down`s a slot
+	// whose kernel my-id diverged from the allocated id so the
+	// dispatch's renderResFile-preamble + up reloads the correct id).
+	err = r.healAndDispatchFsm(ctx, dr, diskless, devices)
+	if err != nil {
+		return err
 	}
 
 	// firstActivation is "did create-md succeed previously?" —
@@ -1984,6 +2010,97 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	}
 
 	return r.finishDRBDApply(ctx, dr, diskless, effectiveFirstActivation, resized, cloned)
+}
+
+// healAndDispatchFsm runs the Bug 360 my-node-id self-heal and then
+// the FSM shadow-dispatch for one Apply pass. Order matters: the
+// self-heal `down`s a kernel slot whose burned-in my-id diverged from
+// the controller-allocated id, and the dispatch's renderResFile
+// preamble + `up` then reloads the slot with the correct id. Pulled
+// out of applyDRBD so the orchestrator stays under the gocyclo budget.
+func (r *Reconciler) healAndDispatchFsm(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string) error {
+	err := r.reconcileKernelMyNodeID(ctx, dr)
+	if err != nil {
+		return err
+	}
+
+	obs := r.observeForFsm(ctx, dr, diskless)
+
+	phase := ObservePhase(obs)
+
+	next := NextTransition(phase, obs)
+	if next == nil {
+		return nil
+	}
+
+	err = r.dispatchFsmAction(ctx, dr, devices, next.Action, obs)
+	if err != nil {
+		return errors.Wrapf(err, "fsm dispatch %s", next.Action)
+	}
+
+	fsmShadowAgreeCount.Add(next.Action+":fsm-dispatched", 1)
+
+	return nil
+}
+
+// reconcileKernelMyNodeID is the Bug 360 self-heal: if the kernel
+// already owns a slot for this resource whose my-node-id differs from
+// the desired local node-id (the controller-allocated
+// Status.DRBDNodeID rendered into dr's DrbdOptions["node-id"]), tear
+// the slot down with `drbdsetup down` so the bring-up path below
+// re-`up`s it with the correct my-id.
+//
+// Why a full down+up: DRBD burns the local node-id into kernel state
+// at `new-resource`/`drbdadm up` time and provides NO way to rewrite
+// a loaded resource's OWN my-id - `drbdadm adjust` only reconciles
+// peers and disks, never the local id. A slot stuck at the wrong
+// my-id (typically 0, leaked from a pre-allocation first-activation
+// render) issues `new-peer <rd> 0 --_name=<peer-with-id-0>` on every
+// adjust and dies with `peer node id cannot be my own node id`
+// (exit 10) indefinitely. Down+up is the only recovery.
+//
+// Bounded + idempotent:
+//   - desired id unparseable -> skip (defer to the allocation gate;
+//     never act on a guess).
+//   - kernel slot absent (KernelMyNodeID -> ok=false) -> skip; first
+//     `up` will load the correct id directly.
+//   - kernel my-id == desired -> no-op (steady state, every reconcile).
+//   - mismatch -> single `drbdsetup down`; the FSM dispatch that runs
+//     immediately after re-renders .res and `up`s with the right id.
+//     A `down` failure is fatal to this Apply pass (return err) so the
+//     next reconcile retries rather than proceeding to a doomed adjust.
+func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.DesiredResource) error {
+	desiredID, err := strconv.Atoi(dr.GetDrbdOptions()["node-id"])
+	if err != nil {
+		// Why: no resolvable desired id (pre-allocation / malformed
+		// DesiredResource). The controller-side allocation gate owns
+		// blocking that case; here we just decline to act on a guess.
+		return nil //nolint:nilerr // unresolved desired id ⇒ decline to act; allocation gate owns this case
+	}
+
+	kernelID, ok := r.cfg.Adm.KernelMyNodeID(ctx, dr.GetName())
+	if !ok {
+		// Kernel has no slot yet (or status unparseable) - the bring-up
+		// path will `up` with the correct id directly; nothing to heal.
+		return nil
+	}
+
+	if int(kernelID) == desiredID {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("Bug 360 self-heal: kernel my-node-id mismatch, recreating slot",
+		"resource", dr.GetName(),
+		"kernelMyNodeID", kernelID,
+		"desiredNodeID", desiredID)
+
+	err = r.cfg.Adm.Down(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "Bug 360 self-heal: drbdadm down %s (kernel my-id %d != desired %d)",
+			dr.GetName(), kernelID, desiredID)
+	}
+
+	return nil
 }
 
 // finishDRBDApply runs the post-adjust steps: pickup-time resize and
@@ -3247,6 +3364,41 @@ func localNodeIDFromOpts(dr *intent.DesiredResource) (int32, bool) {
 	}
 
 	return int32(id), true
+}
+
+// errUnresolvedLocalNodeID is the sentinel returned by
+// refuseUnresolvedLocalNodeID when the controller has not yet
+// allocated this node's DRBD node-id. It is wrapped into the
+// per-resource Apply result so runApply requeues (applyFailureRequeue)
+// rather than treating it as a hard, non-retryable failure — the id
+// always arrives on a subsequent reconcile once the controller's
+// allocator stamps Status.DRBDNodeID.
+var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated by controller")
+
+// refuseUnresolvedLocalNodeID is the Bug 360 prevention gate: it
+// returns errUnresolvedLocalNodeID when the DesiredResource carries no
+// resolvable local `node-id` in DrbdOptions. The dispatcher OMITS that
+// key (rather than rendering an ambiguous `node-id 0`) whenever the
+// controller has not yet stamped this node's Status.DRBDNodeID, so an
+// absent/malformed key is the unambiguous "unresolved" signal.
+//
+// Callers MUST invoke this before ANY verb that renders the .res or
+// loads it into the kernel (create-md, drbdadm up, adjust). Letting
+// create-md run with a zero-defaulted id permanently burns `node-id 0`
+// into the on-disk v09 metadata; once the kernel my-id is later fixed,
+// `drbdsetup attach` fails `(119) ambiguous node id` forever. Refusing
+// up-front — and requeuing — is the only no-data-loss prevention.
+//
+// A present `node-id 0` is honoured: 0 is a legitimate allocation
+// (LowestFreeNodeID hands out the lowest free id, which is 0 for the
+// first/freed slot), and localNodeIDFromOpts distinguishes a present
+// "0" (ok=true) from an absent/empty key (ok=false).
+func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
+	if _, ok := localNodeIDFromOpts(dr); !ok {
+		return errUnresolvedLocalNodeID
+	}
+
+	return nil
 }
 
 // peerNodeIDsFromOpts extracts the peer-name → DRBD-node-id map

@@ -18,6 +18,7 @@ package drbd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -689,6 +690,41 @@ func (a *Adm) IsLoaded(ctx context.Context, resource string) (bool, error) {
 	}
 
 	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// KernelMyNodeID returns the kernel resource's OWN DRBD node-id
+// (the my-node-id burned into the slot at `drbdadm up` time) by
+// parsing `drbdsetup status <res> --json`. Returns (-1, false) when
+// the kernel has no slot for the resource (not loaded) or the status
+// is unparseable - callers treat "unknown" as "nothing to reconcile"
+// rather than acting on a guess.
+//
+// Why (Bug 360): `drbdadm up`/`new-resource` burns the .res's local
+// `node-id` into kernel state permanently. If first-activation rendered
+// the .res with node-id 0 (because the controller had not yet stamped
+// Status.DRBDNodeID for the local node), the kernel my-id sticks at 0
+// even after the .res is later re-rendered with the correct id -
+// `drbdadm adjust` cannot rewrite a loaded resource's my-id. The only
+// fix is `down` + re-`up`; the self-heal path needs this reader to
+// detect the mismatch (kernel my-id != allocated Status.DRBDNodeID).
+func (a *Adm) KernelMyNodeID(ctx context.Context, resource string) (int32, bool) {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return -1, false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil {
+		return -1, false
+	}
+
+	if len(status) == 0 || status[0].NodeID == nil {
+		return -1, false
+	}
+
+	return *status[0].NodeID, true
 }
 
 // HasDisklessVolume reports whether any of the named resource's
