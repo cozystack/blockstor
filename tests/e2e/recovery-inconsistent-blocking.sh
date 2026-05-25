@@ -411,11 +411,17 @@ recovery_start=$(date +%s)
 # (N3 is the only candidate on a 3-node cluster) and start fresh.
 # Fresh state means no leftover bitmap → DRBD does an initial sync
 # from a peer → SyncTarget → UpToDate within the polling window.
-echo ">> wait up to 240s for ${RD} to be locally UpToDate on all 3 workers"
-# 240s budget: zfs-thin reseed on QEMU stand exceeded the previous 120s
-# wall by only a few seconds; doubling the envelope keeps headroom for
-# slow nodes without changing what is being asserted.
-deadline=$(( $(date +%s) + 240 ))
+echo ">> wait up to 600s for ${RD} to be locally UpToDate on all 3 workers"
+# 600s budget: the fresh replica's full SyncTarget (64 MiB) completes in
+# seconds on an idle host, but blockstor sets no c-min-rate, so DRBD
+# throttles resync hard under the Primary's concurrent dd-loop — and on a
+# shared QEMU host running many e2e stands in parallel the resync rate can
+# drop one-to-two orders of magnitude. The previous 240s flaked under that
+# peak load (w3 observed stuck Inconsistent at 242s while a sibling stand
+# resynced concurrently; solo it converges in ~5s, verified 6/6). 600s
+# gives ~100x headroom over idle-host resync time without changing what is
+# asserted (convergence to UpToDate).
+deadline=$(( $(date +%s) + 600 ))
 while (( $(date +%s) < deadline )); do
     d1=$(local_disk_state "$N1" "$RD")
     d2=$(local_disk_state "$N2" "$RD")
