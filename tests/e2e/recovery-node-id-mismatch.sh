@@ -159,7 +159,7 @@ echo ">> snapshot Status.DRBDNodeID for surviving replicas"
 declare -A node_id_before
 for w in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
     id=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${w}" \
-        -o jsonpath='{.status.drbdNodeId}' 2>/dev/null || true)
+        -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
     if [[ -z "$id" ]]; then
         echo "FAIL: Status.DRBDNodeID empty for $w"
         exit 1
@@ -418,7 +418,7 @@ echo ">> assert Phase 8.1 invariant: surviving replicas' drbdNodeId unchanged"
 phase81_ok=true
 for w in "$WORKER_1" "$WORKER_2"; do
     id_after=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${w}" \
-        -o jsonpath='{.status.drbdNodeId}' 2>/dev/null || true)
+        -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
     if [[ "$id_after" != "${node_id_before[$w]}" ]]; then
         echo "   FAIL invariant: $w drbdNodeId drifted: before=${node_id_before[$w]} after=${id_after}"
         phase81_ok=false
@@ -429,7 +429,7 @@ done
 # Worker-3 may have been re-placed elsewhere; whichever replica
 # replaced it just needs a stamped, allocator-consistent id.
 id_w3_after=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" \
-    -o jsonpath='{.status.drbdNodeId}' 2>/dev/null || true)
+    -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
 if [[ -z "$id_w3_after" ]]; then
     echo "FAIL: worker-3 replacement has no Status.DRBDNodeID stamped"
     phase81_ok=false

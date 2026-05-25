@@ -214,7 +214,7 @@ for n in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
     flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || true)
     node_id=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
-        -o jsonpath='{.status.drbdNodeId}' 2>/dev/null || true)
+        -o jsonpath='{.status.drbdNodeID}' 2>/dev/null || true)
     role=$(on_node "$n" drbdsetup role "$RD" 2>/dev/null \
         | tr -d '[:space:]' || true)
     disk_local=$(on_node "$n" drbdsetup status "$RD" --verbose 2>/dev/null \
