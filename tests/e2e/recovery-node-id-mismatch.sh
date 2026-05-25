@@ -315,40 +315,15 @@ fi
 # up is a side-effect we don't depend on for correctness.
 LCTL=(linstor --controllers "http://127.0.0.1:${PF_PORT}" --machine-readable)
 
-# Bug 342 v17 contract: `linstor r d` on a diskful Resource is
-# toggle-disk-remove (flips Spec.Flags to DISKLESS, keeps the CRD
-# so the kernel slot survives across the detach — commit 324d09fe1,
-# bug_342_FINAL_root_cause.md). To physically remove the CRD takes
-# TWO `r d` calls: the first toggles diskful → DISKLESS, the second
-# hits the already-DISKLESS branch in handleResourceDelete and
-# physically Deletes. Mirrors cli-matrix/r-d-collapses-tiebreaker.sh
-# and cli-matrix/r-full-lifecycle.sh.
-echo ">> SKILL recipe: linstor r d $WORKER_3 $RD (1st: toggle diskful → DISKLESS)"
-"${LCTL[@]}" resource delete "$WORKER_3" "$RD" >/dev/null
-
-# Wait for Spec.Flags to gain DISKLESS so the second `r d` lands
-# deterministically on the already-DISKLESS physical-Delete branch
-# rather than racing the Spec patch.
-echo ">> wait up to 60s for ${RD}.${WORKER_3} Spec.Flags to contain DISKLESS"
-deadline=$(( $(date +%s) + 60 ))
-spec_diskless=false
-while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" \
-        -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
-    if [[ "$flags" == *"DISKLESS"* ]]; then
-        spec_diskless=true
-        break
-    fi
-    sleep 2
-done
-if [[ "$spec_diskless" != "true" ]]; then
-    echo "FAIL: ${RD}.${WORKER_3} Spec.Flags never gained DISKLESS after 1st r d"
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" \
-        -o jsonpath='{.spec.flags}' 2>/dev/null || true
-    exit 1
-fi
-
-echo ">> SKILL recipe: linstor r d $WORKER_3 $RD (2nd: physical Delete from already-DISKLESS branch)"
+# `linstor r d` physically removes the replica for all kinds
+# (diskful/diskless/tiebreaker), matching upstream LINSTOR. The
+# Bug-342-v17 toggle-to-diskless reroute (commit 324d09fe1) was
+# reverted in eeddc648e ("restore physical delete semantics for
+# r d"), so a single `r d` tears down worker-3's kernel slot and
+# finalises the Resource CRD — there is no DISKLESS-flag
+# intermediate state. (The separate `r td` / toggle-disk path
+# still toggles; only `r d` deletes.)
+echo ">> SKILL recipe: linstor r d $WORKER_3 $RD (physical delete)"
 "${LCTL[@]}" resource delete "$WORKER_3" "$RD" >/dev/null
 
 # Give the controller a beat to converge — `r d` returns once the
@@ -362,7 +337,7 @@ while (( $(date +%s) < deadline )); do
     sleep 2
 done
 if kubectl get "resources.blockstor.cozystack.io/${RD}.${WORKER_3}" >/dev/null 2>&1; then
-    echo "FAIL: ${RD}.${WORKER_3} survived 60s after 2nd linstor r d"
+    echo "FAIL: ${RD}.${WORKER_3} survived 60s after linstor r d"
     exit 1
 fi
 echo "   worker-3 replica removed"
