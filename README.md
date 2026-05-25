@@ -1,4 +1,4 @@
-# cozystack-blockstor
+# Blockstor
 
 blockstor is a Kubernetes control plane for LVM and ZFS storage with [DRBD](https://linbit.com/drbd/) replication. It exposes a [LINSTOR](https://linbit.com/linstor/)-compatible REST API so existing clients (linstor-csi, piraeus-operator, ha-controller, golinstor) keep working.
 
