@@ -23,6 +23,17 @@ import "github.com/cockroachdb/errors"
 // allocator refuses to hand out 16+.
 const MaxPeers = 16
 
+// NodeIDMax is DRBD-9 v09 metadata's hard upper bound for a node-id
+// slot. `drbdmeta ... set-gi --node-id N` accepts N in 0..31
+// REGARDLESS of the `--max-peers` value create-md was given, and
+// hard-errors `node-id out of range (0...31)` for N>=32 (verified
+// empirically on drbd-utils 9.22 against a v09 loop device created
+// with `create-md 15`). It is distinct from MaxPeers (the mesh /
+// allocator budget, which only governs how many ids we hand out):
+// GI seeding stamps the FULL 0..NodeIDMax slot range so no slot is
+// ever left with a stale per-peer bitmap-UUID. See seedPerPeerGi.
+const NodeIDMax = 31
+
 // ErrNodeIDExhausted means no free id remains in 0..MaxPeers-1 for a
 // new replica. Means the RD is at the max-peers limit and we'd need a
 // dedicated tiebreaker eviction or a higher max-peers compile.

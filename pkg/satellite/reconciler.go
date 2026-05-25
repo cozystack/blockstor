@@ -3372,15 +3372,6 @@ func isUnknownResourceErr(err error) bool {
 // metadata into kernel state).
 
 func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
-	// peerNodeIDs is the deterministic peer-name → DRBD node-id map
-	// the dispatcher already materialised onto DrbdOptions["peer.
-	// <name>.node-id"] from each peer's controller-allocated
-	// Status.DRBDNodeID. Reading from the same source the .res
-	// renderer consumes guarantees both satellites stamp the same
-	// per-peer bitmap slots even when their reconciles race the
-	// fresh-allocation window.
-	peerNodeIDs := peerNodeIDsFromOpts(dr)
-
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
@@ -3392,7 +3383,7 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 			continue
 		}
 
-		err := r.seedPerPeerGi(ctx, dr, vol, device, seed, peerNodeIDs)
+		err := r.seedPerPeerGi(ctx, dr, vol, device, seed)
 		if err != nil {
 			return err
 		}
@@ -3401,64 +3392,71 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 	return nil
 }
 
-// seedPerPeerGi stamps the day0/peer GI tuple into every peer's
-// bitmap slot for one (resource, volume) pair, AND into the local
-// node's own current_uuid slot. DRBD 9.2+ stores current/bitmap
-// UUIDs per-peer (one slot per peer node-id), and the kernel's
-// `self` UUID surfaced during the GI handshake comes from the
-// LOCAL node-id slot — so skipping the full initial-sync requires
-// `drbdmeta set-gi --node-id <X>` to run once for EVERY node-id
-// in the resource (local + all peers) with the same day0 tuple.
+// seedPerPeerGi stamps the day0 GI tuple into EVERY DRBD-9 v09
+// metadata node-id slot (0..drbd.NodeIDMax) for one (resource,
+// volume) pair — the local node's own current_uuid slot AND every
+// possible peer slot, occupied or not. DRBD 9.2+ stores current/
+// bitmap UUIDs per-peer (one slot per node-id) plus the local
+// `self` slot; the GI handshake on first connect compares the
+// initiating node's local-slot current_uuid against the responder's
+// matching peer-slot bitmap_uuid. Any slot we leave un-stamped keeps
+// whatever bitmap_uuid was last written there — for a relocated /
+// deleted / not-yet-visible peer that is a STALE value from a prior
+// incarnation, which the handshake reads as "owe a resync toward
+// that slot" → the replica enters SyncTarget for an often-0-byte
+// resync that then latches behind the diskless tiebreaker's
+// connection dependency and NEVER finishes (the relocate / cold-
+// start "0 bits set, SyncTarget forever" stall, Bug 342 family /
+// DRBD #40 Mode B).
 //
-// Bug 284: when a fresh diskful replica's reconcile races the
-// peer Resource's creation (sequential `linstor r create N1 RD`
-// then `r create N2 RD`), `dr.GetPeers()` may be empty or only
-// contain a DISKLESS tiebreaker at the moment seedInitialGi runs.
-// Stamping only the peer slots leaves the local current_uuid as
-// the random value `drbdadm create-md` generated. When the peer
-// later joins and connects, the handshake compares its local
-// (day0) current_uuid against ours (random) → `uuid_compare()=
-// unrelated-data by rule=history-both` → `Unrelated data,
-// aborting!` → permanent StandAlone. Stamping the local slot
-// fixes the asymmetric-create case (mirrors upstream LINSTOR's
-// `DrbdLayer.createMetaData` loop over `nodeId=0..NODE_ID_MAX`).
+// The fix mirrors upstream LINSTOR's DrbdLayer.createMetaData, which
+// after `create-md --max-peers <N>` seeds GI by looping over EVERY
+// node-id slot (nodeId = 0..NODE_ID_MAX) and stamps the day0 tuple
+// into each — local builder for the local id, "other" builder for
+// the rest — regardless of whether a peer currently occupies that
+// slot. Blanketing all slots guarantees no slot is ever left with a
+// stale per-peer bitmap-UUID, so the handshake can never invent a
+// phantom resync.
 //
-// Returns the first non-nil error from drbdmeta. The "requires
-// --node-id" failure mode the legacy single-call form hit on DRBD
-// 9.2+ is now structurally unreachable: every call carries
-// `--node-id <X>`.
-func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string, peerNodeIDs map[string]int32) error {
-	// Stamp the local node-id's slot FIRST so the local
-	// current_uuid carries day0 even when no peers are visible yet
-	// at apply time (sequential-create race, Bug 284). The peer
-	// loop below adds the remaining slots; both sides converge on
-	// the same day0 tuple regardless of which side's reconcile
-	// runs first.
-	if localID, ok := localNodeIDFromOpts(dr); ok {
-		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, localID, seed)
+// Upper bound = drbd.NodeIDMax (31), verified empirically on
+// drbd-utils 9.22: `drbdmeta ... set-gi --node-id N` succeeds for
+// N in 0..31 on a v09 block created with `create-md 15`
+// (--max-peers=15) and hard-errors `node-id out of range (0...31)`
+// for N>=32. So 0..31 covers every slot create-md sized AND every
+// id the allocator (0..MaxPeers-1) could ever hand out, while never
+// tripping the out-of-range failure. Stamping the 16..31 slots that
+// the allocator never uses is a harmless overwrite of an unused
+// zero-GI slot; the safety it buys is that a late-allocated node-id
+// (Bug 87) or a peer whose Status.DRBDNodeID is not yet visible at
+// apply time can NEVER find its slot left stale.
+//
+// Bug 284 (local slot): the previous shape looped only over the
+// currently-VISIBLE peers (dr.GetPeerNames()) and `continue`d on any
+// peer whose node-id wasn't allocated yet — leaving the local
+// current_uuid (and every unseen / late peer slot) at the random
+// value `drbdadm create-md` generated. When such a peer later joined
+// and connected, the handshake compared its day0 current_uuid
+// against our random one → `uuid_compare()=unrelated-data` →
+// `Unrelated data, aborting!` → permanent StandAlone. The blanket
+// loop subsumes the explicit local-slot stamp that fix added and
+// extends the guarantee to every slot.
+//
+// Returns the first non-nil error from drbdmeta. Every call carries
+// `--node-id <X>`, so the legacy "set-gi requires --node-id" failure
+// mode is structurally unreachable.
+func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string) error {
+	// Blanket EVERY metadata slot 0..NodeIDMax with the same day0
+	// tuple. We deliberately do NOT gate on dr.GetPeerNames() /
+	// per-peer node-id allocation: the whole point is to wipe stale
+	// bitmap-UUIDs out of slots no currently-visible peer occupies
+	// (relocated/deleted prior incarnation, not-yet-visible peer,
+	// late-allocated node-id). The local slot is included in the
+	// range, preserving the Bug 284 local current_uuid stamp.
+	for nodeID := int32(0); nodeID <= drbd.NodeIDMax; nodeID++ {
+		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, nodeID, seed)
 		if err != nil {
-			return errors.Wrapf(err, "set-gi vol %d local (node-id %d)",
-				vol.GetVolumeNumber(), localID)
-		}
-	}
-
-	for _, peer := range dr.GetPeerNames() {
-		peerID, ok := peerNodeIDs[peer]
-		if !ok {
-			// Controller-side allocator hasn't stamped this peer's
-			// Status.DRBDNodeID yet — waitForControllerAllocation
-			// SHOULD have gated apply, but be defensive: skip the
-			// per-peer seed for this peer rather than emit a
-			// bogus --node-id=0 that would collide with the local
-			// slot. Next reconcile (driven by the peer's status
-			// update event) will retry with a real id.
-			continue
-		}
-
-		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, peerID, seed)
-		if err != nil {
-			return errors.Wrapf(err, "set-gi vol %d peer %s (node-id %d)",
-				vol.GetVolumeNumber(), peer, peerID)
+			return errors.Wrapf(err, "set-gi vol %d node-id %d",
+				vol.GetVolumeNumber(), nodeID)
 		}
 	}
 
@@ -3518,37 +3516,6 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	}
 
 	return nil
-}
-
-// peerNodeIDsFromOpts extracts the peer-name → DRBD-node-id map
-// from a DesiredResource's flat DrbdOptions bag. The keys are the
-// `peer.<name>.node-id` entries dispatcher.BuildDesired's
-// addPeerEntries populates from each peer's
-// Status.DRBDNodeID. Bad / missing values are skipped (the caller
-// then leaves that peer's bitmap slot unseeded; DRBD falls through
-// to a real initial-sync on first connect with that peer — slow
-// but correct).
-func peerNodeIDsFromOpts(dr *intent.DesiredResource) map[string]int32 {
-	opts := dr.GetDrbdOptions()
-	peers := dr.GetPeerNames()
-
-	out := make(map[string]int32, len(peers))
-
-	for _, peer := range peers {
-		raw, ok := opts["peer."+peer+".node-id"]
-		if !ok || raw == "" {
-			continue
-		}
-
-		id, err := strconv.ParseInt(raw, 10, 32)
-		if err != nil {
-			continue
-		}
-
-		out[peer] = int32(id)
-	}
-
-	return out
 }
 
 // resolveSeedGi decides what GI to stamp on a fresh replica's

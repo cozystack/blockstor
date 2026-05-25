@@ -3228,6 +3228,126 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	}
 }
 
+// TestApplyFirstActivationSeedsEveryMetadataSlotBlanket pins the
+// blanket-all-slots GI seed (Bug 342 family / DRBD #40 Mode B root
+// cause). seedPerPeerGi must stamp the day0 tuple into EVERY v09
+// metadata node-id slot 0..drbd.NodeIDMax — local, every visible
+// peer, AND every slot no currently-visible peer occupies — so no
+// slot is ever left with a stale per-peer bitmap-UUID that DRBD's
+// GI handshake would read as "owe a resync" → the 0-byte SyncTarget
+// stall.
+//
+// The pre-fix shape looped only over dr.GetPeerNames() and
+// `continue`d on any peer whose node-id wasn't allocated yet. This
+// test exercises exactly that skipped case: peer n3 is in the peer
+// list but has NO `peer.n3.node-id` in DrbdOptions (controller
+// allocator hasn't stamped it / it's a late-allocated id, Bug 87).
+// The old code skipped n3's slot AND every unoccupied slot; the
+// blanket loop stamps all of 0..NodeIDMax regardless.
+func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-blanket_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-blanket_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-blanket_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// n1 (local id 0); peer n2 has an allocated id (1); peer n3 is
+	// VISIBLE in the peer list but has NO node-id allocated yet
+	// (no peer.n3.node-id key). The pre-fix loop would `continue`
+	// on n3 and never touch its slot — the bug this test guards.
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-blanket",
+			NodeName: "n1",
+			Peers:    []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
+				// peer.n3.node-id intentionally ABSENT (late alloc).
+				"peer.n3.port": "7000", "peer.n3.address": "10.0.0.3",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+	day0 := satellite.Day0GiForTest("pvc-blanket", 0)
+
+	// Every slot 0..NodeIDMax must have been stamped with the
+	// identical day0 tuple — including slot 2 (n3, whose node-id was
+	// NOT allocated) and slots 16..31 that no peer occupies.
+	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
+		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:%s:0:0",
+			nodeID, day0, day0)
+		if !slices.Contains(calls, want) {
+			t.Errorf("missing blanket set-gi for node-id %d: want %q in calls", nodeID, want)
+		}
+	}
+
+	// Exactly NodeIDMax+1 set-gi calls for this volume — no more, no
+	// fewer (no out-of-range node-id 32+, no skipped slot).
+	var setGiCount int
+	for _, c := range calls {
+		if strings.HasPrefix(c, "drbdmeta") && strings.Contains(c, "set-gi") && strings.Contains(c, "pvc-blanket/0") {
+			setGiCount++
+		}
+	}
+
+	if want := drbd.NodeIDMax + 1; setGiCount != want {
+		t.Errorf("set-gi call count = %d, want %d (one per slot 0..NodeIDMax, no out-of-range)", setGiCount, want)
+	}
+
+	// No set-gi may target a node-id beyond NodeIDMax (drbdmeta hard-
+	// errors `node-id out of range (0...31)` for >=32).
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "drbdmeta") || !strings.Contains(c, "set-gi") {
+			continue
+		}
+
+		for nodeID := drbd.NodeIDMax + 1; nodeID <= 40; nodeID++ {
+			if strings.Contains(c, fmt.Sprintf("--node-id %d ", nodeID)) {
+				t.Errorf("out-of-range set-gi node-id %d (max is %d): %q", nodeID, drbd.NodeIDMax, c)
+			}
+		}
+	}
+
+	// Every blanket set-gi must land between create-md and adjust.
+	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-blanket", drbd.MaxPeers-1))
+	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-blanket")
+	if createMD < 0 || adjust < 0 {
+		t.Fatalf("missing create-md@%d / adjust@%d in calls: %v", createMD, adjust, calls)
+	}
+
+	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
+		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:%s:0:0",
+			nodeID, day0, day0)
+
+		idx := slices.Index(calls, want)
+		if idx < 0 {
+			continue // already reported above
+		}
+
+		if createMD >= idx || idx >= adjust {
+			t.Errorf("ordering: create-md@%d \u2192 set-gi@%d (node-id %d) \u2192 adjust@%d (want strictly ascending)",
+				createMD, idx, nodeID, adjust)
+		}
+	}
+}
+
 // TestApplyFirstActivationSeedsLocalSlotBug284 pins the Bug 284 fix:
 // the first-activation pass MUST stamp the LOCAL node-id's bitmap
 // slot with day0 even when GetPeers() is empty at apply time
