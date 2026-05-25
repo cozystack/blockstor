@@ -787,6 +787,153 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 	return false
 }
 
+// NeedsRecoveryPromote probes the live kernel via `drbdsetup status
+// <res> --json` and reports whether THIS node should re-arm the
+// auto-primary seed to unstick a fresh RD whose initial sync wedged
+// (Bug 366). It is the kernel-truth predicate behind the satellite's
+// steady-state recovery-promote self-heal — modelled on the existing
+// AnyConnectedPeerHasData backstop, reading observed peer/disk state
+// rather than any latched CRD flag.
+//
+// Why (Bug 366): on a brand-new 3-diskful RD blockstor reaches
+// all-UpToDate via two mechanisms BOTH gated on the same predicate
+// (a data-bearing diskful peer exists): the day0 skip-initial-sync GI
+// seed and the lowest-node-id seed-primary election. When the three
+// first-activation reconciles stagger, the replicas that seed first
+// flip UpToDate; that flips the predicate true for the late replica,
+// which then (a) declines its own day0 seed → comes up Inconsistent,
+// and (b) vetoes the seed-primary election → NO replica is ever
+// promoted Primary. With no Primary the late replica's resync stalls
+// (dual SyncSource collide into resync-suspended:peer / done:0.00) and
+// it sits Inconsistent forever (~2 in 7 cold creates).
+//
+// Returns true ONLY when ALL hold, so EXACTLY ONE node acts and the
+// promote is data-safe + self-limiting:
+//   - the local replica is diskful AND disk:UpToDate (a viable, fully
+//     populated SyncSource — never promote an Inconsistent local);
+//   - at least one connected diskful peer is disk:Inconsistent (the
+//     wedge symptom — there is a peer that still needs a source);
+//   - NO replica anywhere (local role nor any peer-role) is Primary
+//     (a Primary already drives the sync; never disturb it);
+//   - this node's my-node-id is the LOWEST among the UpToDate diskful
+//     replicas (local + every UpToDate peer), so on a multi-UpToDate
+//     RD a single deterministic node promotes — no split-brain race.
+//
+// Data-safety: every replica of a fresh RD shares the synthetic day0
+// Current-UUID (the seed gate guarantees no divergence), so
+// `drbdadm primary --force` here mints no unrelated UUID and the
+// Inconsistent peer simply SyncTargets from this UpToDate source.
+//
+// Self-limiting: once the peer reaches UpToDate it is no longer
+// Inconsistent, so the predicate stops holding and the self-heal never
+// re-fires. Conservative on any probe/parse failure (returns false) —
+// a missed promote just retries on the next reconcile.
+func (a *Adm) NeedsRecoveryPromote(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 || status[0].NodeID == nil {
+		return false
+	}
+
+	res := status[0]
+
+	// Local must be a fully-populated SyncSource: diskful + UpToDate.
+	if !localIsUpToDate(res.Devices) {
+		return false
+	}
+
+	// Never disturb an existing Primary anywhere in the RD.
+	if Role(res.Role).IsPrimary() {
+		return false
+	}
+
+	// Scan peers for the wedge symptom (a diskful peer Inconsistent), a
+	// peer already Primary (veto), and whether any UpToDate peer outranks
+	// us (only the lowest my-node-id among UpToDate replicas promotes).
+	anyPeerInconsistent, weAreLowestUpToDate, peerPrimary := scanRecoveryPromotePeers(res.Connections, *res.NodeID)
+	if peerPrimary {
+		return false
+	}
+
+	return anyPeerInconsistent && weAreLowestUpToDate
+}
+
+// scanRecoveryPromotePeers inspects a resource's peer connections for the
+// Bug 366 recovery-promote decision and reports: whether any diskful peer
+// is Inconsistent (the wedge symptom that needs a SyncSource), whether this
+// node still holds the lowest my-node-id among the UpToDate diskful replicas
+// (so a single deterministic node promotes), and whether any peer is already
+// Primary (a veto — a Primary already drives the sync).
+func scanRecoveryPromotePeers(conns []drbdsetupStatusConnection, myID int32) (bool, bool, bool) {
+	var (
+		anyPeerInconsistent bool
+		weAreLowestUpToDate = true
+		peerPrimary         bool
+	)
+
+	for _, conn := range conns {
+		if Role(conn.PeerRole).IsPrimary() {
+			peerPrimary = true
+		}
+
+		for _, pd := range conn.PeerDevices {
+			switch DiskState(pd.PeerDiskState) {
+			case DiskStateInconsistent:
+				anyPeerInconsistent = true
+			case DiskStateUpToDate:
+				// Another UpToDate diskful replica. The lowest
+				// my-node-id among UpToDate replicas is the sole
+				// promoter — defer if this peer outranks us.
+				if conn.PeerNodeID < myID {
+					weAreLowestUpToDate = false
+				}
+			case DiskStateConsistent, DiskStateOutdated, DiskStateDiskless,
+				DiskStateAttaching, DiskStateDetaching, DiskStateFailed,
+				DiskStateNegotiating, DiskStateDUnknown:
+				// Not the wedge symptom and not a competing UpToDate
+				// promoter; ignore.
+			default:
+				// Unknown/empty state — ignore.
+			}
+		}
+	}
+
+	return anyPeerInconsistent, weAreLowestUpToDate, peerPrimary
+}
+
+// localIsUpToDate reports whether at least one local diskful volume is
+// UpToDate and none is in a non-UpToDate diskful state. A diskless
+// local replica (no disk to be a SyncSource) yields false. Empty
+// device list (slot mid-negotiation) yields false — conservative.
+func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
+	if len(devices) == 0 {
+		return false
+	}
+
+	for _, d := range devices {
+		switch DiskState(d.DiskState) {
+		case DiskStateUpToDate:
+			// good
+		case DiskStateDiskless, DiskStateInconsistent, DiskStateConsistent,
+			DiskStateOutdated, DiskStateAttaching, DiskStateDetaching,
+			DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
+			// Any non-UpToDate diskful volume disqualifies the local
+			// replica as a clean SyncSource.
+			return false
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
 // DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe
 // the satellite consults before committing a `drbdadm down` on the
 // INACTIVE path. It separates "definitely safe to down" from "must

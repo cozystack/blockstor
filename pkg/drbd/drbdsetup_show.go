@@ -129,8 +129,27 @@ type drbdsetupStatusResource struct {
 	// `drbdadm up`/`new-resource` time. Bug 360 reads it to detect a
 	// slot whose my-id diverged from the controller-allocated id.
 	// Pointer so an absent key is distinguishable from a literal 0.
-	NodeID      *int32                      `json:"node-id"`
+	NodeID *int32 `json:"node-id"`
+	// Role is this node's OWN resource role (`role` in drbdsetup
+	// status -j): Primary / Secondary / Unknown. The Bug 366
+	// recovery-promote self-heal reads it to confirm the local node
+	// is not already Primary before re-arming the auto-primary seed.
+	Role string `json:"role"`
+	// Devices is the local per-volume state. The Bug 366
+	// recovery-promote reads `disk-state` to confirm THIS node is
+	// locally UpToDate (a viable SyncSource) before promoting.
+	Devices     []drbdsetupStatusDevice     `json:"devices"`
 	Connections []drbdsetupStatusConnection `json:"connections"`
+}
+
+// drbdsetupStatusDevice is one local volume entry from drbdsetup
+// status -j. Only the fields the Bug 366 recovery-promote consumes
+// are modelled.
+type drbdsetupStatusDevice struct {
+	VolumeNumber int32 `json:"volume"`
+	// DiskState is this node's local disk state for the volume
+	// (`disk-state`): UpToDate / Inconsistent / Diskless / …
+	DiskState string `json:"disk-state"`
 }
 
 // drbdsetupStatusConnection is one peer connection slot, as emitted by
@@ -139,10 +158,14 @@ type drbdsetupStatusResource struct {
 // `peer_devices` array (note the underscore — that one key is snake_case
 // while its siblings are kebab-case in drbd-utils' output).
 type drbdsetupStatusConnection struct {
-	PeerNodeID    int32                       `json:"peer-node-id"`
-	PeerName      string                      `json:"name"`
-	ConnectionStr string                      `json:"connection-state"`
-	PeerDevices   []drbdsetupStatusPeerDevice `json:"peer_devices"`
+	PeerNodeID    int32  `json:"peer-node-id"`
+	PeerName      string `json:"name"`
+	ConnectionStr string `json:"connection-state"`
+	// PeerRole is the peer node's resource role (`peer-role`). The
+	// Bug 366 recovery-promote reads it so the "no replica anywhere
+	// is Primary" precondition covers peers, not just the local node.
+	PeerRole    string                      `json:"peer-role"`
+	PeerDevices []drbdsetupStatusPeerDevice `json:"peer_devices"`
 }
 
 type drbdsetupStatusPeerDevice struct {
