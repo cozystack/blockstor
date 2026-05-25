@@ -78,6 +78,19 @@ type ResourceDefinitionSpec struct {
 	// Phase 10.3.
 	// +optional
 	ExtraProps map[string]string `json:"extraProps,omitempty"`
+
+	// drbdPort is an OPTIONAL preferred TCP port seed for this RD,
+	// mirroring upstream LINSTOR's `RscDfn.port` preferred value. The
+	// per-node port allocator (Resource.Spec.DRBDPort) tries this
+	// value first on each hosting node and falls back to a per-node
+	// free port on collision. nil means "no preference — allocate
+	// per-node freely". This is a seed, NOT the authoritative
+	// listen-port: the authoritative per-replica value lives on
+	// Resource.Spec.DRBDPort. clusterIP-style settable-once so an
+	// accidental edit can't perturb the per-node allocation.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdPort is settable-once"
+	DRBDPort *int32 `json:"drbdPort,omitempty"`
 }
 
 // ResourceDefinitionVolume is one volume slot inside an RD.
@@ -88,6 +101,28 @@ type ResourceDefinitionVolume struct {
 	Props map[string]string `json:"props,omitempty"`
 	// +optional
 	Flags []string `json:"flags,omitempty"`
+
+	// drbdMinor is the /dev/drbd<N> device minor for THIS volume,
+	// identical on every node that hosts a replica (the minor is the
+	// device identity, not a per-replica value). Mirrors upstream
+	// LINSTOR's per-volume-definition `VLM_MINOR_NR`.
+	//
+	// clusterIP-style allocation (Service.spec.clusterIP model): nil
+	// means "controller, allocate one for me"; a non-nil value is
+	// authoritative and is NEVER overwritten — that is what makes a
+	// plain `kubectl get -o yaml` backup + `kubectl apply` restore
+	// preserve the device identity with no resync/flap. The pointer
+	// (rather than a plain int32) distinguishes "unset" from a valid
+	// minor 0. The CEL settable-once rule below rejects mutating a
+	// set value so an accidental edit can't trigger reallocation.
+	//
+	// Replaces the legacy single `RD.Status.DRBDMinor` base +
+	// `base+volumeNumber` derivation: each volume carries its own
+	// minor, so adoption can preserve arbitrary (possibly
+	// non-contiguous) LINSTOR per-volume minors verbatim.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdMinor is settable-once: it may go from unset to a value but not be changed once set"
+	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 }
 
 // ResourceDefinitionStatus is the observed state.
@@ -98,24 +133,24 @@ type ResourceDefinitionStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// drbdPort is the cluster-scope TCP port allocated for THIS RD's
-	// DRBD replication mesh. All Resources of the RD inherit this
-	// value into their own Status.DRBDPort so the satellite's `.res`
-	// renderer writes the SAME port on every `on <node>` block —
-	// divergent ports across peers break drbdadm adjust. Allocated
-	// once when the first Resource of the RD reconciles and never
-	// changes for the lifetime of the RD. Bug 266.
+	// drbdPort is a LEGACY read-only mirror of the (historically
+	// cluster-scope) DRBD port. DEPRECATED: the authoritative DRBD
+	// listen-port now lives per-replica on Resource.Spec.DRBDPort,
+	// and the optional preferred seed on RD.Spec.DRBDPort. Retained
+	// so the one-time status→spec backfill migration can read the
+	// pre-upgrade value, and so observers/REST that still read it
+	// don't break in the same change. Not written by the allocator
+	// any more. Bug 266.
 	// +optional
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 
-	// drbdMinor is the cluster-scope /dev/drbd<N> minor allocated for
-	// THIS RD. All Resources inherit this value into their own
-	// Status.DRBDMinor — the satellite's `.res` renderer writes ONE
-	// minor for every `on <node>` block in the file, so divergent
-	// minors across peers produce inconsistent .res files and
-	// drbdadm adjust rejects "minor mismatch". Multi-volume RDs
-	// consume drbdMinor..drbdMinor+N-1 (volume k → minor+k).
-	// Allocated once and stable for the RD's lifetime. Bug 268.
+	// drbdMinor is a LEGACY read-only mirror of the (historically
+	// cluster-scope, base+k) DRBD minor. DEPRECATED: the authoritative
+	// per-volume minor now lives on
+	// ResourceDefinition.Spec.VolumeDefinitions[].DRBDMinor. Retained
+	// so the one-time status→spec backfill migration can read the
+	// pre-upgrade base value (expanded base+k per volume). Not written
+	// by the allocator any more. Bug 268.
 	// +optional
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 }

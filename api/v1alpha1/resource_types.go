@@ -175,6 +175,40 @@ type ResourceSpec struct {
 	// must issue a fresh toggle-disk to demote.
 	// +optional
 	ToggleDiskCancel bool `json:"toggleDiskCancel,omitempty"`
+
+	// drbdPort is the TCP port THIS replica listens on for the RD's
+	// DRBD replication mesh. PER-NODE (per-replica): the allocator's
+	// taken-set is the ports already used by OTHER Resources ON THE
+	// SAME NODE, so the same port number is freely reused across
+	// different nodes — this scales to 1000+ resources per node
+	// instead of exhausting a cluster-unique 7000-7999 window at
+	// ~1000 resources cluster-wide. The optional RD.Spec.DRBDPort
+	// preferred seed is tried first on each node.
+	//
+	// clusterIP-style allocation (Service.spec.clusterIP model): nil
+	// means "controller, allocate one for me"; non-nil is
+	// authoritative and is NEVER overwritten — that is what makes a
+	// `kubectl get -o yaml` backup + `kubectl apply` restore preserve
+	// the port with no flap. The pointer distinguishes "unset" from a
+	// valid port 0 (never allocated, but kept for type symmetry). The
+	// .res renderer puts each peer's own Spec.DRBDPort into that
+	// peer's `on <node>` block.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdPort is settable-once: it may go from unset to a value but not be changed once set"
+	DRBDPort *int32 `json:"drbdPort,omitempty"`
+
+	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
+	// Per-replica, allocated once and stable for the replica's life —
+	// re-numbering a live replica re-maps its DRBD bitmaps and
+	// corrupts peer-to-peer resync. Range 0..15 (drbd-9 max-peers).
+	//
+	// clusterIP-style allocation: nil means "controller, allocate";
+	// non-nil is authoritative and NEVER overwritten (restore-safe).
+	// Pointer distinguishes "unset" from a valid node-id 0
+	// (LowestFreeNodeID hands out 0 for the first/freed slot).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdNodeID is settable-once: it may go from unset to a value but not be changed once set"
+	DRBDNodeID *int32 `json:"drbdNodeID,omitempty"`
 }
 
 // ResourceVolumeSpec is one volume's per-replica configuration knobs.
@@ -214,28 +248,27 @@ type ResourceStatus struct {
 	// +optional
 	DrbdState string `json:"drbdState,omitempty"`
 
-	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
-	// Allocated once when the Resource first reconciles and never
-	// changes for the lifetime of the Resource — re-numbering live
-	// replicas would re-map their DRBD bitmaps and corrupt data on
-	// peer-to-peer resync. Range 0..15 (drbd-9 max-peers). nil means
-	// the controller has not yet allocated.
+	// drbdNodeID is a read-only mirror of the authoritative
+	// Spec.DRBDNodeID, kept so observers/REST/tests that still read
+	// Status during the migration window don't break. The allocator
+	// writes Spec.DRBDNodeID; the reconciler mirrors it here. nil
+	// means not yet allocated.
 	// +optional
 	DRBDNodeID *int32 `json:"drbdNodeID,omitempty"`
 
-	// drbdPort is the TCP port this replica listens on. Allocated
-	// from the hosting node's TCP-port range — different replicas
-	// of the same RD can use different ports because each lives on
-	// a different node and the port is local to that node. Matches
-	// upstream LINSTOR's per-resource (not per-RD) port model.
-	// nil means not yet allocated.
+	// drbdPort is a read-only mirror of the authoritative
+	// Spec.DRBDPort (per-node listen port), kept so the REST DTO
+	// (drbdLayerFromStatus → TCPPorts) and observers that still read
+	// Status keep working during the migration window. The allocator
+	// writes Spec.DRBDPort; the reconciler mirrors it here.
 	// +optional
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 
-	// drbdMinor is the local /dev/drbd<N> minor number on the
-	// hosting node. Like drbdPort, allocated per-replica from the
-	// node's minor-range — minors are local device numbers, so two
-	// replicas on different nodes can have unrelated minors.
+	// drbdMinor is a read-only mirror of the volume-0 minor now
+	// living authoritatively on
+	// ResourceDefinition.Spec.VolumeDefinitions[0].DRBDMinor. Kept so
+	// the cluster-wide taken-set scan and observers that still read
+	// Status keep working during the migration window.
 	// +optional
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 
