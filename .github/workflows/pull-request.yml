@@ -191,9 +191,9 @@ jobs:
     # stable to attach SSH. Swap to oracle-vm-32cpu-128gb-x86-64 if a
     # future, heavier scenario set needs more RAM/CPU.
     #
-    # Parallel lanes: this is a 2-lane template. To widen coverage, add
-    # entries to `matrix.lane` (e.g. 1 2 3 ... 10) AND bump `env.LANES`
-    # to match — ci-e2e.sh round-robins the SCENARIOS list across LANES,
+    # Parallel lanes: a 4-lane matrix (4 runners in parallel). To widen
+    # coverage, add entries to `matrix.lane` (e.g. 1 2 3 ... 10) AND bump
+    # `env.LANES` to match — ci-e2e.sh round-robins the SCENARIOS list across LANES,
     # so each runner automatically picks up its 1/N share. Nothing else
     # changes. (A future optimisation is a single build job that pushes
     # images to a registry the lanes pull from, instead of each lane
@@ -205,18 +205,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [1, 2]
+        lane: [1, 2, 3, 4]
     env:
-      LANES: 2
-      # Representative scenario set, round-robined across the lanes above.
-      # Expand this list (and the matrix/LANES) to broaden coverage; the
-      # full suite is `make e2e-list`.
+      LANES: 4
+      # Representative scenario set, round-robined across the lanes above
+      # (16 scenarios / 4 lanes = 4 per runner). Expand this list and the
+      # matrix/LANES together to broaden coverage; the full suite is
+      # `make e2e-list`.
       SCENARIOS: >-
         toggle-disk two-volume-rd tiebreaker clone
         resize-pvc snapshot-restore-cross-node
         recovery-stuck-synctarget network-partition
         quorum-loss-recovery backup-restore-identity
         auto-diskful recovery-setgi-per-peer
+        evacuate recovery-port-collision
+        drbd-luks-stack state-auto-resync
     permissions:
       contents: read
       checks: write
