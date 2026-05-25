@@ -1001,3 +1001,188 @@ func TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne(t *testing.T) {
 		}
 	}
 }
+
+// classifyReplicas counts (diskful, plainDiskless, witness) over a
+// replica slice using the same flag rules ensureTiebreaker applies.
+func classifyReplicas(replicas []apiv1.Resource) (int, int, int) {
+	var diskful, diskless, witness int
+
+	for i := range replicas {
+		hasDiskless := false
+		hasTB := false
+
+		for _, f := range replicas[i].Flags {
+			switch f {
+			case apiv1.ResourceFlagDiskless:
+				hasDiskless = true
+			case apiv1.ResourceFlagTieBreaker:
+				hasTB = true
+			}
+		}
+
+		switch {
+		case hasTB:
+			witness++
+		case hasDiskless:
+			diskless++
+		default:
+			diskful++
+		}
+	}
+
+	return diskful, diskless, witness
+}
+
+// TestEnsureTiebreakerRelocateOntoTiebreakerConverges reproduces the
+// `r-full-lifecycle.sh` Phase-3 relocate-onto-the-tiebreaker
+// oscillation under physical-delete semantics.
+//
+// Stand sequence (3 workers): start 2 diskful (n1, n2) + 1 TIE_BREAKER
+// (n3). `r d n2` physically removes n2's diskful, leaving 1 diskful +
+// 1 orphan witness — the Bug-338 shape. Then `r c n3` (the only worker
+// that is neither the survivor nor the just-freed node) lands on the
+// tiebreaker's own node: promoteDisklessReplica strips TIE_BREAKER +
+// DISKLESS from the n3 row in-place and stamps StorPoolName, turning
+// the witness INTO the diskful relocate target on the same (rd, node)
+// key.
+//
+// Pre-fix the Bug-338 orphan-collapse path (removeWitnesses) deleted
+// the witness on n3 by node key from a snapshot taken before the
+// promote. Racing the promote, that Delete wiped the freshly-promoted
+// relocate target, the topology reset to 1 diskful, the next reconcile
+// re-evaluated, and the diskful count flip-flopped 1↔2 (willRemove ↔
+// willCreate) — the relocate target never stabilized.
+//
+// This test drives the destructive overlap directly: it promotes n3's
+// witness in-place, then runs EnsureTiebreaker repeatedly with the
+// PRE-promote witness still in the snapshot path. The invariants:
+//
+//  1. The promoted relocate target on n3 MUST survive — never reaped
+//     as an orphan witness.
+//  2. The reconcile converges to a single stable shape (2 diskful +
+//     exactly 1 witness on the freed node) and stays there across
+//     repeated reconciles — no create/remove flip.
+func TestEnsureTiebreakerRelocateOntoTiebreakerConverges(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	const rdName = "pvc-relocate-tb"
+
+	// Post-`r d n2` state: lone diskful on n1 + orphan witness on n3.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed n1 diskful: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed n3 witness: %v", err)
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// The destructive race: ensureTiebreaker snapshots the topology
+	// while n3 is STILL the orphan witness (diskful=1 → Bug-338
+	// collapse decision = willRemove, witness snapshot = [n3]). Model
+	// that stale snapshot explicitly so removeWitnesses is exercised
+	// against a row that gets promoted out from under it.
+	staleWitnessSnapshot := []apiv1.Resource{
+		{Name: rdName, NodeName: "n3", Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker}},
+	}
+
+	// `r c n3`: promote the witness on n3 to the diskful relocate
+	// target in-place — TIE_BREAKER + DISKLESS stripped, StorPoolName
+	// stamped on the SAME (rd, node) row (promoteDisklessReplica).
+	if err := st.Resources().Update(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n3",
+		Props: map[string]string{"StorPoolName": "stand"},
+	}); err != nil {
+		t.Fatalf("promote n3 witness to diskful: %v", err)
+	}
+
+	// Bug-338 collapse fires with the stale snapshot AFTER the promote
+	// landed. removeWitnesses must NOT delete the now-diskful n3 row.
+	if err := rec.RemoveWitnesses(ctx, rdName, staleWitnessSnapshot); err != nil {
+		t.Fatalf("RemoveWitnesses with stale snapshot: %v", err)
+	}
+
+	if _, err := st.Resources().Get(ctx, rdName, "n3"); err != nil {
+		t.Fatalf("destructive race: removeWitnesses reaped the promoted relocate target on n3: %v", err)
+	}
+
+	// Drive several reconciles. They must converge and stay idempotent.
+	for pass := range 4 {
+		if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+			t.Fatalf("EnsureTiebreaker pass %d: %v", pass, err)
+		}
+
+		all, err := st.Resources().ListByDefinition(ctx, rdName)
+		if err != nil {
+			t.Fatalf("list pass %d: %v", pass, err)
+		}
+
+		// Invariant 1: the relocate target on n3 must survive as a
+		// diskful replica, never reaped as an orphan witness.
+		n3, getErr := st.Resources().Get(ctx, rdName, "n3")
+		if getErr != nil {
+			t.Fatalf("pass %d: relocate target on n3 was reaped: %v", pass, getErr)
+		}
+
+		for _, f := range n3.Flags {
+			if f == apiv1.ResourceFlagTieBreaker {
+				t.Fatalf("pass %d: relocate target on n3 still flagged TIE_BREAKER; flags=%v",
+					pass, n3.Flags)
+			}
+		}
+
+		diskful, diskless, witness := classifyReplicas(all)
+
+		// Invariant 2: converged shape is 2 diskful + exactly 1
+		// witness (on the freed n2) + no plain diskless. The diskful
+		// count must be a stable 2 — not flipping to 1.
+		if diskful != 2 {
+			t.Errorf("pass %d: diskful=%d, want 2 (n1 + relocated n3); entries=%v",
+				pass, diskful, all)
+		}
+
+		if witness != 1 {
+			t.Errorf("pass %d: witness=%d, want exactly 1 (no create/remove flip); entries=%v",
+				pass, witness, all)
+		}
+
+		if diskless != 0 {
+			t.Errorf("pass %d: plain diskless=%d, want 0; entries=%v",
+				pass, diskless, all)
+		}
+	}
+
+	// The witness must have landed on the freed n2 (the only spare
+	// node), not back on n3 (the diskful relocate target).
+	if _, err := st.Resources().Get(ctx, rdName, "n2"); err != nil {
+		t.Errorf("witness should land on freed n2; got error %v", err)
+	}
+}

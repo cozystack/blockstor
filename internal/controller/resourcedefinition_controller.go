@@ -908,8 +908,30 @@ func quorumPropsAlreadySet(rd *blockstoriov1alpha1.ResourceDefinition, value, qu
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.
 // Best-effort: ErrNotFound is swallowed so concurrent reconciles
 // converge.
+//
+// Why the live re-check before each Delete: the `witnesses` slice is a
+// snapshot taken at the top of ensureTiebreaker. During the Phase-3
+// relocate-onto-the-tiebreaker transition (`r-full-lifecycle.sh`:
+// `r d <other-diskful>` leaves 1 diskful + 1 orphan witness, then
+// `r c <tiebreaker-node>` promotes that SAME witness row in-place to
+// the diskful relocate target via promoteDisklessReplica — TIE_BREAKER
+// + DISKLESS stripped, StorPoolName stamped on the same (rd, node)
+// key). If the Bug-338 orphan-collapse fires concurrently it would
+// Delete the just-promoted relocate target by node key, the topology
+// resets, the next `r c`/reconcile re-creates, and the diskful count
+// flip-flops 1↔2 forever (the ensureTiebreaker oscillation). Re-read
+// each row and skip any that no longer carries TIE_BREAKER: a witness
+// that became diskful is the relocate target, not an orphan, and must
+// never be reaped here.
 func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
 	for i := range witnesses {
+		live, getErr := r.Store.Resources().Get(ctx, rdName, witnesses[i].NodeName)
+		if getErr == nil && !slices.Contains(live.Flags, apiv1.ResourceFlagTieBreaker) {
+			// Promoted to the diskful relocate target between the
+			// snapshot and now — leave it; it is no longer a witness.
+			continue
+		}
+
 		err := r.Store.Resources().Delete(ctx, rdName, witnesses[i].NodeName)
 		if err != nil && !stderrors.Is(err, store.ErrNotFound) {
 			return err
