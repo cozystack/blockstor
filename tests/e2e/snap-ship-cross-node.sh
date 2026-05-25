@@ -168,7 +168,13 @@ while (( $(date +%s) < dst_deadline )); do
     DEV_DST=$(kubectl get resource "${RD_DST}.${N3}" \
         -o jsonpath='{.status.volumes[?(@.volumeNumber==0)].devicePath}' \
         2>/dev/null || true)
-    if [[ -n "$DEV_DST" ]]; then
+    # Gate on the block device actually existing, not just the Status
+    # field: on a slow stand a competing reconcile (prior-test cleanup,
+    # snapshot finalizer, or the os.Remove+mknod re-create window inside
+    # EnsureDeviceNode) can briefly unlink /dev/drbdN right after the
+    # devicePath is stamped, and the one-shot `test -b` in read_md5 then
+    # ABORTs. Polling test -b here waits for genuine device readiness.
+    if [[ -n "$DEV_DST" ]] && on_node "$N3" test -b "$DEV_DST" 2>/dev/null; then
         break
     fi
     sleep 2
