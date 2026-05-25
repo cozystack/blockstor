@@ -127,6 +127,15 @@ for n in "$N1" "$N2" "$N3"; do
     assert_row "$RD_HEALTHY" "$n" \
         '.volumes[0].state.disk_state == "UpToDate"' \
         "331.A disk_state on $n"
+    # Bug A: a steady-state UpToDate replica must NEVER carry a
+    # `(NN%)` suffix even when its per-volume OutOfSyncKib is briefly
+    # non-zero toward a still-settling peer. The exact-equality check
+    # above already forbids it, but assert the absence of the "("
+    # token explicitly so a future annotateSyncProgress regression
+    # that re-introduces `UpToDate(22%)` fails loudly here.
+    assert_row "$RD_HEALTHY" "$n" \
+        '(.volumes[0].state.disk_state | test("\\(")) | not' \
+        "331.A UpToDate carries no (NN%) suffix on $n (Bug A)"
     assert_row "$RD_HEALTHY" "$n" \
         '[.layer_object.drbd.connections[]? | .connected] | all' \
         "331.A all peer connections .connected==true on $n"
@@ -249,4 +258,82 @@ assert_row "$RD_TB" "$tb_node" \
 wait_conns_ok "$RD_TB" "$tb_node" "$N1" 60
 wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 
-echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker wire shapes match golden screenshots)"
+# ----------------------------------------------------------------------
+# Sub-test D — SyncTarget / SyncSource carry a (NN%) suffix (Bug B)
+#
+# Golden upstream shape: a replica actively receiving data renders
+# `SyncTarget(NN%)`, the source renders `SyncSource(NN%)` — the
+# percent gives the operator resync progress. Bug 348's over-correction
+# stripped the percent, leaving a bare `SyncTarget`; Bug B restores it.
+#
+# We dirty the bitmap (write data on the primary), then add a third
+# diskful replica so its initial resync is a real non-instant
+# SyncTarget. During the resync window we poll `linstor r l` and assert
+# the contract: whenever a Sync* token appears in the State column it
+# MUST carry a `(NN%)` suffix and MUST NOT appear bare. Sampling is
+# best-effort (the sync can finish fast on a small stand), but a single
+# bare-literal observation fails the cell loudly.
+# ----------------------------------------------------------------------
+
+echo ">> [331.D] SyncTarget/SyncSource carry (NN%) progress suffix (Bug B)"
+
+RD_SYNC=cli-matrix-348-syncpct
+delete_rd "$RD_SYNC" 2>/dev/null || true
+
+"${LCTL[@]}" resource-definition create "$RD_SYNC" >/dev/null
+"${LCTL[@]}" volume-definition create "$RD_SYNC" 512M >/dev/null
+"${LCTL[@]}" resource create "$N1" "$RD_SYNC" --storage-pool=stand >/dev/null
+
+wait_status_state "$RD_SYNC" "$N1" "UpToDate|UpToDate\\(100%\\)" 180 0
+
+# Dirty the bitmap on the primary so the next replica must really
+# resync (a day0 all-zero volume could be skipped/instant). dd onto
+# the kernel drbd device; ignore failure (device path resolution is
+# best-effort and the assertion below is sample-or-skip anyway).
+drbd_dev=$(device_for_rd "$RD_SYNC" "$N1" 2>/dev/null || echo "")
+if [[ -n "$drbd_dev" ]]; then
+    on_node "$N1" bash -c "drbdadm primary ${RD_SYNC} 2>/dev/null || true; test -b ${drbd_dev} && dd if=/dev/urandom of=${drbd_dev} bs=1M count=256 oflag=direct status=none 2>/dev/null" || true
+fi
+
+# Add the second diskful replica and poll for the Sync* shape on it
+# while it catches up.
+"${LCTL[@]}" resource create "$N2" "$RD_SYNC" --storage-pool=stand >/dev/null
+
+sync_observed=0
+deadline=$(( $(date +%s) + 120 ))
+while (( $(date +%s) < deadline )); do
+    state=$("${LCTL[@]}" --machine-readable resource list --resources "$RD_SYNC" 2>/dev/null \
+        | jq -r --arg rd "$RD_SYNC" '
+            .[][]? | select(.name==$rd)
+            | .volumes[]?.state.disk_state // empty' 2>/dev/null || echo "")
+
+    # A bare SyncTarget / SyncSource (no parenthesised percent) is the
+    # Bug B regression — fail immediately if we ever see one.
+    if grep -qE '^(SyncTarget|SyncSource)$' <<<"$state"; then
+        echo "FAIL (331.D): bare Sync* literal without (NN%) — Bug B regression:" >&2
+        echo "$state" >&2
+        exit 1
+    fi
+
+    if grep -qE '^(SyncTarget|SyncSource)\([0-9]+%\)$' <<<"$state"; then
+        sync_observed=1
+        echo "   observed Sync* with progress: $(grep -E '^(SyncTarget|SyncSource)\(' <<<"$state" | head -1)"
+        break
+    fi
+
+    # Resync may already be done (small/fast). Stop polling once both
+    # replicas are UpToDate — nothing left to observe.
+    if status_disk_state "$RD_SYNC" "$N2" 0 | grep -qE '^UpToDate'; then
+        break
+    fi
+    sleep 1
+done
+
+if (( sync_observed == 0 )); then
+    echo "   note: resync completed too fast to sample a Sync* window (no bare-literal regression seen — contract holds)"
+fi
+
+delete_rd "$RD_SYNC" 2>/dev/null || true
+assert_no_orphans "$RD_SYNC" 2>/dev/null || true
+
+echo ">> r-l-conns-shapes OK (Bug 331: Healthy / Diskless / TieBreaker; Bug 348/A/B: UpToDate bare, Sync* carries (NN%))"

@@ -352,6 +352,28 @@ const (
 	replicationStateSyncTarget = "SyncTarget"
 )
 
+// terminalDiskStates are the disk_state tokens that must NEVER carry
+// a `(NN%)` sync-progress suffix. A replica in one of these states is
+// not actively receiving data, so a percentage is meaningless (and,
+// in the UpToDate case, actively misleading — see Bug A below).
+//
+//   - UpToDate / Diskless / TieBreaker are steady terminal states.
+//   - Outdated is a frozen last-known-good state, not a live resync.
+//
+// In a 3-replica topology a fully-UpToDate replica's per-volume
+// OutOfSyncKib can be > 0 because it reflects out-of-sync bytes
+// toward a still-syncing peer; the legacy fallthrough used to
+// decorate that as `UpToDate(22%)`, which the golden upstream shape
+// forbids — `UpToDate(NN%)` must never appear in healthy output.
+//
+//nolint:gochecknoglobals // immutable allow-list — `const` can't hold a map
+var terminalDiskStates = map[string]struct{}{
+	diskStateUpToDate: {},
+	"Diskless":        {},
+	"TieBreaker":      {},
+	"Outdated":        {},
+}
+
 // aggregateRDStats walks the flat per-replica resource list and
 // folds each entry into its parent-RD bucket. The Python CLI's
 // `--faulty` semantics work at RD granularity — "is this resource
@@ -508,26 +530,38 @@ func vdSizeIndex(ctx context.Context, s *Server, resList []apiv1.Resource) map[s
 }
 
 // annotateSyncProgress decorates each Volume.State.DiskState with a
-// "(N%)" suffix when OutOfSyncKib > 0 and the VD size is known.
-// Matches the CDI/upstream-LINSTOR rendering style — `linstor r list`
-// users see e.g. `Inconsistent(45%)` instead of a stale `Inconsistent`
-// label that gives no progress feedback. UpToDate replicas are left
-// alone since the suffix would just be `(100%)`.
+// "(NN%)" sync-progress suffix for replicas that are genuinely
+// receiving data, matching the CDI/upstream-LINSTOR rendering style —
+// `linstor r list` users see e.g. `SyncTarget(45%)` or
+// `Inconsistent(45%)` instead of a bare label with no progress
+// feedback.
 //
-// Bug 348: when ANY peer's replication state is `SyncSource` or
-// `SyncTarget`, upstream LINSTOR's State column renders the literal
-// replication-state name — `SyncSource` on the source side,
-// `SyncTarget` on the target side — sourced directly from drbdsetup
-// events2's replication_state field. The operator-facing signal is
-// "this replica is actively sending / receiving data"; collapsing it
-// to `UpToDate(NN%)` (source) or `Inconsistent(NN%)` (target) hides
-// the directionality. Bug 331 closed Connecting / NetworkFailure
-// column shapes but missed the SyncSource / SyncTarget pair — this
-// override closes the gap. Only the SyncSource / SyncTarget pair is
-// promoted to a literal name; other replication states
-// (PausedSync*, VerifyS/T, Ahead, Behind, Off, WFBitMap*) fall
-// through to the legacy `(NN%)` annotation so existing progress
-// feedback is preserved.
+// The percentage is ONLY appended to actively-syncing / inconsistent
+// states. Terminal states (UpToDate, Diskless, TieBreaker, Outdated)
+// are never decorated — see terminalDiskStates and the two bugs the
+// gate closes:
+//
+// Bug A — `(NN%)` wrongly decorating `UpToDate`. In a 3-replica
+// topology a fully-UpToDate replica's per-volume OutOfSyncKib can be
+// > 0 because it tracks out-of-sync bytes toward a still-syncing
+// peer. The old fallthrough gated only on `OutOfSyncKib <= 0`, so it
+// rendered `UpToDate(22%)`. The golden upstream shape says
+// `UpToDate(NN%)` must never appear; terminalDiskStates suppresses it.
+//
+// Bug B — `(NN%)` stripped from SyncSource / SyncTarget. Bug 348
+// promoted the two transient drbd-9 replication-state tokens to
+// literal State-column values (`SyncSource` on the source side,
+// `SyncTarget` on the target side, sourced from drbdsetup events2's
+// replication_state field), but over-corrected by dropping the
+// progress percent operators want during the resync window. The
+// syncLiteral branch now computes the percent from THIS replica's own
+// OutOfSyncKib + VD size and renders `SyncTarget(NN%)` /
+// `SyncSource(NN%)`, falling back to the bare literal when size /
+// out-of-sync data is unavailable.
+//
+// Other replication states (PausedSync*, VerifyS/T, Ahead, Behind,
+// Off, WFBitMap*) are not promoted to literals; they fall through to
+// the disk_state-with-progress path so existing feedback is preserved.
 func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1.Volume {
 	if len(volumes) == 0 {
 		return volumes
@@ -537,31 +571,53 @@ func annotateSyncProgress(volumes []apiv1.Volume, sizes map[int32]int64) []apiv1
 	copy(out, volumes)
 
 	for i := range out {
+		size := sizes[out[i].VolumeNumber]
+
 		if syncLiteral := activeSyncReplicationState(out[i].State.ReplicationStates); syncLiteral != "" {
-			// Upstream-shaped State: literal replication-state token,
-			// no `(NN%)` suffix. Mirrors Java LINSTOR's behaviour
-			// where the replication_state wins over disk_state during
-			// the SyncSource / SyncTarget transient window. Once the
-			// peer reports `Established`, ReplicationStates carries
-			// Established (or no SyncSource / SyncTarget entry), and
-			// the loop falls through to the disk_state path below —
-			// so the column collapses cleanly back to `UpToDate`.
-			out[i].State.DiskState = syncLiteral
+			// Bug 348 + Bug B: render the literal replication-state
+			// token (SyncSource / SyncTarget) WITH the live progress
+			// percent so operators see how far the resync has come.
+			// The percent comes from this replica's own OutOfSyncKib
+			// against the VD size — when that data is missing we fall
+			// back to the bare literal rather than emit a bogus 0%.
+			// Once the peer reports `Established`, ReplicationStates
+			// no longer carries SyncSource / SyncTarget and the loop
+			// falls through to the disk_state path below, collapsing
+			// the column cleanly back to `UpToDate`.
+			out[i].State.DiskState = withSyncPercent(syncLiteral, out[i].State.OutOfSyncKib, size)
 
 			continue
 		}
 
-		size := sizes[out[i].VolumeNumber]
+		// Terminal states never carry a progress suffix even when
+		// OutOfSyncKib > 0 — see Bug A. Empty disk_state and unknown
+		// VD size are also left untouched.
 		if size <= 0 || out[i].State.OutOfSyncKib <= 0 || out[i].State.DiskState == "" {
 			continue
 		}
 
-		percent := max(0, 100-(out[i].State.OutOfSyncKib*100)/size)
+		if _, terminal := terminalDiskStates[out[i].State.DiskState]; terminal {
+			continue
+		}
 
-		out[i].State.DiskState = fmt.Sprintf("%s(%d%%)", out[i].State.DiskState, percent)
+		out[i].State.DiskState = withSyncPercent(out[i].State.DiskState, out[i].State.OutOfSyncKib, size)
 	}
 
 	return out
+}
+
+// withSyncPercent appends a `(NN%)` sync-progress suffix to a State
+// token. percent = max(0, 100 - oos*100/size); when size <= 0 or
+// oos <= 0 the data is unusable, so the bare token is returned
+// unchanged (never a misleading `(0%)`).
+func withSyncPercent(state string, outOfSyncKib, sizeKib int64) string {
+	if sizeKib <= 0 || outOfSyncKib <= 0 {
+		return state
+	}
+
+	percent := max(0, 100-(outOfSyncKib*100)/sizeKib)
+
+	return fmt.Sprintf("%s(%d%%)", state, percent)
 }
 
 // activeSyncReplicationState returns `SyncSource` or `SyncTarget`
