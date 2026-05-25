@@ -201,25 +201,23 @@ jobs:
     runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
-    timeout-minutes: 180
+    # Whole tests/e2e suite (~59) sharded over LANES; at 4 lanes that's
+    # ~15 scenarios/runner plus build+provision, which needs well over the
+    # default. Capped near GitHub's 360-min max.
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
         lane: [1, 2, 3, 4]
     env:
+      # Number of parallel lanes = number of runners (matrix.lane above).
+      # This is a capacity/cost knob ONLY, not a coverage knob: no
+      # scenario list is hardcoded here — ci-e2e.sh discovers the whole
+      # suite via `make e2e-list` (= ls tests/e2e/*.sh) and shards it
+      # across LANES, so a newly-added test file runs automatically with
+      # zero workflow edits. Add runners by bumping matrix.lane + LANES
+      # together (e.g. 6 lanes ≈ the dev-stand-proven ~6 scenarios/lane).
       LANES: 4
-      # Representative scenario set, round-robined across the lanes above
-      # (16 scenarios / 4 lanes = 4 per runner). Expand this list and the
-      # matrix/LANES together to broaden coverage; the full suite is
-      # `make e2e-list`.
-      SCENARIOS: >-
-        toggle-disk two-volume-rd tiebreaker clone
-        resize-pvc snapshot-restore-cross-node
-        recovery-stuck-synctarget network-partition
-        quorum-loss-recovery backup-restore-identity
-        auto-diskful recovery-setgi-per-peer
-        evacuate recovery-port-collision
-        drbd-luks-stack state-auto-resync
     permissions:
       contents: read
       checks: write
@@ -240,7 +238,7 @@ jobs:
           ls -l /dev/kvm
 
       - name: Run QEMU e2e (lane ${{ matrix.lane }} of ${{ env.LANES }})
-        run: make ci-e2e LANE=${{ matrix.lane }} LANES=${{ env.LANES }} SCENARIOS="${{ env.SCENARIOS }}"
+        run: make ci-e2e LANE=${{ matrix.lane }} LANES=${{ env.LANES }}
 
       - name: Upload e2e logs
         if: always()
