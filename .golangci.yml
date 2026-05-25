@@ -12,6 +12,67 @@ linters:
     - ireturn
     - gocheckcompilerdirectives
   settings:
+    staticcheck:
+      # Enable the ST1003 naming checks (initialisms etc.) and the rest
+      # of staticcheck's "all" set.
+      checks:
+        - all
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+          arguments:
+            # Allow the idiomatic  first parameter in test
+            # helpers before context.Context.
+            - allowTypesBefore: "*testing.T"
+        - name: context-keys-type
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+          arguments:
+            - []
+            - []
+            - - upperCaseConst: true
+                # Project initialisms not in revive's default set. DRBD,
+                # ZFS, IO, ID, UUID, API, URL, HTTP are recognised by
+                # default; GI (DRBD generation identifier) and VDO are not.
+                extraInitialisms:
+                  - GI
+                  - VDO
+    tagliatelle:
+      case:
+        rules:
+          json: camel
+        # The CRD types follow the K8s API convention of uppercasing
+        # whole initialisms in camelCase JSON tags (cf. clusterIP,
+        # podCIDR): currentGI, drbdNodeID, suspendIO, etc. tagliatelle's
+        # camel rule would rewrite these to Go-style currentGi/drbdNodeId,
+        # so the affected fields are pinned here.
+        ignored-fields:
+          - StableID
+          - SeedFromGI
+          - DRBDNodeID
+          - PeerDRBDNodeID
+          - CurrentGI
+          - HistoryGI
+          - SuspendIO
+          - SuspendIOAcked
+          - GroupID
+          - SharedSpaceID
     dupl:
       threshold: 100
     goconst:
@@ -245,7 +306,6 @@ linters:
           - gochecknoglobals
           - godot
           - godox
-          - revive
           - wrapcheck
           - embeddedstructfieldcheck
           - fatcontext
@@ -255,7 +315,6 @@ linters:
           - gochecknoglobals
           - godot
           - godox
-          - revive
           - wrapcheck
           - embeddedstructfieldcheck
           - fatcontext
@@ -334,6 +393,15 @@ linters:
       - linters:
           - unconvert
         path: pkg/storage/file/diskfree\.go
+      # pkg/drbd/devnode.go casts stat.Rdev to uint64 for the same
+      # cross-platform reason: Rdev is uint64 on Linux (so the cast is
+      # a no-op and unconvert flags it, while the //nolint:gosec for the
+      # G115 conversion looks unused) but uint32 on some platforms where
+      # both the cast and the gosec suppression are required.
+      - linters:
+          - unconvert
+          - nolintlint
+        path: pkg/drbd/devnode(_test)?\.go
       # peer_delete_sync.go contains Bug 342 v10 plumbing (per-peer
       # forget-peer ACK annotations) that's staged on the satellite side
       # but not yet called from the REST handler. The unused-code is
