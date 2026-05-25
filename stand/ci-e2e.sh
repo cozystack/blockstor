@@ -35,7 +35,6 @@ LANE=${1:?LANE required (1-based)}
 LANES=${2:?LANES required (total lane count)}
 shift 2
 ALL_SCENARIOS=("$@")
-[ ${#ALL_SCENARIOS[@]} -gt 0 ] || { echo "FATAL: no scenarios given" >&2; exit 2; }
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
@@ -43,6 +42,16 @@ cd "$REPO_ROOT"
 # point it at this checkout instead — on a CI runner the repo lives in
 # $GITHUB_WORKSPACE, not ~/blockstor.
 export BS_REPO="$REPO_ROOT"
+
+# No explicit scenarios → discover the WHOLE suite via `make e2e-list`
+# (= ls tests/e2e/*.sh). That listing is the single source of truth: a
+# new test file is picked up automatically and sharded onto a lane —
+# nothing in the workflow needs updating when a scenario is added. Pass
+# an explicit list only to scope a subset (dev/debug).
+if [ ${#ALL_SCENARIOS[@]} -eq 0 ]; then
+    mapfile -t ALL_SCENARIOS < <(make -s e2e-list)
+fi
+[ ${#ALL_SCENARIOS[@]} -gt 0 ] || { echo "FATAL: make e2e-list returned no scenarios" >&2; exit 2; }
 
 STAND="ci-lane${LANE}"
 REGISTRY_CONTAINER="blockstor-ci-registry"
