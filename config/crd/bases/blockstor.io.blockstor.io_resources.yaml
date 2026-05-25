@@ -279,7 +279,7 @@ spec:
                 description: |-
                   volumes carries per-volume seed configuration that the
                   satellite applies once on first activation of this replica.
-                  Today the only field is SeedFromGi (Phase 8.1) — when set,
+                  Today the only field is SeedFromGI (Phase 8.1) — when set,
                   the satellite stamps the new replica's DRBD metadata with
                   this generation identifier before `drbdadm up` so the GI
                   handshake sees the new device as already-in-sync with that
@@ -291,11 +291,11 @@ spec:
                     hints the satellite consumes during first activation, the Status
                     counterpart carries observed runtime state.
                   properties:
-                    seedFromGi:
+                    seedFromGI:
                       description: |-
-                        seedFromGi pre-seeds the DRBD-9 generation identifier of this
+                        seedFromGI pre-seeds the DRBD-9 generation identifier of this
                         replica's metadata block before the first `drbdadm up`. When
-                        set to the CurrentGi of an existing UpToDate peer, DRBD's GI
+                        set to the CurrentGI of an existing UpToDate peer, DRBD's GI
                         handshake on first connect sees the match and skips the full
                         initial-sync — turning hours of resync on multi-TiB volumes
                         into instant. Phase 8.1.
@@ -412,7 +412,7 @@ spec:
                         events2`. Populated even when Connected — useful for
                         surfacing transitional states.
                       type: string
-                    peerDrbdNodeId:
+                    peerDRBDNodeID:
                       description: |-
                         peerDrbdNodeId is the DRBD-9 node-id assigned to the peer in
                         this resource's connection table. Read from `drbdsetup
@@ -501,7 +501,7 @@ spec:
                   replicas on different nodes can have unrelated minors.
                 format: int32
                 type: integer
-              drbdNodeId:
+              drbdNodeID:
                 description: |-
                   drbdNodeID is the DRBD-9 node-id assigned to this replica.
                   Allocated once when the Resource first reconciles and never
@@ -587,7 +587,7 @@ spec:
                     allocatedKib:
                       format: int64
                       type: integer
-                    currentGi:
+                    currentGI:
                       description: |-
                         currentGi is the DRBD-9 current generation identifier reported
                         by `drbdsetup events2` for this replica's local volume. The
@@ -601,7 +601,7 @@ spec:
                       type: string
                     diskState:
                       type: string
-                    historyGi:
+                    historyGI:
                       description: |-
                         historyGi carries the historical GI chain (DRBD keeps 3-4
                         previous generations). Useful for split-brain forensics and

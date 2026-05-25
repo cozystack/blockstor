@@ -73,7 +73,7 @@ type SnapshotSpec struct {
 	// did ack, otherwise application I/O hangs forever. The
 	// controller's abort path clears SuspendIO unconditionally.
 	// +optional
-	SuspendIO bool `json:"suspendIo,omitempty"`
+	SuspendIO bool `json:"suspendIO,omitempty"`
 
 	// takeSnapshot, when true, signals each satellite that has
 	// already acked the suspend-io barrier (see SuspendIO above) to
@@ -112,7 +112,7 @@ type SnapshotSpec struct {
 	// Empty GroupID is the single-snap path (Bug 351 behaviour
 	// preserved verbatim — siblings denominator collapses to self).
 	// +optional
-	GroupID string `json:"groupId,omitempty"`
+	GroupID string `json:"groupID,omitempty"`
 }
 
 // SnapshotVolumeRef is one volume slot inside a Snapshot.
@@ -191,7 +191,7 @@ type SnapshotPerNodeStatus struct {
 	// flips Spec.SuspendIO=false and the satellite issues
 	// `drbdsetup resume-io <rd>`. Bug 351.
 	// +optional
-	SuspendIOAcked bool `json:"suspendIoAcked,omitempty"`
+	SuspendIOAcked bool `json:"suspendIOAcked,omitempty"`
 
 	// failed is stamped true when the local satellite hit a
 	// terminal failure while either suspending I/O, taking the

@@ -197,7 +197,7 @@ type ResourceVolumeSpec struct {
 	// ignore it (the satellite checks `drbdmeta show-gi` before
 	// re-stamping).
 	// +optional
-	SeedFromGI string `json:"seedFromGi,omitempty"`
+	SeedFromGI string `json:"seedFromGI,omitempty"`
 }
 
 // ResourceStatus is the observed state of a placed resource.
@@ -221,7 +221,7 @@ type ResourceStatus struct {
 	// peer-to-peer resync. Range 0..15 (drbd-9 max-peers). nil means
 	// the controller has not yet allocated.
 	// +optional
-	DRBDNodeID *int32 `json:"drbdNodeId,omitempty"`
+	DRBDNodeID *int32 `json:"drbdNodeID,omitempty"`
 
 	// drbdPort is the TCP port this replica listens on. Allocated
 	// from the hosting node's TCP-port range — different replicas
@@ -346,7 +346,7 @@ type ResourceConnectionStatus struct {
 	// can cross-check; the field is retained here for ergonomics
 	// when only the local Resource is in hand.
 	// +optional
-	PeerDRBDNodeID *int32 `json:"peerDrbdNodeId,omitempty"`
+	PeerDRBDNodeID *int32 `json:"peerDRBDNodeID,omitempty"`
 
 	// peerVolumes is the peer's view of each volume's disk state
 	// on this connection — read from `drbdsetup events2
@@ -410,14 +410,14 @@ type ResourceVolumeStatus struct {
 	// turning hours of resync on multi-TiB volumes into instant.
 	// Updated by the satellite-side observer; never set in Spec.
 	// +optional
-	CurrentGI string `json:"currentGi,omitempty"`
+	CurrentGI string `json:"currentGI,omitempty"`
 
 	// historyGi carries the historical GI chain (DRBD keeps 3-4
 	// previous generations). Useful for split-brain forensics and
 	// cluster-state UI; may be elided when we run tight on Status
 	// budget. Order is newest-first.
 	// +optional
-	HistoryGI []string `json:"historyGi,omitempty"`
+	HistoryGI []string `json:"historyGI,omitempty"`
 
 	// outOfSyncKib is the worst-case "how many KiB this volume is
 	// behind any peer" reported by `drbdsetup events2 --statistics`

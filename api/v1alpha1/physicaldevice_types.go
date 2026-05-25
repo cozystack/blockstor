@@ -108,7 +108,7 @@ type PhysicalDeviceStatus struct {
 	// → `nvme-*` → `by-path/*`). The CRD's metadata.name is
 	// derived from this so it survives `/dev/sdN` re-lettering.
 	// +optional
-	StableID string `json:"stableId,omitempty"`
+	StableID string `json:"stableID,omitempty"`
 
 	// devicePath is the canonical /dev/disk/by-id symlink the
 	// satellite uses internally. Stable across reboots (unless the

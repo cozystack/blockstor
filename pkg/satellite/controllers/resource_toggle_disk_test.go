@@ -551,7 +551,7 @@ func TestPatchToggleDiskRetriesIsFieldSurgical(t *testing.T) {
 	// Belt-and-suspenders: pin every controller-allocator key
 	// individually — these are the exact fields the pre-fix bug
 	// wiped.
-	for _, banned := range []string{"drbdNodeId", "drbdPort", "drbdMinor"} {
+	for _, banned := range []string{"drbdNodeID", "drbdPort", "drbdMinor"} {
 		if _, ok := decoded.Status[banned]; ok {
 			t.Errorf("patch body carries forbidden key %q (Bug 293 regression); body=%s",
 				banned, got.body)

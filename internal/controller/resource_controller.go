@@ -640,7 +640,7 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 	}
 
 	body := map[string]any{"status": map[string]any{
-		"drbdNodeId": target.Status.DRBDNodeID,
+		"drbdNodeID": target.Status.DRBDNodeID,
 		"drbdPort":   target.Status.DRBDPort,
 		"drbdMinor":  target.Status.DRBDMinor,
 	}}

@@ -63,7 +63,7 @@ type StoragePoolSpec struct {
 	// 2-replica RD never lands twice on the same physical LUN.
 	// Empty string = local pool (default).
 	// +optional
-	SharedSpaceID string `json:"sharedSpaceId,omitempty"`
+	SharedSpaceID string `json:"sharedSpaceID,omitempty"`
 
 	// props is the LINSTOR property map for this pool.
 	// +optional

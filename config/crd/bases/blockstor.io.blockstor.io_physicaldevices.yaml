@@ -209,7 +209,7 @@ spec:
                   SIZE`.
                 format: int64
                 type: integer
-              stableId:
+              stableID:
                 description: |-
                   stableID is the stable identifier the satellite picked from
                   `/dev/disk/by-id/...` (preferring `wwn-*` → `scsi-SATA_*`
