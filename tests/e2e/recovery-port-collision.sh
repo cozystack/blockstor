@@ -35,9 +35,14 @@
 #   2. POST N volume-definitions concurrently.
 #   3. POST N resources (autoplace) concurrently.
 #   4. Wait for every replica's Status.DRBDPort to be stamped.
-#   5. Collect all ports and assert pairwise uniqueness across RDs.
-#   6. (Sanity) Each RD's two replicas share the same port (per-RD
-#      invariant, Bug 268).
+#   5. Collect all ports and assert per-node uniqueness: on each node
+#      every RD's port is distinct (two resources on one node cannot
+#      share a TCP port — the real collision hazard).
+#   6. Note: per-node allocation means an RD's two replicas
+#      legitimately get DIFFERENT ports (each node allocates from its
+#      own range, like upstream LINSTOR's per-replica port); the .res
+#      mesh stays consistent because each peer entry carries that
+#      peer's own port (see pkg/dispatcher peerPortOf).
 #
 # Regression guards:
 #   - At least N distinct ports allocated.
@@ -204,17 +209,26 @@ for i in $(seq 1 "$NUM_RDS"); do
     echo "   $rd: $N1=$p1  $N2=$p2"
 done
 
-# Per-RD invariant: replicas of one RD share one port (Bug 268).
-echo ">> per-RD invariant: every RD's replicas share one port"
-fail_per_rd=0
+# Per-node uniqueness on worker-2 (worker-1 is checked just below).
+# Each node allocates DRBD ports from its OWN range (per-node
+# allocation, like upstream LINSTOR's per-replica port — see
+# pkg/dispatcher readDRBDPort/peerPortOf), so an RD's two replicas
+# legitimately get DIFFERENT ports; the .res mesh stays consistent
+# because every peer entry carries that peer's own port. The real
+# collision hazard is two resources on the SAME node sharing a port.
+echo ">> per-node uniqueness: every $N2 RD port must be distinct"
+declare -A seen_n2=()
+fail_n2=0
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
-    if [[ "${rd_port_n1[$rd]}" != "${rd_port_n2[$rd]}" ]]; then
-        echo "FAIL: $rd port diverges across peers: $N1=${rd_port_n1[$rd]} vs $N2=${rd_port_n2[$rd]}"
-        fail_per_rd=$((fail_per_rd + 1))
+    port="${rd_port_n2[$rd]}"
+    if [[ -n "${seen_n2[$port]:-}" ]]; then
+        echo "FAIL: port collision on $N2 — RDs '${seen_n2[$port]}' and '$rd' both got port $port"
+        fail_n2=$((fail_n2 + 1))
     fi
+    seen_n2[$port]=$rd
 done
-if (( fail_per_rd > 0 )); then
+if (( fail_n2 > 0 )); then
     exit 1
 fi
 
