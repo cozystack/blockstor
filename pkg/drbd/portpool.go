@@ -54,20 +54,23 @@ func ParseRange(s string) (int32, int32, error) {
 // Operators can override via controller config; the allocator only
 // hands out ports inside [min, max].
 //
-// DefaultMinorMin is intentionally shifted away from the upstream
-// LINSTOR default of 1000 to 20000 so blockstor's per-RD minor
-// allocator and any coexisting LINSTOR allocator on the same host
-// occupy disjoint device-minor windows. Even when both stacks render
-// .res files into separate state directories, a shared minor would
-// cause /dev/drbd<N> kernel-object collisions the moment a manual
-// drbdadm invocation or a leaked .res reaches the wrong scope. The
-// unconditional shift also keeps us clear of any per-node operator
-// drbdadm commands stamped at minor 1000 in production deployments.
+// DefaultMinorMin mirrors upstream LINSTOR's DEFAULT_MINOR_NR_MIN
+// (1000). Collision-freedom does not come from offsetting this base:
+// LowestFreeMinor scans the cluster-wide taken set (every
+// Resource.Status.DRBDMinor) and hands out the lowest free value, so
+// two replicas can never land on the same /dev/drbd<N>. The cozystack
+// migration model also removes the only reason an offset was ever
+// considered — LINSTOR is shut down before blockstor adopts, and
+// adoption preserves the original LINSTOR minors verbatim, so there is
+// no live second allocator to stay clear of. This is exactly how the
+// TCP-port allocator behaves: it shares upstream LINSTOR's 7000-7999
+// window and relies on the same taken-set scan rather than a base
+// offset to avoid collisions.
 const (
 	DefaultPortMin = 7000
 	DefaultPortMax = 7999
 
-	DefaultMinorMin = 20000
+	DefaultMinorMin = 1000
 	DefaultMinorMax = 65535
 )
 
