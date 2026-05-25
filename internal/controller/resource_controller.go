@@ -1499,7 +1499,7 @@ func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD stri
 			}
 
 			for off := range volCount {
-				out = append(out, *base+int32(off)) //nolint:gosec // off is a bounded volume index (<= len), no overflow
+				out = append(out, *base+int32(off))
 			}
 		}
 	}
