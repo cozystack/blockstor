@@ -147,6 +147,10 @@ func TestAdmShowAbsentResourceReturnsNilNil(t *testing.T) {
 		{"no currently configured drbd", "No currently configured DRBD found"},
 		{"unknown resource", "drbdsetup: Unknown resource pvc-x"},
 		{"no resources defined", "no resources defined!"},
+		// Bug 350: exit-10 transient teardown window — the slot was
+		// just `drbdadm down`-ed. Must tolerate so PruneStaleKernelSlots
+		// treats the absent slot as nothing-to-prune instead of bubbling.
+		{"no such resource exit 10", "No such resource: pvc-x"},
 	}
 
 	for _, tc := range cases {

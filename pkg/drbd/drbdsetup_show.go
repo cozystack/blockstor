@@ -172,7 +172,7 @@ type drbdsetupStatusPeerDevice struct {
 // Tolerant of:
 //   - resource not present in kernel (drbdsetup non-zero with
 //     "No currently configured DRBD" / "Unknown resource" /
-//     "no resources defined") → nil map + nil error
+//     "no resources defined" / "No such resource") → nil map + nil error
 //   - blank stdout / empty `[]` array → nil map + nil error
 //   - malformed JSON → nil map + nil error (degrade to no-op rather
 //     than wedge the reconcile path: the v3 prune is best-effort)
@@ -182,13 +182,24 @@ func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot,
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", "-j", resource)
 	if err != nil {
 		// "No currently configured DRBD found" / "Unknown resource"
-		// / "no resources defined" are the verbatim drbd-utils
-		// messages for the "resource not loaded" branch — treat
-		// absence as empty so callers don't need to branch.
+		// / "no resources defined" / "No such resource" are the
+		// verbatim drbd-utils messages for the "resource not loaded"
+		// branch — treat absence as empty so callers don't need to
+		// branch.
+		//
+		// Bug 350: `drbdsetup status -j <rd>` returns exit 10 with
+		// "No such resource: <rd>" when the slot has just been
+		// `drbdadm down`-ed (the transient teardown window). Without
+		// this substring the error bubbles, and the PruneStaleKernelSlots
+		// caller skips the prune entirely — a resync that was about to
+		// finalize then never does. Tolerating exit-10 here lets the
+		// prune treat the absent slot as "nothing to prune" instead of
+		// wedging the reconcile.
 		errText := err.Error() + " " + string(out)
 		if strings.Contains(errText, "No currently configured DRBD") ||
 			strings.Contains(errText, "Unknown resource") ||
-			strings.Contains(errText, "no resources defined") {
+			strings.Contains(errText, "no resources defined") ||
+			strings.Contains(errText, "No such resource") {
 			return nil, nil
 		}
 
