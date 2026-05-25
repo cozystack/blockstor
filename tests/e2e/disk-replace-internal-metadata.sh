@@ -230,8 +230,23 @@ fi
 # I/O fails over the wire. This is the steady-state shape the
 # upstream recipe expects when an operator arrives at a node that
 # already detached itself via `on-io-error=detach`.
+# Pin DrbdOptions/SkipDisk=True BEFORE the detach. The satellite
+# reconciler runs `drbdadm adjust` on every reconcile and, observing a
+# healthy lower disk, re-attaches a manually-detached replica within
+# ~1.6s (self-healing, Bug 278) — faster than the 1s status poll below,
+# so the Diskless window was missed and the assertion saw UpToDate.
+# SkipDisk=True makes the reconciler honour the detached state
+# (`drbdadm adjust --skip-disk`), so Diskless is durable. Step 5 relies
+# on this too; setting it here is idempotent.
+echo ">> pin DrbdOptions/SkipDisk=True on ${RD}.${N1} before detach (block reconciler re-attach race)"
+kubectl patch "resource.blockstor.cozystack.io/${RD}.${N1}" --type=merge \
+    -p '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
+sleep 5  # let the reconciler observe SkipDisk before we detach
+
 echo ">> simulate disk failure on $N1: drbdadm detach --force"
-on_node "$N1" drbdadm detach --force "$RD"
+# `|| true`: the skip-disk adjust may already have detached the lower
+# disk, so the manual detach can be a no-op that exits non-zero.
+on_node "$N1" drbdadm detach --force "$RD" || true
 
 # Wait briefly for the kernel to settle on disk:Diskless.
 # observer SSA wake-up + apiserver round-trip can take ~10s on busy stand
