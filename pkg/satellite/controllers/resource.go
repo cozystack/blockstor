@@ -455,6 +455,25 @@ func (r *ResourceReconciler) runApply(ctx context.Context, res *blockstoriov1alp
 		return ctrl.Result{}, errors.Wrap(err, "list peer Resources")
 	}
 
+	// Bug 350 reactivate-resync stall: refresh the TARGET's own
+	// Spec.Flags from the uncached APIReader view before building the
+	// DesiredResource. The reconcile-entry `r.Get` reads the c-r
+	// informer cache, which trails the apiserver by hundreds of
+	// milliseconds. After `linstor r activate <node>` clears INACTIVE,
+	// a reconcile that fires on a stale cache still sees INACTIVE set
+	// → applyInactive runs `drbdadm down` on the just-reactivated
+	// replica. That down tears down a slot that has already SyncTarget-
+	// ed back to UpToDate; the immediately-following `up` re-handshakes
+	// and DRBD-9 records "missed end of resync", which — together with a
+	// diskless TIE_BREAKER peer's `resync-susp(connection dependency)` —
+	// wedges the replica Inconsistent forever (out-of-sync=0, never
+	// finalizes). `listPeerResources` already reads every Resource for
+	// the RD uncached AND includes the target itself, so we adopt the
+	// authoritative flags from that same read with zero extra API
+	// calls. Mirrors the peer-side APIReader fix the auto-primary
+	// election relies on (Bug 80).
+	adoptAuthoritativeFlags(res, peers)
+
 	// The DRBD-ID allocation gate only matters when the RD actually
 	// uses DRBD. A LayerStack=["STORAGE"] (or ["LUKS","STORAGE"]) RD
 	// renders no .res and the kernel never sees a node-id, so waiting
@@ -1149,6 +1168,26 @@ func (r *ResourceReconciler) peerReader() client.Reader {
 	}
 
 	return r.Client
+}
+
+// adoptAuthoritativeFlags overwrites target.Spec.Flags with the copy
+// read uncached from the apiserver (the target's own entry in the
+// APIReader-backed peer list), curing the c-r-cache trail on the
+// INACTIVE flag that otherwise lets a post-`r activate` reconcile run
+// applyInactive's `drbdadm down` on a just-reactivated replica (see
+// the call site in runApply for the full wedge chain). No-op when the
+// target isn't found in the list (peer list built from a different
+// reader in a unit test, or the target's CRD was just deleted) — the
+// cached flags then stand, which is the pre-fix behaviour.
+func adoptAuthoritativeFlags(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource) {
+	for i := range peers {
+		if peers[i].Spec.NodeName == target.Spec.NodeName &&
+			peers[i].Spec.ResourceDefinitionName == target.Spec.ResourceDefinitionName {
+			target.Spec.Flags = peers[i].Spec.Flags
+
+			return
+		}
+	}
 }
 
 // rdNeedsDRBD mirrors pkg/satellite/reconciler.go's needsDRBD but
