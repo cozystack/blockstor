@@ -360,10 +360,16 @@ while (( $(date +%s) < deadline )); do
 done
 
 echo ">> STEP 4: POST /v1/resource-definitions/$RD/autoplace (refill to 2 diskful)"
+# Pin node_name_list to {WORKER_1 (survivor), WORKER_3 (replacement)}.
+# Without it the autoplacer is free to pick WORKER_2 — its `stand` pool
+# is score-identical to WORKER_3's, and the NodeName tie-break favours
+# WORKER_2 — but the assertions below (wait_uptodate on W1+W3, on_w3==1)
+# require the refilled replica on WORKER_3. This makes placement
+# deterministic without changing the lost→create→sp→autoplace recipe.
 http4=$(curl -sS -o /tmp/replace-hw-4.out -w '%{http_code}' \
     -XPOST -H'Content-Type: application/json' \
     "http://localhost:$PF_PORT/v1/resource-definitions/$RD/autoplace" \
-    -d "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"$POOL_NAME\"}}")
+    -d "{\"select_filter\":{\"place_count\":2,\"storage_pool\":\"$POOL_NAME\",\"node_name_list\":[\"$WORKER_1\",\"$WORKER_3\"]}}")
 if [[ "$http4" != "200" && "$http4" != "201" ]]; then
     echo "FAIL: step 4 (autoplace) returned http=$http4 body=$(cat /tmp/replace-hw-4.out)"
     exit 1
