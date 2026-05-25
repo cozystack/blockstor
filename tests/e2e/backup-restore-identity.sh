@@ -79,12 +79,18 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # ---- 1. create -------------------------------------------------------
 
+# AutoAddQuorumTiebreaker=false on every RD so the topology is
+# deterministic (explicit diskful replicas only — no auto-witness
+# turning the would-be-3rd-diskful into a Diskless TIE_BREAKER). The
+# identity-preservation contract is identical either way; this just
+# makes the assertions deterministic.
 echo ">> create RD1 ($RD1): 1 volume, 2 diskful on $N1+$N2"
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD1}}
 spec:
+  props: {DrbdOptions/AutoAddQuorumTiebreaker: "false"}
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 EOF
@@ -95,6 +101,7 @@ apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD2}}
 spec:
+  props: {DrbdOptions/AutoAddQuorumTiebreaker: "false"}
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
     - {volumeNumber: 1, sizeKib: 65536}
@@ -106,6 +113,7 @@ apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD3}}
 spec:
+  props: {DrbdOptions/AutoAddQuorumTiebreaker: "false"}
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 EOF
@@ -245,8 +253,32 @@ echo "  RDs still present: $left"
 # ---- 6. restore ------------------------------------------------------
 
 echo ">> restore from backup"
-# Strip resourceVersion/uid/creationTimestamp so apply doesn't 409.
-kubectl apply -f "$BKP" 2>&1 | tail -8
+# Strip server-managed metadata (resourceVersion / uid /
+# creationTimestamp / generation / managedFields) and the status
+# stanza so `kubectl apply` recreates the objects cleanly. The
+# identity lives in spec, which we keep verbatim — that is the whole
+# point of the test.
+python3 - "$BKP" > /tmp/bkprest-restore.yaml <<'PY'
+import sys, yaml
+docs = list(yaml.safe_load_all(open(sys.argv[1])))
+out = []
+for d in docs:
+    if not d:
+        continue
+    items = d.get("items", [d]) if d.get("kind","").endswith("List") else [d]
+    for it in items:
+        md = it.get("metadata", {})
+        for k in ("resourceVersion","uid","creationTimestamp","generation","managedFields","selfLink","ownerReferences"):
+            md.pop(k, None)
+        ann = md.get("annotations", {})
+        ann.pop("kubectl.kubernetes.io/last-applied-configuration", None)
+        if not ann:
+            md.pop("annotations", None)
+        it.pop("status", None)
+        out.append(it)
+yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
+PY
+kubectl apply -f /tmp/bkprest-restore.yaml 2>&1 | tail -12
 
 # ---- 7. start blockstor ---------------------------------------------
 
@@ -344,11 +376,16 @@ for k in "${!MD5[@]}"; do
     echo "  ${rd} vol${vol} md5 intact (${got})"
 done
 
-echo ">> ASSERT Status reconverged (role/disk-state re-populated)"
+echo ">> ASSERT Status reconverged (disk-state re-populated by observer)"
+# Poll rather than instant-read: the md5 reads above toggled
+# primary/secondary, which briefly perturbs the events2 observer's
+# diskState before it re-stamps UpToDate. wait_disk_state tolerates
+# that transient window (the no-resync section already proved the
+# replicas are UpToDate).
 for spec in "${RD1}:${N1}" "${RD3}:${N1}"; do
     rd=${spec%%:*}; node=${spec##*:}
-    ds=$(status_disk_state "$rd" "$node" 0)
-    [[ "$ds" == "UpToDate" ]] || fail "Status did not reconverge: ${rd}.${node} diskState=$ds"
+    wait_disk_state "$rd" "$node" UpToDate 60 0 \
+        || fail "Status did not reconverge: ${rd}.${node} never re-stamped UpToDate"
 done
 echo "  Status reconverged"
 
