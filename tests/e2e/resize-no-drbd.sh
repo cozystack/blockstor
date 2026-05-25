@@ -39,7 +39,7 @@ trap cleanup EXIT
 
 echo ">> apply ${RD} with LayerStack=[STORAGE], initial ${SIZE_INITIAL_KIB} KiB"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -49,7 +49,7 @@ spec:
 EOF
 
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:

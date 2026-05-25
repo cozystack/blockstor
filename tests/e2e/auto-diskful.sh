@@ -36,7 +36,7 @@ echo ">> apply 2 diskful + 1 DISKLESS"
 # racing to create a TIE_BREAKER witness on N3 first (which would
 # then conflict with our explicit apply, ALSO landing on N3).
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -47,7 +47,7 @@ spec:
 EOF
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -62,7 +62,7 @@ done
 # its own witness on $N3 for the 2-diskful → +tiebreaker rule, and it
 # would be exempt from auto-diskful.)
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N3}}
 spec:
@@ -86,7 +86,7 @@ on_node "$N3" drbdadm primary "$RD"
 echo ">> wait 90s for auto-diskful promotion"
 deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || true)
     if [[ "$flags" != *"DISKLESS"* ]]; then
         break
@@ -99,7 +99,7 @@ if [[ "$flags" == *"DISKLESS"* ]]; then
     exit 1
 fi
 
-stor=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+stor=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.spec.props.StorPoolName}')
 if [[ -z "$stor" ]]; then
     echo "FAIL: StorPoolName not stamped on promoted replica"

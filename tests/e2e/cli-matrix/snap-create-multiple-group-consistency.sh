@@ -171,9 +171,9 @@ while (( $(date +%s) < deadline )); do
             | ([.status.nodeStatus[]? | select(.ready==true) | .nodeName]) as $have
             | ($want | length) > 0 and (($want - $have) | length == 0))
         ] | length > 0 and all'
-    snap_a_ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+    snap_a_ok=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
         | jq -r --arg rd "$RD_A" --arg s "$SNAP" "$JQ_OK" 2>/dev/null || echo "false")
-    snap_b_ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+    snap_b_ok=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
         | jq -r --arg rd "$RD_B" --arg s "$SNAP" "$JQ_OK" 2>/dev/null || echo "false")
     if [[ "$snap_a_ok" == "true" && "$snap_b_ok" == "true" ]]; then
         all_ok=true
@@ -192,7 +192,7 @@ on_node "$N1" bash -c "
 
 if ! $all_ok; then
     echo "FAIL (Bug 353): multi-snapshot did not converge to Successful on both RDs in 90s" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io 2>&1 | head -30 >&2
+    kubectl get snapshots.blockstor.cozystack.io 2>&1 | head -30 >&2
     exit 1
 fi
 

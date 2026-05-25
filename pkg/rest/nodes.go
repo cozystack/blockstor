@@ -1171,7 +1171,7 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 // Bug 162 (P0): every non-sentinel branch routes the message through
 // scrubImplDetails before emitting. Without scrubbing, an etcd-side
 // rejection ("etcdserver: request is too large") or an apimachinery
-// status error ("controllerconfigs.blockstor.io.blockstor.io ...")
+// status error ("controllerconfigs.blockstor.cozystack.io ...")
 // reached the wire verbatim, leaking the persistence backend's
 // identity. Bug 146 already scrubbed the inbound JSON-decode path;
 // this is the matching outbound guard.
@@ -1221,7 +1221,7 @@ func writeStoreError(w http.ResponseWriter, err error) {
 //
 // Bug 199 (P2): every message goes through `scrubImplDetails` before
 // hitting the wire. Bug 162 fixed `writeStoreError`'s default branch
-// to scrub etcd / apimachinery / k8s.io / `*.blockstor.io` substrings
+// to scrub etcd / apimachinery / k8s.io / `*.blockstor.cozystack.io` substrings
 // out of the response body, but 51 other call sites in pkg/rest/
 // reach `writeError` directly with the raw `err.Error()` from the
 // K8s-backed store (controller_props, snapshot_multi, autoplace,

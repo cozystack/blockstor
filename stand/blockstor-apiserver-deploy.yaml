@@ -29,7 +29,7 @@ kind: ClusterRole
 metadata:
   name: blockstor-apiserver
 rules:
-  - apiGroups: [blockstor.io.blockstor.io]
+  - apiGroups: [blockstor.cozystack.io]
     resources: ["*"]
     verbs: [get, list, watch, create, update, patch, delete]
   # Secrets — the cluster passphrase (sealed in

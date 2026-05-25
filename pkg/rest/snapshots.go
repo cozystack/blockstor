@@ -993,7 +993,7 @@ func (s *Server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 			Message: "snapshot delete acked but satellite finalizer " +
 				"not removed within timeout: " + snapName,
 			Cause: "the satellite-side finalizer " +
-				"(blockstor.io.blockstor.io/satellite-snapshot) did " +
+				"(blockstor.cozystack.io/satellite-snapshot) did " +
 				"not drain within the wait budget; the snapshot may " +
 				"still be present on disk and the Snapshot CRD will " +
 				"remain visible until the satellite reconciler runs",

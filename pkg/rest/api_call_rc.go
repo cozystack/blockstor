@@ -165,7 +165,7 @@ const warnRscConnPathNotFound = maskWarn | int64(2058)
 // apiCallRcFailSnapshotFinalizerStuck is emitted by `DELETE /v1/
 // resource-definitions/{rd}/snapshots/{snap}` (Bug 193) when the
 // Snapshot CRD's satellite-side finalizer
-// (`blockstor.io.blockstor.io/satellite-snapshot`) fails to drain
+// (`blockstor.cozystack.io/satellite-snapshot`) fails to drain
 // inside `snapshotDeleteWaitBudget`. The pre-fix wire shape was an
 // immediate 200 + SUCCESS line that lied to the caller — the
 // snapshot CRD survived under `kubectl get snapshot` with the

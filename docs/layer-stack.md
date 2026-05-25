@@ -57,7 +57,7 @@ the REST shape mirrors upstream LINSTOR.)
 ### Per-RD via kubectl
 
 ```yaml
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: pvc-encrypted}
 spec:

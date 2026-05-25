@@ -191,7 +191,7 @@ ok_recreate=false
 last_flags=""
 last_disk=""
 while (( $(date +%s) < deadline )); do
-    last_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N_REC}" \
+    last_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N_REC}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     last_disk=$(status_disk_state "$RD" "$N_REC" 0)
     if [[ "$last_flags" != *"DISKLESS"* ]] && [[ "$last_disk" == "UpToDate" ]]; then

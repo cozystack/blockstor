@@ -129,7 +129,7 @@ wait_status_diskless() {
     local deadline=$(( $(date +%s) + timeout ))
     while (( $(date +%s) < deadline )); do
         local flags disk
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${rd}.${node}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         disk=$(status_disk_state "$rd" "$node" 0)
         if [[ "$flags" == *"DISKLESS"* ]]; then
@@ -150,7 +150,7 @@ wait_status_diskless() {
         sleep 2
     done
     echo "wait_status_diskless: ${rd}.${node} never converged to Diskless within ${timeout}s" >&2
-    kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" -o json 2>/dev/null \
+    kubectl get "resources.blockstor.cozystack.io/${rd}.${node}" -o json 2>/dev/null \
         | jq '{flags: .spec.flags, status: .status}' >&2 || true
     return 1
 }
@@ -212,7 +212,7 @@ die() {
 # cells previously hand-rolled this awk pattern; centralise it.
 linstor_replica_count() {
     local rd=$1
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {n++} END {print n+0}'
 }
 
@@ -223,12 +223,12 @@ linstor_replica_count() {
 # `$(linstor_diskful_nodes "$rd")` for word-splitting.
 linstor_diskful_nodes() {
     local rd=$1
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
         | while read -r name; do
             [[ -z "$name" ]] && continue
             local flags
-            flags=$(kubectl get "resources.blockstor.io.blockstor.io/${name}" \
+            flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
                 -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
             if [[ "$flags" != *"DISKLESS"* ]] && [[ "$flags" != *"TIE_BREAKER"* ]]; then
                 # Strip "<rd>." prefix to leave just the node name.
@@ -253,12 +253,12 @@ linstor_diskful_count() {
 # row exists. Lifecycle test uses this to pick the relocate target.
 linstor_tiebreaker_node() {
     local rd=$1
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${rd}." '$1 ~ "^"rd {print $1}' \
         | while read -r name; do
             [[ -z "$name" ]] && continue
             local flags
-            flags=$(kubectl get "resources.blockstor.io.blockstor.io/${name}" \
+            flags=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
                 -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
             if [[ "$flags" == *"TIE_BREAKER"* ]]; then
                 echo "${name#${rd}.}"
@@ -290,7 +290,7 @@ linstor_pick_free_node() {
         done
         (( in_excl )) && continue
         # Has a Resource CRD for this RD already?
-        if kubectl get "resources.blockstor.io.blockstor.io/${rd}.${n}" >/dev/null 2>&1; then
+        if kubectl get "resources.blockstor.cozystack.io/${rd}.${n}" >/dev/null 2>&1; then
             has_replica=1
         else
             has_replica=0
@@ -329,7 +329,7 @@ wait_replica_absent() {
     local rd=$1 node=$2 timeout=${3:-30}
     local deadline=$(( $(date +%s) + timeout ))
     while (( $(date +%s) < deadline )); do
-        if ! kubectl get "resources.blockstor.io.blockstor.io/${rd}.${node}" >/dev/null 2>&1; then
+        if ! kubectl get "resources.blockstor.cozystack.io/${rd}.${node}" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
@@ -352,13 +352,13 @@ assert_no_orphans() {
     local res leftover
 
     # CRD layer.
-    leftover=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    leftover=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' || true)
     if [[ -n "$leftover" ]]; then
         echo "ORPHAN(crd): leftover Resource CRDs for ${rd}: $leftover" >&2
         fail=1
     fi
-    if kubectl get "resourcedefinitions.blockstor.io.blockstor.io/${rd}" >/dev/null 2>&1; then
+    if kubectl get "resourcedefinitions.blockstor.cozystack.io/${rd}" >/dev/null 2>&1; then
         echo "ORPHAN(crd): RD ${rd} still present" >&2
         fail=1
     fi
@@ -470,7 +470,7 @@ assert_luks_passphrase_opens() {
 cleanup_encryption_state() {
     # Resolve the passphrase Secret name (custom ref or default).
     local secret
-    secret=$(kubectl -n "$NS" get controllerconfigs.blockstor.io.blockstor.io \
+    secret=$(kubectl -n "$NS" get controllerconfigs.blockstor.cozystack.io \
         -o jsonpath='{.items[0].spec.passphraseSecretRef}' 2>/dev/null || true)
     [[ -n "$secret" ]] || secret=blockstor-cluster-passphrase
     kubectl -n "$NS" delete secret "$secret" --ignore-not-found >/dev/null 2>&1 || true

@@ -187,7 +187,7 @@ func (s *Server) createOneFromMulti(
 // multiSnapshotEntryErr packages a per-entry failure into an ApiCallRc
 // envelope, routing the underlying error string through
 // `scrubImplDetails` so backend identifiers (etcd / apimachinery /
-// k8s.io / `*.blockstor.io`) never reach the wire. Bug 199 wrapped
+// k8s.io / `*.blockstor.cozystack.io`) never reach the wire. Bug 199 wrapped
 // `writeError` at the envelope-emission seam, but `createOneFromMulti`
 // returns its envelopes to `handleSnapshotCreateMulti` which calls
 // `writeJSON` directly — that path bypasses the writeError-level

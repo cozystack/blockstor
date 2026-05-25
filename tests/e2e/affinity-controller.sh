@@ -86,7 +86,7 @@ dump_diag() {
     echo "---- view ----"
     curl -sf -m5 "http://localhost:$PF_PORT/v1/view/resources?resources=$RD" 2>/dev/null | jq . || true
     echo "---- Resource CRDs ----"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' || true
     echo "---- controller logs ----"
     kubectl -n "$NS" logs deploy/blockstor-controller --tail=60 2>/dev/null || true
@@ -113,7 +113,7 @@ done
 
 echo ">> apply 2 diskful ($N1+$N2) + 1 DISKLESS witness ($N3)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -122,7 +122,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -130,7 +130,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:
@@ -138,7 +138,7 @@ spec:
   nodeName: ${N2}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N3}}
 spec:

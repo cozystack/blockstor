@@ -1,4 +1,4 @@
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Node
 metadata:
   labels:

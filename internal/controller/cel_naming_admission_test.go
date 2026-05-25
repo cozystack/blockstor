@@ -267,7 +267,7 @@ var _ = Describe("CEL naming-convention validation", func() {
 			sp := &blockstoriov1alpha1.StoragePool{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       name,
-					Finalizers: []string{"blockstor.io.blockstor.io/satellite-storagepool"},
+					Finalizers: []string{"blockstor.cozystack.io/satellite-storagepool"},
 				},
 				Spec: blockstoriov1alpha1.StoragePoolSpec{
 					NodeName:     "w1",
@@ -299,7 +299,7 @@ var _ = Describe("CEL naming-convention validation", func() {
 			res := &blockstoriov1alpha1.Resource{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       name,
-					Finalizers: []string{"blockstor.io.blockstor.io/satellite-resource"},
+					Finalizers: []string{"blockstor.cozystack.io/satellite-resource"},
 				},
 				Spec: blockstoriov1alpha1.ResourceSpec{
 					ResourceDefinitionName: "bug71resdel",
@@ -325,7 +325,7 @@ var _ = Describe("CEL naming-convention validation", func() {
 			sn := &blockstoriov1alpha1.Snapshot{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       name,
-					Finalizers: []string{"blockstor.io.blockstor.io/satellite-snapshot"},
+					Finalizers: []string{"blockstor.cozystack.io/satellite-snapshot"},
 				},
 				Spec: blockstoriov1alpha1.SnapshotSpec{
 					ResourceDefinitionName: "bug214sndel",

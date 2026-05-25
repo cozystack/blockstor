@@ -46,9 +46,9 @@ type StoragePoolReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=storagepools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=storagepools/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=storagepools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=storagepools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=storagepools/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=storagepools/finalizers,verbs=update
 
 // Reconcile is a deliberate no-op. See StoragePoolReconciler doc for
 // the rationale (satellite is authoritative; controller-runtime is

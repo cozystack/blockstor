@@ -120,15 +120,15 @@ while (( $(date +%s) < deadline )); do
     # Match the PhysicalDevice CRD for this node + /dev/sdb. The
     # name is derived from a stable id (wwn / scsi-SATA / nvme / by-path)
     # so we can't predict it exactly; filter by node label + lsblk path.
-    pd_name=$(kubectl get physicaldevices.blockstor.io \
+    pd_name=$(kubectl get physicaldevices.blockstor.cozystack.io \
         -l "blockstor.io/node=${NODE}" \
         -o json 2>/dev/null \
         | jq -r '.items[] | select(.status.currentDevPath=="/dev/sdb" or .status.devicePath=="/dev/sdb" or (.status.currentDevPath|endswith("/sdb"))) | .metadata.name' \
         | head -1)
     if [[ -n "$pd_name" ]]; then
-        attach_to=$(kubectl get physicaldevices.blockstor.io "$pd_name" \
+        attach_to=$(kubectl get physicaldevices.blockstor.cozystack.io "$pd_name" \
             -o jsonpath='{.spec.attachTo.storagePoolName}' 2>/dev/null || echo "")
-        phase=$(kubectl get physicaldevices.blockstor.io "$pd_name" \
+        phase=$(kubectl get physicaldevices.blockstor.cozystack.io "$pd_name" \
             -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
         if [[ -z "$attach_to" ]]; then
             break
@@ -140,7 +140,7 @@ done
 if [[ -n "$attach_to" ]]; then
     echo "FAIL (Bug 340): PhysicalDevice $pd_name still has Spec.AttachTo='$attach_to' 30s after sp d" >&2
     echo "----- physicaldevice -----" >&2
-    kubectl get physicaldevices.blockstor.io "$pd_name" -o yaml >&2 || true
+    kubectl get physicaldevices.blockstor.cozystack.io "$pd_name" -o yaml >&2 || true
     echo "--------------------------" >&2
     exit 1
 fi
@@ -152,7 +152,7 @@ fi
 
 # Step 4: cross-verify the operator can immediately re-issue
 # `ps cdp` against the same device — pre-fix this required a
-# manual `kubectl edit physicaldevices.blockstor.io <name>`
+# manual `kubectl edit physicaldevices.blockstor.cozystack.io <name>`
 # to clear AttachTo first.
 echo ">> [Bug 340] verify re-issuing ps cdp works without manual intervention"
 on_node "$NODE" bash -c "

@@ -81,7 +81,7 @@ echo ">> apply 3-replica RD ${RD} on ${POOL}"
 # AutoAddQuorumTiebreaker=false: with 3 diskful replicas on a 3-node
 # cluster, the auto-tiebreaker has nowhere to land and would log-spam.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -92,7 +92,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -383,7 +383,7 @@ echo ">> wait up to 60s for ${RD}.${N3} Spec.Flags to contain DISKLESS"
 deadline=$(( $(date +%s) + 60 ))
 spec_diskless=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *"DISKLESS"* ]]; then
         spec_diskless=true
@@ -393,7 +393,7 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$spec_diskless" != "true" ]]; then
     echo "FAIL: ${RD}.${N3} Spec.Flags never gained DISKLESS after 1st r d"
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || true
     exit 1
 fi
@@ -404,12 +404,12 @@ echo ">> linstor r d ${N3} ${RD} (2nd: physical Delete from already-DISKLESS bra
 echo ">> wait up to 90s for Resource ${RD}.${N3} CRD to vanish"
 deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
-if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
+if kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
     echo "FAIL: ${RD}.${N3} still present after 2nd linstor r d (Bug 1: cascade did not clean up)"
     exit 1
 fi

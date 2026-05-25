@@ -124,8 +124,8 @@ echo ">> wait 90s for the auto-tiebreaker on $N3"
 deadline=$(( $(date +%s) + 90 ))
 TB_NODE=""
 while (( $(date +%s) < deadline )); do
-    if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+    if kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || true)
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             TB_NODE=$N3
@@ -136,7 +136,7 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ -z "$TB_NODE" ]]; then
     echo "FAIL: TIE_BREAKER witness never stamped on $N3 within 90s"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD" '$1 ~ rd'
     exit 1
 fi
@@ -204,11 +204,11 @@ deadline=$(( $(date +%s) + 10 ))
 l1_ok=false
 while (( $(date +%s) < deadline )); do
     rd_present=$(kubectl get \
-        "resourcedefinitions.blockstor.io.blockstor.io/${RD}" \
+        "resourcedefinitions.blockstor.cozystack.io/${RD}" \
         -o name 2>/dev/null || true)
-    r_n1=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N1}" \
+    r_n1=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N1}" \
         -o name 2>/dev/null || true)
-    r_n2=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    r_n2=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o name 2>/dev/null || true)
     if [[ -n "$rd_present" && -n "$r_n1" && -n "$r_n2" ]]; then
         l1_ok=true
@@ -217,12 +217,12 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$l1_ok" != "true" ]]; then
     echo "FAIL: Level 1 — RD=$rd_present  R_${N1}=$r_n1  R_${N2}=$r_n2"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD" '$1 ~ rd'
     exit 1
 fi
 # Tiebreaker Resource CRD must be gone.
-r_tb=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${TB_NODE}" \
+r_tb=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${TB_NODE}" \
     -o name 2>/dev/null || true)
 if [[ -n "$r_tb" ]]; then
     echo "FAIL: Level 1 — tiebreaker Resource CRD ${RD}.${TB_NODE} still present"
@@ -254,12 +254,12 @@ if [[ "$l2_ok" != "true" ]]; then
     "${LCTL[@]}" resource list -r "$RD" || true
     exit 1
 fi
-ANN=$(kubectl get resourcedefinitions.blockstor.io.blockstor.io "$RD" \
+ANN=$(kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" \
     -o jsonpath='{.metadata.annotations.blockstor\.io/auto-tiebreaker-suppressed-until}' \
     2>/dev/null || true)
 if [[ -z "$ANN" ]]; then
     echo "FAIL: Bug-4 suppression annotation missing on RD $RD"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io "$RD" -o yaml \
+    kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" -o yaml \
         | grep -A2 annotations || true
     exit 1
 fi

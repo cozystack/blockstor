@@ -190,7 +190,7 @@ done
 # an earlier phase, or a tiebreaker the controller hasn't reaped yet).
 # Each `r d` physically removes its CRD; Phase 5's `r c --diskless`
 # precondition requires a fully torn-down cluster.
-mapfile -t all_remaining < <(kubectl get resources.blockstor.io.blockstor.io \
+mapfile -t all_remaining < <(kubectl get resources.blockstor.cozystack.io \
     --no-headers 2>/dev/null \
     | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' \
     | sed "s/^${RD}\\.//")
@@ -217,7 +217,7 @@ wait_status_diskless "$RD" "$n1" 60 \
 
 # Sibling-shape check: $n1 must be the ONLY non-tiebreaker row, and it
 # must carry the DISKLESS flag (NOT a diskful spawn).
-n1_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n1}" \
+n1_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 [[ "$n1_flags" == *"DISKLESS"* ]] \
     || die "Phase 5: ${n1} Spec.Flags='$n1_flags' missing DISKLESS — wrong-direction spawn"
@@ -234,7 +234,7 @@ echo ">> Phase 6: r td $n1 $RD -s $SP  (diskless→diskful)"
 wait_status_state "$RD" "$n1" UpToDate 240 \
     || die "Phase 6: ${n1} never reached UpToDate after r td -s $SP"
 
-post_toggle_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n1}" \
+post_toggle_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n1}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
 [[ "$post_toggle_flags" != *"DISKLESS"* ]] \
     || die "Phase 6: ${n1} Spec.Flags='$post_toggle_flags' still contains DISKLESS after toggle to diskful"

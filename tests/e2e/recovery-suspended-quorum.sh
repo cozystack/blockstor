@@ -106,9 +106,9 @@ DISCONNECTED=0
 
 dump_diag() {
     echo "---- dump: kubectl get resources ----"
-    kubectl get resources.blockstor.io.blockstor.io -o wide 2>/dev/null || true
+    kubectl get resources.blockstor.cozystack.io -o wide 2>/dev/null || true
     echo "---- dump: kubectl get resourcedefinitions ----"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io -o wide 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.cozystack.io -o wide 2>/dev/null || true
     for n in "$N1" "$N2" "$N3"; do
         echo "---- dump: drbdsetup status on $n ----"
         on_node "$n" drbdsetup status 2>/dev/null || true
@@ -238,7 +238,7 @@ echo "   poll RD CRD to be gone"
 crd_gone=0
 deadline=$(( $(date +%s) + TEARDOWN_BUDGET ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get resourcedefinitions.blockstor.io.blockstor.io "$RD" \
+    if ! kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" \
             >/dev/null 2>&1; then
         crd_gone=1
         break
@@ -253,7 +253,7 @@ if (( crd_gone != 1 )); then
     echo "      linstor CLI exit was: $linstor_exit"
     echo "      linstor CLI stderr:"
     sed 's/^/        | /' /tmp/rd-delete-bug82.err 2>/dev/null || true
-    kubectl get resourcedefinition.blockstor.io.blockstor.io "$RD" -o yaml 2>/dev/null || true
+    kubectl get resourcedefinition.blockstor.cozystack.io "$RD" -o yaml 2>/dev/null || true
     exit 1
 fi
 echo "   RD CRD $RD gone in ${delete_secs}s (budget ${TEARDOWN_BUDGET}s)"

@@ -186,7 +186,7 @@ deadline=$(( $(date +%s) + 60 ))
 stamped=""
 while (( $(date +%s) < deadline )); do
     for node in "${diskful_nodes[@]}"; do
-        cond=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${node}" \
+        cond=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${node}" \
             -o jsonpath='{.status.conditions[?(@.type=="FilesystemFormatted")].status}' \
             2>/dev/null || echo "")
         if [[ "$cond" == "True" ]]; then
@@ -204,7 +204,7 @@ if [[ -z "$stamped" ]]; then
     echo "FAIL (Bug 311): FilesystemFormatted=True Condition never stamped on any diskful replica within 60s" >&2
     for node in "${diskful_nodes[@]}"; do
         echo "----- ${RD}.${node} status.conditions -----" >&2
-        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${node}" \
+        kubectl get "resources.blockstor.cozystack.io/${RD}.${node}" \
             -o jsonpath='{.status.conditions}' 2>&1 >&2 || true
         echo "" >&2
     done

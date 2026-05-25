@@ -74,9 +74,9 @@ PF_PID=$!
 
 dump_diag() {
     echo "---- dump: kubectl get resources -o wide ----"
-    kubectl get resources.blockstor.io.blockstor.io -o wide 2>/dev/null || true
+    kubectl get resources.blockstor.cozystack.io -o wide 2>/dev/null || true
     echo "---- dump: kubectl get resourcedefinitions -o wide ----"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io -o wide 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.cozystack.io -o wide 2>/dev/null || true
     echo "---- dump: controller log tail ----"
     kubectl -n "$NS" logs -l app=blockstor-controller --tail=80 2>/dev/null || true
 }
@@ -170,7 +170,7 @@ while (( $(date +%s) < deadline )); do
     for i in $(seq 1 "$NUM_RDS"); do
         rd="${RD_PREFIX}-${i}"
         for node in "$N1" "$N2"; do
-            port=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${node}" \
+            port=$(kubectl get resources.blockstor.cozystack.io "${rd}.${node}" \
                 -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
             if [[ -z "$port" ]]; then
                 missing=$((missing + 1))
@@ -195,9 +195,9 @@ declare -A rd_port_n1=()
 declare -A rd_port_n2=()
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
-    p1=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${N1}" \
+    p1=$(kubectl get resources.blockstor.cozystack.io "${rd}.${N1}" \
         -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
-    p2=$(kubectl get resources.blockstor.io.blockstor.io "${rd}.${N2}" \
+    p2=$(kubectl get resources.blockstor.cozystack.io "${rd}.${N2}" \
         -o jsonpath='{.status.drbdPort}' 2>/dev/null || true)
     rd_port_n1[$rd]=$p1
     rd_port_n2[$rd]=$p2

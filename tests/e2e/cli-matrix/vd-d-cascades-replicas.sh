@@ -172,7 +172,7 @@ echo ">> within 120s: per-node Resource.status.volumes must drop volume 0 on bot
 deadline=$(( $(date +%s) + 120 ))
 for N in "$N1" "$N2"; do
     while (( $(date +%s) < deadline )); do
-        vols=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
+        vols=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N}" \
             -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null || echo "")
         if ! grep -qE '(^|[[:space:]])0([[:space:]]|$)' <<<"$vols"; then
             break
@@ -180,11 +180,11 @@ for N in "$N1" "$N2"; do
         sleep 2
     done
 
-    vols=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
+    vols=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N}" \
         -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null || echo "")
     if grep -qE '(^|[[:space:]])0([[:space:]]|$)' <<<"$vols"; then
         echo "FAIL (Bug 355 deep): $RD.$N still has volume 0 in Status.Volumes 120s after vd d 0" >&2
-        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
+        kubectl get "resources.blockstor.cozystack.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
         exit 1
     fi
 done
@@ -201,14 +201,14 @@ for N in "$N1" "$N2"; do
     deadline=$(( $(date +%s) + 60 ))
     s=""
     while (( $(date +%s) < deadline )); do
-        s=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" \
+        s=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N}" \
             -o jsonpath='{.status.volumes[?(@.volumeNumber==1)].diskState}' 2>/dev/null || echo "")
         if [[ "$s" == "UpToDate" ]]; then break; fi
         sleep 2
     done
     if [[ "$s" != "UpToDate" ]]; then
         echo "FAIL (Bug 355 deep): volume 1 on $N is diskState=$s (want UpToDate) post-cascade" >&2
-        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
+        kubectl get "resources.blockstor.cozystack.io/${RD}.${N}" -o yaml 2>&1 | head -40 >&2
         exit 1
     fi
 done

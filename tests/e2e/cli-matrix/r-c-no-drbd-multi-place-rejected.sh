@@ -101,11 +101,11 @@ rm -f "$err_file" "$out_file"
 # the linstor CLI's `r l` view can be ambiguous on transient state
 # during a rejected request.
 echo ">> [Bug 335] assert no Resource CRDs leaked for rejected $RD"
-leaked=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+leaked=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
     | awk -v rd="$RD." '$1 ~ "^"rd' | wc -l)
 if (( leaked > 0 )); then
     echo "FAIL (Bug 335): gate fired but $leaked Resource CRDs leaked:" >&2
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' >&2
     exit 1
 fi

@@ -132,7 +132,7 @@ step "cleanup leftover" \
      kubectl delete resource --all --ignore-not-found --timeout=30s 2>&1 | tail -3;
      kubectl get resourcedefinitions -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=merge -p '{\"metadata\":{\"finalizers\":[]}}' >/dev/null 2>&1 || true;
      kubectl delete resourcedefinition --all --ignore-not-found --timeout=30s 2>&1 | tail -3;
-     kubectl get nodes.blockstor.io.blockstor.io -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=json -p='[{\"op\":\"remove\",\"path\":\"/spec/flags\"}]' >/dev/null 2>&1 || true"
+     kubectl get nodes.blockstor.cozystack.io -o name 2>/dev/null | xargs -r -I{} kubectl patch {} --type=json -p='[{\"op\":\"remove\",\"path\":\"/spec/flags\"}]' >/dev/null 2>&1 || true"
 
 # Tear down any DRBD resources the kernel modules still hold on the
 # satellite pods. `kubectl delete --force --grace-period=0` above

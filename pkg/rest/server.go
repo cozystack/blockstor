@@ -1156,30 +1156,25 @@ func scrubImplDetails(msg string) string {
 	out := strings.NewReplacer(replacements...).Replace(msg)
 
 	// Bug 162: apimachinery's status messages embed the
-	// GroupResource — e.g. "controllerconfigs.blockstor.io" or
-	// "controllerconfigs.blockstor.io.blockstor.io" (resource name
-	// suffixed with group, then printed as <resource>.<group>). The
-	// CRD plural names ARE the persistence backend's identity from
-	// the operator's perspective — the wire surface speaks LINSTOR,
-	// not K8s. Strip them with a regex that matches the
-	// `<word>.blockstor.io[.suffix...]` shape.
+	// GroupResource — e.g. "controllerconfigs.blockstor.cozystack.io"
+	// (resource name suffixed with group, then printed as
+	// <resource>.<group>). The CRD plural names ARE the persistence
+	// backend's identity from the operator's perspective — the wire
+	// surface speaks LINSTOR, not K8s. Strip them with a regex that
+	// matches the `<word>.blockstor.cozystack.io` shape.
 	return blockstorGroupRefRE.ReplaceAllString(out, opaque)
 }
 
 // blockstorGroupRefRE matches an apimachinery-style group/resource
-// reference rooted at our project's API group. Two shapes occur in
-// the wild:
+// reference rooted at our project's API group, e.g.
 //
-//	controllerconfigs.blockstor.io
-//	controllerconfigs.blockstor.io.blockstor.io
+//	controllerconfigs.blockstor.cozystack.io
 //
-// The first is the GroupResource.String() output; the second appears
-// when the CRD's plural itself carries the group suffix
-// (controllerconfigs.blockstor.io is the literal resource name) and
-// apimachinery re-appends the group. We greedily consume any number
-// of trailing ".blockstor.io" segments so both shapes collapse to a
-// single <backend> token.
-var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.io(\.blockstor\.io)*`)
+// which is the GroupResource.String() output that apimachinery embeds
+// in status messages. We collapse it to a single opaque <backend>
+// token so the K8s persistence identity never leaks onto the LINSTOR
+// wire.
+var blockstorGroupRefRE = regexp.MustCompile(`[a-zA-Z0-9-]+\.blockstor\.cozystack\.io`)
 
 // formatBytes renders n as a short human-readable size string for
 // operator-facing error messages. Stays in MiB/KiB granularity so

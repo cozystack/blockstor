@@ -206,7 +206,7 @@ except: print(0)")
         all_uptodate)
             local rd bad
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            bad=$(kubectl get resources.blockstor.io -o json 2>/dev/null \
+            bad=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
                 | python3 -c "import json,sys
 d=json.load(sys.stdin)
 rd='$rd'
@@ -359,7 +359,7 @@ print(json.dumps(s) if s else '')" "$step")
 
 # wait_settle <rd> [timeout_s]
 #
-# Polls `kubectl get resources.blockstor.io -o json` filtered by
+# Polls `kubectl get resources.blockstor.cozystack.io -o json` filtered by
 # spec.resourceName == rd. Considers the cluster "settled" once two
 # consecutive snapshots return identical {diskState, inUse, connections}
 # tuples across all replicas.
@@ -377,7 +377,7 @@ wait_settle() {
 
     while (( $(date +%s) < deadline )); do
         local cur
-        cur=$(kubectl get resources.blockstor.io -o json 2>/dev/null \
+        cur=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
             | python3 -c "import json,sys
 d=json.load(sys.stdin)
 rd='$rd'
@@ -417,11 +417,11 @@ print(json.dumps(keys))" 2>/dev/null || echo "[]")
 assert_no_orphans() {
     local prefix=$1
     local leftover
-    leftover=$(kubectl get resources.blockstor.io -o name 2>/dev/null \
+    leftover=$(kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
         | grep -c "$prefix" || true)
     if [[ "$leftover" -gt 0 ]]; then
         echo "  INVARIANT FAIL: $leftover Resource CRD(s) for $prefix still present" >&2
-        kubectl get resources.blockstor.io -o name 2>/dev/null | grep "$prefix" >&2 || true
+        kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null | grep "$prefix" >&2 || true
         return 1
     fi
     return 0

@@ -67,7 +67,7 @@ trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply 2-replica RD on $N1 + $N2 (no tiebreaker)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -76,7 +76,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -84,7 +84,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:

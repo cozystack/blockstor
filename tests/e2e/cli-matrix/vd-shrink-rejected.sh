@@ -76,7 +76,7 @@ deadline=$(( $(date +%s) + 90 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.io.blockstor.io -o json 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
             | jq -r --arg rd "$RD" '
                 .items[]?
                 | select(.spec.resourceDefinitionName==$rd)
@@ -90,7 +90,7 @@ while (( $(date +%s) < deadline )); do
 done
 if (( ${#placed_nodes[@]} < 2 )); then
     echo "FAIL: autoplace did not stage 2 diskful replicas (got ${#placed_nodes[@]})" >&2
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>&1 | grep "^${RD}\\." >&2
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>&1 | grep "^${RD}\\." >&2
     exit 1
 fi
 wait_uptodate "$RD" "${placed_nodes[0]}" "${placed_nodes[1]}"

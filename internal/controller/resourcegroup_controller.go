@@ -62,11 +62,11 @@ type ResourceGroupReconciler struct {
 	Store store.Store
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcegroups/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcegroups/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile finds every RD spawned from this RG and runs the placer
 // to backfill replicas missing under the new spec. Idempotent: an

@@ -262,7 +262,7 @@ func TestBug149OrphanResourceGarbageCollected(t *testing.T) {
 				// orphan-detection path triggers Delete and the
 				// satellite reconciler runs its teardown chain
 				// with the Bug 107 annotation fallback.
-				"blockstor.io.blockstor.io/satellite-resource",
+				"blockstor.cozystack.io/satellite-resource",
 			},
 			Annotations: map[string]string{
 				// Bug 107: stamped on the last successful apply
@@ -348,7 +348,7 @@ func TestBug149OrphanResourceWithDeletionTimestampAlsoGCs(t *testing.T) {
 			Name:              resourceName,
 			DeletionTimestamp: &now,
 			Finalizers: []string{
-				"blockstor.io.blockstor.io/satellite-resource",
+				"blockstor.cozystack.io/satellite-resource",
 			},
 			Annotations: map[string]string{
 				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0",

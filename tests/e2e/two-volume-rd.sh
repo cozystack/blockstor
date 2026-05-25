@@ -37,7 +37,7 @@ echo ">> apply 2-volume RD"
 # replication on the explicit 2-replica pair, the 3rd-node witness
 # would just slow initial sync and add no value here.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -49,7 +49,7 @@ spec:
 EOF
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

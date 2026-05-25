@@ -153,7 +153,7 @@ done
 
 echo ">> [331.B] 2 diskful + 1 explicit Diskless shape"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD_DISKLESS}}
 spec:
@@ -162,7 +162,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N1}}
 spec:
@@ -170,7 +170,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N2}}
 spec:
@@ -178,7 +178,7 @@ spec:
   nodeName: ${N2}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD_DISKLESS}.${N3}}
 spec:
@@ -227,7 +227,7 @@ deadline=$(( $(date +%s) + 60 ))
 tb_node=""
 while (( $(date +%s) < deadline )); do
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD_TB}.${n}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD_TB}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb_node=$n
@@ -239,7 +239,7 @@ done
 
 if [[ -z "$tb_node" ]]; then
     echo "FAIL (331.C): auto-tiebreaker never created within 60s" >&2
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD_TB." '$1 ~ "^"rd' >&2
     exit 1
 fi

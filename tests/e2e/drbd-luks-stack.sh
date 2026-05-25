@@ -45,7 +45,7 @@ trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply ${RD} with LayerStack=[DRBD,LUKS,STORAGE]"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -58,7 +58,7 @@ EOF
 
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

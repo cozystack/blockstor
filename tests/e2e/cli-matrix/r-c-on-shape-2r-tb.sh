@@ -105,7 +105,7 @@ echo ">> linstor r d $RECREATE $RD"
 echo ">> wait for $RECREATE Resource CRD to be gone"
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resources.blockstor.io.blockstor.io/${RD}.${RECREATE}" >/dev/null 2>&1; then
+    if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${RECREATE}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
@@ -128,7 +128,7 @@ ok=false
 last_flags=""
 last_disk=""
 while (( $(date +%s) < deadline )); do
-    last_flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${RECREATE}" \
+    last_flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${RECREATE}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     last_disk=$(status_disk_state "$RD" "$RECREATE" 0)
 

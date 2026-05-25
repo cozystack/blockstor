@@ -101,7 +101,7 @@ func TestResourceDefinitionReconcileDeletingSkipsTiebreaker(t *testing.T) {
 			Name:              "pvc-dying",
 			DeletionTimestamp: &now,
 			// Apply finalizer so fake-client allows the seed.
-			Finalizers: []string{"blockstor.io.blockstor.io/rd"},
+			Finalizers: []string{"blockstor.cozystack.io/rd"},
 		},
 	}
 

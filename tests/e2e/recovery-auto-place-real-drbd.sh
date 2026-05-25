@@ -89,13 +89,13 @@ PF_PID=$!
 
 dump_diag() {
     echo "---- dump: kubectl get resources -o wide ----"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' || true
     echo "---- dump: resource CRDs as yaml ----"
-    for r in $(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    for r in $(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD." '$1 ~ "^"rd {print $1}'); do
         echo "---- $r ----"
-        kubectl get "resources.blockstor.io.blockstor.io/$r" -o yaml 2>/dev/null \
+        kubectl get "resources.blockstor.cozystack.io/$r" -o yaml 2>/dev/null \
             | sed -n '1,80p' || true
     done
     echo "---- dump: linstor r l --machine-readable -r $RD ----"
@@ -211,9 +211,9 @@ echo "   convergence OK: 2 UpToDate diskful + 1 TIE_BREAKER witness + 0 StandAlo
 echo ">> step 5: kernel-side cross-check (UpToDate, no Inconsistent, all DRBDNodeIDs allocated)"
 diskful_with_id=()
 for n in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
-    flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n}" \
+    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || true)
-    node_id=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n}" \
+    node_id=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
         -o jsonpath='{.status.drbdNodeId}' 2>/dev/null || true)
     role=$(on_node "$n" drbdsetup role "$RD" 2>/dev/null \
         | tr -d '[:space:]' || true)
@@ -280,7 +280,7 @@ ap_count=0
 for n in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
     # jsonpath cannot escape the `/` in `DrbdOptions/auto-primary`,
     # so pull the whole spec.props bag as JSON and pick the key in jq.
-    val=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n}" \
+    val=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
         -o json 2>/dev/null \
         | jq -r '.spec.props["DrbdOptions/auto-primary"] // ""' 2>/dev/null || true)
     if [[ "$val" == "true" ]]; then

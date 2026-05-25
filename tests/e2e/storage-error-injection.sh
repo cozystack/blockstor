@@ -208,7 +208,7 @@ primary_res_name="${RD}.${PRIMARY}"
 # out with python3 (which is universally available on the stand and
 # already used by tests/e2e/lib.sh for port-forward port allocation).
 read_skip_disk_prop() {
-    kubectl get "resource.blockstor.io.blockstor.io/${primary_res_name}" \
+    kubectl get "resource.blockstor.cozystack.io/${primary_res_name}" \
         -o jsonpath='{.spec.props}' 2>/dev/null \
         | python3 -c "
 import sys, json
@@ -231,7 +231,7 @@ done
 if [[ "$skip_disk_value" != "True" ]]; then
     echo "FAIL: observer never stamped ${SKIP_DISK_KEY}=True on ${primary_res_name} within 30s"
     echo "   current Spec.Props:"
-    kubectl get "resource.blockstor.io.blockstor.io/${primary_res_name}" \
+    kubectl get "resource.blockstor.cozystack.io/${primary_res_name}" \
         -o jsonpath='{.spec.props}' 2>/dev/null || true
     echo
     echo "   PRIMARY drbdsetup status:"

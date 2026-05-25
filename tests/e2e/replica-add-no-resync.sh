@@ -42,7 +42,7 @@ trap 'delete_rd "$RD"' EXIT
 
 echo ">> apply 2-replica RD on $N1+$N2"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -53,7 +53,7 @@ spec:
 EOF
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -86,7 +86,7 @@ echo "  $N1->$N2 replication=$n1_before"
 
 echo ">> add 3rd replica on $N3"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N3}}
 spec:

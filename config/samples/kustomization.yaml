@@ -1,9 +1,9 @@
 ## Append samples of your project ##
 resources:
-- blockstor.io_v1alpha1_node.yaml
-- blockstor.io_v1alpha1_storagepool.yaml
-- blockstor.io_v1alpha1_resourcegroup.yaml
-- blockstor.io_v1alpha1_resourcedefinition.yaml
-- blockstor.io_v1alpha1_resource.yaml
-- blockstor.io_v1alpha1_snapshot.yaml
+- blockstor.cozystack.io_v1alpha1_node.yaml
+- blockstor.cozystack.io_v1alpha1_storagepool.yaml
+- blockstor.cozystack.io_v1alpha1_resourcegroup.yaml
+- blockstor.cozystack.io_v1alpha1_resourcedefinition.yaml
+- blockstor.cozystack.io_v1alpha1_resource.yaml
+- blockstor.cozystack.io_v1alpha1_snapshot.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

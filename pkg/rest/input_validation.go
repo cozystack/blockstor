@@ -35,7 +35,7 @@ import (
 // refused it as not-RFC-1123, and the raw apimachinery error leaked
 // to the operator:
 //
-//	ResourceDefinition.blockstor.io "6c179f21-" is invalid:
+//	ResourceDefinition.blockstor.cozystack.io "6c179f21-" is invalid:
 //	metadata.name: Invalid value: "6c179f21-": a lowercase RFC 1123
 //	subdomain must consist of …
 //

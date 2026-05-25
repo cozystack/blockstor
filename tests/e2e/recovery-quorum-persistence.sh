@@ -138,7 +138,7 @@ trap cleanup EXIT
 # step-3 patch sticks across the satellite reconciles that follow.
 echo ">> step 1: apply 3-replica RD ${RD} on ${N1}, ${N2}, ${N3} (auto-quorum disabled, quorum=majority)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -154,7 +154,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -162,7 +162,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:
@@ -170,7 +170,7 @@ spec:
   nodeName: ${N2}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N3}}
 spec:
@@ -270,7 +270,7 @@ kubectl patch resourcedefinition "$RD" --type=merge \
 # can be slow to fire-and-render — annotating the Resource Spec is a
 # deterministic kick that matches the operator-CLI muscle-memory of
 # `kubectl annotate ... reconcile=now` to force-flush a stuck loop.
-kubectl annotate --overwrite "resource.blockstor.io.blockstor.io/${RD}.${N1}" \
+kubectl annotate --overwrite "resource.blockstor.cozystack.io/${RD}.${N1}" \
     blockstor.io/reconcile-kick="$(date +%s)" >/dev/null
 
 # The satellite renders .res from the RD prop set on every reconcile.
@@ -291,7 +291,7 @@ while (( $(date +%s) < deadline )); do
     # Re-kick every 15s in case the first annotation was reconciled
     # before the controller propagated the new RD spec to the
     # satellite's cache.
-    kubectl annotate --overwrite "resource.blockstor.io.blockstor.io/${RD}.${N1}" \
+    kubectl annotate --overwrite "resource.blockstor.cozystack.io/${RD}.${N1}" \
         blockstor.io/reconcile-kick="$(date +%s)" >/dev/null 2>&1 || true
     sleep 3
 done

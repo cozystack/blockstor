@@ -73,14 +73,14 @@ deadline=$(( $(date +%s) + 60 ))
 stable=false
 last_count=0
 while (( $(date +%s) < deadline )); do
-    last_count=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    last_count=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' | wc -l)
     if (( last_count == 1 )); then
         # Give the RD reconciler a beat in case the (pre-fix) witness
         # is about to land on a stale enqueue. We poll one extra
         # period before declaring success.
         sleep 5
-        last_count=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        last_count=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD." '$1 ~ "^"rd' | wc -l)
         if (( last_count == 1 )); then
             stable=true
@@ -92,7 +92,7 @@ done
 
 if [[ "$stable" != "true" ]]; then
     echo "FAIL (Bug 334): expected exactly 1 Resource CRD for $RD; got $last_count" >&2
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' >&2
     exit 1
 fi
@@ -100,13 +100,13 @@ fi
 # Assert no TIE_BREAKER witness on any node. The pre-fix bug stamped
 # the witness on a third node — `kubectl get` exposes it via the
 # Resource.spec.flags array which carries "TIE_BREAKER".
-tb_count=$(kubectl get resources.blockstor.io.blockstor.io -o json 2>/dev/null \
+tb_count=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
     | jq --arg rd "$RD" '[.items[] | select(.spec.resourceDefinitionName == $rd)
                                   | select(.spec.flags // [] | index("TIE_BREAKER"))] | length' \
     2>/dev/null || echo 0)
 if (( tb_count > 0 )); then
     echo "FAIL (Bug 334): $tb_count TIE_BREAKER witness Resource(s) found for $RD (-l STORAGE => no witness)" >&2
-    kubectl get resources.blockstor.io.blockstor.io -o json 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
         | jq --arg rd "$RD" '.items[] | select(.spec.resourceDefinitionName == $rd) | {name: .metadata.name, flags: .spec.flags}' >&2
     exit 1
 fi

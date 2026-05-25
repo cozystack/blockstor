@@ -74,11 +74,11 @@ echo ">> stamp DrbdOptions/SkipDisk=True onto $N2 (simulates pre-upgrade defensi
 # linstor CLI's prop-set path so we mirror the observer's SSA write
 # exactly. The Bug 278 fix gates auto-clear off "prop pinned AND
 # kernel healthy", regardless of the prop's origin.
-kubectl patch "resources.blockstor.io.blockstor.io/${RD}.${N2}" --type=merge -p \
+kubectl patch "resources.blockstor.cozystack.io/${RD}.${N2}" --type=merge -p \
     '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
 
 echo ">> confirm SkipDisk is stamped on $N2 Spec.Props"
-stamped=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+stamped=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
     -o jsonpath='{.spec.props.DrbdOptions/SkipDisk}' 2>/dev/null || echo "")
 if [[ "$stamped" != "True" ]]; then
     echo "FAIL (Bug 278 setup): SkipDisk stamp did not land (got '$stamped'); aborting" >&2
@@ -118,7 +118,7 @@ echo ">> wait up to 60s for the satellite to auto-clear SkipDisk on $N2"
 # the key from Spec.Props (no other owner claims it).
 cleared=false
 for _ in $(seq 1 30); do
-    val=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    val=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o jsonpath='{.spec.props.DrbdOptions/SkipDisk}' 2>/dev/null || echo "")
     if [[ -z "$val" ]]; then
         cleared=true
@@ -129,7 +129,7 @@ done
 
 if [[ "$cleared" != "true" ]]; then
     echo "FAIL (Bug 278): SkipDisk did NOT auto-clear on $N2 within 60s after satellite restart" >&2
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o json 2>/dev/null | jq '{props: .spec.props, status: .status}' >&2 || true
     exit 1
 fi
@@ -137,7 +137,7 @@ fi
 echo ">> confirm $N2 disk state is back to UpToDate (re-attached after clear)"
 if ! wait_status_state "$RD" "$N2" "UpToDate" 60 0; then
     echo "FAIL (Bug 278 deep): SkipDisk cleared but $N2 did not re-attach to UpToDate within 60s" >&2
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o json 2>/dev/null | jq '{props: .spec.props, status: .status}' >&2 || true
     exit 1
 fi

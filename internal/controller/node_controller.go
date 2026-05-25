@@ -71,12 +71,12 @@ type NodeReconciler struct {
 	Store store.Store
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=nodes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=nodes/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=nodes/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcegroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcegroups,verbs=get;list;watch
 
 // Reconcile drives the eviction migration. On every Node change we
 // look for EVICTED; if set, every Resource on that node gets a

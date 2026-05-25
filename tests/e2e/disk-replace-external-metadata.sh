@@ -142,7 +142,7 @@ cleanup() {
     local rc=$?
     delete_rd "$RD"
     kubectl delete --wait=true --timeout=30s --ignore-not-found \
-        storagepool.blockstor.io.blockstor.io \
+        storagepool.blockstor.cozystack.io \
         "$META_SP_1" "$META_SP_2" 2>/dev/null || true
     for node in "${META_CREATED_ON[@]:-}"; do
         [[ -z "$node" ]] && continue
@@ -152,9 +152,9 @@ cleanup() {
     done
     if (( rc != 0 )); then
         echo "---- diag dump ----"
-        kubectl get resourcedefinitions.blockstor.io.blockstor.io "$RD" \
+        kubectl get resourcedefinitions.blockstor.cozystack.io "$RD" \
             -o yaml 2>/dev/null | head -40 || true
-        kubectl get resources.blockstor.io.blockstor.io 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io 2>/dev/null \
             | grep "$RD" || true
     fi
     exit "$rc"
@@ -194,7 +194,7 @@ done
 echo ">> step 2: apply StoragePool CRDs for $META_POOL on $N1, $N2"
 cat <<EOF | kubectl apply -f -
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: ${META_SP_1}
@@ -206,7 +206,7 @@ spec:
     StorDriver/LvmVg: ${META_VG}
     StorDriver/ThinPool: ${META_LVTHIN}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: ${META_SP_2}
@@ -225,7 +225,7 @@ sleep 3
 # ---------------------------------------------------------------------
 echo ">> step 3: apply RD $RD with StorPoolNameDrbdMeta=$META_POOL on $N1+$N2"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -235,7 +235,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -243,7 +243,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: ${DATA_POOL}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:

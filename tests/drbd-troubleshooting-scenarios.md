@@ -412,7 +412,7 @@ this session reproduced).
 force-strip the diskless replica's finalizer (simulating a
 recovery scenario, NOT the recommended path):
 ```bash
-kubectl patch resource.blockstor.io.blockstor.io test.<worker-3> \
+kubectl patch resource.blockstor.cozystack.io test.<worker-3> \
     --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]'
 linstor r l -r test
 # Expected: worker-3 row gone from CLI
@@ -584,7 +584,7 @@ satellite_exec() {
 wait_drbd_state() {
     local rd=$1 node=$2 want=$3 deadline=$((SECONDS + 60))
     while (( SECONDS < deadline )); do
-        got=$(kubectl get resource.blockstor.io.blockstor.io "$rd.$node" \
+        got=$(kubectl get resource.blockstor.cozystack.io "$rd.$node" \
             -o jsonpath='{.status.drbdState}' 2>/dev/null)
         [[ "$got" == "$want" ]] && return 0
         sleep 2

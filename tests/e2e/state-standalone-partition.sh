@@ -101,7 +101,7 @@ echo ">> apply 2-replica RD on $N1 + $N2 (no tiebreaker, no third witness)"
 # scenario asserts behaviour of the kernel-level connection FSM
 # between exactly two peers, and a witness would obscure it.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -110,7 +110,7 @@ spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N1}}
 spec:
@@ -118,7 +118,7 @@ spec:
   nodeName: ${N1}
   props: {StorPoolName: ${STORPOOL}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N2}}
 spec:

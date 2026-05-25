@@ -72,7 +72,7 @@ if ! wait_sync_done "$RD" "$N3" "$N1" 240; then
     # `diskState: "UpToDate(100%)"` on the CRD plus a
     # `replication:Established` line in drbdsetup status — the wire
     # didn't shed the percent suffix.
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
         -o json 2>/dev/null | jq '{flags: .spec.flags, status: .status}' >&2 || true
     on_node "$N3" drbdsetup status --verbose "$RD" 2>&1 >&2 || true
     exit 1

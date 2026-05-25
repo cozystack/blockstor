@@ -53,7 +53,7 @@ func TestAutoDisklessPromoted(t *testing.T) {
 	resCRD := &blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-promote.n1",
-			Finalizers: []string{"blockstor.io.blockstor.io/resource"},
+			Finalizers: []string{"blockstor.cozystack.io/resource"},
 		},
 		Spec: blockstoriov1alpha1.ResourceSpec{
 			ResourceDefinitionName: "pvc-promote",
@@ -118,7 +118,7 @@ func TestAutoDisklessSkipsTiebreaker(t *testing.T) {
 	resCRD := &blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-tb.n1",
-			Finalizers: []string{"blockstor.io.blockstor.io/resource"},
+			Finalizers: []string{"blockstor.cozystack.io/resource"},
 		},
 		Spec: blockstoriov1alpha1.ResourceSpec{
 			ResourceDefinitionName: "pvc-tb",
@@ -166,7 +166,7 @@ func TestAutoDisklessSkipsWhenNoPool(t *testing.T) {
 	resCRD := &blockstoriov1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-nopool.n1",
-			Finalizers: []string{"blockstor.io.blockstor.io/resource"},
+			Finalizers: []string{"blockstor.cozystack.io/resource"},
 		},
 		Spec: blockstoriov1alpha1.ResourceSpec{
 			ResourceDefinitionName: "pvc-nopool",

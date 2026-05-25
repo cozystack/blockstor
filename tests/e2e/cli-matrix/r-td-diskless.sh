@@ -71,7 +71,7 @@ rm -f "$err_file"
 echo ">> wait up to 30s for $N2 to converge to Diskless (CRD flag + observer DiskState)"
 if ! wait_status_diskless "$RD" "$N2" 30; then
     echo "FAIL (Bug 330 regression): $N2 never converged to Diskless within 30s" >&2
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o json 2>/dev/null | jq '{flags: .spec.flags, status: .status}' >&2 || true
     exit 1
 fi

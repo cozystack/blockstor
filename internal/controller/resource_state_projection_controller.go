@@ -85,9 +85,9 @@ type ResourceStateProjectionReconciler struct {
 	client.Client
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources/status,verbs=get;patch;update
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources/status,verbs=get;patch;update
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
 
 // Reconcile reads the Resource's owning Node, decides whether to
 // project Unknown or release the claim, and applies via SSA. No-op

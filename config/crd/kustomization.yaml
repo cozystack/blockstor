@@ -2,12 +2,12 @@
 # since it depends on service name and namespace that are out of this kustomize package.
 # It should be run by config/default
 resources:
-- bases/blockstor.io.blockstor.io_nodes.yaml
-- bases/blockstor.io.blockstor.io_storagepools.yaml
-- bases/blockstor.io.blockstor.io_resourcegroups.yaml
-- bases/blockstor.io.blockstor.io_resourcedefinitions.yaml
-- bases/blockstor.io.blockstor.io_resources.yaml
-- bases/blockstor.io.blockstor.io_snapshots.yaml
+- bases/blockstor.cozystack.io_nodes.yaml
+- bases/blockstor.cozystack.io_storagepools.yaml
+- bases/blockstor.cozystack.io_resourcegroups.yaml
+- bases/blockstor.cozystack.io_resourcedefinitions.yaml
+- bases/blockstor.cozystack.io_resources.yaml
+- bases/blockstor.cozystack.io_snapshots.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

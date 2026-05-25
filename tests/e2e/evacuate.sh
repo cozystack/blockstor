@@ -32,7 +32,7 @@ cleanup() {
     # Clear the EVICTED flag we stamped on $SOURCE — otherwise later
     # tests on the same cluster can't autoplace replicas there and
     # fail with "not enough candidate storage pools".
-    kubectl patch nodes.blockstor.io.blockstor.io "$SOURCE" --type=merge \
+    kubectl patch nodes.blockstor.cozystack.io "$SOURCE" --type=merge \
         -p '{"spec":{"flags":null}}' >/dev/null 2>&1 || true
 }
 
@@ -43,28 +43,28 @@ rd_apply "$RD" "$SOURCE" "$PEER"
 wait_uptodate "$RD" "$SOURCE" "$PEER"
 
 echo ">> mark $SOURCE EVICTED"
-kubectl patch nodes.blockstor.io.blockstor.io "$SOURCE" --type=merge \
+kubectl patch nodes.blockstor.cozystack.io "$SOURCE" --type=merge \
     -p '{"spec":{"flags":["EVICTED"]}}'
 
 echo ">> wait up to 60s for migration to $TARGET"
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${TARGET}" >/dev/null 2>&1; then
+    if kubectl get "resources.blockstor.cozystack.io/${RD}.${TARGET}" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
 
-if ! kubectl get "resources.blockstor.io.blockstor.io/${RD}.${TARGET}" >/dev/null 2>&1; then
+if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${TARGET}" >/dev/null 2>&1; then
     echo "FAIL: NodeReconciler did not create replacement on $TARGET"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers | awk -v rd="$RD" '$1 ~ rd'
+    kubectl get resources.blockstor.cozystack.io --no-headers | awk -v rd="$RD" '$1 ~ rd'
     exit 1
 fi
 
 # Source replica must STILL exist — EVICTED is a "drain" semantic, not
 # a "delete". LOST flag is the destructive variant (covered separately
 # by the eviction unit tests).
-if ! kubectl get "resources.blockstor.io.blockstor.io/${RD}.${SOURCE}" >/dev/null 2>&1; then
+if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${SOURCE}" >/dev/null 2>&1; then
     echo "FAIL: source replica on $SOURCE removed prematurely (EVICTED ≠ LOST)"
     exit 1
 fi

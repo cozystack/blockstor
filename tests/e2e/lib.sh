@@ -291,13 +291,13 @@ read_md5() {
 delete_rd() {
     local rd=$1
 
-    kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
-        | xargs -r kubectl delete --wait=true --timeout=30s snapshots.blockstor.io.blockstor.io 2>/dev/null || true
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        | xargs -r kubectl delete --wait=true --timeout=30s snapshots.blockstor.cozystack.io 2>/dev/null || true
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$rd." '$1 ~ "^"rd {print $1}' \
-        | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.io.blockstor.io 2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.io.blockstor.io/${rd}" 2>/dev/null || true
+        | xargs -r kubectl delete --wait=true --timeout=30s resources.blockstor.cozystack.io 2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resourcedefinitions.blockstor.cozystack.io/${rd}" 2>/dev/null || true
 
     # Force-kill any lingering kernel-level state for this RD. The
     # marker-file cleanup is essential — leaving .md-created behind
@@ -343,7 +343,7 @@ delete_all_rds() {
 
     # Enumerate first; iterate by name so an empty list is a no-op.
     local rds
-    rds=$(kubectl get resourcedefinitions.blockstor.io.blockstor.io \
+    rds=$(kubectl get resourcedefinitions.blockstor.cozystack.io \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$rds" ]]; then
         echo ">> delete_all_rds: pre-test wipe of: $(echo "$rds" | tr '\n' ' ')"
@@ -358,19 +358,19 @@ delete_all_rds() {
     # only matches by RD prefix, so a hand-leaked `foo.node` without
     # a `foo` RD slips past it.
     local res
-    res=$(kubectl get resources.blockstor.io.blockstor.io \
+    res=$(kubectl get resources.blockstor.cozystack.io \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$res" ]]; then
         echo ">> delete_all_rds: orphan Resource sweep: $(echo "$res" | tr '\n' ' ')"
         echo "$res" | xargs -r kubectl delete --wait=true --timeout=30s \
-            resources.blockstor.io.blockstor.io 2>/dev/null || true
+            resources.blockstor.cozystack.io 2>/dev/null || true
     fi
     local snaps
-    snaps=$(kubectl get snapshots.blockstor.io.blockstor.io \
+    snaps=$(kubectl get snapshots.blockstor.cozystack.io \
         --no-headers 2>/dev/null | awk '{print $1}')
     if [[ -n "$snaps" ]]; then
         echo "$snaps" | xargs -r kubectl delete --wait=true --timeout=30s \
-            snapshots.blockstor.io.blockstor.io 2>/dev/null || true
+            snapshots.blockstor.cozystack.io 2>/dev/null || true
     fi
 
     # Wait until the kernel + CRD state converges.
@@ -378,9 +378,9 @@ delete_all_rds() {
     while (( $(date +%s) < deadline )); do
         local crd_count
         crd_count=$( {
-            kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null
-            kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null
-            kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null
         } | grep -cv '^$' || true )
 
         if [[ "$crd_count" == "0" ]]; then
@@ -391,8 +391,8 @@ delete_all_rds() {
     done
 
     echo "delete_all_rds: cluster still has CRDs after ${timeout}s:" >&2
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null >&2 || true
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null >&2 || true
+    kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null >&2 || true
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null >&2 || true
     return 1
 }
 
@@ -410,9 +410,9 @@ wait_cluster_idle() {
     while (( $(date +%s) < deadline )); do
         local crd_count drbd_busy=0
         crd_count=$( {
-            kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null
-            kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null
-            kubectl get snapshots.blockstor.io.blockstor.io --no-headers 2>/dev/null
+            kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null
+            kubectl get snapshots.blockstor.cozystack.io --no-headers 2>/dev/null
         } | grep -cv '^$' || true )
 
         for pod in $(kubectl -n "$NS" get pods -l app=blockstor-satellite -o name 2>/dev/null); do
@@ -498,10 +498,10 @@ reset_cluster_state() {
     #    is left to clear the finalizer and `kubectl delete` would hang.
     #    Patching finalizers=[] makes the subsequent delete_all_rds
     #    actually complete instead of blocking on the apiserver.
-    kubectl get resources.blockstor.io.blockstor.io -o name 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
         | xargs -r -I{} kubectl patch {} --type=merge \
             -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io -o name 2>/dev/null \
+    kubectl get resourcedefinitions.blockstor.cozystack.io -o name 2>/dev/null \
         | xargs -r -I{} kubectl patch {} --type=merge \
             -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
 
@@ -731,14 +731,14 @@ _wait_port_forward() {
 rd_apply() {
     local rd=$1 primary=$2 peer=$3 size=${4:-65536} pool=${5:-${STORPOOL:-stand}}
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${rd}}
 spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${size}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${primary}}
 spec:
@@ -746,7 +746,7 @@ spec:
   nodeName: ${primary}
   props: {StorPoolName: ${pool}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${peer}}
 spec:

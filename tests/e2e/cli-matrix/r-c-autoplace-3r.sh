@@ -94,7 +94,7 @@ echo ">> wait up to 90s for all 3 replicas to land DRBD+STORAGE on $POOL"
 deadline=$(( $(date +%s) + 90 ))
 all3=false
 while (( $(date +%s) < deadline )); do
-    placed=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    placed=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' | wc -l)
     if (( placed == 3 )); then
         all3=true
@@ -105,7 +105,7 @@ done
 
 if [[ "$all3" != "true" ]]; then
     echo "FAIL (Bug 328): autoplace did not stage 3 Resource CRDs within 90s" >&2
-    kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="$RD." '$1 ~ "^"rd' >&2
     exit 1
 fi

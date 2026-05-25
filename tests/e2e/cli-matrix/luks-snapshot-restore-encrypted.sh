@@ -84,7 +84,7 @@ deadline=$(( $(date +%s) + 60 ))
 placed_src=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_src < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD_SRC." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
     )
     if (( ${#placed_src[@]} == 2 )); then break; fi
@@ -143,7 +143,7 @@ deadline=$(( $(date +%s) + 60 ))
 placed_dst=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_dst < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD_DST." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
     )
     if (( ${#placed_dst[@]} == 2 )); then break; fi

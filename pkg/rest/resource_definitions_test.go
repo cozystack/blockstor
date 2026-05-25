@@ -489,7 +489,7 @@ func TestResourceDefinitionsDeleteMissingRD(t *testing.T) {
 // cascade: every child Resource must be deleted before the RD
 // itself goes. Without the cascade, child Resource CRDs never
 // receive a DeletionTimestamp, the satellite's
-// `blockstor.io.blockstor.io/satellite-resource` finalizer never
+// `blockstor.cozystack.io/satellite-resource` finalizer never
 // fires, and DRBD kernel state (minor numbers, TCP ports, peer
 // entries) lingers on every node — the next RD-create with the
 // same name then collides on a stale port or sees half-configured

@@ -205,7 +205,7 @@ for cycle in 1 2 3; do
     deadline=$(( $(date +%s) + 30 ))
     inactive_seen=false
     while (( $(date +%s) < deadline )); do
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"INACTIVE"* ]]; then
             inactive_seen=true
@@ -215,7 +215,7 @@ for cycle in 1 2 3; do
     done
     if ! $inactive_seen; then
         echo "FAIL (cycle $cycle): $N2 never got INACTIVE flag within 30s" >&2
-        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
+        kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
         exit 1
     fi
 
@@ -344,7 +344,7 @@ for cycle in 1 2 3; do
     deadline=$(( $(date +%s) + 30 ))
     cleared=false
     while (( $(date +%s) < deadline )); do
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" != *"INACTIVE"* ]]; then
             cleared=true
@@ -354,7 +354,7 @@ for cycle in 1 2 3; do
     done
     if ! $cleared; then
         echo "FAIL (cycle $cycle): INACTIVE flag never cleared on $N2 within 30s" >&2
-        kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
+        kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
         exit 1
     fi
 

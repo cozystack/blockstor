@@ -164,7 +164,7 @@ _out=$("${LCTL[@]}" snapshot create "$N1" "$N2" "$RD" "$SNAP1" 2>&1) \
 #   Phase 3e: Spec.SuspendIo=false (controller resume-io)
 
 snap_json() {
-    kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+    kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
         | jq -c --arg rd "$RD" --arg s "$1" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)
@@ -362,7 +362,7 @@ echo "   $N2 snap md5 = $md5_n2"
 
 if [[ -z "$md5_n1" || -z "$md5_n2" ]]; then
     echo "FAIL: could not read snapshot backing on one or both nodes" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io -o yaml 2>&1 | head -80 >&2
+    kubectl get snapshots.blockstor.cozystack.io -o yaml 2>&1 | head -80 >&2
     exit 1
 fi
 

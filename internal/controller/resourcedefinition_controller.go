@@ -116,10 +116,10 @@ type ResourceDefinitionReconciler struct {
 	APIReader client.Reader
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions/finalizers,verbs=update
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions/finalizers,verbs=update
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile ensures the tiebreaker for a 2-replica RD. Idempotent:
 // re-running on an RD that already has its tiebreaker is a no-op.

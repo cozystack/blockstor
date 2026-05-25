@@ -116,7 +116,7 @@ _out=$("${LCTL[@]}" snapshot create "$SRC" "$SNAP" 2>&1) \
 # Wait Successful.
 deadline=$(( $(date +%s) + 60 ))
 while (( $(date +%s) < deadline )); do
-    ok=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+    ok=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
         | jq -r --arg rd "$SRC" --arg s "$SNAP" '
             # Why: Snapshot CRD shape is spec.nodes[] + status.nodeStatus[]
             # {nodeName, ready}. Old `.status.successful` field does not
@@ -163,7 +163,7 @@ n_resources=0
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="${TGT}." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
     )
     n_resources=${#placed_nodes[@]}
@@ -179,9 +179,9 @@ if (( n_resources == 0 )); then
     echo "----- linstor rd l -----" >&2
     "${LCTL[@]}" resource-definition list --resource-definitions "$TGT" 2>&1 | head -10 >&2
     echo "----- kubectl get rd $TGT -----" >&2
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io "$TGT" -o yaml 2>&1 | head -40 >&2
+    kubectl get resourcedefinitions.blockstor.cozystack.io "$TGT" -o yaml 2>&1 | head -40 >&2
     echo "----- kubectl get resources for $TGT -----" >&2
-    kubectl get resources.blockstor.io.blockstor.io 2>/dev/null | grep -E "(^${TGT}\\.| RESOURCE)" | head -10 >&2 || echo "(none)"
+    kubectl get resources.blockstor.cozystack.io 2>/dev/null | grep -E "(^${TGT}\\.| RESOURCE)" | head -10 >&2 || echo "(none)"
     exit 1
 fi
 

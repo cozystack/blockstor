@@ -38,7 +38,7 @@ echo ">> wait 60s for ResourceDefinitionReconciler to add tiebreaker"
 deadline=$(( $(date +%s) + 60 ))
 witness_found=false
 while (( $(date +%s) < deadline )); do
-    if kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
+    if kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
         witness_found=true
         break
     fi
@@ -47,11 +47,11 @@ done
 
 if [[ "$witness_found" != "true" ]]; then
     echo "FAIL: tiebreaker witness not created on $N3 (waited $(( $(date +%s) - (deadline - 60) ))s)"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers | awk -v rd="$RD" '$1 ~ rd'
+    kubectl get resources.blockstor.cozystack.io --no-headers | awk -v rd="$RD" '$1 ~ rd'
     exit 1
 fi
 
-flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}')
 
 if [[ "$flags" != *"DISKLESS"* || "$flags" != *"TIE_BREAKER"* ]]; then
@@ -64,7 +64,7 @@ fi
 # negotiation, TIE_BREAKER overrides that. Run a brief observation
 # window to confirm the flag survives.
 sleep 15
-flags_post=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N3}" \
+flags_post=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}')
 if [[ "$flags_post" != *"DISKLESS"* ]]; then
     echo "FAIL: tiebreaker auto-promoted (DISKLESS dropped: $flags_post)"

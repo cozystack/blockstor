@@ -31,23 +31,23 @@ SIZE_KIB=65536  # 64 MiB
 # collide with leftover state from prior smoke iterations.
 
 cleanup() {
-    kubectl delete --wait=true --timeout=30s "resource.blockstor.io.blockstor.io/${RD}.${PRIMARY}" 2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resource.blockstor.io.blockstor.io/${RD}.${PEER}"    2>/dev/null || true
-    kubectl delete --wait=true --timeout=30s "resourcedefinition.blockstor.io.blockstor.io/${RD}"  2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resource.blockstor.cozystack.io/${RD}.${PRIMARY}" 2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resource.blockstor.cozystack.io/${RD}.${PEER}"    2>/dev/null || true
+    kubectl delete --wait=true --timeout=30s "resourcedefinition.blockstor.cozystack.io/${RD}"  2>/dev/null || true
 }
 
 trap cleanup EXIT
 
 echo ">> creating ResourceDefinition + 2 Resources"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${SIZE_KIB}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PRIMARY}}
 spec:
@@ -55,7 +55,7 @@ spec:
   nodeName: ${PRIMARY}
   props: {StorPoolName: stand}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PEER}}
 spec:

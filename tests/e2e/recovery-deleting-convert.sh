@@ -173,7 +173,7 @@ assert_uptodate_12() {
 
 echo ">> apply 3-replica RD ${RD} on ${N1}/${N2}/${N3} (autoplace off)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -184,7 +184,7 @@ spec:
 EOF
 for n in "$N1" "$N2" "$N3"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -257,16 +257,16 @@ echo "   satellite on ${N3} is gone"
 echo ">> delete Resource ${RD}.${N3} (will get stuck in 'DELETING')"
 # Don't --wait — the delete will never finish on its own; we'll drive
 # it home with the toggle-disk recipe below.
-kubectl delete --wait=false "resource.blockstor.io.blockstor.io/${RD}.${N3}"
+kubectl delete --wait=false "resource.blockstor.cozystack.io/${RD}.${N3}"
 
 # Confirm it landed in the "stuck deleting" state, not "actually
 # gone". A successful immediate delete here would mean blockstor isn't
 # stamping the satellite finalizer at all — that's a separate bug, but
 # either way the scenario can't proceed without a stuck CRD to recover.
 sleep 5
-dt=$(kubectl get "resource.blockstor.io.blockstor.io/${RD}.${N3}" \
+dt=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)
-finalizers=$(kubectl get "resource.blockstor.io.blockstor.io/${RD}.${N3}" \
+finalizers=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.metadata.finalizers}' 2>/dev/null || true)
 echo "   N3 replica deletionTimestamp=${dt:-<missing>}  finalizers=${finalizers:-<none>}"
 if [[ -z "$dt" ]]; then
@@ -315,7 +315,7 @@ fi
 # The handler updates Spec.Flags["DISKLESS"]. Verify by reading the
 # CRD — Spec must show the flag, regardless of whether the object is
 # mid-deletion.
-post_flags=$(kubectl get "resource.blockstor.io.blockstor.io/${RD}.${N3}" \
+post_flags=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
     -o jsonpath='{.spec.flags}' 2>/dev/null || true)
 echo "   ${RD}.${N3} spec.flags after toggle-disk = ${post_flags}"
 if [[ "$post_flags" != *"DISKLESS"* ]]; then
@@ -366,7 +366,7 @@ echo ">> wait up to 60s for ${RD}.${N3} CRD to vanish"
 deadline=$(( $(date +%s) + 60 ))
 gone=false
 while (( $(date +%s) < deadline )); do
-    if ! kubectl get "resource.blockstor.io.blockstor.io/${RD}.${N3}" >/dev/null 2>&1; then
+    if ! kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
         gone=true
         break
     fi
@@ -374,7 +374,7 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$gone" != "true" ]]; then
     echo "FAIL: ${RD}.${N3} CRD still present after satellite respawn + toggle-disk recipe"
-    kubectl get "resource.blockstor.io.blockstor.io/${RD}.${N3}" -o yaml 2>/dev/null || true
+    kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" -o yaml 2>/dev/null || true
     exit 1
 fi
 echo "   ${RD}.${N3} CRD is gone — recipe converged"

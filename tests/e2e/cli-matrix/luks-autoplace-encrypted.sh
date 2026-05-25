@@ -90,7 +90,7 @@ deadline=$(( $(date +%s) + 90 ))
 placed=()
 while (( $(date +%s) < deadline )); do
     mapfile -t placed < <(
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
     )
     if (( ${#placed[@]} == 3 )); then break; fi

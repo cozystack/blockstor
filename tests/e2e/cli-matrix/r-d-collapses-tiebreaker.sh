@@ -77,7 +77,7 @@ while (( $(date +%s) < deadline )); do
     pair=()
     tb=""
     for n in "$N1" "$N2" "$N3"; do
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${n}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${n}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" == *"TIE_BREAKER"* ]]; then
             tb=$n
@@ -131,7 +131,7 @@ last_rows=""
 while (( $(date +%s) < deadline )); do
     # Count CRDs for this RD — exactly 1 row should remain (the
     # surviving diskful).
-    rows=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+    rows=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' || true)
     n_rows=$(printf '%s\n' "$rows" | grep -cv '^$' || true)
     last_rows="$rows"
@@ -139,7 +139,7 @@ while (( $(date +%s) < deadline )); do
     if (( n_rows == 1 )); then
         # Verify the lone survivor is NOT the tiebreaker.
         survivor=$(printf '%s\n' "$rows" | head -1)
-        flags=$(kubectl get "resources.blockstor.io.blockstor.io/${survivor}" \
+        flags=$(kubectl get "resources.blockstor.cozystack.io/${survivor}" \
             -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
         if [[ "$flags" != *"TIE_BREAKER"* ]] && [[ "$flags" != *"DISKLESS"* ]]; then
             collapsed=true

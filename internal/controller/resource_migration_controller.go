@@ -73,8 +73,8 @@ type ResourceMigrationReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;update;patch;delete
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources/status,verbs=get
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources/status,verbs=get
 
 // Reconcile drives one pass over the destination Resource:
 // no-op if the migrating-from prop is absent (or stale),

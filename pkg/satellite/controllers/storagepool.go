@@ -37,7 +37,7 @@ import (
 // registered on this satellite. Strips on delete so the
 // apiserver finalises only after the in-memory provider has
 // been deregistered. Phase 10.8.
-const StoragePoolFinalizer = "blockstor.io.blockstor.io/satellite-storagepool"
+const StoragePoolFinalizer = "blockstor.cozystack.io/satellite-storagepool"
 
 // capacityResyncInterval is the cadence the StoragePoolReconciler
 // reschedules itself at to refresh `Status.FreeCapacity` /

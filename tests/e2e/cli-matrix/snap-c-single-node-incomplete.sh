@@ -101,7 +101,7 @@ while (( $(date +%s) < deadline )); do
     # status.flags[] = ["FAILED"]. For Bug 352 we want every node
     # in spec.nodes to appear in nodeStatus with ready=true AND
     # no FAILED flag.
-    rows=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+    rows=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
         | jq -c --arg rd "$RD" --arg s "$SNAP" '
             [.items[]?
              | select(.spec.resourceDefinitionName==$rd)
@@ -134,14 +134,14 @@ if ! $ok; then
     echo "----- linstor snapshot list -----" >&2
     "${LCTL[@]}" snapshot list 2>&1 | head -20 >&2
     echo "----- kubectl get snapshots -----" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io -o yaml 2>&1 | head -80 >&2
+    kubectl get snapshots.blockstor.cozystack.io -o yaml 2>&1 | head -80 >&2
     exit 1
 fi
 
 # Extra sanity: $N2 must NOT appear in spec.nodes of the snapshot.
 # If blockstor expanded the node-list to include $N2 (ignoring the
 # explicit single-node restriction), that's a different bug.
-n2_rows=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
+n2_rows=$(kubectl get snapshots.blockstor.cozystack.io -o json 2>/dev/null \
     | jq -r --arg rd "$RD" --arg s "$SNAP" --arg n "$N2" '
         [.items[]?
          | select(.spec.resourceDefinitionName==$rd)
@@ -149,7 +149,7 @@ n2_rows=$(kubectl get snapshots.blockstor.io.blockstor.io -o json 2>/dev/null \
          | select((.spec.nodes // []) | index($n))] | length')
 if [[ "${n2_rows:-0}" != "0" ]]; then
     echo "FAIL (Bug 352 sibling): snapshot CRD created on $N2 even though the request specified only $N1" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io -o yaml 2>&1 | head -80 >&2
+    kubectl get snapshots.blockstor.cozystack.io -o yaml 2>&1 | head -80 >&2
     exit 1
 fi
 

@@ -96,7 +96,7 @@ echo ">> wait up to 30s for INACTIVE flag visible on $N2 + .res rewrite on $N1"
 deadline=$(( $(date +%s) + 30 ))
 inactive_seen=false
 while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" \
+    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \
         -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
     if [[ "$flags" == *"INACTIVE"* ]]; then
         inactive_seen=true
@@ -106,7 +106,7 @@ while (( $(date +%s) < deadline )); do
 done
 if ! $inactive_seen; then
     echo "FAIL: $N2 never got INACTIVE flag after r deactivate within 30s" >&2
-    kubectl get "resources.blockstor.io.blockstor.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
+    kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" -o yaml 2>&1 | tail -30 >&2
     exit 1
 fi
 # Extra settle window for the .res rewrite to propagate on $N1.

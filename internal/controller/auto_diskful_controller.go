@@ -82,8 +82,8 @@ type AutoDiskfulReconciler struct {
 	Now func() time.Time
 }
 
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;update;patch
 
 // Reconcile drives the auto-diskful timer for one ResourceDefinition.
 // The body is intentionally thin: configuration, deficit-evaluation,

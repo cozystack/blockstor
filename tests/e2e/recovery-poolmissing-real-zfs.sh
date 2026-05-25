@@ -110,7 +110,7 @@ cleanup() {
     local rc=$?
     if (( rc != 0 )); then
         echo "---- DIAG: storagepool CRD status on $NODE ----" >&2
-        kubectl get storagepool.blockstor.io.blockstor.io "${POOL}.${NODE}" \
+        kubectl get storagepool.blockstor.cozystack.io "${POOL}.${NODE}" \
             -o yaml 2>&1 | tail -40 >&2 || true
         echo "---- DIAG: REST view ----" >&2
         curl -fsS "http://127.0.0.1:${PF_PORT}/v1/view/storage-pools?nodes=${NODE}&storage_pools=${POOL}" \
@@ -143,7 +143,7 @@ cleanup() {
         # enough; we double it for QEMU-stand jitter.
         local deadline=$(( $(date +%s) + 60 ))
         while (( $(date +%s) < deadline )); do
-            pm=$(kubectl get storagepool.blockstor.io.blockstor.io \
+            pm=$(kubectl get storagepool.blockstor.cozystack.io \
                 "${POOL}.${NODE}" -o jsonpath='{.status.poolMissing}' 2>/dev/null || echo "")
             [[ "$pm" != "true" ]] && break
             sleep 3

@@ -65,14 +65,14 @@ trap 'delete_rd "$RD_DST"; delete_rd "$RD_SRC"' EXIT
 rd_apply_pool() {
     local rd=$1 primary=$2 peer=$3 pool=$4 size=${5:-65536}
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${rd}}
 spec:
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: ${size}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${primary}}
 spec:
@@ -80,7 +80,7 @@ spec:
   nodeName: ${primary}
   props: {StorPoolName: ${pool}}
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${rd}.${peer}}
 spec:

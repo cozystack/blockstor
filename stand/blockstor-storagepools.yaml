@@ -27,7 +27,7 @@
 # disk isn't available — every Talos worker mounts
 # /var/lib/blockstor-pool as ext4, so `Dir` resolves and the
 # satellite's loopfile provider runs.
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: stand.__WORKER_1__
@@ -38,7 +38,7 @@ spec:
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: stand.__WORKER_2__
@@ -49,7 +49,7 @@ spec:
   props:
     StorDriver/FileDir: /var/lib/blockstor-pool
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: stand.__WORKER_3__
@@ -65,7 +65,7 @@ spec:
 # effect. Empty/missing VG produces a provider that returns
 # `vg not found` on PoolStatus until the operator fixes the
 # stand.
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: lvm-thin.__WORKER_1__
@@ -77,7 +77,7 @@ spec:
     StorDriver/LvmVg: blockstor-lvm
     StorDriver/ThinPool: thin
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: lvm-thin.__WORKER_2__
@@ -89,7 +89,7 @@ spec:
     StorDriver/LvmVg: blockstor-lvm
     StorDriver/ThinPool: thin
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: lvm-thin.__WORKER_3__
@@ -107,7 +107,7 @@ spec:
 # the `sp l` PoolName column). The satellite's factory.go accepts
 # both ZPoolThin (canonical, used here) and the legacy ZPool name
 # for backwards-compat with stands deployed before the rename.
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: zfs-thin.__WORKER_1__
@@ -118,7 +118,7 @@ spec:
   props:
     StorDriver/ZPoolThin: blockstor-zfs
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: zfs-thin.__WORKER_2__
@@ -129,7 +129,7 @@ spec:
   props:
     StorDriver/ZPoolThin: blockstor-zfs
 ---
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: StoragePool
 metadata:
   name: zfs-thin.__WORKER_3__

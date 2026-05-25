@@ -92,7 +92,7 @@ const physicalDeviceConditionDeviceMissing = "DeviceMissing"
 // stamps the finalizer on first observation of `Spec.AttachTo`,
 // and strips it just before its delete-as-completion call.
 // Phase 10.7 step 5 / 10.8 line 4.
-const PhysicalDeviceAttachFinalizer = "blockstor.io.blockstor.io/physicaldevice-attach"
+const PhysicalDeviceAttachFinalizer = "blockstor.cozystack.io/physicaldevice-attach"
 
 // PhysicalDeviceReconciler runs the attach sequence on
 // PhysicalDevice CRDs scoped to this satellite's node. It is

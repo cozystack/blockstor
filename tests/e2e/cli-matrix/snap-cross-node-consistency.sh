@@ -135,7 +135,7 @@ ok=false
 while (( $(date +%s) < deadline )); do
     # Why: Snapshot CRD shape uses status.nodeStatus[].ready per
     # spec.nodes[], not legacy status.successful. False-PASS guard.
-    succ=$(kubectl get snapshots.blockstor.io.blockstor.io \
+    succ=$(kubectl get snapshots.blockstor.cozystack.io \
         -o json 2>/dev/null | jq -r --arg rd "$RD" --arg s "$SNAP" '
         [.items[]?
          | select(.spec.resourceDefinitionName==$rd)
@@ -162,7 +162,7 @@ on_node "$N1" bash -c "
 
 if ! $ok; then
     echo "FAIL: snapshot $SNAP never converged to Successful on both nodes in 60s" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io 2>&1 | head -20 >&2
+    kubectl get snapshots.blockstor.cozystack.io 2>&1 | head -20 >&2
     exit 1
 fi
 
@@ -228,7 +228,7 @@ echo "   $N2 snap md5 = $md5_n2"
 if [[ -z "$md5_n1" || -z "$md5_n2" ]]; then
     echo "FAIL: could not read snapshot backing on one or both nodes" >&2
     echo "----- diagnostic: snapshot CRDs -----" >&2
-    kubectl get snapshots.blockstor.io.blockstor.io 2>&1 | head -20 >&2
+    kubectl get snapshots.blockstor.cozystack.io 2>&1 | head -20 >&2
     exit 1
 fi
 

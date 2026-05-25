@@ -21,7 +21,7 @@ metadata:
   name: satellite-role
 rules:
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - resourcegroups
   - resourcedefinitions
@@ -33,7 +33,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - resources
   verbs:
@@ -43,13 +43,13 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - resources/finalizers
   verbs:
   - update
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - resources/status
   - storagepools/status
@@ -61,7 +61,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - storagepools
   verbs:
@@ -71,7 +71,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - blockstor.io.blockstor.io
+  - blockstor.cozystack.io
   resources:
   - physicaldevices
   verbs:

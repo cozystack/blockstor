@@ -140,7 +140,7 @@ echo ">> apply 2-replica RD on $PRIMARY + $PEER"
 # times out at the test's 180s budget. Tiebreaker isn't part of
 # the rolling-upgrade contract — strip it.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -151,7 +151,7 @@ spec:
 EOF
 for n in "$PRIMARY" "$PEER"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:

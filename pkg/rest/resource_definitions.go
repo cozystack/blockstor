@@ -1018,7 +1018,7 @@ func (s *Server) handleRDDelete(w http.ResponseWriter, r *http.Request) {
 	// DELETE on each. The satellite drives the teardown from
 	// there. Our equivalent is: per-child Resources().Delete()
 	// stamps DeletionTimestamp on the CRD; the satellite's
-	// existing `blockstor.io.blockstor.io/satellite-resource`
+	// existing `blockstor.cozystack.io/satellite-resource`
 	// finalizer then drains DRBD before the apiserver removes
 	// the object.
 	err = s.cascadeDeleteResources(r.Context(), name)

@@ -137,7 +137,7 @@ trap cleanup EXIT
 
 echo ">> step 1: apply 2-replica RD on $N1 + $N2 (pool=$HEALTHY_POOL)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -148,7 +148,7 @@ spec:
 EOF
 for n in "$N1" "$N2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -182,7 +182,7 @@ echo ">> step 3: register N3 as a diskless replica, then provoke stuck toggle"
 # exists. Create the diskless witness first so the controller has
 # a Resource row to flip.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${N3}}
 spec:

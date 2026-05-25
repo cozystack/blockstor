@@ -252,7 +252,7 @@ func vdDeletionVisible(ctx context.Context, st store.Store, rdName string, volum
 // the Snapshot CRD's satellite-side finalizer never runs (paused /
 // disconnected / crashed satellite). The DELETE call lands K8s-side
 // metadata.deletionTimestamp but the CRD survives until the
-// satellite reconciler drops `blockstor.io.blockstor.io/satellite-
+// satellite reconciler drops `blockstor.cozystack.io/satellite-
 // snapshot` from the finalizer list. Operators saw orphan Snapshot
 // CRDs piling up under `kubectl get snapshot` because the apiserver's
 // success reply made them (and CSI replays) move on, none the wiser.

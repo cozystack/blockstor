@@ -23,7 +23,7 @@ limitations under the License.
 //     for goroutines with reconcile workers.
 //
 //  2. RBAC narrows. The reconciler still needs CRUD on every
-//     blockstor.io CRD; the apiserver only needs read-mostly access
+//     blockstor.cozystack.io CRD; the apiserver only needs read-mostly access
 //     plus the few create/delete verbs the upstream LINSTOR REST
 //     contract exposes (RD create, Resource create, Snapshot create,
 //     and so on).

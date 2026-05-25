@@ -56,8 +56,8 @@ dump_diag() {
     echo "---- dump: kubectl logs -n blockstor-system deploy/blockstor-controller --tail=120 ----"
     kubectl logs -n blockstor-system deploy/blockstor-controller --tail=120 || true
     echo "---- dump: kubectl get resourcedefinitions / resources ----"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io 2>/dev/null || true
-    kubectl get resources.blockstor.io.blockstor.io 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.cozystack.io 2>/dev/null || true
+    kubectl get resources.blockstor.cozystack.io 2>/dev/null || true
 }
 
 cleanup() {
@@ -94,8 +94,8 @@ LCTL=(linstor --controllers "http://localhost:$PF_PORT")
 # and BEFORE the churn loop so the loop starts on a clean slate.
 delete_all_rds 90 || {
     echo "FAIL: stand not idle at test start, cannot trust post-state invariants"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io 2>/dev/null || true
-    kubectl get resources.blockstor.io.blockstor.io 2>/dev/null || true
+    kubectl get resourcedefinitions.blockstor.cozystack.io 2>/dev/null || true
+    kubectl get resources.blockstor.cozystack.io 2>/dev/null || true
     exit 1
 }
 
@@ -160,10 +160,10 @@ for i in $(seq 1 "$ITERS"); do
     # Wait full cascade.
     deadline=$(( $(date +%s) + DEL_TIMEOUT ))
     while (( $(date +%s) < deadline )); do
-        res_left=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        res_left=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD." '$1 ~ "^"rd' | wc -l)
         rd_present=0
-        if kubectl get "resourcedefinitions.blockstor.io.blockstor.io/${RD}" >/dev/null 2>&1; then
+        if kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
             rd_present=1
         fi
         if (( res_left == 0 && rd_present == 0 )); then
@@ -174,7 +174,7 @@ for i in $(seq 1 "$ITERS"); do
 
     if (( res_left != 0 || rd_present != 0 )); then
         echo "FAIL[iter=$i]: cascade incomplete after ${DEL_TIMEOUT}s — res_left=$res_left rd_present=$rd_present"
-        kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="$RD." '$1 ~ "^"rd' || true
         exit 1
     fi
@@ -199,20 +199,20 @@ if (( r_left != 0 )); then
 fi
 
 # 2. No orphan Resource CRDs with churn-N. prefix
-orphans=$(kubectl get resources.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+orphans=$(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
     | awk -v p="$RD_PREFIX-" '$1 ~ "^"p' | wc -l)
 if (( orphans != 0 )); then
     echo "FAIL: orphan Resource CRDs matching ${RD_PREFIX}-*:"
-    kubectl get resources.blockstor.io.blockstor.io --no-headers \
+    kubectl get resources.blockstor.cozystack.io --no-headers \
         | awk -v p="$RD_PREFIX-" '$1 ~ "^"p'
     exit 1
 fi
 
-rd_orphans=$(kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers 2>/dev/null \
+rd_orphans=$(kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers 2>/dev/null \
     | awk -v p="$RD_PREFIX-" '$1 ~ "^"p' | wc -l)
 if (( rd_orphans != 0 )); then
     echo "FAIL: orphan ResourceDefinition CRDs matching ${RD_PREFIX}-*:"
-    kubectl get resourcedefinitions.blockstor.io.blockstor.io --no-headers \
+    kubectl get resourcedefinitions.blockstor.cozystack.io --no-headers \
         | awk -v p="$RD_PREFIX-" '$1 ~ "^"p'
     exit 1
 fi

@@ -123,9 +123,9 @@ echo "   diskful: ${diskful[*]}  tiebreaker: $tieB"
 # Capture peers' initial currentGI — this is the signal that
 # seedInitialGi would have to match for skip-sync to fire.
 echo ">> capture diskful peers' currentGi (pre-promote)"
-gi_n1=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${diskful[0]}" \
+gi_n1=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${diskful[0]}" \
     -o jsonpath='{.status.volumes[0].currentGi}' 2>/dev/null || echo "")
-gi_n2=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${diskful[1]}" \
+gi_n2=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${diskful[1]}" \
     -o jsonpath='{.status.volumes[0].currentGi}' 2>/dev/null || echo "")
 echo "   ${diskful[0]} currentGi=$gi_n1"
 echo "   ${diskful[1]} currentGi=$gi_n2"
@@ -151,7 +151,7 @@ while (( $(date +%s) < deadline )); do
     # output (mirrors `linstor r l -o json`). Pull both diskState
     # and replicationState from observer-stamped Status.
     promoted_disk=$(status_disk_state "$RD" "$tieB" 0)
-    promoted_rep=$(kubectl get "resources.blockstor.io.blockstor.io/${RD}.${tieB}" \
+    promoted_rep=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${tieB}" \
         -o jsonpath='{.status.volumes[0].replicationState}' 2>/dev/null || echo "")
 
     # Bug 347 signature: the promoted replica is Inconsistent OR

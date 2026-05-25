@@ -111,7 +111,7 @@ echo ">> create 2-replica RD on $WORKER_1 + $WORKER_2 (zfs-thin pool)"
 # "$WORKER_3 has no copy" sanity check below would then trip on
 # the auto-witness and FAIL before any migration happened.
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: ResourceDefinition
 metadata: {name: ${RD}}
 spec:
@@ -122,7 +122,7 @@ spec:
 EOF
 for n in "$WORKER_1" "$WORKER_2"; do
     cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${n}}
 spec:
@@ -192,7 +192,7 @@ stop_watch() {
 # ---------- Step 1: declare diskless intent on $WORKER_3 ----------
 echo ">> step 1: PUT diskless Resource $RD.$WORKER_3 (intent)"
 cat <<EOF | kubectl apply -f -
-apiVersion: blockstor.io.blockstor.io/v1alpha1
+apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${WORKER_3}}
 spec:
