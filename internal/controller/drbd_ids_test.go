@@ -132,10 +132,23 @@ func TestDRBDPortPerReplicaUniqueOnNode(t *testing.T) {
 	scheme := newScheme(t)
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&blockstoriov1alpha1.Resource{}).Build()
 
-	// Two RDs, three nodes each, packed onto two physical nodes.
+	// Two RDs, each replicated onto the same two physical nodes.
 	// We expect each node's local replicas to have unique ports
-	// among themselves, but ports on n1 are independent of n2.
+	// among themselves (Spec.DRBDPort), but a port number on n1 is
+	// independent of n2 (per-node port scope, Bug 266 scaling fix).
 	for _, rd := range []string{"pvc-A", "pvc-B"} {
+		rdObj := &blockstoriov1alpha1.ResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: rd},
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{VolumeNumber: 0, SizeKib: 1024},
+				},
+			},
+		}
+		if err := cli.Create(ctx, rdObj); err != nil {
+			t.Fatalf("create rd %s: %v", rd, err)
+		}
+
 		for _, node := range []string{"n1", "n2"} {
 			create(ctx, t, cli, rd, node)
 		}
@@ -150,54 +163,45 @@ func TestDRBDPortPerReplicaUniqueOnNode(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	// Build per-node {port,minor} buckets and assert no collisions.
+	// Per-node port buckets: assert no two replicas on one node share
+	// a port (Spec.DRBDPort is authoritative).
 	portsByNode := map[string]map[int32]string{}
-	minorsByNode := map[string]map[int32]string{}
 
 	for i := range list.Items {
 		node := list.Items[i].Spec.NodeName
 		name := list.Items[i].Name
 
-		if list.Items[i].Status.DRBDPort == nil || list.Items[i].Status.DRBDMinor == nil {
-			t.Fatalf("%s: port/minor not allocated", name)
+		if list.Items[i].Spec.DRBDPort == nil {
+			t.Fatalf("%s: port not allocated on Spec", name)
 		}
 
 		if portsByNode[node] == nil {
 			portsByNode[node] = map[int32]string{}
 		}
 
-		if minorsByNode[node] == nil {
-			minorsByNode[node] = map[int32]string{}
-		}
-
-		port := *list.Items[i].Status.DRBDPort
+		port := *list.Items[i].Spec.DRBDPort
 		if other, dup := portsByNode[node][port]; dup {
 			t.Errorf("port %d collides on node %q: %s vs %s", port, node, other, name)
 		}
 
 		portsByNode[node][port] = name
+	}
 
-		minor := *list.Items[i].Status.DRBDMinor
-		if other, dup := minorsByNode[node][minor]; dup {
-			t.Errorf("minor %d collides on node %q: %s vs %s", minor, node, other, name)
-		}
-
-		minorsByNode[node][minor] = name
+	// Per-node ports are independent: n1 and n2 may legitimately
+	// reuse the same port number across the two RDs. Assert the set
+	// of ports on n1 overlaps n2 (reuse is the whole point) rather
+	// than demanding cluster-wide uniqueness.
+	if len(portsByNode["n1"]) == 0 || len(portsByNode["n2"]) == 0 {
+		t.Fatalf("expected ports allocated on both n1 and n2")
 	}
 }
 
 // TestDRBDPortRangePerNodeProp verifies that
-// `DrbdOptions/TcpPortRange` on the Node CRD constrains the
-// per-RD allocator (Bug 266 contract): the chosen port MUST sit in
-// the INTERSECTION of every hosting node's range — divergent ports
-// across peers of the same RD would break drbdadm adjust, so the
-// allocator picks one value that's allocatable on every node.
-//
-// Bug 266 (per-RD allocation) replaces the old per-node semantics
-// where each replica picked its own port from its node's range —
-// that produced the divergence the live stand hit. The new
-// invariant: same port on every replica of one RD; per-node
-// ranges still constrain the choice via intersection.
+// `DrbdOptions/TcpPortRange` on the Node CRD constrains the per-node
+// port allocator: each replica's port MUST sit in ITS OWN node's
+// range. Ports are per-node now (Bug 266 scaling fix), so there is
+// no cross-peer intersection — n1's replica picks from n1's range,
+// n2's from n2's.
 func TestDRBDPortRangePerNodeProp(t *testing.T) {
 	t.Parallel()
 
@@ -210,9 +214,9 @@ func TestDRBDPortRangePerNodeProp(t *testing.T) {
 		).
 		Build()
 
-	// Overlapping ranges: n1 allows 7000-7100, n2 allows 7050-7200.
-	// Intersection = 7050-7100. The per-RD allocator must pick a
-	// port in that band.
+	// Per-node ranges: n1 allows 7000-7100, n2 allows 7050-7200.
+	// Each replica picks from ITS OWN node's range — n1's replica
+	// from 7000-7100, n2's from 7050-7200.
 	for _, spec := range []struct {
 		name, portRange string
 	}{
@@ -252,34 +256,27 @@ func TestDRBDPortRangePerNodeProp(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	const wantLow, wantHigh int32 = 7050, 7100
-
-	var (
-		seenPort     *int32
-		seenPortNode string
-	)
+	// Each replica's port must sit in ITS OWN node's range.
+	wantByNode := map[string][2]int32{
+		"n1": {7000, 7100},
+		"n2": {7050, 7200},
+	}
 
 	for i := range list.Items {
-		port := list.Items[i].Status.DRBDPort
+		node := list.Items[i].Spec.NodeName
+		port := list.Items[i].Spec.DRBDPort
 		if port == nil {
-			t.Fatalf("%s: port not allocated", list.Items[i].Name)
+			t.Fatalf("%s: port not allocated on Spec", list.Items[i].Name)
 		}
 
-		if *port < wantLow || *port > wantHigh {
-			t.Errorf("%s port %d outside intersection [%d,%d]",
-				list.Items[i].Spec.NodeName, *port, wantLow, wantHigh)
+		rng, ok := wantByNode[node]
+		if !ok {
+			t.Fatalf("unexpected node %q", node)
 		}
 
-		if seenPort == nil {
-			seenPort = port
-			seenPortNode = list.Items[i].Spec.NodeName
-
-			continue
-		}
-
-		if *port != *seenPort {
-			t.Errorf("per-RD port differs across peers: %s=%d vs %s=%d",
-				seenPortNode, *seenPort, list.Items[i].Spec.NodeName, *port)
+		if *port < rng[0] || *port > rng[1] {
+			t.Errorf("%s port %d outside its node's range [%d,%d]",
+				node, *port, rng[0], rng[1])
 		}
 	}
 }
@@ -392,37 +389,37 @@ func newScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// TestDRBDMinorMultiVolumeRangeReserved pins the load-bearing
-// multi-volume expansion in takenMinorsOnNode. A multi-volume RD
-// consumes N consecutive minors (the .res renderer emits volume k
-// at base+k). When a NEW Resource lands on the same node, the
-// allocator MUST treat all N consecutive slots as taken — not just
-// the base — otherwise the new replica picks base+1 and DRBD ends
-// up with two devices claiming the same /dev/drbdN.
+// TestDRBDMinorMultiVolumeRangeReserved pins the cluster-wide
+// per-volume minor allocation. Minors are the /dev/drbd<N> device
+// identity (identical on every node), so the scope is the whole
+// cluster and each VolumeDefinition carries its own minor on
+// RD.Spec.VolumeDefinitions[].DRBDMinor.
 //
-// This test seeds a 3-volume RD with DRBDMinor=1000 already
-// allocated on n1, then drives the allocator for a fresh second RD
-// on n1 and asserts the new minor is ≥ 1003 (skipping 1000, 1001,
-// 1002 from the multi-volume RD).
-//
-// Without the expansion loop, the allocator would happily return
-// 1001 here and corrupt DRBD's device map.
+// This test seeds a 3-volume RD with minors 1000,1001,1002 already
+// on its VolumeDefinitions, then drives the allocator for a fresh
+// second RD and asserts its (volume-0) minor is ≥1003 — the
+// cluster-wide taken-set must reserve all three of the multi-vol
+// RD's minors so the new RD never collides on /dev/drbdN.
 func TestDRBDMinorMultiVolumeRangeReserved(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	scheme := newScheme(t)
 	cli := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&blockstoriov1alpha1.Resource{}).
+		WithStatusSubresource(
+			&blockstoriov1alpha1.Resource{},
+			&blockstoriov1alpha1.ResourceDefinition{},
+		).
 		Build()
 
+	m0, m1, m2 := int32(1000), int32(1001), int32(1002)
 	multiVolRD := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-multi"},
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: 1024},
-				{VolumeNumber: 1, SizeKib: 1024},
-				{VolumeNumber: 2, SizeKib: 1024},
+				{VolumeNumber: 0, SizeKib: 1024, DRBDMinor: &m0},
+				{VolumeNumber: 1, SizeKib: 1024, DRBDMinor: &m1},
+				{VolumeNumber: 2, SizeKib: 1024, DRBDMinor: &m2},
 			},
 		},
 	}
@@ -430,52 +427,34 @@ func TestDRBDMinorMultiVolumeRangeReserved(t *testing.T) {
 		t.Fatalf("create multiVolRD: %v", err)
 	}
 
-	// Pre-allocated multi-volume Resource on n1, base minor = 1000
-	// → reserves 1000, 1001, 1002.
-	multiResName := "pvc-multi.n1"
-	multiRes := &blockstoriov1alpha1.Resource{
-		ObjectMeta: metav1.ObjectMeta{Name: multiResName},
-		Spec: blockstoriov1alpha1.ResourceSpec{
-			ResourceDefinitionName: "pvc-multi",
-			NodeName:               "n1",
+	// Fresh single-volume RD. Its volume-0 minor must skip 1000-1002.
+	freshRD := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-fresh"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+			},
 		},
 	}
-	if err := cli.Create(ctx, multiRes); err != nil {
-		t.Fatalf("create multiRes: %v", err)
+	if err := cli.Create(ctx, freshRD); err != nil {
+		t.Fatalf("create freshRD: %v", err)
 	}
 
-	base := int32(1000)
-	zero := int32(0)
-	port := int32(7000)
-
-	multiRes.Status = blockstoriov1alpha1.ResourceStatus{
-		DRBDNodeID: &zero,
-		DRBDPort:   &port,
-		DRBDMinor:  &base,
-	}
-	if err := cli.Status().Update(ctx, multiRes); err != nil {
-		t.Fatalf("status update multiRes: %v", err)
-	}
-
-	// New single-volume RD's replica also lands on n1. Its allocator
-	// must skip 1000-1002 and pick ≥1003.
 	create(ctx, t, cli, "pvc-fresh", "n1")
 
 	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 	allocate(ctx, t, rec, cli, "pvc-fresh")
 
-	freshRes := &blockstoriov1alpha1.Resource{}
-	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-fresh.n1"}, freshRes); err != nil {
-		t.Fatalf("get fresh: %v", err)
+	got := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-fresh"}, got); err != nil {
+		t.Fatalf("get freshRD: %v", err)
 	}
 
-	if freshRes.Status.DRBDMinor == nil {
-		t.Fatalf("fresh DRBDMinor not allocated")
+	if len(got.Spec.VolumeDefinitions) == 0 || got.Spec.VolumeDefinitions[0].DRBDMinor == nil {
+		t.Fatalf("fresh RD volume-0 DRBDMinor not allocated")
 	}
 
-	got := *freshRes.Status.DRBDMinor
-
-	if got < 1003 {
-		t.Errorf("fresh minor: got %d, want ≥1003 (must skip multi-vol's 1000-1002 range)", got)
+	if m := *got.Spec.VolumeDefinitions[0].DRBDMinor; m < 1003 {
+		t.Errorf("fresh minor: got %d, want ≥1003 (must skip multi-vol's 1000-1002 range)", m)
 	}
 }

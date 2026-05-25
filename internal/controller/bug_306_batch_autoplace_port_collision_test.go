@@ -70,6 +70,11 @@ func TestBug306BatchAutoplacePortsUnique(t *testing.T) {
 
 		rd := &blockstoriov1alpha1.ResourceDefinition{
 			ObjectMeta: metav1.ObjectMeta{Name: rdName},
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{VolumeNumber: 0, SizeKib: 1024},
+				},
+			},
 		}
 		objs = append(objs, rd)
 
@@ -171,82 +176,76 @@ func TestBug306BatchAutoplacePortsUnique(t *testing.T) {
 		}
 	}
 
-	// Collect the per-RD ports and assert:
-	//   1. Every RD has a non-nil port stamped.
-	//   2. All replicas of one RD share the same port.
-	//   3. Across RDs, every port is unique (cluster-wide).
-	//   4. Every port is inside the default 7000-7999 range.
-	portByRD := make(map[string]int32, numRDs)
-	minorByRD := make(map[string]int32, numRDs)
+	// Assert (identity-to-spec / per-node port model):
+	//   1. Every replica has a non-nil Spec.DRBDPort, inside 7000-7999.
+	//   2. PER-NODE port uniqueness: no two replicas on the same node
+	//      share a port (this is the same-node collision that would
+	//      break drbdadm adjust). Reuse across nodes is fine.
+	//   3. Cluster-wide minor uniqueness: every RD's volume-0 minor
+	//      differs (minors are the cluster-wide /dev/drbdN identity).
+	portsByNode := make(map[string]map[int32]string)
 
 	resList := &blockstoriov1alpha1.ResourceList{}
 	if err := cli.List(ctx, resList); err != nil {
 		t.Fatalf("list resources: %v", err)
 	}
 
+	rdsWithPort := make(map[string]bool, numRDs)
+
 	for i := range resList.Items {
 		res := &resList.Items[i]
 
-		if res.Status.DRBDPort == nil {
-			t.Errorf("%s: port not allocated", res.Name)
+		if res.Spec.DRBDPort == nil {
+			t.Errorf("%s: port not allocated on Spec", res.Name)
 
 			continue
 		}
 
-		port := *res.Status.DRBDPort
+		port := *res.Spec.DRBDPort
 
 		if port < 7000 || port > 7999 {
-			t.Errorf("%s: port %d outside default 7000-7999 range",
-				res.Name, port)
+			t.Errorf("%s: port %d outside default 7000-7999 range", res.Name, port)
 		}
 
-		rdName := res.Spec.ResourceDefinitionName
-
-		if existing, ok := portByRD[rdName]; ok {
-			if existing != port {
-				t.Errorf("RD %q port diverges across peers: %d vs %d "+
-					"(per-RD scope violated)", rdName, existing, port)
-			}
-		} else {
-			portByRD[rdName] = port
+		node := res.Spec.NodeName
+		if portsByNode[node] == nil {
+			portsByNode[node] = make(map[int32]string)
 		}
 
-		if res.Status.DRBDMinor != nil {
-			minor := *res.Status.DRBDMinor
-
-			if existing, ok := minorByRD[rdName]; ok {
-				if existing != minor {
-					t.Errorf("RD %q minor diverges across peers: %d vs %d",
-						rdName, existing, minor)
-				}
-			} else {
-				minorByRD[rdName] = minor
-			}
+		if other, dup := portsByNode[node][port]; dup {
+			t.Errorf("SAME-NODE PORT COLLISION (Bug 306): %s and %s both got "+
+				"port %d on node %q under parallel batch autoplace — their "+
+				".res files would collide, neither resource would connect",
+				res.Name, other, port, node)
 		}
+
+		portsByNode[node][port] = res.Name
+		rdsWithPort[res.Spec.ResourceDefinitionName] = true
 	}
 
-	// Cross-RD uniqueness: every RD's port must differ.
-	seenPort := make(map[int32]string, numRDs)
-
-	for rdName, port := range portByRD {
-		if other, ok := seenPort[port]; ok {
-			t.Errorf("PORT COLLISION (Bug 306): RDs %q and %q both got port %d "+
-				"under parallel batch autoplace — satellite-side .res files "+
-				"would collide, neither resource would connect",
-				rdName, other, port)
-		}
-
-		seenPort[port] = rdName
+	if len(rdsWithPort) != numRDs {
+		t.Errorf("expected %d RDs with ports, got %d", numRDs, len(rdsWithPort))
 	}
 
-	if len(portByRD) != numRDs {
-		t.Errorf("expected %d RDs with ports, got %d", numRDs, len(portByRD))
-	}
-
-	// Cross-RD uniqueness for minors.
+	// Cluster-wide minor uniqueness: each RD's volume-0 minor differs.
 	seenMinor := make(map[int32]string, numRDs)
 
-	for rdName, minor := range minorByRD {
+	for i := range numRDs {
+		rdName := rdNameFor(i)
+
+		rd := &blockstoriov1alpha1.ResourceDefinition{}
+		if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, rd); err != nil {
+			t.Fatalf("get rd %s: %v", rdName, err)
+		}
+
+		if len(rd.Spec.VolumeDefinitions) == 0 || rd.Spec.VolumeDefinitions[0].DRBDMinor == nil {
+			t.Errorf("RD %q: volume-0 minor not allocated", rdName)
+
+			continue
+		}
+
+		minor := *rd.Spec.VolumeDefinitions[0].DRBDMinor
+
 		if other, ok := seenMinor[minor]; ok {
 			t.Errorf("MINOR COLLISION: RDs %q and %q both got minor %d",
 				rdName, other, minor)

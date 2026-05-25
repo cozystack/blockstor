@@ -27,19 +27,18 @@ import (
 	controllerpkg "github.com/cozystack/blockstor/internal/controller"
 )
 
-// Bug 266 (HIGH): same pathology as Bug 268 but for the DRBD TCP
-// port. Allocating ports at per-node scope lets one RD silently
-// re-use a port already taken by a sibling RD on a DIFFERENT node
-// — and because the satellite's .res file writes the local port
-// across all peer blocks, the two RDs end up advertising the same
-// port AND conflicting node-ids on the wire. drbdadm adjust
-// rejects, the resource never connects, the failure leaks into
-// every neighbouring RD that shares the port number.
+// Bug 266 (identity-to-spec model): DRBD ports are allocated PER NODE
+// and live on Resource.Spec.DRBDPort. The invariant: two replicas ON
+// THE SAME NODE must get DISTINCT ports (a collision breaks drbdadm
+// adjust), while the SAME port number is freely reused across
+// DIFFERENT nodes — that is exactly what lets a node host 1000+
+// resources inside the 7000-7999 window instead of the whole cluster
+// sharing it.
 //
-// Fix shape: same as Bug 268. Allocate ONE port per RD (cluster
-// scope), persist on the parent RD CRD, every Resource inherits it.
-// Two distinct RDs MUST land on distinct ports.
-func TestBug266DRBDPortPerRDUniqueAcrossCluster(t *testing.T) {
+// This is the inverse of the pre-refactor per-RD contract (which
+// forced one cluster-unique port across every peer of an RD): peers of
+// one RD live on different nodes, so each picks its own per-node port.
+func TestBug266DRBDPortPerNodeReuseAndUniqueness(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -51,42 +50,24 @@ func TestBug266DRBDPortPerRDUniqueAcrossCluster(t *testing.T) {
 		).
 		Build()
 
-	// Two RDs, two nodes each. Pre-seed RD-A on w1 with the lowest
-	// free port (7000) so when RD-B's allocator runs it sees:
-	//   w1 taken={7000}  → would pick 7001
-	//   w3 taken={}      → would pick 7000
-	// Per-node allocation hands RD-B port 7001 on w1 but 7000 on w3,
-	// AND that 7000 collides cluster-wide with RD-A's port.
-	// Per-RD allocation must pick ONE port per RD, both RDs distinct.
-	rdA := &blockstoriov1alpha1.ResourceDefinition{}
-	rdA.Name = "pvc-bug266-rdA"
+	// Pre-seed RD-A on w1+w2 with port 7000 (Spec.DRBDPort), so the
+	// per-node taken-set on both w1 and w2 already holds {7000}.
+	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w1", 7000)
+	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w2", 7000)
 
-	if err := cli.Create(ctx, rdA); err != nil {
-		t.Fatalf("create rdA: %v", err)
-	}
-
+	// RD-B lands on w1 and w3. On w1 the taken-set is {7000} (from
+	// RD-A.w1) → must pick 7001. On w3 nothing is taken → may pick
+	// 7000 (reuse across nodes is fine).
 	rdB := &blockstoriov1alpha1.ResourceDefinition{}
 	rdB.Name = "pvc-bug266-rdB"
+	rdB.Spec.VolumeDefinitions = []blockstoriov1alpha1.ResourceDefinitionVolume{
+		{VolumeNumber: 0, SizeKib: 1024},
+	}
 
 	if err := cli.Create(ctx, rdB); err != nil {
 		t.Fatalf("create rdB: %v", err)
 	}
 
-	// Seed RD-A's replicas with the lowest port to bias the per-node
-	// taken set differently across nodes.
-	preSeedPort(ctx, t, cli, rdA.Name, "w1", 7000)
-	preSeedPort(ctx, t, cli, rdA.Name, "w2", 7000)
-
-	// Stamp RD-A's port onto its RD Status so the per-RD allocator
-	// sees it as a cluster-taken value when computing RD-B's port.
-	rdA.Status.DRBDPort = int32Ptr(7000)
-	if err := cli.Status().Update(ctx, rdA); err != nil {
-		t.Fatalf("stamp rdA status: %v", err)
-	}
-
-	// RD-B lands on w1 and w3; w3 has no other replicas → naive
-	// per-node allocator picks 7000 on w3, which collides cluster-
-	// wide with RD-A's 7000.
 	for _, node := range []string{"w1", "w3"} {
 		create(ctx, t, cli, rdB.Name, node)
 	}
@@ -99,49 +80,46 @@ func TestBug266DRBDPortPerRDUniqueAcrossCluster(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	var (
-		bPort     *int32
-		bPortNode string
-	)
+	// Build per-node port buckets across ALL resources and assert no
+	// two resources on one node share a port.
+	portsByNode := map[string]map[int32]string{}
 
 	for i := range list.Items {
-		if list.Items[i].Spec.ResourceDefinitionName != rdB.Name {
-			continue
+		node := list.Items[i].Spec.NodeName
+		name := list.Items[i].Name
+
+		if list.Items[i].Spec.DRBDPort == nil {
+			t.Fatalf("%s: port not allocated on Spec", name)
 		}
 
-		got := list.Items[i].Status.DRBDPort
-		if got == nil {
-			t.Fatalf("%s: port not allocated", list.Items[i].Name)
+		if portsByNode[node] == nil {
+			portsByNode[node] = map[int32]string{}
 		}
 
-		// All RD-B replicas must share the same port.
-		if bPort == nil {
-			bPort = got
-			bPortNode = list.Items[i].Spec.NodeName
-
-			continue
+		port := *list.Items[i].Spec.DRBDPort
+		if other, dup := portsByNode[node][port]; dup {
+			t.Errorf("SAME-NODE port collision: port %d on node %q held by both %s and %s",
+				port, node, other, name)
 		}
 
-		if *got != *bPort {
-			t.Errorf("RD-B port diverges across peers: %s=%d vs %s=%d "+
-				"(per-RD scope violated — divergent ports break drbdadm adjust)",
-				bPortNode, *bPort, list.Items[i].Spec.NodeName, *got)
-		}
+		portsByNode[node][port] = name
 	}
 
-	// RD-B's port MUST differ from RD-A's port (cluster-wide
-	// uniqueness across RDs). RD-A's status.drbdPort == 7000.
-	if bPort != nil && *bPort == 7000 {
-		t.Errorf("RD-B picked port 7000, colliding with RD-A's cluster-wide "+
-			"port (RD-A.Status.DRBDPort=7000). Got bPort=%d", *bPort)
+	// RD-B.w1 must NOT be 7000 (RD-A.w1 holds it on the same node).
+	rbw1 := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-bug266-rdB.w1"}, rbw1); err != nil {
+		t.Fatalf("get RD-B.w1: %v", err)
+	}
+
+	if rbw1.Spec.DRBDPort == nil || *rbw1.Spec.DRBDPort == 7000 {
+		t.Errorf("RD-B.w1 port=%v, must differ from RD-A.w1's 7000 (same node)", rbw1.Spec.DRBDPort)
 	}
 }
 
-// TestBug266DRBDPortRecordedOnRD pins the persistence-on-RD half of
-// the contract: the allocator must stamp the chosen port on the
-// parent RD's Status so subsequent Resources inherit it without
-// re-running the cluster scan.
-func TestBug266DRBDPortRecordedOnRD(t *testing.T) {
+// TestBug266DRBDPortRecordedOnSpec pins that the allocator writes the
+// chosen per-node port onto Resource.Spec.DRBDPort (authoritative,
+// restore-safe) and mirrors it onto Status for backward-compat readers.
+func TestBug266DRBDPortRecordedOnSpec(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -157,6 +135,9 @@ func TestBug266DRBDPortRecordedOnRD(t *testing.T) {
 
 	rdObj := &blockstoriov1alpha1.ResourceDefinition{}
 	rdObj.Name = rdName
+	rdObj.Spec.VolumeDefinitions = []blockstoriov1alpha1.ResourceDefinitionVolume{
+		{VolumeNumber: 0, SizeKib: 1024},
+	}
 
 	if err := cli.Create(ctx, rdObj); err != nil {
 		t.Fatalf("create rd: %v", err)
@@ -169,18 +150,6 @@ func TestBug266DRBDPortRecordedOnRD(t *testing.T) {
 	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
 	allocate(ctx, t, rec, cli, rdName)
 
-	gotRD := &blockstoriov1alpha1.ResourceDefinition{}
-	if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, gotRD); err != nil {
-		t.Fatalf("get rd: %v", err)
-	}
-
-	if gotRD.Status.DRBDPort == nil {
-		t.Fatalf("RD.Status.DRBDPort not stamped after per-RD allocation; " +
-			"the allocator must persist the chosen value on the parent RD")
-	}
-
-	wantPort := *gotRD.Status.DRBDPort
-
 	list := &blockstoriov1alpha1.ResourceList{}
 	if err := cli.List(ctx, list); err != nil {
 		t.Fatalf("list: %v", err)
@@ -191,16 +160,23 @@ func TestBug266DRBDPortRecordedOnRD(t *testing.T) {
 			continue
 		}
 
-		got := list.Items[i].Status.DRBDPort
-		if got == nil || *got != wantPort {
-			t.Errorf("replica %q port=%v, want %d (must equal RD's allocated port)",
-				list.Items[i].Name, got, wantPort)
+		if list.Items[i].Spec.DRBDPort == nil {
+			t.Errorf("replica %q: Spec.DRBDPort not allocated", list.Items[i].Name)
+
+			continue
+		}
+
+		// Status mirror must equal the authoritative Spec value.
+		if list.Items[i].Status.DRBDPort == nil ||
+			*list.Items[i].Status.DRBDPort != *list.Items[i].Spec.DRBDPort {
+			t.Errorf("replica %q: Status.DRBDPort mirror %v != Spec.DRBDPort %d",
+				list.Items[i].Name, list.Items[i].Status.DRBDPort, *list.Items[i].Spec.DRBDPort)
 		}
 	}
 }
 
-// preSeedPort creates a Resource with a stamped Status.DRBDPort so
-// the allocator sees it as a port-taken on the named node.
+// preSeedPort creates a Resource with a stamped Spec.DRBDPort so the
+// per-node allocator sees it as a port-taken on the named node.
 func preSeedPort(ctx context.Context, t *testing.T, cli client.Client, rdName, node string, port int32) {
 	t.Helper()
 
@@ -208,20 +184,11 @@ func preSeedPort(ctx context.Context, t *testing.T, cli client.Client, rdName, n
 	r.Name = rdName + "." + node
 	r.Spec.ResourceDefinitionName = rdName
 	r.Spec.NodeName = node
+	r.Spec.DRBDPort = int32Ptr(port)
+	r.Spec.DRBDNodeID = int32Ptr(0)
 
 	if err := cli.Create(ctx, r); err != nil {
 		t.Fatalf("preSeedPort create %s.%s: %v", rdName, node, err)
-	}
-
-	zero := int32(0)
-	minor := int32(1000)
-
-	r.Status.DRBDNodeID = &zero
-	r.Status.DRBDPort = &port
-	r.Status.DRBDMinor = &minor
-
-	if err := cli.Status().Update(ctx, r); err != nil {
-		t.Fatalf("preSeedPort status update %s.%s: %v", rdName, node, err)
 	}
 }
 
