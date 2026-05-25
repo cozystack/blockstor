@@ -195,11 +195,7 @@ func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot,
 		// finalize then never does. Tolerating exit-10 here lets the
 		// prune treat the absent slot as "nothing to prune" instead of
 		// wedging the reconcile.
-		errText := err.Error() + " " + string(out)
-		if strings.Contains(errText, "No currently configured DRBD") ||
-			strings.Contains(errText, "Unknown resource") ||
-			strings.Contains(errText, "no resources defined") ||
-			strings.Contains(errText, "No such resource") {
+		if isResourceNotLoadedErr(err, out) {
 			return nil, nil
 		}
 
@@ -207,6 +203,37 @@ func (a *Adm) Show(ctx context.Context, resource string) (map[string]KernelSlot,
 	}
 
 	return parseShowJSON(out), nil
+}
+
+// isResourceNotLoadedErr reports whether a non-zero `drbdsetup status`
+// (`-j` or plain) outcome is the verbatim "resource not present in
+// the kernel" branch rather than a genuine probe failure. drbd-utils
+// emits one of these human messages on a clean not-loaded slot:
+//
+//   - "No currently configured DRBD found" — kernel module loaded
+//     but this resource was never `up`-ed / has been fully `down`-ed.
+//   - "Unknown resource" — the resource name is not known to the kernel.
+//   - "no resources defined" — no .res files / no volumes for the name.
+//   - "No such resource: <rd>" (exit 10) — the transient window right
+//     after a `drbdadm down` (Bug 350).
+//
+// CONCLUSIVE absence: a match here means the slot is genuinely gone,
+// which the down-veto treats as "safe to proceed / down is a no-op"
+// rather than as an inconclusive probe failure. Any OTHER non-zero
+// exit (netlink hiccup, timeout, truncated output under cold-satellite
+// timing) does NOT match and is therefore treated as inconclusive by
+// the fail-closed down-veto.
+func isResourceNotLoadedErr(err error, out []byte) bool {
+	if err == nil {
+		return false
+	}
+
+	errText := err.Error() + " " + string(out)
+
+	return strings.Contains(errText, "No currently configured DRBD") ||
+		strings.Contains(errText, "Unknown resource") ||
+		strings.Contains(errText, "no resources defined") ||
+		strings.Contains(errText, "No such resource")
 }
 
 // parseShowJSON does the JSON-unmarshal half of Show. Pulled out so

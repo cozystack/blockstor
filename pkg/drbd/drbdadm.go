@@ -787,42 +787,91 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 	return false
 }
 
-// IsResyncInFlight reports whether the kernel currently holds an
-// active resync (SyncSource or SyncTarget) for any peer-device of the
-// resource. The Bug 350 down-veto (applyInactive) consults it to
-// refuse a `drbdadm down` that would abort a resync the just-
-// reactivated replica is in the middle of — the abort strands the
-// peer Inconsistent forever (out-of-sync=0, never finalizes).
+// DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe
+// the satellite consults before committing a `drbdadm down` on the
+// INACTIVE path. It separates "definitely safe to down" from "must
+// defer the down" so the caller can fail CLOSED on inconclusive
+// cold-satellite timing instead of barrelling through.
+type DownVeto int
+
+const (
+	// DownAllowed: the kernel was probed conclusively and the slot is
+	// either genuinely absent (down is a no-op) or loaded-but-quiescent
+	// (no peer-device mid-resync). Safe to `drbdadm down`.
+	DownAllowed DownVeto = iota
+
+	// DownVetoResync: a peer-device is currently SyncSource/SyncTarget.
+	// Downing now aborts the resync and strands the peer Inconsistent
+	// forever (out-of-sync=0, never finalizes). Defer.
+	DownVetoResync
+
+	// DownVetoInconclusive: the kernel probe failed or returned an
+	// ambiguous/empty result that is NOT the verbatim "resource not
+	// loaded" branch — the dominant cold-satellite timing failure mode
+	// (truncated JSON, netlink hiccup, status timeout) while a slot may
+	// still be loaded or mid-bring-up. We cannot confirm INACTIVE is the
+	// true desired state, so we fail CLOSED and defer; the next reconcile
+	// (warm cache + warm kernel) re-evaluates. NOT returned for a clean
+	// not-loaded slot — that yields DownAllowed so a genuinely idle
+	// resource still downs and the defer can never spin forever.
+	DownVetoInconclusive
+)
+
+// EvaluateDownVeto probes the live kernel via `drbdsetup status
+// <res> --json` and classifies whether the INACTIVE-path `drbdadm
+// down` is safe RIGHT NOW (Bug 350). Unlike the original fail-OPEN
+// IsResyncInFlight, this fails CLOSED on an inconclusive probe so a
+// transient cold-satellite hiccup can never let a spurious down abort
+// a just-reactivated replica's resync.
 //
-// Conservative: returns false on any probe/parse failure (slot
-// absent, status non-zero, malformed JSON). A false result lets the
-// caller proceed with the down, which is the pre-fix behaviour — the
-// veto only ever ADDS safety and never blocks a legitimate teardown
-// of an already-quiescent slot. Mirrors AnyConnectedPeerHasData's
-// fail-open contract so a transient netlink hiccup can't wedge the
-// inactive path.
-func (a *Adm) IsResyncInFlight(ctx context.Context, resource string) bool {
+// Classification:
+//   - probe error matching the verbatim not-loaded branch
+//     (No such resource / Unknown resource / …) → DownAllowed: the slot
+//     is conclusively gone, down is a no-op. This is the anti-infinite-
+//     defer guard — once the slot is actually down, the probe is
+//     conclusive and the caller stops deferring.
+//   - any OTHER probe error (timeout, netlink hiccup) → DownVetoInconclusive.
+//   - exit 0 but unparseable / empty array → DownVetoInconclusive
+//     (drbdsetup emitted partial output for a slot that almost certainly
+//     still exists; a truly-absent slot exits non-zero with a not-loaded
+//     message, handled above).
+//   - parsed, some peer-device SyncSource/SyncTarget → DownVetoResync.
+//   - parsed, all peer-devices quiescent → DownAllowed.
+func (a *Adm) EvaluateDownVeto(ctx context.Context, resource string) DownVeto {
 	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
 	if err != nil {
-		return false
+		// Conclusive absence (clean not-loaded) → down is a no-op, allow
+		// it so a genuinely idle/downed resource is never deferred
+		// indefinitely. Every other error is an inconclusive probe
+		// failure → fail closed.
+		if isResourceNotLoadedErr(err, out) {
+			return DownAllowed
+		}
+
+		return DownVetoInconclusive
 	}
 
 	var status drbdsetupStatusRoot
 
 	err = json.Unmarshal(out, &status)
 	if err != nil || len(status) == 0 {
-		return false
+		// Exit 0 yet no usable resource block: under cold-satellite
+		// timing drbdsetup can emit truncated/partial JSON for a slot
+		// that is in fact loaded. A truly-absent slot exits non-zero
+		// (handled above), so reaching here means "ambiguous, slot
+		// likely present" → fail closed.
+		return DownVetoInconclusive
 	}
 
 	for _, conn := range status[0].Connections {
 		for _, pd := range conn.PeerDevices {
 			if ReplicationState(pd.ReplicationState).IsSyncing() {
-				return true
+				return DownVetoResync
 			}
 		}
 	}
 
-	return false
+	return DownAllowed
 }
 
 // HasDisklessVolume reports whether any of the named resource's

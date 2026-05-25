@@ -1096,24 +1096,45 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 
 	// Bug 350 down-veto (defense-in-depth behind the controller's
 	// uncached authoritative-flag adoption). Probe the live kernel
-	// before committing to `drbdadm down`: if the slot is mid-resync
-	// (some peer-device in SyncSource/SyncTarget), downing now aborts
-	// that resync and strands the peer Inconsistent forever
-	// (out-of-sync=0, never finalizes) — the exact wedge a stale
-	// INACTIVE flag would otherwise inflict on a just-reactivated
-	// replica. Refuse the down on this pass and surface a transient
-	// failure so the reconcile requeues; the next pass re-evaluates
-	// against authoritative flags (cache caught up → no longer
-	// INACTIVE → no down at all) or against a finished resync (no
-	// longer in-flight → down proceeds). IsResyncInFlight fails open
-	// (false on probe error / slot absent), so an already-quiescent or
-	// not-loaded resource downs as before — keeping the path
-	// idempotent.
-	if r.cfg.Adm.IsResyncInFlight(ctx, dr.GetName()) {
+	// before committing to `drbdadm down` and FAIL CLOSED: defer the
+	// down whenever we cannot positively confirm the slot is a
+	// genuinely-idle INACTIVE replica.
+	//
+	//   - DownVetoResync: a peer-device is mid-resync
+	//     (SyncSource/SyncTarget). Downing now aborts that resync and
+	//     strands the peer Inconsistent forever (out-of-sync=0, never
+	//     finalizes) — the exact wedge a stale INACTIVE flag would
+	//     inflict on a just-reactivated replica.
+	//   - DownVetoInconclusive: the kernel probe failed/timed-out or
+	//     returned ambiguous output that is NOT the verbatim
+	//     "resource not loaded" branch — the cold-satellite timing
+	//     window where a slot is most likely still loaded or mid-
+	//     bring-up. The pre-fix code failed OPEN here and let the down
+	//     proceed, which is exactly how the cold-start cycle-1 flake
+	//     killed a resync at ~5%. We now defer instead.
+	//
+	// In BOTH cases refuse the down on this pass and surface a
+	// transient failure so the reconcile requeues (applyFailureRequeue
+	// in runApply). The next pass re-evaluates against authoritative
+	// flags (cache caught up → no longer INACTIVE → no down at all) or
+	// against a warm kernel (resync finished / slot conclusively gone →
+	// down proceeds). EvaluateDownVeto maps a CONCLUSIVE not-loaded
+	// probe (clean exit-10 "No such resource") to DownAllowed, so a
+	// genuinely downed/idle resource is never deferred indefinitely —
+	// the defer is bounded by the slot actually disappearing.
+	switch r.cfg.Adm.EvaluateDownVeto(ctx, dr.GetName()) {
+	case drbd.DownVetoResync:
 		res.Ok = false
 		res.Message = "deferring drbdadm down: resync in flight (Bug 350 veto)"
 
 		return
+	case drbd.DownVetoInconclusive:
+		res.Ok = false
+		res.Message = "deferring drbdadm down: kernel probe inconclusive, cannot confirm idle (Bug 350 fail-closed veto)"
+
+		return
+	case drbd.DownAllowed:
+		// Fall through to the down.
 	}
 
 	err := r.cfg.Adm.Down(ctx, dr.GetName())

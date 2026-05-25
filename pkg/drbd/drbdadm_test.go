@@ -954,11 +954,11 @@ func TestAdmKernelMyNodeIDStatusError(t *testing.T) {
 	}
 }
 
-// TestAdmIsResyncInFlightTrueOnSyncTarget (Bug 350): a peer-device in
-// SyncTarget means the local replica is actively pulling resync data
-// — the down-veto must report true so applyInactive refuses to
-// `drbdadm down` and abort the resync.
-func TestAdmIsResyncInFlightTrueOnSyncTarget(t *testing.T) {
+// TestAdmEvaluateDownVetoResyncOnSyncTarget (Bug 350): a peer-device
+// in SyncTarget means the local replica is actively pulling resync
+// data — EvaluateDownVeto must return DownVetoResync so applyInactive
+// refuses to `drbdadm down` and abort the resync.
+func TestAdmEvaluateDownVetoResyncOnSyncTarget(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
 		Stdout: []byte(`[{"name":"pvc-1","connections":[
@@ -966,15 +966,15 @@ func TestAdmIsResyncInFlightTrueOnSyncTarget(t *testing.T) {
 				{"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate"}]}]}]`),
 	})
 
-	if !drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
-		t.Errorf("IsResyncInFlight SyncTarget: got false, want true")
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownVetoResync {
+		t.Errorf("EvaluateDownVeto SyncTarget: got %d, want DownVetoResync", got)
 	}
 }
 
-// TestAdmIsResyncInFlightTrueOnSyncSource (Bug 350): SyncSource means
-// the local replica is the resync feeder — downing it strands the
-// SyncTarget peer Inconsistent. Must veto.
-func TestAdmIsResyncInFlightTrueOnSyncSource(t *testing.T) {
+// TestAdmEvaluateDownVetoResyncOnSyncSource (Bug 350): SyncSource
+// means the local replica is the resync feeder — downing it strands
+// the SyncTarget peer Inconsistent. Must veto.
+func TestAdmEvaluateDownVetoResyncOnSyncSource(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
 		Stdout: []byte(`[{"name":"pvc-1","connections":[
@@ -982,15 +982,15 @@ func TestAdmIsResyncInFlightTrueOnSyncSource(t *testing.T) {
 				{"volume":0,"replication-state":"SyncSource","peer-disk-state":"Inconsistent"}]}]}]`),
 	})
 
-	if !drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
-		t.Errorf("IsResyncInFlight SyncSource: got false, want true")
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownVetoResync {
+		t.Errorf("EvaluateDownVeto SyncSource: got %d, want DownVetoResync", got)
 	}
 }
 
-// TestAdmIsResyncInFlightFalseOnEstablished (Bug 350): a steady-state
-// Established connection carries no in-flight resync — the down must
-// be allowed to proceed (a genuine deactivate).
-func TestAdmIsResyncInFlightFalseOnEstablished(t *testing.T) {
+// TestAdmEvaluateDownVetoAllowedOnEstablished (Bug 350): a steady-
+// state Established connection carries no in-flight resync — the down
+// must be allowed to proceed (a genuine deactivate).
+func TestAdmEvaluateDownVetoAllowedOnEstablished(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
 		Stdout: []byte(`[{"name":"pvc-1","connections":[
@@ -998,23 +998,71 @@ func TestAdmIsResyncInFlightFalseOnEstablished(t *testing.T) {
 				{"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate"}]}]}]`),
 	})
 
-	if drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
-		t.Errorf("IsResyncInFlight Established: got true, want false")
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownAllowed {
+		t.Errorf("EvaluateDownVeto Established: got %d, want DownAllowed", got)
 	}
 }
 
-// TestAdmIsResyncInFlightFailsOpenOnError (Bug 350): a non-zero
-// drbdsetup exit (slot absent / netlink hiccup) must fail OPEN
-// (false) so the veto never wedges a legitimate teardown of an
-// already-gone slot. Mirrors AnyConnectedPeerHasData's contract.
-func TestAdmIsResyncInFlightFailsOpenOnError(t *testing.T) {
+// TestAdmEvaluateDownVetoAllowedOnNotLoaded (Bug 350): a non-zero
+// drbdsetup exit carrying the verbatim "No such resource" not-loaded
+// message is CONCLUSIVE absence — the slot is gone, down is a no-op,
+// so we must allow it. This is the anti-infinite-defer guard: once a
+// slot has actually been downed, the probe stays conclusive and the
+// caller never defers forever.
+func TestAdmEvaluateDownVetoAllowedOnNotLoaded(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
 		Stdout: []byte("No such resource: pvc-1\n"),
 		Err:    errFakeFailure,
 	})
 
-	if drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
-		t.Errorf("IsResyncInFlight on error: got true, want false (fail-open)")
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownAllowed {
+		t.Errorf("EvaluateDownVeto not-loaded: got %d, want DownAllowed", got)
+	}
+}
+
+// TestAdmEvaluateDownVetoInconclusiveOnProbeError (Bug 350 cold-start):
+// a non-zero drbdsetup exit that is NOT a not-loaded message (timeout,
+// netlink hiccup under cold-satellite timing) is INCONCLUSIVE — we
+// cannot confirm the slot is quiescent, so EvaluateDownVeto must fail
+// CLOSED with DownVetoInconclusive and the caller defers the down.
+func TestAdmEvaluateDownVetoInconclusiveOnProbeError(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(""),
+		Err:    errFakeFailure,
+	})
+
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownVetoInconclusive {
+		t.Errorf("EvaluateDownVeto probe error: got %d, want DownVetoInconclusive (fail-closed)", got)
+	}
+}
+
+// TestAdmEvaluateDownVetoInconclusiveOnEmptyJSON (Bug 350 cold-start):
+// exit 0 yet an empty/truncated JSON array means drbdsetup produced
+// partial output for a slot that almost certainly still exists (a
+// truly-absent slot exits non-zero). Fail CLOSED.
+func TestAdmEvaluateDownVetoInconclusiveOnEmptyJSON(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte("[]"),
+	})
+
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownVetoInconclusive {
+		t.Errorf("EvaluateDownVeto empty JSON: got %d, want DownVetoInconclusive (fail-closed)", got)
+	}
+}
+
+// TestAdmEvaluateDownVetoInconclusiveOnMalformedJSON (Bug 350 cold-
+// start): exit 0 with unparseable JSON (truncated mid-stream) is the
+// same ambiguous-but-likely-present case. Fail CLOSED.
+func TestAdmEvaluateDownVetoInconclusiveOnMalformedJSON(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-1","connec`),
+	})
+
+	if got := drbd.NewAdm(fx).EvaluateDownVeto(t.Context(), "pvc-1"); got != drbd.DownVetoInconclusive {
+		t.Errorf("EvaluateDownVeto malformed JSON: got %d, want DownVetoInconclusive (fail-closed)", got)
 	}
 }

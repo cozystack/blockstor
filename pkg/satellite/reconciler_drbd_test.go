@@ -42,6 +42,12 @@ var (
 	errDrbdadmAdjustFail   = errors.New("drbdadm: simulated mid-Apply abort")
 	errDrbdadmResizeFail   = errors.New("drbdadm: resize failed (peer disconnected)")
 	errDrbdsetupNoResource = errors.New("drbdsetup: exit status 10")
+	// errInconclusiveProbe mirrors the generic non-zero exit drbdsetup
+	// returns under cold-satellite timing (netlink hiccup / status
+	// timeout). The Bug 350 fail-closed down-veto treats it as
+	// INCONCLUSIVE — distinct from the verbatim "No such resource"
+	// not-loaded branch — and defers the down.
+	errInconclusiveProbe = errors.New("drbdsetup: exit status 1")
 	// errDrbdadmDownNotInConfig mirrors the verbatim stderr drbdadm
 	// emits when the .res file is missing from /etc/drbd.d — the
 	// state the orphan-sweeper / DeleteResource-after-restart path
@@ -1082,6 +1088,19 @@ func TestApplyInactiveOnlyDownsDRBD(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 
+	// Bug 350 fail-closed down-veto: the operator deactivated a
+	// steady-state replica, so the kernel probe reports a quiescent
+	// (Established, no resync) slot — a CONCLUSIVE result that lets the
+	// down proceed. Without a registered probe response the FakeExec
+	// would return empty output, which the fail-closed veto correctly
+	// treats as inconclusive and defers; a genuine deactivate of a live
+	// resource has an observable, quiescent kernel slot.
+	fx.Expect("drbdsetup status pvc-inactive --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-inactive","connections":[
+			{"name":"worker-1","connection-state":"Connected","peer_devices":[
+				{"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate"}]}]}]`),
+	})
+
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
 		Providers: map[string]storage.Provider{"thin1": thin},
@@ -1193,6 +1212,119 @@ func TestApplyInactiveVetoesDownDuringResync(t *testing.T) {
 		if strings.Contains(line, "drbdadm down") {
 			t.Errorf("veto must NOT run drbdadm down during resync; got %v", fx.CommandLines())
 		}
+	}
+}
+
+// TestApplyInactiveDefersDownOnInconclusiveProbe (Bug 350 cold-start):
+// on a freshly-booted satellite the kernel probe (`drbdsetup status
+// --json`) can error/time out or return truncated output. That is an
+// INCONCLUSIVE result — NOT the verbatim "resource not loaded" branch —
+// so the fail-closed veto must DEFER the down (Ok=false to requeue) and
+// run NO `drbdadm down`. Pre-fix this failed OPEN and a spurious down
+// aborted a just-reactivated replica's resync at ~5%.
+func TestApplyInactiveDefersDownOnInconclusiveProbe(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// Cold-satellite timing: the probe exits non-zero with output that
+	// is NOT a not-loaded sentinel (a timeout / netlink hiccup).
+	fx.Expect("drbdsetup status pvc-inactive --json", storage.FakeResponse{
+		Stdout: []byte("error receiving netlink message\n"),
+		Err:    errInconclusiveProbe,
+	})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-inactive",
+			NodeName: "n1",
+			Flags:    []string{"INACTIVE"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("inconclusive probe must surface Ok=false to requeue; got Ok=true")
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "drbdadm down") {
+			t.Errorf("fail-closed veto must NOT run drbdadm down on inconclusive probe; got %v", fx.CommandLines())
+		}
+	}
+}
+
+// TestApplyInactiveDownsWhenSlotConclusivelyGone (Bug 350 anti-
+// infinite-defer): once the slot has actually been downed (or was
+// never up), `drbdsetup status` returns the verbatim "No such
+// resource" not-loaded message. That is CONCLUSIVE absence, so the
+// veto must allow the down to proceed (a no-op `drbdadm down`) rather
+// than defer forever. This bounds the fail-closed defer: a genuinely
+// idle INACTIVE replica still converges.
+func TestApplyInactiveDownsWhenSlotConclusivelyGone(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// Conclusive not-loaded: the slot is gone.
+	fx.Expect("drbdsetup status pvc-inactive --json", storage.FakeResponse{
+		Stdout: []byte("No such resource: pvc-inactive\n"),
+		Err:    errInconclusiveProbe,
+	})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-inactive",
+			NodeName: "n1",
+			Flags:    []string{"INACTIVE"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if !results[0].GetOk() {
+		t.Errorf("conclusively-gone slot must allow the down (Ok=true); got Ok=false: %s", results[0].GetMessage())
+	}
+
+	var sawDown bool
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "drbdadm down pvc-inactive") {
+			sawDown = true
+		}
+	}
+
+	if !sawDown {
+		t.Errorf("conclusively-gone slot must still attempt the down; got %v", fx.CommandLines())
 	}
 }
 
