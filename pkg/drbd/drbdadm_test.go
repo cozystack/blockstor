@@ -953,3 +953,68 @@ func TestAdmKernelMyNodeIDStatusError(t *testing.T) {
 		t.Errorf("KernelMyNodeID error: ok=true, want false")
 	}
 }
+
+// TestAdmIsResyncInFlightTrueOnSyncTarget (Bug 350): a peer-device in
+// SyncTarget means the local replica is actively pulling resync data
+// — the down-veto must report true so applyInactive refuses to
+// `drbdadm down` and abort the resync.
+func TestAdmIsResyncInFlightTrueOnSyncTarget(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-1","connections":[
+			{"name":"worker-1","connection-state":"Connected","peer_devices":[
+				{"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate"}]}]}]`),
+	})
+
+	if !drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
+		t.Errorf("IsResyncInFlight SyncTarget: got false, want true")
+	}
+}
+
+// TestAdmIsResyncInFlightTrueOnSyncSource (Bug 350): SyncSource means
+// the local replica is the resync feeder — downing it strands the
+// SyncTarget peer Inconsistent. Must veto.
+func TestAdmIsResyncInFlightTrueOnSyncSource(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-1","connections":[
+			{"name":"worker-2","connection-state":"Connected","peer_devices":[
+				{"volume":0,"replication-state":"SyncSource","peer-disk-state":"Inconsistent"}]}]}]`),
+	})
+
+	if !drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
+		t.Errorf("IsResyncInFlight SyncSource: got false, want true")
+	}
+}
+
+// TestAdmIsResyncInFlightFalseOnEstablished (Bug 350): a steady-state
+// Established connection carries no in-flight resync — the down must
+// be allowed to proceed (a genuine deactivate).
+func TestAdmIsResyncInFlightFalseOnEstablished(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-1","connections":[
+			{"name":"worker-1","connection-state":"Connected","peer_devices":[
+				{"volume":0,"replication-state":"Established","peer-disk-state":"UpToDate"}]}]}]`),
+	})
+
+	if drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
+		t.Errorf("IsResyncInFlight Established: got true, want false")
+	}
+}
+
+// TestAdmIsResyncInFlightFailsOpenOnError (Bug 350): a non-zero
+// drbdsetup exit (slot absent / netlink hiccup) must fail OPEN
+// (false) so the veto never wedges a legitimate teardown of an
+// already-gone slot. Mirrors AnyConnectedPeerHasData's contract.
+func TestAdmIsResyncInFlightFailsOpenOnError(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdsetup status pvc-1 --json", storage.FakeResponse{
+		Stdout: []byte("No such resource: pvc-1\n"),
+		Err:    errFakeFailure,
+	})
+
+	if drbd.NewAdm(fx).IsResyncInFlight(t.Context(), "pvc-1") {
+		t.Errorf("IsResyncInFlight on error: got true, want false (fail-open)")
+	}
+}

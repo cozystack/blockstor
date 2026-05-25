@@ -1094,6 +1094,28 @@ func (r *Reconciler) applyInactive(ctx context.Context, dr *intent.DesiredResour
 		return
 	}
 
+	// Bug 350 down-veto (defense-in-depth behind the controller's
+	// uncached authoritative-flag adoption). Probe the live kernel
+	// before committing to `drbdadm down`: if the slot is mid-resync
+	// (some peer-device in SyncSource/SyncTarget), downing now aborts
+	// that resync and strands the peer Inconsistent forever
+	// (out-of-sync=0, never finalizes) — the exact wedge a stale
+	// INACTIVE flag would otherwise inflict on a just-reactivated
+	// replica. Refuse the down on this pass and surface a transient
+	// failure so the reconcile requeues; the next pass re-evaluates
+	// against authoritative flags (cache caught up → no longer
+	// INACTIVE → no down at all) or against a finished resync (no
+	// longer in-flight → down proceeds). IsResyncInFlight fails open
+	// (false on probe error / slot absent), so an already-quiescent or
+	// not-loaded resource downs as before — keeping the path
+	// idempotent.
+	if r.cfg.Adm.IsResyncInFlight(ctx, dr.GetName()) {
+		res.Ok = false
+		res.Message = "deferring drbdadm down: resync in flight (Bug 350 veto)"
+
+		return
+	}
+
 	err := r.cfg.Adm.Down(ctx, dr.GetName())
 	if err != nil {
 		res.Ok = false

@@ -787,6 +787,44 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 	return false
 }
 
+// IsResyncInFlight reports whether the kernel currently holds an
+// active resync (SyncSource or SyncTarget) for any peer-device of the
+// resource. The Bug 350 down-veto (applyInactive) consults it to
+// refuse a `drbdadm down` that would abort a resync the just-
+// reactivated replica is in the middle of — the abort strands the
+// peer Inconsistent forever (out-of-sync=0, never finalizes).
+//
+// Conservative: returns false on any probe/parse failure (slot
+// absent, status non-zero, malformed JSON). A false result lets the
+// caller proceed with the down, which is the pre-fix behaviour — the
+// veto only ever ADDS safety and never blocks a legitimate teardown
+// of an already-quiescent slot. Mirrors AnyConnectedPeerHasData's
+// fail-open contract so a transient netlink hiccup can't wedge the
+// inactive path.
+func (a *Adm) IsResyncInFlight(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	for _, conn := range status[0].Connections {
+		for _, pd := range conn.PeerDevices {
+			if ReplicationState(pd.ReplicationState).IsSyncing() {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // HasDisklessVolume reports whether any of the named resource's
 // volumes are currently in a "not-attached" disk state in the
 // kernel — specifically `Diskless`, `Detaching`, or `Failed`. Used

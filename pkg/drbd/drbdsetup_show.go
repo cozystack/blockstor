@@ -154,6 +154,11 @@ type drbdsetupStatusPeerDevice struct {
 	// refuse `drbdadm primary --force` on a fresh replica when a
 	// connected peer already has data.
 	PeerDiskState string `json:"peer-disk-state"`
+	// ReplicationState is this peer-device's `replication-state` token
+	// (SyncSource / SyncTarget / Established / …). The Bug 350
+	// down-veto reads it to detect an in-flight resync that a stray
+	// `drbdadm down` would abort, stranding the peer Inconsistent.
+	ReplicationState string `json:"replication-state"`
 }
 
 // Show runs `drbdsetup status -j <resource>` and parses the output

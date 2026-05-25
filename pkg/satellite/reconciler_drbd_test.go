@@ -1141,6 +1141,61 @@ func TestApplyInactiveOnlyDownsDRBD(t *testing.T) {
 	}
 }
 
+// TestApplyInactiveVetoesDownDuringResync (Bug 350): the INACTIVE
+// flag must NOT trigger `drbdadm down` while the kernel reports an
+// in-flight resync (SyncTarget here). This is the defense-in-depth
+// veto: a stale INACTIVE flag slipping past the controller's uncached
+// flag adoption would otherwise abort the resync of a just-reactivated
+// replica, wedging the peer Inconsistent forever. The veto surfaces a
+// transient failure (Ok=false) so the reconcile requeues and the next
+// pass re-evaluates against authoritative flags / a finished resync.
+func TestApplyInactiveVetoesDownDuringResync(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// Kernel truth: a resync is in flight on volume 0 (SyncTarget).
+	fx.Expect("drbdsetup status pvc-inactive --json", storage.FakeResponse{
+		Stdout: []byte(`[{"name":"pvc-inactive","connections":[
+			{"name":"worker-1","connection-state":"Connected","peer_devices":[
+				{"volume":0,"replication-state":"SyncTarget","peer-disk-state":"UpToDate"}]}]}]`),
+	})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-inactive",
+			NodeName: "n1",
+			Flags:    []string{"INACTIVE"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if results[0].GetOk() {
+		t.Errorf("veto must surface Ok=false to requeue; got Ok=true")
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "drbdadm down") {
+			t.Errorf("veto must NOT run drbdadm down during resync; got %v", fx.CommandLines())
+		}
+	}
+}
+
 // TestApplyLUKSWithoutCryptsetupWrapper: LayerStack contains LUKS
 // but the satellite was configured without a Cryptsetup wrapper
 // (e.g. cryptsetup binary missing). applyLUKS must fail loudly with
