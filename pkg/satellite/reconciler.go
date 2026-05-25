@@ -2234,7 +2234,57 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		}
 	}
 
+	// Bug 366 recovery-promote self-heal — re-arm the auto-primary seed
+	// when a fresh RD wedged with the late replica stuck Inconsistent and
+	// no Primary anywhere. See maybeRecoveryPromote for the full why.
+	err := r.maybeRecoveryPromote(ctx, dr, autoPromote, autoPrimaryReplica)
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// maybeRecoveryPromote re-arms the auto-primary seed on a steady-state
+// reconcile to unstick a fresh RD whose initial sync wedged (Bug 366).
+//
+// Why: a brand-new 3-diskful RD reaches all-UpToDate via two mechanisms
+// BOTH gated on "a data-bearing diskful peer exists" (anyDiskfulPeerHasData
+// / PeerHasData): the day0 skip-initial-sync GI seed and the lowest-node-id
+// seed-primary election. When the three first-activation reconciles stagger,
+// the replicas that seed first flip UpToDate; that flips the gate true for
+// the LATE replica, which then (a) declines its own day0 seed → comes up
+// Inconsistent, and (b) vetoes the seed-primary election → NO replica is
+// ever promoted Primary. With no Primary the late replica's resync stalls
+// (dual SyncSource collide into resync-suspended:peer, done:0.00) and it
+// sits Inconsistent forever (~2 in 7 cold creates pre-fix).
+//
+// The one-shot first-activation autoPromote can never recover this —
+// firstActivation has latched false by the time the wedge is observable. So
+// this re-arms the SAME auto-primary action, modelled on the
+// needsAutoMkfsRetry re-entry (same runAutoPromote promote→mkfs→demote
+// lifecycle). NeedsRecoveryPromote reads live drbdsetup status (not latched
+// flags) and fires ONLY when: the local replica is diskful+UpToDate, at
+// least one diskful peer is Inconsistent, NO replica anywhere is Primary,
+// and this node holds the lowest my-node-id among the UpToDate diskful
+// replicas — so EXACTLY ONE deterministic node promotes (no split-brain).
+// runAutoPromote then makes this node the authoritative SyncSource, driving
+// the stalled Inconsistent peer to UpToDate. Data-safe: every replica shares
+// the synthetic day0 Current-UUID, so primary --force mints no unrelated
+// UUID. Bounded / self-limiting: once the peer reaches UpToDate the predicate
+// no longer holds, so it cannot re-fire. We deliberately do NOT route through
+// shouldForcePromote — its AnyConnectedPeerHasData veto is exactly what
+// wedged us (a peer IS UpToDate by now); NeedsRecoveryPromote is the correct,
+// narrower gate for this state.
+func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.DesiredResource, autoPromote, autoPrimaryReplica bool) error {
+	if autoPromote || !autoPrimaryReplica || !r.cfg.Adm.NeedsRecoveryPromote(ctx, dr.GetName()) {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("Bug 366 recovery-promote: re-arming auto-primary to unstick wedged initial sync",
+		"resource", dr.GetName())
+
+	return r.runAutoPromote(ctx, dr)
 }
 
 // needsAutoMkfsRetry probes whether an auto-primary replica must
