@@ -68,7 +68,22 @@ RD=$RD_DST
 wait_uptodate "$RD_DST" "$N2" "$N3"
 
 DEV_DST=$(device_for_rd "$RD_DST" "$N3")
-md5_dst=$(read_md5 "$N3" "$DEV_DST" 262144)
+
+# The restored data reaches the freshly-autoplaced cross-node replica on
+# $N3 via DRBD resync. wait_uptodate above clears once $N3 reports
+# UpToDate, but under CI load the post-restore resync flush can lag the
+# UpToDate signal by a few seconds, so a single immediate read races the
+# still-arriving blocks (observed only on the busy 4-lane CI runner; the
+# dev stand passes every time). Re-read until the restored content lands,
+# bounded to 90s. md5 must still equal the source, so genuine restore-data
+# corruption keeps failing — only propagation latency is tolerated.
+md5_dst=""
+deadline=$(( $(date +%s) + 90 ))
+while (( $(date +%s) < deadline )); do
+    md5_dst=$(read_md5 "$N3" "$DEV_DST" 262144)
+    [[ "$md5_src" == "$md5_dst" ]] && break
+    sleep 3
+done
 
 if [[ "$md5_src" != "$md5_dst" ]]; then
     echo "FAIL: restored data differs (src=$md5_src dst=$md5_dst)"

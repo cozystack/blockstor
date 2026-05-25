@@ -101,6 +101,24 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
         qemu-kvm qemu-system-x86 qemu-utils ovmf \
         bridge-utils dnsmasq-base iproute2 socat conntrack ipset
 fi
+
+# The `linstor` CLI (python-linstor) for scenarios that drive the
+# controller through the real client (`LCTL=(linstor --controllers ...)`,
+# e.g. recovery-node-id-mismatch, recovery-inconsistent-blocking). The dev
+# stand gets it from stand/setup-host.sh, which we deliberately skip here —
+# so `linstor` is only present on a runner that happens to have a leftover
+# copy. On a fresh ephemeral oracle runner it is absent and those scenarios
+# die with `linstor: command not found` (non-deterministic per runner).
+# Install it explicitly, pinned to match the workflow's other jobs
+# (linstor_client.VERSION the integration harness asserts on).
+if ! command -v linstor >/dev/null 2>&1; then
+    log "installing linstor CLI (python-linstor)"
+    python3 -m pip install --break-system-packages --upgrade \
+        python-linstor==1.27.1 argcomplete
+    python3 -m pip install --break-system-packages --no-deps \
+        https://github.com/LINBIT/linstor-client/archive/refs/tags/v1.27.1.tar.gz
+fi
+
 # Ubuntu cloud images ship a catch-all REJECT in FORWARD; the talos
 # qemu bridges (talos<hash>) need traffic forwarded. Mirrors setup-host.sh.
 sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
