@@ -181,20 +181,42 @@ jobs:
             /tmp/envtest-*.log
 
   e2e:
-    name: E2E
-    # Runner selection mirrors cozystack/cozystack: a labelled `debug` PR
-    # lands on a long-lived `self-hosted` runner so the breakpoint step
-    # below has somewhere stable to attach SSH; regular PRs land on the
-    # CNCF-provided Oracle pool (24 CPU / 96 GB / x86-64) which has
-    # enough headroom for kind + real-DRBD QEMU stands (Talos VMs in
-    # .work/<stand>, ~50 GB RAM, KVM nested virt). The pool labels are
-    # org-wide on cozystack, so no extra setup is required here. Swap
-    # to oracle-vm-32cpu-128gb-x86-64 if a future scenario needs more
-    # RAM/CPU.
+    name: E2E (lane ${{ matrix.lane }})
+    # Real-DRBD QEMU/Talos e2e — the same suite maintainers run on the
+    # dev stand (stand/up.sh + blockstor + pools + tests/e2e/*.sh), driven
+    # by stand/ci-e2e.sh. Runs on the CNCF-provided Oracle pool which
+    # exposes /dev/kvm (nested virt), exactly like cozystack/cozystack's
+    # own e2e job. A labelled `debug` PR lands on a long-lived
+    # `self-hosted` runner so the breakpoint step below has somewhere
+    # stable to attach SSH. Swap to oracle-vm-32cpu-128gb-x86-64 if a
+    # future, heavier scenario set needs more RAM/CPU.
+    #
+    # Parallel lanes: this is a 2-lane template. To widen coverage, add
+    # entries to `matrix.lane` (e.g. 1 2 3 ... 10) AND bump `env.LANES`
+    # to match — ci-e2e.sh round-robins the SCENARIOS list across LANES,
+    # so each runner automatically picks up its 1/N share. Nothing else
+    # changes. (A future optimisation is a single build job that pushes
+    # images to a registry the lanes pull from, instead of each lane
+    # rebuilding — cozystack does this; kept simple here on purpose.)
     runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [1, 2]
+    env:
+      LANES: 2
+      # Representative scenario set, round-robined across the lanes above.
+      # Expand this list (and the matrix/LANES) to broaden coverage; the
+      # full suite is `make e2e-list`.
+      SCENARIOS: >-
+        toggle-disk two-volume-rd tiebreaker clone
+        resize-pvc snapshot-restore-cross-node
+        recovery-stuck-synctarget network-partition
+        quorum-loss-recovery backup-restore-identity
+        auto-diskful recovery-setgi-per-peer
     permissions:
       contents: read
       checks: write
@@ -209,19 +231,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      - name: Verify KVM is available
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
+          test -e /dev/kvm || { echo "::error::/dev/kvm missing — this runner lacks (nested) virtualization"; exit 1; }
+          ls -l /dev/kvm
 
-      - name: Verify kind installation
-        run: kind version
+      - name: Run QEMU e2e (lane ${{ matrix.lane }} of ${{ env.LANES }})
+        run: make ci-e2e LANE=${{ matrix.lane }} LANES=${{ env.LANES }} SCENARIOS="${{ env.SCENARIOS }}"
 
-      - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-logs-lane-${{ matrix.lane }}
+          path: |
+            /tmp/e2e-ci-lane${{ matrix.lane }}.results
+            /tmp/e2e-ci-lane${{ matrix.lane }}-*.log
+          if-no-files-found: ignore
 
       # Open an SSH breakpoint to the failing e2e runner so maintainers
       # can attach, inspect kind/blockstor state, and resume with

@@ -13,7 +13,7 @@ KUBECONFIG := $(WORK_DIR)/kubeconfig
 export TALOSCONFIG
 export KUBECONFIG
 
-.PHONY: stand-help up down reset piraeus oracle build-images rebuild blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list iter use list stand-clean
+.PHONY: stand-help up down reset piraeus oracle build-images rebuild blockstor pools smoke smoke-blockstor burnin-blockstor e2e e2e-list ci-e2e iter use list stand-clean
 
 stand-help: ## list dev-stand targets
 	@echo "stand targets (use NAME=<cluster>):"
@@ -58,6 +58,10 @@ e2e: ## run a single e2e scenario (NAME=<cluster>, SCENARIO=<basename without .s
 
 e2e-list: ## list available e2e scenarios
 	@ls tests/e2e/*.sh | xargs -n1 basename | grep -v '^lib\.sh$$' | sed 's/\.sh$$//'
+
+ci-e2e: ## CI: provision an ephemeral stand + run this lane's e2e shard (LANE, LANES, SCENARIOS="a b c")
+	@test -n "$(LANE)" && test -n "$(LANES)" || (echo 'usage: make ci-e2e LANE=<n> LANES=<total> SCENARIOS="s1 s2 ..."'; exit 2)
+	@./stand/ci-e2e.sh "$(LANE)" "$(LANES)" $(SCENARIOS)
 
 iter: ## one dev-loop iteration on a single stand: rollout + cleanup + e2e (NAME=<cluster>, SCENARIO=<name>). Run `make rebuild` first.
 	@test -n "$${SCENARIO}" || (echo "usage: make iter NAME=<cluster> SCENARIO=<name>"; exit 2)
