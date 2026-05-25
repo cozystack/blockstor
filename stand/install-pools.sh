@@ -180,6 +180,14 @@ create_lvm() {
         # steps which also fail (they go through the same
         # /dev/<vg>/<lv> path that udev never created).
         CFG='activation{udev_sync=0 udev_rules=0}'
+        # Idempotency: a prior run may have created thin_meta and/or a
+        # plain 'thin' LV but not finished the thin-pool convert (e.g.
+        # interrupted, or a too-small disk where 'lvcreate -L 13G thin'
+        # ran out of space). The 'lvs .../thin' check above only matches
+        # the FINISHED pool, so scrub any partial leftovers here to keep
+        # these lvcreates re-runnable.
+        lvremove --config \"\$CFG\" -y blockstor-lvm/thin 2>/dev/null || true
+        lvremove --config \"\$CFG\" -y blockstor-lvm/thin_meta 2>/dev/null || true
         lvcreate --config \"\$CFG\" -y -Wn -Zn -L 1G blockstor-lvm -n thin_meta
         lvcreate --config \"\$CFG\" -y -Wn -Zn -L 13G blockstor-lvm -n thin
         lvconvert --config \"\$CFG\" -y -Wn -Zn --type thin-pool --poolmetadata blockstor-lvm/thin_meta blockstor-lvm/thin

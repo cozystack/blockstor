@@ -56,17 +56,20 @@ fi
 STAND="ci-lane${LANE}"
 REGISTRY_CONTAINER="blockstor-ci-registry"
 
-# CI-tuned VM sizing (env-overridable). The dev stand defaults
-# (16 GiB each) assume a multi-TB NVMe; a CI runner has far less, so we
-# shrink each disk. TWO extra disks per worker are REQUIRED: `make pools
-# TYPE=both` puts a ZFS pool on the first and an LVM pool on the second.
-# With only one, LVM device-discovery fell through to /dev/zram0 (not a
-# valid PV), `make pools` exited 5, no StoragePools were created, and
-# every scenario aborted (first oracle run, commit 790b4b3a5). Still 3
-# workers — many scenarios need 2 diskful replicas + a diskless
-# tiebreaker (or 3-way placement).
+# CI VM sizing (env-overridable). TWO extra disks per worker are
+# REQUIRED: `make pools TYPE=both` puts a ZFS pool on the first and an
+# LVM thin pool on the second; with only one, LVM device-discovery fell
+# through to /dev/zram0 (not a valid PV) → `make pools` exit 5 → no
+# StoragePools → every scenario aborted (first oracle run, 790b4b3a5).
+# Each disk MUST be >= ~16 GiB: install-pools.sh's LVM thin pool is 1 GiB
+# meta + 13 GiB data = 14 GiB, so an 8 GiB disk made `lvcreate -L 13G
+# thin` fail (no space), leaving an orphan thin_meta that wedged the
+# re-run with "thin_meta already exists" (exit 5). Match the dev stand's
+# 16 GiB — disks are sparse, so the real footprint stays tiny until
+# written. Still 3 workers (scenarios need 2 diskful + a diskless
+# tiebreaker, or 3-way placement).
 export EXTRA_DISKS=${EXTRA_DISKS:-2}
-export EXTRA_DISK_SIZE_MB=${EXTRA_DISK_SIZE_MB:-8192}
+export EXTRA_DISK_SIZE_MB=${EXTRA_DISK_SIZE_MB:-16384}
 CI_WORKERS=${CI_WORKERS:-3}
 
 log() { echo ">> [$STAND] $*"; }

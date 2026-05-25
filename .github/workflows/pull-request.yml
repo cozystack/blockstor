@@ -285,10 +285,14 @@ jobs:
             {endpoint}
             ```
 
-            Inspect the e2e sandbox:
+            Inspect the wedged stand (Talos+QEMU — there is no Kind here):
             ```
-            kubectl get pods -A
-            kind get clusters
+            cd ~/_work/blockstor/blockstor
+            cat /tmp/e2e-ci-lane*.results          # the lane + which scenario FAILed
+            N=$(ls .work | grep -o 'ci-lane[0-9]*' | head -1)
+            export KUBECONFIG=$PWD/.work/$N/kubeconfig
+            kubectl get pods -A; kubectl get rd,resources -A
+            cat /tmp/e2e-$N-<scenario>.log          # full log of the failing scenario
             ```
 
             Resume from inside: `breakpoint resume`. Otherwise the breakpoint
