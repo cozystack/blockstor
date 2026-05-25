@@ -38,7 +38,7 @@ import (
 //	Phase 1 ─ broadcast `Spec.SuspendIo=true`. Each satellite that
 //	          hosts a diskful peer of the parent RD runs
 //	          `drbdsetup suspend-io <rd>` and stamps
-//	          Status.NodeStatus[].SuspendIoAcked.
+//	          Status.NodeStatus[].SuspendIOAcked.
 //	Phase 2 ─ once every targeted node has acked, stamp
 //	          `Spec.TakeSnapshot=true`. Satellites then dispatch the
 //	          local provider.CreateSnapshot and stamp
@@ -56,7 +56,7 @@ import (
 // the snapshot out to backup / clone / restore loses the
 // "consistent across replicas" invariant. Upstream LINSTOR's
 // CtrlSnapshotCrtApiCallHandler runs the same 3-phase broadcast
-// (setSuspendIo(true) → updateSatellites → ack → takeSnapshot →
+// (setSuspendIO(true) → updateSatellites → ack → takeSnapshot →
 // resumeIoPrivileged) so this controller mirrors that shape.
 //
 // The satellite-side `SnapshotReconciler` (in
@@ -74,7 +74,7 @@ type SnapshotReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=snapshots/finalizers,verbs=update
 // +kubebuilder:rbac:groups=blockstor.io.blockstor.io,resources=resources,verbs=get;list;watch
 
-// Reconcile drives the Spec.SuspendIo / Spec.TakeSnapshot
+// Reconcile drives the Spec.SuspendIO / Spec.TakeSnapshot
 // transitions. Bug 351 (single-Snapshot orchestration) + Bug 353
 // (cross-Snapshot transactional batch via Spec.GroupID).
 func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -95,7 +95,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// (finalizer-aware DeleteSnapshot dispatch in
 	// pkg/satellite/controllers/snapshot.go). Skip orchestration
 	// for a Snapshot that's already being deleted — flipping
-	// Spec.SuspendIo on a terminating object would just race the
+	// Spec.SuspendIO on a terminating object would just race the
 	// satellite's finalizer-strip.
 	if !snap.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
@@ -115,7 +115,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// straight into resume regardless of where in the suspend/take
 	// sequence we are: (1) any per-node Failed=true (satellite gave
 	// up), or (2) the suspend/take deadline expired (silently-hung
-	// take). Both clear SuspendIo across the whole GroupID batch so
+	// take). Both clear SuspendIO across the whole GroupID batch so
 	// no frozen peer is left waiting. Returns aborted=true when it
 	// has driven the abort, in which case Reconcile is done.
 	aborted, result, err := r.checkAbortConditions(ctx, logger, &snap, siblings)
@@ -163,10 +163,10 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	logger.V(1).Info("advancing orchestration phase",
-		"suspendIo", next.SuspendIo, "takeSnapshot", next.TakeSnapshot,
+		"suspendIO", next.SuspendIO, "takeSnapshot", next.TakeSnapshot,
 		"group_id", snap.Spec.GroupID)
 
-	return r.maybeFlipSpec(ctx, &snap, next.SuspendIo, next.TakeSnapshot)
+	return r.maybeFlipSpec(ctx, &snap, next.SuspendIO, next.TakeSnapshot)
 }
 
 // checkAbortConditions evaluates the two abort triggers that outrank
@@ -217,11 +217,11 @@ func (r *SnapshotReconciler) checkAbortConditions(
 
 // isPhase2Promotion reports whether the pending phase decision is the
 // Phase 1 → Phase 2 transition (flipping TakeSnapshot=true while
-// SuspendIo stays true) for a Snapshot that has not already taken it.
+// SuspendIO stays true) for a Snapshot that has not already taken it.
 // Used to scope the UpToDate consistency gate to exactly the moment
 // the satellites are about to dispatch provider.CreateSnapshot.
 func isPhase2Promotion(snap *blockstoriov1alpha1.Snapshot, next snapshotPhaseDecision) bool {
-	return next.Advance && next.SuspendIo && next.TakeSnapshot && !snap.Spec.TakeSnapshot
+	return next.Advance && next.SuspendIO && next.TakeSnapshot && !snap.Spec.TakeSnapshot
 }
 
 // requeueIfSuspended returns the RequeueAfter the controller should
@@ -248,12 +248,12 @@ func (r *SnapshotReconciler) requeueIfSuspended(
 // transitions read clearly at the call site without resorting to
 // named returns (which trip our lint baseline).
 type snapshotPhaseDecision struct {
-	SuspendIo    bool
+	SuspendIO    bool
 	TakeSnapshot bool
 	Advance      bool
 }
 
-// nextPhase computes the (Spec.SuspendIo, Spec.TakeSnapshot) flag
+// nextPhase computes the (Spec.SuspendIO, Spec.TakeSnapshot) flag
 // pair the Snapshot SHOULD carry on its next persisted state
 // transition based on the current Spec view + per-node Status
 // aggregates across every same-Group sibling. The third return is
@@ -270,7 +270,7 @@ type snapshotPhaseDecision struct {
 //
 //   - Phase-1 not started: every targeted node across every sibling
 //     either hasn't reported yet or already drained — stamp
-//     SuspendIo=true.
+//     SuspendIO=true.
 //   - Phase-1 done (every sibling's every node acked): stamp
 //     TakeSnapshot=true.
 //   - Phase-2 done (every sibling's every node Ready): clear both
@@ -280,7 +280,7 @@ func (r *SnapshotReconciler) nextPhase(
 	snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1alpha1.Snapshot,
 ) snapshotPhaseDecision {
 	switch {
-	case !snap.Spec.SuspendIo && !snap.Spec.TakeSnapshot:
+	case !snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot:
 		// Phase 1 not yet started (or already cleared post-abort
 		// / post-success). If every target across every sibling
 		// has either already completed (Ready) or already drained
@@ -289,42 +289,42 @@ func (r *SnapshotReconciler) nextPhase(
 			return snapshotPhaseDecision{}
 		}
 
-		return snapshotPhaseDecision{SuspendIo: true, Advance: true}
+		return snapshotPhaseDecision{SuspendIO: true, Advance: true}
 
-	case snap.Spec.SuspendIo && !snap.Spec.TakeSnapshot:
+	case snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot:
 		// Phase 1 in flight. Promote to Phase 2 once every
 		// sibling's every targeted node has acked the suspend.
 		if !allSiblingsSuspendAcked(siblings) {
-			return snapshotPhaseDecision{SuspendIo: true}
+			return snapshotPhaseDecision{SuspendIO: true}
 		}
 
-		return snapshotPhaseDecision{SuspendIo: true, TakeSnapshot: true, Advance: true}
+		return snapshotPhaseDecision{SuspendIO: true, TakeSnapshot: true, Advance: true}
 
-	case snap.Spec.SuspendIo && snap.Spec.TakeSnapshot:
+	case snap.Spec.SuspendIO && snap.Spec.TakeSnapshot:
 		// Phase 2 in flight. Drop into Phase 3 (resume) once
 		// every sibling's every targeted node has stamped Ready=true.
 		if !allSiblingsReady(siblings) {
-			return snapshotPhaseDecision{SuspendIo: true, TakeSnapshot: true}
+			return snapshotPhaseDecision{SuspendIO: true, TakeSnapshot: true}
 		}
 
 		return snapshotPhaseDecision{Advance: true}
 	}
 
 	return snapshotPhaseDecision{
-		SuspendIo:    snap.Spec.SuspendIo,
+		SuspendIO:    snap.Spec.SuspendIO,
 		TakeSnapshot: snap.Spec.TakeSnapshot,
 	}
 }
 
-// maybeFlipSpec writes the (suspendIo, takeSnapshot) flag pair
+// maybeFlipSpec writes the (suspendIO, takeSnapshot) flag pair
 // onto the Snapshot's Spec via an optimistic-lock loop. Skips the
 // Update entirely when the Spec already matches — pointless
 // ResourceVersion churn would race the satellite's Status.NodeStatus
 // stamps on every Reconcile pass.
 func (r *SnapshotReconciler) maybeFlipSpec(
-	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, suspendIo, takeSnapshot bool,
+	ctx context.Context, snap *blockstoriov1alpha1.Snapshot, suspendIO, takeSnapshot bool,
 ) (ctrl.Result, error) {
-	if snap.Spec.SuspendIo == suspendIo && snap.Spec.TakeSnapshot == takeSnapshot {
+	if snap.Spec.SuspendIO == suspendIO && snap.Spec.TakeSnapshot == takeSnapshot {
 		return ctrl.Result{}, nil
 	}
 
@@ -342,11 +342,11 @@ func (r *SnapshotReconciler) maybeFlipSpec(
 			return errors.Wrap(getErr, "get Snapshot for Spec flip")
 		}
 
-		if current.Spec.SuspendIo == suspendIo && current.Spec.TakeSnapshot == takeSnapshot {
+		if current.Spec.SuspendIO == suspendIO && current.Spec.TakeSnapshot == takeSnapshot {
 			return nil
 		}
 
-		current.Spec.SuspendIo = suspendIo
+		current.Spec.SuspendIO = suspendIO
 		current.Spec.TakeSnapshot = takeSnapshot
 
 		return r.Update(ctx, &current)
@@ -359,23 +359,23 @@ func (r *SnapshotReconciler) maybeFlipSpec(
 }
 
 // allNodesSuspendAcked reports whether every targeted node has
-// stamped Status.NodeStatus[].SuspendIoAcked=true. The denominator
+// stamped Status.NodeStatus[].SuspendIOAcked=true. The denominator
 // is Spec.Nodes (caller-restricted broadcast) — an empty Spec.Nodes
 // returns false, see the defensive guard in Reconcile.
 func allNodesSuspendAcked(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, targets []string) bool {
 	return allTargetsMatch(entries, targets, func(e blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
-		return e.SuspendIoAcked
+		return e.SuspendIOAcked
 	})
 }
 
 // allNodesSuspendCleared is the inverse: every targeted node has
-// SuspendIoAcked=false (or no entry at all). Used as the
+// SuspendIOAcked=false (or no entry at all). Used as the
 // orchestration's terminal-success signal — after Phase 3 the
 // satellites flip their per-node acks back to false to indicate
 // resume-io has fired.
 func allNodesSuspendCleared(entries []blockstoriov1alpha1.SnapshotPerNodeStatus, targets []string) bool {
 	return allTargetsMatch(entries, targets, func(e blockstoriov1alpha1.SnapshotPerNodeStatus) bool {
-		return !e.SuspendIoAcked
+		return !e.SuspendIOAcked
 	})
 }
 
@@ -503,7 +503,7 @@ func (r *SnapshotReconciler) fetchSiblings(
 }
 
 // allSiblingsSuspendAcked reports whether every sibling's every
-// targeted node has stamped SuspendIoAcked=true. Phase 2 advancement
+// targeted node has stamped SuspendIOAcked=true. Phase 2 advancement
 // gate for the cross-Snapshot transactional batch.
 func allSiblingsSuspendAcked(siblings []blockstoriov1alpha1.Snapshot) bool {
 	for i := range siblings {
@@ -516,7 +516,7 @@ func allSiblingsSuspendAcked(siblings []blockstoriov1alpha1.Snapshot) bool {
 }
 
 // allSiblingsSuspendCleared reports whether every sibling's every
-// targeted node has SuspendIoAcked=false (terminal-success drain).
+// targeted node has SuspendIOAcked=false (terminal-success drain).
 func allSiblingsSuspendCleared(siblings []blockstoriov1alpha1.Snapshot) bool {
 	for i := range siblings {
 		if !allNodesSuspendCleared(siblings[i].Status.NodeStatus, siblings[i].Spec.Nodes) {
@@ -541,7 +541,7 @@ func allSiblingsReady(siblings []blockstoriov1alpha1.Snapshot) bool {
 }
 
 // anySiblingFailed reports whether any sibling has any per-node
-// Failed=true. Triggers the abort cascade — clearing SuspendIo on
+// Failed=true. Triggers the abort cascade — clearing SuspendIO on
 // every sibling, not just the failed one, so the still-frozen peers
 // of the unaffected siblings also drain.
 func anySiblingFailed(siblings []blockstoriov1alpha1.Snapshot) bool {
@@ -569,7 +569,7 @@ func firstFailedNodeAcrossSiblings(siblings []blockstoriov1alpha1.Snapshot) stri
 }
 
 // abortGroup propagates the abort signal across every sibling in
-// the transactional batch — clearing Spec.SuspendIo and
+// the transactional batch — clearing Spec.SuspendIO and
 // Spec.TakeSnapshot on every Snapshot CRD that shares a GroupID
 // with the one that observed a Failed=true node. Without this
 // cascade, the un-failed siblings would stay in Phase 1 forever
@@ -586,7 +586,7 @@ func (r *SnapshotReconciler) abortGroup(
 		_, err := r.maybeFlipSpec(ctx, &siblings[i], false, false)
 		if err != nil {
 			return errors.Wrapf(err,
-				"abort cascade: clear SuspendIo on sibling %q", siblings[i].Name)
+				"abort cascade: clear SuspendIO on sibling %q", siblings[i].Name)
 		}
 	}
 

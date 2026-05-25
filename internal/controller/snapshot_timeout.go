@@ -61,24 +61,24 @@ const snapshotSuspendDeadline = 2 * time.Minute
 const snapshotSuspendRequeueCap = 15 * time.Second
 
 // inSuspendPhase reports whether the Snapshot is currently frozen in
-// the suspend/take window — Spec.SuspendIo=true and the orchestration
+// the suspend/take window — Spec.SuspendIO=true and the orchestration
 // has not yet drained back to all-Ready (or already-cleared). This is
 // the window where a hung take wedges the volume, so it is the only
 // window where the deadline / RequeueAfter machinery applies.
 func inSuspendPhase(snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1alpha1.Snapshot) bool {
-	if !snap.Spec.SuspendIo {
+	if !snap.Spec.SuspendIO {
 		return false
 	}
 
 	// Once every sibling's every targeted node is Ready the success
-	// drain is imminent (Phase 3 clears SuspendIo on the next pass);
+	// drain is imminent (Phase 3 clears SuspendIO on the next pass);
 	// there is no hang to guard against, so don't arm the deadline.
 	return !allSiblingsReady(siblings)
 }
 
 // suspendDeadlineExceeded reports whether the Snapshot has been frozen
 // in suspend longer than snapshotSuspendDeadline. The deadline anchor
-// is metadata.CreationTimestamp: the store stamps Spec.SuspendIo=true
+// is metadata.CreationTimestamp: the store stamps Spec.SuspendIO=true
 // at create time (pkg/store/k8s/snapshots.go::wireToCRDSnapshot), so
 // Phase 1 begins effectively at create — CreationTimestamp is the
 // earliest moment any satellite could have been told to freeze, which
@@ -125,7 +125,7 @@ func suspendRequeueAfter(snap *blockstoriov1alpha1.Snapshot, now time.Time) time
 }
 
 // abortGroupWithReason force-aborts the whole transactional batch the
-// same way the per-node-Failed abort path does (clear Spec.SuspendIo /
+// same way the per-node-Failed abort path does (clear Spec.SuspendIO /
 // Spec.TakeSnapshot on every sibling so suspended peers resume), and
 // additionally stamps the controller-side terminal markers on every
 // sibling's Status so `linstor s l` shows WHY the snapshot aborted.
@@ -135,12 +135,12 @@ func suspendRequeueAfter(snap *blockstoriov1alpha1.Snapshot, now time.Time) time
 // themselves (a hung or unreachable satellite never writes a per-node
 // Failed=true), so the controller records the FAILED_DISCONNECT flag +
 // a Condition itself. Flag/Condition stamping is best-effort relative
-// to the resume — the resume (clearing SuspendIo) is the safety-
+// to the resume — the resume (clearing SuspendIO) is the safety-
 // critical action and runs first via abortGroup.
 func (r *SnapshotReconciler) abortGroupWithReason(
 	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot, reason string,
 ) (ctrl.Result, error) {
-	// Resume first: clearing Spec.SuspendIo on every sibling is the
+	// Resume first: clearing Spec.SuspendIO on every sibling is the
 	// outage fix and must happen even if the Status stamps below fail.
 	err := r.abortGroup(ctx, siblings)
 	if err != nil {
@@ -268,12 +268,12 @@ func setSnapshotCondition(conditions *[]metav1.Condition, cond *metav1.Condition
 // non-UpToDate device (Inconsistent / SyncTarget / Outdated) captures
 // torn bytes; upstream LINSTOR refuses with "Cannot take snapshot from
 // non-UpToDate DRBD device". The Phase-2 gate otherwise only checks
-// SuspendIoAcked, which says "the kernel froze I/O" but not "the
+// SuspendIOAcked, which says "the kernel froze I/O" but not "the
 // frozen bytes are good".
 //
 // Returns (ok, offendingNode). ok=true means every targeted diskful
 // replica is UpToDate (or — defensively — has not reported a disk
-// state yet, in which case we don't block: the SuspendIoAcked gate
+// state yet, in which case we don't block: the SuspendIOAcked gate
 // already proves the satellite is live, and a missing observed state
 // shouldn't wedge the snapshot). Diskless / tie-breaker replicas hold
 // no data and are excluded from the denominator.

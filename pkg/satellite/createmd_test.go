@@ -61,7 +61,7 @@ func TestCreateMetadataIdempotentOnPreExistingMd(t *testing.T) {
 	fx.Expect("drbdadm dump-md pvc-md-adopt",
 		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
 
-	// Thin LVM provider so resolveSeedGi synthesises a deterministic
+	// Thin LVM provider so resolveSeedGI synthesises a deterministic
 	// day0 GI (IsThinOrZFS path) and the per-peer set-gi loop fires.
 	// Without a registered provider the seed resolution returns
 	// ok=false and the set-gi loop is a no-op — the test would
@@ -130,14 +130,14 @@ func TestCreateMetadataIdempotentOnPreExistingMd(t *testing.T) {
 	// "stamp the fresh-replica GI tuple regardless of metadata
 	// adoption" (Bug 319 invariant). Expect at least one set-gi
 	// command for the local node-id slot.
-	var sawSetGi bool
+	var sawSetGI bool
 	for _, line := range calls {
 		if strings.HasPrefix(line, "drbdmeta") && strings.Contains(line, "set-gi") {
-			sawSetGi = true
+			sawSetGI = true
 			break
 		}
 	}
-	if !sawSetGi {
+	if !sawSetGI {
 		t.Errorf("expected per-peer drbdmeta set-gi to fire even on adopted metadata; calls=%v", calls)
 	}
 

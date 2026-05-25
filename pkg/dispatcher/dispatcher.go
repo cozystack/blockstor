@@ -248,8 +248,8 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		LayerStack:  layerStack,
 		Connections: connectionsFromRD(rd),
 		// Bug 342 / seed-GI safety: tell the satellite whether a
-		// data-bearing diskful peer already exists so resolveSeedGi
-		// refuses any GI seed (day0 OR controller SeedFromGi) on a
+		// data-bearing diskful peer already exists so resolveSeedGI
+		// refuses any GI seed (day0 OR controller SeedFromGI) on a
 		// fresh replica that must SyncTarget from that peer instead.
 		PeerHasData: anyDiskfulPeerHasData(peers),
 	}
@@ -596,7 +596,7 @@ func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1
 // Diskless peers never count: they have no backing data to seed from.
 // Used both to suppress the seed-primary on a relocate (BuildDesired's
 // auto-primary election) AND to gate the day0/peer GI-seed in the
-// satellite (threaded via DesiredResource.PeerHasData → resolveSeedGi).
+// satellite (threaded via DesiredResource.PeerHasData → resolveSeedGI).
 func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 	for i := range peers {
 		if slices.Contains(peers[i].Spec.Flags, apiv1.ResourceFlagDiskless) {
@@ -818,7 +818,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			VolumeNumber:   vd.VolumeNumber,
 			SizeKib:        vd.SizeKib,
 			StoragePool:    pool,
-			SeedFromGi:     seedFromGi(target, vd.VolumeNumber),
+			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
 		})
@@ -862,15 +862,15 @@ func resolveMetaPool(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alph
 	return ""
 }
 
-// seedFromGi looks up the controller-allocated SeedFromGi for the
+// seedFromGI looks up the controller-allocated SeedFromGI for the
 // given volume number. Empty when the controller hasn't picked a peer
 // yet (fresh-cluster, no UpToDate peer to seed from); the satellite
 // then skips drbdmeta seeding and pays the full initial-sync cost
 // for that volume. Phase 8.1.
-func seedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+func seedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32) string {
 	for i := range target.Spec.Volumes {
 		if target.Spec.Volumes[i].VolumeNumber == volumeNumber {
-			return target.Spec.Volumes[i].SeedFromGi
+			return target.Spec.Volumes[i].SeedFromGI
 		}
 	}
 

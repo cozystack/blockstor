@@ -225,7 +225,7 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 	}
 }
 
-// TestAdmSetGiInvokesDrbdmeta pins the initial-sync skip seeding
+// TestAdmSetGIInvokesDrbdmeta pins the initial-sync skip seeding
 // command shape: `drbdmeta --force <res>/<vol> v09 <device>
 // internal set-gi --node-id <peer> <peer_gi>:<peer_gi>:0:0`.
 //
@@ -243,13 +243,13 @@ func TestAdmDetachInvokesDrbdadm(t *testing.T) {
 //     lives in a per-peer bitmap slot in the modern v09 layout. A
 //     regression to the no-node-id shape would silently re-introduce
 //     a fall-through to the full initial-sync on DRBD 9.2+.
-func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
+func TestAdmSetGIInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	err := adm.SetGi(t.Context(), "pvc-1", 0, "/dev/dm-3", 1, "78A0DDDABCDEF000")
+	err := adm.SetGI(t.Context(), "pvc-1", 0, "/dev/dm-3", 1, "78A0DDDABCDEF000")
 	if err != nil {
-		t.Fatalf("SetGi: %v", err)
+		t.Fatalf("SetGI: %v", err)
 	}
 
 	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
@@ -274,7 +274,7 @@ func TestAdmSetGiInvokesDrbdmeta(t *testing.T) {
 //   - `<peer-node-id>` MUST be passed as the trailing positional
 //     argument (not `--node-id`). The forget-peer subcommand
 //     takes the node-id positionally; a regression that copied
-//     SetGi's `--node-id <N>` shape would surface as drbdmeta
+//     SetGI's `--node-id <N>` shape would surface as drbdmeta
 //     refusing the call with a usage error.
 //   - The `--force` flag MUST be present so drbdmeta accepts the
 //     mutation against in-use metadata (the resource is still

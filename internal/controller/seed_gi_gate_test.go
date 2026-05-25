@@ -24,9 +24,9 @@ import (
 )
 
 // TestAnyDataBearingDiskfulPeer pins the seed-GI data-integrity
-// discriminator (Bug 342): the controller's ensureSeedFromGi must
+// discriminator (Bug 342): the controller's ensureSeedFromGI must
 // recognise a data-bearing diskful peer (UpToDate/Consistent/Outdated)
-// so it refuses to stamp a SeedFromGi on a fresh replica that must
+// so it refuses to stamp a SeedFromGI on a fresh replica that must
 // instead SyncTarget (full resync) from that peer. A genuinely-fresh
 // RD (no data peer) keeps the day0 skip-sync path enabled.
 func TestAnyDataBearingDiskfulPeer(t *testing.T) {
@@ -112,13 +112,13 @@ func TestAnyDataBearingDiskfulPeer(t *testing.T) {
 	}
 }
 
-// TestEnsureSeedFromGiGatedOnDataPeer pins the end-to-end controller
-// gate: ensureSeedFromGi stamps SeedFromGi ONLY when there is no
+// TestEnsureSeedFromGIGatedOnDataPeer pins the end-to-end controller
+// gate: ensureSeedFromGI stamps SeedFromGI ONLY when there is no
 // data-bearing peer. With a data peer present it leaves Spec untouched
 // (mutated=false) so the satellite brings the fresh replica up
 // Inconsistent + SyncTarget; without one it copies the UpToDate peer's
-// CurrentGi (the legacy Phase-8.1 fresh-RD seed).
-func TestEnsureSeedFromGiGatedOnDataPeer(t *testing.T) {
+// CurrentGI (the legacy Phase-8.1 fresh-RD seed).
+func TestEnsureSeedFromGIGatedOnDataPeer(t *testing.T) {
 	t.Parallel()
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{}
@@ -130,7 +130,7 @@ func TestEnsureSeedFromGiGatedOnDataPeer(t *testing.T) {
 		p := blockstoriov1alpha1.Resource{}
 		p.Name = "rd.n-old"
 		p.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{
-			{VolumeNumber: 0, DiskState: state, CurrentGi: gi},
+			{VolumeNumber: 0, DiskState: state, CurrentGI: gi},
 		}
 
 		return p
@@ -145,17 +145,17 @@ func TestEnsureSeedFromGiGatedOnDataPeer(t *testing.T) {
 
 		peers := []blockstoriov1alpha1.Resource{peerWith("UpToDate", "AAAA")}
 
-		mutated, err := r.ensureSeedFromGi(context.Background(), target, peers, rd)
+		mutated, err := r.ensureSeedFromGI(context.Background(), target, peers, rd)
 		if err != nil {
-			t.Fatalf("ensureSeedFromGi: %v", err)
+			t.Fatalf("ensureSeedFromGI: %v", err)
 		}
 
 		if mutated {
-			t.Fatalf("ensureSeedFromGi mutated Spec with a data-bearing peer present — must defer to SyncTarget")
+			t.Fatalf("ensureSeedFromGI mutated Spec with a data-bearing peer present — must defer to SyncTarget")
 		}
 
 		if seedAlreadySet(target, 0) {
-			t.Errorf("SeedFromGi was stamped despite a data-bearing peer")
+			t.Errorf("SeedFromGI was stamped despite a data-bearing peer")
 		}
 	})
 }

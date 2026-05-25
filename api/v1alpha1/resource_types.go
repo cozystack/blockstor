@@ -142,7 +142,7 @@ type ResourceSpec struct {
 
 	// volumes carries per-volume seed configuration that the
 	// satellite applies once on first activation of this replica.
-	// Today the only field is SeedFromGi (Phase 8.1) — when set,
+	// Today the only field is SeedFromGI (Phase 8.1) — when set,
 	// the satellite stamps the new replica's DRBD metadata with
 	// this generation identifier before `drbdadm up` so the GI
 	// handshake sees the new device as already-in-sync with that
@@ -186,9 +186,9 @@ type ResourceVolumeSpec struct {
 	// VolumeDefinition. +required when this struct is populated.
 	VolumeNumber int32 `json:"volumeNumber"`
 
-	// seedFromGi pre-seeds the DRBD-9 generation identifier of this
+	// seedFromGI pre-seeds the DRBD-9 generation identifier of this
 	// replica's metadata block before the first `drbdadm up`. When
-	// set to the CurrentGi of an existing UpToDate peer, DRBD's GI
+	// set to the CurrentGI of an existing UpToDate peer, DRBD's GI
 	// handshake on first connect sees the match and skips the full
 	// initial-sync — turning hours of resync on multi-TiB volumes
 	// into instant. Phase 8.1.
@@ -197,7 +197,7 @@ type ResourceVolumeSpec struct {
 	// ignore it (the satellite checks `drbdmeta show-gi` before
 	// re-stamping).
 	// +optional
-	SeedFromGi string `json:"seedFromGi,omitempty"`
+	SeedFromGI string `json:"seedFromGi,omitempty"`
 }
 
 // ResourceStatus is the observed state of a placed resource.
@@ -410,14 +410,14 @@ type ResourceVolumeStatus struct {
 	// turning hours of resync on multi-TiB volumes into instant.
 	// Updated by the satellite-side observer; never set in Spec.
 	// +optional
-	CurrentGi string `json:"currentGi,omitempty"`
+	CurrentGI string `json:"currentGi,omitempty"`
 
 	// historyGi carries the historical GI chain (DRBD keeps 3-4
 	// previous generations). Useful for split-brain forensics and
 	// cluster-state UI; may be elided when we run tight on Status
 	// budget. Order is newest-first.
 	// +optional
-	HistoryGi []string `json:"historyGi,omitempty"`
+	HistoryGI []string `json:"historyGi,omitempty"`
 
 	// outOfSyncKib is the worst-case "how many KiB this volume is
 	// behind any peer" reported by `drbdsetup events2 --statistics`

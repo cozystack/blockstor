@@ -1293,7 +1293,7 @@ func TestAutoPrimaryGatedOnAllPeerNodeIDs(t *testing.T) {
 // iff a diskful peer reports committed data (UpToDate/Consistent/
 // Outdated), and false for a genuinely-fresh RD (peers fresh /
 // Inconsistent / no DiskState) so the satellite's day0 skip-sync stays
-// enabled. The satellite's resolveSeedGi refuses every GI seed when
+// enabled. The satellite's resolveSeedGI refuses every GI seed when
 // this is true (fresh replica must SyncTarget from the data peer).
 func TestPeerHasDataGatesSeed(t *testing.T) {
 	t.Parallel()

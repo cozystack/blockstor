@@ -2536,7 +2536,7 @@ var errPrimaryForceFailed = errors.New("drbdadm: device busy")
 
 // TestApplyFirstActivationSeedsGiBeforeAdjust pins the Phase 8.1
 // initial-sync skip pipeline: when the controller has filled in
-// SeedFromGi on a freshly-created replica, the satellite must
+// SeedFromGI on a freshly-created replica, the satellite must
 // (a) run create-md to lay down a fresh metadata block, then
 // (b) run drbdmeta set-gi to stamp it with the peer's GI, then
 // (c) run drbdadm adjust to bring the resource up — all in that
@@ -2572,7 +2572,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 					VolumeNumber: 0,
 					SizeKib:      1024 * 1024,
 					StoragePool:  "thin1",
-					SeedFromGi:   "78A0DDDABCDEF000",
+					SeedFromGI:   "78A0DDDABCDEF000",
 				},
 			},
 			DrbdOptions: map[string]string{
@@ -2588,14 +2588,14 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 	calls := fx.CommandLines()
 
 	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-seed", drbd.MaxPeers-1))
-	setGi := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
+	setGI := indexOfPrefix(calls, "drbdmeta --force pvc-seed/0 v09 ")
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-seed")
 
 	if createMD < 0 {
 		t.Fatalf("missing drbdadm create-md in calls: %v", calls)
 	}
 
-	if setGi < 0 {
+	if setGI < 0 {
 		t.Fatalf("missing drbdmeta set-gi in calls: %v", calls)
 	}
 
@@ -2603,18 +2603,18 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 		t.Fatalf("missing drbdadm adjust in calls: %v", calls)
 	}
 
-	if createMD >= setGi || setGi >= adjust {
+	if createMD >= setGI || setGI >= adjust {
 		t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending); calls=%v",
-			createMD, setGi, adjust, calls)
+			createMD, setGI, adjust, calls)
 	}
 
 	// Pin the exact GI tuple shape so the seed gets the peer's
 	// current_uuid in BOTH current_uuid and bitmap_uuid slots,
 	// stamped via `set-gi --node-id <peer>` (DRBD 9.2+ per-peer
 	// slot layout).
-	wantSetGi := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
-	if !slices.Contains(calls, wantSetGi) {
-		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGi, calls)
+	wantSetGI := "drbdmeta --force pvc-seed/0 v09 /dev/vg/pvc-seed_00000 internal set-gi --node-id 1 78A0DDDABCDEF000:78A0DDDABCDEF000:0:0"
+	if !slices.Contains(calls, wantSetGI) {
+		t.Errorf("missing exact set-gi command %q in calls: %v", wantSetGI, calls)
 	}
 }
 
@@ -2883,7 +2883,7 @@ func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
 // would let pre-existing garbage on one replica's extents differ
 // from the other's and never resync.
 //
-// SeedFromGi is empty (no UpToDate peer in Status.Peers). The
+// SeedFromGI is empty (no UpToDate peer in Status.Peers). The
 // existing-peer path is covered by TestApplyFirstActivationSeedsGiBeforeAdjust
 // and is unchanged.
 func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
@@ -2918,7 +2918,7 @@ func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
 
 	for _, line := range fx.CommandLines() {
 		if strings.HasPrefix(line, "drbdmeta") {
-			t.Errorf("drbdmeta ran on thick LVM without SeedFromGi: %s", line)
+			t.Errorf("drbdmeta ran on thick LVM without SeedFromGI: %s", line)
 		}
 	}
 }
@@ -2932,7 +2932,7 @@ func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
 // Inconsistent and SyncTargets from the peer (full resync, data-safe),
 // instead of skip-syncing against a peer whose evolved Current UUID is
 // unrelated to the synthetic day0 → `uuid_compare()=unrelated-data` →
-// StandAlone. This is RACE-FREE: it holds even though SeedFromGi is
+// StandAlone. This is RACE-FREE: it holds even though SeedFromGI is
 // empty (controller stamp never landed), because the gate reads the
 // dispatcher-observed PeerHasData, not the controller stamp.
 func TestApplyFreshReplicaWithDataPeerSkipsSeed(t *testing.T) {
@@ -2993,7 +2993,7 @@ func TestApplyFreshReplicaWithDataPeerSkipsSeed(t *testing.T) {
 // "read-as-zero on unprovisioned blocks" property the upstream
 // short-circuit relies on.
 //
-// The fix MUST work without SeedFromGi being stamped by the
+// The fix MUST work without SeedFromGI being stamped by the
 // controller — that's the difference from the existing-peer path
 // already pinned by TestApplyFirstActivationSeedsGiBeforeAdjust.
 func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
@@ -3074,14 +3074,14 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			calls := fx.CommandLines()
 
 			createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-zskip", drbd.MaxPeers-1))
-			setGi := indexOfPrefix(calls, "drbdmeta --force pvc-zskip/0 v09 ")
+			setGI := indexOfPrefix(calls, "drbdmeta --force pvc-zskip/0 v09 ")
 			adjust := indexOfPrefix(calls, "drbdadm adjust pvc-zskip")
 
 			if createMD < 0 {
 				t.Fatalf("missing drbdadm create-md in calls: %v", calls)
 			}
 
-			if setGi < 0 {
+			if setGI < 0 {
 				t.Fatalf("missing drbdmeta set-gi (day0 skip-init-sync) in calls: %v", calls)
 			}
 
@@ -3089,9 +3089,9 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 				t.Fatalf("missing drbdadm adjust in calls: %v", calls)
 			}
 
-			if createMD >= setGi || setGi >= adjust {
+			if createMD >= setGI || setGI >= adjust {
 				t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending); calls=%v",
-					createMD, setGi, adjust, calls)
+					createMD, setGI, adjust, calls)
 			}
 
 			// Pin the exact day0 GI shape: same current_uuid in BOTH
@@ -3102,10 +3102,10 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 			// the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGi := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:%s:0:0",
+			wantSetGI := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:%s:0:0",
 				tc.wantDevice, day0, day0)
-			if !slices.Contains(calls, wantSetGi) {
-				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGi, calls)
+			if !slices.Contains(calls, wantSetGI) {
+				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGI, calls)
 			}
 		})
 	}
@@ -3123,8 +3123,8 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 // stamps — so DRBD's first-connect GI handshake on every peer-pair
 // matches and the full initial-sync is skipped on every side.
 //
-// Before the fix, seedInitialGi called the legacy single-call
-// SetGi with no `--node-id`, which on DRBD 9.2+ failed with "The
+// Before the fix, seedInitialGI called the legacy single-call
+// SetGI with no `--node-id`, which on DRBD 9.2+ failed with "The
 // set-gi command requires the --node-id option" and was silently
 // downgraded to a no-op — leaving every peer bitmap slot
 // unseeded, so the GI handshake mismatched and the full initial-
@@ -3230,7 +3230,7 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 
 // TestApplyFirstActivationSeedsEveryMetadataSlotBlanket pins the
 // blanket-all-slots GI seed (Bug 342 family / DRBD #40 Mode B root
-// cause). seedPerPeerGi must stamp the day0 tuple into EVERY v09
+// cause). seedPerPeerGI must stamp the day0 tuple into EVERY v09
 // metadata node-id slot 0..drbd.NodeIDMax — local, every visible
 // peer, AND every slot no currently-visible peer occupies — so no
 // slot is ever left with a stale per-peer bitmap-UUID that DRBD's
@@ -3354,18 +3354,18 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 // (sequential-create race: `linstor r create N1 RD` lands its
 // satellite reconcile BEFORE `linstor r create N2 RD` creates the
 // second Resource, so N1 sees no diskful peers in its DesiredResource
-// at the moment seedInitialGi runs).
+// at the moment seedInitialGI runs).
 //
-// Pre-fix shape: seedPerPeerGi looped only over GetPeers(), so with
+// Pre-fix shape: seedPerPeerGI looped only over GetPeers(), so with
 // zero peers it stamped nothing. `drbdadm create-md` then left the
 // local current_uuid at a random value. When N2 later joined,
 // dispatcher re-rendered .res, satellite re-applied — but
 // firstActivation was already false (`.md-created` marker present),
-// so seedInitialGi never re-ran. The handshake then saw N1's random
+// so seedInitialGI never re-ran. The handshake then saw N1's random
 // current_uuid vs N2's day0 → `uuid_compare()=unrelated-data` →
 // `Unrelated data, aborting!` → permanent StandAlone.
 //
-// Fix: seedPerPeerGi additionally stamps `--node-id <local>` with
+// Fix: seedPerPeerGI additionally stamps `--node-id <local>` with
 // the same day0 tuple BEFORE the peer loop. This test exercises
 // the zero-peer first-activation and asserts the local-slot
 // drbdmeta set-gi call lands.
@@ -3429,16 +3429,16 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	// reads the metadata into kernel state).
 	createMD := indexOfPrefix(calls, fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-b284", drbd.MaxPeers-1))
 	adjust := indexOfPrefix(calls, "drbdadm adjust pvc-b284")
-	setGi := slices.Index(calls, wantLocal)
+	setGI := slices.Index(calls, wantLocal)
 
-	if createMD < 0 || adjust < 0 || setGi < 0 {
+	if createMD < 0 || adjust < 0 || setGI < 0 {
 		t.Fatalf("missing one of create-md@%d / set-gi@%d / adjust@%d in calls: %v",
-			createMD, setGi, adjust, calls)
+			createMD, setGI, adjust, calls)
 	}
 
-	if createMD >= setGi || setGi >= adjust {
+	if createMD >= setGI || setGI >= adjust {
 		t.Errorf("ordering: create-md@%d → set-gi@%d → adjust@%d (want strictly ascending)",
-			createMD, setGi, adjust)
+			createMD, setGI, adjust)
 	}
 }
 
@@ -3890,7 +3890,7 @@ func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
 //
 // Why B: at the time of writing, the satellite-side `drbd.Adm`
 // wrapper exposes Up / Down / Adjust / CreateMD / Primary /
-// PrimaryForce / Secondary / Detach / Resize / SetGi / DelPeer —
+// PrimaryForce / Secondary / Detach / Resize / SetGI / DelPeer —
 // notably NO `Connect` verb. The reconciler's sole live-state
 // convergence call is `drbdadm adjust`, which re-reads the .res
 // file and reconfigures peers, but in DRBD 9 does NOT force a

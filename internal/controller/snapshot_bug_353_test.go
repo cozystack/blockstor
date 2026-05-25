@@ -45,7 +45,7 @@ const snapshotGroupIDLabel = "blockstor.io/snapshot-group-id"
 func b353GroupedSnapshot(
 	rdName, snapName, groupID string,
 	nodes []string,
-	suspendIo, takeSnapshot bool,
+	suspendIO, takeSnapshot bool,
 	nodeStatus []blockstoriov1alpha1.SnapshotPerNodeStatus,
 ) *blockstoriov1alpha1.Snapshot {
 	return &blockstoriov1alpha1.Snapshot{
@@ -60,7 +60,7 @@ func b353GroupedSnapshot(
 			SnapshotName:           snapName,
 			Nodes:                  nodes,
 			GroupID:                groupID,
-			SuspendIo:              suspendIo,
+			SuspendIO:              suspendIO,
 			TakeSnapshot:           takeSnapshot,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
@@ -122,13 +122,13 @@ func TestBug353GroupPhase1WaitsForEverySibling(t *testing.T) {
 	a := b353GroupedSnapshot("pvc-a", "snap", groupID,
 		[]string{"n1", "n2"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 	b := b353GroupedSnapshot("pvc-b", "snap", groupID,
 		[]string{"n1", "n2"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
 			// n2 has not reported yet.
 		})
 	c := b353GroupedSnapshot("pvc-c", "snap", groupID,
@@ -151,8 +151,8 @@ func TestBug353GroupPhase1WaitsForEverySibling(t *testing.T) {
 			t.Errorf("%s: Phase 2 fired before group fully acked: %+v", name, got.Spec)
 		}
 
-		if !got.Spec.SuspendIo {
-			t.Errorf("%s: Phase 1 SuspendIo cleared while still mid-batch: %+v", name, got.Spec)
+		if !got.Spec.SuspendIO {
+			t.Errorf("%s: Phase 1 SuspendIO cleared while still mid-batch: %+v", name, got.Spec)
 		}
 	}
 }
@@ -174,17 +174,17 @@ func TestBug353GroupAllSiblingsAckedPromotesEntireGroup(t *testing.T) {
 	a := b353GroupedSnapshot("pvc-a", "snap", groupID,
 		[]string{"n1"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
 		})
 	b := b353GroupedSnapshot("pvc-b", "snap", groupID,
 		[]string{"n2"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 	c := b353GroupedSnapshot("pvc-c", "snap", groupID,
 		[]string{"n3"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n3", SuspendIoAcked: true},
+			{NodeName: "n3", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -204,8 +204,8 @@ func TestBug353GroupAllSiblingsAckedPromotesEntireGroup(t *testing.T) {
 				name, got.Spec)
 		}
 
-		if !got.Spec.SuspendIo {
-			t.Errorf("%s: SuspendIo dropped during Phase 1→2 promotion: %+v",
+		if !got.Spec.SuspendIO {
+			t.Errorf("%s: SuspendIO dropped during Phase 1→2 promotion: %+v",
 				name, got.Spec)
 		}
 	}
@@ -214,7 +214,7 @@ func TestBug353GroupAllSiblingsAckedPromotesEntireGroup(t *testing.T) {
 // TestBug353GroupAllSiblingsReadyDrainsEntireGroup pins the
 // successful Phase 2 → 3 transition: once every sibling's every
 // targeted node has stamped Ready=true, EVERY sibling drains
-// (Spec.SuspendIo=false, Spec.TakeSnapshot=false) so the
+// (Spec.SuspendIO=false, Spec.TakeSnapshot=false) so the
 // satellites issue resume-io. Without the cross-sibling gate, a
 // 3-RD batch where pvc-a completed CreateSnapshot first would
 // drain pvc-a's suspend mid-batch — pvc-a's satellite would
@@ -231,17 +231,17 @@ func TestBug353GroupAllSiblingsReadyDrainsEntireGroup(t *testing.T) {
 	a := b353GroupedSnapshot("pvc-a", "snap", groupID,
 		[]string{"n1"}, true, true,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true, Ready: true, CreateTimestamp: 1},
+			{NodeName: "n1", SuspendIOAcked: true, Ready: true, CreateTimestamp: 1},
 		})
 	b := b353GroupedSnapshot("pvc-b", "snap", groupID,
 		[]string{"n2"}, true, true,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n2", SuspendIoAcked: true, Ready: true, CreateTimestamp: 2},
+			{NodeName: "n2", SuspendIOAcked: true, Ready: true, CreateTimestamp: 2},
 		})
 	c := b353GroupedSnapshot("pvc-c", "snap", groupID,
 		[]string{"n3"}, true, true,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n3", SuspendIoAcked: true, Ready: true, CreateTimestamp: 3},
+			{NodeName: "n3", SuspendIOAcked: true, Ready: true, CreateTimestamp: 3},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -256,8 +256,8 @@ func TestBug353GroupAllSiblingsReadyDrainsEntireGroup(t *testing.T) {
 
 	for _, name := range []string{"pvc-a.snap", "pvc-b.snap", "pvc-c.snap"} {
 		got := getSnap(t, cli, name)
-		if got.Spec.SuspendIo {
-			t.Errorf("%s: SuspendIo not cleared after every sibling Ready: %+v",
+		if got.Spec.SuspendIO {
+			t.Errorf("%s: SuspendIO not cleared after every sibling Ready: %+v",
 				name, got.Spec)
 		}
 
@@ -270,7 +270,7 @@ func TestBug353GroupAllSiblingsReadyDrainsEntireGroup(t *testing.T) {
 
 // TestBug353GroupAbortCascadesOnSiblingFailure pins the abort
 // cascade: any per-node Failed=true on ANY sibling triggers
-// SuspendIo=false on EVERY sibling (not just the failed one).
+// SuspendIO=false on EVERY sibling (not just the failed one).
 // Without the cascade, the un-failed siblings would stay in Phase
 // 1 waiting for the doomed sibling to ack, and the already-
 // suspended satellite peers of the un-failed siblings would never
@@ -287,12 +287,12 @@ func TestBug353GroupAbortCascadesOnSiblingFailure(t *testing.T) {
 	a := b353GroupedSnapshot("pvc-a", "snap", groupID,
 		[]string{"n1"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
 		})
 	b := b353GroupedSnapshot("pvc-b", "snap", groupID,
 		[]string{"n2"}, true, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 	c := b353GroupedSnapshot("pvc-c", "snap", groupID,
 		[]string{"n3"}, true, false,
@@ -311,7 +311,7 @@ func TestBug353GroupAbortCascadesOnSiblingFailure(t *testing.T) {
 	// Reconciling ANY sibling must cascade abort across the
 	// whole group — driving Reconcile on pvc-a alone is enough
 	// because the controller-side reconciler now Lists siblings
-	// and clears SuspendIo on every one of them.
+	// and clears SuspendIO on every one of them.
 	_, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: "pvc-a.snap"},
 	})
@@ -321,8 +321,8 @@ func TestBug353GroupAbortCascadesOnSiblingFailure(t *testing.T) {
 
 	for _, name := range []string{"pvc-a.snap", "pvc-b.snap", "pvc-c.snap"} {
 		got := getSnap(t, cli, name)
-		if got.Spec.SuspendIo {
-			t.Errorf("%s: abort cascade did not clear SuspendIo: %+v", name, got.Spec)
+		if got.Spec.SuspendIO {
+			t.Errorf("%s: abort cascade did not clear SuspendIO: %+v", name, got.Spec)
 		}
 
 		if got.Spec.TakeSnapshot {
@@ -351,12 +351,12 @@ func TestBug353EmptyGroupIDPreservesSingleSnapPath(t *testing.T) {
 			ResourceDefinitionName: "pvc-solo",
 			SnapshotName:           "snap",
 			Nodes:                  []string{"n1", "n2"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
-				{NodeName: "n2", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
+				{NodeName: "n2", SuspendIOAcked: true},
 			},
 		},
 	}
@@ -386,8 +386,8 @@ func TestBug353EmptyGroupIDPreservesSingleSnapPath(t *testing.T) {
 			got.Spec)
 	}
 
-	if !got.Spec.SuspendIo {
-		t.Errorf("single-snap path: SuspendIo dropped during Phase 1→2 promotion: %+v",
+	if !got.Spec.SuspendIO {
+		t.Errorf("single-snap path: SuspendIO dropped during Phase 1→2 promotion: %+v",
 			got.Spec)
 	}
 }

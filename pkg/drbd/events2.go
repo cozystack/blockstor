@@ -153,7 +153,7 @@ func (w *Watcher) Watch(ctx context.Context, ch chan<- Event) error {
 // `--statistics` adds performance counters (read/written byte tallies)
 // to device frames. `--full` adds the DRBD-9 generation identifier
 // fields (`current-uuid`, `bitmap-uuid`) to device frames so the
-// observer can surface them on `Resource.Status.Volumes[i].CurrentGi` —
+// observer can surface them on `Resource.Status.Volumes[i].CurrentGI` —
 // which the controller reads when adding a new replica to skip the
 // full initial-sync (Phase 8.1).
 func StartDrbdsetupEvents2(ctx context.Context) (*Watcher, func(), error) {

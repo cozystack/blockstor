@@ -471,7 +471,7 @@ func (r *Reconciler) SuspendResource(ctx context.Context, resName string) error 
 // called on every node SuspendResource fired on, even on the
 // abort path — a partially-suspended cluster with no follow-up
 // resume leaves application I/O hung forever. The controller-side
-// orchestration unconditionally flips Spec.SuspendIo=false on
+// orchestration unconditionally flips Spec.SuspendIO=false on
 // terminal states (Phase 3 success / any per-node Failed) so this
 // fires on every targeted satellite.
 //
@@ -2443,7 +2443,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 	//     path; re-seeding would corrupt the in-flight session.
 	//
 	// Why (Bug 347): the previous gate (`!firstActivation`) only ran
-	// seedInitialGi on firstActivation=true, which produced a full
+	// seedInitialGI on firstActivation=true, which produced a full
 	// resync on every `linstor r c <tieB-node> <rd>` because tieB→
 	// diskful arrives with firstActivation=false + HasMD=false. The
 	// HasMD probe captures the "fresh superblock" signal that
@@ -2452,7 +2452,7 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		return nil
 	}
 
-	err = r.seedInitialGi(ctx, dr, devices)
+	err = r.seedInitialGI(ctx, dr, devices)
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
 	}
@@ -3360,9 +3360,9 @@ func isUnknownResourceErr(err error) bool {
 	return drbd.IsUnknownResourceErr(err)
 }
 
-// seedInitialGi pre-stamps each diskful volume's freshly-created
+// seedInitialGI pre-stamps each diskful volume's freshly-created
 // DRBD metadata block with the GI the controller picked from an
-// UpToDate peer (Phase 8.1). When SeedFromGi is empty (fresh
+// UpToDate peer (Phase 8.1). When SeedFromGI is empty (fresh
 // cluster, no peer to seed from) the volume is skipped — DRBD will
 // fall through to the full initial-sync on first connect, which is
 // the acceptable cost for the first replica in a new RD.
@@ -3371,19 +3371,19 @@ func isUnknownResourceErr(err error) bool {
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
 
-func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
 			continue
 		}
 
-		seed, ok := r.resolveSeedGi(dr.GetName(), vol, dr.GetPeerHasData())
+		seed, ok := r.resolveSeedGI(dr.GetName(), vol, dr.GetPeerHasData())
 		if !ok {
 			continue
 		}
 
-		err := r.seedPerPeerGi(ctx, dr, vol, device, seed)
+		err := r.seedPerPeerGI(ctx, dr, vol, device, seed)
 		if err != nil {
 			return err
 		}
@@ -3392,7 +3392,7 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 	return nil
 }
 
-// seedPerPeerGi stamps the day0 GI tuple into EVERY DRBD-9 v09
+// seedPerPeerGI stamps the day0 GI tuple into EVERY DRBD-9 v09
 // metadata node-id slot (0..drbd.NodeIDMax) for one (resource,
 // volume) pair — the local node's own current_uuid slot AND every
 // possible peer slot, occupied or not. DRBD 9.2+ stores current/
@@ -3444,7 +3444,7 @@ func (r *Reconciler) seedInitialGi(ctx context.Context, dr *intent.DesiredResour
 // Returns the first non-nil error from drbdmeta. Every call carries
 // `--node-id <X>`, so the legacy "set-gi requires --node-id" failure
 // mode is structurally unreachable.
-func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string) error {
+func (r *Reconciler) seedPerPeerGI(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string) error {
 	// Blanket EVERY metadata slot 0..NodeIDMax with the same day0
 	// tuple. We deliberately do NOT gate on dr.GetPeerNames() /
 	// per-peer node-id allocation: the whole point is to wipe stale
@@ -3453,7 +3453,7 @@ func (r *Reconciler) seedPerPeerGi(ctx context.Context, dr *intent.DesiredResour
 	// late-allocated node-id). The local slot is included in the
 	// range, preserving the Bug 284 local current_uuid stamp.
 	for nodeID := int32(0); nodeID <= drbd.NodeIDMax; nodeID++ {
-		err := r.cfg.Adm.SetGi(ctx, dr.GetName(), vol.GetVolumeNumber(), device, nodeID, seed)
+		err := r.cfg.Adm.SetGI(ctx, dr.GetName(), vol.GetVolumeNumber(), device, nodeID, seed)
 		if err != nil {
 			return errors.Wrapf(err, "set-gi vol %d node-id %d",
 				vol.GetVolumeNumber(), nodeID)
@@ -3518,12 +3518,12 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	return nil
 }
 
-// resolveSeedGi decides what GI to stamp on a fresh replica's
+// resolveSeedGI decides what GI to stamp on a fresh replica's
 // metadata block:
 //
-//   - Controller-supplied SeedFromGi wins. That's the Phase 8.1
+//   - Controller-supplied SeedFromGI wins. That's the Phase 8.1
 //     "copy from an existing UpToDate peer" path — the GI is the
-//     real CurrentGi of the peer, so DRBD's handshake sees a true
+//     real CurrentGI of the peer, so DRBD's handshake sees a true
 //     match and skips initial-sync.
 //
 //   - Otherwise, when the backing provider is guaranteed to hand
@@ -3548,7 +3548,7 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 // anywhere. When ANY diskful peer reports data (peerHasData, observed
 // fresh off the peers' Status.Volumes[].DiskState every reconcile by
 // dispatcher.anyDiskfulPeerHasData), REFUSE every seed — the
-// controller-supplied SeedFromGi (copied from a peer's evolved Current
+// controller-supplied SeedFromGI (copied from a peer's evolved Current
 // UUID) AND the synthetic day0 fallback alike. A fresh replica with a
 // data-bearing peer MUST come up Inconsistent and SyncTarget from that
 // peer (full resync, adopt the peer's GI); seeding ANY GI here lets
@@ -3558,16 +3558,16 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 //
 // Race-free: the decision reads peerHasData (recomputed by the
 // dispatcher on every reconcile from live peer status), NOT a
-// controller stamp that must land in Spec.SeedFromGi in time. Even if
-// the controller never stamps SeedFromGi, a fresh replica with a data
+// controller stamp that must land in Spec.SeedFromGI in time. Even if
+// the controller never stamps SeedFromGI, a fresh replica with a data
 // peer takes the safe "no seed → Inconsistent → SyncTarget" path here,
 // never the unsafe day0 fallback.
-func (r *Reconciler) resolveSeedGi(resourceName string, vol *intent.DesiredVolume, peerHasData bool) (string, bool) {
+func (r *Reconciler) resolveSeedGI(resourceName string, vol *intent.DesiredVolume, peerHasData bool) (string, bool) {
 	if peerHasData {
 		return "", false
 	}
 
-	if seed := vol.GetSeedFromGi(); seed != "" {
+	if seed := vol.GetSeedFromGI(); seed != "" {
 		return seed, true
 	}
 

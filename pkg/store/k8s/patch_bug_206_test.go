@@ -32,7 +32,7 @@ import (
 
 // Bug 206: wireToCRDResourceSpec builds a fresh CRD Spec from the
 // wire shape, which omits Spec.Volumes — the controller-stamped slice
-// carrying SeedFromGi and per-volume DRBD layout. Both `Resources.Update`
+// carrying SeedFromGI and per-volume DRBD layout. Both `Resources.Update`
 // and `Resources.PatchResourceSpec` (Bug 204b) wholesale-assigned the
 // returned Spec, wiping Volumes on every routine REST modify
 // (`r modify --property foo=bar`, layer-stack change, flag toggle).
@@ -41,8 +41,8 @@ import (
 // both code paths.
 
 // TestBug206_PatchResourceSpecWipesSpecVolumes proves that a routine
-// `r modify` after the controller has populated Spec.Volumes[i].SeedFromGi
-// causes the SeedFromGi to be silently wiped, forcing a full DRBD
+// `r modify` after the controller has populated Spec.Volumes[i].SeedFromGI
+// causes the SeedFromGI to be silently wiped, forcing a full DRBD
 // initial-sync on next satellite reconcile.
 func TestBug206_PatchResourceSpecWipesSpecVolumes(t *testing.T) {
 	t.Parallel()
@@ -52,7 +52,7 @@ func TestBug206_PatchResourceSpecWipesSpecVolumes(t *testing.T) {
 		t.Fatalf("AddToScheme: %v", err)
 	}
 
-	// Resource on which the controller has pre-stamped SeedFromGi.
+	// Resource on which the controller has pre-stamped SeedFromGI.
 	seed := crdv1alpha1.Resource{
 		ObjectMeta: metav1.ObjectMeta{Name: "rd1.n1"},
 		Spec: crdv1alpha1.ResourceSpec{
@@ -60,7 +60,7 @@ func TestBug206_PatchResourceSpecWipesSpecVolumes(t *testing.T) {
 			NodeName:               "n1",
 			Volumes: []crdv1alpha1.ResourceVolumeSpec{{
 				VolumeNumber: 0,
-				SeedFromGi:   "78A0DDDABCDEF000",
+				SeedFromGI:   "78A0DDDABCDEF000",
 			}},
 		},
 	}
@@ -84,18 +84,18 @@ func TestBug206_PatchResourceSpecWipesSpecVolumes(t *testing.T) {
 		t.Fatalf("patch: %v", err)
 	}
 
-	// Verify SeedFromGi survives.
+	// Verify SeedFromGI survives.
 	var got crdv1alpha1.Resource
 	if err := cli.Get(context.Background(), client.ObjectKey{Name: "rd1.n1"}, &got); err != nil {
 		t.Fatalf("get post-patch: %v", err)
 	}
 
 	if len(got.Spec.Volumes) == 0 {
-		t.Fatalf("Spec.Volumes was WIPED by the routine prop bump (Bug 206); SeedFromGi lost — DRBD will full-sync")
+		t.Fatalf("Spec.Volumes was WIPED by the routine prop bump (Bug 206); SeedFromGI lost — DRBD will full-sync")
 	}
 
-	if got.Spec.Volumes[0].SeedFromGi != "78A0DDDABCDEF000" {
-		t.Fatalf("SeedFromGi clobbered: got %q want %q", got.Spec.Volumes[0].SeedFromGi, "78A0DDDABCDEF000")
+	if got.Spec.Volumes[0].SeedFromGI != "78A0DDDABCDEF000" {
+		t.Fatalf("SeedFromGI clobbered: got %q want %q", got.Spec.Volumes[0].SeedFromGI, "78A0DDDABCDEF000")
 	}
 }
 
@@ -118,7 +118,7 @@ func TestBug206_UpdateWipesSpecVolumes(t *testing.T) {
 			NodeName:               "n1",
 			Volumes: []crdv1alpha1.ResourceVolumeSpec{{
 				VolumeNumber: 0,
-				SeedFromGi:   "78A0DDDABCDEF000",
+				SeedFromGI:   "78A0DDDABCDEF000",
 			}},
 		},
 	}
@@ -153,10 +153,10 @@ func TestBug206_UpdateWipesSpecVolumes(t *testing.T) {
 	}
 
 	if len(got.Spec.Volumes) == 0 {
-		t.Fatalf("Spec.Volumes was WIPED by the routine Update (Bug 206); SeedFromGi lost — DRBD will full-sync")
+		t.Fatalf("Spec.Volumes was WIPED by the routine Update (Bug 206); SeedFromGI lost — DRBD will full-sync")
 	}
 
-	if got.Spec.Volumes[0].SeedFromGi != "78A0DDDABCDEF000" {
-		t.Fatalf("SeedFromGi clobbered: got %q want %q", got.Spec.Volumes[0].SeedFromGi, "78A0DDDABCDEF000")
+	if got.Spec.Volumes[0].SeedFromGI != "78A0DDDABCDEF000" {
+		t.Fatalf("SeedFromGI clobbered: got %q want %q", got.Spec.Volumes[0].SeedFromGI, "78A0DDDABCDEF000")
 	}
 }

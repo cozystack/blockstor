@@ -51,10 +51,10 @@ func newSnapshotControllerScheme(t *testing.T) *runtime.Scheme {
 
 // TestSnapshotControllerPhase1StampsSuspendIo pins the
 // controller-side Phase 1 promotion: a brand-new Snapshot
-// (SuspendIo=false, TakeSnapshot=false, empty NodeStatus)
-// transitions to SuspendIo=true so the satellites kick off the
+// (SuspendIO=false, TakeSnapshot=false, empty NodeStatus)
+// transitions to SuspendIO=true so the satellites kick off the
 // suspend broadcast. In production the apiserver already stamps
-// SuspendIo=true at Create time, but the controller must idempotently
+// SuspendIO=true at Create time, but the controller must idempotently
 // re-stamp it if a hand-crafted CRD ever lands with the flag cleared.
 func TestSnapshotControllerPhase1StampsSuspendIo(t *testing.T) {
 	t.Parallel()
@@ -91,8 +91,8 @@ func TestSnapshotControllerPhase1StampsSuspendIo(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if !got.Spec.SuspendIo {
-		t.Errorf("Spec.SuspendIo: got false, want true (Phase 1)")
+	if !got.Spec.SuspendIO {
+		t.Errorf("Spec.SuspendIO: got false, want true (Phase 1)")
 	}
 
 	if got.Spec.TakeSnapshot {
@@ -102,7 +102,7 @@ func TestSnapshotControllerPhase1StampsSuspendIo(t *testing.T) {
 
 // TestSnapshotControllerPhase2StampsTakeSnapshot pins the
 // Phase-1→Phase-2 promotion: once every targeted node has stamped
-// SuspendIoAcked=true, the controller flips Spec.TakeSnapshot=true
+// SuspendIOAcked=true, the controller flips Spec.TakeSnapshot=true
 // so the satellites dispatch their local provider.CreateSnapshot.
 func TestSnapshotControllerPhase2StampsTakeSnapshot(t *testing.T) {
 	t.Parallel()
@@ -115,12 +115,12 @@ func TestSnapshotControllerPhase2StampsTakeSnapshot(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1", "n2"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
-				{NodeName: "n2", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
+				{NodeName: "n2", SuspendIOAcked: true},
 			},
 		},
 	}
@@ -147,8 +147,8 @@ func TestSnapshotControllerPhase2StampsTakeSnapshot(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if !got.Spec.SuspendIo {
-		t.Errorf("Spec.SuspendIo dropped during Phase 2 promotion: %+v", got.Spec)
+	if !got.Spec.SuspendIO {
+		t.Errorf("Spec.SuspendIO dropped during Phase 2 promotion: %+v", got.Spec)
 	}
 
 	if !got.Spec.TakeSnapshot {
@@ -158,7 +158,7 @@ func TestSnapshotControllerPhase2StampsTakeSnapshot(t *testing.T) {
 
 // TestSnapshotControllerPhase2WaitsForAllAcks pins the
 // every-node-must-ack gate: when only one of two targeted nodes
-// has stamped SuspendIoAcked=true, the controller MUST NOT
+// has stamped SuspendIOAcked=true, the controller MUST NOT
 // promote to Phase 2 — otherwise the un-acked sibling would
 // dispatch provider.CreateSnapshot before its DRBD layer was
 // frozen, defeating the whole barrier.
@@ -173,11 +173,11 @@ func TestSnapshotControllerPhase2WaitsForAllAcks(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1", "n2"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
 				// n2 hasn't reported yet.
 			},
 		},
@@ -210,14 +210,14 @@ func TestSnapshotControllerPhase2WaitsForAllAcks(t *testing.T) {
 			got.Status.NodeStatus)
 	}
 
-	if !got.Spec.SuspendIo {
-		t.Errorf("Spec.SuspendIo dropped while still Phase 1: %+v", got.Spec)
+	if !got.Spec.SuspendIO {
+		t.Errorf("Spec.SuspendIO dropped while still Phase 1: %+v", got.Spec)
 	}
 }
 
 // TestSnapshotControllerPhase3ClearsSuspendOnSuccess pins the
 // happy-path Phase-3 drain: once every targeted node has stamped
-// Ready=true, the controller clears Spec.SuspendIo (+ implicit
+// Ready=true, the controller clears Spec.SuspendIO (+ implicit
 // TakeSnapshot reset) so the satellites issue `drbdsetup resume-io`.
 func TestSnapshotControllerPhase3ClearsSuspendOnSuccess(t *testing.T) {
 	t.Parallel()
@@ -230,13 +230,13 @@ func TestSnapshotControllerPhase3ClearsSuspendOnSuccess(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1", "n2"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 			TakeSnapshot:           true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true, Ready: true, CreateTimestamp: 1},
-				{NodeName: "n2", SuspendIoAcked: true, Ready: true, CreateTimestamp: 2},
+				{NodeName: "n1", SuspendIOAcked: true, Ready: true, CreateTimestamp: 1},
+				{NodeName: "n2", SuspendIOAcked: true, Ready: true, CreateTimestamp: 2},
 			},
 		},
 	}
@@ -263,8 +263,8 @@ func TestSnapshotControllerPhase3ClearsSuspendOnSuccess(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Spec.SuspendIo {
-		t.Errorf("Spec.SuspendIo: got true after Phase 3 drain, want false")
+	if got.Spec.SuspendIO {
+		t.Errorf("Spec.SuspendIO: got true after Phase 3 drain, want false")
 	}
 
 	if got.Spec.TakeSnapshot {
@@ -274,7 +274,7 @@ func TestSnapshotControllerPhase3ClearsSuspendOnSuccess(t *testing.T) {
 
 // TestSnapshotControllerAbortPathClearsSuspendOnFailure pins the
 // abort drain: any per-node Failed=true forces the controller
-// straight into Phase 3 (clear SuspendIo) regardless of where in
+// straight into Phase 3 (clear SuspendIO) regardless of where in
 // the suspend/take sequence we currently are. Without this, a
 // failure during Phase 1 on one node would leave the acked
 // siblings frozen forever.
@@ -285,7 +285,7 @@ func TestSnapshotControllerAbortPathClearsSuspendOnFailure(t *testing.T) {
 
 	// Phase 1 in flight — n1 acked, n2 hit a terminal error and
 	// stamped Failed=true. The controller MUST abort: clearing
-	// SuspendIo so n1 (frozen) drains rather than waiting on n2's
+	// SuspendIO so n1 (frozen) drains rather than waiting on n2's
 	// never-coming ack.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-1.snap-1"},
@@ -293,11 +293,11 @@ func TestSnapshotControllerAbortPathClearsSuspendOnFailure(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1", "n2"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
 				{NodeName: "n2", Failed: true},
 			},
 		},
@@ -325,8 +325,8 @@ func TestSnapshotControllerAbortPathClearsSuspendOnFailure(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Spec.SuspendIo {
-		t.Errorf("abort path did not clear Spec.SuspendIo: %+v", got.Spec)
+	if got.Spec.SuspendIO {
+		t.Errorf("abort path did not clear Spec.SuspendIO: %+v", got.Spec)
 	}
 
 	if got.Spec.TakeSnapshot {
@@ -335,8 +335,8 @@ func TestSnapshotControllerAbortPathClearsSuspendOnFailure(t *testing.T) {
 }
 
 // TestSnapshotControllerTerminalStateNoOp pins the steady-state
-// short-circuit: once Phase 3 has drained (SuspendIo=false,
-// every node SuspendIoAcked=false), the controller MUST stop
+// short-circuit: once Phase 3 has drained (SuspendIO=false,
+// every node SuspendIOAcked=false), the controller MUST stop
 // touching the Spec — otherwise we'd loop the orchestration
 // forever, re-firing suspend-io on a long-since-completed
 // snapshot.
@@ -354,7 +354,7 @@ func TestSnapshotControllerTerminalStateNoOp(t *testing.T) {
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", Ready: true, CreateTimestamp: 1, SuspendIoAcked: false},
+				{NodeName: "n1", Ready: true, CreateTimestamp: 1, SuspendIOAcked: false},
 			},
 		},
 	}
@@ -381,8 +381,8 @@ func TestSnapshotControllerTerminalStateNoOp(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Spec.SuspendIo {
-		t.Errorf("terminal-state reconcile re-stamped SuspendIo: %+v", got.Spec)
+	if got.Spec.SuspendIO {
+		t.Errorf("terminal-state reconcile re-stamped SuspendIO: %+v", got.Spec)
 	}
 
 	if got.Spec.TakeSnapshot {

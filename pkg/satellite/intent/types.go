@@ -107,9 +107,9 @@ type DesiredResource struct {
 	// diskful PEER already holds committed data (a volume in
 	// UpToDate/Consistent/Outdated — see dispatcher.anyDiskfulPeerHasData,
 	// read fresh off the peers' Status.Volumes[].DiskState every
-	// reconcile). The satellite's resolveSeedGi consults this to
+	// reconcile). The satellite's resolveSeedGI consults this to
 	// REFUSE any GI seed (day0 synthetic OR controller-supplied
-	// SeedFromGi) on a fresh diskful replica when a data-bearing peer
+	// SeedFromGI) on a fresh diskful replica when a data-bearing peer
 	// exists: seeding a GI in that case would let DRBD skip the
 	// initial resync against a peer whose evolved Current UUID is
 	// unrelated to the synthetic seed → `uuid_compare()=unrelated-data`
@@ -121,7 +121,7 @@ type DesiredResource struct {
 	//
 	// Read fresh from peer CRD Status on EVERY reconcile, so the
 	// satellite decision is self-sufficient and does NOT race a
-	// controller stamp landing in time (the SeedFromGi write-race that
+	// controller stamp landing in time (the SeedFromGI write-race that
 	// could otherwise drop the satellite back to the unsafe day0
 	// fallback).
 	PeerHasData bool
@@ -204,7 +204,7 @@ func (x *DesiredResource) GetPeers() []DesiredPeer {
 
 // GetPeerNames returns the peer node names, in the same order as
 // GetPeers. Backward-compat shim for the many call sites (renderer,
-// seedPerPeerGi, etc.) that only need the name set — keeps the
+// seedPerPeerGI, etc.) that only need the name set — keeps the
 // migration from `Peers []string` to `Peers []DesiredPeer` a no-op
 // at every renderer / seed call site. Nil-safe.
 func (x *DesiredResource) GetPeerNames() []string {
@@ -289,7 +289,7 @@ func (x *DesiredResource) GetKernelLoaded() bool {
 
 // GetPeerHasData returns whether the dispatcher observed at least one
 // diskful peer already holding committed data (UpToDate/Consistent/
-// Outdated). resolveSeedGi reads this to refuse any GI seed on a fresh
+// Outdated). resolveSeedGI reads this to refuse any GI seed on a fresh
 // replica that must instead full-resync (SyncTarget) from the peer.
 // Nil-safe.
 func (x *DesiredResource) GetPeerHasData() bool {
@@ -309,7 +309,7 @@ type DesiredVolume struct {
 	VolumeNumber int32
 	SizeKib      int64
 	StoragePool  string
-	SeedFromGi   string
+	SeedFromGI   string
 	// SourceSnapshot, when non-empty, tells the satellite to
 	// materialise this volume by cloning the named snapshot via the
 	// provider's RestoreVolumeFromSnapshot instead of CreateVolume.
@@ -360,14 +360,14 @@ func (x *DesiredVolume) GetStoragePool() string {
 	return x.StoragePool
 }
 
-// GetSeedFromGi returns the GI an existing peer offered as the
+// GetSeedFromGI returns the GI an existing peer offered as the
 // seed for skip-initial-sync, or "" when no seed was found.
-func (x *DesiredVolume) GetSeedFromGi() string {
+func (x *DesiredVolume) GetSeedFromGI() string {
 	if x == nil {
 		return ""
 	}
 
-	return x.SeedFromGi
+	return x.SeedFromGI
 }
 
 // GetSourceSnapshot returns the `<rd>:<snap>` clone source, or
@@ -411,7 +411,7 @@ type ResourceApplyResult struct {
 // ResourceApplyVolumeResult is the per-volume slice item the
 // satellite emits for the consumer side. Only the fields the
 // satellite owns end up here — DRBD-side state (DiskState,
-// CurrentGi) flows via the separate events2 observer.
+// CurrentGI) flows via the separate events2 observer.
 type ResourceApplyVolumeResult struct {
 	VolumeNumber int32
 	DevicePath   string

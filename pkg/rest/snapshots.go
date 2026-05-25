@@ -499,7 +499,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 
 	// Fail-fast offline pre-check (mirrors upstream's getOfflineNodes):
 	// every targeted diskful node must be reachable BEFORE we stamp
-	// SuspendIo=true. Freezing the reachable peers for a snapshot that
+	// SuspendIO=true. Freezing the reachable peers for a snapshot that
 	// can never complete (because one target is offline and will never
 	// ack the suspend or take the snapshot) is exactly the indefinite-
 	// freeze outage this work closes — so refuse up front rather than

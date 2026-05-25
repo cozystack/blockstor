@@ -31,7 +31,7 @@ const MaxPeers = 16
 // with `create-md 15`). It is distinct from MaxPeers (the mesh /
 // allocator budget, which only governs how many ids we hand out):
 // GI seeding stamps the FULL 0..NodeIDMax slot range so no slot is
-// ever left with a stale per-peer bitmap-UUID. See seedPerPeerGi.
+// ever left with a stale per-peer bitmap-UUID. See seedPerPeerGI.
 const NodeIDMax = 31
 
 // ErrNodeIDExhausted means no free id remains in 0..MaxPeers-1 for a

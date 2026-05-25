@@ -349,13 +349,13 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	// so the early call has no fixed-state cost.
 
 	// Initial-sync skip seeding (Phase 8.1): on a freshly-added
-	// replica, pick the CurrentGi of an existing UpToDate peer and
-	// stamp it into Spec.Volumes[i].SeedFromGi. The satellite
+	// replica, pick the CurrentGI of an existing UpToDate peer and
+	// stamp it into Spec.Volumes[i].SeedFromGI. The satellite
 	// reconciler then pre-seeds the new replica's DRBD metadata
 	// before drbdadm up so DRBD's GI handshake skips the full
 	// initial-sync. Idempotent: re-runs on a Resource whose
-	// SeedFromGi is already set leave Spec alone.
-	seeded, err := r.ensureSeedFromGi(ctx, target, peers, rdPtr)
+	// SeedFromGI is already set leave Spec alone.
+	seeded, err := r.ensureSeedFromGI(ctx, target, peers, rdPtr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -709,23 +709,23 @@ func equalStatus(a, b *blockstoriov1alpha1.ResourceStatus) bool {
 		ptrEqI32(a.DRBDMinor, b.DRBDMinor)
 }
 
-// ensureSeedFromGi pre-seeds Spec.Volumes[i].SeedFromGi on a
-// freshly-added replica with an existing UpToDate peer's CurrentGi
+// ensureSeedFromGI pre-seeds Spec.Volumes[i].SeedFromGI on a
+// freshly-added replica with an existing UpToDate peer's CurrentGI
 // so DRBD-9's GI handshake on first connect skips the full
 // initial-sync. Returns true when Spec was mutated so the caller
 // requeues with the persisted value (the next reconcile dispatches
-// to the satellite, which consumes SeedFromGi via drbdmeta).
+// to the satellite, which consumes SeedFromGI via drbdmeta).
 //
-// Idempotency: any volume that already has SeedFromGi set is left
+// Idempotency: any volume that already has SeedFromGI set is left
 // alone — the satellite reconciler is responsible for consuming
 // it once and the controller never rewrites. Volumes whose RD
-// VolumeDefinition has no peer with a non-empty CurrentGi (fresh
+// VolumeDefinition has no peer with a non-empty CurrentGI (fresh
 // cluster, all-new replicas) get nothing set; they pay the
 // (acceptable) full initial-sync cost on first activation.
 //
 // Skipped entirely for DISKLESS replicas — they have no metadata
 // block to seed.
-func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
+func (r *ResourceReconciler) ensureSeedFromGI(_ context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
 	if rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
 		return false, nil
 	}
@@ -745,7 +745,7 @@ func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockst
 	// and a stale/missing stamp would drop the satellite into the
 	// synthetic day0 fallback whose GI is unrelated to the survivor →
 	// `uuid_compare()=unrelated-data` → StandAlone. Refuse to stamp any
-	// SeedFromGi in that case; the satellite's resolveSeedGi enforces
+	// SeedFromGI in that case; the satellite's resolveSeedGI enforces
 	// the same gate race-free from observed peer state.
 	if anyDataBearingDiskfulPeer(peers, target.Name) {
 		return false, nil
@@ -763,7 +763,7 @@ func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockst
 			continue
 		}
 
-		setSeedFromGi(target, vd.VolumeNumber, seed)
+		setSeedFromGI(target, vd.VolumeNumber, seed)
 
 		mutated = true
 	}
@@ -780,11 +780,11 @@ func (r *ResourceReconciler) ensureSeedFromGi(_ context.Context, target *blockst
 }
 
 // seedAlreadySet reports whether target.Spec.Volumes already has a
-// SeedFromGi for the given volume number. Used to make
-// ensureSeedFromGi idempotent.
+// SeedFromGI for the given volume number. Used to make
+// ensureSeedFromGI idempotent.
 func seedAlreadySet(target *blockstoriov1alpha1.Resource, volumeNumber int32) bool {
 	for i := range target.Spec.Volumes {
-		if target.Spec.Volumes[i].VolumeNumber == volumeNumber && target.Spec.Volumes[i].SeedFromGi != "" {
+		if target.Spec.Volumes[i].VolumeNumber == volumeNumber && target.Spec.Volumes[i].SeedFromGI != "" {
 			return true
 		}
 	}
@@ -792,12 +792,12 @@ func seedAlreadySet(target *blockstoriov1alpha1.Resource, volumeNumber int32) bo
 	return false
 }
 
-// pickSeedFromPeers picks an existing peer's CurrentGi for the given
+// pickSeedFromPeers picks an existing peer's CurrentGI for the given
 // volume number. Deterministic: peers are sorted by Name and the
 // first matching one wins, so two reconcile races converge on the
-// same answer (no thrashing of Spec.Volumes[i].SeedFromGi).
+// same answer (no thrashing of Spec.Volumes[i].SeedFromGI).
 //
-// Excludes the target itself, peers without a CurrentGi for this
+// Excludes the target itself, peers without a CurrentGI for this
 // volume, and peers whose Status.Volumes[i].DiskState != UpToDate
 // (a peer that's still syncing wouldn't have the authoritative GI).
 func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, volumeNumber int32) string {
@@ -808,7 +808,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 			continue
 		}
 
-		gi := volumeCurrentGi(&peers[i], volumeNumber)
+		gi := volumeCurrentGI(&peers[i], volumeNumber)
 		if gi == "" {
 			continue
 		}
@@ -835,7 +835,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 		}
 	})
 
-	return volumeCurrentGi(&candidates[0], volumeNumber)
+	return volumeCurrentGI(&candidates[0], volumeNumber)
 }
 
 // anyDataBearingDiskfulPeer reports whether any diskful PEER (excluding
@@ -844,7 +844,7 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 // mean the peer carries real data with a real Current UUID — a fresh
 // local replica must SyncTarget from it (full resync) rather than skip
 // sync via a seeded GI. Mirrors dispatcher.anyDiskfulPeerHasData so the
-// controller-side seed gate and the satellite-side resolveSeedGi gate
+// controller-side seed gate and the satellite-side resolveSeedGI gate
 // agree on the same "day0 vs data-peer-exists" discriminator. Diskless
 // peers never count (no backing data to seed from).
 func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName string) bool {
@@ -880,12 +880,12 @@ func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName 
 	return false
 }
 
-// volumeCurrentGi returns the CurrentGi for the given volume number
+// volumeCurrentGI returns the CurrentGI for the given volume number
 // from a Resource's Status, or "" if not present.
-func volumeCurrentGi(res *blockstoriov1alpha1.Resource, volumeNumber int32) string {
+func volumeCurrentGI(res *blockstoriov1alpha1.Resource, volumeNumber int32) string {
 	for i := range res.Status.Volumes {
 		if res.Status.Volumes[i].VolumeNumber == volumeNumber {
-			return res.Status.Volumes[i].CurrentGi
+			return res.Status.Volumes[i].CurrentGI
 		}
 	}
 
@@ -904,14 +904,14 @@ func volumeDiskState(res *blockstoriov1alpha1.Resource, volumeNumber int32) stri
 	return ""
 }
 
-// setSeedFromGi mutates target.Spec.Volumes to record the seed GI
+// setSeedFromGI mutates target.Spec.Volumes to record the seed GI
 // for the given volume number. Appends a new entry if no
 // ResourceVolumeSpec exists for the volume; otherwise updates in
 // place.
-func setSeedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32, seed string) {
+func setSeedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32, seed string) {
 	for i := range target.Spec.Volumes {
 		if target.Spec.Volumes[i].VolumeNumber == volumeNumber {
-			target.Spec.Volumes[i].SeedFromGi = seed
+			target.Spec.Volumes[i].SeedFromGI = seed
 
 			return
 		}
@@ -919,7 +919,7 @@ func setSeedFromGi(target *blockstoriov1alpha1.Resource, volumeNumber int32, see
 
 	target.Spec.Volumes = append(target.Spec.Volumes, blockstoriov1alpha1.ResourceVolumeSpec{
 		VolumeNumber: volumeNumber,
-		SeedFromGi:   seed,
+		SeedFromGI:   seed,
 	})
 }
 

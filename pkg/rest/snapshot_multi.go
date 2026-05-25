@@ -67,7 +67,7 @@ type multiSnapshotCreateEntry struct {
 // rather than aborting the batch.
 //
 // b353: every entry in the batch is stamped with the same
-// crypto/rand-generated GroupID + SuspendIo=true so the
+// crypto/rand-generated GroupID + SuspendIO=true so the
 // controller-side SnapshotReconciler gates phase advancement on
 // the UNION of every sibling's targeted nodes — a single
 // suspend-io broadcast spans the whole multi-RD batch, giving
@@ -157,7 +157,7 @@ func (s *Server) createOneFromMulti(
 	}
 
 	// Fail-fast offline pre-check, same contract as the per-RD create
-	// path: refuse before stamping SuspendIo so a snapshot that can
+	// path: refuse before stamping SuspendIO so a snapshot that can
 	// never complete doesn't freeze the reachable replicas. In a
 	// multi-RD batch the per-entry refusal lands in the ApiCallRc
 	// envelope (best-effort batch semantics) — the controller's

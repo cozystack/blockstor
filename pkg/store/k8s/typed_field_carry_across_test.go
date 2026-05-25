@@ -159,7 +159,7 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 		},
 		mustCarryAcross: map[string]bool{
 			// Bug 206: controller-stamped per-volume seed
-			// (SeedFromGi). No wire counterpart on apiv1.Resource.
+			// (SeedFromGI). No wire counterpart on apiv1.Resource.
 			"Volumes": true,
 		},
 	},
@@ -190,20 +190,20 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// Snapshot to the single-snap orchestrator mid-batch.
 			"GroupID": true,
 		},
-		// Bug 351: SuspendIo + TakeSnapshot are the
+		// Bug 351: SuspendIO + TakeSnapshot are the
 		// controller-side orchestration's phase-flag pair. They
 		// live on the CRD Spec but have NO wire counterpart on
 		// apiv1.Snapshot — the REST handler only stamps
-		// SuspendIo=true at Create-time via wireToCRDSnapshot
+		// SuspendIO=true at Create-time via wireToCRDSnapshot
 		// (NOT wireToCRDSnapshotSpec), and the controller-side
 		// SnapshotReconciler flips them through their lifecycle.
 		// The store's Update path explicitly carries them across
-		// a wholesale Spec rebuild (preservedSuspendIo /
+		// a wholesale Spec rebuild (preservedSuspendIO /
 		// preservedTakeSnapshot in snapshots.go::Update) so a
 		// REST prop-patch mid-orchestration doesn't clobber the
 		// in-flight suspend/take state.
 		mustCarryAcross: map[string]bool{
-			"SuspendIo":    true,
+			"SuspendIO":    true,
 			"TakeSnapshot": true,
 		},
 	},

@@ -654,7 +654,7 @@ func (r *ResourceReconciler) stampPostApply(ctx context.Context, res *blockstori
 // stampVolumeStatus SSA-patches Resource.Status.Volumes with the
 // per-volume DevicePath the apply chain materialised. Uses a
 // dedicated FieldOwner so the apiserver merges cleanly against the
-// observer's DiskState / CurrentGi writes on the same Volume[i]
+// observer's DiskState / CurrentGI writes on the same Volume[i]
 // (listMapKey=volumeNumber means the slice is merged by volume
 // number, not replaced wholesale).
 func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockstoriov1alpha1.Resource, results []*intent.ResourceApplyResult) error {
@@ -708,7 +708,7 @@ func (r *ResourceReconciler) stampVolumeStatus(ctx context.Context, res *blockst
 
 // volumeStatusFieldOwner is the SSA field-manager the satellite
 // uses when it writes per-volume DevicePath. Distinct from the
-// observer's owner (which writes DiskState / CurrentGi) so the
+// observer's owner (which writes DiskState / CurrentGI) so the
 // apiserver merges the two slices cleanly under
 // `listMapKey=volumeNumber`.
 const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
@@ -725,7 +725,7 @@ const volumeStatusFieldOwner = "blockstor-satellite-volume-status"
 // satellite-stamp owner (`volumeStatusFieldOwner`) already releases
 // its DevicePath claim on the missing entry by NOT including it in
 // the next Apply payload — but the observer's `DiskState` /
-// `CurrentGi` claims on the same `volumeNumber=N` key keep the entry
+// `CurrentGI` claims on the same `volumeNumber=N` key keep the entry
 // alive, and the observer's `volCache` never removes volume entries
 // (events2 frames only ever ADD entries — there is no `destroy
 // volume` frame on the satellite). The claim is therefore permanent

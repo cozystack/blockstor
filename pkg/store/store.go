@@ -169,7 +169,7 @@ type ResourceStore interface {
 	// store routes this through .Status().Update().
 	//
 	// state carries resource-level observed state (InUse, DrbdState).
-	// volumes carries per-volume observed state (DiskState, CurrentGi)
+	// volumes carries per-volume observed state (DiskState, CurrentGI)
 	// the controller's seed-from-peer path reads to skip the full
 	// initial-sync on replica-add (Phase 8.1). Empty slice is fine —
 	// only resource-level state gets updated. Phase 10.2: DrbdState

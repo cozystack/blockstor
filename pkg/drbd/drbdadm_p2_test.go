@@ -180,11 +180,11 @@ func TestAdmWipeMdInvokesDrbdmeta(t *testing.T) {
 	}
 }
 
-// TestAdmShowGiInvokesDrbdmeta pins the raw GI dump shape:
+// TestAdmShowGIInvokesDrbdmeta pins the raw GI dump shape:
 // `drbdmeta --force <res>/<vol> v09 <device> internal show-gi`.
-// The verbose human-readable variant; counterpart to GetGi (which
+// The verbose human-readable variant; counterpart to GetGI (which
 // emits the terser machine-parseable tuple).
-func TestAdmShowGiInvokesDrbdmeta(t *testing.T) {
+func TestAdmShowGIInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal show-gi", storage.FakeResponse{
 		Stdout: []byte(`+--<  Current data generation UUID  >-
@@ -194,9 +194,9 @@ func TestAdmShowGiInvokesDrbdmeta(t *testing.T) {
 
 	adm := drbd.NewAdm(fx)
 
-	out, err := adm.ShowGi(t.Context(), "pvc-1", 0, "/dev/dm-3")
+	out, err := adm.ShowGI(t.Context(), "pvc-1", 0, "/dev/dm-3")
 	if err != nil {
-		t.Fatalf("ShowGi: %v", err)
+		t.Fatalf("ShowGI: %v", err)
 	}
 
 	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal show-gi"
@@ -205,16 +205,16 @@ func TestAdmShowGiInvokesDrbdmeta(t *testing.T) {
 	}
 
 	if len(out) == 0 {
-		t.Errorf("ShowGi: expected stdout to be returned, got empty")
+		t.Errorf("ShowGI: expected stdout to be returned, got empty")
 	}
 }
 
-// TestAdmGetGiInvokesDrbdmeta pins the parsed-tuple shape:
+// TestAdmGetGIInvokesDrbdmeta pins the parsed-tuple shape:
 // `drbdmeta --force <res>/<vol> v09 <device> internal get-gi`.
 // Output is `<current>:<bitmap>:<history0>:<history1>` matching
-// the format SetGi accepts — so the operator can read with GetGi,
-// pick a survivor, write with SetGi on each peer.
-func TestAdmGetGiInvokesDrbdmeta(t *testing.T) {
+// the format SetGI accepts — so the operator can read with GetGI,
+// pick a survivor, write with SetGI on each peer.
+func TestAdmGetGIInvokesDrbdmeta(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal get-gi", storage.FakeResponse{
 		Stdout: []byte("78A0DDDABCDEF000:78A0DDDABCDEF000:0:0\n"),
@@ -222,9 +222,9 @@ func TestAdmGetGiInvokesDrbdmeta(t *testing.T) {
 
 	adm := drbd.NewAdm(fx)
 
-	tuple, err := adm.GetGi(t.Context(), "pvc-1", 0, "/dev/dm-3")
+	tuple, err := adm.GetGI(t.Context(), "pvc-1", 0, "/dev/dm-3")
 	if err != nil {
-		t.Fatalf("GetGi: %v", err)
+		t.Fatalf("GetGI: %v", err)
 	}
 
 	want := "drbdmeta --force pvc-1/0 v09 /dev/dm-3 internal get-gi"
@@ -236,6 +236,6 @@ func TestAdmGetGiInvokesDrbdmeta(t *testing.T) {
 	// tuples across replicas should not have to .TrimSpace() the
 	// result themselves.
 	if tuple != "78A0DDDABCDEF000:78A0DDDABCDEF000:0:0" {
-		t.Errorf("GetGi: got %q, want trimmed tuple", tuple)
+		t.Errorf("GetGI: got %q, want trimmed tuple", tuple)
 	}
 }

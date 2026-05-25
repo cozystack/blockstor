@@ -257,7 +257,7 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 	return a.run(ctx, "resize", "--assume-clean", resource)
 }
 
-// SetGi pre-seeds the per-peer GI slot in this replica's DRBD
+// SetGI pre-seeds the per-peer GI slot in this replica's DRBD
 // metadata with the GI tuple of an existing UpToDate peer (or a
 // deterministic day0 seed for fresh thin/ZFS-backed RDs), so DRBD's
 // GI handshake on first connect recognises the new replica as
@@ -270,7 +270,7 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 //
 // The GI tuple format DRBD's `set-gi` accepts is
 // `<current>:<bitmap>:<history0>:<history1>`. We set both
-// current_uuid and bitmap_uuid to peerCurrentGi so the new replica
+// current_uuid and bitmap_uuid to peerCurrentGI so the new replica
 // claims "I'm at the peer's generation; I have no dirty bits relative
 // to the peer". History is zeroed — DRBD's handshake never matches
 // against history when current+bitmap match, so it doesn't matter.
@@ -280,7 +280,7 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 // metadata layout. Without `--node-id`, drbdmeta refuses the call
 // with "The set-gi command requires the --node-id option" (the
 // e2e regression guard pins the failure shape). The caller MUST
-// invoke SetGi once per peer node-id of the resource so every
+// invoke SetGI once per peer node-id of the resource so every
 // peer's bitmap slot carries the matching tuple; this is what makes
 // the day0 skip-sync optimisation actually take effect on DRBD 9.2+.
 //
@@ -296,9 +296,9 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 // Tested via FakeExec capture in pkg/drbd/drbdadm_test.go and
 // pinned end-to-end in pkg/satellite/reconciler_drbd_test.go's
 // first-activation case.
-func (a *Adm) SetGi(ctx context.Context, resource string, volume int32, device string, peerNodeID int32, peerCurrentGi string) error {
+func (a *Adm) SetGI(ctx context.Context, resource string, volume int32, device string, peerNodeID int32, peerCurrentGI string) error {
 	target := fmt.Sprintf("%s/%d", resource, volume)
-	gi := fmt.Sprintf("%s:%s:0:0", peerCurrentGi, peerCurrentGi)
+	gi := fmt.Sprintf("%s:%s:0:0", peerCurrentGI, peerCurrentGI)
 
 	_, err := a.exec.Run(ctx,
 		"drbdmeta", "--force", target, "v09", device, "internal",
@@ -424,7 +424,7 @@ func (a *Adm) NewCurrentUUID(ctx context.Context, resource string) error {
 // snapshot (LVM-thin / ZFS / file) captures bytes at a stable
 // point. Mirrors upstream LINSTOR's CtrlSnapshotCrtApiCallHandler
 // suspend-io broadcast (controller/.../CtrlSnapshotCrtApiCallHandler.java
-// around setSuspendIo(true) → updateSatellites → ack); the
+// around setSuspendIO(true) → updateSatellites → ack); the
 // per-satellite SnapshotReconciler invokes this in Phase 1 of the
 // `suspend → take → resume` orchestration so two diskful replicas
 // don't capture divergent bytes while the application writer
@@ -452,7 +452,7 @@ func (a *Adm) SuspendIO(ctx context.Context, resource string) error {
 // partially-acked suspend followed by no resume leaves the
 // remaining peers' I/O frozen forever (application traffic
 // hangs). The controller-side SnapshotReconciler unconditionally
-// flips Spec.SuspendIo=false on Phase 3 (or on any per-node
+// flips Spec.SuspendIO=false on Phase 3 (or on any per-node
 // Failed) so this fires on every targeted node. Bug 351.
 //
 // Why drbdadm not drbdsetup: same as SuspendIO above — drbdsetup
@@ -537,11 +537,11 @@ func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device 
 	return nil
 }
 
-// ShowGi runs `drbdmeta --force <res>/<vol> v09 <device> internal
+// ShowGI runs `drbdmeta --force <res>/<vol> v09 <device> internal
 // show-gi` and returns the raw stdout — the on-disk generation
 // UUID tuple, peer slot table, and bitmap-UUID per peer. Used
 // for verification (compare against a peer's view to triage
-// split-brain) and as the source data for GetGi.
+// split-brain) and as the source data for GetGI.
 //
 // Output shape (drbdmeta v09 show-gi):
 //
@@ -553,9 +553,9 @@ func (a *Adm) WipeMd(ctx context.Context, resource string, volume int32, device 
 //	| 0000000000000000
 //	...
 //
-// Callers wanting just the current UUID should prefer GetGi, which
+// Callers wanting just the current UUID should prefer GetGI, which
 // returns the parsed scalar.
-func (a *Adm) ShowGi(ctx context.Context, resource string, volume int32, device string) ([]byte, error) {
+func (a *Adm) ShowGI(ctx context.Context, resource string, volume int32, device string) ([]byte, error) {
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,
@@ -568,15 +568,15 @@ func (a *Adm) ShowGi(ctx context.Context, resource string, volume int32, device 
 	return out, nil
 }
 
-// GetGi is the parsed counterpart to ShowGi — runs the same
+// GetGI is the parsed counterpart to ShowGI — runs the same
 // `drbdmeta ... internal get-gi` subcommand (the terser variant
 // that emits just the GI tuple, suitable for scripted comparison)
 // and returns the trimmed string. The tuple shape is
 // `<current>:<bitmap>:<history0>:<history1>` matching the format
-// SetGi accepts, so callers can round-trip through SetGi after a
-// fix-up. Useful for split-brain triage: compare GetGi output on
-// each replica, pick a survivor, SetGi the others against it.
-func (a *Adm) GetGi(ctx context.Context, resource string, volume int32, device string) (string, error) {
+// SetGI accepts, so callers can round-trip through SetGI after a
+// fix-up. Useful for split-brain triage: compare GetGI output on
+// each replica, pick a survivor, SetGI the others against it.
+func (a *Adm) GetGI(ctx context.Context, resource string, volume int32, device string) (string, error) {
 	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	out, err := a.exec.Run(ctx,

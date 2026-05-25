@@ -30,7 +30,7 @@ import (
 // uses when it writes the FilesystemFormatted Status Condition.
 // Distinct from the MetadataCreated owner (which writes the
 // MetadataCreated Condition), the observer's owner (DiskState /
-// CurrentGi), and the volume-status owner (DevicePath) so the
+// CurrentGI), and the volume-status owner (DevicePath) so the
 // apiserver merges all writers' claims cleanly under listMapKey=type
 // for Conditions and listMapKey=volumeNumber for Volumes.
 const filesystemFormattedFieldOwner = "blockstor-satellite-filesystem-formatted"

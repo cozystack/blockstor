@@ -162,7 +162,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 
 		// Preserve the Bug-351 orchestration flags across REST
 		// prop-patch updates: they live on Spec but are NOT part
-		// of the wire DTO (the apiserver only stamps SuspendIo=true
+		// of the wire DTO (the apiserver only stamps SuspendIO=true
 		// at Create time; the controller-side SnapshotReconciler
 		// flips them through their lifecycle). Without this
 		// preservation a `linstor s set-property <rd> <snap> <key>
@@ -170,7 +170,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		// suspend/take state and either re-trigger the suspend
 		// broadcast or — worse — silently abandon a suspended
 		// cluster mid-snapshot.
-		preservedSuspendIo := existing.Spec.SuspendIo
+		preservedSuspendIO := existing.Spec.SuspendIO
 		preservedTakeSnapshot := existing.Spec.TakeSnapshot
 		// b353: GroupID is a transactional-batch handle stamped
 		// exactly once by handleSnapshotCreateMulti at Create time.
@@ -182,7 +182,7 @@ func (s *snapshots) Update(ctx context.Context, in *apiv1.Snapshot) error {
 		preservedGroupID := existing.Spec.GroupID
 
 		existing.Spec = wireToCRDSnapshotSpec(in)
-		existing.Spec.SuspendIo = preservedSuspendIo
+		existing.Spec.SuspendIO = preservedSuspendIO
 		existing.Spec.TakeSnapshot = preservedTakeSnapshot
 		existing.Spec.GroupID = preservedGroupID
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
@@ -398,14 +398,14 @@ func wireToCRDSnapshot(in *apiv1.Snapshot) *crdv1alpha1.Snapshot {
 	spec := wireToCRDSnapshotSpec(in)
 	// Bug 351: every freshly-created Snapshot enters the
 	// controller-side orchestration's Phase 1 with
-	// Spec.SuspendIo=true. The satellite reconcilers see the
+	// Spec.SuspendIO=true. The satellite reconcilers see the
 	// flag, run `drbdsetup suspend-io <rd>`, and stamp
-	// Status.NodeStatus[].SuspendIoAcked; the controller-side
+	// Status.NodeStatus[].SuspendIOAcked; the controller-side
 	// SnapshotReconciler then advances through Phase 2
 	// (TakeSnapshot=true) and Phase 3 (clear both). The store-only
 	// stamp keeps the REST handler oblivious to the orchestration
 	// shape — the wire DTO doesn't carry these flags.
-	spec.SuspendIo = true
+	spec.SuspendIO = true
 
 	labels := map[string]string{
 		LabelResourceDefinition: in.ResourceName,

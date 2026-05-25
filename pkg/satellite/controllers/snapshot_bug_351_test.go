@@ -54,10 +54,10 @@ func newBug351Scheme(t *testing.T) *runtime.Scheme {
 }
 
 // TestSnapshotReconcileBug351SuspendsAndAcks pins Phase 1: when
-// the controller-side orchestrator stamps Spec.SuspendIo=true, the
+// the controller-side orchestrator stamps Spec.SuspendIO=true, the
 // satellite reconciler MUST call `drbdadm suspend-io <rd>`
 // against the parent RD and stamp
-// Status.NodeStatus[us].SuspendIoAcked=true.
+// Status.NodeStatus[us].SuspendIOAcked=true.
 //
 // Without this barrier two diskful replicas would snapshot
 // independently and capture divergent bytes while the writer's
@@ -76,7 +76,7 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 	}
 
@@ -136,8 +136,8 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 		t.Fatalf("Status.NodeStatus: got %d entries, want 1", len(got.Status.NodeStatus))
 	}
 
-	if !got.Status.NodeStatus[0].SuspendIoAcked {
-		t.Errorf("Status.NodeStatus[0].SuspendIoAcked: got false, want true")
+	if !got.Status.NodeStatus[0].SuspendIOAcked {
+		t.Errorf("Status.NodeStatus[0].SuspendIOAcked: got false, want true")
 	}
 
 	// Ready MUST NOT be set yet — that's Phase 2.
@@ -148,7 +148,7 @@ func TestSnapshotReconcileBug351SuspendsAndAcks(t *testing.T) {
 
 // TestSnapshotReconcileBug351TakeSnapshotAfterAck pins Phase 2:
 // once the orchestrator flipped Spec.TakeSnapshot=true (every
-// node has stamped SuspendIoAcked), the satellite MUST dispatch
+// node has stamped SuspendIOAcked), the satellite MUST dispatch
 // provider.CreateSnapshot and stamp Status.NodeStatus[us].Ready.
 func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 	t.Parallel()
@@ -166,12 +166,12 @@ func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 			TakeSnapshot:           true,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
 			},
 		},
 	}
@@ -228,18 +228,18 @@ func TestSnapshotReconcileBug351TakeSnapshotAfterAck(t *testing.T) {
 		t.Errorf("Status.NodeStatus[0].Ready: got false, want true")
 	}
 
-	// SuspendIoAcked MUST still be true — Phase 3 (resume) is
-	// gated on the orchestrator flipping Spec.SuspendIo=false.
-	if !got.Status.NodeStatus[0].SuspendIoAcked {
-		t.Errorf("Phase 2 dropped SuspendIoAcked prematurely: %+v", got.Status.NodeStatus)
+	// SuspendIOAcked MUST still be true — Phase 3 (resume) is
+	// gated on the orchestrator flipping Spec.SuspendIO=false.
+	if !got.Status.NodeStatus[0].SuspendIOAcked {
+		t.Errorf("Phase 2 dropped SuspendIOAcked prematurely: %+v", got.Status.NodeStatus)
 	}
 }
 
 // TestSnapshotReconcileBug351ResumesWhenSuspendCleared pins
 // Phase 3: when the controller-side orchestrator flips
-// Spec.SuspendIo=false (success path OR abort path), the
+// Spec.SuspendIO=false (success path OR abort path), the
 // satellite MUST call `drbdadm resume-io <rd>` and clear its
-// SuspendIoAcked stamp. Without this drain a partial-success or
+// SuspendIOAcked stamp. Without this drain a partial-success or
 // abort leaves application I/O hung forever on the still-frozen
 // siblings.
 func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
@@ -247,9 +247,9 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 
 	scheme := newBug351Scheme(t)
 
-	// Orchestrator has flipped SuspendIo=false (success: every
+	// Orchestrator has flipped SuspendIO=false (success: every
 	// node already Ready, or abort: some node Failed). Our local
-	// state still has SuspendIoAcked=true — we must drain.
+	// state still has SuspendIOAcked=true — we must drain.
 	snap := &blockstoriov1alpha1.Snapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "pvc-1.snap-1",
@@ -259,12 +259,12 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIo:              false,
+			SuspendIO:              false,
 			TakeSnapshot:           false,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", Ready: true, CreateTimestamp: 1234, SuspendIoAcked: true},
+				{NodeName: "n1", Ready: true, CreateTimestamp: 1234, SuspendIOAcked: true},
 			},
 		},
 	}
@@ -311,8 +311,8 @@ func TestSnapshotReconcileBug351ResumesWhenSuspendCleared(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 
-	if got.Status.NodeStatus[0].SuspendIoAcked {
-		t.Errorf("Status.NodeStatus[0].SuspendIoAcked: got true after resume, want false")
+	if got.Status.NodeStatus[0].SuspendIOAcked {
+		t.Errorf("Status.NodeStatus[0].SuspendIOAcked: got true after resume, want false")
 	}
 
 	// Ready+CreateTimestamp from Phase 2 MUST survive the
@@ -346,7 +346,7 @@ func TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 		},
 	}
 
@@ -399,10 +399,10 @@ func TestSnapshotReconcileBug351AbortStampsFailedOnSuspendError(t *testing.T) {
 		t.Errorf("Status.NodeStatus[us].Failed not stamped: %+v", got.Status.NodeStatus)
 	}
 
-	// SuspendIoAcked MUST stay false — we never successfully
+	// SuspendIOAcked MUST stay false — we never successfully
 	// suspended, so we shouldn't pretend we did.
-	if len(got.Status.NodeStatus) == 1 && got.Status.NodeStatus[0].SuspendIoAcked {
-		t.Errorf("SuspendIoAcked stamped despite suspend failure: %+v", got.Status.NodeStatus)
+	if len(got.Status.NodeStatus) == 1 && got.Status.NodeStatus[0].SuspendIOAcked {
+		t.Errorf("SuspendIOAcked stamped despite suspend failure: %+v", got.Status.NodeStatus)
 	}
 }
 

@@ -44,7 +44,7 @@ func TestVolumesFromStatus(t *testing.T) {
 			AllocatedKib: 1024,
 			UsableKib:    1024,
 			DiskState:    "UpToDate",
-			CurrentGi:    "1234ABCD",
+			CurrentGI:    "1234ABCD",
 		},
 		{
 			VolumeNumber: 1,
@@ -63,7 +63,7 @@ func TestVolumesFromStatus(t *testing.T) {
 	}
 
 	if got[0].State.CurrentGi != "1234ABCD" {
-		t.Errorf("vol[0] CurrentGi: got %q, want 1234ABCD", got[0].State.CurrentGi)
+		t.Errorf("vol[0] CurrentGI: got %q, want 1234ABCD", got[0].State.CurrentGi)
 	}
 
 	if got[1].VolumeNumber != 1 || got[1].State.DiskState != "Inconsistent" {

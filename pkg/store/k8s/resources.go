@@ -164,7 +164,7 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	}
 
 	// Bug 206: Spec.Volumes carries the controller-stamped per-volume
-	// seeding state (SeedFromGi for DRBD's initial-sync fast path) and
+	// seeding state (SeedFromGI for DRBD's initial-sync fast path) and
 	// has no counterpart on the wire `Resource` shape — upstream
 	// LINSTOR exposes these knobs via the satellite-side reconciler,
 	// not the REST surface. `wireToCRDResourceSpec` rebuilds the Spec
@@ -281,7 +281,7 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 
 // SatelliteFieldOwner is the SSA field-manager identity the
 // satellite uses for its observed-state writes (DrbdState,
-// per-volume DiskState/CurrentGi). The controller uses
+// per-volume DiskState/CurrentGI). The controller uses
 // `ControllerFieldOwner` for its allocator outputs (DRBDPort,
 // DRBDMinor, DRBDNodeID). Distinct field owners let SSA's merge
 // algorithm preserve each side's writes when the two collide on
@@ -304,7 +304,7 @@ const (
 // across racing Status writes. Phase 10.2.
 //
 // state.DrbdState lands on Status.DrbdState; per-volume
-// DiskState/CurrentGi land on Status.Volumes[i] (the listMapKey is
+// DiskState/CurrentGI land on Status.Volumes[i] (the listMapKey is
 // `volumeNumber`, so SSA matches up entries correctly).
 func (s *resources) SetState(ctx context.Context, rdName, node string, state apiv1.ResourceState, volumes []apiv1.VolumeObservation) error {
 	name := resourceCRDName(rdName, node)
@@ -413,7 +413,7 @@ func (s *resources) ClearDRBDPort(ctx context.Context, rdName, node string) erro
 // The Status.Volumes slice is a `+listType=map +listMapKey=volumeNumber`
 // list, so the apiserver merges the apply against the existing
 // state by volume number — a frame that only carries DiskState
-// for vol 0 leaves vol 1's CurrentGi alone.
+// for vol 0 leaves vol 1's CurrentGI alone.
 func buildVolumeStatusForApply(observations []apiv1.VolumeObservation) []crdv1alpha1.ResourceVolumeStatus {
 	if len(observations) == 0 {
 		return nil
@@ -425,7 +425,7 @@ func buildVolumeStatusForApply(observations []apiv1.VolumeObservation) []crdv1al
 		out = append(out, crdv1alpha1.ResourceVolumeStatus{
 			VolumeNumber: vol.VolumeNumber,
 			DiskState:    vol.State.DiskState,
-			CurrentGi:    vol.State.CurrentGi,
+			CurrentGI:    vol.State.CurrentGi,
 		})
 	}
 
@@ -474,7 +474,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 }
 
 // volumesFromStatus projects the CRD `Status.Volumes` onto wire
-// `[]Volume`. State carries DiskState + CurrentGi (Generation
+// `[]Volume`. State carries DiskState + CurrentGI (Generation
 // Identifier) — the latter is what the controller seeds new
 // replicas with for skipping the full initial-sync. The Python CLI
 // derives the per-resource rsc_state from `volumes[].state.disk_state`;
@@ -524,7 +524,7 @@ func volumesFromStatus(in []crdv1alpha1.ResourceVolumeStatus) []apiv1.Volume {
 			UsableKib:    volStatus.UsableKib,
 			State: apiv1.VolumeState{
 				DiskState:    volStatus.DiskState,
-				CurrentGi:    volStatus.CurrentGi,
+				CurrentGi:    volStatus.CurrentGI,
 				OutOfSyncKib: volStatus.OutOfSyncKib,
 			},
 			LayerDataList: layerDataList,

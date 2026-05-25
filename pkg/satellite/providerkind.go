@@ -77,10 +77,10 @@ func IsThinOrZFS(kind string) bool {
 // on identical current_uuid / bitmap_uuid pairs without needing a
 // shared random seed — DRBD's GI handshake then matches and skips
 // the full initial-sync (upstream LINSTOR's path goes through
-// `getCurrentGiFromVlmDfnProp` which is itself derived from the
+// `getCurrentGIFromVlmDfnProp` which is itself derived from the
 // RD's VolumeDefinition; we follow the same "same RD ⇒ same GI"
 // rule but without the controller-side prop because no peer
-// has stamped CurrentGi on a brand-new RD).
+// has stamped CurrentGI on a brand-new RD).
 //
 // Format: 16 hex characters, upper-case — DRBD's drbdmeta accepts
 // hex GI tokens. Trailing `0` enforces the DRBD-9 convention that

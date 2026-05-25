@@ -45,7 +45,7 @@ type SnapshotSpec struct {
 	// +optional
 	VolumeDefinitions []SnapshotVolumeRef `json:"volumeDefinitions,omitempty"`
 
-	// suspendIo, when true, signals every satellite that hosts a
+	// suspendIO, when true, signals every satellite that hosts a
 	// diskful replica of the parent ResourceDefinition to call
 	// `drbdsetup suspend-io <rd>` before taking the local backing
 	// snapshot. Bug 351: two diskful replicas snapshotting
@@ -57,29 +57,29 @@ type SnapshotSpec struct {
 	// point-in-time bytes.
 	//
 	// Lifecycle (driven by the controller-side SnapshotReconciler):
-	//   1. apiserver creates Snapshot CRD with SuspendIo=true,
+	//   1. apiserver creates Snapshot CRD with SuspendIO=true,
 	//      TakeSnapshot=false. Satellites stamp
-	//      Status.NodeStatus[].SuspendIoAcked once their suspend-io
+	//      Status.NodeStatus[].SuspendIOAcked once their suspend-io
 	//      call returns.
 	//   2. Once every targeted node has acked, the controller stamps
 	//      Spec.TakeSnapshot=true. Satellites then dispatch
 	//      provider.CreateSnapshot and stamp Status.NodeStatus[].Ready.
 	//   3. Once every targeted node is Ready (or any has Failed=true),
-	//      the controller flips Spec.SuspendIo=false and satellites
+	//      the controller flips Spec.SuspendIO=false and satellites
 	//      issue `drbdsetup resume-io <rd>`.
 	//
 	// Resume-on-failure is mandatory — a partially-acked suspend
 	// followed by an abort MUST still resume I/O on the nodes that
 	// did ack, otherwise application I/O hangs forever. The
-	// controller's abort path clears SuspendIo unconditionally.
+	// controller's abort path clears SuspendIO unconditionally.
 	// +optional
-	SuspendIo bool `json:"suspendIo,omitempty"`
+	SuspendIO bool `json:"suspendIo,omitempty"`
 
 	// takeSnapshot, when true, signals each satellite that has
-	// already acked the suspend-io barrier (see SuspendIo above) to
+	// already acked the suspend-io barrier (see SuspendIO above) to
 	// dispatch the local provider.CreateSnapshot. The flag is
 	// stamped by the controller-side SnapshotReconciler once every
-	// targeted node's Status.NodeStatus[].SuspendIoAcked is true —
+	// targeted node's Status.NodeStatus[].SuspendIOAcked is true —
 	// the two-step `suspend → take → resume` shape mirrors upstream
 	// LINSTOR's CtrlSnapshotCrtApiCallHandler 3-phase flow so the
 	// per-node backing snapshots all reflect the same point-in-time
@@ -100,13 +100,13 @@ type SnapshotSpec struct {
 	//
 	// Lifecycle (driven by the controller-side SnapshotReconciler):
 	//   1. apiserver stamps every batched Snapshot with the same
-	//      crypto/rand-generated GroupID + SuspendIo=true.
+	//      crypto/rand-generated GroupID + SuspendIO=true.
 	//   2. Controller gates phase advancement on the FULL group:
 	//      Phase 2 only fires when every sibling's every targeted
 	//      node has acked the suspend.
 	//   3. Phase 3 only fires when every sibling's every targeted
 	//      node is Ready — or any sibling node Failed=true, in
-	//      which case the abort cascade fires SuspendIo=false on
+	//      which case the abort cascade fires SuspendIO=false on
 	//      every sibling immediately.
 	//
 	// Empty GroupID is the single-snap path (Bug 351 behaviour
@@ -183,21 +183,21 @@ type SnapshotPerNodeStatus struct {
 	// +optional
 	Ready bool `json:"ready,omitempty"`
 
-	// suspendIoAcked is stamped true by the local satellite once
+	// suspendIOAcked is stamped true by the local satellite once
 	// `drbdsetup suspend-io <rd>` has returned for the parent
 	// ResourceDefinition. The controller-side SnapshotReconciler
 	// gates the Phase-2 `TakeSnapshot` transition on every targeted
 	// node having acked. Cleared back to false when the controller
-	// flips Spec.SuspendIo=false and the satellite issues
+	// flips Spec.SuspendIO=false and the satellite issues
 	// `drbdsetup resume-io <rd>`. Bug 351.
 	// +optional
-	SuspendIoAcked bool `json:"suspendIoAcked,omitempty"`
+	SuspendIOAcked bool `json:"suspendIoAcked,omitempty"`
 
 	// failed is stamped true when the local satellite hit a
 	// terminal failure while either suspending I/O, taking the
 	// per-node snapshot, or resuming I/O. The controller-side
 	// SnapshotReconciler treats any Failed=true entry as an abort
-	// signal: it flips Spec.SuspendIo=false immediately so the
+	// signal: it flips Spec.SuspendIO=false immediately so the
 	// already-suspended siblings resume rather than wait
 	// indefinitely on the doomed node, and stamps the parent
 	// Snapshot's Status.Flags with FAILED. Bug 351.

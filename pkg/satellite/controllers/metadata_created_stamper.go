@@ -28,7 +28,7 @@ import (
 
 // metadataCreatedFieldOwner is the SSA field-manager the satellite
 // uses when it writes the MetadataCreated Status Condition. Distinct
-// from the observer's owner (which writes DiskState / CurrentGi) and
+// from the observer's owner (which writes DiskState / CurrentGI) and
 // the volume-status owner (which writes DevicePath) so the apiserver
 // merges all three writers' claims cleanly under listMapKey=type
 // for Conditions and listMapKey=volumeNumber for Volumes.

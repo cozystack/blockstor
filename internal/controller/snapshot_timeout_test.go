@@ -31,7 +31,7 @@ import (
 	"github.com/cozystack/blockstor/internal/controller"
 )
 
-// suspendedSnapshot builds a Snapshot frozen mid-suspend (SuspendIo=true,
+// suspendedSnapshot builds a Snapshot frozen mid-suspend (SuspendIO=true,
 // not all-Ready) with the supplied creation age and per-node status, so
 // the timeout tests can pin the deadline behaviour without dragging in
 // the b353 group boilerplate.
@@ -51,7 +51,7 @@ func suspendedSnapshot(
 			ResourceDefinitionName: rd,
 			SnapshotName:           snap,
 			Nodes:                  nodes,
-			SuspendIo:              true,
+			SuspendIO:              true,
 			TakeSnapshot:           takeSnapshot,
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
@@ -79,8 +79,8 @@ func resourceWithDiskState(rd, node, diskState string) *blockstoriov1alpha1.Reso
 }
 
 // TestSnapshotSuspendTimeoutAbortsAndResumes pins the PRIMARY outage
-// fix: a Snapshot stuck in SuspendIo past snapshotSuspendDeadline with
-// not-all-Ready aborts — the controller clears SuspendIo (so satellites
+// fix: a Snapshot stuck in SuspendIO past snapshotSuspendDeadline with
+// not-all-Ready aborts — the controller clears SuspendIO (so satellites
 // resume-io) and stamps the FAILED_DISCONNECT terminal reason. Without
 // this the volume's I/O stays frozen forever waiting on a take that
 // never reports back.
@@ -94,7 +94,7 @@ func TestSnapshotSuspendTimeoutAbortsAndResumes(t *testing.T) {
 	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
 		3*time.Minute, []string{"n1", "n2"}, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -114,8 +114,8 @@ func TestSnapshotSuspendTimeoutAbortsAndResumes(t *testing.T) {
 
 	got := getSnap(t, cli, "pvc-1.snap-1")
 
-	if got.Spec.SuspendIo {
-		t.Errorf("timeout abort did not clear SuspendIo (I/O still frozen): %+v", got.Spec)
+	if got.Spec.SuspendIO {
+		t.Errorf("timeout abort did not clear SuspendIO (I/O still frozen): %+v", got.Spec)
 	}
 
 	if got.Spec.TakeSnapshot {
@@ -129,7 +129,7 @@ func TestSnapshotSuspendTimeoutAbortsAndResumes(t *testing.T) {
 
 // TestSnapshotSuspendBeforeDeadlineNotAborted pins the no-premature-
 // resume guard: a Snapshot frozen for LESS than the deadline must NOT
-// be aborted — SuspendIo stays true and no FAILED flag is stamped so a
+// be aborted — SuspendIO stays true and no FAILED flag is stamped so a
 // slow-but-healthy take is not killed early.
 func TestSnapshotSuspendBeforeDeadlineNotAborted(t *testing.T) {
 	t.Parallel()
@@ -140,8 +140,8 @@ func TestSnapshotSuspendBeforeDeadlineNotAborted(t *testing.T) {
 	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
 		30*time.Second, []string{"n1", "n2"}, true,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -161,8 +161,8 @@ func TestSnapshotSuspendBeforeDeadlineNotAborted(t *testing.T) {
 
 	got := getSnap(t, cli, "pvc-1.snap-1")
 
-	if !got.Spec.SuspendIo {
-		t.Errorf("premature abort: SuspendIo cleared before deadline: %+v", got.Spec)
+	if !got.Spec.SuspendIO {
+		t.Errorf("premature abort: SuspendIO cleared before deadline: %+v", got.Spec)
 	}
 
 	if slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {
@@ -185,7 +185,7 @@ func TestSnapshotSuspendSetsRequeueBeforeDeadline(t *testing.T) {
 	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
 		30*time.Second, []string{"n1", "n2"}, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -227,8 +227,8 @@ func TestSnapshotPhase2AbortsOnNonUpToDate(t *testing.T) {
 	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
 		20*time.Second, []string{"n1", "n2"}, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -254,8 +254,8 @@ func TestSnapshotPhase2AbortsOnNonUpToDate(t *testing.T) {
 		t.Errorf("Phase 2 promoted with a non-UpToDate replica: %+v", got.Spec)
 	}
 
-	if got.Spec.SuspendIo {
-		t.Errorf("non-UpToDate abort did not clear SuspendIo (I/O still frozen): %+v", got.Spec)
+	if got.Spec.SuspendIO {
+		t.Errorf("non-UpToDate abort did not clear SuspendIO (I/O still frozen): %+v", got.Spec)
 	}
 
 	if !slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {
@@ -275,8 +275,8 @@ func TestSnapshotPhase2PromotesWhenAllUpToDate(t *testing.T) {
 	snap := suspendedSnapshot("pvc-1.snap-1", "pvc-1", "snap-1",
 		20*time.Second, []string{"n1", "n2"}, false,
 		[]blockstoriov1alpha1.SnapshotPerNodeStatus{
-			{NodeName: "n1", SuspendIoAcked: true},
-			{NodeName: "n2", SuspendIoAcked: true},
+			{NodeName: "n1", SuspendIOAcked: true},
+			{NodeName: "n2", SuspendIOAcked: true},
 		})
 
 	cli := fake.NewClientBuilder().
@@ -310,7 +310,7 @@ func TestSnapshotPhase2PromotesWhenAllUpToDate(t *testing.T) {
 // TestSnapshotTimeoutCascadesAcrossGroup pins that the timeout abort
 // propagates across the whole GroupID batch exactly like the per-node-
 // Failed abort cascade: a grouped Snapshot past the deadline drains
-// SuspendIo on every sibling, not just the timed-out one — otherwise
+// SuspendIO on every sibling, not just the timed-out one — otherwise
 // the un-timed-out siblings' frozen peers would never resume.
 func TestSnapshotTimeoutCascadesAcrossGroup(t *testing.T) {
 	t.Parallel()
@@ -329,10 +329,10 @@ func TestSnapshotTimeoutCascadesAcrossGroup(t *testing.T) {
 	}
 
 	a := mk("pvc-a", []string{"n1"}, []blockstoriov1alpha1.SnapshotPerNodeStatus{
-		{NodeName: "n1", SuspendIoAcked: true},
+		{NodeName: "n1", SuspendIOAcked: true},
 	})
 	b := mk("pvc-b", []string{"n2"}, []blockstoriov1alpha1.SnapshotPerNodeStatus{
-		{NodeName: "n2", SuspendIoAcked: true},
+		{NodeName: "n2", SuspendIOAcked: true},
 	})
 	c := mk("pvc-c", []string{"n3"}, nil)
 
@@ -355,8 +355,8 @@ func TestSnapshotTimeoutCascadesAcrossGroup(t *testing.T) {
 
 	for _, name := range []string{"pvc-a.snap", "pvc-b.snap", "pvc-c.snap"} {
 		got := getSnap(t, cli, name)
-		if got.Spec.SuspendIo {
-			t.Errorf("%s: timeout abort cascade did not clear SuspendIo: %+v", name, got.Spec)
+		if got.Spec.SuspendIO {
+			t.Errorf("%s: timeout abort cascade did not clear SuspendIO: %+v", name, got.Spec)
 		}
 
 		if !slices.Contains(got.Status.Flags, blockstoriov1alpha1.SnapshotStatusFlagFailedDisconnect) {

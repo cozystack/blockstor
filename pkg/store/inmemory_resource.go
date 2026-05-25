@@ -171,9 +171,9 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 // In the in-memory store there's no Status subresource, so we just
 // merge the runtime fields onto the stored value.
 //
-// volumes carries per-volume observed state (DiskState, CurrentGi);
+// volumes carries per-volume observed state (DiskState, CurrentGI);
 // stashed in a side-map keyed by (rd, node) so consumers that need
-// per-volume CurrentGi readback can ask. The wire-shape `Resource`
+// per-volume CurrentGI readback can ask. The wire-shape `Resource`
 // type intentionally has no Volumes slice — `ResourceWithVolumes`
 // at the REST boundary stitches per-volume state separately — so
 // the side-map is the InMemory equivalent.

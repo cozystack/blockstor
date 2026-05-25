@@ -243,7 +243,7 @@ func TestWatcherClosesChannelOnEOF(t *testing.T) {
 // the DRBD-9 generation-identifier fields (`current-uuid:` /
 // `bitmap-uuid:`) emitted by `drbdsetup events2 --full`. The
 // satellite observer reads these to populate
-// `Resource.Status.Volumes[i].CurrentGi`, which the controller uses
+// `Resource.Status.Volumes[i].CurrentGI`, which the controller uses
 // when seeding new replicas to skip the full initial-sync (Phase
 // 8.1).
 //

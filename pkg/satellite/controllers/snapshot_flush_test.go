@@ -67,7 +67,7 @@ func seedThinResourceWithExec(t *testing.T, fx *storage.FakeExec, resourceName, 
 }
 
 // TestSnapshotReconcileFlushesBackingDeviceBeforeCreate pins the
-// P0 stale-snapshot fix: Phase 2 (TakeSnapshot=true, SuspendIoAcked
+// P0 stale-snapshot fix: Phase 2 (TakeSnapshot=true, SuspendIOAcked
 // already stamped) MUST flush the kernel writeback cache to the
 // backing block device BEFORE `provider.CreateSnapshot` fires.
 // Without the flush, in-flight dirty pages sit in the kernel page
@@ -106,7 +106,7 @@ func TestSnapshotReconcileFlushesBackingDeviceBeforeCreate(t *testing.T) {
 			ResourceDefinitionName: "pvc-1",
 			SnapshotName:           "snap-1",
 			Nodes:                  []string{"n1"},
-			SuspendIo:              true,
+			SuspendIO:              true,
 			TakeSnapshot:           true,
 			VolumeDefinitions: []blockstoriov1alpha1.SnapshotVolumeRef{
 				{VolumeNumber: 0},
@@ -114,7 +114,7 @@ func TestSnapshotReconcileFlushesBackingDeviceBeforeCreate(t *testing.T) {
 		},
 		Status: blockstoriov1alpha1.SnapshotStatus{
 			NodeStatus: []blockstoriov1alpha1.SnapshotPerNodeStatus{
-				{NodeName: "n1", SuspendIoAcked: true},
+				{NodeName: "n1", SuspendIOAcked: true},
 			},
 		},
 	}

@@ -1255,7 +1255,7 @@ func stringMapsEqual(left, right map[int32]string) bool {
 
 // mergeVolumes folds the per-volume cache so SSA writes carry the
 // full per-volume picture. Without this, two separate event kinds
-// (`device` for DiskState/CurrentGi, `peer-device` for OutOfSyncKib)
+// (`device` for DiskState/CurrentGI, `peer-device` for OutOfSyncKib)
 // would each strip the other's field claims when SSA-applying the
 // same listMap key — leaving Status.Volumes[i] alternating between
 // "has disk-state, no sync" and "has sync, no disk-state".
@@ -1478,7 +1478,7 @@ func (o *ObserverRunnable) mergeConnections(ev *observation) {
 // CRD's Status subresource via SSA. Replaces the retired
 // controller-side `pkg/satellitecontroller.applyObserved` body:
 // same field owner, same `+listType=map +listMapKey=volumeNumber`
-// merge semantics for per-volume DiskState / CurrentGi.
+// merge semantics for per-volume DiskState / CurrentGI.
 //
 // `NotFound` on the Get is normal during convergence — the
 // satellite may observe state for a resource the controller
@@ -1770,7 +1770,7 @@ func buildObserverVolumeStatus(ev *observation, storagePool string) []blockstori
 			VolumeNumber: vol.VolumeNumber,
 			StoragePool:  storagePool,
 			DiskState:    vol.DiskState,
-			CurrentGi:    vol.CurrentUUID,
+			CurrentGI:    vol.CurrentUUID,
 			OutOfSyncKib: vol.OutOfSyncKib,
 			Quorum:       vol.Quorum,
 		})

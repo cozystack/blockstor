@@ -174,7 +174,7 @@ func TestDispatchFsmActionCreateMdGatedByExistingMd(t *testing.T) {
 // already loaded with a Diskless volume (the diskful-flip path).
 // Legacy ensureMetadata routes flip with firstActivation=false (no
 // GI-seed); the shadow's createMetadata would call
-// firstActivation=true → seedInitialGi → in-flight handshake
+// firstActivation=true → seedInitialGI → in-flight handshake
 // corruption (Run 30 lifecycle-toggle-migrate regression). The gate
 // must defer to legacy whenever KernelLoaded && KernelHasDiskless,
 // even though SpecFlagsHasDiskless=false would otherwise permit

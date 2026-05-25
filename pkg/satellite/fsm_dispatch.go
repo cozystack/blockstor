@@ -92,7 +92,7 @@ func (r *Reconciler) dispatchFsmAction(ctx context.Context, dr *intent.DesiredRe
 		//   - KernelLoaded && KernelHasDiskless: diskful-flip path —
 		//     legacy routes through ensureMetadata(firstActivation=false)
 		//     (no GI-seed); the shadow's createMetadata calls
-		//     firstActivation=true which seeds GI via seedInitialGi
+		//     firstActivation=true which seeds GI via seedInitialGI
 		//     and corrupts the in-flight handshake. Stage 4 will own
 		//     the flip path end-to-end; for now defer to legacy.
 		if !obs.SpecHasResource || obs.MetadataExists ||

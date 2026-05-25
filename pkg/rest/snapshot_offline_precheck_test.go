@@ -57,7 +57,7 @@ func seedRDWithReplicas(t *testing.T, st store.Store, rd string, nodeStatus map[
 // TestSnapshotCreateRefusesOfflineTarget pins the fail-fast offline
 // pre-check on the per-RD create path: when a targeted diskful node is
 // OFFLINE the handler refuses with 503 and does NOT persist the
-// Snapshot — so SuspendIo is never stamped and the reachable replicas
+// Snapshot — so SuspendIO is never stamped and the reachable replicas
 // are never frozen for a snapshot that cannot complete. Mirrors
 // upstream getOfflineNodes.
 func TestSnapshotCreateRefusesOfflineTarget(t *testing.T) {
@@ -91,7 +91,7 @@ func TestSnapshotCreateRefusesOfflineTarget(t *testing.T) {
 	}
 
 	if len(snaps) != 0 {
-		t.Errorf("offline-refused snapshot was persisted (SuspendIo would freeze peers): %d rows", len(snaps))
+		t.Errorf("offline-refused snapshot was persisted (SuspendIO would freeze peers): %d rows", len(snaps))
 	}
 }
 

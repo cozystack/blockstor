@@ -80,13 +80,13 @@ func TestDrbdmetaCreateMDSucceeds(t *testing.T) {
 	}
 }
 
-// TestDrbdmetaSetGiRequiresNodeId is the **Bug 81** contract pin.
+// TestDrbdmetaSetGIRequiresNodeID is the **Bug 81** contract pin.
 //
 // On DRBD 9.2+, drbdmeta's `set-gi` subcommand refuses to run without
 // `--node-id <N>`: it returns non-zero + prints "The set-gi command
 // requires the --node-id option" to stderr. Older drbd-utils (≤9.1)
 // accepted the no-node-id form, which is the call shape our
-// pkg/drbd/drbdadm.go:SetGi still emits — so on a modern stand
+// pkg/drbd/drbdadm.go:SetGI still emits — so on a modern stand
 // satellite-side first-activation GI seeding silently no-ops (the
 // reconciler intentionally downgrades the error to a log to avoid
 // crashing first-Apply, see pkg/satellite/reconciler.go:1180).
@@ -95,9 +95,9 @@ func TestDrbdmetaCreateMDSucceeds(t *testing.T) {
 // that drops the message text (or changes the exit code) is caught
 // immediately. When the bug is properly fixed (per-peer iteration
 // with --node-id; tracked as Bug 81 follow-up), this test stays
-// green and the sibling TestDrbdmetaSetGiPerPeer becomes the
+// green and the sibling TestDrbdmetaSetGIPerPeer becomes the
 // happy-path companion.
-func TestDrbdmetaSetGiRequiresNodeId(t *testing.T) {
+func TestDrbdmetaSetGIRequiresNodeID(t *testing.T) {
 	// The error path drbdmeta exercises (CLI flag parser) fires
 	// BEFORE the metadata read, so a fresh-zeroed loopback is fine
 	// — drbdmeta refuses the call long before it touches bytes.
@@ -106,7 +106,7 @@ func TestDrbdmetaSetGiRequiresNodeId(t *testing.T) {
 		"--force",
 		"0", "v09", contract.LoopDevicePath, "internal",
 		"set-gi",
-		// Legacy single-arg GI tuple — the form pkg/drbd/drbdadm.go:SetGi
+		// Legacy single-arg GI tuple — the form pkg/drbd/drbdadm.go:SetGI
 		// emits. DRBD 9.2+ rejects this without --node-id.
 		"0000000000000001:0000000000000001:0:0",
 	)
@@ -127,17 +127,17 @@ func TestDrbdmetaSetGiRequiresNodeId(t *testing.T) {
 	}
 }
 
-// TestDrbdmetaSetGiPerPeer pins the FIXED call shape — `set-gi
+// TestDrbdmetaSetGIPerPeer pins the FIXED call shape — `set-gi
 // --node-id <id> <gi-tuple>` — exits 0 on a fresh metadata block.
 // This is the shape the Bug 81 follow-up will switch pkg/drbd to.
 // Pinning it here lets that fix land without re-running e2e.
-func TestDrbdmetaSetGiPerPeer(t *testing.T) {
+func TestDrbdmetaSetGIPerPeer(t *testing.T) {
 	// Single RunDrbdmeta invocation per test gives us one loopback
 	// file with one container; create-md + set-gi must run in the
 	// same container against the same file, which neither helper
-	// exposes — so we use the createThenSetGi composite helper in
+	// exposes — so we use the createThenSetGI composite helper in
 	// the local package to keep the harness API minimal.
-	res := createThenSetGi(t,
+	res := createThenSetGI(t,
 		"--node-id", "1",
 		"0000000000000001:0000000000000001:0:0",
 	)
@@ -266,10 +266,10 @@ func TestDrbdadmConfigValidate(t *testing.T) {
 
 // ----- helpers -----
 
-// createThenSetGi runs create-md + set-gi against the same loopback
+// createThenSetGI runs create-md + set-gi against the same loopback
 // file inside a single container, so the metadata written by
 // create-md is the same metadata set-gi mutates.
-func createThenSetGi(t *testing.T, setGiArgs ...string) contract.RunResult {
+func createThenSetGI(t *testing.T, setGiArgs ...string) contract.RunResult {
 	t.Helper()
 
 	return contract.RunDrbdmetaChain(t,
