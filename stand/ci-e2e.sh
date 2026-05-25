@@ -39,17 +39,25 @@ ALL_SCENARIOS=("$@")
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
+# run-scenarios-only.sh hardcodes `cd ~/blockstor` (its dev-stand home);
+# point it at this checkout instead — on a CI runner the repo lives in
+# $GITHUB_WORKSPACE, not ~/blockstor.
+export BS_REPO="$REPO_ROOT"
 
 STAND="ci-lane${LANE}"
 REGISTRY_CONTAINER="blockstor-ci-registry"
 
 # CI-tuned VM sizing (env-overridable). The dev stand defaults
-# (EXTRA_DISKS=2, 16 GiB each) assume a multi-TB NVMe; a CI runner has
-# far less, so we provision one smaller storage disk per worker. Still
-# 3 workers — many scenarios need 2 diskful replicas + a diskless
+# (16 GiB each) assume a multi-TB NVMe; a CI runner has far less, so we
+# shrink each disk. TWO extra disks per worker are REQUIRED: `make pools
+# TYPE=both` puts a ZFS pool on the first and an LVM pool on the second.
+# With only one, LVM device-discovery fell through to /dev/zram0 (not a
+# valid PV), `make pools` exited 5, no StoragePools were created, and
+# every scenario aborted (first oracle run, commit 790b4b3a5). Still 3
+# workers — many scenarios need 2 diskful replicas + a diskless
 # tiebreaker (or 3-way placement).
-export EXTRA_DISKS=${EXTRA_DISKS:-1}
-export EXTRA_DISK_SIZE_MB=${EXTRA_DISK_SIZE_MB:-10240}
+export EXTRA_DISKS=${EXTRA_DISKS:-2}
+export EXTRA_DISK_SIZE_MB=${EXTRA_DISK_SIZE_MB:-8192}
 CI_WORKERS=${CI_WORKERS:-3}
 
 log() { echo ">> [$STAND] $*"; }

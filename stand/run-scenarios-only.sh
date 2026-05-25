@@ -21,7 +21,9 @@ set -uo pipefail
 NAME=${1:?NAME required}
 shift
 SCENARIOS=("$@")
-cd ~/blockstor
+# Dev stand runs this from /tmp with the repo at ~/blockstor; CI (ci-e2e.sh)
+# exports BS_REPO to its $GITHUB_WORKSPACE checkout. Honour the override.
+cd "${BS_REPO:-$HOME/blockstor}"
 RESULTS=/tmp/e2e-$NAME.results
 : > "$RESULTS"
 echo "stand: $NAME (already provisioned)" >> "$RESULTS"
