@@ -497,6 +497,17 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fail-fast offline pre-check (mirrors upstream's getOfflineNodes):
+	// every targeted diskful node must be reachable BEFORE we stamp
+	// SuspendIo=true. Freezing the reachable peers for a snapshot that
+	// can never complete (because one target is offline and will never
+	// ack the suspend or take the snapshot) is exactly the indefinite-
+	// freeze outage this work closes — so refuse up front rather than
+	// freeze the others.
+	if !s.refuseSnapshotOnOfflineTargets(w, r, snap.Nodes) {
+		return
+	}
+
 	// Bug 180 pre-write guard: refuse the create if the parent RD is
 	// already mid-tear-down. Upstream LINSTOR stamps the `DELETE` flag
 	// on a ResourceDefinition while CtrlRscDfnDeleteApiCallHandler is
@@ -845,6 +856,50 @@ func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot
 	}
 
 	return nil
+}
+
+// refuseSnapshotOnOfflineTargets is the fail-fast offline guard for
+// the per-RD create path. Returns true when the caller may continue
+// (every target reachable); false when it has already written the 503
+// envelope naming the offline node(s). Pulled out of
+// handleSnapshotCreate to keep it under the funlen cap.
+func (s *Server) refuseSnapshotOnOfflineTargets(w http.ResponseWriter, r *http.Request, targets []string) bool {
+	offline := s.offlineTargetNodes(r.Context(), targets)
+	if len(offline) == 0 {
+		return true
+	}
+
+	writeError(w, http.StatusServiceUnavailable,
+		"snapshot create refused: targeted node(s) "+
+			strings.Join(offline, ", ")+" are offline; "+
+			"retry once they reconnect (refusing to suspend I/O on the "+
+			"reachable replicas for a snapshot that cannot complete)")
+
+	return false
+}
+
+// offlineTargetNodes returns the subset of `targets` whose Node is
+// currently OFFLINE. Used as the snapshot-create fail-fast pre-check
+// (mirrors upstream LINSTOR's getOfflineNodes): refusing before the
+// freeze begins keeps a snapshot that can never complete from
+// suspending I/O on the reachable replicas. Reuses the same liveness
+// signal the rest of the REST layer uses (isNodeOnline →
+// Node.ConnectionStatus), which is best-effort: lookup errors and
+// missing/never-reported nodes count as online so a transient store
+// blip doesn't spuriously refuse every snapshot. The returned slice
+// is sorted for a deterministic operator-facing message.
+func (s *Server) offlineTargetNodes(ctx context.Context, targets []string) []string {
+	offline := make([]string, 0, len(targets))
+
+	for _, node := range targets {
+		if !isNodeOnline(ctx, s.Store.Nodes(), node) {
+			offline = append(offline, node)
+		}
+	}
+
+	slices.Sort(offline)
+
+	return offline
 }
 
 // listDiskfulNodes returns the node names that host a diskful

@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 
@@ -153,6 +154,23 @@ func (s *Server) createOneFromMulti(
 	err := s.hydrateSnapshotFromRD(ctx, &snap, entry.ResourceName)
 	if err != nil {
 		return multiSnapshotEntryErr(entry, err)
+	}
+
+	// Fail-fast offline pre-check, same contract as the per-RD create
+	// path: refuse before stamping SuspendIo so a snapshot that can
+	// never complete doesn't freeze the reachable replicas. In a
+	// multi-RD batch the per-entry refusal lands in the ApiCallRc
+	// envelope (best-effort batch semantics) — the controller's
+	// transactional GroupID gate then resumes any sibling that did
+	// get suspended once this entry never acks, but refusing here
+	// avoids the freeze entirely for the offline-target entry.
+	if offline := s.offlineTargetNodes(ctx, snap.Nodes); len(offline) > 0 {
+		return apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: entry.ResourceName + "/" + entry.Name +
+				": targeted node(s) " + strings.Join(offline, ", ") +
+				" are offline; retry once they reconnect",
+		}
 	}
 
 	err = s.Store.Snapshots().Create(ctx, &snap)

@@ -134,6 +134,27 @@ type SnapshotVolumeRef struct {
 // either delete or recreate.
 const SnapshotStatusFlagFailed = "FAILED"
 
+// SnapshotStatusFlagFailedDisconnect is stamped on Status.Flags by
+// the controller-side SnapshotReconciler when it aborts a snapshot
+// that hung in the suspend/take phase past the deadline — a
+// satellite never reported back (silently unreachable, satellite
+// pod stuck, backend snapshot hang) so no per-node Failed=true
+// stamp ever arrived. Mirrors upstream LINSTOR's `FAILED_DISCONNECT`
+// SnapshotDefinition flag: the take did not complete because a
+// satellite stopped responding rather than because the satellite
+// tried and gave up (`FAILED_DEPLOYMENT`/`FAILED`). The Python CLI
+// renders this as the `State="Satellite disconnected"` column in
+// `linstor s l`. Distinguishing this from the plain FAILED stamp is
+// the "distinguish failure reasons" half of the upstream safety
+// contract — operators see *why* the snapshot aborted.
+const SnapshotStatusFlagFailedDisconnect = "FAILED_DISCONNECT"
+
+// SnapshotStatusConditionType is the well-known Status.Conditions[]
+// type the controller-side SnapshotReconciler stamps to record a
+// human-readable abort reason (timeout vs non-UpToDate replica vs
+// satellite-unreachable) alongside the terminal Flags marker.
+const SnapshotStatusConditionType = "SnapshotComplete"
+
 // SnapshotStatus is the observed state of a Snapshot.
 type SnapshotStatus struct {
 	// nodeStatus reports per-node readiness from the satellites.

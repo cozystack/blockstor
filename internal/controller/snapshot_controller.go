@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
@@ -109,24 +111,16 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	// Abort path takes priority: any per-node Failed=true (in self
-	// or any sibling) forces us into Phase 3 (resume) regardless of
-	// where in the suspend/take sequence we currently are. Without
-	// this, a failure during Phase 1 on one node would leave its
-	// already-acked siblings frozen forever waiting for the
-	// controller to advance to Phase 2 (which never happens because
-	// the failed node never acks).
-	//
-	// b353 cascade: when grouped, the abort signal MUST propagate
-	// across the whole batch — clearing SuspendIo only on the
-	// failed sibling would leave the other siblings' frozen peers
-	// stuck waiting on a never-coming all-acked transition.
-	if anySiblingFailed(siblings) {
-		logger.Info("aborting snapshot group: per-node Failed=true observed",
-			"group_id", snap.Spec.GroupID,
-			"failed_node", firstFailedNodeAcrossSiblings(siblings))
-
-		return r.abortGroup(ctx, siblings)
+	// Abort paths take priority over phase advancement and force us
+	// straight into resume regardless of where in the suspend/take
+	// sequence we are: (1) any per-node Failed=true (satellite gave
+	// up), or (2) the suspend/take deadline expired (silently-hung
+	// take). Both clear SuspendIo across the whole GroupID batch so
+	// no frozen peer is left waiting. Returns aborted=true when it
+	// has driven the abort, in which case Reconcile is done.
+	aborted, result, err := r.checkAbortConditions(ctx, logger, &snap, siblings)
+	if aborted || err != nil {
+		return result, err
 	}
 
 	// A Snapshot whose Spec.Nodes is empty is degenerate at the
@@ -141,7 +135,31 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	next := r.nextPhase(&snap, siblings)
 	if !next.Advance {
-		return ctrl.Result{}, nil
+		return r.requeueIfSuspended(&snap, siblings), nil
+	}
+
+	// Consistency guard: before flipping Phase 1 → Phase 2
+	// (TakeSnapshot=true), refuse to snapshot a non-UpToDate device.
+	// The Phase-2 gate (allSiblingsSuspendAcked) only proves the
+	// kernel froze I/O — it does NOT prove the frozen bytes are good.
+	// Snapshotting an Inconsistent / SyncTarget / Outdated replica
+	// captures torn data; upstream LINSTOR refuses with "Cannot take
+	// snapshot from non-UpToDate DRBD device". On a non-UpToDate
+	// target, abort+resume rather than take a bad snapshot.
+	if isPhase2Promotion(&snap, next) {
+		ok, offending, err := r.allTargetedReplicasUpToDate(ctx, siblings)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if !ok {
+			logger.Info("aborting snapshot group: targeted replica not UpToDate",
+				"group_id", snap.Spec.GroupID, "node", offending)
+
+			return r.abortGroupWithReason(ctx, siblings,
+				"snapshot aborted: replica on node '"+offending+
+					"' is not UpToDate; I/O resumed")
+		}
 	}
 
 	logger.V(1).Info("advancing orchestration phase",
@@ -149,6 +167,80 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		"group_id", snap.Spec.GroupID)
 
 	return r.maybeFlipSpec(ctx, &snap, next.SuspendIo, next.TakeSnapshot)
+}
+
+// checkAbortConditions evaluates the two abort triggers that outrank
+// phase advancement and, when one fires, drives the abort+resume
+// cascade across the whole GroupID batch. Returns aborted=true (with
+// the resulting ctrl.Result) when it handled an abort, so Reconcile
+// can return immediately; aborted=false means the orchestration should
+// continue to phase advancement. Pulled out of Reconcile to keep it
+// under the funlen budget while keeping the abort precedence explicit.
+//
+//  1. anySiblingFailed: a satellite stamped per-node Failed=true
+//     (tried and gave up). b353 cascade resumes every sibling.
+//  2. suspend/take deadline exceeded: a take hung past
+//     snapshotSuspendDeadline without any per-node Failed=true stamp
+//     (satellite stuck / unreachable / backend hang). The PRIMARY
+//     outage fix — without it the volume stays frozen forever. Anchored
+//     on metadata.CreationTimestamp (Phase 1 begins at create); records
+//     FAILED_DISCONNECT so `linstor s l` shows why.
+func (r *SnapshotReconciler) checkAbortConditions(
+	ctx context.Context,
+	logger logr.Logger,
+	snap *blockstoriov1alpha1.Snapshot,
+	siblings []blockstoriov1alpha1.Snapshot,
+) (bool, ctrl.Result, error) {
+	if anySiblingFailed(siblings) {
+		logger.Info("aborting snapshot group: per-node Failed=true observed",
+			"group_id", snap.Spec.GroupID,
+			"failed_node", firstFailedNodeAcrossSiblings(siblings))
+
+		return true, ctrl.Result{}, r.abortGroup(ctx, siblings)
+	}
+
+	if inSuspendPhase(snap, siblings) && suspendDeadlineExceeded(snap, time.Now()) {
+		logger.Info("aborting snapshot group: suspend/take deadline exceeded",
+			"group_id", snap.Spec.GroupID,
+			"deadline", snapshotSuspendDeadline.String(),
+			"created", snap.CreationTimestamp.Time)
+
+		res, err := r.abortGroupWithReason(ctx, siblings,
+			"snapshot aborted: suspend/take exceeded the "+
+				snapshotSuspendDeadline.String()+" deadline; I/O resumed")
+
+		return true, res, err
+	}
+
+	return false, ctrl.Result{}, nil
+}
+
+// isPhase2Promotion reports whether the pending phase decision is the
+// Phase 1 → Phase 2 transition (flipping TakeSnapshot=true while
+// SuspendIo stays true) for a Snapshot that has not already taken it.
+// Used to scope the UpToDate consistency gate to exactly the moment
+// the satellites are about to dispatch provider.CreateSnapshot.
+func isPhase2Promotion(snap *blockstoriov1alpha1.Snapshot, next snapshotPhaseDecision) bool {
+	return next.Advance && next.SuspendIo && next.TakeSnapshot && !snap.Spec.TakeSnapshot
+}
+
+// requeueIfSuspended returns the RequeueAfter the controller should
+// carry when it has no Spec flip to make this pass but the Snapshot is
+// still frozen in the suspend/take window. The controller is
+// event-driven, but a silently-hung take emits no further events, so
+// without this self-requeue the suspend deadline would never be
+// re-evaluated and the timeout abort would never fire. When the
+// Snapshot is not in the suspend window (already draining or
+// complete), no requeue is needed — the satellite Status writes drive
+// the remaining transitions.
+func (r *SnapshotReconciler) requeueIfSuspended(
+	snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1alpha1.Snapshot,
+) ctrl.Result {
+	if !inSuspendPhase(snap, siblings) {
+		return ctrl.Result{}
+	}
+
+	return ctrl.Result{RequeueAfter: suspendRequeueAfter(snap, time.Now())}
 }
 
 // snapshotPhaseDecision is the (target Spec, advance?) verdict
@@ -489,16 +581,16 @@ func firstFailedNodeAcrossSiblings(siblings []blockstoriov1alpha1.Snapshot) stri
 // abortGroup on a partially-drained group is idempotent.
 func (r *SnapshotReconciler) abortGroup(
 	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot,
-) (ctrl.Result, error) {
+) error {
 	for i := range siblings {
 		_, err := r.maybeFlipSpec(ctx, &siblings[i], false, false)
 		if err != nil {
-			return ctrl.Result{}, errors.Wrapf(err,
+			return errors.Wrapf(err,
 				"abort cascade: clear SuspendIo on sibling %q", siblings[i].Name)
 		}
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
