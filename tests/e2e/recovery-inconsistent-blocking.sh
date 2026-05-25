@@ -359,46 +359,18 @@ done
 
 LCTL=(linstor --controllers "http://localhost:${PF_PORT}" --machine-readable)
 
-# Bug 1 (cascade fix) + Bug 342 v17 contract: `linstor r d` on a
-# diskful Resource is now toggle-disk-remove (flips Spec.Flags to
-# DISKLESS, keeps the CRD so the kernel slot survives across the
-# detach — see commit 324d09fe1 and bug_342_FINAL_root_cause.md).
-# To physically remove the CRD takes TWO `r d` calls: the first
-# toggles diskful → DISKLESS, the second hits the already-DISKLESS
-# branch in handleResourceDelete and does the physical Delete.
-# This mirrors the upstream LINSTOR operator model and matches the
-# pattern used by cli-matrix/r-d-collapses-tiebreaker.sh and
-# cli-matrix/r-full-lifecycle.sh.
-echo ">> linstor r d ${N3} ${RD} (1st: toggle inconsistent replica diskful → DISKLESS)"
+# `linstor r d` on a diskful Resource is a single-call PHYSICAL delete
+# (upstream LINSTOR operator model). The earlier 2-phase
+# toggle-to-DISKLESS-then-delete contract (Bug 342 v17) was REVERTED —
+# handleResourceDelete (pkg/rest/autoplace.go) now removes the Resource
+# CRD outright in one call, no intermediate Spec.Flags=DISKLESS state.
+# So one `r d` deletes the inconsistent replica; the cascade must then
+# bring DRBD down on N3 (asserted below).
+echo ">> linstor r d ${N3} ${RD} (single-call physical delete of inconsistent replica)"
 if ! command -v linstor >/dev/null 2>&1; then
     echo "SKIP: linstor CLI not installed on stand host (apt install linstor-client)"
     exit 0
 fi
-"${LCTL[@]}" resource delete "$N3" "$RD" >/dev/null
-
-# Wait for Spec.Flags to carry DISKLESS so the second `r d` lands
-# deterministically on the already-DISKLESS physical-Delete branch
-# rather than racing the Spec patch.
-echo ">> wait up to 60s for ${RD}.${N3} Spec.Flags to contain DISKLESS"
-deadline=$(( $(date +%s) + 60 ))
-spec_diskless=false
-while (( $(date +%s) < deadline )); do
-    flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
-        -o jsonpath='{.spec.flags}' 2>/dev/null || echo "")
-    if [[ "$flags" == *"DISKLESS"* ]]; then
-        spec_diskless=true
-        break
-    fi
-    sleep 2
-done
-if [[ "$spec_diskless" != "true" ]]; then
-    echo "FAIL: ${RD}.${N3} Spec.Flags never gained DISKLESS after 1st r d"
-    kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" \
-        -o jsonpath='{.spec.flags}' 2>/dev/null || true
-    exit 1
-fi
-
-echo ">> linstor r d ${N3} ${RD} (2nd: physical Delete from already-DISKLESS branch)"
 "${LCTL[@]}" resource delete "$N3" "$RD" >/dev/null
 
 echo ">> wait up to 90s for Resource ${RD}.${N3} CRD to vanish"
@@ -410,7 +382,7 @@ while (( $(date +%s) < deadline )); do
     sleep 2
 done
 if kubectl get "resources.blockstor.cozystack.io/${RD}.${N3}" >/dev/null 2>&1; then
-    echo "FAIL: ${RD}.${N3} still present after 2nd linstor r d (Bug 1: cascade did not clean up)"
+    echo "FAIL: ${RD}.${N3} still present after linstor r d (Bug 1: cascade did not clean up)"
     exit 1
 fi
 
