@@ -955,9 +955,21 @@ func TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne(t *testing.T) {
 	// (or the cascade) already removed the n1 Resource from the
 	// store. The reconciler is now firing on the resulting state.
 	// Snapshot: n2 diskful + n3 tiebreaker.
+	//
+	// This is a GENUINE Bug-338 standalone (operator deleted a diskful
+	// and stopped), not the transient relocate-onto-the-tiebreaker
+	// window. Pre-stamp the orphan-witness grace with a timestamp
+	// safely older than orphanWitnessCollapseGrace so the collapse
+	// fires this reconcile rather than being deferred. (A fresh
+	// transient — no stamp — is exercised by
+	// TestEnsureTiebreakerRelocateDefersOrphanCollapse.)
+	seenAt := time.Now().Add(-2 * controllerpkg.OrphanWitnessCollapseGrace).UTC().Format(time.RFC3339)
 
 	rd := &blockstoriov1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug338"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pvc-bug338",
+			Annotations: map[string]string{controllerpkg.OrphanWitnessSeenAtAnnotation: seenAt},
+		},
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
@@ -999,6 +1011,125 @@ func TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne(t *testing.T) {
 			t.Errorf("Bug 338: surviving replica should be diskful, has DISKLESS; flags=%v",
 				post[0].Flags)
 		}
+	}
+}
+
+// TestEnsureTiebreakerRelocateDefersOrphanCollapse pins the
+// relocate-onto-the-tiebreaker stability gate. A FRESH 1-diskful +
+// 1-orphan-witness snapshot (no grace stamp yet) is the transient
+// mid-relocate shape: after `r d <one-of-two-diskful>` the RD sits at
+// 1 diskful + 1 orphan witness for the sub-second window before
+// `r c <tiebreaker-node>` promotes the witness into the relocate
+// target. The reconciler MUST NOT collapse the witness on this first
+// observation — it must defer (keep the witness, stamp the seen-at
+// grace) so the in-flight promote isn't raced and the placement
+// decision doesn't oscillate.
+//
+// Contrast TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne, which
+// pre-stamps a past-grace timestamp to exercise the genuine
+// standalone (operator deleted a diskful and stopped) where the
+// collapse SHOULD fire.
+func TestEnsureTiebreakerRelocateDefersOrphanCollapse(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	const rdName = "pvc-relocate-defer"
+
+	// Transient mid-relocate snapshot: lone diskful on n2 + orphan
+	// witness on n3, NO grace stamp (this is the first observation).
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n2",
+	}); err != nil {
+		t.Fatalf("seed n2 diskful: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed n3 witness: %v", err)
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// Deferral invariant: the witness MUST still be present (collapse
+	// deferred), and the grace stamp MUST now be set so the next
+	// reconcile after the grace can act.
+	if _, err := st.Resources().Get(ctx, rdName, "n3"); err != nil {
+		t.Fatalf("relocate-defer: witness on n3 was collapsed on first observation: %v", err)
+	}
+
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: rdName}, final); err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	if final.Annotations[controllerpkg.OrphanWitnessSeenAtAnnotation] == "" {
+		t.Errorf("relocate-defer: orphan-witness grace stamp not set; annotations=%v", final.Annotations)
+	}
+
+	// Now simulate the relocate `r c n3` landing inside the grace:
+	// promote n3's witness to diskful. The next reconcile sees 2
+	// diskful + 0 witness, must CLEAR the grace stamp and want a fresh
+	// witness (no orphan-collapse, no flip).
+	if err := st.Resources().Update(ctx, &apiv1.Resource{
+		Name: rdName, NodeName: "n3",
+		Props: map[string]string{"StorPoolName": "stand"},
+	}); err != nil {
+		t.Fatalf("promote n3 witness to diskful: %v", err)
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, final); err != nil {
+		t.Fatalf("EnsureTiebreaker after promote: %v", err)
+	}
+
+	cleared := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: rdName}, cleared); err != nil {
+		t.Fatalf("Get RD after promote: %v", err)
+	}
+
+	if cleared.Annotations[controllerpkg.OrphanWitnessSeenAtAnnotation] != "" {
+		t.Errorf("relocate-defer: grace stamp not cleared after relocate landed; annotations=%v",
+			cleared.Annotations)
+	}
+
+	all, err := st.Resources().ListByDefinition(ctx, rdName)
+	if err != nil {
+		t.Fatalf("list after promote: %v", err)
+	}
+
+	diskful, _, witness := classifyReplicas(all)
+	if diskful != 2 {
+		t.Errorf("after relocate: diskful=%d, want 2 (n2 + relocated n3); entries=%v", diskful, all)
+	}
+
+	if witness != 1 {
+		t.Errorf("after relocate: witness=%d, want 1 (fresh on n1); entries=%v", witness, all)
 	}
 }
 

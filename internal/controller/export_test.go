@@ -218,3 +218,12 @@ func IsAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // key for tests so a regression that renamed the key on one side
 // would fail to compile here.
 const AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation
+
+// OrphanWitnessSeenAtAnnotation exposes the Bug-338 orphan-witness
+// grace-stamp key so tests can simulate a persisted (past-grace)
+// standalone vs a fresh transient relocate window.
+const OrphanWitnessSeenAtAnnotation = orphanWitnessSeenAtAnnotation
+
+// OrphanWitnessCollapseGrace exposes the grace duration so tests can
+// stamp a seen-at timestamp safely older than the collapse window.
+const OrphanWitnessCollapseGrace = orphanWitnessCollapseGrace
