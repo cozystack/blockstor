@@ -1790,9 +1790,9 @@ func (r *Reconciler) stampOwnershipMarker(name string) error {
 // loopfile-backed volume gets `disk /dev/loopN` rather than the
 // LVM-shaped guess.
 func (r *Reconciler) renderResFile(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
-	_ = ctx
+	autoDisk := r.autoDiskOptionsForResource(ctx, dr, devices)
 
-	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices)
+	body, err := buildResFile(dr, r.cfg.NodeName, r.cfg.LocalAddress, devices, autoDisk)
 	if err != nil {
 		return errors.Wrapf(err, "build .res for %s", dr.GetName())
 	}
@@ -3627,7 +3627,7 @@ func (r *Reconciler) rememberPool(resourceName, pool string) {
 // disk path. Empty / missing → fall back to the LVM/ZFS-shaped
 // `/dev/<pool>/<rd>_<vol>` guess, which is what works for those
 // providers.
-func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string) (string, error) {
+func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devices map[int32]string, autoDisk map[string]string) (string, error) {
 	opts := dr.GetDrbdOptions()
 	port, _ := strconv.Atoi(opts["port"])
 	nodeID, _ := strconv.Atoi(opts["node-id"])
@@ -3659,6 +3659,7 @@ func buildResFile(dr *intent.DesiredResource, localNode, localAddr string, devic
 	vols := buildResVolumes(dr, devices, minor)
 
 	sections := splitDRBDOptions(opts)
+	mergeAutoDiskOptions(sections.Disk, autoDisk)
 
 	out, err := drbd.Build(drbd.Resource{
 		Name:        dr.GetName(),
@@ -3843,6 +3844,27 @@ func splitDRBDOptions(opts map[string]string) drbdOptionSections {
 	}
 
 	return out
+}
+
+// mergeAutoDiskOptions folds the satellite-derived thin-aware-resync
+// disk options (autoDiskOptions: rs-discard-granularity /
+// discard-zeroes-if-aligned) into the operator-supplied `disk { }`
+// section. An OPERATOR-set value ALWAYS wins — if the operator pinned
+// `DrbdOptions/Disk/rs-discard-granularity` (already present in dst
+// after splitDRBDOptions), we leave it untouched. The auto value only
+// fills keys the operator left unset. Nil/empty auto map is a no-op.
+//
+// Operator-override precedence mirrors upstream LINSTOR, where the
+// auto-* managers (CtrlRscDfnApiCallHelper) skip a volume whose
+// rs-discard-granularity was set by hand.
+func mergeAutoDiskOptions(dst, auto map[string]string) {
+	for k, v := range auto {
+		if _, set := dst[k]; set {
+			continue
+		}
+
+		dst[k] = v
+	}
 }
 
 // drbdAddrPlaceholder is what the controller stamps on a Resource
