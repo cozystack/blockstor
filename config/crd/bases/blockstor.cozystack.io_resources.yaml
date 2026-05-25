@@ -62,7 +62,8 @@ spec:
                 x-kubernetes-validations:
                 - message: 'drbdNodeID is settable-once: it may go from unset to a
                     value but not be changed once set'
-                  rule: self == oldSelf || oldSelf == null
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               drbdOptions:
                 description: |-
                   drbdOptions is the typed DRBD configuration applied to this
@@ -260,7 +261,8 @@ spec:
                 x-kubernetes-validations:
                 - message: 'drbdPort is settable-once: it may go from unset to a value
                     but not be changed once set'
-                  rule: self == oldSelf || oldSelf == null
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               extraProps:
                 additionalProperties:
                   type: string

@@ -89,7 +89,7 @@ type ResourceDefinitionSpec struct {
 	// Resource.Spec.DRBDPort. clusterIP-style settable-once so an
 	// accidental edit can't perturb the per-node allocation.
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdPort is settable-once"
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdPort is settable-once"
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 }
 
@@ -113,15 +113,24 @@ type ResourceDefinitionVolume struct {
 	// plain `kubectl get -o yaml` backup + `kubectl apply` restore
 	// preserve the device identity with no resync/flap. The pointer
 	// (rather than a plain int32) distinguishes "unset" from a valid
-	// minor 0. The CEL settable-once rule below rejects mutating a
-	// set value so an accidental edit can't trigger reallocation.
+	// minor 0.
 	//
 	// Replaces the legacy single `RD.Status.DRBDMinor` base +
 	// `base+volumeNumber` derivation: each volume carries its own
 	// minor, so adoption can preserve arbitrary (possibly
 	// non-contiguous) LINSTOR per-volume minors verbatim.
+	//
+	// NOTE: no CEL settable-once rule here. volumeDefinitions is a
+	// plain (uncorrelatable) array — CEL `oldSelf` cannot track an
+	// element across an update, so a transition rule on a nested
+	// array field is rejected by the apiserver. Immutability is
+	// instead enforced by the controller's allocate-if-nil /
+	// respect-preset pass (it NEVER overwrites a non-nil minor) plus
+	// the store-side VolumeDefinitions carry-across that preserves the
+	// value through a REST modify. The settable-once CEL is retained
+	// on the (correlatable scalar) Resource.Spec.DRBDPort / DRBDNodeID
+	// and RD.Spec.DRBDPort fields.
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdMinor is settable-once: it may go from unset to a value but not be changed once set"
 	DRBDMinor *int32 `json:"drbdMinor,omitempty"`
 }
 

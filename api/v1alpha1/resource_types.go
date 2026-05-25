@@ -194,7 +194,7 @@ type ResourceSpec struct {
 	// .res renderer puts each peer's own Spec.DRBDPort into that
 	// peer's `on <node>` block.
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdPort is settable-once: it may go from unset to a value but not be changed once set"
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdPort is settable-once: it may go from unset to a value but not be changed once set"
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
 
 	// drbdNodeID is the DRBD-9 node-id assigned to this replica.
@@ -207,7 +207,7 @@ type ResourceSpec struct {
 	// Pointer distinguishes "unset" from a valid node-id 0
 	// (LowestFreeNodeID hands out 0 for the first/freed slot).
 	// +optional
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf || oldSelf == null",message="drbdNodeID is settable-once: it may go from unset to a value but not be changed once set"
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdNodeID is settable-once: it may go from unset to a value but not be changed once set"
 	DRBDNodeID *int32 `json:"drbdNodeID,omitempty"`
 }
 
