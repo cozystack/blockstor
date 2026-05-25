@@ -174,8 +174,17 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// the seeded fast path. Carry it across explicitly — mirrors the
 	// VolumeDefinitions carry-across `resourceDefinitions.Update` does.
 	prevVolumes := existing.Spec.Volumes
+	// Identity-to-spec: DRBDPort / DRBDNodeID are controller-allocated
+	// (clusterIP model) with no wire counterpart — a naïve wire-rebuild
+	// would wipe them on every routine REST modify, forcing the
+	// allocator to re-pick fresh values → port/node-id change → DRBD
+	// reconnect/resync. Carry them across, mirroring Spec.Volumes.
+	prevPort := existing.Spec.DRBDPort
+	prevNodeID := existing.Spec.DRBDNodeID
 	existing.Spec = wireToCRDResourceSpec(in)
 	existing.Spec.Volumes = prevVolumes
+	existing.Spec.DRBDPort = prevPort
+	existing.Spec.DRBDNodeID = prevNodeID
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
 	// REST writer's `blockstor.io/peer-changed` bump actually reaches
@@ -245,8 +254,15 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// assignment, so the JSON-merge-patch diff still computes
 		// correctly against the pre-mutate state.
 		prevVolumes := existing.Spec.Volumes
+		// Identity-to-spec: carry controller-allocated DRBDPort /
+		// DRBDNodeID across the wire-rebuild — see the matching
+		// carry-across in `Update` above.
+		prevPort := existing.Spec.DRBDPort
+		prevNodeID := existing.Spec.DRBDNodeID
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
+		existing.Spec.DRBDPort = prevPort
+		existing.Spec.DRBDNodeID = prevNodeID
 
 		// Bug 210: merge rather than wholesale-replace so the
 		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)

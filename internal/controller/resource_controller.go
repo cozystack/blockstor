@@ -630,7 +630,11 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 	// (2) allocate any still-missing per-replica identities INTO Spec.
 	err = r.allocateResourceSpecFields(ctx, target)
 	if err != nil {
-		return err2(err)
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
 	}
 
 	// (3) ensure the parent RD's per-volume minors (separate object /
@@ -670,16 +674,6 @@ func (r *ResourceReconciler) allocateAndApplyDRBDIDs(ctx context.Context, reader
 	}
 
 	return specMutated || statusMutated || minorMutated, nil
-}
-
-// err2 adapts a single error into the (bool, error) shape the NotFound
-// races above use, treating a vanished Resource as a benign no-op.
-func err2(err error) (bool, error) {
-	if errors.IsNotFound(err) {
-		return false, nil
-	}
-
-	return false, err
 }
 
 // backfillResourceSpecFromStatus copies the legacy per-replica Status
@@ -1207,8 +1201,9 @@ func (r *ResourceReconciler) allocateRDVolumeMinors(ctx context.Context, rd *blo
 
 		v := minor
 		rd.Spec.VolumeDefinitions[i].DRBDMinor = &v
-		taken = append(taken, minor)
 		mutated = true
+
+		taken = append(taken, minor)
 	}
 
 	return mutated, nil
@@ -1341,6 +1336,7 @@ func (r *ResourceReconciler) apiReader() client.Reader {
 
 	return r.Client
 }
+
 // hostingNodesForRD returns the set of nodes hosting a Resource of
 // the named RD. Used by the per-RD allocator to intersect each
 // node's port/minor range.
@@ -1370,20 +1366,11 @@ func (r *ResourceReconciler) hostingNodesForRD(ctx context.Context, rdName strin
 	return out, nil
 }
 
-// intersectPortRange computes the intersection of every hosting
-// node's TCP-port range. Empty node set → cluster-default range.
-// Disjoint ranges produce (0,0) — `LowestFreePort` then returns
-// `ErrPortPoolExhausted`, which is the operator-actionable signal
-// that node ranges must be reconciled before any RD can land on
-// the cross-section.
-func (r *ResourceReconciler) intersectPortRange(ctx context.Context, hostNodes []string) (int32, int32, error) {
-	return r.intersectRange(ctx, hostNodes,
-		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDPortRange },
-		"DrbdOptions/TcpPortRange", "TcpPortAutoRange",
-		drbd.DefaultPortMin, drbd.DefaultPortMax)
-}
-
-// intersectMinorRange mirrors intersectPortRange for minors.
+// intersectMinorRange computes the intersection of every hosting
+// node's minor range. Minors are cluster-wide (the /dev/drbd<N>
+// device identity, identical on every node), so a value must be
+// allocatable on every node hosting a volume of the RD. Empty node
+// set → cluster-default range.
 func (r *ResourceReconciler) intersectMinorRange(ctx context.Context, hostNodes []string) (int32, int32, error) {
 	return r.intersectRange(ctx, hostNodes,
 		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDMinorRange },
@@ -1506,13 +1493,13 @@ func (r *ResourceReconciler) takenMinorsCluster(ctx context.Context, selfRD stri
 		// Legacy not-yet-backfilled base (expand base+k per volume).
 		base := rd.Status.DRBDMinor
 		if base != nil && !anyVolumeMinorSet(rd) {
-			volCount := int32(1)
-			if n := int32(len(rd.Spec.VolumeDefinitions)); n > 0 {
-				volCount = n
+			volCount := len(rd.Spec.VolumeDefinitions)
+			if volCount == 0 {
+				volCount = 1
 			}
 
 			for off := range volCount {
-				out = append(out, *base+off)
+				out = append(out, *base+int32(off)) //nolint:gosec // off is a bounded volume index (<= len), no overflow
 			}
 		}
 	}
@@ -1555,14 +1542,6 @@ func (r *ResourceReconciler) portRangeForNode(ctx context.Context, nodeName stri
 		"DrbdOptions/TcpPortRange",
 		"TcpPortAutoRange",
 		drbd.DefaultPortMin, drbd.DefaultPortMax)
-}
-
-func (r *ResourceReconciler) minorRangeForNode(ctx context.Context, nodeName string) (int32, int32, error) {
-	return r.nodeRangeWithClusterFallback(ctx, nodeName,
-		func(s *blockstoriov1alpha1.NodeSpec) *blockstoriov1alpha1.PortRange { return s.DRBDMinorRange },
-		"DrbdOptions/MinorNrRange",
-		"MinorNrAutoRange",
-		drbd.DefaultMinorMin, drbd.DefaultMinorMax)
 }
 
 // nodeRange resolves a port/minor range for the named Node. Reads

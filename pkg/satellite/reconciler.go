@@ -2837,7 +2837,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	}
 
 	for _, vol := range dr.GetVolumes() {
-		device := fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber()))
+		device := fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
 
 		if r.deviceHasFilesystem(ctx, device) {
 			// Volume already carries a filesystem. Two cases land here:
@@ -3054,7 +3054,13 @@ func ensureDeviceNodes(ctx context.Context, dr *intent.DesiredResource) {
 	baseMinor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
 
 	for _, vol := range dr.GetVolumes() {
-		minor := baseMinor + int(vol.GetVolumeNumber())
+		// Per-volume minor is authoritative; fall back to
+		// base+volumeNumber when unset (mid-upgrade / in-flight).
+		minor := int(vol.GetMinor())
+		if minor == 0 {
+			minor = baseMinor + int(vol.GetVolumeNumber())
+		}
+
 		if minor <= 0 {
 			// Base minor unset (DesiredResource may carry no minor
 			// when the controller hasn't allocated one yet — pre-first-
@@ -3725,6 +3731,18 @@ func buildResConnections(dr *intent.DesiredResource) []drbd.ResourceConnection {
 // providers that don't surface a devicePath still get a working
 // .res. The meta-disk path is the scenario 6.18
 // `StorPoolNameDrbdMeta` carve — see Volume.MetaPool godoc.
+// volMinorOrBase returns the volume's authoritative per-volume minor
+// (DesiredVolume.Minor, sourced from RD.Spec.VolumeDefinitions), or
+// the legacy base+volumeNumber derivation when the controller hasn't
+// stamped a per-volume minor yet (mid-upgrade / in-flight reconcile).
+func volMinorOrBase(vol *intent.DesiredVolume, base int) int {
+	if m := int(vol.GetMinor()); m != 0 {
+		return m
+	}
+
+	return base + int(vol.GetVolumeNumber())
+}
+
 func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor int) []drbd.Volume {
 	vols := make([]drbd.Volume, 0, len(dr.GetVolumes()))
 
@@ -3747,12 +3765,21 @@ func buildResVolumes(dr *intent.DesiredResource, devices map[int32]string, minor
 			metaDisk = fmt.Sprintf("/dev/%s/%s_%05d_meta", mp, dr.GetName(), vol.GetVolumeNumber())
 		}
 
+		// Per-volume minor is authoritative (RD.Spec.VolumeDefinitions
+		// → DesiredVolume.Minor). Fall back to base+volumeNumber only
+		// when the controller hasn't stamped a per-volume minor yet
+		// (mid-upgrade / in-flight reconcile).
+		volMinor := int(vol.GetMinor())
+		if volMinor == 0 {
+			volMinor = minor + int(vol.GetVolumeNumber())
+		}
+
 		vols = append(vols, drbd.Volume{
 			Number:   int(vol.GetVolumeNumber()),
-			Device:   fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
+			Device:   fmt.Sprintf("/dev/drbd%d", volMinor),
 			Disk:     disk,
 			MetaDisk: metaDisk,
-			Minor:    minor + int(vol.GetVolumeNumber()),
+			Minor:    volMinor,
 		})
 	}
 
@@ -3977,7 +4004,7 @@ func buildVolumeResults(dr *intent.DesiredResource, devices map[int32]string, di
 		for _, vol := range dr.GetVolumes() {
 			out = append(out, &intent.ResourceApplyVolumeResult{
 				VolumeNumber: vol.GetVolumeNumber(),
-				DevicePath:   fmt.Sprintf("/dev/drbd%d", minor+int(vol.GetVolumeNumber())),
+				DevicePath:   fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor)),
 			})
 		}
 

@@ -131,9 +131,13 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		// across alongside VolumeDefinitions.
 		prevVDs := existing.Spec.VolumeDefinitions
 		prevEncryption := existing.Spec.Encryption
+		prevPort := existing.Spec.DRBDPort
 		existing.Spec = wireToCRDRDSpec(in)
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
+		// Identity-to-spec: preserve the optional controller/operator
+		// DRBD preferred-port seed across the wire rebuild.
+		existing.Spec.DRBDPort = prevPort
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
@@ -244,9 +248,13 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 		// Mirrors the carry-across in `Update` (Bug 206 / Bug 209).
 		prevVDs := existing.Spec.VolumeDefinitions
 		prevEncryption := existing.Spec.Encryption
+		prevPort := existing.Spec.DRBDPort
 		existing.Spec = wireToCRDRDSpec(&wire)
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
+		// Identity-to-spec: preserve the optional DRBD preferred-port
+		// seed across the wire rebuild (mirrors `Update`).
+		existing.Spec.DRBDPort = prevPort
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
 

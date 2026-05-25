@@ -64,7 +64,7 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// clusters don't see ids change on the upgrade reconcile. New
 	// clusters always go through the allocator.
 	port := readDRBDPort(target, peers)
-	minor := readDRBDMinor(target, peers)
+	minor := readDRBDMinor(target, rd)
 
 	// Collect every replica's (node, id) — id sourced from Status.
 	// We ONLY emit peers whose id is allocated; an unallocated peer
@@ -357,15 +357,21 @@ func mergeEffectiveProps(targetProps, effectiveProps, drbdOpts map[string]string
 	return wireProps
 }
 
-// nodeIDOf reads the persisted DRBD node-id off a Resource. Returns
-// -1 when the controller hasn't allocated yet — the caller skips the
-// replica from the wire so we never emit a stale id.
+// nodeIDOf reads the persisted DRBD node-id off a Resource. The
+// authoritative source is Spec.DRBDNodeID (identity-to-spec refactor);
+// the legacy Status.DRBDNodeID is the fallback for not-yet-migrated
+// objects mid-upgrade. Returns -1 when neither is allocated yet — the
+// caller skips the replica from the wire so we never emit a stale id.
 func nodeIDOf(r *blockstoriov1alpha1.Resource) int32 {
-	if r.Status.DRBDNodeID == nil {
-		return -1
+	if r.Spec.DRBDNodeID != nil {
+		return *r.Spec.DRBDNodeID
 	}
 
-	return *r.Status.DRBDNodeID
+	if r.Status.DRBDNodeID != nil {
+		return *r.Status.DRBDNodeID
+	}
+
+	return -1
 }
 
 // idLookup reports the persisted DRBD node-id for a replica name in
@@ -405,6 +411,10 @@ func idValue(idOf map[string]*int32, name string) int32 {
 // controller's allocator catches up — new replicas always go through
 // the per-node allocator.
 func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.Resource) int {
+	if target.Spec.DRBDPort != nil {
+		return int(*target.Spec.DRBDPort)
+	}
+
 	if target.Status.DRBDPort != nil {
 		return int(*target.Status.DRBDPort)
 	}
@@ -412,10 +422,24 @@ func readDRBDPort(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.
 	return derivePort(target.Spec.ResourceDefinitionName)
 }
 
-// readDRBDMinor mirrors readDRBDPort. Per-replica because /dev/drbd<N>
-// is a local device path; two replicas on different nodes are free
-// to take unrelated minors.
-func readDRBDMinor(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1.Resource) int {
+// readDRBDMinor returns the BASE minor (volume 0) for the resource,
+// used to populate DrbdOptions["minor"] and as the fallback for the
+// satellite renderer when a per-volume DesiredVolume.Minor is unset.
+// The authoritative per-volume minor lives on
+// RD.Spec.VolumeDefinitions[].DRBDMinor (the satellite renders each
+// volume's own minor); this base is the volume-0 minor on that RD,
+// with fallbacks to the legacy Status mirror and the deterministic
+// deriveMinor() for in-flight / mid-upgrade reconciles.
+func readDRBDMinor(target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) int {
+	if rd != nil {
+		for i := range rd.Spec.VolumeDefinitions {
+			vd := &rd.Spec.VolumeDefinitions[i]
+			if vd.VolumeNumber == 0 && vd.DRBDMinor != nil {
+				return int(*vd.DRBDMinor)
+			}
+		}
+	}
+
 	if target.Status.DRBDMinor != nil {
 		return int(*target.Status.DRBDMinor)
 	}
@@ -427,6 +451,10 @@ func readDRBDMinor(target *blockstoriov1alpha1.Resource, _ []blockstoriov1alpha1
 // .res file's `peer.<name>.port` must reflect the port that peer
 // listens on (its own allocation), not target's.
 func peerPortOf(r *blockstoriov1alpha1.Resource, fallback int) int {
+	if r.Spec.DRBDPort != nil {
+		return int(*r.Spec.DRBDPort)
+	}
+
 	if r.Status.DRBDPort != nil {
 		return int(*r.Status.DRBDPort)
 	}
@@ -814,6 +842,14 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			}
 		}
 
+		// Per-volume minor (authoritative on RD.Spec). 0 == not yet
+		// allocated; the satellite renderer falls back to the
+		// DrbdOptions["minor"] base + volumeNumber derivation.
+		minor := int32(0)
+		if vd.DRBDMinor != nil {
+			minor = *vd.DRBDMinor
+		}
+
 		out = append(out, &intent.DesiredVolume{
 			VolumeNumber:   vd.VolumeNumber,
 			SizeKib:        vd.SizeKib,
@@ -821,6 +857,7 @@ func buildVolumes(rd *blockstoriov1alpha1.ResourceDefinition, target *blockstori
 			SeedFromGI:     seedFromGI(target, vd.VolumeNumber),
 			SourceSnapshot: srcSnapshot,
 			MetaPool:       metaPool,
+			Minor:          minor,
 		})
 	}
 

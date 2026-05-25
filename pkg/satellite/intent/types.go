@@ -310,6 +310,17 @@ type DesiredVolume struct {
 	SizeKib      int64
 	StoragePool  string
 	SeedFromGI   string
+
+	// Minor is the /dev/drbd<N> device minor for THIS volume, sourced
+	// from the parent RD's Spec.VolumeDefinitions[].DRBDMinor (the
+	// authoritative per-volume identity in the identity-to-spec
+	// model). The satellite's .res renderer emits this exact minor for
+	// the volume rather than deriving base+volumeNumber, so adoption
+	// can preserve arbitrary non-contiguous LINSTOR minors. 0 means
+	// "not yet allocated / unknown" — the renderer then falls back to
+	// the DrbdOptions["minor"] base + volumeNumber derivation for
+	// backward-compat with mid-upgrade clusters.
+	Minor int32
 	// SourceSnapshot, when non-empty, tells the satellite to
 	// materialise this volume by cloning the named snapshot via the
 	// provider's RestoreVolumeFromSnapshot instead of CreateVolume.
@@ -340,6 +351,17 @@ func (x *DesiredVolume) GetVolumeNumber() int32 {
 	}
 
 	return x.VolumeNumber
+}
+
+// GetMinor returns the per-volume /dev/drbd<N> minor, or 0 when not
+// yet allocated (caller falls back to the base+volumeNumber
+// derivation). Nil-safe.
+func (x *DesiredVolume) GetMinor() int32 {
+	if x == nil {
+		return 0
+	}
+
+	return x.Minor
 }
 
 // GetSizeKib returns the volume size in KiB.

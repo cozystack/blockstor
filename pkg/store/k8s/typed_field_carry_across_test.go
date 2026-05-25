@@ -124,12 +124,18 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// Bug 206: addressed via the separate
 			// /v1/.../volume-definitions endpoint family on the
 			// wire; the parent RD's spec rebuild would otherwise
-			// wipe the inline list.
+			// wipe the inline list. The per-volume DRBDMinor
+			// (identity-to-spec) rides inside this carried-across
+			// list, so it is preserved automatically.
 			"VolumeDefinitions": true,
 			// Bug 209: operator-only typed pointer carrying the
 			// LUKS passphrase Secret ref. Wiping it silently
 			// downgrades subsequent volumes to unencrypted.
 			"Encryption": true,
+			// Identity-to-spec: optional controller/operator DRBD
+			// preferred-port seed. No wire counterpart; wiping it
+			// would lose the per-RD port preference.
+			"DRBDPort": true,
 		},
 	},
 	"ResourceGroupSpec": {
@@ -161,6 +167,13 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// Bug 206: controller-stamped per-volume seed
 			// (SeedFromGI). No wire counterpart on apiv1.Resource.
 			"Volumes": true,
+			// Identity-to-spec: controller-allocated per-node DRBD
+			// listen port and per-replica node-id (clusterIP model).
+			// No wire counterpart; carried across on Update/Patch so
+			// a routine REST modify doesn't wipe the allocation and
+			// trigger a port/node-id change → DRBD resync.
+			"DRBDPort":   true,
+			"DRBDNodeID": true,
 		},
 	},
 	"StoragePoolSpec": {
