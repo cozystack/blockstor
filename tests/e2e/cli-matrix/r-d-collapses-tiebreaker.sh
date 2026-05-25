@@ -21,10 +21,15 @@
 # Root cause: the keep-branch of shouldTieBreakerExist preserved the
 # witness whenever diskful ∈ [1, 3), without checking whether a
 # non-witness diskless was present. With diskful dropped to 1 (via
-# `r d` — not a toggle), the lone diskful + lone witness left a
-# 2-voter cluster with no real majority on failure. Per upstream
-# LINSTOR CtrlAutoQuorumTask, the witness should be torn down once
-# diskful < 2 and no user-diskless needs it as a tie-breaker.
+# `r d` — a physical delete of the replica), the lone diskful + lone
+# witness left a 2-voter cluster with no real majority on failure. Per
+# upstream LINSTOR CtrlAutoQuorumTask, the witness should be torn down
+# once diskful < 2 and no user-diskless needs it as a tie-breaker.
+#
+# `r d` physically removes the diskful replica (matching upstream
+# LINSTOR): the Resource CRD disappears, the satellite tears DRBD down
+# on the node and frees the backing storage. Once that drops diskful
+# from 2 to 1, the controller must collapse the now-pointless witness.
 #
 # Unit pin: internal/controller/ensure_tiebreaker_test.go
 # (TestBug338TiebreakerCollapsesWhenDiskfulDropsToOne).
@@ -102,30 +107,22 @@ echo "   diskful pair: $uptodate_pair  tiebreaker: $tb_node"
 # leaves".
 DELETE_NODE=$(echo "$uptodate_pair" | awk '{print $1}')
 
-# Bug 342: r d on a diskful Resource is now toggle-disk-remove (CRD
-# survives with DISKLESS flag), not physical Delete. To exercise the
-# Bug 338 "tiebreaker collapses when diskful drops below 2" contract
-# we need to ACTUALLY remove the peer — that requires a SECOND r d
-# call which hits the already-DISKLESS branch and physically deletes
-# the CRD.
-echo ">> linstor r d $DELETE_NODE $RD  (Bug 342 1st call: toggle diskful → DISKLESS)"
+# `r d` on a diskful Resource is a physical delete (matching upstream
+# LINSTOR): the Resource CRD is removed and the backing storage freed —
+# it does NOT toggle the replica to DISKLESS. A single `r d` therefore
+# drops the diskful count from 2 to 1, which is exactly the Bug 338
+# pre-condition (witness must collapse once diskful < 2).
+echo ">> linstor r d $DELETE_NODE $RD  (physical delete → Resource CRD removed)"
 "${LCTL[@]}" resource delete "$DELETE_NODE" "$RD" >/dev/null 2>&1 || {
-    echo "FAIL: 1st r d (toggle-to-diskless) exited non-zero" >&2
+    echo "FAIL: r d (physical delete) exited non-zero" >&2
     exit 1
 }
 
-# Wait for the Resource to transition to DISKLESS in Spec before the
-# second r d, so the second hit deterministically takes the
-# already-DISKLESS branch (physical Delete) rather than racing the
-# Spec patch.
-wait_status_diskless "$RD" "$DELETE_NODE" 60 \
-    || die "Phase 1: ${DELETE_NODE} never transitioned to Diskless after 1st r d"
-
-echo ">> linstor r d $DELETE_NODE $RD  (Bug 342 2nd call: physical Delete from already-DISKLESS branch)"
-"${LCTL[@]}" resource delete "$DELETE_NODE" "$RD" >/dev/null 2>&1 || {
-    echo "FAIL: 2nd r d (physical Delete) exited non-zero" >&2
-    exit 1
-}
+# Wait for the deleted replica's CRD to physically disappear before
+# asserting the tiebreaker collapse, so the count check below acts on a
+# known-settled shape rather than racing the delete.
+wait_replica_absent "$RD" "$DELETE_NODE" 60 \
+    || die "Phase 1: ${RD}.${DELETE_NODE} CRD never disappeared after r d"
 
 echo ">> wait up to 30s for tiebreaker on $tb_node to be collapsed"
 deadline=$(( $(date +%s) + 30 ))
