@@ -7,9 +7,9 @@ STATE_DIR="$WORK_DIR/talos-state/$NAME"
 
 echo ">> destroying cluster '$NAME'"
 if [[ -d "$WORK_DIR/talos-state" ]]; then
-    sudo talosctl cluster destroy --name "$NAME" --provisioner qemu --state "$WORK_DIR/talos-state" 2>/dev/null || true
+    sudo "${TALOSCTL:-talosctl}" cluster destroy --name "$NAME" --provisioner qemu --state "$WORK_DIR/talos-state" 2>/dev/null || true
 else
-    sudo talosctl cluster destroy --name "$NAME" --provisioner qemu 2>/dev/null || true
+    sudo "${TALOSCTL:-talosctl}" cluster destroy --name "$NAME" --provisioner qemu 2>/dev/null || true
 fi
 
 # Belt-and-braces: any qemu/dhcpd/lb that didn't shut down gracefully — use

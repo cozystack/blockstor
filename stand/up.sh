@@ -10,8 +10,46 @@ CONTROLPLANES=${2:-1}
 WORKERS=${3:-3}
 EXTENSIONS=${4:-siderolabs/drbd,siderolabs/zfs}
 WORK_DIR=${5:-.work/$NAME}
-TALOS_VERSION=${TALOS_VERSION:-v1.10.5}
+TALOS_VERSION=${TALOS_VERSION:-v1.13.2}
 ARCH=${ARCH:-amd64}
+
+# Provisioning Talos $TALOS_VERSION needs a talosctl whose version matches the
+# target Talos release; the host-global talosctl (installed by setup-host.sh)
+# may be pinned to an older version. Resolve a matching binary, downloading
+# into a repo-local cache under .work/ (gitignored) when needed. An operator
+# can still override with TALOSCTL=/path/to/talosctl.
+ensure_talosctl() {
+    # Honour an explicit override verbatim.
+    if [[ -n "${TALOSCTL:-}" ]]; then
+        echo "$TALOSCTL"
+        return
+    fi
+    local want="${TALOS_VERSION#v}"
+    # Reuse the on-PATH talosctl when its client version already matches.
+    if command -v talosctl >/dev/null 2>&1; then
+        local have
+        have=$(talosctl version --client --short 2>/dev/null \
+            | sed -n "s/.*Tag:[[:space:]]*v\{0,1\}\([0-9][^[:space:]]*\).*/\1/p" \
+            | head -n1)
+        if [[ "$have" == "$want" ]]; then
+            echo "talosctl"
+            return
+        fi
+    fi
+    # Otherwise fetch a version-matched binary into the repo-local cache.
+    local cache_dir=".work/_bin"
+    local bin="$cache_dir/talosctl-$TALOS_VERSION"
+    if [[ ! -x "$bin" ]]; then
+        mkdir -p "$cache_dir"
+        echo ">> fetching talosctl $TALOS_VERSION into $bin" >&2
+        curl -fL "https://github.com/siderolabs/talos/releases/download/$TALOS_VERSION/talosctl-linux-$ARCH" \
+            -o "$bin.tmp"
+        chmod +x "$bin.tmp"
+        mv "$bin.tmp" "$bin"
+    fi
+    echo "$bin"
+}
+TALOSCTL=$(ensure_talosctl)
 
 mkdir -p "$WORK_DIR"
 TALOSCONFIG="$WORK_DIR/talosconfig"
@@ -123,7 +161,7 @@ YAML
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
 # talos qemu provisioner needs root for CNI bridge / netfilter; run via sudo -E
 # and fix ownership afterwards so the user can read configs.
-sudo -E talosctl cluster create \
+sudo -E "$TALOSCTL" cluster create \
     --name "$NAME" \
     --provisioner qemu \
     --state "$STATE_DIR" \
@@ -156,7 +194,7 @@ sudo chown -R "$(id -u):$(id -g)" "$(realpath "$WORK_DIR")"
 # is at .2 in the cluster CIDR.
 CP_IP="${NET_CIDR%.*}.2"
 
-talosctl --talosconfig "$TALOSCONFIG" \
+"$TALOSCTL" --talosconfig "$TALOSCONFIG" \
     --endpoints "$CP_IP" --nodes "$CP_IP" \
     kubeconfig --force "$KUBECONFIG"
 

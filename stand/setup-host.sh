@@ -11,7 +11,7 @@
 #     symlinks ~/blockstor/.work to it so VM disks live on fast storage.
 set -euo pipefail
 
-TALOS_VERSION=${TALOS_VERSION:-v1.10.5}
+TALOS_VERSION=${TALOS_VERSION:-v1.13.2}
 KUBECTL_VERSION=${KUBECTL_VERSION:-v1.34.1}
 HELM_VERSION=${HELM_VERSION:-v3.18.4}
 GO_VERSION=${GO_VERSION:-1.24.4}

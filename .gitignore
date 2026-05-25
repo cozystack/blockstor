@@ -1,4 +1,5 @@
 .work/
+# Includes the repo-local talosctl cache (.work/_bin/) used by stand/up.sh.
 *.iso
 *.qcow2
 *.kubeconfig
