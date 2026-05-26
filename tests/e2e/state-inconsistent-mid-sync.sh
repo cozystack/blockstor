@@ -273,8 +273,16 @@ echo ">> wait up to 120s for both peers UpToDate + Established + quorum:yes"
 both_ok=""
 deadline=$(( $(date +%s) + 120 ))
 while (( $(date +%s) < deadline )); do
-    a_disk=$(status_disk_state "$RD" "$NODE_A")
-    b_disk=$(status_disk_state "$RD" "$NODE_B")
+    # disk-state from kernel truth (drbdsetup --json), NOT the CRD helper:
+    # the observer's CRD .status.volumes[].diskState projection can lag for
+    # tens of seconds right after a satellite restart — e.g. when this
+    # scenario is sharded immediately after rolling-upgrade — leaving it
+    # empty while the kernel is already UpToDate, so the wait would time out
+    # on a fully-converged cluster. This wait asserts physical DRBD
+    # convergence, so drbdsetup is the ground truth. (repl/quorum below were
+    # not observed to lag; left on their existing sources.)
+    a_disk=$(on_node "$NODE_A" drbdsetup status "$RD" --json 2>/dev/null | jq -r '.[0].devices[0]."disk-state" // ""' 2>/dev/null || true)
+    b_disk=$(on_node "$NODE_B" drbdsetup status "$RD" --json 2>/dev/null | jq -r '.[0].devices[0]."disk-state" // ""' 2>/dev/null || true)
     a_repl=$(status_replication_state "$RD" "$NODE_A" "$NODE_B")
     b_repl=$(status_replication_state "$RD" "$NODE_B" "$NODE_A")
     a_quorum=$(on_node "$NODE_A" drbdsetup status --verbose "$RD" 2>/dev/null \
