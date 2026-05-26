@@ -274,7 +274,10 @@ func TestThinResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB --config activation{udev_sync=0 udev_rules=0} vg/pvc-1_00000"
+	// Bug 305: the udev-less activation section shares the SINGLE
+	// `--config` that also carries the device filter — a repeated
+	// `--config` is rejected by the LVM CLI.
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}
