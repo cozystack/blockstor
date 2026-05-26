@@ -123,6 +123,11 @@ type volumeObservation struct {
 	VolumeNumber int32
 	DiskState    string
 	CurrentUUID  string
+	// BackingDev is the lower-disk path from the events2 `device`
+	// frame's `backing_dev:` field. Used by the observer to read the
+	// on-disk current-UUID via drbdmeta get-gi when events2 doesn't
+	// carry it (DRBD 9.3.2). Not published to Status.
+	BackingDev   string
 	OutOfSyncKib int64
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
@@ -316,6 +321,7 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 		VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
 		DiskState:    disk,
 		CurrentUUID:  ev.Fields["current-uuid"],
+		BackingDev:   ev.Fields["backing_dev"],
 	}
 
 	// `quorum:yes|no` is emitted on every `device` frame on
@@ -786,11 +792,19 @@ func (o *ObserverRunnable) resyncLoop(ctx context.Context) {
 func (o *ObserverRunnable) resyncOnce(ctx context.Context, logger logr.Logger) {
 	names := o.cachedResourceNames()
 
+	adm := drbd.NewAdm(o.Exec)
+
 	for _, name := range names {
 		obs := o.snapshotFor(name)
 		if obs.ResourceName == "" {
 			continue
 		}
+
+		// Backfill CurrentGI from on-disk metadata here too (not just
+		// the event-driven path): the 5s resync guarantees a
+		// data-state volume's CurrentGI converges even when no further
+		// events2 frame fires after it reached UpToDate.
+		o.backfillCurrentGI(ctx, adm, &obs)
 
 		err := o.writeStatus(ctx, &obs)
 		if err == nil {
@@ -1022,6 +1036,8 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 		}
 	}
 
+	o.backfillCurrentGI(ctx, adm, ev)
+
 	err := o.writeStatus(ctx, ev)
 	if err == nil {
 		return
@@ -1032,6 +1048,52 @@ func (o *ObserverRunnable) handleObservation(ctx context.Context, adm *drbd.Adm,
 	}
 
 	logger.Error(err, "write Resource.Status", "resource", ev.ResourceName)
+}
+
+// backfillCurrentGI fills ev.Volumes[].CurrentUUID from the on-disk GI
+// (`drbdadm get-gi`) when the events2 frame did not carry it. On DRBD
+// 9.3.2 `drbdsetup events2 --full` omits current-uuid on device
+// frames, so the events2-sourced CurrentGI is always empty and the
+// seed-safety gates' day0-sibling discriminator (isDay0SeededVolume)
+// can never recognise a fresh day0 winner — forcing a staggered late
+// replica into a needless SyncTarget. Reading get-gi backfills it so
+// Status.Volumes[].CurrentGI carries the real current-UUID and the
+// gate works.
+//
+// Only volumes in a data-bearing disk state are probed (UpToDate /
+// Consistent / Outdated) — a fresh Inconsistent slot has no
+// meaningful GI to publish yet, and skipping it avoids a get-gi
+// round-trip on every statistics tick. Best-effort: a get-gi error or
+// empty result leaves CurrentUUID as-is (the gate stays conservative).
+func (o *ObserverRunnable) backfillCurrentGI(ctx context.Context, adm *drbd.Adm, ev *observation) {
+	for i := range ev.Volumes {
+		vol := &ev.Volumes[i]
+
+		if vol.CurrentUUID != "" || vol.BackingDev == "" {
+			continue
+		}
+
+		if !isDataBearingDiskState(drbd.DiskState(vol.DiskState)) {
+			continue
+		}
+
+		current, err := adm.CurrentGI(ctx, ev.ResourceName, vol.VolumeNumber, vol.BackingDev)
+		if err != nil || current == "" {
+			continue
+		}
+
+		vol.CurrentUUID = current
+	}
+}
+
+// isDataBearingDiskState reports whether a DRBD disk state means the
+// replica carries real data worth publishing a current-UUID for
+// (UpToDate / Consistent / Outdated). A fresh Inconsistent slot has no
+// meaningful GI yet.
+func isDataBearingDiskState(s drbd.DiskState) bool {
+	return s == drbd.DiskStateUpToDate ||
+		s == drbd.DiskStateConsistent ||
+		s == drbd.DiskStateOutdated
 }
 
 // emitReconcileTrigger sends a GenericEvent for the affected
@@ -1380,6 +1442,15 @@ func mergeVolumeInto(cache map[int32]volumeObservation, incoming volumeObservati
 		merged.Quorum = incoming.Quorum
 		merged.HasQuorum = true
 		changed = true
+	}
+
+	// BackingDev is carried in the cache (so the snapshot the backfill
+	// reads has the lower-disk path) but never marks the volume
+	// `changed` on its own — it is an internal helper field, not a
+	// Status field, so a backing_dev-only frame must not trigger a
+	// Status SSA write.
+	if incoming.BackingDev != "" {
+		merged.BackingDev = incoming.BackingDev
 	}
 
 	cache[incoming.VolumeNumber] = merged

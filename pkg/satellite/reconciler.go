@@ -2194,7 +2194,19 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		return nil
 	}
 
-	if autoPromote {
+	// Reaching UpToDate no longer depends on this promote. The elected
+	// winner already declared itself Consistent+UpToDate via the
+	// `drbdmeta set-gi` seed (seedInitialGI's case-B winner slot), so
+	// the kernel comes up UpToDate from metadata alone. `primary
+	// --force` is now PURELY an mkfs concern: we promote only when the
+	// RD requests a filesystem (and quorum may not be satisfiable yet
+	// because peers haven't connected), run mkfs, then demote
+	// immediately. When no filesystem is requested we skip the promote
+	// entirely — which is exactly what avoids the old bug, where
+	// `primary --force` minted a fresh current-UUID that diverged from
+	// the day0 bitmap-base the peers carry, flipping them to SyncTarget
+	// for a full initial sync even on empty thin/ZFS volumes.
+	if autoPromote && needsMkfs(dr) {
 		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
 			return err
@@ -2502,12 +2514,45 @@ func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResou
 		return nil
 	}
 
-	err = r.seedInitialGI(ctx, dr, devices)
+	err = r.seedInitialGI(ctx, dr, devices, isInitialUpToDateWinner(dr, firstActivation))
 	if err != nil {
 		return errors.Wrapf(err, "seed initial-sync GI %s", dr.GetName())
 	}
 
 	return nil
+}
+
+// isInitialUpToDateWinner reports whether THIS node is the elected
+// initial-UpToDate source for a not-yet-initialized resource — the
+// "winner" of the day0 seed race. When true, seedInitialGI writes the
+// case-B winner seed (random current + day0 bitmap-base + Consistent +
+// UpToDate on the local slot) so the source reaches UpToDate purely
+// from metadata, replacing the old `drbdadm primary --force` that
+// minted a divergent current-UUID and forced a full initial sync.
+//
+// The three gates together are the "elected winner AND volume not yet
+// initialized" condition from the spec:
+//
+//   - firstActivation: this is the resource's first create-md on this
+//     node (metadata never created before). Once the winner is
+//     UpToDate, every subsequent reconcile sees firstActivation=false,
+//     closing the winner path forever — a late-added / relocated
+//     replica can NEVER take case B (it falls to case A day0 or case C
+//     Inconsistent), which is what keeps relocate split-brain-free.
+//   - auto-primary: the dispatcher's lowest-diskful-node-id election
+//     (BuildDesired) stamps this flag on exactly ONE replica per fresh
+//     RD — the elected source. It is the "winner node" marker.
+//   - !PeerHasData: the dispatcher already withholds auto-primary when
+//     any diskful peer holds data, but we re-check here as a belt-and-
+//     braces gate so a relocate target never seeds itself UpToDate.
+//
+// A diskless replica is never a winner (no lower disk / metadata to
+// seed); the auto-primary flag is only ever stamped on diskful
+// replicas, so the flag check already excludes diskless.
+func isInitialUpToDateWinner(dr *intent.DesiredResource, firstActivation bool) bool {
+	return firstActivation &&
+		dr.GetDrbdOptions()["auto-primary"] == drbdBoolPropTrue &&
+		!dr.GetPeerHasData()
 }
 
 // ensurePerVolumeMetadata stamps DRBD-9 metadata on every diskful
@@ -2787,6 +2832,17 @@ func (r *Reconciler) shouldForcePromote(ctx context.Context, dr *intent.DesiredR
 	}
 
 	return true
+}
+
+// needsMkfs reports whether the RD requests an on-creation filesystem
+// (the `FileSystem/Type` prop the controller folds from the RG's
+// effective props). It is the sole remaining reason to `drbdadm
+// primary --force` a fresh replica: mkfs must run while Primary, and
+// quorum may not be satisfiable yet because peers haven't connected.
+// When false, the elected winner reaches UpToDate from its set-gi
+// seed alone and is never promoted at create time.
+func needsMkfs(dr *intent.DesiredResource) bool {
+	return strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) != ""
 }
 
 func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResource) error {
@@ -3427,14 +3483,14 @@ func isUnknownResourceErr(err error) bool {
 // block this then mutates) and drbdadm adjust (which reads the
 // metadata into kernel state).
 
-func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, isWinner bool) error {
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
 			continue
 		}
 
-		seed, ok := r.resolveSeedGI(dr.GetName(), vol, dr.GetPeerHasData())
+		seed, ok := r.resolveVolumeSeed(dr.GetName(), vol, dr.GetPeerHasData(), isWinner)
 		if !ok {
 			continue
 		}
@@ -3500,16 +3556,47 @@ func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResour
 // Returns the first non-nil error from drbdmeta. Every call carries
 // `--node-id <X>`, so the legacy "set-gi requires --node-id" failure
 // mode is structurally unreachable.
-func (r *Reconciler) seedPerPeerGI(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device, seed string) error {
-	// Blanket EVERY metadata slot 0..NodeIDMax with the same day0
-	// tuple. We deliberately do NOT gate on dr.GetPeerNames() /
-	// per-peer node-id allocation: the whole point is to wipe stale
-	// bitmap-UUIDs out of slots no currently-visible peer occupies
-	// (relocated/deleted prior incarnation, not-yet-visible peer,
-	// late-allocated node-id). The local slot is included in the
-	// range, preserving the Bug 284 local current_uuid stamp.
+//
+// One uniform seed per (resource, volume): the SAME GI string is
+// stamped into every node-id slot 0..NodeIDMax. This is correct AND
+// necessary because of how v09 metadata is laid out (drbd-utils
+// m_set_v9_uuid / md_cpu_to_disk_09):
+//
+//   - the current-UUID and the consistent/up-to-date FLAGS are
+//     DEVICE-LEVEL (md->current_uuid, md->flags) — shared, not
+//     per-peer. Every `set-gi --node-id N` call rewrites them, so the
+//     LAST call wins. Stamping the same current+flags on every slot
+//     makes the loop order irrelevant and leaves the device with the
+//     intended current+flags (a winner seed with a per-slot-varying
+//     current would be silently clobbered by the highest node-id).
+//   - only the bitmap-base UUID is PER-PEER (md->peers[N].bitmap_uuid).
+//     We want day0 in every peer slot, which the uniform seed provides.
+//
+// So the winner seed (`current=random, bitmap=day0, Consistent,
+// UpToDate`) applied uniformly yields exactly the spec's end state:
+// shared current=random + Consistent+UpToDate flags, and every peer
+// slot's bitmap-base = day0. The all-day0 skip-init-sync seed
+// (`current=bitmap=day0`, no flags) is likewise uniform.
+//
+// Blanketing all slots (not just dr.GetPeerNames()) is the Bug 284 /
+// Bug 342 invariant: it wipes stale per-peer bitmap-UUIDs out of slots
+// no currently-visible peer occupies (relocated/deleted prior
+// incarnation, not-yet-visible peer, late-allocated node-id) so the
+// handshake can never invent a phantom resync. Upper bound NodeIDMax
+// (31) is the drbdmeta hard ceiling.
+func (r *Reconciler) seedPerPeerGI(ctx context.Context, dr *intent.DesiredResource, vol *intent.DesiredVolume, device string, seed drbd.GISeed) error {
+	// Validate once before touching metadata so a malformed seed (e.g.
+	// up-to-date with empty current) fails fast rather than mid-loop
+	// with half the slots written.
+	validateErr := seed.Validate()
+	if validateErr != nil {
+		return errors.Wrapf(validateErr, "validate GI seed vol %d", vol.GetVolumeNumber())
+	}
+
+	gi := seed.String()
+
 	for nodeID := int32(0); nodeID <= drbd.NodeIDMax; nodeID++ {
-		err := r.cfg.Adm.SetGI(ctx, dr.GetName(), vol.GetVolumeNumber(), device, nodeID, seed)
+		err := r.cfg.Adm.SetGIString(ctx, dr.GetName(), vol.GetVolumeNumber(), device, nodeID, gi)
 		if err != nil {
 			return errors.Wrapf(err, "set-gi vol %d node-id %d",
 				vol.GetVolumeNumber(), nodeID)
@@ -3574,69 +3661,92 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	return nil
 }
 
-// resolveSeedGI decides what GI to stamp on a fresh replica's
-// metadata block:
+// resolveVolumeSeed decides the single GI seed to stamp uniformly into
+// every per-node-id metadata slot of a fresh replica so the resource
+// reaches its initial state WITHOUT a runtime `drbdadm primary
+// --force` (which mints a divergent current-UUID and forces a full
+// initial sync). The seed's device-level current/flags and per-peer
+// bitmap-base are applied to all slots (see seedPerPeerGI for why
+// uniform is both correct and required). It maps onto the spec cases:
 //
-//   - Controller-supplied SeedFromGI wins. That's the Phase 8.1
-//     "copy from an existing UpToDate peer" path — the GI is the
-//     real CurrentGI of the peer, so DRBD's handshake sees a true
-//     match and skips initial-sync.
+//   - peerHasData → no seed (ok=false). Bug 342 data-integrity gate:
+//     a fresh replica joining an RD where a diskful peer already holds
+//     committed data MUST come up Inconsistent and SyncTarget from that
+//     peer. Seeding any GI here lets DRBD's handshake skip the resync
+//     against a peer whose current-UUID is unrelated → `uuid_compare()=
+//     unrelated-data` → permanent StandAlone (the relocate / physical
+//     `r d` then `r c` case). Checked FIRST; wins over every branch,
+//     including the winner branch.
 //
-//   - Otherwise, when the backing provider is guaranteed to hand
-//     back zero-initialised storage (thin LVM, thin or thick ZFS,
-//     sparse file — see IsThinOrZFS), synthesise a deterministic
-//     per-RD, per-volume day0 GI. Same RD name + volume number
-//     produces the same GI on every node so DRBD's GI handshake
-//     matches and skips initial-sync even when no peer has been
-//     stamped UpToDate yet. Mirrors upstream LINSTOR's
-//     `DrbdLayerUtils.skipInitSync` short-circuit (Bug 77).
+//   - Controller-supplied SeedFromGI (Phase 8.1: copied from an
+//     existing UpToDate peer) → `current = bitmap = seed`, no flags.
+//     DRBD's handshake sees a true match and skips the sync. Preferred
+//     over the winner branch because a real peer GI is a stronger
+//     lineage anchor than the synthetic day0.
 //
-//   - Otherwise (thick LVM, opaque file, unknown provider, DISKLESS),
-//     return ok=false. DRBD then falls through to the full
-//     initial-sync on first connect, which is the only safe
-//     behaviour when the backing storage may carry pre-existing
-//     bytes the peer doesn't have.
+//   - isWinner (case B: this node is the elected initial-UpToDate
+//     source and the volume is not yet initialized) → `current =
+//     bitmap = day0`, Consistent + UpToDate. The flags make the
+//     kernel read the replica as UpToDate after adjust — UpToDate
+//     purely from metadata, no promote (that promote is the bug; it
+//     minted a divergent current-UUID).
 //
-// Bug 342 / seed-GI data-integrity gate (peerHasData): the whole
-// seed-GI optimisation — skip the full initial-sync by stamping a GI
-// the peer already agrees with — is ONLY data-safe when the RD is
-// genuinely day0: no existing diskful peer holds committed data
-// anywhere. When ANY diskful peer reports data (peerHasData, observed
-// fresh off the peers' Status.Volumes[].DiskState every reconcile by
-// dispatcher.anyDiskfulPeerHasData), REFUSE every seed — the
-// controller-supplied SeedFromGI (copied from a peer's evolved Current
-// UUID) AND the synthetic day0 fallback alike. A fresh replica with a
-// data-bearing peer MUST come up Inconsistent and SyncTarget from that
-// peer (full resync, adopt the peer's GI); seeding ANY GI here lets
-// DRBD's handshake skip the resync against a peer whose Current UUID is
-// unrelated to the seed → `uuid_compare()=unrelated-data` → permanent
-// StandAlone (the relocate / physical `r d` then `r c` case).
+//     The current-UUID is day0 (NOT a fresh random GID): the winner
+//     stays on the shared day0 lineage so (a) a staggered late replica
+//     observing this winner's CurrentGI == day0 is recognised by the
+//     seed-safety gate as a fresh day0 sibling (dispatcher
+//     isDay0SeededVolume) and may take its OWN day0 skip instead of a
+//     needless SyncTarget; and (b) a dual-winner election race produces
+//     two identical day0 generations that agree at handshake rather
+//     than two divergent random siblings that split-brain. Relocate
+//     stays safe because any real write advances the source's current
+//     past day0 (normal DRBD behaviour), after which the gate counts it
+//     as data-bearing and a new replica correctly SyncTargets.
 //
-// Race-free: the decision reads peerHasData (recomputed by the
-// dispatcher on every reconcile from live peer status), NOT a
-// controller stamp that must land in Spec.SeedFromGI in time. Even if
-// the controller never stamps SeedFromGI, a fresh replica with a data
-// peer takes the safe "no seed → Inconsistent → SyncTarget" path here,
-// never the unsafe day0 fallback.
-func (r *Reconciler) resolveSeedGI(resourceName string, vol *intent.DesiredVolume, peerHasData bool) (string, bool) {
+//   - Else skip-init-sync (case A: thin-backed or all-ZFS, force-
+//     initial-sync not requested) → `current = bitmap = day0`, no
+//     flags. Both peers present equal current-UUIDs with clean bitmaps
+//     → DRBD reads "no data difference" → no sync; both reach UpToDate
+//     at the kernel handshake. (Preserves blockstor's existing,
+//     stand-validated skip-init-sync shape.)
+//
+//   - Else (case C: thick LVM, opaque file, unknown provider, non-
+//     winner) → ok=false. The freshly-created Inconsistent metadata is
+//     left untouched so this replica resyncs from the source.
+//
+// Race-free: peerHasData is recomputed by the dispatcher every
+// reconcile from live peer status, not a controller stamp that must
+// land in Spec in time.
+func (r *Reconciler) resolveVolumeSeed(resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool) (drbd.GISeed, bool) {
 	if peerHasData {
-		return "", false
+		return drbd.GISeed{}, false
 	}
 
+	day0 := day0GiFor(resourceName, vol.GetVolumeNumber())
+
 	if seed := vol.GetSeedFromGI(); seed != "" {
-		return seed, true
+		return drbd.GISeed{Current: seed, BitmapBase: seed}, true
+	}
+
+	if isWinner {
+		return drbd.GISeed{
+			Current:    day0,
+			BitmapBase: day0,
+			Consistent: true,
+			UpToDate:   true,
+		}, true
 	}
 
 	provider, ok := r.cfg.Providers[vol.GetStoragePool()]
 	if !ok || provider == nil {
-		return "", false
+		return drbd.GISeed{}, false
 	}
 
 	if !IsThinOrZFS(provider.Kind()) {
-		return "", false
+		return drbd.GISeed{}, false
 	}
 
-	return day0GiFor(resourceName, vol.GetVolumeNumber()), true
+	return drbd.GISeed{Current: day0, BitmapBase: day0}, true
 }
 
 // providerForResource resolves the provider that owns the named

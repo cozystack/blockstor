@@ -297,8 +297,28 @@ func (a *Adm) Resize(ctx context.Context, resource string) error {
 // pinned end-to-end in pkg/satellite/reconciler_drbd_test.go's
 // first-activation case.
 func (a *Adm) SetGI(ctx context.Context, resource string, volume int32, device string, peerNodeID int32, peerCurrentGI string) error {
-	target := fmt.Sprintf("%s/%d", resource, volume)
 	gi := fmt.Sprintf("%s:%s:0:0", peerCurrentGI, peerCurrentGI)
+
+	return a.SetGIString(ctx, resource, volume, device, peerNodeID, gi)
+}
+
+// SetGIString is the general form of SetGI: it stamps an arbitrary,
+// already-rendered GI string into the per-node-id v09 metadata slot.
+// SetGI is the special case where current == bitmap == peerCurrentGI
+// with no flags (the all-day0 skip-init-sync / SeedFromGI shape).
+//
+// Used by the satellite to reach the initial UpToDate state by
+// writing metadata directly (the elected winner's local slot carries
+// a random current-UUID + day0 bitmap-base + Consistent + UpToDate;
+// the winner's peer slots carry day0 bitmap-base only) instead of
+// force-promoting the device, which would mint a divergent current-
+// UUID and force a full initial sync. Build the GI string with
+// (GISeed).String() so the field/flag layout stays in one place.
+//
+// Same call-ordering contract as SetGI: AFTER create-md, BEFORE
+// drbdadm up. `--node-id` is mandatory on DRBD 9.2+.
+func (a *Adm) SetGIString(ctx context.Context, resource string, volume int32, device string, peerNodeID int32, gi string) error {
+	target := fmt.Sprintf("%s/%d", resource, volume)
 
 	_, err := a.exec.Run(ctx,
 		"drbdmeta", "--force", target, "v09", device, "internal",
@@ -581,12 +601,42 @@ func (a *Adm) GetGI(ctx context.Context, resource string, volume int32, device s
 
 	out, err := a.exec.Run(ctx,
 		"drbdmeta", "--force", target, "v09", device, "internal",
-		"get-gi")
+		"get-gi", "--node-id", "0")
 	if err != nil {
 		return "", errors.Wrapf(err, "drbdmeta get-gi %s", target)
 	}
 
 	return strings.TrimSpace(string(out)), nil
+}
+
+// CurrentGI returns just the current-UUID (the first colon field of
+// the GI tuple) for one volume, read from on-disk metadata via
+// GetGI. Empty string (not an error) when the tuple can't be parsed,
+// so callers can leave an observed CurrentGI unclaimed and keep the
+// seed-safety gate conservative.
+//
+// Why the observer needs this: on DRBD 9.3.2 `drbdsetup events2
+// --full` / `status --json` do NOT emit the current-uuid on device
+// frames, so the events2-sourced CurrentGI is always empty there. The
+// seed-safety gates' day0-sibling discriminator (isDay0SeededVolume)
+// compares a peer's observed CurrentGI against the deterministic day0
+// value to let a staggered late replica skip the initial sync;
+// without an observed CurrentGI it can never fire. The `get-gi
+// --node-id 0` read works on an active (kernel-attached) device via
+// `--force`; the device-level current-UUID is the same in every
+// node-id slot, so node-id 0 is representative.
+func (a *Adm) CurrentGI(ctx context.Context, resource string, volume int32, device string) (string, error) {
+	tuple, err := a.GetGI(ctx, resource, volume, device)
+	if err != nil {
+		return "", err
+	}
+
+	current, _, found := strings.Cut(tuple, ":")
+	if !found || current == "" {
+		return "", nil
+	}
+
+	return strings.ToUpper(current), nil
 }
 
 // StatusResources runs `drbdsetup status` and returns the names of

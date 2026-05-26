@@ -621,22 +621,43 @@ func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1
 // at all until the observer reports), so a genuinely-fresh RD passes
 // this gate and still gets its day0 skip-sync + force-primary seed.
 //
+// Day0-seeded fresh-sibling exception (staggered multi-replica create):
+// a peer whose data-state volume reports a CurrentGI equal to the
+// deterministic drbd.Day0GIFor value is a never-written day0 sibling —
+// NOT a data source. Without this exception, a staggered create has the
+// first replica reach UpToDate via its day0 set-gi seed BEFORE the
+// second replica applies; the gate would then read that fresh sibling
+// as data-bearing, deny the second replica its own day0 skip, and force
+// a needless SyncTarget (and veto the seed-primary, risking the Bug 366
+// recovery-promote wedge). A real relocate survivor mints a runtime
+// current-UUID that cannot equal the deterministic day0 (2^-64
+// collision), so it is still counted; a data-state volume with an empty
+// / not-yet-observed CurrentGI is treated conservatively as
+// data-bearing.
+//
 // Diskless peers never count: they have no backing data to seed from.
 // Used both to suppress the seed-primary on a relocate (BuildDesired's
 // auto-primary election) AND to gate the day0/peer GI-seed in the
-// satellite (threaded via DesiredResource.PeerHasData → resolveSeedGI).
+// satellite (threaded via DesiredResource.PeerHasData → resolveVolumeSeed).
 func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 	for i := range peers {
 		if slices.Contains(peers[i].Spec.Flags, apiv1.ResourceFlagDiskless) {
 			continue
 		}
 
+		rdName := peers[i].Spec.ResourceDefinitionName
+
 		for j := range peers[i].Status.Volumes {
-			switch drbd.DiskState(peers[i].Status.Volumes[j].DiskState) {
+			vol := &peers[i].Status.Volumes[j]
+
+			switch drbd.DiskState(vol.DiskState) {
 			case drbd.DiskStateUpToDate,
 				drbd.DiskStateConsistent,
 				drbd.DiskStateOutdated:
-				return true
+				if !isDay0SeededVolume(rdName, vol) {
+					return true
+				}
+				// Fresh day0-seeded sibling, never written — keep scanning.
 			case drbd.DiskStateDiskless,
 				drbd.DiskStateAttaching,
 				drbd.DiskStateDetaching,
@@ -652,6 +673,20 @@ func anyDiskfulPeerHasData(peers []blockstoriov1alpha1.Resource) bool {
 	}
 
 	return false
+}
+
+// isDay0SeededVolume reports whether a peer's data-state volume carries
+// nothing but the deterministic day0 GI — a fresh, never-written
+// sibling that is NOT a data source. An empty CurrentGI returns false
+// (conservative: not provably day0 ⇒ treat as data-bearing). Compares
+// against the single drbd.Day0GIFor derivation the satellite stamps, so
+// this gate and the satellite-side seed agree exactly.
+func isDay0SeededVolume(rdName string, vol *blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if vol.CurrentGI == "" {
+		return false
+	}
+
+	return strings.EqualFold(vol.CurrentGI, drbd.Day0GIFor(rdName, vol.VolumeNumber))
 }
 
 // lowestDiskfulID picks the smallest allocated node-id among the

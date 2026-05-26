@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 
 	cerrors "github.com/cockroachdb/errors"
@@ -960,9 +961,19 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 // mean the peer carries real data with a real Current UUID — a fresh
 // local replica must SyncTarget from it (full resync) rather than skip
 // sync via a seeded GI. Mirrors dispatcher.anyDiskfulPeerHasData so the
-// controller-side seed gate and the satellite-side resolveSeedGI gate
-// agree on the same "day0 vs data-peer-exists" discriminator. Diskless
-// peers never count (no backing data to seed from).
+// controller-side seed gate and the satellite-side resolveVolumeSeed
+// gate agree on the same discriminator. Diskless peers never count.
+//
+// Day0-seeded fresh-sibling exception (staggered multi-replica create):
+// a peer whose data-state volume reports a CurrentGI equal to the
+// deterministic drbd.Day0GIFor value is a never-written day0 sibling —
+// NOT a data source — so it does not count and the later replica may
+// also day0-skip. The elected winner now seeds current=day0 too, so a
+// fresh UpToDate winner reports CurrentGI==day0 and is correctly seen
+// as a sibling. A real relocate survivor mints a runtime current-UUID
+// that cannot equal the deterministic day0 (2^-64 collision) so it is
+// still counted; a data-state volume with an empty / not-yet-observed
+// CurrentGI is treated conservatively as data-bearing.
 func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName string) bool {
 	for i := range peers {
 		if peers[i].Name == targetName {
@@ -973,12 +984,19 @@ func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName 
 			continue
 		}
 
+		rdName := peers[i].Spec.ResourceDefinitionName
+
 		for j := range peers[i].Status.Volumes {
-			switch drbd.DiskState(peers[i].Status.Volumes[j].DiskState) {
+			vol := &peers[i].Status.Volumes[j]
+
+			switch drbd.DiskState(vol.DiskState) {
 			case drbd.DiskStateUpToDate,
 				drbd.DiskStateConsistent,
 				drbd.DiskStateOutdated:
-				return true
+				if !isDay0SeededDiskfulVolume(rdName, vol) {
+					return true
+				}
+				// Fresh day0-seeded sibling, never written — keep scanning.
 			case drbd.DiskStateDiskless,
 				drbd.DiskStateAttaching,
 				drbd.DiskStateDetaching,
@@ -994,6 +1012,20 @@ func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName 
 	}
 
 	return false
+}
+
+// isDay0SeededDiskfulVolume reports whether a peer's data-state volume
+// carries nothing but the deterministic day0 GI — a fresh, never-
+// written sibling that is NOT a data source. Empty CurrentGI returns
+// false (conservative: not provably day0 ⇒ treat as data-bearing).
+// Controller twin of dispatcher.isDay0SeededVolume; both compare
+// against the single drbd.Day0GIFor derivation the satellite stamps.
+func isDay0SeededDiskfulVolume(rdName string, vol *blockstoriov1alpha1.ResourceVolumeStatus) bool {
+	if vol.CurrentGI == "" {
+		return false
+	}
+
+	return strings.EqualFold(vol.CurrentGI, drbd.Day0GIFor(rdName, vol.VolumeNumber))
 }
 
 // volumeCurrentGI returns the CurrentGI for the given volume number

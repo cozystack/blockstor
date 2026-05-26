@@ -23,6 +23,7 @@ import (
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/dispatcher"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // TestExternalMetadataRouting: scenario 6.18 (StorPoolNameDrbdMeta).
@@ -1311,17 +1312,20 @@ func TestPeerHasDataGatesSeed(t *testing.T) {
 
 	id := func(v int32) *int32 { return &v }
 
-	withState := func(r *blockstoriov1alpha1.Resource, state string) *blockstoriov1alpha1.Resource {
+	withState := func(r *blockstoriov1alpha1.Resource, state, currentGI string) *blockstoriov1alpha1.Resource {
 		r.Status.Volumes = []blockstoriov1alpha1.ResourceVolumeStatus{
-			{VolumeNumber: 0, DiskState: state},
+			{VolumeNumber: 0, DiskState: state, CurrentGI: currentGI},
 		}
 
 		return r
 	}
 
+	day0 := drbd.Day0GIFor(rdName, 0)
+
 	cases := []struct {
 		name      string
 		peerState string
+		currentGI string
 		diskless  bool
 		want      bool
 	}{
@@ -1331,6 +1335,17 @@ func TestPeerHasDataGatesSeed(t *testing.T) {
 		{name: "data-consistent", peerState: "Consistent", want: true},
 		{name: "data-outdated", peerState: "Outdated", want: true},
 		{name: "diskless-uptodate-ignored", peerState: "UpToDate", diskless: true, want: false},
+		// Day0-seeded fresh sibling (staggered create): an UpToDate peer
+		// whose observed CurrentGI is the deterministic day0 value is a
+		// never-written sibling, NOT a data source → the late replica may
+		// also day0-skip.
+		{name: "day0-sibling-uptodate-not-data", peerState: "UpToDate", currentGI: day0, want: false},
+		{name: "day0-sibling-consistent-not-data", peerState: "Consistent", currentGI: day0, want: false},
+		// A real relocate survivor advanced its current-UUID past day0
+		// on first write → still counts as data-bearing.
+		{name: "advanced-current-is-data", peerState: "UpToDate", currentGI: "DEADBEEFCAFE0000", want: true},
+		// Empty CurrentGI on a data-state peer → conservative: data-bearing.
+		{name: "empty-gi-uptodate-conservative", peerState: "UpToDate", currentGI: "", want: true},
 	}
 
 	for _, tc := range cases {
@@ -1347,7 +1362,7 @@ func TestPeerHasDataGatesSeed(t *testing.T) {
 			}
 
 			if tc.peerState != "" {
-				withState(peer, tc.peerState)
+				withState(peer, tc.peerState, tc.currentGI)
 			}
 
 			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{*peer}, nil, nil, rd, nil)

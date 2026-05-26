@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // TestAnyDataBearingDiskfulPeer pins the seed-GI data-integrity
@@ -50,6 +51,21 @@ func TestAnyDataBearingDiskfulPeer(t *testing.T) {
 
 		return r
 	}
+
+	// withGI sets the RD name + observed CurrentGI so the day0-sibling
+	// discriminator (isDay0SeededDiskfulVolume) has a real RD to derive
+	// day0 from.
+	withGI := func(name, rd, state, gi string) blockstoriov1alpha1.Resource {
+		r := diskful(name, state)
+		r.Spec.ResourceDefinitionName = rd
+		r.Status.Volumes[0].CurrentGI = gi
+
+		return r
+	}
+
+	const gateRD = "rd"
+
+	day0 := drbd.Day0GIFor(gateRD, 0)
 
 	cases := []struct {
 		name  string
@@ -97,6 +113,27 @@ func TestAnyDataBearingDiskfulPeer(t *testing.T) {
 			// a genuine PEER blocks the seed. Excluded by name.
 			peers: []blockstoriov1alpha1.Resource{diskful("rd.n-self", "UpToDate")},
 			want:  false,
+		},
+		{
+			// Day0-seeded fresh sibling (staggered create): an UpToDate
+			// peer whose CurrentGI is the deterministic day0 value is a
+			// never-written sibling, NOT a data source.
+			name:  "day0-sibling-uptodate-not-data",
+			peers: []blockstoriov1alpha1.Resource{withGI("rd.n-old", gateRD, "UpToDate", day0)},
+			want:  false,
+		},
+		{
+			// A real relocate survivor advanced its current-UUID past
+			// day0 on first write → still counts as data-bearing.
+			name:  "advanced-current-is-data",
+			peers: []blockstoriov1alpha1.Resource{withGI("rd.n-old", gateRD, "UpToDate", "DEADBEEFCAFE0000")},
+			want:  true,
+		},
+		{
+			// Empty CurrentGI on a data-state peer → conservative.
+			name:  "empty-gi-uptodate-conservative",
+			peers: []blockstoriov1alpha1.Resource{withGI("rd.n-old", gateRD, "UpToDate", "")},
+			want:  true,
 		},
 	}
 
