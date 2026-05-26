@@ -105,18 +105,30 @@ func attachOrExtend(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalD
 	switch dev.AttachTo.ProviderKind {
 	case ProviderKindLVM:
 		if vgExists(ctx, exec, dev.AttachTo.VGName) {
+			if pvInVG(ctx, exec, dev.AttachTo.VGName, devicePath) {
+				return lvmThickResult(dev), nil
+			}
+
 			return extendLVMThick(ctx, exec, dev, devicePath)
 		}
 
 		return attachLVMThick(ctx, exec, dev, devicePath)
 	case ProviderKindLVMThin:
 		if vgExists(ctx, exec, dev.AttachTo.VGName) {
+			if pvInVG(ctx, exec, dev.AttachTo.VGName, devicePath) {
+				return lvmThinResult(dev), nil
+			}
+
 			return extendLVMThin(ctx, exec, dev, devicePath)
 		}
 
 		return attachLVMThin(ctx, exec, dev, devicePath)
 	case ProviderKindZFS, ProviderKindZFSThin:
 		if zpoolExists(ctx, exec, dev.AttachTo.ZPoolName) {
+			if vdevInZpool(ctx, exec, dev.AttachTo.ZPoolName, devicePath) {
+				return zfsResult(dev), nil
+			}
+
 			return extendZFS(ctx, exec, dev, devicePath)
 		}
 
@@ -150,6 +162,113 @@ func zpoolExists(ctx context.Context, exec storage.Exec, pool string) bool {
 	}
 
 	return strings.Contains(string(out), pool)
+}
+
+// vdevInZpool reports whether `devicePath` is already a top-level
+// vdev of the named zpool. This is the idempotency probe that
+// guards the extend branch: `ps cdp <node> zfs /dev/sda` for a
+// *single* device creates a pool whose sole vdev IS /dev/sda, so a
+// re-reconcile that found the pool already present must NOT run
+// `zpool add -f <pool> /dev/sda` — ZFS rejects re-adding a device
+// that is already part of the active pool ("/dev/sda is in use and
+// contains a unknown filesystem"), which would otherwise wedge the
+// reconciler in a tight failing loop and leave the PhysicalDevice
+// CRD stuck (Phase=Failed, finalizer never cleared).
+//
+// `zpool status -P <pool>` prints the full device paths (`-P`) of
+// every vdev. We compare both the full path and its leaf (`sda`)
+// against each output token, because the device a pool was created
+// with (a by-id symlink such as /dev/disk/by-id/...) can be
+// reported by `zpool status` under a different but
+// same-leaf-resolving name. A failed probe (pool vanished between
+// the exists check and here) is treated as "not a member" so the
+// caller falls through to the existing extend path rather than
+// silently skipping a genuine add. Empty inputs → false.
+func vdevInZpool(ctx context.Context, exec storage.Exec, pool, devicePath string) bool {
+	if pool == "" || devicePath == "" {
+		return false
+	}
+
+	out, err := exec.Run(ctx, "zpool", "status", "-P", pool)
+	if err != nil {
+		return false
+	}
+
+	leaf := deviceLeaf(devicePath)
+
+	for field := range strings.FieldsSeq(string(out)) {
+		if field == devicePath {
+			return true
+		}
+
+		if leaf != "" && deviceLeaf(field) == leaf {
+			return true
+		}
+	}
+
+	return false
+}
+
+// pvInVG reports whether `devicePath` is already a physical volume
+// belonging to the named volume group. Mirrors vdevInZpool for the
+// LVM branch: a single-device `ps cdp ... lvm <node> /dev/sda`
+// makes /dev/sda the VG's sole PV, and a re-reconcile must not
+// re-run pvcreate+vgextend on it. `vgextend` on an already-member
+// PV does emit "Physical volume already belongs to this VG" and
+// exits 0, so LVM is less brittle than ZFS here — but probing keeps
+// the two branches symmetric and avoids the noisy pvcreate retry.
+//
+// `pvs -o pv_name,vg_name --noheadings` lists every PV with its VG;
+// we match a row whose PV name resolves to the same leaf as
+// `devicePath` AND whose VG column equals `vg`. A failed probe →
+// false (fall through to extend). Empty inputs → false.
+func pvInVG(ctx context.Context, exec storage.Exec, vg, devicePath string) bool {
+	if vg == "" || devicePath == "" {
+		return false
+	}
+
+	out, err := exec.Run(ctx, "pvs",
+		lvm.Args("--noheadings", "-o", "pv_name,vg_name")...)
+	if err != nil {
+		return false
+	}
+
+	leaf := deviceLeaf(devicePath)
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		pvName, vgName := fields[0], fields[1]
+		if vgName != vg {
+			continue
+		}
+
+		if pvName == devicePath || (leaf != "" && deviceLeaf(pvName) == leaf) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// deviceLeaf returns the final path component of a device path
+// (`/dev/sda` → `sda`, `/dev/disk/by-id/wwn-X` → `wwn-X`). Used by
+// the membership probes to match a device across the differing
+// names `zpool status` / `pvs` may report it under. Empty input →
+// empty.
+func deviceLeaf(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	if idx := strings.LastIndex(path, "/"); idx >= 0 {
+		return path[idx+1:]
+	}
+
+	return path
 }
 
 // vgExists probes whether the named LVM volume group is already
@@ -318,6 +437,46 @@ func readDeviceSizeMiB(ctx context.Context, exec storage.Exec, devicePath string
 	return sizeBytes / mibBytes, true
 }
 
+// lvmThickResult builds the AttachResult for an LVM (thick) pool.
+// Shared by the create, extend, and already-member-idempotent
+// paths so all three hand the reconciler an identical
+// RegisterProvider contract.
+func lvmThickResult(dev *apiv1.PhysicalDevice) AttachResult {
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: ProviderKindLVM,
+		Props: map[string]string{
+			propLvmVG: dev.AttachTo.VGName,
+		},
+	}
+}
+
+// lvmThinResult builds the AttachResult for an LVM_THIN pool.
+// Shared across create / extend / already-member paths.
+func lvmThinResult(dev *apiv1.PhysicalDevice) AttachResult {
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: ProviderKindLVMThin,
+		Props: map[string]string{
+			propLvmVG:    dev.AttachTo.VGName,
+			propThinPool: dev.AttachTo.ThinPoolName,
+		},
+	}
+}
+
+// zfsResult builds the AttachResult for a ZFS / ZFS_THIN pool.
+// ProviderKind echoes the request's kind (ZFS vs ZFS_THIN). Shared
+// across create / extend / already-member paths.
+func zfsResult(dev *apiv1.PhysicalDevice) AttachResult {
+	return AttachResult{
+		PoolName:     dev.AttachTo.StoragePoolName,
+		ProviderKind: dev.AttachTo.ProviderKind,
+		Props: map[string]string{
+			propZPool: dev.AttachTo.ZPoolName,
+		},
+	}
+}
+
 // attachLVMThick: pvcreate + vgcreate. Returns the
 // `LVM` provider kind config the satellite then registers via
 // `RegisterProvider` to make the pool available for
@@ -338,13 +497,7 @@ func attachLVMThick(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalD
 		return AttachResult{}, errors.Wrap(err, "vgcreate")
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: ProviderKindLVM,
-		Props: map[string]string{
-			propLvmVG: vg,
-		},
-	}, nil
+	return lvmThickResult(dev), nil
 }
 
 // attachLVMThin: pvcreate + vgcreate + lvcreate --thinpool.
@@ -379,14 +532,7 @@ func attachLVMThin(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDe
 		return AttachResult{}, errors.Wrap(err, "lvcreate --thinpool")
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: ProviderKindLVMThin,
-		Props: map[string]string{
-			propLvmVG:    vg,
-			propThinPool: thin,
-		},
-	}, nil
+	return lvmThinResult(dev), nil
 }
 
 // attachZFS: zpool create. The pool name on disk matches the
@@ -415,13 +561,7 @@ func attachZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice
 		return AttachResult{}, errors.Wrap(err, "zpool create")
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: dev.AttachTo.ProviderKind,
-		Props: map[string]string{
-			propZPool: pool,
-		},
-	}, nil
+	return zfsResult(dev), nil
 }
 
 // extendVG runs `pvcreate` + `vgextend` to fold `devicePath` into
@@ -462,13 +602,7 @@ func extendLVMThick(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalD
 		return AttachResult{}, err
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: ProviderKindLVM,
-		Props: map[string]string{
-			propLvmVG: vg,
-		},
-	}, nil
+	return lvmThickResult(dev), nil
 }
 
 // extendLVMThin extends an existing thin-pool's backing VG by
@@ -492,24 +626,18 @@ func extendLVMThin(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDe
 		return AttachResult{}, err
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: ProviderKindLVMThin,
-		Props: map[string]string{
-			propLvmVG:    vg,
-			propThinPool: thin,
-		},
-	}, nil
+	return lvmThinResult(dev), nil
 }
 
 // extendZFS extends an existing zpool by adding `devicePath` as
-// a new top-level vdev. `zpool add -f <pool> <device>` is
-// idempotent on a device already part of the pool: ZFS returns
-// `/dev/sdX is part of active pool '<pool>'` and exits non-zero
-// — caller probes vdev membership before calling on a known-
-// member device, OR the next reconcile observes the already-
-// extended pool and the create branch never re-runs anyway.
-// Bug 337.
+// a new top-level vdev. `zpool add -f <pool> <device>` is NOT
+// idempotent on a device already part of the pool — ZFS exits
+// non-zero with "<dev> is in use and contains a unknown
+// filesystem" (it sees the pool's own on-disk label). The caller
+// (`attachOrExtend`) therefore probes vdev membership via
+// `vdevInZpool` BEFORE reaching this function, so we only ever get
+// here for a genuinely new device. Bug 337 / single-device
+// re-reconcile loop fix.
 //
 // `-f` is required for the same reason `zpool create -f` carries
 // it: a device with stale ZFS labels from a prior attempt would
@@ -525,13 +653,7 @@ func extendZFS(ctx context.Context, exec storage.Exec, dev *apiv1.PhysicalDevice
 		return AttachResult{}, errors.Wrap(err, "zpool add")
 	}
 
-	return AttachResult{
-		PoolName:     dev.AttachTo.StoragePoolName,
-		ProviderKind: dev.AttachTo.ProviderKind,
-		Props: map[string]string{
-			propZPool: pool,
-		},
-	}, nil
+	return zfsResult(dev), nil
 }
 
 // attachFile: directory-backed pool — no on-disk format runs
