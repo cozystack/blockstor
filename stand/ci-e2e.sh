@@ -136,30 +136,36 @@ log "building images"
 make build-images
 
 # ── 4. provision the Talos+QEMU cluster ─────────────────────────────
-# `make up` occasionally hands back a dead cluster — 0 nodes ever reach
-# Ready — on a contended oracle runner: with 8 lanes each booting a
-# 4-node Talos+QEMU cluster at once, the qemu provisioner / Talos
-# bootstrap can lose a transient race (observed: one lane wedged at
-# "FATAL: stand not ready nodes=0" while the other 7 came up clean). That
-# is a provisioning flake, not a product fault, so give it one clean
-# retry (down + up) before handing the cluster to the scenarios. Expect
-# CI_WORKERS workers + 1 controlplane = CI_WORKERS+1 nodes Ready.
+# `make up` occasionally hands back a dead or never-Ready cluster on a
+# contended oracle runner: with 8 lanes each booting a 4-node Talos+QEMU
+# cluster, the qemu provisioner / Talos bootstrap can lose a transient
+# race (seen as "FATAL: stand not ready nodes=0", and as "N nodes never
+# Ready" when a slow runner simply doesn't finish etcd/kubelet bring-up
+# in time). Both are provisioning flakes, not product faults. Two
+# distinct failure shapes need two distinct cushions, so:
+#   - up to 3 attempts (down + up between them) to recover a hard dead
+#     bring-up (nodes=0) — lane 7 provision-flaked two runs running with
+#     only 2 attempts;
+#   - a 240s per-attempt readiness wait (was 180s) so a slow-but-healthy
+#     runner finishes all CI_WORKERS+1 nodes Ready on the FIRST attempt
+#     instead of being torn down mid-bring-up and restarted from zero.
+# Expect CI_WORKERS workers + 1 controlplane = CI_WORKERS+1 nodes Ready.
 provision_cluster() {
     local kc=".work/$STAND/kubeconfig" want=$(( CI_WORKERS + 1 )) attempt ready deadline
-    for attempt in 1 2; do
-        log "provisioning cluster attempt $attempt (workers=$CI_WORKERS, extra-disks=$EXTRA_DISKS x ${EXTRA_DISK_SIZE_MB}MB)"
+    for attempt in 1 2 3; do
+        log "provisioning cluster attempt $attempt/3 (workers=$CI_WORKERS, extra-disks=$EXTRA_DISKS x ${EXTRA_DISK_SIZE_MB}MB)"
         make up NAME="$STAND" WORKERS="$CI_WORKERS" || true
-        deadline=$(( $(date +%s) + 180 ))
+        deadline=$(( $(date +%s) + 240 ))
         while (( $(date +%s) < deadline )); do
             ready=$(KUBECONFIG="$kc" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
             [ "${ready:-0}" -ge "$want" ] && { log "cluster ready: $ready/$want nodes Ready"; return 0; }
             sleep 5
         done
         ready=$(KUBECONFIG="$kc" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
-        log "cluster NOT ready after attempt $attempt ($ready/$want nodes Ready) — tearing down for retry"
+        log "cluster NOT ready after attempt $attempt/3 ($ready/$want nodes Ready) — tearing down for retry"
         make down NAME="$STAND" >/dev/null 2>&1 || true
     done
-    echo "::error::cluster $STAND failed to provision ($want nodes never Ready) after 2 attempts" >&2
+    echo "::error::cluster $STAND failed to provision ($want nodes never Ready) after 3 attempts" >&2
     exit 1
 }
 provision_cluster
