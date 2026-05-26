@@ -234,7 +234,29 @@ type Reconciler struct {
 	// satellite restart resets the table, at worst delaying
 	// recovery by `grace` (default 30s).
 	seenStuckAt map[string]time.Time
+
+	// lastRecoveryPromoteAt throttles the Bug 366 recovery-promote
+	// self-heal (maybeRecoveryPromote). Keyed by resource name; value
+	// is the last wall-clock time this node fired a recovery-promote
+	// for it. runAutoPromote (`primary --force` → mkfs → `secondary`)
+	// itself churns kernel state, generating events2 frames that
+	// re-trigger the reconcile while the predicate still holds (peer
+	// Inconsistent + no Primary mid-resync) — without a throttle the
+	// self-heal hot-loops at ~3 Hz, starving the very resync it is
+	// meant to drive (stand-measured: ~589 re-arms on one staggered
+	// create). The throttle fires the promote at most once per
+	// recoveryPromoteThrottle so the kernel-driven SyncTarget has room
+	// to make progress between nudges. Process-memory only; a restart
+	// resets it (at worst one extra promote).
+	lastRecoveryPromoteAt map[string]time.Time
 }
+
+// recoveryPromoteThrottle bounds how often a single resource may fire
+// the Bug 366 recovery-promote self-heal. Generous relative to a
+// kernel resync's progress cadence but short enough that a genuine
+// wedge (peer truly stuck Inconsistent with no Primary) still gets a
+// fresh nudge promptly.
+const recoveryPromoteThrottle = 10 * time.Second
 
 // NewReconciler constructs a Reconciler from cfg.
 //
@@ -247,9 +269,10 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 	}
 
 	return &Reconciler{
-		cfg:            cfg,
-		resourceToPool: map[string]string{},
-		seenStuckAt:    map[string]time.Time{},
+		cfg:                   cfg,
+		resourceToPool:        map[string]string{},
+		seenStuckAt:           map[string]time.Time{},
+		lastRecoveryPromoteAt: map[string]time.Time{},
 	}
 }
 
@@ -2293,10 +2316,40 @@ func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.Desire
 		return nil
 	}
 
+	// Throttle: runAutoPromote churns kernel state (promote → mkfs →
+	// demote) which re-triggers this reconcile while the predicate
+	// still holds mid-resync. Firing on every such reconcile hot-loops
+	// at several Hz and starves the SyncTarget. Skip if we already
+	// promoted this resource within recoveryPromoteThrottle — the
+	// kernel resync the previous promote kicked off needs time to make
+	// progress, and a still-genuine wedge gets a fresh nudge once the
+	// window elapses.
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
 	log.FromContext(ctx).Info("Bug 366 recovery-promote: re-arming auto-primary to unstick wedged initial sync",
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
+}
+
+// recoveryPromoteDue reports whether enough time has elapsed since this
+// node last fired a recovery-promote for `name` to fire another, and
+// records the fire time when it returns true. Serialised by r.mu so
+// concurrent reconciles of the same resource can't both pass the gate.
+func (r *Reconciler) recoveryPromoteDue(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+	if last, ok := r.lastRecoveryPromoteAt[name]; ok && now.Sub(last) < recoveryPromoteThrottle {
+		return false
+	}
+
+	r.lastRecoveryPromoteAt[name] = now
+
+	return true
 }
 
 // needsAutoMkfsRetry probes whether an auto-primary replica must
