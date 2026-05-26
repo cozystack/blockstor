@@ -10,7 +10,7 @@ blockstor is a Kubernetes control plane for LVM and ZFS storage with [DRBD](http
 - **First-class CRDs.** `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice`, `ControllerConfig` are designed to be read and (where appropriate) written by other operators: cozystack tenant operators, GitOps tooling, custom monitoring/alerting, admission webhooks. Schemas carry kubebuilder enum/min/max validation; multi-writer Status uses Server-Side Apply field managers.
 - **Per-node satellite as a controller.** Each satellite is a controller-runtime manager that watches its own slice of CRDs (filtered by `Spec.NodeName`) and writes observed state back via Status SSA directly. No gRPC dispatch from a central controller.
 
-See [`docs/architecture.md`](docs/architecture.md) for the load-bearing design notes.
+See [`docs/architecture.md`](docs/architecture.md) for the load-bearing design notes, and [`docs/usage.md`](docs/usage.md) for installing blockstor onto a cluster and driving it with the `linstor` client.
 
 ### Ecosystem fit
 
