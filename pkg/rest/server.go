@@ -70,10 +70,24 @@ const maxRequestBodyBytes int64 = 1 << 20
 // reach the apiserver directly. Both may be nil/empty in tests that
 // only exercise the legacy KV-backed path.
 type Server struct {
-	Addr      string // e.g. ":3370" — upstream LINSTOR plain-text REST port
+	Addr      string // e.g. ":3370" — plain-HTTP debug port (NOT exposed by the in-cluster Service; reachable only via kubectl port-forward)
 	Store     store.Store
 	Client    client.Client // controller-runtime client for native-object endpoints
 	Namespace string        // namespace where blockstor's own Secrets/ConfigMaps live
+
+	// TLS, when non-nil, makes Start also bring up a mutual-TLS
+	// listener on TLSAddr alongside the plain-HTTP debug listener on
+	// Addr. The in-cluster Service exposes ONLY TLSAddr; the plain
+	// listener stays pod-local for `kubectl port-forward` debugging.
+	//
+	// The listener REQUIRES and VERIFIES a client certificate
+	// (tls.RequireAndVerifyClientCert) against the configured client
+	// CA, and hot-reloads its serving cert/key AND the client-CA
+	// bundle from disk without a restart when cert-manager rotates
+	// them (see reloadableTLS). nil ⇒ TLS listener disabled (the
+	// plain-HTTP path still serves, e.g. in unit tests and the legacy
+	// single-binary controller mount).
+	TLS *TLSOptions
 
 	// linstorRemotes is the in-memory registry for LINSTOR remotes —
 	// see pkg/rest/remotes.go. Lazy-initialised on the first call to
@@ -159,84 +173,184 @@ func (s *Server) SetResolveHost(fn ResolveHostFunc) ResolveHostFunc {
 // introduce write-paths that need a single leader we'll change this to true.
 func (s *Server) NeedLeaderElection() bool { return false }
 
-// Start runs the HTTP server until ctx is cancelled.
+// Start runs the REST server until ctx is cancelled. It always brings
+// up the plain-HTTP debug listener on s.Addr; when s.TLS is set it
+// ALSO brings up a mutual-TLS listener on s.TLS.Addr. Both listeners
+// share one handler. The whole call returns when ctx is cancelled
+// (graceful shutdown of both) or when either listener fails fatally.
 func (s *Server) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("rest")
+	handler := s.handler()
 
-	mux := s.buildMux()
-
-	// Middleware order, outer → inner:
-	//   withLogging         — observes the final status code (incl. 4xx
-	//                          envelopes the inner layers emit).
-	//   instrumentRequests  — Bug 168: emits the blockstor_requests_total
-	//                          / blockstor_request_duration_seconds
-	//                          series. Sits inside withLogging so the
-	//                          status code observation matches the one
-	//                          the log line records, but outside the
-	//                          envelope/content-type middlewares so 4xx
-	//                          replies they emit are still counted.
-	//   with404Envelope     — rewrites ServeMux's plain-text 404/405
-	//                          fallback bodies to LINSTOR `[]ApiCallRc`
-	//                          (Bug 103, Bug 109).
-	//   withContentTypeJSON — Bug 147: refuses POST/PUT/PATCH with a
-	//                          non-JSON Content-Type before any handler
-	//                          tries to decode random bytes as JSON.
-	//                          Consults the mux so a wrong-verb request
-	//                          (which would 405) is not pre-empted with
-	//                          a 415 — the 405 path stays intact.
-	//   withBodyLimit       — Bug 146: caps the request body so an
-	//                          oversized POST trips a 413 envelope at
-	//                          the wire edge instead of leaking the
-	//                          etcd/k8s rejection string in a 500.
-	srv := &http.Server{
-		Addr:              s.Addr,
-		Handler:           withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux)))))),
-		ReadHeaderTimeout: 10 * time.Second,
-		BaseContext:       func(_ net.Listener) context.Context { return ctx },
-	}
-
-	// Bind the listener up-front so we can signal OnReady BEFORE
-	// entering the serve loop. Splitting net.Listen + srv.Serve
-	// out of the combined srv.ListenAndServe lets the apiserver
-	// hold its /readyz at 503 until clients can actually connect
-	// (issue 213). Bind errors are surfaced synchronously — the
-	// caller's manager treats Runnable startup failure as fatal,
-	// same shape as the pre-split ListenAndServe error path.
+	// Bind the plain-HTTP listener up-front so we can signal OnReady
+	// BEFORE entering the serve loop. Splitting net.Listen + Serve
+	// out of ListenAndServe lets the apiserver hold its /readyz at
+	// 503 until clients can actually connect (issue 213). Bind
+	// errors are surfaced synchronously — the caller's manager treats
+	// Runnable startup failure as fatal.
 	lc := &net.ListenConfig{}
 
-	ln, err := lc.Listen(ctx, "tcp", s.Addr)
+	plainLn, err := lc.Listen(ctx, "tcp", s.Addr)
 	if err != nil {
 		return errors.Wrap(err, "REST server listen")
 	}
 
-	if s.OnReady != nil {
-		s.OnReady()
-	}
+	// errCh is buffered for both listeners so neither goroutine
+	// leaks if the other fails first.
+	errCh := make(chan error, 2)
 
-	errCh := make(chan error, 1)
-
+	plainSrv := s.newHTTPServer(ctx, s.Addr, handler)
 	go func() {
-		logger.Info("REST API listening",
+		logger.Info("REST API listening (plain HTTP, debug only)",
 			"addr", s.Addr,
 			"linstor_contract", version.LinstorVersion,
 			"rest_api", version.RestAPIVersion)
 
-		errCh <- srv.Serve(ln)
+		errCh <- serveOrIgnoreClosed(plainSrv.Serve(plainLn))
 	}()
 
+	servers := []*http.Server{plainSrv}
+
+	if s.TLS != nil {
+		tlsSrv, tlsErr := s.startTLS(ctx, handler, errCh, logger)
+		if tlsErr != nil {
+			// Tear the plain listener down before returning so the
+			// manager doesn't see a half-started Runnable.
+			_ = plainSrv.Close()
+
+			return tlsErr
+		}
+
+		servers = append(servers, tlsSrv)
+	}
+
+	// OnReady fires once BOTH listeners (plain + optional TLS) have
+	// bound — kube-proxy must not route to the pod until the TLS
+	// endpoint the Service exposes is actually accepting connections.
+	if s.OnReady != nil {
+		s.OnReady()
+	}
+
+	return waitAndShutdown(ctx, servers, errCh)
+}
+
+// newHTTPServer constructs an *http.Server with the project's shared
+// timeouts and base context. tlsCfg may be nil for the plain listener.
+func (s *Server) newHTTPServer(ctx context.Context, addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(_ net.Listener) context.Context { return ctx },
+	}
+}
+
+// startTLS loads the (reloadable) serving material, arms the hot-reload
+// watcher, binds the TLS listener and starts serving on it. The
+// returned *http.Server is added to the shutdown set by the caller.
+func (s *Server) startTLS(ctx context.Context, handler http.Handler, errCh chan<- error, logger logr) (*http.Server, error) {
+	reloader, err := newReloadableTLS(s.TLS.CertFile, s.TLS.KeyFile, s.TLS.ClientCAFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "TLS material")
+	}
+
+	go reloader.watch(ctx)
+
+	tlsSrv := s.newHTTPServer(ctx, s.TLS.Addr, handler)
+	tlsSrv.TLSConfig = reloader.serverTLSConfig()
+
+	lc := &net.ListenConfig{}
+
+	tlsLn, err := lc.Listen(ctx, "tcp", s.TLS.Addr)
+	if err != nil {
+		return nil, errors.Wrap(err, "REST server TLS listen")
+	}
+
+	go func() {
+		logger.Info("REST API listening (mutual TLS)",
+			"addr", s.TLS.Addr,
+			"client_auth", "RequireAndVerifyClientCert")
+
+		// ServeTLS with empty cert/key paths uses tlsSrv.TLSConfig,
+		// which is our reloadable config (GetCertificate /
+		// GetConfigForClient). The empty-string args are required —
+		// passing files here would shadow the reload hooks.
+		errCh <- serveOrIgnoreClosed(tlsSrv.ServeTLS(tlsLn, "", ""))
+	}()
+
+	return tlsSrv, nil
+}
+
+// handler builds the fully-wrapped REST handler. Shared by both the
+// plain-HTTP debug listener and the mutual-TLS listener so they serve
+// identical routes/middleware.
+//
+// Middleware order, outer → inner:
+//
+//	withLogging         — observes the final status code (incl. 4xx
+//	                       envelopes the inner layers emit).
+//	instrumentRequests  — Bug 168: emits the blockstor_requests_total
+//	                       / blockstor_request_duration_seconds
+//	                       series. Sits inside withLogging so the
+//	                       status code observation matches the one
+//	                       the log line records, but outside the
+//	                       envelope/content-type middlewares so 4xx
+//	                       replies they emit are still counted.
+//	with404Envelope     — rewrites ServeMux's plain-text 404/405
+//	                       fallback bodies to LINSTOR `[]ApiCallRc`
+//	                       (Bug 103, Bug 109).
+//	withContentTypeJSON — Bug 147: refuses POST/PUT/PATCH with a
+//	                       non-JSON Content-Type before any handler
+//	                       tries to decode random bytes as JSON.
+//	                       Consults the mux so a wrong-verb request
+//	                       (which would 405) is not pre-empted with
+//	                       a 415 — the 405 path stays intact.
+//	withBodyLimit       — Bug 146: caps the request body so an
+//	                       oversized POST trips a 413 envelope at
+//	                       the wire edge instead of leaking the
+//	                       etcd/k8s rejection string in a 500.
+func (s *Server) handler() http.Handler {
+	mux := s.buildMux()
+
+	return withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+}
+
+// waitAndShutdown blocks until ctx is cancelled or any listener
+// reports a fatal error, then gracefully shuts down every server.
+func waitAndShutdown(ctx context.Context, servers []*http.Server, errCh <-chan error) error {
 	select {
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 
-		return errors.Wrap(srv.Shutdown(shutCtx), "shutdown REST server")
+		var shutErr error
+
+		for _, srv := range servers {
+			err := srv.Shutdown(shutCtx)
+			if err != nil && shutErr == nil {
+				shutErr = err
+			}
+		}
+
+		return errors.Wrap(shutErr, "shutdown REST server")
 	case err := <-errCh:
-		if errors.Is(err, http.ErrServerClosed) {
+		if err == nil {
 			return nil
 		}
 
 		return errors.Wrap(err, "REST server failed")
 	}
+}
+
+// serveOrIgnoreClosed maps the benign http.ErrServerClosed (returned
+// by Serve/ServeTLS on graceful Shutdown/Close) to nil so it doesn't
+// trip the fatal-error path.
+func serveOrIgnoreClosed(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+
+	return err
 }
 
 // lookupHost dispatches to s.resolveHost if set, else the package
