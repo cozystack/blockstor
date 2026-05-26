@@ -125,3 +125,47 @@ func errOrNil(err error) string {
 
 	return err.Error()
 }
+
+// TestRecoveryPromoteDueThrottle pins the Bug 366 recovery-promote
+// throttle (the runaway-hot-loop fix). The first call for a resource
+// must fire (returns true) and record the time; an immediate second
+// call must be throttled (returns false); an independent resource is
+// unaffected; and once recoveryPromoteThrottle has elapsed (simulated
+// by back-dating the recorded time) the resource may fire again.
+//
+// Why this matters: runAutoPromote churns kernel state (promote → mkfs
+// → demote), which re-triggers the satellite reconcile while the
+// recovery predicate still holds mid-resync. Without the throttle the
+// self-heal fired at several Hz (stand-measured ~589 re-arms on one
+// staggered 3-replica create), starving the very kernel-driven
+// SyncTarget it is meant to drive and stretching all-UpToDate well past
+// the scenario's budget. The throttle bounds it to one promote per
+// recoveryPromoteThrottle so the resync makes progress between nudges.
+func TestRecoveryPromoteDueThrottle(t *testing.T) {
+	t.Parallel()
+
+	r := NewReconciler(ReconcilerConfig{})
+
+	if !r.recoveryPromoteDue("rd-a") {
+		t.Fatal("first recoveryPromoteDue(rd-a) = false, want true (must fire on first call)")
+	}
+
+	if r.recoveryPromoteDue("rd-a") {
+		t.Error("immediate second recoveryPromoteDue(rd-a) = true, want false (throttled)")
+	}
+
+	// A different resource is tracked independently and must fire.
+	if !r.recoveryPromoteDue("rd-b") {
+		t.Error("recoveryPromoteDue(rd-b) = false, want true (independent resource not throttled)")
+	}
+
+	// Back-date rd-a's last-fire past the throttle window: it may fire
+	// again (a genuine wedge still gets a fresh nudge once elapsed).
+	r.mu.Lock()
+	r.lastRecoveryPromoteAt["rd-a"] = r.lastRecoveryPromoteAt["rd-a"].Add(-2 * recoveryPromoteThrottle)
+	r.mu.Unlock()
+
+	if !r.recoveryPromoteDue("rd-a") {
+		t.Error("recoveryPromoteDue(rd-a) after throttle window = false, want true (window elapsed)")
+	}
+}
