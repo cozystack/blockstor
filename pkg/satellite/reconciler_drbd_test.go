@@ -1633,18 +1633,34 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 	}
 }
 
-// TestApplyAutoPrimarySeedFiresOnceOnFirstActivation: with the
-// `auto-primary=true` DRBD option set on first Apply, the satellite
-// must run `drbdadm primary --force` followed by `drbdadm secondary`
-// to seed the resource out of `Inconsistent`. On subsequent reconciles
-// (firstActivation=false because the .res file persists) the seed
-// must NOT fire — running it twice would needlessly bump the bitmap
-// and trigger a network re-sync between peers.
-func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
+// TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI: the elected
+// initial-UpToDate winner (`auto-primary=true`, fresh first
+// activation, no data-bearing peer) reaches UpToDate by WRITING GI
+// metadata — NOT by `drbdadm primary --force`. When the RD requests
+// no filesystem (no `FileSystem/Type`), the satellite must:
+//
+//   - stamp every node-id slot with the SAME uniform GI tuple: a
+//     Consistent + UpToDate seed whose bitmap-base is the day0 GID and
+//     whose current-UUID is a fresh random GID distinct from day0
+//     (`<rand>:<day0>:0:0:1:1` — positional consistent+uptodate). The
+//     current-UUID and flags are device-level (shared) in v09, so the
+//     uniform stamp leaves the device with the intended shared
+//     current+flags and every peer slot's bitmap-base = day0;
+//   - run NO `drbdadm primary --force` and NO `drbdadm secondary` —
+//     the old promote-to-UpToDate is exactly the bug (it minted a
+//     divergent current-UUID and forced a full initial sync of empty
+//     thin volumes).
+//
+// On subsequent reconciles (firstActivation=false) the seed must NOT
+// fire again.
+func TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-seed_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Device path resolution after CreateVolume → drives the set-gi seed.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-seed_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-seed_00000|1048576\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
@@ -1686,12 +1702,80 @@ func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 		return n
 	}
 
-	if saw(first, "drbdadm primary --force pvc-seed") != 1 {
-		t.Errorf("first Apply must run primary --force exactly once; got %v", first)
+	// THE FIX: no promote, no demote — UpToDate comes from set-gi.
+	if saw(first, "drbdadm primary --force pvc-seed") != 0 {
+		t.Errorf("winner must reach UpToDate via set-gi, NOT primary --force; got %v", first)
 	}
 
-	if saw(first, "drbdadm secondary pvc-seed") != 1 {
-		t.Errorf("first Apply must run drbdadm secondary exactly once; got %v", first)
+	if saw(first, "drbdadm secondary pvc-seed") != 0 {
+		t.Errorf("no promote → no demote expected; got %v", first)
+	}
+
+	// Local slot (node-id 0) must carry the Consistent+UpToDate winner
+	// seed: current=<random> distinct from day0, bitmap-base=day0.
+	var localSlot string
+	for _, line := range first {
+		if strings.Contains(line, "set-gi --node-id 0 ") {
+			localSlot = line
+		}
+	}
+
+	if localSlot == "" {
+		t.Fatalf("missing set-gi for local node-id 0; got %v", first)
+	}
+
+	// Extract the GI tuple argument (last token). The v09 GI string is
+	// fully positional: current:bitmap:hist0:hist1:consistent:uptodate
+	// — flags are 0/1 ints, NOT name:value pairs.
+	day0 := satellite.Day0GiForTest("pvc-seed", 0)
+	fields := strings.Fields(localSlot)
+	gi := fields[len(fields)-1]
+	parts := strings.Split(gi, ":")
+	if len(parts) < 6 {
+		t.Fatalf("winner local slot must carry positional consistent+uptodate flags; got %q", gi)
+	}
+
+	current, base := parts[0], parts[1]
+	if parts[4] != "1" || parts[5] != "1" {
+		t.Errorf("winner local slot must be Consistent(idx4=1)+UpToDate(idx5=1); got %q", gi)
+	}
+
+	// Winner current-UUID is day0 (the shared lineage anchor), NOT a
+	// fresh random GID — so a staggered late replica seeing this
+	// winner's CurrentGI==day0 recognises it as a day0 sibling and may
+	// also skip the initial sync (and a dual-winner race agrees rather
+	// than split-brains). The Consistent+UpToDate flags are what make
+	// it UpToDate, not a distinct current.
+	if current != day0 {
+		t.Errorf("winner current-UUID must equal day0 (shared lineage); got current=%s day0=%s", current, day0)
+	}
+
+	if base != day0 {
+		t.Errorf("winner bitmap-base must equal day0; got base=%s day0=%s", base, day0)
+	}
+
+	// Every slot gets the SAME uniform GI string. The current-UUID and
+	// the consistent/up-to-date flags are device-level (shared) in v09
+	// metadata, so stamping them identically on every node-id is what
+	// leaves the device with the intended shared current+flags; the
+	// per-peer bitmap-base (day0) is also identical. A peer slot
+	// (node-id 1) therefore carries the exact same tuple as the local
+	// slot — its bitmap-base is day0, which is the lineage anchor that
+	// makes the peer skip the sync.
+	wantGI := gi // the local-slot GI tuple extracted above
+	var peerSlot string
+	for _, line := range first {
+		if strings.Contains(line, "set-gi --node-id 1 ") {
+			peerSlot = line
+		}
+	}
+
+	if peerSlot == "" {
+		t.Fatalf("missing set-gi for peer node-id 1; got %v", first)
+	}
+
+	if !strings.HasSuffix(peerSlot, " "+wantGI) {
+		t.Errorf("winner peer slot must carry the same uniform GI %q (day0 bitmap-base); got %q", wantGI, peerSlot)
 	}
 
 	// Second Apply: .res persists → firstActivation=false → seed
@@ -1710,6 +1794,89 @@ func TestApplyAutoPrimarySeedFiresOnceOnFirstActivation(t *testing.T) {
 	second := fx.CommandLines()
 	if saw(second, "primary --force") != 0 {
 		t.Errorf("idempotent reconcile must NOT re-seed; got %v", second)
+	}
+
+	if saw(second, "set-gi") != 0 {
+		t.Errorf("idempotent reconcile must NOT re-stamp GI; got %v", second)
+	}
+}
+
+// TestApplyAutoPrimaryWinnerSeedsUpToDateOnThickLVM pins that the
+// elected winner reaches UpToDate via set-gi on THICK LVM too — case
+// B is gated on "this node is the elected source", not on the backing
+// kind. The winner's local slot still gets the random+day0+Consistent
+// +UpToDate seed; a non-winner thick replica (covered by
+// TestApplyFirstActivationNoSkipOnLVMThick) gets NO set-gi and resyncs.
+// This is the contrast: thick winner declares itself UpToDate from
+// metadata; thick non-winner stays Inconsistent for a real resync.
+func TestApplyAutoPrimaryWinnerSeedsUpToDateOnThickLVM(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-tw_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-tw_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-tw_00000|1048576\n")})
+
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thick1": thick},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-tw",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thick1"},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	calls := fx.CommandLines()
+
+	var localSlot string
+	for _, line := range calls {
+		if strings.Contains(line, "set-gi --node-id 0 ") {
+			localSlot = line
+		}
+
+		if strings.Contains(line, "drbdadm primary --force") {
+			t.Errorf("thick winner must reach UpToDate via set-gi, not primary --force; got %s", line)
+		}
+	}
+
+	if localSlot == "" {
+		t.Fatalf("thick winner must seed its local slot UpToDate via set-gi; got %v", calls)
+	}
+
+	day0 := satellite.Day0GiForTest("pvc-tw", 0)
+	fields := strings.Fields(localSlot)
+	gi := fields[len(fields)-1]
+	parts := strings.Split(gi, ":")
+	if len(parts) < 6 {
+		t.Fatalf("thick winner local slot must carry positional consistent+uptodate; got %q", gi)
+	}
+
+	if parts[4] != "1" || parts[5] != "1" {
+		t.Errorf("thick winner local slot must be Consistent(idx4=1)+UpToDate(idx5=1); got %q", gi)
+	}
+
+	if parts[0] != day0 {
+		t.Errorf("thick winner current-UUID must be day0 (shared lineage); got %s want %s", parts[0], day0)
+	}
+
+	if parts[1] != day0 {
+		t.Errorf("thick winner bitmap-base must be day0; got %s want %s", parts[1], day0)
 	}
 }
 
@@ -2483,15 +2650,17 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 }
 
 // TestApplyAutoPrimaryForceErrorWraps pins the auto-primary force
-// error-wrap branch of applyDRBD: when the seed step
+// error-wrap branch of applyDRBD: when the mkfs-promote step
 // `drbdadm primary --force` fails on first activation, applyOne
 // must surface the error tagged with "auto-primary" in the
 // per-resource reply.
 //
-// Without the wrap keyword, an operator can't distinguish a stuck
-// seed (kernel module missing, /dev/drbdN already busy) from the
-// downstream `drbdadm secondary` failure mode that follows the
-// same metadata-shape concerns.
+// `primary --force` now runs ONLY to satisfy mkfs (the RD requests a
+// filesystem via `FileSystem/Type`), so the RD here carries that prop
+// to exercise the promote path; reaching UpToDate itself no longer
+// promotes. Without the wrap keyword an operator can't distinguish a
+// stuck mkfs-promote (kernel module missing, /dev/drbdN busy) from the
+// downstream `drbdadm secondary` failure mode.
 func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
@@ -2513,6 +2682,7 @@ func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 		{
 			Name:     "pvc-seed-fail",
 			NodeName: "n1",
+			Props:    map[string]string{"FileSystem/Type": "ext4"},
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},

@@ -17,10 +17,7 @@ limitations under the License.
 package satellite
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"strings"
+	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
 // IsThinOrZFS reports whether a provider kind is guaranteed to hand
@@ -71,28 +68,11 @@ func IsThinOrZFS(kind string) bool {
 	return false
 }
 
-// day0GiFor derives a deterministic 64-bit DRBD GI for a per-RD,
-// per-volume "day 0" stamp. Same RD name + volume number always
-// yields the same value, so every replica on every node converges
-// on identical current_uuid / bitmap_uuid pairs without needing a
-// shared random seed — DRBD's GI handshake then matches and skips
-// the full initial-sync (upstream LINSTOR's path goes through
-// `getCurrentGIFromVlmDfnProp` which is itself derived from the
-// RD's VolumeDefinition; we follow the same "same RD ⇒ same GI"
-// rule but without the controller-side prop because no peer
-// has stamped CurrentGI on a brand-new RD).
-//
-// Format: 16 hex characters, upper-case — DRBD's drbdmeta accepts
-// hex GI tokens. Trailing `0` enforces the DRBD-9 convention that
-// a real GI is even (low bit is the "primary indicator" — odd =
-// primary writes happened, even = clean). A synthetic day0 is
-// deliberately even so it represents "consistent / no primary
-// writes yet" — DRBD's handshake then treats matching day0 +
-// zero bitmap as "already in sync".
+// day0GiFor is the satellite-local alias for the single-sourced
+// drbd.Day0GIFor derivation. Kept so existing satellite call sites
+// read naturally; the derivation itself (and its rationale) lives in
+// pkg/drbd/gi.go so the controller and dispatcher seed-safety gates
+// compare against the exact same value the satellite stamps.
 func day0GiFor(resourceName string, volumeNumber int32) string {
-	h := sha256.Sum256(fmt.Appendf(nil, "blockstor-day0:%s/%d", resourceName, volumeNumber))
-	// Take the first 8 bytes, force low bit to 0 (even).
-	h[7] &^= 0x01
-
-	return strings.ToUpper(hex.EncodeToString(h[:8]))
+	return drbd.Day0GIFor(resourceName, volumeNumber)
 }
