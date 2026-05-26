@@ -21,7 +21,10 @@
 #
 # Needs an upstream DRBD fix or an operator-recipe workaround (e.g.
 # holding the device open during the under-quorum window). Skip until
-# resolved so the rest of the e2e suite stays meaningful.
+# resolved so the rest of the e2e suite stays meaningful. lib.sh is not
+# sourced yet at this point, so emit the SKIP sentinel inline (matches
+# tests/e2e/lib.sh skip()); the harness allowlists this scenario.
+echo "__E2E_SKIP__: KNOWN-FAILING xfail on the DRBD 9.2.14-class kernel — quorum-loss demote is kernel-driven (Bug 279); needs an upstream DRBD fix"
 exit 0
 #
 # Scenario 5.W13 (tests/scenarios/wave2-05-drbd-state-recovery.md) —

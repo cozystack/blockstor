@@ -108,8 +108,7 @@ else
 fi
 
 if [[ -z "$drbd_ver" ]]; then
-    echo "SKIP: could not detect DRBD kernel version on $N1 (no /proc/drbd, no modinfo) — module likely not loaded"
-    exit 0
+    skip "could not detect DRBD kernel version on $N1 (no /proc/drbd, no modinfo) — module likely not loaded"
 fi
 echo "   DRBD kernel version on $N1 = $drbd_ver"
 
@@ -137,8 +136,7 @@ elif (( maj == 9 && min == 2 && pat >= 17 )); then
 fi
 
 if [[ "$fixed_upstream" == "true" ]]; then
-    echo "SKIP: kernel ${drbd_ver} >= 9.2.17 — bitmap drop fixed upstream (xfail per scenario 5.23)"
-    exit 0
+    skip "kernel ${drbd_ver} >= 9.2.17 — bitmap drop fixed upstream (xfail per scenario 5.23)"
 fi
 
 echo "   kernel ${drbd_ver} is in the 9.2.16- bracket — proceeding with toggle drill"

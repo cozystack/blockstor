@@ -57,8 +57,8 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 if ! command -v jq >/dev/null 2>&1; then
-    echo "SKIP: jq not in PATH (apt install jq)"
-    exit 0
+    echo "FAIL: jq not in PATH (apt install jq)" >&2
+    exit 1
 fi
 
 RD=e2e-affinity-controller

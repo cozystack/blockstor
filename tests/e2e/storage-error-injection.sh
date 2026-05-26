@@ -93,14 +93,12 @@ require_workers 2
 # pkg/satellite/controllers/observer_internal_test.go; the e2e
 # scenario adds value only on a non-Talos worker.
 if grep -qi talos /etc/os-release 2>/dev/null; then
-    echo "SKIP: storage-error-injection needs writable dm-control + loop sysfs; Talos kernel restricts these"
-    exit 0
+    skip "storage-error-injection needs writable dm-control + loop sysfs; Talos kernel restricts these"
 fi
 
 SAT_NODE=$(kubectl -n "$NS" get pods -l app=blockstor-satellite -o jsonpath='{.items[0].spec.nodeName}')
 if kubectl get node "$SAT_NODE" -o jsonpath='{.status.nodeInfo.osImage}' | grep -qi talos; then
-    echo "SKIP: storage-error-injection needs writable dm-control + loop sysfs; node is Talos"
-    exit 0
+    skip "storage-error-injection needs writable dm-control + loop sysfs; node is Talos"
 fi
 
 RD=e2e-dm-error
@@ -127,8 +125,7 @@ wait_uptodate "$RD" "$PRIMARY" "$PEER"
 # line and the truncate trick wouldn't apply.
 BACKING_IMG=/var/lib/blockstor-pool/${RD}_00000.img
 if ! on_node "$PRIMARY" bash -c "test -f ${BACKING_IMG}" 2>/dev/null; then
-    echo "SKIP: backing file ${BACKING_IMG} not found on ${PRIMARY} — RD likely on LVM/ZFS pool, not FILE_THIN"
-    exit 0
+    skip "backing file ${BACKING_IMG} not found on ${PRIMARY} — RD likely on LVM/ZFS pool, not FILE_THIN"
 fi
 
 LOOP_DEV=$(on_node "$PRIMARY" bash -c "losetup -j ${BACKING_IMG} | head -1 | cut -d: -f1" 2>/dev/null || true)
@@ -145,8 +142,7 @@ echo "   DRBD device on PRIMARY: ${DEV}"
 # kernel exposes /dev/mapper/control and the binary is in PATH). A
 # friendly SKIP here beats a confusing failure deeper in the test.
 if ! on_node "$PRIMARY" bash -c "dmsetup version >/dev/null 2>&1"; then
-    echo "SKIP: dmsetup not functional on ${PRIMARY} (binary missing or /dev/mapper/control unavailable)"
-    exit 0
+    skip "dmsetup not functional on ${PRIMARY} (binary missing or /dev/mapper/control unavailable)"
 fi
 
 # Phase A: demonstrate the dm-error target exists and works. We
