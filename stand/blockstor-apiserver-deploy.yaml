@@ -87,15 +87,36 @@ spec:
           image: __REGISTRY__/blockstor-apiserver:dev
           imagePullPolicy: Always
           args:
+            # Plain-HTTP debug listener. NOT exposed by the Service —
+            # reachable only via `kubectl port-forward` to this pod for
+            # local debugging / the `linstor` CLI during development.
             - --rest-bind-address=:3370
+            # Mutual-TLS listener. The ONLY port the Service exposes.
+            # Requires + verifies client certs against the mounted CA;
+            # hot-reloads cert/key/CA on cert-manager rotation without a
+            # restart (no reloader.stakater.com).
+            - --tls-bind-address=:3371
+            - --tls-cert-file=/etc/blockstor/tls/tls.crt
+            - --tls-key-file=/etc/blockstor/tls/tls.key
+            - --tls-client-ca-file=/etc/blockstor/tls/ca.crt
             - --health-probe-bind-address=:8081
             - --metrics-bind-address=0
           env:
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
           ports:
-            - {name: rest, containerPort: 3370}
+            # rest-tls is the in-cluster endpoint (Service-exposed).
+            - {name: rest-tls, containerPort: 3371}
+            # rest-debug stays pod-local (port-forward only).
+            - {name: rest-debug, containerPort: 3370}
             - {name: health, containerPort: 8081}
+          volumeMounts:
+            # cert-manager-issued serving material (tls.crt/tls.key/
+            # ca.crt). The apiserver re-reads all three on rotation via
+            # an fsnotify watch on this dir — no pod restart needed.
+            - name: api-tls
+              mountPath: /etc/blockstor/tls
+              readOnly: true
           # Bug 218: probes hit the controller-runtime manager's
           # /healthz and /readyz endpoints on the named `health`
           # port. tcpSocket on the REST port (3370) marked the pod
@@ -120,13 +141,18 @@ spec:
           resources:
             requests: {cpu: 50m, memory: 128Mi}
             limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: api-tls
+          secret:
+            secretName: blockstor-apiserver-server-tls
 ---
-# Re-point the existing blockstor-controller Service so callers
-# of the merged REST endpoint (linstor-csi, piraeus-operator, the
-# `linstor` CLI) keep working — they hit the apiserver pods
-# instead of the controller. The :7000 satellite-grpc port stays
-# on the controller (retired in Phase 10.6 but the port name is
-# retained for compatibility).
+# In-cluster Service for the apiserver. mTLS-only: it exposes ONLY
+# the TLS port (3371). The plain-HTTP debug port (3370) is
+# deliberately NOT listed here — it stays reachable only via
+# `kubectl port-forward` to a pod, so nothing on the network can
+# talk plaintext to the apiserver. Clients dial
+# https://blockstor-apiserver.blockstor-system.svc:3371 presenting a
+# client cert (see blockstor-apiserver-tls.yaml).
 apiVersion: v1
 kind: Service
 metadata:
@@ -135,4 +161,4 @@ metadata:
 spec:
   selector: {app: blockstor-apiserver}
   ports:
-    - {name: rest, port: 3370, targetPort: 3370}
+    - {name: rest-tls, port: 3371, targetPort: 3371}

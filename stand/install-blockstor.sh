@@ -76,6 +76,20 @@ echo ">> using host registry at $REGISTRY"
 echo ">> apply CRDs"
 kubectl apply -f "$REPO_ROOT/config/crd/bases/" 2>&1 | tail -5
 
+# cert-manager is required for the apiserver's mTLS PKI (Issuer +
+# Certificates in blockstor-apiserver-tls.yaml). piraeus-operator v2
+# already pulls it in on this stand, so in the normal `make piraeus`
+# → `make blockstor` flow it is present. Install it on demand if a
+# bare cluster runs blockstor without piraeus first.
+CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION:-v1.16.2}
+if ! kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    echo ">> cert-manager not found; installing $CERT_MANAGER_VERSION"
+    kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+    kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
+else
+    echo ">> cert-manager already present"
+fi
+
 # Bootstrap blockstor Node CRDs from k8s worker nodes so the
 # satellite reconciler's peer-resolution path has an address per
 # node — otherwise multi-replica .res files render a 0.0.0.0
@@ -104,6 +118,18 @@ done
 
 echo ">> apply controller + RBAC"
 render "$REPO_ROOT/stand/blockstor-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5
+
+# Apply the cert-manager PKI BEFORE the apiserver Deployment so the
+# server cert Secret (blockstor-apiserver-server-tls) exists by the
+# time the apiserver pod tries to mount it. cert-manager itself is a
+# stand prerequisite (install the cert-manager release before
+# install-blockstor.sh, same as piraeus-operator expects it present).
+echo ">> apply apiserver mTLS PKI (cert-manager Issuer + Certificates)"
+kubectl apply -f "$REPO_ROOT/stand/blockstor-apiserver-tls.yaml" 2>&1 | tail -5
+echo ">> wait for apiserver server + client certs to be issued"
+kubectl -n blockstor-system wait --for=condition=Ready \
+    certificate/blockstor-apiserver-server certificate/blockstor-apiserver-client \
+    --timeout=120s
 
 echo ">> apply apiserver + RBAC"
 render "$REPO_ROOT/stand/blockstor-apiserver-deploy.yaml" | kubectl apply -f - 2>&1 | tail -5

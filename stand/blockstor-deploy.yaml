@@ -106,13 +106,15 @@ metadata:
   name: blockstor-controller
   namespace: blockstor-system
 spec:
-  # Selector points at the apiserver pods so existing callers of
-  # `blockstor-controller:3370` (linstor-csi, piraeus-operator, the
-  # `linstor` CLI port-forward in tests/e2e) keep working without
-  # any URL change. The controller Deployment itself no longer
-  # serves :3370. The :7000 grpc port is legacy (Phase 10.6
-  # retired the gRPC contract); kept on the Service for now since
-  # any stale client hitting it gets a clean connection-refused.
+  # Selector points at the apiserver pods so existing callers of the
+  # `blockstor-controller` Service name (linstor-csi, piraeus-operator,
+  # the `linstor` CLI) keep resolving without a rename. mTLS-only: the
+  # Service now exposes ONLY the TLS port (3371). The plain-HTTP debug
+  # port (3370) is intentionally NOT listed — plaintext is reachable
+  # only via `kubectl port-forward` to a pod. Clients must dial
+  # https://blockstor-controller.blockstor-system.svc:3371 presenting a
+  # client cert (the serving cert SANs cover this name too — see
+  # blockstor-apiserver-tls.yaml).
   selector: {app: blockstor-apiserver}
   ports:
-    - {name: rest, port: 3370, targetPort: 3370}
+    - {name: rest-tls, port: 3371, targetPort: 3371}
