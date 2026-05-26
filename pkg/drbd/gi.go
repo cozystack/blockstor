@@ -56,14 +56,22 @@ var ErrGIUpToDateNotConsistent = errors.New("invalid GI seed: up-to-date set wit
 // Why a typed seed (not a bare string): reaching the initial UpToDate
 // state by writing GI metadata directly (instead of force-promoting)
 // needs two shapes that differ only in the flags — the elected winner
-// (current = bitmap = day0 + Consistent + UpToDate, so it is UpToDate
-// from metadata alone) and the all-day0 skip-init-sync replica
-// (current = bitmap = day0, no flags, reaches UpToDate at the peer
-// handshake). Encoding each as a GISeed keeps the field semantics and
-// the "uptodate requires a current-UUID" invariant in one place. The
-// struct still supports a distinct current vs bitmap-base (e.g. for a
-// controller-supplied SeedFromGI) even though the day0 paths set them
-// equal.
+// (current = day0, bitmap-base EMPTY, + Consistent + UpToDate, so it is
+// UpToDate from metadata alone) and the skip-init-sync replica
+// (current = day0, bitmap-base EMPTY, no flags, reaches UpToDate at the
+// peer handshake). Encoding each as a GISeed keeps the field semantics
+// and the "uptodate requires a current-UUID" invariant in one place.
+//
+// The decisive field is BitmapBase: it is left EMPTY (drbdmeta writes
+// bitmap-uuid 0x0) in both seed shapes. This was verified by capturing
+// a working upstream LINSTOR (piraeus) thin resource's live
+// `drbdmeta dump-md`: every per-peer slot carried bitmap-uuid 0x0, and
+// the resource reached UpToDate with ZERO resync. A non-zero
+// bitmap-base (e.g. day0) is read by DRBD's handshake as a live
+// out-of-sync bitmap anchor and triggers a full SyncTarget — the bug a
+// previous iteration shipped. The struct still supports a distinct
+// non-empty BitmapBase for callers that need it, but the day0 seed
+// paths deliberately leave it empty.
 type GISeed struct {
 	// Current is the current-UUID hex token. Empty = field omitted.
 	Current string
@@ -125,16 +133,19 @@ func (s GISeed) Validate() error {
 // up-to-date without consistent (Validate enforces this), so the
 // pair is always emitted together.
 //
-// Examples:
+// Examples (the day0 seed paths leave bitmap-base EMPTY → index 1 is
+// the literal "0" = bitmap-uuid 0x0, matching upstream's working-skip
+// metadata):
 //
-//   - all-day0 skip-init-sync slot:  "<day0>:<day0>:0:0"
-//   - winner slot (UpToDate):        "<day0>:<day0>:0:0:1:1"
+//   - skip-init-sync slot:           "<day0>:0:0:0"
+//   - winner slot (UpToDate):        "<day0>:0:0:0:1:1"
 //   - empty-current slot (unused):   "0:<base>:0:0"
 //
 // The empty-current/empty-base case emits a literal "0" (drbdmeta
 // reads it as "no UUID") rather than a bare empty token, which the
-// positional parser would mis-align. The day0 base in index 1 is
-// what carries the lineage for the winner's peer slots.
+// positional parser would mis-align. A zero bitmap-base (index 1) is
+// what DRBD's handshake reads as "no out-of-sync bits relative to this
+// peer", so a fresh thin replica reaches UpToDate with no resync.
 //
 // String assumes Validate has already passed; callers in the seed
 // path Validate first and surface the error.
@@ -170,9 +181,12 @@ func (s GISeed) String() string {
 // Day0GIFor derives the deterministic per-RD, per-volume "day 0" DRBD
 // generation identifier. Same RD name + volume number always yields
 // the same value on every node and across time, so every replica
-// converges on identical bitmap-base (and, in the skip-init-sync
-// case, current) UUIDs without a shared random seed — DRBD's GI
-// handshake then matches and skips the full initial sync.
+// converges on an identical CURRENT-UUID without needing a shared
+// random seed — DRBD's GI handshake then sees both replicas at the
+// same generation and, with a clean (zero) per-peer bitmap, skips the
+// full initial sync. (The per-peer bitmap-base is left EMPTY, not set
+// to day0 — see GISeed; upstream LINSTOR's working-skip metadata
+// carries a shared current-UUID with bitmap-uuid 0x0 in every slot.)
 //
 // Single source of truth: the satellite stamps this value into fresh
 // metadata, and BOTH the dispatcher and controller seed-safety gates

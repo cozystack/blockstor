@@ -1640,16 +1640,24 @@ func TestApplyLUKSConvergeNoOpWhenMapperMatches(t *testing.T) {
 // no filesystem (no `FileSystem/Type`), the satellite must:
 //
 //   - stamp every node-id slot with the SAME uniform GI tuple: a
-//     Consistent + UpToDate seed whose bitmap-base is the day0 GID and
-//     whose current-UUID is a fresh random GID distinct from day0
-//     (`<rand>:<day0>:0:0:1:1` — positional consistent+uptodate). The
-//     current-UUID and flags are device-level (shared) in v09, so the
-//     uniform stamp leaves the device with the intended shared
-//     current+flags and every peer slot's bitmap-base = day0;
+//     Consistent + UpToDate seed whose current-UUID is the day0 GID and
+//     whose bitmap-base is EMPTY (`<day0>:0:0:0:1:1` — positional
+//     consistent+uptodate, index-1 bitmap-base = literal "0" =
+//     bitmap-uuid 0x0). The current-UUID and flags are device-level
+//     (shared) in v09, so the uniform stamp leaves the device with the
+//     intended shared current+flags and every peer slot's bitmap-uuid
+//     = 0x0 — matching upstream LINSTOR's working-skip metadata
+//     (captured live via `drbdmeta dump-md`);
 //   - run NO `drbdadm primary --force` and NO `drbdadm secondary` —
 //     the old promote-to-UpToDate is exactly the bug (it minted a
 //     divergent current-UUID and forced a full initial sync of empty
 //     thin volumes).
+//
+// The EMPTY bitmap-base is the load-bearing field: a previous iteration
+// stamped bitmap-base = day0 (non-zero) into every slot, which DRBD
+// read as a live out-of-sync anchor and SyncTargeted a full ~1 GiB
+// resync of an empty thin volume. Upstream's metadata carries
+// bitmap-uuid 0x0 in every slot and skips on the same kernel.
 //
 // On subsequent reconciles (firstActivation=false) the seed must NOT
 // fire again.
@@ -1712,7 +1720,7 @@ func TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI(t *testing.T) {
 	}
 
 	// Local slot (node-id 0) must carry the Consistent+UpToDate winner
-	// seed: current=<random> distinct from day0, bitmap-base=day0.
+	// seed: current=day0, bitmap-base EMPTY (positional "0").
 	var localSlot string
 	for _, line := range first {
 		if strings.Contains(line, "set-gi --node-id 0 ") {
@@ -1740,28 +1748,31 @@ func TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI(t *testing.T) {
 		t.Errorf("winner local slot must be Consistent(idx4=1)+UpToDate(idx5=1); got %q", gi)
 	}
 
-	// Winner current-UUID is day0 (the shared lineage anchor), NOT a
-	// fresh random GID — so a staggered late replica seeing this
-	// winner's CurrentGI==day0 recognises it as a day0 sibling and may
-	// also skip the initial sync (and a dual-winner race agrees rather
-	// than split-brains). The Consistent+UpToDate flags are what make
-	// it UpToDate, not a distinct current.
+	// Winner current-UUID is day0 (the shared lineage anchor) — so a
+	// staggered late replica seeing this winner's CurrentGI==day0
+	// recognises it as a day0 sibling and may also skip the initial
+	// sync (and a dual-winner race agrees rather than split-brains).
 	if current != day0 {
 		t.Errorf("winner current-UUID must equal day0 (shared lineage); got current=%s day0=%s", current, day0)
 	}
 
-	if base != day0 {
-		t.Errorf("winner bitmap-base must equal day0; got base=%s day0=%s", base, day0)
+	// Winner bitmap-base must be EMPTY (positional "0" = bitmap-uuid
+	// 0x0). This is the load-bearing field: it matches upstream
+	// LINSTOR's working-skip metadata so DRBD reads a clean bitmap and
+	// skips the resync. A non-zero base (e.g. day0) triggered a full
+	// SyncTarget — the bug.
+	if base != "0" {
+		t.Errorf("winner bitmap-base must be empty (positional 0 = bitmap-uuid 0x0); got base=%s", base)
 	}
 
 	// Every slot gets the SAME uniform GI string. The current-UUID and
 	// the consistent/up-to-date flags are device-level (shared) in v09
 	// metadata, so stamping them identically on every node-id is what
 	// leaves the device with the intended shared current+flags; the
-	// per-peer bitmap-base (day0) is also identical. A peer slot
-	// (node-id 1) therefore carries the exact same tuple as the local
-	// slot — its bitmap-base is day0, which is the lineage anchor that
-	// makes the peer skip the sync.
+	// per-peer bitmap-uuid (0x0, from the empty bitmap-base) is also
+	// identical. A peer slot (node-id 1) therefore carries the exact
+	// same tuple as the local slot — its bitmap-uuid is 0x0, the clean
+	// bitmap that makes the peer skip the sync.
 	wantGI := gi // the local-slot GI tuple extracted above
 	var peerSlot string
 	for _, line := range first {
@@ -1775,7 +1786,7 @@ func TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI(t *testing.T) {
 	}
 
 	if !strings.HasSuffix(peerSlot, " "+wantGI) {
-		t.Errorf("winner peer slot must carry the same uniform GI %q (day0 bitmap-base); got %q", wantGI, peerSlot)
+		t.Errorf("winner peer slot must carry the same uniform GI %q (empty bitmap-base → bitmap-uuid 0x0); got %q", wantGI, peerSlot)
 	}
 
 	// Second Apply: .res persists → firstActivation=false → seed
@@ -1875,8 +1886,8 @@ func TestApplyAutoPrimaryWinnerSeedsUpToDateOnThickLVM(t *testing.T) {
 		t.Errorf("thick winner current-UUID must be day0 (shared lineage); got %s want %s", parts[0], day0)
 	}
 
-	if parts[1] != day0 {
-		t.Errorf("thick winner bitmap-base must be day0; got %s want %s", parts[1], day0)
+	if parts[1] != "0" {
+		t.Errorf("thick winner bitmap-base must be empty (positional 0 = bitmap-uuid 0x0); got %s", parts[1])
 	}
 }
 
@@ -3267,16 +3278,18 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 					createMD, setGI, adjust, calls)
 			}
 
-			// Pin the exact day0 GI shape: same current_uuid in BOTH
-			// current_uuid and bitmap_uuid slots, history zeroed,
-			// stamped via `set-gi --node-id <peer>` (DRBD 9.2+
-			// per-peer slot layout). The satellite derives day0
+			// Pin the exact day0 GI shape: current_uuid = day0,
+			// bitmap_uuid EMPTY (positional "0" = bitmap-uuid 0x0),
+			// history zeroed, stamped via `set-gi --node-id <peer>`
+			// (DRBD 9.2+ per-peer slot layout). The empty bitmap-base
+			// matches upstream LINSTOR's working-skip metadata (every
+			// per-peer bitmap-uuid 0x0). The satellite derives day0
 			// deterministically from RD name + volume number — keep
 			// the expected value in sync with
 			// pkg/satellite/providerkind.go's day0GiFor().
 			day0 := satellite.Day0GiForTest("pvc-zskip", 0)
-			wantSetGI := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:%s:0:0",
-				tc.wantDevice, day0, day0)
+			wantSetGI := fmt.Sprintf("drbdmeta --force pvc-zskip/0 v09 %s internal set-gi --node-id 1 %s:0:0:0",
+				tc.wantDevice, day0)
 			if !slices.Contains(calls, wantSetGI) {
 				t.Errorf("missing exact day0 set-gi command %q in calls: %v", wantSetGI, calls)
 			}
@@ -3354,8 +3367,8 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	// emitted call sequence MUST follow GetPeers() iteration
 	// (n2 → n3) so both satellites visit slots in the same order
 	// (eliminates an FS-write ordering source of divergence).
-	wantN2 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:%s:0:0", day0, day0)
-	wantN3 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:%s:0:0", day0, day0)
+	wantN2 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 1 %s:0:0:0", day0)
+	wantN3 := fmt.Sprintf("drbdmeta --force pvc-race/0 v09 /dev/vg/pvc-race_00000 internal set-gi --node-id 2 %s:0:0:0", day0)
 
 	if !slices.Contains(calls, wantN2) {
 		t.Errorf("missing per-peer set-gi for n2 (node-id 1): want %q in calls: %v", wantN2, calls)
@@ -3461,11 +3474,12 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	day0 := satellite.Day0GiForTest("pvc-blanket", 0)
 
 	// Every slot 0..NodeIDMax must have been stamped with the
-	// identical day0 tuple — including slot 2 (n3, whose node-id was
-	// NOT allocated) and slots 16..31 that no peer occupies.
+	// identical day0 tuple (current=day0, bitmap-base EMPTY → "0") —
+	// including slot 2 (n3, whose node-id was NOT allocated) and slots
+	// 16..31 that no peer occupies.
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:%s:0:0",
-			nodeID, day0, day0)
+		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0",
+			nodeID, day0)
 		if !slices.Contains(calls, want) {
 			t.Errorf("missing blanket set-gi for node-id %d: want %q in calls", nodeID, want)
 		}
@@ -3506,8 +3520,8 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	}
 
 	for nodeID := 0; nodeID <= drbd.NodeIDMax; nodeID++ {
-		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:%s:0:0",
-			nodeID, day0, day0)
+		want := fmt.Sprintf("drbdmeta --force pvc-blanket/0 v09 /dev/vg/pvc-blanket_00000 internal set-gi --node-id %d %s:0:0:0",
+			nodeID, day0)
 
 		idx := slices.Index(calls, want)
 		if idx < 0 {
@@ -3587,12 +3601,12 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	day0 := satellite.Day0GiForTest("pvc-b284", 0)
 
 	// The fix MUST emit `set-gi --node-id 0` (the local node-id)
-	// with the day0 tuple in both current/bitmap slots. Without
-	// this call the local current_uuid stays at the random value
-	// drbdadm create-md generated → permanent unrelated-data on
+	// with the day0 tuple: current=day0, bitmap-base EMPTY ("0").
+	// Without this call the local current_uuid stays at the random
+	// value drbdadm create-md generated → permanent unrelated-data on
 	// every future handshake against a later-joining peer.
-	wantLocal := fmt.Sprintf("drbdmeta --force pvc-b284/0 v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:%s:0:0",
-		day0, day0)
+	wantLocal := fmt.Sprintf("drbdmeta --force pvc-b284/0 v09 /dev/vg/pvc-b284_00000 internal set-gi --node-id 0 %s:0:0:0",
+		day0)
 	if !slices.Contains(calls, wantLocal) {
 		t.Errorf("missing local-slot set-gi (Bug 284 fix): want %q in calls: %v", wantLocal, calls)
 	}
