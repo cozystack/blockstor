@@ -136,8 +136,33 @@ log "building images"
 make build-images
 
 # ── 4. provision the Talos+QEMU cluster ─────────────────────────────
-log "provisioning cluster (workers=$CI_WORKERS, extra-disks=$EXTRA_DISKS x ${EXTRA_DISK_SIZE_MB}MB)"
-make up NAME="$STAND" WORKERS="$CI_WORKERS"
+# `make up` occasionally hands back a dead cluster — 0 nodes ever reach
+# Ready — on a contended oracle runner: with 8 lanes each booting a
+# 4-node Talos+QEMU cluster at once, the qemu provisioner / Talos
+# bootstrap can lose a transient race (observed: one lane wedged at
+# "FATAL: stand not ready nodes=0" while the other 7 came up clean). That
+# is a provisioning flake, not a product fault, so give it one clean
+# retry (down + up) before handing the cluster to the scenarios. Expect
+# CI_WORKERS workers + 1 controlplane = CI_WORKERS+1 nodes Ready.
+provision_cluster() {
+    local kc=".work/$STAND/kubeconfig" want=$(( CI_WORKERS + 1 )) attempt ready deadline
+    for attempt in 1 2; do
+        log "provisioning cluster attempt $attempt (workers=$CI_WORKERS, extra-disks=$EXTRA_DISKS x ${EXTRA_DISK_SIZE_MB}MB)"
+        make up NAME="$STAND" WORKERS="$CI_WORKERS" || true
+        deadline=$(( $(date +%s) + 180 ))
+        while (( $(date +%s) < deadline )); do
+            ready=$(KUBECONFIG="$kc" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
+            [ "${ready:-0}" -ge "$want" ] && { log "cluster ready: $ready/$want nodes Ready"; return 0; }
+            sleep 5
+        done
+        ready=$(KUBECONFIG="$kc" kubectl get nodes --no-headers 2>/dev/null | awk '$2=="Ready"' | wc -l)
+        log "cluster NOT ready after attempt $attempt ($ready/$want nodes Ready) — tearing down for retry"
+        make down NAME="$STAND" >/dev/null 2>&1 || true
+    done
+    echo "::error::cluster $STAND failed to provision ($want nodes never Ready) after 2 attempts" >&2
+    exit 1
+}
+provision_cluster
 
 # ── 5. deploy blockstor + storage pools ─────────────────────────────
 log "installing blockstor"
