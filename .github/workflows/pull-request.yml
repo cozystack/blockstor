@@ -230,6 +230,13 @@ jobs:
       # zero workflow edits. Add runners by bumping matrix.lane + LANES
       # together (e.g. 6 lanes ≈ the dev-stand-proven ~6 scenarios/lane).
       LANES: 6
+      # Scenarios that require the upstream piraeus stack (the LinstorCluster
+      # CRD + linstor-csi NFS-ganesha) are excluded from the blockstor-only
+      # matrix clusters — there piraeus is absent and, now that their
+      # silent-skip guards are gone, they would hard-fail. They run in the
+      # dedicated `e2e-piraeus` job below, which installs piraeus alongside
+      # blockstor. ci-e2e.sh drops these from the discovered suite.
+      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation"
     permissions:
       contents: read
       checks: write
@@ -309,3 +316,86 @@ jobs:
 
             Resume from inside: `breakpoint resume`. Otherwise the breakpoint
             exits 10 minutes after the last SSH session disconnects.
+
+  e2e-piraeus:
+    name: E2E (piraeus interop)
+    # The piraeus-dependent scenarios (rwx-ganesha, observability-three-way,
+    # observability-capacity-correlation) exercise the RWX / linstor-csi
+    # NFS-ganesha + LinstorCluster-CRD surface that only the upstream piraeus
+    # stack provides. They are excluded from the blockstor-only `e2e` matrix
+    # (see E2E_EXCLUDE) and run here on a single cluster that has piraeus
+    # installed alongside blockstor (INSTALL_PIRAEUS=1 → ci-e2e.sh runs
+    # `make piraeus`). blockstor coexists with piraeus's satellite by design
+    # (shared file-thin pool + host /etc/drbd.d, Bugs 305/310/359).
+    #
+    # `needs: e2e` runs this AFTER the 6-lane matrix releases its runners, so
+    # the oracle pool is never asked for a 7th simultaneous cluster (the
+    # over-subscription that killed lanes 7/8 at 8 lanes). `!cancelled()` lets
+    # it run for visibility even if a matrix lane went red.
+    runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
+    needs: [detect-changes, lint, unit-test, e2e]
+    if: ${{ !cancelled() && needs.detect-changes.outputs.code == 'true' && needs.lint.result == 'success' && needs.unit-test.result == 'success' }}
+    timeout-minutes: 150
+    env:
+      INSTALL_PIRAEUS: "1"
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify KVM is available
+        run: |
+          test -e /dev/kvm || { echo "::error::/dev/kvm missing — this runner lacks (nested) virtualization"; exit 1; }
+          ls -l /dev/kvm
+
+      - name: Run piraeus-interop e2e
+        # LANE=1 LANES=1 → the single lane runs every listed scenario;
+        # ci-e2e.sh honours INSTALL_PIRAEUS=1 (job env) to deploy piraeus
+        # after blockstor so these scenarios have the stack they drive.
+        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation"
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-logs-piraeus
+          path: |
+            /tmp/e2e-ci-lane1.results
+            /tmp/e2e-ci-lane1-*.log
+          if-no-files-found: ignore
+
+      - name: Breakpoint on piraeus-interop failure
+        if: |
+          failure() &&
+          vars.BREAKPOINT_ENDPOINT != ''
+        uses: cozystack/breakpoint-action@a6f3a6f87be398ad63b6577351e3398e53f578e4
+        with:
+          mode: pause-idle
+          endpoint: ${{ vars.BREAKPOINT_ENDPOINT }}
+          authorized-users: androndo, Arsolitt, IvanHunters, kvaps, lexfrei, lllamnyp, mattia-eleuteri, matthieu-robin, myasnikovdaniil, sircthulhu, tym83
+          check-run-name: "Breakpoint Open (piraeus)"
+          github-token: ${{ github.token }}
+          check-run-summary-template: |
+            ## 🔴 SSH breakpoint open (piraeus interop) — paused for debug
+
+            ```
+            {endpoint}
+            ```
+
+            ```
+            cd ~/_work/blockstor/blockstor
+            cat /tmp/e2e-ci-lane1.results
+            export KUBECONFIG=$PWD/.work/ci-lane1/kubeconfig
+            kubectl get pods -A; kubectl get rd,resources -A
+            ```
+
+            Resume from inside: `breakpoint resume`.
