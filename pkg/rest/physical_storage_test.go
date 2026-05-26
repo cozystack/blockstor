@@ -790,10 +790,10 @@ func TestPhysicalStorageListWireShapeMatchesUpstreamLINSTOR(t *testing.T) {
 		t.Fatalf("nodes.n1[0]: got %T, want map[string]any", devsRaw[0])
 	}
 
-	// Upstream PhysicalStorageDevice shape — four NON_EMPTY keys.
-	// `device` / `model` / `serial` / `wwn` are exact upstream
-	// names; the python CLI's storpool_cmds.py parses them by
-	// literal key lookup.
+	// Upstream PhysicalStorageDevice shape. `device` / `model` /
+	// `serial` / `wwn` are the string-valued upstream names; the
+	// python CLI's physical_storage_cmds.py parses them by literal
+	// key lookup.
 	wantDev := map[string]string{
 		"device": "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4",
 		"model":  "Samsung SSD 980 PRO",
@@ -807,11 +807,28 @@ func TestPhysicalStorageListWireShapeMatchesUpstreamLINSTOR(t *testing.T) {
 		}
 	}
 
+	// `size` is REQUIRED on every device entry — and this is the pin
+	// the earlier version of this test got wrong. The python-linstor
+	// CLI's responses.py PhysicalStorageDevice.size returns
+	// self._rest_data["size"] with a bare dict lookup, so a device
+	// entry without `size` raises `KeyError: 'size'` and crashes
+	// `linstor physical-storage list` the instant the list is
+	// non-empty. The previous assertion declared the device carried
+	// ONLY device/model/serial/wwn and would have REJECTED a correct,
+	// size-bearing entry — it pinned the broken shape. The empty-list
+	// smoke in client-compat.sh (A.7) never dereferenced size, so
+	// neither layer caught the crash. The key is emitted without
+	// omitempty so a zero-size device still ships it rather than
+	// tripping the same KeyError.
+	if size, ok := dev["size"].(float64); !ok || int64(size) != 1_000_204_886_016 {
+		t.Errorf("device.size: got %v (%T), want 1000204886016 (float64) — missing/zero size crashes `linstor ps l` with KeyError: 'size'", dev["size"], dev["size"])
+	}
+
 	for k := range dev {
 		switch k {
-		case "device", "model", "serial", "wwn":
+		case "device", "size", "model", "serial", "wwn":
 		default:
-			t.Errorf("unexpected device key %q (drift from upstream PhysicalStorageDevice shape: only device/model/serial/wwn allowed)", k)
+			t.Errorf("unexpected device key %q (drift from upstream PhysicalStorageDevice shape: only device/size/model/serial/wwn allowed)", k)
 		}
 	}
 }
