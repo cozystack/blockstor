@@ -201,19 +201,26 @@ jobs:
     runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
-    # Whole tests/e2e suite (~59) sharded over LANES; at 8 lanes that's
-    # ~7-8 scenarios/runner plus build+provision. 8 lanes (≈ the dev-stand-
-    # proven ~6-8 scenarios/cluster density) keeps any single ephemeral
-    # cluster from accumulating enough DRBD-destructive residue to wedge
-    # late scenarios — at 4 lanes the round-robin packed several
-    # recovery-* / snapshot scenarios onto one cluster (~15 each), and the
-    # last one or two timed out with replicas stuck non-UpToDate. Capped
-    # near GitHub's 360-min max.
+    # Whole tests/e2e suite (~59) sharded over LANES; at 6 lanes that's
+    # ~10 scenarios/runner plus build+provision. Lane count is a balance
+    # between two opposite failure modes:
+    #   - TOO FEW lanes (4) packs the heavy DRBD-destructive scenarios
+    #     (~15/cluster) onto one ephemeral cluster, which accumulates
+    #     enough residue to wedge its last scenarios (replicas stuck
+    #     non-UpToDate);
+    #   - TOO MANY lanes (8) over-subscribes the oracle runner POOL —
+    #     booting 8 four-node Talos+QEMU clusters at once starves the
+    #     late-scheduled runners for CPU/memory, so lanes 7/8 repeatedly
+    #     died on infra ("N nodes never Ready", and "runner lost
+    #     communication with the server"), not on product faults.
+    # 6 lanes scatters the heavy scenarios across distinct fresh clusters
+    # (round-robin i%6) while keeping the simultaneous-cluster load the
+    # pool can actually sustain. Capped near GitHub's 360-min max.
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        lane: [1, 2, 3, 4, 5, 6, 7, 8]
+        lane: [1, 2, 3, 4, 5, 6]
     env:
       # Number of parallel lanes = number of runners (matrix.lane above).
       # This is a capacity/cost knob ONLY, not a coverage knob: no
@@ -222,7 +229,7 @@ jobs:
       # across LANES, so a newly-added test file runs automatically with
       # zero workflow edits. Add runners by bumping matrix.lane + LANES
       # together (e.g. 6 lanes ≈ the dev-stand-proven ~6 scenarios/lane).
-      LANES: 8
+      LANES: 6
     permissions:
       contents: read
       checks: write
