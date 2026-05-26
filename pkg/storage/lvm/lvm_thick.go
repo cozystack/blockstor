@@ -58,13 +58,16 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
+	// Skip the optional zero-on-create step (-Wn -Zn) — the satellite
+	// container has no udev daemon, and the wipe trips on the missing
+	// /dev/<vg>/<lv> symlink. Same trick as install-pools.sh. Bug 305:
+	// the udev-less activation section rides in the SAME single
+	// `--config` as the device filter (ArgsUdevless) — a separate
+	// `--config activation{…}` would be a repeated `--config`, which
+	// the LVM CLI rejects.
 	_, err := t.exec.Run(ctx, "lvcreate",
-		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", volumeLVName(vol),
-			// Skip the optional zero-on-create step — the satellite
-			// container has no udev daemon, and the wipe trips on the
-			// missing /dev/<vg>/<lv> symlink. Same trick as install-pools.sh.
-			"--config", "activation{udev_sync=0 udev_rules=0}",
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
 	if err != nil {
@@ -79,12 +82,17 @@ func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // has no udev daemon so `activation{udev_sync=0 udev_rules=0}` keeps
 // `lvextend` from blocking on a sync that never completes (see
 // Thin.ResizeVolume doc for the @drbd_ru repro chain).
+//
+// Bug 305 (P1): the udev-less activation section MUST share the same
+// single `--config` as the device filter — ArgsUdevless merges both.
+// A separate `--config activation{…}` produced a repeated `--config`,
+// which the LVM CLI rejects ("Option --config may not be repeated."),
+// so lvextend never ran and the resize hot-looped forever.
 func (t *Thick) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
-		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-			"--config", "activation{udev_sync=0 udev_rules=0}",
+		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))
@@ -287,12 +295,12 @@ func (t *Thick) RestoreVolumeFromSnapshot(ctx context.Context, target storage.Vo
 	// in the same LVM transaction that allocates the LV, so a crash
 	// BEFORE dd cannot leave an un-tagged LV that would be mis-trusted
 	// on the next reconcile.
+	// Same udev-less satellite workaround as CreateVolume; Bug 305:
+	// ArgsUdevless folds it into the single device-filter `--config`.
 	_, err = t.exec.Run(ctx, "lvcreate",
-		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
+		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			"--name", tgtName,
 			"--addtag", RestoreIncompleteTag,
-			// Same udev-less satellite workaround as CreateVolume.
-			"--config", "activation{udev_sync=0 udev_rules=0}",
 			"-Wn", "-Zn",
 			t.cfg.VolumeGroup)...)
 	if err != nil {

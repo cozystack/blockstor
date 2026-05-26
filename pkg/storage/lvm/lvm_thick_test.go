@@ -55,7 +55,9 @@ func TestThickCreateVolumeIssuesLvcreate(t *testing.T) {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 
-	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 1024MiB --name pvc-1_00000 --config activation{udev_sync=0 udev_rules=0} -Wn -Zn vg"
+	// Bug 305: device filter + udev-less activation ride in ONE
+	// `--config` string (LVM rejects a repeated `--config`).
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 1024MiB --name pvc-1_00000 -Wn -Zn vg"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
 	}
@@ -99,7 +101,9 @@ func TestThickResizeVolumeIssuesLvextend(t *testing.T) {
 		t.Fatalf("ResizeVolume: %v", err)
 	}
 
-	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --size 2048MiB --config activation{udev_sync=0 udev_rules=0} vg/pvc-1_00000"
+	// Bug 305: single `--config` carrying both the device filter and
+	// the udev-less activation section.
+	want := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-1_00000"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q; got %v", want, fx.CommandLines())
 	}

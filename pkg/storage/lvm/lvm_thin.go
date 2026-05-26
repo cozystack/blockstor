@@ -102,12 +102,17 @@ func (t *Thin) CreateVolume(ctx context.Context, vol storage.Volume) error {
 // post-resize `/dev/<vg>/<lv>` symlink races the next reconcile's
 // `blockdev --getsize64`, leaving the volume stuck in `Resizing`
 // state until the operator runs `vgmknodes` + restarts satellite.
+//
+// Bug 305 (P1): the udev-less activation section MUST share the same
+// single `--config` as the device filter — ArgsUdevless merges both.
+// A separate `--config activation{…}` produced a repeated `--config`,
+// which the LVM CLI rejects ("Option --config may not be repeated."),
+// so lvextend never ran and the resize hot-looped forever.
 func (t *Thin) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 	sizeMiB := max(vol.SizeKib/mibPerKib, 1)
 
 	_, err := t.exec.Run(ctx, "lvextend",
-		Args("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
-			"--config", "activation{udev_sync=0 udev_rules=0}",
+		ArgsUdevless("--size", strconv.FormatInt(sizeMiB, 10)+"MiB",
 			t.cfg.VolumeGroup+"/"+volumeLVName(vol))...)
 	if err != nil {
 		return errors.Wrapf(err, "lvextend %s", volumeLVName(vol))

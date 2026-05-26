@@ -81,6 +81,23 @@ const (
 // `Args(...)` helper enforces this.
 const ConfigFilter = `devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] }`
 
+// activationUdevless is the udev-less activation section appended to
+// the SAME `--config` string the device filter lives in, for write
+// commands that materialise a `/dev/<vg>/<lv>` node (lvcreate,
+// lvextend). The satellite container has no udev daemon; without
+// `udev_sync=0 udev_rules=0` an lvcreate/lvextend blocks waiting for a
+// udev cookie that never arrives, then races the node symlink the next
+// reconcile dereferences (Bug 269, P1, @drbd_ru #17589/#13568).
+//
+// Bug 305 (P1, this fix): the LVM CLI rejects a repeated `--config`
+// ("Option --config may not be repeated."). Passing the device filter
+// via Args(...) AND a second `--config activation{…}` at the call site
+// produced TWO `--config` flags, so lvextend never ran — every resize
+// hot-looped and the LV / DRBD device stayed at the old size while the
+// API/CRD already reported the new one. A single `--config` accepts
+// multiple top-level sections, so we merge both into one string.
+const activationUdevless = `activation { udev_sync=0 udev_rules=0 }`
+
 // Args prepends the inline config filter onto the caller's
 // argument list. Use this as the variadic args sent to
 // `Exec.Run("lvs", lvm.Args(extra...)...)`. Centralising the
@@ -89,6 +106,20 @@ const ConfigFilter = `devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] }`
 func Args(extra ...string) []string {
 	out := make([]string, 0, 2+len(extra))
 	out = append(out, "--config", ConfigFilter)
+	out = append(out, extra...)
+
+	return out
+}
+
+// ArgsUdevless is Args for write commands (lvcreate, lvextend) that
+// must run with the udev-less activation workaround. It emits exactly
+// ONE `--config` whose value carries BOTH the device filter and the
+// `activation { udev_sync=0 udev_rules=0 }` section. The LVM CLI
+// forbids a repeated `--config`, so callers MUST NOT add their own
+// second `--config activation{…}` on top of this (Bug 305).
+func ArgsUdevless(extra ...string) []string {
+	out := make([]string, 0, 2+len(extra))
+	out = append(out, "--config", ConfigFilter+" "+activationUdevless)
 	out = append(out, extra...)
 
 	return out
