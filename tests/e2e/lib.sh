@@ -151,11 +151,43 @@ wait_uptodate() {
             return 0
         fi
 
+        # The CRD .status projection can lag tens of seconds behind the
+        # kernel after a satellite restart (e.g. when an RD is created
+        # right after rolling-upgrade), so status_disk_state briefly reads
+        # empty/stale while DRBD is already UpToDate. Accept kernel ground
+        # truth too: one `drbdsetup status --json` on the primary reports
+        # its own disk-state AND this peer's peer-disk-state. This only
+        # ADDS an accept path — a genuinely non-converged RD still shows
+        # non-UpToDate here, so real failures are not masked.
+        if [[ "$(kernel_pair_uptodate "$rd" "$primary" "$peer" "$vol")" == "ok" ]]; then
+            return 0
+        fi
+
         sleep 2
     done
 
     echo "FAIL: $rd vol $vol never reached UpToDate on both peers" >&2
+    echo "   last CRD diskState: $primary=$(status_disk_state "$rd" "$primary" "$vol") $peer=$(status_disk_state "$rd" "$peer" "$vol")" >&2
+    echo "   kernel status (from $primary):" >&2
+    on_node "$primary" drbdsetup status "$rd" --verbose >&2 2>/dev/null || true
     return 1
+}
+
+# kernel_pair_uptodate <rd> <primary> <peer> [vol] — kernel ground truth
+# for wait_uptodate: prints "ok" iff `primary`'s local disk-state AND the
+# `peer` connection's peer-disk-state are both UpToDate, read straight
+# from `drbdsetup status <rd> --json` on the primary. Empty/parse failure
+# (node unreachable, slot mid-negotiation) prints nothing → caller keeps
+# waiting. Independent of the controller's CRD .status projection.
+kernel_pair_uptodate() {
+    local rd=$1 primary=$2 peer=$3 vol=${4:-0}
+    on_node "$primary" drbdsetup status "$rd" --json 2>/dev/null | jq -r \
+        --arg peer "$peer" --argjson v "$vol" '
+        ([.[0].devices[]? | select(.volume==$v) | ."disk-state"] | first) as $loc
+        | ([.[0].connections[]? | select(.name==$peer) | .peer_devices[]?
+            | select(.volume==$v) | ."peer-disk-state"] | first) as $rem
+        | if ($loc=="UpToDate" and $rem=="UpToDate") then "ok" else "no" end' \
+        2>/dev/null || true
 }
 
 # status_connection_state <rd> <node> <peer> — full kernel connection
