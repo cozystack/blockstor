@@ -72,6 +72,10 @@ import (
 // budget and makes the test wiring (later) trivial.
 type apiserverFlags struct {
 	restAddr            string
+	tlsAddr             string
+	tlsCertFile         string
+	tlsKeyFile          string
+	tlsClientCAFile     string
 	metricsAddr         string
 	probeAddr           string
 	controllerNamespace string
@@ -81,7 +85,15 @@ func parseFlags() *apiserverFlags {
 	flags := &apiserverFlags{}
 
 	flag.StringVar(&flags.restAddr, "rest-bind-address", ":3370",
-		"The address the LINSTOR-compatible REST API binds to.")
+		"Plain-HTTP debug bind address. NOT exposed by the in-cluster Service — reachable only via `kubectl port-forward` for local debugging.")
+	flag.StringVar(&flags.tlsAddr, "tls-bind-address", ":3371",
+		"Mutual-TLS bind address (upstream LINSTOR HTTPS port). The in-cluster Service exposes ONLY this port. Requires --tls-cert-file/--tls-key-file/--tls-client-ca-file; empty disables the TLS listener.")
+	flag.StringVar(&flags.tlsCertFile, "tls-cert-file", "",
+		"PEM serving certificate for the mutual-TLS listener (cert-manager tls.crt). Hot-reloaded on rotation without a restart.")
+	flag.StringVar(&flags.tlsKeyFile, "tls-key-file", "",
+		"PEM serving key for the mutual-TLS listener (cert-manager tls.key). Hot-reloaded on rotation without a restart.")
+	flag.StringVar(&flags.tlsClientCAFile, "tls-client-ca-file", "",
+		"PEM CA bundle every client cert is verified against (RequireAndVerifyClientCert; cert-manager ca.crt). Hot-reloaded on rotation without a restart.")
 	flag.StringVar(&flags.metricsAddr, "metrics-bind-address", "0",
 		"The address the metrics endpoint binds to. 0 disables.")
 	flag.StringVar(&flags.probeAddr, "health-probe-bind-address", ":8081",
@@ -180,6 +192,7 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 
 	err = mgr.Add(&rest.Server{
 		Addr:      flags.restAddr,
+		TLS:       tlsOptions(flags),
 		Store:     st,
 		Client:    mgr.GetClient(),
 		Namespace: namespace,
@@ -190,6 +203,25 @@ func registerProbesAndREST(mgr manager.Manager, st store.Store, flags *apiserver
 	}
 
 	return nil
+}
+
+// tlsOptions builds the mutual-TLS configuration from the flags, or
+// nil when TLS is not fully configured. All three cert files plus the
+// bind address must be set; otherwise the apiserver serves plain HTTP
+// only (e.g. a local `go run` without cert-manager). In production the
+// Deployment always sets all four, so the in-cluster Service's TLS
+// port is always live.
+func tlsOptions(flags *apiserverFlags) *rest.TLSOptions {
+	if flags.tlsAddr == "" || flags.tlsCertFile == "" || flags.tlsKeyFile == "" || flags.tlsClientCAFile == "" {
+		return nil
+	}
+
+	return &rest.TLSOptions{
+		Addr:         flags.tlsAddr,
+		CertFile:     flags.tlsCertFile,
+		KeyFile:      flags.tlsKeyFile,
+		ClientCAFile: flags.tlsClientCAFile,
+	}
 }
 
 // waitForCacheSync blocks on the manager's cache sync and then
@@ -241,7 +273,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting apiserver", "rest", flags.restAddr, "namespace", namespace)
+	setupLog.Info("Starting apiserver",
+		"rest_debug_http", flags.restAddr,
+		"rest_tls", flags.tlsAddr,
+		"tls_enabled", tlsOptions(flags) != nil,
+		"namespace", namespace)
 
 	err = mgr.Start(signalCtx)
 	if err != nil {
