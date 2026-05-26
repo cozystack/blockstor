@@ -201,14 +201,19 @@ jobs:
     runs-on: ${{ contains(github.event.pull_request.labels.*.name, 'debug') && 'self-hosted' || 'oracle-vm-24cpu-96gb-x86-64' }}
     needs: [detect-changes, lint, unit-test]
     if: needs.detect-changes.outputs.code == 'true'
-    # Whole tests/e2e suite (~59) sharded over LANES; at 4 lanes that's
-    # ~15 scenarios/runner plus build+provision, which needs well over the
-    # default. Capped near GitHub's 360-min max.
+    # Whole tests/e2e suite (~59) sharded over LANES; at 8 lanes that's
+    # ~7-8 scenarios/runner plus build+provision. 8 lanes (≈ the dev-stand-
+    # proven ~6-8 scenarios/cluster density) keeps any single ephemeral
+    # cluster from accumulating enough DRBD-destructive residue to wedge
+    # late scenarios — at 4 lanes the round-robin packed several
+    # recovery-* / snapshot scenarios onto one cluster (~15 each), and the
+    # last one or two timed out with replicas stuck non-UpToDate. Capped
+    # near GitHub's 360-min max.
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        lane: [1, 2, 3, 4]
+        lane: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       # Number of parallel lanes = number of runners (matrix.lane above).
       # This is a capacity/cost knob ONLY, not a coverage knob: no
@@ -217,7 +222,7 @@ jobs:
       # across LANES, so a newly-added test file runs automatically with
       # zero workflow edits. Add runners by bumping matrix.lane + LANES
       # together (e.g. 6 lanes ≈ the dev-stand-proven ~6 scenarios/lane).
-      LANES: 4
+      LANES: 8
     permissions:
       contents: read
       checks: write
