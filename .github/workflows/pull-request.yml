@@ -1,5 +1,10 @@
 name: Pull Request
 
+env:
+  # Opt JS actions (e.g. actions/upload-artifact) into Node.js 24 — silences the
+  # Node 20 deprecation warning; checkout/setup-go here are already Node24-era.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # Single consolidated CI pipeline for PRs. Fires on every PR open/push and
 # runs lint, unit tests, contract tests, and e2e in parallel. The e2e job
 # carries an opt-in SSH breakpoint (label-gated) so maintainers can attach
