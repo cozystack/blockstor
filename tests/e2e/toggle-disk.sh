@@ -71,7 +71,7 @@ wait_uptodate "$RD" "$N1" "$N2"
 # free local port — distroless controller image has no curl, so
 # `kubectl exec` would fail.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/toggle-disk-pf.log 2>&1 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true; delete_rd "$RD"' EXIT

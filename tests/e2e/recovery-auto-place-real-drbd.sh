@@ -83,7 +83,7 @@ SETTLE_DEADLINE_SEC=120
 # Port-forward to the apiserver — same pattern as client-compat.sh
 # lines 50-72.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-apiserver "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/recovery-auto-place-real-drbd-pf.log 2>&1 &
 PF_PID=$!
 

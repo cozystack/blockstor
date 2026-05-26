@@ -96,7 +96,7 @@ MASK_STOR_POOL_HEX=0x0000000000140000
 # Port-forward to apiserver — same dance as client-compat.sh.
 # ----------------------------------------------------------------
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-apiserver "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/recovery-poolmissing-real-zfs-pf.log 2>&1 &
 PF_PID=$!
 

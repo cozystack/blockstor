@@ -83,7 +83,7 @@ N3=$WORKER_3
 
 # --- linstor CLI port-forward against blockstor-apiserver ---------------
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/7-13-pf.log 2>&1 &
 PF_PID=$!
 

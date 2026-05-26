@@ -178,7 +178,7 @@ echo "   RD UpToDate on $N1 and $N2"
 # Open a controller port-forward for the toggle-disk REST calls.
 # Same pattern as recovery-port-collision.sh / lifecycle-toggle-retry.sh.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/recovery-bitmap-drop-pf.log 2>&1 &
 PF_PID=$!
 trap 'kill "$PF_PID" 2>/dev/null || true; wait "$PF_PID" 2>/dev/null || true; delete_rd "$RD"' EXIT

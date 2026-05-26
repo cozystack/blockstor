@@ -54,7 +54,7 @@ SC=e2e-three-way-sc
 
 # port-forward blockstor-controller:3370 → random local port for `linstor` CLI.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/three-way-pf.log 2>&1 &
 PF_PID=$!
 
@@ -87,7 +87,14 @@ LCTL_M=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 # fix per the Phase 7.9 scenario design: the test exercises
 # blockstor's three-way observability invariant (PVC ↔ Resource CRD
 # ↔ .res), so the CSI provisioning request MUST land on blockstor.
-BLOCKSTOR_URL="http://blockstor-apiserver.blockstor-system.svc:3370"
+# mTLS endpoint (the Service is TLS-only now). Pointing linstor-csi
+# here is necessary but NOT sufficient: piraeus must also mount the
+# blockstor-apiserver-client-tls cert into the CSI pods and present it
+# (LinstorCluster apiTLS / external-controller client-secret wiring).
+# That wiring is piraeus-operator-version-specific and is validated on
+# the stand as a pre-merge follow-up — see the PR's stand-validation
+# note. The URL bump keeps this script honest about the new endpoint.
+BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
 CUR_URL=$(kubectl get linstorcluster linstorcluster \
     -o jsonpath='{.spec.externalController.url}' 2>/dev/null || true)
 if [[ "$CUR_URL" != "$BLOCKSTOR_URL" ]]; then

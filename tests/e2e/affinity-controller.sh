@@ -78,7 +78,7 @@ N2=$WORKER_2
 N3=$WORKER_3
 
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/affinity-controller-pf.log 2>&1 &
 PF_PID=$!
 

@@ -58,7 +58,7 @@ HEAL_TIMEOUT=60
 # but we still go through the Service. Random ephemeral port so this
 # scenario can co-run with sibling iter scenarios on the same host.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "${PF_PORT}:3370" \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "${PF_PORT}:3370" \
     >/tmp/bridge-test-pf.log 2>&1 &
 PF_PID=$!
 
