@@ -262,6 +262,17 @@ func (r *reloadableTLS) watchLoop(ctx context.Context, watcher *fsnotify.Watcher
 				debounce = time.NewTimer(tlsReloadDebounce)
 				debounceC = debounce.C
 			} else {
+				// Stop+drain before Reset: a timer that already fired left a
+				// value in its channel; without draining it the next select
+				// would trip <-debounceC immediately and skip the debounce,
+				// reloading certs before the kubelet finished writing them.
+				if !debounce.Stop() {
+					select {
+					case <-debounce.C:
+					default:
+					}
+				}
+
 				debounce.Reset(tlsReloadDebounce)
 			}
 		case err, ok := <-watcher.Errors:

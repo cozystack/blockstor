@@ -318,28 +318,37 @@ func (s *Server) handler() http.Handler {
 // waitAndShutdown blocks until ctx is cancelled or any listener
 // reports a fatal error, then gracefully shuts down every server.
 func waitAndShutdown(ctx context.Context, servers []*http.Server, errCh <-chan error) error {
+	var serveErr error
+
 	select {
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-
-		var shutErr error
-
-		for _, srv := range servers {
-			err := srv.Shutdown(shutCtx)
-			if err != nil && shutErr == nil {
-				shutErr = err
-			}
-		}
-
-		return errors.Wrap(shutErr, "shutdown REST server")
-	case err := <-errCh:
-		if err == nil {
+	case serveErr = <-errCh:
+		if serveErr == nil {
 			return nil
 		}
-
-		return errors.Wrap(err, "REST server failed")
 	}
+
+	// Always gracefully shut down EVERY listener on the way out, even when
+	// one of them reported a fatal serve error — otherwise the surviving
+	// server's goroutine leaks and keeps its port bound, blocking a clean
+	// restart.
+	shutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
+	var shutErr error
+
+	for _, srv := range servers {
+		err := srv.Shutdown(shutCtx)
+		if err != nil && shutErr == nil {
+			shutErr = err
+		}
+	}
+
+	if serveErr != nil {
+		return errors.Wrap(serveErr, "REST server failed")
+	}
+
+	return errors.Wrap(shutErr, "shutdown REST server")
 }
 
 // serveOrIgnoreClosed maps the benign http.ErrServerClosed (returned

@@ -132,12 +132,17 @@ func (c Config) HTTPClient(serverName string) (*http.Client, error) {
 		return nil, err
 	}
 
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, errors.New("http.DefaultTransport is not *http.Transport")
+	// Clone DefaultTransport to preserve pooling/proxy/dial defaults, but
+	// fall back to a fresh transport if something (e.g. an OTel/APM tracing
+	// library) has replaced DefaultTransport with a non-*http.Transport
+	// RoundTripper — a direct type assertion would panic/fail there.
+	var cloned *http.Transport
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		cloned = transport.Clone()
+	} else {
+		cloned = &http.Transport{}
 	}
 
-	cloned := transport.Clone()
 	cloned.TLSClientConfig = tlsCfg
 
 	return &http.Client{
