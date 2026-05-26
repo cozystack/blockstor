@@ -368,8 +368,8 @@ LCTL=(linstor --controllers "http://localhost:${PF_PORT}" --machine-readable)
 # bring DRBD down on N3 (asserted below).
 echo ">> linstor r d ${N3} ${RD} (single-call physical delete of inconsistent replica)"
 if ! command -v linstor >/dev/null 2>&1; then
-    echo "SKIP: linstor CLI not installed on stand host (apt install linstor-client)"
-    exit 0
+    echo "FAIL: linstor CLI not installed on stand host (apt install linstor-client)" >&2
+    exit 1
 fi
 "${LCTL[@]}" resource delete "$N3" "$RD" >/dev/null
 

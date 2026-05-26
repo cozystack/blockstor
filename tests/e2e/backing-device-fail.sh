@@ -36,14 +36,12 @@ require_workers 2
 # auto-detach logic itself is covered by the unit-test suite in
 # pkg/satellite/controllers/observer_internal_test.go.
 if grep -qi talos /etc/os-release 2>/dev/null; then
-    echo "SKIP: backing-device-fail needs writable /sys/block/*/loop/autoclear; Talos kernel marks it RO"
-    exit 0
+    skip "backing-device-fail needs writable /sys/block/*/loop/autoclear; Talos kernel marks it RO"
 fi
 
 SAT_NODE=$(kubectl -n blockstor-system get pods -l app=blockstor-satellite -o jsonpath='{.items[0].spec.nodeName}')
 if kubectl get node "$SAT_NODE" -o jsonpath='{.status.nodeInfo.osImage}' | grep -qi talos; then
-    echo "SKIP: backing-device-fail needs writable /sys/block/*/loop/autoclear; node is Talos"
-    exit 0
+    skip "backing-device-fail needs writable /sys/block/*/loop/autoclear; node is Talos"
 fi
 
 RD=e2e-disk-fail

@@ -47,8 +47,7 @@ require_workers 2
 # Skip when no blockstor-side StorageClass is present — once a blockstor
 # CSI provisioner ships, switch the SC below to it and drop this guard.
 if ! kubectl get sc -o name 2>/dev/null | grep -q blockstor; then
-    echo "SKIP: no blockstor-side StorageClass — resize-pvc would exercise piraeus only"
-    exit 0
+    skip "no blockstor-side StorageClass — blockstor CSI provisioner not shipped yet; resize-pvc would exercise piraeus only"
 fi
 
 SC=e2e-resize-pvc-sc

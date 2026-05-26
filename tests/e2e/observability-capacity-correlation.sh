@@ -49,12 +49,12 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 1
 
 if ! command -v linstor >/dev/null 2>&1; then
-    echo "SKIP: linstor CLI not in PATH (apt install linstor-client)"
-    exit 0
+    echo "FAIL: linstor CLI not in PATH (apt install linstor-client)" >&2
+    exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
-    echo "SKIP: jq not in PATH"
-    exit 0
+    echo "FAIL: jq not in PATH" >&2
+    exit 1
 fi
 
 # Prerequisite: this scenario re-points piraeus's bundled linstor-csi at
@@ -65,8 +65,8 @@ fi
 # scenario would hard-FAIL. SKIP instead — the prerequisite is absent,
 # not broken.
 if ! kubectl get crd linstorclusters.piraeus.io >/dev/null 2>&1; then
-    echo "SKIP: LinstorCluster CRD (piraeus.io) absent — run stand/install-piraeus.sh to enable"
-    exit 0
+    echo "FAIL: LinstorCluster CRD (piraeus.io) absent — run stand/install-piraeus.sh to enable" >&2
+    exit 1
 fi
 
 # Scenario knobs

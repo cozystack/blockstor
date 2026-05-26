@@ -43,8 +43,8 @@ for c in "${required[@]}"; do
     fi
 done
 if [[ -n "$missing" ]]; then
-    echo "SKIP: piraeus components not Running:$missing"
-    exit 0
+    echo "FAIL: piraeus components not Running:$missing" >&2
+    exit 1
 fi
 
 SC=e2e-rwx-sc
@@ -151,10 +151,10 @@ echo ">> wait both Pods Ready (300s)"
 # piraeus breakage, not a blockstor regression — downgrade to SKIP
 # so the suite doesn't false-fail on it.
 if ! kubectl wait --for=condition=Ready --timeout=300s pod/"$P1" pod/"$P2"; then
-    echo "SKIP: pods never reached Ready — piraeus NFS-Ganesha publish pipeline broken on this stand"
-    echo "      (PVC bound, but NodePublishVolume hung on the consumer side)"
+    echo "FAIL: pods never reached Ready — piraeus NFS-Ganesha publish pipeline broken on this stand" >&2
+    echo "      (PVC bound, but NodePublishVolume hung on the consumer side)" >&2
     kubectl describe pod "$P1" "$P2" 2>/dev/null | grep -E '^(Name|Status|Events|  Warning)' | tail -20 || true
-    exit 0
+    exit 1
 fi
 
 MARK="rwx-$(date +%s)-$$"

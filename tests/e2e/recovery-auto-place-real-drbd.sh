@@ -69,12 +69,12 @@ source "$SCRIPT_DIR/lib.sh"
 require_workers 3
 
 if ! command -v linstor >/dev/null 2>&1; then
-    echo "SKIP: linstor CLI not in PATH (apt install linstor-client)"
-    exit 0
+    echo "FAIL: linstor CLI not in PATH (apt install linstor-client)" >&2
+    exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
-    echo "SKIP: jq not in PATH"
-    exit 0
+    echo "FAIL: jq not in PATH" >&2
+    exit 1
 fi
 
 RD=bug80-e2e
