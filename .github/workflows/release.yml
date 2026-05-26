@@ -1,0 +1,123 @@
+name: Release Images
+
+env:
+  # Opt JS actions (e.g. actions/checkout, docker actions) into Node.js 24 —
+  # silences the Node 20 deprecation warning, matching the rest of the CI.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# Build and publish the three blockstor container images on a version tag.
+#
+# Images (Dockerfile multi-stage targets → canonical ghcr.io paths):
+#   - controller → ghcr.io/cozystack/blockstor
+#   - apiserver  → ghcr.io/cozystack/blockstor-apiserver
+#   - satellite  → ghcr.io/cozystack/blockstor-satellite
+#
+# The repository's dev stand (stand/build-images.sh) builds the exact same
+# three targets into a throwaway localhost:5000 registry with a floating
+# `:dev` tag. This release flow instead pushes to the canonical public
+# registry (ghcr.io, derived from the Go module path
+# github.com/cozystack/blockstor and the short image names used by the stand
+# manifests: blockstor / blockstor-apiserver / blockstor-satellite).
+#
+# Tagging is handled by docker/metadata-action's `type=semver` rules:
+#   tag v1.33.2 → images tagged `1.33.2`, `1.33`, and `latest`.
+#   Pre-release tags (v1.33.0-rc.1) get `1.33.0-rc.1` only — no `latest`.
+# This matches the repo's `vMAJOR.MINOR.PATCH[-rc.N]` tag convention
+# (see `git tag -l`).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger for re-publishing a tag (e.g. after a registry outage).
+  # The chosen ref must be a tag for the version stamping to be meaningful.
+  workflow_dispatch:
+
+# GITHUB_TOKEN needs packages:write to push to ghcr.io; contents:read to
+# check out the tagged tree.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    name: Build and push ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `target` is the Dockerfile stage; `image` is the ghcr.io repo
+          # suffix under ghcr.io/${{ github.repository_owner }}/.
+          - target: controller
+            image: blockstor
+          - target: apiserver
+            image: blockstor-apiserver
+          - target: satellite
+            image: blockstor-satellite
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          # Full history so the in-image git SHA stamp (Bug 171) is the real
+          # commit, not a shallow placeholder. The GIT_HASH build-arg below
+          # is resolved on the runner where the .git tree exists.
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        # Enables cross-arch emulation so the satellite's debian apt install
+        # resolves arm64 packages during the linux/arm64 build leg.
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+          # Tag `latest` only on a stable (non-pre-release) semver tag.
+          flavor: |
+            latest=auto
+
+      - name: Resolve build stamps
+        id: stamp
+        # Mirrors stand/build-images.sh + the top-level Makefile: the
+        # Dockerfile excludes .git via .dockerignore, so the SHA/time are
+        # resolved on the runner and passed in as --build-arg.
+        run: |
+          echo "git_hash=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4 # v6.15.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_HASH=${{ steps.stamp.outputs.git_hash }}
+            BUILD_TIME=${{ steps.stamp.outputs.build_time }}
+          provenance: false
