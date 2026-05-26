@@ -172,14 +172,19 @@ spec:
   props: {StorPoolName: stand}
 EOF
 
-# Wait until ALL THREE replicas land UpToDate. wait_uptodate as-is only
-# checks two peers, so spin our own 3-way poll using the REST view (the
-# observer already projects DiskState per replica into the CRD Status).
-echo ">> wait for all three replicas to land UpToDate"
+# Wait until ALL THREE replicas land UpToDate. Read the authoritative
+# CRD Status (status.drbdState) the observer writes per replica, NOT the
+# controller's REST resource-list disk_state projection: under CI load
+# that projection can lag the CRD by the whole precondition window (seen
+# on the 8-lane runner — every replica's CRD Status was UpToDate while
+# `linstor r l` still showed Unknown), which is a controller-cache lag,
+# not a real DRBD state. The offline-window assertions below still drive
+# the CLI `linstor r l` view; only this precondition reads the CRD.
+echo ">> wait for all three replicas to land UpToDate (authoritative CRD Status)"
 deadline=$(( $(date +%s) + 240 ))
 while (( $(date +%s) < deadline )); do
-    n_up=$("${LCTLJ[@]}" resource list -r "$RD" 2>/dev/null \
-        | jq '[.[][] | select(.volumes[]?.state.disk_state == "UpToDate")] | length' \
+    n_up=$(kubectl get resource.blockstor.cozystack.io -o json 2>/dev/null \
+        | jq --arg rd "${RD}." '[.items[] | select(.metadata.name | startswith($rd)) | select(.status.drbdState == "UpToDate")] | length' \
         2>/dev/null || echo 0)
     if (( n_up == 3 )); then
         break
@@ -192,10 +197,11 @@ if (( n_up != 3 )); then
 fi
 echo "   all 3 replicas UpToDate"
 
-# Snapshot the pre-isolation state of $N3's row so we can assert the
-# last-known DiskState survives the offline window.
-last_known_disk=$("${LCTLJ[@]}" resource list -r "$RD" 2>/dev/null \
-    | jq -r --arg n "$N3" '.[][] | select(.node_name == $n) | .volumes[0].state.disk_state // ""')
+# Snapshot the pre-isolation state of $N3 so we can assert the
+# last-known DiskState survives the offline window (CRD Status, same
+# authoritative source as the precondition above).
+last_known_disk=$(kubectl get "resource.blockstor.cozystack.io/${RD}.${N3}" \
+    -o jsonpath='{.status.drbdState}' 2>/dev/null || echo "")
 echo "   pre-offline DiskState on $N3 = '$last_known_disk' (must survive offline)"
 if [[ "$last_known_disk" != "UpToDate" ]]; then
     echo "FAIL: pre-condition broken — $N3 row did not show UpToDate before isolation"
