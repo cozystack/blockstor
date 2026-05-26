@@ -292,9 +292,20 @@ curl -fsS -X PUT \
 
 # Read it back so a silently-dropped patch (e.g. the PUT routing
 # regression that bit linstor-cli.sh) fails the test loudly here
-# instead of much later in the recipe.
-got=$(curl -fsS "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${RD}" \
-    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("props",{}).get("DrbdOptions/Resource/quorum",""))')
+# instead of much later in the recipe. The override prop persists
+# through the apiserver, whose read cache can lag the write under CI
+# load (same class as the post-rd-d `r l` cache lag), so poll the
+# read-back instead of asserting on the first GET — a first GET that
+# still shows the default 'majority' is the cache catching up, not a
+# dropped patch.
+got=""
+deadline=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < deadline )); do
+    got=$(curl -fsS "http://127.0.0.1:${PF_PORT}/v1/resource-definitions/${RD}" \
+        | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("props",{}).get("DrbdOptions/Resource/quorum",""))')
+    [[ "$got" == "off" ]] && break
+    sleep 2
+done
 if [[ "$got" != "off" ]]; then
     echo "FAIL: quorum prop not stamped on RD (got '${got}')"
     exit 1
