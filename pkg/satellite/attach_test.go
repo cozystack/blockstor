@@ -586,6 +586,140 @@ func TestWipeDeviceContinuesOnWipefsFailure(t *testing.T) {
 	}
 }
 
+// TestAttachZpoolMemberDeviceIsIdempotent pins the single-device
+// re-reconcile fix: `ps cdp <node> zfs /dev/sda` creates a pool
+// whose SOLE vdev is /dev/sda. On a re-reconcile, the pool already
+// exists (zpool list exits 0) AND /dev/sda is already its member —
+// so the satellite MUST treat the attach as idempotently complete
+// and return success WITHOUT running `zpool add -f data /dev/sda`.
+// Before the fix the extend branch ran `zpool add`, which ZFS
+// rejects ("/dev/sda is in use and contains a unknown filesystem"),
+// wedging the reconciler in a tight failing loop with the
+// PhysicalDevice CRD stuck Phase=Failed and the attach finalizer
+// never cleared.
+func TestAttachZpoolMemberDeviceIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	// Pool exists.
+	fx.Expect("zpool list -H -o name data", storage.FakeResponse{Stdout: []byte("data\n")})
+	// /dev/sda is already the pool's sole vdev (real `zpool status -P`
+	// shape: header rows then the pool row, then the vdev row with the
+	// full device path under `-P`).
+	fx.Expect("zpool status -P data", storage.FakeResponse{Stdout: []byte(
+		"  pool: data\n" +
+			" state: ONLINE\n" +
+			"config:\n\n" +
+			"\tNAME        STATE     READ WRITE CKSUM\n" +
+			"\tdata        ONLINE       0     0     0\n" +
+			"\t  /dev/sda  ONLINE       0     0     0\n\n" +
+			"errors: No known data errors\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sda",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "data",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "data",
+		},
+	}
+
+	res, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach on already-member device must succeed idempotently: %v", err)
+	}
+
+	// Result must be the normal terminal-success shape so the
+	// reconciler reaches its delete-as-completion / finalizer-strip
+	// path.
+	if res.PoolName != "data" || res.ProviderKind != "ZFS" || res.Props["StorDriver/ZPool"] != "data" {
+		t.Errorf("idempotent attach result: got %+v, want data/ZFS with ZPool data", res)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "zpool add") {
+			t.Fatalf("`zpool add` MUST NOT run when device is already a pool member; calls=%v", fx.CommandLines())
+		}
+	}
+}
+
+// TestAttachZpoolNonMemberDeviceStillExtends guards the other side
+// of the fix: a genuinely NEW device (pool exists, but this device
+// is NOT yet one of its vdevs) MUST still run `zpool add -f` so
+// real multi-device `ps cdp` expansion keeps working. Without this
+// guard a too-aggressive membership probe would silently swallow
+// legitimate extends.
+func TestAttachZpoolNonMemberDeviceStillExtends(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	fx.Expect("zpool list -H -o name data", storage.FakeResponse{Stdout: []byte("data\n")})
+	// Pool's existing vdev is /dev/sda; the request is for /dev/sdb,
+	// which is NOT a member yet.
+	fx.Expect("zpool status -P data", storage.FakeResponse{Stdout: []byte(
+		"\tNAME        STATE\n\tdata        ONLINE\n\t  /dev/sda  ONLINE\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sdb",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "data",
+			ProviderKind:    "ZFS",
+			ZPoolName:       "data",
+		},
+	}
+
+	_, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	if !slices.Contains(fx.CommandLines(), "zpool add -f data /dev/sdb") {
+		t.Errorf("new device must still extend via `zpool add -f data /dev/sdb`; calls=%v", fx.CommandLines())
+	}
+}
+
+// TestAttachPVMemberDeviceIsIdempotent pins the LVM analog of the
+// single-device re-reconcile fix: when the VG exists AND the device
+// is already one of its PVs, the satellite returns success WITHOUT
+// re-running pvcreate/vgextend.
+func TestAttachPVMemberDeviceIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	fx := storage.NewFakeExec()
+	probe := "vgs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o vg_name vg"
+	fx.Expect(probe, storage.FakeResponse{Stdout: []byte("  vg\n")})
+	pvsProbe := "pvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o pv_name,vg_name"
+	fx.Expect(pvsProbe, storage.FakeResponse{Stdout: []byte("  /dev/sda vg\n")})
+
+	dev := &apiv1.PhysicalDevice{
+		DevicePath: "/dev/sda",
+		AttachTo: &apiv1.PhysicalDeviceAttachTo{
+			StoragePoolName: "thick",
+			ProviderKind:    "LVM",
+			VGName:          "vg",
+		},
+	}
+
+	res, err := satellite.Attach(t.Context(), fx, dev)
+	if err != nil {
+		t.Fatalf("Attach on already-member PV must succeed idempotently: %v", err)
+	}
+
+	if res.PoolName != "thick" || res.ProviderKind != "LVM" || res.Props["StorDriver/LvmVg"] != "vg" {
+		t.Errorf("idempotent attach result: got %+v, want thick/LVM with VG vg", res)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "vgextend ") {
+			t.Fatalf("`vgextend` MUST NOT run when PV is already a VG member; calls=%v", fx.CommandLines())
+		}
+
+		if strings.HasPrefix(line, "pvcreate ") {
+			t.Fatalf("`pvcreate` MUST NOT run when PV is already a VG member; calls=%v", fx.CommandLines())
+		}
+	}
+}
+
 // TestAttachCreatesWhenPoolAbsent pins the negative of the
 // extend branch: when the probe (`zpool list <pool>`) exits
 // non-zero (pool absent), the satellite falls through to
