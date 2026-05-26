@@ -1949,6 +1949,163 @@ func TestApplyAutoPrimarySkippedWhenConnectedPeerHasData(t *testing.T) {
 	}
 }
 
+// TestMigrateDstDisklessToDiskfulFlipRefusesDay0Skip pins the
+// lifecycle-toggle-migrate regression (CI run 26475612774 lane-6).
+//
+// A `linstor r td --migrate-from` destination joins an existing RD as a
+// connected diskless client, then flips diskful (firstActivation=false,
+// diskfulFlip=true). Since PR #20 the migrate SOURCE reaches UpToDate
+// via `set-gi` at current-uuid == day0 and STAYS there (no write
+// advances it on an empty volume; `primary --force` mints no new UUID on
+// an already-UpToDate node — verified on DRBD 9.3.2). The dispatcher's
+// CRD-status gate (PeerHasData) then mis-classifies that day0 Primary as
+// a never-written day0 sibling (isDay0SeededVolume: CurrentGI == day0)
+// and reports PeerHasData=false, so resolveVolumeSeed reaches its case-A
+// skip branch. The flagless day0 skip seed (clean bitmap, no UpToDate)
+// would leave the destination Inconsistent with nothing to SyncTarget →
+// permanent Inconsistent latch.
+//
+// THE FIX: resolveVolumeSeed gates the case-A skip on the kernel-truth
+// AnyConnectedPeerHasData probe. The flip dst's slot is already
+// connected, so the probe sees the UpToDate peer and REFUSES the skip →
+// no `drbdmeta set-gi` is stamped → the freshly-created metadata stays
+// Inconsistent → DRBD runs a real SyncTarget from the peer → UpToDate.
+//
+// Assertion: NO `drbdmeta ... set-gi` fires (the day0 skip is refused).
+func TestMigrateDstDisklessToDiskfulFlipRefusesDay0Skip(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-mig_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-mig_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-mig_00000|1048576\n")})
+
+	// Kernel slot is loaded as intentional-Diskless (the connected
+	// diskless client the migrate dst was before the flip), with the
+	// migrate source connected and UpToDate. Drives the diskfulFlip
+	// detection AND the new AnyConnectedPeerHasData seed gate.
+	kernelDump := []byte(`pvc-mig role:Secondary
+  volume:0 disk:Diskless client:yes
+  n2 role:Primary
+    volume:0 replication:Established peer-disk:UpToDate
+`)
+	fx.Expect("drbdsetup status pvc-mig",
+		storage.FakeResponse{Stdout: kernelDump})
+	fx.Expect("drbdsetup status --verbose pvc-mig",
+		storage.FakeResponse{Stdout: kernelDump})
+	// The seed gate's kernel-truth probe: a connected peer-device that
+	// is UpToDate must veto the day0 skip seed.
+	fx.Expect("drbdsetup status pvc-mig --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":0,"connections":[{"peer-node-id":1,"name":"n2","connection-state":"Connected","peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]}]}]`)})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Diskful DesiredResource as the dispatcher emits after the migrate
+	// REST handler cleared DISKLESS. PeerHasData is FALSE — exactly the
+	// mis-classification (the day0 Primary looks like a fresh sibling).
+	dr := &intent.DesiredResource{
+		Name:        "pvc-mig",
+		NodeName:    "n1",
+		Flags:       []string{},
+		PeerHasData: false,
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("apply result not ok: %+v", results)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdmeta") && strings.Contains(line, "set-gi") {
+			t.Errorf("migrate dst joining a connected UpToDate peer must NOT day0-skip "+
+				"(would latch Inconsistent); the seed must be refused so DRBD SyncTargets. got: %s", line)
+		}
+	}
+}
+
+// TestFreshThinReplicaStillDay0SkipsWhenNoPeerConnected pins the
+// other side of TestMigrateDstDisklessToDiskfulFlipRefusesDay0Skip: the
+// genuinely-fresh skip-init-sync (criterion A) must NOT regress. A fresh
+// thin replica's kernel slot is not yet connected at seed time (the
+// connection establishes during the later `drbdadm adjust`), so the
+// AnyConnectedPeerHasData probe finds nothing and the day0 skip seed
+// still fires — DRBD reads the clean bitmap + shared current and skips
+// the resync.
+func TestFreshThinReplicaStillDay0SkipsWhenNoPeerConnected(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-fresh_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-fresh_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-fresh_00000|1048576\n")})
+
+	// AnyConnectedPeerHasData probe: NO connection yet on a fresh
+	// replica → empty connections list → no data peer → skip proceeds.
+	fx.Expect("drbdsetup status pvc-fresh --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":0,"connections":[]}]`)})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:        "pvc-fresh",
+		NodeName:    "n1",
+		PeerHasData: false,
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	day0 := satellite.Day0GiForTest("pvc-fresh", 0)
+	var sawDay0Skip bool
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "drbdmeta") && strings.Contains(line, "set-gi") &&
+			strings.Contains(line, day0) {
+			sawDay0Skip = true
+			break
+		}
+	}
+	if !sawDay0Skip {
+		t.Errorf("fresh thin replica with no connected data peer must still day0-skip "+
+			"(criterion A: skip-init-sync preserved); expected a set-gi carrying day0=%s, got: %v",
+			day0, fx.CommandLines())
+	}
+}
+
 // TestDeleteResourceClosesLUKSMapper: when the satellite tears down a
 // LUKS-encrypted resource, it must `cryptsetup luksClose` the mapper
 // BEFORE DeleteVolume removes the underlying LV — otherwise the

@@ -3543,7 +3543,7 @@ func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResour
 			continue
 		}
 
-		seed, ok := r.resolveVolumeSeed(dr.GetName(), vol, dr.GetPeerHasData(), isWinner)
+		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), isWinner)
 		if !ok {
 			continue
 		}
@@ -3766,16 +3766,25 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 //     flags. Both peers present equal current-UUIDs with clean bitmaps
 //     → DRBD reads "no data difference" → no sync; both reach UpToDate
 //     at the kernel handshake. (Preserves blockstor's existing,
-//     stand-validated skip-init-sync shape.)
+//     stand-validated skip-init-sync shape.) GATED on the kernel-truth
+//     AnyConnectedPeerHasData probe: a migrate/relocate destination
+//     flips diskless→diskful on a slot that is ALREADY connected to an
+//     UpToDate peer, and since PR #20 that peer sits at day0 so the
+//     CRD-status PeerHasData gate can't see it as data-bearing — the
+//     probe catches it from kernel state and refuses the skip (→ case C
+//     SyncTarget). On a fresh replica the slot is not connected yet at
+//     seed time, so the probe finds nothing and the skip proceeds.
 //
 //   - Else (case C: thick LVM, opaque file, unknown provider, non-
-//     winner) → ok=false. The freshly-created Inconsistent metadata is
-//     left untouched so this replica resyncs from the source.
+//     winner, OR a flip dst with a connected data peer) → ok=false. The
+//     freshly-created Inconsistent metadata is left untouched so this
+//     replica resyncs from the source.
 //
 // Race-free: peerHasData is recomputed by the dispatcher every
 // reconcile from live peer status, not a controller stamp that must
-// land in Spec in time.
-func (r *Reconciler) resolveVolumeSeed(resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool) (drbd.GISeed, bool) {
+// land in Spec in time; the case-A AnyConnectedPeerHasData gate reads
+// live kernel state, immune to the day0 CRD-classification ambiguity.
+func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool) (drbd.GISeed, bool) {
 	if peerHasData {
 		return drbd.GISeed{}, false
 	}
@@ -3838,6 +3847,44 @@ func (r *Reconciler) resolveVolumeSeed(resourceName string, vol *intent.DesiredV
 	}
 
 	if !IsThinOrZFS(provider.Kind()) {
+		return drbd.GISeed{}, false
+	}
+
+	// Migrate / relocate destination gate (kernel-truth backstop).
+	//
+	// The day0 skip-init-sync seed below is ONLY data-safe when this
+	// replica is part of a genuinely-fresh resource — no peer is an
+	// established UpToDate authority that holds the real (even if empty)
+	// copy this replica must derive from. A diskless→diskful flip (the
+	// `linstor r td --migrate-from` / relocate destination: a replica
+	// that was a connected diskless client and is now attaching a fresh
+	// lower disk) joins a resource whose Primary peer is ALREADY UpToDate.
+	//
+	// Since PR #20 the elected winner reaches UpToDate via `set-gi` at
+	// current-uuid == day0 and STAYS there (no runtime write advances it
+	// on an empty thin/ZFS volume, and `primary --force` mints no new UUID
+	// on an already-UpToDate node — verified on DRBD 9.3.2 via get-gi:
+	// the Primary source sits at `<day0>:0:0:0:1:1`). So the CRD-status
+	// gate (dispatcher.anyDiskfulPeerHasData → PeerHasData) can no longer
+	// tell that data-bearing day0 Primary apart from a never-written day0
+	// sibling: isDay0SeededVolume sees CurrentGI == day0 on BOTH and
+	// classifies the real authority as a fresh sibling → PeerHasData is
+	// false → control reaches here. Stamping the day0 skip seed then gives
+	// the destination a clean (zero) bitmap + no UpToDate flag, so DRBD
+	// has neither out-of-sync bits to drive a SyncTarget nor a metadata
+	// flag to declare it UpToDate → it latches Inconsistent forever (the
+	// lifecycle-toggle-migrate regression).
+	//
+	// Use kernel truth, immune to the day0 ambiguity: if a peer connection
+	// already exposes committed data (peer-disk UpToDate/Consistent/
+	// Outdated), REFUSE the skip and leave the freshly-created metadata
+	// Inconsistent so DRBD runs a real SyncTarget from that peer (case C).
+	// On a genuinely-fresh replica the kernel slot is NOT connected yet at
+	// seed time (the connection establishes during the later `drbdadm
+	// adjust`), so the probe finds nothing and the skip proceeds — the
+	// fresh 2-/3-replica skip-init-sync is preserved. Mirrors the
+	// shouldForcePromote AnyConnectedPeerHasData backstop.
+	if r.cfg.Adm.AnyConnectedPeerHasData(ctx, resourceName) {
 		return drbd.GISeed{}, false
 	}
 
