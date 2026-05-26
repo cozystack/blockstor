@@ -1,5 +1,10 @@
 name: Integration tests
 
+env:
+  # Opt JS actions (e.g. actions/upload-artifact) into Node.js 24 — silences the
+  # Node 20 deprecation warning; checkout/setup-go here are already Node24-era.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # Tier 2 of the test strategy (docs/test-strategy.md). Boots envtest
 # (in-process apiserver + etcd), the full controller-runtime manager
 # with every reconciler, the REST server, and an in-process satellite

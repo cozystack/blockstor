@@ -1,5 +1,10 @@
 name: Contract tests
 
+env:
+  # Opt JS actions (e.g. actions/upload-artifact) into Node.js 24 — silences the
+  # Node 20 deprecation warning; checkout/setup-go here are already Node24-era.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 # Tier 3 of the test strategy (docs/test-strategy.md). Runs the
 # drbd-utils contract suite — a thin docker container running real
 # drbdmeta / drbdadm binaries against loopback files — to pin the
