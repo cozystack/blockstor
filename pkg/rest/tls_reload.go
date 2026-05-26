@@ -203,6 +203,7 @@ func (r *reloadableTLS) watch(ctx context.Context) {
 
 		return
 	}
+
 	defer func() { _ = watcher.Close() }()
 
 	for _, dir := range r.watchDirs() {

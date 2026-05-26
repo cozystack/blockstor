@@ -200,6 +200,7 @@ func (s *Server) Start(ctx context.Context) error {
 	errCh := make(chan error, 2)
 
 	plainSrv := s.newHTTPServer(ctx, s.Addr, handler)
+
 	go func() {
 		logger.Info("REST API listening (plain HTTP, debug only)",
 			"addr", s.Addr,
