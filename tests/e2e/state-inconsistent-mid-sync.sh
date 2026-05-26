@@ -89,7 +89,7 @@ PF_LOCAL_PORT=33371
 # port-forward blockstor-apiserver:3370 → local 33371. Linstor CLI
 # wants the REST front; the apiserver Service is the right target on
 # the Phase-11.x split (controller has --enable-rest-api=false).
-kubectl -n "$NS" port-forward svc/blockstor-apiserver \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver \
     "$PF_LOCAL_PORT":3370 >/tmp/state-inconsistent-pf.log 2>&1 &
 PF_PID=$!
 

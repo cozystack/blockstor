@@ -49,7 +49,7 @@ linstor_cli_setup() {
 
     LCTL_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 
-    kubectl -n "$NS" port-forward svc/blockstor-apiserver "$LCTL_PORT":3370 \
+    kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$LCTL_PORT":3370 \
         >/tmp/cli-matrix-pf.log 2>&1 &
     LCTL_PF_PID=$!
 

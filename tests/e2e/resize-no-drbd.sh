@@ -92,7 +92,7 @@ echo "   md5_pre=$md5_pre"
 
 echo ">> PUT size_kib=${SIZE_GROWN_KIB} via REST"
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/resize-no-drbd-pf.log 2>&1 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true; cleanup' EXIT

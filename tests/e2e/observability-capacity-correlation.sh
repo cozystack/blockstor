@@ -95,7 +95,7 @@ PROBE_RD=e2e-cap-probe
 
 # Port-forward to blockstor's REST surface for `linstor` CLI calls.
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n "$NS" port-forward svc/blockstor-controller "$PF_PORT":3370 \
+kubectl -n "$NS" port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/cap-corr-pf.log 2>&1 &
 PF_PID=$!
 
@@ -339,8 +339,11 @@ fi
 # --- Phase 2 (Level 1): apply a 1Gi PVC ---------------------------------
 echo ">> phase 2 (Level 1): apply 1Gi PVC, expect Pending + capacity event"
 
-# Wire linstor-csi at blockstor's apiserver (same dance as observability-three-way).
-BLOCKSTOR_URL="http://blockstor-apiserver.blockstor-system.svc:3370"
+# Wire linstor-csi at blockstor's apiserver (same dance as
+# observability-three-way). mTLS endpoint (Service is TLS-only now);
+# piraeus must also present the client cert — validated on the stand as
+# a pre-merge follow-up (see the PR's stand-validation note).
+BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
 CUR_URL=$(kubectl get linstorcluster linstorcluster \
     -o jsonpath='{.spec.externalController.url}' 2>/dev/null || true)
 if [[ "$CUR_URL" != "$BLOCKSTOR_URL" ]]; then

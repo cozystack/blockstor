@@ -36,7 +36,14 @@ spec:
             - --linstor-endpoint=$(LS_CONTROLLERS)
           env:
             - {name: CSI_ENDPOINT,  value: "unix:///csi/csi.sock"}
-            - {name: LS_CONTROLLERS, value: "http://blockstor-controller.blockstor-system.svc:3370"}
+            # mTLS endpoint. golinstor (which linstor-csi wraps) upgrades
+            # to HTTPS and presents the client cert when LS_USER_*/
+            # LS_ROOT_CA point at PEM files. The Service exposes ONLY
+            # :3371 now, so the old http://...:3370 endpoint is gone.
+            - {name: LS_CONTROLLERS, value: "https://blockstor-controller.blockstor-system.svc:3371"}
+            - {name: LS_USER_CERTIFICATE, value: "/etc/linstor/client/tls.crt"}
+            - {name: LS_USER_KEY, value: "/etc/linstor/client/tls.key"}
+            - {name: LS_ROOT_CA, value: "/etc/linstor/client/ca.crt"}
             # Resolved from a downward-API spec.nodeName if the job
             # is scheduled onto a worker, otherwise hard-coded to a
             # known stand worker. The recorder e2e6 stand uses
@@ -47,6 +54,11 @@ spec:
                 fieldRef: {fieldPath: spec.nodeName}
           volumeMounts:
             - {name: csi, mountPath: /csi}
+            # cert-manager-issued client cert (tls.crt/tls.key/ca.crt)
+            # presented to the apiserver's RequireAndVerifyClientCert
+            # listener. No reloader.stakater.com — the Job is short-lived
+            # so cert rotation is out of scope for it.
+            - {name: client-tls, mountPath: /etc/linstor/client, readOnly: true}
 
         - name: csi-sanity
           image: golang:1.25
@@ -80,6 +92,9 @@ spec:
         - {name: csi, emptyDir: {}}
         - name: scparams
           configMap: {name: csi-sanity-params}
+        - name: client-tls
+          secret:
+            secretName: blockstor-apiserver-client-tls
 
 ---
 apiVersion: v1

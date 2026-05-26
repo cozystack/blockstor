@@ -37,7 +37,11 @@ source "$REPO_ROOT/tests/e2e/lib.sh"
 require_workers 3
 
 PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-kubectl -n blockstor-system port-forward svc/blockstor-controller "$PF_PORT":3370 \
+# The in-cluster Service is mTLS-only (port 3371). For the local CLI
+# validation we port-forward straight to the apiserver pod's plain-HTTP
+# debug port (3370), which is the intended kubectl-port-forward path —
+# it is NOT exposed on the Service.
+kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
     >/tmp/validate-linstor-cli-pf.log 2>&1 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true; \
