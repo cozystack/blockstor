@@ -750,6 +750,12 @@ type physicalStorageEntry struct {
 // PhysicalStorageDevice (slimmer than our internal apiv1.PhysicalDevice).
 type physicalStorageDeviceWireRepetition struct {
 	Device string `json:"device,omitempty"`
+	// Size is emitted WITHOUT omitempty: the python-linstor CLI reads
+	// it as a required key (responses.py PhysicalStorageDevice.size ->
+	// self._rest_data["size"]), so a missing key raises KeyError and
+	// crashes `linstor physical-storage list` whenever the list is
+	// non-empty. Upstream LINSTOR always carries size per device.
+	Size   int64  `json:"size"`
 	Model  string `json:"model,omitempty"`
 	Serial string `json:"serial,omitempty"`
 	WWN    string `json:"wwn,omitempty"`
@@ -795,6 +801,7 @@ func (s *Server) handlePhysicalStorageListForNode(w http.ResponseWriter, r *http
 
 		out = append(out, physicalStorageDeviceWireRepetition{
 			Device: devs[i].DevicePath,
+			Size:   devs[i].SizeBytes,
 			Model:  devs[i].Model,
 			Serial: devs[i].Serial,
 			WWN:    devs[i].StableID,
@@ -869,6 +876,7 @@ func groupPhysicalDevices(devs []apiv1.PhysicalDevice) []physicalStorageEntry {
 		entry.Nodes[devs[i].NodeName] = append(entry.Nodes[devs[i].NodeName],
 			physicalStorageDeviceWireRepetition{
 				Device: devs[i].DevicePath,
+				Size:   devs[i].SizeBytes,
 				Model:  devs[i].Model,
 				Serial: devs[i].Serial,
 				WWN:    devs[i].StableID,
