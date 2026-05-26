@@ -592,6 +592,18 @@ reset_cluster_state() {
     return $rc
 }
 
+# skip emits the e2e SKIP sentinel and exits 0. `make e2e` collapses any
+# non-zero script exit into make's own exit 2, so an exit-code SKIP
+# convention cannot survive the make wrapper — instead we print a stdout
+# sentinel that run-scenarios-only.sh greps for in the per-scenario log
+# and reclassifies as SKIP (for the env-gated allowlist) or FAIL (any
+# other scenario that opts out is a regression — a mandatory test must
+# not silently disappear). Exit 0 so make itself reports success.
+skip() {
+    echo "__E2E_SKIP__: $*"
+    exit 0
+}
+
 # require_workers enforces that the cluster has at least N satellite
 # nodes Ready AND at least N satellite pods Ready (Bug 298). The pod-
 # readiness check guards against the previous-test-cascade pattern:
@@ -611,8 +623,7 @@ require_workers() {
         | awk '$2 == "Ready"' | wc -l)
 
     if (( got < want )); then
-        echo "SKIP: scenario needs $want satellite workers, found $got" >&2
-        exit 0
+        skip "scenario needs $want satellite workers, found $got"
     fi
 
     # Bug 298: wait up to 30s for residual Terminating satellite pods
@@ -637,9 +648,7 @@ require_workers() {
     done
 
     if (( ready_pods < want )); then
-        echo "SKIP: scenario needs $want Ready satellite pods, found $ready_pods" \
-             "(previous-test cascade — check for Terminating pods)" >&2
-        exit 0
+        skip "scenario needs $want Ready satellite pods, found $ready_pods (previous-test cascade — check for Terminating pods)"
     fi
 }
 
