@@ -3623,13 +3623,18 @@ func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResour
 //     intended current+flags (a winner seed with a per-slot-varying
 //     current would be silently clobbered by the highest node-id).
 //   - only the bitmap-base UUID is PER-PEER (md->peers[N].bitmap_uuid).
-//     We want day0 in every peer slot, which the uniform seed provides.
+//     The day0 seed paths leave it EMPTY, so the uniform stamp writes
+//     bitmap-uuid 0x0 into every slot — matching upstream LINSTOR's
+//     working-skip metadata (captured via `drbdmeta dump-md`: every
+//     per-peer slot bitmap-uuid 0x0, resource skips the resync).
 //
-// So the winner seed (`current=random, bitmap=day0, Consistent,
-// UpToDate`) applied uniformly yields exactly the spec's end state:
-// shared current=random + Consistent+UpToDate flags, and every peer
-// slot's bitmap-base = day0. The all-day0 skip-init-sync seed
-// (`current=bitmap=day0`, no flags) is likewise uniform.
+// So the winner seed (`current=day0, bitmap-base EMPTY, Consistent,
+// UpToDate`) applied uniformly yields: shared current=day0 +
+// Consistent+UpToDate flags, and every peer slot's bitmap-uuid 0x0.
+// The skip-init-sync seed (`current=day0, bitmap-base EMPTY`, no flags)
+// is likewise uniform. A NON-zero bitmap-base (a previous iteration
+// stamped day0 there) is read by DRBD as a live out-of-sync anchor and
+// triggers a full SyncTarget — the bug this seeding now avoids.
 //
 // Blanketing all slots (not just dr.GetPeerNames()) is the Bug 284 /
 // Bug 342 invariant: it wipes stale per-peer bitmap-UUIDs out of slots
@@ -3778,13 +3783,50 @@ func (r *Reconciler) resolveVolumeSeed(resourceName string, vol *intent.DesiredV
 	day0 := day0GiFor(resourceName, vol.GetVolumeNumber())
 
 	if seed := vol.GetSeedFromGI(); seed != "" {
+		// Phase 8.1 relocate-skip: the controller copied this GID from a
+		// real UpToDate peer. current == bitmap-base == peer's GID means
+		// "I am at the peer's generation and have no dirty bits relative
+		// to it" — the long-standing, separately-validated seed-from-
+		// real-peer shape (Adm.SetGI). This is NOT the fresh day0 skip
+		// path; it anchors against a live peer's real generation, so the
+		// bitmap-base carries that generation rather than being empty.
 		return drbd.GISeed{Current: seed, BitmapBase: seed}, true
 	}
 
 	if isWinner {
+		// Winner seed, matched byte-for-byte to upstream LINSTOR's
+		// working-skip metadata captured live via `drbdmeta dump-md` on
+		// a piraeus thin resource that reaches UpToDate with ZERO
+		// resync:
+		//
+		//   current-uuid <day0>; flags Consistent+UpToDate;
+		//   EVERY peer slot bitmap-uuid 0x0  (clean — NOT day0).
+		//
+		// The decisive field is the per-peer BITMAP-BASE, left EMPTY
+		// (→ drbdmeta writes bitmap-uuid 0x0). DRBD's connection
+		// handshake reads a zero bitmap-uuid as "no out-of-sync bits
+		// relative to this peer", so with both replicas sharing the
+		// same current-uuid and a clean (zero) bitmap, it concludes
+		// "nothing to copy" and both go straight to UpToDate.
+		//
+		// The earlier shape stamped bitmap-base = day0 (a NON-zero
+		// value equal to current) into every slot. DRBD then read a
+		// non-zero bitmap-base as a live out-of-sync bitmap anchor and
+		// flipped the peer to SyncTarget for a full ~1 GiB resync of an
+		// empty thin volume — the exact bug. (Captured: ours had
+		// bitmap-uuid=day0 in every slot and SyncTargeted; upstream had
+		// bitmap-uuid=0x0 in every slot and skipped, same kernel.)
+		//
+		// current-uuid stays day0 (the shared deterministic lineage
+		// anchor) — NOT a fresh random GID — so the dispatcher's
+		// isDay0SeededVolume discriminator still recognises this winner
+		// as a fresh day0 sibling (staggered late replica may take its
+		// own skip; a dual-winner race agrees rather than split-brains).
+		// Upstream uses a shared random current; day0 is the
+		// blockstor-equivalent shared value and works identically at the
+		// handshake (both replicas present the same current-uuid).
 		return drbd.GISeed{
 			Current:    day0,
-			BitmapBase: day0,
 			Consistent: true,
 			UpToDate:   true,
 		}, true
@@ -3799,7 +3841,14 @@ func (r *Reconciler) resolveVolumeSeed(resourceName string, vol *intent.DesiredV
 		return drbd.GISeed{}, false
 	}
 
-	return drbd.GISeed{Current: day0, BitmapBase: day0}, true
+	// Skip-init-sync (case A): current = day0 (shared lineage anchor),
+	// bitmap-base EMPTY (zero) — same clean-bitmap shape as the winner,
+	// minus the Consistent/UpToDate flags. Both peers present the same
+	// current-uuid with a zero bitmap → DRBD reads "no data difference"
+	// → no sync; both reach UpToDate at the kernel handshake. (Stamping
+	// day0 into bitmap-base here was the same SyncTarget-triggering bug
+	// the winner branch documents.)
+	return drbd.GISeed{Current: day0}, true
 }
 
 // providerForResource resolves the provider that owns the named

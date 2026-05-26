@@ -25,22 +25,25 @@ import (
 	"github.com/cozystack/blockstor/pkg/drbd"
 )
 
-// TestGISeedStringWinnerLocalSlot pins the elected winner's local-slot
-// GI shape: a random current-UUID, day0 as bitmap-base, and BOTH the
-// consistent + up-to-date flags. This is how the source reaches
-// UpToDate by writing metadata instead of `drbdadm primary --force`.
-func TestGISeedStringWinnerLocalSlot(t *testing.T) {
+// TestGISeedStringWinnerSlot pins the elected winner's GI shape as it
+// is actually seeded: a current-UUID (day0 lineage anchor), bitmap-base
+// EMPTY (→ literal "0" = bitmap-uuid 0x0), and BOTH the consistent +
+// up-to-date flags. The empty bitmap-base is the load-bearing field —
+// it matches upstream LINSTOR's working-skip metadata (every per-peer
+// bitmap-uuid 0x0) so the source reaches UpToDate from metadata alone
+// AND the peers skip the resync. A non-zero bitmap-base triggered a
+// full SyncTarget (the bug).
+func TestGISeedStringWinnerSlot(t *testing.T) {
 	seed := drbd.GISeed{
 		Current:    "AABBCCDDEEFF0010",
-		BitmapBase: "1122334455667780",
 		Consistent: true,
 		UpToDate:   true,
 	}
 
 	got := seed.String()
-	want := "AABBCCDDEEFF0010:1122334455667780:0:0:1:1"
+	want := "AABBCCDDEEFF0010:0:0:0:1:1"
 	if got != want {
-		t.Errorf("winner local slot GI: got %q want %q", got, want)
+		t.Errorf("winner slot GI: got %q want %q", got, want)
 	}
 }
 
@@ -58,15 +61,18 @@ func TestGISeedStringWinnerPeerSlot(t *testing.T) {
 	}
 }
 
-// TestGISeedStringSkipInitSync pins the all-day0 skip-init-sync shape
-// (case A): current == bitmap == day0, no flags. Both peers present
-// equal current-UUIDs with clean bitmaps → no sync.
+// TestGISeedStringSkipInitSync pins the skip-init-sync shape (case A):
+// current = day0, bitmap-base EMPTY (→ "0" = bitmap-uuid 0x0), no
+// flags. Both peers present equal current-UUIDs with a clean (zero)
+// bitmap → no sync. The empty bitmap-base matches upstream's
+// working-skip metadata; a day0 (non-zero) bitmap-base triggered a
+// full resync.
 func TestGISeedStringSkipInitSync(t *testing.T) {
 	day0 := "1122334455667780"
-	seed := drbd.GISeed{Current: day0, BitmapBase: day0}
+	seed := drbd.GISeed{Current: day0}
 
 	got := seed.String()
-	want := "1122334455667780:1122334455667780:0:0"
+	want := "1122334455667780:0:0:0"
 	if got != want {
 		t.Errorf("skip-init-sync GI: got %q want %q", got, want)
 	}
