@@ -119,6 +119,17 @@ if ! command -v linstor >/dev/null 2>&1; then
         https://github.com/LINBIT/linstor-client/archive/refs/tags/v1.27.1.tar.gz
 fi
 
+# jq for scenarios that parse kubectl/REST JSON (observability-*,
+# affinity-controller, recovery-auto-place, recovery-poolmissing, ...).
+# Absent on a fresh oracle runner; those scenarios are now mandatory (their
+# old "SKIP: jq not in PATH" silent-pass guards are hard failures), so the
+# tool must be guaranteed present rather than silently skipped around.
+if ! command -v jq >/dev/null 2>&1; then
+    log "installing jq"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends jq
+fi
+
 # Ubuntu cloud images ship a catch-all REJECT in FORWARD; the talos
 # qemu bridges (talos<hash>) need traffic forwarded. Mirrors setup-host.sh.
 sudo iptables -P FORWARD ACCEPT 2>/dev/null || true
@@ -176,7 +187,35 @@ make blockstor NAME="$STAND"
 log "provisioning pools"
 make pools NAME="$STAND" TYPE=both
 
+# Optional: install upstream piraeus (operator + linstor-csi + NFS-ganesha)
+# alongside blockstor. The dedicated e2e-piraeus job sets INSTALL_PIRAEUS=1
+# so the piraeus-dependent scenarios (rwx-ganesha, observability-three-way,
+# observability-capacity-correlation) get the LinstorCluster CRD + the
+# linstor-csi NFS-ganesha path they drive. blockstor coexists with piraeus's
+# satellite by design (shared file-thin pool + host-shared /etc/drbd.d,
+# Bugs 305/310/359).
+if [ "${INSTALL_PIRAEUS:-0}" = "1" ]; then
+    log "installing piraeus (operator + linstor-csi)"
+    make piraeus NAME="$STAND"
+fi
+
 # ── 6. this lane's scenario shard (round-robin over LANES) ──────────
+# E2E_EXCLUDE (space-separated scenario names) drops scenarios from this run.
+# The 6-lane matrix sets it to the piraeus-dependent scenarios so they do NOT
+# run on the blockstor-only matrix clusters (piraeus absent → they would now
+# hard-fail); they run in the e2e-piraeus job instead, which passes them
+# explicitly and leaves E2E_EXCLUDE unset.
+if [ -n "${E2E_EXCLUDE:-}" ]; then
+    kept=()
+    for s in "${ALL_SCENARIOS[@]}"; do
+        case " $E2E_EXCLUDE " in
+            *" $s "*) log "excluding scenario (runs in e2e-piraeus job): $s" ;;
+            *)        kept+=("$s") ;;
+        esac
+    done
+    ALL_SCENARIOS=("${kept[@]}")
+fi
+
 shard=()
 for i in "${!ALL_SCENARIOS[@]}"; do
     if [ $(( i % LANES )) -eq $(( LANE - 1 )) ]; then
