@@ -49,6 +49,8 @@ jobs:
             code:
               - '!docs/**'
               - '!**/*.md'
+              - '!**/*.svg'
+              - '!img/**'
               - '!.github/ISSUE_TEMPLATE/**'
               - '!LICENSE'
 
