@@ -92,7 +92,8 @@ func TestBug319CreateMDBeforeAdjustOnDisklessToDiskfulFlip(t *testing.T) {
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers:           []intent.DesiredPeer{{Name: "n2"}},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port":            "7000",
 			"node-id":         "0",
@@ -270,7 +271,8 @@ func TestBug303NoAttachWhenKernelAlreadyDiskful(t *testing.T) {
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers:           []intent.DesiredPeer{{Name: "n2"}},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port":            "7000",
 			"node-id":         "0",
@@ -351,7 +353,8 @@ func TestApplyDRBDRunsCreateMdOnDisklessToDiskfulFlip(t *testing.T) {
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers:           []intent.DesiredPeer{{Name: "n2"}},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port":            "7000",
 			"node-id":         "0",

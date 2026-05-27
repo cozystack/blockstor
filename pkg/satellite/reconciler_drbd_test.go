@@ -115,7 +115,8 @@ func TestApplyWritesResFile(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -201,7 +202,8 @@ func TestApplyMultiVolumeRDRendersOneResourceWithVolumes(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "fast"},
 				{VolumeNumber: 1, SizeKib: 2 * 1024 * 1024, StoragePool: "slow"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -313,6 +315,7 @@ func TestApplyInvokesDrbdadmAdjust(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -399,6 +402,7 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -447,6 +451,7 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -492,6 +497,7 @@ func TestApplyRendersAllowTwoPrimaries(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 
@@ -543,6 +549,7 @@ func TestApplyDropsLinstorOnlyOptions(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 
@@ -614,6 +621,7 @@ func TestApplyRendersRDProtocolIntoNetBlock(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 
@@ -685,8 +693,9 @@ func TestApplySkipsDRBDWhenLayerStackOmits(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			LayerStack:  []string{"STORAGE"},
-			DrbdOptions: map[string]string{},
+			LayerStack:      []string{"STORAGE"},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions:     map[string]string{},
 		},
 	})
 	if err != nil {
@@ -932,8 +941,9 @@ func TestApplyDRBDLUKSStorageStack(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
-			Props:      map[string]string{"LuksPassphrase": "topsecret"},
+			LayerStack:      []string{"DRBD", "LUKS", "STORAGE"},
+			Props:           map[string]string{"LuksPassphrase": "topsecret"},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -1010,6 +1020,7 @@ func TestApplyDRBDResizeErrorSurfaces(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -1061,6 +1072,7 @@ func TestApplyUnknownStoragePool(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "ghost-pool"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -1537,6 +1549,7 @@ func TestApplyLUKSConvergeResizeAfterCrashRecovery(t *testing.T) {
 			// only omits it pre-allocation, which a previously-resized
 			// resource is well past. Without it the Bug 360 first-
 			// activation gate (correctly) defers the whole DRBD path.
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -1939,6 +1952,7 @@ func TestApplyAutoPrimarySkippedWhenConnectedPeerHasData(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
@@ -2030,7 +2044,8 @@ func TestMigrateDstDisklessToDiskfulFlipRefusesDay0Skip(t *testing.T) {
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers:           []intent.DesiredPeer{{Name: "n2"}},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
@@ -2299,6 +2314,7 @@ func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -2484,6 +2500,7 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -2544,9 +2561,10 @@ func TestApplyDRBDLateVDDoesNotPinDiskless(t *testing.T) {
 	// First pass: RD + Resource exist but no VolumeDefinition yet.
 	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
-			Name:     "pvc-late-vd",
-			NodeName: "n1",
-			Volumes:  nil, // ← Bug 79 repro: empty volumes on first apply
+			Name:            "pvc-late-vd",
+			NodeName:        "n1",
+			Volumes:         nil, // ← Bug 79 repro: empty volumes on first apply
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -2584,6 +2602,7 @@ func TestApplyDRBDLateVDDoesNotPinDiskless(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -2712,6 +2731,7 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 				{VolumeNumber: 1, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -2867,6 +2887,7 @@ func TestApplyAutoPrimaryForceErrorWraps(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 				"auto-primary": "true",
@@ -2929,6 +2950,7 @@ func TestApplyFirstActivationSeedsGiBeforeAdjust(t *testing.T) {
 					SeedFromGI:   "78A0DDDABCDEF000",
 				},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
@@ -3046,7 +3068,8 @@ func TestApplyFirstActivationDiskReplaceInternalMetadata(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7900",
 				"node-id":         "0",
@@ -3175,7 +3198,8 @@ func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7901",
 				"node-id":         "0",
@@ -3261,6 +3285,7 @@ func TestApplyFirstActivationNoSkipOnLVMThick(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thick1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -3315,6 +3340,7 @@ func TestApplyFreshReplicaWithDataPeerSkipsSeed(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "zfs-thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 				"peer.n2.port": "7000", "peer.n2.node-id": "1", "peer.n2.address": "10.0.0.2",
@@ -3868,7 +3894,8 @@ func TestApplyDefersAdjustDuringSyncTarget(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4000,7 +4027,8 @@ func TestApplyDefersAdjustDuringPausedSyncS(t *testing.T) {
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
 					},
-					Peers: []intent.DesiredPeer{{Name: "n2"}},
+					Peers:           []intent.DesiredPeer{{Name: "n2"}},
+					SkipInitialSync: skipInitTrue(),
 					DrbdOptions: map[string]string{
 						"port":            "7000",
 						"node-id":         "0",
@@ -4140,7 +4168,8 @@ func TestReconcilerDoesNotPropagateDiscardMyData(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4311,7 +4340,8 @@ func TestReconcilerRespectsOperatorDisconnect(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7100",
 				"node-id":         "0",
@@ -4482,7 +4512,8 @@ func TestOperatorDisconnectSurvives30sWindow(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7200",
 				"node-id":         "0",
@@ -4677,7 +4708,8 @@ func TestApplyRendersExternalMetaDiskPath(t *testing.T) {
 					MetaPool: "ssd-meta",
 				},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4790,7 +4822,8 @@ func TestApplyRoutesMetaToSeparatePoolScenario5W05(t *testing.T) {
 					MetaPool:    metaPool,
 				},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -4977,9 +5010,10 @@ func TestReconcilerPassesSkipDiskFlag(t *testing.T) {
 
 			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 				{
-					Name:     "pvc-skipdisk",
-					NodeName: "n1",
-					Props:    tc.props,
+					Name:            "pvc-skipdisk",
+					NodeName:        "n1",
+					Props:           tc.props,
+					SkipInitialSync: skipInitTrue(),
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 					},
@@ -5085,6 +5119,7 @@ func TestReconcilerCoercesAdjustToSkipDiskOnKernelDiskless(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -5169,7 +5204,8 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -5221,7 +5257,8 @@ func TestApplyDropsPeerWhenRemovedFromDesired(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: nil, // ← peer list collapsed to "this node only"
+			Peers:           nil, // ← peer list collapsed to "this node only"
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -5368,7 +5405,8 @@ func TestTemporarySecondaryFailureAutoRecovers(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
@@ -5600,6 +5638,7 @@ func TestApplyAutoMkfsXfsFiresOnceOnFirstActivation(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "xfs",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 				"auto-primary": "true",
@@ -5705,6 +5744,7 @@ func TestApplyAutoMkfsHonoursMkfsParams(t *testing.T) {
 				"FileSystem/Type":       "xfs",
 				"FileSystem/MkfsParams": "-K -L data",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "2000",
 				"auto-primary": "true",
@@ -5760,6 +5800,7 @@ func TestApplyAutoMkfsSkipsWithoutFileSystemType(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "3000",
 				"auto-primary": "true",
@@ -5862,6 +5903,7 @@ func TestApplyAutoMkfsSkipsWhenNotPrimary(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "xfs",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "1", "address": "10.0.0.2", "minor": "5000",
 				// auto-primary NOT set → this replica must stay Secondary
@@ -5934,6 +5976,7 @@ func TestApplyAutoMkfsRetryAfterMissedFirstActivation(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "6000",
 				"auto-primary": "true",
@@ -6053,6 +6096,7 @@ func TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "6100",
 				"auto-primary": "true",
@@ -6117,6 +6161,7 @@ func TestApplyAutoMkfsMultiVolumeMkfsBoth(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "7000",
 				"auto-primary": "true",
@@ -6213,7 +6258,8 @@ func TestApplyResFileUsesKernelHostnameNotLINSTORName(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: peerLinstor}},
+			Peers:           []intent.DesiredPeer{{Name: peerLinstor}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -6308,6 +6354,7 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 			},
@@ -6443,6 +6490,7 @@ func TestApplyAutoMkfsMultiVolumeFormatsAllVolumes(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "8000",
 				"auto-primary": "true",
@@ -6532,6 +6580,7 @@ func TestApplyAutoMkfsMultiVolumeSkipsPreFormattedVolume(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "8500",
 				"auto-primary": "true",
@@ -6620,6 +6669,7 @@ func TestApplyAutoMkfsMultiVolumeStampsConditionOnlyAfterAll(t *testing.T) {
 			Props: map[string]string{
 				"FileSystem/Type": "ext4",
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "9000",
 				"auto-primary": "true",
@@ -6809,6 +6859,7 @@ func TestBug278AutoClearSkipDiskOnHealthyReattach(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",
@@ -6890,6 +6941,7 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":    "7000",
 				"node-id": "0",

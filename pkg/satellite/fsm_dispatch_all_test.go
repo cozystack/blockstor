@@ -36,6 +36,15 @@ import (
 	"github.com/cozystack/blockstor/pkg/storage/lvm"
 )
 
+// skipInitTrue builds the *bool the controller stamps into
+// Resource.Spec.SkipInitialSync (threaded onto DesiredResource) for a
+// genuinely-fresh RD that may take the day0 skip. The satellite's
+// gateBringUpReadiness requires this non-nil before seeding a fresh
+// diskful replica, so every Apply-driven fixture in this internal-test
+// package sets it. (reconciler_drbd_test.go carries the same helper for
+// the external satellite_test package.)
+func skipInitTrue() *bool { v := true; return &v }
+
 // dispatchFixtureDR returns a minimal DesiredResource that drives
 // each extracted helper through its happy path. Devices map points
 // at an LVM-shaped lower disk path because buildResFile inspects
@@ -49,7 +58,8 @@ func dispatchFixtureDR(name string) (*intent.DesiredResource, map[int32]string) 
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
-		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		Peers:           []intent.DesiredPeer{{Name: "n2"}},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port":            "7000",
 			"node-id":         "0",
@@ -325,6 +335,7 @@ func TestFsmShadowAgreeCountIncrementsPerAction(t *testing.T) {
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
+		SkipInitialSync: skipInitTrue(),
 		DrbdOptions: map[string]string{
 			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
 		},
