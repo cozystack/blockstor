@@ -19,6 +19,10 @@ The difference is what's underneath. Instead of a central controller with its ow
 
 Go is the lingua franca of the Kubernetes ecosystem — apiserver, kubelet, etcd, the bulk of CSI drivers, controller-runtime itself. Writing blockstor in Go aligns the project with the tooling, libraries, and contributor base of that ecosystem.
 
+### Small footprint
+
+The controller, apiserver, and satellite are statically-linked Go binaries — there is no JVM and no language runtime to ship or warm up. The replication engine, DRBD, is a Linux kernel module rather than a userspace daemon. That keeps the memory and image footprint modest enough for edge and small-node deployments, where a multi-hundred-megabyte Java runtime would not fit comfortably.
+
 ## Status
 
 What works today:
