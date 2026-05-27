@@ -152,11 +152,15 @@ echo "   PV=$PV_NAME volumeHandle=$VOL_HANDLE"
 # In linstor-csi the RD name == volumeHandle (PV-prefixed) by default.
 RD="$VOL_HANDLE"
 
-# Make sure LINSTOR sees the RD AND its replicas have a DRBD port
-# assigned before we extract metadata. A fresh-bound PVC can race the
-# satellite's first-resource-render: the RD CRD exists but the
-# tcp_ports list is still null until the satellite stamps the port.
-echo ">> wait up to 120s for LINSTOR RD $RD + tcp_ports populated"
+# Make sure LINSTOR sees the RD, its replicas have a DRBD port assigned,
+# AND the DRBD minor is observable before we extract metadata. A fresh-bound
+# PVC races the satellite's first-resource-render and drbdadm-up: the RD CRD
+# exists and tcp_ports stamps at .res-render time, but the minor (derived
+# from the volume's /dev/drbdN device_path) only appears once the device is
+# actually up — a beat after the port. Gating on the port alone occasionally
+# reads an empty minor (the source of the "could not extract port/minor"
+# flake on the otherwise-green piraeus lane).
+echo ">> wait up to 120s for LINSTOR RD $RD + tcp_ports + minor populated"
 deadline=$(( $(date +%s) + 120 ))
 seen=""
 while (( $(date +%s) < deadline )); do
@@ -164,16 +168,26 @@ while (( $(date +%s) < deadline )); do
         | jq -r --arg n "$RD" '[.. | objects | select(.name? == $n)] | length')
     port_seen=$("${LCTL_M[@]}" resource list -r "$RD" 2>/dev/null \
         | jq -r '[.[0][]? | .layer_object.drbd.tcp_ports[]? | numbers] | length')
-    if [[ "${rd_seen:-0}" -gt 0 && "${port_seen:-0}" -gt 0 ]]; then
+    # Minor surfaces as volume.minor_nr/minor (upstream) or a /dev/drbdN
+    # device_path on a diskful replica (blockstor) — accept either.
+    minor_seen=$("${LCTL_M[@]}" volume list -r "$RD" 2>/dev/null \
+        | jq -r '[.. | objects | (.minor_nr // .minor // empty) | numbers] | length')
+    if [[ "${minor_seen:-0}" -eq 0 ]]; then
+        minor_seen=$("${LCTL_M[@]}" resource list -r "$RD" 2>/dev/null \
+            | jq -r '[ .[0][]? | (.. | objects | .device_path? // empty) | strings
+                      | select(test("^/dev/drbd[0-9]+$")) ] | length')
+    fi
+    if [[ "${rd_seen:-0}" -gt 0 && "${port_seen:-0}" -gt 0 && "${minor_seen:-0}" -gt 0 ]]; then
         seen=1
         break
     fi
     sleep 2
 done
 if [[ -z "$seen" ]]; then
-    echo "FAIL: RD $RD never showed up with tcp_ports via linstor"
+    echo "FAIL: RD $RD never showed up with tcp_ports + minor via linstor"
     "${LCTL_M[@]}" resource-definition list -r "$RD" || true
     "${LCTL_M[@]}" resource list -r "$RD" || true
+    "${LCTL_M[@]}" volume list -r "$RD" || true
     exit 1
 fi
 
