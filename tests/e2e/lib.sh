@@ -190,6 +190,31 @@ kernel_pair_uptodate() {
         2>/dev/null || true
 }
 
+# kernel_all_uptodate <rd> <node> [vol] — kernel ground truth for an
+# N-peer RD: prints "ok" iff `node`'s local disk-state AND the
+# peer-disk-state of EVERY connection are UpToDate, read straight from
+# `drbdsetup status <rd> --json` on `node`. A single node's status frame
+# reports its own disk-state plus the peer-disk-state of all peers, so
+# for a 3-replica RD one query on any peer covers all three replicas.
+# The connection set must be non-empty (a lone node with no peers can't
+# prove the others are UpToDate). Empty/parse failure (node unreachable,
+# slot mid-negotiation) prints nothing → caller keeps waiting.
+# Independent of the controller's CRD .status projection — same purpose
+# as kernel_pair_uptodate, generalised past two peers.
+kernel_all_uptodate() {
+    local rd=$1 node=$2 vol=${3:-0}
+    on_node "$node" drbdsetup status "$rd" --json 2>/dev/null | jq -r \
+        --argjson v "$vol" '
+        ([.[0].devices[]? | select(.volume==$v) | ."disk-state"] | first) as $loc
+        | [.[0].connections[]? | .peer_devices[]?
+            | select(.volume==$v) | ."peer-disk-state"] as $peers
+        | if ($loc=="UpToDate"
+              and ($peers | length) > 0
+              and ($peers | all(. == "UpToDate")))
+          then "ok" else "no" end' \
+        2>/dev/null || true
+}
+
 # status_connection_state <rd> <node> <peer> — full kernel connection
 # state string as observed FROM `node` TOWARD `peer`: Connected /
 # Connecting / StandAlone / BrokenPipe / NetworkFailure / Timeout /
