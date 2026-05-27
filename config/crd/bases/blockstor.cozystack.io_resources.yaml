@@ -288,6 +288,48 @@ spec:
               resourceDefinitionName:
                 description: resourceDefinitionName is the parent ResourceDefinition.
                 type: string
+              skipInitialSync:
+                description: |-
+                  skipInitialSync is the controller-authoritative, persisted decision
+                  of whether THIS replica may skip the DRBD initial sync (come up
+                  instantly UpToDate via the day0 `set-gi` seed) or MUST run a real
+                  SyncTarget from a data-bearing peer. Stamped ONCE at first reconcile
+                  (append-only, set-if-nil, never mutated) as
+                  `!ResourceDefinition.Spec.Initialized`:
+
+                    - true  → the replica was created while its RD was still a
+                      genuinely-fresh, never-written initial set (RD.Spec.Initialized
+                      nil/false). It is safe to seed the day0 skip → instant UpToDate,
+                      out_of_sync=0, no SyncTarget. The whole initial replica set is
+                      stamped true together, so a fresh 2-/3-replica deployment skips
+                      in lock-step (invariant 1).
+                    - false → the replica joined an RD that had ALREADY held committed
+                      data (RD.Spec.Initialized==true): relocate, migrate-disk, or an
+                      extra replica. It MUST NOT skip — it comes up Inconsistent and
+                      SyncTargets the real data from a peer (invariant 2). This holds
+                      EVEN IF the sole data-holder is offline at seed time, because
+                      the decision is read from the persisted RD latch, NOT from live
+                      kernel/peer state (offline-safety + the core fix).
+
+                  This REPLACES the satellite's live-kernel AnyConnectedPeerHasData
+                  probe as the authoritative skip decision (that probe is unsafe: it
+                  only sees CONNECTED peers, so an offline data-holder made a fresh
+                  replica skip → falsely UpToDate while EMPTY). The probe is retained
+                  only as a defense-in-depth secondary veto.
+
+                  clusterIP-style: nil means "controller, decide and stamp me"
+                  (conservative pre-upgrade / pre-stamp default in resolveVolumeSeed:
+                  do NOT skip — full sync, invariant 5). A non-nil value is
+                  authoritative and NEVER overwritten — restore-safe (invariant 3)
+                  and 3-way-merge-safe (the user never sets it → it is never in their
+                  last-applied → `kubectl apply` / golinstor REST that omit it never
+                  strip it; invariant 4).
+                type: boolean
+                x-kubernetes-validations:
+                - message: 'skipInitialSync is settable-once: it may go from unset
+                    to a value but not be changed once set'
+                  optionalOldSelf: true
+                  rule: '!oldSelf.hasValue() || self == oldSelf.value()'
               storagePool:
                 description: |-
                   storagePool is the LINSTOR storage pool name this replica

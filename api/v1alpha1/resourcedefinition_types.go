@@ -91,6 +91,46 @@ type ResourceDefinitionSpec struct {
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value()",optionalOldSelf=true,message="drbdPort is settable-once"
 	DRBDPort *int32 `json:"drbdPort,omitempty"`
+
+	// initialized is the durable "this RD has completed its initial
+	// replica-set establishment and now holds (or has held) committed
+	// data" latch. The controller flips it true ONCE, append-only, the
+	// first time any diskful replica of the RD reports a real
+	// data-bearing disk state that has advanced past the deterministic
+	// day0 GI (a genuine write, or an adoption of pre-existing data) —
+	// see ResourceReconciler.ensureRDInitialized. Once true it is NEVER
+	// cleared or mutated.
+	//
+	// It is the OFFLINE-SAFE, BACKUP-SAFE source of truth for the
+	// skip-initial-sync decision (replaces the live-kernel
+	// AnyConnectedPeerHasData probe as the authoritative signal):
+	//
+	//   - A Resource created while initialized is nil/false is part of
+	//     the genuinely-fresh initial set — every such replica is
+	//     stamped Spec.SkipInitialSync=true and skips the initial sync
+	//     (instant UpToDate, no SyncTarget). Invariant 1.
+	//   - A Resource created AFTER initialized latched true (relocate /
+	//     migrate-disk / extra replica) is stamped
+	//     Spec.SkipInitialSync=false and must SyncTarget the real data —
+	//     EVEN IF the sole data-holder is offline at seed time, because
+	//     this latch was set while the data was being written (holder
+	//     online) and PERSISTS in Spec across the holder going offline.
+	//     Invariant 2 + offline-safety.
+	//
+	// Lives in Spec (backed up by `kubectl get -o yaml`, restored by
+	// `kubectl apply`), NOT Status — a restored, already-initialized RD
+	// must keep forcing new replicas to sync rather than skip. Invariant
+	// 3 (backup/restore-safe).
+	//
+	// clusterIP-style append-only: nil means "not yet initialized" (the
+	// conservative pre-upgrade / fresh default → fresh replicas may skip,
+	// the controller flips it on first real data). The controller writes
+	// it only when transitioning nil/false→true and never otherwise, so
+	// a user `kubectl apply` / golinstor REST that omits it never fights
+	// the controller (3-way-merge-safe — invariant 4).
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="!oldSelf.hasValue() || self == oldSelf.value() || (oldSelf.value() == false && self == true)",optionalOldSelf=true,message="initialized is append-only: it may go unset→value or false→true but never back to false"
+	Initialized *bool `json:"initialized,omitempty"`
 }
 
 // ResourceDefinitionVolume is one volume slot inside an RD.
