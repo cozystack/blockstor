@@ -28,7 +28,7 @@ import (
 // nil/missing scopes are skipped. Within each scope, only non-empty
 // strings and non-nil pointer fields override — nil pointers (`*bool`,
 // `*int32`) signal "not overridden at this scope, inherit from
-// parent". This matches the design summary in PLAN.md Phase 10.3.
+// parent". This matches the Phase 10.3 design summary.
 //
 // Returns a freshly-allocated *DRBDOptions; the caller may mutate it
 // without disturbing inputs. Returns nil only if all four inputs are

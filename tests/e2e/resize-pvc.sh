@@ -2,7 +2,7 @@
 #
 # usage: resize-pvc.sh WORK_DIR
 #
-# Phase 8.2 follow-up — PLAN.md: "Volume resize end-to-end with a
+# Phase 8.2 follow-up — "Volume resize end-to-end with a
 # real PVC: write checksum, grow via REST, verify checksum +
 # filesystem sees the new size."
 #

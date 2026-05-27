@@ -177,7 +177,7 @@ Form: `--x-replicas-on-different <prop> <max-per-value>`. Example: `--x-replicas
 Four strategies (`MaxFreeSpace`, `MinReservedSpace`, `MinRscCount`,
 `MaxThroughput`) weighted via `Autoplacer/Weights/*` props.
 
-**blockstor status:** Autoplacer is "greatest-free-first, deterministic ties on NodeName" (per PLAN.md line 367). That's effectively `MaxFreeSpace` with no weighting. The other three strategies + weighting are **not implemented**.
+**blockstor status:** Autoplacer is "greatest-free-first, deterministic ties on NodeName". That's effectively `MaxFreeSpace` with no weighting. The other three strategies + weighting are **not implemented**.
 
 **Test (when implemented):**
 - Set `Autoplacer/Weights/MinRscCount=1` on controller, `Autoplacer/Weights/MaxFreeSpace=0`
@@ -470,7 +470,7 @@ the contract-replay tests against the LINSTOR oracle.
 
 ### 7.3 LUKS layer + DRBD shared-secret (S)
 
-**UG ref:** §"Encrypted volumes" + PLAN.md line 385-386
+**UG ref:** §"Encrypted volumes"
 
 LUKS at data-at-rest, `DrbdOptions/Net/shared-secret` for in-transit. Both implemented. Existing tests in `tests/advanced-config-scenarios.md`.
 

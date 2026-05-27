@@ -2,7 +2,7 @@
 # Run scenarios on an already-provisioned stand.
 #
 # Canonical source of truth for the stand-side runner. Lives in
-# /tmp/run-scenarios-only.sh on the OCI dev stand (129.213.29.101) and
+# /tmp/run-scenarios-only.sh on the OCI dev stand (<dev-stand-host>) and
 # is invoked by /tmp/run<N>-dispatch.sh for each parallel e2eN lane.
 # The dispatcher itself stays out-of-band because it carries the
 # per-run scenario matrix (SCEN[e2eN]=...), which changes every Run.

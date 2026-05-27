@@ -85,7 +85,7 @@ These pin the exact JSON shapes golinstor's decoders expect. Each one was a real
 ### 1.9 KV store endpoint returns `[]KV` (single-element array) — S
 
 - **Priority:** P0  **Target:** unit  **Complexity:** L
-- **Source:** PLAN.md csi-sanity gap closure
+- **Source:** csi-sanity gap closure
 
 **Why:** linstor-csi's snapshot-lookup decoder expects an array. Bare object broke `ListSnapshots check presence`.
 
@@ -100,7 +100,7 @@ These pin the exact JSON shapes golinstor's decoders expect. Each one was a real
 ### 1.11 RD clone returns `ResourceDefinitionCloneStarted` envelope — S
 
 - **Priority:** P0  **Target:** unit  **Complexity:** L
-- **Source:** PLAN.md, csi-sanity
+- **Source:** csi-sanity
 
 Was `[]ApiCallRc` — broke `CreateVolume from source`. Now wraps `cloneStartedResponse{Location, SourceName, CloneName, Messages}`.
 
@@ -171,7 +171,7 @@ Typed list returns bare array; only `/v1/remotes` (untyped) returns envelope. Fi
 ### 1.20 ApiCallRc has int64 `ret_code` and uppercase satellite_encryption_type — S
 
 - **Priority:** P0  **Target:** unit  **Complexity:** L
-- **Source:** PLAN.md csi-sanity gap closure
+- **Source:** csi-sanity gap closure
 
 ret_code as int (not string), and CSI-specific normalisations from this session's wire-shape work.
 
@@ -241,7 +241,7 @@ CSI relies on consistent paging behaviour. `pkg/rest/resources_test.go` + `snaps
 ### 1.28 Spawn endpoint autoplaces per RG SelectFilter — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** PLAN.md, linstor-cli #9, recovery skill
+- **Source:** linstor-cli #9, recovery skill
 
 **Why:** `rg spawn` used to be definitional-only — `pkg/rest/spawn.go:spawnAutoplace` added this session.
 

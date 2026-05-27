@@ -18,7 +18,7 @@ with `default` (control plane) + `repl` (10.245.0.0/24) interfaces.
 ### 3.1 NetInterface create / list / modify / delete — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** UG9 §"Managing network interface cards" (lines 2120-2169); ug9-features 1.x; PLAN.md (REST surface)
+- **Source:** UG9 §"Managing network interface cards" (lines 2120-2169); ug9-features 1.x; REST surface
 
 **Unit:** `pkg/rest/nodes_test.go` exercises `POST/PUT/DELETE /v1/nodes/{node}/net-interfaces[/{name}]`. POST returns 201 + ApiCallRc, GET returns the list, DELETE is idempotent.
 **E2E:** `linstor node interface create worker-1 nic_10G 192.168.43.10` → `linstor node interface list worker-1` shows two rows (default + nic_10G).

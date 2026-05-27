@@ -20,7 +20,7 @@ operator-visible behaviour and label-sync flows.
 ### 2.1 PlaceCount + storage-pool filter — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #9, #10; PLAN.md §Autoplacer
+- **Source:** linstor-cli #9, #10; Autoplacer design
 
 **Why:** RG with `--place-count 2 --storage-pool stand` lands exactly 2 diskful replicas on `stand` pools. Foundation of every spawn.
 
@@ -30,14 +30,14 @@ operator-visible behaviour and label-sync flows.
 ### 2.2 Greatest-free-first deterministic ordering — S
 
 - **Priority:** P0  **Target:** unit  **Complexity:** L
-- **Source:** PLAN.md §Autoplacer
+- **Source:** Autoplacer design
 
 `pkg/dispatcher` autoplacer sorts pools by FreeCapacity descending, ties broken on NodeName. Same input → same output for reproducibility.
 
 ### 2.3 Spawn = RD + VDs + Resources in one call — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #9; PLAN.md spawn fix
+- **Source:** linstor-cli #9; spawn fix
 
 Already in 1.28 — cross-listed because the spawn surface IS the autoplacer's primary entry point. Test once, reference both groups.
 

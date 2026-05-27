@@ -3,7 +3,7 @@
 # operator-CLI e2e wave. Every cell here runs the real `linstor`
 # CLI on the stand and asserts Status convergence via
 # observer-stamped Status + kernel probe (NOT just "200 OK"). See
-# PLAN.md L6 section (post-mortem of Bugs 326-330) for why this
+# the L6 section (post-mortem of Bugs 326-330) for why this
 # layer exists.
 #
 # Conventions inherited from tests/e2e/lib.sh — re-sourced so cells

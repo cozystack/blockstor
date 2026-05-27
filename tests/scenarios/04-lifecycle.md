@@ -55,10 +55,10 @@ Returns 4xx + actionable text "cannot delete: 3 resource-definitions exist". For
 ### 4.6 `linstor volume-definition set-size` grows/shrinks — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** UG9 §"Creating and deploying resources and volumes" (lines 844-853); PLAN.md volume-resize e2e
+- **Source:** UG9 §"Creating and deploying resources and volumes" (lines 844-853); volume-resize e2e
 
 **Unit:** PATCH VD size → satellite Reconciler runs `lvextend`/`zfs set volsize` + `drbdadm resize`.
-**E2E:** `tests/e2e/volume-resize-pvc.sh` already exists per PLAN.md. Write checksum, grow via REST, verify checksum + filesystem sees new size.
+**E2E:** `tests/e2e/volume-resize-pvc.sh` already exists. Write checksum, grow via REST, verify checksum + filesystem sees new size.
 
 **Note:** UG warns about shrinking with data → blockstor must propagate the warning (or refuse if no `--force` flag).
 
@@ -117,7 +117,7 @@ Re-issuing same `r td` retries; issuing opposite cancels.
 ### 4.12 Snapshot create + list + delete CRUD — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #18, #19; PLAN.md snapshot reconciler
+- **Source:** linstor-cli #18, #19; snapshot reconciler
 
 **Unit:** `pkg/rest/snapshots_test.go` — CRUD idempotent (delete twice is success); `Spec.Nodes` synthesised at create time (see 1.12).
 **E2E:** `linstor s c test snap1` → `linstor s l -r test` shows Nodes column = both diskful workers.
@@ -132,7 +132,7 @@ Write A → snapshot → write B → rollback → read A. Backend dependent (ZFS
 ### 4.14 Snapshot restore creates new RD — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** UG9 §"Restoring a snapshot" (lines 2474-2498); PLAN.md `POST /v1/resource-definitions/{rd}/snapshot-restore-resource`
+- **Source:** UG9 §"Restoring a snapshot" (lines 2474-2498); `POST /v1/resource-definitions/{rd}/snapshot-restore-resource`
 
 `POST snapshot-restore-resource` seeds new RD from snapshot metadata, returns 201. Satellite clones the per-volume data on next reconcile (via `ShipSnapshot` machinery for cross-node).
 
@@ -146,7 +146,7 @@ Write A → snapshot → write B → rollback → read A. Backend dependent (ZFS
 ### 4.16 Cross-node snapshot ship (within cluster) — S
 
 - **Priority:** P1  **Target:** integration + e2e  **Complexity:** M
-- **Source:** PLAN.md `Reconciler.ShipSnapshot`; UG9 §"Snapshot shipping within a single LINSTOR cluster"
+- **Source:** `Reconciler.ShipSnapshot`; UG9 §"Snapshot shipping within a single LINSTOR cluster"
 
 ZFS: `zfs send | ssh peer zfs recv`. LVM_THIN: `thin-send-recv`. Existing 3 contract tests.
 
@@ -174,7 +174,7 @@ Direct cluster-to-cluster snapshot replication. P2 — useful for in-cluster DR,
 ### 4.19 Node register via Hello — S
 
 - **Priority:** P0  **Target:** integration  **Complexity:** L
-- **Source:** PLAN.md satellite-controller gRPC
+- **Source:** satellite-controller gRPC
 
 Satellite dials controller → Hello idempotently upserts Node CRD → returns ClusterID. Test: envtest with mocked satellite client → Node CRD created with NetInterfaces, Aux/, StoragePools[]. Repeating Hello with same node name updates instead of duplicating.
 
@@ -204,7 +204,7 @@ Evicted node → restore → Online + can be a target for new resources. Existin
 ### 4.23 `linstor node lost <node>` deletes Node CRD — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** drbd-troubleshooting #8; PLAN.md `handleNodeLost`
+- **Source:** drbd-troubleshooting #8; `handleNodeLost`
 
 **Unit:** Lost is idempotent — second call after delete returns success (NotFound folds in).
 **E2E:** power off worker-2; `linstor node lost worker-2`; `linstor n l` shows no worker-2 row; existing resources' worker-2 replicas marked DELETING by controller-side cascade; `rd ap` re-places on remaining nodes.
@@ -228,7 +228,7 @@ Four properties: `DrbdOptions/AutoEvict{MinReplicaCount,AfterTime,MaxDisconnecte
 ### 4.25 Auto-diskful: Diskless held Primary > N minutes → toggle Diskful — S
 
 - **Priority:** P1  **Target:** integration + e2e  **Complexity:** M
-- **Source:** UG9 §"Auto-diskful" (lines 4350-4400); ug9-features 3.3; PLAN.md `internal/controller/auto_diskful_test.go`
+- **Source:** UG9 §"Auto-diskful" (lines 4350-4400); ug9-features 3.3; `internal/controller/auto_diskful_test.go`
 
 **Status:** Implemented; UG-style end-to-end missing.
 

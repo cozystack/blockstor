@@ -2283,7 +2283,7 @@ func TestDeleteResourceFallsBackToDrbdsetupDown(t *testing.T) {
 // just the same result the controller would see if Apply had completed
 // the first time.
 //
-// Pins the Phase 8 PLAN.md item "Hard satellite kill mid-Apply —
+// Pins the Phase 8 item "Hard satellite kill mid-Apply —
 // reconcile must be idempotent". This is the unit-level proof; the
 // stand-side scenario is the same retry path under SIGKILL pressure.
 func TestApplyConvergesAfterMidApplyAbort(t *testing.T) {
