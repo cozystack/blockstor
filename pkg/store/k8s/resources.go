@@ -181,10 +181,16 @@ func (s *resources) Update(ctx context.Context, in *apiv1.Resource) error {
 	// reconnect/resync. Carry them across, mirroring Spec.Volumes.
 	prevPort := existing.Spec.DRBDPort
 	prevNodeID := existing.Spec.DRBDNodeID
+	// Skip-init-sync hardening: SkipInitialSync is a controller-stamped
+	// append-only decision with no wire counterpart — carry it across so
+	// a golinstor REST modify can't strip it and flip the satellite back
+	// to the unsafe day0-skip default (the offline-safety regression).
+	prevSkipInit := existing.Spec.SkipInitialSync
 	existing.Spec = wireToCRDResourceSpec(in)
 	existing.Spec.Volumes = prevVolumes
 	existing.Spec.DRBDPort = prevPort
 	existing.Spec.DRBDNodeID = prevNodeID
+	existing.Spec.SkipInitialSync = prevSkipInit
 
 	// Bug 67: round-trip wire-side Annotations through metadata so the
 	// REST writer's `blockstor.io/peer-changed` bump actually reaches
@@ -259,10 +265,14 @@ func (s *resources) PatchResourceSpec(ctx context.Context, rdName, node string, 
 		// carry-across in `Update` above.
 		prevPort := existing.Spec.DRBDPort
 		prevNodeID := existing.Spec.DRBDNodeID
+		// Skip-init-sync hardening: carry SkipInitialSync across — see
+		// the matching carry-across in `Update` above.
+		prevSkipInit := existing.Spec.SkipInitialSync
 		existing.Spec = wireToCRDResourceSpec(&wire)
 		existing.Spec.Volumes = prevVolumes
 		existing.Spec.DRBDPort = prevPort
 		existing.Spec.DRBDNodeID = prevNodeID
+		existing.Spec.SkipInitialSync = prevSkipInit
 
 		// Bug 210: merge rather than wholesale-replace so the
 		// satellite-stamped `blockstor.io/volume-numbers` (Bug 107)
