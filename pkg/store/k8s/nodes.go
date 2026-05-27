@@ -156,8 +156,8 @@ func (n *nodes) Update(ctx context.Context, in *apiv1.Node) error {
 	// spec that always omits them. Without an explicit carry-across,
 	// a routine REST modify (`linstor n set-property ...`) wipes
 	// the operator-pinned per-node DRBD port/minor range and pushes
-	// new replicas back onto the cluster-wide default 7000-7999 /
-	// 1000-1099 range, frequently into firewall-blocked ports
+	// new replicas back onto the cluster-wide default 20000-20999 /
+	// 20000-65535 range, frequently into firewall-blocked ports
 	// (Bug 208). Same root-cause class as Bug 206's Spec.Volumes
 	// carry-across — mirror that pattern here.
 	prevPortRange := existing.Spec.DRBDPortRange

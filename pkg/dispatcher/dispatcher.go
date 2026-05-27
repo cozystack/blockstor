@@ -1080,13 +1080,15 @@ func DerivePort(rd string) int { return derivePort(rd) }
 // DeriveMinor mirrors DerivePort for /dev/drbd<N>.
 func DeriveMinor(rd string) int { return deriveMinor(rd) }
 
-// derivePort hashes the RD name into the drbd-9 reserved range
-// 7000–7999. Matches what upstream LINSTOR's TcpPortPool does for
-// fresh deployments — collisions on a real cluster are handled by
-// the autoplacer, but for the smoke we live with the hash.
+// derivePort hashes the RD name into blockstor's default TCP-port
+// allocation window 20000–20999 — disjoint from upstream LINSTOR's
+// 7000–7999 so the two can coexist on the same nodes. This is only the
+// transitional fallback used before the controller's allocator stamps a
+// real port; collisions on a real cluster are handled by the autoplacer,
+// but for the smoke we live with the hash.
 func derivePort(rd string) int {
 	const (
-		portBase  = 7000
+		portBase  = 20000
 		portRange = 1000
 	)
 
@@ -1095,10 +1097,11 @@ func derivePort(rd string) int {
 	return portBase + int(binary.BigEndian.Uint16(digest[:2])%portRange)
 }
 
-// deriveMinor likewise hashes into 1000–9999.
+// deriveMinor likewise hashes into 20000–28999 — blockstor's default
+// minor window, disjoint from upstream LINSTOR's 1000+ defaults.
 func deriveMinor(rd string) int {
 	const (
-		minorBase  = 1000
+		minorBase  = 20000
 		minorRange = 9000
 	)
 

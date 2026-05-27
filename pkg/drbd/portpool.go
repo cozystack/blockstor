@@ -50,27 +50,39 @@ func ParseRange(s string) (int32, int32, error) {
 	return int32(low), int32(high), nil
 }
 
-// DefaultPortRange mirrors the upstream LINSTOR TcpPortPool default.
-// Operators can override via controller config; the allocator only
-// hands out ports inside [min, max].
+// Default TCP-port and /dev/drbd<N> minor allocation windows.
+// Operators can override via Node CRD ranges or controller config; the
+// allocator only hands out values inside [min, max].
 //
-// DefaultMinorMin mirrors upstream LINSTOR's DEFAULT_MINOR_NR_MIN
-// (1000). Collision-freedom does not come from offsetting this base:
-// LowestFreeMinor scans the cluster-wide taken set (every
-// Resource.Status.DRBDMinor) and hands out the lowest free value, so
-// two replicas can never land on the same /dev/drbd<N>. The cozystack
-// migration model also removes the only reason an offset was ever
-// considered — LINSTOR is shut down before blockstor adopts, and
-// adoption preserves the original LINSTOR minors verbatim, so there is
-// no live second allocator to stay clear of. This is exactly how the
-// TCP-port allocator behaves: it shares upstream LINSTOR's 7000-7999
-// window and relies on the same taken-set scan rather than a base
-// offset to avoid collisions.
+// These windows are deliberately DISJOINT from upstream LINSTOR's
+// defaults (LINSTOR uses TCP 7000-7999 and minors 1000+) so that
+// blockstor can run on the same nodes as a live upstream LINSTOR
+// without colliding on the shared kernel /dev/drbd<N> namespace or on
+// TCP ports. blockstor allocates from 20000-20999 (ports) and
+// 20000-65535 (minors); LINSTOR keeps its low defaults, and the two
+// allocators never overlap.
+//
+// Resources ADOPTED/MIGRATED from an existing LINSTOR cluster keep
+// their original LINSTOR-assigned ports/minors verbatim (e.g. port
+// 7042, minor 1037). Those sit BELOW the allocation window, but that is
+// fine on both counts:
+//
+//   - The allocator only assigns a value when the per-replica
+//     Spec.DRBDPort / per-volume Spec.DRBDMinor is nil. Adoption writes
+//     the explicit low value, so the allocator never reissues it.
+//   - LowestFreePort / LowestFreeMinor scan the cluster's taken set and
+//     hand out the lowest free value inside [min, max]; the in-range
+//     filter on the taken set only decides which values participate in
+//     collision avoidance WITHIN the window — an explicit out-of-window
+//     value is still excluded from being handed to a fresh allocation
+//     because it is never nil. So a freshly allocated value never lands
+//     on an adopted low value, and an adopted low value is never
+//     clamped or re-allocated.
 const (
-	DefaultPortMin = 7000
-	DefaultPortMax = 7999
+	DefaultPortMin = 20000
+	DefaultPortMax = 20999
 
-	DefaultMinorMin = 1000
+	DefaultMinorMin = 20000
 	DefaultMinorMax = 65535
 )
 

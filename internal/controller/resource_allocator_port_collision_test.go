@@ -32,7 +32,7 @@ import (
 // THE SAME NODE must get DISTINCT ports (a collision breaks drbdadm
 // adjust), while the SAME port number is freely reused across
 // DIFFERENT nodes — that is exactly what lets a node host 1000+
-// resources inside the 7000-7999 window instead of the whole cluster
+// resources inside the 20000-20999 window instead of the whole cluster
 // sharing it.
 //
 // This is the inverse of the pre-refactor per-RD contract (which
@@ -50,14 +50,15 @@ func TestBug266DRBDPortPerNodeReuseAndUniqueness(t *testing.T) {
 		).
 		Build()
 
-	// Pre-seed RD-A on w1+w2 with port 7000 (Spec.DRBDPort), so the
-	// per-node taken-set on both w1 and w2 already holds {7000}.
-	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w1", 7000)
-	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w2", 7000)
+	// Pre-seed RD-A on w1+w2 with port 20000 (Spec.DRBDPort) — the
+	// lowest port in the default window — so the per-node taken-set on
+	// both w1 and w2 already holds {20000}.
+	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w1", 20000)
+	preSeedPort(ctx, t, cli, "pvc-bug266-rdA", "w2", 20000)
 
-	// RD-B lands on w1 and w3. On w1 the taken-set is {7000} (from
-	// RD-A.w1) → must pick 7001. On w3 nothing is taken → may pick
-	// 7000 (reuse across nodes is fine).
+	// RD-B lands on w1 and w3. On w1 the taken-set is {20000} (from
+	// RD-A.w1) → must pick 20001. On w3 nothing is taken → may pick
+	// 20000 (reuse across nodes is fine).
 	rdB := &blockstoriov1alpha1.ResourceDefinition{}
 	rdB.Name = "pvc-bug266-rdB"
 	rdB.Spec.VolumeDefinitions = []blockstoriov1alpha1.ResourceDefinitionVolume{
@@ -105,14 +106,14 @@ func TestBug266DRBDPortPerNodeReuseAndUniqueness(t *testing.T) {
 		portsByNode[node][port] = name
 	}
 
-	// RD-B.w1 must NOT be 7000 (RD-A.w1 holds it on the same node).
+	// RD-B.w1 must NOT be 20000 (RD-A.w1 holds it on the same node).
 	rbw1 := &blockstoriov1alpha1.Resource{}
 	if err := cli.Get(ctx, client.ObjectKey{Name: "pvc-bug266-rdB.w1"}, rbw1); err != nil {
 		t.Fatalf("get RD-B.w1: %v", err)
 	}
 
-	if rbw1.Spec.DRBDPort == nil || *rbw1.Spec.DRBDPort == 7000 {
-		t.Errorf("RD-B.w1 port=%v, must differ from RD-A.w1's 7000 (same node)", rbw1.Spec.DRBDPort)
+	if rbw1.Spec.DRBDPort == nil || *rbw1.Spec.DRBDPort == 20000 {
+		t.Errorf("RD-B.w1 port=%v, must differ from RD-A.w1's 20000 (same node)", rbw1.Spec.DRBDPort)
 	}
 }
 

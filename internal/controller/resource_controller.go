@@ -737,7 +737,7 @@ func backfillResourceSpecFromStatus(target *blockstoriov1alpha1.Resource) {
 // port: PER-NODE scope (Bug 266 scaling fix). The taken-set is the
 // ports already used by OTHER Resources ON THE SAME NODE
 // (Spec.DRBDPort), so the same port number is reused across different
-// nodes — a node can host 1000+ resources within the 7000-7999 window
+// nodes — a node can host 1000+ resources within the 20000-20999 window
 // instead of the whole cluster sharing it. The optional RD.Spec.
 // DRBDPort preferred seed is tried first on the node; on collision the
 // allocator falls back to the lowest per-node-free port.
@@ -1685,7 +1685,7 @@ func (r *ResourceReconciler) intersectRange(
 // Resource ON THE SAME NODE (PER-NODE port scope, Bug 266 scaling fix),
 // excluding `selfName`. The taken-set is per-node — the same port
 // number is reusable on a different node — so a node can host 1000+
-// resources inside the 7000-7999 window instead of the whole cluster
+// resources inside the 20000-20999 window instead of the whole cluster
 // sharing it.
 //
 // Reads the authoritative Spec.DRBDPort. Uses APIReader (uncached) so
@@ -1791,7 +1791,7 @@ func anyVolumeMinorSet(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 //  3. ControllerConfig.Spec.ExtraProps["TcpPortAutoRange"] —
 //     cluster-scope dynamic-port range, the upstream-LINSTOR knob
 //     (`linstor controller set-property TcpPortAutoRange ...`).
-//  4. drbd.DefaultPortMin..drbd.DefaultPortMax (7000-7999).
+//  4. drbd.DefaultPortMin..drbd.DefaultPortMax (20000-20999).
 //
 // A malformed value at any tier surfaces as an error so the
 // operator notices the typo. Scenario 3.W05.

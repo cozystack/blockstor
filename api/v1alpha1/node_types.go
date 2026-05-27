@@ -61,14 +61,14 @@ type NodeSpec struct {
 	// drbdPortRange is the inclusive [min, max] TCP port range the
 	// allocator picks DRBD listen ports from for replicas placed on
 	// this node. Replaces `Props["DrbdOptions/TcpPortRange"]`. nil
-	// inherits the controller-wide default (7000–7999). Phase 10.3.
+	// inherits the controller-wide default (20000–20999). Phase 10.3.
 	// +optional
 	DRBDPortRange *PortRange `json:"drbdPortRange,omitempty"`
 
 	// drbdMinorRange is the inclusive [min, max] /dev/drbd<N> minor
 	// range the allocator picks from. Replaces
 	// `Props["DrbdOptions/MinorNrRange"]`. nil inherits the
-	// controller-wide default (1000–1099). Phase 10.3.
+	// controller-wide default (20000–65535). Phase 10.3.
 	// +optional
 	DRBDMinorRange *PortRange `json:"drbdMinorRange,omitempty"`
 }

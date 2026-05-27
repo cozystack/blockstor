@@ -244,7 +244,7 @@ spec:
                   taken-set is the ports already used by OTHER Resources ON THE
                   SAME NODE, so the same port number is freely reused across
                   different nodes — this scales to 1000+ resources per node
-                  instead of exhausting a cluster-unique 7000-7999 window at
+                  instead of exhausting a cluster-unique 20000-20999 window at
                   ~1000 resources cluster-wide. The optional RD.Spec.DRBDPort
                   preferred seed is tried first on each node.
 

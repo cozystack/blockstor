@@ -38,7 +38,7 @@ import (
 // §3.W05 and the implementation pointer in
 // tests/advanced-config-scenarios.md §5:
 //
-//  1. The cluster-scope range overrides the compiled-in 7000-7999
+//  1. The cluster-scope range overrides the compiled-in 20000-20999
 //     default for a vanilla node.
 //  2. The per-node range still wins when both are set — cluster
 //     scope is a default, not an override.
@@ -53,7 +53,7 @@ import (
 // TestTcpPortAutoRangeConstrainsAllocator pins fact 1: an
 // otherwise-bare cluster (no per-Node overrides) draws ports
 // from the cluster-scope `TcpPortAutoRange` rather than the
-// hard-coded 7000-7999 default.
+// hard-coded 20000-20999 default.
 func TestTcpPortAutoRangeConstrainsAllocator(t *testing.T) {
 	t.Parallel()
 
