@@ -81,6 +81,16 @@ var (
 	errDrbdadmDumpMdNoMeta = errors.New("drbdadm: No valid meta data found")
 )
 
+// skipInitTrue / skipInitFalse build the *bool the controller stamps
+// into Resource.Spec.SkipInitialSync (threaded onto DesiredResource).
+// Since the skip-init-sync hardening, resolveVolumeSeed treats this
+// flag as the AUTHORITATIVE skip decision: a fresh-deployment test that
+// expects the day0 skip / winner set-gi seed must mark its fixture
+// SkipInitialSync=true (the controller decided this is a genuinely-fresh
+// RD), exactly as the real controller stamps it on the initial set.
+func skipInitTrue() *bool  { v := true; return &v }
+func skipInitFalse() *bool { v := false; return &v }
+
 // TestApplyWritesResFile: Apply leaves a /etc/drbd.d/<name>.res file
 // (here under StateDir) reflecting the DesiredResource. The reconciler
 // owns this file — controller never touches it directly.
@@ -1680,8 +1690,9 @@ func TestApplyAutoPrimaryWinnerReachesUpToDateViaSetGI(t *testing.T) {
 
 	dr := []*intent.DesiredResource{
 		{
-			Name:     "pvc-seed",
-			NodeName: "n1",
+			Name:            "pvc-seed",
+			NodeName:        "n1",
+			SkipInitialSync: skipInitTrue(),
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
@@ -1838,8 +1849,9 @@ func TestApplyAutoPrimaryWinnerSeedsUpToDateOnThickLVM(t *testing.T) {
 
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
-			Name:     "pvc-tw",
-			NodeName: "n1",
+			Name:            "pvc-tw",
+			NodeName:        "n1",
+			SkipInitialSync: skipInitTrue(),
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thick1"},
 			},
@@ -2072,9 +2084,10 @@ func TestFreshThinReplicaStillDay0SkipsWhenNoPeerConnected(t *testing.T) {
 	})
 
 	dr := &intent.DesiredResource{
-		Name:        "pvc-fresh",
-		NodeName:    "n1",
-		PeerHasData: false,
+		Name:            "pvc-fresh",
+		NodeName:        "n1",
+		PeerHasData:     false,
+		SkipInitialSync: skipInitTrue(),
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},
@@ -3396,9 +3409,10 @@ func TestApplyFirstActivationSkipsInitialSyncOnThinOrZFS(t *testing.T) {
 
 			_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 				{
-					Name:     "pvc-zskip",
-					NodeName: "n1",
-					Peers:    []intent.DesiredPeer{{Name: "n2"}},
+					Name:            "pvc-zskip",
+					NodeName:        "n1",
+					SkipInitialSync: skipInitTrue(),
+					Peers:           []intent.DesiredPeer{{Name: "n2"}},
 					Volumes: []*intent.DesiredVolume{
 						{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: tc.poolName},
 					},
@@ -3499,9 +3513,10 @@ func TestApplyFirstActivationSeedsEveryPeerSlotConsistently(t *testing.T) {
 	// (id=1) AND n3's (id=2) — with the SAME day0 tuple.
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
-			Name:     "pvc-race",
-			NodeName: "n1",
-			Peers:    []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			Name:            "pvc-race",
+			NodeName:        "n1",
+			SkipInitialSync: skipInitTrue(),
+			Peers:           []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
@@ -3609,9 +3624,10 @@ func TestApplyFirstActivationSeedsEveryMetadataSlotBlanket(t *testing.T) {
 	// on n3 and never touch its slot — the bug this test guards.
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
-			Name:     "pvc-blanket",
-			NodeName: "n1",
-			Peers:    []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
+			Name:            "pvc-blanket",
+			NodeName:        "n1",
+			SkipInitialSync: skipInitTrue(),
+			Peers:           []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}},
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
@@ -3736,9 +3752,10 @@ func TestApplyFirstActivationSeedsLocalSlotBug284(t *testing.T) {
 	// with day0 so the later-joining peer's handshake matches.
 	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
 		{
-			Name:     "pvc-b284",
-			NodeName: "n1",
-			Peers:    nil, // <-- sequential-create race: no peers yet
+			Name:            "pvc-b284",
+			NodeName:        "n1",
+			SkipInitialSync: skipInitTrue(),
+			Peers:           nil, // <-- sequential-create race: no peers yet
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
