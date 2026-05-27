@@ -92,8 +92,8 @@ push() {
     echo ">> $short pinned: $digest"
 }
 
-echo ">> docker build $REGISTRY/blockstor:dev (controller stage)"
-docker build "${BUILD_ARGS[@]}" --target controller -t "$REGISTRY/blockstor:dev" .
+echo ">> docker build $REGISTRY/blockstor-controller:dev (controller stage)"
+docker build "${BUILD_ARGS[@]}" --target controller -t "$REGISTRY/blockstor-controller:dev" .
 
 echo ">> docker build $REGISTRY/blockstor-apiserver:dev (apiserver stage)"
 docker build "${BUILD_ARGS[@]}" --target apiserver -t "$REGISTRY/blockstor-apiserver:dev" .
@@ -101,7 +101,7 @@ docker build "${BUILD_ARGS[@]}" --target apiserver -t "$REGISTRY/blockstor-apise
 echo ">> docker build $REGISTRY/blockstor-satellite:dev (satellite stage)"
 docker build "${BUILD_ARGS[@]}" --target satellite  -t "$REGISTRY/blockstor-satellite:dev" .
 
-push blockstor
+push blockstor-controller
 push blockstor-apiserver
 push blockstor-satellite
 

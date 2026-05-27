@@ -73,7 +73,7 @@ spec:
       serviceAccountName: blockstor-controller
       containers:
         - name: manager
-          image: __REGISTRY__/blockstor:dev
+          image: __REGISTRY__/blockstor-controller:dev
           imagePullPolicy: Always
           args:
             # REST API moved to the separate apiserver Deployment

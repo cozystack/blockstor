@@ -8,7 +8,7 @@ env:
 # Build and publish the three blockstor container images on a version tag.
 #
 # Images (Dockerfile multi-stage targets → canonical ghcr.io paths):
-#   - controller → ghcr.io/cozystack/blockstor
+#   - controller → ghcr.io/cozystack/blockstor-controller
 #   - apiserver  → ghcr.io/cozystack/blockstor-apiserver
 #   - satellite  → ghcr.io/cozystack/blockstor-satellite
 #
@@ -17,7 +17,7 @@ env:
 # `:dev` tag. This release flow instead pushes to the canonical public
 # registry (ghcr.io, derived from the Go module path
 # github.com/cozystack/blockstor and the short image names used by the stand
-# manifests: blockstor / blockstor-apiserver / blockstor-satellite).
+# manifests: blockstor-controller / blockstor-apiserver / blockstor-satellite).
 #
 # Tagging is handled by docker/metadata-action's `type=semver` rules:
 #   tag v1.33.2 → images tagged `1.33.2`, `1.33`, and `latest`.
@@ -55,7 +55,7 @@ jobs:
           # `target` is the Dockerfile stage; `image` is the ghcr.io repo
           # suffix under ghcr.io/${{ github.repository_owner }}/.
           - target: controller
-            image: blockstor
+            image: blockstor-controller
           - target: apiserver
             image: blockstor-apiserver
           - target: satellite

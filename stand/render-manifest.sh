@@ -4,7 +4,7 @@
 #
 # Reads stand/blockstor-*.yaml on stdin via $2, substitutes:
 #   __REGISTRY__                              → <bridge-gateway>:5000
-#   __REGISTRY__/blockstor:dev                → <reg>/blockstor@sha256:<digest>
+#   __REGISTRY__/blockstor-controller:dev     → <reg>/blockstor-controller@sha256:<digest>
 #   __REGISTRY__/blockstor-apiserver:dev      → <reg>/blockstor-apiserver@sha256:<digest>
 #   __REGISTRY__/blockstor-satellite:dev      → <reg>/blockstor-satellite@sha256:<digest>
 # and writes the result to stdout. Digests come from
@@ -56,7 +56,7 @@ render_image() {
     fi
 }
 
-CONTROLLER_IMG=$(render_image blockstor)
+CONTROLLER_IMG=$(render_image blockstor-controller)
 APISERVER_IMG=$(render_image blockstor-apiserver)
 SATELLITE_IMG=$(render_image blockstor-satellite)
 
@@ -64,7 +64,7 @@ SATELLITE_IMG=$(render_image blockstor-satellite)
 # the catch-all `__REGISTRY__` doesn't rewrite the image line before
 # the digest can attach. After the first match the image line no
 # longer contains `__REGISTRY__` and the second sed is a no-op.
-sed -e "s|__REGISTRY__/blockstor:dev|$CONTROLLER_IMG|g" \
+sed -e "s|__REGISTRY__/blockstor-controller:dev|$CONTROLLER_IMG|g" \
     -e "s|__REGISTRY__/blockstor-apiserver:dev|$APISERVER_IMG|g" \
     -e "s|__REGISTRY__/blockstor-satellite:dev|$SATELLITE_IMG|g" \
     -e "s|__REGISTRY__|$REGISTRY|g" \

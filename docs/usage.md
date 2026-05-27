@@ -48,7 +48,7 @@ The reference manifests live under `config/crd/bases/` (CRDs) and `stand/` (the 
          address: 10.0.0.11   # the node's InternalIP, used for DRBD replication
    ```
 
-3. **Workloads** — the controller, apiserver, and satellite DaemonSet. The manifests in `stand/` carry an `__REGISTRY__/<image>:dev` placeholder for the dev stand; for a real cluster set the `image:` fields to the published tags, e.g. `ghcr.io/cozystack/blockstor:<TAG>`, `ghcr.io/cozystack/blockstor-apiserver:<TAG>`, `ghcr.io/cozystack/blockstor-satellite:<TAG>`:
+3. **Workloads** — the controller, apiserver, and satellite DaemonSet. The manifests in `stand/` carry an `__REGISTRY__/<image>:dev` placeholder for the dev stand; for a real cluster set the `image:` fields to the published tags, e.g. `ghcr.io/cozystack/blockstor-controller:<TAG>`, `ghcr.io/cozystack/blockstor-apiserver:<TAG>`, `ghcr.io/cozystack/blockstor-satellite:<TAG>`:
 
    - `stand/blockstor-deploy.yaml` — controller + RBAC + the `blockstor-system` namespace.
    - `stand/blockstor-apiserver-deploy.yaml` — apiserver Deployment + Service.
