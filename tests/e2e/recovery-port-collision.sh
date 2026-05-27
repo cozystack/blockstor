@@ -13,7 +13,7 @@
 #
 # Pre-Bug-306, two RDs reconciling at the same time both observed a
 # stale (cached) cluster-wide taken-set, both picked the lowest
-# free port (7000), and both Status().Update succeeded because
+# free port (20000), and both Status().Update succeeded because
 # Kubernetes optimistic concurrency is per-object: two RDs writing
 # to their OWN statuses don't conflict. Result: N RDs got the SAME
 # DRBD port, the satellite-side .res files collided, neither
@@ -251,17 +251,17 @@ if (( fail_cross > 0 )); then
     exit 1
 fi
 
-# Sanity: every port inside the default 7000-7999 range.
-echo ">> sanity: every port inside default 7000-7999 range"
+# Sanity: every port inside the default 20000-20999 range.
+echo ">> sanity: every port inside default 20000-20999 range"
 for i in $(seq 1 "$NUM_RDS"); do
     rd="${RD_PREFIX}-${i}"
     port="${rd_port_n1[$rd]}"
-    if (( port < 7000 || port > 7999 )); then
-        echo "FAIL: $rd port $port outside default 7000-7999 range"
+    if (( port < 20000 || port > 20999 )); then
+        echo "FAIL: $rd port $port outside default 20000-20999 range"
         exit 1
     fi
 done
 
 unique_count=${#seen[@]}
 echo ">> RECOVERY-PORT-COLLISION OK ($unique_count unique ports for $NUM_RDS RDs," \
-    "all in 7000-7999, no cross-RD collisions under parallel batch autoplace)"
+    "all in 20000-20999, no cross-RD collisions under parallel batch autoplace)"

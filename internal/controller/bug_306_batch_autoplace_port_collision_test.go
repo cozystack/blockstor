@@ -35,7 +35,7 @@ import (
 // /autoplace & done; wait` — and the controller's per-RD port
 // allocator races on the cluster-wide taken-set read. Two RDs
 // reconciling concurrently both observe taken=∅, both pick the
-// lowest free port (7000), and both Status().Update succeed
+// lowest free port (20000), and both Status().Update succeed
 // because Kubernetes optimistic concurrency is per-object: two
 // different RDs writing to their OWN statuses don't conflict.
 // Result: N RDs get the SAME DRBD port, the satellite-side .res
@@ -177,7 +177,7 @@ func TestBug306BatchAutoplacePortsUnique(t *testing.T) {
 	}
 
 	// Assert (identity-to-spec / per-node port model):
-	//   1. Every replica has a non-nil Spec.DRBDPort, inside 7000-7999.
+	//   1. Every replica has a non-nil Spec.DRBDPort, inside 20000-20999.
 	//   2. PER-NODE port uniqueness: no two replicas on the same node
 	//      share a port (this is the same-node collision that would
 	//      break drbdadm adjust). Reuse across nodes is fine.
@@ -203,8 +203,8 @@ func TestBug306BatchAutoplacePortsUnique(t *testing.T) {
 
 		port := *res.Spec.DRBDPort
 
-		if port < 7000 || port > 7999 {
-			t.Errorf("%s: port %d outside default 7000-7999 range", res.Name, port)
+		if port < 20000 || port > 20999 {
+			t.Errorf("%s: port %d outside default 20000-20999 range", res.Name, port)
 		}
 
 		node := res.Spec.NodeName
