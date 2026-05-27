@@ -509,13 +509,27 @@ echo ">> phase 4 (Level 3): satellite filesystem-specific check"
 LEVEL3_FREE_KIB=0
 case "$FILL_POOL" in
     lvm-thin)
+        # Mirror EXACTLY what blockstor's lvm.Thin.PoolStatus does
+        # (pkg/storage/lvm/lvm_thin.go): the thinpool DATA-area free is
+        # lv_size * (100 - data_percent) / 100, where lv_size is the
+        # thinpool data LV's size and data_percent is the % of that data
+        # area allocated. `--nosuffix` makes lvs print the bare number
+        # "13631488.00" (no trailing 'k'), so we just take the integer
+        # part with awk's int() — the same value strconv.ParseFloat()+
+        # int64() yields on the product side.
+        #
+        # NB: do NOT `tr -d '.'` the value — lvs emits a fractional form
+        # like "13631488.00k", and stripping the '.' turns 13631488.00
+        # into 1363148800 (a 100x inflation), which made Level 3 report
+        # ~10 GiB free on a 95%-full 13 GiB pool while blockstor (and the
+        # real thinpool data area) was correctly at ~100 MiB. That 100x
+        # bug is what produced the bogus 76% Level-2-vs-Level-3
+        # discrepancy this scenario used to FAIL on.
         lvs_out=$(on_node "$FILL_NODE" bash -c \
-            "lvs --units k --noheadings -o lv_size,data_percent blockstor-lvm/thin 2>/dev/null" \
+            "lvs --units k --nosuffix --noheadings -o lv_size,data_percent blockstor-lvm/thin 2>/dev/null" \
             | awk '{print $1, $2}')
-        lv_size_k=$(echo "$lvs_out" | awk '{print $1}' | tr -d 'kK.')
+        lv_size_k=$(echo "$lvs_out" | awk '{printf "%d", $1}')
         data_pct=$(echo "$lvs_out" | awk '{print $2}')
-        # lv_size from lvs may include a fractional .kk suffix; strip non-digits.
-        lv_size_k=${lv_size_k%%[!0-9]*}
         # data_pct can be a float like 92.34; awk-multiply.
         LEVEL3_FREE_KIB=$(awk -v sz="$lv_size_k" -v pc="$data_pct" \
             'BEGIN{printf "%d", sz * (100 - pc) / 100}')

@@ -215,6 +215,54 @@ func TestThinPoolStatusParsesVgsLvs(t *testing.T) {
 	}
 }
 
+// TestThinPoolStatusNearFull pins the free_capacity computation on a
+// thin pool driven to ~99% used — the exact regime the
+// observability-capacity-correlation e2e exercises. The thinpool DATA
+// area free is lv_size * (100 - data_percent) / 100, NOT the virtual
+// free of any thin volume. lvs emits the lv_size with a fractional
+// ".00" tail under `--units k`; with `--nosuffix` it's a bare float
+// that strconv.ParseFloat reads correctly.
+//
+// Regression guard: the e2e's Level-3 reference once stripped the '.'
+// from "13631488.00", inflating lv_size 100x (→ 1.27 TiB) and so
+// reporting ~10 GiB "free" on a 95%-full 13 GiB pool while this code
+// (correctly) reported ~100 MiB. This test pins the correct ~100 MiB
+// so any drift in the product computation fails here too.
+func TestThinPoolStatusNearFull(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// 13 GiB thinpool data LV (13631488 KiB) at 99.25% allocated —
+	// the shape `lvs --units k --nosuffix` actually emits.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_size,data_percent --units k --nosuffix vg/thinpool",
+		storage.FakeResponse{Stdout: []byte("13631488.00|99.25\n")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	got, err := p.PoolStatus(t.Context())
+	if err != nil {
+		t.Fatalf("PoolStatus: %v", err)
+	}
+
+	if got.TotalCapacityKib != 13631488 {
+		t.Errorf("TotalCapacityKib: got %d, want 13631488", got.TotalCapacityKib)
+	}
+
+	// PoolStatus computes free = total - int64(total*pct/100):
+	//   used = int64(13631488 * 99.25 / 100) = int64(13529251.36) = 13529251
+	//   free = 13631488 - 13529251 = 102237 KiB (~99.8 MiB).
+	wantFree := int64(102237)
+	if got.FreeCapacityKib != wantFree {
+		t.Errorf("FreeCapacityKib: got %d KiB (%d MiB), want %d KiB (~100 MiB)",
+			got.FreeCapacityKib, got.FreeCapacityKib/1024, wantFree)
+	}
+
+	// Sanity: a near-full pool must report well under 1 GiB free, never
+	// the multi-GiB number the broken lvs-parse decimal-strip produced.
+	if got.FreeCapacityKib > 1024*1024 {
+		t.Errorf("FreeCapacityKib %d KiB > 1 GiB on a 99%%-full pool — capacity probe inflated",
+			got.FreeCapacityKib)
+	}
+}
+
 // TestThinCreateSnapshot uses lvcreate -s.
 func TestThinCreateSnapshot(t *testing.T) {
 	fx := storage.NewFakeExec()
