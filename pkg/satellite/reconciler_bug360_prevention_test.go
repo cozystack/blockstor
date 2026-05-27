@@ -68,6 +68,7 @@ func TestApplyRefusesCreateMdWhenLocalNodeIDUnresolved(t *testing.T) {
 			Peers: []intent.DesiredPeer{{Name: "n2"}},
 			// node-id deliberately ABSENT — the unresolved-allocation
 			// signal the dispatcher emits during the auto-place burst.
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"address":         "10.0.0.1",
@@ -135,7 +136,8 @@ func TestApplyProceedsWhenLocalNodeIDIsZero(t *testing.T) {
 			Volumes: []*intent.DesiredVolume{
 				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 			},
-			Peers: []intent.DesiredPeer{{Name: "n2"}},
+			Peers:           []intent.DesiredPeer{{Name: "n2"}},
+			SkipInitialSync: skipInitTrue(),
 			DrbdOptions: map[string]string{
 				"port":            "7000",
 				"node-id":         "0",
