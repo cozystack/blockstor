@@ -1868,33 +1868,20 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return nil
 	}
 
-	// Bug 360 PREVENTION: refuse the entire first-activation — and
-	// every other .res-consuming verb (createMd, up, adjust) — while
-	// the controller has NOT yet allocated this node's DRBD node-id.
-	// The dispatcher omits the `node-id` key from DrbdOptions when the
-	// local Status.DRBDNodeID is still nil, so an absent key is the
-	// unambiguous "unresolved" signal (a present "0" is a legitimate
-	// allocation from LowestFreeNodeID and must be honoured).
-	//
-	// Why this gate exists even though waitForControllerAllocation
-	// already gates runApply: that controller-side gate protects the
-	// normal reconcile, but it has been observed to let a premature
-	// Apply through during the auto-place initial-create burst (stale
-	// informer cache / sibling-Watches-driven reconcile before the
-	// local Status patch lands). If create-md runs with my-node-id 0
-	// it burns TWO artifacts: the kernel slot my-id (self-healed by
-	// reconcileKernelMyNodeID) AND — irrecoverably without data loss —
-	// the on-disk v09 metadata, which records `node-id 0`. After the
-	// kernel slot is later fixed, `drbdsetup attach` then fails
-	// `(119) ambiguous node id: meta-data 0, config 2` forever and the
-	// replica is stuck Diskless. The only safe cure is to NEVER let
-	// create-md/up run before the allocated id is known — hence this
-	// requeue-until-allocated gate in front of all bring-up verbs.
-	err := refuseUnresolvedLocalNodeID(dr)
-	if err != nil {
-		log.FromContext(ctx).Info("Bug 360: deferring DRBD bring-up until controller allocates local node-id",
-			"resource", dr.GetName())
+	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
+	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
+	// Refuse bring-up while the controller has not yet stamped the
+	// per-replica Spec identity the satellite depends on: the DRBD
+	// node-id (Bug 360) and the skip-init-sync decision (this branch).
+	// Both are controller-allocated, append-only Spec fields; seeding /
+	// bringing up before they land burns irrecoverable on-disk state
+	// (node-id) or deadlocks a fresh deploy with no elected UpToDate
+	// winner (skip-init-sync). Folded into one gate so applyDRBD stays
+	// under the gocyclo budget — see gateBringUpReadiness for the full
+	// rationale of each sub-gate.
+	err := r.gateBringUpReadiness(ctx, dr, diskless, mdMarkerPath)
+	if err != nil {
 		return err
 	}
 
@@ -1905,9 +1892,6 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 	// the switch. Probe errors fall through as zero-valued fields
 	// inside observeForFsm; no retries, no failures bubble up here.
 	r.logFsmShadow(ctx, dr, diskless)
-
-	resPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".res")
-	mdMarkerPath := filepath.Join(r.cfg.StateDir, dr.GetName()+".md-created")
 
 	// tearDownRemovedPeers MUST run before the FSM dispatch block:
 	// it reads the OLD .res to resolve node-ids for peers that have
@@ -3714,6 +3698,126 @@ var errUnresolvedLocalNodeID = errors.New("local DRBD node-id not yet allocated 
 func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 	if _, ok := localNodeIDFromOpts(dr); !ok {
 		return errUnresolvedLocalNodeID
+	}
+
+	return nil
+}
+
+// errUnresolvedSkipInitialSync is the sentinel returned by
+// refuseUnresolvedSkipInitialSync when the controller has not yet
+// stamped Resource.Spec.SkipInitialSync. Wrapped into the per-resource
+// Apply result so runApply requeues (applyFailureRequeue) — the stamp
+// always arrives on a subsequent reconcile once the controller's
+// allocateResourceSpecFields / ensureSkipInitSyncDecision pass commits
+// it. Mirrors errUnresolvedLocalNodeID.
+var errUnresolvedSkipInitialSync = errors.New("Resource.Spec.SkipInitialSync not yet stamped by controller")
+
+// refuseUnresolvedSkipInitialSync is the skip-init-sync prevention
+// gate: it returns errUnresolvedSkipInitialSync when this satellite is
+// about to seed a fresh diskful replica's metadata (freshActivation)
+// but the controller has not yet stamped Resource.Spec.SkipInitialSync
+// (GetSkipInitialSync() == nil).
+//
+// SkipInitialSync is a controller-allocated, append-only Spec field
+// (set to !RD.Spec.Initialized once at creation), exactly like the DRBD
+// node-id / port / minor the satellite already waits for before
+// bring-up. The seed decision in resolveVolumeSeed is undefined until
+// it lands: a nil read forces the conservative "refuse every day0 skip"
+// branch, which on a genuinely-fresh deployment elects NO UpToDate
+// winner and deadlocks both diskful replicas Inconsistent. Gating the
+// seed until the flag is non-nil removes the nil read entirely.
+//
+// Caller MUST gate this only on the fresh-diskful-first-activation case
+// (freshActivation && !diskless): a diskless replica carries no
+// metadata to seed, and a replica whose metadata already exists has
+// already committed its seed decision — neither must be stalled.
+//
+// A present false (controller decided "must SyncTarget") is honoured:
+// GetSkipInitialSync() returns a non-nil *bool for both true and false,
+// so the gate distinguishes "stamped false" (proceed → SyncTarget) from
+// "not stamped yet" (requeue).
+func refuseUnresolvedSkipInitialSync(dr *intent.DesiredResource, freshActivation bool) error {
+	if freshActivation && dr.GetSkipInitialSync() == nil {
+		return errUnresolvedSkipInitialSync
+	}
+
+	return nil
+}
+
+// gateBringUpReadiness refuses (requeues) the DRBD apply while a
+// controller-allocated per-replica Spec field the satellite depends on
+// is still unstamped. Extracted out of applyDRBD so the orchestrator
+// stays under the gocyclo budget; runs the two prevention gates in
+// order, each surfacing its own sentinel + log line.
+//
+// Gate 1 (Bug 360, node-id): refuse the entire first-activation — and
+// every other .res-consuming verb (createMd, up, adjust) — while the
+// controller has NOT yet allocated this node's DRBD node-id. The
+// dispatcher omits the `node-id` key from DrbdOptions when the local
+// Status.DRBDNodeID is still nil, so an absent key is the unambiguous
+// "unresolved" signal (a present "0" is a legitimate allocation from
+// LowestFreeNodeID and must be honoured). This gate exists even though
+// waitForControllerAllocation already gates runApply: that
+// controller-side gate has been observed to let a premature Apply
+// through during the auto-place initial-create burst (stale informer
+// cache / sibling-Watches-driven reconcile before the local Status
+// patch lands). If create-md runs with my-node-id 0 it burns the kernel
+// slot my-id (self-healed by reconcileKernelMyNodeID) AND —
+// irrecoverably without data loss — the on-disk v09 metadata, which
+// records `node-id 0`; `drbdsetup attach` then fails `(119) ambiguous
+// node id` forever. The only safe cure is to never let create-md/up run
+// before the allocated id is known.
+//
+// Gate 2 (skip-init-sync): refuse a fresh diskful replica's
+// first-activation metadata seed while the controller has NOT yet
+// stamped Resource.Spec.SkipInitialSync. The satellite reconciles on
+// its own controller-runtime Watch, independently of the controller's
+// allocate→stamp pass, so on a fresh deployment it can observe a
+// Resource whose node-id/port are already stamped (Gate 1 passes) but
+// whose SkipInitialSync is still nil — the allocateResourceSpecFields
+// stamp lags when the parent RD's `initialized` latch isn't observable
+// yet, and ensureSkipInitSyncDecision lands it only on a later
+// controller pass. If the seed runs in that window, resolveVolumeSeed
+// reads nil → REFUSES every day0 skip (case A AND the case-B winner
+// UpToDate seed) → NO replica is seeded as the UpToDate winner → both
+// diskful replicas come up Inconsistent, each PausedSyncT waiting on the
+// other with no sync source → permanent deadlock. Requeuing here until
+// the flag is non-nil removes the nil read entirely: resolveVolumeSeed
+// is only ever reached once the controller has committed a real
+// true/false decision, so the PR #20 winner-election path fires under
+// SkipInitialSync==true and the offline-safe SyncTarget path fires under
+// false.
+//
+// Gate 2 scope is minimal — never stalls a converged or non-seeding
+// replica: diskless replicas carry no metadata to seed (never gated),
+// and a replica whose metadata already exists (firstActivation=false:
+// MetadataCreated Condition stamped or `.md-created` marker present) has
+// already taken its seed decision (never gated), so steady-state
+// reconciles and the diskless→diskful flip path are untouched. Only the
+// fresh-diskful-first-activation case — the exact case whose seed
+// decision resolveVolumeSeed makes — waits for the stamp.
+func (r *Reconciler) gateBringUpReadiness(ctx context.Context, dr *intent.DesiredResource, diskless bool, mdMarkerPath string) error {
+	err := refuseUnresolvedLocalNodeID(dr)
+	if err != nil {
+		log.FromContext(ctx).Info("Bug 360: deferring DRBD bring-up until controller allocates local node-id",
+			"resource", dr.GetName())
+
+		return err
+	}
+
+	if diskless {
+		return nil
+	}
+
+	_, mdStatErr := os.Stat(mdMarkerPath)
+	freshActivation := !dr.GetMetadataCreated() && os.IsNotExist(mdStatErr)
+
+	err = refuseUnresolvedSkipInitialSync(dr, freshActivation)
+	if err != nil {
+		log.FromContext(ctx).Info("skip-init-sync: deferring fresh-replica DRBD seed until controller stamps Spec.SkipInitialSync",
+			"resource", dr.GetName())
+
+		return err
 	}
 
 	return nil
