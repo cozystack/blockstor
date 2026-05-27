@@ -116,7 +116,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          # OCI labels from metadata-action include
+          # org.opencontainers.image.source=<repo URL>, which lets GHCR
+          # auto-link each published package to cozystack/blockstor and inherit
+          # the repo's visibility. `annotations` carries the same metadata onto
+          # the multi-arch image index manifest.
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
             GIT_HASH=${{ steps.stamp.outputs.git_hash }}
             BUILD_TIME=${{ steps.stamp.outputs.build_time }}
