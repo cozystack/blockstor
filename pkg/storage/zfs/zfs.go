@@ -182,11 +182,12 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	// Why: detach any surviving clones that depend on this dataset's
 	// snapshots before the destroy, so `zfs destroy -r` doesn't fail
 	// with "has dependent clones". No-op when there are no clones.
-	if err := p.promoteDependentClones(ctx, tgtDS); err != nil {
+	err := p.promoteDependentClones(ctx, tgtDS)
+	if err != nil {
 		return errors.Wrapf(err, "promote dependent clones of %s", tgtDS)
 	}
 
-	_, err := p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
+	_, err = p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
 	}
@@ -196,66 +197,6 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	return nil
-}
-
-// promoteDependentClones reparents every clone whose `origin` is a
-// snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
-// snapshots are no longer referenced and `ds` can be destroyed.
-//
-// Why: blockstor's same-node clone is `zfs clone <ds>@<snap> <clone>`,
-// so the clone's origin lives under the source dataset. ZFS blocks
-// `zfs destroy` of a snapshot that still has dependent clones; this is
-// the canonical detach (promote, NOT `destroy -R`, which would take
-// the surviving clone with it).
-//
-// Idempotent + safe with no clones: the `zfs list` enumeration finds
-// nothing and we issue zero promotes. Discovery errors don't bubble
-// — they fall through to the destroy, which surfaces the real
-// "has dependent clones" error if a clone truly blocks it.
-func (p *Provider) promoteDependentClones(ctx context.Context, ds string) error {
-	clones := p.dependentClones(ctx, ds)
-	for _, clone := range clones {
-		if _, err := p.exec.Run(ctx, "zfs", "promote", clone); err != nil {
-			return errors.Wrapf(err, "zfs promote %s", clone)
-		}
-	}
-
-	return nil
-}
-
-// dependentClones lists datasets whose `origin` is a snapshot of `ds`
-// (i.e. origin starts with `<ds>@`). These are the clones that must be
-// promoted before `ds` can be destroyed. Best-effort: any enumeration
-// error yields an empty list (the subsequent destroy still reports the
-// true blocking error).
-func (p *Provider) dependentClones(ctx context.Context, ds string) []string {
-	out, err := p.exec.Run(ctx, "zfs",
-		"list", "-H", "-o", "name,origin", "-t", "filesystem,volume")
-	if err != nil {
-		return nil
-	}
-
-	prefix := ds + "@"
-
-	var clones []string
-
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-
-		name, originSnap := fields[0], fields[1]
-		if name == ds {
-			continue
-		}
-
-		if strings.HasPrefix(originSnap, prefix) {
-			clones = append(clones, name)
-		}
-	}
-
-	return clones
 }
 
 // VolumeStatus parses `zfs list -p` output (bytes, no suffixes). Bug
@@ -725,6 +666,67 @@ func parseVolumeName(name string) (string, int32, bool) {
 // the per-RD volume index in dataset / LV names. Keep in sync with
 // volumeDataset / volumeLVName.
 const volNumberDigits = 5
+
+// promoteDependentClones reparents every clone whose `origin` is a
+// snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
+// snapshots are no longer referenced and `ds` can be destroyed.
+//
+// Why: blockstor's same-node clone is `zfs clone <ds>@<snap> <clone>`,
+// so the clone's origin lives under the source dataset. ZFS blocks
+// `zfs destroy` of a snapshot that still has dependent clones; this is
+// the canonical detach (promote, NOT `destroy -R`, which would take
+// the surviving clone with it).
+//
+// Idempotent + safe with no clones: the `zfs list` enumeration finds
+// nothing and we issue zero promotes. Discovery errors don't bubble
+// — they fall through to the destroy, which surfaces the real
+// "has dependent clones" error if a clone truly blocks it.
+func (p *Provider) promoteDependentClones(ctx context.Context, ds string) error {
+	clones := p.dependentClones(ctx, ds)
+	for _, clone := range clones {
+		_, err := p.exec.Run(ctx, "zfs", "promote", clone)
+		if err != nil {
+			return errors.Wrapf(err, "zfs promote %s", clone)
+		}
+	}
+
+	return nil
+}
+
+// dependentClones lists datasets whose `origin` is a snapshot of `ds`
+// (i.e. origin starts with `<ds>@`). These are the clones that must be
+// promoted before `ds` can be destroyed. Best-effort: any enumeration
+// error yields an empty list (the subsequent destroy still reports the
+// true blocking error).
+func (p *Provider) dependentClones(ctx context.Context, dataset string) []string {
+	out, err := p.exec.Run(ctx, "zfs",
+		"list", "-H", "-o", "name,origin", "-t", "filesystem,volume")
+	if err != nil {
+		return nil
+	}
+
+	prefix := dataset + "@"
+
+	var clones []string
+
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+
+		name, originSnap := fields[0], fields[1]
+		if name == dataset {
+			continue
+		}
+
+		if strings.HasPrefix(originSnap, prefix) {
+			clones = append(clones, name)
+		}
+	}
+
+	return clones
+}
 
 // volumeOrigin reads the zvol's `origin` property — the snapshot
 // dataset name when this volume was created via `zfs clone`, or
