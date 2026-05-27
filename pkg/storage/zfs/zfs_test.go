@@ -640,3 +640,120 @@ func TestDeleteSnapshotErrorWraps(t *testing.T) {
 		t.Errorf("wrap: %q must contain \"zfs destroy\" for operator grep", msg)
 	}
 }
+
+// TestDeleteVolumePromotesDependentClonesBeforeDestroy: deleting a
+// clone *source* whose snapshot still backs a surviving clone must
+// `zfs promote` the clone first so the recursive destroy of the source
+// no longer fails with "has dependent clones". The promote MUST come
+// before the destroy. This is the regression guard for the wedge where
+// `zfs destroy -r` looped forever on the source dataset.
+func TestDeleteVolumePromotesDependentClonesBeforeDestroy(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/src_00000",
+		storage.FakeResponse{Stdout: []byte("tank/src_00000\n")})
+	// dst is a same-node clone of a snapshot under the source dataset.
+	fx.Expect("zfs list -H -o name,origin -t filesystem,volume",
+		storage.FakeResponse{Stdout: []byte(
+			"tank/src_00000\t-\n" +
+				"tank/dst_00000\ttank/src_00000@clone-1\n")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "src",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	promote := "zfs promote tank/dst_00000"
+	destroy := "zfs destroy -r tank/src_00000"
+
+	pIdx := slices.Index(cmds, promote)
+	dIdx := slices.Index(cmds, destroy)
+
+	if pIdx < 0 {
+		t.Errorf("expected %q in calls; got %v", promote, cmds)
+	}
+
+	if dIdx < 0 {
+		t.Errorf("expected %q in calls; got %v", destroy, cmds)
+	}
+
+	if pIdx >= 0 && dIdx >= 0 && pIdx > dIdx {
+		t.Errorf("promote must precede destroy; promote@%d destroy@%d (%v)", pIdx, dIdx, cmds)
+	}
+}
+
+// TestDeleteVolumeNoDependentClonesStaysPlainDestroy: when nothing
+// clones the dataset's snapshots, no `zfs promote` is issued — the
+// fix must be a no-op on the common (no-clone) delete path.
+func TestDeleteVolumeNoDependentClonesStaysPlainDestroy(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/pvc-1_00000",
+		storage.FakeResponse{Stdout: []byte("tank/pvc-1_00000\n")})
+	fx.Expect("zfs list -H -o name,origin -t filesystem,volume",
+		storage.FakeResponse{Stdout: []byte(
+			"tank/pvc-1_00000\t-\n" +
+				"tank/unrelated_00000\t-\n")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "pvc-1",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "zfs promote") {
+			t.Errorf("unexpected promote on no-clone delete: %v", cmds)
+		}
+	}
+
+	if !slices.Contains(cmds, "zfs destroy -r tank/pvc-1_00000") {
+		t.Errorf("expected plain destroy; got %v", cmds)
+	}
+}
+
+// TestDeleteVolumeCloneItselfStillDestroys: deleting the clone (dst)
+// rather than the source is unaffected — dst owns no dependent clones,
+// so it's a plain `zfs destroy -r`. Guards the reverse order (delete
+// clone first, then source) the bug report calls out.
+func TestDeleteVolumeCloneItselfStillDestroys(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("zfs list -H -o name tank/dst_00000",
+		storage.FakeResponse{Stdout: []byte("tank/dst_00000\n")})
+	// dst clones a snapshot of src; nothing clones dst's own snapshots.
+	fx.Expect("zfs list -H -o name,origin -t filesystem,volume",
+		storage.FakeResponse{Stdout: []byte(
+			"tank/src_00000\t-\n" +
+				"tank/dst_00000\ttank/src_00000@clone-1\n")})
+
+	p := zfs.NewProvider(zfs.Config{Pool: "tank"}, fx)
+
+	err := p.DeleteVolume(t.Context(), storage.Volume{
+		ResourceName: "dst",
+		VolumeNumber: 0,
+	})
+	if err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+	for _, cmd := range cmds {
+		if strings.HasPrefix(cmd, "zfs promote") {
+			t.Errorf("clone delete must not promote anything: %v", cmds)
+		}
+	}
+
+	if !slices.Contains(cmds, "zfs destroy -r tank/dst_00000") {
+		t.Errorf("expected plain destroy of clone; got %v", cmds)
+	}
+}

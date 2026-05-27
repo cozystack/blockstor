@@ -153,8 +153,19 @@ func (p *Provider) ResizeVolume(ctx context.Context, vol storage.Volume) error {
 // DeleteVolume `zfs destroy -r`s the zvol (recursive to clean up any
 // dependent snapshots automatically). Missing → no-op.
 //
-// Before the destroy we read the volume's `origin` property — if it
-// points at a deferred-delete marker (DeleteSnapshot's
+// Why: a same-node `zfs clone` (RestoreVolumeFromSnapshot) leaves the
+// clone's `origin` pointing at a snapshot UNDER this dataset. ZFS
+// refuses to `zfs destroy` a snapshot that still has dependent
+// clones, so deleting a clone *source* before its clone wedges with
+// "volume has dependent clones" and the satellite reconciler loops
+// forever. We must NOT `zfs destroy -R` (that would cascade-destroy
+// the surviving clone = data loss). Instead `zfs promote` every
+// dependent clone first — promotion reparents the origin snapshot
+// onto the clone, making the clone independent and freeing this
+// dataset's snapshots for destruction.
+//
+// Before the destroy we also read the volume's `origin` property — if
+// it points at a deferred-delete marker (DeleteSnapshot's
 // `__DELETED__<ts>` rename), drop the marker after the volume is
 // gone. That's the GC half of upstream's deferred-delete pattern:
 // snapshots blocked by clones get renamed; when the last clone goes
@@ -168,6 +179,13 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 
 	origin := p.volumeOrigin(ctx, tgtDS)
 
+	// Why: detach any surviving clones that depend on this dataset's
+	// snapshots before the destroy, so `zfs destroy -r` doesn't fail
+	// with "has dependent clones". No-op when there are no clones.
+	if err := p.promoteDependentClones(ctx, tgtDS); err != nil {
+		return errors.Wrapf(err, "promote dependent clones of %s", tgtDS)
+	}
+
 	_, err := p.exec.Run(ctx, "zfs", "destroy", "-r", tgtDS)
 	if err != nil {
 		return errors.Wrapf(err, "zfs destroy %s", tgtDS)
@@ -178,6 +196,66 @@ func (p *Provider) DeleteVolume(ctx context.Context, vol storage.Volume) error {
 	}
 
 	return nil
+}
+
+// promoteDependentClones reparents every clone whose `origin` is a
+// snapshot of dataset `ds` onto itself via `zfs promote`, so `ds`'s
+// snapshots are no longer referenced and `ds` can be destroyed.
+//
+// Why: blockstor's same-node clone is `zfs clone <ds>@<snap> <clone>`,
+// so the clone's origin lives under the source dataset. ZFS blocks
+// `zfs destroy` of a snapshot that still has dependent clones; this is
+// the canonical detach (promote, NOT `destroy -R`, which would take
+// the surviving clone with it).
+//
+// Idempotent + safe with no clones: the `zfs list` enumeration finds
+// nothing and we issue zero promotes. Discovery errors don't bubble
+// — they fall through to the destroy, which surfaces the real
+// "has dependent clones" error if a clone truly blocks it.
+func (p *Provider) promoteDependentClones(ctx context.Context, ds string) error {
+	clones := p.dependentClones(ctx, ds)
+	for _, clone := range clones {
+		if _, err := p.exec.Run(ctx, "zfs", "promote", clone); err != nil {
+			return errors.Wrapf(err, "zfs promote %s", clone)
+		}
+	}
+
+	return nil
+}
+
+// dependentClones lists datasets whose `origin` is a snapshot of `ds`
+// (i.e. origin starts with `<ds>@`). These are the clones that must be
+// promoted before `ds` can be destroyed. Best-effort: any enumeration
+// error yields an empty list (the subsequent destroy still reports the
+// true blocking error).
+func (p *Provider) dependentClones(ctx context.Context, ds string) []string {
+	out, err := p.exec.Run(ctx, "zfs",
+		"list", "-H", "-o", "name,origin", "-t", "filesystem,volume")
+	if err != nil {
+		return nil
+	}
+
+	prefix := ds + "@"
+
+	var clones []string
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+
+		name, originSnap := fields[0], fields[1]
+		if name == ds {
+			continue
+		}
+
+		if strings.HasPrefix(originSnap, prefix) {
+			clones = append(clones, name)
+		}
+	}
+
+	return clones
 }
 
 // VolumeStatus parses `zfs list -p` output (bytes, no suffixes). Bug
