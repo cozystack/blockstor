@@ -355,3 +355,77 @@ func TestSkipInitSyncAppendOnlyNotReStamped(t *testing.T) {
 			got.Spec.SkipInitialSync)
 	}
 }
+
+// TestSkipInitSyncStampedAlongsideNodeID pins the controller half of the
+// CI run 26500468866 deadlock fix: when the parent RD is observable,
+// allocateResourceSpecFields must stamp Spec.SkipInitialSync in the SAME
+// allocation pass as the DRBD node-id / port — never a state where
+// node-id is committed but SkipInitialSync is left nil. The satellite's
+// node-id gate would pass on a node-id-stamped Resource, so if
+// SkipInitialSync lagged behind node-id the satellite could seed with a
+// nil decision (the deadlock). Driving the reconciler to steady state
+// and asserting both are non-nil pins that they land together.
+func TestSkipInitSyncStampedAlongsideNodeID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	const (
+		rdName       = "together-rd"
+		nodeName     = "n1"
+		resourceName = rdName + "." + nodeName
+	)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+			},
+		},
+	}
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: resourceName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               nodeName,
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(
+			&blockstoriov1alpha1.Resource{},
+			&blockstoriov1alpha1.ResourceDefinition{},
+		).
+		WithObjects(rd, res).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	reconcileToSteadyState(t, ctx, rec, resourceName)
+
+	got := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: resourceName}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	// The DRBD node-id must have been allocated...
+	if got.Spec.DRBDNodeID == nil {
+		t.Fatalf("DRBDNodeID not stamped — allocation never ran")
+	}
+
+	// ...and once node-id is stamped, SkipInitialSync MUST also be
+	// non-nil. A node-id-stamped-but-skip-nil Resource is exactly the
+	// window the satellite's seed could observe and deadlock on.
+	if got.Spec.SkipInitialSync == nil {
+		t.Fatalf("SkipInitialSync left nil while DRBDNodeID=%d was stamped — the deadlock window",
+			*got.Spec.DRBDNodeID)
+	}
+
+	// Fresh RD (no data-bearing peer) → the decision is skip=true.
+	if !*got.Spec.SkipInitialSync {
+		t.Errorf("fresh RD replica must stamp SkipInitialSync=true alongside node-id, got false")
+	}
+}
