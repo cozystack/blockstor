@@ -128,7 +128,17 @@ if [[ "$init" != "true" ]]; then
     exit 1
 fi
 
-DRBD_PORT=$(on_node "$N1" bash -c "grep -oE 'port [0-9]+' /etc/drbd.d/${RD}.res | head -1 | awk '{print \$2}'")
+# Discover the DRBD replication port from the rendered .res — same trick
+# as network-partition.sh / observability-linstor-node-bridge.sh. DRBD-9
+# uses a single mesh listen port per replica, identical on every peer in
+# the .res, so reading from $N1 yields the port shared by $N1+$N2. The
+# rendered form is `address ipv4 X.X.X.X:PORT;` (not a bare `port N`).
+DRBD_PORT=$(on_node "$N1" bash -c "grep -oE 'address.*:[0-9]+' /etc/drbd.d/${RD}.res | head -1 | grep -oE '[0-9]+\$'")
+if [[ -z "$DRBD_PORT" ]]; then
+    echo "FAIL: could not parse DRBD port from /etc/drbd.d/${RD}.res on $N1"
+    on_node "$N1" cat "/etc/drbd.d/${RD}.res" >&2 || true
+    exit 1
+fi
 echo ">> take data-holders $N1+$N2 OFFLINE (iptables drop DRBD port $DRBD_PORT)"
 for n in "$N1" "$N2"; do
     on_node "$n" iptables -A INPUT  -p tcp --dport "$DRBD_PORT" -j DROP
