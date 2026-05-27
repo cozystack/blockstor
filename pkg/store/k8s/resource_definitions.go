@@ -132,12 +132,18 @@ func (s *resourceDefinitions) Update(ctx context.Context, in *apiv1.ResourceDefi
 		prevVDs := existing.Spec.VolumeDefinitions
 		prevEncryption := existing.Spec.Encryption
 		prevPort := existing.Spec.DRBDPort
+		// Skip-init-sync hardening: preserve the append-only initialized
+		// latch across the wire rebuild — golinstor never sends it, so a
+		// naïve rebuild would wipe it and a later replica added to this
+		// established RD would wrongly skip the initial sync.
+		prevInitialized := existing.Spec.Initialized
 		existing.Spec = wireToCRDRDSpec(in)
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
 		// Identity-to-spec: preserve the optional controller/operator
 		// DRBD preferred-port seed across the wire rebuild.
 		existing.Spec.DRBDPort = prevPort
+		existing.Spec.Initialized = prevInitialized
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, in.Annotations)
 
@@ -249,12 +255,16 @@ func (s *resourceDefinitions) PatchResourceDefinitionSpec(ctx context.Context, n
 		prevVDs := existing.Spec.VolumeDefinitions
 		prevEncryption := existing.Spec.Encryption
 		prevPort := existing.Spec.DRBDPort
+		// Skip-init-sync hardening: preserve the append-only initialized
+		// latch across the wire rebuild (mirrors `Update`).
+		prevInitialized := existing.Spec.Initialized
 		existing.Spec = wireToCRDRDSpec(&wire)
 		existing.Spec.VolumeDefinitions = prevVDs
 		existing.Spec.Encryption = prevEncryption
 		// Identity-to-spec: preserve the optional DRBD preferred-port
 		// seed across the wire rebuild (mirrors `Update`).
 		existing.Spec.DRBDPort = prevPort
+		existing.Spec.Initialized = prevInitialized
 
 		mergeUserAnnotationsInto(&existing.ObjectMeta, wire.Annotations)
 
