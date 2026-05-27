@@ -4,6 +4,13 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.1 — 2026-05-28
+
+### Fixed
+
+- **Respawn StandAlone wedge** — deleting a diskful replica and immediately recreating it on the same node no longer wedges the resource. The recreated replica was force-promoting itself and minting a DRBD Current-UUID unrelated to the surviving peer, which the kernel rejected as `unrelated-data` (the connection dropped to `StandAlone` and never recovered). Auto-primary is now gated on the resource's persisted `Initialized` latch, so only a brand-new resource ever seeds a primary.
+- **ZFS clone-source deletion** — deleting a volume that still has a dependent ZFS clone no longer hot-loops on `zfs destroy ... volume has dependent clones`. Dependent clones are now `zfs promote`d before the source is destroyed; the surviving clone keeps its data.
+
 ## v0.1.0 — 2026-05-27
 
 First public release.
