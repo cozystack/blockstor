@@ -252,7 +252,27 @@ func assembleDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1
 		// refuses any GI seed (day0 OR controller SeedFromGI) on a
 		// fresh replica that must SyncTarget from that peer instead.
 		PeerHasData: anyDiskfulPeerHasData(peers),
+		// Skip-init-sync hardening: the controller-authoritative,
+		// persisted, OFFLINE-SAFE skip decision (Resource.Spec.
+		// SkipInitialSync = !RD.Spec.Initialized, stamped once). This is
+		// the AUTHORITATIVE source for resolveVolumeSeed's day0 skip,
+		// replacing the unsafe live-kernel AnyConnectedPeerHasData probe.
+		// Threaded verbatim (pointer tri-state preserved): nil/false →
+		// no skip, true → skip.
+		SkipInitialSync: copyBoolPtr(target.Spec.SkipInitialSync),
 	}
+}
+
+// copyBoolPtr returns a fresh copy of a *bool so the DesiredResource
+// does not alias the caller's Resource Spec pointer.
+func copyBoolPtr(b *bool) *bool {
+	if b == nil {
+		return nil
+	}
+
+	v := *b
+
+	return &v
 }
 
 // buildDesiredPeers walks the dropped peer-name list (already sorted

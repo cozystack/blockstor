@@ -125,6 +125,31 @@ type DesiredResource struct {
 	// could otherwise drop the satellite back to the unsafe day0
 	// fallback).
 	PeerHasData bool
+
+	// SkipInitialSync mirrors the controller-authoritative, persisted
+	// Resource.Spec.SkipInitialSync (skip-init-sync hardening). It is the
+	// AUTHORITATIVE source for the satellite's day0 skip-initial-sync
+	// decision in resolveVolumeSeed, replacing the unsafe live-kernel
+	// AnyConnectedPeerHasData probe (which only sees CONNECTED peers, so
+	// an offline data-holder let a fresh replica skip → falsely UpToDate
+	// while empty).
+	//
+	//   - *bool true  → the controller decided this replica may skip
+	//     (born into a genuinely-fresh, never-initialized RD). day0 skip
+	//     seed → instant UpToDate, no SyncTarget.
+	//   - *bool false → the controller decided this replica MUST sync
+	//     (joined an already-initialized RD: relocate / migrate-disk /
+	//     extra replica). No skip → SyncTarget — even if the data-holder
+	//     is offline at seed time (the decision is read from the persisted
+	//     RD latch, not live peer state).
+	//   - nil → not yet stamped, or a CRD predating the field. Conservative
+	//     default: do NOT skip (full sync).
+	//
+	// Pointer (not bool) so the satellite distinguishes "controller said
+	// skip=false" from "controller hasn't stamped yet": both are non-skip,
+	// but keeping the tri-state matches the clusterIP append-only model
+	// and lets a future caller tell them apart.
+	SkipInitialSync *bool
 }
 
 // DesiredConnection is one (peer-pair, paths) entry on a
@@ -298,6 +323,19 @@ func (x *DesiredResource) GetPeerHasData() bool {
 	}
 
 	return x.PeerHasData
+}
+
+// GetSkipInitialSync returns the controller-authoritative skip-initial-
+// sync decision (true → may skip, false → must SyncTarget, nil → not
+// yet stamped). Nil-safe at the receiver level; the *bool tri-state is
+// preserved so callers can distinguish "skip=false" from "unset". See
+// the field doc on DesiredResource.SkipInitialSync.
+func (x *DesiredResource) GetSkipInitialSync() *bool {
+	if x == nil {
+		return nil
+	}
+
+	return x.SkipInitialSync
 }
 
 // DesiredVolume describes one of an RD's volumes from the apply
