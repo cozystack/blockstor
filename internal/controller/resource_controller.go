@@ -50,6 +50,18 @@ import (
 // the controller no longer stamps it on new Resources.
 const resourceFinalizer = "blockstor.cozystack.io/resource"
 
+// Raw-merge-patch key/kind literals, factored out so the several
+// raw-merge-patch helpers in this file share one spelling (goconst).
+const (
+	patchKeySpec               = "spec"
+	patchKeyStatus             = "status"
+	patchKeyDRBDNodeID         = "drbdNodeID"
+	patchKeyDRBDPort           = "drbdPort"
+	patchKeyDRBDMinor          = "drbdMinor"
+	patchKeySkipInitialSync    = "skipInitialSync"
+	resourceDefinitionKindName = "ResourceDefinition"
+)
+
 // takenPortsCluster / takenMinorsCluster pre-allocate this many slots
 // for the result slice — sized to cover a typical small cluster (5-10
 // RDs × 1-2 vols) without re-growing while not over-allocating for the
@@ -362,6 +374,23 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	}
 
 	if seeded {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Skip-init-sync hardening: latch the RD-level "initialized" truth
+	// (any diskful replica has held real data past day0) and stamp THIS
+	// replica's append-only Spec.SkipInitialSync = !RD.initialized. This
+	// is the controller-authoritative, persisted, offline-safe skip
+	// decision the satellite reads instead of the unsafe live-kernel
+	// AnyConnectedPeerHasData probe. Both writes are set-if-missing /
+	// flip-once; either mutating Spec requeues so the next pass observes
+	// the fresh revision.
+	stamped, err := r.ensureSkipInitSyncDecision(ctx, target, peers, rdPtr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if stamped {
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -731,7 +760,51 @@ func (r *ResourceReconciler) allocateResourceSpecFields(ctx context.Context, tar
 		target.Spec.DRBDPort = &port
 	}
 
+	// Skip-init-sync hardening: stamp the append-only per-replica
+	// SkipInitialSync = !RD.Spec.Initialized ALONGSIDE the node-id/port
+	// allocation so all one-time Spec-identity writes land in a single
+	// patch + requeue (keeps the allocate→steady-state convergence to one
+	// extra pass, and an idempotent re-reconcile a true no-op). Read from
+	// the persisted RD latch, NOT live peer/kernel state, so the decision
+	// is offline-safe. Set-if-nil: a non-nil value is authoritative and
+	// NEVER overwritten (restore-safe / settable-once). When the RD is
+	// absent (unit-test fast path / rd-delete in flight) we leave it nil
+	// and the runApply-side ensureSkipInitSyncDecision fallback stamps it
+	// once the RD is observable.
+	if target.Spec.SkipInitialSync == nil {
+		skip, ok, err := r.rdInitializedForResource(ctx, target.Spec.ResourceDefinitionName)
+		if err != nil {
+			return err
+		}
+
+		if ok {
+			v := !skip
+			target.Spec.SkipInitialSync = &v
+		}
+	}
+
 	return nil
+}
+
+// rdInitializedForResource reads the parent RD's append-only
+// initialized latch. Returns (initialized, rdFound, err). rdFound=false
+// (RD absent — unit-test fast path or rd-delete in flight) tells the
+// caller to defer the SkipInitialSync stamp to a later pass rather than
+// guess. Uses the direct APIReader for the same cache-trail reason the
+// allocator's other reads do.
+func (r *ResourceReconciler) rdInitializedForResource(ctx context.Context, rdName string) (bool, bool, error) {
+	var rd blockstoriov1alpha1.ResourceDefinition
+
+	err := r.apiReader().Get(ctx, client.ObjectKey{Name: rdName}, &rd)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+
+		return false, false, err
+	}
+
+	return rdInitialized(&rd), true, nil
 }
 
 // mirrorIdentitiesToStatus copies the authoritative Spec identities
@@ -764,15 +837,16 @@ func mirrorIdentitiesToStatus(target *blockstoriov1alpha1.Resource, vol0Minor *i
 func (r *ResourceReconciler) patchResourceSpecIdentities(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
 	patchTarget := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "Resource",
+			Kind:       resourceProjectionResourceKind,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: target.Name},
 	}
 
-	body := map[string]any{"spec": map[string]any{
-		"drbdNodeID": target.Spec.DRBDNodeID,
-		"drbdPort":   target.Spec.DRBDPort,
+	body := map[string]any{patchKeySpec: map[string]any{
+		patchKeyDRBDNodeID:      target.Spec.DRBDNodeID,
+		patchKeyDRBDPort:        target.Spec.DRBDPort,
+		patchKeySkipInitialSync: target.Spec.SkipInitialSync,
 	}}
 
 	patchBytes, err := json.Marshal(body)
@@ -791,16 +865,16 @@ func (r *ResourceReconciler) patchResourceSpecIdentities(ctx context.Context, ta
 func (r *ResourceReconciler) patchResourceStatusIdentities(ctx context.Context, target *blockstoriov1alpha1.Resource) error {
 	patchTarget := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "Resource",
+			Kind:       resourceProjectionResourceKind,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: target.Name},
 	}
 
-	body := map[string]any{"status": map[string]any{
-		"drbdNodeID": target.Status.DRBDNodeID,
-		"drbdPort":   target.Status.DRBDPort,
-		"drbdMinor":  target.Status.DRBDMinor,
+	body := map[string]any{patchKeyStatus: map[string]any{
+		patchKeyDRBDNodeID: target.Status.DRBDNodeID,
+		patchKeyDRBDPort:   target.Status.DRBDPort,
+		patchKeyDRBDMinor:  target.Status.DRBDMinor,
 	}}
 
 	patchBytes, err := json.Marshal(body)
@@ -815,7 +889,19 @@ func (r *ResourceReconciler) patchResourceStatusIdentities(ctx context.Context, 
 // identities are unchanged.
 func equalResourceIdentitySpec(a, b *blockstoriov1alpha1.ResourceSpec) bool {
 	return ptrEqI32(a.DRBDNodeID, b.DRBDNodeID) &&
-		ptrEqI32(a.DRBDPort, b.DRBDPort)
+		ptrEqI32(a.DRBDPort, b.DRBDPort) &&
+		ptrEqBool(a.SkipInitialSync, b.SkipInitialSync)
+}
+
+func ptrEqBool(a, b *bool) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return *a == *b
+	}
 }
 
 // equalStatusIdentities reports whether the mirrored Status identities
@@ -1071,6 +1157,147 @@ func setSeedFromGI(target *blockstoriov1alpha1.Resource, volumeNumber int32, see
 	})
 }
 
+// ensureSkipInitSyncDecision is the controller-authoritative,
+// persisted, OFFLINE-SAFE skip-initial-sync decision (the core of the
+// skip-init-sync hardening). It replaces the satellite's unsafe
+// live-kernel AnyConnectedPeerHasData probe as the source of truth with
+// two append-only Spec writes, mirroring the port/minor/node-id
+// clusterIP model:
+//
+//  1. RD-level latch: flip RD.Spec.Initialized=true ONCE, the first
+//     time any diskful replica of the RD reports a real data-bearing
+//     disk state past the deterministic day0 GI (anyDataBearingDiskful-
+//     Peer over the full replica set — it already excludes day0-seeded
+//     fresh siblings). While every replica still sits at day0 (a
+//     genuinely-fresh, never-written deployment) the latch stays
+//     nil/false and the whole initial set skips in lock-step
+//     (invariant 1). The latch lives in Spec so a `kubectl get -o yaml`
+//     backup + apply preserves it (invariant 3) and a write made while
+//     the data-holder was online survives the holder going offline
+//     (offline-safety / invariant 2's hard case).
+//
+//  2. Per-replica stamp: set THIS replica's Spec.SkipInitialSync once
+//     (set-if-nil) to !RD.initialized at the moment of first reconcile.
+//     A replica born into a fresh RD gets true (skip); a replica born
+//     into an already-initialized RD (relocate / migrate-disk / extra
+//     replica) gets false (must SyncTarget) — read from the PERSISTED
+//     latch, never from live peer/kernel state, so it is correct even
+//     when the sole data-holder is offline at seed time.
+//
+// Both writes are strictly nil/false→true (append-only): a non-nil
+// SkipInitialSync is never re-stamped, and Initialized is never cleared.
+// A user manifest / golinstor REST that omits either field never fights
+// the controller (3-way-merge-safe / invariant 4). Returns true when
+// either Spec was mutated so the caller requeues onto the fresh
+// revision; the satellite reads the persisted values on the next pass.
+//
+// DISKLESS replicas carry no metadata to seed, so their SkipInitialSync
+// is irrelevant to the satellite seed path — but we still stamp it (it
+// is harmless and keeps every Resource's Spec uniform for backup
+// round-trips). The RD latch is updated regardless of the target's
+// disk-ness because it is an RD-scoped property observed across peers.
+func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
+	if rd == nil {
+		return false, nil
+	}
+
+	// (1) RD latch: flip initialized=true once real data exists past
+	// day0 anywhere in the replica set. anyDataBearingDiskfulPeer scans
+	// EVERY replica (passing "" as the excluded name includes the target
+	// itself, which is correct here — a written target is just as much
+	// proof the RD holds data as a written peer).
+	if !rdInitialized(rd) && anyDataBearingDiskfulPeer(peers, "") {
+		if err := r.patchRDInitialized(ctx, rd.Name); err != nil {
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		// Reflect locally so the per-replica stamp below reads the
+		// just-latched value within this same reconcile.
+		t := true
+		rd.Spec.Initialized = &t
+
+		return true, nil
+	}
+
+	// (2) Per-replica stamp: set-if-nil, append-only.
+	if target.Spec.SkipInitialSync != nil {
+		return false, nil
+	}
+
+	skip := !rdInitialized(rd)
+	target.Spec.SkipInitialSync = &skip
+
+	if err := r.patchResourceSkipInitialSync(ctx, target.Name, skip); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, err
+	}
+
+	return true, nil
+}
+
+// rdInitialized reports whether the RD's append-only initialized latch
+// is set. A nil pointer (fresh RD, or a CRD predating this field on a
+// pre-upgrade cluster) reads as NOT initialized — the conservative
+// default that lets a genuinely-fresh set skip while the satellite's
+// own nil-SkipInitialSync default refuses to skip (invariant 5).
+func rdInitialized(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return rd != nil && rd.Spec.Initialized != nil && *rd.Spec.Initialized
+}
+
+// patchRDInitialized raw-merge-patches RD.Spec.Initialized=true. Raw
+// merge-patch (not SSA Apply) for the same reason the identity patches
+// use it: it bypasses controller-runtime's cached OpenAPI discovery
+// schema so a CRD schema upgrade that adds spec.initialized takes effect
+// without a controller restart, and it writes ONLY the key it carries so
+// concurrent Spec mutations on other fields are never clobbered.
+func (r *ResourceReconciler) patchRDInitialized(ctx context.Context, rdName string) error {
+	patchTarget := &blockstoriov1alpha1.ResourceDefinition{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       resourceDefinitionKindName,
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+	}
+
+	body := map[string]any{patchKeySpec: map[string]any{"initialized": true}}
+
+	patchBytes, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	return r.Patch(ctx, patchTarget, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
+// patchResourceSkipInitialSync raw-merge-patches the append-only
+// Resource.Spec.SkipInitialSync. Same raw-merge-patch rationale as the
+// identity patches.
+func (r *ResourceReconciler) patchResourceSkipInitialSync(ctx context.Context, resName string, skip bool) error {
+	patchTarget := &blockstoriov1alpha1.Resource{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       resourceProjectionResourceKind,
+			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: resName},
+	}
+
+	body := map[string]any{patchKeySpec: map[string]any{"skipInitialSync": skip}}
+
+	patchBytes, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	return r.Patch(ctx, patchTarget, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
 func ptrEqI32(a, b *int32) bool {
 	switch {
 	case a == nil && b == nil:
@@ -1295,7 +1522,7 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 		vols = append(vols, entry)
 	}
 
-	body := map[string]any{"spec": map[string]any{"volumeDefinitions": vols}}
+	body := map[string]any{patchKeySpec: map[string]any{"volumeDefinitions": vols}}
 
 	patchBytes, err := json.Marshal(body)
 	if err != nil {
@@ -1306,7 +1533,7 @@ func (r *ResourceReconciler) patchRDVolumeMinors(ctx context.Context, rd *blocks
 	// minor write is rejected with Conflict and we re-read.
 	patchTarget := &blockstoriov1alpha1.ResourceDefinition{
 		TypeMeta: metav1.TypeMeta{
-			Kind:       "ResourceDefinition",
+			Kind:       resourceDefinitionKindName,
 			APIVersion: blockstoriov1alpha1.GroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: rd.Name},
