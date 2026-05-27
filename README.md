@@ -9,14 +9,15 @@ The difference is what's underneath. Instead of a central controller with its ow
 
 ## Why?
 
-**It's a Kubernetes control plane to the core.**
-The source of truth is a handful of CRDs — `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice`. They're meant to be read *and* written by other operators: your GitOps tooling, tenant operators, monitoring, admission webhooks. Each carries real schema validation, and multi-writer Status uses Server-Side Apply, so several controllers can co-own an object without clobbering each other.
+### Kubernetes-native architecture
 
-**Every node runs a controller, not an agent.**
-The per-node satellite is itself a `controller-runtime` manager. It watches only the slice of CRDs that belong to its node and writes back what it actually observes — disk states, sync progress, kernel reality — straight into Status. Convergence is the reconcile loop's job, not a fan-out RPC's.
+- **Reconciliation control plane.** State of truth lives in Kubernetes CRDs; controller and satellite are `controller-runtime` managers with watch-based informers, declarative reconcile loops, and Status SSA. No synchronous fan-out RPC, no central in-memory state, no per-request controller→node polling. Desired/observed convergence is automatic.
+- **First-class CRDs.** `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice` are designed to be read and (where appropriate) written by other operators: cozystack tenant operators, GitOps tooling, custom monitoring/alerting, admission webhooks. Schemas carry kubebuilder enum/min/max validation; multi-writer Status uses Server-Side Apply field managers.
+- **Per-node satellite as a controller.** Each satellite is a controller-runtime manager that watches its own slice of CRDs (filtered by `Spec.NodeName`) and writes observed state back via Status SSA directly. No gRPC dispatch from a central controller.
 
-**It fits the ecosystem it lives in.**
-Go is the lingua franca of Kubernetes — the apiserver, kubelet, etcd, most CSI drivers, and `controller-runtime` itself are written in it. Building blockstor in Go puts it on the same tooling, libraries, and contributor base.
+### Ecosystem fit
+
+Go is the lingua franca of the Kubernetes ecosystem — apiserver, kubelet, etcd, the bulk of CSI drivers, controller-runtime itself. Writing blockstor in Go aligns the project with the tooling, libraries, and contributor base of that ecosystem.
 
 ## Status
 
