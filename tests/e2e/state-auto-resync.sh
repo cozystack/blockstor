@@ -117,6 +117,19 @@ trap 'cleanup_partition; delete_rd "$RD"' EXIT
 # 5.15 scenario needs all three diskful rows UpToDate before
 # we start poking the kernel; otherwise the disconnect would
 # race the initial-sync the autoplace just kicked off.
+#
+# Accepts kernel ground truth as well as the CRD projection. The
+# CRD .status projection (status_disk_state) can lag tens of seconds
+# behind the kernel on a busy CI stand — observed here as a 240s
+# timeout whose post-fail drbdsetup dump showed all three peers
+# already UpToDate (the row had converged; only the projection hadn't
+# surfaced). kernel_all_uptodate reads `drbdsetup status --json` on
+# $N1 directly: one frame reports $N1's local disk-state plus the
+# peer-disk-state of $N2 and $N3, so it proves all three replicas
+# from kernel truth. This mirrors the kernel-fallback lib.sh's
+# wait_uptodate gained in c63562707 and only ADDS an accept path —
+# a genuinely non-converged RD still shows non-UpToDate, so real
+# failures are not masked.
 wait_uptodate_3() {
     local rd=$1 deadline=$(( $(date +%s) + 240 ))
     while (( $(date +%s) < deadline )); do
@@ -130,9 +143,16 @@ wait_uptodate_3() {
             fi
         done
         if (( ok == 1 )); then return 0; fi
+
+        # Kernel ground truth: independent of the CRD projection lag.
+        if [[ "$(kernel_all_uptodate "$rd" "$N1")" == "ok" ]]; then
+            return 0
+        fi
+
         sleep 2
     done
     echo "FAIL: $rd never reached UpToDate on all 3 peers" >&2
+    echo "   last CRD diskState: $N1=$(status_disk_state "$rd" "$N1") $N2=$(status_disk_state "$rd" "$N2") $N3=$(status_disk_state "$rd" "$N3")" >&2
     on_node "$N1" drbdsetup status "$rd" 2>/dev/null || true
     return 1
 }
