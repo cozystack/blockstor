@@ -78,9 +78,17 @@ func TestCreateMetadataIdempotentOnPreExistingMd(t *testing.T) {
 		MetadataCreatedStamper: stamper,
 	})
 
+	// Fresh-deployment skip case: the controller stamped
+	// SkipInitialSync=true (RD not yet initialized), which is what
+	// authorises the day0 set-gi seed under the skip-init-sync
+	// hardening. Without it resolveVolumeSeed conservatively refuses the
+	// skip and no set-gi fires.
+	skipTrue := true
+
 	dr := &intent.DesiredResource{
-		Name:     "pvc-md-adopt",
-		NodeName: "n1",
+		Name:            "pvc-md-adopt",
+		NodeName:        "n1",
+		SkipInitialSync: &skipTrue,
 		Volumes: []*intent.DesiredVolume{
 			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
 		},

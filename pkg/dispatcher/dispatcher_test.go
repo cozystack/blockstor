@@ -1482,3 +1482,58 @@ func TestInactivePeerDroppedFromSiblings(t *testing.T) {
 		t.Errorf("drbdOpts missing peer.n2.node-id — active peer must remain (drbdOpts=%v)", got.DrbdOptions)
 	}
 }
+
+// TestBuildDesiredThreadsSkipInitialSync pins the skip-init-sync
+// hardening's threading: the controller-stamped Resource.Spec.
+// SkipInitialSync is carried verbatim (pointer tri-state preserved)
+// onto DesiredResource.SkipInitialSync, which is the authoritative
+// source the satellite's resolveVolumeSeed reads. nil → nil, true →
+// true, false → false; and the copy must not alias the input pointer.
+func TestBuildDesiredThreadsSkipInitialSync(t *testing.T) {
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	bptr := func(b bool) *bool { return &b }
+
+	cases := []struct {
+		name string
+		in   *bool
+	}{
+		{"nil_unstamped", nil},
+		{"true_fresh", bptr(true)},
+		{"false_must_sync", bptr(false)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := &blockstoriov1alpha1.Resource{
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: "pvc-sis",
+					NodeName:               "n1",
+					SkipInitialSync:        tc.in,
+				},
+			}
+
+			got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			switch {
+			case tc.in == nil && got.SkipInitialSync != nil:
+				t.Errorf("nil input must thread nil, got %v", *got.SkipInitialSync)
+			case tc.in != nil && got.SkipInitialSync == nil:
+				t.Errorf("non-nil input %v must thread non-nil, got nil", *tc.in)
+			case tc.in != nil && *got.SkipInitialSync != *tc.in:
+				t.Errorf("threaded value=%v, want %v", *got.SkipInitialSync, *tc.in)
+			case tc.in != nil && got.SkipInitialSync == tc.in:
+				t.Errorf("threaded pointer must be a copy, not alias the input Spec pointer")
+			}
+		})
+	}
+}

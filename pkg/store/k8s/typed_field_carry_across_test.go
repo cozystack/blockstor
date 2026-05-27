@@ -136,6 +136,11 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// preferred-port seed. No wire counterpart; wiping it
 			// would lose the per-RD port preference.
 			"DRBDPort": true,
+			// Skip-init-sync hardening: controller-flipped append-only
+			// "this RD has held data" latch. No wire counterpart;
+			// wiping it would let a new replica added to an established
+			// RD wrongly skip the initial sync (come up UpToDate-empty).
+			"Initialized": true,
 		},
 	},
 	"ResourceGroupSpec": {
@@ -174,6 +179,12 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// trigger a port/node-id change → DRBD resync.
 			"DRBDPort":   true,
 			"DRBDNodeID": true,
+			// Skip-init-sync hardening: controller-stamped append-only
+			// per-replica skip decision (= !RD.Initialized). No wire
+			// counterpart on apiv1.Resource; carried across so a routine
+			// golinstor REST modify can't strip it and flip the
+			// satellite back to the unsafe day0-skip default.
+			"SkipInitialSync": true,
 		},
 	},
 	"StoragePoolSpec": {
