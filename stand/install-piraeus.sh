@@ -24,6 +24,52 @@ metadata:
 spec: {}
 EOF
 
+# Mirror blockstor's apiserver CA into piraeus-datastore so the
+# piraeus-operator can issue linstor-csi client certs from the SAME CA
+# the blockstor apiserver trusts. The observability scenarios
+# (observability-three-way / -capacity-correlation) repoint piraeus's
+# bundled linstor-csi at blockstor's mTLS apiserver
+# (LinstorCluster.spec.externalController.url =
+# https://blockstor-apiserver...:3371). That endpoint is
+# RequireAndVerifyClientCert, so linstor-csi MUST present a client cert
+# chained to blockstor-api-ca. The operator-native knob is
+# LinstorCluster.spec.apiTLS.certManager: when set, the operator creates
+# Certificate resources (linstor-csi-controller-tls / -node-tls) in
+# piraeus-datastore from the referenced cert-manager Issuer and wires
+# LS_USER_CERTIFICATE / LS_USER_KEY / LS_ROOT_CA into the CSI pods (see
+# piraeus-operator v2.10.0 internal/controller/linstorcluster_controller.go
+# kustomizeCSIControllerResources + patches/api-tls-csi-controller.yaml).
+# A cert-manager Issuer is namespace-scoped, so the CA private key must
+# live in piraeus-datastore: copy the blockstor-api-ca Secret here and
+# stand up a CA Issuer over it. Idempotent; harmless to the rwx-ganesha
+# scenario, which keeps piraeus's own controller and never sets apiTLS.
+echo ">> mirror blockstor-api-ca into piraeus-datastore + create CA Issuer"
+deadline=$(( $(date +%s) + 120 ))
+while (( $(date +%s) < deadline )); do
+    if kubectl -n blockstor-system get secret blockstor-api-ca >/dev/null 2>&1; then
+        break
+    fi
+    sleep 3
+done
+if kubectl -n blockstor-system get secret blockstor-api-ca >/dev/null 2>&1; then
+    kubectl -n blockstor-system get secret blockstor-api-ca -o json \
+        | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.annotations, .metadata.labels)' \
+        | kubectl -n piraeus-datastore apply -f -
+    kubectl apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: blockstor-api-ca
+  namespace: piraeus-datastore
+spec:
+  ca:
+    secretName: blockstor-api-ca
+EOF
+    kubectl -n piraeus-datastore wait --for=condition=Ready issuer/blockstor-api-ca --timeout=60s || true
+else
+    echo ">> WARN: blockstor-api-ca Secret not found in blockstor-system — apiserver mTLS PKI absent; observability scenarios will SKIP" >&2
+fi
+
 echo ">> waiting for LinstorCluster ready"
 for i in {1..60}; do
     if kubectl get linstorcluster linstorcluster -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -q True; then

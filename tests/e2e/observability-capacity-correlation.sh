@@ -174,15 +174,14 @@ cleanup() {
     for rd in "${SPAWNED_RDS[@]}"; do
         delete_rd "$rd" 2>/dev/null
     done
-    # Revert LinstorCluster.spec.externalController unconditionally so a
-    # FAIL exit doesn't leave linstor-csi wired at blockstor's apiserver
-    # for the rest of the e2e batch. Without this, downstream scenarios
-    # never reach UpToDate because piraeus tears down its in-cluster
-    # Java linstor-controller when an external one is configured.
-    # Cascade-fail repro: e2e1 batch on 2026-05-17 (4 downstream FAILs).
-    kubectl patch linstorcluster linstorcluster --type=json \
-        -p='[{"op":"remove","path":"/spec/externalController"}]' \
-        2>/dev/null
+    # Revert LinstorCluster.spec.externalController + apiTLS
+    # unconditionally so a FAIL exit doesn't leave linstor-csi wired at
+    # blockstor's apiserver for the rest of the e2e batch. Without this,
+    # downstream scenarios never reach UpToDate because piraeus tears
+    # down its in-cluster Java linstor-controller when an external one is
+    # configured. Cascade-fail repro: e2e1 batch on 2026-05-17 (4
+    # downstream FAILs).
+    unwire_linstor_csi_mtls
     kill "$PF_PID" 2>/dev/null
     wait "$PF_PID" 2>/dev/null
     set -e
@@ -339,28 +338,13 @@ fi
 # --- Phase 2 (Level 1): apply a 1Gi PVC ---------------------------------
 echo ">> phase 2 (Level 1): apply 1Gi PVC, expect Pending + capacity event"
 
-# Wire linstor-csi at blockstor's apiserver (same dance as
-# observability-three-way). mTLS endpoint (Service is TLS-only now);
-# piraeus must also present the client cert — validated on the stand as
-# a pre-merge follow-up (see the PR's stand-validation note).
+# Wire linstor-csi at blockstor's mTLS apiserver (same dance as
+# observability-three-way). The Service is TLS-only (:3371,
+# RequireAndVerifyClientCert); wire_linstor_csi_mtls drives both the
+# externalController repoint AND the client-cert wiring through
+# LinstorCluster.spec.apiTLS.certManager (see tests/e2e/lib.sh).
 BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
-CUR_URL=$(kubectl get linstorcluster linstorcluster \
-    -o jsonpath='{.spec.externalController.url}' 2>/dev/null || true)
-if [[ "$CUR_URL" != "$BLOCKSTOR_URL" ]]; then
-    echo "   wire linstor-csi at $BLOCKSTOR_URL via LinstorCluster.spec.externalController"
-    kubectl patch linstorcluster linstorcluster --type merge \
-        -p "{\"spec\":{\"externalController\":{\"url\":\"$BLOCKSTOR_URL\"}}}"
-    deadline=$(( $(date +%s) + 180 ))
-    while (( $(date +%s) < deadline )); do
-        env_val=$(kubectl -n piraeus-datastore get deploy linstor-csi-controller \
-            -o jsonpath='{.spec.template.spec.containers[?(@.name=="linstor-csi")].env[?(@.name=="LS_CONTROLLERS")].value}' \
-            2>/dev/null || true)
-        [[ "$env_val" == "$BLOCKSTOR_URL" ]] && break
-        sleep 3
-    done
-    kubectl -n piraeus-datastore rollout status deploy/linstor-csi-controller --timeout=120s
-    kubectl -n piraeus-datastore rollout status ds/linstor-csi-node --timeout=120s
-fi
+wire_linstor_csi_mtls "$BLOCKSTOR_URL"
 
 cat <<EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1

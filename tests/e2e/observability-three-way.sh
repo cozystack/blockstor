@@ -87,42 +87,16 @@ LCTL_M=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 # fix per the Phase 7.9 scenario design: the test exercises
 # blockstor's three-way observability invariant (PVC ↔ Resource CRD
 # ↔ .res), so the CSI provisioning request MUST land on blockstor.
-# mTLS endpoint (the Service is TLS-only now). Pointing linstor-csi
-# here is necessary but NOT sufficient: piraeus must also mount the
-# blockstor-apiserver-client-tls cert into the CSI pods and present it
-# (LinstorCluster apiTLS / external-controller client-secret wiring).
-# That wiring is piraeus-operator-version-specific and is validated on
-# the stand as a pre-merge follow-up — see the PR's stand-validation
-# note. The URL bump keeps this script honest about the new endpoint.
+#
+# blockstor's apiserver Service is mTLS-only (:3371,
+# RequireAndVerifyClientCert). Pointing linstor-csi at the URL is
+# necessary but NOT sufficient — piraeus must also present a client
+# cert chained to blockstor-api-ca. wire_linstor_csi_mtls drives both
+# through the operator-native LinstorCluster.spec.apiTLS.certManager
+# knob (see tests/e2e/lib.sh); the CA Issuer it references is mirrored
+# into piraeus-datastore by stand/install-piraeus.sh.
 BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
-CUR_URL=$(kubectl get linstorcluster linstorcluster \
-    -o jsonpath='{.spec.externalController.url}' 2>/dev/null || true)
-if [[ "$CUR_URL" != "$BLOCKSTOR_URL" ]]; then
-    echo ">> wire linstor-csi at $BLOCKSTOR_URL via LinstorCluster.spec.externalController"
-    kubectl patch linstorcluster linstorcluster --type merge \
-        -p "{\"spec\":{\"externalController\":{\"url\":\"$BLOCKSTOR_URL\"}}}"
-
-    echo ">> wait up to 180s for linstor-csi-controller to roll with new LS_CONTROLLERS"
-    deadline=$(( $(date +%s) + 180 ))
-    while (( $(date +%s) < deadline )); do
-        env_val=$(kubectl -n piraeus-datastore get deploy linstor-csi-controller \
-            -o jsonpath='{.spec.template.spec.containers[?(@.name=="linstor-csi")].env[?(@.name=="LS_CONTROLLERS")].value}' \
-            2>/dev/null || true)
-        if [[ "$env_val" == "$BLOCKSTOR_URL" ]]; then
-            break
-        fi
-        sleep 3
-    done
-    if [[ "$env_val" != "$BLOCKSTOR_URL" ]]; then
-        echo "FAIL: linstor-csi-controller LS_CONTROLLERS never reconciled to $BLOCKSTOR_URL (got '$env_val')"
-        kubectl -n piraeus-datastore get deploy linstor-csi-controller -o yaml | grep -A2 LS_CONTROLLERS || true
-        exit 1
-    fi
-    kubectl -n piraeus-datastore rollout status deploy/linstor-csi-controller --timeout=120s
-    kubectl -n piraeus-datastore rollout status ds/linstor-csi-node --timeout=120s
-else
-    echo ">> linstor-csi already wired at $BLOCKSTOR_URL"
-fi
+wire_linstor_csi_mtls "$BLOCKSTOR_URL"
 
 # Create a dedicated StorageClass against linstor-csi so the test
 # isn't sensitive to whatever default SC the stand was provisioned
