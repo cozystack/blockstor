@@ -1,6 +1,6 @@
 # cli-matrix — L6 mandatory operator-CLI e2e
 
-This directory holds the L6 tier of the blockstor test pyramid (see `PLAN.md` § "L6 mandatory: operator-CLI e2e coverage"). Every user-reported operator-CLI bug must have a cell here that runs the real `linstor` CLI against the stand and asserts Status convergence via observer-stamped Resource.Status + a kernel probe — never via the REST "200 OK".
+This directory holds the L6 tier of the blockstor test pyramid (see CLAUDE.md → Test tiers). Every user-reported operator-CLI bug must have a cell here that runs the real `linstor` CLI against the stand and asserts Status convergence via observer-stamped Resource.Status + a kernel probe — never via the REST "200 OK".
 
 Why this layer exists: bug-hunt waves v1–v40 caught ~250 REST-handler-level issues via unit tests + `tests/integration/group_*_test.go`. None of those exercise the real `python-linstor → apiserver SSA → satellite cache lag → events2 observer → Status.DiskState` pipeline end-to-end. Bugs 326-330 are the post-mortem of that gap.
 
@@ -62,4 +62,4 @@ The nightly dispatcher (`/tmp/run14-dispatch.sh` on the dev host) is extended to
 1. Pick a `<verb>-<shape>.sh` filename. Keep verbs aligned with the CLI nouns (`r-c`, `r-d`, `r-td`, `ps-cdp`, `sp-c`, `rd-c`, etc.).
 2. Start from the boilerplate at the top of any existing cell (shebang, source lib, `require_workers`, `trap delete_rd` + `assert_no_orphans`, `linstor_cli_setup`).
 3. Bound every wait with a hard timeout. Use `wait_*` helpers — do NOT add bespoke polling loops unless the contract is genuinely new.
-4. Land the cell in the **same commit** that closes the bug it covers. Per PLAN.md L6 rules: without the L6 cell the bug counts as not closed.
+4. Land the cell in the **same commit** that closes the bug it covers. Per the L6 rules: without the L6 cell the bug counts as not closed.

@@ -20,7 +20,7 @@ analysis with reconciler-survival e2e.
 ### 5.1 events2 `change resource role:Primary` → `Status.InUse=true` — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #15; drbd-troubleshooting (resource-kind frames); PLAN.md observer
+- **Source:** linstor-cli #15; drbd-troubleshooting (resource-kind frames); observer
 
 **Unit:** `pkg/satellite/controllers/observer_test.go` — feed `change resource ... role:Primary` → `translateEvent` emits `resourceObservation{InUse:true}` → status writeback flips Resource.Status.InUse.
 **E2E:** mount /dev/drbd<N> → Pod gets Primary → `linstor r l` shows InUse.
@@ -43,7 +43,7 @@ analysis with reconciler-survival e2e.
 ### 5.4 events2 `destroy connection` deletes peer from Connections[] — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #13; PLAN.md observer destroy-event fix this session
+- **Source:** linstor-cli #13; observer destroy-event fix this session
 
 **Why:** Removed peer must vanish from Conns column, not linger as ghost StandAlone.
 
@@ -228,7 +228,7 @@ Record kernel version in test report.
 ### 5.24 Fix: Node-ID mismatch — recreate replica — S
 
 - **Priority:** P1  **Target:** e2e  **Complexity:** M
-- **Source:** recovery-skill B6; drbd-troubleshooting #11; PLAN.md Phase 8.1 invariant
+- **Source:** recovery-skill B6; drbd-troubleshooting #11; Phase 8.1 invariant
 
 DRBD complains `Peer presented a node_id of X instead of Y`. Recipe: `linstor r d <wrong-node> <rsc> && linstor rd ap <rsc>`. **Phase 8.1 invariant:** `Status.DRBDNodeID` is stable across churn — test churns RD 5 times in a loop; dmesg clean of `node_id` errors.
 

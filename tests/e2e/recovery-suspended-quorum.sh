@@ -58,7 +58,7 @@
 # stuck node, both directions) and force-deletes any leftover RDs
 # via delete_rd so a partial-failure rerun doesn't trip on residue.
 #
-# Stand: e2e-dualpri on 129.213.29.101 — 3 worker nodes + 1 control
+# Stand: e2e-dualpri on <dev-stand-host> — 3 worker nodes + 1 control
 # plane, blockstor controller + apiserver + satellite DaemonSet.
 # Pool: `stand` (FileDir-backed, see stand/blockstor-storagepools.yaml).
 

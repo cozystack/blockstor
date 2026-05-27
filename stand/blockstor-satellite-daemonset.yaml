@@ -317,8 +317,8 @@ spec:
         #
         # In Cozystack's Talos deployment, drbd-reactor lives in the
         # siderolabs/drbd Talos system extension on the host, not as a
-        # sidecar (see PLAN.md "HA failover layer" + "RWX volumes via
-        # Ganesha"). That model is required because:
+        # sidecar (the "HA failover layer" + "RWX volumes via
+        # Ganesha" model). That model is required because:
         #   1. drbd-reactor must subscribe to `drbdsetup events2` on the
         #      host kernel module, the same module the satellite uses;
         #   2. it stamps node taints (`drbd.linbit.com/lost-quorum`)

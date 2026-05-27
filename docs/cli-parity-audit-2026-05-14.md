@@ -1,7 +1,7 @@
 # CLI parity audit: blockstor REST vs upstream LINSTOR (piraeus)
 
 Date: 2026-05-14
-Driver: `linstor` CLI 1.27.1 on `ubuntu@129.213.29.101`
+Driver: `linstor` CLI 1.27.1 on `ubuntu@<dev-stand-host>`
 Targets:
 - **BS**: blockstor apiserver — `linstor controller 1.33.2; GIT-hash: blockstor` — port-forward `localhost:3370` → `svc/blockstor-apiserver.blockstor-system:3370`.
 - **UP**: piraeus bundled Java controller — `linstor controller 1.32.3; GIT-hash: 6dac06aed233f2c89ac7cc6b1185d6dce9ec74c4` — port-forward `localhost:3371` → `svc/linstor-controller.piraeus-datastore:3370`.

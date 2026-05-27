@@ -20,7 +20,7 @@ CI host with a loop-backed pool) for storage operations,
 ### 6.1 LVM_THIN provider lifecycle — S
 
 - **Priority:** P0  **Target:** unit + integration  **Complexity:** L
-- **Source:** PLAN.md `pkg/storage/lvm`; observability #12 (lvs/vgs/pvs)
+- **Source:** `pkg/storage/lvm`; observability #12 (lvs/vgs/pvs)
 
 **Unit:** `pkg/storage/lvm` with `FakeExec` — CreateVolume, VolumeStatus, CreateSnapshot, DeleteSnapshot, DeleteVolume, PoolStatus. Each assertion is a command-line match.
 **Integration:** loop-backed `vgcreate blockstor-lvm /dev/loop0 && lvcreate -T -L 1G blockstor-lvm/thin` → end-to-end CRUD against real LVM.
@@ -28,15 +28,15 @@ CI host with a loop-backed pool) for storage operations,
 ### 6.2 ZFS / ZFS_THIN provider lifecycle — S
 
 - **Priority:** P0  **Target:** unit + integration  **Complexity:** L
-- **Source:** PLAN.md `pkg/storage/zfs/zfs_integration_test.go`
+- **Source:** `pkg/storage/zfs/zfs_integration_test.go`
 
 **Unit:** `pkg/storage/zfs` with FakeExec — same matrix as 6.1.
-**Integration:** `BLOCKSTOR_ZFS_POOL=blockstor-test go test -tags=integration ./pkg/storage/zfs` against a real 240 MiB loop-backed pool. Already green per PLAN.md.
+**Integration:** `BLOCKSTOR_ZFS_POOL=blockstor-test go test -tags=integration ./pkg/storage/zfs` against a real 240 MiB loop-backed pool. Already green.
 
 ### 6.3 FILE / FILE_THIN provider — S
 
 - **Priority:** P1  **Target:** unit + integration  **Complexity:** L
-- **Source:** PLAN.md `pkg/storage/file`
+- **Source:** `pkg/storage/file`
 
 `fallocate` (thick) / `truncate` (thin) for create, `statfs(2)` for capacity. Snapshots intentionally unsupported (caller routes to LVM/ZFS).
 
@@ -50,7 +50,7 @@ LVM thick supports neither thin nor snapshots. Test: `linstor snapshot create lv
 ### 6.5 Pool auto-registration via Hello — S
 
 - **Priority:** P0  **Target:** integration + e2e  **Complexity:** L
-- **Source:** PLAN.md StoragePool auto-registration 2026-05-08
+- **Source:** StoragePool auto-registration 2026-05-08
 
 Satellite ships configured Providers in HelloRequest.Pools → Server.Hello upserts a StoragePool CRD per (node, pool name). 3 satellites with `stand` FILE_THIN pool produce 3 StoragePool CRDs without `linstor storage-pool create`.
 
@@ -123,7 +123,7 @@ CACHE, WRITECACHE, and NVME are explicitly **not supported** (see
 ### 6.10 No-DRBD storage class (single-replica local) — S
 
 - **Priority:** P1  **Target:** unit + e2e  **Complexity:** L
-- **Source:** drbd-troubleshooting #15; PLAN.md Phase 9 LayerStack
+- **Source:** drbd-troubleshooting #15; Phase 9 LayerStack
 
 RG with `PlaceCount: 1, LayerStack: ['STORAGE']` → pure local volume for app-level-replicated workloads (Postgres etc.). `linstor v l` DeviceName = `/dev/<vg>/<lv>` (no /dev/drbd*). `linstor node lost` should refuse or warn for single-replica RD (data loss).
 
@@ -163,7 +163,7 @@ not a code change.
 ### 6.13 LUKS layer encrypts data at rest — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** UG9 §"Encrypted volumes" (lines 2273-2324); PLAN.md `pkg/luks` (5 contract tests)
+- **Source:** UG9 §"Encrypted volumes" (lines 2273-2324); `pkg/luks` (5 contract tests)
 
 **Unit:** `pkg/luks` Format / Open / Close / DevicePath. Key passes via stdin to keep secrets off argv (Phase 6 detail).
 **E2E:** RD with `--layer-list drbd,luks,storage` → backing block device is encrypted (`cryptsetup status` on satellite shows `cipher: aes-xts-plain64`). Pod read/write transparent.
@@ -171,14 +171,14 @@ not a code change.
 ### 6.14 DRBD `shared-secret` for in-transit encryption — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** PLAN.md `POST /v1/resource-definitions/{rd}/encryption-passphrase`
+- **Source:** `POST /v1/resource-definitions/{rd}/encryption-passphrase`
 
 Writes `DrbdOptions/Net/shared-secret` onto RD props. `.res` includes `net { shared-secret "..."; }`. DRBD handshake uses the secret to MAC the connection.
 
 ### 6.15 Master passphrase CRUD endpoints — S
 
 - **Priority:** P0  **Target:** unit  **Complexity:** L
-- **Source:** UG9 §"Encryption commands" (lines 2288-2324); PLAN.md `/v1/encryption/passphrase` POST/PATCH/PUT
+- **Source:** UG9 §"Encryption commands" (lines 2288-2324); `/v1/encryption/passphrase` POST/PATCH/PUT
 
 `create-passphrase` (idempotent), `enter-passphrase` (re-unlock after restart), `modify-passphrase` (rotate). **Critical for piraeus orchestration** — piraeus reads Secret and calls these endpoints.
 
@@ -187,7 +187,7 @@ Writes `DrbdOptions/Net/shared-secret` onto RD props. `.res` includes `net { sha
 ### 6.16 Contract-replay against LINSTOR oracle preserves encryption shape — S
 
 - **Priority:** P1  **Target:** integration  **Complexity:** L
-- **Source:** PLAN.md `tests/contract`
+- **Source:** `tests/contract`
 
 Recorded golinstor traces for encrypt CRUD must replay byte-identical against blockstor. Catches wire-shape regressions before piraeus breaks.
 
@@ -279,7 +279,7 @@ Test command line: `zfs snapshot data/<rd>_00000@snap1`. Existing in `pkg/storag
 ### 6.24 Cross-node ship picks the right tool — S
 
 - **Priority:** P1  **Target:** integration  **Complexity:** L
-- **Source:** PLAN.md `Reconciler.ShipSnapshot` (3 contract tests)
+- **Source:** `Reconciler.ShipSnapshot` (3 contract tests)
 
 ZFS: `zfs send | ssh peer zfs recv`. LVM_THIN: `thin-send-recv`. Dispatched via injectable `ShipExec` so unit tests assert command lines.
 

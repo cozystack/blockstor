@@ -1,122 +1,74 @@
+![Blockstor](img/blockstor-logo-black.svg#gh-light-mode-only)
+![Blockstor](img/blockstor-logo-white.svg#gh-dark-mode-only)
+
 # Blockstor
 
-blockstor is a Kubernetes control plane for LVM and ZFS storage with [DRBD](https://linbit.com/drbd/) replication. It exposes a [LINSTOR](https://linbit.com/linstor/)-compatible REST API so existing clients (linstor-csi, piraeus-operator, ha-controller, golinstor) keep working.
+**Blockstor** is a Kubernetes control plane for LVM and ZFS storage with [DRBD](https://linbit.com/drbd/) replication. It speaks a [LINSTOR](https://linbit.com/linstor/)-compatible REST API, so the clients you already use — `linstor-csi`, `piraeus-operator`, `ha-controller`, `golinstor`, the `linstor` CLI — keep working unchanged.
 
-## Why a new implementation?
+The difference is what's underneath. Instead of a central controller with its own database and synchronous RPC to every node, blockstor is built the way Kubernetes operators are built: the desired state lives in CRDs, and a set of `controller-runtime` reconcilers drive the cluster toward it. There is no external database to back up, no in-memory state to lose on restart, and no controller→node polling to fall behind.
 
-### Kubernetes-native architecture
+## Why?
 
-- **Reconciliation control plane.** State of truth lives in Kubernetes CRDs; controller and satellite are `controller-runtime` managers with watch-based informers, declarative reconcile loops, and Status SSA. No synchronous fan-out RPC, no central in-memory state, no per-request controller→node polling. Desired/observed convergence is automatic.
-- **First-class CRDs.** `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice`, `ControllerConfig` are designed to be read and (where appropriate) written by other operators: cozystack tenant operators, GitOps tooling, custom monitoring/alerting, admission webhooks. Schemas carry kubebuilder enum/min/max validation; multi-writer Status uses Server-Side Apply field managers.
-- **Per-node satellite as a controller.** Each satellite is a controller-runtime manager that watches its own slice of CRDs (filtered by `Spec.NodeName`) and writes observed state back via Status SSA directly. No gRPC dispatch from a central controller.
+**It's a Kubernetes control plane to the core.**
+The source of truth is a handful of CRDs — `Resource`, `ResourceDefinition`, `ResourceGroup`, `StoragePool`, `Snapshot`, `Node`, `PhysicalDevice`. They're meant to be read *and* written by other operators: your GitOps tooling, tenant operators, monitoring, admission webhooks. Each carries real schema validation, and multi-writer Status uses Server-Side Apply, so several controllers can co-own an object without clobbering each other.
 
-See [`docs/architecture.md`](docs/architecture.md) for the load-bearing design notes, and [`docs/usage.md`](docs/usage.md) for installing blockstor onto a cluster and driving it with the `linstor` client.
+**Every node runs a controller, not an agent.**
+The per-node satellite is itself a `controller-runtime` manager. It watches only the slice of CRDs that belong to its node and writes back what it actually observes — disk states, sync progress, kernel reality — straight into Status. Convergence is the reconcile loop's job, not a fan-out RPC's.
 
-### Ecosystem fit
+**It fits the ecosystem it lives in.**
+Go is the lingua franca of Kubernetes — the apiserver, kubelet, etcd, most CSI drivers, and `controller-runtime` itself are written in it. Building blockstor in Go puts it on the same tooling, libraries, and contributor base.
 
-Go is the lingua franca of the Kubernetes ecosystem — apiserver, kubelet, etcd, the bulk of CSI drivers, controller-runtime itself. Writing blockstor in Go aligns the project with the tooling, libraries, and contributor base of that ecosystem.
+## Status
 
-### New functionality
+What works today:
 
-- **Shared-LUN provisioning** with thick LVM + thin qcow2-on-LVM (no filesystem layer), following the design proven in [oVirt VDSM](https://github.com/oVirt/vdsm/blob/master/doc/thin-provisioning.md).
-- **VDUSE backend** via `qemu-storage-daemon` for shared-SAN Kubernetes — see the [LVM/qcow shared-SAN write-up](https://blog.deckhouse.io/lvm-qcow-csi-driver-shared-san-kubernetes-81455201590e) for the design rationale.
-- **Bring-your-own-key (BYOK) encryption** with operator-managed Secret references in the CRD spec rather than a controller-owned passphrase bag.
+- [x] Replicated volumes over DRBD, on LVM, LVM-thin, ZFS, ZFS-thin, or file backends
+- [x] Running **without DRBD** — plain local storage (single-replica diskful or diskless)
+- [x] **LUKS encryption** — volume-level encryption at rest
+- [x] Autoplacement with constraints (zones, node properties, replicas-on-different)
+- [x] TieBreaker + quorum policies
+- [x] **Snapshots** — create, restore as a new resource, roll back, and clone
+- [x] Intra-cluster snapshot shipping (`zfs send`/`recv`, `thin-send-recv`) for clone / add-replica
+- [x] Online volume resize
+- [x] Device-pool creation from physical disks (`physical-storage create-device-pool`)
+- [x] LINSTOR-compatible REST API for the whole client ecosystem, served over mTLS
+
+Not implemented — the API answers these with `501 Not Implemented`:
+
+- [ ] Cross-cluster snapshot shipping (disaster recovery)
+- [ ] Backup create / restore / ship / abort, and the backup queue
+- [ ] Schedules (cron-driven backups)
+- [ ] Remote backends — S3, LINSTOR remotes
+- [ ] Extra storage providers — SPDK, NVMe-oF, OpenFlex, Exos
+
+On the roadmap:
+
+- [ ] **Bring-your-own-key encryption** — operator-managed Secret references in the spec, instead of a controller-owned passphrase bag
+- [ ] **Migration tool from LINSTOR** — adopt an existing LINSTOR cluster's resources into blockstor in place
+- [ ] [Shared-LUN provisioning](https://github.com/oVirt/vdsm/blob/master/doc/thin-provisioning.md) — thick LVM plus thin qcow2-on-LVM, no filesystem layer
+- [ ] [VDUSE backend](https://blog.deckhouse.io/lvm-qcow-csi-driver-shared-san-kubernetes-81455201590e) via `qemu-storage-daemon`, for shared-SAN Kubernetes
+
+## Getting started
+
+Blockstor installs onto an existing cluster and is driven with the standard `linstor` client and piraeus `linstor-csi`. The full walkthrough — installing the control plane, registering nodes and pools, and wiring up CSI — lives in **[`docs/usage.md`](docs/usage.md)**.
+
+The three images are published to GHCR on every release:
+
+- `ghcr.io/cozystack/blockstor-controller` — the reconcilers
+- `ghcr.io/cozystack/blockstor-apiserver` — the LINSTOR-compatible REST API (mTLS)
+- `ghcr.io/cozystack/blockstor-satellite` — the per-node DRBD / storage agent
+
+## Documentation
+
+- [`docs/usage.md`](docs/usage.md) — install and operate blockstor with the `linstor` client + piraeus/linstor-csi.
+- [`docs/architecture.md`](docs/architecture.md) — the load-bearing design decisions.
+- [`docs/layer-stack.md`](docs/layer-stack.md) — DRBD / LUKS / STORAGE compositions.
+- [`AGENTS.md`](AGENTS.md) — repository layout and the local Talos+QEMU dev stand, for contributors.
 
 ## Acknowledgements
 
-blockstor implements a LINSTOR-compatible REST API and was inspired by LINBIT's work on DRBD and LINSTOR, and by the wider DRBD / LINSTOR / Piraeus community.
+Blockstor was inspired by LINBIT's [LINSTOR](https://linbit.com/linstor/), and it operates [DRBD](https://linbit.com/drbd/) to provide block-level replication. It deliberately speaks LINSTOR's API so that the rich ecosystem the LINSTOR community has built keeps working unchanged. Heartfelt thanks to LINBIT and to the wider DRBD / LINSTOR / Piraeus community.
 
-## What's here
+## License
 
-- `cmd/` — three binaries from the Phase 11.x apiserver split:
-  - `cmd/controller/` — controller-runtime manager hosting the RD / RG / RP / Snapshot / Resource / Node reconcilers. The LINSTOR-compatible REST surface is disabled by default since the Phase 11.x apiserver split; pass `--enable-rest-api` (with `--rest-bind-address`) for the legacy single-binary deployment.
-  - `cmd/satellite/` — per-node controller-runtime manager that watches its own slice of CRDs and reconciles DRBD / LUKS / STORAGE layers + drives the events2 observer.
-  - `cmd/apiserver/` — stateless LINSTOR-compatible REST front end backed by the CRD store; runs as a 3-replica Deployment.
-- `pkg/api/v1/` — REST shape types, layer-stack resolver.
-- `pkg/rest/` — REST handlers (LINSTOR-compatible).
-- `pkg/store/` + `pkg/store/k8s/` — InMemory + CRD-backed store, both behind the same `store.Store` interface and exercised by a shared test suite.
-- `pkg/satellite/` — DRBD/LUKS/STORAGE layer reconciler, snapshot-ship dispatcher.
-- `pkg/satellite/controllers/` — controller-runtime reconcilers on the satellite (Resource, StoragePool, Snapshot, PhysicalDevice + events2 observer Runnable).
-- `pkg/storage/{lvm,zfs,loopfile,file}` — provider implementations (LVM-thin, LVM-thick, ZFS / ZFS_THIN, loopfile, host file).
-- `pkg/luks/` — `cryptsetup` wrapper for the LUKS layer.
-- `pkg/drbd/` — `drbdadm` / `drbdsetup` wrappers, .res ConfFileBuilder, events2 parser, options resolver.
-- `pkg/placer/` — autoplacer (capacity-weighted, anti-affinity, shared-LUN-aware).
-- `pkg/dispatcher/` — CRD → DesiredResource translator (resolves layer_stack, options, passphrases). Used by the satellite-side c-r reconcilers.
-- `internal/controller/` — controller-side controller-runtime reconcilers (RD, RG, RP, Snapshot, Resource, Node).
-- `stand/` — Talos+QEMU dev stand (DRBD, ZFS, LVM extensions baked in).
-- `docs/` — `architecture.md`, `layer-stack.md` (DRBD/LUKS/STORAGE compositions), `csi-api-surface.md`.
-- `tests/` — `contract/` (REST contract conformance), `e2e/` (cluster-side scenarios), `smoke-blockstor.sh`, `burnin-blockstor.sh`.
-
-## Layer stack
-
-blockstor implements an ordered layer-stack model. RDs declare a chain — the satellite walks it bottom-up on Apply, top-down on teardown.
-
-| Stack                       | Use case                                     |
-|-----------------------------|----------------------------------------------|
-| `["DRBD","STORAGE"]`        | Default. Replicated PVC.                     |
-| `["LUKS","STORAGE"]`        | Single-replica encrypted PVC, no DRBD.       |
-| `["DRBD","LUKS","STORAGE"]` | Encrypted at-rest + replicated.              |
-| `["STORAGE"]`               | Single-replica local mode (cache, scratch). |
-
-See `docs/layer-stack.md` for the full operator-facing reference.
-
-## Requirements (host)
-
-- Linux x86_64 with KVM enabled (`/dev/kvm` accessible)
-- `talosctl`, `kubectl`, `helm`, `qemu-system-x86_64`
-- DRBD9 kernel module loaded on host (`modprobe drbd`)
-- ~8 GB free RAM and ~20 GB disk per cluster
-
-## Quick start
-
-```sh
-# Single cluster (default name "blockstor")
-make up
-make piraeus
-make blockstor              # install blockstor controller + satellite DaemonSet
-make smoke-blockstor
-make down
-
-# Real-disk pools (ZFS + LVM-thin) on extra disks
-make pools
-STORPOOL=zfs-thin make smoke-blockstor
-
-# Multiple parallel clusters — each gets its own 10.<slot>.0.0/24 CIDR
-make up   NAME=alice
-make up   NAME=bob
-```
-
-Each cluster's config lands under `.work/<NAME>/` (talos+kube).
-
-## Selecting a stand from your shell
-
-```sh
-eval "$(make use NAME=alice)"
-kubectl get nodes
-```
-
-## e2e scenarios
-
-```sh
-make e2e-list                                # enumerate scenarios
-make e2e NAME=alice SCENARIO=tiebreaker
-make e2e NAME=alice SCENARIO=luks-layer
-```
-
-Scenarios live under `tests/e2e/` and each takes a `WORK_DIR` arg.
-
-## Layout
-
-```
-cmd/               controller + satellite + apiserver binaries (Phase 11.x split)
-pkg/               API, REST, store, satellite, storage, drbd, luks, placer, dispatcher
-internal/controller/  controller-side controller-runtime reconcilers
-pkg/satellite/controllers/  satellite-side controller-runtime reconcilers
-stand/             Talos+QEMU dev stand
-docs/              architecture, layer-stack, CSI surface notes
-tests/
-  contract/        REST contract conformance
-  e2e/             cluster-side scenarios (lib.sh + per-scenario .sh)
-  smoke-blockstor.sh
-  burnin-blockstor.sh
-```
+Blockstor is licensed under [Apache 2.0](LICENSE). The code is provided as-is with no warranties.

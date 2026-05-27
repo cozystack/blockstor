@@ -2,7 +2,7 @@
 
 Project-level guidance for AI agents working on `blockstor`. Read first.
 
-## Test tiers (see PLAN.md → Test strategy for full text)
+## Test tiers
 
 - **L1 unit** (`go test ./...`) — every commit.
 - **L2 contract / golden** — recorded golinstor responses → our server, byte-diff.
@@ -70,7 +70,6 @@ The caller is responsible for setting up the port-forward to the BS apiserver (a
 
 ## See also
 
-- `PLAN.md` → Test strategy → L7 mandatory.
 - `docs/cli-parity-audit-2026-05-14.md` — original one-shot audit (history).
 - `docs/cli-parity-known-deltas.md` — current whitelist.
 - `docs/agent-playbook.md` — sub-agent dispatch contract (worktrees, per-group scope).

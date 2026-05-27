@@ -10,7 +10,7 @@ Targets:
 Method: read-only re-audit of the F1-F20 fix list against current `main`. For each item the refresh records:
 - **CLOSED** — fix has landed; commit hash + date cited.
 - **OPEN** — gap still exists; file:line cited where the fix would land.
-- **DEFERRED** — explicitly out of scope per `PLAN.md` or memory.
+- **DEFERRED** — explicitly out of scope.
 - **SUPERSEDED** — replaced by a different fix path (cited).
 
 The original audit was a one-shot Markdown snapshot. As of `261d9e32f` (2026-05-19) we now have a re-runnable harness — `tests/operator-harness/cli-parity-refresh.sh` — that emits the same kind of table from a live two-controller diff and CI-fails on any non-PARITY row absent from `docs/cli-parity-known-deltas.md`. Future audits should therefore live as harness output, not hand-rolled markdown.
@@ -45,7 +45,7 @@ The original audit was a one-shot Markdown snapshot. As of `261d9e32f` (2026-05-
 - **CLOSED**: 19 of 20 (F1, F2, F3, F4, F5, F6, F7, F8, F9, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20).
 - **CLOSED (partial)**: 1 (F10 — recursive layer tree present, but `may_promote`/`promotion_score`/`node_id` not stamped on the wire).
 - **OPEN**: 0 of the original F1-F20 in the strict sense. F10's residual is tracked below.
-- **DEFERRED**: 0 (`PLAN.md` and `docs/cli-parity-known-deltas.md` defer separate items — see section 4).
+- **DEFERRED**: 0 (`docs/cli-parity-known-deltas.md` defers separate items — see section 4).
 - **SUPERSEDED**: 0.
 
 ## 2. Closed since 2026-05-14
@@ -103,7 +103,7 @@ F* (the one-shot 2026-05-14 audit) was a *static read-path wire-shape* survey. I
 2. Post-mutation state convergence (Bugs 327, 329, 330, 332).
 3. Safety invariants on placement decisions (Bugs 328, 334+335).
 
-This is exactly the gap the L7 harness was created to close: `cli-parity-refresh.sh` continues the static survey on a CI cadence; replay YAMLs catch dynamic state convergence; `operator-fuzz.sh` (L8 skeleton, follow-up) catches placement-correctness fuzz. The 9-commit wave Bug 326-335 (2026-05-19) is the post-mortem that proved the gap; the L6 + L7 mandates in `PLAN.md` are the structural response.
+This is exactly the gap the L7 harness was created to close: `cli-parity-refresh.sh` continues the static survey on a CI cadence; replay YAMLs catch dynamic state convergence; `operator-fuzz.sh` (L8 skeleton, follow-up) catches placement-correctness fuzz. The 9-commit wave Bug 326-335 (2026-05-19) is the post-mortem that proved the gap; the L6 + L7 mandates are the structural response.
 
 ## 5. Recommendations
 

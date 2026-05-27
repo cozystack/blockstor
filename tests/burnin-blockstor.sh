@@ -11,7 +11,7 @@
 #   - read on peer, compare md5 (must match — exits non-zero otherwise)
 #   - delete Resource + RD via finalizer
 #
-# Default DURATION_SEC = 86400 (24h). The PLAN's "stand running for
+# Default DURATION_SEC = 86400 (24h). The "stand running for
 # 24h continuous PVC churn" item points at this script.
 #
 # Reports a summary every 60 iterations: pass/fail counts + recent

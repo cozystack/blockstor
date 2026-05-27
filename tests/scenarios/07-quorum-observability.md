@@ -22,7 +22,7 @@ The cross-cutting group. Covers:
 ### 7.1 Default `auto-quorum` triggers at quorum-achievable thresholds — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** UG9 §"Auto-quorum policies" (lines 4234-4279); PLAN.md `storetest.go` pins `DrbdOptions/auto-quorum: io-error`
+- **Source:** UG9 §"Auto-quorum policies" (lines 4234-4279); `storetest.go` pins `DrbdOptions/auto-quorum: io-error`
 
 When ≥ 2 diskful + 1 diskless OR ≥ 3 diskful, LINSTOR auto-configures `quorum majority + on-no-quorum io-error`. Below threshold, auto-disables.
 
@@ -67,7 +67,7 @@ Companion to 7.2. `DrbdOptions/Resource/on-no-data-accessible=suspend-io` keeps 
 ### 7.6 `ensureTiebreaker` stamps 3rd diskless replica — S
 
 - **Priority:** P0  **Target:** unit + e2e  **Complexity:** L
-- **Source:** linstor-cli #10, #11; PLAN.md `internal/controller/ensure_tiebreaker_test.go`
+- **Source:** linstor-cli #10, #11; `internal/controller/ensure_tiebreaker_test.go`
 
 After 2 diskful are placed, controller stamps a 3rd diskless on the remaining worker. Reconciler picks the node with most free space (or deterministic fallback per `pick_tiebreaker_test.go`).
 
@@ -86,7 +86,7 @@ Operator wants exactly 2 replicas (e.g., 2-node DRBD pair with external quorum).
 ### 7.8 Tiebreaker reconciler doesn't fight manual `r d` — S
 
 - **Priority:** P1  **Target:** integration + e2e  **Complexity:** L
-- **Source:** PLAN.md `remove_witnesses_test.go`
+- **Source:** `remove_witnesses_test.go`
 
 When operator deletes the tiebreaker (via `linstor r d`), reconciler waits before re-stamping — gives operator a window to set `AutoAddQuorumTiebreaker=false` if they meant to disable. Or stamps immediately if the prop allows it — pin which behaviour.
 
@@ -172,7 +172,7 @@ Per resource: node-name, volume index, per-volume disk-state, per-peer conn-stat
 ### 7.17 `error-reports` API filters by node + since + limit — S
 
 - **Priority:** P1  **Target:** unit + e2e  **Complexity:** L
-- **Source:** recovery-skill E2; PLAN.md `pkg/rest/error_reports.go`
+- **Source:** recovery-skill E2; `pkg/rest/error_reports.go`
 
 **Unit:** GET with `?node=worker-1&since=2026-01-01&limit=10` → matching reports only.
 **E2E:** induce errors on worker-2 (kill satellite), poll `error-reports?node=worker-2` → returns matching kernel error strings.

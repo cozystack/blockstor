@@ -9,7 +9,7 @@ two surveys:
 2. Every `golinstor.Client` method invoked by `piraeus-operator`
    (`internal/controller/`, `pkg/`).
 
-If a client we listed in `PLAN.md` calls something that is not on this list,
+If a client we surveyed calls something that is not on this list,
 the list is wrong — please add it. Out-of-scope endpoints (cross-cluster
 backup shipping, schedules, S3 / EBS, SPDK, NVMe-oF, OpenFlex, Exos) MUST
 return `501 Not Implemented` with a clear message rather than silently 404.

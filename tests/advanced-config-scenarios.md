@@ -568,7 +568,7 @@ current scope:
   the LINSTOR `backup create`/`backup ship` paths. The endpoints
   return 501 from blockstor today (see `pkg/rest/remotes.go`'s
   empty-list stubs). Revisit when shipping the snapshot-to-S3 leg
-  per the operational follow-up in PLAN.md.
+  per the operational follow-up.
 - **RWX volumes** — Already covered by `tests/e2e/rwx-ganesha.sh`
   (technically piraeus-stack smoke since RWX rides on
   linstor-csi's NFS-Ganesha sidecar, not blockstor's own REST
