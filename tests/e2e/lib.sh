@@ -32,11 +32,16 @@ on_node() {
     local node=$1
     shift
     local pod
+    # Select only a Running satellite pod on the node. A stale Succeeded or
+    # Terminating instance (left over during cluster churn between scenarios)
+    # must never be picked, or `kubectl exec` aborts with "cannot exec into a
+    # completed pod; current phase is Succeeded".
     pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
-        -o "jsonpath={.items[?(@.spec.nodeName==\"${node}\")].metadata.name}")
+        --field-selector "spec.nodeName=${node},status.phase=Running" \
+        -o "jsonpath={.items[0].metadata.name}")
 
     if [[ -z "$pod" ]]; then
-        echo "no satellite pod on node $node" >&2
+        echo "no Running satellite pod on node $node" >&2
         return 1
     fi
 
