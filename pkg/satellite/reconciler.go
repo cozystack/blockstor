@@ -3543,7 +3543,7 @@ func (r *Reconciler) seedInitialGI(ctx context.Context, dr *intent.DesiredResour
 			continue
 		}
 
-		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), isWinner)
+		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), isWinner, dr.GetSkipInitialSync())
 		if !ok {
 			continue
 		}
@@ -3784,10 +3784,37 @@ func refuseUnresolvedLocalNodeID(dr *intent.DesiredResource) error {
 // reconcile from live peer status, not a controller stamp that must
 // land in Spec in time; the case-A AnyConnectedPeerHasData gate reads
 // live kernel state, immune to the day0 CRD-classification ambiguity.
-func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool) (drbd.GISeed, bool) {
+func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string, vol *intent.DesiredVolume, peerHasData, isWinner bool, skipInitialSync *bool) (drbd.GISeed, bool) {
 	if peerHasData {
 		return drbd.GISeed{}, false
 	}
+
+	// Skip-init-sync hardening — the AUTHORITATIVE, controller-decided,
+	// persisted, OFFLINE-SAFE gate (replaces the live-kernel probe that
+	// follows as authority). The controller stamps Resource.Spec.
+	// SkipInitialSync = !RD.Spec.Initialized ONCE at creation:
+	//
+	//   - nil  → not yet stamped (or a pre-upgrade CRD). Conservative
+	//     default: REFUSE every day0 skip (case A AND the case-B winner
+	//     UpToDate seed). The replica comes up Inconsistent and either
+	//     SyncTargets a peer or waits — never falsely UpToDate-empty. A
+	//     genuinely-fresh replica re-reconciles within ~1s once the
+	//     controller stamps true, then takes the skip. Invariant 5.
+	//   - false → controller decided this replica MUST sync (relocate /
+	//     migrate-disk / extra replica joining an already-initialized
+	//     RD). REFUSE the skip → SyncTarget. This holds EVEN IF the sole
+	//     data-holder is offline at seed time, because the decision was
+	//     read from the persisted RD.Spec.Initialized latch, not from
+	//     live kernel/peer state — the core offline-safety fix.
+	//   - true  → controller decided this replica may skip (fresh initial
+	//     set). Fall through to the winner / day0 skip seeds below.
+	//
+	// The SeedFromGI case (an explicit GID the controller copied from a
+	// real UpToDate peer) is NOT gated here: it anchors against a live
+	// peer's real generation and is only ever stamped when no data-
+	// bearing peer exists, so it remains the legitimate Phase 8.1
+	// relocate-skip path.
+	skipAllowed := skipInitialSync != nil && *skipInitialSync
 
 	day0 := day0GiFor(resourceName, vol.GetVolumeNumber())
 
@@ -3802,11 +3829,21 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		return drbd.GISeed{Current: seed, BitmapBase: seed}, true
 	}
 
-	if isWinner {
+	if isWinner && skipAllowed {
 		// Winner seed, matched byte-for-byte to upstream LINSTOR's
 		// working-skip metadata captured live via `drbdmeta dump-md` on
 		// a piraeus thin resource that reaches UpToDate with ZERO
 		// resync:
+		//
+		// Gated on skipAllowed: the case-B winner is the elected
+		// initial-UpToDate source, but it must only mint the day0
+		// Consistent+UpToDate metadata when the controller has confirmed
+		// this is a genuinely-fresh RD (Spec.SkipInitialSync==true). If
+		// the controller said "must sync" (false) or hasn't stamped yet
+		// (nil), the winner falls through to case C (Inconsistent) and
+		// reaches UpToDate only via a real handshake/resync — so an
+		// election that races an offline data-holder can never declare
+		// the empty winner authoritatively UpToDate.
 		//
 		//   current-uuid <day0>; flags Consistent+UpToDate;
 		//   EVERY peer slot bitmap-uuid 0x0  (clean — NOT day0).
@@ -3850,7 +3887,27 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 		return drbd.GISeed{}, false
 	}
 
-	// Migrate / relocate destination gate (kernel-truth backstop).
+	// Skip-init-sync hardening — AUTHORITATIVE gate (case A). The
+	// controller-decided, persisted, offline-safe Spec.SkipInitialSync
+	// is the source of truth: skip ONLY when it explicitly says true.
+	// nil (unstamped / pre-upgrade) and false (relocate / migrate-disk /
+	// extra replica joining an already-initialized RD) both REFUSE the
+	// skip → the replica stays Inconsistent and SyncTargets the real
+	// data, even when the sole data-holder is offline at seed time
+	// (because the decision came from the persisted RD latch, not live
+	// peer/kernel state). This closes the unsafe-probe hole the
+	// kernel-truth backstop below could not: the probe only sees
+	// CONNECTED peers, so an offline data-holder made it return false →
+	// a fresh replica wrongly skipped → falsely UpToDate while empty.
+	if !skipAllowed {
+		return drbd.GISeed{}, false
+	}
+
+	// Migrate / relocate destination gate (kernel-truth backstop;
+	// DEFENSE-IN-DEPTH, no longer the authoritative skip decision —
+	// Spec.SkipInitialSync above owns that). Retained as a secondary
+	// veto: if a peer connection already exposes committed data the
+	// instant we seed, refuse the skip regardless of the Spec flag.
 	//
 	// The day0 skip-init-sync seed below is ONLY data-safe when this
 	// replica is part of a genuinely-fresh resource — no peer is an
