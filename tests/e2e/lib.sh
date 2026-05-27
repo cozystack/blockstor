@@ -796,3 +796,93 @@ spec:
   props: {StorPoolName: ${pool}}
 EOF
 }
+
+# wire_linstor_csi_mtls URL
+#
+# Repoint piraeus's bundled linstor-csi at blockstor's mTLS apiserver
+# (the LINSTOR-compatible REST front end) and present a client cert
+# chained to blockstor-api-ca so the apiserver's
+# RequireAndVerifyClientCert :3371 listener accepts the connection.
+#
+# Both pieces are driven through the piraeus-operator-native
+# LinstorCluster API in a SINGLE patch:
+#   - spec.externalController.url  → LS_CONTROLLERS on the CSI pods AND
+#     disables piraeus's own in-cluster controller (so its plain-HTTP
+#     controller TLS patch is skipped — see piraeus-operator v2.10.0
+#     kustomizeControllerResources early-return on ExternalController).
+#   - spec.apiTLS.certManager      → the operator issues
+#     linstor-csi-controller-tls / linstor-csi-node-tls in
+#     piraeus-datastore from the blockstor-api-ca Issuer
+#     (install-piraeus.sh mirrors the CA + Issuer here) and patches the
+#     CSI Deployment/DaemonSet with LS_USER_CERTIFICATE / LS_USER_KEY /
+#     LS_ROOT_CA pointing at those Secrets — exactly the env shape the
+#     csi-sanity Job proves works against :3371
+#     (stand/csi-sanity-job.yaml).
+#
+# Setting apiTLS together with externalController is required: with only
+# externalController the CSI dials :3371 with NO client cert and the
+# linstor-csi-controller rollout never completes ("1 old replicas are
+# pending termination"). SKIP if the blockstor-api-ca Issuer is absent
+# in piraeus-datastore (apiserver mTLS PKI / install-piraeus.sh CA mirror
+# not present) rather than time out.
+wire_linstor_csi_mtls() {
+    local url=$1
+
+    if ! kubectl -n piraeus-datastore get issuer blockstor-api-ca >/dev/null 2>&1; then
+        skip "blockstor-api-ca Issuer absent in piraeus-datastore — run stand/install-piraeus.sh (CA mirror) so linstor-csi can present an mTLS client cert to apiserver :3371"
+    fi
+
+    local cur_url cur_issuer
+    cur_url=$(kubectl get linstorcluster linstorcluster \
+        -o jsonpath='{.spec.externalController.url}' 2>/dev/null || true)
+    cur_issuer=$(kubectl get linstorcluster linstorcluster \
+        -o jsonpath='{.spec.apiTLS.certManager.name}' 2>/dev/null || true)
+    if [[ "$cur_url" == "$url" && "$cur_issuer" == "blockstor-api-ca" ]]; then
+        echo ">> linstor-csi already wired at $url (mTLS via blockstor-api-ca)"
+        return 0
+    fi
+
+    echo ">> wire linstor-csi at $url via externalController + apiTLS (blockstor-api-ca, mTLS)"
+    kubectl patch linstorcluster linstorcluster --type merge -p "$(cat <<EOF
+{"spec":{"externalController":{"url":"$url"},
+         "apiTLS":{"certManager":{"name":"blockstor-api-ca","kind":"Issuer"}}}}
+EOF
+)"
+
+    # Wait for the operator to (a) re-render LS_CONTROLLERS and (b) wire
+    # the client-cert env vars onto the CSI controller pod template.
+    echo ">> wait up to 180s for linstor-csi-controller to pick up LS_CONTROLLERS + client cert"
+    local deadline=$(( $(date +%s) + 180 ))
+    local env_url env_cert
+    while (( $(date +%s) < deadline )); do
+        env_url=$(kubectl -n piraeus-datastore get deploy linstor-csi-controller \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="linstor-csi")].env[?(@.name=="LS_CONTROLLERS")].value}' \
+            2>/dev/null || true)
+        env_cert=$(kubectl -n piraeus-datastore get deploy linstor-csi-controller \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="linstor-csi")].env[?(@.name=="LS_USER_CERTIFICATE")].valueFrom.secretKeyRef.name}' \
+            2>/dev/null || true)
+        if [[ "$env_url" == "$url" && "$env_cert" == "linstor-csi-controller-tls" ]]; then
+            break
+        fi
+        sleep 3
+    done
+    if [[ "$env_url" != "$url" || "$env_cert" != "linstor-csi-controller-tls" ]]; then
+        echo "FAIL: linstor-csi-controller never reconciled (LS_CONTROLLERS='$env_url', client-cert-secret='$env_cert')"
+        kubectl -n piraeus-datastore get deploy linstor-csi-controller -o yaml | grep -A2 -E 'LS_CONTROLLERS|LS_USER_CERTIFICATE' || true
+        kubectl get linstorcluster linstorcluster -o jsonpath='{.status.conditions}' | jq . 2>/dev/null || true
+        return 1
+    fi
+
+    kubectl -n piraeus-datastore rollout status deploy/linstor-csi-controller --timeout=120s
+    kubectl -n piraeus-datastore rollout status ds/linstor-csi-node --timeout=120s
+}
+
+# unwire_linstor_csi_mtls reverts wire_linstor_csi_mtls so a follow-on
+# scenario (e.g. rwx-ganesha) gets piraeus's own controller back. Drops
+# both externalController and apiTLS in one json-patch; ignores absence.
+unwire_linstor_csi_mtls() {
+    kubectl patch linstorcluster linstorcluster --type=json \
+        -p='[{"op":"remove","path":"/spec/externalController"},
+             {"op":"remove","path":"/spec/apiTLS"}]' \
+        2>/dev/null || true
+}
