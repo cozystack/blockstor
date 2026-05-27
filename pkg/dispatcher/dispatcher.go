@@ -174,9 +174,33 @@ func BuildDesired(target *blockstoriov1alpha1.Resource, peers []blockstoriov1alp
 	// up Inconsistent and SyncTargets from the peer. Only a genuinely
 	// fresh RD — no diskful peer with data — runs the force-primary
 	// seed.
+	//
+	// Respawn-StandAlone wedge (P0): the !anyDiskfulPeerHasData gate
+	// above reads peer Status.DiskState from the informer cache, which
+	// TRAILS a rapid `r d <node>` then `r c <node>` ("relocate /
+	// respawn"). In that window the surviving UpToDate peer is briefly
+	// invisible (its Status churns through the delete: quorum loss,
+	// del-peer, a fresh new-current-uuid on the survivor), so
+	// anyDiskfulPeerHasData returns false, this fresh replica wins the
+	// lowest-node-id election, force-primaries, mints an unrelated
+	// Current UUID, and the survivor declines the handshake
+	// (`uuid_compare()=unrelated-data` -> `Unrelated data, aborting!`)
+	// -> permanent mutual StandAlone that never auto-recovers.
+	//
+	// Why (rdInitialized latch): RD.Spec.Initialized is the controller's
+	// APPEND-ONLY, persisted "real data has existed past day0 somewhere
+	// in this replica set" latch (set once, never cleared - see
+	// ensureSkipInitSyncDecision). It is immune to the cache trail that
+	// defeats the per-peer DiskState scan: an already-initialized RD can
+	// NEVER legitimately need a force-primary seed (the seed exists only
+	// to bootstrap the FIRST replica of a brand-new RD), so any
+	// auto-primary on an initialized RD is by definition the respawn
+	// race. Gating on !rdInitialized(rd) suppresses it race-free while
+	// leaving a genuinely-fresh RD (Initialized nil/false) free to seed.
 	if selfID, ok := idLookup(idOf, target.Spec.NodeName); ok &&
 		!slices.Contains(target.Spec.Flags, "DISKLESS") &&
 		selfID == lowestDiskfulID(target, peers) &&
+		!rdInitialized(rd) &&
 		!anyDiskfulPeerHasData(peers) {
 		drbdOpts["auto-primary"] = boolPropTrue
 	}
@@ -629,6 +653,25 @@ func lookupNetInterfaceAddress(nodeName, ifaceName string, nodes []blockstoriov1
 	}
 
 	return ""
+}
+
+// rdInitialized reports whether the RD's append-only `initialized`
+// latch is set. The controller flips it true ONCE, the first time real
+// data exists past day0 anywhere in the replica set, and NEVER clears
+// it (internal/controller ensureSkipInitSyncDecision). A nil pointer
+// (genuinely-fresh RD, or a CRD predating the field) reads as NOT
+// initialized.
+//
+// Used by the auto-primary election: an initialized RD must never run
+// the force-primary seed, because the seed only bootstraps the first
+// replica of a brand-new RD. Reading this persisted latch is immune to
+// the informer-cache trail that lets a respawned replica briefly miss a
+// surviving data peer and wrongly win the election (the respawn-
+// StandAlone wedge). Kept package-local here (rather than importing the
+// internal/controller copy) to avoid an import cycle; the two readers
+// are byte-identical and pinned by test.
+func rdInitialized(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return rd != nil && rd.Spec.Initialized != nil && *rd.Spec.Initialized
 }
 
 // anyDiskfulPeerHasData reports whether any diskful PEER already holds

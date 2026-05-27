@@ -1287,6 +1287,70 @@ func TestAutoPrimaryGatedOnAllPeerNodeIDs(t *testing.T) {
 			t.Errorf("data-bearing peer n-old must not stamp auto-primary, got %q", got)
 		}
 	})
+
+	t.Run("respawn-on-initialized-rd-suppresses-auto-primary-despite-cache-trail", func(t *testing.T) {
+		t.Parallel()
+
+		// Respawn-StandAlone wedge (P0) regression: `r d <node>` then
+		// `r c <node>` recreates a diskful replica on a freed node. The
+		// fresh replica wins the lowest-node-id election. Its surviving
+		// UpToDate sibling EXISTS but, because the informer cache trails
+		// the rapid delete/recreate churn, its Status.DiskState is not
+		// yet observable (modelled here as an EMPTY Status — exactly
+		// what anyDiskfulPeerHasData saw on the live wedge). The old
+		// per-peer DiskState gate alone returned false in this window,
+		// stamped auto-primary, force-primaried the fresh replica, minted
+		// an unrelated Current UUID, and wedged both sides StandAlone
+		// (`uuid_compare()=unrelated-data`). The persisted RD.Spec.
+		// Initialized=true latch must suppress auto-primary REGARDLESS of
+		// the lagging peer Status, so the fresh replica comes up
+		// Inconsistent and SyncTargets the survivor instead.
+		initRD := &blockstoriov1alpha1.ResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName},
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				Initialized: func() *bool { v := true; return &v }(),
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{VolumeNumber: 0, SizeKib: 1024 * 1024},
+				},
+			},
+		}
+
+		nNew := newDiskfulResource(rdName, "n-new", id(0))
+		// Survivor exists with an allocated id, but its DiskState has NOT
+		// yet surfaced in the cache (Status.Volumes empty) — the trailing
+		// window. anyDiskfulPeerHasData would return false here.
+		nSurvivor := newDiskfulResource(rdName, "n-survivor", id(1))
+
+		fromNew := dispatcher.BuildDesired(nNew, []blockstoriov1alpha1.Resource{*nSurvivor}, nil, nil, initRD, nil)
+		if got, ok := fromNew.DrbdOptions["auto-primary"]; ok {
+			t.Errorf("respawn target on an initialized RD must NOT stamp auto-primary even when the surviving peer Status trails the cache, got %q", got)
+		}
+	})
+
+	t.Run("fresh-uninitialized-rd-still-seeds-auto-primary", func(t *testing.T) {
+		t.Parallel()
+
+		// Negative control: a genuinely-fresh RD (Initialized nil) must
+		// STILL stamp auto-primary on the lowest-id diskful replica so
+		// Bug 77 first-replica bring-up keeps working. The new latch gate
+		// must not over-broaden into the legitimate seed path.
+		freshRD := &blockstoriov1alpha1.ResourceDefinition{
+			ObjectMeta: metav1.ObjectMeta{Name: rdName},
+			Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+				VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+					{VolumeNumber: 0, SizeKib: 1024 * 1024},
+				},
+			},
+		}
+
+		n1 := newDiskfulResource(rdName, "n1", id(0))
+		n2 := newDiskfulResource(rdName, "n2", id(1))
+
+		fromN1 := dispatcher.BuildDesired(n1, []blockstoriov1alpha1.Resource{*n2}, nil, nil, freshRD, nil)
+		if got := fromN1.DrbdOptions["auto-primary"]; got != "true" {
+			t.Errorf("fresh uninitialized RD must stamp auto-primary=true on lowest-id replica, got %q", got)
+		}
+	})
 }
 
 // TestPeerHasDataGatesSeed pins the seed-GI data-integrity signal the
