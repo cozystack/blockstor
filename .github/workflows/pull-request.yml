@@ -233,11 +233,12 @@ jobs:
       # together (e.g. 6 lanes ≈ the dev-stand-proven ~6 scenarios/lane).
       LANES: 6
       # Scenarios that require the upstream piraeus stack (the LinstorCluster
-      # CRD + linstor-csi NFS-ganesha) are excluded from the blockstor-only
-      # matrix clusters — there piraeus is absent and, now that their
-      # silent-skip guards are gone, they would hard-fail. They run in the
-      # dedicated `e2e-piraeus` job below, which installs piraeus alongside
-      # blockstor. ci-e2e.sh drops these from the discovered suite.
+      # CRD + linstor-csi) are excluded from the blockstor-only matrix
+      # clusters — there piraeus is absent and, now that their silent-skip
+      # guards are gone, they would hard-fail. They run in the dedicated
+      # `e2e-piraeus` job below, which installs piraeus in EXTERNAL mode
+      # against blockstor's apiserver (no upstream Java linstor-controller).
+      # ci-e2e.sh drops these from the discovered suite.
       E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation"
     permissions:
       contents: read
@@ -321,14 +322,16 @@ jobs:
 
   e2e-piraeus:
     name: E2E (piraeus interop)
-    # The piraeus-dependent scenarios (rwx-ganesha, observability-three-way,
-    # observability-capacity-correlation) exercise the RWX / linstor-csi
-    # NFS-ganesha + LinstorCluster-CRD surface that only the upstream piraeus
-    # stack provides. They are excluded from the blockstor-only `e2e` matrix
-    # (see E2E_EXCLUDE) and run here on a single cluster that has piraeus
-    # installed alongside blockstor (INSTALL_PIRAEUS=1 → ci-e2e.sh runs
-    # `make piraeus`). blockstor coexists with piraeus's satellite by design
-    # (shared file-thin pool + host /etc/drbd.d, Bugs 305/310/359).
+    # The piraeus-dependent scenarios (observability-three-way,
+    # observability-capacity-correlation, rwx-ganesha) exercise the
+    # LinstorCluster-CRD + linstor-csi surface that the upstream piraeus-
+    # operator owns. They run here on a cluster that has piraeus installed
+    # in EXTERNAL mode against blockstor's apiserver (INSTALL_PIRAEUS=1 →
+    # ci-e2e.sh runs `make piraeus`, which now creates LinstorCluster with
+    # spec.externalController.url + spec.apiTLS pointing at blockstor:3371).
+    # No upstream Java linstor-controller runs in this job — the LINSTOR
+    # state of record is blockstor's apiserver. rwx-ganesha is currently
+    # SKIPped (coexistence-only; needs an external-mode port).
     #
     # `needs: e2e` runs this AFTER the 6-lane matrix releases its runners, so
     # the oracle pool is never asked for a 7th simultaneous cluster (the
