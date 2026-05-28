@@ -242,4 +242,3 @@ func TestBug173PassphraseEnterRejectsMalformedString(t *testing.T) {
 		})
 	}
 }
-
