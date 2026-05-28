@@ -6991,3 +6991,206 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 		t.Errorf("expected NO ClearSkipDisk calls when kernel is still Diskless; got %v", calls)
 	}
 }
+
+// TestApplyAutoMkfsStorageOnlyFormatsRawDevice pins the linstor-csi
+// "local" SC contract: a Resource whose LayerStack=["STORAGE"]
+// carries a `FileSystem/Type` prop (set by linstor-csi's
+// reconcileResourceDefinition on the RD, see pkg/client/linstor.go
+// lines 1602-1607 in linstor-csi v1.10.1) must get mkfs run on the
+// raw LV path before the kubelet's `fsck` reaches it. linstor-csi
+// v1.10.1's NodePublishVolume does `fsck` + plain `mount(2)` (no
+// FormatAndMount fallback — see pkg/client/linstor.go lines
+// 2287-2293), so satellite-side mkfs is the only place the filesystem
+// can land on a CSI-provisioned local PVC.
+//
+// Before Bug 311 follow-up: the auto-mkfs path was wired only inside
+// runAutoPromote → runAutoMkfs → and runAutoPromote ran exclusively
+// from applyDRBD. Storage-only resources bypassed applyDRBD entirely
+// (TestApplySkipsDRBDWhenLayerStackOmits proves the bypass), so
+// FileSystem/Type was silently ignored and the kubelet's fsck failed
+// with exit 8 (Bad magic number).
+func TestApplyAutoMkfsStorageOnlyFormatsRawDevice(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// lvExists probe (lvcreate idempotency check).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-local_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// VolumeStatus query → must surface a non-empty DevicePath so the
+	// new storage-only mkfs path has something to format. Reports the
+	// LV path applyStorage records into the devices map.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-local_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-local_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"data": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	dr := []*intent.DesiredResource{
+		{
+			Name:     "pvc-local",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "data"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			LayerStack:  []string{"STORAGE"},
+			DrbdOptions: map[string]string{},
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	lines := fx.CommandLines()
+
+	count := func(needle string) int {
+		n := 0
+
+		for _, line := range lines {
+			if strings.Contains(line, needle) {
+				n++
+			}
+		}
+
+		return n
+	}
+
+	if count("mkfs.ext4 /dev/vg/pvc-local_00000") != 1 {
+		t.Errorf("expected mkfs.ext4 against the raw LV path exactly once; got %v", lines)
+	}
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "drbdadm ") || strings.HasPrefix(line, "drbdsetup ") {
+			t.Errorf("storage-only stack must NOT touch DRBD; saw %q in %v", line, lines)
+		}
+	}
+
+	markerPath := filepath.Join(dir, "pvc-local.mkfs.done")
+	if _, statErr := os.Stat(markerPath); statErr != nil {
+		t.Errorf("mkfs.done marker: want present after storage-only apply, got stat err %v", statErr)
+	}
+
+	// Second apply: marker present → mkfs MUST NOT re-run (data-loss
+	// guard parity with the DRBD path).
+	fx.Reset()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-local_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-local_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-local_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-local_00000|1048576\n")})
+
+	_, err = rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply (2nd): %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") {
+			t.Errorf("idempotent reconcile must NOT re-run mkfs; saw %q", line)
+		}
+	}
+}
+
+// TestApplyAutoMkfsStorageOnlySkipsWithoutFileSystemType pins the
+// pure block-mode contract: a storage-only Resource without
+// `FileSystem/Type` (raw-block PVC, the linstor-csi default for
+// `volumeMode: Block`) must not get mkfs run on its lower disk —
+// the consumer Pod opens the device directly and any filesystem
+// header would corrupt its on-disk layout.
+func TestApplyAutoMkfsStorageOnlySkipsWithoutFileSystemType(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-block_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-block_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-block_00000|1048576\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"data": thin},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-block",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "data"},
+			},
+			LayerStack:  []string{"STORAGE"},
+			DrbdOptions: map[string]string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") {
+			t.Errorf("no FileSystem/Type on a block-mode storage-only RD → no mkfs expected; saw %q", line)
+		}
+	}
+
+	markerPath := filepath.Join(dir, "pvc-block.mkfs.done")
+	if _, statErr := os.Stat(markerPath); statErr == nil {
+		t.Errorf("mkfs.done marker: want absent for block-mode storage-only, got present at %s", markerPath)
+	}
+}
+
+// TestApplyAutoMkfsStorageOnlySkipsDisklessReplica pins the diskless
+// guard for the storage-only path. A diskless replica with
+// LayerStack=["STORAGE"] is a degenerate config — applyStorageIfDiskful
+// returns an empty devices map without provisioning anything, and
+// the new runStorageOnlyMkfs early-return for diskless ensures we
+// don't attempt to mkfs a nonexistent device path. Mirrors the
+// DRBD-path TestApplyAutoMkfsSkipsDisklessReplica contract.
+func TestApplyAutoMkfsStorageOnlySkipsDisklessReplica(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{},
+		Adm:       drbd.NewAdm(fx),
+		Exec:      fx,
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-diskless-local",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "data"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			LayerStack:  []string{"STORAGE"},
+			DrbdOptions: map[string]string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") {
+			t.Errorf("DISKLESS storage-only replica must skip mkfs; saw %q", line)
+		}
+	}
+}
