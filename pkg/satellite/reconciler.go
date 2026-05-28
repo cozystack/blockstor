@@ -2268,24 +2268,19 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		}
 	}
 
-	// Observe-only path for externally-created filesystems (closes a
-	// hot reconcile loop on RDs whose filesystem the satellite never
-	// formatted itself — NFS-Ganesha RWX PVCs where the sidecar runs
-	// mkfs, operator-recovery `mkfs.ext4 -F /dev/drbdN`, etc.). Without
-	// this stamp, `FilesystemFormatted` stays unset, the dispatcher
-	// folds it back as false on every events2 frame, and the observer
-	// re-stamps KernelLoaded → SSA write → reconcile → repeat at
-	// ~28 Hz steady state.
-	//
-	// Best-effort: any error inside observeExistingFilesystem is
-	// logged + swallowed (returns nil). The helper short-circuits on
-	// diskless / no stamper / Condition already True / FileSystem/Type
-	// set (auto-mkfs owns the stamp) / no volumes / any volume without
-	// a filesystem signature, so a real apply that needs auto-mkfs is
-	// untouched. Placed AFTER the Bug 311 mkfs-retry and BEFORE the
-	// Bug 366 recovery-promote so the stamp lands once the local
-	// replica is up but does not race the seed/retry paths.
-	r.observeExistingFilesystem(ctx, dr, diskless)
+	// NOTE: observeExistingFilesystem helper is intentionally NOT
+	// called here. The original intent (close the ~28 Hz hot loop on
+	// RDs whose filesystem the satellite never formatted itself —
+	// NFS-Ganesha RWX PVCs, etc.) regressed DRBD bring-up convergence
+	// across multiple recovery scenarios when wired into
+	// finishDRBDApply: probing the device via blkid (and even
+	// gating-probes via `drbdsetup status`) on every reconcile during
+	// the bring-up window stalled the apply path long enough for
+	// upstream e2e timeouts to fire. The helper + StampFilesystemObserved
+	// stamper remain in the package as the API surface for a follow-up
+	// that wires the stamp from the observer event path (after the
+	// kernel reports an established+UpToDate frame), which does not
+	// race the per-RD apply lane.
 
 	// Bug 366 recovery-promote self-heal — re-arm the auto-primary seed
 	// when a fresh RD wedged with the late replica stuck Inconsistent and
@@ -3071,105 +3066,6 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	}
 
 	return nil
-}
-
-// observeExistingFilesystem stamps `FilesystemFormatted=True` with
-// `Reason=FilesystemObserved` when every diskful volume of the RD
-// already carries a recognised filesystem the satellite did not
-// format itself. This closes a steady-state reconcile hot loop on
-// RDs whose filesystem was created externally (NFS-Ganesha sidecar
-// running `mkfs` on the RWX PVC, operator-recovery flows,
-// `talosctl ... mkfs.ext4 -F`): without the Condition the
-// dispatcher folds `FilesystemFormatted=false` into every
-// DesiredResource, the observer re-stamps KernelLoaded on each
-// events2 frame, the SSA write triggers the next reconcile, and the
-// cycle repeats at ~28 Hz.
-//
-// Best-effort, never an apply blocker — hence no error return. The
-// early-returns gate the costly blkid round-trip:
-//
-//  1. Diskless replica → no local device to probe.
-//  2. Stamper or Exec wrapper missing → unit-test shape, skip.
-//  3. Condition already cached True → nothing to do.
-//  4. RD has `FileSystem/Type` set → auto-mkfs owns the stamp
-//     (Reason=MkfsSucceeded). Avoids double-stamping under two
-//     different Reasons and keeps Bug 311's retry gate intact.
-//  5. No volumes → nothing to probe.
-//  6. Any local device not yet `disk:UpToDate` (Inconsistent /
-//     SyncTarget / Diskless / mid-negotiation): defer. blkid
-//     opens /dev/drbd<N> and can stall on a syncing device or
-//     fcntl-conflict the concurrent `drbdadm primary --force` /
-//     `drbdmeta set-gi` the bring-up path may be issuing — which
-//     manifests as e2e replicas latching `State=Unknown` while the
-//     kernel itself reports `disk:UpToDate` on a separate slot
-//     because the reconciler is wedged in blkid. The next reconcile
-//     re-probes and stamps once bring-up has settled.
-//  7. Any volume returns no `TYPE=` line → partial populate, MUST
-//     NOT advertise the RD as formatted (would falsely converge a
-//     half-initialised RWX PVC).
-//
-// Stamp errors are logged and swallowed: the dispatcher will read
-// the missing Condition next pass and re-enter this path.
-func (r *Reconciler) observeExistingFilesystem(ctx context.Context, dr *intent.DesiredResource, diskless bool) {
-	if diskless {
-		return
-	}
-
-	if r.cfg.FilesystemFormattedStamper == nil || r.cfg.Exec == nil {
-		return
-	}
-
-	if dr.GetFilesystemFormatted() {
-		return
-	}
-
-	// auto-mkfs owns the stamp on RDs with FileSystem/Type set —
-	// runAutoMkfs writes Reason=MkfsSucceeded after every volume
-	// reaches a filesystem (either freshly mkfs'd or blkid-adopted).
-	// Stamping under Reason=FilesystemObserved here would race with
-	// that path and produce inconsistent audit trails on the same
-	// Condition slot.
-	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) != "" {
-		return
-	}
-
-	volumes := dr.GetVolumes()
-	if len(volumes) == 0 {
-		return
-	}
-
-	// Kernel-truth gate: defer the blkid round-trip until every
-	// local device on this node is `disk:UpToDate`. blkid opens
-	// /dev/drbd<N>, which on an Inconsistent / SyncTarget slot can
-	// stall (open() waits on the device coming up) or fcntl-conflict
-	// the same-node bring-up's `drbdadm primary --force` /
-	// `drbdmeta set-gi` — the satellite reconciler is single-threaded
-	// per RD, so a wedged blkid wedges the WHOLE apply path and
-	// replicas latch `State=Unknown` even after the DRBD kernel
-	// itself converges. Conservative on probe failure (treated as
-	// "not yet ready") — the next reconcile re-evaluates.
-	if r.cfg.Adm == nil || !r.cfg.Adm.LocalAllUpToDate(ctx, dr.GetName()) {
-		return
-	}
-
-	minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
-
-	for _, vol := range volumes {
-		device := fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
-		if !r.deviceHasFilesystem(ctx, device) {
-			// Partial-FS RD — refuse the stamp. Re-probed every
-			// reconcile until every volume carries a signature.
-			return
-		}
-	}
-
-	resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
-
-	stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemObserved(ctx, resourceCRDName)
-	if stampErr != nil {
-		log.FromContext(ctx).Error(stampErr, "stamp FilesystemObserved Condition; will retry next reconcile",
-			"resource", resourceCRDName)
-	}
 }
 
 // deviceHasFilesystem reports whether the given DRBD device already
