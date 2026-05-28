@@ -499,6 +499,129 @@ wait_cluster_idle() {
     return 0
 }
 
+# register_strict_cleanup — install an EXIT trap that runs
+# strict_cleanup_on_exit() for the RDs named in $@. Idempotent: stacks
+# safely with existing scenario traps via _STRICT_CLEANUP_RDS append.
+#
+# Use this from a scenario instead of bare `trap 'delete_rd X' EXIT` so
+# the lane harness (stand/run-scenarios-only.sh) gets a strict guarantee
+# that the cluster is back to the baseline before the next scenario
+# launches. Skips quietly for scenarios that don't migrate (existing
+# bare-trap scenarios keep working as before — strict_cleanup_on_exit
+# is purely additive).
+#
+# Usage in a scenario:
+#   register_strict_cleanup "$RD" "$RD2"
+# instead of:
+#   trap 'delete_rd "$RD"; delete_rd "$RD2"' EXIT
+#
+# Multiple register_strict_cleanup calls accumulate RDs (handy when a
+# scenario creates them progressively).
+_STRICT_CLEANUP_RDS=()
+register_strict_cleanup() {
+    local rd
+    for rd in "$@"; do
+        _STRICT_CLEANUP_RDS+=("$rd")
+    done
+    trap _strict_cleanup_trap EXIT
+}
+
+_strict_cleanup_trap() {
+    local rc=$?
+    strict_cleanup_on_exit "${_STRICT_CLEANUP_RDS[@]}"
+    local cleanup_rc=$?
+    # Demote a PASSing scenario to FAIL if cleanup couldn't drain the
+    # cluster — the harness pre-flight would catch this on the next
+    # scenario anyway, but failing here pins the blame on THIS script
+    # rather than letting the next one inherit a dirty cluster.
+    if [[ $rc -eq 0 && $cleanup_rc -ne 0 ]]; then
+        echo "FAIL: strict_cleanup_on_exit could not drain the cluster — scenario PASS demoted to FAIL" >&2
+        exit 1
+    fi
+    exit "$rc"
+}
+
+# strict_cleanup_on_exit <rd> [<rd>...] — per-scenario EXIT cleanup that
+# guarantees the cluster goes back to the baseline (no orphan RDs, no
+# Terminating satellite pods) before the next scenario launches.
+#
+# Steps (each idempotent, swallow their own errors):
+#   1. delete_rd for every passed RD (same teardown chain the per-test
+#      traps used: Snapshot+Resource+RD cascade + per-node drbdsetup
+#      down + .res / .md-created scrub).
+#   2. kubectl wait --for=delete pod ... --timeout=60s on any satellite
+#      pod that is currently Terminating (DeletionTimestamp set).
+#   3. For any pod that DID NOT clear within step 2, kubectl delete
+#      --grace-period=0 --force, then wait again.
+#   4. Final state check: 0 orphan RDs across the cluster AND every
+#      satellite pod in phase=Running with no DeletionTimestamp. Return
+#      1 if either invariant still doesn't hold.
+#
+# Calling with zero RDs is allowed (only do the pod sweep). Safe to call
+# on an already-clean cluster.
+strict_cleanup_on_exit() {
+    local rds=("$@")
+
+    # Step 1: delete the RDs the scenario tracked.
+    local rd
+    for rd in "${rds[@]}"; do
+        [[ -n "$rd" ]] || continue
+        delete_rd "$rd" 2>/dev/null || true
+    done
+
+    # Step 2: wait for any Terminating satellite pod to actually go away.
+    # `kubectl wait --for=delete` returns 0 only after the pod is fully
+    # gone from the API; if nothing matches the selector, it's also a
+    # no-op (returns 0 immediately).
+    local terminating
+    terminating=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name} {end}' \
+        2>/dev/null)
+    if [[ -n "${terminating// /}" ]]; then
+        local pod
+        for pod in $terminating; do
+            kubectl -n "$NS" wait --for=delete "pod/$pod" \
+                --timeout=60s >/dev/null 2>&1 || true
+        done
+    fi
+
+    # Step 3: force-kill anything that did not clear gracefully. This is
+    # the kubelet-stuck-stop pattern (rolling-upgrade leftover) — same
+    # treatment reset_cluster_state's step 0 applies.
+    local still_terminating
+    still_terminating=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name} {end}' \
+        2>/dev/null)
+    if [[ -n "${still_terminating// /}" ]]; then
+        local pod
+        for pod in $still_terminating; do
+            kubectl -n "$NS" delete pod "$pod" \
+                --grace-period=0 --force >/dev/null 2>&1 || true
+            kubectl -n "$NS" wait --for=delete "pod/$pod" \
+                --timeout=30s >/dev/null 2>&1 || true
+        done
+    fi
+
+    # Step 4: final invariant check.
+    local rd_count running terminating_final total
+    rd_count=$(kubectl get resourcedefinitions.blockstor.cozystack.io \
+        -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    total=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        --no-headers 2>/dev/null | wc -l | tr -d ' ')
+    running=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name} {end}' \
+        2>/dev/null | wc -w | tr -d ' ')
+    terminating_final=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name} {end}' \
+        2>/dev/null | wc -w | tr -d ' ')
+
+    if [[ "$rd_count" != "0" || "$running" != "$total" || "$terminating_final" != "0" ]]; then
+        echo "strict_cleanup_on_exit: cluster NOT clean (rd_count=${rd_count} running=${running}/${total} terminating=${terminating_final})" >&2
+        return 1
+    fi
+    return 0
+}
+
 # reset_cluster_state forces the cluster back to a clean slate between
 # back-to-back e2e scenarios run by stand/run-scenarios-only.sh.
 #
