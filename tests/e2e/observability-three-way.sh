@@ -76,25 +76,13 @@ done
 
 LCTL_M=(linstor --controllers "http://localhost:$PF_PORT" --machine-readable)
 
-# Point piraeus-operator's bundled linstor-csi at blockstor's apiserver
-# so the StorageClass we create below resolves `storagePool: stand`
-# against blockstor's pool registry (and not piraeus's, whose pool
-# name is `pool`). The official piraeus knob is
-# LinstorCluster.spec.externalController.url; setting it makes the
-# operator (a) skip its in-cluster linstor-controller Deployment and
-# (b) re-render the linstor-csi controller+node manifests with
-# LS_CONTROLLERS pointing at the URL we provide. This is the correct
-# fix per the Phase 7.9 scenario design: the test exercises
-# blockstor's three-way observability invariant (PVC ↔ Resource CRD
-# ↔ .res), so the CSI provisioning request MUST land on blockstor.
-#
-# blockstor's apiserver Service is mTLS-only (:3371,
-# RequireAndVerifyClientCert). Pointing linstor-csi at the URL is
-# necessary but NOT sufficient — piraeus must also present a client
-# cert chained to blockstor-api-ca. wire_linstor_csi_mtls drives both
-# through the operator-native LinstorCluster.spec.apiTLS.certManager
-# knob (see tests/e2e/lib.sh); the CA Issuer it references is mirrored
-# into piraeus-datastore by stand/install-piraeus.sh.
+# External mode is the default since stand/install-piraeus.sh creates the
+# LinstorCluster pre-wired with spec.externalController.url +
+# spec.apiTLS.certManager pointing at blockstor's mTLS apiserver. We still
+# call wire_linstor_csi_mtls so the test stays runnable on a stand that
+# was provisioned in coexistence mode (legacy spec:{} LinstorCluster) —
+# the helper short-circuits when the LinstorCluster is already wired,
+# and patches it otherwise. Idempotent.
 BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
 wire_linstor_csi_mtls "$BLOCKSTOR_URL"
 
