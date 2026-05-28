@@ -57,12 +57,42 @@ type FilesystemFormattedStamper struct {
 }
 
 // StampFilesystemFormatted SSA-patches a `FilesystemFormatted=True`
-// Condition onto Resource <resourceName>.Status.Conditions.
-// Idempotent — SSA's listMap merging on `type` means a repeat
-// patch with the same fields is a no-op at the apiserver level
-// (LastTransitionTime is preserved because the apiserver only
-// updates it when the Condition's Status actually changes).
+// Condition onto Resource <resourceName>.Status.Conditions with
+// Reason="MkfsSucceeded" — i.e. the satellite ran `mkfs.<type>` on
+// every diskful volume itself. Idempotent — SSA's listMap merging
+// on `type` means a repeat patch with the same fields is a no-op at
+// the apiserver level (LastTransitionTime is preserved because the
+// apiserver only updates it when the Condition's Status actually
+// changes).
 func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Context, resourceName string) error {
+	return s.stamp(ctx, resourceName, "MkfsSucceeded", "all diskful volumes formatted")
+}
+
+// StampFilesystemObserved SSA-patches the same
+// `FilesystemFormatted=True` Condition but with
+// Reason="FilesystemObserved" — used when the satellite observed an
+// existing filesystem on every diskful volume's DRBD device (via
+// `blkid -o export`) WITHOUT having issued mkfs itself. Common
+// real-world shape: NFS-Ganesha RWX PVCs where mkfs runs from inside
+// the ganesha sidecar pod (not from the satellite), or operator
+// recovery flows that ran `mkfs.<type>` manually on the DRBD device.
+//
+// Without this entry point `needsAutoMkfsRetry` short-circuits only
+// on the Condition / on-disk marker the mkfs path writes, so a
+// resource whose FS appeared externally would loop forever — the
+// observe path stamps the Condition so subsequent reconciles
+// fast-path past auto-mkfs / observer churn.
+func (s *FilesystemFormattedStamper) StampFilesystemObserved(ctx context.Context, resourceName string) error {
+	return s.stamp(ctx, resourceName, "FilesystemObserved",
+		"filesystem detected on every diskful volume (mkfs not run by satellite)")
+}
+
+// stamp is the shared SSA body for the two Reason variants. Same
+// FieldOwner so both entry points layer cleanly under SSA's listMap
+// merge on `type` — the apiserver only flips LastTransitionTime when
+// the Condition's Status actually changes, so a successful mkfs path
+// (MkfsSucceeded) is never overwritten by a later observe pass.
+func (s *FilesystemFormattedStamper) stamp(ctx context.Context, resourceName, reason, message string) error {
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceKind,
@@ -74,8 +104,8 @@ func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Contex
 				{
 					Type:               blockstoriov1alpha1.ConditionFilesystemFormatted,
 					Status:             metav1.ConditionTrue,
-					Reason:             "MkfsSucceeded",
-					Message:            "all diskful volumes formatted",
+					Reason:             reason,
+					Message:            message,
 					LastTransitionTime: metav1.Now(),
 				},
 			},
@@ -91,7 +121,7 @@ func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Contex
 		client.Apply, //nolint:staticcheck // SA1019: applyconfiguration-gen output not yet available for our CRDs
 		client.FieldOwner(filesystemFormattedFieldOwner))
 	if err != nil {
-		return errors.Wrapf(err, "ssa FilesystemFormatted Condition on Resource %s", resourceName)
+		return errors.Wrapf(err, "ssa FilesystemFormatted Condition (reason=%s) on Resource %s", reason, resourceName)
 	}
 
 	return nil

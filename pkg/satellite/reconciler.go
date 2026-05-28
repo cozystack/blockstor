@@ -178,8 +178,26 @@ type FilesystemFormattedStamper interface {
 	// <resourceName>.Status.Conditions. Idempotent — repeat calls
 	// converge on the same Condition shape (LastTransitionTime
 	// moves forward on apiserver-side transition only, not on
-	// every patch).
+	// every patch). Reason="MkfsSucceeded": the satellite ran
+	// `mkfs.<type>` on every diskful volume itself.
 	StampFilesystemFormatted(ctx context.Context, resourceName string) error
+
+	// StampFilesystemObserved SSA-patches the same
+	// `FilesystemFormatted=True` Condition but with
+	// Reason="FilesystemObserved" — used when the filesystem was
+	// detected on the DRBD device WITHOUT the satellite running
+	// mkfs (e.g. an NFS-Ganesha sidecar formatted the device from
+	// inside its own pod, or an operator ran `mkfs.ext4` manually
+	// to recover a volume). The Condition value (True) is the same
+	// as the mkfs-succeeded path — the only difference is the
+	// audit-trail reason / message. Idempotent under SSA's
+	// listMap merge on `type`. Without this entry point the
+	// reconciler's auto-mkfs fast-path never stamps the Condition
+	// for ganesha-shaped RDs (`FileSystem/Type` prop unset on the
+	// RD because ganesha owns mkfs), and `needsAutoMkfsRetry` /
+	// observers retrigger reconciles forever (`~28 RV updates/sec
+	// per Resource` measured on the cli-matrix RWX scenario).
+	StampFilesystemObserved(ctx context.Context, resourceName string) error
 }
 
 // SkipDiskClearer abstracts the "release the satellite's SSA claim
@@ -2193,74 +2211,237 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	autoPromote := firstActivation && autoPrimaryReplica
 	_ = cloned
 
-	if autoPromote && !r.shouldForcePromote(ctx, dr) {
-		// Bug 342 force-promote gate fired: a data-bearing peer exists,
-		// so SKIP `drbdadm primary --force`. The fresh replica stays
-		// Inconsistent and SyncTargets from the peer (full resync,
-		// data-safe). Returning here also skips the mkfs-retry below —
-		// correct, since the replica adopts the peer's filesystem via
-		// the resync rather than formatting locally.
+	skip, err := r.runAutoPrimarySeed(ctx, dr, autoPromote, autoPrimaryReplica)
+	if err != nil {
+		return err
+	}
+
+	if skip {
 		return nil
 	}
 
-	// Reaching UpToDate no longer depends on this promote. The elected
-	// winner already declared itself Consistent+UpToDate via the
-	// `drbdmeta set-gi` seed (seedInitialGI's case-B winner slot), so
-	// the kernel comes up UpToDate from metadata alone. `primary
-	// --force` is now PURELY an mkfs concern: we promote only when the
-	// RD requests a filesystem (and quorum may not be satisfiable yet
-	// because peers haven't connected), run mkfs, then demote
-	// immediately. When no filesystem is requested we skip the promote
-	// entirely — which is exactly what avoids the old bug, where
-	// `primary --force` minted a fresh current-UUID that diverged from
-	// the day0 bitmap-base the peers carry, flipping them to SyncTarget
-	// for a full initial sync even on empty thin/ZFS volumes.
-	if autoPromote && needsMkfs(dr) {
-		err := r.runAutoPromote(ctx, dr)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Bug 311: the auto-mkfs path used to live ONLY inside
-	// runAutoPromote (above), wedged between `drbdadm primary --force`
-	// and `drbdadm secondary`. That coupling meant any transient
-	// failure in the promote/demote dance — primary --force racing the
-	// initial-sync handshake, secondary racing an in-flight Open —
-	// left `.mkfs.done` unwritten while `.md-created` persisted, so the
-	// next reconcile saw firstActivation=false, skipped the whole
-	// auto-promote branch, and mkfs never ran again. piraeus' NFS-
-	// ganesha multi-volume RD (RWX PVC, two VDs, `FileSystem/Type=ext4`
-	// on the RD) reproduced this every time: the resource bound but
-	// `/dev/drbd/by-res/<pvc>/1` had no filesystem and ganesha's
-	// `mount-recovery@<pvc>.service` failed with `fsck.ext2: Bad magic
-	// number in super-block`.
-	//
-	// The retry path runs ONLY when firstActivation has already
-	// happened (so we never double-promote a healthy fresh replica)
-	// AND the `.mkfs.done` marker is still missing AND the RD asks
-	// for a filesystem. It re-enters runAutoPromote which is
-	// idempotent: primary --force on an already-Primary slot is a
-	// kernel no-op, `runAutoMkfs` blkid-probes each device and skips
-	// volumes that already carry a filesystem, and `secondary`
-	// matches the regular post-mkfs demote. Once every diskful
-	// volume passes the blkid probe (either freshly-mkfs'd here or
-	// already populated from a previous attempt), runAutoMkfs writes
-	// the marker and this branch becomes a no-op for the rest of the
-	// resource's life.
-	if !autoPromote && autoPrimaryReplica && r.needsAutoMkfsRetry(dr) {
-		err := r.runAutoPromote(ctx, dr)
-		if err != nil {
-			return err
-		}
+	// Observe-existing-filesystem: stamp `FilesystemFormatted=True`
+	// when blkid sees a filesystem on every diskful volume but
+	// runAutoMkfs never wrote the Condition (it can't — its only
+	// trigger is `FileSystem/Type` on the RD). NFS-Ganesha RWX PVCs
+	// land here: ganesha mkfs's the device from inside its sidecar
+	// pod, the satellite never owns the format step, the Condition
+	// never lands, and `needsAutoMkfsRetry` together with the
+	// observer keeps re-driving reconciles forever (~28 RV
+	// updates/sec/Resource measured on the cli-matrix RWX cell). The
+	// stamp short-circuits that loop without touching the device.
+	// Idempotent: re-runs cheap-stat the Condition cache before any
+	// shell-out and bail when the Condition is already True.
+	err = r.observeExistingFilesystem(ctx, dr, diskless)
+	if err != nil {
+		return err
 	}
 
 	// Bug 366 recovery-promote self-heal — re-arm the auto-primary seed
 	// when a fresh RD wedged with the late replica stuck Inconsistent and
 	// no Primary anywhere. See maybeRecoveryPromote for the full why.
-	err := r.maybeRecoveryPromote(ctx, dr, autoPromote, autoPrimaryReplica)
+	err = r.maybeRecoveryPromote(ctx, dr, autoPromote, autoPrimaryReplica)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+// runAutoPrimarySeed runs the auto-primary seed dance — the
+// `drbdadm primary --force` → mkfs → `secondary` chain — on a fresh
+// replica AND the Bug 311 retry path on a steady-state replica.
+// Extracted from `finishDRBDApply` so the orchestrator stays under
+// the gocyclo budget.
+//
+// Returns (skip=true, nil) when the Bug 342 force-promote gate
+// fired: a data-bearing peer already exists, so the fresh replica
+// must SyncTarget from it instead of promoting itself. The caller
+// MUST return early in that case — the mkfs-retry below is also
+// suppressed (the replica adopts the peer's filesystem via the
+// resync rather than formatting locally), and the observe-existing
+// + recovery-promote helpers run only on a non-skip path.
+//
+// Returns (skip=false, err) on a real promote failure. (skip=false,
+// nil) on the steady-state path (whether or not retry fired) so the
+// caller continues with the observe-existing-filesystem + Bug 366
+// recovery-promote helpers.
+func (r *Reconciler) runAutoPrimarySeed(ctx context.Context, dr *intent.DesiredResource, autoPromote, autoPrimaryReplica bool) (bool, error) {
+	if autoPromote && !r.shouldForcePromote(ctx, dr) {
+		// Bug 342 force-promote gate fired: a data-bearing peer
+		// exists, so SKIP `drbdadm primary --force`. The fresh
+		// replica stays Inconsistent and SyncTargets from the peer
+		// (full resync, data-safe). Returning skip=true also bails
+		// out the mkfs-retry below — correct, since the replica
+		// adopts the peer's filesystem via the resync rather than
+		// formatting locally.
+		return true, nil
+	}
+
+	// Reaching UpToDate no longer depends on this promote. The
+	// elected winner already declared itself Consistent+UpToDate
+	// via the `drbdmeta set-gi` seed (seedInitialGI's case-B winner
+	// slot), so the kernel comes up UpToDate from metadata alone.
+	// `primary --force` is now PURELY an mkfs concern: we promote
+	// only when the RD requests a filesystem (and quorum may not be
+	// satisfiable yet because peers haven't connected), run mkfs,
+	// then demote immediately. When no filesystem is requested we
+	// skip the promote entirely — which is exactly what avoids the
+	// old bug, where `primary --force` minted a fresh current-UUID
+	// that diverged from the day0 bitmap-base the peers carry,
+	// flipping them to SyncTarget for a full initial sync even on
+	// empty thin/ZFS volumes.
+	if autoPromote && needsMkfs(dr) {
+		err := r.runAutoPromote(ctx, dr)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	// Bug 311: the auto-mkfs path used to live ONLY inside
+	// runAutoPromote (above), wedged between `drbdadm primary
+	// --force` and `drbdadm secondary`. That coupling meant any
+	// transient failure in the promote/demote dance — primary
+	// --force racing the initial-sync handshake, secondary racing
+	// an in-flight Open — left `.mkfs.done` unwritten while
+	// `.md-created` persisted, so the next reconcile saw
+	// firstActivation=false, skipped the whole auto-promote
+	// branch, and mkfs never ran again. piraeus' NFS-ganesha
+	// multi-volume RD (RWX PVC, two VDs, `FileSystem/Type=ext4` on
+	// the RD) reproduced this every time: the resource bound but
+	// `/dev/drbd/by-res/<pvc>/1` had no filesystem and ganesha's
+	// `mount-recovery@<pvc>.service` failed with `fsck.ext2: Bad
+	// magic number in super-block`.
+	//
+	// The retry path runs ONLY when firstActivation has already
+	// happened (so we never double-promote a healthy fresh
+	// replica) AND the `.mkfs.done` marker is still missing AND
+	// the RD asks for a filesystem. It re-enters runAutoPromote
+	// which is idempotent: primary --force on an already-Primary
+	// slot is a kernel no-op, `runAutoMkfs` blkid-probes each
+	// device and skips volumes that already carry a filesystem,
+	// and `secondary` matches the regular post-mkfs demote. Once
+	// every diskful volume passes the blkid probe (either
+	// freshly-mkfs'd here or already populated from a previous
+	// attempt), runAutoMkfs writes the marker and this branch
+	// becomes a no-op for the rest of the resource's life.
+	if !autoPromote && autoPrimaryReplica && r.needsAutoMkfsRetry(dr) {
+		err := r.runAutoPromote(ctx, dr)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	return false, nil
+}
+
+// observeExistingFilesystem stamps the `FilesystemFormatted=True`
+// Status Condition (with Reason="FilesystemObserved") when every
+// diskful volume of `dr` already carries a recognised filesystem
+// signature on its DRBD device, but the satellite never ran mkfs
+// itself.
+//
+// Motivation — closes the hot-reconcile loop on volumes whose
+// filesystem was created OUTSIDE the satellite's auto-mkfs path:
+//
+//   - NFS-Ganesha RWX PVCs: linstor-csi runs mkfs inside the
+//     ganesha-server sidecar pod, not via the RG
+//     `FileSystem/Type` prop, so `runAutoMkfs` early-returns and
+//     the Condition is never stamped.
+//   - Operator-recovery flows: someone ran `mkfs.ext4 -F /dev/drbdN`
+//     manually from within the satellite container (or via
+//     `talosctl`) to revive a stuck volume. Same shape: the
+//     satellite never observes the format step.
+//
+// On the stand (`ssh ubuntu@150.136.95.115`,
+// pvc-d966dcf3-fdde-4fb6-bc2b-d7a24e5be3e3) the missing Condition
+// left `KernelLoaded.LastTransitionTime` being SSA-rewritten by the
+// observer on every events2 frame; combined with the reconciler
+// reading `Conditions` and re-emitting Status, the Resource churned
+// ~28 RV updates/sec per node with no user-data activity.
+//
+// Idempotency layers:
+//
+//   - Condition fast path: skip outright when the parent Resource
+//     already carries `FilesystemFormatted=True` in
+//     `dr.GetFilesystemFormatted()` — no shell-out, no SSA write.
+//   - blkid probe: read-only, matches `runAutoMkfs`'s probe shape
+//     so the FakeExec contract pins the same `blkid -o export
+//     /dev/drbd<N>` line in tests.
+//   - Stamp failure tolerated: best-effort like the other Phase
+//     11.3 stamps. A transient apiserver hiccup defers stamping to
+//     the next reconcile; nothing on disk changed.
+//
+// Skip conditions (early return, no shell-out):
+//
+//   - Diskless replica: no local device → blkid would fail; the
+//     diskful peers stamp the Condition.
+//   - No FilesystemFormattedStamper wired: unit tests that don't
+//     mock the apiserver path. The reconciler still produces
+//     correct behaviour without the Condition cache; only the
+//     fast-path optimisation is disabled.
+//   - No Exec wrapper: same shape — unit tests that disable shell
+//     dispatch. blkid can't run without one.
+//   - No volumes: empty Volumes list → nothing to probe; treat as
+//     "not eligible".
+//   - The Condition is already True on the parent Resource.
+//
+// On a populated, diskful resource the probe issues at most one
+// `blkid -o export` per volume per reconcile pass; once the
+// Condition lands the fast path bails on a single map lookup.
+func (r *Reconciler) observeExistingFilesystem(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless {
+		return nil
+	}
+
+	if r.cfg.FilesystemFormattedStamper == nil || r.cfg.Exec == nil {
+		return nil
+	}
+
+	if dr.GetFilesystemFormatted() {
+		return nil
+	}
+
+	vols := dr.GetVolumes()
+	if len(vols) == 0 {
+		return nil
+	}
+
+	// FileSystem/Type set: the auto-mkfs path owns the Condition
+	// stamp on this RD. Skip to avoid a redundant SSA write and to
+	// keep the audit-trail reason accurate (MkfsSucceeded comes from
+	// runAutoMkfs, FilesystemObserved comes from here). If
+	// runAutoMkfs is mid-failure and `.mkfs.done` is absent, we
+	// MUST NOT stamp the Condition either — that would defeat the
+	// Bug 311 retry gate. The auto-mkfs path is the single source of
+	// truth when FileSystem/Type is set.
+	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) != "" {
+		return nil
+	}
+
+	minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
+
+	for _, vol := range vols {
+		device := fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
+		if !r.deviceHasFilesystem(ctx, device) {
+			// At least one volume is still empty — stamping the
+			// Condition now would falsely advertise the RD as fully
+			// formatted. Wait for the external mkfs (ganesha sidecar,
+			// operator) to finish the remaining volumes.
+			return nil
+		}
+	}
+
+	// Every diskful volume carries a filesystem. Stamp the
+	// Condition with the observed-reason so subsequent reconciles
+	// short-circuit. Best-effort: a transient apiserver error
+	// defers the stamp to the next pass, nothing else moves.
+	resourceCRDName := dr.GetName() + "." + dr.GetNodeName()
+
+	stampErr := r.cfg.FilesystemFormattedStamper.StampFilesystemObserved(ctx, resourceCRDName)
+	if stampErr != nil {
+		log.FromContext(ctx).Error(stampErr, "stamp observed FilesystemFormatted Condition; will retry next reconcile",
+			"resource", resourceCRDName)
 	}
 
 	return nil

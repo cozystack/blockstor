@@ -6423,15 +6423,23 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 	}
 }
 
-// fakeFilesystemStamper records every StampFilesystemFormatted call
-// so multi-volume mkfs tests can assert the Condition lands exactly
-// when every diskful volume of the RD has reached a filesystem
-// (freshly mkfs'd or adopted via blkid). Concurrency-safe to match
-// fakeMetadataStamper's contract.
+// fakeFilesystemStamper records every StampFilesystemFormatted /
+// StampFilesystemObserved call so multi-volume mkfs tests can assert
+// the Condition lands exactly when every diskful volume of the RD has
+// reached a filesystem (freshly mkfs'd or adopted via blkid; or
+// observed externally without satellite-driven mkfs). Concurrency-safe
+// to match fakeMetadataStamper's contract.
+//
+// `calls` holds only the StampFilesystemFormatted (Reason=MkfsSucceeded)
+// invocations so existing Bug 311 tests stay green; observed (Reason=
+// FilesystemObserved) invocations are recorded under `observedCalls`
+// so the observe-existing-fs path can be pinned independently.
 type fakeFilesystemStamper struct {
-	mu     sync.Mutex
-	calls  []string
-	stamps func(string) bool // optional: return true to fail the call
+	mu             sync.Mutex
+	calls          []string
+	observedCalls  []string
+	stamps         func(string) bool // optional: return true to fail the formatted call
+	observedStamps func(string) bool // optional: return true to fail the observed call
 }
 
 func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, resourceName string) error {
@@ -6447,12 +6455,35 @@ func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, reso
 	return nil
 }
 
+func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, resourceName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.observedCalls = append(f.observedCalls, resourceName)
+
+	if f.observedStamps != nil && f.observedStamps(resourceName) {
+		return os.ErrPermission
+	}
+
+	return nil
+}
+
 func (f *fakeFilesystemStamper) Calls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	out := make([]string, len(f.calls))
 	copy(out, f.calls)
+
+	return out
+}
+
+func (f *fakeFilesystemStamper) ObservedCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.observedCalls))
+	copy(out, f.observedCalls)
 
 	return out
 }
@@ -6961,5 +6992,312 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 	// the attach the observer just detached for.
 	if calls := clearer.Calls(); len(calls) != 0 {
 		t.Errorf("expected NO ClearSkipDisk calls when kernel is still Diskless; got %v", calls)
+	}
+}
+
+// TestApplyObserveExistingFilesystemStampsCondition pins the
+// observe-existing-filesystem path: when blkid -o export reports a
+// recognised filesystem on every diskful volume of a Resource whose
+// RD has NO `FileSystem/Type` prop (typical NFS-Ganesha RWX shape:
+// mkfs runs inside the ganesha sidecar pod, not via the RG), the
+// satellite MUST stamp `FilesystemFormatted=True` with
+// Reason=FilesystemObserved so subsequent reconciles short-circuit
+// past the auto-mkfs gate. Without this stamp the resource churns
+// at ~28 RV updates/sec (cli-matrix RWX cell measurement).
+//
+// Companion contract: NO mkfs.* command line is emitted — the
+// observe path is read-only.
+func TestApplyObserveExistingFilesystemStampsCondition(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// blkid sees ext4 on the device — mimics a ganesha-sidecar mkfs
+	// or an operator-recovery `mkfs.ext4 -F /dev/drbd20000` run from
+	// the satellite pod. Same shape as the existing Bug 311 blkid
+	// fixture (TestApplyAutoMkfsBlkidProbeSkipsPopulatedVolume).
+	fx.Expect("blkid -o export /dev/drbd20000",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd20000\nTYPE=ext4\nUSAGE=filesystem\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-observefs",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			// No FileSystem/Type prop — ganesha owns the format step.
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "20000",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// No mkfs.* invocations — observe is read-only.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "mkfs.") || strings.Contains(line, " mkfs.") {
+			t.Errorf("observe path must NOT run mkfs; saw %q in %v", line, fx.CommandLines())
+		}
+	}
+
+	// Exactly one StampFilesystemObserved call — the resource name
+	// is `<rd>.<node>` per the Phase 11.3 Stage 2 stamp contract.
+	if got := stamper.ObservedCalls(); len(got) != 1 || got[0] != "pvc-observefs.n1" {
+		t.Errorf("StampFilesystemObserved: want exactly one call for pvc-observefs.n1; got %v", got)
+	}
+
+	// And the mkfs-succeeded path MUST NOT fire — that reason is
+	// reserved for the satellite-driven runAutoMkfs path.
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Errorf("StampFilesystemFormatted (MkfsSucceeded) must not fire on the observe path; got %v", got)
+	}
+}
+
+// TestApplyObserveExistingFilesystemSkipsWhenNoFS pins the inverse:
+// blkid returns empty (no TYPE= line) → no filesystem present yet →
+// observe path MUST NOT stamp the Condition. Otherwise a half-
+// initialised RWX PVC (ganesha still pending mkfs inside its
+// sidecar) would falsely advertise itself as formatted and the
+// CSI/ganesha layer would mount it raw.
+func TestApplyObserveExistingFilesystemSkipsWhenNoFS(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs-empty_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// blkid response left unregistered → FakeExec returns empty
+	// stdout / nil err → deviceHasFilesystem reports false.
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-observefs-empty",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "20100",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if got := stamper.ObservedCalls(); len(got) != 0 {
+		t.Errorf("StampFilesystemObserved must not fire when blkid finds no FS; got %v", got)
+	}
+
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Errorf("StampFilesystemFormatted must not fire when blkid finds no FS; got %v", got)
+	}
+}
+
+// TestApplyObserveExistingFilesystemMultiVolumePartialSkips pins
+// the "stamp only after ALL volumes carry a filesystem" contract
+// for the multi-volume NFS-Ganesha shape: vol-0 already has ext4,
+// vol-1 is still blank. Stamping `FilesystemFormatted=True` now
+// would falsely advertise vol-1 as formatted and break ganesha's
+// `mount-recovery@<pvc>.service` (the same shape Bug 311 closed for
+// the auto-mkfs path).
+func TestApplyObserveExistingFilesystemMultiVolumePartialSkips(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs-multi_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs-multi_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	// vol-0 has ext4, vol-1 is unregistered → blkid returns empty.
+	fx.Expect("blkid -o export /dev/drbd20200",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd20200\nTYPE=ext4\nUSAGE=filesystem\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-observefs-multi",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 131072, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 307200, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "20200",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if got := stamper.ObservedCalls(); len(got) != 0 {
+		t.Errorf("partial-FS multi-volume RD MUST NOT stamp observed; got %v", got)
+	}
+}
+
+// TestApplyObserveExistingFilesystemSkipsWhenFileSystemTypeSet
+// pins the "owner separation" contract: when the RD carries the
+// `FileSystem/Type` prop the auto-mkfs path owns the Condition
+// stamp (Reason=MkfsSucceeded). The observe path MUST early-return
+// without calling blkid, so the audit-trail reason stays accurate
+// and Bug 311's retry gate is not bypassed.
+func TestApplyObserveExistingFilesystemSkipsWhenFileSystemTypeSet(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs-owned_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// blkid would mark /dev/drbd20300 populated — but with
+	// FileSystem/Type set the observe path must not invoke it at
+	// all. Register the response anyway: a regression that calls
+	// blkid would consume this expectation and the assertion below
+	// would have to grow; with the early-return contract the
+	// command count for blkid stays 0.
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-observefs-owned",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Props: map[string]string{
+				"FileSystem/Type": "ext4",
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "20300",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// The auto-mkfs path owns the Condition stamp here. The
+	// observe path's StampFilesystemObserved MUST NOT fire.
+	if got := stamper.ObservedCalls(); len(got) != 0 {
+		t.Errorf("FileSystem/Type set → observe path must early-return; got observed calls %v", got)
+	}
+
+	// No `blkid -o export /dev/drbd20300` line from the observe
+	// path. (runAutoMkfs may still call it as part of its own
+	// per-volume probe — assert via prefix-count that it landed
+	// at most once.)
+	blkidLines := 0
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "blkid -o export /dev/drbd20300") {
+			blkidLines++
+		}
+	}
+
+	if blkidLines > 1 {
+		t.Errorf("observe path must not double-blkid /dev/drbd20300; got %d lines in %v",
+			blkidLines, fx.CommandLines())
+	}
+}
+
+// TestApplyObserveExistingFilesystemSkipsWhenConditionAlready pins
+// the fast-path optimisation: when the parent Resource already
+// carries `FilesystemFormatted=True` (the dispatcher folded the
+// Condition into DesiredResource.FilesystemFormatted), the observe
+// path MUST early-return without calling blkid or the stamper.
+// Stops a hot stamper call on every reconcile pass even after the
+// Condition has landed.
+func TestApplyObserveExistingFilesystemSkipsWhenConditionAlready(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-observefs-cached_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:                "pvc-observefs-cached",
+			NodeName:            "n1",
+			FilesystemFormatted: true,
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "20400",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "blkid ") {
+			t.Errorf("cached Condition → no blkid expected; saw %q in %v", line, fx.CommandLines())
+		}
+	}
+
+	if got := stamper.ObservedCalls(); len(got) != 0 {
+		t.Errorf("cached Condition → StampFilesystemObserved must not fire; got %v", got)
 	}
 }
