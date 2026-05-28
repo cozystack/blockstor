@@ -188,11 +188,11 @@ blockstor **is** the LINSTOR controller plus the satellites: the controller bina
 | `linstor-csi` (csi-controller + csi-node) | **Deploy** — this is what provisions PVs. Point it at the blockstor apiserver. |
 | HA / affinity controller, `drbd-reactor` | Optional — deploy if you want failover/affinity. Point them at the apiserver the same way as the CSI driver (mTLS :3371 + client cert). |
 
-> The dev stand's `make piraeus` (`stand/install-piraeus.sh`) installs piraeus as a **separate, parallel** LINSTOR stack for coexistence testing — it brings up piraeus's own controller and satellites and does **not** point them at blockstor. Do not copy that path for a blockstor-backed cluster; use the wiring below instead.
+> The dev stand's `make piraeus` (`stand/install-piraeus.sh`) installs piraeus in **external-controller mode** against the blockstor apiserver — exactly the wiring described below. The `LinstorCluster` is created with `spec.externalController.url: https://blockstor-apiserver.blockstor-system.svc:3371`, which disables piraeus's bundled in-cluster `linstor-controller` Deployment and re-renders `linstor-csi` with `LS_CONTROLLERS` pointing at blockstor. Use that script as a working reference for a blockstor-backed cluster.
 
 ### Point `linstor-csi` at the blockstor apiserver
 
-The CSI driver's controller endpoint is the apiserver's mTLS Service on port **3371** — the same `blockstor-controller` Service the `linstor` client resolves (the plain-HTTP debug port 3370 is pod-local and is not an option here). `linstor-csi` wraps `golinstor`, which upgrades the endpoint to HTTPS and presents a client certificate when the `LS_USER_*` / `LS_ROOT_CA` variables point at PEM files. The exact wiring (verbatim from `stand/csi-sanity-job.yaml`, the in-repo reference for a CSI client against blockstor):
+The CSI driver's controller endpoint is the apiserver's mTLS Service on port **3371** — the `blockstor-apiserver` Service (a legacy `blockstor-controller` Service name resolves to the same apiserver pods and is also covered by the serving cert's SANs, for backward compatibility with older `LS_CONTROLLERS` values). The plain-HTTP debug port 3370 is pod-local and is not an option here. `linstor-csi` wraps `golinstor`, which upgrades the endpoint to HTTPS and presents a client certificate when the `LS_USER_*` / `LS_ROOT_CA` variables point at PEM files. The exact wiring (verbatim from `stand/csi-sanity-job.yaml`, the in-repo reference for a CSI client against blockstor):
 
 ```yaml
 image: quay.io/piraeusdatastore/piraeus-csi:v1.10.1
@@ -205,7 +205,7 @@ env:
   - name: KUBE_NODE_NAME
     valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
   # mTLS endpoint — the only port the Service exposes.
-  - {name: LS_CONTROLLERS,      value: "https://blockstor-controller.blockstor-system.svc:3371"}
+  - {name: LS_CONTROLLERS,      value: "https://blockstor-apiserver.blockstor-system.svc:3371"}
   - {name: LS_USER_CERTIFICATE, value: "/etc/linstor/client/tls.crt"}
   - {name: LS_USER_KEY,         value: "/etc/linstor/client/tls.key"}
   - {name: LS_ROOT_CA,          value: "/etc/linstor/client/ca.crt"}
@@ -217,7 +217,7 @@ volumes:
       secretName: blockstor-apiserver-client-tls
 ```
 
-Apply the same `LS_CONTROLLERS` / `LS_USER_*` / `LS_ROOT_CA` env and the same `client-tls` mount to **both** the csi-controller Deployment and the csi-node DaemonSet. If you deploy `linstor-csi` through the piraeus operator instead of plain manifests, set the cluster's external controller URL to the same `https://blockstor-controller.blockstor-system.svc:3371` and mount the same client Secret — verify the exact field name for your piraeus-operator version.
+Apply the same `LS_CONTROLLERS` / `LS_USER_*` / `LS_ROOT_CA` env and the same `client-tls` mount to **both** the csi-controller Deployment and the csi-node DaemonSet. If you deploy `linstor-csi` through the piraeus operator instead of plain manifests, set the cluster's external controller URL to `https://blockstor-apiserver.blockstor-system.svc:3371` (the field is `LinstorCluster.spec.externalController.url`) and wire `spec.apiTLS.certManager` at the `blockstor-api-ca` Issuer so the operator issues and mounts the client cert onto the CSI pods for you. `stand/install-piraeus.sh` is the in-repo reference for that wiring.
 
 ### mTLS client certificate via cert-manager
 
@@ -231,7 +231,7 @@ ca-bootstrapper (self-signed Issuer)
               └─> blockstor-apiserver-client   (client cert for in-cluster consumers) → Secret blockstor-apiserver-client-tls
 ```
 
-The `blockstor-apiserver-client` Certificate emits Secret `blockstor-apiserver-client-tls` carrying `tls.crt`, `tls.key` **and** `ca.crt`. Mount that Secret into the CSI pods (as above): `tls.crt`/`tls.key` authenticate the client to the apiserver, and `ca.crt` lets the client verify the apiserver's serving cert. cert-manager rotates these in place and the apiserver hot-reloads them without a restart, so no reloader annotations are needed. The serving cert's SANs already cover the `blockstor-controller` Service name, so dialing `https://blockstor-controller.blockstor-system.svc:3371` validates cleanly.
+The `blockstor-apiserver-client` Certificate emits Secret `blockstor-apiserver-client-tls` carrying `tls.crt`, `tls.key` **and** `ca.crt`. Mount that Secret into the CSI pods (as above): `tls.crt`/`tls.key` authenticate the client to the apiserver, and `ca.crt` lets the client verify the apiserver's serving cert. cert-manager rotates these in place and the apiserver hot-reloads them without a restart, so no reloader annotations are needed. The serving cert's SANs cover both `blockstor-apiserver` and the legacy `blockstor-controller` Service names, so either FQDN validates cleanly.
 
 If the CSI driver runs in a different namespace from the apiserver, replicate the client Secret there (e.g. issue a second `Certificate` from the same `blockstor-api-ca` Issuer into that namespace) — a Secret is namespace-scoped and the Issuer must be reachable.
 
