@@ -74,3 +74,9 @@ Blockstor was inspired by LINBIT's [LINSTOR](https://linbit.com/linstor/), and i
 ## License
 
 Blockstor is licensed under [Apache 2.0](LICENSE). The code is provided as-is with no warranties.
+
+Third-party Go modules and their licenses are catalogued in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md); the runtime dependency graph is constrained to an Apache-2.0–compatible allowlist (Apache-2.0, BSD-2-Clause, BSD-3-Clause, MIT, MPL-2.0, ISC) by the license-scan CI gate in [`.github/workflows/license-check.yml`](.github/workflows/license-check.yml). For interoperability with LINSTOR clients, type definitions are sourced from the Apache-2.0 [`golinstor`](https://github.com/LINBIT/golinstor) library; blockstor does not copy or generate code from upstream LINSTOR (GPL) sources.
+
+## Trademarks
+
+LINSTOR, LINBIT, and DRBD are trademarks or registered trademarks of LINBIT. Blockstor is an independent project and is not affiliated with, endorsed by, or sponsored by LINBIT.
