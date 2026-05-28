@@ -74,6 +74,67 @@ reset_between_scenarios() {
     ( set +e; source "$LIB"; reset_cluster_state 120 ) >> "$RESULTS" 2>&1 || true
 }
 
+# preflight_check polls the cluster until it is back to the baseline
+# state the next scenario expects:
+#   - exactly 3 satellite pods, all in phase=Running, none Terminating
+#     (DeletionTimestamp must be unset — kubelet/containerd can keep a
+#     pod in "Running" + DeletionTimestamp for tens of minutes)
+#   - no ResourceDefinition CRDs (zero orphan RDs across all namespaces)
+#
+# On success: echo "preflight: clean" to $RESULTS, return 0.
+# On timeout: echo a single-line "LEFTOVER: ..." summary to stdout AND
+# set NS=$NS NS-local "$PREFLIGHT_REASON" via a temp file. The caller
+# decides who to blame (previous scenario vs harness setup).
+#
+# Why up to 60s: reset_between_scenarios already runs cleanup, but the
+# kernel-side teardown (drbdsetup down + udev settle) can lag a few
+# seconds even after delete_all_rds() returns. 60s is the same envelope
+# require_workers() uses when probing pod readiness.
+PREFLIGHT_REASON_FILE=/tmp/e2e-$NAME.preflight-reason
+preflight_check() {
+    local deadline=$(( $(date +%s) + 60 ))
+    local reason=""
+    while (( $(date +%s) < deadline )); do
+        # Satellite pod state: count Running + count Terminating.
+        local total running terminating
+        total=$(kubectl --request-timeout=3s -n blockstor-system \
+            get pods -l app=blockstor-satellite --no-headers 2>/dev/null | wc -l | tr -d ' ')
+        running=$(kubectl --request-timeout=3s -n blockstor-system \
+            get pods -l app=blockstor-satellite \
+            -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name} {end}' \
+            2>/dev/null | wc -w | tr -d ' ')
+        terminating=$(kubectl --request-timeout=3s -n blockstor-system \
+            get pods -l app=blockstor-satellite \
+            -o 'jsonpath={range .items[?(@.metadata.deletionTimestamp)]}{.metadata.name} {end}' \
+            2>/dev/null | wc -w | tr -d ' ')
+
+        # Orphan RD CRDs across all namespaces.
+        local rd_count
+        rd_count=$(kubectl --request-timeout=3s get resourcedefinitions.blockstor.cozystack.io \
+            -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+        if [ "$total" = "3" ] && [ "$running" = "3" ] && [ "$terminating" = "0" ] && [ "$rd_count" = "0" ]; then
+            echo "preflight: clean (running=3 terminating=0 rd_count=0)" >> "$RESULTS"
+            : > "$PREFLIGHT_REASON_FILE"
+            return 0
+        fi
+
+        reason="running=${running}/${total} terminating=${terminating} rd_count=${rd_count}"
+        sleep 2
+    done
+
+    # Final snapshot for the LEFTOVER message — include pod-by-pod state
+    # so the responsible scenario is obvious in the log.
+    {
+        echo "preflight: NOT clean after 60s — ${reason}"
+        kubectl --request-timeout=3s -n blockstor-system get pods -l app=blockstor-satellite \
+            -o wide 2>/dev/null || true
+        kubectl --request-timeout=3s get resourcedefinitions.blockstor.cozystack.io -A 2>/dev/null || true
+    } >> "$RESULTS"
+    echo "$reason" > "$PREFLIGHT_REASON_FILE"
+    return 1
+}
+
 # Scenarios ALLOWED to emit the SKIP sentinel (tests/e2e/lib.sh skip()).
 # These are environment-gated cases that cannot run on the Talos+QEMU CI
 # substrate and are deliberately observational:
@@ -91,6 +152,7 @@ SKIP_ALLOWLIST="backing-device-fail storage-error-injection quorum-loss-recovery
 
 scenario_count=${#SCENARIOS[@]}
 scenario_idx=0
+prev_sc=""
 for sc in "${SCENARIOS[@]}"; do
     scenario_idx=$((scenario_idx + 1))
     # L6 cli-matrix cells are referenced as `cli-matrix/<cell>` so
@@ -100,6 +162,48 @@ for sc in "${SCENARIOS[@]}"; do
     # (parent dir doesn't exist), so sanitize for the log name only.
     sc_log=${sc//\//__}
     logf=/tmp/e2e-$NAME-$sc_log.log
+
+    # Pre-flight: cluster must be back to the baseline before launching
+    # the next scenario, otherwise blame the LEFTOVER on the previous
+    # scenario (it had its chance via reset_between_scenarios) — not on
+    # the upcoming one, which would otherwise get "scenario needs 3
+    # Ready satellite pods, found 2 (previous-test cascade)" and look
+    # like a flake (Bug 298 cascade-misattribution pattern).
+    #
+    # First scenario of the lane is special: no `prev_sc` to blame, and
+    # a stand that fails pre-flight on its first scenario is a harness
+    # setup bug — fail FATAL so it's visible immediately.
+    if ! preflight_check; then
+        reason=$(cat "$PREFLIGHT_REASON_FILE" 2>/dev/null || echo "unknown")
+        if [ -n "$prev_sc" ]; then
+            # Rewrite the previous scenario's verdict line in $RESULTS.
+            # Match either PASS / SKIP / TIMEOUT — only "PASS $prev_sc"
+            # gets demoted (a FAIL prev_sc is already correctly blamed,
+            # a SKIP/TIMEOUT line is also better left intact). Use a
+            # python rewrite to keep awk-portable across stand busybox.
+            python3 - "$RESULTS" "$prev_sc" "$reason" <<'PY' || true
+import sys
+path, prev_sc, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    lines = f.readlines()
+rewritten = False
+for i, ln in enumerate(lines):
+    if ln.startswith(f"PASS {prev_sc}\n"):
+        lines[i] = f"FAIL {prev_sc} (LEFTOVER: {reason})\n"
+        rewritten = True
+        break
+if rewritten:
+    with open(path, "w") as f:
+        f.writelines(lines)
+PY
+            echo "preflight: blamed LEFTOVER on previous scenario '$prev_sc' (reason: ${reason})" >> "$RESULTS"
+        else
+            echo "FATAL: pre-flight failed on FIRST scenario of lane ($sc) — harness setup, not scenario fault (reason: ${reason})" >> "$RESULTS"
+            echo "all-scenarios-done: $(date -Iseconds)" >> "$RESULTS"
+            exit 1
+        fi
+    fi
+
     echo "=== START $(date -Iseconds) $sc ===" >> "$RESULTS"
     if timeout 600 make e2e NAME=$NAME SCENARIO=$sc > "$logf" 2>&1; then
         # exit 0 from make — but a scenario may have emitted the SKIP
@@ -136,6 +240,11 @@ for sc in "${SCENARIOS[@]}"; do
         reset_between_scenarios
         echo "=== CLEANUP-DONE $(date -Iseconds) after $sc ===" >> "$RESULTS"
     fi
+
+    # Remember the scenario that just finished so the NEXT iteration's
+    # pre-flight check can blame LEFTOVER state on it (not on its
+    # innocent successor).
+    prev_sc=$sc
 done
 
 echo "all-scenarios-done: $(date -Iseconds)" >> "$RESULTS"
