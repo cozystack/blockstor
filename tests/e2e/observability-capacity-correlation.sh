@@ -174,14 +174,10 @@ cleanup() {
     for rd in "${SPAWNED_RDS[@]}"; do
         delete_rd "$rd" 2>/dev/null
     done
-    # Revert LinstorCluster.spec.externalController + apiTLS
-    # unconditionally so a FAIL exit doesn't leave linstor-csi wired at
-    # blockstor's apiserver for the rest of the e2e batch. Without this,
-    # downstream scenarios never reach UpToDate because piraeus tears
-    # down its in-cluster Java linstor-controller when an external one is
-    # configured. Cascade-fail repro: e2e1 batch on 2026-05-17 (4
-    # downstream FAILs).
-    unwire_linstor_csi_mtls
+    # External mode is now the default (stand/install-piraeus.sh wires
+    # LinstorCluster.spec.externalController + apiTLS at install time),
+    # so we deliberately do NOT unwire on cleanup — reverting would
+    # break linstor-csi for any downstream scenario sharing this stand.
     kill "$PF_PID" 2>/dev/null
     wait "$PF_PID" 2>/dev/null
     set -e
@@ -338,11 +334,10 @@ fi
 # --- Phase 2 (Level 1): apply a 1Gi PVC ---------------------------------
 echo ">> phase 2 (Level 1): apply 1Gi PVC, expect Pending + capacity event"
 
-# Wire linstor-csi at blockstor's mTLS apiserver (same dance as
-# observability-three-way). The Service is TLS-only (:3371,
-# RequireAndVerifyClientCert); wire_linstor_csi_mtls drives both the
-# externalController repoint AND the client-cert wiring through
-# LinstorCluster.spec.apiTLS.certManager (see tests/e2e/lib.sh).
+# External mode is the default since stand/install-piraeus.sh creates the
+# LinstorCluster pre-wired with spec.externalController.url +
+# spec.apiTLS.certManager. wire_linstor_csi_mtls stays as an idempotent
+# guard for stands provisioned in legacy coexistence mode (spec: {}).
 BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
 wire_linstor_csi_mtls "$BLOCKSTOR_URL"
 
