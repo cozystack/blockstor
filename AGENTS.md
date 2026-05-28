@@ -133,6 +133,8 @@ make e2e NAME=alice SCENARIO=luks-layer
 
 Scenarios live under `tests/e2e/` and each takes a `WORK_DIR` argument.
 
+New scenarios SHOULD register their cleanup via `register_strict_cleanup` from `tests/e2e/lib.sh` instead of a bare `trap 'delete_rd X' EXIT`. The strict helper deletes the named RDs, waits for any Terminating satellite pods to actually go away (with `kubectl delete --grace-period=0 --force` as a fallback), and verifies the cluster is back to the baseline (0 orphan RDs, 3 Running satellite pods, none Terminating). If the cluster cannot be drained, a passing scenario is demoted to FAIL — preventing the next scenario from inheriting a dirty cluster and being misblamed by `require_workers`. Existing bare-trap scenarios keep working (the harness still runs `reset_cluster_state` between scenarios, and the lane runner's pre-flight check rewrites the previous scenario's PASS to `FAIL <prev> (LEFTOVER: ...)` if the cluster is dirty).
+
 ## Tests
 
 `go test ./...` runs the unit suite (the envtest-backed integration tests skip
