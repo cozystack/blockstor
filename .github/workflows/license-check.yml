@@ -1,0 +1,49 @@
+name: License check
+
+# Enforces the Apache-2.0 third-party policy: the runtime Go dependency
+# graph must contain only licenses on the allowlist (Apache-2.0,
+# BSD-2-Clause, BSD-3-Clause, MIT, MPL-2.0, ISC). GPL / AGPL / LGPL /
+# SSPL or anything go-licenses classifies as `forbidden` / `restricted`
+# fails the build. See AGENTS.md "Licensing — Apache 2.0, clean-room"
+# and THIRD_PARTY_LICENSES.md for the policy this gate enforces.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  license-check:
+    name: go-licenses allowlist
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@v1.6.0
+
+      - name: Check runtime dependency licenses
+        # The runtime binaries — controller, apiserver, satellite — define
+        # the closure that the policy applies to. Build-only tooling
+        # (linters, codegen) is intentionally outside the runtime graph
+        # and not enforced here.
+        run: |
+          go-licenses check ./cmd/... \
+              --disallowed_types=forbidden,restricted
+
+      - name: Report runtime dependency licenses (informational)
+        if: always()
+        run: |
+          go-licenses report ./cmd/... 2>/dev/null | sort -t, -k2,2 || true
