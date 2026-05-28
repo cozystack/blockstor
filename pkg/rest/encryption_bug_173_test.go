@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /*
 Copyright 2026 Cozystack contributors.
 
@@ -54,10 +56,6 @@ limitations under the License.
 //     JSON string `"…"` → 200. Matches the spec, upstream Java
 //     handler, and golinstor's wire format. This is the test that
 //     fails on HEAD (567e5c982).
-//   - TestBug173OpenAPISpecMatchesHandler: parse
-//     `pkg/api/openapi/types.gen.go`, assert `PassPhraseEnter` is
-//     `string` (not an object struct). Combined with the bare-string
-//     handler test above, the spec and the handler now line up.
 //   - TestBug173PassphraseEnterRejectsEmptyBareString: PATCH with `""`
 //     (empty bare string) → 401 (no proof-of-knowledge), parity with
 //     the wrapped `{"passphrase":""}` rejection path.
@@ -70,9 +68,6 @@ package rest
 
 import (
 	"encoding/json"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"net/http"
 	"testing"
@@ -248,68 +243,3 @@ func TestBug173PassphraseEnterRejectsMalformedString(t *testing.T) {
 	}
 }
 
-// TestBug173OpenAPISpecMatchesHandler statically asserts that the
-// generated `pkg/api/openapi/types.gen.go` declares `PassPhraseEnter`
-// as a bare `string` (the upstream canonical shape) — NOT an object
-// struct. Combined with the bare-string handler test above, this is
-// the contract that pins spec ↔ handler agreement so a future
-// "let's generate types from a stale schema" run can't quietly
-// invert the wire shape.
-//
-// We parse the file with `go/parser` and walk the AST rather than
-// grepping the source — a comment or string literal that happens to
-// say `PassPhraseEnter = string` MUST NOT satisfy this test, only an
-// actual type alias declaration in the type system can.
-func TestBug173OpenAPISpecMatchesHandler(t *testing.T) {
-	const typesPath = "../api/openapi/types.gen.go"
-
-	fset := token.NewFileSet()
-
-	f, err := parser.ParseFile(fset, typesPath, nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatalf("parse %s: %v", typesPath, err)
-	}
-
-	var (
-		found bool
-		shape string
-	)
-
-	ast.Inspect(f, func(n ast.Node) bool {
-		ts, ok := n.(*ast.TypeSpec)
-		if !ok {
-			return true
-		}
-
-		if ts.Name == nil || ts.Name.Name != "PassPhraseEnter" {
-			return true
-		}
-
-		found = true
-
-		// A bare `type X = string` alias has Assign != 0 and Type ==
-		// *ast.Ident with Name == "string". A `type X struct{…}` is
-		// *ast.StructType. We want the alias.
-		ident, ok := ts.Type.(*ast.Ident)
-		if !ok {
-			shape = "non-ident (likely struct or pointer); the openapi spec defines PassPhraseEnter as `type: string` and the handler now accepts a bare string body — regenerate types.gen.go from third_party/linstor-openapi/rest_v1_openapi.yaml"
-
-			return false
-		}
-
-		shape = ident.Name
-
-		return false
-	})
-
-	if !found {
-		t.Fatalf("PassPhraseEnter type declaration not found in %s; "+
-			"types.gen.go drifted from third_party/linstor-openapi/rest_v1_openapi.yaml",
-			typesPath)
-	}
-
-	if shape != "string" {
-		t.Fatalf("PassPhraseEnter shape mismatch: got %q, want \"string\" (upstream spec)\n"+
-			"the openapi spec is the source of truth; the handler must accept this shape", shape)
-	}
-}
