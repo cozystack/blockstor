@@ -63,6 +63,38 @@ type FilesystemFormattedStamper struct {
 // (LastTransitionTime is preserved because the apiserver only
 // updates it when the Condition's Status actually changes).
 func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Context, resourceName string) error {
+	return s.stampFilesystemFormattedCondition(ctx, resourceName,
+		"MkfsSucceeded", "all diskful volumes formatted")
+}
+
+// StampFilesystemObserved SSA-patches a `FilesystemFormatted=True`
+// Condition onto Resource <resourceName>.Status.Conditions with a
+// distinct `Reason` so the audit trail differentiates satellite-driven
+// mkfs (`Reason=MkfsSucceeded`) from externally-created filesystems
+// observed via blkid (`Reason=FilesystemObserved`).
+//
+// CRITICAL — SSA shape: identical to StampFilesystemFormatted
+// (same FieldOwner, same Resource.Status.Conditions listMap entry
+// keyed on `type=FilesystemFormatted`). Differs ONLY in the
+// `Reason`/`Message` fields of that single Condition entry. The
+// matching FieldOwner is what keeps SSA's per-listMap-entry
+// ownership coherent: this writer claims the same Condition slot
+// the formatted stamper claims, so the apiserver never sees two
+// conflicting writers fighting over `.status.conditions[type=
+// FilesystemFormatted]` — and crucially, NEVER touches
+// `.status.volumes` (a separate listMap keyed on volumeNumber,
+// owned by the volume-status / observer writers).
+func (s *FilesystemFormattedStamper) StampFilesystemObserved(ctx context.Context, resourceName string) error {
+	return s.stampFilesystemFormattedCondition(ctx, resourceName,
+		"FilesystemObserved", "filesystem detected on every diskful volume (mkfs not run by satellite)")
+}
+
+// stampFilesystemFormattedCondition is the shared SSA builder for both
+// stamp entry points. Keeping the marshalled patch shape in one place
+// guarantees byte-level equivalence (modulo Reason/Message) across both
+// callers, which is what makes the listMap merge under
+// filesystemFormattedFieldOwner safe.
+func (s *FilesystemFormattedStamper) stampFilesystemFormattedCondition(ctx context.Context, resourceName, reason, message string) error {
 	apply := &blockstoriov1alpha1.Resource{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       resourceKind,
@@ -74,8 +106,8 @@ func (s *FilesystemFormattedStamper) StampFilesystemFormatted(ctx context.Contex
 				{
 					Type:               blockstoriov1alpha1.ConditionFilesystemFormatted,
 					Status:             metav1.ConditionTrue,
-					Reason:             "MkfsSucceeded",
-					Message:            "all diskful volumes formatted",
+					Reason:             reason,
+					Message:            message,
 					LastTransitionTime: metav1.Now(),
 				},
 			},

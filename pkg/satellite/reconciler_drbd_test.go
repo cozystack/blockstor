@@ -6429,9 +6429,13 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 // (freshly mkfs'd or adopted via blkid). Concurrency-safe to match
 // fakeMetadataStamper's contract.
 type fakeFilesystemStamper struct {
-	mu     sync.Mutex
-	calls  []string
-	stamps func(string) bool // optional: return true to fail the call
+	mu    sync.Mutex
+	calls []string
+	// observeCalls records every StampFilesystemObserved call.
+	// Kept distinct from `calls` so tests can pin which path
+	// (formatted vs observed) the satellite took.
+	observeCalls []string
+	stamps       func(string) bool // optional: return true to fail the call
 }
 
 func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, resourceName string) error {
@@ -6445,6 +6449,30 @@ func (f *fakeFilesystemStamper) StampFilesystemFormatted(_ context.Context, reso
 	}
 
 	return nil
+}
+
+func (f *fakeFilesystemStamper) StampFilesystemObserved(_ context.Context, resourceName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.observeCalls = append(f.observeCalls, resourceName)
+
+	if f.stamps != nil && f.stamps(resourceName) {
+		return os.ErrPermission
+	}
+
+	return nil
+}
+
+// ObserveCalls returns a copy of the observe-stamp history (concurrency-safe).
+func (f *fakeFilesystemStamper) ObserveCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]string, len(f.observeCalls))
+	copy(out, f.observeCalls)
+
+	return out
 }
 
 func (f *fakeFilesystemStamper) Calls() []string {
@@ -6961,5 +6989,126 @@ func TestBug278NoClearWhenKernelStillDiskless(t *testing.T) {
 	// the attach the observer just detached for.
 	if calls := clearer.Calls(); len(calls) != 0 {
 		t.Errorf("expected NO ClearSkipDisk calls when kernel is still Diskless; got %v", calls)
+	}
+}
+
+// TestObserveStampsCondition_BlkidFinds pins the externally-formatted
+// filesystem observation path: an auto-primary replica whose device
+// already carries a filesystem the satellite never created itself
+// (no `FileSystem/Type` prop → auto-mkfs structurally bypassed) MUST
+// stamp `FilesystemFormatted=True` via StampFilesystemObserved so the
+// dispatcher fast-path closes the ~28 Hz reconcile hot loop.
+func TestObserveStampsCondition_BlkidFinds(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-obsfs_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// The device already carries an ext4 filesystem an external
+	// actor (NFS-Ganesha sidecar, operator-recovery) wrote.
+	fx.Expect("blkid -o export /dev/drbd7100",
+		storage.FakeResponse{Stdout: []byte("DEVNAME=/dev/drbd7100\nTYPE=ext4\nUSAGE=filesystem\n")})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-obsfs",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			// CRUCIAL: NO FileSystem/Type — auto-mkfs path is
+			// structurally bypassed (mirrors NFS-Ganesha RWX RDs).
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "7100",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// runAutoMkfs never runs (no FileSystem/Type), so the
+	// "Formatted" stamp (Reason=MkfsSucceeded) MUST be absent.
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Errorf("StampFilesystemFormatted must NOT fire when FileSystem/Type is unset; got %v", got)
+	}
+
+	gotObs := stamper.ObserveCalls()
+	if len(gotObs) != 1 || gotObs[0] != "pvc-obsfs.n1" {
+		t.Errorf("StampFilesystemObserved: want exactly one call for pvc-obsfs.n1; got %v", gotObs)
+	}
+}
+
+// TestObserveSkipsWhenAlreadyFormatted pins the Condition-first
+// fast-path: once the dispatcher folds `FilesystemFormatted=True`
+// into the DesiredResource, observeExistingFilesystem MUST short-
+// circuit BEFORE invoking blkid — no probe, no stamp. Catches the
+// per-reconcile churn regression where a True Condition fails to
+// suppress the observe path and SSA-rewrites the same Condition
+// every events2 frame.
+func TestObserveSkipsWhenAlreadyFormatted(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-obscached_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// No `blkid -o export` expectation registered: if the
+	// observe path failed to short-circuit, FakeExec would return
+	// its "unexpected command" error and the Apply call below
+	// would surface it.
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:                "pvc-obscached",
+			NodeName:            "n1",
+			FilesystemFormatted: true, // dispatcher-folded fast-path
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "7200",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "blkid -o export") {
+			t.Errorf("blkid MUST NOT run when FilesystemFormatted is already True; saw %q", line)
+		}
+	}
+
+	if got := stamper.ObserveCalls(); len(got) != 0 {
+		t.Errorf("StampFilesystemObserved MUST NOT fire when Condition is already True; got %v", got)
+	}
+
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Errorf("StampFilesystemFormatted MUST NOT fire from the observe path; got %v", got)
 	}
 }
