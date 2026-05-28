@@ -13,11 +13,36 @@ specifically `linstor-server` (Java) and `drbd-utils`. You may read GPL sources
 for *behavioural understanding only* (what they do, never how they're written),
 and you must not reproduce their structure in blockstor.
 
-Apache-2.0 references that are safe to study and adapt:
+**Hard rules — no GPL artifacts may enter the tree:**
 
-- `drbd-reactor` (Apache 2.0) — events2 parsing, DRBD state enums
-- `linstor-csi` (Apache 2.0) — error-envelope patterns
-- The public DRBD-9 protocol documentation and the `drbdsetup` / `drbdadm` man pages
+- Do not vendor `linstor-server/docs/rest_v1_openapi.yaml` or any other
+  GPL-marked spec file; that yaml itself declares `license.name: GPLv3`.
+  Generating runtime types from a GPL spec produces a derivative work and
+  contaminates the Apache-2.0 tree (the `pkg/api/openapi/types.gen.go`
+  oapi-codegen output that lived here pre-cleanup is exactly the antipattern).
+- Do not commit code generated from a GPL source by any tool
+  (`oapi-codegen`, `swagger-codegen`, hand-translation, AI-summarisation
+  followed by codegen).
+- Do not add a Go module dependency whose license is GPL / AGPL / LGPL / SSPL.
+  CI enforces an allowlist (`Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`,
+  `MIT`, `MPL-2.0`, `ISC`) via `.github/workflows/license-check.yml`.
+- Every blockstor-authored Go source file carries an
+  `// SPDX-License-Identifier: Apache-2.0` header at the top.
+
+**Apache-2.0 references that are safe to study, adapt, and depend on:**
+
+- [`github.com/LINBIT/golinstor`](https://github.com/LINBIT/golinstor)
+  (Apache-2.0) — LINBIT's official Go client. The authoritative source of
+  truth for the LINSTOR REST API wire shape. Already in `go.mod`; prefer
+  importing types from here over hand-rolling them.
+- [`piraeus-operator`](https://github.com/piraeusdatastore/piraeus-operator)
+  (Apache-2.0) — operator patterns, CSI wiring.
+- [`linstor-csi`](https://github.com/piraeusdatastore/linstor-csi)
+  (Apache-2.0) — CSI driver, error-envelope patterns.
+- [`drbd-reactor`](https://github.com/LINBIT/drbd-reactor) (Apache-2.0) —
+  events2 parsing, DRBD state enums.
+- The public DRBD-9 protocol documentation and the `drbdsetup` / `drbdadm`
+  man pages.
 
 When in doubt, work clean-room: one person reads the GPL source to write a
 behavioural spec, and a different person implements the Go from that spec
