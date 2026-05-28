@@ -3086,7 +3086,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 // cycle repeats at ~28 Hz.
 //
 // Best-effort, never an apply blocker — hence no error return. The
-// five early-returns gate the costly blkid round-trip:
+// early-returns gate the costly blkid round-trip:
 //
 //  1. Diskless replica → no local device to probe.
 //  2. Stamper or Exec wrapper missing → unit-test shape, skip.
@@ -3094,9 +3094,19 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 //  4. RD has `FileSystem/Type` set → auto-mkfs owns the stamp
 //     (Reason=MkfsSucceeded). Avoids double-stamping under two
 //     different Reasons and keeps Bug 311's retry gate intact.
-//  5. No volumes / any volume returns no `TYPE=` line → partial
-//     populate, MUST NOT advertise the RD as formatted (would
-//     falsely converge a half-initialised RWX PVC).
+//  5. No volumes → nothing to probe.
+//  6. Any local device not yet `disk:UpToDate` (Inconsistent /
+//     SyncTarget / Diskless / mid-negotiation): defer. blkid
+//     opens /dev/drbd<N> and can stall on a syncing device or
+//     fcntl-conflict the concurrent `drbdadm primary --force` /
+//     `drbdmeta set-gi` the bring-up path may be issuing — which
+//     manifests as e2e replicas latching `State=Unknown` while the
+//     kernel itself reports `disk:UpToDate` on a separate slot
+//     because the reconciler is wedged in blkid. The next reconcile
+//     re-probes and stamps once bring-up has settled.
+//  7. Any volume returns no `TYPE=` line → partial populate, MUST
+//     NOT advertise the RD as formatted (would falsely converge a
+//     half-initialised RWX PVC).
 //
 // Stamp errors are logged and swallowed: the dispatcher will read
 // the missing Condition next pass and re-enter this path.
@@ -3125,6 +3135,20 @@ func (r *Reconciler) observeExistingFilesystem(ctx context.Context, dr *intent.D
 
 	volumes := dr.GetVolumes()
 	if len(volumes) == 0 {
+		return
+	}
+
+	// Kernel-truth gate: defer the blkid round-trip until every
+	// local device on this node is `disk:UpToDate`. blkid opens
+	// /dev/drbd<N>, which on an Inconsistent / SyncTarget slot can
+	// stall (open() waits on the device coming up) or fcntl-conflict
+	// the same-node bring-up's `drbdadm primary --force` /
+	// `drbdmeta set-gi` — the satellite reconciler is single-threaded
+	// per RD, so a wedged blkid wedges the WHOLE apply path and
+	// replicas latch `State=Unknown` even after the DRBD kernel
+	// itself converges. Conservative on probe failure (treated as
+	// "not yet ready") — the next reconcile re-evaluates.
+	if r.cfg.Adm == nil || !r.cfg.Adm.LocalAllUpToDate(ctx, dr.GetName()) {
 		return
 	}
 
