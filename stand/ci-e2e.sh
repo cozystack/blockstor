@@ -187,15 +187,18 @@ make blockstor NAME="$STAND"
 log "provisioning pools"
 make pools NAME="$STAND" TYPE=both
 
-# Optional: install upstream piraeus (operator + linstor-csi + NFS-ganesha)
-# alongside blockstor. The dedicated e2e-piraeus job sets INSTALL_PIRAEUS=1
-# so the piraeus-dependent scenarios (rwx-ganesha, observability-three-way,
-# observability-capacity-correlation) get the LinstorCluster CRD + the
-# linstor-csi NFS-ganesha path they drive. blockstor coexists with piraeus's
-# satellite by design (shared file-thin pool + host-shared /etc/drbd.d,
-# Bugs 305/310/359).
+# Optional: install upstream piraeus (operator + linstor-csi) wired in
+# EXTERNAL mode against blockstor's apiserver. The dedicated e2e-piraeus
+# job sets INSTALL_PIRAEUS=1 so the piraeus-dependent scenarios
+# (observability-three-way, observability-capacity-correlation,
+# rwx-ganesha) get the LinstorCluster CRD + linstor-csi pods they drive.
+# No upstream Java linstor-controller is started: piraeus-operator routes
+# linstor-csi at blockstor:3371 (see stand/install-piraeus.sh —
+# LinstorCluster.spec.externalController.url + apiTLS.certManager).
+# blockstor must be installed BEFORE piraeus so the blockstor-api-ca
+# Secret exists for the CA mirror.
 if [ "${INSTALL_PIRAEUS:-0}" = "1" ]; then
-    log "installing piraeus (operator + linstor-csi)"
+    log "installing piraeus (operator + linstor-csi, EXTERNAL mode -> blockstor)"
     make piraeus NAME="$STAND"
 fi
 

@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # usage: install-piraeus.sh WORK_DIR
-# Installs piraeus-operator + linstor-csi via the published manifests.
+# Installs piraeus-operator + linstor-csi via the published manifests,
+# wired in EXTERNAL mode: linstor-csi talks to blockstor's apiserver as
+# the LINSTOR-compatible backend, and piraeus-operator does NOT spawn
+# its own in-cluster Java linstor-controller. blockstor must already be
+# installed (stand/install-blockstor.sh) so the blockstor-api-ca Secret
+# exists for the CA mirror below and the apiserver Service is reachable
+# at https://blockstor-apiserver.blockstor-system.svc:3371.
 set -euo pipefail
 WORK_DIR=${1:?work_dir required}
 export KUBECONFIG="$WORK_DIR/kubeconfig"
 
 PIRAEUS_VERSION=${PIRAEUS_VERSION:-v2.10.0}
+
+# External-mode endpoint. blockstor's apiserver Service exposes ONLY
+# the mTLS port (:3371, RequireAndVerifyClientCert) — the plain HTTP
+# debug port (:3370) is bound only inside the pod and not in the
+# Service spec, so linstor-csi MUST go through :3371 with a client
+# cert chained to blockstor-api-ca. The apiTLS knob below handles the
+# client-cert side via cert-manager.
+BLOCKSTOR_URL=${BLOCKSTOR_URL:-https://blockstor-apiserver.blockstor-system.svc:3371}
 
 echo ">> applying piraeus-operator $PIRAEUS_VERSION"
 kubectl apply --server-side \
@@ -15,24 +29,9 @@ echo ">> waiting for piraeus-operator to be ready"
 kubectl -n piraeus-datastore wait deploy/piraeus-operator-controller-manager \
     --for=condition=Available --timeout=5m
 
-echo ">> creating LinstorCluster"
-kubectl apply -f - <<EOF
-apiVersion: piraeus.io/v1
-kind: LinstorCluster
-metadata:
-  name: linstorcluster
-spec: {}
-EOF
-
 # Mirror blockstor's apiserver CA into piraeus-datastore so the
 # piraeus-operator can issue linstor-csi client certs from the SAME CA
-# the blockstor apiserver trusts. The observability scenarios
-# (observability-three-way / -capacity-correlation) repoint piraeus's
-# bundled linstor-csi at blockstor's mTLS apiserver
-# (LinstorCluster.spec.externalController.url =
-# https://blockstor-apiserver...:3371). That endpoint is
-# RequireAndVerifyClientCert, so linstor-csi MUST present a client cert
-# chained to blockstor-api-ca. The operator-native knob is
+# the blockstor apiserver trusts. The operator-native knob is
 # LinstorCluster.spec.apiTLS.certManager: when set, the operator creates
 # Certificate resources (linstor-csi-controller-tls / -node-tls) in
 # piraeus-datastore from the referenced cert-manager Issuer and wires
@@ -41,8 +40,9 @@ EOF
 # kustomizeCSIControllerResources + patches/api-tls-csi-controller.yaml).
 # A cert-manager Issuer is namespace-scoped, so the CA private key must
 # live in piraeus-datastore: copy the blockstor-api-ca Secret here and
-# stand up a CA Issuer over it. Idempotent; harmless to the rwx-ganesha
-# scenario, which keeps piraeus's own controller and never sets apiTLS.
+# stand up a CA Issuer over it. Must run BEFORE LinstorCluster creation
+# below — the operator reconciles apiTLS as soon as the CR appears and
+# would block on the missing Issuer otherwise.
 echo ">> mirror blockstor-api-ca into piraeus-datastore + create CA Issuer"
 deadline=$(( $(date +%s) + 120 ))
 while (( $(date +%s) < deadline )); do
@@ -51,11 +51,14 @@ while (( $(date +%s) < deadline )); do
     fi
     sleep 3
 done
-if kubectl -n blockstor-system get secret blockstor-api-ca >/dev/null 2>&1; then
-    kubectl -n blockstor-system get secret blockstor-api-ca -o json \
-        | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.annotations, .metadata.labels)' \
-        | kubectl -n piraeus-datastore apply -f -
-    kubectl apply -f - <<'EOF'
+if ! kubectl -n blockstor-system get secret blockstor-api-ca >/dev/null 2>&1; then
+    echo "FATAL: blockstor-api-ca Secret not found in blockstor-system after 120s — install blockstor BEFORE piraeus (external mode needs the apiserver mTLS CA mirrored)" >&2
+    exit 1
+fi
+kubectl -n blockstor-system get secret blockstor-api-ca -o json \
+    | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.annotations, .metadata.labels)' \
+    | kubectl -n piraeus-datastore apply -f -
+kubectl apply -f - <<'EOF'
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
@@ -65,12 +68,31 @@ spec:
   ca:
     secretName: blockstor-api-ca
 EOF
-    kubectl -n piraeus-datastore wait --for=condition=Ready issuer/blockstor-api-ca --timeout=60s || true
-else
-    echo ">> WARN: blockstor-api-ca Secret not found in blockstor-system — apiserver mTLS PKI absent; observability scenarios will SKIP" >&2
-fi
+kubectl -n piraeus-datastore wait --for=condition=Ready issuer/blockstor-api-ca --timeout=60s
 
-echo ">> waiting for LinstorCluster ready"
+echo ">> creating LinstorCluster in EXTERNAL mode -> $BLOCKSTOR_URL"
+# spec.externalController.url disables piraeus's bundled in-cluster
+# linstor-controller Deployment and re-renders linstor-csi with
+# LS_CONTROLLERS pointing at blockstor's apiserver.
+# spec.apiTLS.certManager makes the operator issue linstor-csi-{controller,node}-tls
+# Secrets from the mirrored blockstor-api-ca Issuer; LS_USER_CERTIFICATE /
+# LS_USER_KEY / LS_ROOT_CA are then wired onto the CSI pods so they can
+# present a client cert to blockstor's RequireAndVerifyClientCert :3371.
+kubectl apply -f - <<EOF
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec:
+  externalController:
+    url: $BLOCKSTOR_URL
+  apiTLS:
+    certManager:
+      name: blockstor-api-ca
+      kind: Issuer
+EOF
+
+echo ">> waiting for LinstorCluster Available"
 for i in {1..60}; do
     if kubectl get linstorcluster linstorcluster -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null | grep -q True; then
         echo ">> LinstorCluster Available"
@@ -119,37 +141,18 @@ spec:
             type: DirectoryOrCreate
 EOF
 
-echo ">> creating LinstorSatelliteConfiguration with a file-thin storage pool"
-# File-thin pool uses an LVM thin volume that piraeus creates from a sparse
-# file under /var/lib/piraeus on each satellite. No host-side prep required.
-kubectl apply -f - <<EOF
-apiVersion: piraeus.io/v1
-kind: LinstorSatelliteConfiguration
-metadata:
-  name: pool
-spec:
-  storagePools:
-    - name: pool
-      fileThinPool:
-        directory: /var/lib/piraeus/file-thin
-EOF
+# External mode: blockstor's satellite owns the storage pools (see
+# stand/install-pools.sh + stand/blockstor-storagepools.yaml). We do NOT
+# create a piraeus-side LinstorSatelliteConfiguration storage pool here —
+# in external mode piraeus-operator drives only linstor-csi, the LINSTOR
+# state of record (nodes, pools, RDs) lives in blockstor.
 
-echo ">> waiting for storage pools to register"
-for i in {1..60}; do
-    READY=$(kubectl get linstornodeconnections -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Available")].status}{"\n"}{end}' 2>/dev/null | grep -c True || true)
-    POOLS=$(kubectl get linstorsatellites -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="StoragePools")].status}{"\n"}{end}' 2>/dev/null | grep -c True || true)
-    if [[ "$POOLS" -ge 1 ]]; then
-        echo ">> storage pools ready on $POOLS satellites"
-        break
-    fi
-    sleep 5
-done
+echo ">> wait for linstor-csi rollouts (LS_CONTROLLERS + client cert wired by operator)"
+kubectl -n piraeus-datastore rollout status deploy/linstor-csi-controller --timeout=180s
+kubectl -n piraeus-datastore rollout status ds/linstor-csi-node --timeout=180s
 
-echo ">> piraeus install complete"
+echo ">> piraeus install complete (external mode)"
 kubectl get pods -n piraeus-datastore
 echo
-echo ">> linstorsatellites:"
-kubectl get linstorsatellites
-echo
-echo ">> exec linstor controller and list pools:"
-kubectl exec -n piraeus-datastore deploy/linstor-controller -- linstor sp l 2>/dev/null || true
+echo ">> linstor-csi controller env (LS_CONTROLLERS + client cert):"
+kubectl -n piraeus-datastore get deploy linstor-csi-controller -o jsonpath='{range .spec.template.spec.containers[?(@.name=="linstor-csi")].env[*]}{.name}={.value}{.valueFrom.secretKeyRef.name}{"\n"}{end}' 2>/dev/null || true
