@@ -7003,6 +7003,11 @@ func TestObserveStampsCondition_BlkidFinds(t *testing.T) {
 	fx := storage.NewFakeExec()
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-obsfs_00000",
 		storage.FakeResponse{Stdout: []byte("")})
+	// Kernel-truth gate: the local replica must be all-UpToDate before
+	// the helper opens /dev/drbdN with blkid. A single UpToDate device
+	// satisfies the gate and lets the blkid probe proceed.
+	fx.Expect("drbdsetup status pvc-obsfs --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":0,"devices":[{"volume":0,"disk-state":"UpToDate"}],"connections":[]}]`)})
 	// The device already carries an ext4 filesystem an external
 	// actor (NFS-Ganesha sidecar, operator-recovery) wrote.
 	fx.Expect("blkid -o export /dev/drbd7100",
@@ -7106,6 +7111,73 @@ func TestObserveSkipsWhenAlreadyFormatted(t *testing.T) {
 
 	if got := stamper.ObserveCalls(); len(got) != 0 {
 		t.Errorf("StampFilesystemObserved MUST NOT fire when Condition is already True; got %v", got)
+	}
+
+	if got := stamper.Calls(); len(got) != 0 {
+		t.Errorf("StampFilesystemFormatted MUST NOT fire from the observe path; got %v", got)
+	}
+}
+
+// TestObserveDefersWhileLocalNotUpToDate pins the kernel-truth gate:
+// while ANY local device is non-UpToDate (Inconsistent, SyncTarget,
+// Diskless, empty/mid-negotiation), observeExistingFilesystem MUST
+// NOT issue blkid and MUST NOT stamp. Catches the regression where
+// `blkid -o export /dev/drbdN` opened a syncing device, stalled the
+// reconciler's apply path, and latched replicas at `State=Unknown`
+// long after the DRBD kernel itself reached UpToDate (PR #34 v1).
+//
+// Drives the gate via a probe response that reports a single
+// Inconsistent local volume. No `blkid` expectation registered: if
+// the helper failed to short-circuit, FakeExec would record the
+// command and the assertion below would catch it.
+func TestObserveDefersWhileLocalNotUpToDate(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-syncing_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Kernel reports the local volume still Inconsistent — the most
+	// common bring-up shape on a fresh diskful replica. The gate
+	// MUST defer; no blkid, no stamp.
+	fx.Expect("drbdsetup status pvc-syncing --json",
+		storage.FakeResponse{Stdout: []byte(`[{"node-id":0,"devices":[{"volume":0,"disk-state":"Inconsistent"}],"connections":[]}]`)})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	stamper := &fakeFilesystemStamper{}
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:                  map[string]storage.Provider{"thin1": thin},
+		Adm:                        drbd.NewAdm(fx),
+		Exec:                       fx,
+		StateDir:                   dir,
+		NodeName:                   "n1",
+		FilesystemFormattedStamper: stamper,
+	})
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-syncing",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "7300",
+				"auto-primary": "true",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "blkid -o export") {
+			t.Errorf("blkid MUST NOT run while a local device is Inconsistent; saw %q", line)
+		}
+	}
+
+	if got := stamper.ObserveCalls(); len(got) != 0 {
+		t.Errorf("StampFilesystemObserved MUST NOT fire while local is non-UpToDate; got %v", got)
 	}
 
 	if got := stamper.Calls(); len(got) != 0 {

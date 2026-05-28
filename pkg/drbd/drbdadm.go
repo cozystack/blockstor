@@ -916,6 +916,43 @@ func (a *Adm) NeedsRecoveryPromote(ctx context.Context, resource string) bool {
 	return anyPeerInconsistent && weAreLowestUpToDate
 }
 
+// LocalAllUpToDate probes the live kernel via `drbdsetup status
+// <res> --json` and reports whether EVERY local device on this node
+// is `disk:UpToDate`. Returns false on probe / parse error, on an
+// empty status payload (slot not yet in the kernel), on an empty
+// device list (mid-negotiation), or when ANY local device is in a
+// non-UpToDate state (Inconsistent / SyncTarget→Inconsistent /
+// Outdated / Diskless / Attaching / etc.).
+//
+// Why: callers that want to issue a device-opening operation (blkid
+// -o export, mkfs, etc.) on /dev/drbd<N> need to defer until the
+// kernel has finished bring-up. While DRBD is Inconsistent or in
+// the middle of SyncTarget, opening the device can stall the apply
+// path or fcntl-conflict the bring-up's own `drbdadm primary --force`
+// / `drbdmeta set-gi` (the satellite reconciler is single-threaded
+// per RD). The diskful bring-up converges within seconds in normal
+// flows; the next reconcile re-evaluates this predicate and lets the
+// caller proceed once every local volume is UpToDate.
+//
+// Conservative on any failure — a deferred probe just retries on the
+// next reconcile and never blocks convergence; a falsely-true result
+// would let the caller open a syncing device.
+func (a *Adm) LocalAllUpToDate(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	return localIsUpToDate(status[0].Devices)
+}
+
 // scanRecoveryPromotePeers inspects a resource's peer connections for the
 // Bug 366 recovery-promote decision and reports: whether any diskful peer
 // is Inconsistent (the wedge symptom that needs a SyncSource), whether this
