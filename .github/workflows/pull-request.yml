@@ -239,7 +239,7 @@ jobs:
       # `e2e-piraeus` job below, which installs piraeus in EXTERNAL mode
       # against blockstor's apiserver (no upstream Java linstor-controller).
       # ci-e2e.sh drops these from the discovered suite.
-      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-local csi-pvc-replicated-rwo"
+      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo"
     permissions:
       contents: read
       checks: write
@@ -366,7 +366,7 @@ jobs:
         # LANE=1 LANES=1 → the single lane runs every listed scenario;
         # ci-e2e.sh honours INSTALL_PIRAEUS=1 (job env) to deploy piraeus
         # after blockstor so these scenarios have the stack they drive.
-        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-local csi-pvc-replicated-rwo"
+        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo"
 
       - name: Upload e2e logs
         if: always()
