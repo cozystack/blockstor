@@ -47,6 +47,19 @@ source "$SCRIPT_DIR/lib.sh"
 # stand is enough; 3 lets allowRemoteVolumeAccess prove its real value.
 require_workers 2
 
+# Prerequisite: this scenario exercises piraeus's bundled linstor-csi.
+# The matrix lanes (E2E_EXCLUDE in .github/workflows/pull-request.yml)
+# never install piraeus — only the dedicated `e2e-piraeus` job does. If
+# the LinstorCluster CRD is missing here, the rest of the script would
+# hard-fail (PVC stays Pending, `kubectl -n piraeus-datastore ...` 404,
+# `kubectl exec` into a satellite-pod-without-linstor blows up). Fail
+# fast with a clear message instead — placement in the right CI job is
+# the fix, not a silent skip.
+if ! kubectl get crd linstorclusters.piraeus.io >/dev/null 2>&1; then
+    echo "FAIL: LinstorCluster CRD (piraeus.io) absent — this scenario belongs in the e2e-piraeus job (INSTALL_PIRAEUS=1)" >&2
+    exit 1
+fi
+
 SC=e2e-csi-replicated
 PVC=e2e-csi-replicated-pvc
 POD=e2e-csi-replicated-pod
@@ -56,12 +69,42 @@ POD=e2e-csi-replicated-pod
 # contract and override the pool name at apply time.
 POOL=${POOL:-lvm-thin}
 
+# stand/install-piraeus.sh pre-wires the LinstorCluster at blockstor's
+# apiserver (externalController.url + apiTLS.certManager). On a stand
+# that was provisioned in coexistence mode (legacy spec:{}), call
+# wire_linstor_csi_mtls so linstor-csi can actually reach blockstor;
+# the helper short-circuits when the LinstorCluster is already wired.
+BLOCKSTOR_URL="https://blockstor-apiserver.blockstor-system.svc:3371"
+wire_linstor_csi_mtls "$BLOCKSTOR_URL"
+
+# Port-forward to blockstor-apiserver:3370 (plain HTTP REST) so the
+# host's `linstor` CLI can dump `r l` / `v l` on failure. The
+# blockstor-apiserver pod itself has no linstor binary, and exec-ing
+# into a satellite pod fails the same way ("executable not found");
+# port-forward + host CLI is the canonical pattern (also used by
+# observability-three-way, recovery-late-vd-real-drbd, etc.).
+PF_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3370 \
+    >/tmp/csi-pvc-replicated-rwo-pf.log 2>&1 &
+PF_PID=$!
+
 local_cleanup() {
     kubectl delete pod "$POD" --ignore-not-found --wait=false 2>/dev/null || true
     kubectl delete pvc "$PVC" --ignore-not-found --wait=false 2>/dev/null || true
     kubectl delete sc "$SC" --ignore-not-found 2>/dev/null || true
+    kill "$PF_PID" 2>/dev/null || true
+    wait "$PF_PID" 2>/dev/null || true
 }
 trap local_cleanup EXIT
+
+# Wait for port-forward to come up (best-effort — diag output is
+# informational, not load-bearing for the pass/fail verdict).
+for _ in $(seq 1 30); do
+    if curl -sf -m1 "http://localhost:$PF_PORT/v1/nodes" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
 
 dump_diag() {
     local label=$1
@@ -75,12 +118,10 @@ dump_diag() {
     echo "----- diag ($label): linstor-csi-node logs -----" >&2
     kubectl -n piraeus-datastore logs ds/linstor-csi-node \
         -c linstor-csi --tail=80 --prefix=true 2>&1 >&2 || true
-    echo "----- diag ($label): linstor r l (via blockstor apiserver) -----" >&2
-    kubectl -n blockstor-system exec deploy/blockstor-apiserver -- \
-        linstor r l 2>&1 >&2 || true
-    echo "----- diag ($label): linstor v l (via blockstor apiserver) -----" >&2
-    kubectl -n blockstor-system exec deploy/blockstor-apiserver -- \
-        linstor v l 2>&1 >&2 || true
+    echo "----- diag ($label): linstor r l (port-forward to blockstor apiserver) -----" >&2
+    linstor --controllers "http://localhost:$PF_PORT" r l 2>&1 >&2 || true
+    echo "----- diag ($label): linstor v l (port-forward to blockstor apiserver) -----" >&2
+    linstor --controllers "http://localhost:$PF_PORT" v l 2>&1 >&2 || true
 }
 
 # How many DRBD replicas to autoplace. autoPlace=3 from the demo SC
