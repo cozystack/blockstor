@@ -21,7 +21,8 @@ import (
 	"maps"
 	"net/http"
 
-	"github.com/cozystack/blockstor/pkg/api/openapi"
+	"github.com/LINBIT/golinstor/client"
+	"github.com/LINBIT/golinstor/clonestatus"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
@@ -233,7 +234,7 @@ func (s *Server) handleRDCloneStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := computeCloneStatus(r.Context(), s.Store, srcName, targetName)
-	writeJSON(w, http.StatusOK, openapi.ResourceDefinitionCloneStatus{
+	writeJSON(w, http.StatusOK, client.ResourceDefinitionCloneStatus{
 		Status: status,
 	})
 }
@@ -249,22 +250,22 @@ func (s *Server) handleRDCloneStatus(w http.ResponseWriter, r *http.Request) {
 // the safest answer is COMPLETE because the target survived and any
 // further validation requires the source to compare against. This
 // preserves the legacy behaviour for that edge case.
-func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName string) openapi.ResourceDefinitionCloneStatusStatus {
+func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName string) clonestatus.CloneStatus {
 	srcVDs, err := st.VolumeDefinitions().List(ctx, srcName)
 	if err != nil {
-		return openapi.COMPLETE
+		return clonestatus.Complete
 	}
 
 	targetVDs, err := st.VolumeDefinitions().List(ctx, targetName)
 	if err != nil {
-		return openapi.COMPLETE
+		return clonestatus.Complete
 	}
 
 	if len(srcVDs) > 0 && len(targetVDs) < len(srcVDs) {
-		return openapi.FAILED
+		return clonestatus.Failed
 	}
 
-	return openapi.COMPLETE
+	return clonestatus.Complete
 }
 
 // writeCloneNotImplemented stamps the Bug 114 refusal envelope.
