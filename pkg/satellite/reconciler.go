@@ -869,24 +869,6 @@ func (r *Reconciler) applyOne(ctx context.Context, dr *intent.DesiredResource) *
 
 			return res
 		}
-	} else {
-		// Storage-only resources (layerList=storage, the linstor-csi
-		// "local" SC shape) bypass applyDRBD entirely, which means the
-		// DRBD-side runAutoPromote → runAutoMkfs chain never runs and
-		// `FileSystem/Type` set by linstor-csi on the RD would be
-		// silently ignored. linstor-csi v1.10.1's NodePublishVolume
-		// does `fsck` + plain `mount(2)` on the device (no
-		// FormatAndMount fallback), so without satellite-side mkfs the
-		// kubelet's fsck rejects the unformatted volume with exit 8.
-		// Match the DRBD-stack contract by running the same auto-mkfs
-		// path against the raw device map from applyStorage.
-		err := r.runStorageOnlyMkfs(ctx, dr, diskless, devices)
-		if err != nil {
-			res.Ok = false
-			res.Message = err.Error()
-
-			return res
-		}
 	}
 
 	res.Volumes = buildVolumeResults(dr, devices, diskless, withDRBD)
@@ -2908,7 +2890,7 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 		return errors.Wrapf(err, "auto-primary %s", dr.GetName())
 	}
 
-	err = r.runAutoMkfs(ctx, dr, drbdDevicesForMkfs(dr))
+	err = r.runAutoMkfs(ctx, dr)
 	if err != nil {
 		return errors.Wrapf(err, "auto-mkfs %s", dr.GetName())
 	}
@@ -2919,55 +2901,6 @@ func (r *Reconciler) runAutoPromote(ctx context.Context, dr *intent.DesiredResou
 	}
 
 	return nil
-}
-
-// drbdDevicesForMkfs builds the {volNumber → /dev/drbd<minor>} map
-// runAutoMkfs feeds into mkfs for DRBD-stacked resources. mkfs on a
-// DRBD volume MUST go through the kernel device (writes are mirrored
-// to peers via initial-sync); writing directly to the lower disk
-// would diverge from the kernel's view and corrupt the replica.
-// Mirrors the per-volume minor resolution buildVolumeResults uses
-// for the same fan-out.
-func drbdDevicesForMkfs(dr *intent.DesiredResource) map[int32]string {
-	minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
-
-	out := make(map[int32]string, len(dr.GetVolumes()))
-	for _, vol := range dr.GetVolumes() {
-		out[vol.GetVolumeNumber()] = fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
-	}
-
-	return out
-}
-
-// runStorageOnlyMkfs handles the auto-mkfs path for resources whose
-// layer stack omits DRBD (`layerList=storage`, the linstor-csi
-// "local" SC shape). For those there is no DRBD slot to promote and
-// no peer mirroring — writes land directly on the lower disk, so
-// mkfs targets the raw device path applyStorage produced. Skips
-// silently when (a) the resource is diskless (no lower disk to
-// format), (b) DRBD is in the stack (runAutoPromote already owns
-// the promote→mkfs→demote ordering), or (c) FileSystem/Type is
-// unset (no FS requested — pure block-mode PVC).
-//
-// linstor-csi v1.10.1's NodePublishVolume runs `fsck` then plain
-// `mount(2)` on the device — there is no FormatAndMount fallback
-// (see pkg/client/linstor.go lines 2287-2293). The satellite is the
-// only place a CSI-provisioned local PVC can get a filesystem
-// before the kubelet tries to mount it.
-func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredResource, diskless bool, devices map[int32]string) error {
-	if diskless {
-		return nil
-	}
-
-	if needsDRBD(dr.GetLayerStack()) {
-		return nil
-	}
-
-	if strings.TrimSpace(dr.GetProps()["FileSystem/Type"]) == "" {
-		return nil
-	}
-
-	return r.runAutoMkfs(ctx, dr, devices)
 }
 
 // runAutoMkfs handles the RG-driven auto-mkfs path of scenario
@@ -3001,15 +2934,7 @@ func (r *Reconciler) runStorageOnlyMkfs(ctx context.Context, dr *intent.DesiredR
 // together with `.res` / `.md-created` so a re-created RD with the
 // same name correctly mkfs-s again — the blkid probe sees an empty
 // (freshly-carved) volume and lets mkfs run.
-//
-// The devices parameter maps volNumber → device path mkfs should
-// target. DRBD-stacked callers pass `/dev/drbd<minor>` (mkfs MUST go
-// through the kernel so writes mirror to peers); storage-only
-// callers pass the raw LV/zvol/loopfile path applyStorage
-// produced. A volume missing from the map is silently skipped — the
-// only legitimate "missing" case is a diskless replica caller,
-// which has already been early-returned by runStorageOnlyMkfs.
-func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) error {
+func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource) error {
 	fsType := strings.TrimSpace(dr.GetProps()["FileSystem/Type"])
 	if fsType == "" {
 		return nil
@@ -3048,6 +2973,8 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 		return nil
 	}
 
+	minor, _ := strconv.Atoi(dr.GetDrbdOptions()["minor"])
+
 	args := []string{}
 
 	if extra := strings.TrimSpace(dr.GetProps()["FileSystem/MkfsParams"]); extra != "" {
@@ -3055,16 +2982,7 @@ func (r *Reconciler) runAutoMkfs(ctx context.Context, dr *intent.DesiredResource
 	}
 
 	for _, vol := range dr.GetVolumes() {
-		device := devices[vol.GetVolumeNumber()]
-		if device == "" {
-			// No device path for this volume → caller is a path that
-			// has nothing to mkfs (diskless replica, missing pickup).
-			// Storage-only callers always populate devices via
-			// applyStorage; DRBD callers always populate via
-			// drbdDevicesForMkfs. Skip rather than fail so this is a
-			// hot-path safety net, not a behavioural change.
-			continue
-		}
+		device := fmt.Sprintf("/dev/drbd%d", volMinorOrBase(vol, minor))
 
 		if r.deviceHasFilesystem(ctx, device) {
 			// Volume already carries a filesystem. Two cases land here:
