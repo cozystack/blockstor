@@ -1,0 +1,20 @@
+Blockstor
+Copyright 2026 The Blockstor Authors
+
+This product is licensed under the Apache License, Version 2.0 (the
+"License"); you may not use this product except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+See LICENSE for the full text of the license.
+
+----
+
+This product includes third-party software components. The names,
+versions, and licenses of those components are catalogued in
+THIRD_PARTY_LICENSES.md at the root of the source distribution.
+
+LINSTOR, LINBIT, and DRBD are trademarks or registered trademarks of
+LINBIT. Blockstor is an independent project and is not affiliated with,
+endorsed by, or sponsored by LINBIT.
