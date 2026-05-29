@@ -773,7 +773,33 @@ reset_cluster_state() {
         ' 2>/dev/null || true
     done
 
-    echo ">> reset_cluster_state: done $(date -Iseconds) (delete_all_rds rc=$rc)"
+    # 6. Wait for the satellite DaemonSet to converge before handing
+    #    control to the next scenario. state-offline-unknown and other
+    #    partition scenarios mutate the DS template (nodeAffinity
+    #    rejecting a worker label) and force-delete the Pod on that
+    #    worker; their EXIT cleanup reverts the template but does not
+    #    always wait for the DS controller to spawn the replacement
+    #    Pod into Ready. Without this barrier the next scenario's
+    #    `require_workers` preflight can race the DS reconciliation
+    #    and SKIP with a "previous-test cascade" message (e.g.
+    #    state-offline-unknown → toggle-disk in ci-lane3 alphabetical
+    #    order). 90s is generous: a fresh satellite Pod typically
+    #    reaches Ready within 10s; we mostly cover the window between
+    #    DS-template-revert and DS-controller noticing it.
+    local ds_deadline=$(( $(date +%s) + 90 ))
+    local ds_desired ds_ready
+    while (( $(date +%s) < ds_deadline )); do
+        ds_desired=$(kubectl -n "$NS" get ds blockstor-satellite \
+            -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+        ds_ready=$(kubectl -n "$NS" get ds blockstor-satellite \
+            -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+        if [[ -n "$ds_desired" ]] && (( ds_desired > 0 )) && (( ds_desired == ds_ready )); then
+            break
+        fi
+        sleep 2
+    done
+
+    echo ">> reset_cluster_state: done $(date -Iseconds) (delete_all_rds rc=$rc, ds_ready=${ds_ready:-?}/${ds_desired:-?})"
     return $rc
 }
 
