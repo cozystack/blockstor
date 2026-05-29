@@ -57,36 +57,6 @@ import (
 // roadmap) keep concurrent grow-shrink decisions distinguishable.
 const Bug148ResizePendingAnnotationPrefix = "bug136.blockstor.cozystack.io/resize-pending-size-kib-vol-"
 
-// orphanWitnessSeenAtAnnotation records the first wall-clock time the
-// RD-reconciler observed the Bug-338 orphan-witness shape (exactly 1
-// diskful + 1 TIE_BREAKER + 0 user-diskless). The collapse only fires
-// once this shape has PERSISTED past orphanWitnessCollapseGrace.
-//
-// Why: the orphan-witness shape is indistinguishable at a single
-// snapshot from the in-flight relocate-onto-the-tiebreaker transition
-// (`r-full-lifecycle.sh` Phase 3). After `r d <one-of-two-diskful>`
-// the RD momentarily sits at 1 diskful + 1 orphan witness — the exact
-// Bug-338 trigger — but the operator immediately follows with
-// `r c <tiebreaker-node>`, promoting the witness into the diskful
-// relocate target. Collapsing on the first snapshot races that
-// promote and churns the witness/placement decision (diskful 1<->2,
-// willRemove<->willCreate) so the relocate target never settles, and
-// the resulting Resource create/delete storm starves the apiserver
-// cache (the relocate `r c` then 404s on a stale RD read). Deferring
-// the collapse by a short grace lets the relocate `r c` land first:
-// the topology changes, the orphan shape is gone, and the collapse
-// never destructively fires. A genuine Bug-338 standalone (operator
-// deletes a diskful and stops) still collapses once the grace lapses.
-const orphanWitnessSeenAtAnnotation = "blockstor.io/orphan-witness-seen-at"
-
-// orphanWitnessCollapseGrace is how long the 1-diskful + 1-witness
-// shape must persist before the Bug-338 collapse fires. Sized to
-// comfortably cover the `r d` -> `r c` relocate gap (sub-second on
-// the stand) plus apiserver-cache trail, while staying far below the
-// 5-minute AutoTiebreaker suppression window so a real standalone
-// diskful sheds its orphan witness promptly.
-const orphanWitnessCollapseGrace = 15 * time.Second
-
 // ResourceDefinitionReconciler watches RD CRDs and maintains the
 // tiebreaker invariant: an RD with exactly 2 diskful replicas in a
 // cluster with 3+ satellite nodes auto-gains a 3rd DISKLESS replica
@@ -258,14 +228,25 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 
 	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness)
 
-	// Relocate-onto-the-tiebreaker stability gate (see
-	// deferOrphanWitnessCollapse): hold the witness across the
-	// transient mid-relocate window so the placement decision settles
-	// instead of oscillating against the in-flight `r c` promote.
-	wantWitness, err = r.deferOrphanWitnessCollapse(ctx, rd, diskful, diskless, witness, wantWitness)
-	if err != nil {
-		return err
-	}
+	// Bug 338: the orphan-witness shape (1 diskful + 1 TIE_BREAKER +
+	// 0 user-diskless) collapses on this reconcile — no grace timer.
+	// The race the earlier grace gate guarded (in-flight relocate
+	// `r c <tiebreaker-node>` promoting the witness in-place via
+	// promoteDisklessReplica while the controller deletes the same
+	// row) is now closed at the node-id-allocator layer by Bug 342's
+	// kernel-confirmed PeerDRBDNodeID union (see
+	// resource_controller.go:collectTakenNodeIDs). If the relocate
+	// `r c` lands after the witness is gone, promoteDisklessReplica
+	// falls through to a fresh Create with a freshly-allocated DRBD
+	// node-id that the allocator guarantees does not collide with
+	// the kernel slot the just-freed witness held — so the relocate
+	// converges via the create-fresh path instead of the in-place
+	// promote-fast-path. One extra Resource CRD cycle in the narrow
+	// `r d → r c` overlap, no oscillation, no kernel-slot reuse.
+	// removeWitnesses still re-checks each row's live Flags before
+	// Delete so a witness that already promoted to the relocate
+	// target (TIE_BREAKER stripped) is skipped — the same layered
+	// guard the relocate-onto-tiebreaker integration test exercises.
 
 	willCreate := wantWitness && len(witness) == 0
 	willRemove := !wantWitness && len(witness) > 0
@@ -892,132 +873,6 @@ func (r *ResourceDefinitionReconciler) setQuorum(ctx context.Context, rd *blocks
 		// Refetch and retry.
 		err = r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd)
 		if err != nil {
-			return err
-		}
-	}
-
-	return apierrors.NewConflict(
-		blockstoriov1alpha1.GroupVersion.WithResource("resourcedefinitions").GroupResource(),
-		rd.Name, nil)
-}
-
-// deferOrphanWitnessCollapse implements the relocate-onto-the-tiebreaker
-// stability gate. The Bug-338 orphan-witness collapse (1 diskful +
-// 1 TIE_BREAKER + 0 user-diskless -> drop the witness) is
-// indistinguishable at a single snapshot from the transient
-// mid-relocate shape: after `r d <one-of-two-diskful>` the RD
-// momentarily holds 1 diskful + 1 orphan witness, then
-// `r c <tiebreaker-node>` promotes that witness into the diskful
-// relocate target. Collapsing on the first snapshot races the promote
-// and oscillates the placement decision (diskful 1<->2,
-// willRemove<->willCreate); the resulting Resource create/delete storm
-// also starves the apiserver cache so the relocate `r c` 404s on a
-// stale RD read.
-//
-// When the snapshot matches the orphan-collapse shape, defer the
-// collapse (return wantWitness=true) until it has PERSISTED past
-// orphanWitnessCollapseGrace — the 5s RequeueAfter in Reconcile
-// re-checks, and a relocate `r c` landing inside the grace changes
-// the shape so the collapse never fires. A genuine Bug-338 standalone
-// still sheds its orphan witness once the grace lapses. Any other
-// shape clears the grace stamp so the next genuine orphan starts a
-// fresh window.
-func (r *ResourceDefinitionReconciler) deferOrphanWitnessCollapse(
-	ctx context.Context,
-	rd *blockstoriov1alpha1.ResourceDefinition,
-	diskful, diskless, witness []apiv1.Resource,
-	wantWitness bool,
-) (bool, error) {
-	nonWitnessDiskless := len(diskless) - len(witness)
-	orphanCollapseShape := !wantWitness && len(witness) > 0 &&
-		len(diskful) == 1 && nonWitnessDiskless == 0
-
-	if !orphanCollapseShape {
-		return wantWitness, r.clearOrphanWitnessGrace(ctx, rd)
-	}
-
-	expired, err := r.orphanWitnessGraceExpired(ctx, rd)
-	if err != nil {
-		return wantWitness, err
-	}
-
-	if !expired {
-		// Keep the witness this cycle; Reconcile's RequeueAfter
-		// re-checks once the grace lapses (or the relocate `r c`
-		// changes the shape first).
-		return true, nil
-	}
-
-	return wantWitness, nil
-}
-
-// orphanWitnessGraceExpired reports whether the Bug-338 orphan-witness
-// shape has persisted long enough to collapse the witness. On the
-// FIRST observation it stamps orphanWitnessSeenAtAnnotation with the
-// current wall-clock time and returns false (defer). On subsequent
-// observations it compares the stamp against orphanWitnessCollapseGrace
-// and returns true once the grace has lapsed.
-//
-// A missing / unparseable stamp is treated as "first observation":
-// stamp fresh and defer. This keeps a hand-edited annotation from
-// either freezing the collapse forever or collapsing instantly.
-func (r *ResourceDefinitionReconciler) orphanWitnessGraceExpired(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
-	raw := ""
-	if rd.Annotations != nil {
-		raw = rd.Annotations[orphanWitnessSeenAtAnnotation]
-	}
-
-	if seenAt, err := time.Parse(time.RFC3339, raw); err == nil {
-		return time.Since(seenAt) >= orphanWitnessCollapseGrace, nil
-	}
-
-	// First (or unparseable) observation — stamp now and defer.
-	if err := r.setOrphanWitnessSeenAt(ctx, rd, time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return false, err
-	}
-
-	return false, nil
-}
-
-// clearOrphanWitnessGrace drops the orphanWitnessSeenAtAnnotation when
-// the RD no longer matches the orphan-collapse shape (the relocate
-// `r c` landed, or the operator otherwise changed the topology), so a
-// later genuine Bug-338 starts a fresh grace window. No-op when the
-// annotation is absent.
-func (r *ResourceDefinitionReconciler) clearOrphanWitnessGrace(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition) error {
-	if rd.Annotations == nil || rd.Annotations[orphanWitnessSeenAtAnnotation] == "" {
-		return nil
-	}
-
-	return r.setOrphanWitnessSeenAt(ctx, rd, "")
-}
-
-// setOrphanWitnessSeenAt writes (value != "") or deletes (value == "")
-// the orphan-witness grace stamp on the RD CRD, with the same
-// conflict-retry shape as setQuorum so a racing reconcile / REST
-// upsert converges instead of being dropped by a stale snapshot.
-func (r *ResourceDefinitionReconciler) setOrphanWitnessSeenAt(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, value string) error {
-	for range 3 {
-		if rd.Annotations == nil {
-			rd.Annotations = map[string]string{}
-		}
-
-		if value == "" {
-			delete(rd.Annotations, orphanWitnessSeenAtAnnotation)
-		} else {
-			rd.Annotations[orphanWitnessSeenAtAnnotation] = value
-		}
-
-		err := r.Update(ctx, rd)
-		if err == nil {
-			return nil
-		}
-
-		if !apierrors.IsConflict(err) {
-			return err
-		}
-
-		if err := r.Get(ctx, client.ObjectKey{Name: rd.Name}, rd); err != nil {
 			return err
 		}
 	}
