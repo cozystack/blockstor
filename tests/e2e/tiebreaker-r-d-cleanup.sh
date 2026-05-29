@@ -60,9 +60,8 @@ N2=$WORKER_2
 N3=$WORKER_3
 
 # Per-step convergence budget. The witness add/remove path is event-
-# driven (RD reconciler watches Resource CRDs) plus a 5s requeue tick
-# under the auto-tiebreaker grace window, so 60s is comfortable on the
-# QEMU stand.
+# driven (RD reconciler watches Resource CRDs) plus a 5s requeue tick,
+# so 60s is comfortable on the QEMU stand.
 CONVERGE=${CONVERGE:-60}
 
 # blockstor's REST/apiserver is exposed inside the cluster on :3370
@@ -173,8 +172,9 @@ diskful_count() {
 
 # wait_witness_count <rd> <want> [timeout] — poll until exactly $want
 # TIE_BREAKER witnesses exist for $rd, or timeout. Tries one extra
-# settle iteration before returning (the controller can churn the
-# witness during the deferOrphanWitnessCollapse grace window).
+# settle iteration before returning (the controller is event-driven
+# off Resource watches, so the witness can briefly oscillate during
+# the per-cycle 5s requeue while the diskful count is observed).
 wait_witness_count() {
     local rd=$1 want=$2 timeout=${3:-$CONVERGE}
     local deadline=$(( $(date +%s) + timeout ))
@@ -291,11 +291,14 @@ fi
 
 # Stability tail: hold for 15s and re-check. The pre-fix symptom of
 # Bug 338 was a witness that oscillated between collapse and resurrect
-# under the deferOrphanWitnessCollapse grace window — a "willRemove:
-# true → willCreate: true → willRemove: true" thrash in the controller
-# logs. A single point-in-time read could catch the witness in the
-# collapsed half of the oscillation and pass; force a tail-window
-# stability check so the regression catcher actually sees the bounce.
+# — a "willRemove: true → willCreate: true → willRemove: true" thrash
+# in the controller logs. A single point-in-time read could catch the
+# witness in the collapsed half of the oscillation and pass; force a
+# tail-window stability check so the regression catcher actually sees
+# the bounce. The Bug-342 node-id-occupied invariant now closes the
+# in-flight relocate race that the prior grace-window guarded, so the
+# collapse fires on the first observation — the stability tail still
+# proves it stays collapsed across a 5s requeue cycle without bouncing.
 echo ">> stability tail: hold 15s, re-check witness count"
 deadline=$(( $(date +%s) + 15 ))
 while (( $(date +%s) < deadline )); do
