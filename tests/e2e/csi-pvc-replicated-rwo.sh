@@ -89,8 +89,17 @@ kubectl -n blockstor-system port-forward deploy/blockstor-apiserver "$PF_PORT":3
 PF_PID=$!
 
 local_cleanup() {
-    kubectl delete pod "$POD" --ignore-not-found --wait=false 2>/dev/null || true
-    kubectl delete pvc "$PVC" --ignore-not-found --wait=false 2>/dev/null || true
+    # Delete Pod synchronously so kubelet finishes NodeUnpublishVolume +
+    # ControllerUnpublishVolume BEFORE the PVC delete triggers
+    # linstor-csi DeleteVolume. Without this ordering, pv-controller
+    # keeps retrying ControllerPublishVolume on the deleted volume
+    # into the next scenario's run window (observed on the piraeus
+    # interop lane: `volume not present in storage backend` retries
+    # every 60s monopolised linstor-csi-node and starved the next
+    # csi-pvc-local PVC's NodePublishVolume past its 240s Pod-Ready
+    # budget).
+    kubectl delete pod "$POD" --ignore-not-found --wait=true --timeout=60s 2>/dev/null || true
+    kubectl delete pvc "$PVC" --ignore-not-found --wait=true --timeout=60s 2>/dev/null || true
     kubectl delete sc "$SC" --ignore-not-found 2>/dev/null || true
     kill "$PF_PID" 2>/dev/null || true
     wait "$PF_PID" 2>/dev/null || true
