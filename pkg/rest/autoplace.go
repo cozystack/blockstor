@@ -75,6 +75,8 @@ func (s *Server) registerAutoplace(mux *http.ServeMux) {
 		s.requireStore(s.handleResourceGet))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources",
 		s.requireStore(s.handleResourceCreate))
+	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}",
+		s.requireStore(s.handleResourceCreateOnNode))
 	mux.HandleFunc("POST /v1/resource-definitions/{rd}/resources/{node}/make-available",
 		s.requireStore(s.handleResourceMakeAvailable))
 	mux.HandleFunc("DELETE /v1/resource-definitions/{rd}/resources/{node}",
@@ -1239,6 +1241,93 @@ func (s *Server) handleResourceCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "resource(s) created on resource-definition: " + rdName,
+	}})
+}
+
+// handleResourceCreateOnNode answers `POST /v1/resource-definitions/
+// {rd}/resources/{node}` — the single-node create variant linstor-csi
+// v1.10.1 uses when a PVC pins a fixed nodeList (the demo "local"
+// SC's `placementCount=1` + `nodeList=<worker>` shape). Upstream
+// LINSTOR's OpenAPI registers BOTH the bulk
+// `/resources` array-shaped POST AND this single-node alias; CSI
+// clients pick whichever matches the placement scope. Before this
+// route blockstor returned HTTP 405 (method not allowed) and CSI's
+// CreateVolume looped forever ("the path POST … is registered, but
+// not for this verb").
+//
+// Wire shape: accepts EITHER a single `ResourceCreate` object OR a
+// 1-element array (same `decodeResourceCreateBody` tolerance as the
+// bulk POST). The {node} URL segment is the load-bearing source of
+// truth — when the body's NodeName is empty we fill it from the
+// path; when both are set we refuse the conflict rather than
+// silently honour one over the other.
+func (s *Server) handleResourceCreateOnNode(w http.ResponseWriter, r *http.Request) {
+	rdName := r.PathValue("rd")
+	node := r.PathValue("node")
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeDecodeError(w, err)
+
+		return
+	}
+
+	// Tolerate empty body BEFORE decoding — the {node} path segment
+	// carries the complete create intent in that case (linstor-csi
+	// v1.10.1 posts no body for the simple per-node Resource.Create
+	// shape). decodeResourceCreateBody errs out on empty input, but
+	// for the single-node alias that's a legitimate request — the
+	// CSI wire shape just uses the path to convey the intent.
+	var envelopes []apiv1.ResourceCreate
+
+	if len(bytes.TrimSpace(body)) == 0 {
+		envelopes = []apiv1.ResourceCreate{{Resource: apiv1.Resource{}}}
+	} else {
+		envelopes, err = decodeResourceCreateBody(body)
+		if err != nil {
+			writeDecodeError(w, err)
+
+			return
+		}
+	}
+
+	if len(envelopes) > 1 {
+		writeError(w, http.StatusBadRequest,
+			"single-node resource create accepts at most one envelope, got "+
+				strconv.Itoa(len(envelopes)))
+
+		return
+	}
+
+	env := &envelopes[0]
+
+	switch {
+	case env.Resource.NodeName == "":
+		env.Resource.NodeName = node
+	case env.Resource.NodeName != node:
+		writeError(w, http.StatusBadRequest,
+			"single-node resource create: body node '"+env.Resource.NodeName+
+				"' does not match URL path node '"+node+"'")
+
+		return
+	}
+
+	created, ok := s.createResources(w, r, rdName, envelopes)
+	if !ok {
+		return
+	}
+
+	// Bug 263 (P1): bump peer-changed annotations on siblings so each
+	// satellite reconciles its .res with the new replica. Same pattern
+	// as handleResourceCreate above.
+	for i := range created {
+		s.bumpPeerChangedOnSiblings(r.Context(), rdName, created[i].NodeName)
+	}
+
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource created on resource-definition: " + rdName +
+			" / node: " + node,
 	}})
 }
 
