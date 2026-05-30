@@ -84,11 +84,11 @@ dump_diag() {
     echo "----- diag ($label): linstor-csi-node logs -----" >&2
     kubectl -n piraeus-datastore logs ds/linstor-csi-node \
         -c linstor-csi --tail=80 --prefix=true 2>&1 >&2 || true
-    echo "----- diag ($label): linstor r l (via blockstor apiserver) -----" >&2
-    kubectl -n blockstor-system exec deploy/blockstor-apiserver -- \
+    echo "----- diag ($label): linstor r l (via blockstor controller) -----" >&2
+    kubectl -n blockstor-system exec deploy/blockstor-controller -- \
         linstor r l 2>&1 >&2 || true
-    echo "----- diag ($label): linstor v l (via blockstor apiserver) -----" >&2
-    kubectl -n blockstor-system exec deploy/blockstor-apiserver -- \
+    echo "----- diag ($label): linstor v l (via blockstor controller) -----" >&2
+    kubectl -n blockstor-system exec deploy/blockstor-controller -- \
         linstor v l 2>&1 >&2 || true
 }
 
