@@ -131,7 +131,7 @@ apiVersion: v1
 kind: Pod
 metadata: {name: $POD}
 spec:
-  nodeName: $WORKER_1
+  nodeSelector: {kubernetes.io/hostname: $WORKER_1}
   restartPolicy: Never
   securityContext:
     runAsNonRoot: true
@@ -186,7 +186,7 @@ apiVersion: v1
 kind: Pod
 metadata: {name: $POD}
 spec:
-  nodeName: $WORKER_1
+  nodeSelector: {kubernetes.io/hostname: $WORKER_1}
   restartPolicy: Never
   securityContext:
     runAsNonRoot: true
