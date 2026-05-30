@@ -126,13 +126,14 @@ func TestControllerPropertiesDelete(t *testing.T) {
 	}
 }
 
-// TestControllerConfigEmptyObject pins the GET /v1/controller/config
-// stub: golinstor's `Controller.GetConfig()` parses the response into
-// a ControllerConfig struct (all fields `omitempty`) so an empty `{}`
-// is the minimal-but-correct response. blockstor doesn't run a JVM
-// config layer; the endpoint exists only because the CLI calls it
-// at startup and breaks on 404.
-func TestControllerConfigEmptyObject(t *testing.T) {
+// TestControllerConfigPopulated pins GET /v1/controller/config:
+// pre-fix it returned bare `{}`. Bug-hunt v0.1.3 Finding 15 wires
+// `log.level` (from the runtime slog LevelVar) and `http.enabled`
+// (always true — the apiserver only exists when HTTP is wired) so
+// `linstor c v` and any client that reads `cfg.log.level` without
+// a PUT round-trip see meaningful values. Sub-objects we don't yet
+// populate (debug / db / https / ldap) stay absent.
+func TestControllerConfigPopulated(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
 
@@ -143,13 +144,25 @@ func TestControllerConfigEmptyObject(t *testing.T) {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
 
-	var got map[string]any
+	var got struct {
+		Log struct {
+			Level string `json:"level"`
+		} `json:"log"`
+		HTTP struct {
+			Enabled bool `json:"enabled"`
+		} `json:"http"`
+	}
+
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 
-	if len(got) != 0 {
-		t.Errorf("expected empty object; got %v", got)
+	if got.Log.Level == "" {
+		t.Errorf("log.level: got empty, want a non-empty level string")
+	}
+
+	if !got.HTTP.Enabled {
+		t.Errorf("http.enabled: got false, want true (apiserver wired)")
 	}
 }
 

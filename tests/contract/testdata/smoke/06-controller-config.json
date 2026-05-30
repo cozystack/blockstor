@@ -1,7 +1,14 @@
 {
-  "name": "controller config empty object",
+  "name": "controller config populated",
   "method": "GET",
   "path": "/v1/controller/config",
   "expectedStatus": 200,
-  "expectedBody": {}
+  "expectedBody": {
+    "log": {
+      "level": "INFO"
+    },
+    "http": {
+      "enabled": true
+    }
+  }
 }

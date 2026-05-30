@@ -164,6 +164,30 @@ const warnNoSatelliteConnection = maskWarn | int64(2057)
 // (2057).
 const warnRscConnPathNotFound = maskWarn | int64(2058)
 
+// warnNetInterfaceNotFound flags a delete-of-missing on
+// `DELETE /v1/nodes/{node}/net-interfaces/{name}`. Bug-hunt v0.1.3
+// Finding 9: the pre-fix handler always returned 200 + maskInfo
+// "net-interface deleted: <name>" even when the interface was never
+// there, indistinguishable from a real drop in audit logs. Following
+// the Bug 56 / 66 family pattern, surface a warn-band envelope so
+// `grep '"ret_code":2059'` flags no-op idempotency replays. Sub-code
+// 2059 keeps the warn-band numbering monotonic alongside
+// warnRscConnPathNotFound (2058).
+const warnNetInterfaceNotFound = maskWarn | int64(2059)
+
+// warnNodeAlreadyGone flags a `DELETE /v1/nodes/{node}/lost` (node-
+// lost) replay where the named node is already absent from the
+// controller. Bug-hunt v0.1.3 Finding 9: the pre-fix handler folded
+// the NotFound into 200 + maskInfo "node lost: <name>", lying to the
+// caller that a real teardown happened. Audit-log greppers + cozystack
+// playbooks that re-run `n lost` on retry expect to distinguish a
+// successful cascade from a no-op replay. Sub-code 2060 keeps the
+// warn-band numbering monotonic alongside warnNetInterfaceNotFound
+// (2059). Separate from warnNodeNotFound (2053, used by plain
+// `DELETE /v1/nodes/{node}`) so the audit shape distinguishes the two
+// removal verbs.
+const warnNodeAlreadyGone = maskWarn | int64(2060)
+
 // apiCallRcFailSnapshotFinalizerStuck is emitted by `DELETE /v1/
 // resource-definitions/{rd}/snapshots/{snap}` (Bug 193) when the
 // Snapshot CRD's satellite-side finalizer

@@ -20,6 +20,7 @@ package rest
 
 import (
 	"context"
+	"log/slog"
 	"maps"
 	"net/http"
 
@@ -66,13 +67,86 @@ func (s *Server) registerControllerProperties(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v1/controller/config", handlePutControllerConfig)
 }
 
-// handleControllerConfig returns an empty ControllerConfig object.
-// blockstor's config lives in k8s (Deployment env, ConfigMaps, the
-// ControllerConfig CRD's typed fields) — there's no JVM-style flat
-// config file to expose. The empty `{}` satisfies golinstor's decoder
-// without leaking anything implementation-specific.
+// handleControllerConfig returns the populated ControllerConfig
+// subset blockstor supports. Bug-hunt v0.1.3 Finding 15: pre-fix
+// this returned bare `{}`, breaking `linstor c v` config display and
+// any client that does `cfg.log.level` to read the current logger
+// state without a PUT round-trip.
+//
+// Populated sub-objects:
+//
+//   - `log.level`: derived from the runtime slog level (PUT
+//     /v1/controller/config flips this same LevelVar — Bug 159).
+//   - `http.enabled`: literal true; the apiserver only exists when
+//     HTTP is wired, so reaching this handler proves it.
+//
+// Other ControllerConfig sub-objects (debug, db, https, ldap) stay
+// empty in this PR — blockstor doesn't run the JVM-style flat
+// config layer, so there's nothing meaningful to expose there.
+// Wider population lands when individual surfaces (e.g. mTLS for
+// https) become user-tunable.
 func handleControllerConfig(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, struct{}{})
+	writeJSON(w, http.StatusOK, controllerConfigEnvelope{
+		Log: controllerConfigLog{
+			Level: currentRuntimeLogLevelName(),
+		},
+		HTTP: controllerConfigHTTP{
+			Enabled: true,
+		},
+	})
+}
+
+// controllerConfigEnvelope mirrors the upstream ControllerConfig
+// JSON shape (subset). Bug-hunt v0.1.3 Finding 15. Only the
+// sub-objects blockstor can meaningfully populate are non-empty;
+// the rest stay zero-valued and serialise as `omitempty`-absent so
+// the wire shape stays compact.
+type controllerConfigEnvelope struct {
+	Log  controllerConfigLog  `json:"log"`
+	HTTP controllerConfigHTTP `json:"http"`
+}
+
+// controllerConfigLog mirrors the upstream log sub-object. We expose
+// the runtime level only; the upstream `directory` / `rest_access_log`
+// / `rest_access_log_mode` fields are JVM-specific and stay absent.
+type controllerConfigLog struct {
+	Level string `json:"level"`
+}
+
+// controllerConfigHTTP mirrors the upstream http sub-object. We
+// expose `enabled` only — the apiserver's listen-address / port
+// come from the K8s Service surface, not from the JVM-config file
+// upstream is mirroring.
+type controllerConfigHTTP struct {
+	Enabled bool `json:"enabled"`
+}
+
+// currentRuntimeLogLevelName reverse-maps the runtimeLogLevel
+// LevelVar to the upstream-CLI level vocabulary used by
+// parseLogLevel (TRACE / DEBUG / INFO / WARN / ERROR). Mirrors the
+// `set-log-level` PUT path so a GET → PUT round-trip is the
+// identity for any value the operator can set.
+//
+// The mapping is exact at the parseLogLevel boundaries (LevelDebug
+// → DEBUG, LevelInfo → INFO, ...) and uses the closest-bucket rule
+// for intermediate values — the LevelVar's Level() always returns
+// the value we Set() on the PUT path, so the only off-mapping case
+// is the initial default LevelInfo (slog's zero value), which maps
+// cleanly to INFO.
+func currentRuntimeLogLevelName() string {
+	level := runtimeLogLevel.Level()
+	switch {
+	case level <= slog.LevelDebug-traceBelowDebug:
+		return logLevelTrace
+	case level <= slog.LevelDebug:
+		return logLevelDebug
+	case level <= slog.LevelInfo:
+		return logLevelInfo
+	case level <= slog.LevelWarn:
+		return logLevelWarn
+	default:
+		return logLevelError
+	}
 }
 
 // handleControllerPropsGet returns ControllerConfig.Spec.ExtraProps

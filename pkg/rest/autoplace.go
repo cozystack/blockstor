@@ -110,7 +110,7 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 
 	out := make([]apiv1.ResourceWithVolumes, 0, len(resList))
 	for i := range resList {
-		out = append(out, apiv1.ResourceWithVolumes{Resource: resList[i]})
+		out = append(out, wrapResourceWithVolumes(&resList[i]))
 	}
 
 	// Bug 188 (P0): scrub deny-listed sensitive keys (passphrase,
@@ -132,6 +132,25 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 	stripInternalAnnotationsFromResourcesWithVolumes(out)
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// wrapResourceWithVolumes wraps a Resource into ResourceWithVolumes so
+// the `volumes` JSON key is always present (never `null`). Bug-hunt
+// v0.1.3 Finding 3: handleResourceList / handleResourceGet wrapped via
+// `ResourceWithVolumes{Resource: res}` leaving the outer Volumes nil,
+// which `encoding/json` serialises as `"volumes":null`. Upstream
+// LINSTOR's `Resource` schema has no `volumes` key at all, but the
+// Python CLI's `responses.py` derefs `rsc._rest_data['volumes']`
+// unconditionally and crashes on `None.iter`. Mirrors the
+// ensureVolumesForView contract used by /v1/view/resources: a non-nil
+// (possibly empty) slice survives the JSON encode as `[]`.
+func wrapResourceWithVolumes(res *apiv1.Resource) apiv1.ResourceWithVolumes {
+	out := apiv1.ResourceWithVolumes{Resource: *res, Volumes: res.Volumes}
+	if out.Volumes == nil {
+		out.Volumes = []apiv1.Volume{}
+	}
+
+	return out
 }
 
 // handleResourceGet answers `GET /v1/resource-definitions/{rd}/resources/{node}`,
@@ -185,7 +204,11 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// strip applied on the cluster-wide view and per-RD list paths.
 	res.Annotations = stripInternalAnnotations(res.Annotations)
 
-	writeJSON(w, http.StatusOK, apiv1.ResourceWithVolumes{Resource: res})
+	// Bug-hunt v0.1.3 Finding 3: wrap via wrapResourceWithVolumes so the
+	// outer `volumes` JSON key serialises as `[]` instead of `null` when
+	// the Resource carries no Volumes; protects python-linstor's
+	// `rsc._rest_data['volumes']` dereference.
+	writeJSON(w, http.StatusOK, wrapResourceWithVolumes(&res))
 }
 
 // handleAutoplace selects up to `place_count` nodes that have a storage

@@ -59,6 +59,14 @@ func (s *Server) registerResourceGroupExtras(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /v1/resource-groups/{rg}/query-max-volume-size",
 		s.requireStore(s.handleQueryMaxVolumeSize))
+	// Bug-hunt v0.1.3 Finding 10: upstream LINSTOR OpenAPI registers
+	// an RG-less variant under OPTIONS /v1/query-max-volume-size (yes,
+	// OPTIONS with a body — upstream quirk so the verb stays read-only
+	// while still accepting an AutoSelectFilter for ad-hoc queries).
+	// `linstor query-max-volume-size --place 2 --storage-pool zfs-thin`
+	// (no RG argument) routes through this URL; pre-fix it 404'd.
+	mux.HandleFunc("OPTIONS /v1/query-max-volume-size",
+		s.requireStore(s.handleQueryMaxVolumeSizeGlobal))
 	mux.HandleFunc("POST /v1/resource-groups/{rg}/adjust",
 		s.requireStore(s.handleRGAdjust))
 
@@ -394,6 +402,83 @@ func (s *Server) handleQueryMaxVolumeSize(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleQueryMaxVolumeSizeGlobal answers the top-level (no-RG)
+// `linstor query-max-volume-size` form. Bug-hunt v0.1.3 Finding 10:
+// upstream LINSTOR registers this under OPTIONS /v1/query-max-volume-
+// size (an upstream quirk — the verb is OPTIONS so it stays
+// nominally read-only while still accepting a body that carries an
+// AutoSelectFilter; HTTP technically allows it). The body is the
+// same AutoSelectFilter the RG-scoped variant computes against, so
+// we route it through computeSizeInfo and reshape into the same
+// `candidates` envelope handleQueryMaxVolumeSize uses.
+//
+// Empty / malformed body collapses to the zero filter (any pool,
+// place_count=1), matching upstream's behaviour for an operator
+// who runs `linstor query-max-volume-size` with no flags.
+func (s *Server) handleQueryMaxVolumeSizeGlobal(w http.ResponseWriter, r *http.Request) {
+	filter, ok := decodeQueryMaxVolumeSizeBody(w, r)
+	if !ok {
+		return
+	}
+
+	info, err := s.computeSizeInfo(r.Context(), &filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	pools := filterPoolNames(&filter)
+	if len(pools) == 0 {
+		pools = clusterPoolNames(r.Context(), s)
+	}
+
+	candidates := make([]maxVolumeSizeCandidate, 0, len(pools))
+
+	for _, p := range pools {
+		candidates = append(candidates, maxVolumeSizeCandidate{
+			MaxVolumeSizeKib: info.SpaceInfo.MaxVlmSizeInKib,
+			StoragePool:      p,
+			NodeNames:        poolNodeNamesFor(r.Context(), s, p),
+			AllThin:          false,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, maxVolumeSizeResponse{
+		DefaultMaxOversubscriptionRatio: 1.0,
+		Candidates:                      candidates,
+	})
+}
+
+// decodeQueryMaxVolumeSizeBody decodes the body of the top-level
+// OPTIONS /v1/query-max-volume-size into an AutoSelectFilter. An
+// empty / absent body collapses to the zero filter (no constraints)
+// so a hand-rolled `curl -X OPTIONS .../v1/query-max-volume-size`
+// with no body returns the cluster-wide candidate list rather than
+// 400 (the canonical decodeJSON helper rejects an empty body via the
+// Bug 158 envelope, which is the right call for create/modify paths
+// but wrong for this OPTIONS-with-optional-body endpoint).
+//
+// Returns (filter, true) on success; (_, false) after writing the
+// canonical Bug 158/161 envelope when the body is present but
+// malformed.
+func decodeQueryMaxVolumeSizeBody(w http.ResponseWriter, r *http.Request) (apiv1.AutoSelectFilter, bool) {
+	var filter apiv1.AutoSelectFilter
+
+	// Peek at Content-Length so an absent / empty body skips the
+	// decoder altogether — the canonical decodeJSON treats empty as
+	// 400 + envelope per Bug 158, but this endpoint must permit it.
+	if r.ContentLength == 0 {
+		return filter, true
+	}
+
+	if !decodeJSON(w, r, &filter) {
+		return apiv1.AutoSelectFilter{}, false
+	}
+
+	return filter, true
 }
 
 // handleRGAdjust answers `linstor rg adjust`. Upstream LINSTOR
