@@ -4,6 +4,35 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.3 — 2026-05-30
+
+### Fixed
+
+- **CSI storage-only auto-mkfs** — `local` StorageClass (no DRBD, single replica) now reaches Pod-ready end-to-end. The satellite was leaving storage-only resources unformatted because the mkfs path was wired only for the DRBD bring-up sequence; linstor-csi then failed `NodeStageVolume` with `wrong fs type`. The reconciler now formats the backing block device on the storage-only path before exposing it to the kubelet, and the `csi-pvc-local` e2e scenario is restored to gate the contract. Also wires the missing `POST /v1/resource-definitions/{rd}/resources/{node}` alias (linstor-csi v1.10.1 issues this single-node create — pre-fix the apiserver returned HTTP 405).
+- **Orphan-witness collapse grace removed** — the controller used to keep a TieBreaker witness alive for several reconcile cycles after the last diskful peer left, on the theory that a fresh diskful might race in. In practice the grace window only ever surfaced as stuck `Off` peers after `r d` + immediate `r c` on the same node. The collapse is now instant: when no diskful peer remains and no fresh placement is pending, the witness is deleted in the same reconcile.
+
+### Test infrastructure
+
+- **`tests/e2e/lib.sh` DS-converge barrier** — `reset_cluster_state` now waits up to 90s for the satellite DaemonSet to converge (`desiredNumberScheduled == numberReady`) before declaring the cluster reset. Pre-fix, fast successive scenarios occasionally started against a not-yet-rolled satellite and the failure looked like a flaky test rather than a missed barrier.
+
+## v0.1.2 — 2026-05-28
+
+Bug-fix and test-coverage release.
+
+### Fixed
+
+- **TieBreaker remains after `r d`** (Bug 338 re-regression) — adds the missing e2e regression catcher (`tests/e2e/tiebreaker-r-d-cleanup.sh`). The controller-side fix landed earlier in `resourcedefinition_controller.go` (`shouldKeepExistingWitness`), but the lack of a real-DRBD test let it silently re-regress on the dev stand. Future TieBreaker changes are now gated by an e2e scenario that exercises `linstor r d` one-by-one and asserts the witness invariant on the QEMU+Talos lane.
+
+### Test infrastructure
+
+- **e2e cascade attribution** — when a scenario leaves the cluster dirty, the next scenario is no longer wrongly blamed. New `strict_cleanup_on_exit` helper + `register_strict_cleanup` trap demote a leaving-PASS to FAIL if the cluster cleanup fails, and a pre-flight check at the top of each scenario rewrites the previous scenario's verdict to FAIL with a `LEFTOVER` reason when satellite pods or RDs are still present from the prior run.
+- **piraeus interop in CI** — the CI matrix now ships an `E2E (piraeus interop)` job that installs the upstream piraeus-operator against the blockstor apiserver and runs the linstor-csi scenarios (`rwx-ganesha`, `observability-three-way`, `observability-capacity-correlation`, `csi-pvc-replicated-rwo`) on a dedicated stand. Main lanes 1-6 keep running bare blockstor; the interop scenarios that need linstor-csi v1.10.1 + LinstorCluster CRD are isolated to the piraeus job.
+- **`csi-pvc-replicated-rwo` e2e** — new test pins the linstor-csi DRBD path end-to-end against the user-facing `replicated` StorageClass shape (3 DRBD replicas, full `DrbdOptions/*` prop set, write→delete pod→read back on another node).
+
+### Refactor
+
+- **`FilesystemFormatted` Stamper API** — adds `StampFilesystemObserved` (`Reason=FilesystemObserved`) alongside the existing `StampFilesystemFormatted` (`Reason=MkfsSucceeded`), plus a byte-identity SSA-shape test that prevents the PR #32-class `.status.volumes:null` regression. The observe call site is intentionally not wired yet — it requires routing from the observer event path rather than the per-RD apply lane and will land in a follow-up.
+
 ## v0.1.1 — 2026-05-28
 
 ### Fixed
