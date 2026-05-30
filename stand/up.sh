@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # usage: up.sh NAME CONTROLPLANES WORKERS EXTENSIONS WORK_DIR
-# Brings up a Talos cluster on QEMU/KVM. When EXTENSIONS is set, uses Talos
-# Image Factory to obtain a kernel+initramfs with those extensions baked in
-# and boots the VMs from those artifacts.
+# Brings up a Talos cluster on QEMU/KVM via `talosctl cluster create qemu`.
+# When EXTENSIONS is set we register a Talos Image Factory schematic with
+# those extensions and pass the resulting id as `--schematic-id`, so the
+# factory ISO the cluster boots from has the DRBD/ZFS bits baked in.
 set -euo pipefail
 
 NAME=${1:?cluster name required}
@@ -84,21 +85,17 @@ else
     BOOT_DIR="$SCHEMATIC_DIR/vanilla-$TALOS_VERSION-$ARCH"
 fi
 
+# Pre-1.13 `talosctl cluster create --provisioner qemu` consumed
+# `--vmlinuz-path`/`--initrd-path` directly, so up.sh used to fetch the
+# kernel + initramfs into $BOOT_DIR. In 1.13 the deprecation shim
+# behind `--provisioner qemu` no longer wires PKI SANs correctly and
+# the bootstrap RPC fails cert verification on the controlplane IP.
+# The replacement `talosctl cluster create qemu` subcommand handles
+# boot-artifact retrieval itself via `--presets iso --schematic-id <id>`
+# (pulls an ISO from the Image Factory) so the local kernel cache is
+# no longer needed. $BOOT_DIR is still created as a sentinel for
+# cleanup logic but stays empty.
 mkdir -p "$BOOT_DIR"
-VMLINUZ="$BOOT_DIR/vmlinuz"
-INITRD="$BOOT_DIR/initramfs.xz"
-INSTALLER_IMG="$BOOT_DIR/installer.tar"
-
-if [[ ! -s "$VMLINUZ" || ! -s "$INITRD" ]]; then
-    if [[ -n "$SCHEMATIC_ID" ]]; then
-        BASE="https://factory.talos.dev/image/$SCHEMATIC_ID/$TALOS_VERSION"
-    else
-        BASE="https://github.com/siderolabs/talos/releases/download/$TALOS_VERSION"
-    fi
-    echo ">> downloading kernel/initramfs from $BASE"
-    curl -fL "$BASE/kernel-$ARCH"        -o "$VMLINUZ"
-    curl -fL "$BASE/initramfs-$ARCH.xz"  -o "$INITRD"
-fi
 
 # Per-cluster CIDR offset to avoid collisions when running parallel stands.
 HASH=$(echo -n "$NAME" | sha256sum | cut -c1-2)
@@ -115,9 +112,9 @@ echo ">> preflight cleanup for '$NAME'"
 sudo bash "$(dirname "$0")/down.sh" "$NAME" "$WORK_DIR" >/dev/null 2>&1 || true
 mkdir -p "$STATE_DIR"
 
-# Talos qemu provisioner uses --vmlinuz-path/--initrd-path only for *boot*; the
-# on-disk install uses ghcr.io/siderolabs/installer:* by default, which lacks
-# our extensions. Override machine.install.image to the same factory schematic
+# The factory ISO carries our extensions for *boot*; the on-disk
+# install uses ghcr.io/siderolabs/installer:* by default, which lacks
+# them. Override machine.install.image to the same factory schematic
 # so the installed Talos has DRBD bits, and tell it to load the modules.
 if [[ -n "$SCHEMATIC_ID" ]]; then
     INSTALL_IMG="factory.talos.dev/installer/$SCHEMATIC_ID:$TALOS_VERSION"
@@ -158,29 +155,51 @@ machine:
         skipFallback: true
 YAML
 
+# Build the `--disks` list: first disk is the boot disk (20 GiB), the
+# rest are EXTRA_DISKS data disks at EXTRA_DISK_SIZE_GB each. The new
+# subcommand expects a single comma-separated `<driver>:<size>` list
+# instead of the old `--disk`/`--extra-disks`/`--extra-disks-size`
+# triple.
+# Backward compat: legacy `EXTRA_DISK_SIZE_MB` (MiB, e.g. 16384 = 16 GiB)
+# wins if set so stand/ci-e2e.sh keeps working unchanged.
+if [[ -n "${EXTRA_DISK_SIZE_MB:-}" ]]; then
+    EXTRA_DISK_SIZE_GB=$(( EXTRA_DISK_SIZE_MB / 1024 ))
+fi
+EXTRA_DISK_SIZE_GB=${EXTRA_DISK_SIZE_GB:-16}
+DISKS="virtio:20GiB"
+for _ in $(seq 1 ${EXTRA_DISKS:-2}); do
+    DISKS="$DISKS,virtio:${EXTRA_DISK_SIZE_GB}GiB"
+done
+
 echo ">> creating cluster '$NAME' (CP=$CONTROLPLANES, workers=$WORKERS, net=$NET_CIDR)"
-# talos qemu provisioner needs root for CNI bridge / netfilter; run via sudo -E
-# and fix ownership afterwards so the user can read configs.
-sudo -E "$TALOSCTL" cluster create \
+# 1.13 `cluster create qemu` subcommand: presets ISO + factory
+# schematic id give us a DRBD/ZFS-extension boot. Flag renames vs
+# the legacy `cluster create --provisioner qemu` path:
+#   --provisioner qemu        → (now the subcommand)
+#   --vmlinuz-path/--initrd-path → --presets iso (factory ISO download)
+#   --talosconfig             → --talosconfig-destination
+#   --memory                  → --memory-controlplanes
+#   --cpus                    → --cpus-controlplanes
+#   --disk + --extra-disks*   → --disks "<driver>:<size>,..."
+# `--wait` is implicit on the new subcommand. Run via `sudo -E`
+# because the qemu provisioner still needs root for CNI / netfilter.
+sudo -E "$TALOSCTL" cluster create qemu \
     --name "$NAME" \
-    --provisioner qemu \
     --state "$STATE_DIR" \
+    --presets iso \
+    --schematic-id "$SCHEMATIC_ID" \
+    --talos-version "$TALOS_VERSION" \
+    --talosconfig-destination "$TALOSCONFIG" \
     --controlplanes "$CONTROLPLANES" \
     --workers "$WORKERS" \
     --cidr "$NET_CIDR" \
-    --vmlinuz-path "$VMLINUZ" \
-    --initrd-path "$INITRD" \
-    --talosconfig "$TALOSCONFIG" \
     --kubernetes-version "${KUBERNETES_VERSION:-v1.34.1}" \
     --config-patch "@$PATCH_FILE" \
-    --memory 4096 \
+    --memory-controlplanes 4096 \
     --memory-workers 4096 \
-    --cpus 2 \
-    --cpus-workers 2 \
-    --disk 20480 \
-    --extra-disks ${EXTRA_DISKS:-2} \
-    --extra-disks-size ${EXTRA_DISK_SIZE_MB:-16384} \
-    --wait
+    --cpus-controlplanes 2.0 \
+    --cpus-workers 2.0 \
+    --disks "$DISKS"
 
 # `chown -R` does not follow a top-level symlink, so when WORK_DIR is
 # a symlink (the dev stand redirects `.work/<name>` →
