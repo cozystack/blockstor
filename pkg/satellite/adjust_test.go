@@ -519,3 +519,274 @@ func TestAdjustResourceBareWhenAllPeersConnected(t *testing.T) {
 			skipNetCmd, cmds)
 	}
 }
+
+// TestAdjustResourceBareOnStandAloneWithoutPeerDevices pins scenario
+// 5.32 / `tests/e2e/recovery-down-reverses.sh`: when the operator
+// ran `drbdadm down <rd>` and the reconciler revived the kernel
+// slot via the Bug-287 `drbdadm up` fallback, the freshly-allocated
+// connection slots can stick in `StandAlone` WITHOUT peer-device
+// entries (the kernel created the slot but the connect handshake
+// never registered the per-volume peer-device table). The next
+// `drbdadm adjust` MUST be a bare adjust — not `--skip-net` — so
+// `drbdsetup connect` is re-issued and the slot exits StandAlone.
+//
+// Smoking-gun evidence captured on PR #46 lane 1 breakpoint:
+//
+//	ci-lane1-worker-2 view:
+//	down-reverses node-id:1 role:Secondary suspended:quorum force-io-failures:no
+//	  volume:0 minor:20000 disk:Inconsistent backing_dev:/dev/loop5 quorum:no
+//	  ci-lane1-worker-1 node-id:0 connection:StandAlone role:Unknown
+//	  ci-lane1-worker-3 node-id:2 connection:StandAlone role:Unknown
+//
+// Both peers StandAlone, no peer-device entries — the recovery-
+// revive signature. Pre-fix the reconciler dispatched `--skip-net`
+// here (StandAlone alone was enough to flip the gate) and the
+// scenario aborted after 60s with both peers still StandAlone.
+// The fix narrows the gate to StandAlone AND peer-devices-present
+// (the operator-disconnect signal), so this case falls through to
+// bare adjust.
+func TestAdjustResourceBareOnStandAloneWithoutPeerDevices(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	// Local disk reads UpToDate (so the SkipDisk coercion path stays
+	// off — we're isolating the SkipNet gate). Peer slot exists in
+	// the kernel but its `peer_devices` array is empty: the post-
+	// `drbdadm up` recovery signature.
+	fx.Expect("drbdsetup status --verbose pvc-down-revive", storage.FakeResponse{
+		Stdout: []byte(`pvc-down-revive node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-down-revive_00000 quorum:yes
+      worker-2 node-id:1 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+`),
+	})
+
+	fx.Expect("drbdsetup status -j pvc-down-revive", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "pvc-down-revive",
+    "connections": [
+      {
+        "peer-node-id": 1,
+        "name": "worker-2",
+        "connection-state": "StandAlone",
+        "peer_devices": []
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-down-revive",
+		NodeName: "n1",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	bareCmd := "drbdadm adjust pvc-down-revive"
+	skipNetCmd := "drbdadm adjust --skip-net pvc-down-revive"
+
+	if !slices.Contains(cmds, bareCmd) {
+		t.Errorf("StandAlone without peer-devices: expected bare %q in commands; "+
+			"got %v (scenario 5.32 wedge — reconciler stuck both peers StandAlone)", bareCmd, cmds)
+	}
+
+	if slices.Contains(cmds, skipNetCmd) {
+		t.Errorf("StandAlone without peer-devices: %q must not run "+
+			"(would strand fresh-revive slots in StandAlone forever); got %v",
+			skipNetCmd, cmds)
+	}
+}
+
+// TestAdjustResourceBareOnMultiPeerStandAloneAllWithoutPeerDevices
+// covers the exact multi-peer shape captured in the PR #46 smoking
+// gun: two peers (UpToDate sibling + Diskless TieBreaker), both
+// stuck in `StandAlone` without peer-device entries after the
+// operator's `drbdadm down`+ Bug-287 `up` revive. Same invariant
+// as the single-peer test, but pinned for the multi-peer case so a
+// future regression that special-cased "exactly one peer" would
+// surface here.
+func TestAdjustResourceBareOnMultiPeerStandAloneAllWithoutPeerDevices(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	fx.Expect("drbdsetup status --verbose down-reverses", storage.FakeResponse{
+		Stdout: []byte(`down-reverses node-id:1 role:Secondary suspended:quorum force-io-failures:no
+  volume:0 minor:20000 disk:Inconsistent backing_dev:/dev/loop5 quorum:no
+      ci-lane1-worker-1 node-id:0 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+      ci-lane1-worker-3 node-id:2 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+`),
+	})
+
+	fx.Expect("drbdsetup status -j down-reverses", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "down-reverses",
+    "connections": [
+      {
+        "peer-node-id": 0,
+        "name": "ci-lane1-worker-1",
+        "connection-state": "StandAlone",
+        "peer_devices": []
+      },
+      {
+        "peer-node-id": 2,
+        "name": "ci-lane1-worker-3",
+        "connection-state": "StandAlone",
+        "peer_devices": []
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "ci-lane1-worker-2",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "down-reverses",
+		NodeName: "ci-lane1-worker-2",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 65536, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "1",
+			"address": "10.0.0.2",
+			"minor":   "20000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	bareCmd := "drbdadm adjust down-reverses"
+	skipNetCmd := "drbdadm adjust --skip-net down-reverses"
+
+	if !slices.Contains(cmds, bareCmd) {
+		t.Errorf("multi-peer StandAlone without peer-devices: expected bare %q; got %v",
+			bareCmd, cmds)
+	}
+
+	if slices.Contains(cmds, skipNetCmd) {
+		t.Errorf("multi-peer StandAlone without peer-devices: %q must not run; got %v",
+			skipNetCmd, cmds)
+	}
+}
+
+// TestAdjustResourceSkipNetOnMixedStandAlonePeerDevices pins the
+// disambiguator's tie-break direction in the multi-peer mixed case:
+// when ONE peer is StandAlone with peer-device entries (operator-
+// disconnect signal) and another is StandAlone WITHOUT peer-device
+// entries (fresh revive), the operator-disconnect signal wins —
+// `--skip-net` MUST fire so the operator's manual disconnect on
+// the first peer survives the reconcile. The fresh-revive peer
+// can wait for the next observer-trigger cycle to be picked up:
+// preserving operator intent on the first peer is the stricter
+// invariant of the two (an unwanted reconnect breaks W12 / split-
+// brain recovery; a delayed reconnect is recoverable).
+func TestAdjustResourceSkipNetOnMixedStandAlonePeerDevices(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	fx.Expect("drbdsetup status --verbose pvc-mixed-standalone", storage.FakeResponse{
+		Stdout: []byte(`pvc-mixed-standalone node-id:0 role:Secondary
+  volume:0 minor:1000 disk:UpToDate backing_dev:/dev/vg/pvc-mixed-standalone_00000 quorum:yes
+      worker-2 node-id:1 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+      worker-3 node-id:2 connection:StandAlone role:Unknown
+    volume:0 replication:Off peer-disk:DUnknown
+`),
+	})
+
+	fx.Expect("drbdsetup status -j pvc-mixed-standalone", storage.FakeResponse{
+		Stdout: []byte(`[
+  {
+    "name": "pvc-mixed-standalone",
+    "connections": [
+      {
+        "peer-node-id": 1,
+        "name": "worker-2",
+        "connection-state": "StandAlone",
+        "peer_devices": [
+          {"volume": 0}
+        ]
+      },
+      {
+        "peer-node-id": 2,
+        "name": "worker-3",
+        "connection-state": "StandAlone",
+        "peer_devices": []
+      }
+    ]
+  }
+]
+`),
+	})
+
+	rec := NewReconciler(ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-mixed-standalone",
+		NodeName: "n1",
+		Props:    map[string]string{},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		DrbdOptions: map[string]string{
+			"port":    "7000",
+			"node-id": "0",
+			"address": "10.0.0.1",
+			"minor":   "1000",
+		},
+	}
+
+	if err := rec.adjustResource(context.Background(), dr, false); err != nil {
+		t.Fatalf("adjustResource: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	skipNetCmd := "drbdadm adjust --skip-net pvc-mixed-standalone"
+	bareCmd := "drbdadm adjust pvc-mixed-standalone"
+
+	if !slices.Contains(cmds, skipNetCmd) {
+		t.Errorf("mixed StandAlone (one with peer-devices): expected %q "+
+			"(operator-disconnect signal wins); got %v", skipNetCmd, cmds)
+	}
+
+	if slices.Contains(cmds, bareCmd) {
+		t.Errorf("mixed StandAlone (one with peer-devices): %q must not run "+
+			"(would re-connect operator-disconnected peer); got %v", bareCmd, cmds)
+	}
+}
