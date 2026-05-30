@@ -2188,12 +2188,19 @@ func TestAutoplaceImpossibleCountListsCriteria(t *testing.T) {
 }
 
 // TestAutoplaceCapacityShortfallSurfacesNumericDetails verifies the
-// capacity-shortfall branch (Bug 35) also routes through the F13
-// structured envelope and that the Details block cites both the
-// required size and the largest free capacity. Operators sizing a
-// PVC against a tight pool need the numeric gap visible in the
+// capacity-shortfall branch (Bug 35 / Issue #45) routes through the
+// F13 structured envelope and that the Details block cites both the
+// required size and the effective MaxVolumeSize cap. Operators sizing
+// a PVC against a tight pool need the numeric gap visible in the
 // reply — without it they have to ssh to a satellite and read
 // `zfs list` / `vgs` to figure out what to grow.
+//
+// Issue #45: the REST-level capacity gate now fires BEFORE the
+// placer, so the numeric reported here is the over-subscription-
+// aware MaxVlmSizeInKib (FreeCapacity 1 × default thin ratio 20 =
+// 20 KiB), matching the value `linstor rg query-size-info` shows
+// and the parallel spawn-side gate (`rejectIfExceedsOversubGate`)
+// reports.
 func TestAutoplaceCapacityShortfallSurfacesNumericDetails(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
@@ -2211,8 +2218,8 @@ func TestAutoplaceCapacityShortfallSurfacesNumericDetails(t *testing.T) {
 	}
 
 	// Pool with 1 KiB free can't host the 1 GiB volume — capacity
-	// gate fires, returning a CapacityShortfallError that
-	// runPlaceAndReport must route through writeAutoplaceShortfall.
+	// gate fires. The REST-level gate (Issue #45) reports the
+	// oversub-aware cap (20 KiB = 1 × default thin ratio 20).
 	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
 		StoragePoolName: "tiny",
 		NodeName:        "n1",
@@ -2252,8 +2259,13 @@ func TestAutoplaceCapacityShortfallSurfacesNumericDetails(t *testing.T) {
 		t.Errorf("details missing required '1048576 KiB', got:\n%s", details)
 	}
 
-	if !strings.Contains(details, " 1 KiB") {
-		t.Errorf("details missing max-free '1 KiB', got:\n%s", details)
+	// REST-level gate reports MaxVlmSizeInKib (oversub-aware): 20 KiB
+	// = FreeCapacity 1 × default thin ratio 20. Pre-Issue-#45 the
+	// placer-level gate reported the raw FreeCapacity (1 KiB); the
+	// new REST gate fires first and surfaces the same value the
+	// spawn-side oversub gate uses, keeping the two paths in sync.
+	if !strings.Contains(details, "20 KiB") {
+		t.Errorf("details missing max-free '20 KiB', got:\n%s", details)
 	}
 }
 
