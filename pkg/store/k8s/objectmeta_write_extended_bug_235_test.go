@@ -61,14 +61,42 @@ import (
 
 // extendedObjectMetaWriteAllowList enumerates {dir, file,
 // line-substring} triples the extended audit accepts as deliberately
-// safe. Empty by default — every existing write in the walked dirs
-// is either a nil-guard init, an additive append, or a selective
-// DeleteFunc (verified by the audit on the baseline commit). Add an
-// entry only with a justification comment explaining why the write
-// cannot regress the wipe class.
+// safe. Add an entry only with a justification comment explaining why
+// the write cannot regress the wipe class.
 //
 //nolint:gochecknoglobals // package-level test data
-var extendedObjectMetaWriteAllowList = []extendedObjectMetaWriteAllowListEntry{}
+var extendedObjectMetaWriteAllowList = []extendedObjectMetaWriteAllowListEntry{
+	// Bug-hunt v0.1.3 Finding 2 (wire-boundary annotation strip):
+	// the three single-object GET handlers below replace the local
+	// `Annotations` field on a value-copy returned by `Store.*().Get`
+	// (which returns `apiv1.Resource` / `apiv1.ResourceDefinition` /
+	// `apiv1.ResourceGroup` by value, not pointer — verified at
+	// pkg/store/k8s/{resources,resource_definitions,resource_groups}.go).
+	// `stripInternalAnnotations` allocates a fresh map every call, so
+	// the assignment swaps a local pointer; the in-store object is
+	// never touched. This is the wire-OUT boundary, not a write-back
+	// path — the Bug 211 wipe class (controller-stamped key destroyed
+	// by a write that reaches the store cache) cannot fire here.
+	// Bulk-list siblings (`stripInternalAnnotationsFromRDs` etc. in
+	// `internal_annotations.go`) use the same shape against
+	// `slice[i].Annotations`, which the regex already excludes — only
+	// these three single-object GET sites need the explicit allow.
+	{
+		dir:           "pkg/rest",
+		file:          "autoplace.go",
+		lineSubstring: "res.Annotations = stripInternalAnnotations(res.Annotations)",
+	},
+	{
+		dir:           "pkg/rest",
+		file:          "resource_definitions.go",
+		lineSubstring: "rd.Annotations = stripInternalAnnotations(rd.Annotations)",
+	},
+	{
+		dir:           "pkg/rest",
+		file:          "resource_groups.go",
+		lineSubstring: "rg.Annotations = stripInternalAnnotations(rg.Annotations)",
+	},
+}
 
 type extendedObjectMetaWriteAllowListEntry struct {
 	dir           string // path relative to module root, e.g. "pkg/rest"

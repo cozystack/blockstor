@@ -124,6 +124,13 @@ func (s *Server) handleResourceList(w http.ResponseWriter, r *http.Request) {
 		redactSensitiveProps(out[i].Props)
 	}
 
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
+	// before the JSON encode. The reconcilers stamp `blockstor.io/*`
+	// and `bug<N>.blockstor.cozystack.io/*` keys for in-process
+	// bookkeeping; the wire shape must not carry them. See
+	// pkg/rest/internal_annotations.go.
+	stripInternalAnnotationsFromResourcesWithVolumes(out)
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -173,6 +180,10 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	// Resources().Get returns a value copy, so the in-place mutation
 	// stays local to this response. Mirrors the list-side scrub above.
 	redactSensitiveProps(res.Props)
+
+	// Bug-hunt v0.1.3 Finding 2: same controller-internal-annotation
+	// strip applied on the cluster-wide view and per-RD list paths.
+	res.Annotations = stripInternalAnnotations(res.Annotations)
 
 	writeJSON(w, http.StatusOK, apiv1.ResourceWithVolumes{Resource: res})
 }

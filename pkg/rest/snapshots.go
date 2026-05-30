@@ -159,6 +159,13 @@ func (s *Server) handleSnapshotsView(w http.ResponseWriter, r *http.Request) {
 	// Bug 115's RD-side redaction at the REST boundary.
 	redactSnapshotsInPlace(snaps)
 
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
+	// from every snapshot. The reconcilers stamp the same
+	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` keys on
+	// Snapshot CRDs as on Resource / RD / RG; the wire shape must not
+	// carry them.
+	stripInternalAnnotationsFromSnapshots(snaps)
+
 	// Optional filters golinstor sends: ?resources=rd1,rd2 &
 	// snapshots=name1,name2 — case-insensitive set membership against
 	// Java LINSTOR's behaviour. Without filtering linstor-csi's "do
@@ -255,6 +262,10 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 	// all carry the canary on the wire without this sweep.
 	redactSnapshotsInPlace(snaps)
 
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
+	// — mirrors the cluster-wide view path.
+	stripInternalAnnotationsFromSnapshots(snaps)
+
 	writeJSON(w, http.StatusOK, snaps)
 }
 
@@ -287,6 +298,10 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 	// this response — the store cache stays un-redacted for the
 	// satellite-side LUKS reads which need the real value.
 	redactSnapshotsInPlace(single)
+
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal annotations
+	// on the single-snapshot wire shape — mirrors the bulk paths.
+	stripInternalAnnotationsFromSnapshots(single)
 
 	writeJSON(w, http.StatusOK, single[0])
 }

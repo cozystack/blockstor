@@ -117,6 +117,12 @@ func (s *Server) handleRDList(w http.ResponseWriter, r *http.Request) {
 		stampRDLayerDataFromStack(&rds[i])
 	}
 
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
+	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// from every RD before the JSON encode. See
+	// pkg/rest/internal_annotations.go.
+	stripInternalAnnotationsFromRDs(rds)
+
 	writeJSON(w, http.StatusOK, rds)
 }
 
@@ -148,6 +154,11 @@ func (s *Server) handleRDGet(w http.ResponseWriter, r *http.Request) {
 	// per-RD GET path, matching the bulk-list handler above. See
 	// stampRDLayerDataFromStack for the projection rules.
 	stampRDLayerDataFromStack(&rd)
+
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
+	// annotations on the single-RD wire shape — mirrors the bulk-list
+	// scrub above.
+	rd.Annotations = stripInternalAnnotations(rd.Annotations)
 
 	writeJSON(w, http.StatusOK, rd)
 }

@@ -108,6 +108,11 @@ func (s *Server) handleRGList(w http.ResponseWriter, r *http.Request) {
 		redactSensitiveProps(rgs[i].Props)
 	}
 
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
+	// annotations from every RG before the JSON encode. See
+	// pkg/rest/internal_annotations.go.
+	stripInternalAnnotationsFromRGs(rgs)
+
 	writeJSON(w, http.StatusOK, rgs)
 }
 
@@ -130,6 +135,11 @@ func (s *Server) handleRGGet(w http.ResponseWriter, r *http.Request) {
 	// mutation is local to this response and does not leak back
 	// into the store cache.
 	redactSensitiveProps(rg.Props)
+
+	// Bug-hunt v0.1.3 Finding 2: strip controller-internal
+	// annotations on the single-RG wire shape — mirrors the bulk-list
+	// scrub above.
+	rg.Annotations = stripInternalAnnotations(rg.Annotations)
 
 	writeJSON(w, http.StatusOK, rg)
 }

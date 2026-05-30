@@ -539,13 +539,16 @@ func isKnownStoragePoolKind(kind string) bool {
 // piraeus assumes that invariant when it iterates over per-node SPs in
 // its reconcile loop.
 //
-// Idempotency: re-POSTing the same (node, pool) is a no-op success rather
-// than 409 Conflict. Piraeus's satellite Hello/heartbeat reposts the same
-// pool on every registration tick; treating it as upsert keeps the retry
-// loop quiet and matches the operator's expectation that "re-announce"
-// is safe. Upstream LINSTOR returns an error on duplicate-create, but
-// piraeus retries through that error indefinitely, so the practical
-// outcome is the same — we just skip the retry storm.
+// Duplicate-create contract (Bug-hunt v0.1.3 Finding 1): a re-POST
+// against an existing (node, pool) returns 409 + (MASK_ERROR | 508
+// = FAIL_EXISTS_STOR_POOL) and does NOT mutate the live row. The
+// pre-fix handler silently overwrote `Props` / `ProviderKind` /
+// `FreeSpaceMgrName` from the POST body and returned 201 — a
+// data-plane-impacting footgun: a retrying CSI driver or a mistaken
+// `linstor sp c` repeat could wipe `StorDriver/ZPool`, flip
+// `provider_kind`, etc. Mutation now lives behind PUT
+// (`storage-pool modify` / `storage-pool set-property`). This
+// matches upstream LINSTOR's behaviour on the same input.
 func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 
@@ -624,7 +627,7 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 	}
 
 	if errors.Is(createErr, store.ErrAlreadyExists) {
-		s.upsertStoragePool(w, r, &body, node)
+		s.refuseDuplicateStoragePool(w, &body, node)
 
 		return
 	}
@@ -691,43 +694,34 @@ func decodeStoragePoolCreate(w http.ResponseWriter, r *http.Request, node string
 	return body, true
 }
 
-// upsertStoragePool merges the POST body's Spec fields onto the
-// existing row when a pool with the same (node, pool) already exists.
-// Capacity / status fields stay where SetCapacity put them. Returns
-// 201 + envelope on success.
-func (s *Server) upsertStoragePool(w http.ResponseWriter, r *http.Request, body *apiv1.StoragePool, node string) {
-	existing, getErr := s.Store.StoragePools().Get(r.Context(), node, body.StoragePoolName)
-	if getErr != nil {
-		writeStoreError(w, getErr)
-
-		return
-	}
-
-	existing.ProviderKind = body.ProviderKind
-	if body.Props != nil {
-		existing.Props = body.Props
-	}
-
-	if body.FreeSpaceMgrName != "" {
-		existing.FreeSpaceMgrName = body.FreeSpaceMgrName
-	}
-
-	if body.SharedSpaceID != "" {
-		existing.SharedSpaceID = body.SharedSpaceID
-	}
-
-	existing.ExternalLocking = body.ExternalLocking
-
-	updateErr := s.Store.StoragePools().Update(r.Context(), &existing)
-	if updateErr != nil {
-		writeStoreError(w, updateErr)
-
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "storage pool already present, updated in place: " + body.StoragePoolName + " on " + node,
+// refuseDuplicateStoragePool rejects a POST against an SP that already
+// exists with the upstream-LINSTOR-shaped 409 + FAIL_EXISTS_STOR_POOL
+// envelope. Bug-hunt v0.1.3 Finding 1: the pre-fix handler silently
+// mutated the live row's Props / ProviderKind / FreeSpaceMgrName from
+// the POST body and returned 201 with "storage pool already present,
+// updated in place" — a retrying CSI driver or a mistaken `linstor sp
+// c` repeat could wipe `StorDriver/ZPool`, flip `provider_kind`, or
+// otherwise corrupt the live row without any 4xx surface.
+//
+// New contract: POST is CREATE-only. Mutation lives behind
+// `PUT /v1/nodes/{node}/storage-pools/{pool}` (storage-pool modify).
+// The wire shape is byte-identical to upstream's `linstor sp c`
+// duplicate reply: 409 + (MASK_ERROR | 508) + the existing /
+// requested object refs.
+func (s *Server) refuseDuplicateStoragePool(w http.ResponseWriter, body *apiv1.StoragePool, node string) {
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsStorPool,
+		Message: "storage pool '" + body.StoragePoolName + "' on node '" + node + "' already exists",
+		Cause: "POST /v1/nodes/{node}/storage-pools is CREATE-only; the requested " +
+			"(node, pool) is already registered.",
+		Correc: "To change provider_kind / props / free_space_mgr_name on an " +
+			"existing pool use `PUT /v1/nodes/" + node + "/storage-pools/" +
+			body.StoragePoolName + "` (`linstor storage-pool set-property` / " +
+			"`linstor storage-pool modify`).",
+		ObjRefs: map[string]string{
+			objRefNode:     node,
+			objRefStorPool: body.StoragePoolName,
+		},
 	}})
 }
 

@@ -111,6 +111,15 @@ func (s *Server) handleResourcesView(w http.ResponseWriter, r *http.Request) {
 		return strings.Compare(left.NodeName, right.NodeName)
 	})
 
+	// Bug-hunt v0.1.3 Finding 2: scrub controller-internal
+	// `blockstor.io/*` + `bug<N>.blockstor.cozystack.io/*` annotations
+	// from every entry before the JSON encode. The reconcilers stamp
+	// these onto the in-process Resource for their own bookkeeping
+	// (peer-changed timestamps, resize-pending size deltas, ...); the
+	// struct field stays, but nothing internal escapes the wire
+	// boundary. See pkg/rest/internal_annotations.go.
+	stripInternalAnnotationsFromResourcesWithVolumes(out)
+
 	writeJSON(w, http.StatusOK, paginateResources(r, out))
 }
 
