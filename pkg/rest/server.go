@@ -33,6 +33,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/events"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/version"
 )
@@ -157,6 +159,22 @@ type Server struct {
 	// invokes the callback inline on its own goroutine and any
 	// blocking work delays the serve loop entry.
 	OnReady func()
+
+	// eventBrokersInit gates the lazy initialisation of the SSE
+	// brokers below. The two brokers back `/v1/events/drbd/promotion`
+	// and `/v1/events/nodes` respectively — see pkg/rest/events.go.
+	// Lazy init keeps a zero-value Server bootable in unit tests
+	// that build the mux without going through a constructor.
+	eventBrokersInit sync.Once
+	// drbdPromotionBroker fans `may-promote-change` events out to
+	// every SSE subscriber on `/v1/events/drbd/promotion`. Publishers
+	// (controller-side role-transition observers) reach this via
+	// Server.DRBDPromotionBroker().
+	drbdPromotionBroker *events.Broker[apiv1.EventMayPromoteChange]
+	// nodeChangeBroker fans `node-change` events out to every SSE
+	// subscriber on `/v1/events/nodes`. Publishers reach this via
+	// Server.NodeChangeBroker().
+	nodeChangeBroker *events.Broker[apiv1.EventNodeChange]
 }
 
 // SetResolveHost overrides the DNS-lookup function used by
@@ -315,7 +333,37 @@ func (s *Server) startTLS(ctx context.Context, handler http.Handler, errCh chan<
 func (s *Server) handler() http.Handler {
 	mux := s.buildMux()
 
-	return withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+	wrapped := withLogging(instrumentRequests(mux, withHEADContentLength(with404Envelope(withContentTypeJSON(mux, withBodyLimit(maxRequestBodyBytes, mux))))))
+
+	// SSE bypass: the event-stream endpoints push frames over a long-
+	// lived connection, which is fundamentally incompatible with the
+	// envelope/HEAD body-buffering wrappers (they swallow Write into a
+	// bytes.Buffer and only replay on handler return — that defeats
+	// streaming entirely; the wrapped ResponseWriter also does not
+	// implement http.Flusher, which streamSSE detects and 500s on).
+	// Route the SSE paths straight to the mux so the raw
+	// http.ResponseWriter — which IS a Flusher — reaches the handler.
+	// The streaming endpoints set their own Content-Type and don't
+	// need the 4xx-envelope hygiene the rest of the API relies on; a
+	// non-existent SSE path is a misconfiguration the operator hits
+	// once, not a client-driver concern.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isSSEPath(r.URL.Path) {
+			mux.ServeHTTP(w, r)
+
+			return
+		}
+
+		wrapped.ServeHTTP(w, r)
+	})
+}
+
+// isSSEPath reports whether the request path is one of the streaming
+// SSE endpoints that must bypass the buffering middleware chain.
+// Centralised here so the bypass logic stays close to the middleware
+// wiring it influences.
+func isSSEPath(p string) bool {
+	return p == "/v1/events/drbd/promotion" || p == "/v1/events/nodes"
 }
 
 // waitAndShutdown blocks until ctx is cancelled or any listener
@@ -440,6 +488,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	s.registerResourceGroupExtras(mux)
 	s.registerSchedules(mux)
 	s.registerUpstreamParity225_229(mux)
+	s.registerEvents(mux)
 
 	return mux
 }
