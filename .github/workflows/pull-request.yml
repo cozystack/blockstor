@@ -239,7 +239,7 @@ jobs:
       # `e2e-piraeus` job below, which installs piraeus in EXTERNAL mode
       # against blockstor's apiserver (no upstream Java linstor-controller).
       # ci-e2e.sh drops these from the discovered suite.
-      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo"
+      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo csi-pvc-local"
     permissions:
       contents: read
       checks: write
@@ -366,7 +366,15 @@ jobs:
         # LANE=1 LANES=1 → the single lane runs every listed scenario;
         # ci-e2e.sh honours INSTALL_PIRAEUS=1 (job env) to deploy piraeus
         # after blockstor so these scenarios have the stack they drive.
-        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo"
+        # csi-pvc-local runs BEFORE csi-pvc-replicated-rwo by design:
+        # the local scenario is stateless (storage-only PVC, no DRBD,
+        # no cross-node migration), so any cleanup races it surfaces
+        # cannot contaminate the next scenario. The replicated one
+        # creates Pods on two workers in sequence and its cleanup,
+        # even after the synchronous Pod-delete fix, races
+        # pv-controller's ControllerPublishVolume retries — putting
+        # it last keeps that storm out of the local scenario's window.
+        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-local csi-pvc-replicated-rwo"
 
       - name: Upload e2e logs
         if: always()
