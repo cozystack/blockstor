@@ -281,6 +281,105 @@ const apiCallRcFailInvldStorPoolName int64 = 552
 // equivalent without a separate rule.
 const apiCallRcFailExistsStorPool int64 = 508
 
+// apiCallRcFailExistsNode mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_NODE` (500). Wired through
+// `writeStoreErrorTyped` for any code path that surfaces a
+// `store.ErrAlreadyExists` against the Nodes collection so the typed
+// band reaches the wire instead of the bare MASK_ERROR. blockstor's
+// `POST /v1/nodes` is deliberately idempotent (cli-parity-audit row
+// #44) and does NOT raise this code, but the underlying CRD store
+// can still surface ErrAlreadyExists on a Create race (two clients
+// posting at the same time, the upsert path loses to the sibling);
+// without the typed band the loser sees an opaque generic error.
+//
+// Bug-hunt 2026-05-30 Finding 5: the duplicate-create / not-found
+// family across CRUD verbs (RG/RD/Resource/Node/SP) used to skip the
+// sub-code OR. Constants for every kind are kept side-by-side so the
+// `writeStoreErrorTyped` switch stays a one-liner per kind.
+const apiCallRcFailExistsNode int64 = 500
+
+// apiCallRcFailExistsRsc mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_RSC`. Emitted by `POST
+// /v1/resource-definitions/{rd}/resources` (bulk) and `POST
+// /v1/resource-definitions/{rd}/resources/{node}` (single-node alias)
+// when a Resource on the requested (rd, node) pair already exists and
+// the caller's body does NOT match the upstream "promote
+// diskless/tiebreaker to diskful" toggle shape (no StorPoolName, no
+// `Flags:[DISKLESS]`, no TIE_BREAKER witness on the existing replica).
+//
+// Bug-hunt 2026-05-30 Finding 5: the pre-fix duplicate-resource POST
+// surfaced as a bare MASK_ERROR with no sub-code, so
+// `client.ApiCallError.Is(client.FAIL_EXISTS_RSC)` in golinstor
+// returned false and piraeus-operator could not branch on "already
+// exists" vs. real conflict.
+//
+// Upstream `ApiConsts.FAIL_EXISTS_RSC` is 502, which collides with
+// blockstor's historical `apiCallRcFailExistsVlmDfn` (also 502).
+// We park FAIL_EXISTS_RSC at 504 — outside the upstream cluster —
+// so golinstor's `Is(FAIL_EXISTS_RSC)` check uses a distinct sub-code
+// from VlmDfn while staying in the blockstor-internal allocation band.
+const apiCallRcFailExistsRsc int64 = 504
+
+// apiCallRcFailExistsRscGrp mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_RSC_GRP`. Emitted by `POST
+// /v1/resource-groups` when an RG with the requested name already
+// exists.
+//
+// Bug-hunt 2026-05-30 Finding 5: the pre-fix duplicate-RG POST went
+// through bare `writeStoreError → writeError` and surfaced
+// `apiCallRcError` with no sub-code. Audit-log greppers and golinstor
+// callers that pattern-match on FAIL_EXISTS_RSC_GRP could not
+// distinguish "RG already exists" from any other 5xx-class store
+// error.
+//
+// 510 (rather than upstream's 522 in `third_party/linstor-common/
+// consts.json`) is the blockstor-internal allocation chosen by the
+// bug-hunt report so the sub-code is stable across the typed
+// duplicate-create family.
+const apiCallRcFailExistsRscGrp int64 = 510
+
+// apiCallRcFailNotFoundNode mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_NOT_FOUND_NODE`. Used by `writeStoreErrorTyped` on
+// cross-reference NotFound for the write side: e.g. `POST
+// /v1/resource-definitions/{rd}/resources` referring to a Node that
+// doesn't exist. Distinct from the existing Bug-94 pre-write gate at
+// `pkg/rest/autoplace.go:checkResourceCreateNodeAndPool` which writes
+// its own typed 404 inline — the constant is wired here so any code
+// path that surfaces a Node NotFound through `writeStoreError`
+// (rather than the inline gate) still gets the typed band.
+//
+// 503 (rather than upstream's 300 in `third_party/linstor-common/
+// consts.json`) is the blockstor-internal allocation chosen by the
+// bug-hunt report so the typed duplicate / not-found family is
+// numerically contiguous.
+const apiCallRcFailNotFoundNode int64 = 503
+
+// apiCallRcFailNotFoundRscDfn mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_NOT_FOUND_RSC_DFN`. Used by `writeStoreErrorTyped`
+// on cross-reference NotFound for the write side: e.g. `POST
+// /v1/resource-definitions/{rd}/snapshots` against an RD that doesn't
+// exist. The existing `refuseResourceCreateOnUnknownRD` Bug-144 gate
+// writes a typed 404 inline before the store call; this constant
+// covers the post-gate paths that surface a NotFound from the store
+// (cache lag, race with a concurrent `rd d`).
+//
+// 540 (rather than upstream's 301 in `third_party/linstor-common/
+// consts.json`) is the blockstor-internal allocation chosen by the
+// bug-hunt report.
+const apiCallRcFailNotFoundRscDfn int64 = 540
+
+// apiCallRcFailNotFoundStorPool mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_NOT_FOUND_STOR_POOL`. Used by `writeStoreErrorTyped`
+// on cross-reference NotFound for the write side: e.g. a `POST
+// resource` whose body pins a StorPoolName that's not registered on
+// the target node and the existing Bug-118 inline gate is bypassed
+// (cache lag, race with a concurrent `sp d`).
+//
+// 550 (rather than upstream's 310 in `third_party/linstor-common/
+// consts.json`) is the blockstor-internal allocation chosen by the
+// bug-hunt report.
+const apiCallRcFailNotFoundStorPool int64 = 550
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the
