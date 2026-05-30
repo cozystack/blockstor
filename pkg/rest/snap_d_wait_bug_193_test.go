@@ -164,6 +164,10 @@ func (s *stuckSnapshotStore) ControllerProps() store.ControllerPropsStore {
 	return s.inner.ControllerProps()
 }
 
+func (s *stuckSnapshotStore) StoragePoolDefinitions() store.StoragePoolDefinitionStore {
+	return s.inner.StoragePoolDefinitions()
+}
+
 // seedSnapshot stamps a parent RD + Snapshot directly on the inner
 // inmemory store so the bug-fixture is in place before the stuck
 // semantics kick in on the Delete path.

@@ -87,26 +87,55 @@ func (s *Server) handleStoragePoolDefinitionList(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Finding 6 (P2): the response now merges two surfaces:
+	//
+	//  1. The synthesized rows (one per unique per-node StoragePool
+	//     name) — keeps the original Python-CLI consumers happy: a
+	//     pool that exists on at least one node always shows up in
+	//     `linstor sp-d l` regardless of whether the controller's
+	//     definition registry was ever populated.
+	//  2. The explicit registry rows persisted by POST /v1/storage-
+	//     pool-definitions. These carry the operator-set props the
+	//     pure-synthesis path can't reproduce (e.g. cluster-wide
+	//     `MaxOversubscriptionRatio`).
+	//
+	// Names overlap when a definition was POSTed AND a per-node pool
+	// was created with the same name — operators get one row with
+	// the explicit definition's props (the registry wins because it
+	// carries operator intent the synthesis can't recover).
+	defs, defErr := s.Store.StoragePoolDefinitions().List(r.Context())
+	if defErr != nil {
+		writeError(w, http.StatusInternalServerError, defErr.Error())
+
+		return
+	}
+
 	// Upstream's StoragePoolDefinition uses `storage_pool_name` on
 	// the wire but the Python parser exposes it as `.name`. golinstor
 	// uses the same lookup as `Name`, so the wire field is the
 	// canonical one. We also surface an empty props map — the Python
 	// CLI dereferences `.properties` on every entry.
-	type storagePoolDefinition struct {
-		StoragePoolName string            `json:"storage_pool_name"`
-		Props           map[string]string `json:"props"`
-	}
+	seen := map[string]int{}
+	out := make([]storagePoolDefinitionWire, 0, len(pools)+len(defs))
 
-	seen := map[string]struct{}{}
-	out := make([]storagePoolDefinition, 0, len(pools))
+	for i := range defs {
+		props := map[string]string{}
+		maps.Copy(props, defs[i].Props)
+
+		seen[defs[i].Name] = len(out)
+		out = append(out, storagePoolDefinitionWire{
+			StoragePoolName: defs[i].Name,
+			Props:           props,
+		})
+	}
 
 	for i := range pools {
 		if _, dup := seen[pools[i].StoragePoolName]; dup {
 			continue
 		}
 
-		seen[pools[i].StoragePoolName] = struct{}{}
-		out = append(out, storagePoolDefinition{
+		seen[pools[i].StoragePoolName] = len(out)
+		out = append(out, storagePoolDefinitionWire{
 			StoragePoolName: pools[i].StoragePoolName,
 			Props:           map[string]string{},
 		})

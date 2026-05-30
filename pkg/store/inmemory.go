@@ -32,29 +32,31 @@ import (
 // InMemory is the Phase 1 store: thread-safe, RAM-backed, lost on restart.
 // Phase 2 introduces a CRD-backed store that satisfies the same interface.
 type InMemory struct {
-	nodes               *inMemoryNodes
-	storagePools        *inMemoryStoragePools
-	resourceGroups      *inMemoryResourceGroups
-	resourceDefinitions *inMemoryResourceDefinitions
-	resources           *inMemoryResources
-	volumeDefinitions   *inMemoryVolumeDefinitions
-	snapshots           *inMemorySnapshots
-	physicalDevices     *inMemoryPhysicalDevices
-	controllerProps     *inMemoryControllerProps
+	nodes                  *inMemoryNodes
+	storagePools           *inMemoryStoragePools
+	resourceGroups         *inMemoryResourceGroups
+	resourceDefinitions    *inMemoryResourceDefinitions
+	resources              *inMemoryResources
+	volumeDefinitions      *inMemoryVolumeDefinitions
+	snapshots              *inMemorySnapshots
+	physicalDevices        *inMemoryPhysicalDevices
+	controllerProps        *inMemoryControllerProps
+	storagePoolDefinitions *inMemoryStoragePoolDefinitions
 }
 
 // NewInMemory constructs an InMemory store with empty per-resource maps.
 func NewInMemory() *InMemory {
 	return &InMemory{
-		nodes:               &inMemoryNodes{m: map[string]apiv1.Node{}},
-		storagePools:        &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
-		resourceGroups:      &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
-		resourceDefinitions: &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
-		resources:           &inMemoryResources{m: map[rKey]apiv1.Resource{}},
-		volumeDefinitions:   &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
-		snapshots:           &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
-		physicalDevices:     &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},
-		controllerProps:     &inMemoryControllerProps{props: map[string]string{}},
+		nodes:                  &inMemoryNodes{m: map[string]apiv1.Node{}},
+		storagePools:           &inMemoryStoragePools{m: map[spKey]apiv1.StoragePool{}},
+		resourceGroups:         &inMemoryResourceGroups{m: map[string]apiv1.ResourceGroup{}},
+		resourceDefinitions:    &inMemoryResourceDefinitions{m: map[string]apiv1.ResourceDefinition{}},
+		resources:              &inMemoryResources{m: map[rKey]apiv1.Resource{}},
+		volumeDefinitions:      &inMemoryVolumeDefinitions{m: map[vdKey]apiv1.VolumeDefinition{}},
+		snapshots:              &inMemorySnapshots{m: map[snapKey]apiv1.Snapshot{}},
+		physicalDevices:        &inMemoryPhysicalDevices{m: map[string]apiv1.PhysicalDevice{}},
+		controllerProps:        &inMemoryControllerProps{props: map[string]string{}},
+		storagePoolDefinitions: &inMemoryStoragePoolDefinitions{m: map[string]StoragePoolDefinition{}},
 	}
 }
 
@@ -84,6 +86,118 @@ func (s *InMemory) PhysicalDevices() PhysicalDeviceStore { return s.physicalDevi
 
 // ControllerProps returns the singleton controller-scope props bag.
 func (s *InMemory) ControllerProps() ControllerPropsStore { return s.controllerProps }
+
+// StoragePoolDefinitions returns the controller-scope storage pool
+// definition registry.
+func (s *InMemory) StoragePoolDefinitions() StoragePoolDefinitionStore {
+	return s.storagePoolDefinitions
+}
+
+// inMemoryStoragePoolDefinitions is a thread-safe map of the
+// controller-scope storage pool definition registry. The k8s store
+// holds the same shape; both implementations are process-local for
+// now (see ControllerPropsStore for the same compromise) — operators
+// re-create definitions after a controller restart, and the props
+// keep no persisted state downstream.
+type inMemoryStoragePoolDefinitions struct {
+	mu sync.RWMutex
+	m  map[string]StoragePoolDefinition
+}
+
+// List returns every definition sorted by name. Deterministic order
+// keeps tests stable and matches every other in-memory store.
+func (s *inMemoryStoragePoolDefinitions) List(_ context.Context) ([]StoragePoolDefinition, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]StoragePoolDefinition, 0, len(s.m))
+	for k := range s.m {
+		out = append(out, copyStoragePoolDefinition(s.m[k]))
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+
+	return out, nil
+}
+
+// Get returns the definition or ErrNotFound.
+func (s *inMemoryStoragePoolDefinitions) Get(_ context.Context, name string) (StoragePoolDefinition, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	def, ok := s.m[name]
+	if !ok {
+		return StoragePoolDefinition{}, errors.Wrapf(ErrNotFound, "storage pool definition %q", name)
+	}
+
+	return copyStoragePoolDefinition(def), nil
+}
+
+// Create inserts a new definition. Returns ErrAlreadyExists when the
+// name is already taken — POST is CREATE-only, mutation lives behind
+// PUT (mirrors Finding 1's fix for the StoragePool surface).
+func (s *inMemoryStoragePoolDefinitions) Create(_ context.Context, def *StoragePoolDefinition) error {
+	if def == nil {
+		return errors.New("nil StoragePoolDefinition")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.m[def.Name]; exists {
+		return errors.Wrapf(ErrAlreadyExists, "storage pool definition %q", def.Name)
+	}
+
+	s.m[def.Name] = copyStoragePoolDefinition(*def)
+
+	return nil
+}
+
+// Update overwrites an existing definition. Returns ErrNotFound when
+// the row is absent.
+func (s *inMemoryStoragePoolDefinitions) Update(_ context.Context, def *StoragePoolDefinition) error {
+	if def == nil {
+		return errors.New("nil StoragePoolDefinition")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.m[def.Name]; !exists {
+		return errors.Wrapf(ErrNotFound, "storage pool definition %q", def.Name)
+	}
+
+	s.m[def.Name] = copyStoragePoolDefinition(*def)
+
+	return nil
+}
+
+// Delete removes the named definition. Returns ErrNotFound when
+// absent — the REST handler folds that into the warn-band envelope.
+func (s *inMemoryStoragePoolDefinitions) Delete(_ context.Context, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.m[name]; !exists {
+		return errors.Wrapf(ErrNotFound, "storage pool definition %q", name)
+	}
+
+	delete(s.m, name)
+
+	return nil
+}
+
+// copyStoragePoolDefinition deep-copies the props map so callers can
+// mutate the returned value without racing the store.
+func copyStoragePoolDefinition(def StoragePoolDefinition) StoragePoolDefinition {
+	out := StoragePoolDefinition{Name: def.Name}
+	if def.Props != nil {
+		out.Props = make(map[string]string, len(def.Props))
+		maps.Copy(out.Props, def.Props)
+	}
+
+	return out
+}
 
 // inMemoryControllerProps is a single-row bag protected by an RWMutex.
 // The k8s store will back the same shape with a singleton CRD; here we

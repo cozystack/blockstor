@@ -20,6 +20,7 @@ package rest
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -346,6 +347,27 @@ func (s *Server) handleNodeConfigPut(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStoragePoolDefinitionSingle(w http.ResponseWriter, r *http.Request) {
 	want := r.PathValue("name")
 
+	// Finding 6 (P2): check the explicit definition registry first.
+	// An operator-POSTed definition that has no per-node pool yet
+	// MUST still resolve here (without the registry lookup the only
+	// definitions visible were the ones synthesised from existing
+	// per-node pools, so a freshly-created definition disappeared
+	// until at least one pool was bound to it).
+	def, defErr := s.Store.StoragePoolDefinitions().Get(r.Context(), want)
+	if defErr == nil {
+		props := map[string]string{}
+		if def.Props != nil {
+			maps.Copy(props, def.Props)
+		}
+
+		writeJSON(w, http.StatusOK, []storagePoolDefinitionWire{{
+			StoragePoolName: def.Name,
+			Props:           props,
+		}})
+
+		return
+	}
+
 	pools, err := s.Store.StoragePools().List(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -353,17 +375,12 @@ func (s *Server) handleStoragePoolDefinitionSingle(w http.ResponseWriter, r *htt
 		return
 	}
 
-	type storagePoolDefinition struct {
-		StoragePoolName string            `json:"storage_pool_name"`
-		Props           map[string]string `json:"props"`
-	}
-
 	for i := range pools {
 		if !strings.EqualFold(pools[i].StoragePoolName, want) {
 			continue
 		}
 
-		writeJSON(w, http.StatusOK, []storagePoolDefinition{{
+		writeJSON(w, http.StatusOK, []storagePoolDefinitionWire{{
 			StoragePoolName: pools[i].StoragePoolName,
 			Props:           map[string]string{},
 		}})

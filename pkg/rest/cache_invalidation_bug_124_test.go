@@ -236,6 +236,10 @@ func (s *laggingStore) ControllerProps() store.ControllerPropsStore {
 	return s.inner.ControllerProps()
 }
 
+func (s *laggingStore) StoragePoolDefinitions() store.StoragePoolDefinitionStore {
+	return s.inner.StoragePoolDefinitions()
+}
+
 // seedRDWithResources stamps an RD and `replicas`-many child
 // Resources directly on the inner inmemory store so the bug-fixture
 // is ready before the laggingStore semantics kick in. The RD-create

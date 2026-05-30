@@ -175,6 +175,10 @@ func (s *errInjectingSnapshotStore) ControllerProps() store.ControllerPropsStore
 	return s.inner.ControllerProps()
 }
 
+func (s *errInjectingSnapshotStore) StoragePoolDefinitions() store.StoragePoolDefinitionStore {
+	return s.inner.StoragePoolDefinitions()
+}
+
 // seedRDForMultiSnapshot stamps an RD onto the inner inmemory store so
 // the multi-create handler's hydrate path succeeds and the test reaches
 // the Snapshots().Create call where the synthesised err fires.
