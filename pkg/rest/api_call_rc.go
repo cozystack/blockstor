@@ -262,6 +262,25 @@ const apiCallRcFailExistsVlmDfn int64 = 502
 // without a separate rule.
 const apiCallRcFailInvldStorPoolName int64 = 552
 
+// apiCallRcFailExistsStorPool mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_STOR_POOL` (508). Emitted by
+// `POST /v1/nodes/{node}/storage-pools` when an SP with the same
+// (node, pool) already exists. Bug-hunt v0.1.3 Finding 1: the pre-fix
+// handler silently mutated the live row's Props / ProviderKind /
+// FreeSpaceMgrName from the POST body and returned 201, so a retrying
+// CSI driver or a mistaken `linstor sp c` repeat could wipe
+// `StorDriver/ZPool`, flip `provider_kind`, etc. The new contract:
+// POST is CREATE-only; mutation lives behind PUT (storage-pool modify).
+//
+// The MASK_ERROR bit is OR'd in by the `apiCallRcError` envelope
+// wrapper at the call site; the bare 508 sub-code here keeps the
+// wire shape byte-identical to upstream's `linstor sp c` reply on
+// the same input. Choosing 508 (rather than a fresh sub-code in our
+// 996+ range) lets audit-log greppers that already classify
+// upstream's FAIL_EXISTS_STOR_POOL traffic catch blockstor's
+// equivalent without a separate rule.
+const apiCallRcFailExistsStorPool int64 = 508
+
 // ObjRefs key constants — the wire-side identifiers upstream LINSTOR
 // uses to tag ApiCallRc entries with the object(s) the message refers
 // to. The strings are case-sensitive (the Python CLI matches on the

@@ -497,14 +497,16 @@ func TestPerNodeStoragePoolPostCreatesPool(t *testing.T) {
 	}
 }
 
-// TestPerNodeStoragePoolPostIdempotent pins the upsert semantics: a
-// satellite that re-announces the same (node, pool) every heartbeat
-// must not see 409/error — the registration loop relies on
-// re-POST being a no-op-success. We also assert that an updated
-// ProviderKind / Props on the second POST overwrites the stored row,
-// so operator-driven `linstor storage-pool create` re-runs with
-// corrected config actually take effect.
-func TestPerNodeStoragePoolPostIdempotent(t *testing.T) {
+// TestPerNodeStoragePoolPostDuplicateRefused pins the duplicate-POST
+// contract: a second `POST /v1/nodes/{n}/storage-pools` against an
+// existing (node, pool) must return 409 + (MASK_ERROR | 508) and
+// MUST NOT mutate the stored row's Spec fields. Bug-hunt v0.1.3
+// Finding 1: the pre-fix handler silently overwrote `Props` /
+// `ProviderKind` / `FreeSpaceMgrName` from the POST body and returned
+// 201, so a retrying CSI driver or a mistaken `linstor sp c` repeat
+// could wipe `StorDriver/ZPool`, flip `provider_kind`, etc. Mutation
+// now lives behind `PUT /v1/nodes/{n}/storage-pools/{pool}`.
+func TestPerNodeStoragePoolPostDuplicateRefused(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
@@ -532,11 +534,12 @@ func TestPerNodeStoragePoolPostIdempotent(t *testing.T) {
 	}
 
 	// Re-POST same (node, name) with a different ProviderKind/Props.
-	// Must succeed, must overwrite Spec fields, must NOT 409.
+	// MUST 409 — new contract: POST is CREATE-only. Mutation lives
+	// behind PUT.
 	second, err := json.Marshal(apiv1.StoragePool{
 		StoragePoolName: "p1",
 		ProviderKind:    apiv1.StoragePoolKindZFSThin,
-		Props:           map[string]string{"StorDriver/ZPool": "zp1"},
+		Props:           map[string]string{"StorDriver/ZPool": "zp1", "Aux/inject": "x"},
 	})
 	if err != nil {
 		t.Fatalf("marshal second: %v", err)
@@ -545,25 +548,52 @@ func TestPerNodeStoragePoolPostIdempotent(t *testing.T) {
 	resp2 := httpPost(t, base+"/v1/nodes/n1/storage-pools", second)
 	defer func() { _ = resp2.Body.Close() }()
 
-	if resp2.StatusCode == http.StatusConflict {
-		t.Fatalf("idempotency broken: got 409 on re-POST")
+	if resp2.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate POST: got %d, want 409", resp2.StatusCode)
 	}
 
-	if resp2.StatusCode != http.StatusCreated {
-		t.Fatalf("second POST: got %d, want 201", resp2.StatusCode)
+	// Envelope shape: MASK_ERROR | FAIL_EXISTS_STOR_POOL (508).
+	var env []apiv1.APICallRc
+	if err := json.NewDecoder(resp2.Body).Decode(&env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
 	}
 
+	if len(env) == 0 {
+		t.Fatalf("envelope: got empty, want one ApiCallRc with FAIL_EXISTS_STOR_POOL")
+	}
+
+	if env[0].RetCode&apiCallRcError == 0 {
+		t.Errorf("ret_code: missing MASK_ERROR bit, got %d", env[0].RetCode)
+	}
+
+	if env[0].RetCode&apiCallRcFailExistsStorPool == 0 {
+		t.Errorf("ret_code: missing FAIL_EXISTS_STOR_POOL (508) sub-code, got %d", env[0].RetCode)
+	}
+
+	// Stored row MUST be untouched — no Props swap, no ProviderKind
+	// flip, no Aux/inject leak. This is the data-plane integrity bit
+	// of the fix.
 	got, err := st.StoragePools().Get(ctx, "n1", "p1")
 	if err != nil {
-		t.Fatalf("store Get after second POST: %v", err)
+		t.Fatalf("store Get after refused duplicate POST: %v", err)
 	}
 
-	if got.ProviderKind != apiv1.StoragePoolKindZFSThin {
-		t.Errorf("provider_kind not updated: got %q, want ZFS_THIN", got.ProviderKind)
+	if got.ProviderKind != apiv1.StoragePoolKindLVMThin {
+		t.Errorf("provider_kind mutated by refused POST: got %q, want LVM_THIN",
+			got.ProviderKind)
 	}
 
-	if got.Props["StorDriver/ZPool"] != "zp1" || got.Props["StorDriver/LvmVg"] != "" {
-		t.Errorf("props not replaced: got %v, want only StorDriver/ZPool=zp1", got.Props)
+	if got.Props["StorDriver/LvmVg"] != "vg1" {
+		t.Errorf("StorDriver/LvmVg mutated by refused POST: got %q, want vg1",
+			got.Props["StorDriver/LvmVg"])
+	}
+
+	if _, leaked := got.Props["Aux/inject"]; leaked {
+		t.Errorf("Aux/inject from refused POST body landed in stored Props: %v", got.Props)
+	}
+
+	if _, leaked := got.Props["StorDriver/ZPool"]; leaked {
+		t.Errorf("StorDriver/ZPool from refused POST body landed in stored Props: %v", got.Props)
 	}
 }
 
