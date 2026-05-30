@@ -98,8 +98,20 @@ fi
 mkdir -p "$BOOT_DIR"
 
 # Per-cluster CIDR offset to avoid collisions when running parallel stands.
+# Talos's default Kubernetes service CIDR is 10.96.0.0/12 (covers
+# 10.96.0.0 – 10.111.255.255). If our slot lands inside that range,
+# the controlplane's own bridge IP overlaps with the service-IP pool,
+# Talos's `address-overlap` diagnostic fires, and apid refuses to put
+# the IP into its API server cert SANs — so bootstrap fails with
+# `cannot validate certificate for 10.X.0.2 because it doesn't
+# contain any IP SANs`. Skip slots 96..111 to dodge the collision.
 HASH=$(echo -n "$NAME" | sha256sum | cut -c1-2)
-SLOT=$((16#$HASH % 200 + 5))
+RAW_SLOT=$((16#$HASH % 200 + 5))
+if [[ $RAW_SLOT -ge 96 && $RAW_SLOT -le 111 ]]; then
+    SLOT=$(( RAW_SLOT - 16 ))
+else
+    SLOT=$RAW_SLOT
+fi
 NET_CIDR="10.${SLOT}.0.0/24"
 
 STATE_DIR="$WORK_DIR/talos-state"
