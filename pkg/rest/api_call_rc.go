@@ -222,6 +222,30 @@ const apiCallRcFailSnapshotFinalizerStuck int64 = 998
 // a separate rule.
 const apiCallRcFailExistsSnapshotDfn int64 = 514
 
+// apiCallRcFailExistsStorPoolDfn mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_EXISTS_STOR_POOL_DFN` (508). Emitted by
+// `POST /v1/storage-pool-definitions` when a definition with the
+// requested name already exists. The MASK_ERROR bit is OR'd in by
+// the envelope wrapper at the call site; the bare 508 sub-code here
+// keeps the wire shape byte-identical to upstream's `linstor sp-d c`
+// reply on the same input.
+//
+// Finding 6: blockstor never wired the POST handler before, so a
+// duplicate create returned 405 instead of this typed conflict. With
+// the handler wired and this sub-code emitted, golinstor's
+// `client.ApiCallError.Is(client.FAIL_EXISTS_STOR_POOL_DFN)` returns
+// true on a real duplicate — operators that branch on typed errors
+// can treat "already exists" as a no-op success.
+const apiCallRcFailExistsStorPoolDfn int64 = 508
+
+// warnStoragePoolDfnNotFound flags a delete-of-missing on
+// `DELETE /v1/storage-pool-definitions/{name}`. Sub-code 2059 sits
+// one past warnRscConnPathNotFound (2058) so the warn-band numbering
+// stays monotonic; the python CLI surfaces the line as a WARNING
+// rather than a silent INFO replay, matching Bug 56's pattern for
+// RDs / SPs / nodes.
+const warnStoragePoolDfnNotFound = maskWarn | int64(2059)
+
 // apiCallRcFailExistsRscDfn mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_RSC_DFN` (`501 | MASK_ERROR`). Emitted by
 // `DELETE /v1/resource-groups/{rg}` when the RG still has at least one
@@ -414,5 +438,6 @@ const (
 	objRefRscGrp      = "RscGrp"
 	objRefSnapshotDfn = "SnapshotDfn"
 	objRefStorPool    = "StorPool"
+	objRefStorPoolDfn = "StorPoolDfn"
 	objRefVlmNr       = "VlmNr"
 )

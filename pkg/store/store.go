@@ -276,6 +276,40 @@ type ControllerPropsStore interface {
 	Set(ctx context.Context, props map[string]string) error
 }
 
+// StoragePoolDefinition is the controller-scope row that registers a
+// StoragePool *name* (e.g. "zfs-thin") independent of which nodes
+// host it. Upstream LINSTOR keeps a dedicated `StorPoolDfn` table
+// next to per-node StoragePools; the `MaxOversubscriptionRatio`
+// and similar cluster-wide knobs hang off this row. Blockstor folds
+// the per-node and the definition surface into one CRD (StoragePool),
+// so a definition without any per-node pool is purely a name+props
+// registration, captured here in a small process-local table.
+//
+// The row survives only for the lifetime of the controller process —
+// no CRD or Secret backs it yet. This is the same compromise
+// ControllerPropsStore makes; operators can re-create definitions
+// after a controller restart, and the four upstream-defined props
+// (`MaxOversubscriptionRatio` etc.) are pure scoring multipliers
+// with no persisted state depending on them.
+type StoragePoolDefinition struct {
+	Name  string
+	Props map[string]string
+}
+
+// StoragePoolDefinitionStore persists the controller-scope storage
+// pool definition registry. The REST handlers at
+// `/v1/storage-pool-definitions[/{name}]` are the operator surface;
+// the store is intentionally minimal (no patch helpers, no status
+// subresource) because the definition row carries no state beyond
+// its name + props.
+type StoragePoolDefinitionStore interface {
+	List(ctx context.Context) ([]StoragePoolDefinition, error)
+	Get(ctx context.Context, name string) (StoragePoolDefinition, error)
+	Create(ctx context.Context, def *StoragePoolDefinition) error
+	Update(ctx context.Context, def *StoragePoolDefinition) error
+	Delete(ctx context.Context, name string) error
+}
+
 // Store aggregates per-resource stores.
 type Store interface {
 	Nodes() NodeStore
@@ -287,4 +321,5 @@ type Store interface {
 	Snapshots() SnapshotStore
 	PhysicalDevices() PhysicalDeviceStore
 	ControllerProps() ControllerPropsStore
+	StoragePoolDefinitions() StoragePoolDefinitionStore
 }

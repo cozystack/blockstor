@@ -82,6 +82,91 @@ func (s *Server) registerResourceToggleDisk(mux *http.ServeMux) {
 	// the new diskful copy lands in on {dst}.
 	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}/{pool}",
 		s.requireStore(s.handleResourceMigrateDisk))
+	// Finding 7 (P2): bodyless variant of the same endpoint. Upstream
+	// OpenAPI (rest_v1_openapi.yaml lines 2611-2646) defines BOTH the
+	// path-suffix and the bodyless forms. python-linstor's common
+	// `linstor r migrate-disk <to_node> <rd> <from_node>` CLI form
+	// (no `--storage-pool` flag) URL-encodes WITHOUT the trailing
+	// `/{pool}` segment and ships the pool name in the JSON body
+	// instead. Without this route the CLI hit a bare 404 envelope
+	// and migration via the common no-pool form was unusable.
+	mux.HandleFunc("PUT /v1/resource-definitions/{rd}/resources/{dst}/migrate-disk/{src}",
+		s.requireStore(s.handleResourceMigrateDiskBodyless))
+}
+
+// migrateDiskBody is the JSON payload accepted by the bodyless
+// migrate-disk variant. Mirrors upstream's `JsonGenTypes.
+// ResourceMigrateDisk` — the `storage_pool` field is the pool the
+// new diskful copy lands in on the destination node, and the
+// optional `layer_list` is forwarded through Spec.LayerStack so the
+// satellite assembles the same stack as the source replica. Both
+// fields are optional: an empty `storage_pool` falls through to the
+// controller's auto-diskful pool picker on the destination node,
+// matching upstream LINSTOR's behaviour when no pool is supplied.
+type migrateDiskBody struct {
+	StoragePool string   `json:"storage_pool,omitempty"`
+	LayerList   []string `json:"layer_list,omitempty"`
+}
+
+// handleResourceMigrateDiskBodyless serves the bodyless migrate-disk
+// variant. Decodes the pool from the JSON body, then delegates to the
+// shared `migrateDisk` helper so the validation + 2-phase add-before-
+// drop semantics stay identical to the path-suffix variant.
+//
+// An absent body is tolerated — the empty pool is forwarded to the
+// migrate helper, which leaves Spec.StoragePool unset on the
+// destination and lets the controller's auto-diskful path pick a
+// pool from the hosting node during the next reconcile.
+func (s *Server) handleResourceMigrateDiskBodyless(w http.ResponseWriter, r *http.Request) {
+	var body migrateDiskBody
+
+	// The bodyless variant tolerates a truly empty body (no JSON at
+	// all). decodeJSON rejects EOF with a typed envelope; route around
+	// that for this endpoint only by short-circuiting when
+	// Content-Length is zero.
+	if r.ContentLength != 0 {
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+	}
+
+	s.migrateDiskCommon(w, r, body.StoragePool)
+}
+
+// migrateDiskCommon factors out the shared body of the two
+// migrate-disk handlers (path-suffix + bodyless). Lifts the pool from
+// either source, then re-uses the original handler's lookup +
+// validation + promotion sequence.
+func (s *Server) migrateDiskCommon(w http.ResponseWriter, r *http.Request, pool string) {
+	rdName := r.PathValue("rd")
+	dst := r.PathValue("dst")
+	src := r.PathValue("src")
+
+	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
+
+	if !s.validateMigrateSrc(w, r, rdName, src) {
+		return
+	}
+
+	if !s.promoteMigrateDst(w, r, rdName, dst, pool, src) {
+		return
+	}
+
+	poolMsg := "(no pool specified; controller picks one)"
+	if pool != "" {
+		poolMsg = "on pool '" + pool + "'"
+	}
+
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource '" + rdName + "' migrating from '" + src + "' to '" + dst +
+			"' " + poolMsg + " (pending; src will be removed once dst is UpToDate)",
+	}})
 }
 
 // handleResourceToggleDisk flips Spec.Flags["DISKLESS"] on the
@@ -278,37 +363,12 @@ const MigratingFromProp = "BlockstorMigratingFrom"
 // Returns 200 with an APICallRc envelope on success, 404 on unknown
 // RD or missing src diskful replica, 409 when src is Primary InUse.
 func (s *Server) handleResourceMigrateDisk(w http.ResponseWriter, r *http.Request) {
-	rdName := r.PathValue("rd")
-	dst := r.PathValue("dst")
-	src := r.PathValue("src")
-	pool := r.PathValue("pool")
-
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	if !s.validateMigrateSrc(w, r, rdName, src) {
-		return
-	}
-
-	if !s.promoteMigrateDst(w, r, rdName, dst, pool, src) {
-		return
-	}
-
-	// Option B: src lives. ResourceMigrationReconciler observes
-	// the BlockstorMigratingFrom prop stamped in promoteMigrateDst,
-	// waits for dst Volumes to reach UpToDate, then deletes src and
-	// clears the prop. Operation is "pending" at REST layer; caller
-	// must observe Status (or poll the resources list) to confirm
-	// completion.
-	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-		RetCode: maskInfo,
-		Message: "resource '" + rdName + "' migrating from '" + src + "' to '" + dst +
-			"' on pool '" + pool + "' (pending; src will be removed once dst is UpToDate)",
-	}})
+	// The path-suffix variant carries the pool name in the URL.
+	// The bodyless variant decodes it from the JSON body. Both
+	// converge on `migrateDiskCommon` which runs the shared lookup
+	// + validation + promotion sequence and writes the final
+	// envelope.
+	s.migrateDiskCommon(w, r, r.PathValue("pool"))
 }
 
 // validateMigrateSrc enforces the migrate-disk preconditions on the
