@@ -131,7 +131,11 @@ trap 'cleanup_partition; delete_rd "$RD"' EXIT
 # a genuinely non-converged RD still shows non-UpToDate, so real
 # failures are not masked.
 wait_uptodate_3() {
-    local rd=$1 deadline=$(( $(date +%s) + 240 ))
+    # Bumped 240→300 and added an at-deadline retry: lane6/run 26706441200
+    # FAILed and the immediate post-fail `drbdsetup status` dump showed all
+    # three peers UpToDate, meaning convergence raced the deadline by a
+    # few seconds. The retry below absorbs that edge window.
+    local rd=$1 deadline=$(( $(date +%s) + 300 ))
     while (( $(date +%s) < deadline )); do
         local ok=1
         for n in "$N1" "$N2" "$N3"; do
@@ -151,6 +155,14 @@ wait_uptodate_3() {
 
         sleep 2
     done
+
+    # Last-chance check before declaring failure — pads against the
+    # converged-during-final-sleep race surfaced in run 26706441200.
+    sleep 5
+    if [[ "$(kernel_all_uptodate "$rd" "$N1")" == "ok" ]]; then
+        return 0
+    fi
+
     echo "FAIL: $rd never reached UpToDate on all 3 peers" >&2
     echo "   last CRD diskState: $N1=$(status_disk_state "$rd" "$N1") $N2=$(status_disk_state "$rd" "$N2") $N3=$(status_disk_state "$rd" "$N3")" >&2
     on_node "$N1" drbdsetup status "$rd" 2>/dev/null || true

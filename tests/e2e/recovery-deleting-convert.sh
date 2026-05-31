@@ -198,15 +198,25 @@ done
 # Reuse wait_uptodate for the (N1,N2) pair; check N3 separately so
 # the 180 s budget is shared but per-peer status is explicit.
 wait_uptodate "$RD" "$N1" "$N2"
-deadline=$(( $(date +%s) + 60 ))
+# Accept kernel ground truth too (mirrors wait_uptodate's own fallback) —
+# run 26662475084 FAILed here with N3's CRD .status briefly empty while the
+# kernel was already UpToDate, the same projection-lag pattern documented
+# above for the (N1,N2) pair. Bumped 60→120 for extra headroom on the
+# 3-peer initial sync at the QEMU stand's native disk rate.
+deadline=$(( $(date +%s) + 120 ))
+n3_ok=0
 while (( $(date +%s) < deadline )); do
     if [[ "$(disk_state "$N3")" == *"UpToDate"* ]]; then
-        break
+        n3_ok=1; break
+    fi
+    if [[ "$(kernel_pair_uptodate "$RD" "$N1" "$N3")" == "ok" ]]; then
+        n3_ok=1; break
     fi
     sleep 2
 done
-if [[ "$(disk_state "$N3")" != *"UpToDate"* ]]; then
+if (( n3_ok == 0 )); then
     echo "FAIL: N3 not UpToDate before scenario starts"
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true
     exit 1
 fi
 echo "   all 3 peers UpToDate"

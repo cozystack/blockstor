@@ -114,14 +114,22 @@ cleanup() {
         2>/dev/null || true
     kubectl label node "$WORKER_3" "${EVICT_LABEL}-" 2>/dev/null || true
 
-    # Wait briefly for satellite Pod readiness before tearing the RD —
-    # gives delete_rd's per-pod drbdsetup-down clean shot at WORKER_3.
-    local deadline=$(( $(date +%s) + 60 ))
+    # Wait for ALL 3 satellite Pods Ready before tearing the RD — checking
+    # only WORKER_3 raced the next scenario's `require_workers 3` preflight
+    # when DS desired/ready briefly desynced after the affinity-revert
+    # (toggle-disk SKIPped with "found 2" on lane 3 of run 26646144009).
+    # Widen window to 120s and require numberReady==desiredNumberScheduled,
+    # the same signal `reset_cluster_state` and `require_workers` use.
+    local deadline=$(( $(date +%s) + 120 ))
+    local ds_ready=0 ds_desired=0
     while (( $(date +%s) < deadline )); do
-        local ready
-        ready=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
-            -o "jsonpath={.items[?(@.spec.nodeName==\"${WORKER_3}\")].status.containerStatuses[0].ready}" 2>/dev/null || true)
-        [[ "$ready" == "true" ]] && break
+        ds_desired=$(kubectl -n "$NS" get ds blockstor-satellite \
+            -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || echo 0)
+        ds_ready=$(kubectl -n "$NS" get ds blockstor-satellite \
+            -o jsonpath='{.status.numberReady}' 2>/dev/null || echo 0)
+        if [[ -n "$ds_desired" ]] && (( ds_desired > 0 )) && (( ds_desired == ds_ready )); then
+            break
+        fi
         sleep 2
     done
 
@@ -245,11 +253,15 @@ echo ">> label $N3 with $EVICT_LABEL=offline so DS affinity excludes it"
 kubectl label node "$N3" "${EVICT_LABEL}=offline" --overwrite
 
 echo ">> force-delete satellite Pod on $N3 (no grace — bypass preStop, race the DS eviction)"
-sat_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
-    -o "jsonpath={.items[?(@.spec.nodeName==\"${N3}\")].metadata.name}")
-if [[ -n "$sat_pod" ]]; then
-    kubectl -n "$NS" delete pod "$sat_pod" --force --grace-period=0 --wait=false
-fi
+# Closes the get-then-delete race: between `get pod name` and `delete pod $name`
+# the DS controller can complete its own eviction first (the affinity patch
+# above already excluded $N3), and the `delete pod $name` then 404s. Use a
+# field-selector delete instead so kubectl resolves the target server-side
+# under the satellite label, and tolerate NotFound — either the DS controller
+# already evicted the pod (success) or we beat it to the punch (also success).
+kubectl -n "$NS" delete pod -l app=blockstor-satellite \
+    --field-selector "spec.nodeName=${N3}" \
+    --force --grace-period=0 --wait=false --ignore-not-found
 
 # Confirm the DaemonSet refused to re-schedule (so heartbeats truly stop).
 sleep 8
