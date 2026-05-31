@@ -1516,40 +1516,7 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 	res := env.Resource
 	res.Name = rdName
 
-	if res.NodeName == "" {
-		writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
-
-		return nil, false
-	}
-
-	// Enforce the cluster-wide naming convention up front: the CRD
-	// metadata.name will be `<rd>.<node>`, so an embedded '.' in
-	// either side would shift the boundary and either collide with
-	// another (rd, node) pair or stage a CRD the CEL rule on the
-	// type would later reject with a 422. Catch it here with a
-	// friendly 400.
-	if strings.Contains(res.NodeName, ".") {
-		writeError(w, http.StatusBadRequest,
-			"node_name must not contain '.': metadata.name must equal <rd>.<node>")
-
-		return nil, false
-	}
-
-	if strings.Contains(rdName, ".") {
-		writeError(w, http.StatusBadRequest,
-			"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
-
-		return nil, false
-	}
-
-	// Bug 167: refuse Resource-create entries that carry a flag string
-	// outside the documented upstream LINSTOR enum. Pre-fix the phantom
-	// flag persisted onto the CRD; the satellite reconciler then had to
-	// guess whether the typo was a no-op or a misspelled `DISKLESS`.
-	flagErr := validateResourceFlags(res.Flags)
-	if flagErr != nil {
-		writeError(w, http.StatusBadRequest, flagErr.Error())
-
+	if !validateResourceCreateShape(w, rdName, &res) {
 		return nil, false
 	}
 
@@ -1594,6 +1561,29 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 	// TIEBREAKER flags into this spawn — we only stamp StorPoolName,
 	// never copy flags from peers.
 	s.resolveStorPoolForFreshCreate(r.Context(), rdName, &res)
+
+	// Issue #45: per-pool capacity gate on the real linstor-csi
+	// CreateVolume path. linstor-csi's manual scheduler (StorageClass
+	// with `nodeList` + `placementCount=1`) fires
+	// `POST /v1/resource-definitions/{rd}/resources/{node}` via
+	// golinstor's `Resources.Create`, which routes here — NOT through
+	// `/autoplace`. The PR #47 capacity gate on `/autoplace` therefore
+	// never sees this request, and pre-fix a CreateVolume against a
+	// now-full pool placed the replica anyway: the PVC reached Bound
+	// immediately and only failed later when the satellite tried to
+	// allocate the backing LV.
+	//
+	// The gate consults the resolved StoragePool's FreeCapacity on the
+	// target node directly — not `computeSizeInfo` — because this code
+	// path knows the EXACT (node, pool) target, so the autoplace gate's
+	// cluster-wide MaxVlmSizeInKib aggregation would mask a full pool
+	// behind sibling pools on other nodes. A 13 GiB lvm-thin on
+	// worker-1 at 100% used while worker-2's lvm-thin is empty MUST
+	// refuse `r c worker-1 <rd>` even though the cluster-wide cap
+	// remains 13 GiB.
+	if !s.rejectResourceCreateIfPoolFull(w, r, rdName, &res) {
+		return nil, false
+	}
 
 	out, ok := s.createOrPromoteResource(w, r, &res)
 	if !ok {
@@ -2004,6 +1994,245 @@ func (s *Server) resolveStorPoolForFreshCreate(ctx context.Context, rdName strin
 	}
 
 	res.Props["StorPoolName"] = pool
+}
+
+// validateResourceCreateShape runs the wire-shape gates that don't
+// touch the store: NodeName presence, the `<rd>.<node>` naming
+// boundary (CRD metadata.name CEL rule), and the upstream LINSTOR
+// flag enum (Bug 167). Hoisted out of `createOneResource` so that
+// function stays under the funlen budget after the Issue #45
+// per-pool capacity gate landed.
+//
+// Returns true when the caller may proceed; false when the HTTP
+// error has already been written.
+func validateResourceCreateShape(w http.ResponseWriter, rdName string, res *apiv1.Resource) bool {
+	if res.NodeName == "" {
+		writeError(w, http.StatusBadRequest, "node_name is required on every resource create entry")
+
+		return false
+	}
+
+	// Enforce the cluster-wide naming convention up front: the CRD
+	// metadata.name will be `<rd>.<node>`, so an embedded '.' in
+	// either side would shift the boundary and either collide with
+	// another (rd, node) pair or stage a CRD the CEL rule on the
+	// type would later reject with a 422. Catch it here with a
+	// friendly 400.
+	if strings.Contains(res.NodeName, ".") {
+		writeError(w, http.StatusBadRequest,
+			"node_name must not contain '.': metadata.name must equal <rd>.<node>")
+
+		return false
+	}
+
+	if strings.Contains(rdName, ".") {
+		writeError(w, http.StatusBadRequest,
+			"resource_definition name must not contain '.': metadata.name must equal <rd>.<node>")
+
+		return false
+	}
+
+	// Bug 167: refuse Resource-create entries that carry a flag string
+	// outside the documented upstream LINSTOR enum. Pre-fix the phantom
+	// flag persisted onto the CRD; the satellite reconciler then had to
+	// guess whether the typo was a no-op or a misspelled `DISKLESS`.
+	flagErr := validateResourceFlags(res.Flags)
+	if flagErr != nil {
+		writeError(w, http.StatusBadRequest, flagErr.Error())
+
+		return false
+	}
+
+	return true
+}
+
+// rejectResourceCreateIfPoolFull is the Issue #45 capacity gate on
+// the real linstor-csi CreateVolume path. Mirrors the parallel
+// `rejectAutoplaceIfExceedsCapacityGate` on /autoplace and
+// `rejectIfExceedsOversubGate` on /spawn so a CreateVolume against
+// a now-full pool fails-fast with a structured 409 envelope BEFORE
+// the Resource is persisted (no orphan CRD on the reject path).
+//
+// Why this gate is per-pool (not computeSizeInfo-shaped):
+//   - `/autoplace` and `/spawn` are placer-driven: they accept a
+//     filter and the placer picks pools. `computeSizeInfo` returns
+//     the cluster-wide worst-case-of-top-N cap so any pool the placer
+//     could pick is covered.
+//   - This handler routes through `POST /v1/resource-definitions/
+//     {rd}/resources/{node}` (the golinstor `Resources.Create`
+//     endpoint linstor-csi's `manual` scheduler uses when the SC sets
+//     `nodeList`). The caller has already named the EXACT (node,
+//     pool) target, so the cluster-wide cap would mask a full target
+//     pool behind sibling pools on other nodes. A 13 GiB lvm-thin on
+//     worker-1 at 100% used while worker-2's lvm-thin is empty MUST
+//     refuse `r c worker-1 <rd>` even though the cluster-wide cap
+//     remains 13 GiB.
+//
+// Skipped when:
+//   - Resource is DISKLESS / TIE_BREAKER (no backing storage needed).
+//   - No pool name could be resolved (consistent with
+//     `refuseResourceCreateOnUnknownPool` — diskless fallback path).
+//   - RD has no VolumeDefinitions yet (definitions-only create; the
+//     subsequent VD POST will get the gate next time around).
+//
+// Returns true when the caller may proceed; false when the HTTP
+// error has already been written.
+func (s *Server) rejectResourceCreateIfPoolFull(w http.ResponseWriter, r *http.Request, rdName string, res *apiv1.Resource) bool {
+	// Diskless / tiebreaker witnesses don't allocate backing storage.
+	if containsResourceFlag(res.Flags, apiv1.ResourceFlagDiskless) ||
+		containsResourceFlag(res.Flags, apiv1.ResourceFlagTieBreaker) {
+		return true
+	}
+
+	poolName := s.resolveGatePoolName(r.Context(), rdName, res)
+	if poolName == "" {
+		// Pool unresolved — `refuseResourceCreateOnUnknownPool` already
+		// returns true in this case (diskless fallback), and the
+		// satellite reconciler's `disk none;` path takes over. The
+		// capacity gate is specifically about a NAMED pool that's
+		// full; "no pool at all" is a different code path.
+		return true
+	}
+
+	pool, err := s.Store.StoragePools().Get(r.Context(), res.NodeName, poolName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// `refuseResourceCreateOnUnknownPool` ran first and would
+			// have returned the 404 already. Defensive: if we got here
+			// the SP must exist on the target node, so this branch is
+			// a TOCTOU residual — let the post-write Bug 145 re-check
+			// handle it.
+			return true
+		}
+
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	requiredKib, err := s.sumRDVolumeDefinitionsKib(r.Context(), rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if requiredKib <= 0 {
+		// No VDs yet (e.g. a definitions-only create racing ahead of
+		// the VD POST). Skip the gate — there's nothing to size
+		// against. Mirrors `rejectAutoplaceIfExceedsCapacityGate` and
+		// `rejectIfExceedsOversubGate` semantics.
+		return true
+	}
+
+	if pool.FreeCapacity >= requiredKib {
+		return true
+	}
+
+	// Reuse the same RetCode + envelope shape as the /autoplace gate
+	// (PR #47) so operators and tools that classify replies by the
+	// `ret_code` + sub-code pair handle both gates uniformly.
+	filter := &apiv1.AutoSelectFilter{
+		StoragePool:  poolName,
+		NodeNameList: []string{res.NodeName},
+		PlaceCount:   1,
+	}
+
+	writeAutoplaceShortfall(w, filter, "", &placer.CapacityShortfallError{
+		RequiredKib: requiredKib,
+		MaxFreeKib:  pool.FreeCapacity,
+	})
+
+	return false
+}
+
+// resolveGatePoolName returns the StoragePool name the Issue #45
+// capacity gate should look up FreeCapacity against. Mirrors the
+// upstream LINSTOR fallback chain
+// (`CtrlRscCrtApiHelper.resolveStorPoolName`) but tolerates a wider
+// set of input shapes since linstor-csi's `CreateVolume` posts an
+// EMPTY body to `POST /v1/resource-definitions/{rd}/resources/{node}`
+// and relies on RG-level propagation for the pool name. The four
+// tiers, in priority order:
+//
+//  1. `res.Props["StorPoolName"]` — explicit `--storage-pool` from
+//     the operator or the CSI client.
+//  2. `rd.Props["StorPoolName"]` — RD-level sticky default (Scenario
+//     4.W15).
+//  3. `rg.SelectFilter.StoragePool` — RG single-pool default
+//     (`linstor rg c --storage-pool <p>`).
+//  4. `rg.SelectFilter.StoragePoolList[0]` — RG list-pool default,
+//     which is the shape linstor-csi posts when the SC sets
+//     `linstor.csi.linbit.com/storagePool: <p>` (the per-pool
+//     fallback `resolveStorPoolForFreshCreate` already covers tiers
+//     1-3 by stamping res.Props, but it does NOT cover tier 4 — by
+//     design, since the placer was the one to pick a specific pool
+//     out of the list, and the per-resource Props gets stamped at
+//     placer time. The capacity gate has to repeat tier 4 here so a
+//     CSI request with no body and only an RG StoragePoolList is
+//     still gated.
+//
+// Returns "" when no tier matches — the gate then skips with a
+// no-op (consistent with `refuseResourceCreateOnUnknownPool`'s
+// "no pool, no gate" semantic on the diskless fallback path). Best-
+// effort throughout: any store lookup error is swallowed so a
+// transient k8s read doesn't escalate a CreateVolume into a 500.
+func (s *Server) resolveGatePoolName(ctx context.Context, rdName string, res *apiv1.Resource) string {
+	if pool := res.Props["StorPoolName"]; pool != "" {
+		return pool
+	}
+
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return ""
+	}
+
+	if pool := rd.Props["StorPoolName"]; pool != "" {
+		return pool
+	}
+
+	if rd.ResourceGroupName == "" {
+		return ""
+	}
+
+	rg, err := s.Store.ResourceGroups().Get(ctx, rd.ResourceGroupName)
+	if err != nil {
+		return ""
+	}
+
+	if pool := rg.SelectFilter.StoragePool; pool != "" {
+		return pool
+	}
+
+	if len(rg.SelectFilter.StoragePoolList) > 0 {
+		return rg.SelectFilter.StoragePoolList[0]
+	}
+
+	return ""
+}
+
+// sumRDVolumeDefinitionsKib returns the largest VolumeDefinition's
+// SizeKib on the named RD. Every volume of an RD provisions against
+// the same pool (upstream LINSTOR contract), so the per-pool
+// capacity gate must clear the biggest of them. Returns 0 — no
+// filter — when the RD has no VDs yet. Mirrors
+// `Placer.requiredKib` exactly so the gate semantics agree with the
+// placer's own per-pool check on the autoplace path.
+func (s *Server) sumRDVolumeDefinitionsKib(ctx context.Context, rdName string) (int64, error) {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rdName)
+	if err != nil {
+		return 0, err //nolint:wrapcheck // handler wraps via writeStoreError
+	}
+
+	var maxKib int64
+
+	for i := range vds {
+		if vds[i].SizeKib > maxKib {
+			maxKib = vds[i].SizeKib
+		}
+	}
+
+	return maxKib, nil
 }
 
 // stripDisklessAndWitnessFlags walks `flags` and produces the post-promote

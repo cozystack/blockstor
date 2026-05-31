@@ -243,6 +243,9 @@ jobs:
       # does not re-register after re-labeling on the replaced node); root
       # cause is in the satellite/controller path, not in CI infrastructure,
       # and reverting #48 isn't viable. Track separately; restore once fixed.
+      # observability-capacity-correlation requires piraeus's LinstorCluster CRD,
+      # which is only installed in the e2e-piraeus job below — keep it out of the
+      # 6-lane matrix or it hard-fails at the prerequisite check.
       E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo csi-pvc-local node-replace-hardware"
     permissions:
       contents: read
@@ -378,12 +381,13 @@ jobs:
         # even after the synchronous Pod-delete fix, races
         # pv-controller's ControllerPublishVolume retries — putting
         # it last keeps that storm out of the local scenario's window.
-        # observability-capacity-correlation is temporarily removed: see
-        # issue #45 — linstor-csi for placementCount=1+nodeList drives a
-        # code path that bypasses the autoplace/spawn/single-node-alias
-        # gates added in PR #47, so the level-1 PVC-stays-Pending
-        # assertion still fails. Re-enable when that path is gated.
-        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way csi-pvc-local csi-pvc-replicated-rwo"
+        # observability-capacity-correlation re-enabled: issue #45 closed
+        # by gating the real linstor-csi single-node create path on
+        # `POST /v1/resource-definitions/{rd}/resources/{node}` (the
+        # endpoint linstor-csi's `manual` scheduler hits when the SC
+        # sets `nodeList` + `placementCount=1`). The level-1
+        # PVC-stays-Pending assertion now passes on the dev stand.
+        run: make ci-e2e LANE=1 LANES=1 SCENARIOS="rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-local csi-pvc-replicated-rwo"
 
       - name: Upload e2e logs
         if: always()
