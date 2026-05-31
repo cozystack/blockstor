@@ -290,6 +290,22 @@ func (s *Server) handleAutoplace(w http.ResponseWriter, r *http.Request) {
 		filter.ProviderList = []string{srcKind}
 	}
 
+	// Issue #45: REST-level capacity gate. Mirrors the parallel
+	// `rejectIfExceedsOversubGate` on the spawn path so linstor-csi's
+	// autoplace call fails-fast with a structured 409 BEFORE the
+	// placer is invoked. Without this gate, a CreateVolume against a
+	// StorageClass pinned to a now-full pool (`FreeCapacity=0` /
+	// `MaxVlmSizeInKib=0`) still placed the replica — the PVC
+	// reached Bound immediately and only failed later when the
+	// satellite tried to allocate the backing LV. The gate consults
+	// `computeSizeInfo.MaxVlmSizeInKib` (the same value `linstor rg
+	// query-size-info` surfaces) so over-subscription ratios and the
+	// shared-LUN dedup are honoured uniformly across spawn /
+	// autoplace.
+	if !s.rejectAutoplaceIfExceedsCapacityGate(r.Context(), w, rdName, &filter, srcKind) {
+		return
+	}
+
 	if !s.runPlaceAndReport(w, r, rdName, &filter, srcKind) {
 		return
 	}
@@ -892,6 +908,97 @@ const (
 // tests) need the same sub-code, not a generic
 // "high-bit set" error.
 const apiCallRcFailNotEnoughNodes int64 = 996
+
+// rejectAutoplaceIfExceedsCapacityGate is the REST-level capacity
+// guard for Issue #45. Mirrors `rejectIfExceedsOversubGate` in
+// spawn.go: consults `computeSizeInfo.MaxVlmSizeInKib` (the same
+// value `linstor rg query-size-info` surfaces) and fails-fast with
+// a structured 409 BEFORE the placer is invoked when any of the
+// RD's VolumeDefinitions exceeds the effective cluster cap for the
+// merged filter.
+//
+// Returns true when the caller may proceed (no VDs, no eligible
+// pools at this filter, or every VD fits the cap), false when the
+// HTTP error has already been written.
+//
+// Precedence vs. the placer's per-pool capacity gate (Bug 35):
+//   - placer gate compares `pool.FreeCapacity < requiredKib` after
+//     pool selection and only when there are VDs on the RD.
+//   - this REST gate compares `vd.SizeKib > MaxVlmSizeInKib`, where
+//     `MaxVlmSizeInKib` already accounts for over-subscription
+//     ratios and shared-LUN dedup across the cluster.
+//
+// The two gates are complementary: the REST gate refuses fast when
+// no candidate pool can possibly host the volume; the placer gate
+// catches per-pool shortfalls under topology constraints (e.g.
+// anti-affinity).
+//
+// Empty / zero VolumeDefinitions (definitions-only spawn before VDs
+// are written) skip the check — nothing to gate.
+//
+// MaxVlmSizeInKib==0 means there are no eligible pools at the
+// requested placement (e.g. unknown storage_pool name, or every
+// candidate already filtered out by the RG/SP filter). The placer's
+// own "not enough candidate storage pools" envelope has richer
+// per-pool context for that case, so the gate stays silent and lets
+// runPlaceAndReport surface the failure.
+func (s *Server) rejectAutoplaceIfExceedsCapacityGate(ctx context.Context, w http.ResponseWriter, rdName string, filter *apiv1.AutoSelectFilter, srcKind string) bool {
+	vds, err := s.Store.VolumeDefinitions().List(ctx, rdName)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	if len(vds) == 0 {
+		return true
+	}
+
+	var requiredKib int64
+	for i := range vds {
+		if vds[i].SizeKib > requiredKib {
+			requiredKib = vds[i].SizeKib
+		}
+	}
+
+	if requiredKib <= 0 {
+		return true
+	}
+
+	info, err := s.computeSizeInfo(ctx, filter)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return false
+	}
+
+	capKib := info.SpaceInfo.MaxVlmSizeInKib
+	if capKib <= 0 {
+		// No candidate pools at the requested placement — defer to
+		// the placer's "not enough candidate storage pools" path so
+		// the 409 envelope carries the per-filter exclusion reasons
+		// (writeAutoplaceShortfall has richer context than this
+		// gate).
+		return true
+	}
+
+	if requiredKib <= capKib {
+		return true
+	}
+
+	// Reuse writeAutoplaceShortfall so the 409 wire shape matches
+	// the placer's CapacityShortfallError path: same ApiCallRc code
+	// (apiCallRcFailNotEnoughNodes), same criteria bullet list, same
+	// Auto-place configuration block. Operators (and tests) can
+	// classify both REST-gate and placer-gate shortfalls with one
+	// rule.
+	writeAutoplaceShortfall(w, filter, srcKind, &placer.CapacityShortfallError{
+		RequiredKib: requiredKib,
+		MaxFreeKib:  capKib,
+	})
+
+	return false
+}
 
 // mergeAutoplaceFilter merges the request's filter on top of the parent
 // ResourceGroup's stored select filter. Request fields win.
