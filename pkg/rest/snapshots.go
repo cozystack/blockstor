@@ -551,22 +551,30 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	// column.
 	snap.Snapshots = makeSnapshotPerNode(snap.Name, snap.Nodes, snap.VolumeDefinitions)
 
-	// Idempotent create: a CSI driver retries CreateSnapshot for the
-	// same (rd, snap_name) until success, so a re-request must return
-	// 200 + ApiCallRc rather than 409.
+	// Bug-hunt 2026-05-30 Finding 4 (P2): a duplicate `POST
+	// /v1/resource-definitions/{rd}/snapshots` against an existing
+	// snapshot used to return HTTP 200 + `maskInfo` ("snapshot already
+	// exists"). linstor-csi's CreateSnapshot retry handler matches on
+	// `ApiCallError.GetReturnCode() & FAIL_EXISTS_SNAPSHOT_DFN` to
+	// detect "already exists, surface the existing handle"; with
+	// MASK_INFO on the wire the driver believed a FRESH snapshot was
+	// taken and used the returned handle for restore-from-snapshot —
+	// silently restoring a different point-in-time than the operator
+	// requested. The fix returns 409 + FAIL_EXISTS_SNAPSHOT_DFN, but
+	// keeps the existing snapshot's UUID + per-node create-timestamp
+	// reachable in `ObjRefs` so CSI clients that consult the body can
+	// still pick up the existing handle deterministically (matches
+	// CSI v1 § CreateSnapshot retry semantics).
 	existing, getErr := s.Store.Snapshots().Get(r.Context(), rd, snap.Name)
 	if getErr == nil {
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: maskInfo,
-			Message: "snapshot already exists: " + existing.Name,
-		}})
+		writeSnapshotExistsConflict(w, rd, &existing)
 
 		return
 	}
 
 	err = s.Store.Snapshots().Create(r.Context(), &snap)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreErrorTyped(w, err, storeKindResourceDfn)
 
 		return
 	}
@@ -584,6 +592,64 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "snapshot created: " + snap.Name,
+	}})
+}
+
+// writeSnapshotExistsConflict emits the Bug-hunt 2026-05-30 Finding 4
+// typed conflict envelope on a duplicate `POST
+// /v1/resource-definitions/{rd}/snapshots`. Wire shape:
+//
+//   - HTTP 409 Conflict (was 200 + MASK_INFO before the fix — the
+//     misclassification let linstor-csi accept the stale handle as a
+//     fresh snapshot and corrupted restore-from-snapshot semantics).
+//   - `ret_code = apiCallRcError | apiCallRcFailExistsSnapshotDfn`
+//     (514 | MASK_ERROR) so
+//     `golinstor.ApiCallError.Is(client.FAIL_EXISTS_SNAPSHOT_DFN)`
+//     returns true and CSI's "already exists, fetch the existing
+//     handle" branch fires.
+//   - The `ObjRefs` map carries the EXISTING snapshot's UUID +
+//     per-node CreateTimestamp so CSI clients that consult the body
+//     can pick up the existing snapshot handle deterministically
+//     (CSI v1 § CreateSnapshot retry contract: the retried call must
+//     surface the existing snapshot's id + timestamp, not a no-op
+//     success without metadata).
+//
+// Per-node CreateTimestamp keys are namespaced by node so a multi-
+// diskful snapshot exposes each peer's local-take timestamp; CSI
+// typically consults the first non-zero entry but the full map is
+// the auditable spec.
+func writeSnapshotExistsConflict(w http.ResponseWriter, rd string, existing *apiv1.Snapshot) {
+	objRefs := map[string]string{
+		objRefRscDfn:      rd,
+		objRefSnapshotDfn: existing.Name,
+	}
+
+	if existing.UUID != "" {
+		objRefs["SnapshotDfnUuid"] = existing.UUID
+	}
+
+	for i := range existing.Snapshots {
+		node := existing.Snapshots[i]
+		if node.UUID != "" {
+			objRefs["SnapshotUuid/"+node.NodeName] = node.UUID
+		}
+
+		if node.CreateTimestamp != 0 {
+			ts := strconv.FormatInt(node.CreateTimestamp, 10)
+			objRefs["CreateTimestamp/"+node.NodeName] = ts
+		}
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsSnapshotDfn,
+		Message: "snapshot already exists: " + existing.Name +
+			" (on resource definition '" + rd + "')",
+		Cause: "a snapshot with this name is already registered under " +
+			"resource definition '" + rd + "'",
+		Correc: "pick a different snapshot name, or read the existing " +
+			"snapshot's UUID / per-node create-timestamp from this " +
+			"envelope's obj_refs to recover the stale handle",
+		ObjRefs: objRefs,
 	}})
 }
 

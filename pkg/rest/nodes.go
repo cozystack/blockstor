@@ -1210,11 +1210,101 @@ func (s *Server) resourcesOnNode(ctx context.Context, node string) ([]string, er
 // IsAlreadyExists branches map to 409 with a generic message — the
 // raw apimachinery string is dropped to avoid the Bug 162 leak.
 func writeStoreError(w http.ResponseWriter, err error) {
+	writeStoreErrorTyped(w, err, storeKindUnknown)
+}
+
+// scrubbedNotFoundMessage is the generic "not found" wire string
+// emitted when an apimachinery 404 reaches writeStoreErrorTyped. The
+// raw apimachinery error embeds the GroupResource string which leaks
+// the CRD plural and API group (Bug 162); dropping to the generic
+// literal mirrors the same scrub `writeStoreError` applies to the
+// IsAlreadyExists branch.
+const scrubbedNotFoundMessage = "not found"
+
+// storeResourceKind tags a writeStoreErrorTyped call with the kind of
+// object the store call addressed, so the helper can OR the matching
+// `apiCallRcFailExists*` / `apiCallRcFailNotFound*` sub-code onto the
+// MASK_ERROR envelope.
+//
+// Bug-hunt 2026-05-30 Finding 5: the duplicate-create / not-found
+// family across CRUD verbs (RG/RD/Resource/Node/SP) used to skip the
+// typed sub-code OR — every path wrote bare `apiCallRcError` with no
+// FAIL_* band, so `golinstor.ApiCallError.Is(client.FAIL_EXISTS_RSC_DFN)`
+// (and siblings) returned false on real duplicates. The typed helper
+// fixes that without breaking the single-call-site `writeStoreError`:
+// the un-typed entry point now delegates to writeStoreErrorTyped with
+// `storeKindUnknown`, which is byte-identical to the pre-fix behaviour.
+//
+// Callers pick the kind based on the primary resource of the handler:
+// for a `POST /v1/resource-groups` handler the kind is RG; for a
+// `POST resource` whose body resolves an RD by name the kind for the
+// RD-lookup `writeStoreErrorTyped` call is RD (cross-reference). The
+// shape mirrors objRefNode/objRefRscDfn/... — same data, but as a
+// switch driver rather than a wire-side string.
+type storeResourceKind int
+
+const (
+	storeKindUnknown storeResourceKind = iota
+	storeKindNode
+	storeKindResourceDfn
+	storeKindResourceGrp
+	storeKindResource
+	storeKindStorPool
+)
+
+// writeStoreErrorTyped is the Bug-hunt 2026-05-30 Finding 5 typed
+// variant of writeStoreError. Same NotFound/AlreadyExists/k8s-shaped
+// fan-out, but the AlreadyExists and NotFound branches OR the
+// kind-specific `apiCallRcFailExists*` / `apiCallRcFailNotFound*`
+// sub-code into the envelope's `ret_code` so:
+//
+//   - `golinstor.ApiCallError.Is(client.FAIL_EXISTS_RSC_DFN)` and
+//     siblings return true on the matching kind, letting piraeus-
+//     operator and linstor-csi branch on "already exists" vs. real
+//     conflict.
+//   - Audit-log greppers that route on the upstream catalogue (`(ret_code
+//     & 0x1FF) == 501` etc.) catch the typed band without needing the
+//     handler to know the upstream Java constant inline.
+//
+// Falls back to the un-typed envelope shape on every other error
+// class (context-cancel / 5xx / decode failure) — kept byte-identical
+// to the pre-Bug-Hunt-Finding-5 behaviour so the generic 5xx-retry
+// surface is preserved. `kind == storeKindUnknown` is byte-identical
+// to `writeStoreError` (the original helper is now a thin alias).
+//
+// Bug 164: K8s-shaped status errors (`apierrors.IsConflict` /
+// `IsAlreadyExists`) bypass the local store sentinels and used to fall
+// through to the default 500 branch. linstor-csi treats 5xx as fatal
+// but 409 as retryable, so a single optimistic-lock collision wedged
+// every CSI call against the affected RD. The IsConflict /
+// IsAlreadyExists branches map to 409 with a generic message — the
+// raw apimachinery string is dropped to avoid the Bug 162 leak.
+func writeStoreErrorTyped(w http.ResponseWriter, err error, kind storeResourceKind) {
 	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, store.ErrAlreadyExists):
-		writeError(w, http.StatusConflict, err.Error())
+		sub := existsSubCodeForKind(kind)
+		if sub == 0 {
+			writeError(w, http.StatusConflict, err.Error())
+
+			return
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | sub,
+			Message: scrubImplDetails(err.Error()),
+		}})
+	case errors.Is(err, store.ErrNotFound):
+		sub := notFoundSubCodeForKind(kind)
+		if sub == 0 {
+			writeError(w, http.StatusNotFound, err.Error())
+
+			return
+		}
+
+		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | sub,
+			Message: scrubImplDetails(err.Error()),
+		}})
 	case apierrors.IsConflict(err):
 		// Optimistic-lock conflict. Generic message — the apimachinery
 		// error embeds the GroupResource string which leaks the CRD
@@ -1222,16 +1312,77 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict,
 			"conflict: store object was modified, retry the request")
 	case apierrors.IsAlreadyExists(err):
-		writeError(w, http.StatusConflict,
-			"conflict: store object already exists")
+		sub := existsSubCodeForKind(kind)
+		if sub == 0 {
+			writeError(w, http.StatusConflict,
+				"conflict: store object already exists")
+
+			return
+		}
+
+		writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | sub,
+			Message: "conflict: store object already exists",
+		}})
 	case apierrors.IsNotFound(err):
-		// Same shape as the local sentinel — keep the wire status
-		// uniform so CSI's 404-handling path fires the same way.
-		writeError(w, http.StatusNotFound, "not found")
+		sub := notFoundSubCodeForKind(kind)
+		if sub == 0 {
+			// Same shape as the local sentinel — keep the wire status
+			// uniform so CSI's 404-handling path fires the same way.
+			writeError(w, http.StatusNotFound, scrubbedNotFoundMessage)
+
+			return
+		}
+
+		writeJSON(w, http.StatusNotFound, []apiv1.APICallRc{{
+			RetCode: apiCallRcError | sub,
+			Message: scrubbedNotFoundMessage,
+		}})
 	default:
 		writeError(w, http.StatusInternalServerError,
 			"store error: "+scrubImplDetails(err.Error()))
 	}
+}
+
+// existsSubCodeForKind returns the typed FAIL_EXISTS_* sub-code for
+// the named kind, or 0 when no upstream-aligned constant is defined.
+// Kept as a tiny lookup so writeStoreErrorTyped stays a switch.
+func existsSubCodeForKind(kind storeResourceKind) int64 {
+	switch kind {
+	case storeKindNode:
+		return apiCallRcFailExistsNode
+	case storeKindResourceDfn:
+		return apiCallRcFailExistsRscDfn
+	case storeKindResourceGrp:
+		return apiCallRcFailExistsRscGrp
+	case storeKindResource:
+		return apiCallRcFailExistsRsc
+	case storeKindStorPool:
+		return apiCallRcFailExistsStorPool
+	case storeKindUnknown:
+		return 0
+	}
+
+	return 0
+}
+
+// notFoundSubCodeForKind returns the typed FAIL_NOT_FOUND_* sub-code
+// for the named kind. Resource/RG have no upstream FAIL_NOT_FOUND_*
+// constant in the existing blockstor set so they fall through to the
+// un-typed envelope (the historical pre-Bug-Hunt-Finding-5 behaviour).
+func notFoundSubCodeForKind(kind storeResourceKind) int64 {
+	switch kind {
+	case storeKindNode:
+		return apiCallRcFailNotFoundNode
+	case storeKindResourceDfn:
+		return apiCallRcFailNotFoundRscDfn
+	case storeKindStorPool:
+		return apiCallRcFailNotFoundStorPool
+	case storeKindResource, storeKindResourceGrp, storeKindUnknown:
+		return 0
+	}
+
+	return 0
 }
 
 // writeError sends the LINSTOR-shaped `[]ApiCallRc` error envelope.

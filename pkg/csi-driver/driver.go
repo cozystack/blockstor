@@ -54,6 +54,7 @@ import (
 	"fmt"
 	"math"
 
+	linstor "github.com/LINBIT/golinstor"
 	lapi "github.com/LINBIT/golinstor/client"
 )
 
@@ -181,7 +182,18 @@ func (d *Driver) CreateSnapshot(ctx context.Context, req *CreateSnapshotRequest)
 	}
 
 	err := d.Client.Resources.CreateSnapshot(ctx, snap)
-	if err != nil {
+	if err != nil && !lapi.IsApiCallError(err, linstor.FailExistsSnapshotDfn) {
+		// CSI spec §CreateSnapshot mandates idempotency: a retried
+		// call with the same (SourceVolumeID, Name) tuple MUST
+		// surface the existing snapshot rather than erroring out.
+		// blockstor's REST surface returns 409 +
+		// FAIL_EXISTS_SNAPSHOT_DFN on the duplicate POST (see
+		// pkg/rest/snapshots.go::writeSnapshotExistsConflict — the
+		// envelope embeds the existing snapshot's UUID + per-node
+		// CreateTimestamp in ObjRefs for clients that want the
+		// authoritative handle). We fold that into success here so
+		// csi-snapshotter's retry loop converges, matching upstream
+		// linstor-csi's behaviour on the same wire shape.
 		return nil, fmt.Errorf("CreateSnapshot %s/%s: %w", req.SourceVolumeID, req.Name, err)
 	}
 
