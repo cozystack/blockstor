@@ -439,7 +439,22 @@ func (s *Server) handleNodeLost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.Store.Nodes().Delete(r.Context(), name)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Bug-hunt v0.1.3 Finding 9: surface a warn-band envelope
+			// so audit-log greppers + `*_lost_total` Prometheus
+			// alerts can distinguish a real `n lost` teardown from
+			// an idempotent retry against an already-absent node.
+			// Mirrors the Bug 56 / 66 family pattern every other
+			// delete-of-missing handler in this package uses.
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: warnNodeAlreadyGone,
+				Message: "node already absent: " + name,
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return

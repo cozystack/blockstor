@@ -197,15 +197,30 @@ func (s *Server) handleNetInterfaceUpdate(w http.ResponseWriter, r *http.Request
 // so a sibling `handleNetInterfaceCreate` adding a different
 // interface concurrently won't be silently dropped on the
 // wholesale-Spec-replace path the old `Update` used.
+//
+// Bug-hunt v0.1.3 Finding 9: when the named interface was never
+// present on the node, surface a warn-band ApiCallRc envelope
+// (warnNetInterfaceNotFound) instead of the success-band maskInfo
+// shape so audit-log greppers can distinguish a real drop from an
+// idempotent no-op. Mirrors the Bug 56 / 66 pattern every other
+// delete-of-missing handler in this package uses.
 func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request) {
 	nodeName := r.PathValue("node")
 	name := r.PathValue("name")
 
+	found := false
+
 	err := s.Store.Nodes().PatchNetInterfaces(r.Context(), nodeName, func(current []apiv1.NetInterface) ([]apiv1.NetInterface, error) {
+		// Reset on every retry — Bug 201's Patch closure may re-run
+		// against a freshly-fetched state, so a state-dependent flag
+		// has to be (re)computed inside the closure to stay correct.
+		found = false
 		out := current[:0]
 
 		for i := range current {
 			if current[i].Name == name {
+				found = true
+
 				continue
 			}
 
@@ -216,6 +231,15 @@ func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		writeStoreError(w, err)
+
+		return
+	}
+
+	if !found {
+		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+			RetCode: warnNetInterfaceNotFound,
+			Message: "net-interface already absent: " + name,
+		}})
 
 		return
 	}

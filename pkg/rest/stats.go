@@ -20,6 +20,9 @@ package rest
 
 import (
 	"net/http"
+	"slices"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // registerStats wires the cluster-wide counter endpoint family.
@@ -58,6 +61,13 @@ func (s *Server) registerStats(mux *http.ServeMux) {
 		s.requireStore(s.handleStatsVolumes))
 	mux.HandleFunc("GET /v1/stats/snapshots",
 		s.requireStore(s.handleStatsSnapshots))
+	// Bug-hunt v0.1.3 Finding 13: upstream OpenAPI line 397 declares
+	// /v1/stats/nodes as a per-status histogram surface — `linstor
+	// node stats` and the prometheus-exporter scrape it on a tick.
+	// Pre-fix the apiserver only wired the other six sub-paths so
+	// node stats returned 404.
+	mux.HandleFunc("GET /v1/stats/nodes",
+		s.requireStore(s.handleStatsNodes))
 }
 
 // countEnvelope is the upstream `*Stats` schema shape: a single
@@ -68,6 +78,65 @@ func (s *Server) registerStats(mux *http.ServeMux) {
 type countEnvelope struct {
 	Count int64 `json:"count"`
 }
+
+// nodeStatsEnvelope is the upstream `NodeStats` shape: one `count`
+// total plus per-status sub-counts (online / offline / evicted).
+// Bug-hunt v0.1.3 Finding 13. The field set mirrors what
+// `linstor node stats` and the prometheus-exporter both read from
+// upstream. ConnectionStatus is the satellite-heartbeat-stamped
+// wire field every Node carries; "ONLINE" / "OFFLINE" are the two
+// terminal values, anything else (CONNECTING, UNKNOWN, blank) is
+// treated as not-online by the same convention the Bug 111 gate
+// uses (checkNodeLostAllowed) so the counts stay consistent across
+// surfaces. Evicted is counted independently of online/offline —
+// an EVICTED node may still be ONLINE during the drain phase.
+type nodeStatsEnvelope struct {
+	Count   int64 `json:"count"`
+	Online  int64 `json:"online"`
+	Offline int64 `json:"offline"`
+	Evicted int64 `json:"evicted"`
+}
+
+// handleStatsNodes emits the node-status histogram. Bug-hunt v0.1.3
+// Finding 13: pre-fix `/v1/stats/nodes` 404'd while the six sibling
+// `/v1/stats/<kind>` sub-paths were wired. The four-field shape
+// (count / online / offline / evicted) matches upstream's NodeStats
+// schema (the `linstor node stats` Python CLI dereferences each key
+// unconditionally — anything missing crashes the render).
+func (s *Server) handleStatsNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.Store.Nodes().List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+
+		return
+	}
+
+	out := nodeStatsEnvelope{Count: int64(len(nodes))}
+
+	for i := range nodes {
+		if nodes[i].ConnectionStatus == nodeConnectionStatusOnline {
+			out.Online++
+		} else {
+			// Treat CONNECTING / UNKNOWN / blank as offline — matches
+			// the Bug 111 gate's "anything not ONLINE is not online"
+			// rule so the histogram stays consistent with the gate.
+			out.Offline++
+		}
+
+		if slices.Contains(nodes[i].Flags, apiv1.NodeFlagEvicted) {
+			out.Evicted++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// nodeConnectionStatusOnline is the wire-canonical "satellite is
+// healthy" value of Node.ConnectionStatus. Hoisted to a constant so
+// the stats histogram and any future gate read from one source of
+// truth — typo'ing this string would silently flip every node to
+// "offline" in the histogram.
+const nodeConnectionStatusOnline = "ONLINE"
 
 // handleStatsResourceDefinitions emits the count of resource
 // definitions. Bug 195. List+len is the cheapest implementation —
