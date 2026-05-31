@@ -84,7 +84,11 @@ N1=$WORKER_1
 N2=$WORKER_2
 SIZE_KIB=65536
 REVIVE_DEADLINE_SECS=60
-UPTODATE_DEADLINE_SECS=60
+# Bumped 60→120: the StandAlone-after-revive convergence path (see
+# shouldSkipNetOnAdjust block comment above) routinely takes >60s on the
+# QEMU stand when the reconcile-tick hits mid-handshake; runs 26693209114
+# and 26662475084 both timed out here on already-healthy resources.
+UPTODATE_DEADLINE_SECS=120
 
 trap 'delete_rd "$RD"' EXIT
 
