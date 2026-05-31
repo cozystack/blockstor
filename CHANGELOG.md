@@ -4,6 +4,35 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.4 — 2026-05-31
+
+Bug-hunt + REST safety release. Closes issue #45 (autoplace capacity gate on the real linstor-csi single-node create path) and re-enables the corresponding e2e scenario.
+
+### Fixed
+
+- **Autoplace / spawn / single-node-create capacity gate (issue #45)** — when a StorageClass set `placementCount: 1` + `nodeList`, linstor-csi's `manual` scheduler bypassed the existing autoplace gate and accepted placement on a 100%-full pool, leaving the PVC `Bound` with a broken backing volume. The capacity check now lives inside `createOneResource` (shared by both the bulk `/v1/resource-definitions/{rd}/resources` and the single-node alias `/v1/resource-definitions/{rd}/resources/{node}`), reads `pool.FreeCapacity` directly, and rejects with 409 + `FAIL_NOT_ENOUGH_NODES`. A separate gate also runs on `/v1/resource-definitions/{rd}/autoplace` and `/v1/resource-groups/{rg}/spawn`. The 4-tier pool-name resolver honours `RG.SelectFilter.StoragePoolList`, which is the field linstor-csi posts.
+- **Recovery after operator `drbdadm down` no longer reverts** — the satellite's `shouldSkipNetOnAdjust` gate was too broad: it skipped the net section of `drbdadm adjust` whenever any peer device was `StandAlone`, which then masked the operator-driven `down` and let the reconciler re-up the resource into the wrong topology. The gate is now narrowed to `StandAlone AND peer-devices-present`, matching the actual respawn case it was meant to cover.
+- **Resource DELETE / SP DELETE / Node DELETE typed envelopes** — these endpoints used to return generic 500s or unparseable error bodies. They now return upstream-matching `FAIL_*` envelopes (`FAIL_EXISTS_RSC`, `FAIL_EXISTS_STOR_POOL`, `FAIL_IN_USE`, `FAIL_NOT_FOUND_RSC_DFN`, etc.), and the CSI driver treats `FAIL_EXISTS_SNAPSHOT_DFN` as idempotent success.
+- **Duplicate storage-pool POST is refused, not silently mutated** — `POST /v1/nodes/{n}/storage-pools` against an existing SP used to overwrite the existing object. It now returns 409 + `FAIL_EXISTS_STOR_POOL`.
+- **Internal annotations are stripped from REST reads** — `blockstor.io/*` and `*.blockstor.cozystack.io/*` annotations are now stripped on the wire boundary for `r l`, `rd l`, `rg l`, `snap l`, autoplace GETs, and the single-node alias.
+- **Recovery-down-reverses regression** — narrowed satellite skip-net gate so the StandAlone-after-respawn path doesn't revert operator-driven `drbdadm down`.
+
+### Added
+
+- **Missing REST routes wired** — `/v1/storage-pool-definitions`, `/v1/migrate-disk`, and the `properties/info` family are now wired with real handlers and OpenAPI shapes.
+- **DRBD promotion + node event streams** — `GET /v1/events/drbd/promotion` and `GET /v1/events/nodes` now serve newline-delimited JSON events.
+
+### Test infrastructure
+
+- **`observability-capacity-correlation` and `csi-pvc-local` restored to the piraeus-interop lane** — both e2e scenarios now PASS after the fixes above; `csi-pvc-local` was held back by `nodeName` (immune to taints) and is now driven by `nodeSelector`. `node-replace-hardware` remains excluded pending a separate fix in the node-replacement satellite path.
+- **Flaky scenarios hardened** — `state-offline-unknown` (pod-name race), `state-auto-resync` (timeout 240s → 300s + grace re-check), `recovery-down-reverses` (timeout 60s → 120s), `recovery-deleting-convert` (CRD-status fallback to kernel pair). Origins are documented inline per scenario.
+- **Bare-blockstor 6-lane matrix excludes piraeus-only scenarios** — `observability-capacity-correlation` is excluded from the 6-lane matrix because it requires piraeus's `LinstorCluster` CRD, which is installed only in the e2e-piraeus job.
+- **`stand/up.sh` ported to talosctl 1.13's `cluster create qemu` subcommand** + skip-list for `/24` slots inside Talos's default `10.96.0.0/12` service CIDR (slots 96-111).
+
+### Refactor
+
+- **`createOneResource` extracted from the bulk and single-node REST handlers** so the capacity gate, pool resolver, and create-shape validator have one home.
+
 ## v0.1.3 — 2026-05-30
 
 ### Fixed
