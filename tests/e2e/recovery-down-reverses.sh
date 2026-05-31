@@ -37,17 +37,28 @@
 #
 # OBSERVED CURRENT STATE (recorded for the spec-gap)
 # --------------------------------------------------
-# pkg/satellite/reconciler.go::applyDRBD runs `drbdadm adjust <rd>`
-# unconditionally as long as a `.md-created` marker exists for the
-# RD. After `drbdadm down`, the kernel slot is gone but the marker
-# survives, so the reconciler retries `adjust` — which then fails
-# with "Failure: (158) Unknown resource" because adjust expects
-# the resource to already be loaded. The reconciler never falls
-# back to `drbdadm up` / `new-resource`, so the resource stays
-# down indefinitely. See reconciler_drbd_test.go:1606-1615 for
-# the same gap noted under a different scenario (Bug 8 / 5.16).
-# Scenario 5.32 therefore FAILs on master today and serves as the
-# forward-spec for the missing kernel-state-aware revive path.
+# Initial wedge (pre-fix): pkg/satellite/reconciler.go::applyDRBD ran
+# `drbdadm adjust <rd>` unconditionally as long as a `.md-created`
+# marker existed for the RD. After `drbdadm down`, the kernel slot
+# was gone but the marker survived, so the reconciler retried
+# `adjust` — which failed with "Failure: (158) Unknown resource".
+# Fixed by the Bug-287 fallback in runAdjust (catch the 158 error
+# text → fall back to `drbdadm up`) AND the FSM dispatch chain
+# (Phase=MetadataReady → ActionUp). Step 4 of this test pins that
+# revive path.
+#
+# Recovery wedge (flaky on PR #46 lane 1, 2026-05-30): even when
+# the satellite revived the kernel slot via `drbdadm up`, both
+# peer connection slots stuck in `connection:StandAlone` and never
+# reconnected. The next `drbdadm adjust` was coerced onto
+# `--skip-net` by shouldSkipNetOnAdjust (any StandAlone peer was
+# enough to trigger the gate) — preserving the wedge instead of
+# re-issuing `drbdsetup connect`. Fixed by narrowing the gate to
+# StandAlone-AND-peer-devices-present (the operator-disconnect
+# signature). A fresh-revive StandAlone (post-`drbdadm up`, no
+# peer-device entries registered yet) now falls through to bare
+# adjust, which re-issues `connect`. Step 5 below pins that
+# convergence with a 60s budget.
 #
 # Steps
 #   1. Apply 2-replica RD on $N1+$N2, wait UpToDate.
@@ -165,8 +176,28 @@ done
 
 if (( connected == 0 )); then
     echo "FAIL: ${RD} did not reach Connected+UpToDate within ${UPTODATE_DEADLINE_SECS}s"
+    echo "      last observed per-peer connection state:"
+    echo "        ${N1} -> ${N2}: ${n1_conn}"
+    echo "        ${N2} -> ${N1}: ${n2_conn}"
+    echo "        ${N1} local disk: ${n1_local_disk}"
+    echo "        ${N2} local disk: ${n2_local_disk}"
     echo "      ${N1} view:"; on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/      /' || true
     echo "      ${N2} view:"; on_node "$N2" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/      /' || true
+    # Scenario 5.32 forensic dump: when both peers stay StandAlone after
+    # the revive, the json view shows whether peer-device entries were
+    # registered. Empty peer_devices = post-`drbdadm up` revive signature
+    # (kernel slot created but connect handshake never registered the
+    # per-volume table); non-empty = operator-disconnect signature. See
+    # pkg/satellite/reconciler.go::shouldSkipNetOnAdjust and
+    # tests/e2e/recovery-down-reverses.sh comment block above.
+    echo "      ${N2} drbdsetup status -j ${RD}:"
+    on_node "$N2" drbdsetup status -j "$RD" 2>&1 | sed 's/^/      /' || true
+    echo "      satellite logs (last 80 lines, ${N2}):"
+    sat_pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        -o "jsonpath={.items[?(@.spec.nodeName==\"${N2}\")].metadata.name}" 2>/dev/null || true)
+    if [[ -n "${sat_pod}" ]]; then
+        kubectl -n "$NS" logs --tail=80 "$sat_pod" 2>/dev/null | sed 's/^/      /' || true
+    fi
     exit 1
 fi
 

@@ -3535,9 +3535,10 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 
 // shouldSkipNetOnAdjust probes the kernel for operator-initiated
 // `StandAlone` peer connection slots. When any peer is in
-// `StandAlone`, the caller dispatches `drbdadm adjust --skip-net`
-// rather than plain adjust — preserving the operator's manual
-// disconnect across the reconcile.
+// `StandAlone` AND the kernel has peer-device entries registered
+// for it, the caller dispatches `drbdadm adjust --skip-net` rather
+// than plain adjust — preserving the operator's manual disconnect
+// across the reconcile.
 //
 // W12 + network-partition guard: when the operator runs
 // `drbdadm disconnect <rd>` or `drbdsetup disconnect --force=yes <rd>
@@ -3565,6 +3566,28 @@ func (r *Reconciler) dispatchAdjust(ctx context.Context, resource string, skipDi
 // prop changes) still runs; net-attach is left for the operator to
 // restore via `drbdadm connect`.
 //
+// Scenario 5.32 / recovery-down-reverses guard: the same `StandAlone`
+// connection-state token shows up in a SECOND, semantically distinct
+// case — the post-`drbdadm down` recovery window. When an operator
+// runs `drbdadm down <rd>` and the reconciler revives the kernel
+// slot via the Bug-287 `drbdadm up` fallback (ActionUp via FSM), a
+// transient or failed handshake can leave fresh peer connection
+// slots stuck in StandAlone WITHOUT peer-device entries — the
+// kernel allocated the slot but the connect handshake never
+// registered the per-volume peer-device table. The operator-
+// disconnect case ALWAYS retains peer-device entries (kernel keeps
+// the configured volumes around after `drbdadm disconnect`, only
+// the connection-state flips), so the presence of at least one
+// peer-device entry is the disambiguator: it is the kernel's
+// "this slot was successfully negotiated at some point" marker.
+//
+// We therefore require BOTH StandAlone connection-state AND at
+// least one peer-device entry for any volume in the desired set
+// before coercing `--skip-net`. A fresh-revive StandAlone (no
+// peer-devices) falls through to the bare adjust path — which
+// re-issues `drbdsetup connect` and unwedges scenario 5.32
+// (`tests/e2e/recovery-down-reverses.sh`).
+//
 // Best-effort: a probe error returns false so adjust falls through
 // to the existing full-adjust path (failing closed would freeze
 // adjust on any transient drbdsetup hiccup). The probe is
@@ -3577,9 +3600,21 @@ func (r *Reconciler) shouldSkipNetOnAdjust(ctx context.Context, resource string)
 	}
 
 	for _, slot := range slots {
-		if slot.ConnectionState == string(drbd.ConnectionStateStandAlone) {
-			return true
+		if slot.ConnectionState != string(drbd.ConnectionStateStandAlone) {
+			continue
 		}
+		// Recovery-down-reverses disambiguator: a StandAlone slot with
+		// NO peer-device entry is a fresh slot that has not completed a
+		// connect handshake (post-`drbdadm up` revive window). Treat
+		// that as "needs full adjust" so the next `drbdadm adjust`
+		// re-issues `drbdsetup connect`. Only StandAlone slots that
+		// retain peer-device entries (the operator-disconnect signal)
+		// trigger `--skip-net`.
+		if len(slot.PeerDevicesByVolNum) == 0 {
+			continue
+		}
+
+		return true
 	}
 
 	return false
