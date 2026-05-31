@@ -243,7 +243,10 @@ jobs:
       # does not re-register after re-labeling on the replaced node); root
       # cause is in the satellite/controller path, not in CI infrastructure,
       # and reverting #48 isn't viable. Track separately; restore once fixed.
-      E2E_EXCLUDE: "rwx-ganesha observability-three-way csi-pvc-replicated-rwo csi-pvc-local node-replace-hardware"
+      # observability-capacity-correlation requires piraeus's LinstorCluster CRD,
+      # which is only installed in the e2e-piraeus job below — keep it out of the
+      # 6-lane matrix or it hard-fails at the prerequisite check.
+      E2E_EXCLUDE: "rwx-ganesha observability-three-way observability-capacity-correlation csi-pvc-replicated-rwo csi-pvc-local node-replace-hardware"
     permissions:
       contents: read
       checks: write
