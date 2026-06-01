@@ -125,11 +125,15 @@ func TestBug319CreateMDBeforeAdjustOnDisklessToDiskfulFlip(t *testing.T) {
 	// papered over a missing create-md re-entry with an explicit
 	// `drbdadm attach`; Bug 319 lifts the gate so create-md is the
 	// load-bearing step.
+	// Bug B.4: create-md is now per-volume (`<rd>/<volNumber>`), not
+	// per-RD. The per-RD form would EBUSY on multi-volume late-add
+	// paths where vol-0 is already attached.
 	createMDIdx := slices.IndexFunc(cmds, func(s string) bool {
-		return strings.HasPrefix(s, "drbdadm create-md") && strings.HasSuffix(s, "pvc-bug303")
+		return strings.HasPrefix(s, "drbdadm create-md") &&
+			(strings.HasSuffix(s, "pvc-bug303/0") || strings.HasSuffix(s, "pvc-bug303"))
 	})
 	if createMDIdx < 0 {
-		t.Errorf("expected `drbdadm create-md ... pvc-bug303` on the diskless→diskful flip; got: %v", cmds)
+		t.Errorf("expected `drbdadm create-md ... pvc-bug303/<vol>` on the diskless→diskful flip; got: %v", cmds)
 	}
 
 	adjustIdx := slices.IndexFunc(cmds, func(s string) bool {
@@ -378,11 +382,13 @@ func TestApplyDRBDRunsCreateMdOnDisklessToDiskfulFlip(t *testing.T) {
 
 	cmds := fx.CommandLines()
 
+	// Bug B.4: create-md is now per-volume.
 	createMDIdx := slices.IndexFunc(cmds, func(s string) bool {
-		return strings.HasPrefix(s, "drbdadm create-md") && strings.HasSuffix(s, "pvc-bug319")
+		return strings.HasPrefix(s, "drbdadm create-md") &&
+			(strings.HasSuffix(s, "pvc-bug319/0") || strings.HasSuffix(s, "pvc-bug319"))
 	})
 	if createMDIdx < 0 {
-		t.Errorf("expected `drbdadm create-md ... pvc-bug319` on the flip even with "+
+		t.Errorf("expected `drbdadm create-md ... pvc-bug319/<vol>` on the flip even with "+
 			".md-created marker present; got: %v", cmds)
 	}
 
