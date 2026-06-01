@@ -20,9 +20,11 @@ package satellite_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/cozystack/blockstor/pkg/luks"
 	"github.com/cozystack/blockstor/pkg/satellite"
 	intent "github.com/cozystack/blockstor/pkg/satellite/intent"
 	"github.com/cozystack/blockstor/pkg/storage"
@@ -129,6 +131,116 @@ func TestBug267DisklessSkipsDeleteWhenNoStoragePool(t *testing.T) {
 	if deleteCalls != 0 {
 		t.Errorf("DeleteVolume invoked on fresh DISKLESS replica with no "+
 			"prior storage; got %d calls", deleteCalls)
+	}
+}
+
+// TestToggleToDisklessClosesLUKSMapperBeforeReclaim pins the
+// bug-hunt v2 E.1b / E.1c invariant: when a LUKS-stacked Resource
+// transitions to DISKLESS via `linstor r td --diskless`, the
+// satellite reconciler MUST run `cryptsetup luksClose <mapper>`
+// BEFORE calling `provider.DeleteVolume`. Mirror of the
+// `DeleteResource` cleanup order (drbdadm down → luksClose →
+// DeleteVolume). Before the fix the mapper survived on the
+// now-diskless host holding `/dev/zvol/...` open, so the
+// follow-on `r d` either errored ("dataset is busy") or — on the
+// observed dev-stand — silently no-op'd and the zvol leaked
+// permanently.
+//
+// Test shape: feed the reconciler exactly what the dispatcher
+// emits for a LUKS-stacked Resource being toggled to diskless
+// (Spec.LayerStack contains "LUKS", Spec.Flags has DISKLESS,
+// every Volume's StoragePool is stamped with the historical
+// pool). Stage a FakeExec that records the `cryptsetup luksClose`
+// invocation and assert the command line + ordering against the
+// `DeleteVolume` provider hook.
+func TestToggleToDisklessClosesLUKSMapperBeforeReclaim(t *testing.T) {
+	prov := &disklessCleanupFakeProvider{}
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": prov},
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	dr := &intent.DesiredResource{
+		Name:       "pvc-luks-toggle",
+		NodeName:   "n1",
+		LayerStack: []string{"DRBD", "LUKS", "STORAGE"},
+		Flags:      []string{"DISKLESS"},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024, StoragePool: "thin1"},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("apply result not ok: %+v", results)
+	}
+
+	cmds := fx.CommandLines()
+
+	luksCloseIdx := -1
+
+	for i, line := range cmds {
+		if strings.Contains(line, "cryptsetup luksClose") {
+			luksCloseIdx = i
+
+			break
+		}
+	}
+
+	if luksCloseIdx == -1 {
+		t.Fatalf("expected `cryptsetup luksClose` on toggle-to-diskless of LUKS-stacked Resource; got %v", cmds)
+	}
+
+	prov.mu.Lock()
+	deleteCalls := prov.deleteCalls
+	prov.mu.Unlock()
+
+	if deleteCalls == 0 {
+		t.Errorf("DeleteVolume not invoked after LUKS close — toggle path skipped storage reclaim; bug-hunt v2 E.1c reproduces")
+	}
+}
+
+// TestToggleToDisklessSkipsLUKSCloseWithoutLUKSLayer guards the
+// inverse: a non-LUKS Resource transitioning to DISKLESS must NOT
+// invoke `cryptsetup luksClose` (a stray call on a non-existent
+// mapper is harmless on the wire but wastes a netlink round-trip
+// per reconcile and pollutes satellite logs with "no such device"
+// noise). Confirms the new hook is properly gated on
+// `needsLUKS(layerStack)`.
+func TestToggleToDisklessSkipsLUKSCloseWithoutLUKSLayer(t *testing.T) {
+	prov := &disklessCleanupFakeProvider{}
+	fx := storage.NewFakeExec()
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers:  map[string]storage.Provider{"thin1": prov},
+		Cryptsetup: luks.NewCryptsetup(fx),
+	})
+
+	dr := &intent.DesiredResource{
+		Name:       "pvc-noluks-toggle",
+		NodeName:   "n1",
+		LayerStack: []string{"DRBD", "STORAGE"},
+		Flags:      []string{"DISKLESS"},
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024, StoragePool: "thin1"},
+		},
+	}
+
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{dr})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "cryptsetup luksClose") {
+			t.Errorf("unexpected luksClose on non-LUKS Resource: %q", line)
+		}
 	}
 }
 

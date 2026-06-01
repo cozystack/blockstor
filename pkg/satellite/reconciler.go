@@ -1242,6 +1242,32 @@ func (r *Reconciler) applyStorageIfDiskful(ctx context.Context, dr *intent.Desir
 			return nil, false, false, err
 		}
 
+		// Bug-hunt v2 E.1b / E.1c: when LUKS sits between DRBD and
+		// storage, `cryptsetup luksClose` MUST run between the DRBD
+		// detach and the storage DeleteVolume — exactly the order
+		// `DeleteResource` follows for full-RD teardown above. Before
+		// this hook the toggle path skipped LUKS cleanup entirely;
+		// the dm-crypt mapper survived on the now-diskless host
+		// holding `/dev/zvol/...` open, so `reclaimVolumesForDiskless`
+		// next-line either error'd ("dataset is busy") or — in the
+		// observed dev-stand case — silently no-op'd because the ZFS
+		// provider's DeleteVolume swallowed the leftover, leaving the
+		// zvol AND the LUKS mapper resident on the host. The
+		// subsequent `r d` then skipped the storage layer entirely
+		// (Spec.Flags already DISKLESS) and the zvol leaked
+		// permanently (bug-hunt2 E.1c).
+		//
+		// Best-effort, identical to DeleteResource's cryptsetup loop:
+		// a mapper that was never opened (fresh toggle on a Resource
+		// that hadn't yet promoted past `Created`) returns non-zero
+		// and we don't care; the missing-mapper path can't strand
+		// the toggle.
+		if r.cfg.Cryptsetup != nil && needsLUKS(dr.GetLayerStack()) {
+			for _, vol := range dr.GetVolumes() {
+				_ = r.cfg.Cryptsetup.Close(ctx, luksMapperName(dr.GetName(), vol.GetVolumeNumber()))
+			}
+		}
+
 		err = r.reclaimVolumesForDiskless(ctx, dr)
 		if err != nil {
 			return nil, false, false, err

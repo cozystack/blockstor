@@ -140,7 +140,20 @@ SIZE_KIB=65536
 SIZE_BYTES=$((64 * 1024))   # marker payload — bigger than 4 KiB align
                             # unit, small enough to resync in well
                             # under 10 s on the QEMU stand
-RECOVERY_WINDOW=${RECOVERY_WINDOW:-15}
+## RECOVERY_WINDOW: ceiling for "$N1 reaches UpToDate after `drbdadm
+## attach + clear SkipDisk`". The marker payload is only 64 KiB so the
+## bitmap-diff resync is bandwidth-trivial, but on loaded CI runners
+## with 8 parallel QEMU clusters sharing one host, observer SSA →
+## apiserver round-trip → controller reconcile → satellite-side
+## events2 polling adds up — measured 18-35s tail latency on
+## ci-lane2 (2026-06-01 PR #55 run, lane 2 hit 15s ceiling at
+## disk:Inconsistent replication:SyncTarget peer-disk:UpToDate, i.e.
+## the sync was actively in flight). 60s gives 2-3x headroom over the
+## observed CI tail while still failing fast against a truly stuck
+## sync (the unhealthy path is "never advances", not "advances slowly
+## but eventually"). Operators on the dev stand still see sub-5s
+## convergence; the bump is CI-only headroom.
+RECOVERY_WINDOW=${RECOVERY_WINDOW:-60}
 
 trap 'delete_rd "$RD"' EXIT
 
