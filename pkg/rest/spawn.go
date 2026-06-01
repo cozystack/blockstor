@@ -69,6 +69,24 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug C.4 (bug-hunt v3): the spawned RD name flows straight into
+	// `buildSpawnedRD` → `Store.ResourceDefinitions().Create()`. When the
+	// caller supplies a mixed-case / invalid name, the k8s CRD store
+	// slugifies the metadata.name and the lowercased value no longer
+	// matches the spec.resourceDefinitionName CRD admission check; the
+	// store-side rejection leaves a half-built RD entry in the linstor
+	// view and the operator sees a raw "metadata.name must equal …"
+	// leak — the same Bug-97 class the direct `rd c` path already gates
+	// against. Mirror that gate here at the wire boundary, BEFORE any
+	// Store.Create call, so the failure mode is one consistent LINSTOR
+	// envelope and no orphan state is left behind.
+	nameErr := validateLinstorName("resource definition", req.ResourceDefinitionName)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
+
+		return
+	}
+
 	// Over-subscription gate (Scenarios 7.19/7.20/7.21). The cap is
 	// computed against the RG's effective SelectFilter (merged with
 	// spawn-time overrides) so the operator's `not_place_with_rsc` /
