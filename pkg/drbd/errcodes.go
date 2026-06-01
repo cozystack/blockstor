@@ -21,6 +21,7 @@ package drbd
 import (
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // DrbdsetupErrCode is a numeric DRBD-utils error code surfaced in
@@ -76,6 +77,14 @@ const (
 	// scenario 5.32 probe-vs-adjust race the reconciler's adjust
 	// path recovers from via `drbdadm up`.
 	ErrMinorNotKnownOnPeer DrbdsetupErrCode = 158
+
+	// ErrInvalidConfigRequest (162) — drbdsetup's generic
+	// "kernel rejected the request" envelope, with the specific
+	// failure mode carried in the `additional info from kernel:`
+	// trailer. The reconciler matches on the (162) prefix when
+	// pairing with a known kernel trailer signature; see
+	// IsBitmapDropBothDisksErr for the tiebreaker-relocate case.
+	ErrInvalidConfigRequest DrbdsetupErrCode = 162
 
 	// ErrNeedApplyAL (167) — drbdsetup needs an activity-log
 	// apply pass before the requested verb can proceed.
@@ -142,4 +151,43 @@ func IsErrCode(err error, code DrbdsetupErrCode) bool {
 // documenting.
 func IsUnknownResourceErr(err error) bool {
 	return IsErrCode(err, ErrMinorNotKnownOnPeer)
+}
+
+// IsBitmapDropBothDisksErr reports whether `err` matches the
+// tiebreaker-relocate-StandAlone-wedge signature: the kernel
+// refused to drop the per-peer bitmap because its on-disk
+// metadata still reads the peer as diskful for that node-id
+// slot. The verbatim signature is `(162) Invalid configuration
+// request` + kernel info `Can not drop the bitmap when both
+// sides have a disk` emitted by `drbdsetup peer-device-options
+// <res> <peer-node-id> <vol> --set-defaults --bitmap=no` — the
+// declarative form `drbdadm adjust` runs for any `disk none`
+// peer in the .res.
+//
+// Triggered when the controller re-allocates DRBDNodeID for a
+// returning TIE_BREAKER onto a peer-slot whose v09 metadata has
+// never been used (default-initialised non-zero bitmap-uuid
+// reads back as `peer-disk:Outdated`). A single full bring-up
+// cycle (`drbdadm down` + `drbdadm up`) flushes the in-memory
+// peer-disk state so the next `drbdadm adjust` accepts
+// `--bitmap=no` cleanly.
+//
+// The first failed adjust leaves a StandAlone slot with
+// peer-device entries registered (kernel allocated them via
+// new-peer before peer-device-options fired), at which point
+// shouldSkipNetOnAdjust permanently misfires for that slot —
+// surface the predicate here so the adjust-error handler can
+// take the recovery path before the gate latches.
+func IsBitmapDropBothDisksErr(err error) bool {
+	if !IsErrCode(err, ErrInvalidConfigRequest) {
+		return false
+	}
+
+	// Other (162) failure modes exist (e.g. ineligible flag
+	// combinations on `new-peer`); the kernel-info trailer is
+	// the disambiguator. Match on the stable "Can not drop the
+	// bitmap" phrase emitted from drbd-utils `wire.c` so locale
+	// translations of surrounding kernel diagnostics don't
+	// false-match.
+	return strings.Contains(err.Error(), "Can not drop the bitmap")
 }
