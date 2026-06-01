@@ -3514,7 +3514,65 @@ func (r *Reconciler) runAdjust(ctx context.Context, dr *intent.DesiredResource, 
 		return nil
 	}
 
+	// Recover from the tiebreaker-relocate StandAlone wedge:
+	// when the controller re-allocates DRBDNodeID for a returning
+	// TIE_BREAKER onto a fresh peer-slot, the surviving diskful's
+	// v09 metadata for that slot reads back as
+	// `peer-disk:Outdated` (default-initialised bitmap-uuid). The
+	// failing adjust hits `peer-device-options --bitmap=no` and
+	// the kernel refuses with `(162) Can not drop the bitmap when
+	// both sides have a disk`. recoverFromBitmapBothDisks below
+	// runs a full down + up + adjust cycle so the next adjust
+	// reads peer-disk from a fresh handshake (DUnknown) rather
+	// than from the stale metadata default — see
+	// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
+	if drbd.IsBitmapDropBothDisksErr(err) {
+		return r.recoverFromBitmapBothDisks(ctx, dr, skipDisk, skipNet)
+	}
+
 	return errors.Wrapf(err, "adjust %s", dr.GetName())
+}
+
+// recoverFromBitmapBothDisks executes the down + up + adjust
+// recovery for the tiebreaker-relocate StandAlone wedge.
+// Without this recovery the first failed adjust leaves the
+// returning TB's kernel slot StandAlone with peer-device entries
+// kernel-registered (the new-peer call ran before peer-device-
+// options failed); shouldSkipNetOnAdjust then permanently
+// latches `--skip-net` for that slot and the slot stays
+// StandAlone forever.
+//
+// Bounded to a single bounce per adjust pass: the recovery
+// retries dispatchAdjust once; if the second adjust still
+// fails, bubble the error so the reconciler retry loop
+// re-converges on the next tick instead of looping in-place.
+//
+// Down on a Primary-Open resource would block, but the
+// signature only fires on the moment a returning TB joins —
+// the wedge surfaces on the surviving diskful side which is
+// Secondary (unmounted at the moment the TB respawns).
+func (r *Reconciler) recoverFromBitmapBothDisks(ctx context.Context, dr *intent.DesiredResource, skipDisk, skipNet bool) error {
+	log.FromContext(ctx).Info("adjust failed with bitmap-bothdisks; recovering via down + up + adjust",
+		"resource", dr.GetName())
+
+	err := r.cfg.Adm.Down(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm down %s (recovery from bitmap-bothdisks)", dr.GetName())
+	}
+
+	err = r.cfg.Adm.Up(ctx, dr.GetName())
+	if err != nil {
+		return errors.Wrapf(err, "drbdadm up %s (recovery from bitmap-bothdisks)", dr.GetName())
+	}
+
+	err = r.dispatchAdjust(ctx, dr.GetName(), skipDisk, skipNet)
+	if err != nil {
+		return errors.Wrapf(err, "adjust %s (after bitmap-bothdisks recovery)", dr.GetName())
+	}
+
+	ensureDeviceNodes(ctx, dr)
+
+	return nil
 }
 
 // dispatchAdjust picks the right `drbdadm adjust` variant for the

@@ -64,6 +64,33 @@ var (
 	errDrbdadmAdjust158 = errors.New("pvc-down158: Failure: (158) Unknown resource\n" +
 		"additional info from kernel:\nunknown resource\n" +
 		"Command 'drbdsetup new-minor pvc-down158 1000 0' terminated with exit code 10: exit status 1")
+	// errDrbdadmAdjust162BitmapBothDisks mirrors the verbatim stderr
+	// drbdadm-9 emits when the controller has just re-allocated a
+	// returning TIE_BREAKER onto a peer-slot whose v09 metadata reads
+	// `peer-disk:Outdated` (default-initialised bitmap-uuid) and
+	// adjust's declarative `--bitmap=no` reaches the kernel before
+	// any handshake has reset the peer-disk view. Captured live from
+	// the dev stand during the wedge repro; the substring
+	// "Can not drop the bitmap" is the disambiguator
+	// IsBitmapDropBothDisksErr matches on top of the (162) code.
+	errDrbdadmAdjust162BitmapBothDisks = errors.New(
+		"pvc-tb-relocate: Failure: (162) Invalid configuration request\n" +
+			"additional info from kernel:\nCan not drop the bitmap when both sides have a disk\n" +
+			"Command 'drbdsetup peer-device-options pvc-tb-relocate 2 0 --set-defaults --bitmap=no' terminated with exit code 10: exit status 1")
+	// errDrbdadmAdjust162OtherReason mirrors a (162) failure mode
+	// whose kernel-info trailer is unrelated to the bitmap drop —
+	// the bitmap-bothdisks predicate must reject this so unrelated
+	// 162-class errors don't trigger the down + up + adjust
+	// recovery (which would needlessly bounce the resource).
+	errDrbdadmAdjust162OtherReason = errors.New("pvc-x: Failure: (162) Invalid configuration request\n" +
+		"additional info from kernel:\nsome other reason")
+	// errDrbdadmBitmapTrailerOnlyNoCode is the symmetric reject:
+	// a "Can not drop the bitmap" diagnostic that doesn't carry
+	// the (162) errno prefix. drbdsetup is consistent about
+	// emitting both together, so the bitmap-bothdisks predicate
+	// must refuse to fire on the kernel-info trailer alone.
+	errDrbdadmBitmapTrailerOnlyNoCode = errors.New("pvc-x: some other failure\n" +
+		"additional info from kernel:\nCan not drop the bitmap")
 	// errDrbdadmPrimaryStateChange mirrors the verbatim stderr drbdadm
 	// emits when `drbdadm primary --force` races the initial-sync
 	// handshake on a fresh diskful replica (Bug 311 reproducer):
@@ -6420,6 +6447,167 @@ func TestApplyFallsBackToUpOnAdjust158(t *testing.T) {
 
 	if len(results) != 1 || !results[0].GetOk() {
 		t.Errorf("expected Ok=true after up-fallback recovery; got results=%+v", results)
+	}
+}
+
+// TestRecoverFromBitmapBothDisks pins the tiebreaker-relocate
+// StandAlone wedge recovery contract: the recovery helper called
+// from runAdjust when adjust fails with the (162) "Can not drop
+// the bitmap when both sides have a disk" signature MUST issue
+// `drbdadm down` → `drbdadm up` → retry `drbdadm adjust` in that
+// order, so the kernel re-reads peer-disk from a fresh handshake
+// (DUnknown) rather than from the stale-default metadata
+// (Outdated) on the second adjust pass.
+//
+// Without this recovery the first failed adjust leaves the slot
+// StandAlone with kernel-registered peer-device entries (new-peer
+// runs before peer-device-options fails), at which point
+// shouldSkipNetOnAdjust permanently latches `--skip-net` for that
+// slot — the slot stays StandAlone forever.
+//
+// We drive the helper directly via the export_test re-export
+// rather than through Apply because the package's FakeExec map
+// is keyed on the full command line and not sequence-aware —
+// staging two distinct responses for the same `drbdadm adjust`
+// invocation isn't possible. The end-to-end coverage lives in
+// tests/e2e/tiebreaker-r-d-r-c-other-node.sh.
+func TestRecoverFromBitmapBothDisks(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	// Stage all three recovery commands as plain successes. The
+	// helper itself doesn't trigger the failing adjust — that
+	// branch lives in runAdjust above the call site — so we only
+	// care that down + up + retry-adjust fire in order.
+	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{})
+	fx.Expect("drbdadm up pvc-tb-relocate", storage.FakeResponse{})
+	fx.Expect("drbdadm adjust pvc-tb-relocate", storage.FakeResponse{})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: t.TempDir(),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-tb-relocate",
+		NodeName: "n1",
+	}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
+	if err != nil {
+		t.Fatalf("recovery returned error: %v", err)
+	}
+
+	cmds := fx.CommandLines()
+
+	downIdx, upIdx, adjustIdx := -1, -1, -1
+
+	for i, line := range cmds {
+		switch {
+		case strings.Contains(line, "drbdadm down pvc-tb-relocate"):
+			downIdx = i
+		case strings.Contains(line, "drbdadm up pvc-tb-relocate"):
+			upIdx = i
+		case strings.Contains(line, "drbdadm adjust pvc-tb-relocate"):
+			adjustIdx = i
+		}
+	}
+
+	if downIdx == -1 || upIdx == -1 || adjustIdx == -1 {
+		t.Fatalf("expected recovery to issue down + up + adjust; got %v", cmds)
+	}
+
+	if downIdx >= upIdx || upIdx >= adjustIdx {
+		t.Errorf("recovery sequence out of order: down=%d up=%d adjust=%d; got %v",
+			downIdx, upIdx, adjustIdx, cmds)
+	}
+}
+
+// TestRecoverFromBitmapBothDisksBubblesDownErr pins the
+// fail-loud contract on the recovery's first step: if
+// `drbdadm down` itself fails the recovery surfaces the error
+// (rather than charging into `drbdadm up` against unknown
+// kernel state).
+func TestRecoverFromBitmapBothDisksBubblesDownErr(t *testing.T) {
+	fx := storage.NewFakeExec()
+
+	fx.Expect("drbdadm down pvc-tb-relocate", storage.FakeResponse{
+		Err: errDrbdadmDownNotInConfig,
+	})
+
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Adm:      drbd.NewAdm(fx),
+		StateDir: t.TempDir(),
+		NodeName: "n1",
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-tb-relocate",
+		NodeName: "n1",
+	}
+
+	err := rec.RecoverFromBitmapBothDisksForTest(t.Context(), dr, false, false)
+	if err == nil {
+		t.Fatal("expected recovery to bubble drbdadm down failure; got nil")
+	}
+
+	// Up + adjust must NOT fire after a failed down — they
+	// would race a half-torn kernel state and the next
+	// reconcile would loop on the same wedge signature.
+	for _, line := range fx.CommandLines() {
+		if strings.Contains(line, "drbdadm up pvc-tb-relocate") ||
+			strings.Contains(line, "drbdadm adjust pvc-tb-relocate") {
+			t.Errorf("recovery must stop after a failed down; saw %q", line)
+		}
+	}
+}
+
+// TestIsBitmapDropBothDisksErr pins the predicate that drives the
+// reactive recovery in runAdjust. The (162) code alone is not
+// enough — drbdsetup emits the same code for unrelated config
+// errors — so the predicate must also match the kernel-info
+// trailer "Can not drop the bitmap" verbatim. Locale-translated
+// kernel diagnostics around it must not break the match.
+func TestIsBitmapDropBothDisksErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "verbatim live signature",
+			err:  errDrbdadmAdjust162BitmapBothDisks,
+			want: true,
+		},
+		{
+			name: "162 without the bitmap trailer (different kernel reject)",
+			err:  errDrbdadmAdjust162OtherReason,
+			want: false,
+		},
+		{
+			name: "bitmap trailer without (162) code",
+			err:  errDrbdadmBitmapTrailerOnlyNoCode,
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "(158) unknown resource (Bug 287 path) must NOT match",
+			err:  errDrbdadmAdjust158,
+			want: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := drbd.IsBitmapDropBothDisksErr(c.err)
+			if got != c.want {
+				t.Errorf("IsBitmapDropBothDisksErr(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
 	}
 }
 
