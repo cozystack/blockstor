@@ -297,7 +297,22 @@ func (s *Server) handleResourceToggleDiskToDiskful(w http.ResponseWriter, r *htt
 	// Bug 281: same Get → Update race as handleResourceToggleDisk.
 	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
 		func(res *apiv1.Resource) error {
+			// Both DISKLESS and TIE_BREAKER must be stripped: an
+			// auto-managed witness Resource is always created with
+			// `{DISKLESS, TIE_BREAKER}` flags, so promoting it via
+			// `r td --storage-pool <pool>` must clear BOTH or the
+			// CRD ends up `flags=[TIE_BREAKER]` on a diskful peer.
+			// shouldTieBreakerExist / shouldKeepExistingWitness
+			// then double-count the slot (filterTieBreaker
+			// matches on the TIE_BREAKER flag, not on the disk
+			// state) and the diskful peer is treated as a witness
+			// in the next ensureTiebreaker pass — silent
+			// invariant violation. Strip both regardless of which
+			// the caller intended; promoting a non-witness
+			// diskless is the same operation and dropping a flag
+			// that isn't there is a no-op.
 			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagDiskless, false)
+			res.Flags = applyFlagMutation(res.Flags, apiv1.ResourceFlagTieBreaker, false)
 
 			if pool != "" {
 				stampStoragePool(res, pool)
