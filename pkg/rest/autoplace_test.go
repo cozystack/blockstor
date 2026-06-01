@@ -1413,6 +1413,102 @@ func TestResourceDeleteRegularReplicaSkipsSuppression(t *testing.T) {
 	}
 }
 
+// TestResourceDeleteKeepTiebreakerStampsOverride pins Bug B.1
+// (hunt-v3): `DELETE /v1/resource-definitions/{rd}/resources/{node}?keep_tiebreaker=true`
+// must stamp the KeepTiebreakerUntilAnnotation on the parent RD with
+// a future RFC3339 deadline BEFORE the Resource Delete commits. The
+// controller's `shouldTieBreakerExist` reads this annotation to
+// preserve an existing TIE_BREAKER witness across a diskful→1
+// transition the Bug-338 carve-out would otherwise reap.
+//
+// Without the stamp, the CLI flag silently no-ops because the
+// reconciler can't distinguish operator intent from steady-state.
+func TestResourceDeleteKeepTiebreakerStampsOverride(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-kt"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-kt", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-kt/resources/n2?keep_tiebreaker=true")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-kt")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	raw, ok := rd.Annotations[KeepTiebreakerUntilAnnotation]
+	if !ok || raw == "" {
+		t.Fatalf("keep-tiebreaker annotation missing; annotations=%v", rd.Annotations)
+	}
+
+	deadline, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("annotation value %q is not RFC3339: %v", raw, err)
+	}
+
+	if !deadline.After(time.Now()) {
+		t.Errorf("annotation deadline %v is not in the future", deadline)
+	}
+}
+
+// TestResourceDeleteWithoutKeepTiebreakerSkipsOverride: a plain
+// `linstor r d <node> <rd>` (no `?keep_tiebreaker=true` query param)
+// must NOT stamp the KeepTiebreakerUntilAnnotation. Only the explicit
+// CLI opt-in carries the override intent — every other delete must
+// fall through to the normal auto-witness invariant.
+func TestResourceDeleteWithoutKeepTiebreakerSkipsOverride(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-no-kt"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-no-kt", NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed replica: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpDelete(t, base+"/v1/resource-definitions/pvc-no-kt/resources/n1")
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete status: got %d, want 200", resp.StatusCode)
+	}
+
+	rd, err := st.ResourceDefinitions().Get(ctx, "pvc-no-kt")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if _, ok := rd.Annotations[KeepTiebreakerUntilAnnotation]; ok {
+		t.Errorf("keep-tiebreaker annotation must not appear without ?keep_tiebreaker=true; got %v",
+			rd.Annotations)
+	}
+}
+
 // TestResourceDeleteBumpsSiblingPeers pins Bug 67's core invariant:
 // when `linstor r d <node> <rd>` drops one peer, every SURVIVING
 // sibling Resource of the same RD gets `blockstor.io/peer-changed`
