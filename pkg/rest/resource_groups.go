@@ -31,6 +31,8 @@ import (
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
+
+	"github.com/pkg/errors"
 )
 
 // registerResourceGroups wires the /v1/resource-groups CRUD endpoints.
@@ -168,6 +170,17 @@ func (s *Server) handleRGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 367 / 361: refuse negative or absurdly-large place_count
+	// at the wire boundary. See validateRGSelectFilterPlaceCount —
+	// shared with handleRGUpdate so POST and PUT enforce the same
+	// rule.
+	pcErr := validateRGSelectFilterPlaceCount(rg.SelectFilter.PlaceCount, rg.SelectFilter.AdditionalPlaceCount)
+	if pcErr != nil {
+		writeError(w, http.StatusBadRequest, pcErr.Error())
+
+		return
+	}
+
 	err = s.Store.ResourceGroups().Create(r.Context(), &rg)
 	if err != nil {
 		writeStoreError(w, err)
@@ -201,6 +214,31 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// `rg modify --override-props` cannot silently overwrite this
 	// PUT's contribution.
 	var rebalanceScheduled bool
+
+	// Bug 367 / 361: refuse negative or absurdly-large place_count
+	// on the patch body BEFORE we hand it to PatchResourceGroup. The
+	// validator only cares about fields the patch explicitly carries
+	// (the merge respects "field absent = leave alone" semantics for
+	// place_count via mergeRGSelectFilterScalars), so checking the
+	// raw patch is the cheap way to keep the rule out of the store
+	// error path — writeStoreError would otherwise demote a clear
+	// 400 to a 500 because the callback returned a non-store error.
+	mentioned := rgSelectFilterKeys(raw)
+	if _, ok := mentioned["place_count"]; ok {
+		if pcErr := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0); pcErr != nil {
+			writeError(w, http.StatusBadRequest, pcErr.Error())
+
+			return
+		}
+	}
+
+	if _, ok := mentioned["additional_place_count"]; ok {
+		if pcErr := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount); pcErr != nil {
+			writeError(w, http.StatusBadRequest, pcErr.Error())
+
+			return
+		}
+	}
 
 	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
 		prevFilter := existing.SelectFilter
@@ -844,4 +882,67 @@ func rgDeleteRefusedMessage(name string, count int) string {
 	}
 
 	return fmt.Sprintf("%s cannot delete: %d resource-definitions exist", upstream, count)
+}
+
+// rgPlaceCountSanityCeiling caps place_count / additional_place_count
+// at one million. The largest documented LINSTOR cluster is on the
+// order of a few hundred nodes; a million-replica RG cannot be
+// satisfied by any real deployment and almost always means an
+// operator typo / wire-fuzz leaked through. Anything above this is
+// refused at the REST boundary so the rebalance scheduler never
+// allocates against an absurd target.
+const rgPlaceCountSanityCeiling = 1_000_000
+
+// validateRGSelectFilterPlaceCount enforces the [0, 1_000_000] range
+// on AutoSelectFilter.PlaceCount / AdditionalPlaceCount.
+//
+// Bug 367 / 361 / 362 (bug-hunt v6, 2026-06-02):
+//
+//   - POST /v1/resource-groups with place_count=-3 silently created
+//     a corrupt RG; `rg spawn-resources` against it later produced
+//     an RD with zero replicas (a "successful" spawn that placed no
+//     data — silent corruption class).
+//
+//   - PUT /v1/resource-groups/<rg> with place_count=-5 went one
+//     worse: HTTP 200, message "rebalance scheduled for N RDs" —
+//     i.e. the scheduler kicked off against a negative target. The
+//     same PUT with place_count=0 also schedules rebalance but is
+//     intentionally allowed here: upstream linstor-client documents
+//     `--place-count 0` as "remove all replicas", so blocking 0
+//     would break the legitimate scale-to-zero workflow.
+//
+// The validator runs on BOTH create and modify so the two wire
+// entry points share the same rule. The upper bound exists so a
+// fuzzed `place_count=2147483647` (Go int32 max) can't slip through
+// either — same defensive ceiling shape as the Bug 254 vd_c size
+// gate.
+func validateRGSelectFilterPlaceCount(placeCount, additionalPlaceCount apiv1.LaxInt32) error {
+	if placeCount < 0 {
+		return errors.Errorf(
+			"select_filter.place_count %d is negative; must be >= 0 "+
+				"(0 means 'remove all replicas' per upstream linstor-client; "+
+				"any positive value is a replica target)",
+			placeCount)
+	}
+
+	if placeCount > rgPlaceCountSanityCeiling {
+		return errors.Errorf(
+			"select_filter.place_count %d exceeds the %d sanity ceiling; "+
+				"no real LINSTOR cluster has that many candidate nodes",
+			placeCount, rgPlaceCountSanityCeiling)
+	}
+
+	if additionalPlaceCount < 0 {
+		return errors.Errorf(
+			"select_filter.additional_place_count %d is negative; must be >= 0",
+			additionalPlaceCount)
+	}
+
+	if additionalPlaceCount > rgPlaceCountSanityCeiling {
+		return errors.Errorf(
+			"select_filter.additional_place_count %d exceeds the %d sanity ceiling",
+			additionalPlaceCount, rgPlaceCountSanityCeiling)
+	}
+
+	return nil
 }
