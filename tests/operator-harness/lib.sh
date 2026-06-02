@@ -231,6 +231,16 @@ print(bad)")
             present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -ci 'TieBreaker' || true)
             [[ "$present" == "0" ]]
             ;;
+        tiebreaker_present)
+            # Bug 386: assert a TieBreaker witness EXISTS for the rd.
+            # The inverse of no_tiebreaker — used by the node-restore
+            # catcher to confirm the witness is RE-created after the
+            # drained node is brought back with `n rst`.
+            local rd present
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -ci 'TieBreaker' || true)
+            [[ "$present" -ge 1 ]]
+            ;;
         sync_clean)
             local rd
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")

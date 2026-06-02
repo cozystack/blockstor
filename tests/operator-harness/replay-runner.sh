@@ -49,6 +49,8 @@
 #   - all_uptodate         wait until every replica reports UpToDate
 #   - replica_diskless     wait until rd@node has disk_state == Diskless
 #   - no_tiebreaker        assert NO TieBreaker is auto-spawned
+#   - tiebreaker_present   assert a TieBreaker witness EXISTS for rd
+#                           (Bug 386: re-created after `n rst`)
 #   - sync_clean           wait until UpToDate without "(NN%)" suffix
 #   - resource_absent      wait until r d takes effect on a node
 #   - rd_absent            wait until rd is gone everywhere

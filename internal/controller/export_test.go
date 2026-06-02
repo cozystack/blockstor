@@ -46,6 +46,21 @@ func (r *ResourceDefinitionReconciler) EnqueueRDForResource(ctx context.Context,
 	return r.enqueueRDForResource(ctx, obj)
 }
 
+// EnqueueRDsForNode exposes the Bug-386 Node-watch fan-out for tests.
+// Production wiring stays unexported via SetupWithManager. Pins the
+// "node flag toggle re-enqueues every RD" contract that recreates a
+// collapsed tiebreaker after `linstor n rst`.
+func (r *ResourceDefinitionReconciler) EnqueueRDsForNode(ctx context.Context, obj client.Object) []reconcile.Request {
+	return r.enqueueRDsForNode(ctx, obj)
+}
+
+// NodeHasDrainFlag exposes the EVICTED/LOST flag-set probe the Bug-386
+// Node-watch predicate uses to decide whether a Node event is a drain
+// transition worth re-enqueueing RDs for.
+func NodeHasDrainFlag(n *blockstoriov1alpha1.Node) bool {
+	return nodeHasDrainFlag(n)
+}
+
 // AlreadyExists exposes the wrapped-error keyword check the RD
 // reconciler uses to tolerate kube-apiserver "already exists"
 // races. Tests pin both the positive and the false-positive paths.
