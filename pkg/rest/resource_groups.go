@@ -776,6 +776,25 @@ func (s *Server) handleRGPropDelete(w http.ResponseWriter, r *http.Request) {
 	// deletion via wholesale-Spec-replace.
 	probe, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
 	if err != nil {
+		// Bug 378: parent-NotFound is idempotent, same as the
+		// controller-prop-delete sibling
+		// (handleControllerPropDelete) and `rg d <rg>` itself
+		// (warnRGNotFound). Pre-fix, a teardown script that ran
+		// `rg d <rg>` then `rg dp <rg> Foo` raced into a 404
+		// once the RG cleared; now the second call folds to the
+		// same warn-band 200 the rest of the rg-delete surface
+		// emits.
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskWarn,
+				Message: "resource group already absent: " + rgName +
+					" (drop-property no-op on " + key + ")",
+				ObjRefs: map[string]string{objRefRscGrp: rgName},
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return

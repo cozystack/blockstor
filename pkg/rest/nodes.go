@@ -942,6 +942,30 @@ func (s *Server) handleNodePropDelete(w http.ResponseWriter, r *http.Request) {
 	// retry — still converges).
 	probe, err := s.Store.Nodes().Get(r.Context(), nodeName)
 	if err != nil {
+		// Bug 378: parent-NotFound is also idempotent. The
+		// controller-side sibling endpoint
+		// (`DELETE /v1/controller/properties/{key...}`) returns
+		// 200 on every input — see
+		// TestControllerPropertiesDeleteMissingKeyIsIdempotent —
+		// because `controller drop-property` upstream is
+		// intentionally idempotent so a re-run of an operator's
+		// teardown script doesn't error on already-cleaned state.
+		// Pre-fix this branch crashed cozystack's node-evacuation
+		// playbook: `linstor n d <node>` followed by
+		// `linstor n dp <node> Foo` raced into a 404 on the
+		// second call once the node finally cleared. Same
+		// warn-band shape `n d` itself emits (warnNodeNotFound).
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskWarn,
+				Message: "node already absent: " + nodeName +
+					" (drop-property no-op on " + key + ")",
+				ObjRefs: map[string]string{objRefNode: nodeName},
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
