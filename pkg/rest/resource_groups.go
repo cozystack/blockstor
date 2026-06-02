@@ -225,7 +225,8 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	// 400 to a 500 because the callback returned a non-store error.
 	mentioned := rgSelectFilterKeys(raw)
 	if _, ok := mentioned["place_count"]; ok {
-		if pcErr := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0); pcErr != nil {
+		pcErr := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0)
+		if pcErr != nil {
 			writeError(w, http.StatusBadRequest, pcErr.Error())
 
 			return
@@ -233,8 +234,9 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, ok := mentioned["additional_place_count"]; ok {
-		if pcErr := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount); pcErr != nil {
-			writeError(w, http.StatusBadRequest, pcErr.Error())
+		apcErr := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount)
+		if apcErr != nil {
+			writeError(w, http.StatusBadRequest, apcErr.Error())
 
 			return
 		}
