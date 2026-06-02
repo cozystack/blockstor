@@ -1312,8 +1312,110 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForResource),
 			builder.WithPredicates(resourceEventFilter)).
+		// Bug 386: re-run the tiebreaker invariant when a node's
+		// EVICTED / LOST flag set changes. `linstor n rst` clears
+		// EVICTED on a recovered node; `linstor n evacuate` sets it.
+		// `ensureTiebreaker` (and pickTiebreakerNode) treat an
+		// EVICTED/LOST node as an unusable witness candidate, so a
+		// 2-diskful RD whose witness collapsed while a node was drained
+		// must re-place the TIE_BREAKER once the node returns. Without
+		// this watch nothing enqueues the RD on a node-flag toggle and
+		// the witness is only (re)placed on the next periodic re-sync —
+		// leaving two diskful UpToDate replicas with no quorum witness
+		// in between (split-brain risk on a subsequent failure). The
+		// nodeDrainFlagChanged predicate filters to the flag transition
+		// so unrelated Node Spec edits (props, net-interfaces) don't
+		// fan out to every RD.
+		Watches(&blockstoriov1alpha1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
+			builder.WithPredicates(nodeDrainFlagChanged())).
 		Named("resourcedefinition").
 		Complete(r)
+}
+
+// nodeDrainFlagChanged fires only when a Node's drain-signal flag set
+// (EVICTED / LOST) transitions. The REST `n rst` / `n evacuate` /
+// `n lost` handlers stamp these onto `Spec.Flags`; the satellite also
+// re-applies Node Spec on every reconcile with the flag set unchanged,
+// so a bare generation/Spec-equality watch would fan out to every RD
+// on every heartbeat. Restricting to the EVICTED/LOST membership delta
+// keeps the Bug 386 re-enqueue precise.
+//
+// Create fires when the node already carries a drain flag (controller
+// restart re-reads existing state) so the witness invariant runs at
+// least once against the recovered topology.
+func nodeDrainFlagChanged() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			n, ok := e.Object.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			return nodeHasDrainFlag(n)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok := e.ObjectOld.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			newNode, ok := e.ObjectNew.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode)
+		},
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// nodeHasDrainFlag reports whether a Node CRD carries an EVICTED or
+// LOST flag on either Spec (operator intent, set by the REST handlers)
+// or Status (satellite-observed). Mirrors isDisabledNode's flag set so
+// the watch predicate and the witness-candidate filter agree on what
+// "drained" means.
+func nodeHasDrainFlag(n *blockstoriov1alpha1.Node) bool {
+	for _, f := range n.Spec.Flags {
+		if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
+			return true
+		}
+	}
+
+	for _, f := range n.Status.Flags {
+		if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
+			return true
+		}
+	}
+
+	return false
+}
+
+// enqueueRDsForNode maps a Node flag-change event to every
+// ResourceDefinition in the cluster. The tiebreaker invariant is a
+// cluster-wide candidate-set decision (any RD's witness might have
+// collapsed onto, or now want to re-land on, the toggled node), so a
+// per-node restore re-evaluates all RDs. The set of RDs is small
+// relative to Resources, and the nodeDrainFlagChanged predicate gates
+// the fan-out to genuine EVICTED/LOST transitions, so this stays cheap.
+func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ client.Object) []reconcile.Request {
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	out := make([]reconcile.Request, 0, len(rdList.Items))
+	for i := range rdList.Items {
+		out = append(out, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: rdList.Items[i].Name},
+		})
+	}
+
+	return out
 }
 
 // enqueueRDForResource maps a Resource event to its parent RD.
