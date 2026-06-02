@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -77,6 +78,26 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 	}
 
 	patch := body.GenericPropsModify
+
+	// Bug 373 (P1 data-availability): refuse any patch that touches
+	// the backing-driver identity props (StorDriver/ZPool[Thin],
+	// LvmVg, ThinPool, FileDir, StorPoolName). These keys are
+	// effectively immutable — they pin a StoragePool to a specific
+	// VG / zpool / directory on the host, and the satellite's
+	// NewProviderFromKind reads them once at registration. Letting
+	// a PUT override them silently flips the pool to a different /
+	// non-existent backend, leaves every active replica still
+	// UpToDate (the kernel-side DRBD device is already open) but
+	// breaks every subsequent placement / autoplace / resize.
+	// Refused HERE rather than at the store boundary so the wire
+	// envelope carries the LINSTOR-standard 552 sub-code and points
+	// at the right escape path (drop + recreate the pool, never
+	// mutate the backing key on the live row).
+	if msg, refused := refuseSPDriverPropMutation(&patch); refused {
+		writeSPDriverPropMutationRefusal(w, node, pool, msg)
+
+		return
+	}
 
 	// Bug 204b: route through PatchStoragePoolSpec so the override /
 	// delete delta is re-applied to the freshly-fetched StoragePool on
@@ -738,6 +759,122 @@ const (
 	propZPoolThin    = "StorDriver/ZPoolThin"
 	propFileDir      = "StorDriver/FileDir"
 )
+
+// immutableSPDriverProps returns the StoragePool prop keys that pin
+// the pool to a specific backing VG / zpool / directory on the host.
+// Mutating any of these on a live StoragePool row silently flips the
+// pool to a different (or non-existent) backend without re-running the
+// satellite's NewProviderFromKind, which leaves every active replica
+// still UpToDate at the kernel-DRBD layer but breaks every subsequent
+// placement / autoplace / resize call against the pool — a P1 data-
+// availability footgun. Bug 373: refuse the mutation at the REST
+// boundary; the only safe path is "drop + recreate the pool with the
+// new backing key".
+//
+// `StorDriver/StorPoolName` is in the list too because Bug 63's
+// expandStorPoolNameAlias derives the kind-specific keys from it on
+// the create path — letting a PUT clobber it would re-trigger the
+// same alias-rewrite path against the live row and silently mutate
+// the kind-specific key downstream.
+//
+// Returned as a function (not a package-level var) so the lint
+// `gochecknoglobals` budget stays clean; the slice is tiny and the
+// validator is hit once per PUT.
+func immutableSPDriverProps() []string {
+	return []string{
+		propStorPoolName,
+		propLvmVG,
+		propThinPool,
+		propZPool,
+		propZPoolThin,
+		propFileDir,
+	}
+}
+
+// refuseSPDriverPropMutation walks the GenericPropsModify patch and
+// returns a (joined-prop-list, true) tuple when any of the immutable
+// backing-driver keys would be touched. Three flanks are checked:
+//
+//   - override_props: an explicit value for any immutable key.
+//   - delete_props: an explicit key in the immutable set.
+//   - delete_namespaces: a prefix that, with the '/' separator
+//     appended, would catch any immutable key. The shared "StorDriver"
+//     prefix means deleting the namespace would wipe the pool's
+//     backing identity wholesale, so refuse that too.
+//
+// Returns ("", false) when the patch is clean (no immutable keys
+// touched). The caller writes the typed-envelope error on refuse.
+func refuseSPDriverPropMutation(patch *apiv1.GenericPropsModify) (string, bool) {
+	if patch == nil {
+		return "", false
+	}
+
+	keys := immutableSPDriverProps()
+	hit := make([]string, 0, len(keys))
+
+	for _, key := range keys {
+		if _, ok := patch.OverrideProps[key]; ok {
+			hit = append(hit, key)
+
+			continue
+		}
+
+		if slices.Contains(patch.DeleteProps, key) {
+			hit = append(hit, key)
+		}
+	}
+
+	// delete_namespaces: a single "StorDriver" entry (or any prefix
+	// that catches the immutable keys' shared "StorDriver/" namespace)
+	// would otherwise nuke the backing identity wholesale. Flag the
+	// whole namespace so the operator sees the actionable name.
+	for _, ns := range patch.DeleteNamespace {
+		prefix := ns + "/"
+
+		for _, key := range keys {
+			if strings.HasPrefix(key, prefix) {
+				hit = append(hit, "delete_namespaces:"+ns)
+
+				break
+			}
+		}
+	}
+
+	if len(hit) == 0 {
+		return "", false
+	}
+
+	return strings.Join(hit, ", "), true
+}
+
+// writeSPDriverPropMutationRefusal emits the Bug 373 typed-envelope
+// 400 response: LINSTOR sub-code 552 (FAIL_INVLD_STOR_POOL_NAME),
+// operator-facing cause + correction text, and obj_refs pinning the
+// (node, pool) pair so audit-log greppers can correlate against the
+// originating PUT. Extracted out of handleNodeStoragePoolModify to
+// keep the handler under the funlen budget.
+func writeSPDriverPropMutationRefusal(w http.ResponseWriter, node, pool, msg string) {
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInvldStorPoolName,
+		Message: "storage pool '" + pool + "' on node '" + node +
+			"': refusing to mutate backing-driver identity prop(s): " + msg,
+		Cause: "the requested override_props / delete_props / " +
+			"delete_namespaces touches a StorDriver/* key that pins " +
+			"this StoragePool to its backing VG / zpool / directory. " +
+			"These keys are read once at satellite registration; " +
+			"changing them on a live pool silently desyncs the row " +
+			"from the actual backend and breaks every subsequent " +
+			"placement, autoplace, and resize call against the pool.",
+		Correc: "drop the storage pool (`linstor sp d`) and recreate " +
+			"it with the desired backing key, OR target the prop " +
+			"on a freshly-created StoragePool — never mutate the " +
+			"backing key on the live row.",
+		ObjRefs: map[string]string{
+			objRefNode:     node,
+			objRefStorPool: pool,
+		},
+	}})
+}
 
 // expandStorPoolNameAlias normalises a pool's Spec.Props for Bug 63.
 //
