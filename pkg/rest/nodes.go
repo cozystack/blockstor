@@ -449,6 +449,12 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 370: default + validate `type` at the wire boundary. See
+	// resolveAndValidateNodeType below for the full rationale.
+	if !resolveAndValidateNodeType(w, &n) {
+		return
+	}
+
 	// Scenario 4.W01: synthesize the default NetInterface if the
 	// caller passed none. `linstor node create <name> <ip>` is the
 	// canonical CLI form; the client always sends a body with at
