@@ -4311,7 +4311,15 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	// adjust`), so the probe finds nothing and the skip proceeds — the
 	// fresh 2-/3-replica skip-init-sync is preserved. Mirrors the
 	// shouldForcePromote AnyConnectedPeerHasData backstop.
-	if r.cfg.Adm.AnyConnectedPeerHasData(ctx, resourceName) {
+	// Bug B.4: per-volume probe. The RD-scoped variant returns
+	// true if ANY peer-device on the resource is UpToDate; for a
+	// `vd c` adding vol-1 to an RD whose vol-0 is already
+	// UpToDate on both peers, the RD-scoped check would refuse
+	// the seed for vol-1 even though vol-1's peer-devices are
+	// Inconsistent. Per-volume scoping surfaces the truth about
+	// the NEW volume's peer state in isolation from any
+	// already-UpToDate sibling volumes.
+	if r.cfg.Adm.AnyConnectedPeerHasDataForVolume(ctx, resourceName, vol.GetVolumeNumber()) {
 		return drbd.GISeed{}, false
 	}
 

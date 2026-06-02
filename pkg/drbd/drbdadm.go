@@ -861,6 +861,58 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 	return false
 }
 
+// AnyConnectedPeerHasDataForVolume is the per-volume variant of
+// AnyConnectedPeerHasData. It returns true only when at least one
+// connected peer's peer-device for the given volume number is in
+// `UpToDate` / `Consistent` / `Outdated`. Used by Bug B.4 path:
+// `linstor vd c <rd> N` adds a NEW volume to a running RD whose
+// existing volumes are already UpToDate on every peer — the
+// per-RD probe sees UpToDate peer-devices for the OLD volumes
+// and falsely refuses the day0 skip-init-sync seed for the NEW
+// volume, leaving it Inconsistent forever. Per-volume scoping
+// surfaces the truth: the new volume's peer-devices are
+// Inconsistent / not-yet-attached, so the seed proceeds.
+//
+// Identical conservative semantics to the RD-scoped variant:
+// returns false on any probe / parse failure or when the volume
+// has no matching peer-devices in any connection (i.e. nobody
+// is connected with the new minor yet — that is the "fresh
+// volume" steady state, no peer holds data for it).
+func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource string, volNumber int32) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	for _, conn := range status[0].Connections {
+		for _, pd := range conn.PeerDevices {
+			if pd.VolumeNumber != volNumber {
+				continue
+			}
+
+			switch DiskState(pd.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
+				return true
+			case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+				DiskStateFailed, DiskStateNegotiating, DiskStateInconsistent,
+				DiskStateDUnknown:
+				// No committed data on this peer-device; keep scanning.
+			default:
+				// Unknown/empty state — treat as "no data".
+			}
+		}
+	}
+
+	return false
+}
+
 // NeedsRecoveryPromote probes the live kernel via `drbdsetup status
 // <res> --json` and reports whether THIS node should re-arm the
 // auto-primary seed to unstick a fresh RD whose initial sync wedged
