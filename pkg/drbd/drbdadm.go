@@ -184,17 +184,39 @@ func (a *Adm) CreateMD(ctx context.Context, resource string) error {
 // — real drbdadm never returns success with no output, but a faked
 // exec in unit tests can, and we'd rather err on the side of
 // "missing → safe to create-md".
+//
+// Bug B.4 carve-out: when the volume's lower disk is already
+// attached to a running DRBD kernel slot, drbdmeta refuses to open
+// it ("Device or resource busy" / "Device 'X' is configured!") and
+// `dump-md` exits non-zero. Treating that as "missing" would route
+// the caller into create-md against an attached minor, which
+// EBUSY-loops at ~10 Hz. A volume that's attached BY DEFINITION
+// has metadata — the kernel could not have brought it up otherwise
+// — so map the busy/configured error string to `hasMD=true` and
+// skip the create-md call entirely.
 func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 	out, err := a.exec.Run(ctx, "drbdadm", "dump-md", resource)
-	if err != nil {
-		// `No valid meta data found` / drbdmeta "missing image" / etc.
-		// all bubble up as non-zero exit. Treat as "not yet
-		// initialised" — the caller's create-md will either succeed
-		// (truly missing) or surface a more specific failure.
-		return false, nil //nolint:nilerr // non-zero exit is the "metadata absent" signal, not a bubble-up error
+	if err == nil {
+		return len(out) > 0, nil
 	}
 
-	return len(out) > 0, nil
+	// Attached-lower-disk surface: dump-md cannot exclusive-
+	// open the device because the kernel holds it. The device
+	// is attached, therefore metadata exists. Surface
+	// hasMD=true so the caller skips create-md. (Bug B.4)
+	errStr := err.Error()
+	if strings.Contains(errStr, "Device or resource busy") ||
+		strings.Contains(errStr, "is configured!") ||
+		strings.Contains(string(out), "Device or resource busy") ||
+		strings.Contains(string(out), "is configured!") {
+		return true, nil
+	}
+
+	// `No valid meta data found` / drbdmeta "missing image" / etc.
+	// all bubble up as non-zero exit. Treat as "not yet
+	// initialised" — the caller's create-md will either succeed
+	// (truly missing) or surface a more specific failure.
+	return false, nil
 }
 
 // Primary flips the resource to Primary role so it can be opened
@@ -823,6 +845,58 @@ func (a *Adm) AnyConnectedPeerHasData(ctx context.Context, resource string) bool
 
 	for _, conn := range status[0].Connections {
 		for _, pd := range conn.PeerDevices {
+			switch DiskState(pd.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
+				return true
+			case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+				DiskStateFailed, DiskStateNegotiating, DiskStateInconsistent,
+				DiskStateDUnknown:
+				// No committed data on this peer-device; keep scanning.
+			default:
+				// Unknown/empty state — treat as "no data".
+			}
+		}
+	}
+
+	return false
+}
+
+// AnyConnectedPeerHasDataForVolume is the per-volume variant of
+// AnyConnectedPeerHasData. It returns true only when at least one
+// connected peer's peer-device for the given volume number is in
+// `UpToDate` / `Consistent` / `Outdated`. Used by Bug B.4 path:
+// `linstor vd c <rd> N` adds a NEW volume to a running RD whose
+// existing volumes are already UpToDate on every peer — the
+// per-RD probe sees UpToDate peer-devices for the OLD volumes
+// and falsely refuses the day0 skip-init-sync seed for the NEW
+// volume, leaving it Inconsistent forever. Per-volume scoping
+// surfaces the truth: the new volume's peer-devices are
+// Inconsistent / not-yet-attached, so the seed proceeds.
+//
+// Identical conservative semantics to the RD-scoped variant:
+// returns false on any probe / parse failure or when the volume
+// has no matching peer-devices in any connection (i.e. nobody
+// is connected with the new minor yet — that is the "fresh
+// volume" steady state, no peer holds data for it).
+func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource string, volNumber int32) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	for _, conn := range status[0].Connections {
+		for _, pd := range conn.PeerDevices {
+			if pd.VolumeNumber != volNumber {
+				continue
+			}
+
 			switch DiskState(pd.PeerDiskState) {
 			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
 				return true

@@ -2539,27 +2539,63 @@ func (r *Reconciler) isDisklessToDiskfulFlip(ctx context.Context, dr *intent.Des
 // gating but no longer drives the GI-seed decision — the
 // pre-CreateMD HasMD probe is the more accurate signal.
 func (r *Reconciler) ensureMetadata(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, mdMarkerPath string, firstActivation bool) error {
-	hasMD, err := r.cfg.Adm.HasMD(ctx, dr.GetName())
-	if err != nil {
-		return errors.Wrapf(err, "dump-md %s", dr.GetName())
-	}
+	// Bug B.4 (P0): probe + create-md per-volume rather than per-
+	// resource. The legacy single-shot `drbdadm dump-md <rd>` /
+	// `drbdadm create-md <rd>` walks every volume in .res and bails
+	// on the FIRST one that doesn't match the requested operation —
+	// for `dump-md` that means "no metadata" if ANY volume lacks it,
+	// and for `create-md` it means EBUSY against vol-0 if vol-0 is
+	// already attached. Mirrors upstream LINSTOR's
+	// DrbdLayer.adjustResource per-volume hasMetaData + createMd
+	// pattern (satellite/.../DrbdLayer.java).
+	//
+	// Triggered by `linstor vd c <rd> N` adding vol-1 to a 2-replica
+	// RD where vol-0 has already reached UpToDate: the new kernel
+	// slot brings vol-1 up as `disk:Diskless` (no metadata yet),
+	// which trips `isDisklessToDiskfulFlip` (HasDisklessVolume=true)
+	// and routes through here with firstActivation=false. The
+	// per-resource HasMD probe then sees "vol-1 has no metadata" →
+	// returns false → CreateMD against the per-resource target →
+	// fails EBUSY on vol-0's attached minor → reconciler hot-loops
+	// at ~10 Hz and the WHOLE resource enters `suspended:quorum`
+	// because vol-1 cannot achieve quorum, blocking vol-0 I/O.
+	//
+	// Per-volume scoping is also the SAFETY invariant for the
+	// historical (single-volume) path: an RD-scoped `create-md
+	// --force` walks every volume and would wipe a sibling volume's
+	// existing GI + bitmap state. Targeting `<rd>/<volNumber>` keeps
+	// drbdmeta away from already-stamped lower disks.
+	metadataFreshlyCreated := false
 
-	// Why (Bug 347): capture the "metadata is about to be freshly
-	// created" signal BEFORE CreateMD runs so we can gate the
-	// downstream GI-seed on it. `firstActivation` alone is too
-	// narrow — it's false on tieB→diskful even though the
-	// tiebreaker has no DRBD-9 superblock to inherit GI from, so
-	// the seed must still run to dodge a full resync.
-	metadataFreshlyCreated := !hasMD
+	for _, vol := range dr.GetVolumes() {
+		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
-	if !hasMD {
-		err = r.createMDWithCollisionRecovery(ctx, dr.GetName(), dr.GetName())
-		if err != nil {
-			return errors.Wrapf(err, "create-md %s", dr.GetName())
+		hasMD, probeErr := r.cfg.Adm.HasMD(ctx, target)
+		if probeErr != nil {
+			return errors.Wrapf(probeErr, "dump-md %s", target)
+		}
+
+		if hasMD {
+			continue
+		}
+
+		// Why (Bug 347): capture "at least one volume's metadata is
+		// about to be freshly created" so the downstream GI-seed
+		// gate fires. Mirrors the pre-CreateMD HasMD signal the
+		// previous per-resource probe captured. `firstActivation`
+		// alone is too narrow — it's false on tieB→diskful even
+		// though the tiebreaker has no DRBD-9 superblock to inherit
+		// GI from, so the seed must still run to dodge a full
+		// resync.
+		metadataFreshlyCreated = true
+
+		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
+		if createErr != nil {
+			return errors.Wrapf(createErr, "create-md %s", target)
 		}
 	}
 
-	err = os.WriteFile(mdMarkerPath, nil, resFilePerm)
+	err := os.WriteFile(mdMarkerPath, nil, resFilePerm)
 	if err != nil {
 		return errors.Wrapf(err, "write %s", mdMarkerPath)
 	}
@@ -2719,6 +2755,8 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		return err
 	}
 
+	freshlyCreated := map[int32]struct{}{}
+
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
@@ -2734,6 +2772,64 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
+		}
+
+		freshlyCreated[vol.GetVolumeNumber()] = struct{}{}
+	}
+
+	if len(freshlyCreated) == 0 {
+		return nil
+	}
+
+	// Bug B.4: seed the day0 GI tuple on volumes whose metadata was
+	// just freshly created so the subsequent FSM-dispatched adjust
+	// brings the new volume up Consistent (case-B winner shape) or
+	// at least with a clean per-peer bitmap (case-A skip-init-sync).
+	// Without the seed both diskful peers handshake at zero
+	// current-UUID, neither is force-promoted (the late-add path
+	// runs with firstActivation=false on the parent RD), and the
+	// volume latches Inconsistent forever.
+	//
+	// Per-volume scoping: only the freshly-created volumes get
+	// touched. vol-0 (already attached, HasMD=true) is skipped
+	// before the loop ever fires — drbdmeta set-gi against an
+	// attached lower disk would EBUSY just like create-md would.
+	// The per-volume `resolveVolumeSeed` already gates on the
+	// per-volume `AnyConnectedPeerHasDataForVolume` probe so the
+	// late-add can take the day0 skip-init-sync seed even when
+	// sibling volumes have UpToDate peers.
+	return r.seedFreshVolumes(ctx, dr, devices, freshlyCreated)
+}
+
+// seedFreshVolumes runs seedPerPeerGI for the subset of volumes
+// listed in `fresh`. Mirrors the loop in seedInitialGI but limits
+// touch to the volumes whose metadata was just freshly created,
+// so already-stamped sibling volumes (vol-0 in the Bug B.4
+// late-add scenario) are never re-seeded. isWinner is hard-coded
+// to false because this path runs with firstActivation=false on
+// the parent RD — the per-volume gate inside resolveVolumeSeed
+// decides which seed shape (case-A skip-init-sync, case-B
+// winner, or no-op) is appropriate via the per-volume
+// AnyConnectedPeerHasDataForVolume probe.
+func (r *Reconciler) seedFreshVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, fresh map[int32]struct{}) error {
+	for _, vol := range dr.GetVolumes() {
+		if _, ok := fresh[vol.GetVolumeNumber()]; !ok {
+			continue
+		}
+
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			continue
+		}
+
+		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), false, dr.GetSkipInitialSync())
+		if !ok {
+			continue
+		}
+
+		err := r.seedPerPeerGI(ctx, dr, vol, device, seed)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -4275,7 +4371,15 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	// adjust`), so the probe finds nothing and the skip proceeds — the
 	// fresh 2-/3-replica skip-init-sync is preserved. Mirrors the
 	// shouldForcePromote AnyConnectedPeerHasData backstop.
-	if r.cfg.Adm.AnyConnectedPeerHasData(ctx, resourceName) {
+	// Bug B.4: per-volume probe. The RD-scoped variant returns
+	// true if ANY peer-device on the resource is UpToDate; for a
+	// `vd c` adding vol-1 to an RD whose vol-0 is already
+	// UpToDate on both peers, the RD-scoped check would refuse
+	// the seed for vol-1 even though vol-1's peer-devices are
+	// Inconsistent. Per-volume scoping surfaces the truth about
+	// the NEW volume's peer state in isolation from any
+	// already-UpToDate sibling volumes.
+	if r.cfg.Adm.AnyConnectedPeerHasDataForVolume(ctx, resourceName, vol.GetVolumeNumber()) {
 		return drbd.GISeed{}, false
 	}
 

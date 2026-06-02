@@ -292,26 +292,28 @@ func TestApplyMultiVolumeRDRendersOneResourceWithVolumes(t *testing.T) {
 		t.Errorf("want 4 `volume` sub-blocks (2 vols x 2 hosts), got %d in:\n%s", c, got)
 	}
 
-	// `drbdadm create-md <rd>` initialises metadata for ALL volumes
-	// in the resource (DRBD walks the rendered .res and creates AL +
-	// bitmap + GI state per `volume {}` sub-block). The reconciler
-	// therefore issues one create-md against the resource name, not
-	// one per volume number — matches upstream LINSTOR's DrbdAdm.
-	// We just guard that it ran at all; per-volume metadata is
-	// covered by the on-disk `volume {}` sub-blocks asserted above
-	// (DRBD wouldn't initialise vol 1 if its block were missing).
-	var sawCreateMD bool
-
-	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "drbdadm") && strings.Contains(line, "create-md") &&
-			strings.HasSuffix(line, "pvc-multi") {
-			sawCreateMD = true
-			break
+	// `drbdadm create-md <rd>/<volNumber>` initialises metadata per
+	// volume — Bug B.4 changed the per-RD walk to a per-volume probe
+	// + create-md loop. Upstream LINSTOR's DrbdLayer.adjustResource
+	// matches: hasMetaData per-volume, createMd per-volume for those
+	// that lack it. Per-volume scoping is also a safety invariant —
+	// an RD-scoped `create-md --force` would walk every volume and
+	// wipe vol-0's existing GI + bitmap state on a late-add path.
+	for _, want := range []string{
+		"drbdadm create-md --force --max-peers=15 pvc-multi/0",
+		"drbdadm create-md --force --max-peers=15 pvc-multi/1",
+	} {
+		if !slices.Contains(fx.CommandLines(), want) {
+			t.Errorf("want %q; cmds:\n%v", want, fx.CommandLines())
 		}
 	}
 
-	if !sawCreateMD {
-		t.Errorf("want one `drbdadm create-md ... pvc-multi`; cmds:\n%v", fx.CommandLines())
+	// Per-RD `drbdadm create-md ... pvc-multi` (no `/<vol>` suffix)
+	// MUST NOT run — it would EBUSY against an already-attached
+	// volume's minor and hot-loop the reconciler (Bug B.4 surface).
+	forbidden := "drbdadm create-md --force --max-peers=15 pvc-multi"
+	if slices.Contains(fx.CommandLines(), forbidden) {
+		t.Errorf("per-RD create-md MUST NOT run (Bug B.4 regression); cmds:\n%v", fx.CommandLines())
 	}
 
 	// adjust runs against the resource name too — DRBD applies the
@@ -2510,8 +2512,8 @@ func TestApplyDRBDCreateMDErrorWraps(t *testing.T) {
 
 	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-md-fail_00000",
 		storage.FakeResponse{Stdout: []byte("")})
-	// drbdadm create-md fails.
-	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-md-fail", drbd.MaxPeers-1),
+	// drbdadm create-md fails. Bug B.4: per-volume target.
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-md-fail/0", drbd.MaxPeers-1),
 		storage.FakeResponse{Err: errCreateMDFailed})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -3209,7 +3211,8 @@ func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
 	// real drbdadm dump-md prints a multi-line `version`/`la-size`/
 	// `bm-uuid`/... dump; the satellite's HasMD only needs `err == nil
 	// && len(out) > 0`, so a minimal canned response suffices.
-	fx.Expect("drbdadm dump-md pvc-w09-adopt",
+	// Bug B.4: probe is per-volume (`<rd>/<volNumber>`).
+	fx.Expect("drbdadm dump-md pvc-w09-adopt/0",
 		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
 
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
@@ -3258,7 +3261,8 @@ func TestApplyAdoptsExistingMetadataAfterDiskReplace(t *testing.T) {
 
 	// dump-md (HasMD probe) MUST have fired — without it the safety
 	// guard is bypassed and the create-md call above would have run.
-	if indexOfPrefix(calls, "drbdadm dump-md pvc-w09-adopt") < 0 {
+	// Bug B.4: per-volume target.
+	if indexOfPrefix(calls, "drbdadm dump-md pvc-w09-adopt/0") < 0 {
 		t.Errorf("HasMD probe (drbdadm dump-md) missing from call sequence: %v", calls)
 	}
 
