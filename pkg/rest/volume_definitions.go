@@ -229,6 +229,17 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 365: reject out-of-range volume_number at the GET wire
+	// boundary too. Symmetric to Bug 363 (create) and the
+	// vd-delete gate below — keeps the entire VD CRUD surface
+	// consistent on the addressable [0, 65535] DRBD-9 range.
+	vnErr := validateVolumeNumber(vn)
+	if vnErr != nil {
+		writeVDNumberRejection(w, rd, vn, vnErr)
+
+		return
+	}
+
 	vd, err := s.Store.VolumeDefinitions().Get(r.Context(), rd, vn)
 	if err != nil {
 		writeStoreError(w, err)
@@ -673,6 +684,17 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 365: reject out-of-range volume_number at the PUT/PATCH
+	// wire boundary too. Symmetric to Bug 363 (create) and the
+	// vd-get / vd-delete gates — keeps the entire VD CRUD surface
+	// consistent on the addressable [0, 65535] DRBD-9 range.
+	vnErr := validateVolumeNumber(vn)
+	if vnErr != nil {
+		writeVDNumberRejection(w, rd, vn, vnErr)
+
+		return
+	}
+
 	var patch volumeDefinitionModifyBody
 
 	if !decodeJSON(w, r, &patch) {
@@ -907,6 +929,24 @@ func (s *Server) handleVDDelete(w http.ResponseWriter, r *http.Request) {
 	vn, err := parseVolNum(r.PathValue("vn"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	// Bug 365 (P2, hunt-caught 2026-06-02): reject out-of-range
+	// volume_number before the store-level Delete masks it as
+	// "already absent". Pre-fix `vd d <rd> -1`, `vd d <rd> 65536`
+	// and `vd d <rd> 99999` all returned 200 + warnVDNotFound,
+	// silently telling operators their bogus input was valid (the
+	// store can never have persisted such a row because Bug 363
+	// rejects it at vd c). The mismatch confused tooling that
+	// audits idempotent deletes for "the row was there but now
+	// isn't" semantics. Bug 363 already pins the [0, 65535] range
+	// at create-time; this gate mirrors it at the DELETE wire
+	// boundary so the contract is symmetric.
+	vnErr := validateVolumeNumber(vn)
+	if vnErr != nil {
+		writeVDNumberRejection(w, rd, vn, vnErr)
 
 		return
 	}
