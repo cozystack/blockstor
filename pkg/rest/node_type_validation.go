@@ -21,48 +21,62 @@ package rest
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
-// knownNodeTypes is the closed enum upstream LINSTOR accepts for
+// ErrInvldNodeType is the sentinel for Bug 370 — POST /v1/nodes with
+// an unknown `type` value. Callers (handleNodeCreate) wrap it with the
+// offending value + accepted enumeration via errors.Wrap so the wire
+// envelope still carries the contextual hint while the sentinel
+// supports `errors.Is` matching for tests / future callers.
+var ErrInvldNodeType = errors.New("invalid node type")
+
+// knownNodeTypesList is the closed enum upstream LINSTOR accepts for
 // `spec.type` on `POST /v1/nodes`. The CRD CEL rule on
 // pkg/store/k8s mirrors the same list; any change here must stay in
 // sync with the schema. Order is informational — the enumeration
 // returned via the refusal message matches the order operators see
 // in upstream documentation.
-var knownNodeTypes = []string{
-	apiv1.NodeTypeController,
-	apiv1.NodeTypeSatellite,
-	apiv1.NodeTypeCombined,
-	apiv1.NodeTypeAuxiliary,
-	apiv1.NodeTypeRemoteSpdk,
-	apiv1.NodeTypeOpenflexTarget,
-	apiv1.NodeTypeEbsTarget,
-	apiv1.NodeTypeEbsInitiator,
+//
+// Wrapped in a function rather than a package-level slice so the
+// linter's gochecknoglobals rule stays happy while the data still
+// reads as a single source of truth.
+func knownNodeTypesList() []string {
+	return []string{
+		apiv1.NodeTypeController,
+		apiv1.NodeTypeSatellite,
+		apiv1.NodeTypeCombined,
+		apiv1.NodeTypeAuxiliary,
+		apiv1.NodeTypeRemoteSpdk,
+		apiv1.NodeTypeOpenflexTarget,
+		apiv1.NodeTypeEbsTarget,
+		apiv1.NodeTypeEbsInitiator,
+	}
 }
 
-// validateNodeType returns a non-nil error when `t` is non-empty and
-// outside the upstream enum. Empty string is accepted — the downstream
-// store-write path defaults a missing Type to SATELLITE so callers that
-// post a body without the `type` key (the canonical `linstor n c <name>
-// <ip>` shape) stay unaffected.
-func validateNodeType(t string) error {
-	if t == "" {
+// validateNodeType returns a non-nil error when nodeType is non-empty
+// and outside the upstream enum. Empty string is accepted — the
+// downstream store-write path defaults a missing Type to SATELLITE so
+// callers that post a body without the `type` key (the canonical
+// `linstor n c <name> <ip>` shape) stay unaffected.
+func validateNodeType(nodeType string) error {
+	if nodeType == "" {
 		return nil
 	}
 
-	upper := strings.ToUpper(t)
-	for _, k := range knownNodeTypes {
-		if k == upper {
-			return nil
-		}
+	known := knownNodeTypesList()
+	if slices.Contains(known, strings.ToUpper(nodeType)) {
+		return nil
 	}
 
-	return fmt.Errorf(
-		"node_type %q is invalid: supported values are %s",
-		t, strings.Join(knownNodeTypes, ", "))
+	return errors.Wrap(ErrInvldNodeType, fmt.Sprintf(
+		"%q: supported values are %s",
+		nodeType, strings.Join(known, ", ")))
 }
 
 // writeNodeTypeError writes the Bug 370 refusal envelope: HTTP 400 +
