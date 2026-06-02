@@ -212,6 +212,18 @@ func (s *Server) handleNetInterfaceUpdate(w http.ResponseWriter, r *http.Request
 // shape so audit-log greppers can distinguish a real drop from an
 // idempotent no-op. Mirrors the Bug 56 / 66 pattern every other
 // delete-of-missing handler in this package uses.
+//
+// Bug 379: parent-NotFound (node never existed) folds into the same
+// idempotent envelope. Pre-fix this branch leaked a raw
+// `patch NetInterfaces of Node "X": node "X": object not found`
+// 404 — symmetric with the Bug 378 gap on per-key property delete:
+// cozystack's node-evacuation playbook calls
+// `linstor node interface delete <node> <nic>` in a retry loop, and
+// a second pass after `linstor n d <node>` succeeded should be a
+// no-op rather than a fatal "object not found" envelope. The
+// controller-side sibling
+// (`DELETE /v1/controller/properties/{key...}`) returns 200 on every
+// input for the same reason — see TestControllerPropertiesDelete*.
 func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request) {
 	nodeName := r.PathValue("node")
 	name := r.PathValue("name")
@@ -238,6 +250,25 @@ func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request
 		return out, nil
 	})
 	if err != nil {
+		// Bug 379: parent-NotFound is also idempotent. Mirrors the
+		// Bug 378 fix on `handleNodePropDelete`: a teardown script
+		// that first runs `linstor n d <node>` then
+		// `linstor node interface delete <node> default` must not
+		// fail on the second call once the node finally clears.
+		// Surface the same warn-band envelope `handleNodeDelete`
+		// itself emits so an audit-log grep on warnNodeNotFound
+		// catches the cascade.
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskWarn,
+				Message: "node already absent: " + nodeName +
+					" (net-interface delete no-op on " + name + ")",
+				ObjRefs: map[string]string{objRefNode: nodeName},
+			}})
+
+			return
+		}
+
 		writeStoreError(w, err)
 
 		return
