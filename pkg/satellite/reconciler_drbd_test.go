@@ -2881,6 +2881,276 @@ func TestApplyDRBDAllocatesBackingForLateAddedVolume(t *testing.T) {
 	}
 }
 
+// TestApplyLateAddedVolumeWinnerSeedsUpToDate pins Bug 384 (P0, data
+// integrity — regression of Bug 79/332): when `linstor vd c <rd> 1G`
+// adds vol-1 to a multi-replica RD whose vol-0 already reached
+// UpToDate, the lowest-node-id diskful replica MUST seed the new
+// volume Consistent+UpToDate (the case-B winner shape) so it converges
+// — NOT take the case-A skip-init-sync seed (clean bitmap, no UpToDate
+// flag), which leaves the new volume Inconsistent on EVERY replica
+// with no SyncSource to recover from.
+//
+// Root cause: the late-add seed path runs with firstActivation=false
+// on the parent RD (the RD is already Initialized by the time the
+// `vd c` lands), so the dispatcher's first-activation auto-primary
+// winner election never fires. seedFreshVolumes previously passed
+// isWinner=false unconditionally → every replica took case-A → no
+// UpToDate authority → vol-1 latched Inconsistent forever (verbatim
+// operator repro on a 2-diskful lvm-thin RD).
+//
+// The fix recomputes the lowest-node-id election locally per fresh
+// volume (isLateAddWinner). This fixture is the lowest-id node
+// (local node-id 0, peer node-id 1) so it is the elected winner: its
+// vol-1 set-gi MUST carry the positional Consistent(idx4=1)+
+// UpToDate(idx5=1) flags at current=day0. vol-0's metadata MUST NOT be
+// re-seeded (HasMD=true short-circuits create-md, so it never enters
+// the fresh-seed set).
+func TestApplyLateAddedVolumeWinnerSeedsUpToDate(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// vol-0 already provisioned (idempotent lvs short-circuit).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-win_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-late-win_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late-win_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late-win_00000|1048576\n")})
+
+	// vol-1 is NEW — lvs reports nothing, CreateVolume lvcreates it,
+	// then the path read returns the freshly-carved LV.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-win_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late-win_00001",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late-win_00001|1048576\n")})
+
+	// Per-volume HasMD probe: vol-0 stamped, vol-1 missing.
+	fx.Expect("drbdadm dump-md pvc-late-win/0",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
+	fx.Expect("drbdadm dump-md pvc-late-win/1",
+		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
+
+	// Per-volume create-md for vol-1 only.
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-win/1", drbd.MaxPeers-1),
+		storage.FakeResponse{})
+
+	// Kernel slot already loaded (vol-0 UpToDate). drbdsetup status
+	// (no --json) drives FSM dispatch; the --json variant
+	// AnyConnectedPeerHasDataForVolume probes returns empty → "no peer
+	// holds data for vol-1" → the seed proceeds.
+	fx.Expect("drbdsetup status pvc-late-win",
+		storage.FakeResponse{Stdout: []byte("pvc-late-win role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdsetup status --verbose pvc-late-win",
+		storage.FakeResponse{Stdout: []byte("pvc-late-win role:Secondary\n  volume:0 disk:UpToDate\n")})
+
+	fx.Expect("drbdadm adjust pvc-late-win", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Steady state: single-volume .res + md-created marker from the
+	// first-activation pass, the on-disk shape when `vd c` lands.
+	resPath := filepath.Join(dir, "pvc-late-win.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-late-win {\n  on n1 {\n    volume 0 {\n    }\n  }\n}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "pvc-late-win.md-created"), nil, 0o600); err != nil {
+		t.Fatalf("seed md-created: %v", err)
+	}
+
+	// 2-diskful RD: local n1 node-id 0 (the lowest → late-add winner),
+	// peer n2 node-id 1. MetadataCreated=true (RD already Initialized),
+	// SkipInitialSync=true (replicas were stamped pre-init), late-add
+	// vol-1. This is the exact wire shape the operator repro produced.
+	peerID := int32(1)
+	dr := []*intent.DesiredResource{
+		{
+			Name:            "pvc-late-win",
+			NodeName:        "n1",
+			MetadataCreated: true,
+			SkipInitialSync: skipInitTrue(),
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []intent.DesiredPeer{{Name: "n2", NodeID: &peerID}},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+				"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply: expected Ok=true; got results=%+v", results)
+	}
+
+	calls := fx.CommandLines()
+	day0 := satellite.Day0GiForTest("pvc-late-win", 1)
+
+	// THE FIX: vol-1's local-slot set-gi MUST carry the winner shape —
+	// current=day0, Consistent(idx4=1)+UpToDate(idx5=1). The set-gi
+	// target is `<rd>/1` (vol-1 only); vol-0 is never re-seeded.
+	var vol1LocalSlot string
+
+	for _, line := range calls {
+		if strings.Contains(line, "pvc-late-win/1 ") && strings.Contains(line, "set-gi --node-id 0 ") {
+			vol1LocalSlot = line
+		}
+	}
+
+	if vol1LocalSlot == "" {
+		t.Fatalf("Bug 384: late-added vol-1 got NO winner set-gi on the lowest-id local slot — it would latch Inconsistent forever; cmds=%v", calls)
+	}
+
+	fields := strings.Fields(vol1LocalSlot)
+	gi := fields[len(fields)-1]
+	parts := strings.Split(gi, ":")
+
+	if len(parts) < 6 {
+		t.Fatalf("late-add winner vol-1 slot must carry positional consistent+uptodate flags; got %q", gi)
+	}
+
+	if parts[0] != day0 {
+		t.Errorf("late-add winner vol-1 current-UUID must equal day0 (shared lineage); got current=%s day0=%s", parts[0], day0)
+	}
+
+	if parts[1] != "0" {
+		t.Errorf("late-add winner vol-1 bitmap-base must be empty (0 = bitmap-uuid 0x0); got base=%s", parts[1])
+	}
+
+	if parts[4] != "1" || parts[5] != "1" {
+		t.Errorf("Bug 384: late-add winner vol-1 slot must be Consistent(idx4=1)+UpToDate(idx5=1); got %q — vol-1 would come up Inconsistent on every replica", gi)
+	}
+
+	// vol-0's metadata MUST NOT be touched by the late-add seed — it is
+	// HasMD=true, so it never joins the fresh-seed set. A set-gi against
+	// `<rd>/0` would wipe vol-0's live GI + bitmap state.
+	for _, line := range calls {
+		if strings.Contains(line, "pvc-late-win/0 ") && strings.Contains(line, "set-gi") {
+			t.Errorf("late-add seed re-stamped vol-0 GI (would wipe its live metadata): %s", line)
+		}
+	}
+}
+
+// TestApplyLateAddedVolumeNonWinnerTakesSkipInitSync pins the
+// complementary Bug 384 invariant: a late-add replica that is NOT the
+// lowest node-id (a peer holds a lower id) MUST take the case-A
+// skip-init-sync seed (current=day0, clean bitmap, NO UpToDate flag),
+// never the winner seed. Exactly one replica wins; the rest SyncTarget
+// from it. Here local n1 is node-id 2 with peers at 0 and 1, so n1 is
+// NOT the winner.
+func TestApplyLateAddedVolumeNonWinnerTakesSkipInitSync(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-lose_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-late-lose_00000\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late-lose_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late-lose_00000|1048576\n")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-late-lose_00001",
+		storage.FakeResponse{Stdout: []byte("")})
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-late-lose_00001",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-late-lose_00001|1048576\n")})
+	fx.Expect("drbdadm dump-md pvc-late-lose/0",
+		storage.FakeResponse{Stdout: []byte("version \"v09\";\nla-size-sect 2048;\n")})
+	fx.Expect("drbdadm dump-md pvc-late-lose/1",
+		storage.FakeResponse{Err: errDrbdadmDumpMdNoMeta})
+	fx.Expect(fmt.Sprintf("drbdadm create-md --force --max-peers=%d pvc-late-lose/1", drbd.MaxPeers-1),
+		storage.FakeResponse{})
+	fx.Expect("drbdsetup status pvc-late-lose",
+		storage.FakeResponse{Stdout: []byte("pvc-late-lose role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdsetup status --verbose pvc-late-lose",
+		storage.FakeResponse{Stdout: []byte("pvc-late-lose role:Secondary\n  volume:0 disk:UpToDate\n")})
+	fx.Expect("drbdadm adjust pvc-late-lose", storage.FakeResponse{})
+
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n3",
+	})
+
+	resPath := filepath.Join(dir, "pvc-late-lose.res")
+	if err := os.WriteFile(resPath, []byte("resource pvc-late-lose {\n  on n3 {\n    volume 0 {\n    }\n  }\n}\n"), 0o600); err != nil {
+		t.Fatalf("seed .res: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "pvc-late-lose.md-created"), nil, 0o600); err != nil {
+		t.Fatalf("seed md-created: %v", err)
+	}
+
+	peer0, peer1 := int32(0), int32(1)
+	dr := []*intent.DesiredResource{
+		{
+			Name:            "pvc-late-lose",
+			NodeName:        "n3",
+			MetadataCreated: true,
+			SkipInitialSync: skipInitTrue(),
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+				{VolumeNumber: 1, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+			},
+			Peers: []intent.DesiredPeer{
+				{Name: "n1", NodeID: &peer0},
+				{Name: "n2", NodeID: &peer1},
+			},
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "2", "address": "10.0.0.3", "minor": "1000",
+				"peer.n1.address": "10.0.0.1", "peer.n1.node-id": "0", "peer.n1.port": "7000",
+				"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+			},
+		},
+	}
+
+	results, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(results) != 1 || !results[0].GetOk() {
+		t.Fatalf("Apply: expected Ok=true; got results=%+v", results)
+	}
+
+	calls := fx.CommandLines()
+
+	// The non-winner still seeds vol-1 (case-A skip-init-sync) so the
+	// bitmap is clean and it SyncTargets cleanly from the winner — but
+	// the local slot MUST NOT carry the UpToDate flag, otherwise two
+	// replicas would both claim authority.
+	var vol1LocalSlot string
+
+	for _, line := range calls {
+		if strings.Contains(line, "pvc-late-lose/1 ") && strings.Contains(line, "set-gi --node-id 2 ") {
+			vol1LocalSlot = line
+		}
+	}
+
+	if vol1LocalSlot == "" {
+		t.Fatalf("non-winner late-add vol-1 must still get a case-A skip-init-sync seed on its local slot; cmds=%v", calls)
+	}
+
+	gi := strings.Fields(vol1LocalSlot)
+	tuple := gi[len(gi)-1]
+	parts := strings.Split(tuple, ":")
+
+	// Case-A seed is `<day0>:0:0:0` — only current + empty bitmap, no
+	// positional consistent/uptodate flags.
+	if len(parts) >= 6 && parts[5] == "1" {
+		t.Errorf("Bug 384 split-brain guard: non-winner late-add vol-1 MUST NOT carry UpToDate(idx5=1); got %q", tuple)
+	}
+}
+
 // TestApplyAutoPrimaryForceErrorWraps pins the auto-primary force
 // error-wrap branch of applyDRBD: when the mkfs-promote step
 // `drbdadm primary --force` fails on first activation, applyOne
