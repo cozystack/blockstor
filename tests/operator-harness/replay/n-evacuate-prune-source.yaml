@@ -1,0 +1,85 @@
+name: n-evacuate-prune-source
+description: |
+  Bug 389: `linstor node evacuate <node>` is an online drain that must
+  place a replacement diskful replica on a healthy peer, wait for it to
+  reach UpToDate, then DELETE the source replica on the evacuated node —
+  leaving that node empty so `node delete` would complete cleanly.
+
+  Pre-fix blockstor gap-filled the replacement but NEVER pruned the
+  source (`if !lost { return nil }` in node_controller.go), so the RD
+  ran at place_count+1 diskful forever with one copy pinned to an
+  EVICTED node and the drain never finished.
+
+  Scenario (3-node): place 2 diskful replicas on node1 + node2, then
+  evacuate node1. The placer gap-fills on node3 (the only free pool
+  node). Assert: node3 reaches UpToDate (add-before-drop), the source
+  on node1 is pruned (resource_absent), and node2 + node3 are both
+  UpToDate so redundancy was preserved throughout.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-initial-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: node-evacuate-node1
+    cmd: ["node", "evacuate", "{{node1}}"]
+    expect_exit: 0
+  - name: wait-replacement-on-node3
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Add-before-drop: the replacement on the free pool node must
+      # reach UpToDate before the source is allowed to drop.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: "UpToDate"
+      timeout_s: 240
+  - name: wait-source-pruned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # THE Bug 389 ASSERTION: once the replacement is UpToDate the
+      # source replica on the evacuated node must be deleted.
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
+  - name: wait-redundancy-preserved
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # After the drain settles, every surviving replica (node2 +
+      # node3) is UpToDate — redundancy never dipped below place_count.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["node", "restore", "{{node1}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
