@@ -266,7 +266,19 @@ func (s *Server) handleResourceConnectionPathCreate(w http.ResponseWriter, r *ht
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
+	// Bug 374: emit `[]ApiCallRc` envelope on 201 instead of a bare
+	// WriteHeader. golinstor's response parser (Bug 45) and python-
+	// linstor 1.27.1 (Bug 129) unconditionally json-decode every
+	// non-204 2xx response, so an empty body crashes the CLI with
+	// "Expecting value: line 1 column 1 (char 0)".
+	writeJSON(w, http.StatusCreated, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource connection path created: " + body.Name +
+			" on " + rdName + " (" + nodeA + " <-> " + nodeB + ")",
+		ObjRefs: map[string]string{
+			objRefRscDfn: rdName,
+		},
+	}})
 }
 
 // upsertResourceConnectionPath does the RD read-modify-write so the

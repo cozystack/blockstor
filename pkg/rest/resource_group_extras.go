@@ -303,7 +303,19 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Bug 374: emit `[]ApiCallRc` envelope on 200 instead of a bare
+	// WriteHeader. Sibling RG/VG write paths (handleVGCreate /
+	// handleVGDelete) already emit MASK_INFO / WARN-mask envelopes
+	// so `linstor rg vg m` doesn't crash python-linstor's
+	// json.loads on the no-op-body 200.
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "volume group modified: " + rgName + " vlmNr " +
+			strconv.Itoa(int(vlmNr)),
+		ObjRefs: map[string]string{
+			objRefRscGrp: rgName,
+		},
+	}})
 }
 
 // handleVGDelete drops a VolumeGroup entry from its parent RG.

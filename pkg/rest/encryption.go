@@ -245,7 +245,16 @@ func (s *Server) handlePassphraseCreate(w http.ResponseWriter, r *http.Request) 
 			// same usable state as the original create.
 			s.passphraseUnlocked.Store(true)
 
-			w.WriteHeader(http.StatusOK)
+			// Bug 374: emit a MASK_INFO envelope on the
+			// idempotent-replay branch. The fresh-create
+			// branch below already does this (Bug 129); the
+			// replay path silently regressed back to a bare
+			// 200, which python-linstor still rejects with
+			// the same "Expecting value" trace.
+			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "Master passphrase already set",
+			}})
 
 			return
 		}
