@@ -197,8 +197,67 @@ done
 # have a disk`. The kernel slot for the returning TB stays
 # StandAlone; shouldSkipNetOnAdjust then misfires forever.
 
+# Bug 359: the immediate `r d $N2 → r c $N3` sequence races the
+# RD reconciler's Bug-338 carve-out — the controller's witness
+# collapse on $N3 oscillates with the operator's relocate Create
+# on the same node. The REST handler retries the create-or-promote
+# race (Bug 359 fix in createOrPromoteResource), but in the worst
+# case it surfaces 503 to let the caller back off. A second-level
+# retry here covers both that 503 and the ensure-tiebreaker
+# thrashing window: wait for the controller to settle on a stable
+# post-r-d topology (either 1-diskful or 1-diskful + 1-witness)
+# before issuing the relocate.
+echo ">> wait for post-r-d controller topology to stabilise (<=20s)"
+stable_since=0
+last_witness_count=-1
+deadline=$(( $(date +%s) + 20 ))
+while (( $(date +%s) < deadline )); do
+    witness_count=$(kubectl get resources.blockstor.cozystack.io \
+        -l "blockstor.cozystack.io/resource-definition=$RD" \
+        -o json 2>/dev/null \
+        | jq '[.items[] | select(.spec.flags // [] | contains(["TIE_BREAKER"]))] | length' 2>/dev/null \
+        || echo "0")
+    if [[ "$witness_count" == "$last_witness_count" ]]; then
+        if (( stable_since == 0 )); then
+            stable_since=$(date +%s)
+        fi
+        # Require 4s of stability before proceeding.
+        if (( $(date +%s) - stable_since >= 4 )); then
+            echo "   topology settled: witness_count=$witness_count"
+            break
+        fi
+    else
+        stable_since=0
+        last_witness_count=$witness_count
+    fi
+    sleep 1
+done
+
 echo ">> linstor r c $N3 $RD (relocate diskful onto the old TIE_BREAKER host)"
-"${LCTL[@]}" resource create "$N3" "$RD" --storage-pool stand
+# Retry on Bug 359 503 envelope (witness-collapse race).
+for attempt in 1 2 3 4 5; do
+    if "${LCTL[@]}" resource create "$N3" "$RD" --storage-pool stand 2>&1 | tee /tmp/rc-attempt-$attempt.out; then
+        rc_status=0
+    else
+        rc_status=$?
+    fi
+    if (( rc_status == 0 )); then
+        break
+    fi
+    if grep -qE "tiebreaker collapse|503|Service Unavailable" /tmp/rc-attempt-$attempt.out 2>/dev/null; then
+        echo "   r c attempt $attempt hit the Bug 359 503 race, sleeping 2s and retrying"
+        sleep 2
+        continue
+    fi
+    echo "FAIL: r c returned non-503 error on attempt $attempt"
+    cat /tmp/rc-attempt-$attempt.out
+    exit 1
+done
+
+if (( rc_status != 0 )); then
+    echo "FAIL: r c never succeeded within 5 attempts (Bug 359 race did not settle)"
+    exit 1
+fi
 
 echo ">> wait $N3 UpToDate after relocate (<=180s)"
 wait_disk_state "$RD" "$N3" UpToDate 180 0

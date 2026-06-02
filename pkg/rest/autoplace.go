@@ -1760,10 +1760,85 @@ func (s *Server) refuseResourceCreateOnNodeDeletedRace(w http.ResponseWriter, r 
 // createOrPromoteResource creates res or promotes an existing
 // diskless replica in place. Writes the HTTP error and returns
 // (nil, false) on failure.
+// tieBreakerCollapseRetryAttempts and tieBreakerCollapseRetryDelay
+// bound the Bug 359 race window between (a) the RD reconciler's
+// `removeWitnesses` Delete that fires when `r d <last-diskful-peer>`
+// drops the diskful count to one (the Bug-338 carve-out collapses
+// the orphan TIE_BREAKER) and (b) an operator `r c <ex-witness-node>
+// <rd>` relocate that lands inside the same reconcile tick. The
+// kubectl Delete on the witness CRD finishes synchronously from the
+// reconciler's POV, but the k8s apiserver still serves the CRD as
+// "exists, DeletionTimestamp set, finalizer pending" for ~tens of ms
+// until the satellite strips its finalizer. During that window REST
+// `Resources().Create(...)` hits AlreadyExists, `Resources().Get(...)`
+// may return NotFound (if the finalizer-strip races just ahead of
+// the Get), and `promoteDisklessReplica` then surfaces NotFound from
+// its internal PatchResourceSpec. Pre-Bug-359 we surfaced that as a
+// 404 "not found" envelope to the operator — they never asked for a
+// promote, the witness collapse was an internal carve-out.
+//
+// The fix retries the whole create-or-promote sequence for ~1s with
+// a 200ms cadence; the AlreadyExists window closes the moment GC
+// finishes, after which `Resources().Create` succeeds as a fresh
+// replica and the relocate converges. Two retries is the worst case
+// observed on the dev stand; five gives 3x headroom for CI noise.
+const (
+	tieBreakerCollapseRetryAttempts = 5
+	tieBreakerCollapseRetryDelay    = 200 * time.Millisecond
+)
+
 func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) (*apiv1.Resource, bool) {
+	// Bug 359: a single attempt races the RD reconciler's
+	// `removeWitnesses` Delete when the same `r d` that triggered
+	// the TIE_BREAKER collapse is immediately followed by a
+	// relocate `r c <ex-witness-node>`. See the constant block above
+	// for the timing analysis. The retry envelope only fires on the
+	// witness-collapse path (AlreadyExists → Get returns NotFound,
+	// or promote returns NotFound); a real conflict on a non-witness
+	// replica surfaces as 409 on the first attempt as before.
+	for attempt := range tieBreakerCollapseRetryAttempts {
+		out, ok, retry := s.createOrPromoteResourceAttempt(w, r, res)
+		if !retry {
+			return out, ok
+		}
+
+		if attempt == tieBreakerCollapseRetryAttempts-1 {
+			break
+		}
+
+		select {
+		case <-r.Context().Done():
+			writeError(w, http.StatusGatewayTimeout,
+				"resource create: context cancelled during witness-collapse retry")
+
+			return nil, false
+		case <-time.After(tieBreakerCollapseRetryDelay):
+		}
+	}
+
+	// All retries exhausted — surface a 503 envelope so CSI /
+	// operator tooling can distinguish "transient race, retry me"
+	// from a true 404. Pre-Bug-359 we surfaced this race as a bare
+	// "not found" 404 which conflated the witness-collapse window
+	// with a real missing-RD or missing-pool error.
+	writeError(w, http.StatusServiceUnavailable,
+		"resource create racing tiebreaker collapse on "+res.NodeName+
+			", retry the create after the witness CRD finalizer strip completes")
+
+	return nil, false
+}
+
+// createOrPromoteResourceAttempt runs one pass of the Bug-260
+// create-or-promote pipeline. Returns (result, ok, retry):
+//   - ok==true, retry==false: created or promoted; caller proceeds.
+//   - ok==false, retry==false: terminal error already written to w.
+//   - ok==false, retry==true: Bug-359 race detected (witness CRD
+//     mid-delete); caller should sleep and re-attempt. NOTHING has
+//     been written to w in this case.
+func (s *Server) createOrPromoteResourceAttempt(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) (*apiv1.Resource, bool, bool) {
 	err := s.Store.Resources().Create(r.Context(), res)
 	if err == nil {
-		return res, true
+		return res, true, false
 	}
 
 	// Upstream LINSTOR semantics: `resource create <node> <rd>
@@ -1795,23 +1870,40 @@ func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request,
 		existing, getErr := s.Store.Resources().Get(r.Context(), res.Name, res.NodeName)
 		if getErr == nil && containsResourceFlag(existing.Flags, apiv1.ResourceFlagTieBreaker) {
 			wantsPromote = true
+		} else if errors.Is(getErr, store.ErrNotFound) {
+			// Bug 359 race: Create saw AlreadyExists but Get saw the
+			// CRD already gone — the Bug-338 witness collapse finished
+			// its Delete + finalizer strip between our Create and Get.
+			// Ask the caller to retry; the next Create should succeed
+			// as a fresh replica.
+			return nil, false, true
 		}
 	}
 
 	if errors.Is(err, store.ErrAlreadyExists) && wantsPromote {
 		promoted, promErr := s.promoteDisklessReplica(r.Context(), res)
 		if promErr != nil {
+			if errors.Is(promErr, store.ErrNotFound) {
+				// Bug 359 race: PromoteDisklessReplica's
+				// PatchResourceSpec saw the witness vanish under it
+				// between our flags probe and the patch closure —
+				// same collapse window described in
+				// createOrPromoteResource. Retry the whole sequence;
+				// the witness is fully gone now.
+				return nil, false, true
+			}
+
 			writeStoreError(w, promErr)
 
-			return nil, false
+			return nil, false, false
 		}
 
-		return promoted, true
+		return promoted, true, false
 	}
 
 	writeStoreError(w, err)
 
-	return nil, false
+	return nil, false, false
 }
 
 // promoteDisklessReplica takes a Resource the caller just tried to
