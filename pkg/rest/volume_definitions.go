@@ -1266,13 +1266,32 @@ func (s *Server) pruneVolumesFromResources(ctx context.Context, rd string, vn in
 	}
 }
 
+// parseVolNum decodes the {vn} / {vlmNr} URL pathvar into the int32
+// volume-number DRBD expects. Bug 380 (P3, bughunt round 11): pre-fix
+// the wire surfaced a raw `strconv.ParseInt: parsing "abc": invalid
+// syntax` to the caller — an internal Go error string that leaks the
+// stdlib func name and gives the operator zero hint about what the
+// allowed range actually is. Symmetric with the Bug 365 / Bug 363
+// envelope on the POST/DELETE body branches: an out-of-range or
+// non-numeric `volume_number` returns the same `[0, 65535]` correction
+// regardless of whether it arrived via path or body. parseVolNum
+// itself returns the wire-ready error string so every caller
+// (handleVDGet / handleVDDelete / handleVDPut / handleVolumeGet ...)
+// stays a one-line `writeError(w, 400, err.Error())` — no new
+// per-handler envelope drift.
 func parseVolNum(raw string) (int32, error) {
-	v, err := strconv.ParseInt(raw, 10, 32)
+	parsed, err := strconv.ParseInt(raw, 10, 32)
 	if err != nil {
-		return 0, err //nolint:wrapcheck // returned to handler that wraps it
+		// Same correction hint Bug 365 surfaces on the body branch —
+		// volume_number is a DRBD wire field, [0, 65535].
+		return 0, errors.Newf( //nolint:wrapcheck // wire-ready string, returned straight to writeError
+			"invalid volume number %q in URL path: "+
+				"volume_number must be a decimal integer in [0, 65535]; "+
+				"check the LINSTOR REST API documentation",
+			raw)
 	}
 
-	return int32(v), nil
+	return int32(parsed), nil
 }
 
 // resizePendingAnnotationPrefix is the per-volume annotation key
