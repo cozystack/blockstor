@@ -87,6 +87,49 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 381 (P3, bughunt round 11 — 2026-06-02): the spawn fast
+	// path silently accepted non-positive `volume_sizes`. The wire
+	// field is bytes (Bug-92 shape); each entry is divided by 1024
+	// to land as size_kib on the VD, so a `-100` truncated to
+	// `size_kib=0` and a `0` stayed `0`. Both spawned the RD with a
+	// zero-sized VD — the satellite reconciler then looped on
+	// `drbdadm create-md` indefinitely (DRBD's per-device minimum is
+	// ~4 MiB once metadata is reserved). Reject non-positive entries
+	// at the wire boundary BEFORE `Store.Create` so a bad spawn is
+	// one consistent LINSTOR envelope and no orphan RD is left
+	// behind. We don't apply the full Bug 155 [4096 KiB, 16 TiB]
+	// gate here because the oversub gate already runs against the
+	// caller's bytes value upstream (see `rejectIfExceedsOversubGate`
+	// + `oversub_test.go`), and unit tests cover ≤4 MiB sizes for
+	// oversub-policy probes that we don't want to break. The Bug 155
+	// bound itself still kicks in if the caller later issues a
+	// `vd c` or `vd modify` — but those paths already gate it.
+	// Symmetric with the VD-create body branch's writeVDSizeRejection
+	// so the CLI parity audit row for `rg spawn` matches `vd c` on
+	// the non-positive input class operators actually hit.
+	for i, sizeBytes := range req.VolumeSizes {
+		if sizeBytes > 0 {
+			continue
+		}
+
+		// Fabricate the same below-minimum sentinel the VD-create
+		// path uses so the wire shape is byte-identical. The
+		// post-divide size_kib value is what the operator sees in
+		// the envelope; we report it directly so `0` and `-100`
+		// both surface as `size_kib=0 below minimum 4096 KiB` (the
+		// effective floor) rather than a separate "non-positive"
+		// envelope that no other handler emits.
+		sizeKib := sizeBytes / bytesPerKib
+		reason := errors.Wrapf(ErrVolumeSizeBelowMinimum,
+			"size_kib=%d below minimum %d KiB "+
+				"(DRBD reserves ~32 KiB of metadata per peer; backing layers add alignment on top)",
+			sizeKib, minVolumeDefinitionSizeKib)
+
+		writeVDSizeRejection(w, req.ResourceDefinitionName, int32(i), sizeKib, reason)
+
+		return
+	}
+
 	// Over-subscription gate (Scenarios 7.19/7.20/7.21). The cap is
 	// computed against the RG's effective SelectFilter (merged with
 	// spawn-time overrides) so the operator's `not_place_with_rsc` /
