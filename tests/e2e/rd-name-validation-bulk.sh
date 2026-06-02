@@ -52,14 +52,19 @@ require_workers 1
 
 cleanup() {
     set +e
-    # Best-effort cleanup of every RD this scenario MIGHT have created,
-    # including the orphan rows the bug used to leak. The orphan check
-    # itself happens BEFORE this, so cleanup here just keeps the stand
-    # tidy for the next scenario.
-    kubectl delete snapshot "${SRC}.${SNAP}" --ignore-not-found --timeout=30s 2>/dev/null || true
-    for rd in e2e-c4-src e2e-c4-good-spawn e2e-c4-good-restore; do
+    # Order matters: drop the restore-clone RD FIRST (it holds a ZFS
+    # clone of $SNAP), then $SRC (the snapshot's parent), then the
+    # Snapshot itself, then RG. Tearing $SNAP down while a child
+    # clone still holds the ZFS dataset busy hangs the snapshot
+    # finalizer for 120s+, leaving an orphan that contaminates the
+    # next scenario on the same lane (the cross-scenario
+    # `dataset is busy` cascade the lane-sharding note in
+    # blockstor_zfs_clone_source_delete documents).
+    for rd in e2e-c4-good-restore e2e-c4-good-spawn e2e-c4-src; do
         delete_rd "$rd" 2>/dev/null || true
     done
+    kubectl delete snapshot "${SRC}.${SNAP}" --ignore-not-found --wait=true --timeout=60s 2>/dev/null
+    kubectl wait --for=delete "snapshot/${SRC}.${SNAP}" --timeout=60s 2>/dev/null
     kubectl delete resourcegroup "$RG" --ignore-not-found --timeout=30s 2>/dev/null
     set -e
 }
