@@ -38,7 +38,12 @@ steps:
     cmd: ["resource-definition", "create", "{{rd}}"]
     expect_exit: 0
   - name: create-vol0
-    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    # 64M (not 1G): Bug 384 is a deterministic per-volume winner-election
+    # defect in the satellite (seedFreshVolumes / isLateAddWinner), NOT a
+    # sync-timing race, so the trigger is size-independent. A 1G fresh-replica
+    # sync on an I/O-constrained stand (~0.5 MB/s) blows the 240s all_uptodate
+    # await; 64M converges in seconds and exercises the identical code path.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
     expect_exit: 0
   - name: r-c-node1
     cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
@@ -54,7 +59,9 @@ steps:
       rd: "{{rd}}"
       timeout_s: 240
   - name: late-vd-create-vol1
-    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    # 64M — see create-vol0 note. The late-added second volume is what Bug 384
+    # regressed; its winner election is size-independent.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
     expect_exit: 0
     await:
       kind: all_uptodate
