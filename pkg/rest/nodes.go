@@ -43,6 +43,14 @@ import (
 // `props.CurStltConnName` both default to it.
 const DefaultNetInterfaceName = "default"
 
+// envelopeVerbModified is the verb token reused by both the
+// per-NetInterface mutateNetInterface success envelope and the
+// node-level PUT envelope. golangci-lint goconst flagged the two
+// inline copies; centralising matches the existing
+// envelopeVerbCreated-style discipline in resource_definitions.go
+// and keeps the wire string a single source of truth.
+const envelopeVerbModified = "modified"
+
 // ResolveHostFunc is the DNS-lookup seam handleNodeCreate uses when
 // the POST body omits a NetInterface address. Tests swap this for a
 // deterministic stub via Server.SetResolveHost; production wires
@@ -254,6 +262,16 @@ func (s *Server) handleNetInterfaceDelete(w http.ResponseWriter, r *http.Request
 // supplied mutation against the node's NetInterface list via the
 // Bug 201 Patch helper. Used by both create and update so the
 // decoder + Patch plumbing stays in one place.
+//
+// Bug 371: address + satellite_port were never wire-validated on
+// this path. A `PUT /v1/nodes/<n>/net-interfaces/default` with
+// `{"address":"garbage","satellite_port":-7}` returned HTTP 200 and
+// persisted the malformed values into the live Node spec — enough
+// to deform the address/port of an Online satellite and break its
+// controller→satellite handshake. We now mirror handleNodeCreate's
+// Bug 120 address gate and add an explicit [1, 65535] port range
+// check. Symmetric with the Bug 368/369 fix on POST /v1/nodes:
+// both wire entry points share the same validator semantics.
 func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutate func([]apiv1.NetInterface, apiv1.NetInterface) ([]apiv1.NetInterface, error)) {
 	nodeName := r.PathValue("node")
 
@@ -263,8 +281,36 @@ func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutat
 		return
 	}
 
-	if iface.Name == "" && r.PathValue("name") == "" {
+	// PUT carries the interface name in the path; POST carries it
+	// in the body. Stamp the path value into iface BEFORE validation
+	// so the error envelope always names the actual target — and so
+	// the success-band message below never has a trailing space.
+	if pathName := r.PathValue("name"); pathName != "" {
+		iface.Name = pathName
+	}
+
+	if iface.Name == "" {
 		writeError(w, http.StatusBadRequest, "interface name is required")
+
+		return
+	}
+
+	// Bug 371: address must be a parseable IP literal or a
+	// DNS-resolvable hostname (same gate as handleNodeCreate's Bug
+	// 120 check). Empty / "garbage" addresses must not persist.
+	addrErr := s.validateNetInterfaceAddresses(r.Context(), []apiv1.NetInterface{iface})
+	if addrErr != nil {
+		writeError(w, http.StatusBadRequest, addrErr.Error())
+
+		return
+	}
+
+	// Bug 371: satellite_port must be a valid TCP port. See
+	// validateNetInterfacePorts for the full rule. Shared with
+	// handleNodeCreate so POST + PUT enforce the same range.
+	portErr := validateNetInterfacePorts([]apiv1.NetInterface{iface})
+	if portErr != nil {
+		writeError(w, http.StatusBadRequest, portErr.Error())
 
 		return
 	}
@@ -288,9 +334,14 @@ func mutateNetInterface(w http.ResponseWriter, r *http.Request, s *Server, mutat
 		status = http.StatusCreated
 	}
 
+	verb := envelopeVerbModified
+	if r.Method == http.MethodPost {
+		verb = "created"
+	}
+
 	writeJSON(w, status, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "net-interface " + r.Method + " " + iface.Name,
+		Message: "net-interface " + verb + ": " + iface.Name,
 	}})
 }
 
@@ -431,6 +482,16 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 	ifaceErr := s.validateNetInterfaceAddresses(r.Context(), n.NetInterfaces)
 	if ifaceErr != nil {
 		writeError(w, http.StatusBadRequest, ifaceErr.Error())
+
+		return
+	}
+
+	// Bug 368/369: refuse negative or >65535 satellite_port. Same
+	// rule as the Bug 371 net-interface PUT path; see
+	// validateNetInterfacePorts.
+	portErr := validateNetInterfacePorts(n.NetInterfaces)
+	if portErr != nil {
+		writeError(w, http.StatusBadRequest, portErr.Error())
 
 		return
 	}
@@ -717,6 +778,36 @@ func (s *Server) validateNetInterfaceAddresses(ctx context.Context, ifaces []api
 	return nil
 }
 
+// validateNetInterfacePorts refuses out-of-range satellite_port /
+// stlt_encryption_port values at the REST boundary.
+//
+// Bug 368/369/371: the previous behaviour accepted negative ports
+// (-1, -7) and >65535 ports (99999) verbatim on both POST /v1/nodes
+// and PUT /v1/nodes/<n>/net-interfaces/<name>, persisting them into
+// the Node CRD. Negative ports masquerade as "unset" inside
+// net.Dial which then defaults to 0; >65535 panics any reconciler
+// that round-trips through Go's net.JoinHostPort with the literal.
+// Either case made the satellite permanently unreachable.
+//
+// Port 0 is intentionally permitted: upstream LINSTOR treats it as
+// "inherit the default" (3366 / 3367) at the wire level. Anything
+// in [1, 65535] is accepted without further question — RFC 6335
+// reserves [1, 1023] for privileged ports but LINSTOR routinely
+// uses 3366/3367 and the controller has no business policing the
+// operator's choice within the valid TCP range.
+func validateNetInterfacePorts(ifaces []apiv1.NetInterface) error {
+	for i := range ifaces {
+		if p := ifaces[i].SatellitePort; p != 0 && (p < 1 || p > 65535) {
+			return errors.Errorf(
+				"net-interface %q: satellite_port %d out of range; expected 1..65535 "+
+					"(TCP port range per RFC 6335) or 0 to inherit the default",
+				ifaces[i].Name, p)
+		}
+	}
+
+	return nil
+}
+
 // resolveDefaultAddress synthesises the address for the default
 // NetInterface when the POST /v1/nodes body omits one. Picks the
 // first NetInterface address if the caller passed any (defensive —
@@ -814,7 +905,7 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
-		Message: "node modified: " + name,
+		Message: "node " + envelopeVerbModified + ": " + name,
 	}})
 }
 
