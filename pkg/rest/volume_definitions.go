@@ -282,19 +282,8 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 
 	vd := envelope.VolumeDefinition
 
-	// Bug 191: distinguish "client omitted volume_number" (auto-assign)
-	// from "client sent volume_number=0" (explicit zero). The typed
-	// decode above can't tell them apart because the wire field is a
-	// plain int32 — both shapes deserialise to VolumeNumber=0.
-	if !vdCreateVolumeNumberExplicit(rawBody) {
-		assigned, assignErr := s.autoAssignVolumeNumber(r.Context(), rd)
-		if assignErr != nil {
-			writeStoreError(w, assignErr)
-
-			return
-		}
-
-		vd.VolumeNumber = assigned
+	if !s.resolveVolumeNumber(w, r, rd, rawBody, &vd) {
+		return
 	}
 
 	// Bug 155: refuse out-of-bounds sizes at the REST boundary so the
@@ -338,6 +327,49 @@ func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "volume definition created",
 	}})
+}
+
+// resolveVolumeNumber folds the auto-assign + explicit-VlmNr
+// validation branches out of handleVDCreate so the parent stays under
+// the funlen threshold. Returns true on success (vd.VolumeNumber is
+// populated and within bounds) and false when an envelope was already
+// written to w (the caller must return immediately).
+//
+// Bug 191: auto-assign fires when the raw POST body does NOT carry an
+// explicit `volume_number` key — Go's int32 zero would otherwise
+// silently collide with VlmNr=0 on the second `vd c` against the
+// same RD. Bug 363: when the caller DOES specify a volume_number, it
+// must lie inside DRBD-9's addressable [0, 65535] range; out-of-bound
+// values would otherwise hang the satellite in "waiting for DRBD-ID
+// allocation" because no positive minor can be derived from them.
+func (s *Server) resolveVolumeNumber(
+	w http.ResponseWriter,
+	r *http.Request,
+	rd string,
+	rawBody []byte,
+	vd *apiv1.VolumeDefinition,
+) bool {
+	if !vdCreateVolumeNumberExplicit(rawBody) {
+		assigned, assignErr := s.autoAssignVolumeNumber(r.Context(), rd)
+		if assignErr != nil {
+			writeStoreError(w, assignErr)
+
+			return false
+		}
+
+		vd.VolumeNumber = assigned
+
+		return true
+	}
+
+	nrErr := validateVolumeNumber(vd.VolumeNumber)
+	if nrErr != nil {
+		writeVDNumberRejection(w, rd, vd.VolumeNumber, nrErr)
+
+		return false
+	}
+
+	return true
 }
 
 // vdCreateVolumeNumberExplicit reports whether the raw POST body
@@ -450,6 +482,82 @@ const minVolumeDefinitionSizeKib int64 = 4 * 1024
 // operator a typed error envelope instead of an opaque satellite
 // retry loop.
 const maxVolumeDefinitionSizeKib int64 = 16 * 1024 * 1024 * 1024
+
+// minVolumeNumber is the smallest accepted explicit volume_number on
+// `POST /v1/resource-definitions/{rd}/volume-definitions` (Bug 363).
+// DRBD volume numbers are unsigned; the wire-side int32 was leaking
+// negative values straight through, leaving the satellite stuck in
+// "waiting for DRBD-ID allocation" because no positive minor can be
+// derived from a negative VlmNr.
+const minVolumeNumber int32 = 0
+
+// maxVolumeNumber is the largest accepted explicit volume_number (Bug
+// 363). DRBD-9 caps the per-resource volume namespace at 16 bits
+// (0..65535) — values above that fail at `drbdadm adjust` time with
+// "vol-XXXXX not addressable", which manifests as the same stuck
+// satellite "waiting for DRBD-ID allocation" symptom.
+const maxVolumeNumber int32 = 65535
+
+// ErrVolumeNumberBelowMinimum is the sentinel for the negative-VlmNr
+// rejection (volume_number < 0). Wrapped with %w + bound detail by
+// validateVolumeNumber; static-error requirement is err113.
+var ErrVolumeNumberBelowMinimum = errors.New("volume_number below minimum")
+
+// ErrVolumeNumberAboveMaximum is the sentinel for the out-of-range-
+// VlmNr rejection (volume_number > 65535). See
+// ErrVolumeNumberBelowMinimum for the rationale.
+var ErrVolumeNumberAboveMaximum = errors.New("volume_number above maximum")
+
+// validateVolumeNumber returns nil when the requested explicit
+// VolumeNumber is within DRBD-9's addressable range
+// [minVolumeNumber, maxVolumeNumber] (Bug 363). Otherwise it returns a
+// human-readable rejection reason the caller formats into the LINSTOR
+// envelope. The auto-assign path (no explicit volume_number in the
+// POST body) is always valid by construction and bypasses this gate.
+func validateVolumeNumber(vn int32) error {
+	if vn < minVolumeNumber {
+		return fmt.Errorf(
+			"%w: volume_number=%d below minimum %d (DRBD volume numbers are unsigned)",
+			ErrVolumeNumberBelowMinimum, vn, minVolumeNumber,
+		)
+	}
+
+	if vn > maxVolumeNumber {
+		return fmt.Errorf(
+			"%w: volume_number=%d above maximum %d (DRBD-9 caps the per-resource "+
+				"volume namespace at 16 bits)",
+			ErrVolumeNumberAboveMaximum, vn, maxVolumeNumber,
+		)
+	}
+
+	return nil
+}
+
+// writeVDNumberRejection emits the Bug 363 volume-number-out-of-bounds
+// refusal envelope. 400 + FAIL_INVLD_VLM_NR keeps the wire shape
+// consistent with the Bug 155 size-rejection path; the inner
+// cause/correction names the addressable range so the operator can
+// pick a fresh VlmNr without re-reading the spec.
+func writeVDNumberRejection(w http.ResponseWriter, rd string, vn int32, reason error) {
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInvldVlmNr,
+		Message: fmt.Sprintf("invalid volume definition number for %q vlm=%d: %s",
+			rd, vn, reason.Error()),
+		Cause: fmt.Sprintf(
+			"volume_number must be in [%d, %d]; the satellite reconciler "+
+				"would hang in 'waiting for DRBD-ID allocation' otherwise",
+			minVolumeNumber, maxVolumeNumber,
+		),
+		Correc: fmt.Sprintf(
+			"pick a volume_number between %d and %d and re-issue `linstor vd c`",
+			minVolumeNumber, maxVolumeNumber,
+		),
+		ObjRefs: map[string]string{
+			objRefRscDfn: rd,
+			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
+		},
+	}})
+}
 
 // ErrVolumeSizeBelowMinimum is the sentinel for Bug 155's lower-bound
 // rejection (size_kib < minVolumeDefinitionSizeKib). Wrapped with

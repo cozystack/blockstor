@@ -278,6 +278,17 @@ const apiCallRcFailInUse int64 = 997
 // `--force`).
 const apiCallRcFailInvldVlmSize int64 = 206
 
+// apiCallRcFailInvldVlmNr mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_INVLD_VLM_NR` (205). Emitted by the Bug 363
+// volume-number-out-of-bounds refusal at `POST /v1/resource-
+// definitions/{rd}/volume-definitions` when the explicit
+// `volume_number` lies outside DRBD-9's addressable [0, 65535] range.
+// Choosing 205 (rather than a fresh sub-code in our 996+ range) keeps
+// the wire shape consistent with upstream LINSTOR's reply on the same
+// input — alongside FAIL_INVLD_VLM_SIZE (206) which already lives in
+// this file.
+const apiCallRcFailInvldVlmNr int64 = 205
+
 // apiCallRcFailExistsVlmDfn mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_VLM_DFN` (502). Emitted by `POST
 // /v1/resource-definitions/{rd}/volume-definitions` when the
