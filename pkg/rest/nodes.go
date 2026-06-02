@@ -449,18 +449,9 @@ func (s *Server) handleNodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 370: refuse an unknown `type` value at the wire boundary.
-	// Pre-fix the store-level CRD admission caught the bad enum and
-	// surfaced as an opaque 500 with the raw CEL message ("spec.type:
-	// Unsupported value …"), which python-linstor cannot classify.
-	// Mirror upstream LINSTOR's FAIL_INVLD_NODE_TYPE (430) refusal so
-	// the operator gets a 400 + structured envelope listing the
-	// accepted enum values. Empty Type is normalized to SATELLITE
-	// downstream and stays valid here.
-	typeErr := validateNodeType(n.Type)
-	if typeErr != nil {
-		writeNodeTypeError(w, typeErr.Error())
-
+	// Bug 370: default + validate `type` at the wire boundary. See
+	// resolveAndValidateNodeType below for the full rationale.
+	if !resolveAndValidateNodeType(w, &n) {
 		return
 	}
 

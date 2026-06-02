@@ -91,6 +91,35 @@ func writeNodeTypeError(w http.ResponseWriter, msg string) {
 	}})
 }
 
+// resolveAndValidateNodeType normalises `n.Type` and gates it through
+// the upstream enum. Empty Type is defaulted to SATELLITE (matches
+// the canonical `linstor n c <name> <ip>` body shape — no `type`
+// key — and prevents the CRD admission's enum-closed-set from
+// surfacing as an opaque HTTP 500 with the raw CEL message). A
+// non-empty Type outside the enum produces the Bug 370 refusal
+// envelope (400 + FAIL_INVLD_NODE_TYPE).
+//
+// Pulled out of handleNodeCreate to keep that handler under the
+// funlen budget alongside the existing Bug 97 / Bug 120 / Bug
+// 368/369 / Bug 132 gates.
+//
+// Returns true when the caller may proceed; false when the HTTP
+// error has already been written.
+func resolveAndValidateNodeType(w http.ResponseWriter, n *apiv1.Node) bool {
+	if n.Type == "" {
+		n.Type = apiv1.NodeTypeSatellite
+	}
+
+	err := validateNodeType(n.Type)
+	if err != nil {
+		writeNodeTypeError(w, err.Error())
+
+		return false
+	}
+
+	return true
+}
+
 // apiCallRcFailInvldNodeType mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_INVLD_NODE_TYPE` (430). Emitted by
 // `POST /v1/nodes` when the body carries a `type` outside the
