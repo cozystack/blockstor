@@ -1,0 +1,95 @@
+name: n-evict-tiebreaker-no-shuffle
+description: |
+  Bug-385 catcher (P1, user-reported). Cluster shape: 2 diskful replicas
+  (node1, node2) + 1 TieBreaker witness on node3. Operator evicts the
+  tiebreaker node (`linstor n e node3`).
+
+  Pre-fix the witness was counted as a live tiebreaker even though it sat
+  on the just-EVICTED node, so the witness invariant read as satisfied
+  and the evict never took effect — the TieBreaker stayed pinned to the
+  drained node and a healthy diskful drifted into the tiebreaker role.
+
+  Expected convergence:
+    - the witness on the EVICTED node3 is reaped (resource_absent); with
+      only 3 nodes there is no healthy spare, so it does not relocate.
+    - BOTH original diskful replicas (node1, node2) stay UpToDate — a
+      healthy diskful is NEVER demoted to TieBreaker.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: tiebreaker-on-node3
+    # Hand-create the witness on node3 so the scenario is deterministic
+    # regardless of the auto-tiebreaker config / which node auto-tb picks.
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+  - name: n-evict-node3
+    # The exact operator action from the repro: evict the tiebreaker node.
+    cmd: ["node", "evict", "{{node3}}"]
+    expect_exit: 0
+    await:
+      # Evict must take effect: the witness no longer sits on the drained
+      # node3. No healthy spare exists (3 nodes), so it is reaped, not
+      # relocated.
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 90
+  - name: node1-still-uptodate
+    # Load-bearing invariant: the first healthy diskful was NOT demoted
+    # to TieBreaker by the evict (the wrong behaviour from the repro).
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 90
+  - name: node2-still-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: UpToDate
+      timeout_s: 90
+
+teardown:
+  # Restore the evicted node so the shared stand is left healthy for the
+  # next workflow, BEFORE deleting the RD.
+  - cmd: ["node", "restore", "{{node3}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
