@@ -398,11 +398,18 @@ func TestNetInterfaceUpdateCreatesOnMissing(t *testing.T) {
 	}
 }
 
-// TestNetInterfaceDeleteUnknownNode pins the 404 branch on
-// handleNetInterfaceDelete (was 76.5%): DELETE against an unknown
-// {node} pathvar must surface a clean 404 rather than 500. Operator
-// scripts that idempotently delete interfaces on node teardown
-// expect 404 when the node is already gone.
+// TestNetInterfaceDeleteUnknownNode pins the parent-NotFound branch
+// on handleNetInterfaceDelete (was 76.5%): DELETE against an unknown
+// {node} pathvar must surface a clean response rather than 500.
+//
+// Bug 379 (2026-06-02): the response shape flipped from 404 to a
+// warn-band 200 envelope so the call is idempotent. Operator scripts
+// that delete interfaces on node teardown (e.g. cozystack's
+// node-evacuation playbook calling
+// `linstor node interface delete <node> default` after
+// `linstor n d <node>`) now exit-0 on the second pass, matching the
+// pre-existing Bug 378 contract on per-key property delete and the
+// Bug 66 contract on `linstor n d` itself.
 func TestNetInterfaceDeleteUnknownNode(t *testing.T) {
 	base, stop := startServerWithStore(t, store.NewInMemory())
 	defer stop()
@@ -410,8 +417,9 @@ func TestNetInterfaceDeleteUnknownNode(t *testing.T) {
 	resp := httpDelete(t, base+"/v1/nodes/ghost/net-interfaces/default")
 	_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status: got %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status: got %d, want 200 (Bug 379: parent-missing is idempotent)",
+			resp.StatusCode)
 	}
 }
 
