@@ -211,10 +211,19 @@ except: print(0)")
 d=json.load(sys.stdin)
 rd='$rd'
 bad=0
+seen=0
 for it in d.get('items',[]):
-    if it.get('spec',{}).get('resourceName')!=rd: continue
+    if it.get('spec',{}).get('resourceDefinitionName')!=rd: continue
+    seen+=1
     for v in it.get('status',{}).get('volumes',[]) or []:
-        if v.get('diskState')!='UpToDate': bad+=1
+        # A diskless / tiebreaker replica reports diskState 'Diskless' and is
+        # never 'UpToDate' by design — accept it. Only a DISKFUL replica that
+        # has not reached UpToDate (Inconsistent / Outdated / SyncTarget / …)
+        # counts as 'bad', i.e. not-yet-converged.
+        if v.get('diskState') not in ('UpToDate','Diskless'): bad+=1
+# No matching replica at all means the rd is absent / not yet observed — that
+# is NOT 'all uptodate', so report it as bad so the waiter keeps polling.
+if seen==0: bad+=1
 print(bad)")
             [[ "$bad" == "0" ]]
             ;;
@@ -360,7 +369,7 @@ print(json.dumps(s) if s else '')" "$step")
 # wait_settle <rd> [timeout_s]
 #
 # Polls `kubectl get resources.blockstor.cozystack.io -o json` filtered by
-# spec.resourceName == rd. Considers the cluster "settled" once two
+# spec.resourceDefinitionName == rd. Considers the cluster "settled" once two
 # consecutive snapshots return identical {diskState, inUse, connections}
 # tuples across all replicas.
 #
@@ -384,7 +393,7 @@ rd='$rd'
 keys=[]
 for it in d.get('items',[]):
     sp=it.get('spec',{})
-    if sp.get('resourceName')!=rd: continue
+    if sp.get('resourceDefinitionName')!=rd: continue
     st=it.get('status',{})
     v=(st.get('volumes') or [{}])[0]
     keys.append((sp.get('nodeName',''), v.get('diskState',''), v.get('inUse',False)))
@@ -414,17 +423,28 @@ print(json.dumps(keys))" 2>/dev/null || echo "[]")
 #
 # Returns 0 if no Resource CRDs with name starting with $prefix remain.
 # Caller is expected to have torn down all RDs created during the run.
+#
+# Teardown (`rd delete`) removes the Resource CRDs asynchronously: the
+# apiserver returns from the delete call before the satellite has finished
+# `drbdadm down` + finalizer removal, so a single snapshot taken right after
+# teardown races the GC and reports phantom orphans. Poll for up to
+# NO_ORPHANS_SETTLE_S (default 30s), passing the instant the count reaches 0;
+# only a count that is still non-zero after the window is a real orphan.
 assert_no_orphans() {
     local prefix=$1
+    local settle_s=${NO_ORPHANS_SETTLE_S:-30}
+    local deadline=$(( $(date +%s) + settle_s ))
     local leftover
-    leftover=$(kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
-        | grep -c "$prefix" || true)
-    if [[ "$leftover" -gt 0 ]]; then
-        echo "  INVARIANT FAIL: $leftover Resource CRD(s) for $prefix still present" >&2
-        kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null | grep "$prefix" >&2 || true
-        return 1
-    fi
-    return 0
+    while :; do
+        leftover=$(kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null \
+            | grep -c "$prefix" || true)
+        [[ "$leftover" -eq 0 ]] && return 0
+        (( $(date +%s) >= deadline )) && break
+        sleep 2
+    done
+    echo "  INVARIANT FAIL: $leftover Resource CRD(s) for $prefix still present after ${settle_s}s" >&2
+    kubectl get resources.blockstor.cozystack.io -o name 2>/dev/null | grep "$prefix" >&2 || true
+    return 1
 }
 
 # ----------------------------------------------------------------------
