@@ -48,13 +48,14 @@ import (
 // input and the rule it violated.
 //
 // The chosen ruleset is RFC 1123 subdomain (lowercase alphanumerics +
-// hyphen, can't start/end with hyphen, max 253 chars). Upstream
-// LINSTOR's wire-side regex is `^[A-Za-z][A-Za-z0-9_-]{1,47}$` —
-// stricter on length (48) but permissive on case + underscore. We
-// pick RFC 1123 because the k8s store is authoritative for storage:
-// any name that would later fail the metadata.Name regex is rejected
-// up front, so the operator sees ONE consistent failure mode rather
-// than "linstor said OK, but kubectl says no".
+// hyphen, can't start/end with hyphen) capped at 48 chars (Bug 360).
+// Upstream LINSTOR's wire-side regex is `^[A-Za-z][A-Za-z0-9_-]{1,47}$`
+// — permissive on case + underscore, but the same 48-char length cap
+// we mirror here. We pick RFC 1123 (lowercase-only, no underscore)
+// because the k8s store is authoritative for storage: any name that
+// would later fail the metadata.Name regex is rejected up front, so
+// the operator sees ONE consistent failure mode rather than "linstor
+// said OK, but kubectl says no".
 
 // rfc1123SubdomainName is the wire-level identifier regex applied to
 // every user-supplied LINSTOR name (Bug 97). Mirrors
@@ -71,12 +72,27 @@ import (
 // pkg/rest/autoplace.go).
 var rfc1123SubdomainName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
-// maxLinstorName caps the wire-side identifier length. RFC 1123
-// subdomain allows up to 253 chars; we mirror the same limit here so
-// the REST gate doesn't accept anything the k8s store would later
-// refuse. (`<rd>.<node>` Resource CRD names would still fit comfortably
-// since each side is independently bounded.)
-const maxLinstorName = 253
+// maxLinstorName caps the wire-side identifier length. Upstream
+// LINSTOR's wire-level regex tops out at 48 characters
+// (DRBD_RES_NAME_MAX), but the k8s store has a second hard ceiling that
+// matters more in practice: every user-supplied name flows into a
+// Kubernetes `metadata.labels` value on the Resource CRD
+// (`LabelResourceDefinition`, `LabelNodeName` in pkg/store/k8s/
+// resources.go). k8s label VALUES are bounded to 63 characters by the
+// apimachinery validator — anything longer slips past `rd c` (which
+// only writes a metadata.name, the 253-char regime) and explodes on
+// the next `r c` with `metadata.labels: Invalid value: …: must be no
+// more than 63 characters`. The RD is now a zombie: it lives in the
+// catalogue and accepts `vd c`, but the first replica create fails
+// inside the store layer, leaving a partial state the operator can
+// only clean up manually.
+//
+// Bug 360 (hunt-v4): cap the wire-side limit at 48 so the rd-create
+// rejection happens up front, BEFORE the partial-create lands and
+// BEFORE the k8s label cap can ever fire. 48 also matches upstream
+// LINSTOR's documented identifier length for forward-compat with any
+// caller that relies on the upstream limit.
+const maxLinstorName = 48
 
 // ErrInvalidLinstorName is the static sentinel for Bug-97 rejections.
 // Callers wrap it via fmt.Errorf("%w: …") with object-kind + name +
