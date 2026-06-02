@@ -486,6 +486,50 @@ func (s *Server) refuseRDCreateOnUnknownRG(w http.ResponseWriter, r *http.Reques
 	return false
 }
 
+// refuseRDUpdateOnUnknownRG is Bug 372's gate, the symmetric pair to
+// refuseRDCreateOnUnknownRG. Pre-fix `PUT /v1/resource-definitions/
+// {rd}` with a `resource_group` / `resource_group_name` /
+// `dst_rsc_grp` value naming a non-existent RG returned 200 +
+// "resource definition modified" and silently stamped the bogus name
+// onto `RD.Spec.ResourceGroupName`. The RD then lived on with a
+// dangling reference: `linstor rd l` rendered fine, but the placer's
+// Controller→RG→RD prop-inheritance walk silently dropped the RG
+// tier, breaking auto-place, auto-diskful, place_count observability,
+// and rebalance scheduling.
+//
+// Reuses refuseRDCreateOnUnknownRG since the gate semantics are
+// identical — the wire envelope wording stays uniform across create
+// and modify.
+//
+// Skip the gate when `rgChange` equals the RD's current
+// ResourceGroupName: Bug 163's GET→jq→PUT round-trip echoes the
+// stored RG name back unchanged, and the well-known `DfltRscGrp` is
+// lazily-created (ensureDefaultRGAssignment on RD create) — an
+// existing RD may legitimately reference an RG name that `Get`
+// surfaces as ErrNotFound during the round-trip window. A no-op
+// stamp must never refuse; only a real move to a fresh name does.
+//
+// Empty `rgChange` (the canonical `rd set-property` shape that
+// doesn't touch the RG link) bypasses the gate entirely — the
+// downstream merge leaves ResourceGroupName alone.
+//
+// Returns true when the caller may proceed; false when the HTTP
+// error has already been written.
+func (s *Server) refuseRDUpdateOnUnknownRG(w http.ResponseWriter, r *http.Request, rdName, rgChange string) bool {
+	if rgChange == "" {
+		return true
+	}
+
+	current, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	if getErr == nil && current.ResourceGroupName == rgChange {
+		return true
+	}
+
+	probe := apiv1.ResourceDefinition{ResourceGroupName: rgChange}
+
+	return s.refuseRDCreateOnUnknownRG(w, r, &probe)
+}
+
 // DefaultResourceGroupName is the well-known RG every RD falls into
 // when the caller didn't pin one. Matches upstream LINSTOR's
 // `DfltRscGrp` literal so golinstor / linstor-csi callers that walk
@@ -946,6 +990,12 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	// through the `--dst-rsc-grp` CLI flag.
 	if rgChange == "" {
 		rgChange = patch.DstRscGrp
+	}
+
+	// Bug 372 (P1): refuse rgChange that names a non-existent RG. See
+	// refuseRDUpdateOnUnknownRG below for the full rationale.
+	if !s.refuseRDUpdateOnUnknownRG(w, r, name, rgChange) {
+		return
 	}
 
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name, func(rd *apiv1.ResourceDefinition) error {

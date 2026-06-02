@@ -152,6 +152,14 @@ func TestBug232RDModifyAcceptsDstRscGrp(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
+	// Bug 372 follow-up: refuseRDUpdateOnUnknownRG now gates the
+	// modify shape; seed `rg-new` so the cross-RG move resolves
+	// against a real RG instead of tripping the dangling-reference
+	// refusal.
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{Name: "rg-new"}); err != nil {
+		t.Fatalf("seed rg-new: %v", err)
+	}
+
 	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
 		Name:              "rd1",
 		ResourceGroupName: "rg-old",
