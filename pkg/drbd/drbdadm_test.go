@@ -1068,3 +1068,92 @@ func TestAdmEvaluateDownVetoInconclusiveOnMalformedJSON(t *testing.T) {
 		t.Errorf("EvaluateDownVeto malformed JSON: got %d, want DownVetoInconclusive (fail-closed)", got)
 	}
 }
+
+// errHasMDDumpMdEBUSY mirrors the verbatim shape drbdmeta returns
+// when the lower disk is attached to the kernel — exclusive open
+// fails with "Device or resource busy" and drbdmeta exits 20.
+var errHasMDDumpMdEBUSY = errors.New("open(/dev/loop5) failed: Device or resource busy\nExclusive open failed.\nOperation canceled.\nCommand 'drbdmeta 20000 v09 /dev/loop5 internal dump-md' terminated with exit code 20: exit status 20")
+
+// errHasMDDumpMdConfigured mirrors the alternate attached-device
+// surface ("Device 'X' is configured!") drbdmeta emits when the
+// kernel already owns the minor. The capitalised leading word is
+// intentional — verbatim drbdmeta wire shape, the HasMD parser
+// matches the substring at any offset so casing must be preserved.
+//
+//nolint:staticcheck // verbatim drbdmeta error wire shape; capitalisation is load-bearing
+var errHasMDDumpMdConfigured = errors.New("Device '20000' is configured!\nCommand 'drbdmeta 20000 v09 /dev/loop5 internal dump-md' terminated with exit code 20")
+
+// errHasMDDumpMdNoMeta mirrors the verbatim "no metadata" exit
+// drbdadm returns when the lower disk has no DRBD-9 superblock.
+var errHasMDDumpMdNoMeta = errors.New("drbdadm: No valid meta data found")
+
+// TestHasMDReturnsTrueOnAttachedDevice pins the Bug B.4 (P0)
+// carve-out: when `drbdadm dump-md <rd>/<vol>` errors because the
+// lower disk is exclusive-held by the kernel (volume already
+// attached), HasMD MUST return true. Skipping that case routes
+// the caller into create-md against an attached minor and
+// EBUSY-loops the reconciler at ~10 Hz, suspending the whole
+// resource on quorum. The kernel could not have brought the
+// volume up unless metadata was already present, so attached =
+// metadata-exists by definition.
+func TestHasMDReturnsTrueOnAttachedDevice(t *testing.T) {
+	// Two error shapes drbdmeta surfaces when the lower disk is
+	// attached: pre-create-md probe (`dump-md` exits 20 with
+	// "Device or resource busy" + "Operation canceled") and the
+	// "Device 'X' is configured!" stale-output marker. Both mean
+	// the kernel owns the device, so metadata is present.
+	cases := []struct {
+		name string
+		out  string
+		err  error
+	}{
+		{
+			name: "EBUSY error",
+			out:  "Operation canceled.\n",
+			err:  errHasMDDumpMdEBUSY,
+		},
+		{
+			name: "Device configured",
+			out:  "# Output might be stale, since minor 20000 is attached\n",
+			err:  errHasMDDumpMdConfigured,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := storage.NewFakeExec()
+			fx.Expect("drbdadm dump-md pvc-b4/0",
+				storage.FakeResponse{Stdout: []byte(tc.out), Err: tc.err})
+
+			has, hasErr := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-b4/0")
+			if hasErr != nil {
+				t.Fatalf("HasMD: %v", hasErr)
+			}
+
+			if !has {
+				t.Errorf("HasMD on attached device: got false, want true "+
+					"(attached lower disk implies metadata exists; Bug B.4 EBUSY-loop surface). out=%q err=%v",
+					tc.out, tc.err)
+			}
+		})
+	}
+}
+
+// TestHasMDReturnsFalseOnNoMetaData pins the existing
+// "metadata-absent" signal: `dump-md` exits non-zero with
+// "No valid meta data found" and HasMD returns false so the
+// caller's create-md fires on the truly-missing case.
+func TestHasMDReturnsFalseOnNoMetaData(t *testing.T) {
+	fx := storage.NewFakeExec()
+	fx.Expect("drbdadm dump-md pvc-fresh/0",
+		storage.FakeResponse{Err: errHasMDDumpMdNoMeta})
+
+	has, err := drbd.NewAdm(fx).HasMD(t.Context(), "pvc-fresh/0")
+	if err != nil {
+		t.Fatalf("HasMD: %v", err)
+	}
+
+	if has {
+		t.Errorf("HasMD on missing metadata: got true, want false")
+	}
+}

@@ -184,17 +184,39 @@ func (a *Adm) CreateMD(ctx context.Context, resource string) error {
 // — real drbdadm never returns success with no output, but a faked
 // exec in unit tests can, and we'd rather err on the side of
 // "missing → safe to create-md".
+//
+// Bug B.4 carve-out: when the volume's lower disk is already
+// attached to a running DRBD kernel slot, drbdmeta refuses to open
+// it ("Device or resource busy" / "Device 'X' is configured!") and
+// `dump-md` exits non-zero. Treating that as "missing" would route
+// the caller into create-md against an attached minor, which
+// EBUSY-loops at ~10 Hz. A volume that's attached BY DEFINITION
+// has metadata — the kernel could not have brought it up otherwise
+// — so map the busy/configured error string to `hasMD=true` and
+// skip the create-md call entirely.
 func (a *Adm) HasMD(ctx context.Context, resource string) (bool, error) {
 	out, err := a.exec.Run(ctx, "drbdadm", "dump-md", resource)
-	if err != nil {
-		// `No valid meta data found` / drbdmeta "missing image" / etc.
-		// all bubble up as non-zero exit. Treat as "not yet
-		// initialised" — the caller's create-md will either succeed
-		// (truly missing) or surface a more specific failure.
-		return false, nil //nolint:nilerr // non-zero exit is the "metadata absent" signal, not a bubble-up error
+	if err == nil {
+		return len(out) > 0, nil
 	}
 
-	return len(out) > 0, nil
+	// Attached-lower-disk surface: dump-md cannot exclusive-
+	// open the device because the kernel holds it. The device
+	// is attached, therefore metadata exists. Surface
+	// hasMD=true so the caller skips create-md. (Bug B.4)
+	errStr := err.Error()
+	if strings.Contains(errStr, "Device or resource busy") ||
+		strings.Contains(errStr, "is configured!") ||
+		strings.Contains(string(out), "Device or resource busy") ||
+		strings.Contains(string(out), "is configured!") {
+		return true, nil
+	}
+
+	// `No valid meta data found` / drbdmeta "missing image" / etc.
+	// all bubble up as non-zero exit. Treat as "not yet
+	// initialised" — the caller's create-md will either succeed
+	// (truly missing) or surface a more specific failure.
+	return false, nil
 }
 
 // Primary flips the resource to Primary role so it can be opened
