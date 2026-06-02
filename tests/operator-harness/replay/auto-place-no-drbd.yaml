@@ -24,7 +24,7 @@ steps:
     # DRBD MUST either be accepted (single-replica STORAGE) OR rejected
     # with a clear error — but NEVER silently coerce to DRBD. We pin
     # the "reject" semantics matching upstream LINSTOR.
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 10
   - name: no-tiebreaker-spawned
     cmd: ["resource", "list", "--resources", "{{rd}}"]

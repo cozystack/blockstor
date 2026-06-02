@@ -32,7 +32,7 @@ steps:
     expect_exit: 0
   - name: auto-place-2
     # 2 diskful + auto-tiebreaker → the canonical 2r-tb shape.
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 0
     await:
       kind: all_uptodate

@@ -31,7 +31,7 @@ steps:
     cmd: ["volume-definition", "create", "{{rd}}", "32M"]
     expect_exit: 0
   - name: auto-place-2-encrypted
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 0
     await:
       kind: replica_count
