@@ -223,6 +223,18 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
+	// Bug 387: an INACTIVE replica is `drbdadm down` (operator
+	// deactivation) — its DRBD device is not up, so it is NOT a voting
+	// peer in the quorum the auto-tiebreaker invariant defends. Counting
+	// it as a diskful replica corrupts every downstream witness decision:
+	// e.g. an RD with 2 active diskful + 1 INACTIVE diskful, after an
+	// `r d` of one active diskful, would otherwise look like "2 diskful,
+	// nonWitnessDiskless==0, even" and spuriously grow a TIE_BREAKER —
+	// upstream LINSTOR just deletes the replica with no witness. Drop
+	// INACTIVE replicas from the voting set before the split so they
+	// influence neither the diskful count nor the diskless/witness count.
+	replicas = filterActiveReplicas(replicas)
+
 	diskful, diskless := splitByDiskless(replicas)
 	witness := filterTieBreaker(diskless)
 
@@ -1035,6 +1047,27 @@ func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdNa
 	}
 
 	return nil
+}
+
+// filterActiveReplicas drops INACTIVE replicas from the slice. An
+// INACTIVE replica is one the operator deactivated with `drbdadm down`
+// (Bug 387): its DRBD device is not running, so it casts no vote in the
+// `quorum: majority` decision the auto-tiebreaker invariant defends.
+// The tiebreaker policy must reason only over the live voting peers, so
+// INACTIVE replicas are excluded before the diskful/diskless split —
+// they count as neither a voting diskful nor a diskless witness/peer.
+func filterActiveReplicas(replicas []apiv1.Resource) []apiv1.Resource {
+	active := make([]apiv1.Resource, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		active = append(active, replicas[i])
+	}
+
+	return active
 }
 
 // splitByDiskless partitions replicas into (diskful, diskless) lists.
