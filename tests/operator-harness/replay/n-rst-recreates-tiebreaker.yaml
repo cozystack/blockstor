@@ -1,0 +1,75 @@
+name: n-rst-recreates-tiebreaker
+description: |
+  Bug-386 catcher. Cluster shape: 2 diskful replicas + 1 auto TieBreaker
+  on a third node (`r c --auto-place 2`). Operator drains the witness
+  node (`n evacuate`), which collapses the TieBreaker (an EVICTED node
+  is not a witness candidate). Then the node recovers and the operator
+  runs `n rst`. The TieBreaker MUST be re-created so the resource
+  regains the diskful+diskful+TB shape — otherwise two diskful UpToDate
+  replicas sit with no quorum witness (split-brain risk on a subsequent
+  failure).
+
+  Verbatim operator repro:
+    $ linstor n rst dev-worker-3
+    $ linstor r l
+     test  dev-worker-1  DRBD,STORAGE  UpToDate
+     test  dev-worker-3  DRBD,STORAGE  UpToDate
+    # TieBreaker was NOT recreated (the bug)
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-2
+    # 2 diskful + auto-tiebreaker → the canonical 2r-tb shape.
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: wait-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: evacuate-node3
+    # Drain the third node. With 2 diskful already placed and no spare
+    # worker in a 3-node cluster, EVICTED collapses the witness.
+    cmd: ["node", "evacuate", "{{node3}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: restore-node3
+    # Node recovered. Clearing EVICTED must re-run the tiebreaker
+    # invariant (Bug 386 fix: Node watch on the RD reconciler).
+    cmd: ["node", "restore", "{{node3}}"]
+    expect_exit: 0
+  - name: tiebreaker-recreated
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["node", "restore", "{{node3}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
