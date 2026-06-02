@@ -167,6 +167,9 @@ func (s *Server) handleStoragePoolDefinitionModify(w http.ResponseWriter, r *htt
 	}
 
 	def, err := s.Store.StoragePoolDefinitions().Get(r.Context(), name)
+
+	existing := !errors.Is(err, store.ErrNotFound)
+
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		def = store.StoragePoolDefinition{Name: name, Props: map[string]string{}}
@@ -176,28 +179,21 @@ func (s *Server) handleStoragePoolDefinitionModify(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if def.Props == nil {
-		def.Props = map[string]string{}
-	}
+	// Bug 375: SPD-level echo of Bug 373. Refuse a PUT that mutates
+	// StorDriver/* identity keys on an EXISTING definition; PUT-create
+	// on a brand-new name is still allowed (the seed path operators
+	// rely on for one-round-trip provisioning via
+	// `linstor sp-d set-property new-def StorDriver/LvmVg vg-x`).
+	// Helper detail in writeSPDfnDriverPropMutationRefusal.
+	if existing {
+		if msg, refused := refuseSPDriverPropMutation(&body); refused {
+			writeSPDfnDriverPropMutationRefusal(w, name, msg)
 
-	maps.Copy(def.Props, body.OverrideProps)
-
-	for _, k := range body.DeleteProps {
-		delete(def.Props, k)
-	}
-
-	// delete_namespaces: drop every key under the given namespace
-	// prefix. Mirrors upstream LINSTOR's `delete_namespaces` behaviour
-	// — separator is '/', prefix matches literally.
-	for _, ns := range body.DeleteNamespace {
-		prefix := ns + "/"
-
-		for k := range def.Props {
-			if strings.HasPrefix(k, prefix) {
-				delete(def.Props, k)
-			}
+			return
 		}
 	}
+
+	applySPDfnPropsPatch(&def, &body)
 
 	// Try Update first; on ErrNotFound (PUT-creates path) fall back to
 	// Create so the wire surface is upsert-idempotent.
@@ -216,6 +212,37 @@ func (s *Server) handleStoragePoolDefinitionModify(w http.ResponseWriter, r *htt
 		RetCode: maskInfo,
 		Message: "storage pool definition modified: " + name,
 	}})
+}
+
+// applySPDfnPropsPatch merges a `GenericPropsModify` payload onto
+// `def.Props` in place: override_props is `maps.Copy`'d on top,
+// delete_props drops the listed keys, and delete_namespaces strips
+// every key whose `<namespace>/` prefix matches (separator is '/',
+// matching upstream LINSTOR's semantics). Pulled out of
+// handleStoragePoolDefinitionModify so the handler stays under the
+// funlen budget after the Bug 375 immutability gate landed; centralises
+// the merge so the SPD-side patch shape stays in lockstep with the
+// per-node SP-side flow (see refuseSPDriverPropMutation comments).
+func applySPDfnPropsPatch(def *store.StoragePoolDefinition, patch *apiv1.GenericPropsModify) {
+	if def.Props == nil {
+		def.Props = map[string]string{}
+	}
+
+	maps.Copy(def.Props, patch.OverrideProps)
+
+	for _, k := range patch.DeleteProps {
+		delete(def.Props, k)
+	}
+
+	for _, ns := range patch.DeleteNamespace {
+		prefix := ns + "/"
+
+		for k := range def.Props {
+			if strings.HasPrefix(k, prefix) {
+				delete(def.Props, k)
+			}
+		}
+	}
 }
 
 // handleStoragePoolDefinitionDelete serves DELETE /v1/storage-pool-definitions/{name}.
@@ -256,6 +283,44 @@ func (s *Server) handleStoragePoolDefinitionDelete(w http.ResponseWriter, r *htt
 	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 		RetCode: maskInfo,
 		Message: "storage pool definition deleted: " + name,
+	}})
+}
+
+// writeSPDfnDriverPropMutationRefusal emits the Bug 375 typed-envelope
+// 400 response. SPD-side echo of `writeSPDriverPropMutationRefusal`
+// (Bug 373) — same LINSTOR sub-code (552 FAIL_INVLD_STOR_POOL_NAME),
+// same operator-facing prose, but obj_refs pin the StorPoolDfn name
+// (the SPD has no per-node anchor) and the correction points at the
+// SPD escape path (drop + recreate the definition with the desired
+// backing key instead of mutating it on the live row).
+//
+// Only the existing-row PUT path calls this; PUT-create against a
+// brand-new SPD name is still allowed to seed StorDriver/* keys in a
+// single round-trip — that's the `linstor sp-d set-property new-def
+// StorDriver/LvmVg vg-x` flow operators rely on for one-call
+// provisioning of fresh definitions.
+func writeSPDfnDriverPropMutationRefusal(w http.ResponseWriter, name, msg string) {
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInvldStorPoolName,
+		Message: "storage pool definition '" + name +
+			"': refusing to mutate backing-driver identity prop(s): " + msg,
+		Cause: "the requested override_props / delete_props / " +
+			"delete_namespaces touches a StorDriver/* key that pins " +
+			"this StoragePoolDefinition's default backing identity. " +
+			"Per-node StoragePools created against this definition " +
+			"inherit StorDriver/* keys from the SPD when the per-node " +
+			"create body omits them; silently flipping the SPD's " +
+			"backing key under existing per-node pools desyncs the " +
+			"catalog from the live rows and breaks placement / " +
+			"autoplace consistency the moment the next per-node " +
+			"`linstor sp c` lands.",
+		Correc: "drop the storage pool definition (`linstor sp-d d`) " +
+			"and recreate it with the desired backing key, OR target " +
+			"the prop on a freshly-named SPD — never mutate the " +
+			"backing key on an existing definition row.",
+		ObjRefs: map[string]string{
+			objRefStorPoolDfn: name,
+		},
 	}})
 }
 
