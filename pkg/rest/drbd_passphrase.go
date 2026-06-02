@@ -20,6 +20,8 @@ package rest
 
 import (
 	"net/http"
+
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 )
 
 // drbdPassphraseRequest carries the per-RD DRBD shared secret.
@@ -73,7 +75,20 @@ func (s *Server) handleDRBDPassphraseSet(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Bug 374: emit `[]ApiCallRc` envelope on 200 instead of a bare
+	// WriteHeader. python-linstor 1.27.1 (Bug 129) and golinstor
+	// (Bug 45) unconditionally json-decode every non-204 2xx response
+	// and crash with "Expecting value: line 1 column 1 (char 0)" on
+	// an empty body. Sibling props-write paths
+	// (handleControllerPropsModify, mutateResourceFlag) all emit a
+	// MASK_INFO envelope so the CLI surfaces a clean success line.
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "DRBD shared secret set on resource definition: " + rdName,
+		ObjRefs: map[string]string{
+			objRefRscDfn: rdName,
+		},
+	}})
 }
 
 // drbdSharedSecretKey is the upstream LINSTOR property name we mirror

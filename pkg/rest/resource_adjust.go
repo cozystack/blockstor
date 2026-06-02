@@ -43,6 +43,15 @@ func (s *Server) registerAdjust(mux *http.ServeMux) {
 // handleAdjustAll verifies the RD exists, then returns 200. A real
 // implementation would bump a generation token the satellite watches,
 // but until WatchResources lands the reconciler polls.
+//
+// Bug 374 (P2, hunt-caught 2026-06-02): emit an `[]ApiCallRc` envelope
+// on 200 instead of a bare WriteHeader. golinstor's response parser
+// (Bug 45) and python-linstor 1.27.1 (Bug 129) unconditionally json-
+// decode every non-204 2xx response, so an empty body crashes the CLI
+// with "Unable to parse REST json data: Expecting value: line 1
+// column 1 (char 0)". Sibling write-side endpoints
+// (`mutateResourceFlag`, autoplace, handleControllerPropsModify) all
+// emit MASK_INFO envelopes for the same reason.
 func (s *Server) handleAdjustAll(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 
@@ -53,10 +62,17 @@ func (s *Server) handleAdjustAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource definition adjusted: " + rdName,
+		ObjRefs: map[string]string{
+			objRefRscDfn: rdName,
+		},
+	}})
 }
 
-// handleAdjustOne is the per-replica counterpart.
+// handleAdjustOne is the per-replica counterpart. Same Bug 374 wire-
+// shape contract as handleAdjustAll.
 func (s *Server) handleAdjustOne(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
@@ -68,7 +84,14 @@ func (s *Server) handleAdjustOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
+		RetCode: maskInfo,
+		Message: "resource adjusted: " + rdName + " on " + node,
+		ObjRefs: map[string]string{
+			objRefRscDfn: rdName,
+			objRefNode:   node,
+		},
+	}})
 }
 
 // registerResourceLifecycle wires activate/deactivate. Upstream LINSTOR
