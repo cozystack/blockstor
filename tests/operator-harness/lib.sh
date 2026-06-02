@@ -65,7 +65,25 @@ __BLOCKSTOR_HARNESS_LIB_LOADED=1
 # linstor CLI wrapper
 # ----------------------------------------------------------------------
 
+# `node evict` is a controller-side action that the bundled linstor-client
+# 1.27.1 does not expose as a subcommand (it only ships evacuate/lost/
+# restore). The REST controller, however, implements it as
+# `PUT /v1/nodes/<node>/evict`. So a replay step can stay operator-faithful
+# (`cmd: ["node", "evict", "<node>"]`) and we transparently drive it through
+# the REST endpoint here. The same call is mirrored by the cli-matrix
+# n-evict catcher's expectation. Recognise the long form and the `n e` /
+# `node e` short forms.
 linstor_cli() {
+    if [[ "$1" == "node" || "$1" == "n" ]] \
+        && [[ "$2" == "evict" || "$2" == "e" ]] \
+        && [[ -n "${3:-}" ]]; then
+        local node=$3
+        local base=${BS_URL:?BS_URL required}
+        # curl returns 0 on a 200; map any non-2xx to a non-zero exit so the
+        # step's expect_exit contract still holds.
+        curl -fsS -m 10 -X PUT "${base%/}/v1/nodes/${node}/evict" >/dev/null
+        return $?
+    fi
     "$LINSTOR_CMD" --controllers "${BS_URL:?BS_URL required}" "$@"
 }
 
@@ -185,7 +203,7 @@ check_assertion() {
             rd=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")
             rd=$(substitute "$rd")
             min=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('min',2))" "$spec")
-            count=$(linstor_cli --output-fmt=json resource list --resources "$rd" 2>/dev/null \
+            count=$(linstor_cli -m resource list --resources "$rd" 2>/dev/null \
                 | python3 -c "import json,sys
 try:
     d=json.load(sys.stdin)
@@ -237,7 +255,14 @@ print(bad)")
         no_tiebreaker)
             local rd present
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -ci 'TieBreaker' || true)
+            # Match the LINSTOR State token `TieBreaker` case-SENSITIVELY:
+            # the replay RD names themselves contain the lowercase substring
+            # "tiebreaker" (replay-*-tiebreaker-*), so a case-insensitive
+            # grep -ci false-matches the resource name on EVERY data row and
+            # the count can never reach 0 — the assertion would wrongly time
+            # out even when the cluster has no witness. The State column
+            # always renders the witness as `TieBreaker` (capital T/B).
+            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -c 'TieBreaker' || true)
             [[ "$present" == "0" ]]
             ;;
         tiebreaker_present)
@@ -247,7 +272,11 @@ print(bad)")
             # drained node is brought back with `n rst`.
             local rd present
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
-            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -ci 'TieBreaker' || true)
+            # Case-SENSITIVE on purpose — see the no_tiebreaker note above: a
+            # case-insensitive grep would match the lowercase "tiebreaker"
+            # substring in the RD name and report a witness present on every
+            # row, masking a genuinely missing TieBreaker.
+            present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -c 'TieBreaker' || true)
             [[ "$present" -ge 1 ]]
             ;;
         sync_clean)
@@ -275,7 +304,7 @@ print(bad)")
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             vol=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vol',0))" "$spec")
             expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected_kib',0))" "$spec")
-            actual=$(VOL="$vol" linstor_cli --output-fmt=json volume-definition list --resource-definitions "$rd" 2>/dev/null \
+            actual=$(VOL="$vol" linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
                 | python3 -c "import json,sys,os
 try:
     d=json.load(sys.stdin)
