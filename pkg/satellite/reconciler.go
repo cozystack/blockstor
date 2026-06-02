@@ -2755,6 +2755,8 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		return err
 	}
 
+	freshlyCreated := map[int32]struct{}{}
+
 	for _, vol := range dr.GetVolumes() {
 		target := fmt.Sprintf("%s/%d", dr.GetName(), vol.GetVolumeNumber())
 
@@ -2770,6 +2772,64 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 		createErr := r.createMDWithCollisionRecovery(ctx, dr.GetName(), target)
 		if createErr != nil {
 			return errors.Wrapf(createErr, "create-md %s", target)
+		}
+
+		freshlyCreated[vol.GetVolumeNumber()] = struct{}{}
+	}
+
+	if len(freshlyCreated) == 0 {
+		return nil
+	}
+
+	// Bug B.4: seed the day0 GI tuple on volumes whose metadata was
+	// just freshly created so the subsequent FSM-dispatched adjust
+	// brings the new volume up Consistent (case-B winner shape) or
+	// at least with a clean per-peer bitmap (case-A skip-init-sync).
+	// Without the seed both diskful peers handshake at zero
+	// current-UUID, neither is force-promoted (the late-add path
+	// runs with firstActivation=false on the parent RD), and the
+	// volume latches Inconsistent forever.
+	//
+	// Per-volume scoping: only the freshly-created volumes get
+	// touched. vol-0 (already attached, HasMD=true) is skipped
+	// before the loop ever fires — drbdmeta set-gi against an
+	// attached lower disk would EBUSY just like create-md would.
+	// The per-volume `resolveVolumeSeed` already gates on the
+	// per-volume `AnyConnectedPeerHasDataForVolume` probe so the
+	// late-add can take the day0 skip-init-sync seed even when
+	// sibling volumes have UpToDate peers.
+	return r.seedFreshVolumes(ctx, dr, devices, freshlyCreated)
+}
+
+// seedFreshVolumes runs seedPerPeerGI for the subset of volumes
+// listed in `fresh`. Mirrors the loop in seedInitialGI but limits
+// touch to the volumes whose metadata was just freshly created,
+// so already-stamped sibling volumes (vol-0 in the Bug B.4
+// late-add scenario) are never re-seeded. isWinner is hard-coded
+// to false because this path runs with firstActivation=false on
+// the parent RD — the per-volume gate inside resolveVolumeSeed
+// decides which seed shape (case-A skip-init-sync, case-B
+// winner, or no-op) is appropriate via the per-volume
+// AnyConnectedPeerHasDataForVolume probe.
+func (r *Reconciler) seedFreshVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, fresh map[int32]struct{}) error {
+	for _, vol := range dr.GetVolumes() {
+		if _, ok := fresh[vol.GetVolumeNumber()]; !ok {
+			continue
+		}
+
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			continue
+		}
+
+		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), false, dr.GetSkipInitialSync())
+		if !ok {
+			continue
+		}
+
+		err := r.seedPerPeerGI(ctx, dr, vol, device, seed)
+		if err != nil {
+			return err
 		}
 	}
 
