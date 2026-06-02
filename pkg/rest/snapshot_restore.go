@@ -92,9 +92,10 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	if req.ToResource == "" {
-		writeError(w, http.StatusBadRequest, "to_resource is required")
-
+	// Bug C.4 (bug-hunt v3): same name-validation gate as the sibling
+	// resource-restore handler — both share the ToResource field and
+	// both mutate Store state keyed on its raw value.
+	if !validateSnapshotRestoreRequest(w, &req) {
 		return
 	}
 
@@ -126,6 +127,43 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 	}})
 }
 
+// validateSnapshotRestoreRequest runs every pre-store wire-boundary
+// gate the new-RD-spawning restore handler needs: ToResource is set
+// (required field), and ToResource is a valid LINSTOR identifier
+// (Bug C.4 / bug-hunt v3). Returns true when the caller may proceed,
+// false when the HTTP error has already been written.
+//
+// Mirrors validateRDCreateBody's shape so every new pre-Store gate
+// lives in one canonical spot rather than as another `if/return`
+// inside the parent handler.
+//
+// Bug C.4: the target RD name flows straight into materializeRestoredRD
+// → Store.ResourceDefinitions().Create(), where the k8s CRD store
+// slugifies + hash-prefixes the metadata.name and the lowercased result
+// no longer matches the spec.resourceDefinitionName CRD admission
+// check. The store-side rejection leaves a half-built RD entry in the
+// linstor view, and the operator sees a raw "metadata.name must equal …"
+// leak — the same Bug-97 class the direct `rd c` path already gates
+// against. We mirror that gate here at the wire boundary, BEFORE the
+// Store.Create call, so the failure mode is one consistent LINSTOR
+// envelope and no orphan state is left behind.
+func validateSnapshotRestoreRequest(w http.ResponseWriter, req *snapshotRestoreRequest) bool {
+	if req.ToResource == "" {
+		writeError(w, http.StatusBadRequest, "to_resource is required")
+
+		return false
+	}
+
+	nameErr := validateLinstorName("resource definition", req.ToResource)
+	if nameErr != nil {
+		writeError(w, http.StatusBadRequest, nameErr.Error())
+
+		return false
+	}
+
+	return true
+}
+
 // handleSnapshotRestore creates a new ResourceDefinition from a
 // snapshot. The data clone (zfs send|recv / lvcreate -s of a snapshot
 // LV) is the satellite's job once it picks up the new RD via reconcile;
@@ -139,9 +177,7 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.ToResource == "" {
-		writeError(w, http.StatusBadRequest, "to_resource is required")
-
+	if !validateSnapshotRestoreRequest(w, &req) {
 		return
 	}
 
