@@ -43,14 +43,20 @@ steps:
       rd: "{{rd}}"
       timeout_s: 240
   - name: tiebreaker-on-node3
-    # Hand-create the witness on node3 so the scenario is deterministic
-    # regardless of the auto-tiebreaker config / which node auto-tb picks.
-    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
+    # With 2 diskful on node1+node2 the RD reconciler auto-places the
+    # TIE_BREAKER witness on the only remaining node (node3) — deterministic
+    # in a 3-node cluster. We MUST exercise the real auto-TieBreaker here,
+    # not a hand-created `r c --diskless`: Bug 385's stranded-witness reaping
+    # (removeStrandedWitnesses) only deletes replicas carrying the TieBreaker
+    # flag. A user-placed `--diskless` replica is operator-owned and is NOT
+    # auto-reaped on evict, so seeding the witness by hand would make the
+    # evict step time out on a correct controller. The cli-matrix catcher
+    # uses the same auto-placed-witness shape.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
     await:
-      kind: replica_diskless
+      kind: tiebreaker_present
       rd: "{{rd}}"
-      node: "{{node3}}"
       timeout_s: 60
   - name: n-evict-node3
     # The exact operator action from the repro: evict the tiebreaker node.
