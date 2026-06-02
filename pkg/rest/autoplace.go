@@ -2052,7 +2052,29 @@ func (s *Server) resolveTakeoverStorPool(ctx context.Context, rdName, takeoverNo
 		return "", errors.Wrapf(rgErr, "lookup RG %q for takeover pool resolution", rd.ResourceGroupName)
 	}
 
-	return rg.SelectFilter.StoragePool, nil
+	if pool := rg.SelectFilter.StoragePool; pool != "" {
+		return pool, nil
+	}
+
+	// Bug 364 (P1): also walk the RG's StoragePoolList default. The
+	// linstor-csi driver posts no body to
+	// `POST /v1/resource-definitions/{rd}/resources/{node}` and
+	// relies on RG-side propagation for the pool name; when the
+	// SC sets `linstor.csi.linbit.com/storagePool: <p>`,
+	// linstor-csi's RGCreate path lands the value under
+	// SelectFilter.StoragePoolList[0] (not .StoragePool). Pre-fix the
+	// fresh-create resolution only checked SelectFilter.StoragePool,
+	// so an `r c <node> <rd>` against such an RG persisted a Resource
+	// with empty Props["StorPoolName"] — the satellite reconciler
+	// then had no pool to bind to and the replica wedged at
+	// `Provisioning` forever. Matches the existing
+	// `resolveGatePoolName` walk shape (the per-pool capacity gate
+	// already tolerates StoragePoolList tier-4 for the same reason).
+	if len(rg.SelectFilter.StoragePoolList) > 0 {
+		return rg.SelectFilter.StoragePoolList[0], nil
+	}
+
+	return "", nil
 }
 
 // resolveStorPoolForFreshCreate implements the Bug 327 fix for the
