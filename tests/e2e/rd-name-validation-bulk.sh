@@ -56,6 +56,7 @@ cleanup() {
     # including the orphan rows the bug used to leak. The orphan check
     # itself happens BEFORE this, so cleanup here just keeps the stand
     # tidy for the next scenario.
+    kubectl delete snapshot "${SRC}.${SNAP}" --ignore-not-found --timeout=30s 2>/dev/null || true
     for rd in e2e-c4-src e2e-c4-good-spawn e2e-c4-good-restore; do
         delete_rd "$rd" 2>/dev/null || true
     done
@@ -88,12 +89,17 @@ spec:
 EOF
 
 echo ">> seed Snapshot $SNAP on $SRC"
+# Snapshot CRD enforces metadata.name == <resourceDefinitionName>.<snapshotName>
+# (CEL rule in api/v1alpha1/snapshot_types.go). The composite key shape is what
+# every REST snapshot handler round-trips through, so keep the YAML aligned
+# with the production wire — otherwise admission rejects on strict decoding.
 cat <<EOF | kubectl apply -f -
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Snapshot
-metadata: {name: ${SNAP}}
+metadata: {name: ${SRC}.${SNAP}}
 spec:
-  resourceName: ${SRC}
+  resourceDefinitionName: ${SRC}
+  snapshotName: ${SNAP}
   nodes: [${WORKER_1}]
   volumeDefinitions:
     - {volumeNumber: 0, sizeKib: 65536}
