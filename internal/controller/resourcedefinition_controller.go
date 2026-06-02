@@ -380,8 +380,8 @@ func shouldTieBreakerExist(
 
 	const witnessUnnecessaryDiskfulCount = 3
 
-	keepExistingWitness := len(witness) > 0 &&
-		shouldKeepExistingWitness(len(diskful), nonWitnessDiskless, witnessUnnecessaryDiskfulCount)
+	keepExistingWitness := keepExistingWitnessFor(rd, diskful, witness, nonWitnessDiskless,
+		witnessUnnecessaryDiskfulCount)
 
 	// Bug 108: post-toggle race repair. The keep branch above
 	// preserves an existing witness across diskful→diskless; this
@@ -406,6 +406,43 @@ func shouldTieBreakerExist(
 		(len(diskful)+nonWitnessDiskless) == 2
 
 	return wantNewWitness || keepExistingWitness || repairAfterToggleRace
+}
+
+// keepExistingWitnessFor folds the two "preserve an existing
+// TIE_BREAKER witness" branches into a single helper so
+// shouldTieBreakerExist stays under the gocyclo threshold. Both
+// branches gate on `len(witness) > 0` — we never "keep" what isn't
+// there.
+//
+// Branches:
+//
+//  1. Operator-intent override (Bug B.1, hunt-v3):
+//     `linstor r d --keep-tiebreaker <diskful>` stamps the
+//     KeepTiebreakerUntilAnnotation on the parent RD. While the
+//     annotation deadline is in the future AND at least one diskful
+//     survives, retain the witness regardless of the Bug-338 carve-
+//     out. The diskful floor matters because lone TIE_BREAKER + 0
+//     diskful = 1 voter, strictly worse than no witness.
+//
+//  2. Bug-104 / Bug-338 steady-state keep branch:
+//     shouldKeepExistingWitness encodes the existing "preserve the
+//     witness across diskful→diskless toggle" + "collapse the
+//     orphaned witness when diskful=1 and no non-witness diskless
+//     co-resident" rules.
+func keepExistingWitnessFor(
+	rd *blockstoriov1alpha1.ResourceDefinition,
+	diskful, witness []apiv1.Resource,
+	nonWitnessDiskless, witnessUnnecessaryDiskfulCount int,
+) bool {
+	if len(witness) == 0 {
+		return false
+	}
+
+	if len(diskful) >= 1 && isKeepTiebreakerActive(rd) {
+		return true
+	}
+
+	return shouldKeepExistingWitness(len(diskful), nonWitnessDiskless, witnessUnnecessaryDiskfulCount)
 }
 
 // isAutoQuorumDisabled reports whether the RD opted out of the
@@ -444,6 +481,43 @@ func isTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	}
 
 	raw, ok := rd.Annotations[apiv1.AutoTiebreakerSuppressedUntilAnnotation]
+	if !ok || raw == "" {
+		return false
+	}
+
+	deadline, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+
+	return time.Now().Before(deadline)
+}
+
+// isKeepTiebreakerActive reports whether an operator recently ran
+// `linstor r d --keep-tiebreaker <diskful> <rd>` against this RD.
+// The REST per-resource-delete handler stamps an RFC3339 deadline on
+// the parent RD when the `?keep_tiebreaker=true` query parameter is
+// set; this helper returns true while the deadline is in the future.
+//
+// Used by `shouldTieBreakerExist` to short-circuit the Bug-338
+// orphan-witness collapse: with this annotation fresh, an existing
+// TIE_BREAKER witness must survive a diskful→single-replica
+// transition the carve-out would otherwise reap. Without the
+// override, the CLI flag silently no-ops because the controller's
+// reconciler can't distinguish operator intent ("keep this witness")
+// from steady-state ("orphaned witness, prune").
+//
+// Bad / unparseable values are treated as "no override" so a hand-
+// edited annotation can't accidentally freeze the witness invariant
+// forever. An expired stamp also returns false — the auto-quorum
+// invariant resumes its normal Bug-338 behaviour with no manual
+// cleanup needed.
+func isKeepTiebreakerActive(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	if rd == nil || rd.Annotations == nil {
+		return false
+	}
+
+	raw, ok := rd.Annotations[apiv1.KeepTiebreakerUntilAnnotation]
 	if !ok || raw == "" {
 		return false
 	}

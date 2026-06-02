@@ -53,6 +53,18 @@ import (
 const (
 	AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation
 	autoTiebreakerSuppressionWindow         = 5 * time.Minute
+
+	// KeepTiebreakerUntilAnnotation: re-export the canonical constant
+	// so the REST package can stamp it without importing internals.
+	//
+	// keepTiebreakerOverrideWindow: 5 minutes is long enough to cover
+	// a typical follow-up sequence (e.g. delete the second diskful
+	// after explicitly opting in to keep the witness, then create a
+	// fresh diskful elsewhere) without permanently masking the
+	// auto-witness invariant if the operator walks away. Matches the
+	// suppression window for consistency.
+	KeepTiebreakerUntilAnnotation = apiv1.KeepTiebreakerUntilAnnotation
+	keepTiebreakerOverrideWindow  = 5 * time.Minute
 )
 
 // registerAutoplace wires `POST /v1/resource-definitions/{rd}/autoplace` and
@@ -2542,9 +2554,35 @@ func decodeResourceCreateBody(body []byte) ([]apiv1.ResourceCreate, error) {
 // Delete so a concurrent reconcile observes "Resource gone +
 // annotation present" rather than "Resource gone + no annotation"
 // (which would race the witness back in).
+//
+// Bug B.1 (hunt-v3): `linstor r d --keep-tiebreaker <diskful> <rd>`
+// must NOT reap the auto-managed TIE_BREAKER witness in the same
+// reconcile that observes diskful drop. Upstream LINSTOR's CLI help
+// states "Keeps the tiebreaker instead of accidentally deleting it";
+// without the override the RD reconciler hits the Bug-338 carve-out
+// (diskful=1 + witness=1, no non-witness diskless → collapse) and
+// removes the witness right after the `r d` completes. We stamp a
+// short-lived `KeepTiebreakerUntilAnnotation` so the reconciler's
+// `shouldKeepExistingWitness` reads it and short-circuits to true
+// while the deadline is in the future. The stamp lands BEFORE the
+// Delete commits, mirroring the suppression annotation's
+// already-proven order: a Reconcile woken by the Delete event will
+// observe the annotation by the time it lists Resources.
 func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
+	keepTiebreaker := queryFlag(r, "keep_tiebreaker")
+
+	if keepTiebreaker {
+		// Best-effort. Failure to stamp doesn't block the
+		// operator-requested delete; the worst case without the
+		// annotation is "the witness is collapsed within ~5s of the
+		// r d" — annoying, but recoverable by a follow-up `r c` to
+		// re-create the witness manually. NotFound on the parent RD
+		// is folded into nil inside stampKeepTiebreaker (concurrent
+		// rd-delete cascade) so the same call path is safe here.
+		_ = s.stampKeepTiebreaker(r.Context(), rdName)
+	}
 
 	// Look up the Resource before any destructive action. The flag
 	// inspection drives the legacy tiebreaker-suppression stamp on
@@ -2734,6 +2772,36 @@ func (s *Server) stampTiebreakerSuppression(ctx context.Context, rdName string) 
 		}
 
 		rd.Annotations[AutoTiebreakerSuppressedUntilAnnotation] = deadline
+
+		return nil
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+
+	return err //nolint:wrapcheck // best-effort, caller swallows
+}
+
+// stampKeepTiebreaker writes the KeepTiebreakerUntilAnnotation onto
+// the parent RD with a `now + keepTiebreakerOverrideWindow` deadline.
+// The RD-side reconciler reads the annotation in its keep-branch and
+// preserves an existing TIE_BREAKER witness across shapes the Bug-338
+// carve-out would otherwise collapse (e.g. 1 diskful + 1 witness + 0
+// non-witness diskless).
+//
+// Idempotent: a fresh stamp always wins (later operator intent
+// overrides earlier). NotFound on the parent RD is swallowed — a
+// concurrent RD-delete cascade is the most common reason and the
+// caller doesn't care.
+func (s *Server) stampKeepTiebreaker(ctx context.Context, rdName string) error {
+	deadline := time.Now().Add(keepTiebreakerOverrideWindow).UTC().Format(time.RFC3339)
+
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, rdName, func(rd *apiv1.ResourceDefinition) error {
+		if rd.Annotations == nil {
+			rd.Annotations = map[string]string{}
+		}
+
+		rd.Annotations[KeepTiebreakerUntilAnnotation] = deadline
 
 		return nil
 	})

@@ -33,6 +33,33 @@ package v1
 // is the neutral, dependency-free shared layer both already import.
 const AutoTiebreakerSuppressedUntilAnnotation = "blockstor.io/auto-tiebreaker-suppressed-until"
 
+// KeepTiebreakerUntilAnnotation is stamped on an RD when an operator
+// runs `linstor r d --keep-tiebreaker <diskful-node> <rd>`. Upstream
+// LINSTOR's CLI promises the semantics "keep the tiebreaker instead
+// of accidentally deleting it" — the typical use case is collapsing a
+// 2-diskful + 1-witness shape down to 1-diskful + 1-witness on
+// purpose, against the Bug-338 carve-out that would otherwise reap
+// the orphan witness for a 1-diskful RD.
+//
+// The value is an RFC3339 wall-clock deadline. While the deadline is
+// in the future, the RD reconciler's `shouldKeepExistingWitness`
+// helper short-circuits to true regardless of the auto-collapse
+// shape, so the witness survives long enough for the operator's
+// follow-up call (typically `r d` on the second diskful, or a fresh
+// `r c` to bring a new diskful in). The deadline is intentionally
+// short so a forgotten annotation can't permanently freeze the
+// auto-witness invariant — once it expires, the normal Bug-338
+// collapse path resumes without any manual cleanup.
+//
+// Bad / unparseable values are treated as "no override" so a hand-
+// edited annotation can't accidentally freeze quorum forever.
+//
+// Defined here (rather than in pkg/rest or internal/controller) so
+// the REST writer and controller reader share a single source of
+// truth without either package importing the other — pkg/api/v1 is
+// the neutral, dependency-free shared layer both already import.
+const KeepTiebreakerUntilAnnotation = "blockstor.io/keep-tiebreaker-until"
+
 // AutoDiskfulDeadlineAnnotation is stamped on an RD when the
 // AutoDiskfulReconciler first observes a diskful-replica deficit
 // (count < SelectFilter.PlaceCount) and the effective

@@ -345,6 +345,186 @@ func TestEnsureTiebreakerExpiredSuppressionResumesAutoWitness(t *testing.T) {
 	}
 }
 
+// TestKeepTiebreakerAnnotation_HonoredWhileFresh pins Bug B.1
+// (hunt-v3): `linstor r d --keep-tiebreaker <diskful>` stamps the
+// KeepTiebreakerUntilAnnotation on the parent RD; while the deadline
+// is in the future, the auto-witness reconciler must preserve an
+// existing TIE_BREAKER witness across a diskful→1 transition that
+// the Bug-338 carve-out would otherwise reap.
+//
+// Repro shape: 1 diskful + 1 witness + 0 non-witness diskless. The
+// carve-out in shouldKeepExistingWitness would normally collapse the
+// witness (1 voter quorum:off > 2 voter no-majority); the operator
+// override flips that decision because they explicitly asked to keep
+// the witness.
+func TestKeepTiebreakerAnnotation_HonoredWhileFresh(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// Topology: 1 diskful on n1, 1 TIE_BREAKER witness on n3,
+	// 0 non-witness diskless. This is the exact shape the Bug-338
+	// carve-out wants to collapse — the operator override must
+	// preserve it.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-keep-tb", NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed diskful replica: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-keep-tb", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed witness replica: %v", err)
+	}
+
+	// Fresh keep-tiebreaker: deadline 5 minutes in the future.
+	deadline := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-keep-tb",
+			Annotations: map[string]string{
+				controllerpkg.KeepTiebreakerUntilAnnotation: deadline,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// The witness on n3 must still exist after the reconcile.
+	got, err := st.Resources().Get(ctx, "pvc-keep-tb", "n3")
+	if err != nil {
+		t.Fatalf("witness on n3 was removed despite keep-tiebreaker annotation: %v", err)
+	}
+
+	hasTB := false
+
+	for _, f := range got.Flags {
+		if f == apiv1.ResourceFlagTieBreaker {
+			hasTB = true
+
+			break
+		}
+	}
+
+	if !hasTB {
+		t.Errorf("witness on n3 lost its TIE_BREAKER flag; got %v", got.Flags)
+	}
+
+	// The helper must agree.
+	if !controllerpkg.IsKeepTiebreakerActive(rd) {
+		t.Errorf("IsKeepTiebreakerActive returned false for a fresh annotation")
+	}
+}
+
+// TestKeepTiebreakerAnnotation_ExpiredFallsThrough pins the symmetric
+// half of Bug B.1: once the keep-tiebreaker deadline passes, the
+// Bug-338 collapse path resumes without any manual cleanup. Without
+// the expiry, a forgotten annotation would silently disable the
+// auto-quorum invariant forever — a footgun.
+//
+// Same topology as the fresh-annotation case, but the deadline is in
+// the past. Expected: the orphan witness is reaped, and the helper
+// reports the annotation as inactive.
+func TestKeepTiebreakerAnnotation_ExpiredFallsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-keep-tb-stale", NodeName: "n1",
+	}); err != nil {
+		t.Fatalf("seed diskful replica: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-keep-tb-stale", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed witness replica: %v", err)
+	}
+
+	// Expired keep-tiebreaker: deadline 5 minutes in the past.
+	expired := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-keep-tb-stale",
+			Annotations: map[string]string{
+				controllerpkg.KeepTiebreakerUntilAnnotation: expired,
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	// Bug-338 carve-out resumes: orphan witness must be gone.
+	if _, err := st.Resources().Get(ctx, "pvc-keep-tb-stale", "n3"); err == nil {
+		t.Errorf("orphan witness on n3 survived an expired keep-tiebreaker annotation")
+	}
+
+	// Helper must report inactive.
+	if controllerpkg.IsKeepTiebreakerActive(rd) {
+		t.Errorf("IsKeepTiebreakerActive returned true for an expired annotation")
+	}
+
+	// Hand-typed garbage must also not activate the override.
+	rdGarbage := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pvc-keep-tb-junk",
+			Annotations: map[string]string{
+				controllerpkg.KeepTiebreakerUntilAnnotation: "definitely not a timestamp",
+			},
+		},
+	}
+
+	if controllerpkg.IsKeepTiebreakerActive(rdGarbage) {
+		t.Errorf("IsKeepTiebreakerActive returned true for unparseable annotation")
+	}
+}
+
 // TestEnsureTiebreakerHonoursAutoQuorumDisabled: scenario 7.W01
 // (wave2-07-quorum-observability.md §7.W01, UG9 lines 4233-4279).
 //

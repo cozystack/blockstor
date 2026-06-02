@@ -209,6 +209,14 @@ func IsTiebreakerSuppressed(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 	return isTiebreakerSuppressed(rd)
 }
 
+// IsKeepTiebreakerActive exposes the operator-intent override helper
+// for tests. Mirrors the IsTiebreakerSuppressed pattern: tests can
+// assert both that the helper reads the annotation and that the
+// reconciler honours the deadline window.
+func IsKeepTiebreakerActive(rd *blockstoriov1alpha1.ResourceDefinition) bool {
+	return isKeepTiebreakerActive(rd)
+}
+
 // IsAutoQuorumDisabled exposes the auto-quorum opt-out gate for
 // tests. Scenario 7.W01 pins both the disabled-and-skip path and
 // the default-enabled passthrough.
@@ -220,3 +228,8 @@ func IsAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 // key for tests so a regression that renamed the key on one side
 // would fail to compile here.
 const AutoTiebreakerSuppressedUntilAnnotation = apiv1.AutoTiebreakerSuppressedUntilAnnotation
+
+// KeepTiebreakerUntilAnnotation exposes the operator-intent
+// annotation key for tests. Same compile-time-rename guard as the
+// suppression key above.
+const KeepTiebreakerUntilAnnotation = apiv1.KeepTiebreakerUntilAnnotation
