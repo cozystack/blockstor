@@ -677,21 +677,8 @@ func writeVDExistsConflict(w http.ResponseWriter, rd string, vn int32) {
 func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
-	vn, err := parseVolNum(r.PathValue("vn"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-
-		return
-	}
-
-	// Bug 365: reject out-of-range volume_number at the PUT/PATCH
-	// wire boundary too. Symmetric to Bug 363 (create) and the
-	// vd-get / vd-delete gates — keeps the entire VD CRUD surface
-	// consistent on the addressable [0, 65535] DRBD-9 range.
-	vnErr := validateVolumeNumber(vn)
-	if vnErr != nil {
-		writeVDNumberRejection(w, rd, vn, vnErr)
-
+	vn, ok := parseAndValidateVDPathVolNum(w, rd, r.PathValue("vn"))
+	if !ok {
 		return
 	}
 
@@ -717,12 +704,7 @@ func (s *Server) handleVDUpdate(w http.ResponseWriter, r *http.Request) {
 
 	previousSizeKib := existing.SizeKib
 
-	// Scenario 4.W13: reject any shrink (`new < previous`) unless the
-	// operator opted in via `force=true`. Runs BEFORE the merge + store
-	// write so a rejected shrink leaves the stored spec untouched — a
-	// partial update would desync the controller spec from the
-	// satellite reality.
-	if rejectShrinkWithoutForce(w, r, &patch, rd, vn, previousSizeKib) {
+	if rejectVDPatchSize(w, r, &patch, rd, vn, previousSizeKib) {
 		return
 	}
 
@@ -785,6 +767,86 @@ func appendForceShrinkAdvisory(envelope []apiv1.APICallRc, patch *volumeDefiniti
 			objRefVlmNr:  strconv.FormatInt(int64(vn), 10),
 		},
 	})
+}
+
+// parseAndValidateVDPathVolNum decodes `{vn}` from the URL path and
+// runs the Bug 365 range check, writing the typed envelope and
+// returning ok=false on either failure. Extracted out of
+// handleVDUpdate to keep the HTTP handler under the funlen budget.
+func parseAndValidateVDPathVolNum(w http.ResponseWriter, rd, rawVN string) (int32, bool) {
+	vn, err := parseVolNum(rawVN)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+
+		return 0, false
+	}
+
+	// Bug 365: reject out-of-range volume_number at the PUT/PATCH
+	// wire boundary too. Symmetric to Bug 363 (create) and the
+	// vd-get / vd-delete gates — keeps the entire VD CRUD surface
+	// consistent on the addressable [0, 65535] DRBD-9 range.
+	vnErr := validateVolumeNumber(vn)
+	if vnErr != nil {
+		writeVDNumberRejection(w, rd, vn, vnErr)
+
+		return 0, false
+	}
+
+	return vn, true
+}
+
+// rejectVDPatchSize runs the two size-related preflight checks on a
+// VD PUT patch: the Bug 383 non-positive floor and the scenario 4.W13
+// shrink-refusal. Returns true when either rejection fired (the HTTP
+// envelope is already written) so the caller short-circuits. Split
+// out of handleVDUpdate to keep the handler under the funlen budget;
+// preserves the documented evaluation order (floor first, then shrink-
+// vs-force) so the operator-facing error message stays accurate.
+func rejectVDPatchSize(
+	w http.ResponseWriter, r *http.Request, patch *volumeDefinitionModifyBody,
+	rd string, vn int32, previousSizeKib int64,
+) bool {
+	// Bug 383 (P3, hunt-caught 2026-06-02): reject `size_kib <= 0` on
+	// PUT regardless of `force=true`. See rejectVDNonPositiveSize.
+	if rejectVDNonPositiveSize(w, patch, rd, vn) {
+		return true
+	}
+
+	// Scenario 4.W13: reject any shrink (`new < previous`) unless the
+	// operator opted in via `force=true`. Runs BEFORE the merge + store
+	// write so a rejected shrink leaves the stored spec untouched — a
+	// partial update would desync the controller spec from the
+	// satellite reality.
+	return rejectShrinkWithoutForce(w, r, patch, rd, vn, previousSizeKib)
+}
+
+// rejectVDNonPositiveSize writes a 400 + FAIL_INVLD_VLM_SIZE envelope
+// when the patch carries a non-positive `size_kib` and returns true
+// to signal the caller to short-circuit.
+//
+// Bug 383 (P3, hunt-caught 2026-06-02): force=true MUST NOT relax the
+// absolute non-positive floor on PUT. The shrink path's force escape
+// hatch was scoped only at "no auto-shrink" (callers that already ran
+// `resize2fs -s` know the new size is below the live one); it was
+// never intended to let a caller persist `size_kib=0` or a negative
+// value into the spec. The satellite reconciler then looped on
+// `drbdadm create-md` indefinitely (DRBD's per-device minimum is
+// ~4 MiB once metadata is reserved), identical to the Bug 381 spawn-
+// fast-path footgun but reached through the PUT update path. Rejected
+// before the shrink-check so the operator-facing message is the right
+// one (invalid size, not "filesystem shrink-then-resize").
+func rejectVDNonPositiveSize(
+	w http.ResponseWriter, patch *volumeDefinitionModifyBody, rd string, vn int32,
+) bool {
+	if patch.SizeKib == nil || *patch.SizeKib > 0 {
+		return false
+	}
+
+	writeVDSizeRejection(w, rd, vn, *patch.SizeKib,
+		fmt.Errorf("%w: size_kib=%d must be > 0 (force=true does NOT relax this floor)",
+			ErrVolumeSizeBelowMinimum, *patch.SizeKib))
+
+	return true
 }
 
 // rejectShrinkWithoutForce writes a 400 + FAIL_INVLD_VLM_SIZE
