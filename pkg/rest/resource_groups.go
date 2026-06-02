@@ -216,30 +216,14 @@ func (s *Server) handleRGUpdate(w http.ResponseWriter, r *http.Request) {
 	var rebalanceScheduled bool
 
 	// Bug 367 / 361: refuse negative or absurdly-large place_count
-	// on the patch body BEFORE we hand it to PatchResourceGroup. The
-	// validator only cares about fields the patch explicitly carries
-	// (the merge respects "field absent = leave alone" semantics for
-	// place_count via mergeRGSelectFilterScalars), so checking the
-	// raw patch is the cheap way to keep the rule out of the store
-	// error path — writeStoreError would otherwise demote a clear
-	// 400 to a 500 because the callback returned a non-store error.
-	mentioned := rgSelectFilterKeys(raw)
-	if _, ok := mentioned["place_count"]; ok {
-		pcErr := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0)
-		if pcErr != nil {
-			writeError(w, http.StatusBadRequest, pcErr.Error())
+	// on the patch body BEFORE we hand it to PatchResourceGroup. See
+	// rgUpdatePlaceCountGate — keeps the wire-validation rule out of
+	// the store error path and the handler under the funlen budget.
+	gateErr := rgUpdatePlaceCountGate(raw, &patch)
+	if gateErr != nil {
+		writeError(w, http.StatusBadRequest, gateErr.Error())
 
-			return
-		}
-	}
-
-	if _, ok := mentioned["additional_place_count"]; ok {
-		apcErr := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount)
-		if apcErr != nil {
-			writeError(w, http.StatusBadRequest, apcErr.Error())
-
-			return
-		}
+		return
 	}
 
 	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), name, func(existing *apiv1.ResourceGroup) error {
@@ -894,6 +878,40 @@ func rgDeleteRefusedMessage(name string, count int) string {
 // refused at the REST boundary so the rebalance scheduler never
 // allocates against an absurd target.
 const rgPlaceCountSanityCeiling = 1_000_000
+
+// rgUpdatePlaceCountGate runs the Bug 367 / 361 wire-validation
+// rule on the PUT patch body BEFORE PatchResourceGroup sees it.
+//
+// Extracted from handleRGUpdate to keep the handler under the funlen
+// budget; the split tracks the natural "validate → patch → persist"
+// boundary in the request lifecycle. The validator only cares about
+// fields the patch explicitly carries (the merge respects "field
+// absent = leave alone" semantics for place_count via
+// mergeRGSelectFilterScalars), so we inspect rgSelectFilterKeys(raw)
+// to decide which sub-fields are in play.
+//
+// Returning an error here lets the caller emit a clean 400 with the
+// validator's actionable message; routing the error through the
+// PatchResourceGroup callback would demote it to a 500 (writeStoreError
+// has no band for "bad request").
+func rgUpdatePlaceCountGate(raw []byte, patch *apiv1.ResourceGroup) error {
+	mentioned := rgSelectFilterKeys(raw)
+	if _, ok := mentioned["place_count"]; ok {
+		err := validateRGSelectFilterPlaceCount(patch.SelectFilter.PlaceCount, 0)
+		if err != nil {
+			return err
+		}
+	}
+
+	if _, ok := mentioned["additional_place_count"]; ok {
+		err := validateRGSelectFilterPlaceCount(0, patch.SelectFilter.AdditionalPlaceCount)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
 
 // validateRGSelectFilterPlaceCount enforces the [0, 1_000_000] range
 // on AutoSelectFilter.PlaceCount / AdditionalPlaceCount.
