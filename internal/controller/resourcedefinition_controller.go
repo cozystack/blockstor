@@ -223,7 +223,30 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
-	diskful, diskless := splitByDiskless(replicas)
+	// Bug 385: a replica hosted on an EVICTED / LOST node is a draining
+	// placement, not a live one. Counting it would (a) let a stranded
+	// diskful keep the witness invariant "satisfied" so the reconciler
+	// never relocates the witness off the drained node, and (b) leave a
+	// TIE_BREAKER pinned to the very node the operator just evicted —
+	// the exact "evict doesn't take effect" symptom. Mirror the placer's
+	// documented semantic ("replicas on EVICTED/LOST nodes are NOT
+	// counted") so the witness / quorum decision runs over live replicas
+	// only. Stranded witnesses are reaped explicitly below so a fresh one
+	// can land on a healthy spare (or quorum falls to off when none
+	// remains) — never by demoting a healthy diskful to TIE_BREAKER.
+	disabled, err := r.disabledNodeSet(ctx)
+	if err != nil {
+		return err
+	}
+
+	live, stranded := splitByDisabledNode(replicas, disabled)
+
+	err = r.removeStrandedWitnesses(ctx, rd.Name, stranded)
+	if err != nil {
+		return err
+	}
+
+	diskful, diskless := splitByDiskless(live)
 	witness := filterTieBreaker(diskless)
 
 	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness)
@@ -1154,6 +1177,74 @@ func isDisabledNode(node *apiv1.Node) bool {
 	}
 
 	return false
+}
+
+// disabledNodeSet returns the set of node names flagged EVICTED / LOST.
+// Bug 385: the RD-level witness / quorum decision must treat replicas on
+// these nodes as draining placements, not live ones — mirroring the
+// placer's `disabledNodes` semantic. Re-probed from the store on every
+// reconcile so a freshly-stamped EVICTED flag takes effect on the next
+// witness pass.
+func (r *ResourceDefinitionReconciler) disabledNodeSet(ctx context.Context) (map[string]struct{}, error) {
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	disabled := make(map[string]struct{})
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[nodes[i].Name] = struct{}{}
+		}
+	}
+
+	return disabled, nil
+}
+
+// splitByDisabledNode partitions replicas into (live, stranded) by the
+// disabled-node set. `live` is hosted on healthy (non-EVICTED/-LOST)
+// nodes and drives the witness / quorum decision; `stranded` sits on a
+// draining node and is handled separately (Bug 385).
+func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}) ([]apiv1.Resource, []apiv1.Resource) {
+	var live, stranded []apiv1.Resource
+
+	for i := range replicas {
+		if _, off := disabled[replicas[i].NodeName]; off {
+			stranded = append(stranded, replicas[i])
+
+			continue
+		}
+
+		live = append(live, replicas[i])
+	}
+
+	return live, stranded
+}
+
+// removeStrandedWitnesses deletes every TIE_BREAKER witness that sits on
+// an EVICTED / LOST node (Bug 385). A diskless witness has no business
+// remaining on a drained node — leaving it there pins the witness to the
+// very node the operator evicted and blocks a fresh witness from landing
+// on a healthy spare. Diskful replicas on disabled nodes are intentionally
+// left alone here: relocating / deleting those is the NodeReconciler's job
+// (placer gap-fill for EVICTED, source-delete for LOST), and dropping a
+// diskful's only data copy from this path would be a data-availability
+// hazard. Per-row Delete tolerates NotFound so a concurrent
+// node-migration cascade can't fail the reconcile.
+func (r *ResourceDefinitionReconciler) removeStrandedWitnesses(ctx context.Context, rdName string, stranded []apiv1.Resource) error {
+	for i := range stranded {
+		if !slices.Contains(stranded[i].Flags, apiv1.ResourceFlagTieBreaker) {
+			continue
+		}
+
+		err := r.Store.Resources().Delete(ctx, rdName, stranded[i].NodeName)
+		if err != nil && !stderrors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // alreadyExists is a string-based check for the wrapped errors the
