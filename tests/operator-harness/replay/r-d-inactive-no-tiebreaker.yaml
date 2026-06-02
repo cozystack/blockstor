@@ -1,0 +1,81 @@
+name: r-d-inactive-no-tiebreaker
+description: |
+  Bug-387 catcher (P1). Deleting one active diskful replica with
+  `linstor r d` on an RD that has 2 active diskful + 1 INACTIVE replica
+  must NOT convert the deleted replica into a TieBreaker witness.
+
+  An INACTIVE replica is `drbdadm down` (operator deactivation) — it is
+  not a voting peer in the DRBD `quorum: majority` decision. The RD
+  auto-tiebreaker reconciler previously counted it as a full diskful, so
+  after the `r d` the topology looked like "2 diskful, even parity, no
+  user-diskless" and it spuriously grew a TieBreaker (1 active diskful +
+  1 witness = a 2-voter quorum with no majority protection). Upstream
+  LINSTOR simply deletes the replica with no witness conversion.
+
+  Sequence: 3 diskful RD → deactivate node1 (INACTIVE) → r d node2 →
+  assert node2 fully gone AND no TieBreaker is auto-spawned, leaving the
+  1 INACTIVE + 1 active diskful residual untouched.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-deactivate-node1
+    cmd: ["resource", "deactivate", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+  - name: r-d-node2-active-diskful
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 60
+  - name: no-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 30
+  - name: node2-stays-absent
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource", "activate", "{{node1}}", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
