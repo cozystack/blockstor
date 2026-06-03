@@ -292,6 +292,13 @@ if [[ "$md5_after" != "$md5_before" ]]; then
     n2_backing=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null | grep -oE 'backing_dev:[^ ]+' | head -1 | cut -d: -f2-)
     md5_peer=""
     if [[ -n "$n2_backing" ]]; then
+        # Drop the PEER's page cache before reading its backing device. A bare
+        # buffered read here races DRBD's replication ACK: the data has landed
+        # on the peer's disk but the host page-cache still holds pre-write
+        # pages, so the read returns STALE bytes and reports a phantom drift
+        # (reproduced 8/8). The cache drop forces a read from the backing
+        # store — same coherency discipline as the Primary buffered read above.
+        on_node "$N2" sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
         md5_peer=$(on_node "$N2" dd if="$n2_backing" bs=4096 count="$blocks" status=none 2>/dev/null | md5sum | awk '{print $1}')
     fi
     if [[ "$md5_buffered" == "$md5_before" || "$md5_peer" == "$md5_before" ]]; then
