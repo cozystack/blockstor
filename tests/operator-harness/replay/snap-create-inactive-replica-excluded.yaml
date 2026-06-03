@@ -30,6 +30,10 @@ prerequisites:
 
 vars:
   sp: stand
+  # Explicit short rd: the default `replay-<name>-<rand4>` is 49 chars for
+  # this scenario name, exceeding LINSTOR's 48-char resource-name limit, so
+  # create-rd was rejected and the replay could never run.
+  rd: snap394-inactive
 
 steps:
   - name: create-rd
