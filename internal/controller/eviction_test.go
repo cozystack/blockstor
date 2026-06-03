@@ -119,11 +119,14 @@ func TestNodeReconciler_EvictedTriggersMigration(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	// EVICTED is the soft "drain me" hint: the migration adds a
-	// replacement on a healthy node but leaves the source replica
-	// in place — the operator decides when to actually remove it
-	// (typically once the new replica is UpToDate). For LOST, the
-	// source is deleted in the same reconcile pass.
+	// EVICTED is an online drain with strict add-before-drop ordering
+	// (Bug 389): the migration adds a replacement on a healthy node but
+	// the source replica on the evacuated node is NOT dropped until the
+	// replacement is observed UpToDate. Here the replacement on n3 has
+	// no Resource CRD reporting UpToDate yet, so the source on n1 must
+	// survive this pass — redundancy never dips mid-drain. The actual
+	// source prune (once the replacement converges) is exercised by
+	// TestNodeReconciler_EvictedPrunesSourceAfterReplacementUpToDate.
 	//
 	// So after one EVICTED reconcile we expect 3 replicas: original
 	// n1 + n2 + the freshly placed replacement on n3.
