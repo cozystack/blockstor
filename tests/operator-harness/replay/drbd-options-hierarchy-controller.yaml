@@ -1,0 +1,75 @@
+name: drbd-options-hierarchy-controller
+description: |
+  Corner-case C1/C2 — DRBD options inheritance hierarchy
+  (Controller -> ResourceGroup -> ResourceDefinition -> Resource) and the
+  "closer to the resource wins" precedence rule.
+
+  C1 (inheritance / retroactive): a `controller drbd-options --max-buffers`
+  value must land in the rendered DRBD config of a resource created AFTER
+  the controller-level set.
+
+  C2 (closer wins): when the SAME knob is set at the controller AND at the
+  resource-definition, the RD value must win on the wire.
+
+  Guards the effectiveprops controller-tier precedence fix: pre-fix the
+  controller ExtraProps were merged AFTER the RD typed value, so the
+  cluster-wide controller default clobbered the closer RD override and
+  drbdsetup kept showing the controller value even after the RD set.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: controller-set-max-buffers
+    cmd: ["controller", "drbd-options", "--max-buffers", "36864"]
+    expect_exit: 0
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: assert-controller-inherited
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: max-buffers
+      expected: "36864"
+      timeout_s: 120
+  - name: rd-override-max-buffers
+    cmd: ["resource-definition", "drbd-options", "--max-buffers", "8192", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: max-buffers
+      expected: "8192"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["controller", "drbd-options", "--unset-max-buffers"]
+
+invariants:
+  - no_orphans

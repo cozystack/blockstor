@@ -68,6 +68,12 @@
 #                           expected volume-number set in spec.volumes +
 #                           status.volumes AND metadata.resourceVersion
 #                           is stable over settle_s (Bug 399 no-flap)
+#   - drbd_option          `drbdsetup show <rd>` on <node>'s satellite
+#                           pod reports <key> == <expected> — the live
+#                           kernel view of the rendered DRBD option, so
+#                           it captures the full Controller→RG→RD→Resource
+#                           inheritance + "closer wins" precedence
+#                           (corner-case C1/C2)
 #
 # Invariants (post-teardown):
 #

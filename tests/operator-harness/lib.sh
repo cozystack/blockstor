@@ -470,6 +470,38 @@ except Exception:
 
             return 0
             ;;
+        drbd_option)
+            # Corner-case C1/C2: assert the rendered DRBD config on a
+            # node carries <key> == <expected> for rd. Reads the live
+            # kernel config via `drbdsetup show <rd>` on the satellite
+            # pod scheduled on <node>, so it reflects the full
+            # Controller→RG→RD→Resource inheritance + "closer wins"
+            # precedence — not just what the CRD stored. Used to pin the
+            # effectiveprops controller-tier precedence fix end-to-end.
+            #
+            # spec fields:
+            #   rd        resource-definition name (substituted)
+            #   node      node whose satellite pod to probe (substituted)
+            #   key       drbd option token as drbdsetup prints it
+            #             (e.g. "max-buffers")
+            #   expected  expected value (string match)
+            #   namespace satellite namespace (default blockstor-system)
+            local rd node key expected ns pod actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
+            key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            ns=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('namespace','blockstor-system'))" "$spec")
+            pod=$(kubectl -n "$ns" get pods -l app=blockstor-satellite \
+                --field-selector "spec.nodeName=${node},status.phase=Running" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [[ -z "$pod" ]]; then
+                return 1
+            fi
+            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show "$rd" 2>/dev/null \
+                | awk -v k="$key" '$1==k { gsub(/;/,""); print $2; exit }')
+            [[ "$actual" == "$expected" ]]
+            ;;
         *)
             echo "    unknown assertion kind: $kind" >&2
             return 1
