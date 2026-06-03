@@ -23,6 +23,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/placer"
@@ -217,6 +218,22 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bug 397 (P0, DATA INTEGRITY): an explicit `--node-name` restore MUST
+	// NOT place a diskful replica on a node that does NOT hold the snapshot.
+	// Such a replica falls back to a BLANK CreateVolume on the satellite (no
+	// local snapshot, cross-node fetch may miss) and — if it then takes the
+	// skip-init-sync day0 seed — latches UpToDate while EMPTY: a silent
+	// data-integrity loss (an empty replica presenting as a good copy,
+	// promotable on failover). The auto-place branch already constrains
+	// placement to snap.Nodes via constrainAutoplaceToSnapshotNodes; mirror
+	// that contract here at the API edge for the explicit-node path so the
+	// bad placement is rejected BEFORE any Store mutation, matching upstream
+	// LINSTOR (restoring to a snapshot-less node errors clearly rather than
+	// silently placing an empty replica).
+	if !validateRestoreNodesHoldSnapshot(w, srcRD, snapName, &req, &snap) {
+		return
+	}
+
 	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap)
 	if err != nil {
 		writeStoreError(w, err)
@@ -228,6 +245,77 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		RetCode: maskInfo,
 		Message: "snapshot restored: " + snapName + " → " + newRDName,
 	}})
+}
+
+// validateRestoreNodesHoldSnapshot is the Bug 397 input-validation guard
+// for the explicit `--node-name` restore path. It rejects the request when
+// any requested node does NOT appear in the snapshot's node set
+// (snap.Nodes) — those nodes cannot clone the snapshot locally, so a
+// diskful replica stamped there would fall back to a blank volume and risk
+// latching UpToDate while empty.
+//
+// No-ops (returns true) when:
+//   - the caller supplied no explicit nodes (auto-place branch handles its
+//     own snap.Nodes constraint downstream);
+//   - the snapshot records no nodes (snap.Nodes empty) — we cannot prove a
+//     violation, so we defer to the satellite-side seed guard (defense in
+//     depth) rather than reject a possibly-legitimate request.
+//
+// Returns false (and writes the typed error envelope) when at least one
+// requested node is not in snap.Nodes.
+func validateRestoreNodesHoldSnapshot(w http.ResponseWriter, srcRD, snapName string, req *snapshotRestoreRequest, snap *apiv1.Snapshot) bool {
+	nodes := canonicalRestoreNodeList(req)
+	if len(nodes) == 0 {
+		return true
+	}
+
+	if len(snap.Nodes) == 0 {
+		return true
+	}
+
+	snapNodes := make(map[string]struct{}, len(snap.Nodes))
+	for _, n := range snap.Nodes {
+		snapNodes[n] = struct{}{}
+	}
+
+	var missing []string
+
+	seen := make(map[string]struct{}, len(nodes))
+
+	for _, n := range nodes {
+		if n == "" {
+			continue
+		}
+
+		if _, dup := seen[n]; dup {
+			continue
+		}
+
+		seen[n] = struct{}{}
+
+		if _, ok := snapNodes[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+
+	if len(missing) == 0 {
+		return true
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailNotFoundNode,
+		Message: "cannot restore snapshot '" + snapName + "' onto node(s) " +
+			strings.Join(missing, ", ") + ": the snapshot does not exist there",
+		Cause: "snapshot '" + snapName + "' on '" + srcRD + "' is present only on " +
+			strings.Join(snap.Nodes, ", ") + "; a diskful replica on a snapshot-less " +
+			"node would be created empty and could silently latch UpToDate without " +
+			"the snapshot's data",
+		Correc: "restore onto a node that holds the snapshot (" +
+			strings.Join(snap.Nodes, ", ") + "), or omit --node-name to auto-place " +
+			"onto the snapshot's nodes",
+	}})
+
+	return false
 }
 
 // resolveSnapshotName picks the snapshot name from the three accepted

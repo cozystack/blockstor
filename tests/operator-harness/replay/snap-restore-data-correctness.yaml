@@ -1,0 +1,113 @@
+name: snap-restore-data-correctness
+description: |
+  Bug-397 catcher (P0, DATA INTEGRITY). The round-3 hunt found there is
+  NO restore data-correctness replay today; this is it.
+
+  A snapshot-restore that targets a node LACKING the snapshot used to
+  fall back to a BLANK volume while leaving skip-init-sync enabled, so
+  the empty replica latched UpToDate WITHOUT syncing from the real
+  restored peer — silent data loss (an empty replica presenting as a
+  good copy, promotable on failover). Affects thin/ZFS providers (ZFS
+  is the cozystack default).
+
+  Two-layer defense, both exercised here:
+
+    A. INPUT GUARD — `snapshot resource restore` with an explicit node
+       list naming a node NOT in the snapshot's node set must be
+       REJECTED (non-zero), mirroring upstream LINSTOR, instead of
+       silently stamping an empty replica. Step `restore-snapshotless-
+       node-rejected` pins this; pre-fix the call returned 0 and placed
+       an empty replica on the snapshot-less node.
+
+    B. RESTORE CORRECTNESS — restoring onto the snapshot's OWN nodes
+       must converge every replica to UpToDate. Step `restore-onto-
+       snapshot-nodes` + the `all_uptodate` await pins this. The
+       satellite-side seed gate (defense in depth) ensures a
+       blank-fallback replica comes up Inconsistent and SyncTargets the
+       real restored peer rather than latching UpToDate empty; the
+       legitimate all-clone restore fast-path is preserved.
+
+  Sequence: 2-replica diskful RD on node1+node2 → snapshot (lives on
+  node1,node2 only) → restore targeting node1+node3 (node3 snapshot-
+  less) MUST be rejected → restore targeting node1+node2 converges
+  UpToDate on both. The harness data-presence check is the per-replica
+  marker read in the sibling L6 cell
+  (tests/e2e/cli-matrix/snap-restore-snapshotless-node-rejected.sh);
+  this replay codifies the operator sequence + the reject/converge
+  contract the harness can assert directly.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: snap397-src
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-source-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "snap397"]
+    expect_exit: 0
+  # ---- Layer A: restore onto a snapshot-less node MUST be rejected ----
+  # The snapshot lives on node1+node2 only. node3 does NOT hold it, so a
+  # diskful restore there would create an empty replica. The handler
+  # rejects this at the API edge (apiCallRcError envelope → CLI exit 10,
+  # matching the auto-place-no-drbd rejection idiom). Pre-fix this
+  # returned 0 and silently placed an empty replica on node3.
+  - name: restore-snapshotless-node-rejected
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}",
+          "--from-snapshot", "snap397",
+          "--to-resource", "snap397-tgt-bad",
+          "{{node1}}", "{{node3}}"]
+    expect_exit: 10
+  - name: rejected-restore-left-no-rd
+    cmd: ["resource-definition", "list", "--resource-definitions", "snap397-tgt-bad"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: snap397-tgt-bad
+      timeout_s: 30
+  # ---- Layer B: restore onto the snapshot's nodes converges UpToDate ----
+  - name: restore-onto-snapshot-nodes
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}",
+          "--from-snapshot", "snap397",
+          "--to-resource", "snap397-tgt-ok",
+          "{{node1}}", "{{node2}}"]
+    expect_exit: 0
+  - name: restored-replicas-all-uptodate
+    cmd: ["resource", "list", "--resources", "snap397-tgt-ok"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: snap397-tgt-ok
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "snap397-tgt-ok"]
+  - cmd: ["resource-definition", "delete", "snap397-tgt-bad"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "snap397"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
