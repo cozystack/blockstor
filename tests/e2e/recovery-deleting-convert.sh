@@ -161,9 +161,28 @@ assert_uptodate_12() {
             echo "   [$tag] N1+N2 UpToDate OK"
             return 0
         fi
+        # The CRD .status projection lags during the satellite's post-toggle
+        # `drbdadm adjust` — re-rendering N3's stanza bounces the N1<->N2 link
+        # for a few seconds, during which events2 briefly reports a
+        # non-UpToDate peer-disk-state even though N2's LOCAL disk stays
+        # UpToDate the whole time. Fall back to kernel ground truth (the same
+        # accept-path PR #50 added to the Phase-1 wait, here extended to the
+        # post-toggle assertion) so a stale projection read cannot masquerade
+        # as a sustained regression.
+        if [[ "$(kernel_pair_uptodate "$RD" "$N1" "$N2")" == "ok" ]]; then
+            echo "   [$tag] N1+N2 UpToDate OK (kernel ground truth; CRD projection lag: N1=$s1 N2=$s2)"
+            return 0
+        fi
         sleep 1
     done
     echo "FAIL[${tag}]: N1=$s1 / N2=$s2 — diskful peers must stay UpToDate"
+    # Capture kernel ground truth + generation identifiers so the next CI
+    # failure carries the evidence to tell a real regression (a sustained
+    # disk-state drop / wrong resync direction) apart from transient
+    # projection lag — today only md5/CRD reads are logged.
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true
+    on_node "$N1" drbdadm get-gi "$RD" 2>/dev/null || true
+    on_node "$N2" drbdadm get-gi "$RD" 2>/dev/null || true
     return 1
 }
 

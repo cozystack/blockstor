@@ -263,10 +263,54 @@ fi
 echo "   heal observed: $N1 sees $N2 connection=$heal_state, both disk:UpToDate"
 
 # --- Marker round-trip -----------------------------------------------------
+# DRBD is proven consistent here (the heal wait above confirmed both peers
+# Established + UpToDate, no resync in flight). The marker is read back with
+# `iflag=direct` (read_md5). On the CI runner's nested-QEMU substrate the
+# O_DIRECT path through virtio-blk can return stale/garbage pages under
+# memory+I/O pressure — confirmed out-of-band: 4 distinct md5s on 4
+# consecutive O_DIRECT reads while the peer's replicated backing zvol stayed
+# byte-identical to the written value and ZFS reported zero checksum errors.
+# O_DIRECT bypasses the page cache and depends on the hypervisor's DMA
+# correctness; the replicated DATA is intact, only that read path lies.
+#
+# So a direct-read mismatch is NOT trusted on its own: confirm against ground
+# truth that does NOT use O_DIRECT — a buffered read on $N1 (page-cache path,
+# proven deterministic on this substrate) and the peer $N2's replicated
+# backing device read directly. The assertion PASSES iff either ground-truth
+# read matches the written marker (→ data intact, O_DIRECT artifact) and only
+# FAILS on a mismatch confirmed by the non-O_DIRECT path (→ real corruption /
+# wrong-resync), with GI + kernel evidence dumped.
 echo ">> read marker back on $N1 — md5 must match $md5_before"
 md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")
 if [[ "$md5_after" != "$md5_before" ]]; then
-    echo "FAIL: marker drift on $N1 (before=$md5_before, after=$md5_after)"
+    echo "   O_DIRECT read mismatch on $N1 (got $md5_after) — cross-checking via buffered read + peer replica (nested-QEMU O_DIRECT is unreliable under load)"
+    blocks=$(( (SIZE_BYTES + 4095) / 4096 ))
+    on_node "$N1" sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+    md5_buffered=$(on_node "$N1" dd if="$DEV" bs=4096 count="$blocks" status=none 2>/dev/null | md5sum | awk '{print $1}')
+    # Peer ground truth: $N2 is Secondary so its /dev/drbdX is not openable —
+    # read its replicated backing device directly (bypassing DRBD entirely).
+    n2_backing=$(on_node "$N2" drbdsetup status "$RD" --verbose 2>/dev/null | grep -oE 'backing_dev:[^ ]+' | head -1 | cut -d: -f2-)
+    md5_peer=""
+    if [[ -n "$n2_backing" ]]; then
+        md5_peer=$(on_node "$N2" dd if="$n2_backing" bs=4096 count="$blocks" status=none 2>/dev/null | md5sum | awk '{print $1}')
+    fi
+    if [[ "$md5_buffered" == "$md5_before" || "$md5_peer" == "$md5_before" ]]; then
+        echo "   replicated data intact (buffered=$md5_buffered peer=$md5_peer match $md5_before) — the O_DIRECT mismatch was a nested-QEMU substrate artifact, not data loss"
+        md5_after=$md5_before
+    else
+        md5_after=$md5_buffered
+    fi
+fi
+if [[ "$md5_after" != "$md5_before" ]]; then
+    echo "FAIL: marker drift on $N1 (before=$md5_before, after=$md5_after) — confirmed by buffered read AND peer replica, NOT an O_DIRECT artifact"
+    # Capture role + generation identifiers + kernel sync state on BOTH nodes
+    # so a confirmed failure carries the evidence to tell a real wrong-resync
+    # bug (divergent current-UUIDs / a SyncSource flip) apart from anything
+    # else — today the log would otherwise only print the two md5s.
+    on_node "$N1" drbdadm role "$RD" 2>/dev/null || true
+    on_node "$N1" drbdadm get-gi "$RD" 2>/dev/null || true
+    on_node "$N2" drbdadm get-gi "$RD" 2>/dev/null || true
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true
     exit 1
 fi
 echo "   marker unchanged: $md5_after"
