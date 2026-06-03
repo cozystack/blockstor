@@ -465,10 +465,17 @@ func successDenominator(snap *apiv1.Snapshot, diskful map[string]struct{}) map[s
 }
 
 // diskfulPeerSet enumerates the Resources of an RD and returns the
-// set of node names whose Flags slice contains neither DISKLESS nor
-// TIE_BREAKER. NotFound on the RD soft-fails to an empty set —
-// matches handleSnapshotList's "treat orphan snapshot rows as
+// set of node names whose Flags slice contains neither DISKLESS,
+// TIE_BREAKER, nor INACTIVE. NotFound on the RD soft-fails to an empty
+// set — matches handleSnapshotList's "treat orphan snapshot rows as
 // renderable" stance.
+//
+// Bug 394: INACTIVE replicas are excluded from the snapshot target set
+// (listDiskfulNodes), so they never receive a Snapshots[] entry. They
+// must therefore also be excluded from the success denominator here,
+// otherwise an RD with an INACTIVE replica would hang at Incomplete
+// forever (the INACTIVE node can never satisfy the success check).
+// Mirrors the DISKLESS/TIE_BREAKER skips.
 func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]struct{}, error) {
 	resList, err := s.Store.Resources().ListByDefinition(ctx, rdName)
 	if err != nil {
@@ -488,6 +495,10 @@ func (s *Server) diskfulPeerSet(ctx context.Context, rdName string) (map[string]
 		}
 
 		if slices.Contains(flags, apiv1.ResourceFlagTieBreaker) {
+			continue
+		}
+
+		if slices.Contains(flags, apiv1.ResourceFlagInactive) {
 			continue
 		}
 
@@ -985,10 +996,18 @@ func (s *Server) offlineTargetNodes(ctx context.Context, targets []string) []str
 	return offline
 }
 
-// listDiskfulNodes returns the node names that host a diskful
+// listDiskfulNodes returns the node names that host an ACTIVE diskful
 // (non-DISKLESS) replica of rd. Used to default snap.Nodes when the
 // caller didn't pin a per-node list — matches upstream's
 // "snapshot all diskful replicas" semantic.
+//
+// Bug 394: an INACTIVE diskful replica holds data but its DRBD device
+// is down (`drbdadm down`), so the satellite cannot ack the snapshot
+// suspend-io barrier for it — that node reports Failed and the whole
+// snapshot group aborts (resume-on-abort). Exclude INACTIVE replicas
+// from the target node set, mirroring the DISKLESS skip; the INACTIVE
+// replica catches up on reactivation. Same INACTIVE-miscount class as
+// Bugs 387/390/393.
 func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, error) {
 	resList, err := s.Store.Resources().ListByDefinition(ctx, rd)
 	if err != nil {
@@ -999,6 +1018,10 @@ func listDiskfulNodes(ctx context.Context, s *Server, rd string) ([]string, erro
 
 	for i := range resList {
 		if slices.Contains(resList[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		if slices.Contains(resList[i].Flags, apiv1.ResourceFlagInactive) {
 			continue
 		}
 
