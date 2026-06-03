@@ -1,0 +1,62 @@
+name: r-c-autoplace-plus-one
+description: |
+  Corner-case campaign D2 (UG9 linstor-administration.adoc ~1246-1278):
+  `r c --auto-place +1 <rd>` adds EXACTLY ONE replica to the resource's
+  current diskful count, ignoring the parent RG's place-count. The
+  placement constraints still apply to the new replica.
+
+  This replay spawns a 2-replica RD from an RG, then runs
+  `--auto-place +1` and asserts the resource grows to exactly 3
+  replicas (existing + 1), all UpToDate. A regression that re-applied
+  the RG place-count (2) or miscounted a diskless/tiebreaker peer
+  toward the existing total would land the wrong replica count.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  rg: rg-d2-plusone
+  sp: stand
+
+steps:
+  - name: create-rg
+    cmd: ["resource-group", "create", "{{rg}}", "--place-count", "2", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: spawn-2r
+    cmd: ["resource-group", "spawn-resources", "{{rg}}", "{{rd}}", "32M"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: auto-place-plus-one
+    cmd: ["resource", "create", "--auto-place", "+1", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 90
+  - name: wait-3r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-group", "delete", "{{rg}}"]
+
+invariants:
+  - no_orphans
