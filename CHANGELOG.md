@@ -4,6 +4,14 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.9 — 2026-06-03
+
+Patch release with a single operator-reported fix. Versions v0.1.6–v0.1.8 are skipped: those tags pre-exist in the repository from an inherited lineage and do not correspond to blockstor releases.
+
+### Fixed
+
+- **Resource flaps forever after `vd d` (Bug 399, #92)** — deleting a volume definition removed the volume from the RD and the DRBD kernel, but two add-only projections never forgot it: the controller's RD → `Resource.spec.volumes` projection kept a stale entry, and the satellite observer's volume cache only evicted on the events2 `destroy device` frame — which a DISKLESS/tiebreaker replica never receives (it has no local disk to destroy) — so the observer re-emitted a phantom `status.volumes[n]=Diskless` every kernel tick, oscillating the resource status and PATCH-storming the apiserver ~1/s indefinitely. The controller now prunes `spec.volumes` entries absent from the RD, and the observer converges its volume cache against the live RD volume set (the `blockstor.io/volume-numbers` annotation), so both diskful and diskless replicas settle to exactly the remaining volumes. The e2e `volumes_settled` flap gate was also made kine-safe (volume-set stability across polls instead of resourceVersion equality, which k3s/kine inflates with the global store revision).
+
 ## v0.1.5 — 2026-06-03
 
 Large bug-fix release. Spans the REST API wire-validation surface (Bugs 356–383: input validation, typed `FAIL_*` envelopes, idempotency), the satellite DRBD / LUKS / metadata paths, and a multi-round operator-lifecycle bug-hunt that closed the four operator-reported DRBD lifecycle bugs the REST sweep missed plus their adjacent classes (Bugs 384–397). Every operator-facing fix lands with an L1/L2 unit/contract test, an L6 `cli-matrix` cell, and an L7 operator-replay workflow, validated on the live Talos+DRBD stand.
