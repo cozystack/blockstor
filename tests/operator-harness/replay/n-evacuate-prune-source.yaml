@@ -10,11 +10,25 @@ description: |
   ran at place_count+1 diskful forever with one copy pinned to an
   EVICTED node and the drain never finished.
 
+  REWORK (round 2): the first fix added an add-before-drop gate but
+  derived the drain target from the RG's place_count. This RD is created
+  with a bare `resource-definition create` (no --resource-group), so it
+  inherits the default DfltRscGrp whose place_count is 0. The first fix
+  then defaulted place_count to 1 — which made the placer treat the
+  single surviving peer as "satisfied" (no replacement placed) and the
+  readiness gate pass at 1 healthy replica, so the source was pruned and
+  the RD dropped to ONE diskful (drop-without-add, worse than the
+  original bug). This replay reproduces exactly that DfltRscGrp /
+  place_count=0 path: two manual `resource create <node>` replicas on a
+  zero-place_count RD. The rework derives the target from the CURRENT
+  diskful count (2), so a replacement MUST land before the source goes.
+
   Scenario (3-node): place 2 diskful replicas on node1 + node2, then
   evacuate node1. The placer gap-fills on node3 (the only free pool
   node). Assert: node3 reaches UpToDate (add-before-drop), the source
   on node1 is pruned (resource_absent), and node2 + node3 are both
-  UpToDate so redundancy was preserved throughout.
+  UpToDate so redundancy was preserved throughout (still 2 diskful,
+  never 1).
 
 prerequisites:
   min_nodes: 3
@@ -66,6 +80,19 @@ steps:
       kind: resource_absent
       rd: "{{rd}}"
       node: "{{node1}}"
+      timeout_s: 120
+  - name: assert-two-diskful-remain
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # REWORK assertion: the drain must leave the SAME diskful
+      # redundancy it started with (2), NOT drop to 1. The defective
+      # round-1 fix (place_count defaulted to 1 on the DfltRscGrp path)
+      # pruned the source without placing a replacement → exactly 1
+      # diskful, which this min:2 check catches.
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
       timeout_s: 120
   - name: wait-redundancy-preserved
     cmd: ["resource", "list", "--resources", "{{rd}}"]
