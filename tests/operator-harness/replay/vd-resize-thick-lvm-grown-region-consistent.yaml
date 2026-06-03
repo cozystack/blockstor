@@ -1,0 +1,115 @@
+name: vd-resize-thick-lvm-grown-region-consistent
+description: |
+  Bug 395 (P1, DATA INTEGRITY) operator-replay catcher for thick-LVM
+  resize. Drives the operator CLI sequence:
+
+    rd c → vd c 1G → r c --auto-place=2 -s <thick-LVM pool> → grow 1G→2G
+
+  on a thick LINSTOR `LVM` pool (kind=LVM, NOT LVM_THIN). Pre-fix the
+  satellite ran `drbdadm resize --assume-clean` unconditionally, which
+  marks the grown region [1G, 2G) UpToDate on every replica WITHOUT a
+  resync. For thick LVM that is unsound — `lvextend` exposes recycled
+  VG extents whose prior content differs per node, so the replicas
+  silently disagreed on the grown region (w1 read 0xA1, w2 read 0xB2
+  through the replicated /dev/drbd device) with out-of-sync:0 and no
+  split-brain flag. A failover then changed the bytes an application
+  read.
+
+  The fix makes resize provider-aware: thick LVM is non-zero-fill, so
+  the satellite OMITS `--assume-clean`, DRBD marks the grown region
+  out-of-sync and resyncs it from the UpToDate source. The
+  operator-visible signal of the resync is that the replicas pass
+  THROUGH a non-zero out-of-sync count and converge back to a CLEAN
+  `sync_clean` (UpToDate with no "(NN%)" suffix) — that is what this
+  workflow asserts.
+
+  The deep grown-region byte-identity check (read [1G, 2G) through the
+  replicated device on both replicas and assert equal) lives in the L6
+  cli-matrix cell
+  tests/e2e/cli-matrix/vd-resize-thick-lvm-grown-region-consistent.sh
+  — the replay runner drives the operator CLI + convergence; the
+  cli-matrix cell drives the raw cross-replica read on the live stand.
+
+  Zero-fill providers (zfs/thin/file) are unaffected and keep the
+  --assume-clean fast path — covered by vd-resize-full-lifecycle.yaml.
+
+  Requires a thick LINSTOR `LVM` pool registered on >=2 nodes. Set
+  vars.sp to that pool's name (default "lvm-thick"). If the stand only
+  has thin/zfs pools this workflow cannot exercise the bug.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: lvm-thick
+
+vars:
+  sp: lvm-thick
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-uptodate-1g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  # ---- Grow 1G → 2G (thick LVM: DRBD must resync the grown region) ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: wait-uptodate-2g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  # sync_clean is the load-bearing assertion: the grown region was
+  # resynced (out-of-sync briefly non-zero) and has now drained back to
+  # UpToDate WITHOUT a "(NN%)" suffix. Pre-fix the resync never ran, so
+  # this would pass trivially BUT the cli-matrix cell's cross-replica
+  # read catches the silent divergence; together they bracket the bug.
+  - name: sync-clean-2g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: sync_clean
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans

@@ -2230,7 +2230,18 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// disk to resize but they still need their internal state to
 	// catch up; drbdadm resize handles that case too.
 	if resized {
-		err := r.cfg.Adm.Resize(ctx, dr.GetName())
+		// Bug 395 (P1, data integrity): gate `--assume-clean` on whether
+		// the backing provider zero-fills the grown region. For thick
+		// `LVM` (non-zero-fill) we MUST omit `--assume-clean` so DRBD
+		// marks the grown region out-of-sync and resyncs it from the
+		// UpToDate source — otherwise replicas silently disagree on
+		// [old_size, new_size) (recycled VG extents differ per node).
+		// Diskless replicas have no backing disk and no provider, so the
+		// helper returns true (the notify-only resize there has no data
+		// region to mark; the diskful peers drive the resync).
+		assumeClean := r.resizeAssumeClean(dr)
+
+		err := r.cfg.Adm.Resize(ctx, dr.GetName(), assumeClean)
 		if err != nil {
 			return errors.Wrapf(err, "resize %s", dr.GetName())
 		}
@@ -2335,6 +2346,48 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	}
 
 	return nil
+}
+
+// resizeAssumeClean decides whether the pickup-time `drbdadm resize`
+// may pass `--assume-clean` (skip resync of the grown region) for this
+// resource (Bug 395, P1 data integrity).
+//
+// `--assume-clean` is sound ONLY when every diskful volume's backing
+// provider zero-fills the grown region [old_size, new_size) — i.e. the
+// grown bytes are deterministically zero on every replica. Classic
+// thick `LVM` does NOT (recycled VG extents differ per node), so for it
+// we return false and let DRBD mark the grown region out-of-sync and
+// resync it from the UpToDate source.
+//
+// A provider that does not implement storage.ResizeZeroFiller is
+// treated as non-zero-fill (the safe default → return false). A volume
+// whose pool is unknown to this satellite (e.g. a diskless replica with
+// no StoragePool, or a historical pool after a rename) is skipped: it
+// has no local backing disk to mark dirty, and the diskful peers'
+// reconcilers drive the cluster-wide resync decision. With no diskful
+// volume on this node the helper returns true (the notify-only resize
+// has nothing local to resync).
+func (r *Reconciler) resizeAssumeClean(dr *intent.DesiredResource) bool {
+	for _, vol := range dr.GetVolumes() {
+		pool := vol.GetStoragePool()
+		if pool == "" {
+			continue
+		}
+
+		provider, ok := r.cfg.Providers[pool]
+		if !ok {
+			continue
+		}
+
+		zf, ok := provider.(storage.ResizeZeroFiller)
+		if !ok || !zf.ResizeZeroFills() {
+			// Non-zero-fill (or capability not declared): the grown
+			// region must be resynced — omit `--assume-clean`.
+			return false
+		}
+	}
+
+	return true
 }
 
 // maybeRecoveryPromote re-arms the auto-primary seed on a steady-state
