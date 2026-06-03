@@ -219,3 +219,61 @@ func TestCornerB_ApplyPropsModifyEmptyDeletes(t *testing.T) {
 		t.Errorf("nil bag with delete should allocate, got nil")
 	}
 }
+
+// TestCornerB_DefaultQuorumPairIsDeliberateDelta pins corner-case B6
+// and the DELIBERATE DELTA it records.
+//
+// UG9 §"Auto-quorum policies" TIP (~4251-4253): the upstream LINSTOR
+// default policy pair is `quorum majority` + `on-no-quorum io-error`.
+// blockstor INTENTIONALLY diverges on the second half — it seeds
+// `on-no-quorum=suspend-io` instead (Bug 297, P1 data-loss class:
+// io-error freezes the minority replica in a state that survives
+// partition heal and breaks auto-promote; suspend-io blocks I/O until
+// quorum returns, then resumes cleanly). This divergence is recorded
+// in docs/cli-parity-known-deltas.md and must NOT be silently
+// "fixed" back to io-error.
+//
+// This test is the guard: it pins the actual blockstor seed so a
+// future refactor that flips it back to io-error fails loudly and the
+// author is forced to confront the Bug 297 rationale + the delta row.
+func TestCornerB_DefaultQuorumPairIsDeliberateDelta(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.ResourceDefinitionCreate{
+		ResourceDefinition: apiv1.ResourceDefinition{Name: "cc-b-defaults"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201; body=%s", resp.StatusCode, readAll(t, resp))
+	}
+
+	got, err := st.ResourceDefinitions().Get(t.Context(), "cc-b-defaults")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	// First half MATCHES upstream verbatim: auto-quorum=majority.
+	if got.Props[cbAutoQuorumKey] != "majority" {
+		t.Errorf("B6: %s: got %q, want %q (upstream default, must match)",
+			cbAutoQuorumKey, got.Props[cbAutoQuorumKey], "majority")
+	}
+
+	// Second half is the DELIBERATE DELTA: blockstor seeds suspend-io,
+	// NOT the upstream-documented io-error. Pin suspend-io so a flip
+	// back to io-error (reintroducing the Bug 297 data-loss) is caught.
+	if got.Props[cbOnNoQuorumKey] != "suspend-io" {
+		t.Errorf("B6 DELIBERATE DELTA: %s: got %q, want %q "+
+			"(blockstor diverges from upstream io-error for Bug 297 data-safety; "+
+			"see docs/cli-parity-known-deltas.md)",
+			cbOnNoQuorumKey, got.Props[cbOnNoQuorumKey], "suspend-io")
+	}
+}
