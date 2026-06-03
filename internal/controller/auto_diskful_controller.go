@@ -116,7 +116,12 @@ func (r *AutoDiskfulReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	diskful, candidates := splitDiskfulAndCandidates(replicas)
+	disabled, err := r.disabledNodeSet(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	diskful, candidates := splitDiskfulAndCandidates(replicas, disabled)
 
 	if int32(len(diskful)) >= placeCount { //nolint:gosec // len of an in-memory slice fits int32
 		// Cluster is back at full diskful health — clear the timer.
@@ -432,18 +437,43 @@ func (r *AutoDiskfulReconciler) now() time.Time {
 	return time.Now()
 }
 
-// splitDiskfulAndCandidates partitions an RD's replicas. Diskful is
-// "no DISKLESS flag at all". Candidates are diskless replicas without
-// the TIE_BREAKER flag — promoting a witness defeats its sole purpose
+// splitDiskfulAndCandidates partitions an RD's replicas.
+//
+// A replica sitting on a disabled (EVICTED/LOST) node is dropped from
+// BOTH buckets: it must not be counted as a live diskful (Bug 390 #2 —
+// otherwise the deficit from the lost node is masked and the timer
+// never arms), and it must not be selected as a promotion candidate
+// (Bug 390 #4 — promoting onto a draining/gone node re-creates diskful
+// storage where the operator is trying to drain). This mirrors the
+// placer's countDiskfulReplicas / disabledNodes gating.
+//
+// Diskful is "no DISKLESS flag and not INACTIVE". An INACTIVE replica
+// (`drbdadm down`) serves no I/O and must not satisfy place_count for
+// auto-repair purposes (Bug 390 #3 — same miscount class Bug 387 fixed
+// at the tiebreaker entry).
+//
+// Candidates are active, non-disabled diskless replicas without the
+// TIE_BREAKER flag — promoting a witness defeats its sole purpose
 // (network presence for quorum) and would burn storage on what's
 // supposed to be a free vote.
-func splitDiskfulAndCandidates(replicas []apiv1.Resource) ([]apiv1.Resource, []apiv1.Resource) {
+func splitDiskfulAndCandidates(replicas []apiv1.Resource, disabled map[string]struct{}) ([]apiv1.Resource, []apiv1.Resource) {
 	var (
 		diskful    []apiv1.Resource
 		candidates []apiv1.Resource
 	)
 
 	for i := range replicas {
+		if _, off := disabled[replicas[i].NodeName]; off {
+			// Replica on an EVICTED/LOST node — treat as absent.
+			continue
+		}
+
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagInactive) {
+			// `drbdadm down` — serves no I/O, never counts toward
+			// place_count and is not a promotion candidate.
+			continue
+		}
+
 		if !slices.Contains(replicas[i].Flags, apiv1.ResourceFlagDiskless) {
 			diskful = append(diskful, replicas[i])
 
@@ -458,6 +488,29 @@ func splitDiskfulAndCandidates(replicas []apiv1.Resource) ([]apiv1.Resource, []a
 	}
 
 	return diskful, candidates
+}
+
+// disabledNodeSet returns the EVICTED/LOST node names as a lookup set,
+// reusing the shared isDisabledNode predicate (defined alongside the
+// RD-controller tiebreaker path) so auto-diskful gates on exactly the
+// same disabled-node definition the placer uses. Eviction is the
+// operator's drain signal: a replica on such a node must not be counted
+// as live, and must never be a promotion target.
+func (r *AutoDiskfulReconciler) disabledNodeSet(ctx context.Context) (map[string]struct{}, error) {
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]struct{}, len(nodes))
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			out[nodes[i].Name] = struct{}{}
+		}
+	}
+
+	return out, nil
 }
 
 // parsePositiveMinutes accepts the upstream-LINSTOR property shape:

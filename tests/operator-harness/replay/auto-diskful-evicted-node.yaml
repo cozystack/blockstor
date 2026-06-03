@@ -1,0 +1,77 @@
+name: auto-diskful-evicted-node
+description: |
+  Bug-390 catcher. The auto-diskful controller partitions an RD's
+  replicas to decide whether place_count is satisfied. Pre-fix the
+  partition was blind to node state: a diskful replica on an
+  EVICTED/LOST node was still counted as a live diskful, so the deficit
+  created by draining a node was masked and never repaired.
+
+  Workflow: autoplace 3 diskful replicas, arm DrbdOptions/auto-diskful,
+  then `node evacuate {{node3}}`. The evicted node's diskful must stop
+  counting toward place_count, so the controller refills a replacement
+  diskful on a HEALTHY node and the cluster reconverges to 3 UpToDate
+  replicas — none stuck on the draining node (a replica stranded on the
+  evicted node could never report UpToDate, so all_uptodate is the
+  convergence gate here).
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: place-n1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool=stand"]
+    expect_exit: 0
+  - name: place-n2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool=stand"]
+    expect_exit: 0
+  - name: place-n3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool=stand"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 120
+  - name: wait-all-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: arm-auto-diskful
+    cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", "1"]
+    expect_exit: 0
+  - name: evacuate-n3
+    cmd: ["node", "evacuate", "{{node3}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 240
+  - name: wait-refill-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["node", "evacuate", "--restore", "{{node3}}"]
+  - cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", ""]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
