@@ -1,0 +1,86 @@
+name: vd-d-prune-resource-volumes-no-flap
+description: |
+  Bug-399 catcher (operational flap) — the `vd d` REMOVE-side mirror of
+  the Bug-384 late-add. Create a 2-volume RD, drive both volumes
+  UpToDate, then `vd d` the second volume and assert the per-node
+  Resource CRDs converge to exactly [vol-0] with NO status flap.
+
+  Pre-fix: RD.spec.volumeDefinitions correctly drops to [vol-0] and the
+  satellite removes volume:1 from the DRBD kernel + deletes its backing
+  LV, BUT the controller's RD -> Resource.spec.volumes projection was
+  ADD-ONLY (ensureSeedFromGI / setSeedFromGI only ever append), so the
+  per-node Resource.spec.volumes still carried {volumeNumber:1}. That
+  stale entry kept the controller "knowing" about vol-1, so the phantom
+  status.volumes[1]=Diskless entry (vol-1's backing gone) was never
+  garbage-collected — and the observer's volCache, which had no
+  destroy-device path, kept re-emitting it. Result: status.volumes
+  oscillated between [v0:UpToDate] and [v0:UpToDate, v1:Diskless] and
+  metadata.resourceVersion churned ~1/s forever (an apiserver PATCH
+  storm).
+
+  Post-fix: the controller prunes Resource.spec.volumes entries absent
+  from the RD (pruneStaleResourceVolumes), and the observer evicts the
+  removed volume from volCache on the `destroy device` frame so it stops
+  re-emitting the phantom status entry. spec.volumes + status.volumes
+  converge to exactly [vol-0] and resourceVersion goes stable.
+
+  The volumes_settled await is the no-flap gate: it asserts every
+  Resource of the RD carries EXACTLY the {0} volume set in both
+  spec.volumes and status.volumes AND that metadata.resourceVersion is
+  identical across a settle window (a still-flapping Resource bumps it).
+
+  Unit pins (BS + kernel halves of this operator-level catcher):
+    internal/controller/bug_399_vd_d_prune_resource_volumes_test.go
+    pkg/satellite/controllers/bug_399_volume_evict_test.go
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    # 64M: Bug 399 is a deterministic projection/eviction defect, not a
+    # sync-timing race, so the trigger is size-independent. Small volume
+    # converges in seconds on the I/O-constrained stand.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: create-vol1
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-both-volumes-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: vd-d-vol1
+    # THE BUG: remove vol-1 from the 2-volume RD.
+    cmd: ["volume-definition", "delete", "{{rd}}", "1"]
+    expect_exit: 0
+    await:
+      # spec.volumes + status.volumes must converge to exactly [0] AND
+      # resourceVersion must be stable over the settle window (no flap).
+      kind: volumes_settled
+      rd: "{{rd}}"
+      expected: "0"
+      settle_s: 8
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

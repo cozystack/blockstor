@@ -370,11 +370,90 @@ except Exception:
             actual=$(kubectl -n "$ns" exec "$pod" -- sh -c "md5sum '$path' 2>/dev/null | awk '{print \$1}'" 2>/dev/null || echo "")
             [[ -n "$expected" && "$actual" == "$expected" ]]
             ;;
+        volumes_settled)
+            # Bug 399: after `vd d`, every Resource of rd must converge
+            # to EXACTLY the expected volume-number set in BOTH
+            # spec.volumes and status.volumes, AND stop flapping. The
+            # bug left a stale spec.volumes[removed] + phantom
+            # status.volumes[removed]=Diskless that the observer kept
+            # re-emitting, churning metadata.resourceVersion ~1/s.
+            #
+            # spec: `expected` is a comma-separated volume-number set
+            # (e.g. "0"). We assert two things in one pass:
+            #   (a) no Resource carries a volume NOT in `expected` in
+            #       either spec.volumes or status.volumes (the prune /
+            #       status-GC half), and every diskful replica carries
+            #       all expected volumes in spec.volumes;
+            #   (b) metadata.resourceVersion is IDENTICAL across two
+            #       snapshots taken `settle_s` apart (the no-flap half) —
+            #       a still-flapping Resource bumps it within the window.
+            local rd expected settle_s
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected','0'))" "$spec")
+            settle_s=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('settle_s',6))" "$spec")
+
+            local snap1 snap2
+            snap1=$(volumes_settled_snapshot "$rd" "$expected") || return 1
+            # snapshot non-empty + volume sets correct?
+            [[ "$snap1" == VOLSET_BAD* ]] && return 1
+            [[ -z "$snap1" ]] && return 1
+
+            sleep "$settle_s"
+
+            snap2=$(volumes_settled_snapshot "$rd" "$expected") || return 1
+            [[ "$snap2" == VOLSET_BAD* ]] && return 1
+            [[ -z "$snap2" ]] && return 1
+
+            # Identical resourceVersion map across the window => no flap.
+            [[ "$snap1" == "$snap2" ]]
+            ;;
         *)
             echo "    unknown assertion kind: $kind" >&2
             return 1
             ;;
     esac
+}
+
+# volumes_settled_snapshot <rd> <expected-csv>
+#
+# Helper for the volumes_settled assertion (Bug 399). Emits a stable,
+# sorted "<name>=<resourceVersion>" line per Resource of rd, but ONLY if
+# every Resource's spec.volumes and status.volumes volume-number sets
+# are consistent with the expected set:
+#   - no volume present that is NOT in `expected` (stale / phantom);
+#   - status.volumes may be a SUBSET (a freshly-observed replica may not
+#     have stamped every volume yet, and diskless/tiebreaker rows carry
+#     fewer) but must never carry an out-of-set volume.
+# Prints "VOLSET_BAD <detail>" (and returns 0) when a volume-set
+# violation is found, so the caller treats it as not-yet-settled.
+volumes_settled_snapshot() {
+    local rd=$1 expected=$2
+    kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+        | EXPECTED="$expected" RD="$rd" python3 -c "import json,sys,os
+d=json.load(sys.stdin)
+rd=os.environ['RD']
+expected=set(int(x) for x in os.environ['EXPECTED'].split(',') if x.strip()!='')
+rows=[]
+seen=0
+for it in d.get('items',[]):
+    sp=it.get('spec',{})
+    if sp.get('resourceDefinitionName')!=rd: continue
+    seen+=1
+    name=it.get('metadata',{}).get('name','')
+    rv=it.get('metadata',{}).get('resourceVersion','')
+    spec_nums=set(v.get('volumeNumber') for v in (sp.get('volumes') or []))
+    st_nums=set(v.get('volumeNumber') for v in ((it.get('status',{}) or {}).get('volumes') or []))
+    # Any volume outside the expected set is a stale spec entry or a
+    # phantom status entry -> not settled.
+    if (spec_nums - expected) or (st_nums - expected):
+        print('VOLSET_BAD %s spec=%s status=%s expected=%s' % (name, sorted(x for x in spec_nums if x is not None), sorted(x for x in st_nums if x is not None), sorted(expected)))
+        sys.exit(0)
+    rows.append('%s=%s' % (name, rv))
+if seen==0:
+    # rd not observed yet -> not settled (empty output).
+    sys.exit(0)
+rows.sort()
+print('\n'.join(rows))"
 }
 
 # ----------------------------------------------------------------------

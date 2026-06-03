@@ -60,6 +60,10 @@
 #   - vd_size_kib          VolumeDefinition.size_kib equals expected_kib
 #   - pvc_capacity         PVC.Status.Capacity.storage matches expected
 #   - pod_md5_invariant    md5sum of file inside pod matches expected baseline
+#   - volumes_settled      every Resource of rd carries EXACTLY the
+#                           expected volume-number set in spec.volumes +
+#                           status.volumes AND metadata.resourceVersion
+#                           is stable over settle_s (Bug 399 no-flap)
 #
 # Invariants (post-teardown):
 #
