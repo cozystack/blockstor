@@ -304,6 +304,51 @@ print(bad)")
             present=$(linstor_cli resource list --resources "$rd" 2>/dev/null | grep -c 'TieBreaker' || true)
             [[ "$present" -ge 1 ]]
             ;;
+        prop_value)
+            # Corner-case B (B1/B4/B5): assert a property on an
+            # RD/RG list-properties surface. spec fields:
+            #   obj:      "rd" (default) or "rg" — which object kind
+            #   name:     RD or RG name ({{rd}} / {{rg}} substituted)
+            #   key:      property key (e.g. DrbdOptions/Resource/quorum)
+            #   expected: desired value. If OMITTED or "", the key must
+            #             be ABSENT (empty-value=delete / B5). Otherwise
+            #             the key must be present with exactly this value.
+            # Uses the machine-readable `-m` properties listing so the
+            # parse is column-agnostic (the python human table aligns
+            # differently across client versions).
+            local p_kind p_name p_key p_expected p_obj p_actual p_present
+            p_kind=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('obj','rd'))" "$spec")
+            p_name=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name',''))" "$spec")")
+            p_key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
+            p_expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
+            if [[ "$p_kind" == "rg" ]]; then
+                p_obj=$(linstor_cli -m resource-group list-properties "$p_name" 2>/dev/null || echo "")
+            else
+                p_obj=$(linstor_cli -m resource-definition list-properties "$p_name" 2>/dev/null || echo "")
+            fi
+            # The -m list-properties payload is a list of {key,value}
+            # entries (possibly double-nested by golinstor). Resolve the
+            # value for p_key, reporting present/absent + the value.
+            read -r p_present p_actual < <(printf '%s' "$p_obj" | KEY="$p_key" python3 -c "import json,sys,os
+key=os.environ['KEY']
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print('0 '); sys.exit(0)
+while isinstance(d, list) and d and isinstance(d[0], list):
+    d=d[0]
+for it in d if isinstance(d, list) else []:
+    if not isinstance(it, dict): continue
+    if it.get('key')==key:
+        print('1 '+str(it.get('value',''))); sys.exit(0)
+print('0 ')")
+            if [[ -z "$p_expected" ]]; then
+                # Absence assertion (B5).
+                [[ "$p_present" == "0" ]]
+            else
+                [[ "$p_present" == "1" && "$p_actual" == "$p_expected" ]]
+            fi
+            ;;
         sync_clean)
             local rd
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")

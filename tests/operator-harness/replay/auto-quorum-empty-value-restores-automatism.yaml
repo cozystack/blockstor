@@ -1,0 +1,85 @@
+name: auto-quorum-empty-value-restores-automatism
+description: |
+  Corner-case B2/B5 catcher. Two intents in one operator sequence:
+
+  B2 — auto-quorum=disabled set BEFORE the resource is placed does NOT
+  suppress the auto-TieBreaker: the witness is gated on the SEPARATE
+  `DrbdOptions/auto-add-quorum-tiebreaker` prop, so a 2-diskful place
+  still grows a TieBreaker. While disabled, the controller leaves the
+  quorum policy alone (operator owns it).
+
+  B5 — clearing `DrbdOptions/auto-quorum` with an EMPTY value DELETES
+  the property entirely (UG9 NOTE ~4277-4279), not stores "". Once the
+  key is gone the automatism resumes and re-asserts quorum=majority on
+  the 2-diskful+witness shape on its own.
+
+  Verbatim operator repro:
+    $ linstor rd set-property {{rd}} DrbdOptions/auto-quorum disabled
+    $ linstor r c --auto-place 2 --storage-pool=stand {{rd}}   # TB still appears
+    $ linstor rd set-property {{rd}} DrbdOptions/auto-quorum     # empty = delete
+    $ linstor rd lp {{rd}} | grep auto-quorum                    # key GONE
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: disable-auto-quorum-before-spawn
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/auto-quorum", "disabled"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: tiebreaker-created-despite-disabled
+    # B2: auto-quorum=disabled does NOT gate the TieBreaker.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: clear-auto-quorum-empty-value
+    # B5: empty value = delete the property entirely.
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/auto-quorum"]
+    expect_exit: 0
+  - name: auto-quorum-key-gone
+    cmd: ["resource-definition", "list-properties", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: rd
+      name: "{{rd}}"
+      key: "DrbdOptions/auto-quorum"
+      # expected omitted ⇒ key must be ABSENT.
+      timeout_s: 30
+  - name: automatism-resumes-quorum-majority
+    # With the key deleted the reconciler manages quorum again and
+    # re-asserts majority on the 2-diskful+witness shape.
+    cmd: ["resource-definition", "list-properties", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: rd
+      name: "{{rd}}"
+      key: "DrbdOptions/Resource/quorum"
+      expected: "majority"
+      timeout_s: 45
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

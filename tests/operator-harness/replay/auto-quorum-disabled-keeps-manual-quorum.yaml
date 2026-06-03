@@ -1,0 +1,98 @@
+name: auto-quorum-disabled-keeps-manual-quorum
+description: |
+  Corner-case B1/B4 catcher. Pins that `DrbdOptions/auto-quorum
+  disabled` (the canonical kebab-case key the upstream CLI writes)
+  actually takes effect: once disabled, the auto-quorum reconciler
+  must STOP overwriting the operator's manual `DrbdOptions/Resource/
+  quorum` on every pass, and the auto-added TieBreaker (gated on a
+  SEPARATE prop, DrbdOptions/auto-add-quorum-tiebreaker) must stay in
+  place — disabling auto-quorum does NOT reap the witness.
+
+  Pre-fix root cause: the controller read the camelCase
+  `DrbdOptions/AutoQuorum` key, which no production path ever wrote,
+  so a real `set-property DrbdOptions/auto-quorum disabled` was
+  silently ignored and the reconciler re-stamped quorum=majority on
+  the 2-diskful+TB shape every reconcile — clobbering the operator's
+  manual `quorum off`.
+
+  Verbatim operator repro:
+    $ linstor rd set-property {{rd}} DrbdOptions/auto-quorum disabled
+    $ linstor rd set-property {{rd}} DrbdOptions/Resource/quorum off
+    $ linstor rd lp {{rd}} | grep quorum
+    DrbdOptions/Resource/quorum  off       # must STAY off, not revert
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-2
+    # 2 diskful + auto-tiebreaker → canonical 2r-tb shape.
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: wait-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: confirm-auto-quorum-majority
+    # Default seed: auto-quorum=majority drives quorum=majority on the
+    # 2-diskful+witness shape.
+    cmd: ["resource-definition", "list-properties", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: rd
+      name: "{{rd}}"
+      key: "DrbdOptions/Resource/quorum"
+      expected: "majority"
+      timeout_s: 60
+  - name: disable-auto-quorum
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/auto-quorum", "disabled"]
+    expect_exit: 0
+  - name: set-manual-quorum-off
+    cmd: ["resource-definition", "set-property", "{{rd}}", "DrbdOptions/Resource/quorum", "off"]
+    expect_exit: 0
+  - name: manual-quorum-survives
+    # The fix: auto-quorum=disabled must stop the reconciler from
+    # reverting quorum back to majority. Poll long enough to cover
+    # several reconcile passes (rdReconcileRequeue = 5s).
+    cmd: ["resource-definition", "list-properties", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: rd
+      name: "{{rd}}"
+      key: "DrbdOptions/Resource/quorum"
+      expected: "off"
+      timeout_s: 45
+  - name: tiebreaker-still-present
+    # Disabling auto-quorum does NOT reap the witness — it is gated on
+    # a separate prop.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
