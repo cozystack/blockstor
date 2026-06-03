@@ -457,6 +457,117 @@ func TestAutoDiskfulPropHierarchyRDWins(t *testing.T) {
 	}
 }
 
+// setRGAutoDiskful stamps the auto-diskful minutes prop on the
+// fixture's resource group ("rg"). The seedAutoDiskfulFixture helper
+// only exposes Controller + RD scope; the middle (RG) layer is set
+// here so the full Controller<RG<RD priority chain can be exercised.
+func setRGAutoDiskful(t *testing.T, ctx context.Context, st store.Store, minutes string) {
+	t.Helper()
+
+	rg, err := st.ResourceGroups().Get(ctx, "rg")
+	if err != nil {
+		t.Fatalf("get rg: %v", err)
+	}
+
+	if rg.Props == nil {
+		rg.Props = map[string]string{}
+	}
+
+	rg.Props[apiv1.AutoDiskfulPropKey] = minutes
+
+	if err := st.ResourceGroups().Update(ctx, &rg); err != nil {
+		t.Fatalf("update rg props: %v", err)
+	}
+}
+
+// TestAutoDiskfulPropHierarchyRGWins pins the MIDDLE layer of the
+// Controller < RG < RD priority chain (UG9 §"Setting the auto-diskful
+// option on a resource group or controller"): with the RD prop UNSET,
+// the RG-scope prop must override the cluster-scope ControllerProps
+// default. This is the layer the existing RDWins test skips over —
+// without it a regression that read Controller instead of RG when RD
+// is absent would go unnoticed.
+func TestAutoDiskfulPropHierarchyRGWins(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	rd := seedAutoDiskfulFixture(t, ctx, st,
+		2, "30" /* ctrl=30min */, "", /* rd unset → RG must win */
+		[]string{"n1"},
+		[]string{"n2", "n3"},
+	)
+
+	setRGAutoDiskful(t, ctx, st, "7") // rg=7min — between ctrl and the RDWins test's 2
+
+	t0 := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+
+	rec := &controllerpkg.AutoDiskfulReconciler{
+		Store: st,
+		Now:   func() time.Time { return t0 },
+	}
+
+	res, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: rd.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if res.RequeueAfter != 7*time.Minute {
+		t.Errorf("requeue used ControllerProps minutes, expected RG scope: got %v, want 7m",
+			res.RequeueAfter)
+	}
+
+	got, err := st.ResourceDefinitions().Get(ctx, rd.Name)
+	if err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	want := t0.Add(7 * time.Minute).Format(time.RFC3339)
+
+	if got.Annotations[apiv1.AutoDiskfulDeadlineAnnotation] != want {
+		t.Errorf("deadline used cluster prop: got %q, want %q (RG scope wins over Controller)",
+			got.Annotations[apiv1.AutoDiskfulDeadlineAnnotation], want)
+	}
+}
+
+// TestAutoDiskfulPropHierarchyRDBeatsRG pins the top of the chain when
+// ALL THREE scopes are set: RD must win over both RG and Controller.
+// Complements RGWins (RG beats Controller) and RDWins (RD beats
+// Controller) — together the three tests cover every edge of the
+// Controller < RG < RD lattice the UG9 hierarchy spec mandates.
+func TestAutoDiskfulPropHierarchyRDBeatsRG(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewInMemory()
+
+	rd := seedAutoDiskfulFixture(t, ctx, st,
+		2, "30" /* ctrl=30 */, "3", /* rd=3 must win */
+		[]string{"n1"},
+		[]string{"n2", "n3"},
+	)
+
+	setRGAutoDiskful(t, ctx, st, "7") // rg=7 — must be overridden by rd=3
+
+	t0 := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+
+	rec := &controllerpkg.AutoDiskfulReconciler{
+		Store: st,
+		Now:   func() time.Time { return t0 },
+	}
+
+	res, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: rd.Name}})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if res.RequeueAfter != 3*time.Minute {
+		t.Errorf("requeue used RG/Controller minutes, expected RD scope: got %v, want 3m",
+			res.RequeueAfter)
+	}
+}
+
 // TestAutoDiskfulDisabledByZeroProp: a non-positive / unparseable
 // prop disables the feature at every scope. No deadline is stamped;
 // any stale deadline is stripped.
