@@ -1,0 +1,101 @@
+name: rd-d-blocked-by-snapshot
+description: |
+  Corner-case E1 (deletion semantics), UG9 linstor-administration.adoc
+  ~1364-1366, ~1395. Two asymmetric deletion rules an operator relies on:
+
+    1. `rd d <rd>` is REFUSED while the RD still has snapshots — the
+       operator must drop the snapshots first. Upstream raises
+       FAIL_EXISTS_SNAPSHOT_DFN ("... because it has snapshots."),
+       surfaced by the linstor CLI as a non-zero exit (apiCallRcError
+       envelope → exit 10).
+
+    2. `r d <node> <rd>` of a SINGLE replica is NOT blocked by snapshots:
+       it drops one per-node replica and the snapshots SURVIVE.
+
+  Sequence: 2-replica diskful RD on node1+node2 → snapshot → `rd d` MUST
+  be rejected (snapshot present) → `r d node2` MUST succeed (snapshot
+  survives) → drop the snapshot → `rd d` MUST succeed.
+
+  The snapshot guard lives only on the RD-delete handler
+  (pkg/rest/resource_definitions.go::handleRDDelete); this replay codifies
+  the exact operator sequence so a refactor that wired the guard onto the
+  per-replica delete path would FAIL here, not just in the L1 mock.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: cce-e1-rdsnap
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "cce-e1-snap"]
+    expect_exit: 0
+  # ---- Contract 1: rd d refused while a snapshot exists ----
+  - name: rd-d-rejected-by-snapshot
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 10
+  # The RD must survive the refused delete.
+  - name: rd-still-present-after-rejection
+    cmd: ["resource-definition", "list", "--resource-definitions", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 30
+  # ---- Contract 2: single-replica r d is NOT blocked; snapshot survives ----
+  - name: r-d-single-replica-allowed
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+  - name: r-d-took-effect
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 60
+  # Snapshot must STILL be present — `rd d` is still refused.
+  - name: rd-d-still-refused-snapshot-survived
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 10
+  # ---- Contract 3: drop the snapshot, then rd d succeeds ----
+  - name: snapshot-delete
+    cmd: ["snapshot", "delete", "{{rd}}", "cce-e1-snap"]
+    expect_exit: 0
+  - name: rd-d-now-succeeds
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["snapshot", "delete", "{{rd}}", "cce-e1-snap"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
