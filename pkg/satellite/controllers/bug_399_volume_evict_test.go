@@ -19,9 +19,17 @@ limitations under the License.
 package controllers
 
 import (
+	"context"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/drbd"
+	"github.com/cozystack/blockstor/pkg/storage"
 )
 
 // Bug 399: after `vd d` removes a volume, drbdsetup emits
@@ -174,5 +182,242 @@ func TestMergeVolumesDestroyUnknownVolumeNoop(t *testing.T) {
 
 	if phantom {
 		t.Errorf("destroy of unknown volume added a phantom cache entry")
+	}
+}
+
+// Bug 399 (diskless/tiebreaker facet): the partial fix stopped the flap
+// on diskful replicas (the `destroy device` eviction above), but a
+// DISKLESS / tiebreaker replica still flapped. A diskless replica has no
+// local backing disk to tear down, so drbd-9 never emits a
+// `destroy device` frame for its removed volume — its `vN:Diskless`
+// device frame simply stops arriving. With no destroy signal the
+// append-only volCache kept the stale entry forever and the observer
+// re-emitted a phantom Status.Volumes[n] on every resync tick. The fix:
+// converge the cache to the RD's live volume set (the
+// `blockstor.io/volume-numbers` annotation the reconciler stamps), which
+// is destroy-event-independent. These tests pin that convergence.
+
+// TestPruneVolumeCacheToDesiredEvictsDisklessOrphan is the diskless
+// flap-stopper. The cache holds two Diskless volumes (the tiebreaker's
+// 2-volume view before `vd d 1`). No `destroy device` ever arrives for
+// volume 1 (the diskless replica has no disk to destroy). The prune
+// against an RD whose annotation now lists only "0" must evict volume 1,
+// re-emit a snapshot carrying only volume 0, and a subsequent tick must
+// NOT resurrect volume 1 — that resurrection was the flap.
+func TestPruneVolumeCacheToDesiredEvictsDisklessOrphan(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{NodeName: "worker-3"}
+
+	// Diskless replica caches both volumes via `device disk:Diskless`
+	// frames — exactly how a tiebreaker reports its volumes.
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Diskless"}},
+	})
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 1, DiskState: "Diskless"}},
+	})
+
+	// `vd d 1` removed volume 1 from the RD. The reconciler re-stamped
+	// the annotation to "0". No `destroy device` frame for the diskless
+	// replica — the only convergence signal is the desired set.
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "flap399.worker-3",
+			Annotations: map[string]string{
+				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0",
+			},
+		},
+	}
+
+	ev := &observation{ResourceName: "flap399"}
+	o.pruneVolumeCacheToDesired(ev, res)
+
+	if got := volSet(ev.Volumes); got[1] || !got[0] {
+		t.Errorf("snapshot after prune = %v, want only volume 0", got)
+	}
+
+	o.volMu.Lock()
+	_, vol1Present := o.volCache["flap399"][1]
+	cacheLen := len(o.volCache["flap399"])
+	o.volMu.Unlock()
+
+	if vol1Present {
+		t.Errorf("volume 1 still cached after prune — diskless flap would persist")
+	}
+
+	if cacheLen != 1 {
+		t.Errorf("volCache len = %d, want 1 (only volume 0)", cacheLen)
+	}
+
+	// A later Diskless device tick on the survivor must not re-add the
+	// orphan, and a re-prune must be a no-op (converged → no write).
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Diskless"}},
+	})
+
+	settled := &observation{ResourceName: "flap399"}
+	o.pruneVolumeCacheToDesired(settled, res)
+
+	if settled.Volumes != nil {
+		t.Errorf("converged prune emitted a snapshot %+v, want no write", settled.Volumes)
+	}
+}
+
+// TestPruneVolumeCacheToDesiredNoAnnotationNoop pins the safety guard:
+// when the desired set is unknown (no / empty / unparseable
+// `blockstor.io/volume-numbers` annotation) the prune must NOT touch the
+// cache. Blanking a replica's volumes on a missing record would be far
+// worse than a transient stale entry (early convergence before the first
+// stamp lands).
+func TestPruneVolumeCacheToDesiredNoAnnotationNoop(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{NodeName: "worker-3"}
+
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Diskless"}},
+	})
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 1, DiskState: "Diskless"}},
+	})
+
+	// Resource with no volume-numbers annotation at all.
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: "flap399.worker-3"},
+	}
+
+	ev := &observation{ResourceName: "flap399"}
+	o.pruneVolumeCacheToDesired(ev, res)
+
+	if ev.Volumes != nil {
+		t.Errorf("prune with unknown desired set emitted %+v, want no write", ev.Volumes)
+	}
+
+	o.volMu.Lock()
+	cacheLen := len(o.volCache["flap399"])
+	o.volMu.Unlock()
+
+	if cacheLen != 2 {
+		t.Errorf("volCache len = %d, want 2 — prune must not evict on unknown desired set", cacheLen)
+	}
+}
+
+// TestPruneVolumeCacheToDesiredKeepsLateAdd guards the vd-c late-add
+// (Bug 384): a volume the RD still declares must NEVER be pruned. The
+// annotation reflects the live RD, so a freshly-added volume is already
+// in the desired set; the prune only removes volumes the RD has dropped.
+func TestPruneVolumeCacheToDesiredKeepsLateAdd(t *testing.T) {
+	t.Parallel()
+
+	o := &ObserverRunnable{NodeName: "worker-3"}
+
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Diskless"}},
+	})
+
+	// RD now declares volumes 0 AND 1 (a vd-c just landed). The cache
+	// only has 0 so far; the prune must not blank it, and must not add 1
+	// (the device frame for the new volume arrives separately).
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "flap399.worker-3",
+			Annotations: map[string]string{
+				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0,1",
+			},
+		},
+	}
+
+	ev := &observation{ResourceName: "flap399"}
+	o.pruneVolumeCacheToDesired(ev, res)
+
+	if ev.Volumes != nil {
+		t.Errorf("prune with all-present desired set emitted %+v, want no write", ev.Volumes)
+	}
+
+	o.volMu.Lock()
+	_, vol0Present := o.volCache["flap399"][0]
+	cacheLen := len(o.volCache["flap399"])
+	o.volMu.Unlock()
+
+	if !vol0Present || cacheLen != 1 {
+		t.Errorf("volCache = len %d (vol0 present=%v), want exactly {0}", cacheLen, vol0Present)
+	}
+}
+
+// TestWriteStatusConvergesDisklessVolumes is the end-to-end integration:
+// it drives the real writeStatus path (the chokepoint both events and the
+// 5s resync go through) and proves a diskless replica's Status.Volumes
+// converges to the RD's surviving set. Pre-fix writeStatus published both
+// cached volumes every tick (the phantom); post-fix it publishes only the
+// survivor.
+func TestWriteStatusConvergesDisklessVolumes(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = blockstoriov1alpha1.AddToScheme(scheme)
+
+	// Diskless replica whose RD has dropped volume 1: annotation lists
+	// only "0", and a diskless replica carries no Spec.Volumes entries.
+	existing := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "flap399.worker-3",
+			Annotations: map[string]string{
+				blockstoriov1alpha1.ResourceAnnotationVolumeNumbers: "0",
+			},
+		},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "flap399",
+			NodeName:               "worker-3",
+		},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(existing).
+		WithStatusSubresource(existing).
+		Build()
+
+	o := &ObserverRunnable{Client: cli, Exec: storage.NewFakeExec(), NodeName: "worker-3"}
+
+	// Seed the cache with both diskless volumes (no destroy frame ever
+	// arrives for the tiebreaker's removed volume).
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 0, DiskState: "Diskless"}},
+	})
+	o.mergeVolumes(&observation{
+		ResourceName: "flap399",
+		Volumes:      []volumeObservation{{VolumeNumber: 1, DiskState: "Diskless"}},
+	})
+
+	// A resync-style write: snapshot carries the full cache.
+	ev := o.snapshotFor("flap399")
+	if err := o.writeStatus(context.Background(), &ev); err != nil {
+		t.Fatalf("writeStatus: %v", err)
+	}
+
+	var got blockstoriov1alpha1.Resource
+	if err := cli.Get(context.Background(), client.ObjectKey{Name: "flap399.worker-3"}, &got); err != nil {
+		t.Fatalf("get Resource: %v", err)
+	}
+
+	gotSet := map[int32]bool{}
+	for i := range got.Status.Volumes {
+		gotSet[got.Status.Volumes[i].VolumeNumber] = true
+	}
+
+	if gotSet[1] {
+		t.Errorf("Status.Volumes still carries removed volume 1: %v — diskless flap", gotSet)
+	}
+
+	if !gotSet[0] {
+		t.Errorf("Status.Volumes dropped surviving volume 0: %v", gotSet)
 	}
 }
