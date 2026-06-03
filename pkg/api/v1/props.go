@@ -77,6 +77,27 @@ const (
 	// on QoS (wave1 7.22) which is out-of-scope. This key is the
 	// SCORING half only.
 	PropAutoplacerMaxThroughput = "Autoplacer/MaxThroughput"
+
+	// PropAutoplaceTarget is the per-Node opt-out from autoplace
+	// targeting. Set `linstor node set-property <node> AutoplaceTarget
+	// false` to keep the autoplacer from choosing the node for NEW
+	// replicas while leaving existing replicas untouched — the
+	// maintenance-drain workflow from
+	// kb.linbit.com/linstor/preventing-linstor-resource-placement-on-a-node.
+	//
+	// Unlike the EVICTED / LOST node flags (which the placer treats as
+	// "disabled" and therefore EXCLUDES existing replicas from the
+	// place_count accounting so the gap is re-filled elsewhere),
+	// AutoplaceTarget=false is a target-selection-only gate: existing
+	// replicas on the node still count toward place_count and are never
+	// migrated. Only the candidate-pool filter consults it.
+	//
+	// Default (prop unset, or any value other than a parseable false)
+	// is "node is an eligible target" — the prop is an opt-OUT. Only an
+	// explicit, parseable false excludes the node; an operator typo
+	// degrades to "still eligible" rather than silently draining the
+	// whole cluster off the node.
+	PropAutoplaceTarget = "AutoplaceTarget"
 )
 
 // ControllerPropsName is the singleton row key for the controller-
