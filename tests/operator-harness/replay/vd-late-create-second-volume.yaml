@@ -1,0 +1,75 @@
+name: vd-late-create-second-volume
+description: |
+  Bug-384 catcher (P0, data integrity; regression of the Bug 79/332
+  family). The DISTINGUISHING factor from vd-late-create.yaml is the
+  ordering: here vol-0 is created and driven UpToDate FIRST (so the RD
+  flips Spec.Initialized=true), and ONLY THEN is a SECOND volume added
+  via `vd c`. That late-added vol-1 lands on an ALREADY-initialized RD,
+  so the dispatcher's first-activation winner election (auto-primary,
+  gated on !rdInitialized) can never fire for it.
+
+  Pre-fix the satellite seeded vol-1 with the case-A skip-init-sync GI
+  on EVERY diskful replica (clean bitmap, NO UpToDate flag) and elected
+  no winner, so vol-1 came up Inconsistent on both replicas with no
+  SyncSource and never converged — verbatim operator repro:
+
+    linstor vd c test 1G   →  test  dev-worker-1  ...  Inconsistent
+                              test  dev-worker-3  ...  Inconsistent
+
+  Post-fix the satellite re-runs the lowest-node-id winner election
+  locally per fresh volume (seedFreshVolumes / isLateAddWinner): the
+  lowest-id replica seeds vol-1 Consistent+UpToDate, the rest take
+  case-A, and all_uptodate (which checks EVERY volume of EVERY replica)
+  converges.
+
+  Note: vd-late-create.yaml exercises the FIRST-volume late-add (vd c on
+  a VD-less RD) which routes through first-activation and was always
+  green; it does NOT cover this second-volume path.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    # 64M (not 1G): Bug 384 is a deterministic per-volume winner-election
+    # defect in the satellite (seedFreshVolumes / isLateAddWinner), NOT a
+    # sync-timing race, so the trigger is size-independent. A 1G fresh-replica
+    # sync on an I/O-constrained stand (~0.5 MB/s) blows the 240s all_uptodate
+    # await; 64M converges in seconds and exercises the identical code path.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-vol0-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: late-vd-create-vol1
+    # 64M — see create-vol0 note. The late-added second volume is what Bug 384
+    # regressed; its winner election is size-independent.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

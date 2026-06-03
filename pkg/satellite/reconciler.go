@@ -2805,13 +2805,34 @@ func (r *Reconciler) ensurePerVolumeMetadata(ctx context.Context, dr *intent.Des
 // listed in `fresh`. Mirrors the loop in seedInitialGI but limits
 // touch to the volumes whose metadata was just freshly created,
 // so already-stamped sibling volumes (vol-0 in the Bug B.4
-// late-add scenario) are never re-seeded. isWinner is hard-coded
-// to false because this path runs with firstActivation=false on
-// the parent RD — the per-volume gate inside resolveVolumeSeed
-// decides which seed shape (case-A skip-init-sync, case-B
-// winner, or no-op) is appropriate via the per-volume
-// AnyConnectedPeerHasDataForVolume probe.
+// late-add scenario) are never re-seeded.
+//
+// Bug 384 (P0, regression of Bug 79/332): the late-add path runs with
+// firstActivation=false on the parent RD, so the dispatcher's
+// first-activation winner election (auto-primary, gated on
+// !rdInitialized) never fires — the RD is already Initialized by the
+// time `linstor vd c` lands. The previous code therefore passed
+// isWinner=false unconditionally, so EVERY diskful replica took the
+// case-A skip-init-sync seed (current=day0, clean bitmap, NO UpToDate
+// flag). With no replica declaring itself the UpToDate source and no
+// primary --force on this path, the freshly-carved volume came up
+// Inconsistent on ALL replicas and never converged (verbatim operator
+// repro: `vd c test 1G` → vol-1 Inconsistent on every node).
+//
+// Fix: re-run the SAME lowest-node-id winner election the dispatcher
+// runs at first activation, but locally per fresh volume. Exactly one
+// diskful replica (the lowest allocated node-id) takes the case-B
+// winner seed (Consistent+UpToDate) and becomes the SyncSource; the
+// rest take case-A. resolveVolumeSeed's per-volume
+// AnyConnectedPeerHasDataForVolume + PeerHasData vetoes still fire
+// FIRST, so a relocate / migrate-disk target (a peer already holds
+// data on this volume) never wins itself UpToDate-empty — the winner
+// seed is byte-identical to the first-activation winner and shares the
+// day0 lineage anchor, so a staggered dual election agrees rather than
+// split-brains.
 func (r *Reconciler) seedFreshVolumes(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string, fresh map[int32]struct{}) error {
+	isWinner := isLateAddWinner(dr)
+
 	for _, vol := range dr.GetVolumes() {
 		if _, ok := fresh[vol.GetVolumeNumber()]; !ok {
 			continue
@@ -2822,7 +2843,7 @@ func (r *Reconciler) seedFreshVolumes(ctx context.Context, dr *intent.DesiredRes
 			continue
 		}
 
-		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), false, dr.GetSkipInitialSync())
+		seed, ok := r.resolveVolumeSeed(ctx, dr.GetName(), vol, dr.GetPeerHasData(), isWinner, dr.GetSkipInitialSync())
 		if !ok {
 			continue
 		}
@@ -2834,6 +2855,51 @@ func (r *Reconciler) seedFreshVolumes(ctx context.Context, dr *intent.DesiredRes
 	}
 
 	return nil
+}
+
+// isLateAddWinner reports whether THIS node is the elected initial-
+// UpToDate source for a late-added volume — the lowest-node-id diskful
+// replica, the same election the dispatcher runs at first activation
+// (lowestDiskfulID). It returns true iff this node's allocated DRBD
+// node-id is strictly the lowest among the local node-id and every
+// peer's allocated node-id.
+//
+// Why local (not auto-primary): the dispatcher only stamps the
+// auto-primary winner flag on a NOT-yet-Initialized RD (Bug 356 /
+// respawn-StandAlone guard). A `linstor vd c` always lands AFTER the RD
+// is Initialized, so no replica carries auto-primary on this path and
+// isInitialUpToDateWinner can never elect one. Recomputing the election
+// from the node-id set the dispatcher already rendered into the wire
+// payload restores the missing winner without re-arming the unsafe
+// respawn-time auto-primary.
+//
+// Deterministic + split-brain-safe: node-id is stable across reconciles
+// so the SAME replica wins every pass, and the strict-lowest comparison
+// elects EXACTLY ONE node. Peers whose node-id is not yet allocated
+// (NodeID==nil) are skipped — the election waits implicitly for the
+// next reconcile once every peer id is stamped, the same shape
+// diskfulPeersAllocated enforces on the dispatcher side. The result is
+// only ever consumed by resolveVolumeSeed AFTER its PeerHasData /
+// AnyConnectedPeerHasDataForVolume vetoes, so a winner verdict on a
+// volume whose peer already holds data is suppressed before it can
+// seed.
+func isLateAddWinner(dr *intent.DesiredResource) bool {
+	localID, ok := localNodeIDFromOpts(dr)
+	if !ok {
+		return false
+	}
+
+	for _, peer := range dr.GetPeers() {
+		if peer.NodeID == nil {
+			continue
+		}
+
+		if *peer.NodeID <= localID {
+			return false
+		}
+	}
+
+	return true
 }
 
 // createMDWithCollisionRecovery wraps Adm.CreateMD with a one-shot

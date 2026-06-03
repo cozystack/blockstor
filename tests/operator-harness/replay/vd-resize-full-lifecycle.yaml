@@ -45,7 +45,7 @@ steps:
       expected_kib: 1048576
       timeout_s: 30
   - name: auto-place-2
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool", "{{sp}}", "{{rd}}"]
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 0
     await:
       kind: replica_count

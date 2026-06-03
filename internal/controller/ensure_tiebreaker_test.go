@@ -20,6 +20,7 @@ package controller_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -1372,5 +1373,232 @@ func TestEnsureTiebreakerRelocateOntoTiebreakerConverges(t *testing.T) {
 	// node), not back on n3 (the diskful relocate target).
 	if _, err := st.Resources().Get(ctx, rdName, "n2"); err != nil {
 		t.Errorf("witness should land on freed n2; got error %v", err)
+	}
+}
+
+// TestBug386NodeRestoreRecreatesTiebreaker pins the Bug 386 fix: after
+// a node is restored with `linstor n rst`, a 2-diskful resource in a
+// 3-node cluster must re-gain its DISKLESS TIE_BREAKER witness.
+//
+// Repro shape (verbatim operator report): a 3-node cluster runs a
+// 2-diskful RD (n1, n2) whose witness collapsed while n3 was drained
+// (EVICTED). `pickTiebreakerNode` / `isDisabledNode` exclude an
+// EVICTED node, so while n3 carried the flag the only candidate
+// witness host was gone and ensureTiebreaker left the RD at two
+// diskful UpToDate replicas with no witness — a quorum/split-brain
+// hazard on a subsequent failure.
+//
+// `linstor n rst n3` clears the EVICTED flag. The fix wires a Node
+// watch (nodeDrainFlagChanged → enqueueRDsForNode) so the restore
+// re-enqueues the RD and ensureTiebreaker re-runs. This test pins the
+// reconcile-level outcome: with EVICTED cleared, the witness must be
+// (re)placed on n3 so the resource regains the diskful+diskful+TB
+// shape upstream LINSTOR maintains for quorum=majority.
+func TestBug386NodeRestoreRecreatesTiebreaker(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	// 3-node cluster; n3 is currently EVICTED (drained), so it is not
+	// a viable witness candidate.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{
+		Name: "n3", Type: apiv1.NodeTypeSatellite,
+		Flags: []string{apiv1.NodeFlagEvicted},
+	}); err != nil {
+		t.Fatalf("seed evicted node n3: %v", err)
+	}
+
+	// 2 diskful replicas on n1 + n2, NO witness — the collapsed shape
+	// the operator observed while n3 was drained.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-bug386", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug386"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// Pre-restore sanity: with n3 EVICTED, ensureTiebreaker cannot
+	// place a witness (no viable candidate node). The RD stays at 2
+	// diskful, 0 witness — the exact hazard Bug 386 reports.
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("pre-restore EnsureTiebreaker: %v", err)
+	}
+
+	pre, err := st.Resources().ListByDefinition(ctx, "pvc-bug386")
+	if err != nil {
+		t.Fatalf("list pre-restore: %v", err)
+	}
+
+	_, _, preWitness := classifyReplicas(pre)
+	if preWitness != 0 {
+		t.Fatalf("pre-restore: witness=%d, want 0 (n3 EVICTED, no candidate); entries=%v",
+			preWitness, pre)
+	}
+
+	// Operator runs `linstor n rst n3`: the REST handler clears the
+	// EVICTED flag on the Node. Simulate that store mutation.
+	n3, err := st.Nodes().Get(ctx, "n3")
+	if err != nil {
+		t.Fatalf("get n3: %v", err)
+	}
+
+	n3.Flags = nil
+	if err := st.Nodes().Update(ctx, &n3); err != nil {
+		t.Fatalf("restore n3 (clear EVICTED): %v", err)
+	}
+
+	// The Node watch re-enqueues the RD; ensureTiebreaker re-runs.
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("post-restore EnsureTiebreaker: %v", err)
+	}
+
+	post, err := st.Resources().ListByDefinition(ctx, "pvc-bug386")
+	if err != nil {
+		t.Fatalf("list post-restore: %v", err)
+	}
+
+	diskful, diskless, witness := classifyReplicas(post)
+
+	if diskful != 2 {
+		t.Errorf("post-restore: diskful=%d, want 2; entries=%v", diskful, post)
+	}
+
+	if diskless != 0 {
+		t.Errorf("post-restore: plain diskless=%d, want 0; entries=%v", diskless, post)
+	}
+
+	if witness != 1 {
+		t.Fatalf("Bug 386: post-restore witness=%d, want 1 (TB recreated after n rst); entries=%v",
+			witness, post)
+	}
+
+	// The recreated witness must land on the restored n3 — the only
+	// non-diskful candidate now that EVICTED is cleared.
+	tb, err := st.Resources().Get(ctx, "pvc-bug386", "n3")
+	if err != nil {
+		t.Fatalf("Bug 386: witness not on restored n3: %v", err)
+	}
+
+	if !slices.Contains(tb.Flags, apiv1.ResourceFlagTieBreaker) {
+		t.Errorf("Bug 386: n3 replica must carry TIE_BREAKER; flags=%v", tb.Flags)
+	}
+}
+
+// TestBug386NodeHasDrainFlag pins the EVICTED/LOST flag-set probe that
+// gates the Bug-386 Node watch. The predicate fires only when this
+// membership changes, so it must read both Spec (operator intent) and
+// Status (satellite-observed) flags and ignore unrelated values.
+func TestBug386NodeHasDrainFlag(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		node *blockstoriov1alpha1.Node
+		want bool
+	}{
+		{
+			name: "no flags",
+			node: &blockstoriov1alpha1.Node{},
+			want: false,
+		},
+		{
+			name: "spec EVICTED",
+			node: &blockstoriov1alpha1.Node{
+				Spec: blockstoriov1alpha1.NodeSpec{Flags: []string{apiv1.NodeFlagEvicted}},
+			},
+			want: true,
+		},
+		{
+			name: "spec LOST",
+			node: &blockstoriov1alpha1.Node{
+				Spec: blockstoriov1alpha1.NodeSpec{Flags: []string{apiv1.NodeFlagLost}},
+			},
+			want: true,
+		},
+		{
+			name: "status EVICTED",
+			node: &blockstoriov1alpha1.Node{
+				Status: blockstoriov1alpha1.NodeStatus{Flags: []string{apiv1.NodeFlagEvicted}},
+			},
+			want: true,
+		},
+		{
+			name: "unrelated flag",
+			node: &blockstoriov1alpha1.Node{
+				Spec: blockstoriov1alpha1.NodeSpec{Flags: []string{"STANDBY"}},
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := controllerpkg.NodeHasDrainFlag(tc.node); got != tc.want {
+				t.Errorf("NodeHasDrainFlag(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBug386EnqueueRDsForNode pins the Node-watch fan-out: a node
+// flag-change event must re-enqueue EVERY ResourceDefinition in the
+// cluster so each RD's tiebreaker invariant re-evaluates against the
+// recovered candidate set. The tiebreaker is a cluster-wide
+// candidate-set decision, so the mapper is intentionally RD-agnostic.
+func TestBug386EnqueueRDsForNode(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	ctx := context.Background()
+
+	rdA := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "rd-a"}}
+	rdB := &blockstoriov1alpha1.ResourceDefinition{ObjectMeta: metav1.ObjectMeta{Name: "rd-b"}}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rdA, rdB).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{Client: cli, Scheme: scheme, Store: store.NewInMemory()}
+
+	reqs := rec.EnqueueRDsForNode(ctx, &blockstoriov1alpha1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "n3"},
+	})
+
+	if len(reqs) != 2 {
+		t.Fatalf("enqueueRDsForNode: got %d requests, want 2 (one per RD); reqs=%v", len(reqs), reqs)
+	}
+
+	got := map[string]bool{}
+	for _, req := range reqs {
+		got[req.Name] = true
+	}
+
+	for _, want := range []string{"rd-a", "rd-b"} {
+		if !got[want] {
+			t.Errorf("enqueueRDsForNode: missing RD %q in fan-out; reqs=%v", want, reqs)
+		}
 	}
 }

@@ -223,7 +223,43 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 		return err
 	}
 
-	diskful, diskless := splitByDiskless(replicas)
+	// Bug 385: a replica hosted on an EVICTED / LOST node is a draining
+	// placement, not a live one. Counting it would (a) let a stranded
+	// diskful keep the witness invariant "satisfied" so the reconciler
+	// never relocates the witness off the drained node, and (b) leave a
+	// TIE_BREAKER pinned to the very node the operator just evicted —
+	// the exact "evict doesn't take effect" symptom. Mirror the placer's
+	// documented semantic ("replicas on EVICTED/LOST nodes are NOT
+	// counted") so the witness / quorum decision runs over live replicas
+	// only. Stranded witnesses are reaped explicitly below so a fresh one
+	// can land on a healthy spare (or quorum falls to off when none
+	// remains) — never by demoting a healthy diskful to TIE_BREAKER.
+	disabled, err := r.disabledNodeSet(ctx)
+	if err != nil {
+		return err
+	}
+
+	live, stranded := splitByDisabledNode(replicas, disabled)
+
+	err = r.removeStrandedWitnesses(ctx, rd.Name, stranded)
+	if err != nil {
+		return err
+	}
+
+	// Bug 387: an INACTIVE replica is `drbdadm down` (operator
+	// deactivation) — its DRBD device is not up, so it is NOT a voting
+	// peer in the quorum the auto-tiebreaker invariant defends. Counting
+	// it as a diskful replica corrupts every downstream witness decision:
+	// e.g. an RD with 2 active diskful + 1 INACTIVE diskful, after an
+	// `r d` of one active diskful, would otherwise look like "2 diskful,
+	// nonWitnessDiskless==0, even" and spuriously grow a TIE_BREAKER —
+	// upstream LINSTOR just deletes the replica with no witness. Drop
+	// INACTIVE replicas from the (already disabled-node-filtered) voting
+	// set before the split so neither disabled-node nor deactivated
+	// replicas influence the diskful or diskless/witness count.
+	live = filterActiveReplicas(live)
+
+	diskful, diskless := splitByDiskless(live)
 	witness := filterTieBreaker(diskless)
 
 	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness)
@@ -1037,6 +1073,27 @@ func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdNa
 	return nil
 }
 
+// filterActiveReplicas drops INACTIVE replicas from the slice. An
+// INACTIVE replica is one the operator deactivated with `drbdadm down`
+// (Bug 387): its DRBD device is not running, so it casts no vote in the
+// `quorum: majority` decision the auto-tiebreaker invariant defends.
+// The tiebreaker policy must reason only over the live voting peers, so
+// INACTIVE replicas are excluded before the diskful/diskless split —
+// they count as neither a voting diskful nor a diskless witness/peer.
+func filterActiveReplicas(replicas []apiv1.Resource) []apiv1.Resource {
+	active := make([]apiv1.Resource, 0, len(replicas))
+
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		active = append(active, replicas[i])
+	}
+
+	return active
+}
+
 // splitByDiskless partitions replicas into (diskful, diskless) lists.
 // DRBD treats DISKLESS replicas as connection-mesh participants only
 // — they don't allocate storage but they vote in the quorum.
@@ -1154,6 +1211,74 @@ func isDisabledNode(node *apiv1.Node) bool {
 	}
 
 	return false
+}
+
+// disabledNodeSet returns the set of node names flagged EVICTED / LOST.
+// Bug 385: the RD-level witness / quorum decision must treat replicas on
+// these nodes as draining placements, not live ones — mirroring the
+// placer's `disabledNodes` semantic. Re-probed from the store on every
+// reconcile so a freshly-stamped EVICTED flag takes effect on the next
+// witness pass.
+func (r *ResourceDefinitionReconciler) disabledNodeSet(ctx context.Context) (map[string]struct{}, error) {
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	disabled := make(map[string]struct{})
+
+	for i := range nodes {
+		if isDisabledNode(&nodes[i]) {
+			disabled[nodes[i].Name] = struct{}{}
+		}
+	}
+
+	return disabled, nil
+}
+
+// splitByDisabledNode partitions replicas into (live, stranded) by the
+// disabled-node set. `live` is hosted on healthy (non-EVICTED/-LOST)
+// nodes and drives the witness / quorum decision; `stranded` sits on a
+// draining node and is handled separately (Bug 385).
+func splitByDisabledNode(replicas []apiv1.Resource, disabled map[string]struct{}) ([]apiv1.Resource, []apiv1.Resource) {
+	var live, stranded []apiv1.Resource
+
+	for i := range replicas {
+		if _, off := disabled[replicas[i].NodeName]; off {
+			stranded = append(stranded, replicas[i])
+
+			continue
+		}
+
+		live = append(live, replicas[i])
+	}
+
+	return live, stranded
+}
+
+// removeStrandedWitnesses deletes every TIE_BREAKER witness that sits on
+// an EVICTED / LOST node (Bug 385). A diskless witness has no business
+// remaining on a drained node — leaving it there pins the witness to the
+// very node the operator evicted and blocks a fresh witness from landing
+// on a healthy spare. Diskful replicas on disabled nodes are intentionally
+// left alone here: relocating / deleting those is the NodeReconciler's job
+// (placer gap-fill for EVICTED, source-delete for LOST), and dropping a
+// diskful's only data copy from this path would be a data-availability
+// hazard. Per-row Delete tolerates NotFound so a concurrent
+// node-migration cascade can't fail the reconcile.
+func (r *ResourceDefinitionReconciler) removeStrandedWitnesses(ctx context.Context, rdName string, stranded []apiv1.Resource) error {
+	for i := range stranded {
+		if !slices.Contains(stranded[i].Flags, apiv1.ResourceFlagTieBreaker) {
+			continue
+		}
+
+		err := r.Store.Resources().Delete(ctx, rdName, stranded[i].NodeName)
+		if err != nil && !stderrors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // alreadyExists is a string-based check for the wrapped errors the
@@ -1312,8 +1437,110 @@ func (r *ResourceDefinitionReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Watches(&blockstoriov1alpha1.Resource{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueRDForResource),
 			builder.WithPredicates(resourceEventFilter)).
+		// Bug 386: re-run the tiebreaker invariant when a node's
+		// EVICTED / LOST flag set changes. `linstor n rst` clears
+		// EVICTED on a recovered node; `linstor n evacuate` sets it.
+		// `ensureTiebreaker` (and pickTiebreakerNode) treat an
+		// EVICTED/LOST node as an unusable witness candidate, so a
+		// 2-diskful RD whose witness collapsed while a node was drained
+		// must re-place the TIE_BREAKER once the node returns. Without
+		// this watch nothing enqueues the RD on a node-flag toggle and
+		// the witness is only (re)placed on the next periodic re-sync —
+		// leaving two diskful UpToDate replicas with no quorum witness
+		// in between (split-brain risk on a subsequent failure). The
+		// nodeDrainFlagChanged predicate filters to the flag transition
+		// so unrelated Node Spec edits (props, net-interfaces) don't
+		// fan out to every RD.
+		Watches(&blockstoriov1alpha1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueRDsForNode),
+			builder.WithPredicates(nodeDrainFlagChanged())).
 		Named("resourcedefinition").
 		Complete(r)
+}
+
+// nodeDrainFlagChanged fires only when a Node's drain-signal flag set
+// (EVICTED / LOST) transitions. The REST `n rst` / `n evacuate` /
+// `n lost` handlers stamp these onto `Spec.Flags`; the satellite also
+// re-applies Node Spec on every reconcile with the flag set unchanged,
+// so a bare generation/Spec-equality watch would fan out to every RD
+// on every heartbeat. Restricting to the EVICTED/LOST membership delta
+// keeps the Bug 386 re-enqueue precise.
+//
+// Create fires when the node already carries a drain flag (controller
+// restart re-reads existing state) so the witness invariant runs at
+// least once against the recovered topology.
+func nodeDrainFlagChanged() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			n, ok := e.Object.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			return nodeHasDrainFlag(n)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNode, ok := e.ObjectOld.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			newNode, ok := e.ObjectNew.(*blockstoriov1alpha1.Node)
+			if !ok {
+				return false
+			}
+
+			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode)
+		},
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		GenericFunc: func(_ event.GenericEvent) bool { return false },
+	}
+}
+
+// nodeHasDrainFlag reports whether a Node CRD carries an EVICTED or
+// LOST flag on either Spec (operator intent, set by the REST handlers)
+// or Status (satellite-observed). Mirrors isDisabledNode's flag set so
+// the watch predicate and the witness-candidate filter agree on what
+// "drained" means.
+func nodeHasDrainFlag(n *blockstoriov1alpha1.Node) bool {
+	for _, f := range n.Spec.Flags {
+		if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
+			return true
+		}
+	}
+
+	for _, f := range n.Status.Flags {
+		if f == apiv1.NodeFlagEvicted || f == apiv1.NodeFlagLost {
+			return true
+		}
+	}
+
+	return false
+}
+
+// enqueueRDsForNode maps a Node flag-change event to every
+// ResourceDefinition in the cluster. The tiebreaker invariant is a
+// cluster-wide candidate-set decision (any RD's witness might have
+// collapsed onto, or now want to re-land on, the toggled node), so a
+// per-node restore re-evaluates all RDs. The set of RDs is small
+// relative to Resources, and the nodeDrainFlagChanged predicate gates
+// the fan-out to genuine EVICTED/LOST transitions, so this stays cheap.
+func (r *ResourceDefinitionReconciler) enqueueRDsForNode(ctx context.Context, _ client.Object) []reconcile.Request {
+	var rdList blockstoriov1alpha1.ResourceDefinitionList
+
+	err := r.List(ctx, &rdList)
+	if err != nil {
+		return nil
+	}
+
+	out := make([]reconcile.Request, 0, len(rdList.Items))
+	for i := range rdList.Items {
+		out = append(out, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: rdList.Items[i].Name},
+		})
+	}
+
+	return out
 }
 
 // enqueueRDForResource maps a Resource event to its parent RD.
