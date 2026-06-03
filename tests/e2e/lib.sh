@@ -220,16 +220,31 @@ kernel_all_uptodate() {
         2>/dev/null || true
 }
 
-# status_connection_state <rd> <node> <peer> — full kernel connection
-# state string as observed FROM `node` TOWARD `peer`: Connected /
-# Connecting / StandAlone / BrokenPipe / NetworkFailure / Timeout /
-# Established / Unconnected / Disconnecting / ProtocolError / TearDown /
-# WFConnection. Returns "" if the connection row hasn't been observed
-# yet (Resource missing or pre-events2). Prefer this over parsing
-# `drbdsetup status --verbose | grep -oE 'connection:[A-Za-z]+'`.
+# status_connection_state <rd> <node> <peer> — full connection state
+# string as observed FROM `node` TOWARD `peer`: Connected / Connecting /
+# StandAlone / BrokenPipe / NetworkFailure / Timeout / Established /
+# Unconnected / Disconnecting / ProtocolError / TearDown / WFConnection.
+# Returns "" if the connection row hasn't been observed yet.
+#
+# Reads KERNEL ground truth first (`drbdsetup status --json` on `node`),
+# falling back to the CRD .status.connections projection only when the
+# node/kernel read fails. The CRD projection is events2-driven and lags
+# (or is briefly empty) under heavy CI load — which made the partition /
+# heal waits in state-standalone-partition flake (the projection read
+# empty for the whole window while the kernel already showed Connecting).
+# The kernel token set is identical to the projection's, so callers that
+# match Established|Connected / BAD_STATES_RE are unaffected.
 status_connection_state() {
-    kubectl get resource "${1}.${2}" -o json 2>/dev/null \
-        | jq -r --arg p "${3}" \
+    local rd=$1 node=$2 peer=$3 st
+    st=$(on_node "$node" drbdsetup status "$rd" --json 2>/dev/null \
+        | jq -r --arg p "$peer" '.[0].connections[]? | select(.name==$p) | .connection // empty' 2>/dev/null \
+        | head -1)
+    if [[ -n "$st" ]]; then
+        printf '%s\n' "$st"
+        return 0
+    fi
+    kubectl get resource "${rd}.${node}" -o json 2>/dev/null \
+        | jq -r --arg p "$peer" \
             '.status.connections[]? | select(.peerNodeName==$p) | .message // ""'
 }
 
@@ -314,7 +329,8 @@ write_random() {
     local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
-        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
+        _w=0; while [ \$_w -lt 30 ] && ! test -b ${dev}; do sleep 0.5; _w=\$((_w+1)); done
+        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device after 15s — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
         dd if=/dev/urandom of=${dev} bs=4096 count=${blocks} status=none oflag=direct
         dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
@@ -331,7 +347,8 @@ read_md5() {
     local blocks=$(( (bytes + 4095) / 4096 ))
     on_node "$node" bash -c "
         drbdadm primary ${RD} 2>/dev/null || true
-        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
+        _w=0; while [ \$_w -lt 30 ] && ! test -b ${dev}; do sleep 0.5; _w=\$((_w+1)); done
+        test -b ${dev} || { echo \"ABORT: ${dev} is not a block device after 15s — \$(stat -c '%F' ${dev} 2>/dev/null || echo missing)\" >&2; exit 2; }
         dd if=${dev} bs=4096 count=${blocks} status=none iflag=direct | md5sum | awk '{print \$1}'
     "
 }
