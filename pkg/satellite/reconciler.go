@@ -250,6 +250,24 @@ type Reconciler struct {
 	// recovery by `grace` (default 30s).
 	seenStuckAt map[string]time.Time
 
+	// restoreBlankFallback records, per "<resource>/<volNumber>", that a
+	// snapshot-restore-backed volume could NOT be materialised from the
+	// snapshot on THIS node and fell back to a blank CreateVolume (no local
+	// snapshot, and cross-node fetch absent or missed). It is written in
+	// materializeVolume during applyStorage and consulted in the SAME
+	// reconcile pass by resolveVolumeSeed (Bug 397, P0 DATA INTEGRITY): a
+	// blank-fallback replica MUST NOT take the day0 skip-init-sync seed — it
+	// holds NO snapshot data, so it has to come up Inconsistent and
+	// SyncTarget the real restored peer instead of latching UpToDate empty.
+	//
+	// A volume that genuinely received the clone (RestoreVolumeFromSnapshot
+	// or cross-node recv succeeded) is recorded as false, so the legitimate
+	// all-clone restore fast-path keeps its skip (every diskful replica is
+	// byte-identical to the snapshot). Process-memory only; on a restart
+	// applyStorage re-runs (and re-probes) before seedInitialGI in the same
+	// pass, repopulating the marker, so the gate stays correct.
+	restoreBlankFallback map[string]bool
+
 	// lastRecoveryPromoteAt throttles the Bug 366 recovery-promote
 	// self-heal (maybeRecoveryPromote). Keyed by resource name; value
 	// is the last wall-clock time this node fired a recovery-promote
@@ -287,6 +305,7 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 		cfg:                   cfg,
 		resourceToPool:        map[string]string{},
 		seenStuckAt:           map[string]time.Time{},
+		restoreBlankFallback:  map[string]bool{},
 		lastRecoveryPromoteAt: map[string]time.Time{},
 	}
 }
@@ -1465,6 +1484,8 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 
 	src := vol.GetSourceSnapshot()
 	if src == "" {
+		// Not a restore-backed volume; nothing for the Bug 397 seed gate
+		// to constrain. A plain blank create is not a snapshot fallback.
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
@@ -1499,6 +1520,13 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		PoolName:     vol.GetStoragePool(),
 	})
 	if !errors.Is(err, storage.ErrNotFound) {
+		if err == nil {
+			// Local clone succeeded: this replica holds the snapshot's
+			// data. Clear any stale blank-fallback marker so the
+			// legitimate all-clone restore fast-path keeps its skip.
+			r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), false)
+		}
+
 		return err //nolint:wrapcheck // caller wraps
 	}
 
@@ -1506,10 +1534,15 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 	// also doesn't pan out we fall through to a blank CreateVolume
 	// so DRBD has something to resync into.
 	if r.cfg.CrossNodeFetcher == nil {
+		// Bug 397: blank fallback — this replica did NOT receive the
+		// snapshot data. Mark it so resolveVolumeSeed refuses the day0
+		// skip and DRBD SyncTargets the real restored peer.
+		r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), true)
+
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
-	return r.crossNodeClone(ctx, provider, target, srcRD, snapName, vol.GetVolumeNumber())
+	return r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
 }
 
 // crossNodeClone is materializeVolume's cross-node fallback branch.
@@ -1522,11 +1555,14 @@ func (r *Reconciler) crossNodeClone(
 	ctx context.Context,
 	provider storage.Provider,
 	target storage.Volume,
-	srcRD, snapName string,
+	rdName, srcRD, snapName string,
 	volNum int32,
 ) error {
 	shipper, ok := provider.(storage.SnapshotShipper)
 	if !ok {
+		// Provider can't receive a shipped snapshot — blank fallback.
+		r.recordRestoreBlankFallback(rdName, volNum, true)
+
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
@@ -1534,9 +1570,11 @@ func (r *Reconciler) crossNodeClone(
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			// No peer has the snapshot — DRBD resync is the last
-			// resort. Returns wrong-data on receive (split-brain
-			// from metadata mismatch); upstream behaviour with
-			// FILE_THIN matches this for now.
+			// resort. Bug 397: blank fallback, this replica holds NO
+			// snapshot data, so resolveVolumeSeed must refuse the day0
+			// skip and let DRBD SyncTarget the real restored peer.
+			r.recordRestoreBlankFallback(rdName, volNum, true)
+
 			return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 		}
 
@@ -1550,7 +1588,40 @@ func (r *Reconciler) crossNodeClone(
 		return errors.Wrapf(err, "recv %s/%s from %s", srcRD, snapName, peer)
 	}
 
+	// Cross-node recv succeeded: this replica holds the snapshot's data.
+	// Clear any stale marker so the all-clone fast-path skip is preserved.
+	r.recordRestoreBlankFallback(rdName, volNum, false)
+
 	return nil
+}
+
+// recordRestoreBlankFallback stores, for a snapshot-restore-backed volume,
+// whether THIS node fell back to a blank CreateVolume (true) because it
+// could not materialise the snapshot, or genuinely received the clone
+// (false). resolveVolumeSeed reads this within the same reconcile pass to
+// decide whether the day0 skip-init-sync seed is safe (Bug 397). Keyed by
+// "<resource>/<volNumber>".
+func (r *Reconciler) recordRestoreBlankFallback(rdName string, volNum int32, blank bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.restoreBlankFallback[restoreSeedKey(rdName, volNum)] = blank
+}
+
+// isRestoreBlankFallback reports whether the given (resource, volume) was
+// recorded as a blank-fallback restore on this node in the current process
+// lifetime. Defaults to false when no record exists (no restore in flight,
+// or a plain create) so non-restore volumes keep their normal seed path.
+func (r *Reconciler) isRestoreBlankFallback(rdName string, volNum int32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.restoreBlankFallback[restoreSeedKey(rdName, volNum)]
+}
+
+// restoreSeedKey builds the map key for the blank-fallback table.
+func restoreSeedKey(rdName string, volNum int32) string {
+	return rdName + "/" + strconv.Itoa(int(volNum))
 }
 
 // tearDownRemovedPeers runs `drbdadm del-peer` AND `drbdmeta
@@ -4311,6 +4382,28 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 	// bearing peer exists, so it remains the legitimate Phase 8.1
 	// relocate-skip path.
 	skipAllowed := skipInitialSync != nil && *skipInitialSync
+
+	// Bug 397 (P0, DATA INTEGRITY): restore-aware skip gate. A
+	// snapshot-restore-backed volume (SourceSnapshot set) that fell back to
+	// a BLANK CreateVolume on THIS node — because the snapshot was not
+	// present locally and the cross-node fetch missed (or no fetcher /
+	// shipper is configured) — holds NONE of the snapshot's data. If it
+	// took the day0 skip-init-sync seed it would latch UpToDate while empty
+	// (its day0 clean bitmap matches the restored peer's day0 clean bitmap,
+	// so DRBD does NO resync) → silent data-integrity loss, an empty
+	// replica presenting as a good copy and promotable on failover.
+	//
+	// Refuse the skip for the blank-fallback replica: it then comes up
+	// Inconsistent and SyncTargets the real restored peer, recovering the
+	// snapshot's data over the wire. The LEGITIMATE all-clone restore
+	// fast-path is preserved: a replica that genuinely received the clone
+	// (RestoreVolumeFromSnapshot / cross-node recv succeeded) is recorded
+	// as NOT a blank fallback, so it keeps its skip — every diskful replica
+	// is byte-identical to the snapshot and a full resync is needless.
+	if skipAllowed && vol.GetSourceSnapshot() != "" &&
+		r.isRestoreBlankFallback(resourceName, vol.GetVolumeNumber()) {
+		skipAllowed = false
+	}
 
 	day0 := day0GiFor(resourceName, vol.GetVolumeNumber())
 
