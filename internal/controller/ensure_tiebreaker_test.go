@@ -565,11 +565,20 @@ func TestEnsureTiebreakerHonoursAutoQuorumDisabled(t *testing.T) {
 	// Operator opted out of auto-quorum and set the per-RD policy
 	// explicitly. `quorum=off` + `on-no-quorum=io-error` is the
 	// "scale-out fast, fail-loud" combo from UG9.
+	//
+	// Corner-case B1/B4: drive the gate with the CANONICAL kebab-case
+	// `DrbdOptions/auto-quorum` key — the exact spelling the upstream
+	// `linstor (rg|rd) set-property … DrbdOptions/auto-quorum disabled`
+	// CLI emits. The earlier revision of this test stamped the
+	// camelCase `DrbdOptions/AutoQuorum`, which the (then-broken) gate
+	// also read — so the test passed while a real cluster's CLI opt-out
+	// was silently ignored. Pinning the kebab key here guards against a
+	// regression back to the dead-key gate.
 	rd := &blockstoriov1alpha1.ResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "pvc-manual-quorum"},
 		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 			Props: map[string]string{
-				"DrbdOptions/AutoQuorum":            "disabled",
+				"DrbdOptions/auto-quorum":           "disabled",
 				"DrbdOptions/Resource/quorum":       "off",
 				"DrbdOptions/Resource/on-no-quorum": "io-error",
 			},
@@ -613,8 +622,8 @@ func TestEnsureTiebreakerHonoursAutoQuorumDisabled(t *testing.T) {
 
 	// Auto-quorum opt-out marker must survive the round-trip
 	// unchanged — a stamp-and-strip refactor would be a regression.
-	if got := final.Spec.Props["DrbdOptions/AutoQuorum"]; got != "disabled" {
-		t.Errorf("AutoQuorum prop: got %q, want %q (must round-trip verbatim)",
+	if got := final.Spec.Props["DrbdOptions/auto-quorum"]; got != "disabled" {
+		t.Errorf("auto-quorum prop: got %q, want %q (must round-trip verbatim)",
 			got, "disabled")
 	}
 }
@@ -645,7 +654,29 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "disabled (canonical)",
+			// Corner-case B1/B4: canonical kebab-case key — the exact
+			// spelling the upstream CLI writes.
+			name: "disabled (canonical kebab key)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/auto-quorum": "disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Disabled (mixed case from manual paste, kebab key)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props: map[string]string{"DrbdOptions/auto-quorum": "Disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			// Forward-compat fallback: a legacy hand-stamped camelCase
+			// value must still opt out.
+			name: "disabled (legacy camelCase key fallback)",
 			rd: &blockstoriov1alpha1.ResourceDefinition{
 				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 					Props: map[string]string{"DrbdOptions/AutoQuorum": "disabled"},
@@ -654,10 +685,14 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "Disabled (mixed case from manual paste)",
+			// The canonical kebab key wins over a stale legacy value.
+			name: "kebab disabled overrides legacy non-disabled",
 			rd: &blockstoriov1alpha1.ResourceDefinition{
 				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-					Props: map[string]string{"DrbdOptions/AutoQuorum": "Disabled"},
+					Props: map[string]string{
+						"DrbdOptions/auto-quorum": "disabled",
+						"DrbdOptions/AutoQuorum":  "io-error",
+					},
 				},
 			},
 			want: true,
@@ -666,7 +701,7 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 			name: "suspend-io (auto-set instruction, not disable)",
 			rd: &blockstoriov1alpha1.ResourceDefinition{
 				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-					Props: map[string]string{"DrbdOptions/AutoQuorum": "suspend-io"},
+					Props: map[string]string{"DrbdOptions/auto-quorum": "suspend-io"},
 				},
 			},
 			want: false,
@@ -675,7 +710,7 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 			name: "io-error (auto-set instruction, not disable)",
 			rd: &blockstoriov1alpha1.ResourceDefinition{
 				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-					Props: map[string]string{"DrbdOptions/AutoQuorum": "io-error"},
+					Props: map[string]string{"DrbdOptions/auto-quorum": "io-error"},
 				},
 			},
 			want: false,
