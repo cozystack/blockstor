@@ -1,0 +1,116 @@
+name: vd-d-prune-resource-volumes-no-flap
+description: |
+  Bug-399 catcher (operational flap) — the `vd d` REMOVE-side mirror of
+  the Bug-384 late-add. Create a 2-volume RD on 2 diskful replicas PLUS a
+  TieBreaker (diskless replica on a third node), drive both volumes
+  UpToDate, then `vd d` the second volume and assert ALL per-node
+  Resource CRDs — diskful AND diskless — converge to exactly [vol-0] with
+  NO status flap.
+
+  Pre-fix had TWO distinct flaps:
+
+    1. DISKFUL replicas: RD.spec.volumeDefinitions correctly drops to
+       [vol-0] and the satellite removes volume:1 from the DRBD kernel +
+       deletes its backing LV, BUT the controller's RD -> Resource.
+       spec.volumes projection was ADD-ONLY, so the per-node Resource.
+       spec.volumes still carried {volumeNumber:1}. That stale entry kept
+       the controller "knowing" about vol-1, so its phantom
+       status.volumes[1] was never garbage-collected.
+
+    2. DISKLESS / TieBreaker replica: a diskless replica has NO local
+       backing disk to tear down, so drbd-9 never emits a
+       `destroy device volume:1` frame for it — the observer's volCache
+       (append-only) kept re-emitting status.volumes[1]=Diskless on every
+       tick. The diskless replica's status.volumes oscillated between [0]
+       and [0,1] ~1/tick.
+
+  Post-fix: the controller prunes Resource.spec.volumes entries absent
+  from the RD (pruneStaleResourceVolumes); the observer evicts the
+  removed volume from volCache on the `destroy device` frame (diskful
+  path) AND converges the diskless replica's cached volume set to the
+  RD's live volume-number set via the `blockstor.io/volume-numbers`
+  annotation (pruneVolumeCacheToDesired) so a missing destroy event no
+  longer strands a phantom. spec.volumes + status.volumes converge to
+  exactly [vol-0] on every replica and the flap stops.
+
+  The volumes_settled await is the no-flap gate: it asserts every
+  Resource of the RD carries EXACTLY the {0} volume set in both
+  spec.volumes and status.volumes AND that the per-replica status.volumes
+  SET is byte-stable across a multi-poll settle window (a still-flapping
+  diskless replica changes its set between polls). The gate compares the
+  volume SET, NOT metadata.resourceVersion, because the stand's k3s/kine
+  backend reports the global store revision per GET (it climbs even with
+  zero per-object churn — an rv-equality check is a false negative there).
+
+  Unit pins (BS + kernel halves of this operator-level catcher):
+    internal/controller/bug_399_vd_d_prune_resource_volumes_test.go
+    pkg/satellite/controllers/bug_399_volume_evict_test.go
+      (incl. the diskless-tiebreaker convergence regression)
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    # 64M: Bug 399 is a deterministic projection/eviction defect, not a
+    # sync-timing race, so the trigger is size-independent. Small volume
+    # converges in seconds on the I/O-constrained stand.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: create-vol1
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: ensure-tiebreaker-node3
+    # Hand-create the diskless replica on node3 so the diskless flap is
+    # exercised deterministically regardless of auto-tiebreaker config.
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+  - name: wait-both-volumes-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: vd-d-vol1
+    # THE BUG: remove vol-1 from the 2-volume RD. Both the diskful
+    # replicas AND the diskless tiebreaker must converge to [0] with no
+    # flap.
+    cmd: ["volume-definition", "delete", "{{rd}}", "1"]
+    expect_exit: 0
+    await:
+      # spec.volumes + status.volumes must converge to exactly [0] on
+      # every replica AND the per-replica status volume SET must be
+      # byte-stable across the multi-poll settle window (no flap). polls
+      # spans the diskless replica's ~1/tick oscillation so a live flap
+      # is caught between consecutive snapshots.
+      kind: volumes_settled
+      rd: "{{rd}}"
+      expected: "0"
+      settle_s: 8
+      polls: 5
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

@@ -134,6 +134,18 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// Removed is an internal marker set by translateDeviceEvent for
+	// `destroy device` frames (drbdsetup emits one after a volume is
+	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
+	// resource without that volume). mergeVolumes drops the entry from
+	// the per-resource volCache so the observer stops re-emitting the
+	// stale Status.Volumes[i] snapshot on every subsequent tick. Without
+	// it the cache never forgets the volume (events2 only ever ADDs to
+	// the cache otherwise), and the observer keeps re-applying a phantom
+	// `vN:Diskless` entry that the controller/satellite purge just
+	// removed — a permanent Status flap (Bug 399).
+	Removed bool
 }
 
 // peerVolumeObservation carries the peer's view of one volume's
@@ -316,6 +328,23 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	volNum, err := strconv.Atoi(volStr)
 	if err != nil {
+		return out, true
+	}
+
+	// `destroy device name:<rd> volume:<n>` arrives after the kernel
+	// tears the volume slot down — e.g. the `vd d` cascade re-adjusts
+	// the resource without that volume. Surface it as a removal so
+	// mergeVolumes evicts the entry from the per-resource volCache;
+	// otherwise the observer keeps re-emitting a phantom Status.Volumes
+	// entry on every subsequent tick and the Status flaps forever
+	// (Bug 399). DiskState/UUID on a destroy frame are meaningless —
+	// only the volume number matters for the eviction.
+	if ev.Action == eventActionDestroy {
+		out.Volumes = []volumeObservation{{
+			VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+			Removed:      true,
+		}}
+
 		return out, true
 	}
 
@@ -1350,6 +1379,20 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	changed := false
 
 	for _, incoming := range ev.Volumes {
+		if incoming.Removed {
+			// `destroy device` — evict the volume so the snapshot
+			// stops carrying it. Only counts as a change when the
+			// entry was actually present (a destroy for an already-
+			// unknown volume is a no-op and must not spin a write).
+			if _, ok := cache[incoming.VolumeNumber]; ok {
+				delete(cache, incoming.VolumeNumber)
+
+				changed = true
+			}
+
+			continue
+		}
+
 		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
@@ -1361,6 +1404,92 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 		return
 	}
 
+	snapshot := make([]volumeObservation, 0, len(cache))
+	for _, entry := range cache {
+		snapshot = append(snapshot, entry)
+	}
+
+	ev.Volumes = snapshot
+}
+
+// pruneVolumeCacheToDesired converges the per-resource volume cache to
+// the RD's current volume set, evicting any cached volume the RD no
+// longer declares. This is the destroy-event-independent counterpart
+// to the `destroy device` eviction path in mergeVolumes (Bug 399).
+//
+// Why it's needed: a DISKFUL replica's removed volume is torn down in
+// the kernel and drbd-9 emits a `destroy device` frame that mergeVolumes
+// uses to evict the cache entry. A DISKLESS / tiebreaker replica has no
+// backing disk to tear down, so the kernel does NOT emit a matching
+// `destroy device` for it — its `vN:Diskless` device frame simply stops
+// arriving. Without a destroy signal the append-only cache keeps the
+// stale entry forever and the observer re-emits a phantom
+// Status.Volumes[n] on every resync tick: a permanent Status flap that
+// oscillates as the controller/satellite purge races the observer's
+// re-emit.
+//
+// The reconciler stamps the live RD volume set onto the Resource CRD's
+// `blockstor.io/volume-numbers` annotation on every successful apply
+// pass, so it is the authoritative desired set for both diskful and
+// diskless replicas. Prune the cache against it: drop every cached
+// volume whose number is absent from the annotation.
+//
+// Safety:
+//   - Absent / empty / unparseable annotation → no-op. We only prune
+//     when we positively know the desired set; an unknown set must
+//     never blank a replica's volumes (early convergence before the
+//     first stamp, a corrupted annotation byte, etc.).
+//   - vd-c late-add (Bug 384) is safe: the annotation reflects the RD,
+//     so a freshly-added volume is already IN the desired set and is
+//     never pruned. We only remove volumes the RD has dropped.
+//   - Idempotent: rebuilds ev.Volumes only when an entry was actually
+//     evicted. A converged replica (cache == desired) is left untouched
+//     so the SSA apply for this tick carries whatever mergeVolumes
+//     already decided — no apiserver thrash.
+func (o *ObserverRunnable) pruneVolumeCacheToDesired(ev *observation, res *blockstoriov1alpha1.Resource) {
+	if ev == nil || ev.ResourceName == "" || res == nil {
+		return
+	}
+
+	nums := parseVolumeNumbers(res.Annotations[blockstoriov1alpha1.ResourceAnnotationVolumeNumbers])
+	if len(nums) == 0 {
+		// Desired set unknown — never prune on an absent/empty/
+		// unparseable annotation. Blanking a replica's volumes on a
+		// missing record would be far worse than a stale entry.
+		return
+	}
+
+	desired := make(map[int32]bool, len(nums))
+	for _, n := range nums {
+		desired[n] = true
+	}
+
+	o.volMu.Lock()
+	defer o.volMu.Unlock()
+
+	cache, ok := o.volCache[ev.ResourceName]
+	if !ok {
+		return
+	}
+
+	changed := false
+
+	for volNum := range cache {
+		if !desired[volNum] {
+			delete(cache, volNum)
+
+			changed = true
+		}
+	}
+
+	if !changed {
+		return
+	}
+
+	// An entry was evicted — rebuild the snapshot from the pruned cache
+	// so this tick's SSA apply carries the converged set. Overrides any
+	// nil ev.Volumes mergeVolumes left when the kernel frame itself was
+	// idempotent: the prune is the change that must reach the apiserver.
 	snapshot := make([]volumeObservation, 0, len(cache))
 	for _, entry := range cache {
 		snapshot = append(snapshot, entry)
@@ -1577,6 +1706,24 @@ func (o *ObserverRunnable) writeStatus(ctx context.Context, ev *observation) err
 	lookupErr := o.Client.Get(ctx, client.ObjectKey{Name: name}, &lookup)
 	if lookupErr == nil {
 		storagePool = lookup.Spec.StoragePool
+
+		// Bug 399 (diskless/tiebreaker facet): converge the cached
+		// volume set to the RD's current volume set, evicting any
+		// volume that no longer exists. The diskful path is fixed by
+		// the `destroy device` eviction, but a DISKLESS replica has no
+		// local backing disk to tear down — drbd-9 does not emit a
+		// `destroy device` frame for it the way it does for the
+		// diskful peers, so the cached `vN:Diskless` entry is never
+		// evicted by the event path and the observer re-emits a
+		// phantom Status.Volumes[n] on every tick (a permanent flap).
+		// The reconciler stamps the authoritative live volume set on
+		// `blockstor.io/volume-numbers`; prune the cache against it so
+		// the diskless replica's Status.Volumes converges to exactly
+		// the surviving set without waiting for a destroy event that
+		// never comes. Idempotent: rebuilds ev.Volumes only when the
+		// prune actually evicted an entry, so a converged replica does
+		// not thrash the apiserver.
+		o.pruneVolumeCacheToDesired(ev, &lookup)
 	}
 
 	// No prior Get on the apply payload itself: SSA Patch is the

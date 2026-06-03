@@ -363,19 +363,16 @@ func (r *ResourceReconciler) runApply(ctx context.Context, target *blockstoriov1
 	// stamped it returns mutated=false without touching the apiserver,
 	// so the early call has no fixed-state cost.
 
-	// Initial-sync skip seeding (Phase 8.1): on a freshly-added
-	// replica, pick the CurrentGI of an existing UpToDate peer and
-	// stamp it into Spec.Volumes[i].SeedFromGI. The satellite
-	// reconciler then pre-seeds the new replica's DRBD metadata
-	// before drbdadm up so DRBD's GI handshake skips the full
-	// initial-sync. Idempotent: re-runs on a Resource whose
-	// SeedFromGI is already set leave Spec alone.
-	seeded, err := r.ensureSeedFromGI(ctx, target, peers, rdPtr)
+	// Project RD.Spec.VolumeDefinitions onto this Resource's
+	// Spec.Volumes: prune removed volumes (Bug 399 / `vd d` remove
+	// side) then seed-GI the survivors (Phase 8.1 add side). Either
+	// mutation persists + requeues onto the fresh revision.
+	projected, err := r.ensureVolumeProjection(ctx, target, peers, rdPtr)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if seeded {
+	if projected {
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -976,6 +973,88 @@ func (r *ResourceReconciler) ensureSeedFromGI(_ context.Context, target *blockst
 	if !mutated {
 		return false, nil
 	}
+
+	if err := r.Update(context.Background(), target); err != nil { //nolint:contextcheck // ctx-cancel survives Update — propagating it would race the requeue
+		return false, err
+	}
+
+	return true, nil
+}
+
+// ensureVolumeProjection reconciles Resource.Spec.Volumes against the
+// parent RD's VolumeDefinitions: it first prunes entries for volumes
+// the RD no longer declares (Bug 399 / `vd d`), then seed-GIs the
+// survivors (Phase 8.1). Returns true when either step mutated Spec
+// (and persisted it) so the caller requeues onto the fresh revision.
+//
+// Prune runs before seed so the add-path only ever operates on the
+// live volume set, and a single reconcile never both removes and
+// re-seeds the same VolumeNumber. Both steps are individually
+// idempotent — a Resource already in sync takes the no-write fast path.
+func (r *ResourceReconciler) ensureVolumeProjection(ctx context.Context, target *blockstoriov1alpha1.Resource, peers []blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
+	pruned, err := r.pruneStaleResourceVolumes(ctx, target, rd)
+	if err != nil {
+		return false, err
+	}
+
+	if pruned {
+		return true, nil
+	}
+
+	return r.ensureSeedFromGI(ctx, target, peers, rd)
+}
+
+// pruneStaleResourceVolumes drops Resource.Spec.Volumes entries whose
+// VolumeNumber is no longer declared by the parent RD's
+// VolumeDefinitions (Bug 399). The RD→Resource volume projection is
+// otherwise add-only (ensureSeedFromGI / setSeedFromGI only ever
+// append), so after `vd d` removes a VolumeDefinition the matching
+// Spec.Volumes entry survives forever — and the controller keeps
+// "knowing" about the removed volume, so the phantom Status.Volumes
+// entry for it is never garbage-collected and the Resource Status
+// oscillates indefinitely.
+//
+// Returns true (and persists via Update) when it actually removed an
+// entry, so the caller requeues onto the pruned revision. Strictly
+// idempotent: a Resource already in sync with its RD takes the
+// no-mutation fast path and never touches the apiserver — no PATCH
+// thrash.
+//
+// Safety against the `vd c` late-add race (Bug 384): an entry is only
+// pruned when its VolumeNumber is ABSENT from the RD's current
+// VolumeDefinitions. A volume mid-add already has its VolumeDefinition
+// authored on the RD (that is what triggers the Resource reconcile),
+// so it is in the desired set and is never pruned. A defensive guard
+// also skips the whole pass when the RD carries zero VolumeDefinitions
+// (freshly-created or mid-cascade-delete RD) so we never blank a
+// Resource's Spec.Volumes out from under an in-flight create/teardown.
+func (r *ResourceReconciler) pruneStaleResourceVolumes(_ context.Context, target *blockstoriov1alpha1.Resource, rd *blockstoriov1alpha1.ResourceDefinition) (bool, error) {
+	if rd == nil || len(rd.Spec.VolumeDefinitions) == 0 {
+		return false, nil
+	}
+
+	if len(target.Spec.Volumes) == 0 {
+		return false, nil
+	}
+
+	desired := make(map[int32]struct{}, len(rd.Spec.VolumeDefinitions))
+	for i := range rd.Spec.VolumeDefinitions {
+		desired[rd.Spec.VolumeDefinitions[i].VolumeNumber] = struct{}{}
+	}
+
+	survivors := make([]blockstoriov1alpha1.ResourceVolumeSpec, 0, len(target.Spec.Volumes))
+
+	for i := range target.Spec.Volumes {
+		if _, ok := desired[target.Spec.Volumes[i].VolumeNumber]; ok {
+			survivors = append(survivors, target.Spec.Volumes[i])
+		}
+	}
+
+	if len(survivors) == len(target.Spec.Volumes) {
+		return false, nil
+	}
+
+	target.Spec.Volumes = survivors
 
 	if err := r.Update(context.Background(), target); err != nil { //nolint:contextcheck // ctx-cancel survives Update — propagating it would race the requeue
 		return false, err
