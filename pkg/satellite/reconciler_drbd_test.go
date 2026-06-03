@@ -407,6 +407,13 @@ func TestApplyDisklessNoCreateMD(t *testing.T) {
 // already exists at 1 GiB, the desired size is 2 GiB → reconciler
 // must call lvextend then drbdadm resize. Pins the upstream-style
 // growth-path semantics CSI ControllerExpandVolume relies on.
+//
+// Bug 395 (P1, data integrity): this case uses an LVM_THIN pool — a
+// zero-fill provider — so the fast path is preserved: the drbdadm
+// resize KEEPS `--assume-clean` (the grown thin chunks read back as
+// zeros on every replica, so no resync is needed). The non-zero-fill
+// (thick LVM) counterpart is TestApplyThickResizeOmitsAssumeClean
+// below, which asserts `--assume-clean` is dropped so DRBD resyncs.
 func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
@@ -454,6 +461,77 @@ func TestApplyTriggersResizeOnGrow(t *testing.T) {
 	for _, w := range want {
 		if !slices.Contains(fx.CommandLines(), w) {
 			t.Errorf("expected %q in calls; got %v", w, fx.CommandLines())
+		}
+	}
+}
+
+// TestApplyThickResizeOmitsAssumeClean is the Bug 395 (P1, data
+// integrity) regression: growing a thick-LVM-backed volume MUST issue
+// `drbdadm resize` WITHOUT `--assume-clean`. Thick `LVM` is NOT
+// zero-on-allocate — `lvextend` exposes recycled VG extents whose prior
+// content differs per node — so the only way the grown region
+// [old_size, new_size) ends up byte-identical across replicas is for
+// DRBD to mark it out-of-sync and resync it from the UpToDate source.
+// `--assume-clean` would skip that resync and silently diverge the
+// replicas (0xA1 on w1 vs 0xB2 on w2, confirmed on the stand) with no
+// out-of-sync flag.
+//
+// Mirror of TestApplyTriggersResizeOnGrow but with lvm.NewThick instead
+// of lvm.NewThin — the lvextend/lvs command shapes are identical; only
+// the drbdadm resize argv differs (no --assume-clean).
+func TestApplyThickResizeOmitsAssumeClean(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	// Volume already exists (thick CreateVolume idempotent-skip probe).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-grow_00000",
+		storage.FakeResponse{Stdout: []byte("pvc-grow_00000\n")})
+	// VolumeStatus: 1 GiB on disk (1024*1024 KiB).
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings --separator | -o lv_path,lv_size --units k --nosuffix vg/pvc-grow_00000",
+		storage.FakeResponse{Stdout: []byte("/dev/vg/pvc-grow_00000|1048576\n")})
+
+	thick := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thick1": thick},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Desired: 2 GiB.
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-grow",
+			NodeName: "n1",
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thick1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// lvextend must run (the grow happened) and drbdadm resize must
+	// follow WITHOUT --assume-clean.
+	wantLvextend := "lvextend --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } activation { udev_sync=0 udev_rules=0 } --size 2048MiB vg/pvc-grow_00000"
+	if !slices.Contains(fx.CommandLines(), wantLvextend) {
+		t.Errorf("expected %q in calls; got %v", wantLvextend, fx.CommandLines())
+	}
+
+	wantResize := "drbdadm resize pvc-grow"
+	if !slices.Contains(fx.CommandLines(), wantResize) {
+		t.Errorf("expected %q in calls; got %v", wantResize, fx.CommandLines())
+	}
+
+	// Bug 395: the grown region MUST NOT be marked clean — assert no
+	// drbdadm resize carries --assume-clean for the thick provider.
+	for _, cl := range fx.CommandLines() {
+		if strings.HasPrefix(cl, "drbdadm resize") && strings.Contains(cl, "--assume-clean") {
+			t.Errorf("thick-LVM resize must omit --assume-clean (Bug 395); got %q", cl)
 		}
 	}
 }
