@@ -45,6 +45,9 @@
 # Assertion kinds supported under "await":
 #
 #   - replica_count        wait until N replicas of rd exist with disk≠Diskless
+#   - active_diskful_count wait until ≥ min ACTIVE diskful replicas exist
+#                           (excludes DISKLESS/TIE_BREAKER and INACTIVE;
+#                            Bug 393 — INACTIVE must not satisfy place_count)
 #   - disk_state           wait until rd@node reports disk_state == expected
 #   - all_uptodate         wait until every replica reports UpToDate
 #   - replica_diskless     wait until rd@node has disk_state == Diskless
@@ -67,7 +70,8 @@
 #
 #   {{rd}}            workflow.vars.rd (default "replay-<name>-<rand4>")
 #   {{sp}}            workflow.vars.sp (default "stand")
-#   {{node1}} … {{node3}}  resolved from kubectl-discovered worker list
+#   {{node1}} … {{node4}}  resolved from kubectl-discovered worker list
+#                           ({{node4}} needs min_nodes: 4)
 #
 # Exit codes:
 #
@@ -125,6 +129,10 @@ mapfile -t WORKERS < <(
 NODE1="${WORKERS[0]:-}"
 NODE2="${WORKERS[1]:-}"
 NODE3="${WORKERS[2]:-}"
+# NODE4 is the gap-fill target for redundancy-refill workflows (Bug 393):
+# an RD pinned to NODE1..3 that loses one active replica must refill onto
+# a node OUTSIDE that set. Workflows needing it declare min_nodes: 4.
+NODE4="${WORKERS[3]:-}"
 
 # ----------------------------------------------------------------------
 # variable substitution

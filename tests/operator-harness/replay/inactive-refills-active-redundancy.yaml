@@ -1,0 +1,91 @@
+name: inactive-refills-active-redundancy
+description: |
+  Bug-393 catcher (P1). The autoplacer must NOT count an INACTIVE
+  diskful replica toward place_count.
+
+  An INACTIVE replica is `drbdadm down` (operator deactivation, Bug 350):
+  it serves no I/O, casts no quorum vote, and is dropped from every
+  sibling's .res file. So an RD sitting at 2 ACTIVE diskful + 1 INACTIVE
+  diskful with place_count=3 is effectively 1-short on active redundancy.
+  Pre-fix, `pkg/placer/placer.go countDiskfulReplicas` counted the
+  INACTIVE replica as satisfied (`placed >= want`), so a re-autoplace did
+  nothing and the RD silently ran with only 2 active replicas. The fix
+  excludes INACTIVE so the placer gap-fills a replacement active diskful.
+
+  Sequence: pin 3 diskful (node1+node2+node3) → wait all UpToDate →
+  deactivate node1 (INACTIVE) → re-autoplace=3 → assert the active
+  diskful count climbs back to 3 (the replacement lands on node4, the
+  only worker outside the original taken set) and node4 reaches UpToDate.
+  This is the SAME INACTIVE-miscount class as Bugs 387 / 390.
+
+prerequisites:
+  min_nodes: 4
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-3-active-diskful
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 240
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-deactivate-node1
+    cmd: ["resource", "deactivate", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+  # Re-trigger autoplace. Pre-fix the placer counts the INACTIVE node1 as
+  # the 3rd diskful and is satisfied → no replacement is created. Post-fix
+  # the INACTIVE replica does NOT count, so the placer gap-fills a fresh
+  # active diskful on node4.
+  - name: re-autoplace-3
+    cmd: ["resource", "create", "--auto-place=3", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 240
+  # The replacement active diskful must materialise on node4 — the only
+  # worker outside the original 3-node taken set — and reach UpToDate.
+  - name: node4-replacement-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node4}}"
+      expected: UpToDate
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource", "activate", "{{node1}}", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
