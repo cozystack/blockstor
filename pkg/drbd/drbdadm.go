@@ -274,11 +274,33 @@ func (a *Adm) Attach(ctx context.Context, resource string) error {
 // Resize rescans the lower disk's size and tells DRBD to grow the
 // replicated volume to match. The lower disk (LV / zvol / dm-crypt
 // target) must already be the target size — this is a notify-only
-// command. `--assume-clean` skips the resync of the new bytes since
-// they were just allocated, which would otherwise serialise growing
-// every replica.
-func (a *Adm) Resize(ctx context.Context, resource string) error {
-	return a.run(ctx, "resize", "--assume-clean", resource)
+// command.
+//
+// assumeClean selects the post-grow reconciliation strategy for the new
+// region [old_size, new_size):
+//
+//   - assumeClean=true: pass `--assume-clean` so DRBD marks the grown
+//     region UpToDate on every replica WITHOUT a resync. Sound ONLY
+//     for zero-on-allocate providers (ZFS/thin/file), where the grown
+//     bytes are deterministically zero on every replica — skipping the
+//     resync there is a correct fast path that avoids serialising the
+//     grow on every replica.
+//   - assumeClean=false: omit the flag so DRBD marks the grown region
+//     out-of-sync on the non-source peers and resyncs it from the
+//     UpToDate source. Required for classic thick `LVM` (Bug 395, P1
+//     data integrity): `lvextend` exposes recycled VG extents whose
+//     prior content differs per node, so `--assume-clean` would
+//     silently leave replicas disagreeing on the grown region with no
+//     out-of-sync flag.
+//
+// The caller derives assumeClean from the provider's
+// storage.ResizeZeroFiller capability.
+func (a *Adm) Resize(ctx context.Context, resource string, assumeClean bool) error {
+	if assumeClean {
+		return a.run(ctx, "resize", "--assume-clean", resource)
+	}
+
+	return a.run(ctx, "resize", resource)
 }
 
 // SetGI pre-seeds the per-peer GI slot in this replica's DRBD

@@ -296,15 +296,15 @@ func TestAdmForgetPeerInvokesDrbdmeta(t *testing.T) {
 	}
 }
 
-// TestAdmResizeInvokesDrbdadm: Resize → `drbdadm resize --assume-clean <res>`.
-// --assume-clean skips re-syncing the new bytes (they're freshly
-// allocated zeros) — without it growing 3 replicas serialises on
-// every resync.
+// TestAdmResizeInvokesDrbdadm: Resize(assumeClean=true) →
+// `drbdadm resize --assume-clean <res>`. --assume-clean skips
+// re-syncing the new bytes (zero-fill providers expose freshly-zeroed
+// extents) — without it growing 3 replicas serialises on every resync.
 func TestAdmResizeInvokesDrbdadm(t *testing.T) {
 	fx := storage.NewFakeExec()
 	adm := drbd.NewAdm(fx)
 
-	err := adm.Resize(t.Context(), "pvc-1")
+	err := adm.Resize(t.Context(), "pvc-1", true)
 	if err != nil {
 		t.Fatalf("Resize: %v", err)
 	}
@@ -312,6 +312,34 @@ func TestAdmResizeInvokesDrbdadm(t *testing.T) {
 	want := "drbdadm resize --assume-clean pvc-1"
 	if !slices.Contains(fx.CommandLines(), want) {
 		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+}
+
+// TestAdmResizeWithoutAssumeClean: Resize(assumeClean=false) →
+// `drbdadm resize <res>` (no --assume-clean). Bug 395 (P1, data
+// integrity): non-zero-fill providers (thick LVM) MUST omit
+// --assume-clean so DRBD marks the grown region out-of-sync and
+// resyncs it from the UpToDate source — otherwise replicas silently
+// disagree on the grown region (0xA1/0xB2 divergence confirmed on the
+// stand).
+func TestAdmResizeWithoutAssumeClean(t *testing.T) {
+	fx := storage.NewFakeExec()
+	adm := drbd.NewAdm(fx)
+
+	err := adm.Resize(t.Context(), "pvc-1", false)
+	if err != nil {
+		t.Fatalf("Resize: %v", err)
+	}
+
+	want := "drbdadm resize pvc-1"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+
+	for _, cl := range fx.CommandLines() {
+		if strings.Contains(cl, "--assume-clean") {
+			t.Errorf("did not expect --assume-clean in calls; got %v", fx.CommandLines())
+		}
 	}
 }
 
