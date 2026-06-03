@@ -39,6 +39,7 @@ A cell counts as **FAIL** if either leg times out, the `linstor` CLI exits non-z
 | `sync-final-uptodate-transition.sh` | 329 | After a 3rd replica is added to a 2-replica RD, the new replica's State converges from `UpToDate(NN%)` to a bare `UpToDate` AND replication state reaches `Established`. |
 | `r-td-diskless.sh` | 330 | `linstor r td --diskless <node> <rd>` on a diskful replica flips Spec.Flags + Status.DiskState to Diskless within 30s, and `drbdsetup status` on the satellite confirms `disk:Diskless`. |
 | `r-l-conns-shapes.sh` | 331 | Conns/State column contract: parses `linstor r l` JSON across (Healthy, Disconnected peer, Diskless, TieBreaker) shapes and pins observer's events2 translation. |
+| `snap-restore-snapshotless-node-rejected.sh` | 397 | P0 DATA INTEGRITY. `snapshot resource restore` onto a node NOT holding the snapshot is rejected (no silent empty replica, no orphan RD); restoring onto the snapshot's own nodes converges UpToDate AND every replica holds the real snapshot bytes (marker read per-replica), never a silently-empty UpToDate copy. |
 
 ## Running
 
