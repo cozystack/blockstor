@@ -267,6 +267,15 @@ echo ">> read marker back on $N1 — md5 must match $md5_before"
 md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")
 if [[ "$md5_after" != "$md5_before" ]]; then
     echo "FAIL: marker drift on $N1 (before=$md5_before, after=$md5_after)"
+    # Capture role + generation identifiers + kernel sync state on BOTH
+    # nodes so the next CI hit carries the evidence to tell a real
+    # wrong-resync-direction bug apart from a host-side storage artifact
+    # (loopfile page-cache residue) or a transient demote race — today the
+    # log only prints the two md5s, which cannot distinguish those.
+    on_node "$N1" drbdadm role "$RD" 2>/dev/null || true
+    on_node "$N1" drbdadm get-gi "$RD" 2>/dev/null || true
+    on_node "$N2" drbdadm get-gi "$RD" 2>/dev/null || true
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>/dev/null || true
     exit 1
 fi
 echo "   marker unchanged: $md5_after"
