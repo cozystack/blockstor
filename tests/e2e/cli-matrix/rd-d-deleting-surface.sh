@@ -133,12 +133,15 @@ deadline=$(( $(date +%s) + 60 ))
 deleting_seen=false
 while (( $(date +%s) < deadline )); do
     # Wire-level assertion: the Resource view carries the DELETE flag for
-    # the blocked replica. `r l -o json` exposes the flags array directly.
+    # the blocked replica. golinstor's `r l -o json` is a doubly-nested
+    # array of per-replica rows; the resource-level flags live under
+    # `rsc_flags` (see multi-volume-late-vd-create.sh / n-rst-recreates-
+    # tiebreaker.sh for the same shape).
     rl_json=$("${LCTL[@]}" resource list --resources "$RD" -o json 2>/dev/null || echo '[]')
     has_delete=$(jq -r --arg n "$N2" '
-        [ .[]? | (.resources // .)[]?
-          | select(.node_name == $n or .node == $n)
-          | (.flags // []) | index("DELETE") ] | any' <<<"$rl_json" 2>/dev/null || echo false)
+        [ .[]?[]?
+          | select(.node_name == $n)
+          | (.rsc_flags // []) | index("DELETE") ] | any' <<<"$rl_json" 2>/dev/null || echo false)
     # Fallback: the human-readable State column rendered by the CLI.
     rl_txt=$("${LCTL[@]}" resource list --resources "$RD" 2>/dev/null || true)
     if [[ "$has_delete" == "true" ]] || grep -qiE 'DELETING' <<<"$rl_txt"; then
