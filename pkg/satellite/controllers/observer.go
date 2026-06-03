@@ -134,6 +134,18 @@ type volumeObservation struct {
 	HasSync      bool // true when this observation carried out-of-sync stats
 	Quorum       bool
 	HasQuorum    bool // true when this observation carried a quorum:<yes|no> field
+
+	// Removed is an internal marker set by translateDeviceEvent for
+	// `destroy device` frames (drbdsetup emits one after a volume is
+	// torn down from the kernel — e.g. the `vd d` cascade adjusts the
+	// resource without that volume). mergeVolumes drops the entry from
+	// the per-resource volCache so the observer stops re-emitting the
+	// stale Status.Volumes[i] snapshot on every subsequent tick. Without
+	// it the cache never forgets the volume (events2 only ever ADDs to
+	// the cache otherwise), and the observer keeps re-applying a phantom
+	// `vN:Diskless` entry that the controller/satellite purge just
+	// removed — a permanent Status flap (Bug 399).
+	Removed bool
 }
 
 // peerVolumeObservation carries the peer's view of one volume's
@@ -316,6 +328,23 @@ func translateDeviceEvent(ev drbd.Event) (observation, bool) {
 
 	volNum, err := strconv.Atoi(volStr)
 	if err != nil {
+		return out, true
+	}
+
+	// `destroy device name:<rd> volume:<n>` arrives after the kernel
+	// tears the volume slot down — e.g. the `vd d` cascade re-adjusts
+	// the resource without that volume. Surface it as a removal so
+	// mergeVolumes evicts the entry from the per-resource volCache;
+	// otherwise the observer keeps re-emitting a phantom Status.Volumes
+	// entry on every subsequent tick and the Status flaps forever
+	// (Bug 399). DiskState/UUID on a destroy frame are meaningless —
+	// only the volume number matters for the eviction.
+	if ev.Action == eventActionDestroy {
+		out.Volumes = []volumeObservation{{
+			VolumeNumber: int32(volNum), //nolint:gosec // drbd-9 volume numbers fit in int32
+			Removed:      true,
+		}}
+
 		return out, true
 	}
 
@@ -1350,6 +1379,20 @@ func (o *ObserverRunnable) mergeVolumes(ev *observation) {
 	changed := false
 
 	for _, incoming := range ev.Volumes {
+		if incoming.Removed {
+			// `destroy device` — evict the volume so the snapshot
+			// stops carrying it. Only counts as a change when the
+			// entry was actually present (a destroy for an already-
+			// unknown volume is a no-op and must not spin a write).
+			if _, ok := cache[incoming.VolumeNumber]; ok {
+				delete(cache, incoming.VolumeNumber)
+
+				changed = true
+			}
+
+			continue
+		}
+
 		if mergeVolumeInto(cache, incoming) {
 			changed = true
 		}
