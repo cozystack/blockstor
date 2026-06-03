@@ -603,16 +603,13 @@ func rgSelectFilterClearTable() map[string]func(*apiv1.AutoSelectFilter) {
 // mergeRGProps applies the OverrideProps / DeleteProps merge
 // semantic LINSTOR uses for any property-bag-bearing object:
 // override entries land first, then delete entries strip their keys.
+//
+// Corner-case B5 / I1: routes through the shared applyPropsModify core
+// so an override entry with an empty value DELETES the key — the
+// `linstor rg set-property g DrbdOptions/Resource/on-no-quorum`
+// (no value) = delete-property semantic the upstream UG9 NOTE pins.
 func mergeRGProps(existing, patch *apiv1.ResourceGroup) {
-	if existing.Props == nil && (len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0) {
-		existing.Props = map[string]string{}
-	}
-
-	maps.Copy(existing.Props, patch.OverrideProps)
-
-	for _, k := range patch.DeleteProps {
-		delete(existing.Props, k)
-	}
+	existing.Props = applyPropsModify(existing.Props, patch.OverrideProps, patch.DeleteProps)
 }
 
 // handleRGDelete drops a ResourceGroup.
