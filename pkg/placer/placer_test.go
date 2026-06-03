@@ -1018,6 +1018,95 @@ func TestPlacerDeficitExcludesDisklessAndTiebreaker(t *testing.T) {
 	}
 }
 
+// TestPlacerDeficitExcludesInactiveDiskful pins Bug 393: an INACTIVE
+// diskful replica is `drbdadm down` — it serves no I/O and casts no
+// quorum vote — so it must NOT count toward place_count. An RD at
+// 2 active diskful + 1 INACTIVE diskful with place_count=3 is 1-short
+// on ACTIVE redundancy; the placer must gap-fill a replacement active
+// diskful rather than declaring satisfaction.
+//
+// Setup: place_count=3, 4 healthy nodes. Pre-seed 2 active diskful
+// replicas (n1+n2) and one INACTIVE diskful replica (n3). The placer
+// must add a 3rd ACTIVE diskful replica on n4 — NOT treat the INACTIVE
+// replica as the 3rd active replica and exit early. The INACTIVE
+// replica's node stays "taken" so the replacement lands on n4.
+func TestPlacerDeficitExcludesInactiveDiskful(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	seedStore(t, st, []string{"n1", "n2", "n3", "n4"})
+
+	// Two active diskful replicas on n1 + n2.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: n,
+			Props: map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("seed diskful %s: %v", n, err)
+		}
+	}
+
+	// INACTIVE diskful replica on n3: backing pool present (it IS
+	// diskful) but deactivated. Without the Bug 393 fix the placer
+	// counts n3 as a satisfied replica and stops at 2 active + 1
+	// INACTIVE instead of going to 3 active diskful.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-1", NodeName: "n3",
+		Props: map[string]string{"StorPoolName": "pool"},
+		Flags: []string{apiv1.ResourceFlagInactive},
+	}); err != nil {
+		t.Fatalf("seed inactive: %v", err)
+	}
+
+	p := placer.New(st)
+
+	placed, want, err := p.Place(ctx, "pvc-1", &apiv1.AutoSelectFilter{PlaceCount: 3})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Errorf("placed/want: got %d/%d, want 3/3 (INACTIVE must not count)", placed, want)
+	}
+
+	got, _ := st.Resources().ListByDefinition(ctx, "pvc-1")
+
+	active := 0
+	inactive := 0
+
+	for _, r := range got {
+		if slices.Contains(r.Flags, apiv1.ResourceFlagInactive) {
+			inactive++
+
+			continue
+		}
+
+		active++
+	}
+
+	if active != 3 {
+		t.Errorf("active diskful count: got %d, want 3 (gap-fill must run); resources=%+v", active, got)
+	}
+
+	if inactive != 1 {
+		t.Errorf("inactive count: got %d, want 1 (existing INACTIVE left untouched); resources=%+v", inactive, got)
+	}
+
+	// The new active diskful replica must land on n4 — the only
+	// remaining healthy node not already taken by an existing replica
+	// (n3 stays taken so we don't double-place onto the INACTIVE node).
+	gotNodes := map[string]bool{}
+	for _, r := range got {
+		gotNodes[r.NodeName] = true
+	}
+
+	if !gotNodes["n4"] {
+		t.Errorf("expected new active diskful replica on n4; got %+v", gotNodes)
+	}
+}
+
 // TestPlacePlaceCountIgnoresDisklessWitness pins Bug 28: PlaceCount
 // counts DISKFUL replicas only — a DISKLESS / TIE_BREAKER witness
 // pre-seeded by the RD reconciler's ensureTiebreaker race must NOT

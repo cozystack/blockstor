@@ -171,6 +171,7 @@ substitute() {
     s=${s//\{\{node1\}\}/${NODE1:-}}
     s=${s//\{\{node2\}\}/${NODE2:-}}
     s=${s//\{\{node3\}\}/${NODE3:-}}
+    s=${s//\{\{node4\}\}/${NODE4:-}}
     echo "$s"
 }
 
@@ -211,6 +212,30 @@ try:
         d=d[0]
     print(len(d))
 except: print(0)")
+            [[ "$count" -ge "$min" ]]
+            ;;
+        active_diskful_count)
+            # Bug 393: count replicas of rd that are ACTIVE diskful —
+            # i.e. NOT DISKLESS / TIE_BREAKER (no backing disk) and NOT
+            # INACTIVE (`drbdadm down`, non-voting, non-serving). This is
+            # exactly what place_count must be measured against: an
+            # INACTIVE diskful replica does NOT count toward satisfied
+            # redundancy, so the placer must gap-fill to reach `min`.
+            local rd min count
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            min=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('min',2))" "$spec")
+            count=$(kubectl get resources.blockstor.cozystack.io -o json 2>/dev/null \
+                | python3 -c "import json,sys
+d=json.load(sys.stdin)
+rd='$rd'
+n=0
+for it in d.get('items',[]):
+    if it.get('spec',{}).get('resourceDefinitionName')!=rd: continue
+    flags=it.get('spec',{}).get('flags',[]) or []
+    if 'DISKLESS' in flags or 'TIE_BREAKER' in flags: continue
+    if 'INACTIVE' in flags: continue
+    n+=1
+print(n)")
             [[ "$count" -ge "$min" ]]
             ;;
         disk_state)
