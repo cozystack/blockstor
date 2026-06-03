@@ -23,19 +23,32 @@
 #   STATUS oscillated forever (resourceVersion churned ~1/s — an
 #   apiserver PATCH storm).
 #
+# This cell also covers the DISKLESS / TieBreaker facet: a diskless
+# replica has no backing disk to tear down, so drbd-9 never emits a
+# `destroy device` frame for its removed volume — without a destroy
+# signal the observer's volCache re-emitted a phantom status.volumes[1]
+# every tick and the diskless replica's status.volumes oscillated between
+# [0] and [0,1] ~1/tick. We hand-create a diskless replica on a 3rd node
+# so this facet is exercised deterministically.
+#
 # Expected after the fix:
 #   - every Resource's spec.volumes settles to exactly [vol-0];
-#   - status.volumes settles to exactly [vol-0] (no phantom v1:Diskless);
-#   - metadata.resourceVersion STOPS changing (the flap is gone).
+#   - status.volumes settles to exactly [vol-0] (no phantom v1:Diskless),
+#     including the diskless tiebreaker;
+#   - the per-replica status.volumes SET STOPS changing (the flap is
+#     gone). NB: we assert on the volume SET, not metadata.resourceVersion
+#     — on the stand's k3s/kine backend a GET reports the global store
+#     revision, which climbs on unrelated writes, so an rv-equality flap
+#     check is a false negative there.
 #
 # Unit pins (the BS↔kernel halves this stand cell complements):
 #   internal/controller/bug_399_vd_d_prune_resource_volumes_test.go
-#       — controller prunes Resource.spec.volumes + no resourceVersion
-#         churn once converged.
+#       — controller prunes Resource.spec.volumes once converged.
 #   pkg/satellite/controllers/bug_399_volume_evict_test.go
 #       — observer evicts the removed volume from volCache on
-#         `destroy device`, so it stops re-emitting the phantom status
-#         entry.
+#         `destroy device` (diskful) AND converges the diskless replica's
+#         cached set to the RD volume-number annotation, so it stops
+#         re-emitting the phantom status entry.
 
 set -euo pipefail
 
@@ -46,7 +59,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-require_workers 2
+require_workers 3
 
 linstor_cli_setup
 
@@ -76,6 +89,29 @@ echo ">> [Bug 399] rd c + vd c (vol-0) + vd c (vol-1)"
 
 echo ">> [Bug 399] r c --auto-place=2 -s $POOL"
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
+
+# Hand-create a DISKLESS replica on a free node so the diskless /
+# tiebreaker flap facet is exercised deterministically (independent of
+# auto-tiebreaker config). A diskless replica gets NO `destroy device`
+# frame when vol-1 is removed, so it is the harder half of Bug 399.
+echo ">> wait for the 2 diskful replicas to land, then place a diskless replica on a 3rd node"
+deadline=$(( $(date +%s) + 60 ))
+diskless_node=""
+while (( $(date +%s) < deadline )); do
+    mapfile -t diskful < <(linstor_diskful_nodes "$RD")
+    if (( ${#diskful[@]} >= 2 )); then
+        diskless_node=$(linstor_pick_free_node "$RD" "${diskful[@]}")
+        [[ -n "$diskless_node" ]] && break
+    fi
+    sleep 2
+done
+
+if [[ -z "$diskless_node" ]]; then
+    echo "SKIP: could not find a free 3rd node for the diskless replica — diskless facet not available"
+else
+    echo ">> [Bug 399] r c $diskless_node $RD --diskless (tiebreaker witness)"
+    "${LCTL[@]}" resource create "$diskless_node" "$RD" --diskless >/dev/null
+fi
 
 echo ">> wait up to 120s for vol-0 + vol-1 to reach UpToDate on both diskful replicas"
 deadline=$(( $(date +%s) + 120 ))
@@ -163,33 +199,47 @@ if [[ "$converged" != "true" ]]; then
     exit 1
 fi
 
-# THE FLAP ASSERTION: with the volume set converged, resourceVersion of
-# every Resource must STOP changing. Sample twice over a 10s window — a
-# Bug-399 flap churns resourceVersion ~1/s, so any change here is the
-# smoking gun.
-echo ">> [Bug 399] flap check: resourceVersion must be stable over a 10s window"
-declare -A rv_before
-while read -r name; do
-    [[ -z "$name" ]] && continue
-    rv_before["$name"]=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
-        -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
-done < <(kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
-            | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}')
+# THE FLAP ASSERTION: with the volume set converged, every Resource's
+# status.volumes SET must STOP changing. A Bug-399 flap (notably the
+# diskless tiebreaker) oscillates status.volumes between [0] and [0,1]
+# ~1/tick, so the set changes between consecutive polls.
+#
+# We assert on the volume SET, NOT metadata.resourceVersion: on the
+# stand's k3s/kine backend a GET reports the global store revision, which
+# climbs on every unrelated write even when THIS resource has zero churn
+# — an rv-equality check is a false negative there. The volume-set
+# comparison is kine-safe and is exactly what catches the real phantom.
+echo ">> [Bug 399] flap check: per-replica status.volumes SET must be stable over a 12s window (5 polls)"
+status_volset_snapshot() {
+    kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
+        | awk -v rd="${RD}." '$1 ~ "^"rd {print $1}' \
+        | sort \
+        | while read -r name; do
+            [[ -z "$name" ]] && continue
+            local st
+            st=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
+                -o jsonpath='{.status.volumes[*].volumeNumber}' 2>/dev/null \
+                | tr ' ' '\n' | sort -n | tr '\n' ',')
+            echo "${name}=${st}"
+        done
+}
 
-sleep 10
-
+prev_snap=""
 flapped=0
-for name in "${!rv_before[@]}"; do
-    rv_after=$(kubectl get "resources.blockstor.cozystack.io/${name}" \
-        -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo "")
-    if [[ "${rv_before[$name]}" != "$rv_after" ]]; then
-        echo "FLAP: $name resourceVersion churned ${rv_before[$name]} -> $rv_after" >&2
+for (( poll=0; poll<5; poll++ )); do
+    cur_snap=$(status_volset_snapshot)
+    if [[ -n "$prev_snap" && "$cur_snap" != "$prev_snap" ]]; then
+        echo "FLAP: status.volumes set changed between polls" >&2
+        diff <(printf '%s\n' "$prev_snap") <(printf '%s\n' "$cur_snap") >&2 || true
         flapped=1
+        break
     fi
+    prev_snap="$cur_snap"
+    (( poll < 4 )) && sleep 3
 done
 
 if (( flapped )); then
-    echo "FAIL (Bug 399): Resource status is still flapping after vd d — resourceVersion churn detected" >&2
+    echo "FAIL (Bug 399): Resource status is still flapping after vd d — status.volumes set churn detected" >&2
     exit 1
 fi
 
