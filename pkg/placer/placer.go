@@ -367,14 +367,24 @@ func (p *Placer) assemblePlan(ctx context.Context, rdName string, filter *apiv1.
 }
 
 // countDiskfulReplicas returns the number of existing replicas that
-// satisfy place_count: diskful (no DISKLESS flag) and not on an
-// EVICTED/LOST node.
+// satisfy place_count: diskful (no DISKLESS flag), active (no INACTIVE
+// flag), and not on an EVICTED/LOST node.
 //
 // DISKLESS replicas — including auto-tiebreaker witnesses, which carry
 // both DISKLESS and TIE_BREAKER — do NOT count. place_count is the
 // diskful-replica target. A 3-replica RG sitting at 2 diskful + 1
 // diskless witness must be treated as 1-short so the placer fills the
 // gap rather than declaring satisfaction.
+//
+// INACTIVE replicas do NOT count either. An INACTIVE replica is
+// `drbdadm down` (Bug 350): it serves no I/O, casts no quorum vote,
+// and is dropped from every sibling's .res file (see the dispatcher's
+// regenerateResFile INACTIVE filter). So an RD sitting at 2 active
+// diskful + 1 INACTIVE diskful with place_count=3 is effectively
+// 1-short on active redundancy, and the placer must gap-fill a
+// replacement active diskful on a healthy node rather than declaring
+// satisfaction. This mirrors the active-replica accounting used by the
+// satellite/dispatcher INACTIVE filters (Bugs 350/387).
 func countDiskfulReplicas(existing []apiv1.Resource, disabled map[string]struct{}) int {
 	count := 0
 
@@ -384,6 +394,10 @@ func countDiskfulReplicas(existing []apiv1.Resource, disabled map[string]struct{
 		}
 
 		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagInactive) {
 			continue
 		}
 
