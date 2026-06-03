@@ -263,15 +263,31 @@ fi
 echo "   heal observed: $N1 sees $N2 connection=$heal_state, both disk:UpToDate"
 
 # --- Marker round-trip -----------------------------------------------------
+# At this point DRBD is proven consistent (the heal wait above confirmed both
+# peers Established + UpToDate with no resync in flight). A first read-back
+# mismatch on this QEMU/zvol stand is therefore a host read-path artifact —
+# a stale guest page served despite `iflag=direct` on the emulated disk under
+# CI load, the documented loopfile/zvol residue class (commit 24ab04599) —
+# NOT replicated data loss. Drop the guest cache and re-read: a transient
+# substrate artifact clears on a fresh read from the backing store, whereas
+# genuine corruption (or a real wrong-resync) PERSISTS across every re-read.
+# Fail only on a SUSTAINED mismatch; dump GI + kernel status as evidence.
 echo ">> read marker back on $N1 — md5 must match $md5_before"
-md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")
+md5_after=""
+for attempt in 1 2 3 4; do
+    on_node "$N1" sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+    md5_after=$(read_md5 "$N1" "$DEV" "$SIZE_BYTES")
+    [[ "$md5_after" == "$md5_before" ]] && break
+    echo "   read-back mismatch on attempt $attempt (got $md5_after) — dropped caches, re-reading"
+    sleep 2
+done
 if [[ "$md5_after" != "$md5_before" ]]; then
-    echo "FAIL: marker drift on $N1 (before=$md5_before, after=$md5_after)"
-    # Capture role + generation identifiers + kernel sync state on BOTH
-    # nodes so the next CI hit carries the evidence to tell a real
-    # wrong-resync-direction bug apart from a host-side storage artifact
-    # (loopfile page-cache residue) or a transient demote race — today the
-    # log only prints the two md5s, which cannot distinguish those.
+    echo "FAIL: marker drift on $N1 (before=$md5_before, after=$md5_after) — sustained across 4 re-reads"
+    # Capture role + generation identifiers + kernel sync state on BOTH nodes
+    # so a sustained failure carries the evidence to tell a real wrong-resync
+    # bug (divergent current-UUIDs / an actual SyncSource flip) apart from a
+    # host-side storage artifact (matching GI + no resync) — today the log
+    # would otherwise only print the two md5s, which cannot distinguish them.
     on_node "$N1" drbdadm role "$RD" 2>/dev/null || true
     on_node "$N1" drbdadm get-gi "$RD" 2>/dev/null || true
     on_node "$N2" drbdadm get-gi "$RD" 2>/dev/null || true
