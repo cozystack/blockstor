@@ -221,3 +221,34 @@ type SnapshotShipper interface {
 	// metadata for the local node-id.
 	RecvSnapshot(ctx context.Context, target Volume, src io.Reader) error
 }
+
+// ResizeZeroFiller is the optional "grown region reads back as zeros"
+// capability (Bug 395, P1 data integrity). A provider implements it to
+// declare whether the bytes exposed by a grow (the region
+// [old_size, new_size)) are deterministically zero on every replica.
+//
+// This gates the `--assume-clean` fast path on `drbdadm resize`: that
+// flag tells DRBD to mark the grown region UpToDate on every replica
+// WITHOUT a resync. That is sound ONLY when the grown bytes are
+// guaranteed identical across replicas. Zero-on-allocate backends
+// (ZFS/ZFS_THIN refreservation reads zeros for never-written blocks,
+// LVM_THIN zeroes new thin chunks, FILE/FILE_THIN grow into a hole that
+// reads as zeros) satisfy this. Classic thick `LVM` does NOT:
+// `lvextend` exposes recycled VG extents whose prior content differs
+// per node, so `--assume-clean` would silently leave the replicas
+// disagreeing on [old_size, new_size) with no out-of-sync flag — a
+// failover then changes the bytes an application reads.
+//
+// A provider that does NOT implement this interface is treated as
+// NOT zero-fill (the safe default): the satellite omits `--assume-clean`
+// so DRBD marks the grown region out-of-sync and resyncs it from the
+// UpToDate source, guaranteeing every replica agrees on the grown
+// bytes. Implemented as an optional capability so the base Provider
+// interface stays under the interfacebloat budget.
+type ResizeZeroFiller interface {
+	// ResizeZeroFills reports whether a grow on this provider yields a
+	// region that reads back as zeros on every replica. true → the
+	// `drbdadm resize --assume-clean` fast path is sound; false →
+	// DRBD must resync the grown region.
+	ResizeZeroFills() bool
+}

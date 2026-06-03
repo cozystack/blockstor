@@ -63,6 +63,14 @@ func (p *Provider) Kind() string {
 	return "ZFS"
 }
 
+// ResizeZeroFills reports true for both ZFS and ZFS_THIN: ZFS reads
+// zeros for never-written blocks (thick uses a refreservation but the
+// blocks are still zero-on-read until written), so a grown region
+// [old_size, new_size) is byte-identical (all zeros) across replicas.
+// The `drbdadm resize --assume-clean` fast path is sound — no resync of
+// the grown region is needed (Bug 395). See storage.ResizeZeroFiller.
+func (*Provider) ResizeZeroFills() bool { return true }
+
 // Pool returns the underlying ZFS pool name (`zpool list` identifier).
 // The satellite Reconciler's FlushBackingDevices uses this to issue
 // `zpool sync <pool>` between drbdadm suspend-io and `zfs snapshot`

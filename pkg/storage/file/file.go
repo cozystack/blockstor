@@ -76,6 +76,14 @@ func (p *Provider) Kind() string {
 	return "FILE"
 }
 
+// ResizeZeroFills reports true for both FILE and FILE_THIN: growing the
+// backing file (truncate/fallocate) extends it into a hole that reads
+// back as zeros on every replica, so the grown region
+// [old_size, new_size) is byte-identical across replicas. The
+// `drbdadm resize --assume-clean` fast path is sound — no resync of the
+// grown region is needed (Bug 395). See storage.ResizeZeroFiller.
+func (*Provider) ResizeZeroFills() bool { return true }
+
 // CreateVolume idempotently:
 //   - creates the backing file at full size (fallocate, thick) or
 //     as a sparse file (truncate, thin)

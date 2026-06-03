@@ -57,6 +57,13 @@ func NewThin(cfg ThinConfig, ex storage.Exec) *Thin {
 // Kind returns the upstream LINSTOR provider kind string.
 func (*Thin) Kind() string { return "LVM_THIN" }
 
+// ResizeZeroFills reports true: LVM thin pools zero newly-provisioned
+// chunks, so a grown region [old_size, new_size) reads back as zeros on
+// every replica. The `drbdadm resize --assume-clean` fast path is
+// therefore sound — no resync of the grown region is needed (Bug 395).
+// See storage.ResizeZeroFiller.
+func (*Thin) ResizeZeroFills() bool { return true }
+
 // volumeLVName mirrors upstream LINSTOR's naming: `<resource>_<vol5digits>`.
 // We zero-pad the volume number to keep lexical sort meaningful.
 func volumeLVName(vol storage.Volume) string {

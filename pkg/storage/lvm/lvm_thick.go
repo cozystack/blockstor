@@ -52,6 +52,15 @@ func NewThick(cfg ThickConfig, ex storage.Exec) *Thick {
 // Kind returns the upstream LINSTOR provider kind string.
 func (*Thick) Kind() string { return "LVM" }
 
+// ResizeZeroFills reports false: classic thick LVM does NOT zero on
+// allocate. `lvextend` exposes recycled VG extents whose prior content
+// differs per node, so a grown region [old_size, new_size) is NOT
+// guaranteed identical across replicas. The satellite therefore omits
+// `drbdadm resize --assume-clean` for this provider and lets DRBD
+// resync the grown region from the UpToDate source (Bug 395, P1 data
+// integrity). See storage.ResizeZeroFiller.
+func (*Thick) ResizeZeroFills() bool { return false }
+
 // CreateVolume allocates a thick LV. Idempotent: existing LV is a no-op.
 func (t *Thick) CreateVolume(ctx context.Context, vol storage.Volume) error {
 	if t.lvExists(ctx, volumeLVName(vol)) {
