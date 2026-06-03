@@ -1970,3 +1970,168 @@ func TestSnapshotBug352TwoNodeScopedDenominatorOnePeerInFlightStaysIncomplete(t 
 			"reported back: %v", got[0].Flags)
 	}
 }
+
+// TestSnapshotCreateExcludesInactiveReplica_Bug394 pins the Bug 394
+// fix: an RD with an INACTIVE diskful replica must NOT target that
+// node in the snapshot fan-out. An INACTIVE replica holds data but its
+// DRBD device is down (`drbdadm down`), so the satellite cannot ack
+// the snapshot suspend-io barrier for it — the node reports Failed and
+// the whole snapshot group aborts (resume-on-abort). Pre-fix,
+// listDiskfulNodes only skipped DISKLESS, so the INACTIVE node leaked
+// into Spec.Nodes and every `snapshot create` on the RD aborted.
+//
+// Post-fix the snapshot targets only the ACTIVE diskful set; the
+// INACTIVE replica catches up on reactivation. Same INACTIVE-miscount
+// class as Bugs 387/390/393.
+func TestSnapshotCreateExcludesInactiveReplica_Bug394(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-inactive"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Three diskful replicas: n1 + n2 ACTIVE, n3 INACTIVE (DRBD device
+	// down). The fan-out must include n1 + n2 only.
+	for _, r := range []apiv1.Resource{
+		{Name: "pvc-inactive", NodeName: "n1"},
+		{Name: "pvc-inactive", NodeName: "n2"},
+		{Name: "pvc-inactive", NodeName: "n3", Flags: []string{apiv1.ResourceFlagInactive}},
+	} {
+		if err := st.Resources().Create(ctx, &r); err != nil {
+			t.Fatalf("seed resource %s: %v", r.NodeName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Payload omits `nodes` — lets the controller derive "every ACTIVE
+	// diskful peer" (the `linstor snapshot create <rd> <snap>` form).
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-bug394"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-inactive/snapshots", body)
+	_ = resp.Body.Close()
+
+	// The create must SUCCEED across the active set rather than abort.
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (snapshot must succeed across active set)", resp.StatusCode)
+	}
+
+	got, err := st.Snapshots().Get(ctx, "pvc-inactive", "snap-bug394")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+
+	// Spec.Nodes MUST resolve to the ACTIVE diskful set only.
+	if len(got.Nodes) != 2 {
+		t.Fatalf("Nodes: got %v (len=%d), want exactly [n1 n2] (INACTIVE n3 must be excluded)",
+			got.Nodes, len(got.Nodes))
+	}
+
+	if slices.Contains(got.Nodes, "n3") {
+		t.Errorf("Nodes: INACTIVE replica n3 leaked into snapshot target set: %v "+
+			"(suspend-io barrier would abort the group)", got.Nodes)
+	}
+
+	wantNodes := map[string]bool{"n1": true, "n2": true}
+	for _, n := range got.Nodes {
+		if !wantNodes[n] {
+			t.Errorf("Nodes: unexpected entry %q", n)
+		}
+
+		delete(wantNodes, n)
+	}
+
+	for n := range wantNodes {
+		t.Errorf("Nodes: missing active diskful peer %q", n)
+	}
+
+	// Per-node materialisation mirrors the active set — the INACTIVE
+	// node must not receive a Snapshots[] entry.
+	if len(got.Snapshots) != 2 {
+		t.Fatalf("Snapshots[]: got %d entries, want 2 (one per active diskful peer); got=%+v",
+			len(got.Snapshots), got.Snapshots)
+	}
+
+	for _, sn := range got.Snapshots {
+		if sn.NodeName == "n3" {
+			t.Errorf("Snapshots[]: INACTIVE n3 included in per-node materialisation: %+v", got.Snapshots)
+		}
+	}
+}
+
+// TestSnapshotStateIgnoresInactiveReplica_Bug394 pins the
+// success-denominator half of the Bug 394 fix: diskfulPeerSet must
+// exclude INACTIVE replicas, exactly as it excludes DISKLESS and
+// TIE_BREAKER. The INACTIVE replica is never a snapshot target (it
+// holds no Snapshots[] entry), so if it stayed in the denominator the
+// snapshot would hang at Incomplete forever — every active peer can
+// report success yet the INACTIVE node can never satisfy the check.
+//
+// The snapshot row is seeded with an EMPTY Nodes list so the success
+// derivation takes the broadcast path (successDenominator returns the
+// full diskful set verbatim). That is what makes diskfulPeerSet's
+// INACTIVE skip load-bearing: with a non-empty Nodes list the absent
+// INACTIVE node would be filtered out by the Nodes∩diskful intersection
+// regardless, masking the bug.
+//
+// Topology: n1 + n2 ACTIVE diskful (both reported CreateTimestamp),
+// n3 INACTIVE diskful. The snapshot MUST be stamped SUCCESSFUL.
+func TestSnapshotStateIgnoresInactiveReplica_Bug394(t *testing.T) {
+	ctx := t.Context()
+
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name: "bug394test",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	resources := []apiv1.Resource{
+		{Name: "bug394test", NodeName: "worker-1"},
+		{Name: "bug394test", NodeName: "worker-2"},
+		{Name: "bug394test", NodeName: "worker-3", Flags: []string{apiv1.ResourceFlagInactive}},
+	}
+
+	for i := range resources {
+		if err := st.Resources().Create(ctx, &resources[i]); err != nil {
+			t.Fatalf("seed Resource %s: %v", resources[i].NodeName, err)
+		}
+	}
+
+	// Broadcast snapshot row: empty Nodes → successDenominator returns
+	// the diskfulPeerSet verbatim. Both ACTIVE peers reported
+	// CreateTimestamp; the INACTIVE worker-3 reported nothing (its DRBD
+	// device is down). Pre-fix, diskfulPeerSet counted worker-3, so the
+	// "every diskful peer reported" check never passed → no SUCCESSFUL.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap1",
+		ResourceName: "bug394test",
+		Snapshots: []apiv1.SnapshotPerNode{
+			{SnapshotName: "snap1", NodeName: "worker-1", CreateTimestamp: 1714000000},
+			{SnapshotName: "snap1", NodeName: "worker-2", CreateTimestamp: 1714000050},
+		},
+	}); err != nil {
+		t.Fatalf("seed Snapshot: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	got := decodeSnapshotPage(t, base+"/v1/view/snapshots")
+	if len(got) != 1 {
+		t.Fatalf("view len: got %d, want 1", len(got))
+	}
+
+	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
+		t.Errorf("Flags: got %v, want SUCCESSFUL (every active diskful peer reported, "+
+			"INACTIVE worker-3 MUST be excluded from the denominator)", got[0].Flags)
+	}
+}

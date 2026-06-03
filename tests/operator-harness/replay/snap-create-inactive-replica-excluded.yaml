@@ -1,0 +1,81 @@
+name: snap-create-inactive-replica-excluded
+description: |
+  Bug-394 catcher (P2, but reliably breaks snapshots). A `snapshot
+  create` on an RD that has an INACTIVE diskful replica must SUCCEED
+  across the ACTIVE diskful set and must NOT target the INACTIVE node.
+
+  Root cause (pre-fix): pkg/rest/snapshots.go listDiskfulNodes skipped
+  DISKLESS (and thus TIE_BREAKER) replicas but NOT INACTIVE ones, so
+  the defaulted snap.Nodes included a node whose DRBD resource is
+  `drbdadm down` (INACTIVE). The snapshot suspend-io barrier then waits
+  for that node to ack a `drbdsetup suspend-io`, which the satellite
+  cannot do on a down resource → that node reports Failed → the whole
+  snapshot group aborts (resume-on-abort). Net effect: a `snapshot
+  create` on ANY RD that has an INACTIVE replica reliably FAILED.
+
+  Same INACTIVE-miscount class as Bugs 387/390/393. An INACTIVE replica
+  holds data but its DRBD device is down; it cannot participate in the
+  suspend-io barrier and catches up on reactivation, so a snapshot of
+  the active set is the correct semantic.
+
+  Sequence: 3 diskful RD → deactivate node3 (INACTIVE) → snapshot
+  create (default fan-out) → assert the create returns 0 (group did
+  NOT abort) and the snapshot is visible in the list. Pre-fix the
+  create step aborts (non-zero) because the suspend-io barrier hangs
+  on the down node3 replica.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  # Deactivate node3 → INACTIVE (drbdadm down). No await kind exists
+  # for "replica is INACTIVE", and re-asserting all_uptodate here is
+  # unsafe (the down node3 replica no longer reports UpToDate), so we
+  # follow the proven r-d-inactive-no-tiebreaker.yaml pattern: let the
+  # deactivate settle and rely on the next step's expect_exit. The bug
+  # signal is the snapshot-create step below — pre-fix the suspend-io
+  # barrier hangs on the down node3 replica and the group aborts
+  # non-zero (resume-on-abort).
+  - name: r-deactivate-node3
+    cmd: ["resource", "deactivate", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+  - name: snapshot-create-succeeds-across-active-set
+    cmd: ["snapshot", "create", "{{rd}}", "snap-bug394"]
+    expect_exit: 0
+  - name: snapshot-visible-in-list
+    cmd: ["snapshot", "list"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["snapshot", "delete", "{{rd}}", "snap-bug394"]
+  - cmd: ["resource", "activate", "{{node3}}", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
