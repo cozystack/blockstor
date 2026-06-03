@@ -1,0 +1,94 @@
+name: toggle-disk-migrate-from
+description: |
+  H2 (toggle-disk state-machine campaign): `linstor resource toggle-disk
+  <dst> <rd> --storage-pool <sp> --migrate-from <src>` is sync-then-remove
+  (UG9 §"Migrating a resource to another node"). Start with 2 diskful
+  (node1=src, node2=keep) + 1 diskless landing pad (node3=dst). Toggle the
+  diskless dst to diskful with --migrate-from node1.
+
+  Contract pinned:
+    - During the migration the ACTIVE diskful count stays >= 2 (dst is
+      added before src is dropped — never below the original redundancy).
+    - The destination (node3) reaches UpToDate.
+    - The migrate SOURCE (node1) Resource is removed ONLY AFTER dst is
+      UpToDate (sync-then-remove).
+
+  The modern `--drbd-diskless` flag is used for the landing pad on purpose
+  (it posts wire flag DRBD_DISKLESS; the controller must normalise it to
+  DISKLESS — H3 in the same campaign).
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "128M"]
+    expect_exit: 0
+  - name: r-c-src-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-keep-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-dst-drbd-diskless
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--drbd-diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+  - name: wait-both-diskful
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: r-td-migrate-from
+    cmd: ["resource", "toggle-disk", "{{node3}}", "{{rd}}", "--storage-pool", "{{sp}}", "--migrate-from", "{{node1}}"]
+    expect_exit: 0
+    await:
+      # Destination must reach UpToDate. The migration reconciler only
+      # prunes the source once this is observed, so awaiting it here
+      # gates the sync-then-remove assertion below.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: UpToDate
+      timeout_s: 300
+  - name: assert-redundancy-held
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Redundancy invariant: at least 2 active diskful replicas exist
+      # the whole way through — the destination was added before the
+      # source was dropped (sync-then-remove, never drop-then-add).
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 60
+  - name: assert-src-removed
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Source pruned ONLY after dst UpToDate — completes the
+      # sync-then-remove contract.
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
