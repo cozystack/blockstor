@@ -195,6 +195,22 @@ const (
 	// delete-then-notify-then-prune handshake without copying GPL
 	// code.
 	ResourceFlagDeleting = "DELETING"
+
+	// ResourceFlagDelete is the upstream-canonical LINSTOR flag token
+	// (`Resource.java::Flags.DELETE` / `ResourceDefinition.java::Flags.
+	// DELETE`) that marks an object in the two-phase delete: the
+	// controller has flagged it for deletion but the satellites have not
+	// yet confirmed the on-node teardown. In blockstor the equivalent
+	// state is "the CRD carries a DeletionTimestamp but its
+	// satellite-resource finalizer is still held" (a downed satellite
+	// can't drain DRBD, so the object lingers). The store projection
+	// surfaces this flag on the wire when DeletionTimestamp is set so
+	// `linstor rd l` / `linstor r l` render the State column as
+	// `DELETING` — matching upstream's CLI display word for the DELETE
+	// flag. Distinct from ResourceFlagDeleting above, which is a
+	// blockstor-internal peer-forget handshake token that never reaches
+	// the wire.
+	ResourceFlagDelete = "DELETE"
 )
 
 // nodeNamespaceUUID is the v5 namespace used to derive stable per-Node
