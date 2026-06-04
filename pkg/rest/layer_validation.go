@@ -102,6 +102,22 @@ func normalizeLayerStack(layers []string) ([]string, error) {
 func validateLayerStackOrder(normalized []string) error {
 	joined := strings.Join(normalized, ",")
 
+	// Duplicate detection runs FIRST so a stack like `DRBD,DRBD,STORAGE`
+	// is reported as a duplicate rather than tripping the position
+	// check below ("DRBD must be the first layer") — the second DRBD
+	// lands at index 1 and would otherwise mask the real cause. Upstream
+	// LINSTOR rejects the same input (envelope `The layer stack [...] is
+	// invalid`); blockstor surfaces the more specific reason. Corner D7b.
+	seen := map[string]bool{}
+	for _, layer := range normalized {
+		if seen[layer] {
+			return fmt.Errorf("%w: layer %s appears more than once in %s",
+				ErrInvalidLayerOrder, layer, joined)
+		}
+
+		seen[layer] = true
+	}
+
 	if normalized[len(normalized)-1] != apiv1.LayerKindStorage {
 		return fmt.Errorf("%w: STORAGE must be the terminal (last) layer; got %s",
 			ErrInvalidLayerOrder, joined)
@@ -130,16 +146,6 @@ func validateLayerStackOrder(normalized []string) error {
 		// LUKS-above-DRBD means DRBD replicates plaintext.
 		return fmt.Errorf("%w: LUKS must be a child of DRBD, not parent; got %s",
 			ErrInvalidLayerOrder, joined)
-	}
-
-	seen := map[string]bool{}
-	for _, layer := range normalized {
-		if seen[layer] {
-			return fmt.Errorf("%w: layer %s appears more than once in %s",
-				ErrInvalidLayerOrder, layer, joined)
-		}
-
-		seen[layer] = true
 	}
 
 	return nil
