@@ -1,0 +1,90 @@
+name: snap-vd-restore-volume-conflict-rejected
+description: |
+  Corner-case G3b catcher (two-phase restore edge — volume-number
+  conflict).
+
+  `linstor snapshot volume-definition restore` hydrates a snapshot's
+  recorded volume layout onto a (typically pre-existing, EMPTY) target
+  RD. If the target RD ALREADY carries a volume-definition whose number
+  collides with one of the snapshot's, the restore must be REJECTED up
+  front with a typed FAIL_EXISTS_VLM_DFN envelope naming the offending
+  volume number — never partially mutate the target.
+
+  Pre-fix the per-VD hydrate Create surfaced a bare 409 only AFTER an
+  earlier non-colliding VD had already landed, leaving a half-restored
+  RD. The handler now pre-checks every snapshot volume number against
+  the target's existing VDs and refuses before any Store mutation.
+
+  Sequence: source RD (1 volume) on node1 → snapshot → target RD created
+  with its OWN volume 0 → VD-restore into the clashing target MUST be
+  rejected (CLI exit 10), and the target's own VD stays intact → control
+  VD-restore into a fresh EMPTY RD succeeds.
+
+  L6 companion: tests/e2e/cli-matrix/snap-vd-restore-volume-conflict-rejected.sh
+  (richer per-VD size assertion); this replay codifies the operator
+  sequence + the reject/accept contract the harness asserts directly.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: snapg3b-src
+
+steps:
+  - name: create-src-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-src-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-source-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "snapg3b"]
+    expect_exit: 0
+  # ---- target RD with its OWN clashing volume 0 ----
+  - name: create-conflict-rd
+    cmd: ["resource-definition", "create", "snapg3b-tgt-conflict"]
+    expect_exit: 0
+  - name: create-conflict-vd
+    cmd: ["volume-definition", "create", "snapg3b-tgt-conflict", "128M"]
+    expect_exit: 0
+  # ---- VD-restore into the clashing target MUST be rejected ----
+  # The snapshot records volume 0; the target already has volume 0, so
+  # the restore collides on the volume-number key. The handler refuses
+  # with FAIL_EXISTS_VLM_DFN (apiCallRcError envelope → CLI exit 10).
+  - name: vd-restore-conflict-rejected
+    cmd: ["snapshot", "volume-definition", "restore",
+          "--from-resource", "{{rd}}",
+          "--from-snapshot", "snapg3b",
+          "--to-resource", "snapg3b-tgt-conflict"]
+    expect_exit: 10
+  # ---- control: VD-restore into a fresh EMPTY RD succeeds ----
+  - name: create-empty-rd
+    cmd: ["resource-definition", "create", "snapg3b-tgt-ok"]
+    expect_exit: 0
+  - name: vd-restore-into-empty-ok
+    cmd: ["snapshot", "volume-definition", "restore",
+          "--from-resource", "{{rd}}",
+          "--from-snapshot", "snapg3b",
+          "--to-resource", "snapg3b-tgt-ok"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "snapg3b-tgt-ok"]
+  - cmd: ["resource-definition", "delete", "snapg3b-tgt-conflict"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "snapg3b"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
