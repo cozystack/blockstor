@@ -48,8 +48,9 @@ const (
 	PropAutoSnapshotRunEvery = "AutoSnapshot/RunEvery"
 
 	// PropAutoSnapshotKeep bounds the retained auto-snapshot count.
-	// Default 10 (DFLT_AUTO_SNAPSHOT_KEEP). A value <=0 disables the
-	// prune step, in which case every auto-snapshot is kept.
+	// Default 10 (DFLT_AUTO_SNAPSHOT_KEEP). Per upstream's documented
+	// semantic, a value <= 0 (or the prop being absent) falls back to
+	// that default of 10 — it does NOT disable the prune (G4).
 	PropAutoSnapshotKeep = "AutoSnapshot/Keep"
 
 	// PropAutoSnapshotNextID is the monotonically-incremented
@@ -371,10 +372,11 @@ func (r *AutoSnapshotRunnable) stampRDAfterCreate(
 // "Manually-created snapshots NOT counted against the keep budget"
 // invariant.
 //
-// A Keep value of 0 or negative disables the prune (every
-// auto-snapshot is retained) — matches the upstream OpenAPI
-// "Removing this property or having a value <= 0 disables
-// auto-cleanup" wording.
+// G4 (corner-case): a Keep value of 0 or negative falls back to the
+// DEFAULT Keep (10) — it does NOT disable cleanup. This matches the
+// upstream administration guide: "If AutoSnapshot/Keep is omitted (or
+// <= 0), LINSTOR will keep the last 10 snapshots by default"
+// (linstor-administration.adoc ~2467).
 func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 	ctx context.Context,
 	rd *blockstoriov1alpha1.ResourceDefinition,
@@ -387,12 +389,16 @@ func (r *AutoSnapshotRunnable) pruneOldAutoSnapshots(
 			return errors.Wrapf(err, "parse %s=%q", PropAutoSnapshotKeep, rawKeep)
 		}
 
-		if parsed <= 0 {
-			// Disable cleanup — every auto-snapshot is kept.
-			return nil
+		// G4 (corner-case): upstream LINSTOR's documented semantic is
+		// "if AutoSnapshot/Keep is omitted (or <= 0), LINSTOR will keep
+		// the last 10 snapshots by default" (linstor-administration.adoc
+		// ~2467). A <= 0 value therefore falls back to the default Keep
+		// (10) — it does NOT disable cleanup. Pre-fix blockstor treated
+		// <= 0 as "keep everything", which let an unbounded number of
+		// auto-snapshots accumulate and silently diverged from upstream.
+		if parsed > 0 {
+			keep = int(parsed)
 		}
-
-		keep = int(parsed)
 	}
 
 	var snapList blockstoriov1alpha1.SnapshotList
