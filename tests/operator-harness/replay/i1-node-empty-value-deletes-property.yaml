@@ -23,13 +23,15 @@ prerequisites:
 
 vars:
   # No RD/SP objects are created — this is a pure node-prop workflow.
-  # Aux/ keeps the key in the operator-writable namespace and avoids
-  # touching any DRBD-affecting property.
-  marker_key: Aux/cc-i1-marker
+  # The marker key `Aux/cc-i1-marker` is inlined verbatim in the steps
+  # (the replay runner only substitutes {{rd}}/{{sp}}/{{node1..4}}, not
+  # custom vars). Aux/ keeps the key in the operator-writable namespace
+  # and avoids touching any DRBD-affecting property.
+  rd: cc-i1-node-unused
 
 steps:
   - name: set-node-prop
-    cmd: ["node", "set-property", "{{node1}}", "{{marker_key}}", "present"]
+    cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker", "present"]
     expect_exit: 0
   - name: node-prop-is-set
     cmd: ["node", "list-properties", "{{node1}}"]
@@ -38,12 +40,12 @@ steps:
       kind: prop_value
       obj: node
       name: "{{node1}}"
-      key: "{{marker_key}}"
+      key: "Aux/cc-i1-marker"
       expected: "present"
       timeout_s: 30
   - name: clear-node-prop-empty-value
     # I1: empty value = delete the property entirely (non-RD object).
-    cmd: ["node", "set-property", "{{node1}}", "{{marker_key}}"]
+    cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker"]
     expect_exit: 0
   - name: node-prop-is-gone
     cmd: ["node", "list-properties", "{{node1}}"]
@@ -52,14 +54,14 @@ steps:
       kind: prop_value
       obj: node
       name: "{{node1}}"
-      key: "{{marker_key}}"
+      key: "Aux/cc-i1-marker"
       # expected omitted ⇒ key must be ABSENT.
       timeout_s: 30
 
 teardown:
   # Best-effort: make sure the marker is gone even if a step bailed
   # mid-run (deleting an already-absent key is a no-op for the CLI).
-  - cmd: ["node", "set-property", "{{node1}}", "{{marker_key}}"]
+  - cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker"]
 
 invariants:
   - no_orphans
