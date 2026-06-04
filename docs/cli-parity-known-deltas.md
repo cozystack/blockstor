@@ -26,6 +26,7 @@ Row IDs match the command-catalogue indexes used by `cli-parity-refresh.sh` (see
 | 53 | `backup l` | MISSING_FEATURE | 2026-12-31 | Backup/restore subsystem (F20 follow-up: orchestration only — DTO already lands). |
 | 54 | `schedule l` | MISSING_FEATURE | 2026-12-31 | Schedules subsystem deferred to follow-up wave. |
 | 55 | `key-value-store list` | WIRE_SHAPE | 2026-09-30 | BS exposes the KVS endpoints but the wire shape lacks `props.LinstorKvs/...` namespace nesting; CSI uses a flat key set so unblocked. |
+| 60 | `vd s <rd> <vn> <smaller>` (shrink) | BEHAVIOR | permanent | BLOCKSTOR_STRICTER: upstream LINSTOR has permitted `vd set-size` downward since 1.8.0 for layer stacks that support it (e.g. STORAGE/ZFS-only); BS rejects ALL shrinks with `FAIL_INVLD_VLM_SIZE` (HTTP 400) unless the operator opts in with `force=true` (body field or `?force=true`). Rationale: every BS RD is DRBD-backed and DRBD cannot shrink past the on-disk metadata position without destroying it, so an unconditional reject is the safe default. The `force=true` escape hatch covers the post-`resize2fs -s` operator. Pinned by `tests/e2e/cli-matrix/vd-shrink-rejected.sh` (L6), `replay/vd-resize-full-lifecycle.yaml` (L7), and `pkg/rest/volume_definitions_test.go::TestVolumeDefinitionsUpdateShrink{Rejected,WithForceAccepted}` + `pkg/rest/bug_383_*` (L1). |
 
 ## Open (block merge until addressed)
 

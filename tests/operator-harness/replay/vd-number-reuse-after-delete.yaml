@@ -1,0 +1,115 @@
+name: vd-number-reuse-after-delete
+description: |
+  Corner-case A2b (volume-number reuse after delete) — operator-level
+  catcher. Upstream LINSTOR assigns the SMALLEST FREE volume number on a
+  plain `vd c` (no --vlmnr): with vols 0+1 present, `vd d 0` frees 0, and
+  the next plain `vd c` re-takes the freed 0 — NOT 2 (max+1). Verified
+  identical against the upstream Java oracle (piraeus-server v1.33.2).
+
+  Sequence:
+    1. rd c + vd c (vol-0) + vd c (vol-1) on 2 diskful replicas.
+    2. Drive BOTH volumes UpToDate.
+    3. `vd d 0` — delete the lowest number, freeing it.
+    4. `vd c` (plain) — MUST re-take the freed 0.
+    5. Assert every Resource converges to EXACTLY the {0,1} volume set
+       (no phantom vol from the delete, the re-added 0 projected onto
+       every replica) AND the re-added vol-0 reaches UpToDate.
+
+  This catcher exercises two fix paths in one shot:
+
+    - Bug-399 prune (REMOVE side): `vd d 0` must drop vol-0 from every
+      replica's Resource.spec.volumes + status.volumes. A stale entry
+      would leave the converged set as a superset of {1} after step 3,
+      or a phantom in status after the re-add.
+
+    - Bug-384 late-add seed (ADD side): the re-added vol-0 must be
+      re-projected onto every diskful replica, get its backing LV +
+      per-volume create-md, and reach UpToDate. A regression here leaves
+      the re-added vol-0 Unintentional-Diskless and all_uptodate fails.
+
+  The volumes_settled await is the no-flap gate: after the re-add settles
+  the per-replica status.volumes SET is EXACTLY {0,1} and byte-stable
+  across the poll window. all_uptodate confirms the re-added vol-0
+  actually converged (not just projected). The smallest-free allocation
+  rule itself (0 reused, not 2) is pinned at L1
+  (pkg/rest/vd_number_reuse_corner_a_test.go) and at L6
+  (tests/e2e/cli-matrix/vd-number-reuse-after-delete.sh, which asserts
+  the exact VlmNr set off `vd l`).
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vol0
+    # 64M: A2b is a deterministic allocation/projection property, not a
+    # sync-timing race — size-independent. Small volume converges in
+    # seconds on the I/O-constrained stand.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: create-vol1
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-both-volumes-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: vd-d-vol0
+    # Delete the LOWEST number so the freed slot is 0. Every replica must
+    # converge to exactly [1] (Bug-399 prune of the remove side).
+    cmd: ["volume-definition", "delete", "{{rd}}", "0"]
+    expect_exit: 0
+    await:
+      kind: volumes_settled
+      rd: "{{rd}}"
+      expected: "1"
+      settle_s: 8
+      polls: 5
+      timeout_s: 120
+  - name: vd-c-reuse-0
+    # THE A2b PROPERTY: a plain `vd c` after `vd d 0` re-takes the freed
+    # 0 (smallest free), NOT 2. The re-added vol-0 must be re-seeded onto
+    # every diskful replica (Bug-384 late-add) and reach UpToDate.
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+    await:
+      # spec.volumes + status.volumes converge to EXACTLY {0,1} on every
+      # replica with no flap: the re-added 0 is projected (not a phantom)
+      # and the surviving 1 is retained.
+      kind: volumes_settled
+      rd: "{{rd}}"
+      expected: "0,1"
+      settle_s: 8
+      polls: 5
+      timeout_s: 180
+  - name: wait-reused-vol0-uptodate
+    # Kernel-truth: the re-added vol-0 actually converged, not merely
+    # projected. A Bug-384 late-add regression leaves it Diskless and
+    # this fails.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
