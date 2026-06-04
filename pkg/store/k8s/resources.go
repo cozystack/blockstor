@@ -20,6 +20,7 @@ package k8s
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -460,6 +461,38 @@ func buildVolumeStatusForApply(observations []apiv1.VolumeObservation) []crdv1al
 	return out
 }
 
+// withDeletingFlag appends the upstream-canonical `DELETE` flag to a
+// CRD's spec Flags slice when the object carries a DeletionTimestamp
+// (E4 / two-phase RD deletion). controller-runtime keeps returning a
+// CRD with a non-nil DeletionTimestamp from List/Get for as long as a
+// finalizer is held — in blockstor that window is "the
+// satellite-resource finalizer hasn't drained DRBD yet", e.g. because
+// the owning satellite is down. Surfacing DELETE here makes
+// `linstor rd l` / `linstor r l` render the State column as DELETING
+// during that interim, matching upstream LINSTOR's two-phase delete
+// visibility (the satellites confirm the on-node teardown before the
+// object disappears from the DB).
+//
+// Idempotent: if the spec already carries DELETE (a future cascade
+// path might stamp it explicitly) the flag is not duplicated. The
+// input slice is never mutated — a fresh slice is returned only when a
+// flag must be added, otherwise the original is passed through.
+func withDeletingFlag(flags []string, deleting bool) []string {
+	if !deleting {
+		return flags
+	}
+
+	if slices.Contains(flags, apiv1.ResourceFlagDelete) {
+		return flags
+	}
+
+	out := make([]string, 0, len(flags)+1)
+	out = append(out, flags...)
+	out = append(out, apiv1.ResourceFlagDelete)
+
+	return out
+}
+
 func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 	props := mergeProps(crd.Spec.Props, typedToProps(crd.Spec.DRBDOptions, crd.Spec.ExtraProps))
 
@@ -478,7 +511,7 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		Name:     crd.Spec.ResourceDefinitionName,
 		NodeName: crd.Spec.NodeName,
 		Props:    props,
-		Flags:    crd.Spec.Flags,
+		Flags:    withDeletingFlag(crd.Spec.Flags, crd.DeletionTimestamp != nil),
 		// Resource CRD has no LayerStack — that lives on the parent RD.
 		// Looking it up here turns every list/view into an N+1 query, so
 		// we approximate with the default stack. The Python CLI only

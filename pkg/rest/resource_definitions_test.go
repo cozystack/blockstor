@@ -21,6 +21,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -833,6 +834,87 @@ func TestResourceDefinitionsDeleteAfterSnapshotsCleared(t *testing.T) {
 
 	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-clear"); err == nil {
 		t.Errorf("RD still present after delete")
+	}
+}
+
+// TestResourceDeleteSingleReplicaPreservesSnapshots pins the second
+// half of the E1 corner case: while `rd d` is REFUSED on an RD that
+// still has snapshots, `r d` of a SINGLE replica is NOT — it only
+// drops that one per-node Resource and leaves the parent RD, the
+// surviving replicas, AND every Snapshot row intact. Upstream LINSTOR
+// scopes the snapshot guard to resource-DEFINITION delete only
+// (CtrlRscDfnDeleteApiCallHandler.ensureNoSnapDfns); a per-replica
+// `linstor resource delete <node> <rd>` never touches the
+// snapshot-definition set (UG9 ~1364-1366, ~1395). Without this pin a
+// future refactor that wired the snapshot guard onto the per-replica
+// delete handler would silently break the documented "snapshots
+// survive a replica delete" contract.
+func TestResourceDeleteSingleReplicaPreservesSnapshots(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const rd = "pvc-rd-snap-survive"
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{Name: rd, NodeName: n}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	for _, snapName := range []string{"snap-a", "snap-b"} {
+		if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+			Name: snapName, ResourceName: rd,
+		}); err != nil {
+			t.Fatalf("seed snapshot %s: %v", snapName, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// `r d n2 <rd>` — single replica delete. Must succeed (200) even
+	// though snapshots exist on the parent RD.
+	resp := httpDelete(t, base+"/v1/resource-definitions/"+rd+"/resources/n2")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("r d single replica: got %d, want 200 (snapshot guard must NOT apply to per-replica delete)", resp.StatusCode)
+	}
+
+	// The deleted replica is gone.
+	if _, err := st.Resources().Get(ctx, rd, "n2"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("deleted replica n2 still present: err=%v (want ErrNotFound)", err)
+	}
+
+	// The parent RD survives.
+	if _, err := st.ResourceDefinitions().Get(ctx, rd); err != nil {
+		t.Errorf("parent RD must survive a per-replica delete: %v", err)
+	}
+
+	// Surviving replicas stay put.
+	left, err := st.Resources().ListByDefinition(ctx, rd)
+	if err != nil {
+		t.Fatalf("list replicas: %v", err)
+	}
+
+	if len(left) != 2 {
+		t.Errorf("surviving replicas: got %d, want 2", len(left))
+	}
+
+	// Critical contract: both snapshots survive untouched.
+	snaps, err := st.Snapshots().ListByDefinition(ctx, rd)
+	if err != nil {
+		t.Fatalf("list snapshots: %v", err)
+	}
+
+	if len(snaps) != 2 {
+		t.Errorf("snapshots after single-replica delete: got %d, want 2 (snapshots MUST survive `r d`)", len(snaps))
 	}
 }
 

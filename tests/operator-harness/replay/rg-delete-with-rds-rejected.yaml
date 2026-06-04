@@ -1,0 +1,76 @@
+name: rg-delete-with-rds-rejected
+description: |
+  Corner-case E3 (deletion semantics + reassign escape), UG9
+  linstor-administration.adoc ~1403-1429.
+
+    1. `rg delete <rg>` is REFUSED while any ResourceDefinition still
+       references it (FAIL_EXISTS_RSC_DFN: "Cannot delete resource group
+       '<rg>' because it has existing resource definitions."). There is
+       no `--force`. The CLI surfaces this as a non-zero exit
+       (apiCallRcError envelope → exit 10).
+
+    2. The escape is to REASSIGN the RD to another group with
+       `rd modify <rd> --resource-group <other>`; the now-empty original
+       group can then be deleted.
+
+  This replay codifies the operator sequence purely via exit-code
+  contracts (the runner has no "property-inherited" await kind — the
+  retroactive-inheritance flip is asserted at the L6 layer in
+  tests/e2e/cli-matrix/rg-delete-with-rds-rejected.sh, which can grep
+  `rd lp`). Sequence: rg c src + rg c dst → rd c under src → `rg d src`
+  MUST be rejected (exit 10) → `rd modify --resource-group dst` → `rg d
+  src` MUST now succeed (empty) → `rg d dst` after the RD is dropped.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: cce-e3-escape-rd
+
+steps:
+  - name: create-src-rg
+    cmd: ["resource-group", "create", "cce-e3-src"]
+    expect_exit: 0
+  - name: create-dst-rg
+    cmd: ["resource-group", "create", "cce-e3-dst"]
+    expect_exit: 0
+  - name: create-rd-under-src
+    cmd: ["resource-definition", "create", "{{rd}}", "--resource-group", "cce-e3-src"]
+    expect_exit: 0
+  # ---- Contract 1: rg d src refused while the RD references it ----
+  - name: rg-d-src-rejected
+    cmd: ["resource-group", "delete", "cce-e3-src"]
+    expect_exit: 10
+  # src_rg must survive the refused delete.
+  - name: src-rg-still-present
+    cmd: ["resource-group", "list", "--resource-groups", "cce-e3-src"]
+    expect_exit: 0
+  # ---- Contract 2: reassign the RD to dst_rg (the escape) ----
+  - name: rd-modify-resource-group
+    cmd: ["resource-definition", "modify", "{{rd}}", "--resource-group", "cce-e3-dst"]
+    expect_exit: 0
+  # ---- Contract 3: src_rg is now empty → delete succeeds ----
+  - name: rg-d-src-now-succeeds
+    cmd: ["resource-group", "delete", "cce-e3-src"]
+    expect_exit: 0
+  # Drop the RD, then the destination group is empty too.
+  - name: delete-rd
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: rg-d-dst-succeeds
+    cmd: ["resource-group", "delete", "cce-e3-dst"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-group", "delete", "cce-e3-src"]
+  - cmd: ["resource-group", "delete", "cce-e3-dst"]
+
+invariants:
+  - no_orphans

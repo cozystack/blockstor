@@ -302,7 +302,7 @@ func crdToWireRD(crd *crdv1alpha1.ResourceDefinition) apiv1.ResourceDefinition {
 		ResourceGroupName: crd.Spec.ResourceGroupName,
 		Props:             props,
 		Annotations:       userAnnotations(crd.Annotations),
-		Flags:             crd.Spec.Flags,
+		Flags:             withDeletingFlag(crd.Spec.Flags, crd.DeletionTimestamp != nil),
 		LayerStack:        crd.Spec.LayerStack,
 		UUID:              string(crd.UID),
 	}
