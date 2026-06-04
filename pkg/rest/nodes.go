@@ -24,6 +24,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1089,6 +1090,22 @@ func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Corner-case F6 (UG9 §"Auto-evict" / EVICTED latched state):
+	// EVICTED is a one-way drain mark. Upstream LINSTOR refuses a plain
+	// `node delete` on an EVICTED node — the operator must decide
+	// EXPLICITLY between `node restore` (cancel the drain, the node
+	// keeps its SP / props / resources) and `node lost` (the node is
+	// gone for good, cascade its orphans). A bare `n d` on an EVICTED
+	// node would race the in-flight migration cascade the NodeReconciler
+	// is driving (add-before-drop) and silently discard that decision,
+	// so we reject it with 409 + FAIL_IN_USE and point at the two
+	// sanctioned exits. `?force=true` keeps the disaster-recovery
+	// override (it already cascades orphans above), matching the Bug 92
+	// / Bug 179 escape-hatch precedent on this same handler.
+	if !force && s.refuseNodeDeleteIfEvicted(ctx, w, name) {
+		return
+	}
+
 	(&deleteWithRollback[apiv1.Node]{
 		refuseIfReferenced: func() bool {
 			if force {
@@ -1152,6 +1169,53 @@ func (s *Server) refuseNodeDeleteIfReferenced(w http.ResponseWriter, r *http.Req
 	}
 
 	writeJSON(w, http.StatusConflict, buildNodeDeleteRefusal(name, resourceRefs, spRefs))
+
+	return true
+}
+
+// refuseNodeDeleteIfEvicted is the corner-case F6 latched-state gate.
+// Returns true (HTTP 409 already written, caller must stop) when the
+// node carries the EVICTED flag — a plain `node delete` on a draining
+// node is refused so the operator chooses explicitly between
+// `node restore` and `node lost`. Returns false (proceed) for a node
+// that is not EVICTED, or that no longer exists (the parent handler's
+// idempotent-delete replay path writes the warn envelope itself).
+//
+// A LOST-flagged node is NOT caught here: LOST already means "gone for
+// good" and a delete of a LOST node is the natural cleanup, so only the
+// soft EVICTED drain mark latches the delete.
+func (s *Server) refuseNodeDeleteIfEvicted(ctx context.Context, w http.ResponseWriter, name string) bool {
+	node, err := s.Store.Nodes().Get(ctx, name)
+	if err != nil {
+		// NotFound → let the parent's idempotent-delete path handle it
+		// (warn envelope). Any other error surfaces as a store error.
+		if errors.Is(err, store.ErrNotFound) {
+			return false
+		}
+
+		writeStoreError(w, err)
+
+		return true
+	}
+
+	if !slices.Contains(node.Flags, apiv1.NodeFlagEvicted) {
+		return false
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailInUse,
+		Message: "Node '" + name + "' cannot be deleted while it is " +
+			"EVICTED (draining).",
+		Cause: "the node is in the EVICTED state; a plain delete would " +
+			"race the in-flight eviction migration and discard the " +
+			"restore-or-lost decision",
+		Correc: "use `linstor node restore " + name + "` to cancel the " +
+			"drain (the node keeps its storage pools, properties and " +
+			"resources), or `linstor node lost " + name + "` to remove a " +
+			"node that is gone for good; pass `?force=true` to delete it " +
+			"anyway and cascade the orphans",
+		ObjRefs: map[string]string{objRefNode: name},
+	}})
 
 	return true
 }
