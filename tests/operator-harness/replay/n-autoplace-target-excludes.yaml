@@ -1,0 +1,100 @@
+name: n-autoplace-target-excludes
+description: |
+  Corner-case F4 (UG9 §"AutoplaceTarget";
+  kb.linbit.com/linstor/preventing-linstor-resource-placement-on-a-node):
+  `linstor node set-property <node> AutoplaceTarget false` must exclude
+  the node from autoplace TARGETING — the placer never picks it for a
+  NEW replica — while leaving any existing replica untouched. This is
+  the maintenance-drain workflow: stop new placements without evicting.
+
+  Pre-fix blockstor: the placer's only node-exclusion was the EVICTED /
+  LOST flag set; the per-node AutoplaceTarget prop was never consulted,
+  so a drained maintenance node kept receiving new replicas.
+
+  Scenario (3-node): stamp AutoplaceTarget=false on node1, then
+  autoplace 2 diskful replicas. Assert (after placement settles to 2)
+  that node1 holds NO replica — both copies landed on node2 + node3.
+  Then clear the prop and autoplace a fresh RD with place-count 3:
+  node1 must now receive a replica, proving the exclusion is opt-out
+  and reversible.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: drain-node1-autoplace-target-false
+    cmd: ["node", "set-property", "{{node1}}", "AutoplaceTarget", "false"]
+    expect_exit: 0
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: autoplace-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+  - name: wait-two-diskful-placed
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Placement must settle to 2 diskful BEFORE we assert node1 is
+      # empty — otherwise resource_absent on node1 would pass trivially
+      # before the autoplacer has even run.
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: assert-node1-excluded
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # THE F4 ASSERTION: the AutoplaceTarget=false node never received
+      # a replica — both copies landed on node2 + node3.
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 30
+  - name: assert-both-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: clear-autoplace-target
+    cmd: ["node", "set-property", "{{node1}}", "AutoplaceTarget", "true"]
+    expect_exit: 0
+  - name: create-rd-restore
+    cmd: ["resource-definition", "create", "{{rd}}-rst"]
+    expect_exit: 0
+  - name: create-vd-restore
+    cmd: ["volume-definition", "create", "{{rd}}-rst", "32M"]
+    expect_exit: 0
+  - name: autoplace-3-uses-node1
+    cmd: ["resource", "create", "--auto-place", "3", "--storage-pool={{sp}}", "{{rd}}-rst"]
+    expect_exit: 0
+  - name: assert-node1-now-included
+    cmd: ["resource", "list", "--resources", "{{rd}}-rst"]
+    expect_exit: 0
+    await:
+      # After clearing the prop, a place-count-3 autoplace must land a
+      # replica on node1 (it reaches UpToDate). Proves the exclusion is
+      # a reversible opt-out, not a sticky flag.
+      kind: disk_state
+      rd: "{{rd}}-rst"
+      node: "{{node1}}"
+      expected: "UpToDate"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["node", "set-property", "{{node1}}", "AutoplaceTarget", "true"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}-rst"]
+
+invariants:
+  - no_orphans
