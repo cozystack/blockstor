@@ -2357,3 +2357,63 @@ func TestSnapshotCreateUnresolvablePoolPasses_G5(t *testing.T) {
 		t.Fatalf("status: got %d, want 201 (unresolvable pool must pass through)", resp.StatusCode)
 	}
 }
+
+// TestSnapshotCreateScopesGateToTargetNodes_G5 pins the subset-scoping
+// contract: an RD with one thin replica (n1) and one thick replica (n2).
+// A snapshot that explicitly targets ONLY the thin node n1 must be
+// ALLOWED (the gate is scoped to the resolved target set, mirroring the
+// offline pre-check). A snapshot targeting the thick node n2 is refused.
+func TestSnapshotCreateScopesGateToTargetNodes_G5(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-mix"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// n1 thin (capable), n2 thick (incapable).
+	for _, p := range []struct {
+		node, pool string
+		canSnap    bool
+	}{
+		{"n1", "thinpool", true},
+		{"n2", "thickpool", false},
+	} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: p.pool, NodeName: p.node,
+			ProviderKind: "LVM", SupportsSnapshot: p.canSnap,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", p.pool, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-mix", NodeName: p.node,
+			Props: map[string]string{"StorPoolName": p.pool},
+		}); err != nil {
+			t.Fatalf("seed resource %s: %v", p.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Target ONLY the thin node n1 → allowed.
+	okBody, _ := json.Marshal(apiv1.Snapshot{Name: "snap-thin", Nodes: []string{"n1"}})
+	okResp := httpPost(t, base+"/v1/resource-definitions/pvc-mix/snapshots", okBody)
+	_ = okResp.Body.Close()
+
+	if okResp.StatusCode != http.StatusCreated {
+		t.Errorf("targeting thin-only n1: got %d, want 201 (gate scoped to target set)", okResp.StatusCode)
+	}
+
+	// Target the thick node n2 → refused.
+	badBody, _ := json.Marshal(apiv1.Snapshot{Name: "snap-thick", Nodes: []string{"n2"}})
+	badResp := httpPost(t, base+"/v1/resource-definitions/pvc-mix/snapshots", badBody)
+	defer func() { _ = badResp.Body.Close() }()
+
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("targeting thick n2: got %d, want 400 (thick pool refused)", badResp.StatusCode)
+	}
+}

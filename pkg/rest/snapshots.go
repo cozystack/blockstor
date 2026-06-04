@@ -545,7 +545,7 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 	// provider would actually `lvcreate --snapshot` a 25%ORIGIN COW
 	// overlay that silently invalidates on overflow (Bug 245 footgun),
 	// so we refuse at the API edge BEFORE any Store mutation.
-	if !s.refuseSnapshotOnNonSnapshotPool(w, r, rd) {
+	if !s.refuseSnapshotOnNonSnapshotPool(w, r, rd, snap.Nodes) {
 		return
 	}
 
@@ -1001,7 +1001,7 @@ func (s *Server) refuseSnapshotOnOfflineTargets(w http.ResponseWriter, r *http.R
 // refuse a legitimate snapshot. Only an explicit
 // `SupportsSnapshot == false` on a resolvable pool refuses — matching
 // the tri-state caution the rest of the snapshot path applies.
-func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.Request, rd string) bool {
+func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.Request, rd string, targetNodes []string) bool {
 	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rd)
 	if err != nil {
 		// Surface the store error rather than silently passing — the
@@ -1012,7 +1012,7 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 		return false
 	}
 
-	locs := s.nonSnapshotPoolLocations(r.Context(), resList)
+	locs := s.nonSnapshotPoolLocations(r.Context(), resList, targetNodes)
 	if len(locs) == 0 {
 		return true
 	}
@@ -1036,21 +1036,35 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 // nonSnapshotPoolLocations resolves each diskful/active replica's
 // storage pool and returns a sorted, de-duplicated list of human-
 // readable `"<pool> on <node>"` locations whose pool reports
-// `SupportsSnapshot == false`. An empty result means every diskful
-// replica sits in a snapshot-capable pool (or capability could not be
-// resolved — treated as capable; see refuseSnapshotOnNonSnapshotPool).
-func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource) []string {
-	type offender struct {
-		node string
-		pool string
+// `SupportsSnapshot == false`. An empty result means every targeted
+// diskful replica sits in a snapshot-capable pool (or capability could
+// not be resolved — treated as capable; see
+// refuseSnapshotOnNonSnapshotPool).
+//
+// targetNodes scopes the check to the resolved snapshot target set
+// (snap.Nodes) — the same set the offline pre-check uses — so a caller
+// that snapshots only a snapshot-capable subset of an otherwise
+// mixed-provider RD is not falsely refused. An empty targetNodes means
+// "all diskful replicas" (the un-pinned default-fan-out case).
+func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource, targetNodes []string) []string {
+	want := make(map[string]struct{}, len(targetNodes))
+	for _, n := range targetNodes {
+		want[n] = struct{}{}
 	}
 
-	var offenders []offender
+	var offenders []poolOffender
 
 	seen := make(map[string]struct{}, len(resList))
 
 	for i := range resList {
 		res := &resList[i]
+
+		// Scope to the resolved target set when the caller pinned one.
+		if len(want) > 0 {
+			if _, ok := want[res.NodeName]; !ok {
+				continue
+			}
+		}
 
 		// Only diskful, active replicas materialise a real backing
 		// volume to snapshot — diskless / inactive replicas are skipped
@@ -1078,11 +1092,23 @@ func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.R
 		}
 
 		if !pool.SupportsSnapshot {
-			offenders = append(offenders, offender{node: res.NodeName, pool: poolName})
+			offenders = append(offenders, poolOffender{node: res.NodeName, pool: poolName})
 		}
 	}
 
-	slices.SortFunc(offenders, func(a, b offender) int {
+	return formatPoolOffenders(offenders)
+}
+
+// poolOffender pairs a node with a non-snapshot-capable pool it hosts.
+type poolOffender struct {
+	node string
+	pool string
+}
+
+// formatPoolOffenders sorts the offenders deterministically (by node,
+// then pool) and renders each as `"<pool> on <node>"`.
+func formatPoolOffenders(offenders []poolOffender) []string {
+	slices.SortFunc(offenders, func(a, b poolOffender) int {
 		if a.node != b.node {
 			return strings.Compare(a.node, b.node)
 		}
