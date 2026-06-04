@@ -85,12 +85,28 @@ steps:
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
     await:
-      # Source pruned ONLY after dst UpToDate — completes the
-      # sync-then-remove contract.
-      kind: resource_absent
+      # Source's DISKFUL replica pruned ONLY after dst UpToDate — the
+      # sync-then-remove contract. Asserted as "no longer diskful"
+      # rather than resource_absent: pruning the diskful source leaves
+      # 2 diskful replicas (even parity), so the auto-tiebreaker
+      # legitimately re-occupies the vacated node on a 3-worker stand —
+      # a Resource CRD for node1 exists again as a diskless
+      # TIE_BREAKER, and absence can never hold. Stand-validated: the
+      # controller logs "migration complete: src pruned, dst UpToDate".
+      kind: replica_diskless
       rd: "{{rd}}"
       node: "{{node1}}"
       timeout_s: 120
+  - name: assert-two-diskful
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The migrated set settles at exactly 2 active diskful replicas
+      # (node2 + node3); node1 holds only the witness.
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 60
 
 teardown:
   - cmd: ["resource-definition", "delete", "{{rd}}"]
