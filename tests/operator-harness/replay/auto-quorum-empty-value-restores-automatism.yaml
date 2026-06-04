@@ -24,6 +24,10 @@ prerequisites:
   storage_pool: stand
 
 vars:
+  # Short rd name: LINSTOR caps resource-definition names at 48 chars and
+  # the workflow name alone is longer than that, so the default
+  # `replay-<name>-<rand>` would overflow.
+  rd: cc-b-empty
   sp: stand
 
 steps:
