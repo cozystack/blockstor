@@ -1,0 +1,65 @@
+name: n-d-evicted-rejected
+description: |
+  Corner-case F6 (UG9 §"Auto-evict" / EVICTED latched state): EVICTED is
+  a one-way drain mark. A plain `linstor node delete` on an EVICTED node
+  must be REJECTED so the operator chooses explicitly between
+  `node restore` (cancel the drain, keep SP / props / resources) and
+  `node lost` (the node is gone for good). A bare `n d` would race the
+  in-flight eviction migration and discard that decision.
+
+  Pre-fix blockstor: `n d` only refused on outstanding Resource / SP
+  references, so once the eviction reconciler drained the node `n d`
+  silently succeeded — bypassing the restore-or-lost decision.
+
+  Scenario (3-node): autoplace 2 diskful replicas, evacuate node1 (it
+  enters EVICTED), then attempt `node delete node1` — assert it fails.
+  Finally `node restore node1` to leave the cluster clean.
+
+  NOTE on expect_exit: the rejection is an API-error envelope
+  (FAIL_IN_USE), which the python-linstor CLI surfaces as exit 10. If a
+  stand run shows a different non-zero code, adjust this single value —
+  the contract is "non-zero", pinned more strictly here for regression
+  sensitivity.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: autoplace-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+  - name: wait-two-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: evacuate-node1
+    cmd: ["node", "evacuate", "{{node1}}"]
+    expect_exit: 0
+  - name: delete-evicted-node-rejected
+    # THE F6 ASSERTION: `n d` on the EVICTED node must fail. The node is
+    # latched in the drain state; only restore or lost is allowed.
+    cmd: ["node", "delete", "{{node1}}"]
+    expect_exit: 10
+  - name: restore-node1
+    cmd: ["node", "restore", "{{node1}}"]
+    expect_exit: 0
+
+teardown:
+  - cmd: ["node", "restore", "{{node1}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

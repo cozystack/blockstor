@@ -837,12 +837,27 @@ func (p *Placer) candidatePools(ctx context.Context, filter *apiv1.AutoSelectFil
 		return nil, candidateGates{}, err
 	}
 
+	// Fold AutoplaceTarget=false nodes into the target-exclusion set
+	// used by the candidate-pool filter ONLY. Kept separate from the
+	// EVICTED/LOST `disabled` set on purpose: AutoplaceTarget excludes a
+	// node from NEW placements but leaves existing replicas counting
+	// toward place_count (no migration), whereas `disabled` also drops
+	// existing replicas from the count so the gap is re-filled. Merging
+	// the two for matchesPoolFilter is safe (both forbid landing a new
+	// replica on the node); the divergence only matters for the
+	// existing-replica accounting in countDiskfulReplicas, which keeps
+	// using the EVICTED/LOST-only `disabled` set.
+	excludedTargets, err := p.autoplaceExcludedNodes(ctx, disabled)
+	if err != nil {
+		return nil, candidateGates{}, err
+	}
+
 	ctrlProps, err := p.store.ControllerProps().Get(ctx)
 	if err != nil {
 		return nil, candidateGates{}, errors.Wrap(err, "get controller props")
 	}
 
-	out, gates := applyCapacityAndOversubGates(all, filter, disabled, ctrlProps, minFreeKib)
+	out, gates := applyCapacityAndOversubGates(all, filter, excludedTargets, ctrlProps, minFreeKib)
 
 	weights, err := p.loadWeights(ctx)
 	if err != nil {
@@ -1129,8 +1144,12 @@ func throughputHint(pool *apiv1.StoragePool) float64 {
 
 // matchesPoolFilter is the AutoSelectFilter eligibility check for a
 // single pool: drops the DISKLESS provider kind, drops pools on
-// EVICTED / LOST nodes, and enforces every name-list / provider-list
-// constraint on the filter. Returns true when the pool clears every
+// target-excluded nodes (the EVICTED / LOST `disabled` set plus
+// `AutoplaceTarget=false` nodes — see autoplaceExcludedNodes), and
+// enforces every name-list / provider-list constraint on the filter.
+// The `disabled` map the caller passes here is the target-exclusion
+// set, NOT the EVICTED/LOST-only set used for existing-replica
+// accounting. Returns true when the pool clears every
 // non-capacity gate; the capacity gate stays in candidatePools so it
 // can also track the largest rejected FreeCapacity for the error
 // envelope. Split out to keep candidatePools under the gocyclo budget.
@@ -1219,6 +1238,46 @@ func (p *Placer) disabledNodes(ctx context.Context) (map[string]struct{}, error)
 
 				break
 			}
+		}
+	}
+
+	return out, nil
+}
+
+// autoplaceExcludedNodes returns the set of nodes that may not host a
+// NEW replica: the EVICTED / LOST `disabled` set plus every node whose
+// `AutoplaceTarget` prop parses to an explicit false. The returned map
+// is a fresh copy so the caller's `disabled` set (used for the
+// existing-replica accounting in countDiskfulReplicas, which must NOT
+// pick up the AutoplaceTarget exclusion) stays untouched.
+//
+// AutoplaceTarget is the maintenance-drain opt-out
+// (kb.linbit.com/linstor/preventing-linstor-resource-placement-on-a-node):
+// existing replicas on the node are left alone and still count toward
+// place_count, but the autoplacer never selects the node for a new
+// replica. Only a parseable false excludes the node — any other value
+// (true, unset, an operator typo) keeps the node eligible, so a
+// fat-fingered prop can never silently drain the cluster off the node.
+func (p *Placer) autoplaceExcludedNodes(ctx context.Context, disabled map[string]struct{}) (map[string]struct{}, error) {
+	nodes, err := p.store.Nodes().List(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "list nodes")
+	}
+
+	out := make(map[string]struct{}, len(disabled)+len(nodes))
+	for name := range disabled {
+		out[name] = struct{}{}
+	}
+
+	for i := range nodes {
+		raw, ok := nodes[i].Props[apiv1.PropAutoplaceTarget]
+		if !ok {
+			continue
+		}
+
+		v, perr := strconv.ParseBool(raw)
+		if perr == nil && !v {
+			out[nodes[i].Name] = struct{}{}
 		}
 	}
 
