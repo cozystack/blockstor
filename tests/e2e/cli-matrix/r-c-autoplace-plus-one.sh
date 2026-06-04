@@ -25,6 +25,14 @@
 # Unit pin: pkg/rest/autoplace_test.go
 #   (TestAutoplaceAdditionalPlusOneAddsOneReplica + siblings).
 # L7 replay: tests/operator-harness/replay/r-c-autoplace-plus-one.yaml.
+#
+# ORACLE NOTE (upstream LINSTOR 1.33.2, corner-campaign group D): the
+# plan's companion claim that the `+N` shorthand is REJECTED for
+# `rg create --place-count` was DISPROVEN against the upstream oracle —
+# `rg create <rg> --place-count +1` is ACCEPTED (RG persists, exit 0),
+# the `+N` delta only carries semantics on the `r c --auto-place` path.
+# This cell therefore pins only the extension half (the real contract);
+# there is no rejection-half assertion because upstream has none.
 
 set -euo pipefail
 

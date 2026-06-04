@@ -877,7 +877,18 @@ func TestResourceGroupListPropertiesEmptyDecodes(t *testing.T) {
 // (P1, unit) for the SelectFilter clear-via-empty-list path:
 // `linstor rg modify <rg> --replicas-on-same ""` translates into a
 // PATCH body whose `select_filter.replicas_on_same` is a non-nil
-// empty list (JSON `[]`). The handler must clear ReplicasOnSame on
+// empty list (JSON `[]`).
+//
+// Corner-campaign D4, confirmed against the upstream LINSTOR 1.33.2
+// oracle: the CLI emits a BYTE-IDENTICAL body for the bare flag
+// (`--replicas-on-same`, no value) and the empty-string spelling
+// (`--replicas-on-same ”`) — both send
+//
+//	PUT /v1/resource-groups/<rg>  {"select_filter":{"replicas_on_same":[]}}
+//
+// so a single empty-list handler covers both unset spellings.
+//
+// The handler must clear ReplicasOnSame on
 // the persisted RG and — critically — must NOT wipe sibling
 // SelectFilter fields (PlaceCount, LayerStack, …) that the patch
 // did not mention. Upstream's `AutoSelectorConfig.applyChanges`
