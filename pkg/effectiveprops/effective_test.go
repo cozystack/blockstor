@@ -237,3 +237,72 @@ func TestResolve_ControllerNonDRBDPropDropped(t *testing.T) {
 		t.Fatalf("controller non-DRBD ExtraProp leaked onto resource: Aux/zone=%q", v)
 	}
 }
+
+// TestResolve_RDNonDRBDExtraPropSurvives pins the exact production RD
+// shape produced by `linstor rd set-property <rd> FileSystem/Type ext4`
+// (and by the linstor-csi CreateVolume hot path): the store transcoder
+// routes the non-DRBD `FileSystem/Type` key into the RD's
+// Spec.ExtraProps (propsToTyped sends every non-`DrbdOptions/` key to
+// extras). The effective render dispatched to the satellite MUST carry
+// that key through — the satellite gates its mkfs / `primary --force`
+// path on `dr.GetProps()["FileSystem/Type"]`
+// (pkg/satellite/reconciler.go hasFileSystemConfigured). Dropping it
+// silently disables mkfs, so a fresh replica never writes, the DRBD
+// current-UUID never rotates past the day0 GI, and the controller's
+// RD.Spec.Initialized latch (ensureSkipInitSyncDecision) never flips —
+// the `respawn-standalone-wedge` e2e SETUP failure.
+//
+// Regression guard for the effectiveprops hierarchy-funnel refactor: a
+// non-resource scope's non-DRBD ExtraProps must NOT be dropped the way
+// `ResolveOptions` drops non-resource-scope non-DRBD keys.
+func TestResolve_RDNonDRBDExtraPropSurvives(t *testing.T) {
+	scheme := newScheme(t)
+
+	// Shape as persisted by handleRDCreate + seedAutoQuorumDefaults +
+	// the store transcoder: on-no-quorum typed, auto-quorum +
+	// FileSystem/Type in ExtraProps.
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: v1.ObjectMeta{Name: "e2e-respawn-wedge"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			DRBDOptions: &blockstoriov1alpha1.DRBDOptions{
+				Resource: &blockstoriov1alpha1.DRBDResourceOptions{
+					OnNoQuorum: "suspend-io",
+				},
+			},
+			ExtraProps: map[string]string{
+				"DrbdOptions/auto-quorum": "majority",
+				"FileSystem/Type":         "ext4",
+			},
+		},
+	}
+
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: v1.ObjectMeta{Name: "e2e-respawn-wedge-node1"},
+	}
+
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		Build()
+
+	got, err := effectiveprops.Resolve(context.Background(), client.Reader(cli), res, rd)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if got["FileSystem/Type"] != "ext4" {
+		t.Fatalf("RD non-DRBD ExtraProp dropped from effective render: "+
+			"FileSystem/Type=%q want ext4 — the satellite mkfs/force-primary "+
+			"path is gated on this key; dropping it wedges the "+
+			"RD.Spec.Initialized latch", got["FileSystem/Type"])
+	}
+
+	// The quorum knobs must still render (they were correct before; pin
+	// them so the fix doesn't regress the DRBD-key path).
+	if got["DrbdOptions/Resource/on-no-quorum"] != "suspend-io" {
+		t.Fatalf("typed on-no-quorum lost: got %q", got["DrbdOptions/Resource/on-no-quorum"])
+	}
+
+	if got["DrbdOptions/auto-quorum"] != "majority" {
+		t.Fatalf("auto-quorum ExtraProp lost: got %q", got["DrbdOptions/auto-quorum"])
+	}
+}

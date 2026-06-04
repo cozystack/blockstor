@@ -35,6 +35,7 @@ package effectiveprops
 import (
 	"context"
 	"maps"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -111,7 +112,46 @@ func Resolve(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.R
 
 	out := drbd.ResolveOptions(ctrlMerged, rgMerged, rdMerged, resMerged)
 
+	// ResolveOptions only threads through NON-DRBD props from the
+	// most-specific (resource) scope — by design for keys like
+	// StorPoolName that only make sense on the resource. But the RG and
+	// RD scopes carry load-bearing NON-DRBD ExtraProps that the
+	// satellite reads off the dispatched resource: most importantly
+	// `FileSystem/Type` (+ `FileSystem/MkfsParams`), which the
+	// `linstor rd set-property … FileSystem/Type ext4` CLI and the
+	// linstor-csi CreateVolume path stamp on the RD and which gate the
+	// satellite's mkfs / `primary --force` seed path
+	// (pkg/satellite/reconciler.go hasFileSystemConfigured). Dropping
+	// them silently disables mkfs → a fresh replica never writes → the
+	// DRBD current-UUID never rotates past the day0 GI → the
+	// controller's RD.Spec.Initialized latch never flips.
+	//
+	// Re-overlay the non-DRBD ExtraProps from the RG then RD scope
+	// (closer scope last, so RD wins over RG; the resource scope already
+	// won via ResolveOptions). DRBD keys are intentionally skipped here —
+	// the precedence walk above already resolved them. The controller
+	// scope is deliberately NOT re-overlaid: cluster-wide non-DRBD knobs
+	// like `Aux/zone` must not leak onto every resource (C1 contract).
+	overlayNonDRBDExtras(out, rgInfo.Extras)
+	overlayNonDRBDExtras(out, rdInfo.Extras)
+
 	return out, nil
+}
+
+// overlayNonDRBDExtras copies the non-`DrbdOptions/...` entries of a
+// scope's ExtraProps into out (overriding on key collision). DRBD keys
+// are skipped — those are resolved by the precedence walk in
+// ResolveOptions and must not be re-applied here (that would let an
+// upper scope's DRBD ExtraProp clobber a closer scope's resolved
+// value). nil src is a no-op.
+func overlayNonDRBDExtras(out, src map[string]string) {
+	for key, value := range src {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
+			continue
+		}
+
+		out[key] = value
+	}
 }
 
 // emitScopeProps flattens one scope's typed DRBDOptions plus its
