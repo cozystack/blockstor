@@ -604,6 +604,69 @@ func TestSnapshotRollbackAllReplicasSecondaryReaches501(t *testing.T) {
 	}
 }
 
+// TestSnapshotRollbackSnapshotlessNodeReaches501_G2 pins corner-case
+// G2 as a DELIBERATE DELTA. Upstream LINSTOR >= 1.31.2 changed
+// `snapshot rollback` so a snapshot-less node (a replica added AFTER
+// the snapshot was taken, or one whose resource was deleted) gets an
+// empty resource + resync on rollback — and the rollback RESTORES
+// replicas on nodes where the resource had been deleted
+// (linstor-administration.adoc ~2512). blockstor deliberately does NOT
+// expose `zfs rollback` at all (it destroys every newer snapshot and
+// the deleted-replica-resurrection is a counterintuitive footgun), so
+// the rollback endpoint returns a 501 that points the operator at the
+// safe, non-destructive `snapshot-restore-resource` path. This test
+// models the exact 1.31.2+ scenario — snapshot on n1/n2, a third
+// diskful replica on n3 that does NOT hold the snapshot, all Secondary
+// — and asserts blockstor still returns 501 (no destructive backend
+// path is reached, no deleted replicas are resurrected).
+func TestSnapshotRollbackSnapshotlessNodeReaches501_G2(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Snapshot recorded only on n1/n2.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name: "s1", ResourceName: "pvc-1", Nodes: []string{"n1", "n2"},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	// Three diskful replicas, all Secondary — n3 was added AFTER the
+	// snapshot, so it is snapshot-less (the upstream 1.31.2+ edge).
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: n,
+			State: apiv1.ResourceState{InUse: boolPtr(false)},
+		}); err != nil {
+			t.Fatalf("seed res %s: %v", n, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-1/snapshots/s1/rollback", []byte("{}"))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status: got %d, want 501 (snapshot-less node → blockstor refuses rollback entirely)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	// The 501 must point operators at the safe restore path rather than
+	// silently doing nothing.
+	if len(rc) == 0 || !strings.Contains(rc[0].Message, "snapshot-restore-resource") {
+		t.Errorf("501 message must point at snapshot-restore-resource, got %+v", rc)
+	}
+}
+
 // TestSnapshotsDeleteUnknownRD pins one half of the CSI idempotence
 // contract: DELETE on an unknown {rd} path segment returns 200 +
 // ApiCallRc("snapshot already absent: ..."), NOT 404. csi-sanity's
@@ -2133,5 +2196,224 @@ func TestSnapshotStateIgnoresInactiveReplica_Bug394(t *testing.T) {
 	if !slices.Contains(got[0].Flags, apiv1.SnapshotFlagSuccessful) {
 		t.Errorf("Flags: got %v, want SUCCESSFUL (every active diskful peer reported, "+
 			"INACTIVE worker-3 MUST be excluded from the denominator)", got[0].Flags)
+	}
+}
+
+// seedSnapshotPoolFixture wires a RD + one diskful Resource pinned to a
+// storage pool with the given snapshot capability. Used by the G5 gate
+// tests to exercise refuseSnapshotOnNonSnapshotPool.
+func seedSnapshotPoolFixture(t *testing.T, st store.Store, rd, node, pool string, canSnap bool) {
+	t.Helper()
+
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName:  pool,
+		NodeName:         node,
+		ProviderKind:     "LVM",
+		SupportsSnapshot: canSnap,
+	}); err != nil {
+		t.Fatalf("seed pool: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name:     rd,
+		NodeName: node,
+		Props:    map[string]string{"StorPoolName": pool},
+	}); err != nil {
+		t.Fatalf("seed resource: %v", err)
+	}
+}
+
+// TestSnapshotCreateRefusedOnThickPool_G5 pins the corner-case G5 gate:
+// `snapshot create` against an RD whose diskful replica sits in a
+// thick (SupportsSnapshot=false) storage pool is refused with a 400 +
+// FAIL_SNAPSHOTS_NOT_SUPPORTED envelope BEFORE any Store mutation —
+// mirroring upstream LINSTOR which only allows snapshots on thin
+// LVM / ZFS (and FILE_THIN downstream). Without the gate blockstor's
+// thick-LVM provider would silently stage a 25%ORIGIN COW overlay
+// (Bug 245 footgun).
+func TestSnapshotCreateRefusedOnThickPool_G5(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedSnapshotPoolFixture(t, st, "pvc-thick", "n1", "thickpool", false)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-thick/snapshots", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status: got %d, want 400 (thick pool snapshot refusal)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode ApiCallRc envelope: %v", err)
+	}
+
+	if len(rc) == 0 {
+		t.Fatalf("empty ApiCallRc envelope")
+	}
+
+	// Negative ret_code — the `linstor` CLI treats ret_code >= 0 as
+	// success and would not surface the refusal to the operator.
+	if rc[0].RetCode >= 0 {
+		t.Errorf("ret_code: got %#x, want negative (error)", rc[0].RetCode)
+	}
+
+	// FAIL_SNAPSHOTS_NOT_SUPPORTED (994) sub-code must be set so
+	// golinstor's typed-error matchers fire.
+	const failBit = 994
+	if rc[0].RetCode&failBit != failBit {
+		t.Errorf("ret_code: got %#x, want FAIL_SNAPSHOTS_NOT_SUPPORTED (994) bit set", rc[0].RetCode)
+	}
+
+	// Message must name the offending pool + node so the operator knows
+	// which replica to relocate.
+	if !strings.Contains(rc[0].Message, "thickpool") || !strings.Contains(rc[0].Message, "n1") {
+		t.Errorf("message missing offending pool/node: %q", rc[0].Message)
+	}
+
+	// No Snapshot CRD must have been persisted — the gate runs before
+	// the Store.Create.
+	if _, err := st.Snapshots().Get(t.Context(), "pvc-thick", "snap-1"); err == nil {
+		t.Errorf("snapshot was persisted despite the refusal (gate ran too late)")
+	}
+}
+
+// TestSnapshotCreateAllowedOnThinPool_G5 is the positive control: an RD
+// on a thin (SupportsSnapshot=true) pool still snapshots normally, so
+// the G5 gate does not over-reach onto capable providers.
+func TestSnapshotCreateAllowedOnThinPool_G5(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedSnapshotPoolFixture(t, st, "pvc-thin", "n1", "thinpool", true)
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-thin/snapshots", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (thin pool snapshot allowed)", resp.StatusCode)
+	}
+
+	if _, err := st.Snapshots().Get(t.Context(), "pvc-thin", "snap-1"); err != nil {
+		t.Errorf("snapshot not persisted on a snapshot-capable pool: %v", err)
+	}
+}
+
+// TestSnapshotCreateUnresolvablePoolPasses_G5 pins the best-effort
+// fall-through: a diskful replica with NO StorPoolName prop (pool not
+// resolvable) must NOT be refused — a transient store blip or an
+// as-yet-unprobed pool should not spuriously block a legitimate
+// snapshot. The gate only refuses an explicit SupportsSnapshot=false.
+func TestSnapshotCreateUnresolvablePoolPasses_G5(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-x"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// Diskful replica but no StorPoolName prop → pool unresolvable.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: "pvc-x", NodeName: "n1"}); err != nil {
+		t.Fatalf("seed resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-x/snapshots", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (unresolvable pool must pass through)", resp.StatusCode)
+	}
+}
+
+// TestSnapshotCreateScopesGateToTargetNodes_G5 pins the subset-scoping
+// contract: an RD with one thin replica (n1) and one thick replica (n2).
+// A snapshot that explicitly targets ONLY the thin node n1 must be
+// ALLOWED (the gate is scoped to the resolved target set, mirroring the
+// offline pre-check). A snapshot targeting the thick node n2 is refused.
+func TestSnapshotCreateScopesGateToTargetNodes_G5(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-mix"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// n1 thin (capable), n2 thick (incapable).
+	for _, p := range []struct {
+		node, pool string
+		canSnap    bool
+	}{
+		{"n1", "thinpool", true},
+		{"n2", "thickpool", false},
+	} {
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: p.pool, NodeName: p.node,
+			ProviderKind: "LVM", SupportsSnapshot: p.canSnap,
+		}); err != nil {
+			t.Fatalf("seed pool %s: %v", p.pool, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-mix", NodeName: p.node,
+			Props: map[string]string{"StorPoolName": p.pool},
+		}); err != nil {
+			t.Fatalf("seed resource %s: %v", p.node, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Target ONLY the thin node n1 → allowed.
+	okBody, _ := json.Marshal(apiv1.Snapshot{Name: "snap-thin", Nodes: []string{"n1"}})
+	okResp := httpPost(t, base+"/v1/resource-definitions/pvc-mix/snapshots", okBody)
+	_ = okResp.Body.Close()
+
+	if okResp.StatusCode != http.StatusCreated {
+		t.Errorf("targeting thin-only n1: got %d, want 201 (gate scoped to target set)", okResp.StatusCode)
+	}
+
+	// Target the thick node n2 → refused.
+	badBody, _ := json.Marshal(apiv1.Snapshot{Name: "snap-thick", Nodes: []string{"n2"}})
+	badResp := httpPost(t, base+"/v1/resource-definitions/pvc-mix/snapshots", badBody)
+	defer func() { _ = badResp.Body.Close() }()
+
+	if badResp.StatusCode != http.StatusBadRequest {
+		t.Errorf("targeting thick n2: got %d, want 400 (thick pool refused)", badResp.StatusCode)
 	}
 }

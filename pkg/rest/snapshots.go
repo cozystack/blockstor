@@ -536,6 +536,19 @@ func (s *Server) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// G5 (corner-case): refuse the snapshot when ANY targeted diskful
+	// replica lives in a storage pool whose provider cannot take
+	// copy-on-write snapshots (thick `LVM`, plain thick `FILE`,
+	// `DISKLESS`). Upstream LINSTOR rejects this at the controller —
+	// only thin LVM and ZFS (and `FILE_THIN` downstream) are
+	// snapshot-capable. Without this gate, blockstor's thick-LVM
+	// provider would actually `lvcreate --snapshot` a 25%ORIGIN COW
+	// overlay that silently invalidates on overflow (Bug 245 footgun),
+	// so we refuse at the API edge BEFORE any Store mutation.
+	if !s.refuseSnapshotOnNonSnapshotPool(w, r, rd, snap.Nodes) {
+		return
+	}
+
 	// Bug 180 pre-write guard: refuse the create if the parent RD is
 	// already mid-tear-down. Upstream LINSTOR stamps the `DELETE` flag
 	// on a ResourceDefinition while CtrlRscDfnDeleteApiCallHandler is
@@ -970,6 +983,145 @@ func (s *Server) refuseSnapshotOnOfflineTargets(w http.ResponseWriter, r *http.R
 			"reachable replicas for a snapshot that cannot complete)")
 
 	return false
+}
+
+// refuseSnapshotOnNonSnapshotPool is the G5 capability gate. It walks
+// the RD's diskful replicas, resolves each one's storage pool, and
+// refuses the snapshot when ANY pool reports `SupportsSnapshot ==
+// false` — i.e. a thick provider (thick `LVM`, plain thick `FILE`,
+// `DISKLESS`) that cannot take a copy-on-write snapshot. Mirrors
+// upstream LINSTOR's controller-side `FAIL_SNAPSHOTS_NOT_SUPPORTED`
+// refusal. Returns true when the caller may continue (every diskful
+// replica sits in a snapshot-capable pool, or capability is
+// un-observed); false when it has already written the 400 + envelope.
+//
+// Best-effort resolution: a pool we cannot look up (Get error, missing
+// StorPoolName prop, never-reported Status) is treated as capable so a
+// transient store blip or an as-yet-unprobed pool doesn't spuriously
+// refuse a legitimate snapshot. Only an explicit
+// `SupportsSnapshot == false` on a resolvable pool refuses — matching
+// the tri-state caution the rest of the snapshot path applies.
+func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.Request, rd string, targetNodes []string) bool {
+	resList, err := s.Store.Resources().ListByDefinition(r.Context(), rd)
+	if err != nil {
+		// Surface the store error rather than silently passing — the
+		// create would fail downstream anyway and the operator should
+		// see why.
+		writeStoreError(w, err)
+
+		return false
+	}
+
+	locs := s.nonSnapshotPoolLocations(r.Context(), resList, targetNodes)
+	if len(locs) == 0 {
+		return true
+	}
+
+	writeJSON(w, http.StatusBadRequest, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailSnapshotsNotSupported,
+		Message: "snapshot of resource definition '" + rd +
+			"' refused: storage pool(s) " + strings.Join(locs, ", ") +
+			" do not support snapshots",
+		Cause: "the targeted storage pool uses a thick provider (thick LVM, " +
+			"plain FILE, or DISKLESS); only thin LVM and ZFS (and FILE_THIN) " +
+			"can take copy-on-write snapshots",
+		Correc: "place the resource on a thin-provisioned snapshot-capable " +
+			"pool (LVM_THIN / ZFS_THIN / FILE_THIN), or use `linstor rd clone` " +
+			"for a full-copy duplicate that does not require snapshot support",
+	}})
+
+	return false
+}
+
+// nonSnapshotPoolLocations resolves each diskful/active replica's
+// storage pool and returns a sorted, de-duplicated list of human-
+// readable `"<pool> on <node>"` locations whose pool reports
+// `SupportsSnapshot == false`. An empty result means every targeted
+// diskful replica sits in a snapshot-capable pool (or capability could
+// not be resolved — treated as capable; see
+// refuseSnapshotOnNonSnapshotPool).
+//
+// targetNodes scopes the check to the resolved snapshot target set
+// (snap.Nodes) — the same set the offline pre-check uses — so a caller
+// that snapshots only a snapshot-capable subset of an otherwise
+// mixed-provider RD is not falsely refused. An empty targetNodes means
+// "all diskful replicas" (the un-pinned default-fan-out case).
+func (s *Server) nonSnapshotPoolLocations(ctx context.Context, resList []apiv1.Resource, targetNodes []string) []string {
+	want := make(map[string]struct{}, len(targetNodes))
+	for _, n := range targetNodes {
+		want[n] = struct{}{}
+	}
+
+	var offenders []poolOffender
+
+	seen := make(map[string]struct{}, len(resList))
+
+	for i := range resList {
+		res := &resList[i]
+
+		// Scope to the resolved target set when the caller pinned one.
+		if len(want) > 0 {
+			if _, ok := want[res.NodeName]; !ok {
+				continue
+			}
+		}
+
+		// Only diskful, active replicas materialise a real backing
+		// volume to snapshot — diskless / inactive replicas are skipped
+		// by listDiskfulNodes too, so don't gate on their (absent) pool.
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) ||
+			slices.Contains(res.Flags, apiv1.ResourceFlagInactive) {
+			continue
+		}
+
+		poolName := res.Props[storPoolPropKey]
+		if poolName == "" {
+			continue
+		}
+
+		key := res.NodeName + "/" + poolName
+		if _, dup := seen[key]; dup {
+			continue
+		}
+
+		seen[key] = struct{}{}
+
+		pool, getErr := s.Store.StoragePools().Get(ctx, res.NodeName, poolName)
+		if getErr != nil {
+			continue
+		}
+
+		if !pool.SupportsSnapshot {
+			offenders = append(offenders, poolOffender{node: res.NodeName, pool: poolName})
+		}
+	}
+
+	return formatPoolOffenders(offenders)
+}
+
+// poolOffender pairs a node with a non-snapshot-capable pool it hosts.
+type poolOffender struct {
+	node string
+	pool string
+}
+
+// formatPoolOffenders sorts the offenders deterministically (by node,
+// then pool) and renders each as `"<pool> on <node>"`.
+func formatPoolOffenders(offenders []poolOffender) []string {
+	slices.SortFunc(offenders, func(a, b poolOffender) int {
+		if a.node != b.node {
+			return strings.Compare(a.node, b.node)
+		}
+
+		return strings.Compare(a.pool, b.pool)
+	})
+
+	locs := make([]string, 0, len(offenders))
+	for _, o := range offenders {
+		locs = append(locs, o.pool+" on "+o.node)
+	}
+
+	return locs
 }
 
 // offlineTargetNodes returns the subset of `targets` whose Node is

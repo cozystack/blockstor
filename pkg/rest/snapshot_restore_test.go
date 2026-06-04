@@ -74,6 +74,85 @@ func TestSnapshotRestoreCreatesNewRD(t *testing.T) {
 	}
 }
 
+// TestSnapshotRestoreAfterSourceResourcesDeleted_G3a pins corner-case
+// G3a: the upstream administration guide states a snapshot can be
+// restored "even when the original resource has been removed from the
+// nodes where the snapshots were taken" (linstor-administration.adoc
+// ~2480). E1 proved upstream BLOCKS `rd d` while snapshots exist, so
+// the relevant sequence is `r d` of every replica (the RD + the
+// snapshot survive), then restore from the surviving snapshot. The
+// snapshot is stored independently of the (now-deleted) Resources, so
+// the restore must still build the new RD + place its replicas on the
+// snapshot's recorded nodes.
+func TestSnapshotRestoreAfterSourceResourcesDeleted_G3a(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	// Snapshot recorded on n1/n2 — but NO Resources exist (every replica
+	// was `r d`'d). The RD shell + the snapshot both survive.
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-keep",
+		ResourceName: "pvc-src",
+		Nodes:        []string{"n1", "n2"},
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Explicit node list (the snapshot's recorded nodes) so the restore
+	// places replicas without depending on a parent RG / autoplace.
+	body, _ := json.Marshal(snapshotRestoreRequest{
+		ToResource:   "pvc-restored",
+		FromSnapshot: "snap-keep",
+		Nodes:        []string{"n1", "n2"},
+	})
+
+	resp := httpPost(t, base+"/v1/resource-definitions/pvc-src/snapshot-restore-resource", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status: got %d, want 201 (restore must work after source resources deleted)", resp.StatusCode)
+	}
+
+	if _, err := st.ResourceDefinitions().Get(ctx, "pvc-restored"); err != nil {
+		t.Fatalf("restored RD missing: %v", err)
+	}
+
+	// The restored RD must carry the snapshot's volume layout.
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored VDs: %v", err)
+	}
+
+	if len(vds) != 1 || vds[0].VolumeNumber != 0 {
+		t.Errorf("restored VDs: got %+v, want exactly [vol 0]", vds)
+	}
+
+	// Replicas must be stamped on the snapshot's recorded nodes.
+	resList, err := st.Resources().ListByDefinition(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored resources: %v", err)
+	}
+
+	placed := make(map[string]bool, len(resList))
+	for i := range resList {
+		placed[resList[i].NodeName] = true
+	}
+
+	if !placed["n1"] || !placed["n2"] {
+		t.Errorf("restored replicas: got nodes %v, want {n1,n2}", placed)
+	}
+}
+
 // TestSnapshotRestoreUnknownSnapshot: 404 if the snapshot doesn't exist.
 func TestSnapshotRestoreUnknownSnapshot(t *testing.T) {
 	st := store.NewInMemory()
@@ -844,5 +923,131 @@ func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 		if !placed {
 			t.Errorf("expected a replica on snapshot node %q, none placed", n)
 		}
+	}
+}
+
+// TestSnapshotRestoreVolumeDefinitionIntoEmptyRD_G3b is the positive
+// control for the VD-restore variant: restoring a snapshot's volume
+// layout onto a freshly-created EMPTY target RD succeeds and hydrates
+// the recorded volumes. Mirrors the documented two-phase workflow
+// (`rd create resource2` → `snapshot volume-definition restore`).
+func TestSnapshotRestoreVolumeDefinitionIntoEmptyRD_G3b(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	// Empty target RD — no VDs of its own.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-tgt"}); err != nil {
+		t.Fatalf("seed target RD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{ToResource: "pvc-tgt"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src/snapshot-restore-volume-definition/snap-1", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200 (VD restore into empty RD)", resp.StatusCode)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-tgt")
+	if err != nil {
+		t.Fatalf("list target VDs: %v", err)
+	}
+
+	if len(vds) != 1 || vds[0].VolumeNumber != 0 {
+		t.Errorf("target VDs: got %+v, want exactly [vol 0]", vds)
+	}
+}
+
+// TestSnapshotRestoreVolumeDefinitionConflict_G3b pins corner-case G3b:
+// restoring a snapshot's volume definitions onto an RD that ALREADY
+// carries a volume-definition with a clashing number is refused with a
+// 409 + FAIL_EXISTS_VLM_DFN envelope BEFORE any mutation, naming the
+// offending volume number. Without the up-front guard the per-VD
+// hydrate Create surfaces a bare 409 only after a partial restore.
+func TestSnapshotRestoreVolumeDefinitionConflict_G3b(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-src"}); err != nil {
+		t.Fatalf("seed source RD: %v", err)
+	}
+
+	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
+		Name:         "snap-1",
+		ResourceName: "pvc-src",
+		VolumeDefinitions: []apiv1.SnapshotVolumeDef{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024},
+		},
+	}); err != nil {
+		t.Fatalf("seed snap: %v", err)
+	}
+
+	// Target RD already has its OWN volume 0.
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-tgt"}); err != nil {
+		t.Fatalf("seed target RD: %v", err)
+	}
+
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-tgt", &apiv1.VolumeDefinition{
+		VolumeNumber: 0, SizeKib: 2048 * 1024,
+	}); err != nil {
+		t.Fatalf("seed target VD: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	body, _ := json.Marshal(snapshotRestoreRequest{ToResource: "pvc-tgt"})
+
+	resp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-src/snapshot-restore-volume-definition/snap-1", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status: got %d, want 409 (volume-number conflict)", resp.StatusCode)
+	}
+
+	var rc []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rc); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rc) == 0 || rc[0].RetCode >= 0 {
+		t.Fatalf("ret_code: got %+v, want a negative (error) code", rc)
+	}
+
+	// FAIL_EXISTS_VLM_DFN (502) sub-code so golinstor's typed matcher fires.
+	const failBit = 502
+	if rc[0].RetCode&failBit != failBit {
+		t.Errorf("ret_code: got %#x, want FAIL_EXISTS_VLM_DFN (502) bit set", rc[0].RetCode)
+	}
+
+	// The target RD's original volume 0 must remain untouched (size
+	// 2048 MiB) — the guard must not have partially mutated it.
+	got, err := st.VolumeDefinitions().Get(ctx, "pvc-tgt", 0)
+	if err != nil {
+		t.Fatalf("target VD 0 vanished: %v", err)
+	}
+
+	if got.SizeKib != 2048*1024 {
+		t.Errorf("target VD 0 size: got %d, want untouched 2048 MiB", got.SizeKib)
 	}
 }

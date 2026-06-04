@@ -23,6 +23,7 @@ import (
 	"maps"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -114,6 +115,19 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
+	// G3b (corner-case): the VD-restore variant hydrates the snapshot's
+	// recorded volume layout onto a (typically pre-existing, empty)
+	// target RD. If the target RD ALREADY carries a volume-definition
+	// whose number collides with one of the snapshot's, refuse up front
+	// with a typed FAIL_EXISTS_VLM_DFN envelope naming the offending
+	// volume number — rather than letting hydrateVolumesFromSnapshot's
+	// per-VD Create surface a bare 409 only AFTER it has already
+	// partially mutated the target (an earlier non-colliding VD would
+	// land before the colliding one errored, leaving a half-restored RD).
+	if !s.refuseRestoreOnVolumeConflict(w, r, req.ToResource, &snap) {
+		return
+	}
+
 	err = hydrateVolumesFromSnapshot(r.Context(), s, req.ToResource, &snap)
 	if err != nil {
 		writeStoreError(w, err)
@@ -126,6 +140,60 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		Message: "snapshot volume definitions restored: " +
 			snapName + " → " + req.ToResource,
 	}})
+}
+
+// refuseRestoreOnVolumeConflict is the G3b pre-mutation guard for the
+// VD-restore handler. It compares the snapshot's recorded volume
+// numbers against the target RD's existing VolumeDefinitions and
+// refuses with a typed FAIL_EXISTS_VLM_DFN (502) envelope when any
+// number collides. Returns true (caller may proceed) when the target
+// has no conflicting VD or its VD list could not be read (best-effort:
+// the downstream hydrate Create still guards). Returns false (and
+// writes the 409 envelope) on a collision.
+func (s *Server) refuseRestoreOnVolumeConflict(w http.ResponseWriter, r *http.Request, toResource string, snap *apiv1.Snapshot) bool {
+	existing, err := s.Store.VolumeDefinitions().List(r.Context(), toResource)
+	if err != nil || len(existing) == 0 {
+		return true
+	}
+
+	have := make(map[int32]struct{}, len(existing))
+	for i := range existing {
+		have[existing[i].VolumeNumber] = struct{}{}
+	}
+
+	var clashes []int32
+
+	for i := range snap.VolumeDefinitions {
+		if _, ok := have[snap.VolumeDefinitions[i].VolumeNumber]; ok {
+			clashes = append(clashes, snap.VolumeDefinitions[i].VolumeNumber)
+		}
+	}
+
+	if len(clashes) == 0 {
+		return true
+	}
+
+	slices.Sort(clashes)
+
+	nums := make([]string, 0, len(clashes))
+	for _, n := range clashes {
+		nums = append(nums, strconv.Itoa(int(n)))
+	}
+
+	writeJSON(w, http.StatusConflict, []apiv1.APICallRc{{
+		RetCode: apiCallRcError | apiCallRcFailExistsVlmDfn,
+		Message: "cannot restore snapshot volume definitions onto '" +
+			toResource + "': volume number(s) " + strings.Join(nums, ", ") +
+			" already exist on the target",
+		Cause: "the target resource definition already carries a volume " +
+			"definition with the same number as the snapshot's; restoring " +
+			"would collide on the volume-number key",
+		Correc: "restore into a resource definition with no conflicting " +
+			"volume definitions (e.g. a freshly-created empty RD), or remove " +
+			"the clashing volume definition(s) from '" + toResource + "' first",
+	}})
+
+	return false
 }
 
 // validateSnapshotRestoreRequest runs every pre-store wire-boundary

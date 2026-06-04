@@ -207,6 +207,21 @@ const warnNodeAlreadyGone = maskWarn | int64(2060)
 // envelope wrapper at the call site.
 const apiCallRcFailSnapshotFinalizerStuck int64 = 998
 
+// apiCallRcFailSnapshotsNotSupported mirrors upstream LINSTOR's
+// `ApiConsts.FAIL_SNAPSHOTS_NOT_SUPPORTED` (`994 | MASK_ERROR`).
+// Emitted by `POST /v1/resource-definitions/{rd}/snapshots` (G5) when
+// a targeted diskful replica lives in a storage pool whose provider
+// cannot take copy-on-write snapshots (thick `LVM`, plain thick
+// `FILE`, `DISKLESS`). The upstream controller refuses the snapshot
+// at the API edge — thin LVM and ZFS (and `FILE_THIN` downstream) are
+// the only snapshot-capable providers. blockstor's thick-LVM provider
+// CAN technically `lvcreate --snapshot` (a 25%ORIGIN COW overlay that
+// silently invalidates on overflow), so without this gate the
+// satellite would happily stage a footgun snapshot the operator never
+// asked to risk. The MASK_ERROR bit is OR'd in by the envelope wrapper
+// at the call site.
+const apiCallRcFailSnapshotsNotSupported int64 = 994
+
 // apiCallRcFailExistsSnapshotDfn mirrors upstream LINSTOR's
 // `ApiConsts.FAIL_EXISTS_SNAPSHOT_DFN` (`514 | MASK_ERROR`). Emitted by
 // `DELETE /v1/resource-definitions/{rd}` when the RD still has at

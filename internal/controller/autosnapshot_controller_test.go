@@ -390,11 +390,14 @@ func TestAutoSnapshotRunEveryDisabledSkipsRD(t *testing.T) {
 	}
 }
 
-// TestAutoSnapshotKeepZeroDisablesPrune: the OpenAPI doc says
-// "Removing this property or having a value <= 0 disables
-// auto-cleanup, all auto-snapshots will be kept". Pin that
-// invariant — Keep=0 means never prune.
-func TestAutoSnapshotKeepZeroDisablesPrune(t *testing.T) {
+// TestAutoSnapshotKeepZeroFallsBackToDefault10 (G4): the upstream
+// administration guide is explicit — "If AutoSnapshot/Keep is omitted
+// (or <= 0), LINSTOR will keep the last 10 snapshots by default"
+// (linstor-administration.adoc ~2467). A Keep value of 0 therefore
+// falls back to the default budget of 10, it does NOT disable cleanup.
+// (Pre-fix blockstor diverged here, treating <= 0 as "keep
+// everything" — see git history for TestAutoSnapshotKeepZeroDisablesPrune.)
+func TestAutoSnapshotKeepZeroFallsBackToDefault10(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
@@ -417,8 +420,40 @@ func TestAutoSnapshotKeepZeroDisablesPrune(t *testing.T) {
 	}
 
 	snaps := listAutoSnapshotsByRD(t, cli, "pvc-w05-keep0")
-	if len(snaps) != 15 {
-		t.Errorf("expected 15 auto-snapshots (cleanup disabled), got %d", len(snaps))
+	if len(snaps) != controllerpkg.DefaultAutoSnapshotKeep {
+		t.Errorf("expected %d auto-snapshots (Keep=0 falls back to default 10), got %d",
+			controllerpkg.DefaultAutoSnapshotKeep, len(snaps))
+	}
+}
+
+// TestAutoSnapshotKeepNegativeFallsBackToDefault10 (G4): same contract
+// for an explicitly negative Keep — `<= 0` is the documented trigger,
+// so a negative value must also resolve to the default budget of 10.
+func TestAutoSnapshotKeepNegativeFallsBackToDefault10(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	rd := makeRDWithAutoSnapshot(t, "pvc-w05-keepneg", 15, "-3")
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(rd).
+		Build()
+
+	clk := &stubClock{t: time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)}
+	r := &controllerpkg.AutoSnapshotRunnable{Client: cli, Clock: clk}
+
+	for i := range 14 {
+		if err := r.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick #%d: %v", i, err)
+		}
+
+		clk.advance(15*time.Minute + time.Second)
+	}
+
+	snaps := listAutoSnapshotsByRD(t, cli, "pvc-w05-keepneg")
+	if len(snaps) != controllerpkg.DefaultAutoSnapshotKeep {
+		t.Errorf("expected %d auto-snapshots (Keep<0 falls back to default 10), got %d",
+			controllerpkg.DefaultAutoSnapshotKeep, len(snaps))
 	}
 }
 
