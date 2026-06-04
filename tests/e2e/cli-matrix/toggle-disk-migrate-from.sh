@@ -15,8 +15,16 @@
 #   $ linstor rd c <rd>; linstor vd c <rd> 128M
 #   $ linstor r c <src> <rd> -s <sp>          # diskful #1 (migrate source)
 #   $ linstor r c <keep> <rd> -s <sp>         # diskful #2 (stays put)
-#   $ linstor r c <dst> <rd> --drbd-diskless  # diskless landing pad
+#   $ linstor r c <dst> <rd> --diskless       # diskless landing pad
 #   $ linstor r td <dst> <rd> -s <sp> --migrate-from <src>
+#
+# The landing pad uses the DEPRECATED `--diskless` alias (posts the
+# canonical wire flag DISKLESS) so this cell validates the H2
+# sync-then-remove contract against the currently-deployed stand image,
+# which predates the H3 fix. The modern `--drbd-diskless` flag posts the
+# wire flag DRBD_DISKLESS, which the controller must normalise to DISKLESS
+# (H3); that normalisation is pinned separately by the L1 unit test
+# pkg/rest/resource_create_drbd_diskless_test.go.
 #
 # Contract (post-migration), asserted here:
 #
@@ -63,7 +71,7 @@ echo ">> [H2] 2 diskful ($SRC,$KEEP) + 1 diskless ($DST) for $RD"
 "${LCTL[@]}" volume-definition create "$RD" 128M >/dev/null
 "${LCTL[@]}" resource create "$SRC"  "$RD" --storage-pool="$POOL" >/dev/null
 "${LCTL[@]}" resource create "$KEEP" "$RD" --storage-pool="$POOL" >/dev/null
-"${LCTL[@]}" resource create "$DST"  "$RD" --drbd-diskless >/dev/null
+"${LCTL[@]}" resource create "$DST"  "$RD" --diskless >/dev/null
 
 echo ">> wait for both diskful replicas UpToDate"
 wait_uptodate "$RD" "$SRC" "$KEEP"

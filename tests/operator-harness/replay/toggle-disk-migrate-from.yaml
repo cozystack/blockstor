@@ -13,9 +13,14 @@ description: |
     - The migrate SOURCE (node1) Resource is removed ONLY AFTER dst is
       UpToDate (sync-then-remove).
 
-  The modern `--drbd-diskless` flag is used for the landing pad on purpose
-  (it posts wire flag DRBD_DISKLESS; the controller must normalise it to
-  DISKLESS — H3 in the same campaign).
+  The landing pad is created with the deprecated `--diskless` alias (posts
+  the canonical wire flag DISKLESS) so this replay validates the H2
+  sync-then-remove contract on the currently-DEPLOYED stand image, which
+  predates the H3 fix. The modern `--drbd-diskless` flag posts the wire
+  flag DRBD_DISKLESS, which the controller must normalise to DISKLESS (H3);
+  that wire-boundary normalisation is pinned separately by the L1 unit test
+  `pkg/rest/resource_create_drbd_diskless_test.go` and only takes effect
+  once the H3 controller change is rolled out.
 
 prerequisites:
   min_nodes: 3
@@ -37,8 +42,8 @@ steps:
   - name: r-c-keep-diskful
     cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
     expect_exit: 0
-  - name: r-c-dst-drbd-diskless
-    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--drbd-diskless"]
+  - name: r-c-dst-diskless
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--diskless"]
     expect_exit: 0
     await:
       kind: replica_diskless
