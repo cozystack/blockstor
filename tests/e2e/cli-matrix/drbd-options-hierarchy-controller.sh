@@ -98,8 +98,16 @@ echo ">> rd c + vd c + r c (--auto-place=2 -s $POOL)"
 "${LCTL[@]}" volume-definition create "$RD" 1G >/dev/null
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
-echo ">> wait for 2 diskful replicas"
-wait_replica_count "$RD" 2
+echo ">> wait for 2 diskful replicas (auto-tiebreaker may add a 3rd, diskless row)"
+deadline=$(( $(date +%s) + 60 ))
+while :; do
+    diskful_n=$(linstor_diskful_nodes "$RD" | grep -c . || true)
+    [[ "$diskful_n" == "2" ]] && break
+    if (( $(date +%s) > deadline )); then
+        die "never reached 2 diskful replicas (last=$diskful_n)"
+    fi
+    sleep 2
+done
 
 # Pick a diskful node to probe the kernel config on.
 node=$(linstor_diskful_nodes "$RD" | head -1)
