@@ -20,7 +20,6 @@ package rest
 
 import (
 	"context"
-	"maps"
 	"net/http"
 
 	"github.com/cockroachdb/errors"
@@ -999,15 +998,10 @@ func (s *Server) handleRDUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), name, func(rd *apiv1.ResourceDefinition) error {
-		if rd.Props == nil && len(patch.OverrideProps) > 0 {
-			rd.Props = map[string]string{}
-		}
-
-		maps.Copy(rd.Props, patch.OverrideProps)
-
-		for _, k := range patch.DeleteProps {
-			delete(rd.Props, k)
-		}
+		// Corner-case B5 / I1: shared property-modify core — an empty
+		// override value deletes the key (upstream `set-property KEY ""`
+		// = delete-property), matching the RG path and the UG9 NOTE.
+		rd.Props = applyPropsModify(rd.Props, patch.OverrideProps, patch.DeleteProps)
 
 		if rgChange != "" {
 			rd.ResourceGroupName = rgChange

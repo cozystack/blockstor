@@ -496,9 +496,29 @@ func isAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		return false
 	}
 
-	const propKey = "DrbdOptions/AutoQuorum"
+	// Corner-case B1/B4: the canonical upstream key is the kebab-case
+	// `DrbdOptions/auto-quorum` — that is what the `linstor (rg|rd)
+	// set-property … DrbdOptions/auto-quorum disabled` CLI writes, what
+	// `seedAutoQuorumDefaults` stamps on RD create, and what the
+	// PropsInfo catalogue advertises. The earlier camelCase spelling
+	// (`DrbdOptions/AutoQuorum`) was never written by any production
+	// path, so the gate silently never fired against a real cluster:
+	// auto-quorum=disabled set via the CLI was ignored and the
+	// reconciler kept overwriting the operator's manual quorum policy
+	// on every pass. Read the kebab key first; keep the camelCase
+	// spelling as a forward-compat fallback so any hand-stamped legacy
+	// value still opts out.
+	const (
+		propKey       = "DrbdOptions/auto-quorum"
+		legacyPropKey = "DrbdOptions/AutoQuorum"
+	)
 
-	return strings.EqualFold(rd.Spec.Props[propKey], "disabled")
+	value, ok := rd.Spec.Props[propKey]
+	if !ok {
+		value = rd.Spec.Props[legacyPropKey]
+	}
+
+	return strings.EqualFold(value, "disabled")
 }
 
 // isTiebreakerSuppressed reports whether the operator recently

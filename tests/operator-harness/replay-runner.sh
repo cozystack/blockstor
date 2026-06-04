@@ -54,6 +54,10 @@
 #   - no_tiebreaker        assert NO TieBreaker is auto-spawned
 #   - tiebreaker_present   assert a TieBreaker witness EXISTS for rd
 #                           (Bug 386: re-created after `n rst`)
+#   - prop_value           assert a property on an RD/RG list-properties
+#                           surface: {kind:rd|rg, name, key, expected}.
+#                           expected omitted/"" ⇒ key must be ABSENT
+#                           (empty-value=delete; corner-case B1/B4/B5)
 #   - sync_clean           wait until UpToDate without "(NN%)" suffix
 #   - resource_absent      wait until r d takes effect on a node
 #   - rd_absent            wait until rd is gone everywhere
