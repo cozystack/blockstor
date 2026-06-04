@@ -628,6 +628,86 @@ func TestEnsureTiebreakerHonoursAutoQuorumDisabled(t *testing.T) {
 	}
 }
 
+// TestEnsureTiebreakerDisabledDoesNotReseedOnNoQuorum is the B5
+// regression that the dev-stand reproduced against the released
+// (camelCase-bug) binary: with `DrbdOptions/auto-quorum=disabled` set
+// via the real CLI (kebab key) and NO on-no-quorum prop, the
+// reconciler must NOT re-seed `on-no-quorum=suspend-io`.
+//
+// Stand evidence (BS v0.1.9, buggy): after
+//
+//	rd set-property R DrbdOptions/auto-quorum disabled
+//	rd set-property R DrbdOptions/Resource/on-no-quorum         (empty=delete)
+//
+// the CLI deleted the key, then the reconciler re-stamped
+// `on-no-quorum=suspend-io` because isAutoQuorumDisabled read the dead
+// camelCase key, returned false, and ran setQuorum's companion seed —
+// so an operator could never actually clear the prop. With the
+// kebab-key fix, isAutoQuorumDisabled returns true, ensureTiebreaker
+// short-circuits before setQuorum, and the prop stays absent.
+func TestEnsureTiebreakerDisabledDoesNotReseedOnNoQuorum(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	// 2 diskful — the shape that, under active auto-quorum, would
+	// drive quorum=majority + the suspend-io companion seed.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-b5", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	// Operator disabled auto-quorum (canonical kebab key) and cleared
+	// on-no-quorum (the CLI delete already removed it — Props has no
+	// on-no-quorum entry).
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-b5"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			Props: map[string]string{
+				"DrbdOptions/auto-quorum": "disabled",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-b5"}, final); err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	if got, present := final.Spec.Props["DrbdOptions/Resource/on-no-quorum"]; present {
+		t.Errorf("B5: on-no-quorum re-seeded to %q under auto-quorum=disabled; "+
+			"must stay ABSENT (the deleted prop must not come back)", got)
+	}
+
+	if got, present := final.Spec.Props["DrbdOptions/Resource/quorum"]; present {
+		t.Errorf("B5: quorum re-stamped to %q under auto-quorum=disabled; "+
+			"the reconciler must leave quorum policy to the operator", got)
+	}
+}
+
 // TestIsAutoQuorumDisabled pins the helper across the input shapes
 // the production code can encounter: nil RD, nil Props, missing key,
 // explicit `disabled` (canonical and mixed case), and the two other
