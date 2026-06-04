@@ -68,7 +68,21 @@ SIZE_BYTES=$((1024 * 1024))   # 1 MiB marker payload — large enough to
                               # re-sync in well under 30 s on QEMU.
 
 BAD_STATES_RE='StandAlone|Connecting|NetworkFailure|BrokenPipe|Disconnecting|Timeout'
-PARTITION_TIMEOUT=30
+HEALTHY_STATES_RE='Connected|Established'
+# PR #96 / CI lane 5 (run 26920040194) flaked with:
+#   "ci-lane5-worker-1's view of ci-lane5-worker-2 never left
+#    Connected/Established within 30s"
+# i.e. after the iptables drop landed, the observing wait never saw the
+# connection leave Connected within 30 s under CI load. Two contributing
+# modes, hardened below: (1) under nested-QEMU pressure DRBD's own
+# ko-count/ping-timeout detection of a silently-dropped link can take
+# longer than 30 s to flip the peer FSM out of Connected — the analogous
+# fence-detect wait in network-partition.sh already budgets 90 s, so
+# match it here; (2) transient EMPTY/garbage `drbdsetup status` reads
+# under load were being treated as state samples — the wait now only
+# counts a CONFIRMED healthy reading (Connected|Established) as "still
+# connected" and treats an empty read as a retry, never a sample.
+PARTITION_TIMEOUT=90
 # Bug 307: Run 16 failed with both peers stuck `disk:Outdated
 # peer-disk:Outdated replication:Established` 30 s after iptables
 # removal. Root cause was a transient mid-suite satellite-pod restart
@@ -186,12 +200,46 @@ echo "   DRBD port = $DRBD_PORT"
 echo ">> isolate $N2: iptables drop tcp:$DRBD_PORT in+out (sport+dport)"
 BLOCKED_NODE="$N2"
 BLOCKED_PORT="$DRBD_PORT"
-on_node "$N2" sh -c "
-    iptables -A INPUT  -p tcp --dport $DRBD_PORT -j DROP
-    iptables -A OUTPUT -p tcp --dport $DRBD_PORT -j DROP
-    iptables -A INPUT  -p tcp --sport $DRBD_PORT -j DROP
-    iptables -A OUTPUT -p tcp --sport $DRBD_PORT -j DROP
-"
+
+# apply_partition_rules adds the four DROP rules. Idempotent-ish: a
+# second call appends duplicates, but cleanup_iptables -D removes them
+# all in a loop so that is harmless.
+apply_partition_rules() {
+    on_node "$N2" sh -c "
+        iptables -A INPUT  -p tcp --dport $DRBD_PORT -j DROP
+        iptables -A OUTPUT -p tcp --dport $DRBD_PORT -j DROP
+        iptables -A INPUT  -p tcp --sport $DRBD_PORT -j DROP
+        iptables -A OUTPUT -p tcp --sport $DRBD_PORT -j DROP
+    "
+}
+
+# partition_rules_present asserts all four DROP rules exist on $N2 via
+# `iptables -C` (check, exit 0 == rule present). Returns 0 iff every
+# rule landed. We VERIFY the partition actually landed before entering
+# the wait: a silently-failed iptables apply (busy xtables lock,
+# transient exec hiccup) would otherwise leave the link up and the wait
+# would spuriously "never leave Connected" — exactly the PR #96 symptom.
+partition_rules_present() {
+    on_node "$N2" sh -c "
+        iptables -C INPUT  -p tcp --dport $DRBD_PORT -j DROP 2>/dev/null &&
+        iptables -C OUTPUT -p tcp --dport $DRBD_PORT -j DROP 2>/dev/null &&
+        iptables -C INPUT  -p tcp --sport $DRBD_PORT -j DROP 2>/dev/null &&
+        iptables -C OUTPUT -p tcp --sport $DRBD_PORT -j DROP 2>/dev/null
+    " >/dev/null 2>&1
+}
+
+apply_partition_rules
+# Verify the rules landed; retry the apply once if any are missing.
+if ! partition_rules_present; then
+    echo "   WARN: partition rules not all present after first apply on $N2 — retrying once"
+    apply_partition_rules
+    if ! partition_rules_present; then
+        echo "FAIL: could not install iptables DROP rules for tcp:$DRBD_PORT on $N2 (partition never landed)"
+        on_node "$N2" iptables -S 2>&1 | sed 's/^/    N2 iptables -S: /' || true
+        exit 1
+    fi
+fi
+echo "   partition rules confirmed present on $N2 (tcp:$DRBD_PORT sport+dport, in+out)"
 
 # --- Assert non-Connected within $PARTITION_TIMEOUT ------------------------
 #
@@ -202,19 +250,41 @@ on_node "$N2" sh -c "
 echo ">> wait up to ${PARTITION_TIMEOUT}s for $N1's view of $N2 to flip non-Connected"
 deadline=$(( $(date +%s) + PARTITION_TIMEOUT ))
 part_state=""
+part_ok=false
+last_confirmed=""   # last reading that was a real (non-empty) token
 while (( $(date +%s) < deadline )); do
     part_state=$(status_connection_state "$RD" "$N1" "$N2")
+    # Transient EMPTY/garbage read under load: drbdsetup status can
+    # momentarily return no peer line (or the observer snapshot lags) on
+    # a loaded nested-QEMU runner. An empty token is NOT a sample — it is
+    # neither "still Connected" nor "partitioned" — so retry without
+    # counting it. Only a CONFIRMED token drives the decision.
+    if [[ -z "$part_state" ]]; then
+        sleep 2
+        continue
+    fi
+    last_confirmed="$part_state"
     if [[ "$part_state" =~ ^($BAD_STATES_RE)$ ]]; then
+        part_ok=true
         break
     fi
+    # A confirmed Connected/Established reading: the link is still up.
+    # Keep waiting (the kernel's ko-count detection has not fired yet).
     sleep 2
 done
 
-if [[ ! ( "$part_state" =~ ^($BAD_STATES_RE)$ ) ]]; then
+if [[ "$part_ok" != "true" ]]; then
     echo "FAIL: $N1's view of $N2 never left Connected/Established within ${PARTITION_TIMEOUT}s"
-    echo "  last connection-state token: '${part_state:-<empty>}'"
-    echo "  raw drbdsetup status --verbose on $N1:"
-    on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/    /' || true
+    echo "  last connection-state token: '${last_confirmed:-<empty>}'"
+    echo "  ---- evidence: iptables rules on both nodes ----"
+    on_node "$N2" iptables -S 2>&1 | sed 's/^/    N2 iptables -S: /' || true
+    on_node "$N1" iptables -S 2>&1 | sed 's/^/    N1 iptables -S: /' || true
+    echo "  ---- evidence: drbdsetup status --verbose on BOTH workers ----"
+    on_node "$N1" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/    N1: /' || true
+    on_node "$N2" drbdsetup status "$RD" --verbose 2>&1 | sed 's/^/    N2: /' || true
+    echo "  ---- evidence: dmesg tail | grep drbd ----"
+    on_node "$N1" sh -c 'dmesg 2>/dev/null | grep -i drbd | tail -20' 2>&1 | sed 's/^/    N1 dmesg: /' || true
+    on_node "$N2" sh -c 'dmesg 2>/dev/null | grep -i drbd | tail -20' 2>&1 | sed 's/^/    N2 dmesg: /' || true
     exit 1
 fi
 echo "   partition observed: $N1 sees $N2 connection=$part_state"
@@ -240,10 +310,19 @@ heal_state=""
 heal_ok=false
 while (( $(date +%s) < deadline )); do
     heal_state=$(status_connection_state "$RD" "$N1" "$N2")
+    # Same empty-read tolerance as the partition-detect wait: a transient
+    # empty/garbage status read under load is not a sample — retry rather
+    # than risk a spurious early loop iteration. (The success condition
+    # below already requires a confirmed-healthy triple, so an empty read
+    # never PASSES; this just makes the intent explicit and symmetric.)
+    if [[ -z "$heal_state" ]]; then
+        sleep 2
+        continue
+    fi
     n1_disk=$(status_disk_state "$RD" "$N1")
     n2_disk=$(status_disk_state "$RD" "$N2")
 
-    if [[ ( "$heal_state" == "Established" || "$heal_state" == "Connected" ) \
+    if [[ "$heal_state" =~ ^($HEALTHY_STATES_RE)$ \
           && "$n1_disk" == "UpToDate" && "$n2_disk" == "UpToDate" ]]; then
         heal_ok=true
         break
