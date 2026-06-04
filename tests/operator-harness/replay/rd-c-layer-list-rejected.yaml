@@ -1,0 +1,65 @@
+name: rd-c-layer-list-rejected
+description: |
+  Corner-case D7b (linstor-administration.adoc ~1819-1833):
+  `--layer-list` negative cases at `rd create`.
+
+  Upstream LINSTOR validates the layer stack at RD-create time and
+  rejects malformed inputs; blockstor mirrors the OUTCOME (rejection)
+  at the REST wire boundary. The error-envelope wire shape diverges and
+  is whitelisted in docs/cli-parity-known-deltas.md row 69.
+
+  This replay codifies the two CLI-driveable rejection contracts via
+  exit-code only (the runner has no "rejection-envelope-text" await
+  kind — the message-shape assertion lives in the L6 cell
+  tests/e2e/cli-matrix/rd-c-layer-list-rejected.sh, which also covers
+  the unknown-layer server-side allowlist via a raw REST POST that the
+  python-linstor CLI would reject client-side):
+
+    1. invalid order `luks,drbd,storage` (LUKS must sit below DRBD)
+       MUST be rejected (apiCallRcError → CLI exit 10).
+    2. duplicate layer `drbd,drbd,storage` MUST be rejected (exit 10).
+    3. neither rejected create may leak an RD — the `no_orphans`
+       invariant + the explicit `rd_absent`-by-list checks below assert
+       the gate fires before any store write.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd_order: ccd2-d7b-order
+  rd_dup: ccd2-d7b-dup
+
+steps:
+  # ---- Contract 1: invalid order luks,drbd,storage ----
+  - name: rd-c-invalid-order-rejected
+    cmd: ["resource-definition", "create", "{{rd_order}}", "--layer-list", "luks,drbd,storage"]
+    expect_exit: 10
+  # The rejected create must not have persisted an RD.
+  - name: order-rd-absent
+    cmd: ["resource-definition", "list", "--resource-definitions", "{{rd_order}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd_order}}"
+      timeout_s: 30
+
+  # ---- Contract 2: duplicate layer drbd,drbd,storage ----
+  - name: rd-c-duplicate-rejected
+    cmd: ["resource-definition", "create", "{{rd_dup}}", "--layer-list", "drbd,drbd,storage"]
+    expect_exit: 10
+  - name: dup-rd-absent
+    cmd: ["resource-definition", "list", "--resource-definitions", "{{rd_dup}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd_dup}}"
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd_order}}"]
+  - cmd: ["resource-definition", "delete", "{{rd_dup}}"]
+
+invariants:
+  - no_orphans
