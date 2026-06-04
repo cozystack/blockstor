@@ -324,10 +324,14 @@ print(bad)")
             [[ "$present" -ge 1 ]]
             ;;
         prop_value)
-            # Corner-case B (B1/B4/B5): assert a property on an
-            # RD/RG list-properties surface. spec fields:
-            #   obj:      "rd" (default) or "rg" — which object kind
-            #   name:     RD or RG name ({{rd}} / {{rg}} substituted)
+            # Corner-case B (B1/B4/B5) + I1: assert a property on an
+            # object's list-properties surface. spec fields:
+            #   obj:      "rd" (default), "rg", "node", or "controller"
+            #             — which object kind. (corner-case I1 added the
+            #             node/controller cases for the non-RD
+            #             empty-value=delete pins.)
+            #   name:     object name ({{rd}} / {{rg}} / {{node}}
+            #             substituted). Ignored for "controller".
             #   key:      property key (e.g. DrbdOptions/Resource/quorum)
             #   expected: desired value. If OMITTED or "", the key must
             #             be ABSENT (empty-value=delete / B5). Otherwise
@@ -340,11 +344,20 @@ print(bad)")
             p_name=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name',''))" "$spec")")
             p_key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
             p_expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
-            if [[ "$p_kind" == "rg" ]]; then
-                p_obj=$(linstor_cli -m resource-group list-properties "$p_name" 2>/dev/null || echo "")
-            else
-                p_obj=$(linstor_cli -m resource-definition list-properties "$p_name" 2>/dev/null || echo "")
-            fi
+            case "$p_kind" in
+                rg)
+                    p_obj=$(linstor_cli -m resource-group list-properties "$p_name" 2>/dev/null || echo "")
+                    ;;
+                node)
+                    p_obj=$(linstor_cli -m node list-properties "$p_name" 2>/dev/null || echo "")
+                    ;;
+                controller)
+                    p_obj=$(linstor_cli -m controller list-properties 2>/dev/null || echo "")
+                    ;;
+                *)
+                    p_obj=$(linstor_cli -m resource-definition list-properties "$p_name" 2>/dev/null || echo "")
+                    ;;
+            esac
             # The -m list-properties payload is a list of {key,value}
             # entries (possibly double-nested by golinstor). Resolve the
             # value for p_key, reporting present/absent + the value.
