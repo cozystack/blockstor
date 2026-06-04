@@ -35,6 +35,7 @@ package effectiveprops
 import (
 	"context"
 	"maps"
+	"strings"
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -77,17 +78,108 @@ func Resolve(ctx context.Context, c client.Reader, target *blockstoriov1alpha1.R
 		return nil, err
 	}
 
-	typed := drbd.ResolveDRBDOptions(ctrlTyped, rgInfo.Typed, rdInfo.Typed, target.Spec.DRBDOptions)
+	// Build one flat DRBD-props map per scope — typed fields emitted
+	// back to their `DrbdOptions/...` wire keys, unioned with that
+	// scope's untyped ExtraProps. A scope's typed/extras keysets are
+	// disjoint by construction (the store transcoder routes each
+	// recognised key into the typed struct and everything else into
+	// ExtraProps), so the union is unambiguous within a scope.
+	//
+	// The controller scope is special: `controller drbd-options`
+	// persists into ControllerConfig.Spec.ExtraProps (raw, untyped —
+	// see pkg/rest/controller_props.go), so ctrlTyped is normally nil
+	// and ctrlExtras carries the cluster-wide knobs. We still feed
+	// ctrlTyped through emitScopeProps for completeness.
+	ctrlProps := emitScopeProps(ctrlTyped, ctrlExtras)
+	rgProps := emitScopeProps(rgInfo.Typed, rgInfo.Extras)
+	rdProps := emitScopeProps(rdInfo.Typed, rdInfo.Extras)
+	resProps := emitScopeProps(target.Spec.DRBDOptions, target.Spec.ExtraProps)
 
-	out := drbd.ResolveOptions(nil, rgInfo.Props, rdInfo.Props, target.Spec.Props)
+	// Merge the DRBD knobs in upstream-LINSTOR precedence order:
+	// Controller → ResourceGroup → ResourceDefinition → Resource, each
+	// lower (closer-to-the-resource) scope overriding the one above.
+	// ResolveOptions also threads through the non-DRBD raw Spec.Props
+	// (StorPoolName, Aux/*) from each scope. Because every scope's DRBD
+	// knobs are funneled through the *same* precedence walk here, a
+	// closer scope's explicit override always wins regardless of
+	// whether the value was stored typed or as an ExtraProp — the
+	// "closer to the resource wins" rule (C2) holds across the whole
+	// chain, including the controller tier (C1).
+	ctrlMerged := mergeScopeProps(ctrlProps, nil)
+	rgMerged := mergeScopeProps(rgProps, rgInfo.Props)
+	rdMerged := mergeScopeProps(rdProps, rdInfo.Props)
+	resMerged := mergeScopeProps(resProps, target.Spec.Props)
 
-	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
-	maps.Copy(out, ctrlExtras)
-	maps.Copy(out, rgInfo.Extras)
-	maps.Copy(out, rdInfo.Extras)
-	maps.Copy(out, target.Spec.ExtraProps)
+	out := drbd.ResolveOptions(ctrlMerged, rgMerged, rdMerged, resMerged)
+
+	// ResolveOptions only threads through NON-DRBD props from the
+	// most-specific (resource) scope — by design for keys like
+	// StorPoolName that only make sense on the resource. But the RG and
+	// RD scopes carry load-bearing NON-DRBD ExtraProps that the
+	// satellite reads off the dispatched resource: most importantly
+	// `FileSystem/Type` (+ `FileSystem/MkfsParams`), which the
+	// `linstor rd set-property … FileSystem/Type ext4` CLI and the
+	// linstor-csi CreateVolume path stamp on the RD and which gate the
+	// satellite's mkfs / `primary --force` seed path
+	// (pkg/satellite/reconciler.go hasFileSystemConfigured). Dropping
+	// them silently disables mkfs → a fresh replica never writes → the
+	// DRBD current-UUID never rotates past the day0 GI → the
+	// controller's RD.Spec.Initialized latch never flips.
+	//
+	// Re-overlay the non-DRBD ExtraProps from the RG then RD scope
+	// (closer scope last, so RD wins over RG; the resource scope already
+	// won via ResolveOptions). DRBD keys are intentionally skipped here —
+	// the precedence walk above already resolved them. The controller
+	// scope is deliberately NOT re-overlaid: cluster-wide non-DRBD knobs
+	// like `Aux/zone` must not leak onto every resource (C1 contract).
+	overlayNonDRBDExtras(out, rgInfo.Extras)
+	overlayNonDRBDExtras(out, rdInfo.Extras)
 
 	return out, nil
+}
+
+// overlayNonDRBDExtras copies the non-`DrbdOptions/...` entries of a
+// scope's ExtraProps into out (overriding on key collision). DRBD keys
+// are skipped — those are resolved by the precedence walk in
+// ResolveOptions and must not be re-applied here (that would let an
+// upper scope's DRBD ExtraProp clobber a closer scope's resolved
+// value). nil src is a no-op.
+func overlayNonDRBDExtras(out, src map[string]string) {
+	for key, value := range src {
+		if strings.HasPrefix(key, drbd.PropPrefix) {
+			continue
+		}
+
+		out[key] = value
+	}
+}
+
+// emitScopeProps flattens one scope's typed DRBDOptions plus its
+// untyped ExtraProps into a single `DrbdOptions/...` wire-key map.
+// Typed fields win over an ExtraProp of the same key within the scope
+// (the transcoder keeps the two keysets disjoint, so this only ever
+// matters for hand-crafted inputs). Returns a fresh map.
+func emitScopeProps(typed *blockstoriov1alpha1.DRBDOptions, extras map[string]string) map[string]string {
+	out := map[string]string{}
+
+	maps.Copy(out, extras)
+	maps.Copy(out, drbd.TypedDRBDOptionsToProps(typed))
+
+	return out
+}
+
+// mergeScopeProps unions a scope's flattened DRBD knobs (drbdProps)
+// with its raw, non-DRBD Spec.Props (StorPoolName, Aux/*). The DRBD
+// knobs take precedence on key collision — a `DrbdOptions/...` key
+// only ever appears in drbdProps, so in practice the two are disjoint.
+// Returns a fresh map; nil inputs are treated as empty.
+func mergeScopeProps(drbdProps, rawProps map[string]string) map[string]string {
+	out := map[string]string{}
+
+	maps.Copy(out, rawProps)
+	maps.Copy(out, drbdProps)
+
+	return out
 }
 
 // scopeInputs gathers the RG + RD scope inputs the hierarchy
