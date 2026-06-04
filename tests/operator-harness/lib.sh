@@ -181,14 +181,33 @@ substitute() {
 
 await_assertion() {
     local spec=$1
-    local kind timeout_s deadline
+    local kind timeout_s deadline hold_s held_since now
     kind=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('kind',''))" "$spec")
     timeout_s=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('timeout_s',${ASSERT_TIMEOUT_S}))" "$spec")
-    deadline=$(( $(date +%s) + timeout_s ))
+    # Optional hold_s: the assertion must not only become true once but
+    # STAY true for hold_s consecutive seconds. Catches value flapping
+    # (e.g. an operator-set property that a reconciler keeps reverting:
+    # a plain first-match await can sample the lucky instant between
+    # the write and the revert and false-PASS — seen on corner-B2).
+    # Any failed sample resets the hold window. The overall deadline
+    # spans timeout_s + hold_s so a late first success still gets a
+    # full hold window.
+    hold_s=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('hold_s',0))" "$spec")
+    deadline=$(( $(date +%s) + timeout_s + hold_s ))
+    held_since=""
 
     while (( $(date +%s) < deadline )); do
         if check_assertion "$kind" "$spec"; then
-            return 0
+            if (( hold_s == 0 )); then
+                return 0
+            fi
+            now=$(date +%s)
+            [[ -n "$held_since" ]] || held_since=$now
+            if (( now - held_since >= hold_s )); then
+                return 0
+            fi
+        else
+            held_since=""
         fi
         sleep 2
     done
