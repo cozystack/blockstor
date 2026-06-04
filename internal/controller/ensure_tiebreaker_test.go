@@ -628,6 +628,91 @@ func TestEnsureTiebreakerHonoursAutoQuorumDisabled(t *testing.T) {
 	}
 }
 
+// TestEnsureTiebreakerHonoursAutoQuorumDisabledInExtraProps is the B2
+// regression: it reproduces the EXACT production CRD shape the
+// dev-stand replay (auto-quorum-disabled-keeps-manual-quorum) hits.
+//
+// The CRD-backed store's wireToCRDRDSpec strips every `DrbdOptions/*`
+// key out of Spec.Props and routes the section-less, un-typed
+// `DrbdOptions/auto-quorum` into Spec.ExtraProps (only
+// `AutoAddQuorumTiebreaker` is typed). The earlier B1 reconciler test
+// stamped the disable key in Spec.Props — a shape no real CLI write
+// produces on a CRD cluster — so it passed while the live stand still
+// re-stamped quorum=majority over the operator's manual `quorum off`.
+//
+// Here the disable marker lives in ExtraProps (where the store really
+// puts it) and the manual `quorum off` in Props (a non-DRBD... no:
+// quorum IS a DRBD key, but the in-memory fake client keeps whatever
+// we set — we assert the reconciler does NOT overwrite it). Pre-fix
+// isAutoQuorumDisabled read only Spec.Props, returned false, and
+// setQuorum clobbered the value; post-fix it consults ExtraProps,
+// returns true, and ensureTiebreaker short-circuits.
+func TestEnsureTiebreakerHonoursAutoQuorumDisabledInExtraProps(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-b2-extra", NodeName: n,
+		}); err != nil {
+			t.Fatalf("seed replica %s: %v", n, err)
+		}
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-b2-extra"},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			// Production CRD shape: the disable marker lives in
+			// ExtraProps, exactly where the store transcode puts the
+			// CLI-written `DrbdOptions/auto-quorum disabled`.
+			ExtraProps: map[string]string{
+				"DrbdOptions/auto-quorum": "disabled",
+			},
+			Props: map[string]string{
+				"DrbdOptions/Resource/quorum": "off",
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// Gate must agree with the ExtraProps-borne marker.
+	if !controllerpkg.IsAutoQuorumDisabled(rd) {
+		t.Fatalf("IsAutoQuorumDisabled returned false for ExtraProps auto-quorum=disabled RD")
+	}
+
+	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+		t.Fatalf("EnsureTiebreaker: %v", err)
+	}
+
+	final := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, types.NamespacedName{Name: "pvc-b2-extra"}, final); err != nil {
+		t.Fatalf("Get RD: %v", err)
+	}
+
+	// The operator's manual `quorum off` must survive — the auto
+	// reconciler would otherwise compute `majority` and clobber it.
+	if got := final.Spec.Props["DrbdOptions/Resource/quorum"]; got != "off" {
+		t.Errorf("B2: quorum prop got %q, want %q (ExtraProps auto-quorum=disabled "+
+			"must stop the reconciler clobbering the manual value)", got, "off")
+	}
+}
+
 // TestEnsureTiebreakerDisabledDoesNotReseedOnNoQuorum is the B5
 // regression that the dev-stand reproduced against the released
 // (camelCase-bug) binary: with `DrbdOptions/auto-quorum=disabled` set
@@ -791,6 +876,65 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 			rd: &blockstoriov1alpha1.ResourceDefinition{
 				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
 					Props: map[string]string{"DrbdOptions/auto-quorum": "io-error"},
+				},
+			},
+			want: false,
+		},
+		{
+			// Corner-case B2 (production CRD shape): the store routes
+			// the section-less `DrbdOptions/auto-quorum` key OUT of
+			// Spec.Props (stripDRBDProps) and into Spec.ExtraProps. The
+			// gate MUST read that bag too, otherwise the operator's
+			// `set-property DrbdOptions/auto-quorum disabled` is silently
+			// ignored on every real cluster. This is the case the B1
+			// fix missed.
+			name: "disabled in ExtraProps (kebab key, CRD store shape)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					ExtraProps: map[string]string{"DrbdOptions/auto-quorum": "disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "Disabled (mixed case) in ExtraProps",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					ExtraProps: map[string]string{"DrbdOptions/auto-quorum": "Disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			// Legacy camelCase spelling, also routed to ExtraProps by
+			// the store — forward-compat fallback must still opt out.
+			name: "disabled in ExtraProps (legacy camelCase fallback)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					ExtraProps: map[string]string{"DrbdOptions/AutoQuorum": "disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			// Mixed bags: Props carries an unrelated key, ExtraProps
+			// carries the real disable instruction. Must still fire.
+			name: "disabled in ExtraProps with unrelated Spec.Props key",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					Props:      map[string]string{"StorPoolName": "stand"},
+					ExtraProps: map[string]string{"DrbdOptions/auto-quorum": "disabled"},
+				},
+			},
+			want: true,
+		},
+		{
+			// A non-disable value in ExtraProps must NOT opt out — the
+			// reconciler keeps managing quorum.
+			name: "suspend-io in ExtraProps (not disable)",
+			rd: &blockstoriov1alpha1.ResourceDefinition{
+				Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+					ExtraProps: map[string]string{"DrbdOptions/auto-quorum": "suspend-io"},
 				},
 			},
 			want: false,
