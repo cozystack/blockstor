@@ -130,7 +130,10 @@ wait_uptodate "$RD" "$N1" "$N3"
 # RD.Spec.Initialized must have latched true once real data exists.
 # This is the persisted signal the fix keys on; assert it so a future
 # regression in the controller latch is caught here too.
-deadline=$(( $(date +%s) + 60 ))
+# 180s (was 60s): the latch rides DRBD current-UUID rotation through the
+# satellite observer + informer-cache trail; on loaded CI runners the 60s
+# window can lapse while the latch is merely late, not absent.
+deadline=$(( $(date +%s) + 180 ))
 init_ok=false
 while (( $(date +%s) < deadline )); do
     init=$(kubectl get resourcedefinition "$RD" -o jsonpath='{.spec.initialized}' 2>/dev/null || echo "")
