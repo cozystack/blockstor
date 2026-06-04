@@ -85,6 +85,11 @@ steps:
       key: "DrbdOptions/Resource/quorum"
       expected: "off"
       timeout_s: 45
+      # Must HOLD, not merely appear: without hold_s the await can
+      # sample the instant between the operator write and a buggy
+      # reconciler revert and false-PASS (exactly how the pre-B2
+      # image slipped through once).
+      hold_s: 30
   - name: tiebreaker-still-present
     # Disabling auto-quorum does NOT reap the witness — it is gated on
     # a separate prop.

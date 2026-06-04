@@ -492,7 +492,7 @@ func keepExistingWitnessFor(
 // Case-insensitive match: operators sometimes paste `Disabled` from
 // the manual.
 func isAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
-	if rd == nil || rd.Spec.Props == nil {
+	if rd == nil {
 		return false
 	}
 
@@ -513,12 +513,51 @@ func isAutoQuorumDisabled(rd *blockstoriov1alpha1.ResourceDefinition) bool {
 		legacyPropKey = "DrbdOptions/AutoQuorum"
 	)
 
-	value, ok := rd.Spec.Props[propKey]
-	if !ok {
-		value = rd.Spec.Props[legacyPropKey]
+	// Corner-case B2: the CRD-backed store (wireToCRDRDSpec →
+	// propsToTyped / stripDRBDProps) routes EVERY `DrbdOptions/*` key
+	// OUT of Spec.Props. Recognised keys become typed Spec.DRBDOptions;
+	// the section-less ones we don't type yet — and
+	// `DrbdOptions/auto-quorum` is exactly such a key, only
+	// `DrbdOptions/AutoAddQuorumTiebreaker` is typed — land in
+	// Spec.ExtraProps. The B1 fix corrected the key spelling but still
+	// read only Spec.Props, so on a real (CRD-backed) cluster the
+	// operator's `set-property DrbdOptions/auto-quorum disabled` lived
+	// in Spec.ExtraProps where this gate never looked: it never fired
+	// and setQuorum kept re-stamping quorum=majority over the
+	// operator's manual `quorum off`. Consult both bags — Spec.Props
+	// first (the in-memory / fake-client tests populate it directly),
+	// then Spec.ExtraProps (the production CRD shape).
+	value := rdPropFromBags(rd, propKey)
+	if value == "" {
+		value = rdPropFromBags(rd, legacyPropKey)
 	}
 
 	return strings.EqualFold(value, "disabled")
+}
+
+// rdPropFromBags reads a single property key off an RD, consulting
+// Spec.Props first and falling back to Spec.ExtraProps. The CRD-backed
+// store splits the upstream flat `DrbdOptions/*` prop bag across two
+// CRD fields (Spec.Props keeps non-DRBD keys; recognised DRBD keys
+// become typed Spec.DRBDOptions; unrecognised DRBD keys land in
+// Spec.ExtraProps — see pkg/store/k8s.wireToCRDRDSpec), so any
+// reconciler helper that wants the operator-visible value of a
+// section-less DRBD key MUST look in both. Returns "" when neither bag
+// carries the key.
+func rdPropFromBags(rd *blockstoriov1alpha1.ResourceDefinition, key string) string {
+	if rd.Spec.Props != nil {
+		if v, ok := rd.Spec.Props[key]; ok {
+			return v
+		}
+	}
+
+	if rd.Spec.ExtraProps != nil {
+		if v, ok := rd.Spec.ExtraProps[key]; ok {
+			return v
+		}
+	}
+
+	return ""
 }
 
 // isTiebreakerSuppressed reports whether the operator recently
