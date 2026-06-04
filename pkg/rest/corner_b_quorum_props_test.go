@@ -277,3 +277,56 @@ func TestCornerB_DefaultQuorumPairIsDeliberateDelta(t *testing.T) {
 			cbOnNoQuorumKey, got.Props[cbOnNoQuorumKey], "suspend-io")
 	}
 }
+
+// TestCornerB_QuorumMinimumRedundancyPassthrough pins corner-case B8.
+//
+// `DrbdOptions/Resource/quorum-minimum-redundancy` is a generic DRBD
+// option. Oracle evidence (piraeus-server 1.33.2): upstream VALIDATES
+// the value against the DRBD schema `(1-32)|all|majority|off` and
+// rejects `bogus` with FAIL_INVLD_PROP. blockstor's property bag is
+// permissive — it accepts and stores any DrbdOptions value verbatim
+// (no per-key value validator exists; the satellite/drbdadm rejects a
+// truly invalid value at .res render time). This is a DELIBERATE
+// DELTA recorded in docs/cli-parity-known-deltas.md.
+//
+// This test pins the accepted-and-stored behaviour for a VALID value
+// (passthrough works → the satellite renders it into options{}), which
+// is the operator-visible half that matters for CSI / cozystack.
+func TestCornerB_QuorumMinimumRedundancyPassthrough(t *testing.T) {
+	st := store.NewInMemory()
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{
+		Name: "cc-b-qmr",
+	}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const qmrKey = "DrbdOptions/Resource/quorum-minimum-redundancy"
+
+	body, err := json.Marshal(map[string]any{
+		"override_props": map[string]string{qmrKey: "2"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	resp := httpPut(t, base+"/v1/resource-definitions/cc-b-qmr", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200; body=%s", resp.StatusCode, readAll(t, resp))
+	}
+
+	got, err := st.ResourceDefinitions().Get(t.Context(), "cc-b-qmr")
+	if err != nil {
+		t.Fatalf("get RD: %v", err)
+	}
+
+	if got.Props[qmrKey] != "2" {
+		t.Errorf("B8: %s: got %q, want %q (must round-trip / propagate)",
+			qmrKey, got.Props[qmrKey], "2")
+	}
+}
