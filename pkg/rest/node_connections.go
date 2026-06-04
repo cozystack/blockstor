@@ -455,11 +455,8 @@ func mergeNodeConnectionPropsInto(
 		props = map[string]string{}
 	}
 
-	maps.Copy(props, modify.OverrideProps)
-
-	for _, k := range modify.DeleteProps {
-		delete(props, k)
-	}
+	// I1: empty override value deletes the key (set-property KEY "").
+	applyPropsModify(props, modify.OverrideProps, modify.DeleteProps)
 
 	// Namespace-prefix delete (e.g. `delete_namespaces: ["DrbdOptions/Net"]`)
 	// removes every key under the given prefix. Matches upstream

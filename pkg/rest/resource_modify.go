@@ -19,7 +19,6 @@ limitations under the License.
 package rest
 
 import (
-	"maps"
 	"net/http"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
@@ -83,11 +82,8 @@ func (s *Server) handleResourceModify(w http.ResponseWriter, r *http.Request) {
 		// Override before delete — matches upstream LINSTOR
 		// CtrlRscModifyApiCallHandler ordering and the sibling
 		// handleControllerPropsModify / handleNodeUpdate behaviour.
-		maps.Copy(res.Props, patch.OverrideProps)
-
-		for _, k := range patch.DeleteProps {
-			delete(res.Props, k)
-		}
+		// I1: empty override value deletes the key (set-property KEY "").
+		applyPropsModify(res.Props, patch.OverrideProps, patch.DeleteProps)
 
 		return nil
 	})

@@ -320,9 +320,6 @@ func applyControllerProps(ctx context.Context, c client.Client, modify *apiv1.Ge
 // merge step extracted so PatchControllerExtraProps can re-run it on
 // each retry against the freshly-fetched props bag.
 func applyControllerPropsModify(props map[string]string, modify *apiv1.GenericPropsModify) {
-	maps.Copy(props, modify.OverrideProps)
-
-	for _, k := range modify.DeleteProps {
-		delete(props, k)
-	}
+	// I1: empty override value deletes the key (set-property KEY "").
+	applyPropsModify(props, modify.OverrideProps, modify.DeleteProps)
 }

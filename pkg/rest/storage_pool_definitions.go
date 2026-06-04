@@ -19,7 +19,6 @@ limitations under the License.
 package rest
 
 import (
-	"maps"
 	"net/http"
 	"strings"
 
@@ -228,11 +227,8 @@ func applySPDfnPropsPatch(def *store.StoragePoolDefinition, patch *apiv1.Generic
 		def.Props = map[string]string{}
 	}
 
-	maps.Copy(def.Props, patch.OverrideProps)
-
-	for _, k := range patch.DeleteProps {
-		delete(def.Props, k)
-	}
+	// I1: empty override value deletes the key (set-property KEY "").
+	applyPropsModify(def.Props, patch.OverrideProps, patch.DeleteProps)
 
 	for _, ns := range patch.DeleteNamespace {
 		prefix := ns + "/"
