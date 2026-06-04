@@ -60,7 +60,9 @@ _out=$("${LCTL[@]}" volume-definition create "$SRC" 64M 2>&1) \
     || { echo "FAIL: vd c $SRC: $_out" >&2; exit 1; }
 _out=$("${LCTL[@]}" resource create "$N1" "$SRC" --storage-pool=stand 2>&1) \
     || { echo "FAIL: r c $N1 $SRC: $_out" >&2; exit 1; }
-wait_uptodate "$SRC" "$N1"
+# Single-replica source: wait_uptodate is a 2-peer convergence helper
+# (requires a primary AND a peer); use the single-node disk-state poll.
+wait_disk_state "$SRC" "$N1" "UpToDate" 180
 
 _out=$("${LCTL[@]}" snapshot create "$SRC" "$SNAP" 2>&1) \
     || { echo "FAIL: snap c $SRC $SNAP: $_out" >&2; exit 1; }

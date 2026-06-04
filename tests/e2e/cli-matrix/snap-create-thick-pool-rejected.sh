@@ -100,7 +100,9 @@ _out=$("${LCTL[@]}" volume-definition create "$RD" 32M 2>&1) \
     || { echo "FAIL: vd c $RD: $_out" >&2; exit 1; }
 _out=$("${LCTL[@]}" resource create "$N1" "$RD" --storage-pool="$THICKPOOL" 2>&1) \
     || { echo "FAIL: r c $N1 $RD on thick pool: $_out" >&2; exit 1; }
-wait_uptodate "$RD" "$N1"
+# Single-replica diskful on the thick pool: poll the single-node disk
+# state (wait_uptodate is a 2-peer helper and needs a third positional).
+wait_disk_state "$RD" "$N1" "UpToDate" 180
 
 echo ">> [G5] snapshot create on the thick pool MUST be REJECTED"
 err_file=$(mktemp)
