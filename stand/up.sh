@@ -155,10 +155,10 @@ machine:
       - name: dm_crypt
   # Narrow LVM's device scan so the node-side pvscan (udev-triggered on
   # device creation) never opens DRBD / device-mapper / ZFS-zvol / loop
-  # devices. Without this, an `lvextend`/`drbdmeta`/`drbdadm up` on a
+  # devices. Without this, an lvextend/drbdmeta/"drbdadm up" on a
   # FILE_THIN loop backing device races the background pvscan, which holds
   # the device open and the satellite fails with
-  # `open(/dev/loopN) failed: Device or resource busy` (drbdmeta exit 20)
+  # "open(/dev/loopN) failed: Device or resource busy" (drbdmeta exit 20)
   # — the root cause of the recovery-down-reverses / state-* e2e flakes.
   # backup/archive are disabled too so lvm metadata ops don't fan out.
   files:
