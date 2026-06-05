@@ -69,7 +69,9 @@ steps:
       timeout_s: 240
 
 teardown:
-  - cmd: ["node", "evacuate", "--restore", "{{node3}}"]
+  # `node restore` (alias `n rst`) is the inverse of `node evacuate` —
+  # client 1.27.1 has no `node evacuate --restore` form.
+  - cmd: ["node", "restore", "{{node3}}"]
   - cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", ""]
   - cmd: ["resource-definition", "delete", "{{rd}}"]
 

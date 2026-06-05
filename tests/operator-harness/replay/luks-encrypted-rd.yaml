@@ -19,11 +19,15 @@ vars:
 
 steps:
   - name: ensure-passphrase
-    # idempotent: if the controller already has a passphrase, this exits
-    # with a controller-level error but does not affect the workflow.
-    # We treat exit 10 ("already exists") as success here.
-    cmd: ["encryption", "create-passphrase", "{{passphrase}}"]
-    expect_exit: 0
+    # The passphrase is supplied via the -p/--passphrase FLAG; it is not a
+    # positional (the CLI prompts interactively otherwise). The literal
+    # value is fine here — the runner only substitutes {{rd}}/{{sp}}/{{rg}}/
+    # {{node*}}, so a {{passphrase}} placeholder would pass through verbatim.
+    # On a shared stand a passphrase may already exist, in which case the
+    # controller returns "already exists" (exit 10); that is benign for the
+    # rest of the workflow, so we accept it.
+    cmd: ["encryption", "create-passphrase", "-p", "fuzz-passphrase-do-not-rely-on"]
+    expect_exit: [0, 10]
   - name: create-rd-luks
     cmd: ["resource-definition", "create", "{{rd}}", "-l", "drbd,luks,storage"]
     expect_exit: 0
