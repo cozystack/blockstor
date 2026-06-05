@@ -168,6 +168,7 @@ substitute() {
     local s=$1
     s=${s//\{\{rd\}\}/${RD:-}}
     s=${s//\{\{sp\}\}/${SP:-}}
+    s=${s//\{\{rg\}\}/${RG:-}}
     s=${s//\{\{node1\}\}/${NODE1:-}}
     s=${s//\{\{node2\}\}/${NODE2:-}}
     s=${s//\{\{node3\}\}/${NODE3:-}}
@@ -406,20 +407,27 @@ print('0 ')")
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             vol=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vol',0))" "$spec")
             expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected_kib',0))" "$spec")
-            actual=$(VOL="$vol" linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
-                | python3 -c "import json,sys,os
+            # The target volume number is passed as argv[1] to the parser.
+            # It must NOT ride a `VOL=... cmd | python3` env prefix: in a
+            # pipeline the prefix binds to the LEFT command (linstor_cli),
+            # never the right (python3), so os.environ['VOL'] would KeyError
+            # and the parser always fell through to print(0) — vd_size_kib
+            # could never pass and the resize lifecycle was permanently red.
+            actual=$(linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
+                | python3 -c "import json,sys
 try:
+    target=int(sys.argv[1])
     d=json.load(sys.stdin)
     while isinstance(d, list) and d and isinstance(d[0], list):
         d=d[0]
     for it in d if isinstance(d, list) else []:
         for v in it.get('vlm_dfns', []) or it.get('volume_definitions', []) or []:
-            if v.get('volume_number', v.get('vlm_nr', -1)) == int(os.environ['VOL']):
+            if v.get('volume_number', v.get('vlm_nr', -1)) == target:
                 print(v.get('size_kib', v.get('sizeKib', 0)))
                 sys.exit(0)
     print(0)
 except Exception:
-    print(0)" 2>/dev/null || echo 0)
+    print(0)" "$vol" 2>/dev/null || echo 0)
             [[ "$actual" == "$expected" ]]
             ;;
         pvc_capacity)
@@ -613,7 +621,15 @@ run_step() {
     local name cmd_json expect_exit
     name=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name','(unnamed)'))" "$step")
     cmd_json=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('cmd',[])))" "$step")
-    expect_exit=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expect_exit',0))" "$step")
+    # expect_exit may be a scalar (default 0) OR a list of acceptable codes.
+    # A list is needed for idempotent steps whose exit depends on shared
+    # pre-existing controller state (e.g. `encryption create-passphrase`
+    # returns 0 on a fresh controller and 10 when a passphrase already
+    # exists on the shared stand). Emit the accepted codes one per line.
+    mapfile -t expect_exits < <(python3 -c "import json,sys
+e=json.loads(sys.argv[1]).get('expect_exit',0)
+for v in (e if isinstance(e,list) else [e]):
+    print(v)" "$step")
 
     mapfile -t argv < <(python3 -c "import json,sys
 for a in json.loads(sys.argv[1]):
@@ -627,8 +643,12 @@ for a in json.loads(sys.argv[1]):
 
     echo "  -> step: $name :: linstor ${subst[*]}"
     run_linstor_cmd "${subst[@]}"
-    if [[ "$LAST_EXIT" != "$expect_exit" ]]; then
-        echo "    FAIL: expected exit $expect_exit, got $LAST_EXIT" >&2
+    local ok=0 code
+    for code in "${expect_exits[@]}"; do
+        [[ "$LAST_EXIT" == "$code" ]] && { ok=1; break; }
+    done
+    if [[ "$ok" != "1" ]]; then
+        echo "    FAIL: expected exit ${expect_exits[*]}, got $LAST_EXIT" >&2
         printf '    stderr: %s\n' "$LAST_STDERR" >&2
         return 1
     fi

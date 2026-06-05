@@ -86,6 +86,7 @@
 #
 #   {{rd}}            workflow.vars.rd (default "replay-<name>-<rand4>")
 #   {{sp}}            workflow.vars.sp (default "stand")
+#   {{rg}}            workflow.vars.rg (default "rg-<name>-<rand4>")
 #   {{node1}} … {{node4}}  resolved from kubectl-discovered worker list
 #                           ({{node4}} needs min_nodes: 4)
 #
@@ -162,6 +163,11 @@ RD=$(yaml_get "$WORKFLOW" "vars.rd")
 RD=${RD:-$DEFAULT_RD}
 SP=$(yaml_get "$WORKFLOW" "vars.sp")
 SP=${SP:-stand}
+# {{rg}} resolves from vars.rg (resource-group workflows). No synthetic
+# default — a workflow that references {{rg}} without declaring vars.rg
+# would otherwise substitute an empty string and create an unnamed group.
+RG=$(yaml_get "$WORKFLOW" "vars.rg")
+RG=${RG:-rg-${NAME}-${RAND}}
 
 # ----------------------------------------------------------------------
 # invariants
