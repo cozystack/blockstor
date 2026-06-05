@@ -54,8 +54,13 @@ steps:
     expect_exit: 0
     await:
       # THE F4 ASSERTION: the AutoplaceTarget=false node never received
-      # a replica — both copies landed on node2 + node3.
-      kind: resource_absent
+      # a DISKFUL replica — both copies landed on node2 + node3. On a
+      # 3-worker stand the auto-tiebreaker witness legitimately lands on
+      # the only remaining node (node1), so a Resource CRD for node1
+      # exists as a diskless TIE_BREAKER and resource_absent can never
+      # hold — assert "not diskful" instead (same lesson as the
+      # toggle-disk --migrate-from replay).
+      kind: replica_diskless
       rd: "{{rd}}"
       node: "{{node1}}"
       timeout_s: 30
