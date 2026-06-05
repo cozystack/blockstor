@@ -58,7 +58,11 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 240
+      # Initial autoplace syncs the full 1G volume to a fresh peer. On this
+      # stand DRBD resyncs at ~4 MB/s, so 1G can take minutes. Timeout is a
+      # slow-stand ceiling, not a target; CI stands converge well under it.
+      # Assertion strictness (all replicas UpToDate) unchanged.
+      timeout_s: 600
 
   # ---- Grow 1G → 2G ----
   - name: grow-2g
@@ -76,7 +80,9 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 180
+      # Growing 1G->2G resyncs the grown 1G region. ~4 MB/s on this stand =>
+      # minutes. Slow-stand ceiling, not a target; strictness unchanged.
+      timeout_s: 600
 
   # ---- Grow 2G → 4G ----
   - name: grow-4g
@@ -94,7 +100,9 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 180
+      # Growing 2G->4G resyncs the grown 2G region. ~4 MB/s on this stand =>
+      # minutes. Slow-stand ceiling, not a target; strictness unchanged.
+      timeout_s: 600
 
   # ---- Shrink MUST be rejected ----
   # DRBD cannot shrink past the metadata position; upstream LINSTOR

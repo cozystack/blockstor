@@ -86,7 +86,13 @@ steps:
       rd: "{{rd}}"
       node: "{{node3}}"
       expected: UpToDate
-      timeout_s: 120
+      # Phase-3 relocate triggers a full-volume resync of the 512M volume
+      # onto node3. On this stand DRBD resyncs at ~4 MB/s, so a fresh
+      # diskful peer can take several minutes to reach UpToDate. The
+      # timeout is a ceiling for the slow stand, NOT a target -- CI stands
+      # resync far faster and converge well under it. Assertion strictness
+      # (must reach UpToDate) is unchanged.
+      timeout_s: 600
   - name: wait-sync-clean
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
