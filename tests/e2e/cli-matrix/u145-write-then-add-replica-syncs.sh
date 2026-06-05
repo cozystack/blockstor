@@ -100,19 +100,26 @@ wait_uptodate "$RD" "$N1" "$N2"
 # to have advanced, which a direct DRBD-device write achieves. The md5
 # content-correctness check (PVC/pod) is an optional bonus below.
 echo ">> [U145] write 16 MiB to $N1's DRBD device (advance GI past day0)"
-N1_MINOR=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.volumes[0].minorNumber}' 2>/dev/null)
-if [[ -z "$N1_MINOR" ]]; then
-    echo "FAIL (U145): could not resolve $N1 minor number for direct write" >&2
+# Resolve the volume-0 DRBD device path from CRD status. Prefer the
+# per-volume devicePath; fall back to /dev/drbd<drbdMinor>.
+N1_DEV=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.volumes[0].devicePath}' 2>/dev/null)
+if [[ -z "$N1_DEV" ]]; then
+    N1_MINOR=$(kubectl get resource "${RD}.${N1}" -o jsonpath='{.status.drbdMinor}' 2>/dev/null)
+    [[ -n "$N1_MINOR" ]] && N1_DEV="/dev/drbd${N1_MINOR}"
+fi
+if [[ -z "$N1_DEV" ]]; then
+    echo "FAIL (U145): could not resolve $N1 DRBD device path for direct write" >&2
+    kubectl get resource "${RD}.${N1}" -o jsonpath='{.status}' 2>/dev/null | sed 's/^/    /' >&2 || true
     exit 1
 fi
 on_node "$N1" sh -c "
-    D=/dev/drbd${N1_MINOR};
+    D=${N1_DEV};
     drbdsetup primary $RD --force 2>/dev/null || drbdadm primary --force $RD 2>/dev/null || true;
     dd if=/dev/urandom of=\$D bs=1M count=16 oflag=direct 2>/dev/null;
     sync;
     drbdadm secondary $RD 2>/dev/null || true;
-" || { echo "FAIL (U145): direct write to $N1 DRBD device failed" >&2; exit 1; }
-echo "   wrote 16 MiB to /dev/drbd${N1_MINOR} on $N1"
+" || { echo "FAIL (U145): direct write to $N1 DRBD device ($N1_DEV) failed" >&2; exit 1; }
+echo "   wrote 16 MiB to $N1_DEV on $N1"
 
 # Optional CONTENT half: bind a PVC + writer pod and lay down a
 # reproducible md5 anchor. SKIP this half cleanly when CSI plumbing is
