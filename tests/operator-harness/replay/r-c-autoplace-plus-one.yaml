@@ -11,6 +11,15 @@ description: |
   the RG place-count (2) or miscounted a diskless/tiebreaker peer
   toward the existing total would land the wrong replica count.
 
+  Corner-case campaign D2b: on a 3-worker cluster the place-count-2
+  spawn leaves an auto-tiebreaker witness on the third node. The `+1`
+  must UPGRADE that witness into a diskful replica in place (the
+  candidate selection that pre-fix excluded the witness-holding node,
+  failing with "Not enough nodes ... Replica count: 3"). This replay
+  asserts the witness EXISTS before the +1 and is GONE after it — i.e.
+  the third diskful replica is the upgraded witness, not a placement
+  shortfall. Pinned by pkg/placer/corner_d2b_autoplace_over_tiebreaker_test.go.
+
 prerequisites:
   min_nodes: 3
   storage_pool: stand
@@ -38,6 +47,17 @@ steps:
       kind: all_uptodate
       rd: "{{rd}}"
       timeout_s: 240
+  - name: assert-witness-present
+    # D2b precondition: place-count 2 on a 3-worker cluster spawns an
+    # auto-tiebreaker witness on the third node. The +1 below must
+    # upgrade THIS witness — assert it exists first so a topology that
+    # never created one doesn't silently weaken the upgrade assertion.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
   - name: auto-place-plus-one
     cmd: ["resource", "create", "--auto-place", "+1", "{{rd}}"]
     expect_exit: 0
@@ -45,6 +65,16 @@ steps:
       kind: replica_count
       rd: "{{rd}}"
       min: 3
+      timeout_s: 90
+  - name: assert-witness-upgraded
+    # D2b core: the witness on the third node was upgraded to diskful
+    # in place, so no TIE_BREAKER row remains. Pre-fix the +1 failed
+    # with a placement shortfall and the witness stayed put.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
       timeout_s: 90
   - name: wait-3r-uptodate
     cmd: ["resource", "list", "--resources", "{{rd}}"]
