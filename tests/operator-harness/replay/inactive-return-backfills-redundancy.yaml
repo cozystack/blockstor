@@ -1,0 +1,95 @@
+name: inactive-return-backfills-redundancy
+description: |
+  Corner case U255 (upstream-mined, P2) — 3-worker "inactive-return"
+  flavor. Backfill after capacity returns: a place-count-2 RD where one
+  node's replica is held down (INACTIVE — `drbdadm down`, no I/O, no
+  quorum vote, dropped from siblings' .res) leaves active redundancy at 1.
+  Re-running autoplace must NOT count the INACTIVE replica as satisfied —
+  it must gap-fill an active diskful on a healthy node, restoring active
+  redundancy to 2. When the deactivated node's capacity later RETURNS
+  (`r activate`), the resource is back to full health.
+
+  NOTE: the upstream "brand-new node added later" flavor needs a 4th
+  worker to land the backfill on — not feasible on this fixed 3-worker
+  stand (see inactive-refills-active-redundancy.yaml, min_nodes: 4). This
+  replay pins the inactive-RETURN flavor that IS reproducible on 3
+  workers: deactivate one of two diskful replicas, backfill the active
+  redundancy onto the third worker, then reactivate.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-2-active-diskful
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 240
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-deactivate-node2
+    # node2 goes INACTIVE — active redundancy drops to 1.
+    cmd: ["resource", "deactivate", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+  - name: re-autoplace-2-backfills
+    # Pre-fix the placer counts the INACTIVE node2 as the 2nd diskful and
+    # is satisfied → no backfill. Post-fix (Bug 393) the INACTIVE replica
+    # does NOT count, so the placer gap-fills an active diskful on node3.
+    cmd: ["resource", "create", "--auto-place=2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 240
+  - name: node3-backfill-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The backfilled active diskful lands on node3 (the only worker
+      # outside the node1+node2 taken set) and reaches UpToDate.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: UpToDate
+      timeout_s: 240
+  - name: r-activate-node2-capacity-returns
+    # Capacity returns: node2 is reactivated. The resource is now fully
+    # healthy again with redundancy restored.
+    cmd: ["resource", "activate", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource", "activate", "{{node2}}", "{{rd}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

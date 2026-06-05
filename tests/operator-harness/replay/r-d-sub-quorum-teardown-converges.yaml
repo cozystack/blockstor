@@ -1,0 +1,93 @@
+name: r-d-sub-quorum-teardown-converges
+description: |
+  Corner case U197 (upstream-mined, P1): an `r d` that drops a resource
+  BELOW quorum must still complete cleanly — the teardown must not wedge
+  with a half-deleted replica stuck in DELETING because the surviving
+  diskful can no longer form a majority to acknowledge the removal.
+
+  Scenario (3-node): 3 diskful replicas (node1+node2+node3), all
+  UpToDate (quorum = majority, 3 voters). Delete node1 (2 voters left,
+  still majority — clean), then delete node2 (1 voter left — BELOW
+  quorum). The second delete is the U197 stress: with on-no-quorum the
+  surviving node1... node3 could in principle suspend I/O, but the
+  control-plane teardown of the DELETED replicas must still converge.
+
+  Assert: after both deletes the removed replicas are ABSENT (no wedged
+  DELETING row), the surviving replica on node3 is still present, and the
+  whole RD then deletes cleanly (rd_absent) — no orphan, no stuck
+  finalizer.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node3
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-all-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: r-d-node1
+    # First delete: 3 → 2 voters, still majority. Must complete cleanly.
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
+  - name: r-d-node2-below-quorum
+    # Second delete: 2 → 1 voter, BELOW quorum. The teardown of the
+    # deleted replica must STILL converge — no wedged DELETING row.
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 120
+  - name: surviving-replica-present
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The lone surviving replica on node3 is still there — the deletes
+      # removed exactly the requested replicas, nothing more.
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 1
+      timeout_s: 60
+  - name: rd-deletes-cleanly
+    # The whole RD must then delete cleanly — no orphan / stuck finalizer
+    # from the sub-quorum teardown.
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
