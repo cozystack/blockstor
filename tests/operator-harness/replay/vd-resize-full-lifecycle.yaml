@@ -58,7 +58,11 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 240
+      # Initial autoplace syncs the full 1G volume to a fresh peer. On this
+      # stand DRBD resyncs at ~4 MB/s, so 1G can take minutes. Timeout is a
+      # slow-stand ceiling, not a target; CI stands converge well under it.
+      # Assertion strictness (all replicas UpToDate) unchanged.
+      timeout_s: 600
 
   # ---- Grow 1G → 2G ----
   - name: grow-2g
@@ -76,7 +80,9 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 180
+      # Growing 1G->2G resyncs the grown 1G region. ~4 MB/s on this stand =>
+      # minutes. Slow-stand ceiling, not a target; strictness unchanged.
+      timeout_s: 600
 
   # ---- Grow 2G → 4G ----
   - name: grow-4g
@@ -94,7 +100,9 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 180
+      # Growing 2G->4G resyncs the grown 2G region. ~4 MB/s on this stand =>
+      # minutes. Slow-stand ceiling, not a target; strictness unchanged.
+      timeout_s: 600
 
   # ---- Shrink MUST be rejected ----
   # DRBD cannot shrink past the metadata position; upstream LINSTOR
@@ -102,8 +110,15 @@ steps:
   # assert non-zero exit on the CLI; size invariance is asserted via
   # the follow-up vd_size_kib check still pointing at 4G.
   - name: shrink-rejected
+    # The shrink MUST be rejected (non-zero exit). The python-linstor client
+    # surfaces an API-level rejection as exit 10 (its "API call returned an
+    # error" class), while a plain client/usage failure is exit 1. Both mean
+    # "rejected", and which one fires is a client-side detail, so we accept
+    # either -- the load-bearing contract (shrink does NOT take effect) is
+    # pinned by size-unchanged-after-reject below, which asserts the size is
+    # still 4G. Validated on stand: shrink past metadata returns exit 10.
     cmd: ["volume-definition", "set-size", "{{rd}}", "0", "1G"]
-    expect_exit: 1
+    expect_exit: [1, 10]
   - name: size-unchanged-after-reject
     cmd: ["volume-definition", "list", "--resource-definitions", "{{rd}}"]
     expect_exit: 0

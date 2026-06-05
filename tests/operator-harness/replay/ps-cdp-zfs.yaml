@@ -14,6 +14,12 @@ description: |
 prerequisites:
   min_nodes: 1
   storage_pool: stand
+  # The device-pool create needs a sacrificial block device that only some
+  # stands provision (stand/bringup.sh creates a safe-to-wipe loop device).
+  # Where it is absent the workflow SKIPs cleanly instead of FAILing -- a
+  # missing fixture is "not exercisable here", not a product bug. Must match
+  # vars.device below.
+  device_on_any_node: /dev/loop9
 
 vars:
   sp: zfs-fuzz-pool

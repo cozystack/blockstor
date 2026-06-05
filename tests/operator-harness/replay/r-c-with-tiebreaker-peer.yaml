@@ -45,13 +45,23 @@ steps:
       node: "{{node3}}"
       timeout_s: 30
   - name: r-d-node2-diskful
+    # Dropping node2's diskful replica leaves node1 diskful + the node3
+    # witness. With auto-add-quorum-tiebreaker default-on (parity with
+    # upstream; INFRA oracle smoke confirmed the witness re-occupies a
+    # vacated node on low-diskful shapes) the controller keeps a
+    # DISKLESS TieBreaker resident for quorum rather than leaving node2
+    # bare. So instead of asserting node2 is absent (a false FAIL of
+    # correct, parity-matching behaviour) we assert a TieBreaker witness
+    # exists for the rd -- same lesson as toggle-disk-migrate-from (#103)
+    # and n-autoplace-target-excludes (#109). The diskful backing on
+    # node2 is gone; the bare `r c node2` below proves it re-spawns
+    # DISKFUL despite a resident witness (the actual Bug-327 contract).
     cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
     expect_exit: 0
     await:
-      kind: resource_absent
+      kind: tiebreaker_present
       rd: "{{rd}}"
-      node: "{{node2}}"
-      timeout_s: 60
+      timeout_s: 120
   - name: r-c-node2-bare
     # No flag — operator expects diskful. Must NOT coerce to Diskless
     # just because a tiebreaker is parked on node3.

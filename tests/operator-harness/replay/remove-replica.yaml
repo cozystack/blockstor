@@ -1,8 +1,11 @@
 name: remove-replica
 description: |
-  Shrink a 3-replica RD to 2. Validates that the removed replica is
-  fully deleted (kernel slot + CR + storage) and the remaining replicas
-  do NOT enter a permanent Connecting state.
+  Shrink a 3-diskful RD to 2. After `r d <node3>` the RD is left with 2
+  diskful peers, so auto-add-quorum-tiebreaker (default-on, parity with
+  upstream) re-occupies node3 with a DISKLESS TieBreaker witness. We
+  assert that witness is present (the diskful backing on node3 is gone;
+  only the witness remains) and the remaining replicas do NOT enter a
+  permanent Connecting state.
 
 prerequisites:
   min_nodes: 3
@@ -35,13 +38,21 @@ steps:
       rd: "{{rd}}"
       timeout_s: 240
   - name: r-d-node3
+    # After dropping the third diskful replica the RD is left with exactly
+    # 2 diskful peers. With auto-add-quorum-tiebreaker default-on (matching
+    # upstream LINSTOR; the INFRA oracle smoke confirmed upstream auto-adds
+    # the witness on 2-diskful shapes), the controller re-occupies the
+    # vacated node with a DISKLESS TieBreaker to keep quorum. So the
+    # operator-visible end-state is NOT "node3 absent" but "node3 carries a
+    # TieBreaker witness". Asserting resource_absent here would be a false
+    # FAIL of correct, parity-matching behaviour -- same lesson as
+    # toggle-disk-migrate-from (#103) and n-autoplace-target-excludes (#109).
     cmd: ["resource", "delete", "{{node3}}", "{{rd}}"]
     expect_exit: 0
     await:
-      kind: resource_absent
+      kind: tiebreaker_present
       rd: "{{rd}}"
-      node: "{{node3}}"
-      timeout_s: 60
+      timeout_s: 120
 
 teardown:
   - cmd: ["resource-definition", "delete", "{{rd}}"]

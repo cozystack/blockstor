@@ -60,6 +60,9 @@ steps:
       timeout_s: 60
   - name: n-evict-node3
     # The exact operator action from the repro: evict the tiebreaker node.
+    # Client 1.27.1 has no `node evict` verb, but the harness's linstor_cli
+    # shim maps `node evict <n>` to a raw `PUT /v1/nodes/<n>/evict` so the
+    # replay can drive the real evict REST path.
     cmd: ["node", "evict", "{{node3}}"]
     expect_exit: 0
     await:

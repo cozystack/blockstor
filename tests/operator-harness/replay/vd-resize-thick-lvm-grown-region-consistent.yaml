@@ -40,6 +40,13 @@ description: |
 prerequisites:
   min_nodes: 2
   storage_pool: lvm-thick
+  # This workflow needs a thick LINSTOR `LVM` pool (kind=LVM, NOT LVM_THIN)
+  # registered on >= 2 nodes. On stands that only carry thin/zfs/file pools
+  # the bug is not exercisable, so SKIP cleanly instead of FAILing on the
+  # missing pool. Must match vars.sp below.
+  storage_pool_min_nodes:
+    name: lvm-thick
+    min: 2
 
 vars:
   sp: lvm-thick

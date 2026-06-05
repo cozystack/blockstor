@@ -27,20 +27,43 @@ vars:
   sp: stand
 
 steps:
-  # --- Phase 1: initial autoplace ---
+  # --- Phase 1: 2 explicit diskful (node1+node2) + auto-tiebreaker ---
+  # NOTE: phase 3 relocates onto {{node3}}, which only works if node3 is
+  # NOT already a diskful replica. `--auto-place=2` picks the 2 diskful
+  # nodes non-deterministically, so it can land a diskful on node3 and then
+  # the phase-3 `r c node3` hits "resource already exists" (exit 10). We
+  # therefore PIN the diskful pair to node1+node2; auto-add-quorum-tiebreaker
+  # (default-on) then deterministically lands the witness on the only free
+  # node, node3, making it the relocate target -- exactly the topology the
+  # L6 ground-truth cell r-full-lifecycle.sh discovers dynamically. The
+  # pure autoplace-node-selection path is covered by autoplace-3r.yaml and
+  # the L6 cell; this lifecycle catcher needs a deterministic shape.
   - name: create-rd
     cmd: ["resource-definition", "create", "{{rd}}"]
     expect_exit: 0
   - name: create-vd
     cmd: ["volume-definition", "create", "{{rd}}", "512M"]
     expect_exit: 0
-  - name: auto-place-2
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+  - name: r-c-node1-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
     expect_exit: 0
     await:
       kind: replica_count
       rd: "{{rd}}"
       min: 2
+      timeout_s: 120
+  - name: ensure-tiebreaker-node3
+    # 2 diskful peers => auto-add-quorum-tiebreaker lands a DISKLESS witness
+    # on node3 (the only free node), making node3 the deterministic relocate
+    # target for phase 3.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
       timeout_s: 120
   - name: wait-autoplace-uptodate
     cmd: ["resource", "list", "--resources", "{{rd}}"]
@@ -48,7 +71,9 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 240
+      # 512M full resync at the stand's ~4 MB/s can take minutes; 600s is a
+      # slow-stand ceiling, not a target (CI converges well under it).
+      timeout_s: 600
 
   # --- Phase 2: same-node delete + re-create (Bug 338 + 327) ---
   - name: r-d-node1
@@ -86,7 +111,13 @@ steps:
       rd: "{{rd}}"
       node: "{{node3}}"
       expected: UpToDate
-      timeout_s: 120
+      # Phase-3 relocate triggers a full-volume resync of the 512M volume
+      # onto node3. On this stand DRBD resyncs at ~4 MB/s, so a fresh
+      # diskful peer can take several minutes to reach UpToDate. The
+      # timeout is a ceiling for the slow stand, NOT a target -- CI stands
+      # resync far faster and converge well under it. Assertion strictness
+      # (must reach UpToDate) is unchanged.
+      timeout_s: 600
   - name: wait-sync-clean
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0

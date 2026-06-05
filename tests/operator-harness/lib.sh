@@ -168,11 +168,71 @@ substitute() {
     local s=$1
     s=${s//\{\{rd\}\}/${RD:-}}
     s=${s//\{\{sp\}\}/${SP:-}}
+    s=${s//\{\{rg\}\}/${RG:-}}
+    # {{device}} resolves from vars.device (physical-storage workflows like
+    # ps-cdp-zfs). Without this branch the placeholder passed through verbatim
+    # and the device-pool create was handed the literal string "{{device}}" --
+    # same class of bug as the earlier {{rg}} pass-through.
+    s=${s//\{\{device\}\}/${DEVICE:-}}
     s=${s//\{\{node1\}\}/${NODE1:-}}
     s=${s//\{\{node2\}\}/${NODE2:-}}
     s=${s//\{\{node3\}\}/${NODE3:-}}
     s=${s//\{\{node4\}\}/${NODE4:-}}
     echo "$s"
+}
+
+# ----------------------------------------------------------------------
+# fixture probes (used by replay-runner.sh prerequisites)
+# ----------------------------------------------------------------------
+
+# fixture_sp_node_count <pool-name>
+#
+# Echoes the number of distinct nodes on which the named LINSTOR storage
+# pool is registered (provider_kind != null). Used by the
+# prerequisites.storage_pool_min_nodes SKIP gate so a workflow that needs
+# a pool the stand does not have (e.g. a thick LVM pool) SKIPs cleanly
+# instead of FAILing. Uses the machine-readable `-m` surface so the parse
+# is column-agnostic.
+fixture_sp_node_count() {
+    local pool=$1
+    linstor_cli -m storage-pool list --storage-pools "$pool" 2>/dev/null         | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(0); sys.exit(0)
+while isinstance(d, list) and d and isinstance(d[0], list):
+    d=d[0]
+nodes=set()
+for it in d if isinstance(d, list) else []:
+    if not isinstance(it, dict): continue
+    if it.get('provider_kind') is None: continue
+    n=it.get('node_name')
+    if n: nodes.add(n)
+print(len(nodes))" 2>/dev/null || echo 0
+}
+
+# fixture_device_on_any_worker <device-path>
+#
+# Returns 0 if <device-path> is a present block device on at least one
+# worker's satellite pod, 1 otherwise. Used by the
+# prerequisites.device_on_any_node SKIP gate so the ps-cdp-zfs workflow
+# (which needs a sacrificial loop device that only some stands provision)
+# SKIPs cleanly instead of FAILing on stands without it. Probes the
+# satellite pod via kubectl exec; if no satellite pod is reachable we
+# conservatively report absent (the caller SKIPs).
+fixture_device_on_any_worker() {
+    local dev=$1
+    local ns=${SATELLITE_NS:-blockstor-system}
+    local pods
+    mapfile -t pods < <(kubectl -n "$ns" get pods -l app=blockstor-satellite         --field-selector status.phase=Running         -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+    local p
+    for p in "${pods[@]}"; do
+        [[ -z "$p" ]] && continue
+        if kubectl -n "$ns" exec "$p" -- test -b "$dev" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ----------------------------------------------------------------------
@@ -406,20 +466,27 @@ print('0 ')")
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             vol=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('vol',0))" "$spec")
             expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected_kib',0))" "$spec")
-            actual=$(VOL="$vol" linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
-                | python3 -c "import json,sys,os
+            # The target volume number is passed as argv[1] to the parser.
+            # It must NOT ride a `VOL=... cmd | python3` env prefix: in a
+            # pipeline the prefix binds to the LEFT command (linstor_cli),
+            # never the right (python3), so os.environ['VOL'] would KeyError
+            # and the parser always fell through to print(0) — vd_size_kib
+            # could never pass and the resize lifecycle was permanently red.
+            actual=$(linstor_cli -m volume-definition list --resource-definitions "$rd" 2>/dev/null \
+                | python3 -c "import json,sys
 try:
+    target=int(sys.argv[1])
     d=json.load(sys.stdin)
     while isinstance(d, list) and d and isinstance(d[0], list):
         d=d[0]
     for it in d if isinstance(d, list) else []:
         for v in it.get('vlm_dfns', []) or it.get('volume_definitions', []) or []:
-            if v.get('volume_number', v.get('vlm_nr', -1)) == int(os.environ['VOL']):
+            if v.get('volume_number', v.get('vlm_nr', -1)) == target:
                 print(v.get('size_kib', v.get('sizeKib', 0)))
                 sys.exit(0)
     print(0)
 except Exception:
-    print(0)" 2>/dev/null || echo 0)
+    print(0)" "$vol" 2>/dev/null || echo 0)
             [[ "$actual" == "$expected" ]]
             ;;
         pvc_capacity)
@@ -613,7 +680,15 @@ run_step() {
     local name cmd_json expect_exit
     name=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('name','(unnamed)'))" "$step")
     cmd_json=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('cmd',[])))" "$step")
-    expect_exit=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expect_exit',0))" "$step")
+    # expect_exit may be a scalar (default 0) OR a list of acceptable codes.
+    # A list is needed for idempotent steps whose exit depends on shared
+    # pre-existing controller state (e.g. `encryption create-passphrase`
+    # returns 0 on a fresh controller and 10 when a passphrase already
+    # exists on the shared stand). Emit the accepted codes one per line.
+    mapfile -t expect_exits < <(python3 -c "import json,sys
+e=json.loads(sys.argv[1]).get('expect_exit',0)
+for v in (e if isinstance(e,list) else [e]):
+    print(v)" "$step")
 
     mapfile -t argv < <(python3 -c "import json,sys
 for a in json.loads(sys.argv[1]):
@@ -627,8 +702,12 @@ for a in json.loads(sys.argv[1]):
 
     echo "  -> step: $name :: linstor ${subst[*]}"
     run_linstor_cmd "${subst[@]}"
-    if [[ "$LAST_EXIT" != "$expect_exit" ]]; then
-        echo "    FAIL: expected exit $expect_exit, got $LAST_EXIT" >&2
+    local ok=0 code
+    for code in "${expect_exits[@]}"; do
+        [[ "$LAST_EXIT" == "$code" ]] && { ok=1; break; }
+    done
+    if [[ "$ok" != "1" ]]; then
+        echo "    FAIL: expected exit ${expect_exits[*]}, got $LAST_EXIT" >&2
         printf '    stderr: %s\n' "$LAST_STDERR" >&2
         return 1
     fi

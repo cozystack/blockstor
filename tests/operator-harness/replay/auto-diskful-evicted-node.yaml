@@ -15,7 +15,14 @@ description: |
   convergence gate here).
 
 prerequisites:
-  min_nodes: 3
+  # 4 nodes are required, not 3: the workflow places a diskful on every one
+  # of node1/node2/node3, then evacuates node3 and asserts the auto-diskful
+  # controller REFILLS back to 3 diskful. On a 3-node stand the displaced
+  # replica has nowhere healthy to land (all peers already host one), so
+  # replica_count can never return to 3 and the assertion times out — a
+  # false FAIL of correct controller behaviour. With min_nodes: 4 the
+  # refill targets the spare node4; on a 3-node stand the runner SKIPs.
+  min_nodes: 4
   storage_pool: stand
 
 vars:
@@ -69,7 +76,9 @@ steps:
       timeout_s: 240
 
 teardown:
-  - cmd: ["node", "evacuate", "--restore", "{{node3}}"]
+  # `node restore` (alias `n rst`) is the inverse of `node evacuate` —
+  # client 1.27.1 has no `node evacuate --restore` form.
+  - cmd: ["node", "restore", "{{node3}}"]
   - cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", ""]
   - cmd: ["resource-definition", "delete", "{{rd}}"]
 

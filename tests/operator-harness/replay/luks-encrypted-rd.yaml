@@ -2,12 +2,22 @@ name: luks-encrypted-rd
 description: |
   Bug-333 catcher. Exercises an encrypted RD lifecycle:
     1. encryption create-passphrase
-    2. rd create -l drbd,luks,storage
-    3. vd create
-    4. r create --auto-place=2
-    5. snapshot create + delete (validates LUKS-aware snapshot path)
+    2. controller set-property DrbdOptions/EncryptPassphrase <pp>
+    3. rd create -l drbd,luks,storage
+    4. vd create
+    5. r create --auto-place=2
+    6. snapshot create + delete (validates LUKS-aware snapshot path)
   Validates that the LUKS layer is included in the actual layer stack
   and snapshot path doesn't crash python-linstor.
+
+  NOTE: a LUKS-layered RD requires BOTH the cluster passphrase
+  (encryption create-passphrase) AND the controller property
+  DrbdOptions/EncryptPassphrase (the LUKS layer reads per-volume key
+  material from it). Without the property the controller correctly
+  rejects rd-create with "LUKS layer requires DrbdOptions/EncryptPassphrase
+  to be set first" (exit 10) -- an INTENTIONAL guard, not a product gap.
+  The green L6 cell tests/e2e/cli-matrix/luks-rd-create-encrypted.sh
+  sets the property the same way; this replay mirrors it.
 
 prerequisites:
   min_nodes: 2
@@ -19,10 +29,24 @@ vars:
 
 steps:
   - name: ensure-passphrase
-    # idempotent: if the controller already has a passphrase, this exits
-    # with a controller-level error but does not affect the workflow.
-    # We treat exit 10 ("already exists") as success here.
-    cmd: ["encryption", "create-passphrase", "{{passphrase}}"]
+    # The passphrase is supplied via the -p/--passphrase FLAG; it is not a
+    # positional (the CLI prompts interactively otherwise). The literal
+    # value is fine here — the runner only substitutes {{rd}}/{{sp}}/{{rg}}/
+    # {{node*}}, so a {{passphrase}} placeholder would pass through verbatim.
+    # On a shared stand a passphrase may already exist, in which case the
+    # controller returns "already exists" (exit 10); that is benign for the
+    # rest of the workflow, so we accept it.
+    cmd: ["encryption", "create-passphrase", "-p", "fuzz-passphrase-do-not-rely-on"]
+    expect_exit: [0, 10]
+  - name: set-encrypt-passphrase-property
+    # A LUKS-layered RD additionally requires the controller property
+    # DrbdOptions/EncryptPassphrase; the cluster passphrase alone is not
+    # enough. Without it, rd-create below is correctly rejected with
+    # "LUKS layer requires DrbdOptions/EncryptPassphrase to be set first"
+    # (exit 10). Setting a controller property is idempotent, so this is
+    # safe to re-run on the shared stand. Mirrors the green L6 cell
+    # tests/e2e/cli-matrix/luks-rd-create-encrypted.sh.
+    cmd: ["controller", "set-property", "DrbdOptions/EncryptPassphrase", "fuzz-passphrase-do-not-rely-on"]
     expect_exit: 0
   - name: create-rd-luks
     cmd: ["resource-definition", "create", "{{rd}}", "-l", "drbd,luks,storage"]
