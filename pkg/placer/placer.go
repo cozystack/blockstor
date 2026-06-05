@@ -126,6 +126,12 @@ func (e *OversubscriptionShortfallError) Error() string {
 	)
 }
 
+// storPoolNameProp is the Resource Spec prop key that pins a replica to
+// a backing storage pool. Mirrors the literal the REST handlers and the
+// satellite dispatcher key on; centralised here so the placer's
+// create-and-promote paths can't drift on the spelling.
+const storPoolNameProp = "StorPoolName"
+
 // Placer adds replicas to satisfy a placement filter. Construct via
 // New; one instance per autoplace call (it does no internal caching).
 type Placer struct {
@@ -499,6 +505,18 @@ type state struct {
 	// bucket "<key>=", matching upstream LINSTOR's behaviour where
 	// "missing property" is just another value of that key.
 	xBuckets map[string]int
+	// upgradeable maps a node name to the diskless replica (DISKLESS /
+	// TIE_BREAKER witness) it currently holds. corner-D2b: a node that
+	// hosts ONLY a diskless witness is NOT "taken" for diskful purposes
+	// — upstream LINSTOR upgrades the witness to a diskful replica
+	// in place when `--auto-place +1` (or an absolute place_count) needs
+	// the node. Such nodes are deliberately kept OUT of `taken` so
+	// candidateNodeProps still considers them; tryPlace then promotes
+	// the existing witness (strip DISKLESS+TIE_BREAKER, stamp
+	// StorPoolName) instead of creating a fresh Resource, reusing the
+	// exact transition pkg/rest.promoteDisklessReplica performs for the
+	// explicit `r c <node> --storage-pool` toggle-disk path.
+	upgradeable map[string]string
 }
 
 func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes map[string]map[string]string, pools []apiv1.StoragePool, allowPoolDriverMixing bool) *state {
@@ -512,27 +530,40 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 		filter:                filter,
 		xBuckets:              make(map[string]int, len(filter.XReplicasOnDifferentMap)),
 		allowPoolDriverMixing: allowPoolDriverMixing,
+		upgradeable:           make(map[string]string),
 	}
 
 	for i := range existing {
+		// corner-D2b: a node whose only replica is a diskless witness
+		// (DISKLESS, typically also TIE_BREAKER) is NOT taken for
+		// diskful placement — it's an UPGRADE candidate. Record it so
+		// tryPlace can promote the witness in place, and crucially do
+		// NOT add it to `taken` (which would make candidateNodeProps
+		// reject it the way a real diskful peer is rejected). Diskful
+		// replicas still claim the node via `taken` below.
+		if slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+			s.upgradeable[existing[i].NodeName] = existing[i].Props[storPoolNameProp]
+
+			continue
+		}
+
 		s.taken[existing[i].NodeName] = struct{}{}
 
-		// Seed XReplicasOnDifferentMap buckets from any existing
-		// diskful replica. DISKLESS witnesses don't occupy a
-		// topology bucket — they're network-only attachments and
-		// upstream LINSTOR doesn't count them toward x-replicas
-		// either (mirrors place_count's diskful-only semantic).
-		if !slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
-			nodeProps := nodes[existing[i].NodeName]
-			for key := range filter.XReplicasOnDifferentMap {
-				s.xBuckets[xBucketKey(key, nodeProps)]++
-			}
+		// Seed XReplicasOnDifferentMap buckets from this diskful
+		// replica. DISKLESS witnesses (handled by the continue above)
+		// don't occupy a topology bucket — they're network-only
+		// attachments and upstream LINSTOR doesn't count them toward
+		// x-replicas either (mirrors place_count's diskful-only
+		// semantic).
+		nodeProps := nodes[existing[i].NodeName]
+		for key := range filter.XReplicasOnDifferentMap {
+			s.xBuckets[xBucketKey(key, nodeProps)]++
 		}
 
 		// Pre-seed shared-space anti-affinity: if an existing replica
 		// already lives on a shared-LUN pool, no new replica may land
 		// on a pool sharing that LUN identifier.
-		stor := existing[i].Props["StorPoolName"]
+		stor := existing[i].Props[storPoolNameProp]
 		if stor == "" {
 			continue
 		}
@@ -548,9 +579,10 @@ func newState(filter *apiv1.AutoSelectFilter, existing []apiv1.Resource, nodes m
 
 		// Pre-seed Bug 76 same-kind constraint from the first
 		// diskful replica already on the RD. DISKLESS replicas
-		// don't claim a backing pool so they're skipped — see
-		// IsProviderKindMixingAllowed for the rationale.
-		if s.firstKind == "" && !slices.Contains(existing[i].Flags, apiv1.ResourceFlagDiskless) {
+		// (handled by the continue above) don't claim a backing pool
+		// so they never reach here — see IsProviderKindMixingAllowed
+		// for the rationale.
+		if s.firstKind == "" {
 			s.firstKind = pool.ProviderKind
 		}
 	}
@@ -669,18 +701,34 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 		return false, nil
 	}
 
-	res := apiv1.Resource{
-		Name:     rdName,
-		NodeName: pool.NodeName,
-		Props:    map[string]string{"StorPoolName": pool.StoragePoolName},
-	}
+	// corner-D2b: when the candidate node already hosts a diskless
+	// witness (recorded in `upgradeable` at newState time), promote it
+	// to diskful in place instead of creating a fresh Resource — a
+	// Create would hit ErrAlreadyExists and the witness would never gain
+	// a backing disk. The promote strips DISKLESS+TIE_BREAKER and stamps
+	// the chosen StorPoolName, the exact transition the explicit
+	// `r c <node> --storage-pool` toggle-disk path performs via
+	// pkg/rest.promoteDisklessReplica.
+	if _, isWitness := s.upgradeable[pool.NodeName]; isWitness {
+		err := s.promoteWitness(ctx, st, rdName, pool)
+		if err != nil {
+			return false, err
+		}
+	} else {
+		res := apiv1.Resource{
+			Name:     rdName,
+			NodeName: pool.NodeName,
+			Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+		}
 
-	err := st.Resources().Create(ctx, &res)
-	if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
-		return false, errors.Wrap(err, "create resource")
+		err := st.Resources().Create(ctx, &res)
+		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+			return false, errors.Wrap(err, "create resource")
+		}
 	}
 
 	s.taken[pool.NodeName] = struct{}{}
+	delete(s.upgradeable, pool.NodeName)
 
 	if s.sameTuple == nil && len(s.filter.ReplicasOnSame) > 0 {
 		s.sameTuple = lookupKeys(nodeProps, s.filter.ReplicasOnSame)
@@ -713,6 +761,60 @@ func (s *state) tryPlace(ctx context.Context, st store.Store, rdName string, poo
 	}
 
 	return true, nil
+}
+
+// promoteWitness converts the diskless witness already on pool.NodeName
+// into a diskful replica backed by pool.StoragePoolName (corner-D2b).
+// It strips DISKLESS + TIE_BREAKER and stamps StorPoolName via
+// PatchResourceSpec — the same store-level transition that
+// pkg/rest.promoteDisklessReplica performs for the explicit
+// `r c <node> --storage-pool` toggle-disk path. The flag transition
+// itself is shared through apiv1.PromoteWitnessFlags so both paths can
+// never drift.
+//
+// The patch is conflict-safe: PatchResourceSpec re-runs the closure
+// against the freshly-fetched live replica on every optimistic-
+// concurrency retry, so a racing satellite Status write converges
+// instead of clobbering the promote. A NotFound (the witness was
+// collapsed out from under us between newState and here) is treated as
+// "nothing to promote" and falls back to a fresh Create so the
+// placement still lands.
+func (s *state) promoteWitness(ctx context.Context, st store.Store, rdName string, pool *apiv1.StoragePool) error {
+	err := st.Resources().PatchResourceSpec(ctx, rdName, pool.NodeName, func(live *apiv1.Resource) error {
+		keep, _ := apiv1.PromoteWitnessFlags(live.Flags, true)
+		live.Flags = keep
+
+		if live.Props == nil {
+			live.Props = map[string]string{}
+		}
+
+		live.Props[storPoolNameProp] = pool.StoragePoolName
+
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, store.ErrNotFound) {
+		return errors.Wrap(err, "promote witness to diskful")
+	}
+
+	// The witness vanished between newState and the patch (e.g. a
+	// concurrent witness-collapse). Land a fresh diskful replica so the
+	// placement target is still met.
+	res := apiv1.Resource{
+		Name:     rdName,
+		NodeName: pool.NodeName,
+		Props:    map[string]string{storPoolNameProp: pool.StoragePoolName},
+	}
+
+	createErr := st.Resources().Create(ctx, &res)
+	if createErr != nil && !errors.Is(createErr, store.ErrAlreadyExists) {
+		return errors.Wrap(createErr, "create resource after witness vanished")
+	}
+
+	return nil
 }
 
 // poolKey is the composite (node, pool) lookup key used to find a

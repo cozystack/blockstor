@@ -2384,27 +2384,12 @@ func (s *Server) sumRDVolumeDefinitionsKib(ctx context.Context, rdName string) (
 // real diskful replicas. Pulled out of promoteDisklessReplica to keep
 // that function under the funlen budget after the Bug 205 Patch refactor.
 func stripDisklessAndWitnessFlags(flags []string, wantDiskful bool) ([]string, bool) {
-	wasDiskless := false
-	keep := flags[:0]
-
-	for _, flag := range flags {
-		switch flag {
-		case apiv1.ResourceFlagTieBreaker:
-			wasDiskless = true
-		case apiv1.ResourceFlagDiskless:
-			wasDiskless = true
-
-			if wantDiskful {
-				continue
-			}
-
-			keep = append(keep, flag)
-		default:
-			keep = append(keep, flag)
-		}
-	}
-
-	return keep, wasDiskless
+	// Delegate to the canonical witness→diskful flag transition shared
+	// with the autoplace path (corner-D2b). Keeping one implementation
+	// guarantees `r c <node> --storage-pool` (this path) and
+	// `r c --auto-place +1` (the placer's upgrade-over-witness path)
+	// strip exactly the same flags.
+	return apiv1.PromoteWitnessFlags(flags, wantDiskful)
 }
 
 // containsResourceFlag is a small helper so the create/promote

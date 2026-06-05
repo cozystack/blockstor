@@ -300,3 +300,45 @@ type StoragePoolModify struct {
 	UUID             string            `json:"uuid,omitempty"`
 	State            string            `json:"state,omitempty"`
 }
+
+// PromoteWitnessFlags returns the Flags slice for a diskless / TIE_BREAKER
+// witness promoted to diskful, plus whether the input was actually a
+// diskless witness. It is the single source of truth for the
+// "witness → diskful" flag transition shared by the explicit
+// `linstor r c <node> <rd> --storage-pool ...` toggle-disk path
+// (pkg/rest.promoteDisklessReplica) and the autoplace path
+// (pkg/placer, when `--auto-place +1` lands on a node that already
+// holds the auto-tiebreaker witness — corner-D2b).
+//
+// wantDiskful=true drops both DISKLESS and TIE_BREAKER (full promote to
+// diskful). wantDiskful=false drops only TIE_BREAKER and keeps DISKLESS
+// (the linstor-csi make-available fallback: a plain DISKLESS replica,
+// no longer a controller-owned witness). The second return is true when
+// at least one of DISKLESS / TIE_BREAKER was present, so callers can
+// distinguish "promoted a witness" from "the replica was already
+// diskful" (a real conflict the caller must surface as 409).
+//
+// The input slice is never mutated — a fresh slice is returned.
+func PromoteWitnessFlags(flags []string, wantDiskful bool) ([]string, bool) {
+	wasDiskless := false
+	keep := make([]string, 0, len(flags))
+
+	for _, flag := range flags {
+		switch flag {
+		case ResourceFlagTieBreaker:
+			wasDiskless = true
+		case ResourceFlagDiskless:
+			wasDiskless = true
+
+			if wantDiskful {
+				continue
+			}
+
+			keep = append(keep, flag)
+		default:
+			keep = append(keep, flag)
+		}
+	}
+
+	return keep, wasDiskless
+}
