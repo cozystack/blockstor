@@ -21,7 +21,6 @@ package rest
 import (
 	"context"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"slices"
@@ -926,11 +925,9 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 
 	if len(patch.OverrideProps) > 0 || len(patch.DeleteProps) > 0 {
 		err = s.Store.Nodes().PatchProps(r.Context(), name, func(props map[string]string) error {
-			maps.Copy(props, patch.OverrideProps)
-
-			for _, k := range patch.DeleteProps {
-				delete(props, k)
-			}
+			// I1: route through the shared core so an empty
+			// override value deletes the key (set-property KEY "").
+			applyPropsModify(props, patch.OverrideProps, patch.DeleteProps)
 
 			return nil
 		})

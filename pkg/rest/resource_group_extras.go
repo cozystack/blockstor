@@ -552,11 +552,8 @@ func mergeVGProps(vg *apiv1.VolumeGroup, override map[string]string, deletes []s
 		vg.Props = map[string]string{}
 	}
 
-	maps.Copy(vg.Props, override)
-
-	for _, k := range deletes {
-		delete(vg.Props, k)
-	}
+	// I1: empty override value deletes the key (set-property KEY "").
+	applyPropsModify(vg.Props, override, deletes)
 }
 
 func parseVolumeNumber(w http.ResponseWriter, raw string) (int32, bool) {

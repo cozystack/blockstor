@@ -939,7 +939,10 @@ func mergeVolumeDefinitionPatch(existing *apiv1.VolumeDefinition, patch *volumeD
 			existing.Props = map[string]string{}
 		}
 
-		maps.Copy(existing.Props, patch.OverrideProps)
+		// I1: override_props is the set-property surface where an
+		// empty value deletes the key (set-property KEY ""). The
+		// legacy `props` full-shape overlay keeps plain copy semantics.
+		applyPropsModify(existing.Props, patch.OverrideProps, nil)
 		maps.Copy(existing.Props, patch.Props)
 	}
 

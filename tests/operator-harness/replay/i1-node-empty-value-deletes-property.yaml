@@ -1,0 +1,67 @@
+name: i1-node-empty-value-deletes-property
+description: |
+  Corner-case I1 catcher on a NON-RD object (node). PR #97 implemented
+  empty-value=delete only for resource-definition / resource-group
+  set-property; this replay pins the SAME semantic on the node
+  set-property surface (the representative non-RD object).
+
+  UG9 NOTE (~4277-4279): setting a property to an empty value DELETES
+  it from the object entirely. The python-linstor CLI routes
+  `set-property KEY` (no value) to the delete shape, and blockstor's
+  server also folds an empty override value to a delete, so the final
+  state converges to key-absence regardless of the wire shape.
+
+  Verbatim operator repro:
+    $ linstor node set-property {{node1}} Aux/cc-i1-marker present
+    $ linstor node list-properties {{node1}} | grep Aux/cc-i1-marker  # set
+    $ linstor node set-property {{node1}} Aux/cc-i1-marker            # empty = delete
+    $ linstor node list-properties {{node1}} | grep Aux/cc-i1-marker  # GONE
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  # No RD/SP objects are created — this is a pure node-prop workflow.
+  # The marker key `Aux/cc-i1-marker` is inlined verbatim in the steps
+  # (the replay runner only substitutes {{rd}}/{{sp}}/{{node1..4}}, not
+  # custom vars). Aux/ keeps the key in the operator-writable namespace
+  # and avoids touching any DRBD-affecting property.
+  rd: cc-i1-node-unused
+
+steps:
+  - name: set-node-prop
+    cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker", "present"]
+    expect_exit: 0
+  - name: node-prop-is-set
+    cmd: ["node", "list-properties", "{{node1}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: node
+      name: "{{node1}}"
+      key: "Aux/cc-i1-marker"
+      expected: "present"
+      timeout_s: 30
+  - name: clear-node-prop-empty-value
+    # I1: empty value = delete the property entirely (non-RD object).
+    cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker"]
+    expect_exit: 0
+  - name: node-prop-is-gone
+    cmd: ["node", "list-properties", "{{node1}}"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: node
+      name: "{{node1}}"
+      key: "Aux/cc-i1-marker"
+      # expected omitted ⇒ key must be ABSENT.
+      timeout_s: 30
+
+teardown:
+  # Best-effort: make sure the marker is gone even if a step bailed
+  # mid-run (deleting an already-absent key is a no-op for the CLI).
+  - cmd: ["node", "set-property", "{{node1}}", "Aux/cc-i1-marker"]
+
+invariants:
+  - no_orphans

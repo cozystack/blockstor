@@ -842,6 +842,144 @@ func TestPrefNicSteersDRBDAddress(t *testing.T) {
 	}
 }
 
+// TestK2_SPPrefNicDoesNotRouteDiskless pins corner-case K2 (UG9 NOTE
+// ~2152-2159): a PrefNic property set on a *storage pool* steers DRBD
+// traffic only for resources that USE that pool. A Diskless /
+// tiebreaker replica has no diskful storage pool, so it does NOT pick
+// up the diskful pool's SP-level PrefNic — its DRBD address falls
+// through to the node default until the operator sets PrefNic at the
+// node level (or on the `default` net interface).
+//
+// blockstor gets this for free: prefNicAddress keys the lookup on the
+// replica's own targetPoolName(). A diskless replica's StoragePool is
+// empty (or a diskless pool with no PrefNic), so lookupPrefNic skips
+// the diskful pool's PrefNic and only a node-level PrefNic applies.
+//
+// The two sub-cases below differ ONLY in whether a node-level PrefNic
+// is set, holding the diskful pool's SP-level PrefNic constant:
+//
+//   - SP-PrefNic only → diskless replica binds the node default IP.
+//   - SP-PrefNic + node-PrefNic → diskless replica binds the fast NIC
+//     (node scope routes diskless; SP scope alone does not).
+func TestK2_SPPrefNicDoesNotRouteDiskless(t *testing.T) {
+	const (
+		rdName    = "pvc-tb"
+		n1Default = "10.244.0.2"
+		n1Fast    = "192.168.43.231"
+		n2Default = "10.244.0.5"
+		diskfulSP = "data-hdd"
+	)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	makeNodes := func(n1Props map[string]string) []blockstoriov1alpha1.Node {
+		return []blockstoriov1alpha1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "n1"},
+				Spec: blockstoriov1alpha1.NodeSpec{
+					Type:  "Satellite",
+					Props: n1Props,
+					NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+						{Name: "default", Address: n1Default},
+						{Name: "nic_10G", Address: n1Fast},
+					},
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "n2"},
+				Spec: blockstoriov1alpha1.NodeSpec{
+					Type: "Satellite",
+					NetInterfaces: []blockstoriov1alpha1.NodeNetInterface{
+						{Name: "default", Address: n2Default},
+					},
+				},
+			},
+		}
+	}
+
+	// The diskful pool on n1 carries an SP-level PrefNic pointing at the
+	// fast NIC. The diskless target below does NOT use this pool.
+	pools := []blockstoriov1alpha1.StoragePool{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1-" + diskfulSP},
+			Spec: blockstoriov1alpha1.StoragePoolSpec{
+				NodeName: "n1",
+				PoolName: diskfulSP,
+				Props:    map[string]string{"PrefNic": "nic_10G"},
+			},
+		},
+	}
+
+	cases := []struct {
+		name     string
+		n1Props  map[string]string
+		wantAddr string
+		comment  string
+	}{
+		{
+			name: "sp-prefnic-only-diskless-uses-default",
+			// No PrefNic applies to the diskless replica, so its address
+			// stays the drbdAddrAny placeholder (0.0.0.0) the satellite
+			// swaps for its own pod IP / node-default at .res render
+			// time — crucially NOT the diskful pool's fast NIC.
+			n1Props:  nil,
+			wantAddr: "0.0.0.0",
+			comment:  "SP-level PrefNic on the diskful pool must NOT route the diskless replica",
+		},
+		{
+			name:     "node-prefnic-routes-diskless",
+			n1Props:  map[string]string{"PrefNic": "nic_10G"},
+			wantAddr: n1Fast,
+			comment:  "node-level PrefNic routes the diskless replica to the fast NIC",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetID := int32(0)
+			peerID := int32(1)
+
+			// Diskless target: empty Spec.StoragePool (tiebreaker /
+			// diskless role has no diskful pool).
+			target := &blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-tb-n1"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n1",
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &targetID},
+			}
+
+			peer := blockstoriov1alpha1.Resource{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-tb-n2"},
+				Spec: blockstoriov1alpha1.ResourceSpec{
+					ResourceDefinitionName: rdName,
+					NodeName:               "n2",
+					StoragePool:            diskfulSP,
+				},
+				Status: blockstoriov1alpha1.ResourceStatus{DRBDNodeID: &peerID},
+			}
+
+			got := dispatcher.BuildDesired(target, []blockstoriov1alpha1.Resource{peer},
+				makeNodes(tc.n1Props), pools, rd, nil)
+			if got == nil {
+				t.Fatalf("BuildDesired returned nil")
+			}
+
+			if addr := got.DrbdOptions["address"]; addr != tc.wantAddr {
+				t.Errorf("%s: diskless target address=%q want %q (drbdOpts=%v)",
+					tc.comment, addr, tc.wantAddr, got.DrbdOptions)
+			}
+		})
+	}
+}
+
 // TestAutoQuorumDisabledPassesManualSettings: scenario 7.W01
 // (wave2-07 §7.W01, UG9 lines 4233-4279). Models the operator
 // workflow where auto-quorum is opted out at the cluster scope and

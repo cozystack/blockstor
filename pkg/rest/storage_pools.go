@@ -20,7 +20,6 @@ package rest
 
 import (
 	"context"
-	"maps"
 	"net/http"
 	"slices"
 	"strconv"
@@ -111,11 +110,8 @@ func (s *Server) handleNodeStoragePoolModify(w http.ResponseWriter, r *http.Requ
 			sp.Props = map[string]string{}
 		}
 
-		maps.Copy(sp.Props, patch.OverrideProps)
-
-		for _, k := range patch.DeleteProps {
-			delete(sp.Props, k)
-		}
+		// I1: empty override value deletes the key (set-property KEY "").
+		applyPropsModify(sp.Props, patch.OverrideProps, patch.DeleteProps)
 
 		// DeleteNamespace: drop every key under the given namespace
 		// prefix. Mirrors upstream LINSTOR's `delete_namespaces`

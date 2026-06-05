@@ -64,6 +64,71 @@ func TestLowestFreePort_IgnoresOutOfRange(t *testing.T) {
 	}
 }
 
+// TestK3_DefaultPortRangeIsBlockstorWindow pins corner-case K3: where
+// upstream LINSTOR's TcpPortAutoRange defaults to 7000-7999 (UG9
+// ~2225-2231), blockstor deliberately allocates from 20000-20999 so it
+// can coexist with a live upstream LINSTOR on the same nodes without
+// colliding on the shared kernel DRBD port / minor namespace. This is a
+// documented divergence (known-deltas row 68). The override knob
+// (Node.Spec.Props["DrbdOptions/TcpPortRange"] / controller config) is
+// LINSTOR-compatible — only the default base differs.
+func TestK3_DefaultPortRangeIsBlockstorWindow(t *testing.T) {
+	t.Parallel()
+
+	if drbd.DefaultPortMin != 20000 || drbd.DefaultPortMax != 20999 {
+		t.Errorf("default port window = %d-%d, want 20000-20999 (blockstor base, disjoint from upstream 7000-7999)",
+			drbd.DefaultPortMin, drbd.DefaultPortMax)
+	}
+
+	// First allocation in an empty cluster hands out the window base.
+	got, err := drbd.LowestFreePort(nil, drbd.DefaultPortMin, drbd.DefaultPortMax)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if got != 20000 {
+		t.Errorf("first port = %d, want 20000", got)
+	}
+}
+
+// TestK3_PortReusedAfterDelete pins the reuse-after-`rd d` semantic
+// (MATCHES upstream): once a resource is deleted its port leaves the
+// cluster taken-set, so the next allocation reuses the lowest free
+// value — the previously-held port. The allocator is deterministic, so
+// create→note-port→delete→create yields the same port back.
+func TestK3_PortReusedAfterDelete(t *testing.T) {
+	t.Parallel()
+
+	const low, high = int32(20000), int32(20999)
+
+	// Cluster already holds 20000 and 20002; the first free port is
+	// 20001 — that's what a fresh `rd c` would take.
+	taken := []int32{20000, 20002}
+
+	first, err := drbd.LowestFreePort(taken, low, high)
+	if err != nil {
+		t.Fatalf("first alloc: %v", err)
+	}
+
+	if first != 20001 {
+		t.Fatalf("first alloc = %d, want 20001", first)
+	}
+
+	// `rd d` frees 20002; the next alloc reuses the lowest free, which
+	// is still 20001 (20002 is back but higher). Now free 20000 too and
+	// confirm it is handed back first — proving deleted ports re-enter
+	// the pool rather than being permanently burned.
+	afterDelete := []int32{20002} // 20000 deleted, 20001 never taken
+	reused, err := drbd.LowestFreePort(afterDelete, low, high)
+	if err != nil {
+		t.Fatalf("post-delete alloc: %v", err)
+	}
+
+	if reused != 20000 {
+		t.Errorf("post-delete alloc = %d, want 20000 reused (deleted port must re-enter the pool)", reused)
+	}
+}
+
 func TestLowestFreePort_Exhausted(t *testing.T) {
 	t.Parallel()
 

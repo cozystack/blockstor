@@ -20,7 +20,6 @@ package rest
 
 import (
 	"fmt"
-	"maps"
 	"net/http"
 	"strings"
 
@@ -217,11 +216,8 @@ func mergeVolumePropsPatch(vol *apiv1.Volume, patch *apiv1.GenericPropsModify) {
 		vol.Props = map[string]string{}
 	}
 
-	maps.Copy(vol.Props, patch.OverrideProps)
-
-	for _, k := range patch.DeleteProps {
-		delete(vol.Props, k)
-	}
+	// I1: empty override value deletes the key (set-property KEY "").
+	applyPropsModify(vol.Props, patch.OverrideProps, patch.DeleteProps)
 
 	for _, ns := range patch.DeleteNamespace {
 		for k := range vol.Props {
