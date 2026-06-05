@@ -182,35 +182,67 @@ func TestAutoDiskOptions_ProbeFailureOmitsGranularity(t *testing.T) {
 	}
 }
 
-// TestAutoDiskOptions_ThickOmitsEverything: thick LVM is NOT
-// discard-zero safe — NO disk options at all (full safe resync). The
-// device is never even probed.
-func TestAutoDiskOptions_ThickOmitsEverything(t *testing.T) {
+// TestAutoDiskOptions_ThickNoZeroesButGranularity: thick LVM is NOT
+// discard-zero safe → discard-zeroes-if-aligned=no, but the granularity
+// is gated INDEPENDENTLY on the backing device's reported DISC-GRAN. A
+// thick LV whose device supports discard still gets rs-discard-granularity
+// so an aligned all-zero region can be UNMAPped during resync.
+func TestAutoDiskOptions_ThickNoZeroesButGranularity(t *testing.T) {
 	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/dev/vg/pvc-1_00000", "65536")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindLVM, "/dev/vg/pvc-1_00000")
 
-	if len(opts) != 0 {
-		t.Errorf("thick LVM produced disk options %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no (thick)", opts[diskOptDiscardZeroesAligned])
 	}
 
-	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "lsblk") {
-			t.Errorf("thick LVM probed the device (%q); want no probe", line)
-		}
+	if opts[diskOptRsDiscardGranularity] != "65536" {
+		t.Errorf("rs-discard-granularity = %q, want 65536", opts[diskOptRsDiscardGranularity])
 	}
 }
 
-// TestAutoDiskOptions_FileThinOmitsEverything: FILE_THIN is excluded
-// from discard-zeroes-if-aligned (loop-backed sparse file) — no disk
-// options, matching upstream's `no` for FILE_THIN.
-func TestAutoDiskOptions_FileThinOmitsEverything(t *testing.T) {
+// TestAutoDiskOptions_FileThin4KLoop pins the Q3 corner-case: a
+// partially-written FILE_THIN volume on a 4 KiB-discard loop device.
+// discard-zeroes-if-aligned is `no` (loop-backed sparse file, NOT
+// zero-discard safe), but rs-discard-granularity MUST be emitted (4096)
+// because the backing loop device reports a non-zero discard
+// granularity — DECOUPLED from the discard-zeroes gate. Without this
+// blockstor resynced ~2x the bytes upstream did. Target render matches
+// upstream 1.33.2: `discard-zeroes-if-aligned no; rs-discard-granularity
+// 4096;`.
+func TestAutoDiskOptions_FileThin4KLoop(t *testing.T) {
 	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "4096")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
 
-	if len(opts) != 0 {
-		t.Errorf("FILE_THIN produced disk options %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no (FILE_THIN)", opts[diskOptDiscardZeroesAligned])
+	}
+
+	if opts[diskOptRsDiscardGranularity] != "4096" {
+		t.Errorf("rs-discard-granularity = %q, want 4096 (decoupled from discard-zeroes)", opts[diskOptRsDiscardGranularity])
+	}
+}
+
+// TestAutoDiskOptions_FileThinZeroGranNothingUseful: a FILE_THIN volume
+// whose backing device reports DISC-GRAN=0 (no discard support) gets
+// discard-zeroes-if-aligned=no and NO granularity — DRBD falls back to a
+// safe full resync. The disk block still renders the flag (matching
+// upstream's explicit `no`).
+func TestAutoDiskOptions_FileThinZeroGranNothingUseful(t *testing.T) {
+	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "0")
+
+	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
+
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no", opts[diskOptDiscardZeroesAligned])
+	}
+
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Errorf("rs-discard-granularity present (%q) for DISC-GRAN=0; want omitted", opts[diskOptRsDiscardGranularity])
 	}
 }
 
@@ -269,10 +301,13 @@ func TestAutoDiskOptionsForResource_ZfsThin(t *testing.T) {
 	}
 }
 
-// TestAutoDiskOptionsForResource_ThickNil: a thick LVM pool yields no
-// auto disk options.
-func TestAutoDiskOptionsForResource_ThickNil(t *testing.T) {
+// TestAutoDiskOptionsForResource_ThickNoZeroes: a thick LVM pool yields
+// discard-zeroes-if-aligned=no but still picks up rs-discard-granularity
+// from the backing device (independent gate).
+func TestAutoDiskOptionsForResource_ThickNoZeroes(t *testing.T) {
 	fx := storage.NewFakeExec()
+	device := "/dev/vg/pvc-1_00000"
+	discGranResponse(fx, device, "65536")
 	prov := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
 	rec := NewReconciler(ReconcilerConfig{
 		Providers: map[string]storage.Provider{"thick1": prov},
@@ -280,17 +315,21 @@ func TestAutoDiskOptionsForResource_ThickNil(t *testing.T) {
 	})
 
 	opts := rec.autoDiskOptionsForResource(context.Background(), drFor("pvc-1", "thick1"),
-		map[int32]string{0: "/dev/vg/pvc-1_00000"})
+		map[int32]string{0: device})
 
-	if len(opts) != 0 {
-		t.Fatalf("thick LVM resource produced %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" || opts[diskOptRsDiscardGranularity] != "65536" {
+		t.Fatalf("thick LVM resource = %v; want no + 65536", opts)
 	}
 }
 
-// TestAutoDiskOptionsForResource_FileThinNil: FILE_THIN yields no auto
-// disk options (excluded from discard-zeroes-if-aligned).
-func TestAutoDiskOptionsForResource_FileThinNil(t *testing.T) {
+// TestAutoDiskOptionsForResource_FileThin4KLoop: the Q3 corner-case at
+// the resource level — FILE_THIN on a 4 KiB-discard loop yields
+// discard-zeroes-if-aligned=no + rs-discard-granularity=4096, so a
+// partially-written volume resyncs only the written bytes.
+func TestAutoDiskOptionsForResource_FileThin4KLoop(t *testing.T) {
 	fx := storage.NewFakeExec()
+	device := "/var/lib/blockstor/pvc-1.img"
+	discGranResponse(fx, device, "4096")
 	prov := file.NewProvider(file.Config{Dir: t.TempDir(), Thin: true}, fx)
 	rec := NewReconciler(ReconcilerConfig{
 		Providers: map[string]storage.Provider{"file1": prov},
@@ -298,10 +337,10 @@ func TestAutoDiskOptionsForResource_FileThinNil(t *testing.T) {
 	})
 
 	opts := rec.autoDiskOptionsForResource(context.Background(), drFor("pvc-1", "file1"),
-		map[int32]string{0: "/var/lib/blockstor/pvc-1.img"})
+		map[int32]string{0: device})
 
-	if len(opts) != 0 {
-		t.Fatalf("FILE_THIN resource produced %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" || opts[diskOptRsDiscardGranularity] != "4096" {
+		t.Fatalf("FILE_THIN resource = %v; want no + 4096", opts)
 	}
 }
 
@@ -404,6 +443,47 @@ func TestBuildResFile_RendersDiscardDiskBlock(t *testing.T) {
 
 	if !strings.Contains(body, "rs-discard-granularity 16384;") {
 		t.Errorf("missing rs-discard-granularity in:\n%s", body)
+	}
+}
+
+// TestBuildResFile_RendersFileThinNoZeroesBlock pins the Q3 rendered
+// .res: a FILE_THIN-on-4K-loop volume renders a disk block with
+// `discard-zeroes-if-aligned no;` AND `rs-discard-granularity 4096;` —
+// matching upstream 1.33.2's render for the same backing.
+func TestBuildResFile_RendersFileThinNoZeroesBlock(t *testing.T) {
+	dr := &intent.DesiredResource{
+		Name:     "pvc-ft",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "file1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+	devices := map[int32]string{0: "/var/lib/blockstor/pvc-ft.img"}
+	autoDisk := map[string]string{
+		diskOptDiscardZeroesAligned: "no",
+		diskOptRsDiscardGranularity: "4096",
+	}
+
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	if err != nil {
+		t.Fatalf("buildResFile: %v", err)
+	}
+
+	if !strings.Contains(body, "disk {") {
+		t.Fatalf("no disk block in:\n%s", body)
+	}
+
+	if !strings.Contains(body, "discard-zeroes-if-aligned no;") {
+		t.Errorf("missing discard-zeroes-if-aligned no; in:\n%s", body)
+	}
+
+	if !strings.Contains(body, "rs-discard-granularity 4096;") {
+		t.Errorf("missing rs-discard-granularity 4096; in:\n%s", body)
 	}
 }
 
