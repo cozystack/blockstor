@@ -1532,6 +1532,21 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 		return nil, false
 	}
 
+	// H3 (corner-case): the modern `linstor r c <node> <rd>
+	// --drbd-diskless` (and its `--nvme-initiator` sibling) post the
+	// wire flag DRBD_DISKLESS, whereas the deprecated `--diskless`
+	// alias still posts the canonical DISKLESS. Every diskless-detection
+	// site in blockstor (the placer's splitByDiskless, the satellite's
+	// applyStorageIfDiskful, the quorum/tiebreaker math, …) keys on the
+	// canonical apiv1.ResourceFlagDiskless == "DISKLESS" only. Without
+	// folding DRBD_DISKLESS into DISKLESS at the wire boundary, a replica
+	// requested with the RECOMMENDED `--drbd-diskless` flag would be
+	// classified DISKFUL — the satellite would carve backing storage for
+	// a replica the operator explicitly asked to be diskless, and the
+	// quorum/tiebreaker arithmetic would miscount it. Canonicalise here,
+	// once, so the rest of the pipeline sees a single spelling.
+	normalizeDisklessFlag(&res)
+
 	if !s.checkResourceCreateNodeAndPool(w, r, &res) {
 		return nil, false
 	}
@@ -2396,6 +2411,47 @@ func stripDisklessAndWitnessFlags(flags []string, wantDiskful bool) ([]string, b
 // branching reads at the call site without an inline loop.
 func containsResourceFlag(flags []string, want string) bool {
 	return slices.Contains(flags, want)
+}
+
+// normalizeDisklessFlag folds the wire flag DRBD_DISKLESS into the
+// canonical DISKLESS on a freshly-decoded resource-create body. The
+// modern `linstor r c --drbd-diskless` / `--nvme-initiator` CLI flags
+// emit DRBD_DISKLESS; the deprecated `--diskless` alias emits the
+// canonical DISKLESS (verified via `linstor --curl` against the
+// upstream oracle, client 1.27.1). blockstor's diskless-detection
+// surface keys exclusively on apiv1.ResourceFlagDiskless == "DISKLESS",
+// so a body carrying only DRBD_DISKLESS would otherwise be treated as
+// a diskful create. Replace every DRBD_DISKLESS occurrence with
+// DISKLESS in place, de-duplicating if both spellings are present so a
+// later exact-match flag walk doesn't see a phantom duplicate. No-op
+// when the flag is absent (the common diskful / explicit-DISKLESS
+// case), so the hot path pays only a single slice scan.
+func normalizeDisklessFlag(res *apiv1.Resource) {
+	if !slices.Contains(res.Flags, rscFlagDrbdDiskless) {
+		return
+	}
+
+	out := res.Flags[:0]
+	seenDiskless := false
+
+	for _, flag := range res.Flags {
+		isDiskless := flag == rscFlagDrbdDiskless || flag == apiv1.ResourceFlagDiskless
+		if !isDiskless {
+			out = append(out, flag)
+
+			continue
+		}
+
+		if seenDiskless {
+			continue
+		}
+
+		seenDiskless = true
+
+		out = append(out, apiv1.ResourceFlagDiskless)
+	}
+
+	res.Flags = out
 }
 
 // handleResourceMakeAvailable answers
