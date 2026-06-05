@@ -169,11 +169,70 @@ substitute() {
     s=${s//\{\{rd\}\}/${RD:-}}
     s=${s//\{\{sp\}\}/${SP:-}}
     s=${s//\{\{rg\}\}/${RG:-}}
+    # {{device}} resolves from vars.device (physical-storage workflows like
+    # ps-cdp-zfs). Without this branch the placeholder passed through verbatim
+    # and the device-pool create was handed the literal string "{{device}}" --
+    # same class of bug as the earlier {{rg}} pass-through.
+    s=${s//\{\{device\}\}/${DEVICE:-}}
     s=${s//\{\{node1\}\}/${NODE1:-}}
     s=${s//\{\{node2\}\}/${NODE2:-}}
     s=${s//\{\{node3\}\}/${NODE3:-}}
     s=${s//\{\{node4\}\}/${NODE4:-}}
     echo "$s"
+}
+
+# ----------------------------------------------------------------------
+# fixture probes (used by replay-runner.sh prerequisites)
+# ----------------------------------------------------------------------
+
+# fixture_sp_node_count <pool-name>
+#
+# Echoes the number of distinct nodes on which the named LINSTOR storage
+# pool is registered (provider_kind != null). Used by the
+# prerequisites.storage_pool_min_nodes SKIP gate so a workflow that needs
+# a pool the stand does not have (e.g. a thick LVM pool) SKIPs cleanly
+# instead of FAILing. Uses the machine-readable `-m` surface so the parse
+# is column-agnostic.
+fixture_sp_node_count() {
+    local pool=$1
+    linstor_cli -m storage-pool list --storage-pools "$pool" 2>/dev/null         | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print(0); sys.exit(0)
+while isinstance(d, list) and d and isinstance(d[0], list):
+    d=d[0]
+nodes=set()
+for it in d if isinstance(d, list) else []:
+    if not isinstance(it, dict): continue
+    if it.get('provider_kind') is None: continue
+    n=it.get('node_name')
+    if n: nodes.add(n)
+print(len(nodes))" 2>/dev/null || echo 0
+}
+
+# fixture_device_on_any_worker <device-path>
+#
+# Returns 0 if <device-path> is a present block device on at least one
+# worker's satellite pod, 1 otherwise. Used by the
+# prerequisites.device_on_any_node SKIP gate so the ps-cdp-zfs workflow
+# (which needs a sacrificial loop device that only some stands provision)
+# SKIPs cleanly instead of FAILing on stands without it. Probes the
+# satellite pod via kubectl exec; if no satellite pod is reachable we
+# conservatively report absent (the caller SKIPs).
+fixture_device_on_any_worker() {
+    local dev=$1
+    local ns=${SATELLITE_NS:-blockstor-system}
+    local pods
+    mapfile -t pods < <(kubectl -n "$ns" get pods -l app=blockstor-satellite         --field-selector status.phase=Running         -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+    local p
+    for p in "${pods[@]}"; do
+        [[ -z "$p" ]] && continue
+        if kubectl -n "$ns" exec "$p" -- test -b "$dev" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ----------------------------------------------------------------------

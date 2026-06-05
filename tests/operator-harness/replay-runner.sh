@@ -22,6 +22,10 @@
 #     prerequisites:
 #       min_nodes: 2
 #       storage_pool: stand
+#       # Optional fixture-presence SKIP gates (exit 0 if the fixture is
+#       # absent -- a missing fixture is "not exercisable here", not a fault):
+#       storage_pool_min_nodes: { name: lvm-thick, min: 2 }
+#       device_on_any_node: /dev/loop9
 #     steps:
 #       - name: create-rd
 #         cmd: ["resource-definition", "create", "{{rd}}"]
@@ -87,6 +91,8 @@
 #   {{rd}}            workflow.vars.rd (default "replay-<name>-<rand4>")
 #   {{sp}}            workflow.vars.sp (default "stand")
 #   {{rg}}            workflow.vars.rg (default "rg-<name>-<rand4>")
+#   {{device}}        workflow.vars.device (no default; physical-storage
+#                     workflows like ps-cdp-zfs)
 #   {{node1}} … {{node4}}  resolved from kubectl-discovered worker list
 #                           ({{node4}} needs min_nodes: 4)
 #
@@ -168,6 +174,10 @@ SP=${SP:-stand}
 # would otherwise substitute an empty string and create an unnamed group.
 RG=$(yaml_get "$WORKFLOW" "vars.rg")
 RG=${RG:-rg-${NAME}-${RAND}}
+# {{device}} resolves from vars.device (physical-storage workflows). No
+# synthetic default -- a workflow referencing {{device}} without declaring
+# vars.device would otherwise substitute an empty string into the CLI.
+DEVICE=$(yaml_get "$WORKFLOW" "vars.device")
 
 # ----------------------------------------------------------------------
 # invariants
@@ -189,6 +199,36 @@ MIN_NODES=${MIN_NODES:-2}
 if [[ "${#WORKERS[@]}" -lt "$MIN_NODES" ]]; then
     echo "SKIP: workflow needs $MIN_NODES workers, stand has ${#WORKERS[@]}"
     exit 0
+fi
+
+# Fixture-presence SKIP gates. These let a workflow that needs a stand
+# fixture the current stand may not have (a thick-LVM storage pool, a
+# sacrificial loop device) SKIP cleanly with exit 0 instead of FAILing on
+# a missing fixture -- a missing fixture is "not exercisable here", not a
+# product bug. Both gates are OPT-IN: a workflow without the prerequisite
+# key is unaffected.
+
+# prerequisites.storage_pool_min_nodes: { name: <pool>, min: <N> }
+# SKIP unless the named LINSTOR storage pool is registered on >= min nodes.
+SP_REQ_NAME=$(yaml_get "$WORKFLOW" "prerequisites.storage_pool_min_nodes.name")
+if [[ -n "$SP_REQ_NAME" ]]; then
+    SP_REQ_MIN=$(yaml_get "$WORKFLOW" "prerequisites.storage_pool_min_nodes.min")
+    SP_REQ_MIN=${SP_REQ_MIN:-1}
+    SP_HAVE=$(fixture_sp_node_count "$SP_REQ_NAME")
+    if [[ "${SP_HAVE:-0}" -lt "$SP_REQ_MIN" ]]; then
+        echo "SKIP: workflow needs storage pool '$SP_REQ_NAME' on >= $SP_REQ_MIN node(s), stand has it on ${SP_HAVE:-0} -- fixture absent"
+        exit 0
+    fi
+fi
+
+# prerequisites.device_on_any_node: <device-path>
+# SKIP unless that block device exists on at least one worker satellite.
+DEV_REQ=$(yaml_get "$WORKFLOW" "prerequisites.device_on_any_node")
+if [[ -n "$DEV_REQ" ]]; then
+    if ! fixture_device_on_any_worker "$DEV_REQ"; then
+        echo "SKIP: workflow needs block device '$DEV_REQ' on a worker, none present -- fixture absent"
+        exit 0
+    fi
 fi
 
 # steps
