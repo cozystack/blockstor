@@ -1,0 +1,82 @@
+name: u145-add-replica-over-data-syncs
+description: |
+  U145 (P0, DATA INTEGRITY) operator-CLI replay. Upstream LINSTOR user
+  report: adding a diskful replica to a resource that already holds data
+  brought the new replica up UpToDate IMMEDIATELY without syncing — a
+  silent empty copy presenting as good, promotable on failover → data
+  loss.
+
+  For blockstor this is the critical interaction with the skip-init-sync
+  design: a replica added to an RD that has already been written (RD.Spec.
+  Initialized latched true) MUST be stamped SkipInitialSync=false by the
+  controller and come up Inconsistent → SyncTarget, converging to a clean
+  UpToDate with no stuck (NN%) — never instant-UpToDate-empty.
+
+  This replay pins the operator-CLI convergence half: build a 2-replica
+  RD, let it reach UpToDate (the lowest-id winner has minted a real
+  past-day0 generation — proxy for "data exists"), then add a 3rd diskful
+  replica and assert it converges to clean UpToDate (sync_clean) on every
+  replica without breaking the existing two.
+
+  The data-write + NEGATIVE (never instant-UpToDate) + md5 content-
+  correctness half — which needs a PVC/pod and kernel-state polling — is
+  delegated to the L6 cli-matrix cell u145-write-then-add-replica-syncs.sh
+  (same division of labour as the vd-resize lifecycle, whose pod md5
+  anchor lives in its L6 cell). The L1 seed-decision pins are
+  internal/controller TestSkipInitSyncDataBearingPeerLatchesAndNewReplica
+  Syncs and pkg/satellite TestResolveVolumeSeedReadsSkipInitialSyncSpec
+  Flag.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: lvm-thin
+
+vars:
+  sp: lvm-thin
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  # Add the 3rd diskful replica AFTER the initial set has converged. The
+  # RD is Initialized, so this replica must SyncTarget from a data-bearing
+  # peer — not skip-seed to instant-UpToDate.
+  - name: r-c-node3-over-data
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 3
+      timeout_s: 60
+  # The new replica must reach a CLEAN UpToDate (no stuck (NN%)) on every
+  # replica — proving the SyncTarget seed completed, not an instant skip.
+  - name: wait-3r-sync-clean
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: sync_clean
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
