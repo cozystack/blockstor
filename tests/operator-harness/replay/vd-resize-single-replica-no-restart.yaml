@@ -1,0 +1,95 @@
+name: vd-resize-single-replica-no-restart
+description: |
+  U329 (P1) — a `vd set-size` grow on a SINGLE-replica RD must converge
+  through the live reconcile loop, with no restart needed. Upstream
+  LINSTOR only applied the grow after a satellite/controller bounce; the
+  VD size updated but the backing LV + DRBD device stayed at the old
+  size until something restarted.
+
+  Single replica is the strictest topology: no peer to mask a missed
+  local reconcile, no resync to hide behind.
+
+  Operator sequence:
+    rd c → vd c 1G → r c node1 (single diskful) → grow 1G→2G
+
+  CLI-side contract:
+    - the grow returns 0 and vd size reflects 2G
+    - the single replica is STILL UpToDate after the grow (the kernel
+      re-probed the grown disk via drbdadm resize on the live path)
+
+  Backing-LV + kernel-device ground truth AND the explicit
+  "satellite pod restartCount unchanged" assertion live in the L6
+  cli-matrix cell tests/e2e/cli-matrix/vd-resize-single-replica-no-restart.sh
+  — the replay runner cannot observe pod restarts, so it pins the
+  operator-CLI convergence half here.
+
+  If this YAML goes red, no fix in:
+    - pkg/satellite/reconciler.go (applyStorage grow probe + finishDRBDApply
+      drbdadm resize trigger)
+    - pkg/rest/volume_definitions.go (size set + resize-pending stamp)
+  may be claimed closed.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: r-c-single
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      # Single replica reaches UpToDate from its own day0 GI seed.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+
+  # ---- Grow 1G → 2G on the single replica ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: still-uptodate-after-grow
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The single replica must remain UpToDate — the grow landed on the
+      # backing LV + kernel device via the live reconcile (no restart),
+      # so the device re-probe did not knock it out of UpToDate.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans

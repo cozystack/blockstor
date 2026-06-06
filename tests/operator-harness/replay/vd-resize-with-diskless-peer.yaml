@@ -1,0 +1,118 @@
+name: vd-resize-with-diskless-peer
+description: |
+  U48 (P1) — `vd set-size` grow with a DISKLESS replica present must NOT
+  fan `drbdadm resize` out to the diskless peer. Upstream LINSTOR issued
+  the resize on the diskless node, the kernel rejected it ("requires a
+  local disk"), and the whole volume wedged mid-resize.
+
+  Operator sequence:
+    rd c → vd c 1G → r c node1 + r c node2 (diskful) →
+    r c --drbd-diskless node3 → grow 1G→2G
+
+  The CLI-side contract:
+    - the diskless peer converges to Diskless and STAYS Diskless across
+      the grow (it never wedges to Failed/Inconsistent)
+    - the grow returns 0 and vd size reflects 2G
+    - every replica reconverges (all_uptodate tolerates the Diskless
+      peer by design — see lib.sh all_uptodate)
+
+  Backing-LV ground truth (the diskless peer has NO LV, and the diskful
+  peers' LVs grew) lives in the L6 cli-matrix cell
+  tests/e2e/cli-matrix/vd-resize-with-diskless-peer.sh — the replay
+  runner only drives the operator CLI + Status convergence.
+
+  If this YAML goes red, no fix in:
+    - pkg/satellite/reconciler.go (applyStorageIfDiskful diskless gate /
+      finishDRBDApply resize block)
+    - pkg/dispatcher/dispatcher.go (size fan-out to diskless Resources)
+  may be claimed closed.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: r-c-node1-diskful
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2-diskful
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2-diskful-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      # 1G full sync to a fresh peer at ~4 MB/s on this stand => minutes.
+      timeout_s: 600
+  - name: r-c-node3-diskless
+    # node + rd are positional FIRST, then the flag — the linstor 1.27.1
+    # client parses `r c --drbd-diskless <rd> <node>` as <rd>=<node>
+    # (rejects "resource definition not found").
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--drbd-diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 120
+
+  # ---- Grow 1G → 2G with the diskless peer present ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: wait-uptodate-after-grow
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # all_uptodate tolerates a Diskless replica (it counts Diskless as
+      # OK, only a non-UpToDate DISKFUL replica is "bad"). So this passing
+      # means: both diskful peers reconverged AND the diskless peer did
+      # NOT wedge into a non-UpToDate/non-Diskless state.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+  - name: diskless-peer-still-diskless-not-wedged
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # U48 core assertion: after the grow the diskless peer is STILL
+      # Diskless. A "requires a local disk" resize fan-out would have
+      # left it Failed/Inconsistent (replica_diskless would never hold).
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans

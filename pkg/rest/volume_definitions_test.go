@@ -1102,6 +1102,116 @@ func TestVDUpdateGrowNoWarning(t *testing.T) {
 	}
 }
 
+// TestVDUpdateGrowWithUnhealthyPeerDefersNotRejects is the U204/U388
+// (P2) regression: a `vd set-size` grow MUST succeed and be stamped on
+// every replica EVEN WHEN a peer replica is unhealthy (Inconsistent /
+// disconnected). Upstream LINSTOR reports could wedge the volume by
+// stalling the grow on the unreachable peer; blockstor deliberately has
+// NO peer-health gate on the resize REST path — a DRBD grow with a
+// disconnected peer is safe (the reachable peers extend immediately and
+// the unhealthy peer resyncs the grown region on reconnect). The resize
+// is "deferred" per-replica, never rejected.
+//
+// This pins the wire-observable half: the PUT returns 200 with a
+// success-only envelope (no FAIL_*, no health-related rejection) and the
+// resize-pending breadcrumb is stamped on BOTH the healthy and the
+// unhealthy replica, so the satellite picks the grow up on each as soon
+// as it can reconcile. The live network-partition + reconnect-resync
+// half lives in the L6 cell
+// tests/e2e/cli-matrix/vd-resize-peer-disconnected-defers.sh.
+func TestVDUpdateGrowWithUnhealthyPeerDefersNotRejects(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	const rd = "pvc-unhealthy-peer-grow"
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: rd}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const initialKib = 1048576 // 1 GiB
+	if err := st.VolumeDefinitions().Create(ctx, rd,
+		&apiv1.VolumeDefinition{VolumeNumber: 0, SizeKib: initialKib}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	// Two diskful replicas. n1 is healthy (UpToDate); n2 is UNHEALTHY —
+	// its Status reports the volume Inconsistent, the shape a
+	// mid-resync or freshly-reconnected peer carries. A naive
+	// peer-health gate would reject the grow because not every replica
+	// is UpToDate.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: rd, NodeName: "n1"}); err != nil {
+		t.Fatalf("seed Resource n1: %v", err)
+	}
+
+	if err := st.Resources().Create(ctx, &apiv1.Resource{Name: rd, NodeName: "n2"}); err != nil {
+		t.Fatalf("seed Resource n2: %v", err)
+	}
+
+	// Stamp n2 as unhealthy via the Status subresource.
+	if err := st.Resources().SetState(ctx, rd, "n2", apiv1.ResourceState{},
+		[]apiv1.VolumeObservation{
+			{VolumeNumber: 0, State: apiv1.VolumeState{DiskState: "Inconsistent"}},
+		}); err != nil {
+		t.Fatalf("seed unhealthy status on n2: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	const grownKib = 2097152 // 2 GiB
+
+	body, _ := json.Marshal(apiv1.VolumeDefinition{SizeKib: grownKib})
+	resp := httpPut(t, base+"/v1/resource-definitions/"+rd+"/volume-definitions/0", body)
+	defer func() { _ = resp.Body.Close() }()
+
+	// 1. The grow must NOT be rejected on peer health.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("U204/U388: grow with an unhealthy peer returned %d, want 200 "+
+			"(blockstor must defer the unhealthy peer, not reject the resize)", resp.StatusCode)
+	}
+
+	var rcs []apiv1.APICallRc
+	if err := json.NewDecoder(resp.Body).Decode(&rcs); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+
+	if len(rcs) != 1 {
+		t.Fatalf("U204/U388: grow envelope has %d entries, want 1 (success only); got=%+v", len(rcs), rcs)
+	}
+
+	if rcs[0].RetCode&apiCallRcError != 0 {
+		t.Errorf("U204/U388: grow with unhealthy peer leaked error-mask bit: ret_code=%x", rcs[0].RetCode)
+	}
+
+	// 2. The committed VD size must be the grown size.
+	vd, err := st.VolumeDefinitions().Get(ctx, rd, 0)
+	if err != nil {
+		t.Fatalf("Get VD: %v", err)
+	}
+
+	if vd.SizeKib != grownKib {
+		t.Errorf("U204/U388: VD SizeKib=%d after grow, want %d", vd.SizeKib, grownKib)
+	}
+
+	// 3. The resize-pending breadcrumb must be stamped on BOTH replicas
+	// — the deferred grow is queued per-replica regardless of health, so
+	// the unhealthy n2 picks it up as soon as it can reconcile.
+	wantKey := resizePendingAnnotationPrefix + "0"
+	for _, node := range []string{"n1", "n2"} {
+		rsc, err := st.Resources().Get(ctx, rd, node)
+		if err != nil {
+			t.Fatalf("Get Resource %s: %v", node, err)
+		}
+
+		got := rsc.Annotations[wantKey]
+		if got != "2097152" {
+			t.Errorf("U204/U388: resize-pending stamp on %s = %q, want %q "+
+				"(grow must be deferred to every replica, including the unhealthy one)",
+				node, got, "2097152")
+		}
+	}
+}
+
 // TestVDUpdateNoSizeChangeNoWarning pins the "size-omitted" and
 // "same-size" cases: a props-only modify, or a no-op resize that
 // re-applies the current SizeKib (csi-resizer retry path), must
