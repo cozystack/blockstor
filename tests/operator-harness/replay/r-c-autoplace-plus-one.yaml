@@ -36,6 +36,19 @@ steps:
     cmd: ["resource-group", "spawn-resources", "{{rg}}", "{{rd}}", "32M"]
     expect_exit: 0
     await:
+      # Bug 391 cross-check: `32M` must spawn a 32768 KiB VD, not a
+      # 32 KiB one. A 32 KiB VD is below DRBD's create-md floor and the
+      # replicas below would never converge — so the size assertion
+      # guards this workflow against a silent spawn-size regression.
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 32768
+      timeout_s: 60
+  - name: spawn-2r-replicas
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
       kind: replica_count
       rd: "{{rd}}"
       min: 2
