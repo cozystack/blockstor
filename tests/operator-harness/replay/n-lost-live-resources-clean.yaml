@@ -1,0 +1,94 @@
+name: n-lost-live-resources-clean
+description: |
+  Upstream-issue U173 (P2, "Referential-integrity violation on `node
+  lost`"): upstream LINSTOR (SQL-FK-backed) hit a foreign-key violation
+  when `node lost` ran against a node that still held live resources —
+  the node row could not be deleted while child resource rows referenced
+  it, so the operation could not complete and the node was left
+  un-deletable.
+
+  blockstor is not SQL-FK-based; its referential-integrity guarantee is
+  enforced at the REST boundary instead. `node lost` on a node whose
+  SATELLITE IS STILL ONLINE (heartbeating) and that still references
+  live resources is REJECTED (Bug 111 gate, FAIL_IN_USE) — running it
+  against a live satellite would orphan its Resources, leave DRBD kernel
+  state up on the host, and unregister a running daemon. The reject is
+  the referential-integrity safeguard: BS never lets `node lost` strand
+  dangling Resource refs; it refuses the unsafe op and points the
+  operator at `n d` / `n evacuate`. Crucially, after the reject BOTH the
+  node AND its resources are byte-for-byte intact (no partial cascade,
+  no dangling state) — the exact U173 failure mode (a half-completed
+  delete leaving orphans) cannot occur.
+
+  The OFFLINE-node half of U173 — `node lost` on a genuinely dead node
+  (satellite gone) MUST complete, cascade the orphan Resource /
+  StoragePool CRDs, delete the Node CRD, and leave NO Resource anywhere
+  still referencing it — is destructive to a shared stand (it
+  permanently removes a worker; the satellite does NOT auto-resurrect
+  the Node CRD, by design — see pkg/satellite/controllers/heartbeat.go
+  nodeMissingHint). It is therefore pinned at L1 by
+  pkg/rest.TestNodeLostWithLiveResourcesLeavesNoDanglingRefs (+
+  TestNodeLostCascadeDeletesResources / ...StoragePools) rather than
+  re-run live here.
+
+  Scenario (3-node, all satellites ONLINE): autoplace 2 diskful
+  replicas, then `node lost node1` while node1 holds a live replica —
+  assert it is REJECTED, and assert node1 + the resource are still
+  present and untouched afterwards.
+
+  NOTE on expect_exit: the rejection is a FAIL_IN_USE APICallRc, which
+  the python-linstor CLI surfaces as exit 10. If a stand run shows a
+  different non-zero code, adjust this single value — the contract is
+  "rejected, non-zero".
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: autoplace-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+  - name: wait-two-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: node-lost-live-rejected
+    # THE U173 ASSERTION: `node lost` on a LIVE (ONLINE) node holding a
+    # live resource must be REJECTED — BS refuses to strand dangling
+    # Resource references. The safe paths are `n d` / `n evacuate`.
+    cmd: ["node", "lost", "{{node1}}"]
+    expect_exit: 10
+  - name: node-still-present
+    # Referential integrity intact: the rejected `node lost` left the
+    # node fully registered (no partial cascade). `node list` must still
+    # show node1 ONLINE.
+    cmd: ["node", "list", "--nodes", "{{node1}}"]
+    expect_exit: 0
+  - name: resource-still-present
+    # The live replica on node1 is byte-for-byte intact — the U173
+    # failure mode (orphaned / half-deleted child rows) did not occur.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 60
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
