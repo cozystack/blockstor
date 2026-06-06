@@ -31,16 +31,19 @@ import (
 )
 
 // TestDiscardZeroesIfAligned pins the provider-kind gate for the
-// `discard-zeroes-if-aligned` disk option to upstream LINSTOR's
-// CtrlRscCrtApiHelper switch: only the kinds whose backing device
-// deterministically discards-to-zero on an aligned range qualify.
-// FILE_THIN MUST be excluded even though IsThinOrZFS includes it.
+// `discard-zeroes-if-aligned` disk option: the kinds whose backing
+// device deterministically discards-to-zero on an aligned range.
+// FILE_THIN is INCLUDED (loop punch-hole reads back zeros by contract)
+// — a deliberate divergence from upstream's explicit `no` (known-deltas
+// row 76): an explicit `no` makes the kernel mark a fresh replica's
+// whole device out-of-sync at first attach, neutralising the day0 GI
+// skip-initial-sync seed (the r-full P1 512M full-sync regression).
 func TestDiscardZeroesIfAligned(t *testing.T) {
 	cases := map[string]bool{
 		ProviderKindLVMThin:  true,
 		ProviderKindZFS:      true,
 		ProviderKindZFSThin:  true,
-		ProviderKindFileThin: false, // loop-backed sparse file: NOT zero-discard safe
+		ProviderKindFileThin: true,  // loop punch-hole reads back zeros; keeps day0 attach bitmap clean
 		ProviderKindLVM:      false, // thick: stale bytes
 		ProviderKindFile:     false,
 		ProviderKindDiskless: false,
@@ -50,6 +53,31 @@ func TestDiscardZeroesIfAligned(t *testing.T) {
 	for kind, want := range cases {
 		if got := discardZeroesIfAligned(kind); got != want {
 			t.Errorf("discardZeroesIfAligned(%q) = %v, want %v", kind, got, want)
+		}
+	}
+}
+
+// TestRsDiscardGranularitySafe pins the NARROWER provider-kind gate for
+// rs-discard-granularity: real block-device thin/ZFS pools only.
+// FILE_THIN MUST stay excluded (the mkfs-discard × loop ×
+// rs-discard-granularity PausedSyncT wedge) even though it now
+// qualifies for discard-zeroes-if-aligned — the two gates are
+// deliberately decoupled in BOTH directions.
+func TestRsDiscardGranularitySafe(t *testing.T) {
+	cases := map[string]bool{
+		ProviderKindLVMThin:  true,
+		ProviderKindZFS:      true,
+		ProviderKindZFSThin:  true,
+		ProviderKindFileThin: false, // loop wedge: granularity must stay off
+		ProviderKindLVM:      false,
+		ProviderKindFile:     false,
+		ProviderKindDiskless: false,
+		"SOMETHING_NEW":      false,
+	}
+
+	for kind, want := range cases {
+		if got := rsDiscardGranularitySafe(kind); got != want {
+			t.Errorf("rsDiscardGranularitySafe(%q) = %v, want %v", kind, got, want)
 		}
 	}
 }
@@ -208,9 +236,10 @@ func TestAutoDiskOptions_ThickNoZeroesNoGranularity(t *testing.T) {
 
 // TestAutoDiskOptions_FileThin4KLoop_NoGranularity is the Q3-REGRESSION
 // pin: a FILE_THIN volume on a 4 KiB-discard loop device gets
-// discard-zeroes-if-aligned=no (loop-backed sparse file, NOT zero-discard
-// safe) AND — critically — NO rs-discard-granularity, EVEN THOUGH the
-// loop device reports DISC-GRAN=4096.
+// discard-zeroes-if-aligned=yes (loop punch-hole reads back zeros, and
+// the flag keeps the day0 fresh-attach bitmap clean — the r-full P1
+// regression pin) AND — critically — NO rs-discard-granularity, EVEN
+// THOUGH the loop device reports DISC-GRAN=4096.
 //
 // Why the granularity MUST be omitted here (the regression this fixes):
 // rendering rs-discard-granularity into a loop-backed FILE_THIN volume's
@@ -225,19 +254,19 @@ func TestAutoDiskOptions_ThickNoZeroesNoGranularity(t *testing.T) {
 // FULL-resyncs and wedges on FILE_THIN (loop). The e2e
 // respawn-standalone-wedge scenario failed for exactly this reason.
 //
-// So rs-discard-granularity is gated on the discard-zero-safe provider
-// set (LVM_THIN / ZFS / ZFS_THIN); FILE_THIN is excluded and renders only
-// the inert `discard-zeroes-if-aligned no` — exactly what main rendered
-// before the thin-aware-resync feature (a no-op disk option), preserving
-// the day0 skip + mkfs convergence.
+// So rs-discard-granularity is gated on the granularity-safe provider
+// set (LVM_THIN / ZFS / ZFS_THIN); FILE_THIN is excluded and renders
+// `discard-zeroes-if-aligned yes` only — semantically what main rendered
+// before #112 (the option was omitted and DRBD's compiled-in default is
+// yes), preserving the day0 skip + mkfs convergence.
 func TestAutoDiskOptions_FileThin4KLoop_NoGranularity(t *testing.T) {
 	fx := storage.NewFakeExec()
 	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "4096")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
 
-	if opts[diskOptDiscardZeroesAligned] != "no" {
-		t.Errorf("discard-zeroes-if-aligned = %q, want no (FILE_THIN)", opts[diskOptDiscardZeroesAligned])
+	if opts[diskOptDiscardZeroesAligned] != "yes" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want yes (FILE_THIN loop punch-hole)", opts[diskOptDiscardZeroesAligned])
 	}
 
 	if _, present := opts[diskOptRsDiscardGranularity]; present {
@@ -258,17 +287,17 @@ func TestAutoDiskOptions_FileThin4KLoop_NoGranularity(t *testing.T) {
 
 // TestAutoDiskOptions_FileThinZeroGranNothingUseful: a FILE_THIN volume
 // whose backing device reports DISC-GRAN=0 still gets only
-// discard-zeroes-if-aligned=no and NO granularity. (FILE_THIN is gated
+// discard-zeroes-if-aligned=yes and NO granularity. (FILE_THIN is gated
 // out of the granularity regardless of DISC-GRAN; this case just confirms
-// the rendered flag is the inert `no`.)
+// the rendered flag.)
 func TestAutoDiskOptions_FileThinZeroGranNothingUseful(t *testing.T) {
 	fx := storage.NewFakeExec()
 	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "0")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
 
-	if opts[diskOptDiscardZeroesAligned] != "no" {
-		t.Errorf("discard-zeroes-if-aligned = %q, want no", opts[diskOptDiscardZeroesAligned])
+	if opts[diskOptDiscardZeroesAligned] != "yes" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want yes", opts[diskOptDiscardZeroesAligned])
 	}
 
 	if _, present := opts[diskOptRsDiscardGranularity]; present {
@@ -359,11 +388,13 @@ func TestAutoDiskOptionsForResource_ThickNoZeroes(t *testing.T) {
 
 // TestAutoDiskOptionsForResource_FileThin4KLoop is the Q3-REGRESSION pin
 // at the resource level: FILE_THIN on a 4 KiB-discard loop yields ONLY
-// discard-zeroes-if-aligned=no and NO rs-discard-granularity. Rendering
+// discard-zeroes-if-aligned=yes and NO rs-discard-granularity. Rendering
 // the granularity on a loop-backed FILE_THIN volume regressed fresh-
 // create convergence on the mkfs/force-primary path (the e2e
-// respawn-standalone-wedge full-resync wedge); see
-// TestAutoDiskOptions_FileThin4KLoop_NoGranularity for the full rationale.
+// respawn-standalone-wedge full-resync wedge); rendering the zeroes flag
+// as `no` neutralised the day0 skip at attach (the r-full P1 512M
+// full-sync regression); see TestAutoDiskOptions_FileThin4KLoop_NoGranularity
+// for the full rationale.
 func TestAutoDiskOptionsForResource_FileThin4KLoop(t *testing.T) {
 	fx := storage.NewFakeExec()
 	device := "/var/lib/blockstor/pvc-1.img"
@@ -377,8 +408,8 @@ func TestAutoDiskOptionsForResource_FileThin4KLoop(t *testing.T) {
 	opts := rec.autoDiskOptionsForResource(context.Background(), drFor("pvc-1", "file1"),
 		map[int32]string{0: device})
 
-	if opts[diskOptDiscardZeroesAligned] != "no" {
-		t.Fatalf("FILE_THIN resource = %v; want discard-zeroes-if-aligned=no", opts)
+	if opts[diskOptDiscardZeroesAligned] != "yes" {
+		t.Fatalf("FILE_THIN resource = %v; want discard-zeroes-if-aligned=yes", opts)
 	}
 
 	if _, present := opts[diskOptRsDiscardGranularity]; present {
@@ -538,8 +569,10 @@ func TestBuildResFile_FileThinDay0SkipRender(t *testing.T) {
 		t.Fatalf("buildResFile: %v", err)
 	}
 
-	if !strings.Contains(body, "discard-zeroes-if-aligned no;") {
-		t.Errorf("missing discard-zeroes-if-aligned no; in FILE_THIN render:\n%s", body)
+	if !strings.Contains(body, "discard-zeroes-if-aligned yes;") {
+		t.Errorf("missing discard-zeroes-if-aligned yes; in FILE_THIN render "+
+			"(without it the kernel marks the fresh attach fully out-of-sync — "+
+			"day0 skip-initial-sync regression, r-full P1):\n%s", body)
 	}
 
 	if strings.Contains(body, "rs-discard-granularity") {
