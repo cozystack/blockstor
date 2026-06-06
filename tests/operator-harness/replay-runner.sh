@@ -49,6 +49,10 @@
 # Assertion kinds supported under "await":
 #
 #   - replica_count        wait until N replicas of rd exist with disk≠Diskless
+#   - replica_count_max    NEGATIVE assert: rd replica count never exceeds
+#                           `max`. Pair with `hold_s` to prove no background
+#                           reconcile materialises extra replicas (U222:
+#                           RG-reassignment is non-retroactive)
 #   - active_diskful_count wait until ≥ min ACTIVE diskful replicas exist
 #                           (excludes DISKLESS/TIE_BREAKER and INACTIVE;
 #                            Bug 393 — INACTIVE must not satisfy place_count)

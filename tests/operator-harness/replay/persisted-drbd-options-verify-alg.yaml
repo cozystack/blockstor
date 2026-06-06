@@ -1,0 +1,84 @@
+name: persisted-drbd-options-verify-alg
+description: |
+  Upstream-issue U337 / U302 — persisted DRBD-options must not break a
+  subsequent resource create, and a configured `verify-alg` must reach
+  the rendered `net { }` block VERBATIM.
+
+  Operator sequence (the real-world C-package report):
+
+    rd c <rd>
+    rd drbd-options --verify-alg crc32c <rd>     # persist a non-catalog
+    rd drbd-options --max-buffers 36864 <rd>     # net knob + a catalog one
+    vd c <rd> 32M
+    r c <node1> <rd> -s <sp>                      # create replicas AFTER
+    r c <node2> <rd> -s <sp>                      # the options were set
+
+  Convergence assertion: both replicas reach UpToDate (the persisted
+  options did NOT wedge the reconcile), AND `drbdsetup show <rd>` on
+  node1 reports `verify-alg crc32c` verbatim — proving the uncatalogued
+  Net key routed to net{} (SectionFor's prefix routing) rather than
+  falling through to the catch-all resource options{} block where
+  drbdadm would reject it.
+
+  crc32c is chosen because it is always available in the Linux kernel
+  crypto API (no extra module load needed on the stand nodes).
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: rd-set-verify-alg
+    cmd: ["resource-definition", "drbd-options", "--verify-alg", "crc32c", "{{rd}}"]
+    expect_exit: 0
+  - name: rd-set-max-buffers
+    cmd: ["resource-definition", "drbd-options", "--max-buffers", "36864", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: assert-verify-alg-verbatim
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: verify-alg
+      expected: crc32c
+      timeout_s: 120
+  - name: assert-max-buffers-rendered
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: max-buffers
+      expected: "36864"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

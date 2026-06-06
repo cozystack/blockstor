@@ -293,6 +293,28 @@ try:
 except: print(0)")
             [[ "$count" -ge "$min" ]]
             ;;
+        replica_count_max)
+            # Upstream-issue U222 (non-retroactive placement): assert the
+            # replica count of rd NEVER EXCEEDS `max`. This is a NEGATIVE
+            # assertion — pair it with `hold_s: <N>` so the await holds the
+            # "count <= max" condition for N consecutive seconds, proving no
+            # background reconcile materialised extra replicas (e.g. after an
+            # RD is reassigned to a higher-place-count RG, which must NOT
+            # auto-deploy). Mirrors replica_count's enumeration exactly, only
+            # the comparison flips to `-le`.
+            local rd max count
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            max=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('max',0))" "$spec")
+            count=$(linstor_cli -m resource list --resources "$rd" 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    while isinstance(d, list) and d and isinstance(d[0], list):
+        d=d[0]
+    print(len(d))
+except: print(0)")
+            [[ "$count" -le "$max" ]]
+            ;;
         active_diskful_count)
             # Bug 393: count replicas of rd that are ACTIVE diskful —
             # i.e. NOT DISKLESS / TIE_BREAKER (no backing disk) and NOT
