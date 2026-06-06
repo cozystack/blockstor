@@ -735,6 +735,102 @@ func TestNodeLostCascadeDeletesStoragePools(t *testing.T) {
 	}
 }
 
+// TestNodeLostWithLiveResourcesLeavesNoDanglingRefs pins
+// upstream-issue U173 (P2, "Referential-integrity violation on
+// `node lost`"): a `node lost` against a node that STILL HOLDS live
+// resources must COMPLETE — the Node CRD is gone AND no orphan
+// Resource / connection state is left referencing the lost node
+// that could block the delete or strand the name.
+//
+// Upstream LINSTOR (SQL-FK-backed) hit a foreign-key violation here
+// because the node row could not be deleted while child resource
+// rows still referenced it, so `node lost` could not complete.
+// blockstor is not SQL-FK-based, but the analog risk is real: a
+// surviving Resource CRD whose NodeName points at the deleted node
+// would dangle forever (the owning satellite is gone, so its
+// finalizer never runs — see handleNodeLost's cascade rationale)
+// and would brick the next RD-create that recycles the name/port.
+//
+// The cascade itself is pinned by
+// TestNodeLostCascadeDeletesResources / ...StoragePools; this test
+// pins the COMBINED referential-integrity outcome U173 cares about:
+// the node is deletable WITH live resources present, the Node CRD
+// is actually gone, and a post-lost scan of EVERY Resource in the
+// store finds NONE still referencing the lost node. The surviving
+// peer replicas are untouched (they carry quorum after the loss).
+//
+// The end-to-end stand assertion runs via
+// tests/operator-harness/replay/n-lost-live-resources-clean.yaml,
+// which re-registers the node in teardown so the shared stand is
+// left intact.
+func TestNodeLostWithLiveResourcesLeavesNoDanglingRefs(t *testing.T) {
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "lost-node"}); err != nil {
+		t.Fatalf("seed lost node: %v", err)
+	}
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "peer-node"}); err != nil {
+		t.Fatalf("seed peer node: %v", err)
+	}
+
+	// Two RDs, each with a live diskful replica on the lost node and
+	// a surviving peer replica. These are the "live resources" U173
+	// reports as blocking the delete.
+	for _, rd := range []string{"pvc-a", "pvc-b"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: rd, NodeName: "lost-node",
+		}); err != nil {
+			t.Fatalf("seed replica on lost node for %s: %v", rd, err)
+		}
+
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: rd, NodeName: "peer-node",
+		}); err != nil {
+			t.Fatalf("seed replica on peer node for %s: %v", rd, err)
+		}
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/nodes/lost-node/lost", nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	// 1. The call must COMPLETE (no FK-violation-style failure even
+	//    with live resources present).
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("node lost did not complete with live resources: got %d, want 200", resp.StatusCode)
+	}
+
+	// 2. The Node CRD is actually gone.
+	if _, err := st.Nodes().Get(ctx, "lost-node"); err == nil {
+		t.Error("lost-node Node CRD still present after node lost")
+	}
+
+	// 3. No Resource ANYWHERE still references the lost node — a full
+	//    store scan, which is the referential-integrity invariant
+	//    U173 is about (no dangling child rows).
+	all, err := st.Resources().List(ctx)
+	if err != nil {
+		t.Fatalf("list resources: %v", err)
+	}
+
+	for i := range all {
+		if all[i].NodeName == "lost-node" {
+			t.Errorf("dangling Resource %q still references lost-node after node lost", all[i].Name)
+		}
+	}
+
+	// 4. The surviving peer replicas are untouched — they keep quorum.
+	for _, rd := range []string{"pvc-a", "pvc-b"} {
+		if _, err := st.Resources().Get(ctx, rd, "peer-node"); err != nil {
+			t.Errorf("peer replica %s on peer-node missing after node lost: %v", rd, err)
+		}
+	}
+}
+
 // postEvacuateMulti sugar wraps the `POST /v1/nodes/evacuate` body
 // shape — `{"nodes":[...]}` — so individual tests stay focused on
 // the assertion under check, not on JSON plumbing.
