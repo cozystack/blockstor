@@ -1,0 +1,93 @@
+name: r-d-r-c-tiebreaker-node-swallow
+description: |
+  Bug 359, third interleaving — the SWALLOWED relocate create. After
+  `r d <second-diskful>` the Bug-338 carve-out collapses the orphan
+  TIE_BREAKER within one reconcile tick; an operator `r c <tb-node>`
+  landing while the witness CRD is mid-delete (deletionTimestamp set,
+  satellite finalizer pending) used to in-place "promote" the DYING row
+  — the patch succeeded, the deletion then removed it wholesale, the
+  CLI printed SUCCESS, and the RD ended with a single replica and no
+  witness. Reproduced live with a 0.25 s CRD sampler:
+
+    12:03:57.88  r d lands (deletionTimestamp on the diskful row)
+    12:03:58.36  witness row flips [DISKLESS,TIE_BREAKER,DELETE]
+    12:03:58.56  r c <tb-node> returns SUCCESS
+    12:03:58.85  witness row GONE — and the r c'd replica with it
+
+  The fix routes a promote against a DELETE-flagged row into the
+  Bug-359 retry loop, so the next attempt's Create lands fresh after
+  the finalizer strip. This workflow pins the converged end state: the
+  r c'd replica EXISTS and is diskful, and the witness machinery
+  re-spawns a TIE_BREAKER on the vacated node.
+
+  Explicit node placement (not autoplace) so the TB lands
+  deterministically on node3 and the raced `r c` targets it verbatim.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  rd: tb-swallow
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    # 2 diskful → the auto-tiebreaker spawns on node3 (the only free
+    # worker) — the deterministic target for the raced r c below.
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: r-d-node2
+    # NO await — the very next step must land inside the witness
+    # collapse window this scenario exists to race.
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+  - name: r-c-tb-node-immediately
+    # Bare form (no --storage-pool): the upstream toggle-disk shape;
+    # the pool resolves from the surviving diskful sibling.
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # THE swallow detector: the created replica must actually exist
+      # and converge diskful-UpToDate. Pre-fix the create returned
+      # SUCCESS while the row vanished with the dying witness, so this
+      # await timed out with the resource absent.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node3}}"
+      expected: UpToDate
+      timeout_s: 120
+  - name: tiebreaker-respawns
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: settle-all-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 60
+      hold_s: 10
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
