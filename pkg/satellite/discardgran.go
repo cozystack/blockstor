@@ -52,8 +52,9 @@ const (
 	diskOptRsDiscardGranularity = "rs-discard-granularity"
 	diskOptDiscardZeroesAligned = "discard-zeroes-if-aligned"
 
-	// drbdYes is DRBD's affirmative value for a boolean disk option.
+	// drbdYes / drbdNo are DRBD's boolean disk-option values.
 	drbdYes = "yes"
+	drbdNo  = "no"
 )
 
 // DRBD's accepted bounds for rs-discard-granularity. Mirrors upstream
@@ -72,17 +73,23 @@ const (
 // resource-scope `disk { }` block (which DRBD applies to every
 // volume).
 //
-// It probes each local diskful volume's backing device and is
-// deliberately CONSERVATIVE for the (today hypothetical) multi-volume
-// case: the options are emitted only when EVERY local diskful volume's
-// provider is discard-zero-safe; if any volume is thick/file/unknown
-// the whole block is omitted (safe full resync for all). The
-// rs-discard-granularity, when present, is the SMALLEST across the
-// volumes so the single resource-scope value stays a valid multiple of
-// every device's discard granularity — never producing an UNDER-aligned
-// UNMAP. A volume whose device can't be probed simply contributes no
-// granularity (discard-zeroes-if-aligned still applies; DRBD falls back
-// to a full copy where it can't discard).
+// It probes each local diskful volume's backing device. Each volume
+// contributes a discard-zeroes-if-aligned flag (yes/no per provider
+// kind) and, for the discard-zero-safe BLOCK-device provider set
+// (LVM_THIN / ZFS / ZFS_THIN) whose device reports a non-zero discard
+// granularity, an rs-discard-granularity value. Loop-backed FILE_THIN is
+// excluded from the granularity (see autoDiskOptions for the loop+mkfs
+// wedge rationale).
+//
+// The resource-scope collapse is CONSERVATIVE for the (today
+// hypothetical) multi-volume case (mergeResourceDiscardOptions):
+// discard-zeroes-if-aligned is "yes" only when EVERY volume is
+// discard-zero-safe (one "no" pins the resource to "no"); the
+// rs-discard-granularity is the SMALLEST across the volumes so the
+// single resource-scope value stays a valid multiple of every device's
+// discard granularity — never an UNDER-aligned UNMAP. A volume whose
+// device can't be probed simply contributes no granularity (DRBD falls
+// back to a full copy where it can't discard).
 //
 // A diskless local replica (no diskful volumes) returns nil — there is
 // no backing device to discard against.
@@ -114,11 +121,6 @@ func (r *Reconciler) autoDiskOptionsForResource(
 		device := devices[vol.GetVolumeNumber()]
 
 		volOpts := autoDiskOptions(ctx, exec, provider.Kind(), device)
-		if len(volOpts) == 0 {
-			// This volume is not discard-zero-safe — omit the whole
-			// block so no volume gets an unsafe option.
-			return nil
-		}
 
 		mergeResourceDiscardOptions(out, volOpts)
 
@@ -133,21 +135,34 @@ func (r *Reconciler) autoDiskOptionsForResource(
 }
 
 // mergeResourceDiscardOptions folds one volume's auto disk options into
-// the resource-scope accumulator. discard-zeroes-if-aligned is a flat
-// flag (all discard-zero-safe volumes set "yes").
-// rs-discard-granularity collapses to the SMALLEST seen value so the
-// single resource-scope number is a valid multiple of every volume's
-// backing-device granularity.
+// the resource-scope accumulator (a single `disk { }` block DRBD applies
+// to every volume of the resource):
+//
+//   - discard-zeroes-if-aligned collapses CONSERVATIVELY to "yes" only
+//     when EVERY volume is discard-zero-safe; a single "no" volume pins
+//     the whole resource to "no". Otherwise a thick/file volume sharing
+//     the resource could be told an aligned discard yields zero when it
+//     does not — a data-safety violation. (Today resources are
+//     single-volume, but the merge must stay safe for the multi-volume
+//     future.)
+//   - rs-discard-granularity collapses to the SMALLEST seen value so the
+//     single resource-scope number stays a valid multiple of every
+//     volume's backing-device granularity (never an UNDER-aligned UNMAP).
 func mergeResourceDiscardOptions(acc, volOpts map[string]string) {
 	for key, val := range volOpts {
-		if key != diskOptRsDiscardGranularity {
-			acc[key] = val
-
-			continue
-		}
-
-		prev, have := acc[key]
-		if !have || smallerNumeric(val, prev) {
+		switch key {
+		case diskOptRsDiscardGranularity:
+			prev, have := acc[key]
+			if !have || smallerNumeric(val, prev) {
+				acc[key] = val
+			}
+		case diskOptDiscardZeroesAligned:
+			// "no" wins: once any volume is unsafe the resource flag
+			// must stay "no". Only set "yes" if not yet pinned to "no".
+			if acc[key] != drbdNo {
+				acc[key] = val
+			}
+		default:
 			acc[key] = val
 		}
 	}
@@ -172,54 +187,100 @@ func smallerNumeric(left, right string) bool {
 // (sans the `DrbdOptions/Disk/` prefix) ready to merge into the
 // rendered `disk { }` block.
 //
+// Both options are gated on the SAME discard-zero-safe provider set
+// (LVM_THIN / ZFS / ZFS_THIN). discard-zeroes-if-aligned mirrors
+// upstream's CtrlRscCrtApiHelper switch; rs-discard-granularity is
+// additionally gated on that set rather than on the device's reported
+// DISC-GRAN alone — see autoDiskOptions's inline rationale: a loop-
+// backed FILE_THIN device reports DISC-GRAN=4096 but rendering
+// rs-discard-granularity there REGRESSES fresh-create convergence on
+// the mkfs/force-primary path (the wedge that broke the e2e
+// respawn-standalone-wedge scenario). Keeping the option on real
+// block-device thin/ZFS pools retains the genuine thin-aware-resync win
+// (partially-written volume resyncs ~only the written bytes) where it is
+// both safe and effective.
+//
 // Data-safety contract — the optimisation may ONLY skip provably-zero
-// ranges (thin discard), NEVER any written data. The gates here are
-// the same ones upstream LINSTOR uses:
+// ranges (thin discard), NEVER any written data:
 //
-//   - discard-zeroes-if-aligned is enabled ONLY for provider kinds
-//     whose backing device deterministically reads/discards as zero in
-//     an ALIGNED region: LVM_THIN, ZFS, ZFS_THIN. NOT for FILE_THIN
-//     (loop-backed sparse files do not reliably honour aligned discard
-//     → zero), NOT for thick LVM / plain FILE / DISKLESS. This matches
-//     upstream's CtrlRscCrtApiHelper provider switch exactly. Note we
-//     deliberately do NOT reuse IsThinOrZFS here: that helper includes
-//     FILE_THIN (correct for the seed-GI skip-sync gate) but FILE_THIN
-//     must NOT get discard-zeroes-if-aligned.
+//   - discard-zeroes-if-aligned is `yes` ONLY for provider kinds whose
+//     backing device deterministically reads/discards as zero in an
+//     ALIGNED region: LVM_THIN, ZFS, ZFS_THIN. For every other kind
+//     (FILE_THIN loop-backed sparse file, thick LVM, plain FILE,
+//     unknown) it is `no` — matching upstream's CtrlRscCrtApiHelper
+//     switch, which renders an explicit `no`. Note we deliberately do
+//     NOT reuse IsThinOrZFS here: that helper includes FILE_THIN
+//     (correct for the seed-GI skip-sync gate) but FILE_THIN must NOT
+//     get discard-zeroes-if-aligned=yes.
 //
-//   - rs-discard-granularity is set ONLY when the backing block device
-//     actually reports a non-zero discard granularity (lsblk DISC-GRAN
-//     > 0). A device that reports 0 does not support discard — setting
-//     a non-zero granularity there would make drbdsetup reject the
-//     option (or, worse, attempt unsupported UNMAPs). When the
-//     granularity can't be determined or is 0, we OMIT the key
-//     entirely and DRBD falls back to a full byte-copy resync — always
-//     safe.
+//   - rs-discard-granularity is set ONLY for the discard-zero-safe
+//     provider set AND when the backing block device reports a non-zero
+//     discard granularity (lsblk DISC-GRAN > 0). A device reporting 0
+//     does not support discard — emitting a non-zero granularity there
+//     would make drbdsetup reject the option, so we OMIT the key and
+//     DRBD falls back to a full byte-copy resync. FILE_THIN is excluded
+//     even though its loop backing reports a non-zero DISC-GRAN (see the
+//     inline mkfs/loop wedge rationale below).
 //
-// When in doubt the map omits a key (full transfer), never the
-// reverse. An empty/nil return means "render no auto disk options".
+// When in doubt the map omits the granularity key (full transfer),
+// never the reverse. The discard-zeroes flag is ALWAYS present (yes or
+// no), mirroring upstream which renders it explicitly. An empty return
+// would mean "render no disk block"; this function returns at least the
+// discard-zeroes flag for any diskful volume, so the block renders
+// whenever a backing device is present.
 func autoDiskOptions(
 	ctx context.Context,
 	exec storage.Exec,
 	providerKind string,
 	devicePath string,
 ) map[string]string {
-	if !discardZeroesIfAligned(providerKind) {
-		// Thick LVM / plain FILE / FILE_THIN / DISKLESS / unknown:
-		// the backing device cannot be trusted to discard-to-zero on
-		// an aligned range. Emit nothing — DRBD keeps its safe
-		// full-copy resync.
-		return nil
+	zeroesVal := drbdNo
+	if discardZeroesIfAligned(providerKind) {
+		zeroesVal = drbdYes
 	}
 
 	out := map[string]string{
-		diskOptDiscardZeroesAligned: drbdYes,
+		diskOptDiscardZeroesAligned: zeroesVal,
+	}
+
+	// rs-discard-granularity is emitted ONLY for a discard-zero-safe
+	// provider kind — i.e. a real block device whose aligned discard
+	// deterministically reads back zero (LVM_THIN / ZFS / ZFS_THIN).
+	//
+	// WHY this is gated on the SAME provider set as discard-zeroes (and
+	// NOT, as an earlier revision did, on the device's reported
+	// DISC-GRAN alone): a loop-backed FILE_THIN volume reports a non-zero
+	// lsblk DISC-GRAN (4096 on the stand) yet rendering
+	// rs-discard-granularity into its `disk { }` block REGRESSES the
+	// fresh-create convergence. When the elected day0 winner force-
+	// primaries to run `mkfs` (the FileSystem/Type path), mkfs issues a
+	// full-device discard; on the loop backing — which has a documented
+	// DRBD kernel write-path interaction (see tests/e2e/lib.sh) — that
+	// discard storm, with rs-discard-granularity active, dirties the
+	// bitmap relative to the day0-seeded peers and forces a FULL initial
+	// SyncTarget that then wedges (PausedSyncT dependency between the two
+	// targets). Proven on the dev stand + CI: an identical 3-replica
+	// create with FileSystem/Type=ext4 CONVERGES INSTANTLY on LVM_THIN
+	// (real block device, same full disk block) but FULL-resyncs and
+	// wedges on FILE_THIN (loop). The e2e `respawn-standalone-wedge`
+	// scenario (FILE_THIN + mkfs) failed for exactly this reason; the
+	// `replica-add-no-resync` scenario (FILE_THIN, NO mkfs) passed, so
+	// the trigger is the mkfs-discard × loop × rs-discard-granularity
+	// interaction, not the option in isolation.
+	//
+	// For FILE_THIN we therefore render only `discard-zeroes-if-aligned
+	// no` (DRBD's inert default) and OMIT the granularity — DRBD then
+	// does a full byte-copy resync on the rare loop relocate, which is
+	// always correct, while the day0 skip + mkfs convergence is
+	// preserved. The genuine thin-aware-resync win is retained where it
+	// is both safe AND effective: the real block-device thin/ZFS pools.
+	if !discardZeroesIfAligned(providerKind) {
+		return out
 	}
 
 	// Only attempt the granularity when we have a real device path to
 	// probe. A diskless local replica (devicePath == "") has no
-	// backing device — discard-zeroes-if-aligned alone is harmless
-	// (it governs how DRBD treats discards it receives) and we skip
-	// the granularity probe.
+	// backing device — skip the granularity probe.
 	if devicePath == "" {
 		return out
 	}

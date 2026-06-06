@@ -182,35 +182,97 @@ func TestAutoDiskOptions_ProbeFailureOmitsGranularity(t *testing.T) {
 	}
 }
 
-// TestAutoDiskOptions_ThickOmitsEverything: thick LVM is NOT
-// discard-zero safe — NO disk options at all (full safe resync). The
-// device is never even probed.
-func TestAutoDiskOptions_ThickOmitsEverything(t *testing.T) {
+// TestAutoDiskOptions_ThickNoZeroesNoGranularity: thick LVM is NOT
+// discard-zero safe → discard-zeroes-if-aligned=no, AND it gets NO
+// rs-discard-granularity. rs-discard-granularity is gated on the
+// discard-zero-safe provider set (LVM_THIN / ZFS / ZFS_THIN); a thick
+// LV is excluded even when its device reports a non-zero DISC-GRAN,
+// because an aligned discard on thick storage does NOT deterministically
+// read back zero — UNMAPping a region there during resync could expose
+// stale bytes as zeros (and it is also part of the loop/FILE_THIN
+// fresh-create regression class this gate closes).
+func TestAutoDiskOptions_ThickNoZeroesNoGranularity(t *testing.T) {
 	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/dev/vg/pvc-1_00000", "65536")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindLVM, "/dev/vg/pvc-1_00000")
 
-	if len(opts) != 0 {
-		t.Errorf("thick LVM produced disk options %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no (thick)", opts[diskOptDiscardZeroesAligned])
 	}
 
-	for _, line := range fx.CommandLines() {
-		if strings.HasPrefix(line, "lsblk") {
-			t.Errorf("thick LVM probed the device (%q); want no probe", line)
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Errorf("rs-discard-granularity present (%q) for thick LVM; want omitted", opts[diskOptRsDiscardGranularity])
+	}
+}
+
+// TestAutoDiskOptions_FileThin4KLoop_NoGranularity is the Q3-REGRESSION
+// pin: a FILE_THIN volume on a 4 KiB-discard loop device gets
+// discard-zeroes-if-aligned=no (loop-backed sparse file, NOT zero-discard
+// safe) AND — critically — NO rs-discard-granularity, EVEN THOUGH the
+// loop device reports DISC-GRAN=4096.
+//
+// Why the granularity MUST be omitted here (the regression this fixes):
+// rendering rs-discard-granularity into a loop-backed FILE_THIN volume's
+// disk block breaks fresh-create convergence. When the elected day0
+// winner force-primaries to run mkfs (the FileSystem/Type path), mkfs
+// issues a full-device discard; on the loop backing — which has a
+// documented DRBD kernel write-path interaction — that discard storm,
+// with rs-discard-granularity active, dirties the bitmap relative to the
+// day0-seeded peers and forces a FULL initial SyncTarget that then wedges.
+// Proven on stand+CI: an identical 3-replica create + mkfs CONVERGES
+// INSTANTLY on LVM_THIN (real block device, same disk block) but
+// FULL-resyncs and wedges on FILE_THIN (loop). The e2e
+// respawn-standalone-wedge scenario failed for exactly this reason.
+//
+// So rs-discard-granularity is gated on the discard-zero-safe provider
+// set (LVM_THIN / ZFS / ZFS_THIN); FILE_THIN is excluded and renders only
+// the inert `discard-zeroes-if-aligned no` — exactly what main rendered
+// before the thin-aware-resync feature (a no-op disk option), preserving
+// the day0 skip + mkfs convergence.
+func TestAutoDiskOptions_FileThin4KLoop_NoGranularity(t *testing.T) {
+	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "4096")
+
+	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
+
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no (FILE_THIN)", opts[diskOptDiscardZeroesAligned])
+	}
+
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Errorf("rs-discard-granularity present (%q) for loop-backed FILE_THIN; want OMITTED "+
+			"(breaks fresh-create+mkfs convergence — see respawn-standalone-wedge regression)",
+			opts[diskOptRsDiscardGranularity])
+	}
+
+	// FILE_THIN must NOT probe lsblk at all for the granularity — the
+	// provider-kind gate short-circuits before the probe. (The probe is
+	// still harmless, but pinning no-probe documents the gate order.)
+	for _, cl := range fx.CommandLines() {
+		if strings.Contains(cl, "lsblk") {
+			t.Errorf("FILE_THIN probed lsblk (%q); the provider gate should short-circuit before the probe", cl)
 		}
 	}
 }
 
-// TestAutoDiskOptions_FileThinOmitsEverything: FILE_THIN is excluded
-// from discard-zeroes-if-aligned (loop-backed sparse file) — no disk
-// options, matching upstream's `no` for FILE_THIN.
-func TestAutoDiskOptions_FileThinOmitsEverything(t *testing.T) {
+// TestAutoDiskOptions_FileThinZeroGranNothingUseful: a FILE_THIN volume
+// whose backing device reports DISC-GRAN=0 still gets only
+// discard-zeroes-if-aligned=no and NO granularity. (FILE_THIN is gated
+// out of the granularity regardless of DISC-GRAN; this case just confirms
+// the rendered flag is the inert `no`.)
+func TestAutoDiskOptions_FileThinZeroGranNothingUseful(t *testing.T) {
 	fx := storage.NewFakeExec()
+	discGranResponse(fx, "/var/lib/blockstor/pvc-1.img", "0")
 
 	opts := autoDiskOptions(context.Background(), fx, ProviderKindFileThin, "/var/lib/blockstor/pvc-1.img")
 
-	if len(opts) != 0 {
-		t.Errorf("FILE_THIN produced disk options %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Errorf("discard-zeroes-if-aligned = %q, want no", opts[diskOptDiscardZeroesAligned])
+	}
+
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Errorf("rs-discard-granularity present (%q) for FILE_THIN; want omitted", opts[diskOptRsDiscardGranularity])
 	}
 }
 
@@ -269,10 +331,14 @@ func TestAutoDiskOptionsForResource_ZfsThin(t *testing.T) {
 	}
 }
 
-// TestAutoDiskOptionsForResource_ThickNil: a thick LVM pool yields no
-// auto disk options.
-func TestAutoDiskOptionsForResource_ThickNil(t *testing.T) {
+// TestAutoDiskOptionsForResource_ThickNoZeroes: a thick LVM pool yields
+// discard-zeroes-if-aligned=no and NO rs-discard-granularity — the
+// granularity is gated on the discard-zero-safe provider set, which
+// excludes thick LVM.
+func TestAutoDiskOptionsForResource_ThickNoZeroes(t *testing.T) {
 	fx := storage.NewFakeExec()
+	device := "/dev/vg/pvc-1_00000"
+	discGranResponse(fx, device, "65536")
 	prov := lvm.NewThick(lvm.ThickConfig{VolumeGroup: "vg"}, fx)
 	rec := NewReconciler(ReconcilerConfig{
 		Providers: map[string]storage.Provider{"thick1": prov},
@@ -280,17 +346,28 @@ func TestAutoDiskOptionsForResource_ThickNil(t *testing.T) {
 	})
 
 	opts := rec.autoDiskOptionsForResource(context.Background(), drFor("pvc-1", "thick1"),
-		map[int32]string{0: "/dev/vg/pvc-1_00000"})
+		map[int32]string{0: device})
 
-	if len(opts) != 0 {
-		t.Fatalf("thick LVM resource produced %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Fatalf("thick LVM resource = %v; want discard-zeroes-if-aligned=no", opts)
+	}
+
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Fatalf("thick LVM resource carries rs-discard-granularity (%v); want omitted", opts)
 	}
 }
 
-// TestAutoDiskOptionsForResource_FileThinNil: FILE_THIN yields no auto
-// disk options (excluded from discard-zeroes-if-aligned).
-func TestAutoDiskOptionsForResource_FileThinNil(t *testing.T) {
+// TestAutoDiskOptionsForResource_FileThin4KLoop is the Q3-REGRESSION pin
+// at the resource level: FILE_THIN on a 4 KiB-discard loop yields ONLY
+// discard-zeroes-if-aligned=no and NO rs-discard-granularity. Rendering
+// the granularity on a loop-backed FILE_THIN volume regressed fresh-
+// create convergence on the mkfs/force-primary path (the e2e
+// respawn-standalone-wedge full-resync wedge); see
+// TestAutoDiskOptions_FileThin4KLoop_NoGranularity for the full rationale.
+func TestAutoDiskOptionsForResource_FileThin4KLoop(t *testing.T) {
 	fx := storage.NewFakeExec()
+	device := "/var/lib/blockstor/pvc-1.img"
+	discGranResponse(fx, device, "4096")
 	prov := file.NewProvider(file.Config{Dir: t.TempDir(), Thin: true}, fx)
 	rec := NewReconciler(ReconcilerConfig{
 		Providers: map[string]storage.Provider{"file1": prov},
@@ -298,10 +375,15 @@ func TestAutoDiskOptionsForResource_FileThinNil(t *testing.T) {
 	})
 
 	opts := rec.autoDiskOptionsForResource(context.Background(), drFor("pvc-1", "file1"),
-		map[int32]string{0: "/var/lib/blockstor/pvc-1.img"})
+		map[int32]string{0: device})
 
-	if len(opts) != 0 {
-		t.Fatalf("FILE_THIN resource produced %v; want none", opts)
+	if opts[diskOptDiscardZeroesAligned] != "no" {
+		t.Fatalf("FILE_THIN resource = %v; want discard-zeroes-if-aligned=no", opts)
+	}
+
+	if _, present := opts[diskOptRsDiscardGranularity]; present {
+		t.Fatalf("FILE_THIN resource carries rs-discard-granularity (%v); want OMITTED "+
+			"(loop+mkfs fresh-create wedge regression)", opts)
 	}
 }
 
@@ -404,6 +486,110 @@ func TestBuildResFile_RendersDiscardDiskBlock(t *testing.T) {
 
 	if !strings.Contains(body, "rs-discard-granularity 16384;") {
 		t.Errorf("missing rs-discard-granularity in:\n%s", body)
+	}
+}
+
+// TestBuildResFile_FileThinDay0SkipRender is the END-TO-END Q3-REGRESSION
+// pin: a FILE_THIN-on-4K-loop volume, driven through the REAL
+// autoDiskOptionsForResource gate (not a hand-built map), renders a
+// `.res` whose disk block carries `discard-zeroes-if-aligned no;` but
+// NEVER `rs-discard-granularity`. This is the render that preserves
+// blockstor's day0 GI-skip + mkfs/force-primary convergence on loop-
+// backed FILE_THIN.
+//
+// REGRESSION CONTEXT: a prior revision rendered `rs-discard-granularity
+// 4096;` into this exact block (the loop reports DISC-GRAN=4096). On a
+// fresh 3-replica create whose elected winner force-primaries to run
+// mkfs, that option turned the day0-skip into a FULL initial SyncTarget
+// that wedged — the e2e respawn-standalone-wedge failure. The same disk
+// block is INERT on a real block device (LVM_THIN converges instantly),
+// so the granularity is gated to the discard-zero-safe block-device
+// providers and OMITTED for loop-backed FILE_THIN. This test renders the
+// .res through the production path so a re-decoupling that re-introduces
+// the granularity fails here at L1.
+func TestBuildResFile_FileThinDay0SkipRender(t *testing.T) {
+	fx := storage.NewFakeExec()
+	device := "/var/lib/blockstor/pvc-ft.img"
+	discGranResponse(fx, device, "4096")
+	prov := file.NewProvider(file.Config{Dir: t.TempDir(), Thin: true}, fx)
+	rec := NewReconciler(ReconcilerConfig{
+		Providers: map[string]storage.Provider{"file1": prov},
+		Exec:      fx,
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-ft",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "file1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+	devices := map[int32]string{0: device}
+
+	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
+
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	if err != nil {
+		t.Fatalf("buildResFile: %v", err)
+	}
+
+	if !strings.Contains(body, "discard-zeroes-if-aligned no;") {
+		t.Errorf("missing discard-zeroes-if-aligned no; in FILE_THIN render:\n%s", body)
+	}
+
+	if strings.Contains(body, "rs-discard-granularity") {
+		t.Errorf("FILE_THIN render carries rs-discard-granularity — day0-skip/mkfs convergence "+
+			"REGRESSION (respawn-standalone-wedge):\n%s", body)
+	}
+}
+
+// TestBuildResFile_LvmThinDay0SkipRender is the positive counterpart:
+// a REAL block-device thin provider (LVM_THIN) DOES get
+// `rs-discard-granularity` rendered (the genuine thin-aware-resync win is
+// retained where it is safe + effective). Together with the FILE_THIN
+// pin above this nails the provider-gate boundary at L1.
+func TestBuildResFile_LvmThinDay0SkipRender(t *testing.T) {
+	fx := storage.NewFakeExec()
+	device := "/dev/vg/pvc-lt_00000"
+	discGranResponse(fx, device, "65536")
+	prov := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "pool"}, fx)
+	rec := NewReconciler(ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": prov},
+		Exec:      fx,
+	})
+
+	dr := &intent.DesiredResource{
+		Name:     "pvc-lt",
+		NodeName: "n1",
+		Volumes: []*intent.DesiredVolume{
+			{VolumeNumber: 0, SizeKib: 1024 * 1024, StoragePool: "thin1"},
+		},
+		Peers: []intent.DesiredPeer{{Name: "n2"}},
+		DrbdOptions: map[string]string{
+			"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			"peer.n2.address": "10.0.0.2", "peer.n2.node-id": "1", "peer.n2.port": "7000",
+		},
+	}
+	devices := map[int32]string{0: device}
+
+	autoDisk := rec.autoDiskOptionsForResource(context.Background(), dr, devices)
+
+	body, err := buildResFile(dr, "n1", "10.0.0.1", devices, autoDisk)
+	if err != nil {
+		t.Fatalf("buildResFile: %v", err)
+	}
+
+	if !strings.Contains(body, "discard-zeroes-if-aligned yes;") {
+		t.Errorf("missing discard-zeroes-if-aligned yes; in LVM_THIN render:\n%s", body)
+	}
+
+	if !strings.Contains(body, "rs-discard-granularity 65536;") {
+		t.Errorf("LVM_THIN render missing rs-discard-granularity (thin-aware-resync win lost):\n%s", body)
 	}
 }
 

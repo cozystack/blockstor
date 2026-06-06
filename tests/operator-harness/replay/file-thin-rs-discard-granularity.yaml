@@ -1,0 +1,92 @@
+name: file-thin-rs-discard-granularity
+description: |
+  Corner-case Q3 (FILE_THIN disk-block render) + its fresh-create
+  convergence REGRESSION guard, at the operator-CLI level.
+
+  The thin-aware-resync feature renders `discard-zeroes-if-aligned` +
+  `rs-discard-granularity` into the DRBD disk block so a partially-written
+  THIN volume resyncs only the written bytes. That win is gated to the
+  discard-zero-safe BLOCK-device providers (LVM_THIN / ZFS / ZFS_THIN).
+
+  A loop-backed FILE_THIN volume reports a non-zero lsblk DISC-GRAN (4096)
+  but rendering `rs-discard-granularity` there REGRESSED fresh-create
+  convergence: when the elected day0 winner force-primaries to run mkfs
+  (the FileSystem/Type path), mkfs issues a full-device discard; on the
+  loop backing that discard storm, with rs-discard-granularity active,
+  dirtied the bitmap relative to the day0-seeded peers and forced a FULL
+  initial SyncTarget that wedged (the e2e respawn-standalone-wedge
+  failure). The identical create converges instantly on LVM_THIN, so the
+  option is gated OUT of loop-backed FILE_THIN.
+
+  This workflow asserts, at the operator-CLI level, that on FILE_THIN:
+
+    1. discard-zeroes-if-aligned is `no` (provider gate unchanged);
+    2. rs-discard-granularity is ABSENT from the live DRBD config
+       (drbdsetup show); and
+    3. a 2nd diskful replica added to the fresh RD converges cleanly via
+       the day0 skip (sync_clean — no full resync of the empty device).
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: set-filesystem-type
+    cmd: ["resource-definition", "set-property", "{{rd}}", "FileSystem/Type", "ext4"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+  - name: r-c-diskful-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 120
+  - name: assert-discard-zeroes-no
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: "discard-zeroes-if-aligned"
+      expected: "no"
+      timeout_s: 60
+  - name: assert-rs-discard-granularity-absent
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # rs-discard-granularity must NOT appear in `drbdsetup show` for a
+      # loop-backed FILE_THIN volume — its absence makes `actual` empty,
+      # matching expected "". A re-decoupling that re-introduces it would
+      # make actual=4096 != "" and fail here.
+      kind: drbd_option
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      key: "rs-discard-granularity"
+      expected: ""
+      timeout_s: 60
+  - name: r-c-diskful-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: sync_clean
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 300
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
