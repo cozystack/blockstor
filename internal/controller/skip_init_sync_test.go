@@ -431,3 +431,99 @@ func TestSkipInitSyncStampedAlongsideNodeID(t *testing.T) {
 		t.Errorf("fresh RD replica must stamp SkipInitialSync=true alongside node-id, got false")
 	}
 }
+
+// TestSkipInitSyncLatchRequiresObservedGI pins the strict (proven-GI)
+// latch gate: an UpToDate diskful peer whose CurrentGI has NOT yet
+// been observed (the observer's get-gi backfill is best-effort and the
+// first status write can carry DiskState without it) must NOT flip the
+// append-only RD.Spec.Initialized latch. Firing on that transient
+// window permanently poisoned a never-written RD: every later
+// re-created replica was stamped SkipInitialSync=false and full-synced
+// the empty volume (the r-full Phase-2 `r d` -> bare `r c` flake). The
+// missed latch self-corrects: the next status-driven reconcile sees
+// the backfilled (real, past-day0) CurrentGI and latches then — the
+// second half of this test.
+func TestSkipInitSyncLatchRequiresObservedGI(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+
+	const (
+		rdName  = "latch-gi-rd"
+		node    = "n1"
+		resName = rdName + "." + node
+	)
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024},
+			},
+		},
+	}
+
+	// UpToDate diskful replica with an EMPTY CurrentGI — the transient
+	// first-status window of a brand-new day0 winner.
+	res := &blockstoriov1alpha1.Resource{
+		ObjectMeta: metav1.ObjectMeta{Name: resName},
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: rdName,
+			NodeName:               node,
+		},
+		Status: blockstoriov1alpha1.ResourceStatus{
+			Volumes: []blockstoriov1alpha1.ResourceVolumeStatus{
+				{
+					VolumeNumber: 0,
+					DiskState:    string(drbd.DiskStateUpToDate),
+					CurrentGI:    "", // not yet observed
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(
+			&blockstoriov1alpha1.Resource{},
+			&blockstoriov1alpha1.ResourceDefinition{},
+		).
+		WithObjects(rd, res).
+		Build()
+
+	rec := &controllerpkg.ResourceReconciler{Client: cli, Scheme: scheme}
+
+	reconcileToSteadyState(t, ctx, rec, resName)
+
+	gotRD := &blockstoriov1alpha1.ResourceDefinition{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, gotRD); err != nil {
+		t.Fatalf("get rd: %v", err)
+	}
+
+	if gotRD.Spec.Initialized != nil && *gotRD.Spec.Initialized {
+		t.Fatal("RD latched initialized=true on an UpToDate peer with UNOBSERVED CurrentGI — " +
+			"the transient first-status window must not poison the append-only latch")
+	}
+
+	// Backfill lands: the same volume now reports a real, past-day0
+	// CurrentGI. The next reconcile must latch.
+	gotRes := &blockstoriov1alpha1.Resource{}
+	if err := cli.Get(ctx, client.ObjectKey{Name: resName}, gotRes); err != nil {
+		t.Fatalf("get res: %v", err)
+	}
+
+	gotRes.Status.Volumes[0].CurrentGI = "DEADBEEFCAFEBABE"
+	if err := cli.Status().Update(ctx, gotRes); err != nil {
+		t.Fatalf("update status: %v", err)
+	}
+
+	reconcileToSteadyState(t, ctx, rec, resName)
+
+	if err := cli.Get(ctx, client.ObjectKey{Name: rdName}, gotRD); err != nil {
+		t.Fatalf("get rd after backfill: %v", err)
+	}
+
+	if gotRD.Spec.Initialized == nil || !*gotRD.Spec.Initialized {
+		t.Fatal("RD must latch initialized=true once the peer's real (past-day0) CurrentGI is observed")
+	}
+}

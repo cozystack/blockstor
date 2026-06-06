@@ -187,33 +187,42 @@ func smallerNumeric(left, right string) bool {
 // (sans the `DrbdOptions/Disk/` prefix) ready to merge into the
 // rendered `disk { }` block.
 //
-// Both options are gated on the SAME discard-zero-safe provider set
-// (LVM_THIN / ZFS / ZFS_THIN). discard-zeroes-if-aligned mirrors
-// upstream's CtrlRscCrtApiHelper switch; rs-discard-granularity is
-// additionally gated on that set rather than on the device's reported
-// DISC-GRAN alone — see autoDiskOptions's inline rationale: a loop-
-// backed FILE_THIN device reports DISC-GRAN=4096 but rendering
-// rs-discard-granularity there REGRESSES fresh-create convergence on
-// the mkfs/force-primary path (the wedge that broke the e2e
-// respawn-standalone-wedge scenario). Keeping the option on real
-// block-device thin/ZFS pools retains the genuine thin-aware-resync win
-// (partially-written volume resyncs ~only the written bytes) where it is
-// both safe and effective.
+// The two options have DIFFERENT provider gates (deliberately
+// decoupled both ways):
+//
+//   - discard-zeroes-if-aligned (discardZeroesIfAligned): the
+//     discard-reads-back-zero set — LVM_THIN / ZFS / ZFS_THIN /
+//     FILE_THIN. FILE_THIN's `yes` is an intentional divergence from
+//     upstream's explicit `no` (known-deltas row 76): loop punch-hole
+//     reads back zeros by contract, and the flag is what lets the
+//     kernel treat a fresh replica's whole device (la_size 0 → size)
+//     as "assumed zeroed" at attach — without it the bitmap comes up
+//     fully set and the day0 GI skip-initial-sync seed is neutralised
+//     (every fresh FILE_THIN create full-syncs; the r-full P1 512M
+//     regression).
+//
+//   - rs-discard-granularity (rsDiscardGranularitySafe): the REAL
+//     block-device subset only (LVM_THIN / ZFS / ZFS_THIN) — see the
+//     inline rationale: a loop-backed FILE_THIN device reports
+//     DISC-GRAN=4096 but rendering rs-discard-granularity there
+//     REGRESSES fresh-create convergence on the mkfs/force-primary
+//     path (the wedge that broke the e2e respawn-standalone-wedge
+//     scenario). Keeping the option on real block-device thin/ZFS
+//     pools retains the genuine thin-aware-resync win
+//     (partially-written volume resyncs ~only the written bytes)
+//     where it is both safe and effective.
 //
 // Data-safety contract — the optimisation may ONLY skip provably-zero
 // ranges (thin discard), NEVER any written data:
 //
 //   - discard-zeroes-if-aligned is `yes` ONLY for provider kinds whose
 //     backing device deterministically reads/discards as zero in an
-//     ALIGNED region: LVM_THIN, ZFS, ZFS_THIN. For every other kind
-//     (FILE_THIN loop-backed sparse file, thick LVM, plain FILE,
+//     ALIGNED region: LVM_THIN, ZFS, ZFS_THIN, FILE_THIN (loop
+//     punch-hole). For every other kind (thick LVM, plain FILE,
 //     unknown) it is `no` — matching upstream's CtrlRscCrtApiHelper
-//     switch, which renders an explicit `no`. Note we deliberately do
-//     NOT reuse IsThinOrZFS here: that helper includes FILE_THIN
-//     (correct for the seed-GI skip-sync gate) but FILE_THIN must NOT
-//     get discard-zeroes-if-aligned=yes.
+//     switch, which renders an explicit `no` there.
 //
-//   - rs-discard-granularity is set ONLY for the discard-zero-safe
+//   - rs-discard-granularity is set ONLY for the granularity-safe
 //     provider set AND when the backing block device reports a non-zero
 //     discard granularity (lsblk DISC-GRAN > 0). A device reporting 0
 //     does not support discard — emitting a non-zero granularity there
@@ -268,13 +277,15 @@ func autoDiskOptions(
 	// the trigger is the mkfs-discard × loop × rs-discard-granularity
 	// interaction, not the option in isolation.
 	//
-	// For FILE_THIN we therefore render only `discard-zeroes-if-aligned
-	// no` (DRBD's inert default) and OMIT the granularity — DRBD then
-	// does a full byte-copy resync on the rare loop relocate, which is
+	// For FILE_THIN we therefore render `discard-zeroes-if-aligned yes`
+	// (loop punch-hole reads back zeros — and the kernel needs the flag
+	// to keep the day0 fresh-attach bitmap clean, see
+	// discardZeroesIfAligned) but OMIT the granularity — DRBD then does
+	// a full byte-copy resync on the rare loop relocate, which is
 	// always correct, while the day0 skip + mkfs convergence is
 	// preserved. The genuine thin-aware-resync win is retained where it
 	// is both safe AND effective: the real block-device thin/ZFS pools.
-	if !discardZeroesIfAligned(providerKind) {
+	if !rsDiscardGranularitySafe(providerKind) {
 		return out
 	}
 
@@ -301,18 +312,64 @@ func autoDiskOptions(
 // discardZeroesIfAligned reports whether the provider kind's backing
 // device deterministically yields zeros on an ALIGNED discard, so DRBD
 // can safely treat an aligned all-zero range as a discard during
-// resync. Mirrors upstream LINSTOR's CtrlRscCrtApiHelper switch:
+// resync — and, critically, may assume a freshly-grown region reads as
+// zeros at attach time (la_size 0 → device size on a brand-new
+// replica). Based on upstream LINSTOR's CtrlRscCrtApiHelper switch,
+// with one deliberate divergence (FILE_THIN — see below):
 //
 //   - LVM_THIN: dm-thin honours aligned discard → unprovisioned reads
 //     zero.
+//
 //   - ZFS / ZFS_THIN: zvols are copy-on-write; an aligned discard frees
 //     the block and subsequent reads return zero.
-//   - FILE_THIN: loop-backed sparse file — aligned discard is NOT
-//     guaranteed to punch a hole / read back zero. Upstream renders
-//     `no` for FILE_THIN; we omit the option (equivalent: DRBD's
-//     default is off).
-//   - LVM (thick) / FILE / DISKLESS / unknown: not discard-zero safe.
+//
+//   - FILE_THIN: loop-backed sparse file. The loop driver implements
+//     discard as fallocate(PUNCH_HOLE), and a punched hole reads back
+//     zeros BY CONTRACT (the kernel zero-fills partial blocks); loop
+//     only advertises discard at all when the backing filesystem
+//     supports hole punching. So an aligned discard deterministically
+//     yields zeros — `yes` is factually correct.
+//
+//     INTENTIONAL DIVERGENCE from upstream, which renders `no` for
+//     FILE/FILE_THIN (known-deltas row 76): an explicit `no` makes the
+//     kernel mark the WHOLE device out-of-sync at first attach (fresh
+//     metadata has la_size 0, so the entire device is "new region" —
+//     with `no` it cannot be assumed zeroed), which neutralises the
+//     day0 GI skip-initial-sync seed and forces a full byte-copy
+//     initial sync of every fresh FILE_THIN resource (the r-full P1
+//     512M regression: ~115 s on the loop substrate). With `yes` the
+//     attach logs "new region assumed zeroed", the bitmap stays clean,
+//     and the day0-seeded replica set reaches UpToDate with ZERO bytes
+//     transferred — the long-validated pre-#112 behaviour (the option
+//     was previously omitted and DRBD's compiled-in default is yes).
+//
+//   - LVM (thick) / FILE / DISKLESS / unknown: not discard-zero safe
+//     (recycled thick extents / fully-allocated file may carry stale
+//     data; upstream-aligned `no`).
 func discardZeroesIfAligned(kind string) bool {
+	switch kind {
+	case ProviderKindLVMThin,
+		ProviderKindZFS,
+		ProviderKindZFSThin,
+		ProviderKindFileThin:
+		return true
+	}
+
+	return false
+}
+
+// rsDiscardGranularitySafe reports whether rs-discard-granularity may
+// be rendered for the provider kind: the discard-zero-safe BLOCK-device
+// set (LVM_THIN / ZFS / ZFS_THIN) ONLY.
+//
+// Deliberately NARROWER than discardZeroesIfAligned: FILE_THIN is
+// discard-zero-safe (loop punch-hole reads back zeros, so it gets
+// `discard-zeroes-if-aligned yes`) but must NOT get the granularity —
+// rendering it on a loop-backed volume regresses the fresh-create
+// convergence via the mkfs-discard × loop × rs-discard-granularity
+// interaction (the PausedSyncT wedge; see autoDiskOptions's inline
+// rationale and the e2e respawn-standalone-wedge scenario).
+func rsDiscardGranularitySafe(kind string) bool {
 	switch kind {
 	case ProviderKindLVMThin,
 		ProviderKindZFS,

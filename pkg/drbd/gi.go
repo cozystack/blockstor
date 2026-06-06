@@ -87,6 +87,30 @@ type GISeed struct {
 	// empty current-UUID; String() enforces this by also requiring
 	// Consistent and refusing to emit otherwise (see Validate).
 	UpToDate bool
+	// WasUpToDate stamps MDF_WAS_UP_TO_DATE (GI string index 5) WITHOUT
+	// MDF_CONSISTENT — the non-winner day0 skip-init-sync shape.
+	//
+	// Why this combination exists: at attach, the DRBD kernel decides
+	// whether a freshly-grown region (a brand-new replica grows from
+	// metadata la_size 0 to the full device size) may be assumed zeroed
+	// — and therefore left CLEAN in the bitmap — via two paths
+	// (drbd_nl.c attach, "new region assumed zeroed"): MDF_WAS_UP_TO_DATE
+	// ("was UpToDate"), or all-zero bitmap/history UUIDs gated on a
+	// non-zero rs-discard-granularity ("day0 volume"). A loop-backed
+	// FILE_THIN volume deliberately renders NO rs-discard-granularity
+	// (the mkfs-discard wedge), so the second path is unavailable and a
+	// flagless day0 seed attaches with the FULL device marked
+	// out-of-sync — turning the skip into a full byte-copy initial sync.
+	// Stamping WasUpToDate (without Consistent) routes the non-winner
+	// through the first path.
+	//
+	// Data-safe: disk_state_from_md checks MDF_CONSISTENT FIRST — a
+	// !Consistent device attaches Inconsistent regardless of this flag,
+	// so the non-winner still cannot be promoted or treated as a data
+	// authority; it only flips UpToDate via the (now 0-bit) handshake
+	// with the elected winner. The kernel rewrites the flag from live
+	// state at the first real disk-state transition.
+	WasUpToDate bool
 }
 
 // Validate enforces the DRBD GI invariants blockstor relies on:
@@ -106,6 +130,13 @@ func (s GISeed) Validate() error {
 
 	if s.UpToDate && !s.Consistent {
 		return ErrGIUpToDateNotConsistent
+	}
+
+	// WasUpToDate anchors the kernel's "new region assumed zeroed"
+	// attach decision to a generation; with no current-UUID there is
+	// nothing to anchor to (same rationale as the UpToDate invariant).
+	if s.WasUpToDate && s.Current == "" {
+		return ErrGIUpToDateNoCurrent
 	}
 
 	return nil
@@ -165,16 +196,24 @@ func (s GISeed) String() string {
 	giStr := fmt.Sprintf("%s:%s:0:0", current, base)
 
 	// Flags are positional and parsed in order, so we can only append
-	// the consistent (index 4) and up-to-date (index 5) fields, never
-	// up-to-date alone. Emit nothing when neither is set (the all-day0
-	// skip-init-sync shape) so the slot keeps drbdmeta's default-clear
-	// flags.
+	// the consistent (index 4) and was-up-to-date (index 5) fields,
+	// never index 5 alone — an explicit "0" must hold index 4 open.
+	// Emit nothing when no flag is set (the legacy flagless shape) so
+	// the slot keeps drbdmeta's default-clear flags.
 	if s.UpToDate {
-		return giStr + ":1:1" // consistent=1, up-to-date=1
+		return giStr + ":1:1" // consistent=1, was-up-to-date=1
 	}
 
 	if s.Consistent {
-		return giStr + ":1" // consistent=1, up-to-date defaults clear
+		return giStr + ":1" // consistent=1, was-up-to-date defaults clear
+	}
+
+	if s.WasUpToDate {
+		// Non-winner day0 skip shape: NOT consistent (attaches
+		// Inconsistent, cannot be promoted) but was-up-to-date set so
+		// the kernel's attach-time "new region assumed zeroed" path
+		// keeps the bitmap clean (see the field doc).
+		return giStr + ":0:1" // consistent=0, was-up-to-date=1
 	}
 
 	return giStr

@@ -1,0 +1,77 @@
+name: file-thin-day0-skip-no-initial-sync
+description: |
+  Pin: a fresh 512M 2-replica autoplace create on FILE_THIN reaches
+  all-UpToDate via the day0 GI skip-initial-sync seed — WITHOUT a full
+  initial resync. This is the exact r-full Phase-1 shape
+  (`r c --auto-place 2 -s stand`, 512M) that regressed when #112 started
+  rendering an explicit `discard-zeroes-if-aligned no` for FILE_THIN:
+  the kernel could no longer assume a brand-new replica's whole device
+  (metadata la_size 0 -> device size) was zeroed at attach, marked the
+  full bitmap out-of-sync, and the day0-seeded pair full-synced 512 MB
+  over the wire (~115 s on the loop substrate) instead of skipping.
+
+  dmesg signature of the regression (FILE_THIN, both replicas seeded
+  with the identical day0 current-UUID):
+
+    uuid_compare()=no-sync by rule=both-off
+    strategy = target-use-bitmap due to disk states. (Inconsistent/UpToDate)
+    Began resync as SyncSource (will sync 524012 KB [131003 bits set])
+
+  vs the healthy skip (same image, LVM_THIN — and FILE_THIN after the
+  fix): "was UpToDate, new region assumed zeroed" at attach, bits:0 at
+  the handshake, "will sync 0 KB [0 bits set]".
+
+  The 60 s all_uptodate budget is the regression discriminator: the
+  day0 skip converges in seconds, while a full 512 MB byte-copy on the
+  loop substrate needs ~2 minutes and times out here.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  rd: ft-day0-skip
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-512m
+    # 512M, not a token size: small volumes full-sync fast enough to
+    # masquerade as a skip (64M ≈ 15 s); 512M is unambiguous.
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: wait-tiebreaker-spawned
+    # Let the auto-tiebreaker finish spawning BEFORE the no-flap hold:
+    # the TB resource transitions through Created/Attaching on its way
+    # to Diskless, which the all_uptodate hold would read as a flap.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: settle-no-flap
+    # The skip must HOLD: a replica that flapped into a late resync
+    # (or got churned by a spurious recovery-promote) fails the hold.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 60
+      hold_s: 10
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

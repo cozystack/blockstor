@@ -85,6 +85,13 @@ run_resize_lifecycle() {
         [[ -n "$_pvc" ]] && kubectl -n "$_ns" delete pvc "$_pvc" --wait=true --timeout=60s 2>/dev/null || true
         [[ -n "$_rd" ]] && delete_rd "$_rd"
         [[ -n "$_rd" ]] && assert_no_orphans "$_rd"
+
+        # Exit-code hygiene: when the SKIP path leaves this trap armed
+        # with the per-pool locals out of scope, the guarded lines above
+        # short-circuit FALSE (status 1) and bash propagates that as the
+        # SCRIPT's exit code — a clean SKIP then reads as FAIL to the
+        # dispatcher. A trap's cleanup must never invent a failure.
+        return 0
     }
     # Per-pool cleanup runs at the end of this function (and on any
     # error via the EXIT trap below).

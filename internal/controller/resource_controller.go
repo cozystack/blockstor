@@ -1142,6 +1142,33 @@ func pickSeedFromPeers(peers []blockstoriov1alpha1.Resource, targetName string, 
 // still counted; a data-state volume with an empty / not-yet-observed
 // CurrentGI is treated conservatively as data-bearing.
 func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName string) bool {
+	return scanDataBearingDiskfulPeers(peers, targetName, false)
+}
+
+// anyProvenDataBearingDiskfulPeer is the STRICT variant for the
+// IRREVERSIBLE RD.Spec.Initialized latch: a data-state volume only
+// counts when its CurrentGI has actually been OBSERVED (non-empty) and
+// differs from the deterministic day0 value.
+//
+// Why the empty-CurrentGI conservatism must NOT feed the latch: the
+// observer publishes the first UpToDate DiskState and the get-gi
+// CurrentGI backfill in the same observation only best-effort — a
+// transient miss leaves a short window where a brand-new day0 winner
+// reads as "UpToDate, CurrentGI unknown". The per-reconcile seed gates
+// (anyDataBearingDiskfulPeer / dispatcher PeerHasData) treat that
+// conservatively as data-bearing, which is SAFE for them because they
+// recompute from live status and self-correct on the next pass. The
+// latch is append-only: firing it during that window permanently
+// poisons the RD — every later re-created replica is stamped
+// SkipInitialSync=false and full-syncs a never-written volume (the
+// r-full Phase-2 `r d` → bare `r c` flake, 512M ≈ 115 s on the loop
+// substrate). A missed latch, by contrast, just retries on the next
+// status-driven reconcile once the backfill lands.
+func anyProvenDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName string) bool {
+	return scanDataBearingDiskfulPeers(peers, targetName, true)
+}
+
+func scanDataBearingDiskfulPeers(peers []blockstoriov1alpha1.Resource, targetName string, requireObservedGI bool) bool {
 	for i := range peers {
 		if peers[i].Name == targetName {
 			continue
@@ -1160,6 +1187,13 @@ func anyDataBearingDiskfulPeer(peers []blockstoriov1alpha1.Resource, targetName 
 			case drbd.DiskStateUpToDate,
 				drbd.DiskStateConsistent,
 				drbd.DiskStateOutdated:
+				if requireObservedGI && vol.CurrentGI == "" {
+					// Not yet observed — not PROVEN data-bearing.
+					// (Strict latch mode only; see
+					// anyProvenDataBearingDiskfulPeer.)
+					continue
+				}
+
 				if !isDay0SeededDiskfulVolume(rdName, vol) {
 					return true
 				}
@@ -1283,11 +1317,19 @@ func (r *ResourceReconciler) ensureSkipInitSyncDecision(ctx context.Context, tar
 	}
 
 	// (1) RD latch: flip initialized=true once real data exists past
-	// day0 anywhere in the replica set. anyDataBearingDiskfulPeer scans
-	// EVERY replica (passing "" as the excluded name includes the target
-	// itself, which is correct here — a written target is just as much
-	// proof the RD holds data as a written peer).
-	if !rdInitialized(rd) && anyDataBearingDiskfulPeer(peers, "") {
+	// day0 anywhere in the replica set. The scan covers EVERY replica
+	// (passing "" as the excluded name includes the target itself,
+	// which is correct here — a written target is just as much proof
+	// the RD holds data as a written peer).
+	//
+	// STRICT (proven-GI) variant, NOT anyDataBearingDiskfulPeer: this
+	// write is append-only, and the conservative "UpToDate with
+	// not-yet-observed CurrentGI counts as data-bearing" default would
+	// let a transient first-status window of a brand-new day0 winner
+	// permanently poison the RD (every later re-created replica then
+	// full-syncs a never-written volume — the r-full Phase-2 flake).
+	// See anyProvenDataBearingDiskfulPeer.
+	if !rdInitialized(rd) && anyProvenDataBearingDiskfulPeer(peers, "") {
 		if err := r.patchRDInitialized(ctx, rd.Name); err != nil {
 			if errors.IsNotFound(err) {
 				return false, nil

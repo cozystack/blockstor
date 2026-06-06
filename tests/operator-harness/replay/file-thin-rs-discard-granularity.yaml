@@ -18,9 +18,19 @@ description: |
   failure). The identical create converges instantly on LVM_THIN, so the
   option is gated OUT of loop-backed FILE_THIN.
 
+  discard-zeroes-if-aligned, by contrast, MUST be `yes` for FILE_THIN:
+  loop punch-hole reads back zeros by contract, and the flag is what lets
+  the kernel treat a brand-new replica's whole device (metadata la_size 0
+  -> device size) as "assumed zeroed" at attach. An explicit `no`
+  (upstream's value -- known-deltas row 76) made the kernel mark every
+  fresh FILE_THIN attach fully out-of-sync, neutralising the day0 GI
+  skip-initial-sync seed: every fresh create full-synced (the r-full P1
+  512M regression).
+
   This workflow asserts, at the operator-CLI level, that on FILE_THIN:
 
-    1. discard-zeroes-if-aligned is `no` (provider gate unchanged);
+    1. discard-zeroes-if-aligned is `yes` (day0-attach clean-bitmap flag;
+       intentional divergence from upstream's `no`);
     2. rs-discard-granularity is ABSENT from the live DRBD config
        (drbdsetup show); and
     3. a 2nd diskful replica added to the fresh RD converges cleanly via
@@ -52,15 +62,19 @@ steps:
       node: "{{node1}}"
       expected: UpToDate
       timeout_s: 120
-  - name: assert-discard-zeroes-no
+  - name: assert-discard-zeroes-yes
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
     await:
+      # `yes` equals the DRBD compiled-in default, which plain
+      # `drbdsetup show` omits — probe with --show-defaults so the
+      # EFFECTIVE value is asserted either way.
       kind: drbd_option
       rd: "{{rd}}"
       node: "{{node1}}"
       key: "discard-zeroes-if-aligned"
-      expected: "no"
+      expected: "yes"
+      show_defaults: true
       timeout_s: 60
   - name: assert-rs-discard-granularity-absent
     cmd: ["resource", "list", "--resources", "{{rd}}"]

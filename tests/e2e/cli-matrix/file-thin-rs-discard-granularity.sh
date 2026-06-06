@@ -22,10 +22,20 @@
 # converges instantly on LVM_THIN (real block device, same disk block) —
 # so the option is gated OUT of loop-backed FILE_THIN.
 #
+# discard-zeroes-if-aligned, by contrast, MUST be `yes` for FILE_THIN:
+# loop punch-hole reads back zeros by contract, and the flag is what
+# lets the kernel treat the whole device of a brand-new replica
+# (metadata la_size 0 → device size) as "assumed zeroed" at attach.
+# Rendering an explicit `no` (upstream's value — known-deltas row 76)
+# made the kernel mark every fresh FILE_THIN attach fully out-of-sync,
+# neutralising the day0 GI skip-initial-sync seed: every fresh create
+# full-synced (the r-full P1 512M regression).
+#
 # Contract — assert all three legs on FILE_THIN (`stand` pool):
-#   1. the rendered .res carries `discard-zeroes-if-aligned no;`
-#      (upstream-parity provider flag) but NO `rs-discard-granularity`
-#      (the regression-causing key);
+#   1. the rendered .res carries `discard-zeroes-if-aligned yes;`
+#      (the day0-attach clean-bitmap flag; intentional divergence from
+#      upstream's `no`) but NO `rs-discard-granularity` (the
+#      regression-causing key);
 #   2. a fresh resource whose RD carries FileSystem/Type=ext4 (drives the
 #      winner force-primary + mkfs path) converges WITHOUT a full initial
 #      resync — i.e. the day0 skip holds (peers reach UpToDate, the
@@ -75,10 +85,11 @@ echo ">> [Q3] 512M FILE_THIN, FileSystem/Type=ext4 (drives force-primary mkfs), 
 echo ">> wait $N1 UpToDate"
 wait_disk_state "$RD" "$N1" UpToDate 120
 
-echo ">> assert rendered .res on $N1: discard-zeroes no, NO rs-discard-granularity"
+echo ">> assert rendered .res on $N1: discard-zeroes yes, NO rs-discard-granularity"
 RES=$(on_node "$N1" cat "/etc/drbd.d/${RD}.res")
-if ! grep -Eq "discard-zeroes-if-aligned[[:space:]]+no;" <<<"$RES"; then
-    echo "FAIL: rendered .res lacks discard-zeroes-if-aligned no (FILE_THIN):" >&2
+if ! grep -Eq "discard-zeroes-if-aligned[[:space:]]+yes;" <<<"$RES"; then
+    echo "FAIL: rendered .res lacks discard-zeroes-if-aligned yes (FILE_THIN):" >&2
+    echo "      => fresh attaches mark the whole device out-of-sync; day0 skip broken (r-full P1)" >&2
     echo "$RES" >&2
     exit 1
 fi
