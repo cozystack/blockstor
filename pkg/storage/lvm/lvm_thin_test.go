@@ -63,6 +63,67 @@ func TestThinCreateVolumeIssuesLvcreate(t *testing.T) {
 	}
 }
 
+// TestThinCreateVolumeGrossSizeRounding is the U421 (P3) rounding-parity
+// pin. The gross/allocated size a consumer (CSI ControllerExpandVolume,
+// CDI image import) ends up with is set by the provider's KiB→MiB
+// conversion, NOT by the raw `size_kib` the client sent. The rule is
+// `sizeMiB = max(SizeKib / 1024, 1)` — integer division, i.e. truncation
+// toward MiB granularity with a 1-MiB floor:
+//
+//   - MiB-aligned requests pass through exactly (1 GiB → 1024 MiB,
+//     100 MiB → 100 MiB). These are the common CDI/CSI cases.
+//   - A sub-MiB or odd-KiB request truncates DOWN to the MiB boundary
+//     (1500 KiB → 1 MiB, 2 MiB+1 KiB → 2 MiB). Consumers that need the
+//     extra bytes must request a MiB-aligned size; this is the same
+//     LINSTOR-internal MiB rounding the upstream allocator applies, so
+//     `vd l -m` allocated-size parity with the oracle holds for aligned
+//     requests and is deterministic (never rounds UP) for odd ones.
+//   - The floor keeps a tiny request (< 1 MiB) from collapsing to a
+//     0-extent lvcreate the LVM CLI would reject.
+//
+// Pinning the exact `<N>MiB` argv is the load-bearing contract: a future
+// refactor that flipped truncation to round-up (math.Ceil) would silently
+// over-allocate vs the oracle and break byte-exact CDI size expectations.
+func TestThinCreateVolumeGrossSizeRounding(t *testing.T) {
+	cases := []struct {
+		name    string
+		sizeKib int64
+		wantMiB string
+	}{
+		{"1GiB-aligned", 1024 * 1024, "1024MiB"},
+		{"100MiB-aligned", 100 * 1024, "100MiB"},
+		{"odd-subMiB-floors-to-1", 1500, "1MiB"},
+		{"odd-2MiB-plus-1KiB-truncates-down", 2*1024 + 1, "2MiB"},
+		{"tiny-4KiB-hits-1MiB-floor", 4, "1MiB"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := storage.NewFakeExec()
+			fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_00000",
+				storage.FakeResponse{Stdout: []byte("")})
+
+			p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+			err := p.CreateVolume(t.Context(), storage.Volume{
+				ResourceName: "pvc-1",
+				VolumeNumber: 0,
+				SizeKib:      tc.sizeKib,
+			})
+			if err != nil {
+				t.Fatalf("CreateVolume: %v", err)
+			}
+
+			want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --thin --virtualsize " +
+				tc.wantMiB + " --name pvc-1_00000 vg/thinpool"
+			if !slices.Contains(fx.CommandLines(), want) {
+				t.Errorf("U421: size_kib=%d expected lvcreate %q; got %v",
+					tc.sizeKib, want, fx.CommandLines())
+			}
+		})
+	}
+}
+
 // TestThinCreateVolumeIdempotent: if the LV already exists, no lvcreate
 // is issued. Reconcile loops re-call CreateVolume; this is what makes
 // them safe.
