@@ -1,0 +1,70 @@
+name: autoplace-contradictory-constraints-rejected
+description: |
+  Upstream-issues campaign-2 (agent U6), items U139/U94: an autoplace
+  whose topology constraints are self-contradictory must FAIL SHORT with
+  the FAIL_NOT_ENOUGH_NODES (996) envelope — it must NEVER be reported as
+  "successfully autoplaced on 0 nodes".
+
+  `--replicas-on-same site` together with `--replicas-on-different site`
+  pins the first replica's site value AND forbids any other replica from
+  sharing it: beyond the first replica the request is unsatisfiable. A
+  place-count=2 autoplace therefore can never converge, and the CLI must
+  exit non-zero (10) rather than claim success. The RD must not end up
+  with 2 diskful replicas.
+
+  This is the operator-CLI-level reproduction of the upstream
+  "successfully autoplaced on 0 nodes" complaint.
+
+  Unit pins:
+    pkg/placer/issues_u6_placement_family_test.go
+      ::TestU139ContradictoryConstraintsPlaceZeroNeverSilentSuccess
+    pkg/rest/autoplace_issues_u6_test.go
+      ::TestU139ContradictoryConstraintsReturns409
+  L6: tests/e2e/cli-matrix/r-c-autoplace-pool-pinned.sh
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: lvm-thin
+
+vars:
+  sp: lvm-thin
+
+steps:
+  - name: label-node1-site-a
+    cmd: ["node", "set-property", "{{node1}}", "Aux/site", "site-a"]
+    expect_exit: 0
+  - name: label-node2-site-b
+    cmd: ["node", "set-property", "{{node2}}", "Aux/site", "site-b"]
+    expect_exit: 0
+  - name: label-node3-site-c
+    cmd: ["node", "set-property", "{{node3}}", "Aux/site", "site-c"]
+    expect_exit: 0
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: autoplace-contradictory-must-reject
+    # replicas-on-same site AND replicas-on-different site is
+    # self-contradictory beyond the first replica. The CLI MUST reject
+    # with FAIL_NOT_ENOUGH_NODES (exit 10), not succeed-on-zero.
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}",
+          "--replicas-on-same", "site", "--replicas-on-different", "site", "{{rd}}"]
+    expect_exit: 10
+  - name: no-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 15
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["node", "set-property", "{{node1}}", "Aux/site", ""]
+  - cmd: ["node", "set-property", "{{node2}}", "Aux/site", ""]
+  - cmd: ["node", "set-property", "{{node3}}", "Aux/site", ""]
+
+invariants:
+  - no_orphans

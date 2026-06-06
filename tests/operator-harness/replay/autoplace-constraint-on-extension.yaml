@@ -1,0 +1,93 @@
+name: autoplace-constraint-on-extension
+description: |
+  Upstream-issues campaign-2 (agent U6), items U88/U113: a placement
+  constraint supplied on an EXTENSION of an existing resource is honored,
+  exactly as it would be on a from-scratch placement.
+
+  An RD is first placed with a single diskful replica. A later
+  `--auto-place +1 --replicas-on-different site` must add the second
+  replica on a DIFFERENT site from the existing one — the placer seeds
+  its anti-affinity seen-set from the already-placed replica
+  (newState -> topologySeen), so the extension respects the constraint.
+
+  The replay pins convergence: after the +1 the resource reaches exactly
+  2 diskful replicas, all UpToDate, with no flapping. A regression that
+  ignored the existing replica when applying replicas-on-different (or
+  that re-placed onto the same site) would either wedge with a shortfall
+  or violate the operator-declared spread.
+
+  Unit pin:
+    pkg/placer/issues_u6_placement_family_test.go
+      ::TestU88ReplicasOnDifferentHonoredOnExtension
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: lvm-thin
+
+vars:
+  sp: lvm-thin
+
+steps:
+  - name: label-node1-site-a
+    cmd: ["node", "set-property", "{{node1}}", "Aux/site", "site-a"]
+    expect_exit: 0
+  - name: label-node2-site-a
+    # node2 shares node1's site so the anti-affinity rule has a tempting
+    # same-site candidate to (correctly) reject.
+    cmd: ["node", "set-property", "{{node2}}", "Aux/site", "site-a"]
+    expect_exit: 0
+  - name: label-node3-site-b
+    cmd: ["node", "set-property", "{{node3}}", "Aux/site", "site-b"]
+    expect_exit: 0
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: place-first-replica-on-node1
+    # Pin the first replica explicitly onto node1 (site-a) so the
+    # extension's anti-affinity has a deterministic existing site to
+    # spread away from.
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 1
+      timeout_s: 120
+  - name: wait-1r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 180
+  - name: extend-plus-one-different-site
+    # The extension MUST honor replicas-on-different site against the
+    # EXISTING replica — landing the new replica on site-b (node3), never
+    # a second site-a node (node2).
+    cmd: ["resource", "create", "--auto-place", "+1", "--storage-pool={{sp}}",
+          "--replicas-on-different", "site", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["node", "set-property", "{{node1}}", "Aux/site", ""]
+  - cmd: ["node", "set-property", "{{node2}}", "Aux/site", ""]
+  - cmd: ["node", "set-property", "{{node3}}", "Aux/site", ""]
+
+invariants:
+  - no_orphans
