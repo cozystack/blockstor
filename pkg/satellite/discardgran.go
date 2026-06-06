@@ -75,8 +75,11 @@ const (
 //
 // It probes each local diskful volume's backing device. Each volume
 // contributes a discard-zeroes-if-aligned flag (yes/no per provider
-// kind) and, when its device reports a non-zero discard granularity, an
-// rs-discard-granularity value — INDEPENDENT gates (see autoDiskOptions).
+// kind) and, for the discard-zero-safe BLOCK-device provider set
+// (LVM_THIN / ZFS / ZFS_THIN) whose device reports a non-zero discard
+// granularity, an rs-discard-granularity value. Loop-backed FILE_THIN is
+// excluded from the granularity (see autoDiskOptions for the loop+mkfs
+// wedge rationale).
 //
 // The resource-scope collapse is CONSERVATIVE for the (today
 // hypothetical) multi-volume case (mergeResourceDiscardOptions):
