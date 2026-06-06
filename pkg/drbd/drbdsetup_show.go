@@ -184,6 +184,15 @@ type drbdsetupStatusPeerDevice struct {
 	// down-veto reads it to detect an in-flight resync that a stray
 	// `drbdadm down` would abort, stranding the peer Inconsistent.
 	ReplicationState string `json:"replication-state"`
+	// ResyncSuspended is the peer-device's `resync-suspended` token:
+	// "no" when a resync toward/from this peer is free to run,
+	// otherwise the suspension reason set ("peer" / "dependency" /
+	// "user", comma-joined). The Bug 366 recovery-promote predicate
+	// reads it to tell a HEALTHY progressing initial sync (SyncSource
+	// with resync-suspended=no — leave it alone) apart from the genuine
+	// wedge it exists to unstick (dual SyncSource collapsed into
+	// resync-suspended:peer at done:0.00).
+	ResyncSuspended string `json:"resync-suspended"`
 }
 
 // Show runs `drbdsetup status -j <resource>` and parses the output

@@ -1014,10 +1014,21 @@ func (a *Adm) NeedsRecoveryPromote(ctx context.Context, resource string) bool {
 
 // scanRecoveryPromotePeers inspects a resource's peer connections for the
 // Bug 366 recovery-promote decision and reports: whether any diskful peer
-// is Inconsistent (the wedge symptom that needs a SyncSource), whether this
-// node still holds the lowest my-node-id among the UpToDate diskful replicas
-// (so a single deterministic node promotes), and whether any peer is already
-// Primary (a veto — a Primary already drives the sync).
+// is WEDGED Inconsistent (the symptom that needs a forced SyncSource),
+// whether this node still holds the lowest my-node-id among the UpToDate
+// diskful replicas (so a single deterministic node promotes), and whether
+// any peer is already Primary (a veto — a Primary already drives the sync).
+//
+// An Inconsistent peer that is being ACTIVELY resynced from this node
+// (replication-state SyncSource — or WFBitMapS, the bitmap-exchange step
+// immediately before it — with resync-suspended "no") is NOT the wedge:
+// the sync machinery is already running and will finish on its own.
+// Firing the recovery-promote there made every real initial sync
+// (e.g. a fresh FILE_THIN 512M create, ~2 min on the loop substrate)
+// churn a pointless `primary --force` → `secondary` cycle every throttle
+// window for the whole duration. The genuine Bug 366 wedge state — dual
+// SyncSource collapsed into resync-suspended:peer at done:0.00 — still
+// qualifies, because there resync-suspended is NOT "no".
 func scanRecoveryPromotePeers(conns []drbdsetupStatusConnection, myID int32) (bool, bool, bool) {
 	var (
 		anyPeerInconsistent bool
@@ -1033,7 +1044,9 @@ func scanRecoveryPromotePeers(conns []drbdsetupStatusConnection, myID int32) (bo
 		for _, pd := range conn.PeerDevices {
 			switch DiskState(pd.PeerDiskState) {
 			case DiskStateInconsistent:
-				anyPeerInconsistent = true
+				if !peerDeviceActivelySyncing(pd) {
+					anyPeerInconsistent = true
+				}
 			case DiskStateUpToDate:
 				// Another UpToDate diskful replica. The lowest
 				// my-node-id among UpToDate replicas is the sole
@@ -1053,6 +1066,24 @@ func scanRecoveryPromotePeers(conns []drbdsetupStatusConnection, myID int32) (bo
 	}
 
 	return anyPeerInconsistent, weAreLowestUpToDate, peerPrimary
+}
+
+// peerDeviceActivelySyncing reports whether an Inconsistent peer device
+// is already being driven to UpToDate by a live, unsuspended resync
+// from this node: replication-state SyncSource (or WFBitMapS — the
+// bitmap-exchange handshake step that immediately precedes SyncSource)
+// with resync-suspended "no" (an empty token is treated as "no" for
+// drbd-utils versions that omit the field when nothing is suspended).
+// Such a peer needs no recovery-promote — the kernel finishes the sync
+// on its own; promoting mid-sync only churns Primary/Secondary state.
+func peerDeviceActivelySyncing(peerDev drbdsetupStatusPeerDevice) bool {
+	switch peerDev.ReplicationState {
+	case "SyncSource", "WFBitMapS":
+	default:
+		return false
+	}
+
+	return peerDev.ResyncSuspended == "no" || peerDev.ResyncSuspended == ""
 }
 
 // NeedsSoloPromote probes the live kernel via `drbdsetup status <res>
