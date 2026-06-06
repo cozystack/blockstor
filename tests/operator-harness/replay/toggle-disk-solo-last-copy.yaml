@@ -1,0 +1,87 @@
+name: toggle-disk-solo-last-copy
+description: |
+  Solo diskless→diskful toggle on the LAST/ONLY replica of an initialized
+  RD — the r-full Phase 6 wedge. Initialize the RD with 2 diskful replicas
+  (so RD.Spec.Initialized latches true and SkipInitialSync becomes false),
+  reach UpToDate, then delete BOTH diskful, re-add a single diskless
+  replica, and `r toggle-disk -s <sp>` it to diskful.
+
+  The toggled replica is now the lone, peerless copy. Before the
+  solo-promote self-heal it wedged at Inconsistent forever: the dispatcher
+  suppresses the auto-primary seed on an initialized RD, and the
+  offline-safety seed-refusal (SkipInitialSync=false) declines the day0
+  UpToDate skip — so with no peer to SyncTarget from there was no path to
+  UpToDate. The satellite's maybeSoloPromote now force-primaries the lone
+  slot. It MUST converge to UpToDate.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+
+  # --- Initialize: 2 diskful, reach UpToDate (latches RD.Initialized) ---
+  - name: r-c-diskful-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-diskful-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+
+  # --- Collapse: delete BOTH diskful (RD.Initialized stays latched) ---
+  - name: r-d-node1
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+  - name: r-d-node2
+    cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 60
+
+  # --- Re-add a single diskless replica ---
+  - name: r-c-diskless-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--diskless"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 60
+
+  # --- Solo toggle diskless→diskful: MUST converge UpToDate ---
+  - name: r-td-solo-diskful
+    cmd: ["resource", "toggle-disk", "--storage-pool", "{{sp}}", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
