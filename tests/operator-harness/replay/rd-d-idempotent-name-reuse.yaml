@@ -1,0 +1,86 @@
+name: rd-d-idempotent-name-reuse
+description: |
+  U19/U90/U112/U41/U101/U186/U242 (Resources stuck on DELETING; can't
+  complete or retry the delete; can't reuse a name stuck in DELETING).
+
+  Operator-CLI contract codified here:
+    1. `rd d` of a placed RD succeeds.
+    2. A SECOND `rd d` (the retry the user reports they "can't do") is
+       IDEMPOTENT — exit 0, never an error, never a wedge.
+    3. The RD fully clears (rd_absent).
+    4. The SAME name is immediately REUSABLE — a fresh `rd c` +
+       `r c` succeeds (name freed, no stale DELETING object lingers).
+
+  The finalizer-blocked DELETING latch (peer unreachable / on-node
+  teardown stuck) is exercised at L6 in
+  cli-matrix/rd-d-deleting-surface.sh, which adds a test finalizer to
+  simulate the stuck satellite and asserts the retried `rd d` stays
+  idempotent while blocked, then converges on release. This replay pins
+  the operator-visible retry + name-reuse guarantees on the live stand
+  without the finalizer simulation.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: rd-d-first
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+  - name: rd-d-retry-idempotent
+    # THE U19 ASSERTION: a repeated `rd d` must be a clean idempotent
+    # no-op (exit 0), not an error — the retry the user reports they
+    # "can't do" while a delete is in flight.
+    cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+  - name: wait-rd-absent
+    cmd: ["resource-definition", "list"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 180
+  - name: reuse-name-rd-c
+    # U186/U242: the freed name must be reusable.
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: reuse-name-vd-c
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: reuse-name-r-c
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

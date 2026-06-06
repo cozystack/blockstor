@@ -1,0 +1,119 @@
+name: r-d-last-uptodate-midsync-rejected
+description: |
+  U130 (LINSTOR shouldn't allow deleting the last active peer). User-
+  reported upstream wedge (LINBIT/linstor-server, closed): with 1 diskful
+  (UpToDate) source and a freshly-added second diskful still SyncTarget,
+  an `r d` of the ORIGINAL diskful before the resync finishes strands the
+  SyncTarget (no source), wedges the DELETING node on Connecting, and
+  leaves no UpToDate backing storage.
+
+  BS guard (pkg/rest/resource_delete_last_uptodate_u130.go): `r d` of the
+  LAST UpToDate diskful while a diskful peer is mid-sync
+  (SyncTarget/Inconsistent) is REJECTED with a FAIL_IN_USE ApiCallRc
+  envelope (python-linstor surfaces it as exit 10). `--force` overrides.
+
+  Deterministic mid-sync window: a 512 MiB volume is placed on node1
+  first (reaches UpToDate), then the resync is throttled hard via
+  `rd drbd-options --c-max-rate` so that when node2's diskful replica is
+  added it stays SyncTarget long enough for the rejection probe. The
+  `disk_state: SyncTarget` await gates the rejection step on a live
+  mid-sync state, so the assertion is not racing the resync.
+
+  Must-not-regress (bug-hunt #6): once node2 reaches UpToDate (throttle
+  lifted), the SAME `r d node1` is ALLOWED — the last-legitimate-diskful
+  delete stays permitted like upstream. Teardown leaves no stranded
+  replica.
+
+  NOTE on expect_exit: the rejection is a FAIL_IN_USE error envelope the
+  python-linstor CLI surfaces as exit 10. If a stand run shows a
+  different non-zero code, adjust this single value — the contract is
+  "non-zero, delete refused".
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "512M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-node1-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 300
+  - name: throttle-resync
+    # Hard-throttle the resync so the next add stays SyncTarget long
+    # enough for the rejection probe (avoids the stand's skip-sync race).
+    cmd: ["resource-definition", "drbd-options", "--c-max-rate", "1024", "{{rd}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+    await:
+      # Gate on a LIVE mid-sync state: node2 must be observed SyncTarget
+      # before we probe the rejection. If the stand skip-syncs through
+      # this faster than the throttle should allow, bump c-max-rate down
+      # / the volume size up rather than weakening the assertion.
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: SyncTarget
+      timeout_s: 120
+  - name: r-d-node1-rejected-midsync
+    # THE U130 ASSERTION: `r d node1` (the only UpToDate source) MUST be
+    # refused while node2 is mid-sync. Removing it would strand node2.
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 10
+  - name: assert-node1-survived
+    # The refusal must have blocked the destructive delete — node1 is
+    # still UpToDate.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 30
+  - name: unset-throttle
+    cmd: ["resource-definition", "drbd-options", "--unset-c-max-rate", "{{rd}}"]
+    expect_exit: 0
+  - name: wait-node2-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: UpToDate
+      timeout_s: 600
+  - name: r-d-node1-allowed-after-sync
+    # Must-not-regress: once node2 is UpToDate, the SAME delete is
+    # ALLOWED (last legitimate diskful drop, like upstream / bug-hunt #6).
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

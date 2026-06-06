@@ -2763,6 +2763,18 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// U130 guard: refuse removing the LAST UpToDate diskful replica
+	// while a peer is still mid-sync (SyncTarget/Inconsistent). Dropping
+	// the only source strands the syncing peer and leaves the resource
+	// with no UpToDate backing storage. Runs BEFORE any destructive
+	// action; the legacy tiebreaker-suppression stamp below only fires
+	// on the witness path, which the guard skips (diskful-only). An
+	// explicit `?force=true` overrides. See
+	// resource_delete_last_uptodate_u130.go.
+	if !s.refuseLastUpToDateDiskfulMidSyncDelete(r.Context(), w, rdName, &existing, queryFlag(r, "force")) {
+		return
+	}
+
 	// `r d` physically removes the replica for ALL replica kinds —
 	// diskful, diskless, and tiebreaker — matching upstream LINSTOR
 	// `linstor resource delete`. The satellite resource controller's
@@ -2790,15 +2802,7 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 	// TIE_BREAKER still gets the auto-tiebreaker-suppression stamp so
 	// the RD-level reconciler doesn't immediately re-stamp a fresh
 	// witness the next time `ensureTiebreaker` fires.
-	tieBreaker := slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker)
-
-	if tieBreaker {
-		// Best-effort. Failure to stamp must not block the
-		// operator-requested delete; the worst case without
-		// the annotation is "auto-witness comes back in 5
-		// seconds" — annoying, but not data-loss.
-		_ = s.stampTiebreakerSuppression(r.Context(), rdName)
-	}
+	s.maybeStampTiebreakerSuppressionOnDelete(r.Context(), rdName, &existing)
 
 	err := s.Store.Resources().Delete(r.Context(), rdName, node)
 	if err != nil {
@@ -2837,6 +2841,25 @@ func (s *Server) handleResourceDelete(w http.ResponseWriter, r *http.Request) {
 		RetCode: apiCallRcInfo | apiCallRcRscDeleted,
 		Message: "resource deleted: " + rdName + " on " + node,
 	}})
+}
+
+// maybeStampTiebreakerSuppressionOnDelete stamps the
+// auto-tiebreaker-suppression annotation on the parent RD when the
+// replica being deleted is a TIE_BREAKER, so the RD-level reconciler
+// doesn't immediately re-stamp a fresh witness the next time
+// `ensureTiebreaker` fires.
+//
+// Best-effort: a stamp failure must not block the operator-requested
+// delete; the worst case without the annotation is "auto-witness comes
+// back in ~5s" — annoying, not data-loss. Extracted from
+// handleResourceDelete to keep that handler under the funlen budget once
+// the U130 mid-sync guard was added.
+func (s *Server) maybeStampTiebreakerSuppressionOnDelete(ctx context.Context, rdName string, existing *apiv1.Resource) {
+	if !slices.Contains(existing.Flags, apiv1.ResourceFlagTieBreaker) {
+		return
+	}
+
+	_ = s.stampTiebreakerSuppression(ctx, rdName)
 }
 
 // bumpPeerChangedOnSiblings stamps an RFC3339Nano timestamp on every

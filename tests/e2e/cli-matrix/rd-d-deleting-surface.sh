@@ -172,6 +172,37 @@ if ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2
 fi
 
 # =====================================================================
+# U19/U90/U112/U41/U101/U186/U242: a SECOND `rd d` while the resource is
+# latched in DELETING (peer unreachable / finalizer held) must be
+# IDEMPOTENT — it must NOT error, must NOT wedge, and must leave the
+# teardown progressing. The user reports were "resource stuck on
+# DELETING, can't complete or retry the delete". BS realises the
+# two-phase delete with finalizers: a repeat `rd d` re-stamps the
+# (already-set) DeletionTimestamp via an idempotent client.Delete, so
+# the CLI returns success and the operator can safely retry.
+# =====================================================================
+echo ">> Phase 4b (U19): repeat rd d while DELETING — must be idempotent (exit 0)"
+retry_err=$(mktemp)
+if ! "${LCTL[@]}" resource-definition delete "$RD" >"$retry_err" 2>&1; then
+    echo "FAIL (U19): a retried 'rd d' while DELETING returned non-zero (not idempotent)" >&2
+    echo "----- retry output -----" >&2
+    cat "$retry_err" >&2
+    rm -f "$retry_err"
+    exit 1
+fi
+rm -f "$retry_err"
+echo "   OK: retried rd d while DELETING is idempotent (exit 0)"
+
+# The retry must NOT have force-cleared the finalizer-blocked child —
+# the teardown is still genuinely blocked until we release our finalizer.
+if [[ -z "$(rsc_crd_name "$N2")" ]] \
+    && ! kubectl get "resourcedefinitions.blockstor.cozystack.io/${RD}" >/dev/null 2>&1; then
+    echo "FAIL (U19): retried rd d finalised the object despite a held finalizer" >&2
+    exit 1
+fi
+echo "   OK: retry did not bypass the held finalizer (teardown still blocked, not wedged)"
+
+# =====================================================================
 # Release: remove the test finalizer; the real delete completes.
 # =====================================================================
 echo ">> Phase 5: remove the test finalizer; delete must complete"
@@ -193,4 +224,22 @@ if ! $cleared; then
     exit 1
 fi
 
-echo ">> PASS: rd-d-deleting-surface (E4: DELETING visible during two-phase delete, finalizer blocks final removal)"
+# =====================================================================
+# U186/U242: "can't reuse a name stuck in DELETING". Once the teardown
+# completes (DELETING cleared), the SAME RD name MUST be reusable — a
+# fresh `rd c <same-name>` must succeed, proving the name was freed and
+# no stale object/finalizer lingers to block re-creation.
+# =====================================================================
+echo ">> Phase 6 (U186/U242): the freed name must be reusable — rd c $RD again"
+reuse_err=$(mktemp)
+if ! "${LCTL[@]}" resource-definition create "$RD" >"$reuse_err" 2>&1; then
+    echo "FAIL (U186/U242): could not re-create RD '$RD' after its DELETING cleared — name not freed" >&2
+    echo "----- re-create output -----" >&2
+    cat "$reuse_err" >&2
+    rm -f "$reuse_err"
+    exit 1
+fi
+rm -f "$reuse_err"
+echo "   OK: name '$RD' reused successfully after teardown (delete_rd in cleanup removes it)"
+
+echo ">> PASS: rd-d-deleting-surface (E4 two-phase delete + U19 idempotent retry + U186/U242 name-reuse)"
