@@ -49,6 +49,16 @@ steps:
       kind: all_uptodate
       rd: "{{rd}}"
       timeout_s: 60
+  - name: wait-tiebreaker-spawned
+    # Let the auto-tiebreaker finish spawning BEFORE the no-flap hold:
+    # the TB resource transitions through Created/Attaching on its way
+    # to Diskless, which the all_uptodate hold would read as a flap.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 120
   - name: settle-no-flap
     # The skip must HOLD: a replica that flapped into a late resync
     # (or got churned by a spurious recovery-promote) fails the hold.
@@ -57,7 +67,7 @@ steps:
     await:
       kind: all_uptodate
       rd: "{{rd}}"
-      timeout_s: 30
+      timeout_s: 60
       hold_s: 10
 
 teardown:
