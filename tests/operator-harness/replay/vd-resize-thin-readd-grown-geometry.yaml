@@ -1,0 +1,124 @@
+name: vd-resize-thin-readd-grown-geometry
+description: |
+  U389 (P2) — after a `vd set-size` grow, dropping a replica (`r d`) and
+  re-adding it (autoplace) must provision the new replica at the LIVE
+  grown geometry, not a stale pre-grow VD snapshot. blockstor derives the
+  new replica's size from the live VolumeDefinition (dispatcher
+  buildVolumes → DesiredVolume.SizeKib = vd.SizeKib), so the re-added
+  replica is sized to the grown volume by construction.
+
+  Operator sequence:
+    rd c → vd c 1G → r c --auto-place=2 → grow 1G→2G →
+    r d <one peer> → r c --auto-place=2 (re-add) → re-added peer UpToDate
+
+  CLI-side contract:
+    - after the grow, vd size == 2G
+    - after the re-add, the count is back to 2 diskful and EVERY replica
+      (including the re-added one) reaches UpToDate — which is only
+      possible if the re-added replica was provisioned at the grown 2G
+      geometry (a stale 1G lower disk could never attach/UpToDate against
+      a 2G volume)
+
+  Backing-LV ground truth (re-added LV == 2G) lives in the L6 cli-matrix
+  cell tests/e2e/cli-matrix/vd-resize-thin-readd-grown-geometry.sh; the
+  size-derivation is pinned at L1 by
+  pkg/dispatcher/dispatcher_test.go::TestReAddedReplicaPicksUpLiveGrownSize.
+
+  If this YAML goes red, no fix in:
+    - pkg/dispatcher/dispatcher.go (buildVolumes size derivation)
+    - pkg/satellite/reconciler.go (fresh-replica provisioning at vd size)
+  may be claimed closed.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-uptodate-1g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+  # ---- Grow 1G → 2G ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: wait-uptodate-2g
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+  # ---- Drop one replica on node1, re-add via autoplace ----
+  - name: r-d-node1
+    cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 90
+  - name: re-add-autoplace
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: re-added-replica-reaches-uptodate-at-grown-size
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The re-added replica can only reach UpToDate if it was provisioned
+      # at the grown 2G geometry — a stale 1G lower disk could never
+      # attach against the 2G volume. Full 2G resync to the fresh peer at
+      # ~4 MB/s on this stand => minutes; slow-stand ceiling.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans
