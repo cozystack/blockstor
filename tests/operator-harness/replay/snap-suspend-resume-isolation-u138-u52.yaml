@@ -1,0 +1,113 @@
+name: snap-suspend-resume-isolation-u138-u52
+description: |
+  Campaign-2 U138 + U52.
+
+  U138 (suspend-io unwind): a snapshot create suspends DRBD I/O on the
+  diskful peers via the Phase-1 barrier and MUST always unwind (Phase-3
+  resume) once the take completes — leaving I/O suspended is a permanent
+  application outage. The `snapshot create` step returning exit 0 is
+  itself the resume proof: the controller flips Spec.SuspendIO=false (and
+  the satellites issue `drbdsetup resume-io`) only after the take
+  completes, so a snapshot that never resumed would never reach the
+  Successful/visible state the step asserts. The follow-up `all_uptodate`
+  re-assertion confirms the resource is healthy and serving I/O after the
+  snapshot.
+
+  U52 (failure isolation / independence): two independent RDs (A and B)
+  each take their own snapshot. The two snapshots share no GroupID, so
+  one's suspend/resume cycle must not interfere with the other — both
+  complete and both resources stay UpToDate. A regression that dragged
+  one snapshot's suspend/abort into the unrelated one would leave the
+  second create hung or the second resource non-UpToDate.
+
+  Sequence: two independent 2-replica diskful RDs on node1+node2 →
+  snapshot A → snapshot B → both visible → both RDs re-assert UpToDate.
+  The companion cli-matrix cell additionally writes to each DRBD device
+  after the snapshot to prove the kernel-level resume (a still-suspended
+  device blocks the write).
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+  rd: u138-a
+
+steps:
+  - name: create-rd-a
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-a
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-a-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-a-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate-a
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+  - name: create-rd-b
+    cmd: ["resource-definition", "create", "u52-b"]
+    expect_exit: 0
+  - name: create-vd-b
+    cmd: ["volume-definition", "create", "u52-b", "64M"]
+    expect_exit: 0
+  - name: r-c-b-node1
+    cmd: ["resource", "create", "{{node1}}", "u52-b", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: r-c-b-node2
+    cmd: ["resource", "create", "{{node2}}", "u52-b", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate-b
+    cmd: ["resource", "list", "--resources", "u52-b"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: u52-b
+      timeout_s: 240
+
+  # ---- U138: snapshot A suspends then MUST resume (exit 0 == resumed) ----
+  - name: snapshot-a-create
+    cmd: ["snapshot", "create", "{{rd}}", "snap-u138a"]
+    expect_exit: 0
+  # ---- U52: snapshot B is independent — its own suspend/resume cycle ----
+  - name: snapshot-b-create
+    cmd: ["snapshot", "create", "u52-b", "snap-u52b"]
+    expect_exit: 0
+  - name: both-snapshots-visible
+    cmd: ["snapshot", "list"]
+    expect_exit: 0
+
+  # ---- After both snapshots, both resources are healthy / I/O resumed ---
+  - name: a-still-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+  - name: b-still-uptodate
+    cmd: ["resource", "list", "--resources", "u52-b"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: u52-b
+      timeout_s: 120
+
+teardown:
+  - cmd: ["snapshot", "delete", "{{rd}}", "snap-u138a"]
+  - cmd: ["snapshot", "delete", "u52-b", "snap-u52b"]
+  - cmd: ["resource-definition", "delete", "u52-b"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

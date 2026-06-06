@@ -1,0 +1,74 @@
+name: snap-single-replica-zfs-restore-u464
+description: |
+  Campaign-2 U464 (BS-side restore variant). Upstream U464 is single-node
+  ZFS in-place rollback; blockstor DELIBERATELY rejects in-place rollback
+  (501, known-delta row #73 — `zfs rollback` destroys every newer
+  snapshot). The supported single-node path is RESTORE: snapshot a
+  single-replica resource and materialise it into a NEW
+  resource-definition cloned (`zfs clone`) from the snapshot, on the same
+  node, on a zfs-thin pool.
+
+  Sequence: single-replica diskful RD on node1 (zfs-thin) → snapshot
+  create (single-replica suspend/take/resume barrier completes) → restore
+  the snapshot into a new RD on the same node → the restored replica
+  converges UpToDate (real data via `zfs clone`). The companion cli-matrix
+  cell additionally asserts the in-place `snapshot rollback` of the same
+  snapshot still 501s (deliberate-delta guard intact).
+
+  Pre-regression signals: the snapshot create hangs (single-replica
+  suspend barrier never drains) or the restored RD never reaches UpToDate
+  (the clone/restore materialisation broke on zfs-thin).
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: zfs-thin
+
+vars:
+  sp: zfs-thin
+  rd: u464-src
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: snapshot-create
+    cmd: ["snapshot", "create", "{{rd}}", "snap-u464"]
+    expect_exit: 0
+  - name: snapshot-visible
+    cmd: ["snapshot", "list"]
+    expect_exit: 0
+  - name: restore-single-replica
+    cmd: ["snapshot", "resource", "restore",
+          "--from-resource", "{{rd}}",
+          "--from-snapshot", "snap-u464",
+          "--to-resource", "u464-tgt",
+          "{{node1}}"]
+    expect_exit: 0
+  - name: restored-replica-uptodate
+    cmd: ["resource", "list", "--resources", "u464-tgt"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: u464-tgt
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "u464-tgt"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "snap-u464"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
