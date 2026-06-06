@@ -268,7 +268,7 @@ func groupIResourceConnectionPathCreate(t *testing.T, stack *harness.Stack) {
 		pathTwoAB = "10.99.1.12"
 	)
 
-	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4*1024*1024)
+	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4096)
 	groupIWaitResourcesCreated(t, stack, rdName, 2)
 
 	groupIPostResourceConnectionPath(t, stack.RestURL, rdName,
@@ -355,7 +355,7 @@ func groupIPingTimeoutPropagation(t *testing.T, stack *harness.Stack) {
 	groupIPutControllerProp(t, stack.RestURL, groupIPropPingTimeout, "100")
 	groupIPutRGProp(t, stack.RestURL, harness.FixtureDefaultRG, groupIPropPingTimeout, "200")
 
-	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4*1024*1024)
+	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4096)
 	groupIWaitResourcesCreated(t, stack, rdName, 2)
 
 	groupIPutRDProp(t, stack.RestURL, rdName, groupIPropPingTimeout, "300")
@@ -399,7 +399,7 @@ func groupINetOptionsSplit(t *testing.T, stack *harness.Stack) {
 
 	const rdName = "rd-netopts"
 
-	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4*1024*1024)
+	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4096)
 	groupIWaitResourcesCreated(t, stack, rdName, 2)
 
 	want := map[string]string{
@@ -472,7 +472,7 @@ func groupIEffectivePropsAtAllLevels(t *testing.T, stack *harness.Stack) {
 	// new RD.Props at spawn time — writing the RG key before spawn
 	// would surface the value at RD scope on the resolver's walk,
 	// hiding the per-scope tag the Bug 203 guard asserts.
-	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4*1024*1024)
+	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4096)
 	groupIWaitResourcesCreated(t, stack, rdName, 2)
 
 	groupIPutRGProp(t, stack.RestURL, harness.FixtureDefaultRG, rgKey, rgVal)
@@ -549,7 +549,7 @@ func groupIDrbdProxyEndpoint(t *testing.T, stack *harness.Stack) {
 
 	const rdName = "rd-drbd-proxy"
 
-	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4*1024*1024)
+	spawnRDViaRG(t, stack, harness.FixtureDefaultRG, rdName, 4096)
 	groupIWaitResourcesCreated(t, stack, rdName, 2)
 
 	resp := groupIDoHTTPRequest(t, http.MethodPost,

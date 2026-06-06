@@ -86,10 +86,10 @@ const groupJDefaultPlaceCount = 2
 // exercised.
 const groupJVolumeSizeKib int64 = 1024 * 1024 // 1 GiB
 
-// groupJVolumeSizeBytes is the byte-denominated form. The REST
-// spawn handler interprets `volume_sizes[]` as bytes and divides
-// by 1024 to land KiB on the VolumeDefinition; the Driver's
-// CapacityRangeMin is also byte-denominated to match the CSI spec.
+// groupJVolumeSizeBytes is the byte-denominated form, used only for
+// the Driver's CSI CapacityRangeMin (which IS byte-denominated per
+// the CSI spec). The REST spawn handler's `volume_sizes[]` field is
+// KiB (Bug 391) — pass groupJVolumeSizeKib to spawnViaRG, not this.
 const groupJVolumeSizeBytes = groupJVolumeSizeKib * 1024
 
 // TestGroupJ is the single parent that boots the stack once and
@@ -141,15 +141,15 @@ func TestGroupJ(t *testing.T) {
 // deterministic across the 9 fixture SPs (3 nodes × {lvm-thin,
 // zfs-thin, file}); pass "" to inherit from the RG.
 //
-// sizeBytes is byte-denominated to match the REST handler's
-// `volume_sizes[]` interpretation (it divides by 1024 to derive
-// VolumeDefinition.SizeKib).
-func spawnViaRG(t *testing.T, csi *harness.CSI, rdName, storPool string, sizeBytes int64) {
+// sizeKib is KiB-denominated to match the REST handler's
+// `volume_sizes[]` interpretation (Bug 391: the field is size_kib,
+// stamped verbatim onto the VolumeDefinition).
+func spawnViaRG(t *testing.T, csi *harness.CSI, rdName, storPool string, sizeKib int64) {
 	t.Helper()
 
 	req := lapi.ResourceGroupSpawn{
 		ResourceDefinitionName: rdName,
-		VolumeSizes:            []int64{sizeBytes},
+		VolumeSizes:            []int64{sizeKib},
 	}
 
 	if storPool != "" {
@@ -324,7 +324,7 @@ func runCSIIdentityServer(t *testing.T, csi *harness.CSI) {
 func runCSICreateVolumeFromEmpty(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-create-empty"
 
-	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeKib)
 
 	waitForRDInStore(t, stack, rdName)
 
@@ -362,7 +362,7 @@ func runCSICreateVolumeFromEmpty(t *testing.T, stack *harness.Stack, csi *harnes
 func runCSICreateVolumeIdempotent(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-idempotent"
 
-	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeKib)
 
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
@@ -377,7 +377,7 @@ func runCSICreateVolumeIdempotent(t *testing.T, stack *harness.Stack, csi *harne
 	// truncating the existing volume.
 	err := csi.Client.ResourceGroups.Spawn(context.Background(), harness.FixtureDefaultRG, lapi.ResourceGroupSpawn{
 		ResourceDefinitionName: rdName,
-		VolumeSizes:            []int64{groupJVolumeSizeBytes},
+		VolumeSizes:            []int64{groupJVolumeSizeKib},
 		SelectFilter: lapi.AutoSelectFilter{
 			PlaceCount:  groupJDefaultPlaceCount,
 			StoragePool: "zfs-thin",
@@ -415,7 +415,7 @@ func runCSICreateVolumeIdempotent(t *testing.T, stack *harness.Stack, csi *harne
 func runCSIDeleteVolume(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-delete"
 
-	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -459,7 +459,7 @@ func runCSIDeleteVolume(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 func runCSIControllerPublish(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-publish-diskful"
 
-	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -506,7 +506,7 @@ func runCSIControllerPublish(t *testing.T, stack *harness.Stack, csi *harness.CS
 func runCSIControllerPublishDiskless(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-publish-diskless"
 
-	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "lvm-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -571,7 +571,7 @@ func runCSICreateSnapshot(t *testing.T, stack *harness.Stack, csi *harness.CSI) 
 		snapName = "snap-1"
 	)
 
-	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -618,7 +618,7 @@ func runCSIDeleteSnapshotIdempotent(t *testing.T, stack *harness.Stack, csi *har
 		snapName = "snap-del"
 	)
 
-	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -664,7 +664,7 @@ func runCSIDeleteSnapshotIdempotent(t *testing.T, stack *harness.Stack, csi *har
 func runCSIListSnapshotsPagination(t *testing.T, stack *harness.Stack, csi *harness.CSI) {
 	const rdName = "pvc-snap-paginate"
 
-	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, rdName, "zfs-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, rdName)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, rdName) == groupJDefaultPlaceCount
@@ -745,12 +745,11 @@ func runCSICreateVolumeFromSnapshot(t *testing.T, stack *harness.Stack, csi *har
 		srcRD        = "pvc-clone-src"
 		snapName     = "snap-1"
 		destRD       = "pvc-clone-dest"
-		bytesPerKiB  = int64(1024)
 		restoreProp  = "BlockstorRestoreFromSnapshot"
 		restoreValue = srcRD + ":" + snapName
 	)
 
-	spawnViaRG(t, csi, srcRD, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, srcRD, "zfs-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, srcRD)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, srcRD) == groupJDefaultPlaceCount
@@ -766,7 +765,7 @@ func runCSICreateVolumeFromSnapshot(t *testing.T, stack *harness.Stack, csi *har
 
 	resp, err := csi.Driver.CreateVolume(context.Background(), &csidriver.CreateVolumeRequest{
 		Name:             destRD,
-		CapacityRangeMin: groupJVolumeSizeKib * bytesPerKiB,
+		CapacityRangeMin: groupJVolumeSizeBytes,
 		ContentSource: &csidriver.VolumeContentSourceSnapshot{
 			SourceRD:     srcRD,
 			SnapshotName: snapName,
@@ -825,7 +824,7 @@ func runCSICreateVolumeFromClone(t *testing.T, stack *harness.Stack, csi *harnes
 		destRD = "pvc-direct-clone"
 	)
 
-	spawnViaRG(t, csi, srcRD, "zfs-thin", groupJVolumeSizeBytes)
+	spawnViaRG(t, csi, srcRD, "zfs-thin", groupJVolumeSizeKib)
 	waitForRDInStore(t, stack, srcRD)
 	harness.Eventually(t, groupJTimeout, func() bool {
 		return countDiskfulResourcesForRD(t, stack, srcRD) == groupJDefaultPlaceCount
