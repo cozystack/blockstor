@@ -1802,6 +1802,16 @@ const (
 	tieBreakerCollapseRetryDelay    = 200 * time.Millisecond
 )
 
+// errWitnessMidDelete marks the third Bug-359 interleaving: the
+// witness row still exists but its deletionTimestamp is set (DELETE
+// flag on the wire object) — the apiserver would ACCEPT a spec patch
+// against it and the pending finalizer-strip would then swallow the
+// promote wholesale. Wraps store.ErrNotFound so the existing
+// createOrPromoteResourceAttempt retry plumbing treats a dying row
+// exactly like an already-gone one.
+var errWitnessMidDelete = errors.Wrap(store.ErrNotFound,
+	"witness mid-delete (DELETE flag set, finalizer strip pending)")
+
 func (s *Server) createOrPromoteResource(w http.ResponseWriter, r *http.Request, res *apiv1.Resource) (*apiv1.Resource, bool) {
 	// Bug 359: a single attempt races the RD reconciler's
 	// `removeWitnesses` Delete when the same `r d` that triggered
@@ -1976,6 +1986,23 @@ func (s *Server) promoteDisklessReplica(ctx context.Context, target *apiv1.Resou
 	// witness-vs-real-conflict check is re-evaluated each retry
 	// against fresh state.
 	err := s.Store.Resources().PatchResourceSpec(ctx, target.Name, target.NodeName, func(live *apiv1.Resource) error {
+		// Bug 359 third interleaving: the witness row is MID-DELETE
+		// (the Bug-338 collapse set its deletionTimestamp; the wire
+		// object surfaces that as the DELETE flag) but the finalizer
+		// has not been stripped yet, so the apiserver still ACCEPTS
+		// spec patches against it. Promoting such a row "succeeds"
+		// and is then swallowed wholesale when the deletion finishes
+		// — the operator's `r d <peer>` + `r c <ex-witness-node>`
+		// relocate silently lost its create (caught live: the r-full
+		// Phase-3 r c returned SUCCESS yet the RD ended with a single
+		// replica and no witness). Refuse to patch a dying row and
+		// route to the same retry the NotFound interleavings use; the
+		// next attempt's Create lands fresh once the finalizer strip
+		// completes.
+		if containsResourceFlag(live.Flags, apiv1.ResourceFlagDelete) {
+			return errWitnessMidDelete
+		}
+
 		keep, wasDiskless := stripDisklessAndWitnessFlags(live.Flags, wantDiskful)
 
 		if !wasDiskless {
