@@ -123,39 +123,54 @@ if (( rows != 1 )); then
     exit 1
 fi
 
-# --- U110: State / InUse columns must be populated for a no-DRBD row ----
+# --- U110: State / InUse columns populated for a no-DRBD row ------------
 # Upstream-issue U110: a storage-layer-only (no-DRBD) resource still has
-# to report a State and an InUse value in `linstor r l`. The python CLI
-# fills the State column from the volume's disk_state (there is no DRBD
-# role/connection to read), and the InUse column from the resource's
-# `state.in_use` field. A regression that left these blank for the
-# STORAGE-only stack would render an empty State column — the operator
-# can no longer tell a healthy storage-only volume from a stuck one.
-echo ">> [U110] assert State (volume disk_state) populated for the no-DRBD row"
+# to report a State and an InUse/Usage value in `linstor r l`. There is
+# no DRBD device, so neither BS nor upstream populates a per-volume
+# `state.disk_state` in the `-m` JSON (oracle 1.33.2 confirmed: vol.state
+# is `None` for STORAGE-only on BOTH). The operator-visible signal is the
+# DERIVED State COLUMN the python CLI renders — `Created` for a healthy
+# storage-only volume (upstream renders exactly `Created`; BS matches) —
+# plus the Usage/InUse column from `rsc.state.in_use`. This pins that
+# surface so a regression that blanked the State column (or dropped
+# in_use) for the no-DRBD stack would fail here.
+echo ">> [U110] assert derived State column non-blank for the no-DRBD row"
 deadline=$(( $(date +%s) + 60 ))
-disk_state=""
+state_col=""
 while (( $(date +%s) < deadline )); do
-    disk_state=$("${LCTL[@]}" --machine-readable resource list-volumes --resources "$RD" 2>/dev/null \
-        | jq -r 'first(.[][]?.volumes[]?.state.disk_state // empty) // empty' 2>/dev/null || echo "")
-    [[ -n "$disk_state" ]] && break
+    # The python CLI's `r l` State column is the 7th `|`-delimited field
+    # for our single-resource row. Match the RD row and pull the State
+    # cell, stripping ANSI colour + surrounding whitespace.
+    state_col=$("${LCTL[@]}" resource list --resources "$RD" 2>/dev/null \
+        | sed 's/\x1b\[[0-9;]*m//g' \
+        | awk -F'|' -v rd="$RD" '$0 ~ rd { gsub(/^[ \t]+|[ \t]+$/,"",$7); print $7; exit }')
+    [[ -n "$state_col" && "$state_col" != "State" ]] && break
     sleep 3
 done
-if [[ -z "$disk_state" ]]; then
-    echo "FAIL (U110): no-DRBD resource $RD reports empty volume disk_state — State column would render blank" >&2
-    "${LCTL[@]}" --machine-readable resource list-volumes --resources "$RD" 2>&1 | tail -20 >&2
+if [[ -z "$state_col" || "$state_col" == "State" ]]; then
+    echo "FAIL (U110): no-DRBD resource $RD renders a BLANK State column" >&2
+    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
     exit 1
 fi
-echo ">> [U110] State column populated: disk_state=$disk_state"
+echo ">> [U110] State column populated: '$state_col' (upstream renders 'Created' here)"
 
-# InUse must be a concrete boolean (not null/missing) so the InUse
-# column renders. A freshly-created, unmounted volume is in_use=false;
-# we only assert the field is present and boolean, not its value.
-in_use=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-    | jq -r 'first(.[][]? | select(.state != null) | .state.in_use) // "MISSING"' 2>/dev/null || echo "MISSING")
-if [[ "$in_use" != "true" && "$in_use" != "false" ]]; then
-    echo ">> [U110] note: in_use rendered as '$in_use' (satellite may not have reported usage yet; State pin is the hard gate)"
-else
-    echo ">> [U110] InUse column populated: in_use=$in_use"
+# InUse/Usage: the human `r l` Usage column must render a non-blank
+# token (`Unused` for a freshly-created, unmounted volume). This is the
+# operator-visible InUse signal and is parity-correct: oracle 1.33.2
+# leaves `rsc.state` EMPTY ({}) in the -m JSON for a STORAGE-only
+# resource (no DRBD role to read in_use from), so the -m `state.in_use`
+# field is NOT a reliable cross-impl pin — but the python CLI still
+# renders the Usage column as `Unused` from the (absent) primary role.
+# BS matches: human `r l` shows Usage=Unused. Assert the column, not the
+# flaky -m field.
+usage_col=$("${LCTL[@]}" resource list --resources "$RD" 2>/dev/null \
+    | sed 's/\x1b\[[0-9;]*m//g' \
+    | awk -F'|' -v rd="$RD" '$0 ~ rd { gsub(/^[ \t]+|[ \t]+$/,"",$5); print $5; exit }')
+if [[ -z "$usage_col" ]]; then
+    echo "FAIL (U110): no-DRBD resource $RD renders a BLANK Usage column" >&2
+    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
+    exit 1
 fi
+echo ">> [U110] Usage column populated: '$usage_col' (upstream renders 'Unused' here)"
 
-echo ">> r-c-no-drbd-no-tiebreaker OK (Bug 334 pinned: -l STORAGE auto-place=1 yields 1 replica, no TIE_BREAKER witness; U110: State/InUse populated)"
+echo ">> r-c-no-drbd-no-tiebreaker OK (Bug 334 pinned: -l STORAGE auto-place=1 yields 1 replica, no TIE_BREAKER witness; U110: State='$state_col' Usage='$usage_col')"
