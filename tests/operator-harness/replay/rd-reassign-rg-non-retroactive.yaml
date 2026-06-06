@@ -1,0 +1,72 @@
+name: rd-reassign-rg-non-retroactive
+description: |
+  Upstream-issue U222 — reassigning an RD to a HIGHER place-count
+  resource-group does NOT auto-deploy replicas. RG SelectFilter
+  PlaceCount is consulted only at autoplace / spawn time, never
+  retroactively when the RD's group membership changes (the
+  upstream-documented placement asymmetry).
+
+  Operator sequence ({{rg}} is the place-2 group; {{rg}}-b the place-3):
+
+    rg c {{rg}}   --place-count 2
+    rg c {{rg}}-b --place-count 3
+    rd c {{rd}} --resource-group {{rg}}        # 0 replicas (no r c yet)
+    rd modify {{rd}} --resource-group {{rg}}-b # raise group place-count
+
+  Convergence assertion: after the reassignment the RD has ZERO
+  replicas and STAYS at zero for a stability window (replica_count_max
+  with hold_s) — proving no controller-side reconcile (e.g. the
+  RGRebalanceReconciler) treated the membership change as a deploy
+  trigger. The higher place-count is inert until an explicit
+  `r c --auto-place` / `rg spawn`.
+
+  Our E3/I2 replays cover prop INHERITANCE (the RG's props DO flow into
+  the RD); this codifies the COMPLEMENTARY half — inheritance feeds
+  FUTURE placement decisions, it is not itself a placement trigger.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rg-place2
+    cmd: ["resource-group", "create", "{{rg}}", "--place-count", "2", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: create-rg-b-place3
+    cmd: ["resource-group", "create", "{{rg}}-b", "--place-count", "3", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: create-rd-in-rg
+    cmd: ["resource-definition", "create", "{{rd}}", "--resource-group", "{{rg}}"]
+    expect_exit: 0
+  - name: assert-zero-replicas-pre-move
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count_max
+      rd: "{{rd}}"
+      max: 0
+      hold_s: 10
+      timeout_s: 30
+  - name: reassign-rd-to-rg-b
+    cmd: ["resource-definition", "modify", "{{rd}}", "--resource-group", "{{rg}}-b"]
+    expect_exit: 0
+  - name: assert-zero-replicas-after-move
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count_max
+      rd: "{{rd}}"
+      max: 0
+      hold_s: 20
+      timeout_s: 40
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+  - cmd: ["resource-group", "delete", "{{rg}}-b"]
+  - cmd: ["resource-group", "delete", "{{rg}}"]
+
+invariants:
+  - no_orphans

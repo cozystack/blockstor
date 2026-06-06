@@ -151,6 +151,34 @@ func TestBuildEmitsArbitraryNetOptions(t *testing.T) {
 	}
 }
 
+// TestBuildRendersVerifyAlgVerbatimIntoNet pins upstream-issue U302: a
+// configured `verify-alg` must render VERBATIM into the `net { }` block.
+// The CLI persists `DrbdOptions/Net/verify-alg <name>`; the satellite
+// routes it (via splitDRBDOptions) into Net.Options, and Build must
+// emit it byte-for-byte as `verify-alg <name>;` inside net{} — the
+// exact shape `drbdsetup show` echoes back, so the L7 drbd_option
+// assertion (which greps drbdsetup output) and this render pin agree.
+func TestBuildRendersVerifyAlgVerbatimIntoNet(t *testing.T) {
+	got, err := drbd.Build(drbd.Resource{
+		Name: "pvc-1",
+		Net: drbd.Net{
+			Options: map[string]string{"verify-alg": "crc32c"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if !strings.Contains(got, "net {") {
+		t.Errorf("expected a net{} block; got:\n%s", got)
+	}
+
+	// Verbatim shape — no quoting, no rewriting of the alg name.
+	if !strings.Contains(got, "verify-alg crc32c;") {
+		t.Errorf("verify-alg not rendered verbatim into net{}; got:\n%s", got)
+	}
+}
+
 // TestBuildEmitsResourceOptions: top-level `options { … }` block when
 // Resource.Options is set.
 func TestBuildEmitsResourceOptions(t *testing.T) {

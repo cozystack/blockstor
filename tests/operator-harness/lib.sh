@@ -293,6 +293,28 @@ try:
 except: print(0)")
             [[ "$count" -ge "$min" ]]
             ;;
+        replica_count_max)
+            # Upstream-issue U222 (non-retroactive placement): assert the
+            # replica count of rd NEVER EXCEEDS `max`. This is a NEGATIVE
+            # assertion — pair it with `hold_s: <N>` so the await holds the
+            # "count <= max" condition for N consecutive seconds, proving no
+            # background reconcile materialised extra replicas (e.g. after an
+            # RD is reassigned to a higher-place-count RG, which must NOT
+            # auto-deploy). Mirrors replica_count's enumeration exactly, only
+            # the comparison flips to `-le`.
+            local rd max count
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            max=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('max',0))" "$spec")
+            count=$(linstor_cli -m resource list --resources "$rd" 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    while isinstance(d, list) and d and isinstance(d[0], list):
+        d=d[0]
+    print(len(d))
+except: print(0)")
+            [[ "$count" -le "$max" ]]
+            ;;
         active_diskful_count)
             # Bug 393: count replicas of rd that are ACTIVE diskful —
             # i.e. NOT DISKLESS / TIE_BREAKER (no backing disk) and NOT
@@ -597,8 +619,16 @@ except Exception:
             if [[ -z "$pod" ]]; then
                 return 1
             fi
+            # `drbdsetup show` prints numeric options bare (`max-buffers
+            # 36864;`) but STRING options quoted (`verify-alg "crc32c";`).
+            # Strip both the trailing `;` AND surrounding double-quotes so
+            # a string-valued option (verify-alg, cram-hmac-alg, …) matches
+            # its unquoted `expected`. Without the quote-strip the await
+            # compared `"crc32c"` against `crc32c` and always timed out
+            # (U302: verify-alg DOES render verbatim into net{}, confirmed
+            # via drbdsetup on the stand — the miss was the parser, not BS).
             actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show "$rd" 2>/dev/null \
-                | awk -v k="$key" '$1==k { gsub(/;/,""); print $2; exit }')
+                | awk -v k="$key" '$1==k { gsub(/[;"]/,""); print $2; exit }')
             [[ "$actual" == "$expected" ]]
             ;;
         *)
