@@ -645,6 +645,62 @@ except Exception:
                 | awk -v k="$key" '$1==k { gsub(/[;"]/,""); print $2; exit }')
             [[ "$actual" == "$expected" ]]
             ;;
+        quorum)
+            # Upstream-issue U341 (P1, "Lost quorum when migrating a
+            # resource to another node"): assert the live DRBD quorum
+            # on <node>'s satellite, read straight from the kernel via
+            # `drbdsetup status <rd> --json`. Pair with `hold_s: <N>`
+            # to prove quorum is HELD for N consecutive seconds across
+            # a migration window — a single transient `quorum:false`
+            # sample (the U341 symptom: the migrate vacated the
+            # quorum-providing peer before the new diskful was
+            # UpToDate) fails the assertion.
+            #
+            # spec fields:
+            #   rd        resource-definition name (substituted)
+            #   node      node whose satellite pod to probe; this is
+            #             the SURVIVING replica we assert keeps quorum
+            #   expected  "true" (default) | "false"
+            #   namespace satellite namespace (default blockstor-system)
+            #
+            # The probe reads the device-level `quorum` flag DRBD
+            # stamps per-volume. A node whose resource isn't up yet
+            # (no JSON / parse error) reports not-quorate, so a
+            # standalone `quorum: true` await also doubles as a
+            # "resource is up and quorate on this node" gate.
+            local rd node expected ns pod actual
+            rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+            node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
+            expected=$(python3 -c "import json,sys; print(str(json.loads(sys.argv[1]).get('expected','true')).lower())" "$spec")
+            ns=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('namespace','blockstor-system'))" "$spec")
+            pod=$(kubectl -n "$ns" get pods -l app=blockstor-satellite \
+                --field-selector "spec.nodeName=${node},status.phase=Running" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+            if [[ -z "$pod" ]]; then
+                return 1
+            fi
+            # `drbdsetup status --json` prints an array of resources,
+            # each with a `devices` array carrying a per-volume
+            # `quorum` boolean. Quorate iff EVERY local device is
+            # quorate (a multi-volume resource must hold quorum on all
+            # of them). Any parse failure / missing resource ⇒ not
+            # quorate (returns "false"), so the await keeps polling
+            # rather than false-PASSing on a transient read error.
+            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup status "$rd" --json 2>/dev/null \
+                | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    devs=[]
+    for r in d:
+        devs += r.get('devices',[])
+    if not devs:
+        print('false')
+    else:
+        print('true' if all(bool(v.get('quorum',False)) for v in devs) else 'false')
+except Exception:
+    print('false')")
+            [[ "$actual" == "$expected" ]]
+            ;;
         *)
             echo "    unknown assertion kind: $kind" >&2
             return 1

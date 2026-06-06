@@ -84,6 +84,15 @@
 #                           it captures the full Controller→RG→RD→Resource
 #                           inheritance + "closer wins" precedence
 #                           (corner-case C1/C2)
+#   - quorum               live DRBD quorum on <node> (read from the
+#                           kernel via `drbdsetup status <rd> --json`)
+#                           equals <expected> (true|false, default
+#                           true). Pair with `hold_s` to prove quorum
+#                           is HELD across a window — e.g. throughout a
+#                           `--migrate-from` migration so the
+#                           quorum-providing peer is never vacated
+#                           before the new diskful is UpToDate
+#                           (upstream-issue U341)
 #
 # Invariants (post-teardown):
 #
