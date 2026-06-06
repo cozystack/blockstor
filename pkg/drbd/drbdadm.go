@@ -1055,6 +1055,114 @@ func scanRecoveryPromotePeers(conns []drbdsetupStatusConnection, myID int32) (bo
 	return anyPeerInconsistent, weAreLowestUpToDate, peerPrimary
 }
 
+// NeedsSoloPromote probes the live kernel via `drbdsetup status <res>
+// --json` and reports whether THIS node is a lone, peerless diskful
+// replica wedged below UpToDate — the case where a force-primary is the
+// ONLY way to reach UpToDate because there is no peer to SyncTarget
+// from.
+//
+// Why (solo diskless→diskful toggle wedge): when the operator flips the
+// LAST/ONLY replica of an RD from diskless to diskful (r-full Phase 6:
+// every prior diskful was deleted, a diskless witness re-added, then
+// `r td -s <pool>`), the satellite carves a fresh lower disk and the
+// replica comes up Inconsistent. Two upstream-aligned data-safety gates
+// then conspire to leave it Inconsistent forever:
+//
+//   - the dispatcher suppresses the `auto-primary` seed on an
+//     INITIALIZED RD (BuildDesired's `!rdInitialized(rd)` gate, the
+//     respawn-StandAlone fix), so no force-primary / case-B UpToDate
+//     winner seed fires;
+//   - resolveVolumeSeed refuses the day0 skip when SkipInitialSync==false
+//     (the offline-safety fix), so the replica is seeded to SyncTarget a
+//     peer rather than declare itself UpToDate.
+//
+// Both are correct in their multi-replica intent: never fabricate an
+// UpToDate-empty replica while a real data peer exists. But for a SOLO
+// replica with ZERO peers there is no other copy to diverge from and no
+// SyncSource to wait for — the operator's explicit toggle to diskful IS
+// the instruction to make this the authoritative copy. NeedsRecoveryPromote
+// cannot cover it: that predicate requires the local to be ALREADY
+// UpToDate and a PEER to be Inconsistent — the exact inverse of the solo
+// case. Hence this dedicated peerless predicate.
+//
+// Returns true ONLY when ALL hold, so the promote is data-safe and
+// self-limiting:
+//   - the kernel slot exists and reports a my-node-id;
+//   - there are ZERO peer connections (a genuinely solo replica — never
+//     act when any peer slot exists, where the recovery / SyncTarget
+//     paths own convergence and a force-primary could mint a divergent
+//     Current UUID);
+//   - the local role is not already Primary (nothing to do);
+//   - the local replica is diskful but NOT UpToDate (Inconsistent /
+//     Consistent / Outdated): a diskless local has no disk to promote,
+//     and an already-UpToDate local needs no promote.
+//
+// Self-limiting: once `primary --force` flips the lone slot to UpToDate
+// the predicate stops holding, so it never re-fires. Conservative on any
+// probe/parse failure (returns false) — a missed promote just retries on
+// the next reconcile.
+func (a *Adm) NeedsSoloPromote(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 || status[0].NodeID == nil {
+		return false
+	}
+
+	res := status[0]
+
+	// Solo only: any peer connection means another replica exists, and
+	// the recovery-promote / SyncTarget paths own convergence there. A
+	// force-primary against a peer could mint a divergent Current UUID
+	// and split-brain.
+	if len(res.Connections) != 0 {
+		return false
+	}
+
+	// Never disturb an already-Primary slot.
+	if Role(res.Role).IsPrimary() {
+		return false
+	}
+
+	// Promote only a diskful-but-not-UpToDate local: a diskless local
+	// has no disk to promote, an already-UpToDate one needs none.
+	return localIsDiskfulBelowUpToDate(res.Devices)
+}
+
+// localIsDiskfulBelowUpToDate reports whether the local replica has at
+// least one diskful volume and EVERY diskful volume sits below UpToDate
+// (Inconsistent / Consistent / Outdated). A Diskless device disqualifies
+// the replica (nothing to promote); an empty device list (slot mid-
+// negotiation) yields false — conservative. Used by NeedsSoloPromote to
+// confirm a lone replica genuinely needs the force-primary nudge.
+func localIsDiskfulBelowUpToDate(devices []drbdsetupStatusDevice) bool {
+	if len(devices) == 0 {
+		return false
+	}
+
+	for _, d := range devices {
+		switch DiskState(d.DiskState) {
+		case DiskStateInconsistent, DiskStateConsistent, DiskStateOutdated:
+			// A diskful volume below UpToDate — the promote target.
+		case DiskStateUpToDate, DiskStateDiskless, DiskStateAttaching,
+			DiskStateDetaching, DiskStateFailed, DiskStateNegotiating,
+			DiskStateDUnknown:
+			// UpToDate (no promote needed), diskless (nothing to
+			// promote), or a transient/failed state — do not act.
+			return false
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
 // localIsUpToDate reports whether at least one local diskful volume is
 // UpToDate and none is in a non-UpToDate diskful state. A diskless
 // local replica (no disk to be a SyncSource) yields false. Empty

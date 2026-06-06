@@ -2417,6 +2417,21 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// kernel reports an established+UpToDate frame), which does not
 	// race the per-RD apply lane.
 
+	// Steady-state promote self-heals — run after the firstActivation
+	// promote so a wedged replica still converges. Folded into one helper
+	// so finishDRBDApply stays under the gocyclo budget.
+	return r.maybePromoteSelfHeals(ctx, dr, diskless, autoPromote, autoPrimaryReplica)
+}
+
+// maybePromoteSelfHeals runs the two steady-state force-primary self-heals
+// in order: the Bug 366 recovery-promote (a fresh RD whose late replica
+// wedged Inconsistent with a data-bearing peer and no Primary) and the
+// solo-promote (a lone, peerless diskful replica wedged below UpToDate
+// after a diskless→diskful toggle). Both read live kernel state and are
+// self-limiting; their predicates are mutually exclusive (recovery needs a
+// peer, solo needs none), so at most one acts per pass. Extracted from
+// finishDRBDApply to keep that function under the gocyclo budget.
+func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.DesiredResource, diskless, autoPromote, autoPrimaryReplica bool) error {
 	// Bug 366 recovery-promote self-heal — re-arm the auto-primary seed
 	// when a fresh RD wedged with the late replica stuck Inconsistent and
 	// no Primary anywhere. See maybeRecoveryPromote for the full why.
@@ -2425,7 +2440,67 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		return err
 	}
 
-	return nil
+	// Solo diskless→diskful toggle self-heal — force-promote a lone,
+	// peerless diskful replica wedged below UpToDate. See maybeSoloPromote
+	// for the full why (the auto-primary suppression × offline-safety
+	// seed-refusal interaction that strands an initialized-RD last copy).
+	return r.maybeSoloPromote(ctx, dr, diskless)
+}
+
+// maybeSoloPromote force-primaries a lone, peerless diskful replica that
+// is wedged below UpToDate so it can become the authoritative copy. It is
+// the self-heal for the solo diskless→diskful toggle (r-full Phase 6:
+// `r td -s <pool>` on the last/only replica of an initialized RD).
+//
+// Why a separate path from the firstActivation auto-promote and from
+// maybeRecoveryPromote:
+//
+//   - the firstActivation auto-promote only fires when the dispatcher
+//     stamped `auto-primary`, which it suppresses on an INITIALIZED RD
+//     (the respawn-StandAlone fix) and which races the diskless→diskful
+//     flag-strip on a fresh RD — so the lone toggled replica frequently
+//     gets no auto-primary at all;
+//   - even when auto-primary IS set, the promote runs only when the RD
+//     requests a filesystem (`needsMkfs`) — a plain block RD with no
+//     filesystem never promotes;
+//   - maybeRecoveryPromote (Bug 366) requires the local to be ALREADY
+//     UpToDate and a PEER to be Inconsistent — the inverse of the solo
+//     wedge (local Inconsistent, zero peers).
+//
+// NeedsSoloPromote reads live kernel state (zero connections + diskful
+// local below UpToDate + not already Primary), so it is data-safe: with
+// no peer there is nothing to diverge from, and the operator's explicit
+// toggle to diskful IS the instruction to make this the authoritative
+// copy. runAutoPromote (primary --force → optional mkfs → secondary)
+// flips the lone slot Inconsistent → UpToDate. The predicate stops
+// holding once that happens, so the self-heal is self-limiting.
+//
+// Throttled via recoveryPromoteDue (shared with the Bug 366 path): the
+// promote churns kernel state and re-triggers this reconcile; firing on
+// every pass would hot-loop. A still-genuine wedge gets a fresh nudge
+// once the window elapses. Skipped for diskless replicas (no disk to
+// promote) and when Adm is unwired (storage-only unit tests).
+func (r *Reconciler) maybeSoloPromote(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless || r.cfg.Adm == nil {
+		return nil
+	}
+
+	if len(dr.GetPeerNames()) != 0 {
+		return nil
+	}
+
+	if !r.cfg.Adm.NeedsSoloPromote(ctx, dr.GetName()) {
+		return nil
+	}
+
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("solo-promote: force-primary on lone peerless diskful replica wedged below UpToDate",
+		"resource", dr.GetName())
+
+	return r.runAutoPromote(ctx, dr)
 }
 
 // resizeAssumeClean decides whether the pickup-time `drbdadm resize`
