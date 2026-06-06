@@ -109,7 +109,8 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	}
 
 	// The busy delete MUST requeue (idempotent retry), NOT give up.
-	if res.RequeueAfter == 0 { //nolint:staticcheck // res.Requeue deprecated; RequeueAfter is the retry signal
+	requeued := res.RequeueAfter > 0 || res.Requeue
+	if !requeued {
 		t.Errorf("U32: busy snapshot delete did not requeue (would latch DELETING "+
 			"forever); result=%+v", res)
 	}
