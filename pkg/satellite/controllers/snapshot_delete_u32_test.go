@@ -87,7 +87,7 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	// still has the snapshot block device open, or an lvm metadata lock).
 	lvremoveCmd := "lvremove --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --force vg/ccu3-u32_snap_00000"
 	fx.Expect(lvremoveCmd, storage.FakeResponse{
-		Err: errors.New("Logical volume vg/ccu3-u32_snap_00000 in use."),
+		Err: errors.New("logical volume vg/ccu3-u32_snap_00000 in use"),
 	})
 
 	rec := seedThinResource(t, fx, "ccu3-u32", "thin1")
@@ -109,7 +109,7 @@ func TestU32_SnapshotDeleteIdempotentRetryUntilBackingGone(t *testing.T) {
 	}
 
 	// The busy delete MUST requeue (idempotent retry), NOT give up.
-	if !res.Requeue && res.RequeueAfter == 0 {
+	if res.RequeueAfter == 0 { //nolint:staticcheck // res.Requeue deprecated; RequeueAfter is the retry signal
 		t.Errorf("U32: busy snapshot delete did not requeue (would latch DELETING "+
 			"forever); result=%+v", res)
 	}
