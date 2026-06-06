@@ -80,6 +80,37 @@ func TestGISeedStringSkipInitSync(t *testing.T) {
 	}
 }
 
+// TestGISeedStringWasUpToDateNonWinner pins the non-winner day0
+// skip-init-sync shape: consistent=0 (idx4, the device still attaches
+// Inconsistent — no authority), was-up-to-date=1 (idx5, routes the
+// attach through the kernel's "was UpToDate, new region assumed
+// zeroed" path so the brand-new device keeps a CLEAN bitmap). Without
+// idx5 a provider that renders no rs-discard-granularity (loop-backed
+// FILE_THIN) attaches with the FULL device marked out-of-sync and the
+// day0 skip degrades into a full byte-copy initial sync — the r-full
+// P1 512M regression.
+func TestGISeedStringWasUpToDateNonWinner(t *testing.T) {
+	day0 := "1122334455667780"
+	seed := drbd.GISeed{Current: day0, WasUpToDate: true}
+
+	got := seed.String()
+	want := "1122334455667780:0:0:0:0:1"
+	if got != want {
+		t.Errorf("non-winner was-up-to-date GI: got %q want %q", got, want)
+	}
+}
+
+// TestGISeedValidateWasUpToDateRequiresCurrent: was-up-to-date anchors
+// the kernel's assumed-zeroed attach decision to a generation; with no
+// current-UUID there is nothing to anchor to.
+func TestGISeedValidateWasUpToDateRequiresCurrent(t *testing.T) {
+	seed := drbd.GISeed{WasUpToDate: true}
+
+	if err := seed.Validate(); err == nil {
+		t.Fatal("WasUpToDate with empty current-UUID must fail validation")
+	}
+}
+
 // TestGISeedConsistentWithoutUpToDate confirms a Consistent-only seed
 // emits the consistent flag but not up-to-date.
 func TestGISeedConsistentWithoutUpToDate(t *testing.T) {

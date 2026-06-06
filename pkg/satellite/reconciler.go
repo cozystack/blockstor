@@ -4681,12 +4681,24 @@ func (r *Reconciler) resolveVolumeSeed(ctx context.Context, resourceName string,
 
 	// Skip-init-sync (case A): current = day0 (shared lineage anchor),
 	// bitmap-base EMPTY (zero) — same clean-bitmap shape as the winner,
-	// minus the Consistent/UpToDate flags. Both peers present the same
-	// current-uuid with a zero bitmap → DRBD reads "no data difference"
-	// → no sync; both reach UpToDate at the kernel handshake. (Stamping
-	// day0 into bitmap-base here was the same SyncTarget-triggering bug
-	// the winner branch documents.)
-	return drbd.GISeed{Current: day0}, true
+	// minus the Consistent/UpToDate authority flags. Both peers present
+	// the same current-uuid with a zero bitmap → DRBD reads "no data
+	// difference" → no sync; both reach UpToDate at the kernel
+	// handshake. (Stamping day0 into bitmap-base here was the same
+	// SyncTarget-triggering bug the winner branch documents.)
+	//
+	// WasUpToDate (WITHOUT Consistent — the replica still attaches
+	// Inconsistent and cannot be promoted): routes the attach through
+	// the kernel's "was UpToDate, new region assumed zeroed" path so
+	// the brand-new device (metadata la_size 0 → full size) keeps a
+	// CLEAN bitmap. Without it the kernel's only other clean path
+	// ("day0 volume") is gated on a non-zero rs-discard-granularity —
+	// deliberately NOT rendered on loop-backed FILE_THIN (the mkfs
+	// wedge) — so a flagless seed attached with the FULL device marked
+	// out-of-sync and the "skip" became a full byte-copy initial sync
+	// (the r-full P1 512M regression; LVM_THIN masked it because its
+	// granularity is rendered).
+	return drbd.GISeed{Current: day0, WasUpToDate: true}, true
 }
 
 // providerForResource resolves the provider that owns the named
