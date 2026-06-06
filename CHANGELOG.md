@@ -4,6 +4,42 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.10 — 2026-06-06
+
+Corner-case parity campaign release. Every behavior in this release was validated on a live Talos+QEMU stand, with the ⚖️-ambiguous cases compared against an upstream LINSTOR 1.33.2 oracle cluster (controller + 3 satellites) running side-by-side on the same DRBD kernel. 61 corner-case plan items closed; 15 new rows added to the known-deltas whitelist.
+
+### Fixed
+
+- **`DrbdOptions/auto-quorum disabled` was silently ignored (#97, #105)** — the opt-out gate read the camelCase `DrbdOptions/AutoQuorum` key that no production path writes (#97), and after the key fix it still read `Spec.Props` while the store transcoder routes the kebab key into `Spec.ExtraProps` (#105) — so the reconciler kept re-stamping `quorum=majority` over an operator's manual `quorum off`. Both layers fixed; the gate now honors the canonical key in both property bags. Caught at operator-CLI level by the L7 replay — twice — after unit fixtures passed.
+- **Empty `set-property` value now deletes the key everywhere (#97, #107)** — upstream semantics ("empty value = delete the property") were implemented for RD/RG modify first (#97) and then rolled out to all remaining CLI-reachable handlers: node, storage-pool, controller, resource, volume-definition, volume-group, storage-pool-definition (#107). KV-store and log-level handlers are deliberately exempt (empty is real data there).
+- **Controller-tier DRBD options no longer beat closer scopes (#98)** — `linstor controller drbd-options` values used to override RD-level overrides; the effective-properties resolver now applies the upstream precedence (controller < resource-group < resource-definition < resource) uniformly. The rewrite initially dropped non-DRBD upper-scope properties (`FileSystem/Type` never reached the satellite, breaking mkfs seeding) — caught by 3× CI failures and an isolated-stand A/B repro, fixed in the same PR.
+- **Autoplace now upgrades a tiebreaker witness in place (#111)** — `resource create --auto-place +1` (and the absolute form) on a 2-diskful + witness shape failed with "Not enough nodes": the placer counted the witness-holding node as taken. It is now an upgrade candidate, promoted via the same flag transition the explicit `r c --storage-pool` path uses; wire result matches upstream (in-place witness upgrade, no fourth node).
+- **`node delete` on an EVICTED node is rejected; `AutoplaceTarget=false` excludes a node from autoplace (#102)** — both upstream-documented guards were missing.
+- **Deprecated `--diskless` wire alias accepted (#103)** — `DRBD_DISKLESS` is normalized to `DISKLESS` at the resource-create boundary, so older clients and scripts behave identically to upstream.
+- **Snapshot edge guards (#100)** — in-place `snapshot rollback` is rejected with an actionable pointer to the safe `snapshot resource restore` path (upstream's rollback both destroys newer snapshots and, on ≥1.31.2, silently resurrects deleted replicas — verified live against the oracle); restore into an RD that already has volume definitions returns the upstream-typed `FAIL_EXISTS_VLM_DFN` envelope; `AutoSnapshot/Keep ≤ 0` falls back to 10; snapshots on thick-LVM pools are rejected with the upstream envelope.
+- **Finalizer-blocked deletions surface the `DELETE` flag (#94)** — a resource-definition held by node teardown now shows `DELETING` in `rd l`, matching upstream's two-phase deletion visibility.
+- **`--layer-list` duplicate-layer rejection reports the real fault (#108)** — duplicate detection now runs before the position check, so `drbd,drbd,storage` says "appears more than once" instead of a misleading ordering error.
+
+- **Resync transfers only written data on real-block thin pools (#112)** — the rendered `disk {}` section now includes `rs-discard-granularity` on LVM-thin/ZFS pools (matching upstream), so DRBD discards provably-zero ranges during resync instead of byte-copying them — measured ~2x faster recovery of partially-written volumes. FILE_THIN (loop-backed) pools deliberately omit the option: a full-device mkfs discard on loop backing dirties the bitmap against the day0-seeded peers and wedges fresh-create convergence (found by CI, isolated on the stand, recorded as a known delta).
+
+### Parity pins and recorded divergences
+
+- Volume-number allocation (smallest-free reuse after `vd d`, explicit `--vlmnr` gap fill) pinned oracle-identical; multi-volume RDs render as one DRBD resource with nested `volume {}` blocks (#96).
+- Deletion semantics pinned byte-identical to upstream: `rd d` blocked by snapshots while `r d` is not; `rg delete` with live RDs rejected with the upstream envelope (#94).
+- Placement contracts pinned: unsatisfiable place-count accepted at `rg c` and failing only at spawn (FAIL_NOT_ENOUGH_NODES); `--x-replicas-on-different` empty-bucket semantics; bare-flag autoplace property reset; `--providers` order-independence (#99). The plan's assumption that `rg c --place-count +1` is rejected upstream was disproven by the oracle and documented.
+- BalanceResources: blockstor's `RGRebalanceReconciler` already provides the equivalent of upstream's periodic balancer and honors `BalanceResourcesEnabled=false`; residual divergences recorded (#108).
+- Quorum behavior pinned at the DRBD-kernel level: a diskless tiebreaker can hold but never return quorum — a severed node stays UpToDate yet unpromotable (`drbdadm primary` → "No quorum"), exactly per the DRBD documentation (#106).
+- New known-deltas rows for: shrink rejection (BS stricter, `force=true` escape), default `on-no-quorum=suspend-io` seed (data-safety choice vs upstream's unset), quorum-property strip-vs-stamp on `r d`, permissive property-value validation, resource-connection/node-connection peer-options surfaces, per-object option-class enforcement, StorPoolName resolution chain, autoplacer weight defaults, DRBD port/minor base ranges (20000+ to coexist with upstream on shared kernels), `rd lp` inherited-property inlining, layer-list error envelope shape.
+
+### Testing & infrastructure
+
+- Upstream LINSTOR 1.33.2 oracle cluster install script for the dev stand: controller + 3 satellites with disjoint DRBD port/minor ranges, enabling live A/B parity validation (#95).
+- `state-standalone-partition` hardened against its dominant CI flake modes: the partition rule is verified applied before the detect wait, transient empty status reads are retried instead of sampled, and an evidence dump precedes any failure (#104).
+- Replay harness: `hold_s` await option — an assertion must stay true for N consecutive seconds, catching value-flapping that a first-match await false-passes (#105); `prop_value` await extended to node/controller objects (#107); `vd_size_kib` await fixed (an environment-variable-across-pipe bug made it pass-proof since introduction) and `{{rg}}`/`{{device}}` substitutions added (#110); fixture-gated replays now SKIP cleanly when the stand lacks the fixture (#110).
+- Replay assertions made auto-tiebreaker-aware: after operations that leave two diskful replicas, the witness legitimately re-occupies the vacated node — `resource_absent` assertions replaced with `replica_diskless`/`tiebreaker_present` (#103, #109, #110).
+- `stand/up.sh`: backticks in heredoc comments no longer execute as command substitution on hosts that have the named binaries; respawn-wedge latch wait widened for loaded CI runners (#101).
+- Slow-stand resync headroom on large-volume replay gates; L4 quorum scenario and corner-case L6/L7 coverage across all campaign groups (#99, #100, #102, #103, #106, #107, #108, #110).
+
 ## v0.1.9 — 2026-06-03
 
 Patch release with a single operator-reported fix. Versions v0.1.6–v0.1.8 are skipped: those tags pre-exist in the repository from an inherited lineage and do not correspond to blockstor releases.
