@@ -2297,9 +2297,19 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
-	// the lower disk's size. Diskless replicas don't have a lower
-	// disk to resize but they still need their internal state to
-	// catch up; drbdadm resize handles that case too.
+	// the lower disk's size.
+	//
+	// U48 (P1): `drbdadm resize` is fanned out to DISKFUL replicas
+	// ONLY. The gate is `resized`, which applyStorageIfDiskful pins to
+	// false for diskless replicas (they short-circuit before the
+	// storage-grow probe and never set resized=true). So this block is
+	// structurally unreachable on a diskless / TieBreaker peer — exactly
+	// the upstream LINSTOR footgun where `drbdadm resize` was issued on a
+	// diskless node and the kernel rejected it ("requires a local disk"),
+	// wedging the volume mid-resize. The diskless peer's internal size
+	// view catches up for free via the connection handshake once a
+	// diskful peer resizes; it does NOT need a local `drbdadm resize`.
+	// Pinned by TestApplyDisklessReplicaSkipsResizeFanout.
 	if resized {
 		// Bug 395 (P1, data integrity): gate `--assume-clean` on whether
 		// the backing provider zero-fills the grown region. For thick
@@ -2307,9 +2317,8 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 		// marks the grown region out-of-sync and resyncs it from the
 		// UpToDate source — otherwise replicas silently disagree on
 		// [old_size, new_size) (recycled VG extents differ per node).
-		// Diskless replicas have no backing disk and no provider, so the
-		// helper returns true (the notify-only resize there has no data
-		// region to mark; the diskful peers drive the resync).
+		// This block only runs on diskful replicas (see U48 note above),
+		// so resizeAssumeClean always has a real provider to interrogate.
 		assumeClean := r.resizeAssumeClean(dr)
 
 		err := r.cfg.Adm.Resize(ctx, dr.GetName(), assumeClean)

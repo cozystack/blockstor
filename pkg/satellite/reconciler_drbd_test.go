@@ -581,6 +581,73 @@ func TestApplyNoResizeOnFreshCreate(t *testing.T) {
 	}
 }
 
+// TestApplyDisklessReplicaSkipsResizeFanout is the U48 (P1) regression:
+// a `vd set-size` grow MUST NOT fan `drbdadm resize` (nor any storage
+// `lvextend`) out to a DISKLESS / TieBreaker replica. Upstream LINSTOR
+// reportedly issued `drbdadm resize` on the diskless peer, which the
+// kernel rejected with "requires a local disk" and wedged the volume
+// mid-resize.
+//
+// In blockstor the gate is structural: applyStorageIfDiskful short-
+// circuits for diskless replicas and returns resized=false, so the
+// downstream `if resized { Adm.Resize() }` in finishDRBDApply never
+// fires. This test pins that contract from the operator-visible side:
+// a diskless replica whose desired Volume carries a GROWN SizeKib (the
+// exact shape the controller stamps after a `vd s` on a resource with a
+// diskless peer present) must produce ZERO lvextend and ZERO
+// `drbdadm resize` calls. The desired Volume keeps a StoragePool set —
+// this is the post-`r td --diskless` shape (Spec.Flags=[DISKLESS] but
+// the Volume still carries its old pool), the worst case for an
+// accidental resize fan-out.
+func TestApplyDisklessReplicaSkipsResizeFanout(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+
+	// No storage-provider expectations are registered: a diskless
+	// replica must not touch the storage layer at all, so any lvs /
+	// lvextend shell-out would surface as an unexpected-command panic
+	// from the FakeExec (or, at minimum, the assertions below).
+	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
+	rec := satellite.NewReconciler(satellite.ReconcilerConfig{
+		Providers: map[string]storage.Provider{"thin1": thin},
+		Adm:       drbd.NewAdm(fx),
+		StateDir:  dir,
+		NodeName:  "n1",
+	})
+
+	// Desired: DISKLESS replica, Volume grown to 2 GiB (controller has
+	// already propagated the new VolumeDefinition size into every
+	// Resource's Volumes[], diskless ones included).
+	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+		{
+			Name:     "pvc-diskless-grow",
+			NodeName: "n1",
+			Flags:    []string{"DISKLESS"},
+			Volumes: []*intent.DesiredVolume{
+				{VolumeNumber: 0, SizeKib: 2 * 1024 * 1024, StoragePool: "thin1"},
+			},
+			SkipInitialSync: skipInitTrue(),
+			DrbdOptions: map[string]string{
+				"port": "7000", "node-id": "0", "address": "10.0.0.1", "minor": "1000",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "lvextend ") {
+			t.Errorf("U48: diskless replica issued lvextend (resize fanned to diskless): %s", line)
+		}
+
+		if strings.HasPrefix(line, "drbdadm resize") {
+			t.Errorf("U48: diskless replica issued drbdadm resize "+
+				"(\"requires a local disk\" wedge): %s", line)
+		}
+	}
+}
+
 // TestApplyRendersAllowTwoPrimaries verifies the option-hierarchy
 // pipeline lands `allow-two-primaries yes;` in the generated .res
 // file. Required for Ganesha-RWX (NFS export flips Primary on

@@ -179,6 +179,61 @@ func TestMetaPoolDefaultsToInternal(t *testing.T) {
 	}
 }
 
+// TestReAddedReplicaPicksUpLiveGrownSize is the U389 (P2) regression:
+// after a `vd set-size` grow, dropping one replica (`r d`) and re-adding
+// it (autoplace) must provision the new replica at the LIVE (grown) VD
+// geometry — never a stale pre-grow snapshot. The dispatcher derives
+// DesiredVolume.SizeKib straight from the parent RD's
+// Spec.VolumeDefinitions[].SizeKib (the single source of truth that
+// `vd s` mutates in place), so a freshly-staged Resource with no prior
+// Status carries the current grown size by construction.
+//
+// We model the re-add as a brand-new diskful Resource (no
+// Status/Volumes, mimicking the autoplacer staging a fresh peer) against
+// an RD whose VD already reflects the grown size. The asserted invariant
+// is that the re-added replica's DesiredVolume.SizeKib equals the grown
+// VD size — the byte-geometry the existing UpToDate peers already run.
+func TestReAddedReplicaPicksUpLiveGrownSize(t *testing.T) {
+	const grownKib = int64(4 * 1024 * 1024) // 4 GiB, post two grows from 1 GiB
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				// The VD has already been grown in place by `vd s`.
+				{VolumeNumber: 0, SizeKib: grownKib},
+			},
+		},
+	}
+
+	// Fresh diskful Resource: the autoplacer just staged this peer onto
+	// n3 after the operator ran `r d <rd> n3` then re-placed. It has no
+	// Status, no prior Volumes — exactly the "from scratch" shape that
+	// could otherwise pick up a stale size if the dispatcher consulted
+	// anything other than the live VD.
+	target := &blockstoriov1alpha1.Resource{
+		Spec: blockstoriov1alpha1.ResourceSpec{
+			ResourceDefinitionName: "pvc-1",
+			NodeName:               "n3",
+			StoragePool:            "data-hdd",
+		},
+	}
+
+	got := dispatcher.BuildDesired(target, nil, nil, nil, rd, nil)
+	if got == nil {
+		t.Fatalf("BuildDesired returned nil")
+	}
+
+	if len(got.Volumes) != 1 {
+		t.Fatalf("want 1 volume, got %d", len(got.Volumes))
+	}
+
+	if vol := got.Volumes[0]; vol.SizeKib != grownKib {
+		t.Errorf("U389: re-added replica SizeKib=%d, want live grown %d "+
+			"(re-add must match current geometry, not a stale VD snapshot)",
+			vol.SizeKib, grownKib)
+	}
+}
+
 // TestMultiVolumeRDConsistencyGroup pins scenario 4.W25 (wave2-04-
 // lifecycle.md): an RD with multiple VolumeDefinitions forms ONE DRBD
 // resource that owns ALL of them. The dispatcher must surface every
