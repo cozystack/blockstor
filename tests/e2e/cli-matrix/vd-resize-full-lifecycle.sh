@@ -181,7 +181,11 @@ run_resize_lifecycle() {
     echo ">> linstor vd s $RD 0 1G (MUST fail — DRBD cannot shrink past meta)"
     local err_file
     err_file=$(mktemp)
-    if "${LCTL[@]}" volume-definition set-size "$RD" 0 1G 2>"$err_file" >/dev/null; then
+    # Capture BOTH streams: python-linstor prints the server ERROR
+    # envelope to stdout, so a `2>err_file` alone leaves the message-grep
+    # below reading an empty file (false FAIL even though the rejection
+    # fired). See vd-shrink-rejected.sh for the same fix.
+    if "${LCTL[@]}" volume-definition set-size "$RD" 0 1G >"$err_file" 2>&1; then
         echo "FAIL: shrink 4G→1G unexpectedly succeeded — DRBD protocol violation not surfaced" >&2
         cat "$err_file" >&2
         rm -f "$err_file"

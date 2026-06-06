@@ -96,15 +96,21 @@ fi
 wait_uptodate "$RD" "${placed_nodes[0]}" "${placed_nodes[1]}"
 
 echo ">> linstor vd s $RD 0 500M (MUST exit non-zero)"
+# python-linstor prints the server-side ERROR envelope to STDOUT (not
+# stderr), so capture BOTH streams into err_file — a `2>err_file` alone
+# leaves err_file empty and the message grep below false-FAILs even
+# though the rejection itself fired (rc=10). Confirmed on the stand:
+# the "cannot shrink volume … shrink-then-resize required" text lands on
+# stdout.
 err_file=$(mktemp)
-if "${LCTL[@]}" volume-definition set-size "$RD" 0 500M >/dev/null 2>"$err_file"; then
+if "${LCTL[@]}" volume-definition set-size "$RD" 0 500M >"$err_file" 2>&1; then
     echo "FAIL: vd s 2G→500M unexpectedly succeeded" >&2
     echo "   DRBD protocol forbids shrink past meta — REST must reject." >&2
     cat "$err_file" >&2
     exit 1
 fi
 
-echo ">> stderr must mention shrink / reduce / smaller"
+echo ">> error text must mention shrink / reduce / smaller"
 if ! grep -qiE 'shrink|cannot.*(reduce|shrink)|smaller|reduction|STORAGE_POOL_CAPACITY_REDUCTION_FAILED' "$err_file"; then
     echo "FAIL: shrink rejected but error text is unhelpful:" >&2
     cat "$err_file" >&2
