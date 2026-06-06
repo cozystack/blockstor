@@ -20,6 +20,7 @@ package rest
 
 import (
 	"encoding/json"
+	"io"
 	"maps"
 	"net/http"
 	"strings"
@@ -1118,6 +1119,83 @@ func TestSPCreateDisklessNoProps(t *testing.T) {
 
 	if !found {
 		t.Errorf("created DISKLESS pool not visible in /v1/view/storage-pools; got pools=%+v", pools)
+	}
+}
+
+// TestDisklessStorPoolCapacityOmitsSentinel pins upstream-issue U64:
+// the diskless storage-pool's capacity figures must NOT serialise as
+// the int64 max sentinel (9223372036854775807) on the `sp l -m` wire.
+//
+// Upstream LINSTOR historically reported a diskless pool's free /
+// total capacity as Long.MAX_VALUE — a 9.2e18 "garbage" figure that
+// confused capacity-tooling that summed pool capacities (it overflowed
+// any aggregate that touched a diskless row). blockstor stores the
+// diskless pool with FreeCapacity==0 / TotalCapacity==0 and both
+// fields carry `omitempty`, so the RAW JSON the CLI parses must omit
+// the keys entirely rather than emit either the sentinel or an
+// explicit `0`. This is a deliberate divergence from the upstream
+// sentinel (whitelisted in docs/cli-parity-known-deltas.md) — "omit"
+// is strictly cleaner for any consumer that sums capacities, and the
+// CLI renders an omitted diskless capacity as empty, matching the
+// operator's expectation of "n/a" for a pool with no backing storage.
+//
+// The test inspects the RAW response bytes (not the decoded struct)
+// because the sentinel-vs-omit distinction is invisible after a Go
+// round-trip through an int64 field: a 9.2e18 value would decode
+// silently and only a byte-level check catches the regression.
+func TestDisklessStorPoolCapacityOmitsSentinel(t *testing.T) {
+	const sentinel = "9223372036854775807" // math.MaxInt64
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.Nodes().Create(ctx, &apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite}); err != nil {
+		t.Fatalf("seed node: %v", err)
+	}
+
+	// Seed the canonical per-satellite diskless pool exactly as
+	// handleNodeCreate auto-provisions it — no capacity fields set.
+	if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+		StoragePoolName: DfltDisklessStorPoolName,
+		NodeName:        "n1",
+		ProviderKind:    apiv1.StoragePoolKindDiskless,
+	}); err != nil {
+		t.Fatalf("seed diskless pool: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpGet(t, base+"/v1/view/storage-pools?nodes=n1")
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	body := string(raw)
+
+	// Headline U64 guard: never the int64-max sentinel on the wire.
+	if strings.Contains(body, sentinel) {
+		t.Errorf("diskless pool body carries the int64-max capacity sentinel %s: %s",
+			sentinel, body)
+	}
+
+	// And, because both fields carry omitempty and the seed is zero,
+	// the keys must be absent entirely — not even an explicit `0`.
+	// (A future refactor that drops omitempty would emit `0`, which is
+	// harmless to summers but breaks the CLI's "n/a" rendering; pin it.)
+	if strings.Contains(body, "free_capacity") {
+		t.Errorf("diskless pool body should omit free_capacity (no backing storage): %s", body)
+	}
+
+	if strings.Contains(body, "total_capacity") {
+		t.Errorf("diskless pool body should omit total_capacity (no backing storage): %s", body)
 	}
 }
 

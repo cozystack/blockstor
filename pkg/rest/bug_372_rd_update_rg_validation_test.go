@@ -201,6 +201,117 @@ func TestBug372PUTRDPropsOnlyDoesNotTriggerRGGate(t *testing.T) {
 	}
 }
 
+// TestU222RDReassignToHigherPlaceCountRGIsNonRetroactive pins
+// upstream-issue U222: reassigning an RD to a resource-group with a
+// HIGHER place-count does NOT auto-deploy new replicas. This is the
+// upstream-documented placement asymmetry — RG SelectFilter.PlaceCount
+// is consulted ONLY at autoplace / spawn time (an explicit
+// `r c --auto-place` / `rg spawn` call), never retroactively when the
+// RD's group membership changes. Our E3/I2 cover prop inheritance
+// (the RG's props/layer-stack DO flow into the RD); this pins the
+// COMPLEMENTARY half: inheritance is for *future* placement decisions,
+// it is NOT a trigger that materialises replicas on its own.
+//
+// Repro shape (oracle-confirmed identical on LINSTOR 1.33.2):
+//
+//	rg create rg-2 --place-count 2
+//	rg create rg-3 --place-count 3
+//	rd create testrd --resource-group rg-2     # 0 replicas (no r c yet)
+//	rd modify testrd --resource-group rg-3      # still 0 replicas
+//
+// A regression that wired an RG-membership change into a controller-side
+// auto-deploy reconcile (an easy mistake when adding an
+// RGRebalanceReconciler) would grow Store.Resources() here and fail.
+func TestU222RDReassignToHigherPlaceCountRGIsNonRetroactive(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	// rg-2: place-count 2; rg-3: place-count 3.
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-2",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: apiv1.LaxInt32(2)},
+	}); err != nil {
+		t.Fatalf("seed rg-2: %v", err)
+	}
+
+	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
+		Name:         "rg-3",
+		SelectFilter: apiv1.AutoSelectFilter{PlaceCount: apiv1.LaxInt32(3)},
+	}); err != nil {
+		t.Fatalf("seed rg-3: %v", err)
+	}
+
+	// RD in the 2-place group, no replicas materialised (no `r c`).
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{
+		Name:              "testrd",
+		ResourceGroupName: "rg-2",
+	}); err != nil {
+		t.Fatalf("seed rd: %v", err)
+	}
+
+	// Sanity: zero replicas before the move.
+	before, err := st.Resources().List(ctx)
+	if err != nil {
+		t.Fatalf("list resources before: %v", err)
+	}
+
+	if got := countReplicasOf(before, "testrd"); got != 0 {
+		t.Fatalf("pre-move replica count of testrd: got %d, want 0", got)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	// Reassign to the higher-place-count group (a legitimate 200 move).
+	resp := httpPut(t, base+"/v1/resource-definitions/testrd",
+		[]byte(`{"resource_group":"rg-3"}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		got, _ := readAllBody(resp)
+		t.Fatalf("status: got %d, want 200 (valid RG move). Body: %s",
+			resp.StatusCode, got)
+	}
+
+	// The move must stamp the new group...
+	rd, err := st.ResourceDefinitions().Get(ctx, "testrd")
+	if err != nil {
+		t.Fatalf("re-fetch rd: %v", err)
+	}
+
+	if got, want := rd.ResourceGroupName, "rg-3"; got != want {
+		t.Errorf("stored resource_group_name: got %q, want %q (move did not stamp)", got, want)
+	}
+
+	// ...but MUST NOT have auto-deployed any replicas. The higher
+	// place-count is inert until an explicit autoplace/spawn call.
+	after, err := st.Resources().List(ctx)
+	if err != nil {
+		t.Fatalf("list resources after: %v", err)
+	}
+
+	if got := countReplicasOf(after, "testrd"); got != 0 {
+		t.Errorf("post-move replica count of testrd: got %d, want 0 "+
+			"(RG place-count is non-retroactive; reassignment must not auto-deploy)", got)
+	}
+}
+
+// countReplicasOf counts Resource replicas whose ResourceName matches
+// rd. Small helper kept local to the U222 pin.
+func countReplicasOf(resources []apiv1.Resource, rd string) int {
+	n := 0
+
+	for i := range resources {
+		if resources[i].Name == rd {
+			n++
+		}
+	}
+
+	return n
+}
+
 // TestBug372PUTRDDstRscGrpAliasTriggersGate pins the `dst_rsc_grp`
 // alias (python-linstor 1.27.0's third spelling — see Bug 232). The
 // validation has to fire on every spelling the merge reads.
