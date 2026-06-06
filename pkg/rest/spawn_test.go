@@ -48,7 +48,9 @@ func TestSpawnCreatesRDAndVDs(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-1",
-		VolumeSizes:            []int64{2 * 1024 * 1024, 4 * 1024 * 1024}, // bytes
+		// volume_sizes is KiB (Bug 391): the python client encodes
+		// `2M`/`4M` as [2048, 4096] via parse_volume_size_to_kib.
+		VolumeSizes: []int64{2048, 4096}, // KiB
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -83,7 +85,8 @@ func TestSpawnCreatesRDAndVDs(t *testing.T) {
 		t.Fatalf("len: got %d, want 2", len(vds))
 	}
 
-	// 2 MiB / 1024 = 2048 KiB; 4 MiB → 4096 KiB.
+	// volume_sizes entries land verbatim as size_kib (Bug 391): the
+	// requested [2048, 4096] KiB must NOT be divided by 1024.
 	if vds[0].SizeKib != 2048 || vds[1].SizeKib != 4096 {
 		t.Errorf("VD sizes: got %d, %d, want 2048, 4096", vds[0].SizeKib, vds[1].SizeKib)
 	}
@@ -325,7 +328,7 @@ func TestSpawnRejectsExceedingFreeCapacityRatio(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-too-big",
-		VolumeSizes:            []int64{3 * 1024 * 1024}, // 3 MiB = 3072 KiB > 2048 cap
+		VolumeSizes:            []int64{3072}, // 3 MiB = 3072 KiB > 2048 cap
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -400,7 +403,7 @@ func TestSpawnRejectsExceedingTotalCapacityRatio(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-total-gate",
-		VolumeSizes:            []int64{24 * 1024}, // 24 KiB > cap=20
+		VolumeSizes:            []int64{24}, // 24 KiB > cap=20 (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-total/spawn", body)
@@ -443,7 +446,7 @@ func TestSpawnRejectsExceedingOversubscriptionRatio(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-umb",
-		VolumeSizes:            []int64{40 * 1024}, // 40 KiB > 30 cap
+		VolumeSizes:            []int64{40}, // 40 KiB > 30 cap (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-umb/spawn", body)
@@ -489,7 +492,7 @@ func TestSpawnAcceptsWithinOversubscriptionGate(t *testing.T) {
 
 	body, _ := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-fits",
-		VolumeSizes:            []int64{40 * 1024}, // 40 KiB ≤ 50 cap
+		VolumeSizes:            []int64{40}, // 40 KiB ≤ 50 cap (volume_sizes is KiB, Bug 391)
 	})
 
 	resp := httpPost(t, base+"/v1/resource-groups/rg-ok/spawn", body)
@@ -627,7 +630,7 @@ func TestSpawnAutoplacesFromRGSelectFilter(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-spawn",
-		VolumeSizes:            []int64{4 * 1024 * 1024}, // 4 MiB
+		VolumeSizes:            []int64{4096}, // 4 MiB = 4096 KiB (Bug 391)
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -749,7 +752,10 @@ func TestSpawnAutoplaceRejectsCrossKindFromRG(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-mixed",
-		VolumeSizes:            []int64{1024 * 1024},
+		// 4 MiB in KiB (Bug 391): well under the default-ratio cap
+		// (free 1000 KiB × 20 = 20000) so this exercises the
+		// cross-kind placement deferral, not the oversub gate.
+		VolumeSizes: []int64{4096},
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -842,8 +848,11 @@ func TestSpawnPartialFlagAllowsShortPlacement(t *testing.T) {
 
 	body, err := json.Marshal(apiv1.ResourceGroupSpawn{
 		ResourceDefinitionName: "pvc-partial",
-		VolumeSizes:            []int64{1024 * 1024},
-		PartialFlag:            true,
+		// 4 MiB in KiB (Bug 391): under the default-ratio cap
+		// (free 1000 KiB × 20 = 20000) so the partial-placement
+		// path is what's exercised, not the oversub gate.
+		VolumeSizes: []int64{4096},
+		PartialFlag: true,
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
