@@ -344,6 +344,19 @@ func (r *NodeReconciler) pruneSource(ctx context.Context, rdName, node string) e
 // explicitly NOT counted toward satisfaction (it is being drained).
 // Until the gate passes the source on the evacuated node must live so
 // redundancy never dips.
+//
+// U305 (P0) data-loss guard — never drop the last copy: a hard >= 1
+// floor on healthy UpToDate diskful replicas is enforced regardless of
+// filter.PlaceCount. The effective target can legitimately resolve to 0
+// — e.g. the evacuated node is the ONLY node (or every other node is
+// itself draining), so currentDiskfulTarget caps to healthyNodes == 0.
+// Without the floor the gate would read `0 >= 0 == true` and pruneSource
+// would drop the lone source replica with NO replacement anywhere,
+// leaving the resource sourceless / Outdated (data loss). The floor
+// holds the source until a genuine healthy replacement is UpToDate; if
+// none can ever be placed (no spare node) the source is correctly held
+// forever — the node hangs in EVACUATE, which is the documented
+// upstream-LINSTOR fail-safe (migrate-or-refuse, never silent dataloss).
 func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter *apiv1.AutoSelectFilter, rdName, evictedNode string) (bool, error) {
 	drained, err := r.drainingNodes(ctx)
 	if err != nil {
@@ -387,7 +400,9 @@ func (r *NodeReconciler) evacuationReplacementReady(ctx context.Context, filter 
 		}
 	}
 
-	return healthyUpToDate >= int(filter.PlaceCount), nil
+	// U305 never-drop-the-last-copy floor (>= 1) in addition to the
+	// place-count target — see the doc comment above.
+	return healthyUpToDate >= int(filter.PlaceCount) && healthyUpToDate >= 1, nil
 }
 
 // replicaUpToDate reads the Resource CRD Status for `rdName` on `node`

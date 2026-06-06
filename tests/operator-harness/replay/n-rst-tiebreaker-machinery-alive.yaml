@@ -1,0 +1,93 @@
+name: n-rst-tiebreaker-machinery-alive
+description: |
+  Corner case U382 (upstream-mined, P2): after an evict + restore cycle
+  on the witness node, the auto-tiebreaker machinery must still WORK — a
+  later witness add / auto-add must succeed, not silently no-op because
+  some per-RD state latched during the drain.
+
+  This extends n-rst-recreates-tiebreaker (Bug 386, which asserts the
+  witness is re-created on `n rst`) with an explicit POST-RESTORE TB
+  probe: once the node is restored and the witness is back, DELETE the
+  witness replica and assert the reconciler AUTO-RE-ADDS it. That round
+  trip exercises the full ensureTiebreaker create path AFTER the
+  evict/restore cycle — proving the machinery is alive, not just that the
+  one witness Bug 386 restored happened to survive.
+
+  Verbatim operator shape:
+    2 diskful + 1 auto TieBreaker → evacuate witness node (TB collapses)
+    → restore witness node (TB re-created) → r d <tb-node> (witness gone)
+    → witness AUTO re-added (machinery still works after the cycle).
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: wait-tiebreaker-spawned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: evacuate-node3
+    cmd: ["node", "evacuate", "{{node3}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: restore-node3
+    cmd: ["node", "restore", "{{node3}}"]
+    expect_exit: 0
+  - name: tiebreaker-recreated-after-restore
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  # ---- U382 explicit post-restore TB-add probe ----
+  - name: find-tiebreaker-node
+    # The witness now lives on whichever node the reconciler picked after
+    # restore. Delete it explicitly to drive a fresh auto-add round trip.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+  - name: delete-the-witness
+    # `r d` of the TIE_BREAKER stamps the short suppression window; the
+    # witness should AUTO re-add once that window lapses — proving the
+    # machinery still creates witnesses after the evict/restore cycle.
+    cmd: ["resource", "delete", "{{node3}}", "{{rd}}"]
+    expect_exit: 0
+  - name: witness-auto-readded
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # THE U382 ASSERTION: the auto-tiebreaker machinery still fires
+      # after the evict + restore cycle — a fresh witness lands.
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["node", "restore", "{{node3}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans

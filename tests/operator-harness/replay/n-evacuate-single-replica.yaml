@@ -1,0 +1,97 @@
+name: n-evacuate-single-replica
+description: |
+  Corner case U305 (upstream-mined, P0): `linstor node evacuate <node>`
+  of the node holding the ONLY diskful replica of an RD must MIGRATE that
+  copy (place a replacement on a healthy peer, wait for it to reach
+  UpToDate, then drop the source) — it must NEVER drop the lone source
+  while no replacement is durable, which would leave the resource
+  Outdated / sourceless (data loss).
+
+  Pre-fix blockstor: when the drain target capped to 0 (e.g. no spare
+  node), the add-before-drop gate read `healthyUpToDate >= 0 == true` and
+  pruneSource dropped the lone source with no replacement — sourceless.
+  The fix enforces a hard `>= 1` floor: the source is held until a real
+  healthy replacement is UpToDate (migrate) or forever when none can be
+  placed (refuse/hold).
+
+  Scenario (3-node): place ONE diskful replica on node1, then evacuate
+  node1. The placer migrates the copy to a spare pool node. Assert: the
+  replacement reaches UpToDate (add-before-drop), the source on node1 is
+  pruned (resource_absent), at least 1 diskful replica remains
+  (replica_count — never sourceless), and the survivors are all UpToDate.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    # A SINGLE diskful replica — the only copy of the data.
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool={{sp}}"]
+    expect_exit: 0
+  - name: wait-initial-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: node-evacuate-node1
+    cmd: ["node", "evacuate", "{{node1}}"]
+    expect_exit: 0
+  - name: wait-replacement-on-node2
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The lone copy must be migrated to a healthy peer and reach
+      # UpToDate BEFORE the source is allowed to drop (add-before-drop).
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: "UpToDate"
+      timeout_s: 240
+  - name: wait-source-pruned
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Once the migrated copy is durable the source on the evacuated
+      # node must be deleted.
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
+  - name: assert-not-sourceless
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # THE U305 DATA-LOSS ASSERTION: the resource must NEVER be left
+      # with zero replicas. At least one diskful copy survives the drain.
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 1
+      timeout_s: 120
+  - name: wait-redundancy-preserved
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Every surviving replica is UpToDate — redundancy never dipped to
+      # an Outdated / sourceless state.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 120
+
+teardown:
+  - cmd: ["node", "restore", "{{node1}}"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
