@@ -619,8 +619,16 @@ except Exception:
             if [[ -z "$pod" ]]; then
                 return 1
             fi
+            # `drbdsetup show` prints numeric options bare (`max-buffers
+            # 36864;`) but STRING options quoted (`verify-alg "crc32c";`).
+            # Strip both the trailing `;` AND surrounding double-quotes so
+            # a string-valued option (verify-alg, cram-hmac-alg, …) matches
+            # its unquoted `expected`. Without the quote-strip the await
+            # compared `"crc32c"` against `crc32c` and always timed out
+            # (U302: verify-alg DOES render verbatim into net{}, confirmed
+            # via drbdsetup on the stand — the miss was the parser, not BS).
             actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show "$rd" 2>/dev/null \
-                | awk -v k="$key" '$1==k { gsub(/;/,""); print $2; exit }')
+                | awk -v k="$key" '$1==k { gsub(/[;"]/,""); print $2; exit }')
             [[ "$actual" == "$expected" ]]
             ;;
         *)
