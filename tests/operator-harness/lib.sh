@@ -607,12 +607,25 @@ except Exception:
             #             (e.g. "max-buffers")
             #   expected  expected value (string match)
             #   namespace satellite namespace (default blockstor-system)
-            local rd node key expected ns pod actual
+            #   show_defaults  optional bool: pass --show-defaults so an
+            #             option whose configured value EQUALS the
+            #             compiled-in default (which plain `drbdsetup
+            #             show` omits) is still printed and assertable
+            #             (e.g. FILE_THIN's discard-zeroes-if-aligned
+            #             yes). Leave unset for absence assertions
+            #             (expected "") — with --show-defaults nothing
+            #             is ever absent.
+            local rd node key expected ns pod actual showdef showflag
             rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
             node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
             key=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('key',''))" "$spec")
             expected=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('expected',''))" "$spec")
             ns=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('namespace','blockstor-system'))" "$spec")
+            showdef=$(python3 -c "import json,sys; print(str(json.loads(sys.argv[1]).get('show_defaults',False)).lower())" "$spec")
+            showflag=""
+            if [[ "$showdef" == "true" ]]; then
+                showflag="--show-defaults"
+            fi
             pod=$(kubectl -n "$ns" get pods -l app=blockstor-satellite \
                 --field-selector "spec.nodeName=${node},status.phase=Running" \
                 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -627,7 +640,8 @@ except Exception:
             # compared `"crc32c"` against `crc32c` and always timed out
             # (U302: verify-alg DOES render verbatim into net{}, confirmed
             # via drbdsetup on the stand — the miss was the parser, not BS).
-            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show "$rd" 2>/dev/null \
+            # shellcheck disable=SC2086  # $showflag is deliberately word-split (empty or one flag)
+            actual=$(kubectl -n "$ns" exec "$pod" -- drbdsetup show $showflag "$rd" 2>/dev/null \
                 | awk -v k="$key" '$1==k { gsub(/[;"]/,""); print $2; exit }')
             [[ "$actual" == "$expected" ]]
             ;;
