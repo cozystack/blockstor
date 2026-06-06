@@ -1,0 +1,90 @@
+name: vd-resize-peer-disconnected-defers
+description: |
+  U204/U388 (P2) — a `vd set-size` grow must DEFER (not reject, not
+  wedge) when a peer replica is unhealthy/disconnected. blockstor has no
+  peer-health gate on the resize REST path: the reachable peers extend
+  immediately and the unhealthy peer resyncs the grown region on
+  reconnect.
+
+  The replay runner cannot create a real network partition (iptables /
+  kernel-level ops), so the live "partition N2 → grow → heal → N2 catches
+  up" scenario lives in the L6 cli-matrix cell
+  tests/e2e/cli-matrix/vd-resize-peer-disconnected-defers.sh, and the
+  wire envelope (grow with an unhealthy peer returns 200 success-only +
+  resize-pending stamped on every replica) is pinned by the L1 test
+  pkg/rest/volume_definitions_test.go::
+  TestVDUpdateGrowWithUnhealthyPeerDefersNotRejects.
+
+  This L7 codifies the operator-CLI no-wedge BASELINE the deferral builds
+  on: a 2-replica grow returns 0 and BOTH replicas reconverge to
+  UpToDate (the deferred-peer path degenerates to this once the peer
+  reconnects). If this baseline regresses, the deferral story cannot hold
+  either.
+
+  If this YAML goes red, no fix in:
+    - pkg/rest/volume_definitions.go (resize accept + per-replica stamp)
+    - pkg/satellite/reconciler.go (per-replica grow + resync)
+  may be claimed closed.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd-1g
+    cmd: ["volume-definition", "create", "{{rd}}", "1G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 1048576
+      timeout_s: 30
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-2r-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+  # ---- Grow 1G → 2G; must not wedge, both reconverge ----
+  - name: grow-2g
+    cmd: ["volume-definition", "set-size", "{{rd}}", "0", "2G"]
+    expect_exit: 0
+    await:
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 2097152
+      timeout_s: 60
+  - name: wait-uptodate-after-grow
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 600
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+
+invariants:
+  - no_orphans
