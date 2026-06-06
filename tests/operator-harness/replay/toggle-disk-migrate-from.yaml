@@ -12,6 +12,11 @@ description: |
     - The destination (node3) reaches UpToDate.
     - The migrate SOURCE (node1) Resource is removed ONLY AFTER dst is
       UpToDate (sync-then-remove).
+    - Upstream-issue U341 (P1): the surviving KEEP replica (node2)
+      holds DRBD quorum the WHOLE way through — the quorum-providing
+      peer is never vacated before the new diskful is UpToDate, so the
+      resource never transiently drops below quorum (no I/O suspension
+      risk). Asserted via the `quorum` await with a hold window.
 
   The landing pad is created with the deprecated `--diskless` alias (posts
   the canonical wire flag DISKLESS) so this replay validates the H2
@@ -80,6 +85,26 @@ steps:
       kind: active_diskful_count
       rd: "{{rd}}"
       min: 2
+      timeout_s: 60
+  - name: assert-quorum-held-on-keep
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # Upstream-issue U341 (P1, "Lost quorum when migrating a
+      # resource to another node"): the surviving KEEP replica
+      # (node2) must NEVER lose quorum across the migration. The
+      # migrate reconciler prunes the source only after the
+      # destination is UpToDate (add-before-drop), so the quorum-voter
+      # set is only ever grown then trimmed — it never dips below
+      # majority. Read the live kernel quorum on node2 and HOLD it
+      # true for 30 consecutive seconds: a single `quorum:false`
+      # sample is the U341 symptom (the quorum-providing peer vacated
+      # mid-flight, suspending I/O) and fails the run.
+      kind: quorum
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      expected: true
+      hold_s: 30
       timeout_s: 60
   - name: assert-src-removed
     cmd: ["resource", "list", "--resources", "{{rd}}"]

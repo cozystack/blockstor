@@ -38,6 +38,14 @@
 #      Resource CRD removed) — sync-then-remove completed.
 #   4. The keep node and the destination both remain diskful; final
 #      diskful count is exactly 2 (keep + dst), source pruned.
+#   5. Upstream-issue U341 (P1, "Lost quorum when migrating a resource
+#      to another node"): the surviving KEEP replica holds DRBD quorum
+#      at EVERY migration poll. Because the source is pruned only after
+#      the destination is UpToDate (add-before-drop), the quorum-voter
+#      set is only ever grown then trimmed and never dips below
+#      majority — so the resource never transiently loses quorum
+#      (no I/O suspension risk). Read straight from the kernel via
+#      `drbdsetup status <rd>` on the keep node's satellite.
 
 set -euo pipefail
 
@@ -86,10 +94,12 @@ echo ">> r td $DST $RD -s $POOL --migrate-from $SRC (sync-then-remove)"
 # redundancy invariant. The destination must reach UpToDate AND the
 # source must disappear; throughout, the diskful count must stay >= 2.
 echo ">> drive migration, asserting diskful count never drops below 2"
+echo ">>   and quorum is held on $KEEP throughout (U341)"
 deadline=$(( $(date +%s) + 300 ))
 dst_uptodate=0
 src_gone=0
 min_diskful=99
+quorum_checks=0
 while (( $(date +%s) < deadline )); do
     dc=$(linstor_diskful_count "$RD")
     if (( dc < min_diskful )); then
@@ -102,6 +112,24 @@ while (( $(date +%s) < deadline )); do
         kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
             | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
         exit 1
+    fi
+
+    # U341 quorum invariant: read the live kernel quorum on the
+    # SURVIVING keep replica. `drbdsetup status <rd>` prints
+    # `quorum:no` per-device when quorum is lost; its absence (the
+    # default `quorum:yes`, often elided) means quorate. A single
+    # `quorum:no` sample is the U341 symptom — the migrate vacated the
+    # quorum-providing peer before the new diskful was UpToDate —
+    # fail fast. Only assert once the keep replica is actually up in
+    # the kernel (drbdsetup exits 0); skip a poll where the status
+    # read fails so a transient satellite-exec hiccup doesn't flake.
+    if keep_status=$(on_node "$KEEP" drbdsetup status "$RD" 2>/dev/null); then
+        quorum_checks=$(( quorum_checks + 1 ))
+        if grep -q "quorum:no" <<<"$keep_status"; then
+            echo "FAIL (U341): keep replica $KEEP lost quorum during migration" >&2
+            echo "$keep_status" >&2
+            exit 1
+        fi
     fi
 
     dst_disk=$(status_disk_state "$RD" "$DST" 0)
@@ -142,4 +170,9 @@ if linstor_diskful_nodes "$RD" | grep -qx "$SRC"; then
     exit 1
 fi
 
-echo ">> toggle-disk-migrate-from OK (H2 pinned: min diskful during migration = $min_diskful >= 2; src removed only after dst UpToDate)"
+if (( quorum_checks == 0 )); then
+    echo "FAIL (U341): never managed to read kernel quorum on $KEEP during migration" >&2
+    exit 1
+fi
+
+echo ">> toggle-disk-migrate-from OK (H2 pinned: min diskful during migration = $min_diskful >= 2; src removed only after dst UpToDate; U341: quorum held on $KEEP across $quorum_checks polls)"
