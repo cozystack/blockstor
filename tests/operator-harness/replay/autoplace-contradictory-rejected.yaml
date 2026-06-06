@@ -1,4 +1,4 @@
-name: autoplace-contradictory-constraints-rejected
+name: autoplace-contradictory-rejected
 description: |
   Upstream-issues campaign-2 (agent U6), items U139/U94: an autoplace
   whose topology constraints are self-contradictory must FAIL SHORT with
