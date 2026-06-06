@@ -62,7 +62,10 @@ steps:
       # 1G full sync to a fresh peer at ~4 MB/s on this stand => minutes.
       timeout_s: 600
   - name: r-c-node3-diskless
-    cmd: ["resource", "create", "--drbd-diskless", "{{rd}}", "{{node3}}"]
+    # node + rd are positional FIRST, then the flag — the linstor 1.27.1
+    # client parses `r c --drbd-diskless <rd> <node>` as <rd>=<node>
+    # (rejects "resource definition not found").
+    cmd: ["resource", "create", "{{node3}}", "{{rd}}", "--drbd-diskless"]
     expect_exit: 0
     await:
       kind: replica_diskless

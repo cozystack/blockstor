@@ -105,8 +105,10 @@ if [[ -z "$DLNODE" ]]; then
         exit 0
     fi
     echo ">> adding explicit diskless replica on $DLNODE"
-    _out=$("${LCTL[@]}" resource create --drbd-diskless "$RD" "$DLNODE" 2>&1) \
-        || { echo "FAIL: r c --drbd-diskless $RD $DLNODE: $_out" >&2; exit 1; }
+    # node + rd are positional FIRST, then the flag — `r c --drbd-diskless
+    # <rd> <node>` is misparsed by the linstor 1.27.1 client.
+    _out=$("${LCTL[@]}" resource create "$DLNODE" "$RD" --drbd-diskless 2>&1) \
+        || { echo "FAIL: r c $DLNODE $RD --drbd-diskless: $_out" >&2; exit 1; }
 else
     echo ">> reusing auto-placed TieBreaker on $DLNODE as the diskless peer"
 fi
