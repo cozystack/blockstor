@@ -67,8 +67,13 @@ steps:
     # The extension MUST honor replicas-on-different site against the
     # EXISTING replica — landing the new replica on site-b (node3), never
     # a second site-a node (node2).
-    cmd: ["resource", "create", "--auto-place", "+1", "--storage-pool={{sp}}",
-          "--replicas-on-different", "site", "{{rd}}"]
+    #
+    # CLI arg-order quirk: --replicas-on-different takes nargs='*' and
+    # greedily eats the trailing positional RD name. Keep the
+    # self-contained --storage-pool={{sp}} as the LAST flag before {{rd}}.
+    cmd: ["resource", "create", "--auto-place", "+1",
+          "--replicas-on-different", "site",
+          "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 0
     await:
       kind: replica_count

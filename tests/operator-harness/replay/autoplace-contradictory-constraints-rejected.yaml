@@ -49,8 +49,14 @@ steps:
     # replicas-on-same site AND replicas-on-different site is
     # self-contradictory beyond the first replica. The CLI MUST reject
     # with FAIL_NOT_ENOUGH_NODES (exit 10), not succeed-on-zero.
-    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}",
-          "--replicas-on-same", "site", "--replicas-on-different", "site", "{{rd}}"]
+    #
+    # CLI arg-order quirk: --replicas-on-same / --replicas-on-different
+    # take nargs='*' and greedily consume the trailing positional RD
+    # name. Keep the self-contained --storage-pool={{sp}} as the LAST
+    # flag before {{rd}} so argparse stops eating AUX values there.
+    cmd: ["resource", "create", "--auto-place", "2",
+          "--replicas-on-same", "site", "--replicas-on-different", "site",
+          "--storage-pool={{sp}}", "{{rd}}"]
     expect_exit: 10
   - name: no-tiebreaker-spawned
     cmd: ["resource", "list", "--resources", "{{rd}}"]

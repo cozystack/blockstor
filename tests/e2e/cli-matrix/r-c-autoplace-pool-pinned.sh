@@ -80,7 +80,13 @@ RDS+=("$rd")
 "${LCTL[@]}" resource-definition create "$rd" >/dev/null
 "${LCTL[@]}" volume-definition create "$rd" 256M >/dev/null
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$rd" >/dev/null
-wait_replica_count "$rd" 2 90
+# auto-quorum may add a DISKLESS TIE_BREAKER witness on a 3rd node, so the
+# TOTAL resource count can be 3. We assert on the DISKFUL count, not the
+# total — wait until exactly 2 diskful replicas exist.
+for _ in $(seq 1 90); do
+    [[ "$(linstor_diskful_count "$rd")" == "2" ]] && break
+    sleep 1
+done
 
 mapfile -t placed_nodes < <(linstor_diskful_nodes "$rd")
 if (( ${#placed_nodes[@]} != 2 )); then
@@ -117,9 +123,15 @@ RDS+=("$rd")
 "${LCTL[@]}" volume-definition create "$rd" 256M >/dev/null
 
 echo ">> [U139] autoplace=2 with contradictory same+different site MUST fail short"
+# NOTE (CLI arg-order quirk): python-linstor's --replicas-on-same /
+# --replicas-on-different take nargs='*' and greedily eat the trailing
+# positional RD name. Keep a self-contained flag (--storage-pool=...) as
+# the LAST token before "$rd" so argparse stops consuming AUX values at
+# the next "-" flag and the RD name lands as the positional.
 err_file=$(mktemp)
-if "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" \
-        --replicas-on-same site --replicas-on-different site "$rd" >"$err_file" 2>&1; then
+if "${LCTL[@]}" resource create --auto-place=2 \
+        --replicas-on-same site --replicas-on-different site \
+        --storage-pool="$POOL" "$rd" >"$err_file" 2>&1; then
     echo "FAIL (U139 regression): contradictory-constraint autoplace SUCCEEDED — must fail short" >&2
     cat "$err_file" >&2
     rm -f "$err_file"
