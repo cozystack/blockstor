@@ -88,38 +88,44 @@ func (s *Server) handleSpawn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bug 381 (P3, bughunt round 11 — 2026-06-02): the spawn fast
-	// path silently accepted non-positive `volume_sizes`. The wire
-	// field is bytes (Bug-92 shape); each entry is divided by 1024
-	// to land as size_kib on the VD, so a `-100` truncated to
-	// `size_kib=0` and a `0` stayed `0`. Both spawned the RD with a
-	// zero-sized VD — the satellite reconciler then looped on
-	// `drbdadm create-md` indefinitely (DRBD's per-device minimum is
-	// ~4 MiB once metadata is reserved). Reject non-positive entries
-	// at the wire boundary BEFORE `Store.Create` so a bad spawn is
-	// one consistent LINSTOR envelope and no orphan RD is left
-	// behind. We don't apply the full Bug 155 [4096 KiB, 16 TiB]
-	// gate here because the oversub gate already runs against the
-	// caller's bytes value upstream (see `rejectIfExceedsOversubGate`
-	// + `oversub_test.go`), and unit tests cover ≤4 MiB sizes for
-	// oversub-policy probes that we don't want to break. The Bug 155
-	// bound itself still kicks in if the caller later issues a
-	// `vd c` or `vd modify` — but those paths already gate it.
-	// Symmetric with the VD-create body branch's writeVDSizeRejection
-	// so the CLI parity audit row for `rg spawn` matches `vd c` on
-	// the non-positive input class operators actually hit.
-	for i, sizeBytes := range req.VolumeSizes {
-		if sizeBytes > 0 {
+	// path silently accepted non-positive `volume_sizes`, spawning
+	// the RD with a zero-sized VD — the satellite reconciler then
+	// looped on `drbdadm create-md` indefinitely (DRBD's per-device
+	// minimum is ~4 MiB once metadata is reserved). Reject
+	// non-positive entries at the wire boundary BEFORE `Store.Create`
+	// so a bad spawn is one consistent LINSTOR envelope and no orphan
+	// RD is left behind.
+	//
+	// Bug 391 (spawn-size unit, 2026-06-06): `volume_sizes` is KiB,
+	// NOT bytes. The python linstor client encodes the operator's
+	// size argument with `parse_volume_size_to_kib` before POSTing
+	// (e.g. `rg spawn-resources <rg> <rd> 32M` → `[32768]`), and the
+	// upstream REST API spec documents the field as "sizes (in kib)".
+	// The handler previously divided every entry by 1024 (treating it
+	// as bytes — the Bug-92 shape that applies to a DIFFERENT field),
+	// so `32M` landed as a 32 KiB VD. Each entry is now used directly
+	// as size_kib, matching the `vd c` path (volume_definitions.go,
+	// which reads `size_kib` verbatim).
+	//
+	// We don't apply the full Bug 155 [4096 KiB, 16 TiB] gate here
+	// because the oversub gate already runs against the requested KiB
+	// upstream (see `rejectIfExceedsOversubGate` + `oversub_test.go`),
+	// and unit tests cover small sizes for oversub-policy probes that
+	// we don't want to break. The Bug 155 bound itself still kicks in
+	// if the caller later issues a `vd c` or `vd modify`. Symmetric
+	// with the VD-create body branch's writeVDSizeRejection so the
+	// CLI parity audit row for `rg spawn` matches `vd c` on the
+	// non-positive input class operators actually hit.
+	for i, sizeKib := range req.VolumeSizes {
+		if sizeKib > 0 {
 			continue
 		}
 
 		// Fabricate the same below-minimum sentinel the VD-create
-		// path uses so the wire shape is byte-identical. The
-		// post-divide size_kib value is what the operator sees in
-		// the envelope; we report it directly so `0` and `-100`
-		// both surface as `size_kib=0 below minimum 4096 KiB` (the
-		// effective floor) rather than a separate "non-positive"
-		// envelope that no other handler emits.
-		sizeKib := sizeBytes / bytesPerKib
+		// path uses so the wire shape is byte-identical: `0` and
+		// `-100` both surface as `size_kib=<n> below minimum 4096
+		// KiB` (the effective floor) rather than a separate
+		// "non-positive" envelope that no other handler emits.
 		reason := errors.Wrapf(ErrVolumeSizeBelowMinimum,
 			"size_kib=%d below minimum %d KiB "+
 				"(DRBD reserves ~32 KiB of metadata per peer; backing layers add alignment on top)",
@@ -259,17 +265,18 @@ func buildSpawnedRD(req *apiv1.ResourceGroupSpawn, rgName string, rg *apiv1.Reso
 	return rd
 }
 
-const bytesPerKib = 1024
-
 // spawnVolumeDefinitions creates one VD per requested size on the named RD.
-// Volume numbers follow the slice index, matching upstream LINSTOR.
+// Volume numbers follow the slice index, matching upstream LINSTOR. Each
+// `sizes` entry is size_kib (Bug 391) — the python client + upstream REST
+// spec both encode `volume_sizes` in KiB — so it is stamped on the VD
+// verbatim, identically to the `vd c` path.
 func (s *Server) spawnVolumeDefinitions(ctx context.Context, rdName string, rg *apiv1.ResourceGroup, sizes []int64) error {
-	for i, sizeBytes := range sizes {
+	for i, sizeKib := range sizes {
 		volNum := int32(i)
 
 		vd := apiv1.VolumeDefinition{
 			VolumeNumber: volNum,
-			SizeKib:      sizeBytes / bytesPerKib,
+			SizeKib:      sizeKib,
 			Props:        copyVolumeGroupProps(rg.VolumeGroups, volNum),
 		}
 
@@ -352,8 +359,7 @@ func (s *Server) rejectIfExceedsOversubGate(ctx context.Context, w http.Response
 		return false
 	}
 
-	for i, sizeBytes := range req.VolumeSizes {
-		sizeKib := sizeBytes / bytesPerKib
+	for i, sizeKib := range req.VolumeSizes {
 		if sizeKib > capKib {
 			writeError(w, http.StatusConflict,
 				"over-subscription gate: volume "+

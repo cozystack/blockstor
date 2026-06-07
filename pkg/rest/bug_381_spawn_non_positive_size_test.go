@@ -31,12 +31,12 @@ import (
 
 // Bug 381 (P3, bughunt round 11 — 2026-06-02): the spawn fast path
 // `POST /v1/resource-groups/{rg}/spawn` silently accepted
-// non-positive `volume_sizes` entries. The wire field is bytes
-// (Bug-92 shape); each entry is divided by 1024 to land as size_kib
-// on the VD, so a `-100` truncated to `size_kib=0` and a `0` stayed
-// `0`. Both spawned the RD with a zero-sized VD — the satellite
-// reconciler then looped on `drbdadm create-md` indefinitely
-// (DRBD's per-device minimum is ~4 MiB once metadata is reserved).
+// non-positive `volume_sizes` entries. The wire field is size_kib
+// (Bug 391 — the python client + upstream REST spec both encode
+// `volume_sizes` in KiB), so a `-100` and a `0` both spawned the RD
+// with a zero/negative-sized VD — the satellite reconciler then
+// looped on `drbdadm create-md` indefinitely (DRBD's per-device
+// minimum is ~4 MiB once metadata is reserved).
 //
 // The direct `POST /v1/resource-definitions/{rd}/volume-definitions`
 // path already rejected the same input via Bug 155

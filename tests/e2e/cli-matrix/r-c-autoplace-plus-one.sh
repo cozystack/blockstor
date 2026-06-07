@@ -63,15 +63,33 @@ echo ">> [D2] rg create --place-count 2 + spawn -> 2 diskful replicas"
 "${LCTL[@]}" resource-group create "$RG" --place-count 2 --storage-pool="$POOL" >/dev/null
 "${LCTL[@]}" resource-group spawn-resources "$RG" "$RD" 32M >/dev/null
 
-# Wait for 2 diskful replicas UpToDate.
-wait_replica_count "$RD" 2 90 || {
-    echo "FAIL (D2 setup): RD did not reach 2 replicas" >&2
-    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -20 >&2
+# Bug 391 cross-check: `32M` must spawn a 32768 KiB VD, not a 32 KiB
+# one (a 32 KiB VD is below DRBD's create-md floor and the replicas
+# below would never converge). Guards this workflow against a silent
+# spawn-size regression that the replica-count assertion alone would
+# mask.
+if ! wait_vd_size "$RD" 0 32768 60; then
+    got=$(linstor_vd_size_kib "$RD" 0)
+    echo "FAIL (D2/Bug391): VD size_kib=${got}, want 32768 (32M must not be divided to 32 KiB)" >&2
+    "${LCTL[@]}" volume-definition list --resource-definitions "$RD" 2>&1 | tail -20 >&2
     exit 1
-}
-diskful2=$(linstor_diskful_count "$RD")
+fi
+echo ">> spawned VD = 32768 KiB (32M) — OK"
+
+# Wait for the place-count=2 spawn to converge to 2 DISKFUL replicas.
+# An auto-quorum RD also spawns a diskless TIE_BREAKER (total CRDs = 3),
+# so gate on the diskful count, not the total replica count — the old
+# wait_replica_count "$RD" 2 timed out at 3 once the tiebreaker landed.
+ap_deadline=$(( $(date +%s) + 90 ))
+diskful2=0
+while (( $(date +%s) < ap_deadline )); do
+    diskful2=$(linstor_diskful_count "$RD")
+    (( diskful2 == 2 )) && break
+    sleep 2
+done
 if [[ "$diskful2" != "2" ]]; then
     echo "FAIL (D2 setup): expected 2 diskful replicas, got $diskful2" >&2
+    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -20 >&2
     exit 1
 fi
 echo ">> baseline: 2 diskful replicas — OK"

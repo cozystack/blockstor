@@ -1,0 +1,79 @@
+name: rg-spawn-size-parse
+description: |
+  Bug 391 (spawn-size unit): `rg spawn-resources <rg> <rd> 32M` must
+  create a 32 MiB volume — a VolumeDefinition of 32768 KiB — NOT a
+  32 KiB one.
+
+  The python linstor client parses the `32M` token into KiB
+  (`parse_volume_size_to_kib("32M") == 32768`) and ships it on the wire
+  as the `volume_sizes` array, which the upstream REST API documents as
+  "sizes (in kib)". blockstor's spawn handler previously treated the
+  field as BYTES and divided every entry by 1024, so `32M` landed as a
+  32 KiB VD — below DRBD's ~4 MiB per-device floor, which made the
+  satellite reconciler hot-loop on `drbdadm create-md`.
+
+  Operator sequence:
+    rg create --place-count 1 → spawn-resources <rd> 32M
+
+  CLI-side contract:
+    - the spawned VolumeDefinition is exactly 32768 KiB (vd_size_kib)
+    - the single replica reaches UpToDate (a 32 KiB VD never could —
+      create-md would loop), pinned via replica_count + all_uptodate
+
+  Unit pin: pkg/rest/bug_391_spawn_size_kib_test.go.
+  L6 cell: tests/e2e/cli-matrix/rg-spawn-size-parse.sh.
+
+  If this YAML goes red, no fix in pkg/rest/spawn.go (volume_sizes →
+  size_kib stamping) may be claimed closed.
+
+prerequisites:
+  min_nodes: 1
+  storage_pool: stand
+
+vars:
+  rg: rg-bug391-spawn-size
+  sp: stand
+
+steps:
+  - name: create-rg
+    cmd: ["resource-group", "create", "{{rg}}", "--place-count", "1", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: spawn-32m
+    cmd: ["resource-group", "spawn-resources", "{{rg}}", "{{rd}}", "32M"]
+    expect_exit: 0
+    await:
+      # 32M == 32768 KiB. Pre-fix this landed at 32 (the /1024 divide).
+      kind: vd_size_kib
+      rd: "{{rd}}"
+      vol: 0
+      expected_kib: 32768
+      timeout_s: 60
+  - name: wait-replica
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 1
+      timeout_s: 120
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # A 32 KiB VD would loop on drbdadm create-md and never converge.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: rd_absent
+      rd: "{{rd}}"
+      timeout_s: 60
+  - cmd: ["resource-group", "delete", "{{rg}}"]
+    expect_exit: 0
+
+invariants:
+  - no_orphans
