@@ -591,6 +591,82 @@ func TestMigrateDiskRefusesPrimaryInUse(t *testing.T) {
 	}
 }
 
+// TestMigrateDiskRefusesDisklessSource pins upstream-issue U341
+// (P1, "Lost quorum when migrating resource to another node"): a
+// `r td <dst> <rd> --migrate-from <src>` where the SOURCE replica
+// is DISKLESS must be REFUSED with 409, and the diskless source
+// must be left byte-for-byte untouched.
+//
+// U341's repro is the diskless(InUse) peer that provides quorum
+// for the resource. Upstream LINSTOR's migrate path could vacate
+// that peer mid-flight, transiently dropping the resource below
+// quorum (IO suspension risk). blockstor's migrate-disk handler
+// has no diskful storage to relocate off a DISKLESS replica, so
+// validateMigrateSrc rejects the request outright — the
+// quorum-providing peer is never disturbed. The correct operator
+// flow for moving a quorum witness is `r c <newnode> --diskless`
+// then `r d <src> <rd>` (add-before-drop on the witness), which
+// keeps the voter set whole; migrate-disk is for diskful copies.
+//
+// This is the wire-boundary half of the U341 guarantee; the
+// add-before-drop half (diskful src held until dst is UpToDate, so
+// the diskful voter count never dips) is pinned by
+// TestMigrateDiskAddBeforeDropOrdering and the
+// ResourceMigrationReconciler tests. The end-to-end quorum-held
+// assertion runs on the stand via
+// tests/operator-harness/replay/toggle-disk-migrate-from.yaml and
+// tests/e2e/cli-matrix/toggle-disk-migrate-from.sh.
+func TestMigrateDiskRefusesDisklessSource(t *testing.T) {
+	st := store.NewInMemory()
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-witness"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// The migrate SOURCE is a DISKLESS replica — the U341
+	// quorum-providing witness an operator might mistakenly try to
+	// move via migrate-disk.
+	if err := st.Resources().Create(t.Context(), &apiv1.Resource{
+		Name:     "pvc-witness",
+		NodeName: "src-node",
+		Flags:    []string{apiv1.ResourceFlagDiskless},
+	}); err != nil {
+		t.Fatalf("seed diskless src Resource: %v", err)
+	}
+
+	base, stop := startServerWithStore(t, st)
+	defer stop()
+
+	resp := httpPut(t,
+		base+"/v1/resource-definitions/pvc-witness/resources/dst-node/migrate-disk/src-node/zfs-thin",
+		nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Errorf("status: got %d, want 409 (no diskful storage to migrate off a DISKLESS source)", resp.StatusCode)
+	}
+
+	// The diskless source — the quorum voter — must be byte-for-byte
+	// untouched: still present, still DISKLESS, no MigratingFrom prop.
+	srcRes, err := st.Resources().Get(t.Context(), "pvc-witness", "src-node")
+	if err != nil {
+		t.Fatalf("diskless src removed despite 409: %v", err)
+	}
+
+	if !slices.Contains(srcRes.Flags, apiv1.ResourceFlagDiskless) {
+		t.Errorf("diskless src lost its DISKLESS flag: %v", srcRes.Flags)
+	}
+
+	if srcRes.Props[MigratingFromProp] != "" {
+		t.Errorf("MigratingFrom prop stamped on the source: %q", srcRes.Props[MigratingFromProp])
+	}
+
+	// The dst must NOT have been created — the request was rejected
+	// before promoteMigrateDst runs.
+	if _, err := st.Resources().Get(t.Context(), "pvc-witness", "dst-node"); err == nil {
+		t.Error("dst Resource created despite the diskless-source rejection")
+	}
+}
+
 // TestMigrateDiskAddBeforeDropOrdering pins the Bug 34 Option B
 // ordering contract for scenario 4.W21 / wave1 4.10: the REST
 // migrate-disk handler must add the destination diskful replica

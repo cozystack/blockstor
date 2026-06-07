@@ -1,0 +1,105 @@
+name: redundancy-restore-after-node-failure
+description: |
+  Upstream-issue U236 (P2, "Keep same number of replicas after node
+  failure"): when a node holding one of N replicas is lost, the
+  place-count must be auto-restored on a healthy spare — operators
+  reported the pre-auto-rebalance era left the resource permanently
+  under-replicated after a failure. Upstream closed this once
+  auto-rebalance / auto-diskful landed.
+
+  blockstor restores redundancy through the auto-diskful controller +
+  RGRebalanceReconciler: a diskful replica on an evicted/lost node stops
+  counting toward place_count, the deficit arms the auto-diskful timer,
+  and the placer refills a fresh diskful on a HEALTHY spare. This replay
+  pins the END-TO-END restore on a 3-node stand using a place=2 layout
+  (the canonical "1 of 2 replicas lost" case): node1 + node2 hold the
+  two diskful replicas, node3 is the spare.
+
+  Failure is simulated with `node evacuate` — the stand-safe proxy for a
+  node going away (a real `node lost` permanently removes a shared
+  worker; the satellite does NOT auto-resurrect its Node CRD, so it is
+  destructive — see n-lost-live-resources-clean.yaml). Evacuate marks
+  node1 EVICTED; its diskful must stop counting toward place_count, so
+  the controller refills the second replica onto node3 and the cluster
+  reconverges to TWO active diskful replicas, both UpToDate, with NONE
+  stranded on the evicted node.
+
+  Sibling coverage: auto-diskful-evicted-node.yaml pins the same
+  mechanism at place=3 with a node4 spare (SKIPs on a 3-node stand);
+  this replay covers the place=2 / 3-node case so the redundancy-restore
+  contract has a cell that actually runs on the dev stand.
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  # Explicit short rd: the default replay-<name>-<rand4> would be
+  # replay-redundancy-restore-after-node-failure-XXXX (49 chars),
+  # exceeding the LINSTOR 48-char resource-name limit and failing
+  # rd-create with exit 10. Keep the replay- prefix for orphan sweep.
+  rd: replay-redund-restore
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: place-n1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool=stand"]
+    expect_exit: 0
+  - name: place-n2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool=stand"]
+    expect_exit: 0
+    await:
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-two-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: arm-auto-diskful
+    cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", "1"]
+    expect_exit: 0
+  - name: evacuate-n1
+    # Failure proxy: node1 (1 of the 2 diskful holders) goes away.
+    cmd: ["node", "evacuate", "{{node1}}"]
+    expect_exit: 0
+    await:
+      # THE U236 ASSERTION: redundancy is auto-restored. The evicted
+      # node's diskful stops counting, so the placer refills a fresh
+      # ACTIVE diskful on the healthy spare (node3) and the cluster
+      # returns to 2 active diskful replicas within the bounded window.
+      kind: active_diskful_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 300
+  - name: wait-restore-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      # The refilled replica syncs to UpToDate — redundancy is not just
+      # nominally restored (CRD count) but genuinely durable on the
+      # wire. A replica stranded on the evicted node could never reach
+      # UpToDate, so all_uptodate is the convergence gate.
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 300
+
+teardown:
+  # `node restore` (alias `n rst`) is the inverse of `node evacuate`;
+  # client 1.27.1 has no `node evacuate --restore` form.
+  - cmd: ["node", "restore", "{{node1}}"]
+  - cmd: ["controller", "set-property", "DrbdOptions/auto-diskful", ""]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
