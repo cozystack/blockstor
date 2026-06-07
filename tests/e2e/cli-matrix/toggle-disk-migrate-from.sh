@@ -34,8 +34,10 @@
 #      what an Option-A (drop-then-add) implementation would transiently
 #      expose.
 #   2. The destination replica reaches UpToDate.
-#   3. AFTER the destination is UpToDate the SOURCE replica is gone (its
-#      Resource CRD removed) — sync-then-remove completed.
+#   3. AFTER the destination is UpToDate the SOURCE no longer hosts a
+#      DISKFUL replica - its disk is pruned (sync-then-remove). An
+#      auto-quorum tiebreaker may re-occupy the vacated node as a
+#      diskless witness; that is not the migrate source.
 #   4. The keep node and the destination both remain diskful; final
 #      diskful count is exactly 2 (keep + dst), source pruned.
 #   5. Upstream-issue U341 (P1, "Lost quorum when migrating a resource
@@ -135,7 +137,15 @@ while (( $(date +%s) < deadline )); do
     dst_disk=$(status_disk_state "$RD" "$DST" 0)
     [[ "$dst_disk" == "UpToDate" ]] && dst_uptodate=1
 
+    # The migrate source counts as pruned once it no longer hosts a
+    # DISKFUL replica. On an auto-quorum RD the post-migration shape is
+    # 2 diskful + 1 diskless TIE_BREAKER, and that tiebreaker can
+    # legitimately re-land on the just-vacated src node, re-creating the
+    # `<rd>.<src>` CRD as a diskless witness. That witness is NOT the
+    # migrate source, so gate on diskful-absence, not CRD-absence.
     if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${SRC}" >/dev/null 2>&1; then
+        src_gone=1
+    elif ! linstor_diskful_nodes "$RD" | grep -qx "$SRC"; then
         src_gone=1
     fi
 
@@ -151,7 +161,7 @@ if (( dst_uptodate != 1 )); then
 fi
 
 if (( src_gone != 1 )); then
-    echo "FAIL (H2): migrate source $SRC was NOT removed after dst synced (sync-then-remove incomplete)" >&2
+    echo "FAIL (H2): migrate source $SRC still hosts a diskful replica after dst synced (sync-then-remove incomplete)" >&2
     kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
     exit 1
