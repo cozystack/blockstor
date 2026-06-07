@@ -34,6 +34,11 @@ prerequisites:
   storage_pool: stand
 
 vars:
+  # Explicit short rd: the default replay-<name>-<rand4> would be
+  # replay-redundancy-restore-after-node-failure-XXXX (49 chars),
+  # exceeding the LINSTOR 48-char resource-name limit and failing
+  # rd-create with exit 10. Keep the replay- prefix for orphan sweep.
+  rd: replay-redund-restore
   sp: stand
 
 steps:
