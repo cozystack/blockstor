@@ -853,17 +853,24 @@ assert_resize_converged() {
         local got_kib=0
         local deadline=$(( $(date +%s) + 60 ))
         while (( $(date +%s) < deadline )); do
-            # lvm-thin / lvm: lvs --units k
+            # lvm-thin / lvm: match the LV by name (LINSTOR names the
+            # backing LV "<rd>_<5-digit-vol>") and read its size in KiB.
+            # NB: must select lv_name AND lv_size — filtering a size-only
+            # listing by the RD name never matches, so an earlier version
+            # silently fell through to the zfs branch on lvm pools.
             got_kib=$(on_node "$node" bash -c "
-                lvs --noheadings --units k -o lv_size 2>/dev/null \
-                    | awk -v rd='${rd}' '\$0 ~ rd' | head -1 | tr -dc '0-9'
-            " 2>/dev/null || echo 0)
+                lvs --noheadings --units k --nosuffix -o lv_name,lv_size 2>/dev/null \
+                    | awk -v rd='${rd}_' '\$1 ~ (\"^\" rd) {gsub(/\\..*/,\"\",\$2); print \$2; exit}'
+            " 2>/dev/null | tr -dc '0-9' || echo 0)
             if [[ -z "$got_kib" || "$got_kib" == "0" ]]; then
-                # zfs fallback: zfs get -p volsize  -> bytes
+                # zfs fallback: match the zvol dataset by RD name and read
+                # its volsize (bytes). Skip the literal '-' that volsize-
+                # less datasets print, which would break the arithmetic.
                 local bytes
                 bytes=$(on_node "$node" bash -c "
-                    zfs list -H -p -o volsize 2>/dev/null | head -1
-                " 2>/dev/null || echo 0)
+                    zfs list -H -p -o name,volsize 2>/dev/null \
+                        | awk -v rd='${rd}_' '\$1 ~ rd && \$2 ~ /^[0-9]+\$/ {print \$2; exit}'
+                " 2>/dev/null | tr -dc '0-9' || echo 0)
                 got_kib=$(( ${bytes:-0} / 1024 ))
             fi
             if (( got_kib >= expected_kib )); then
