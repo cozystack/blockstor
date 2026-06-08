@@ -590,57 +590,175 @@ pod_md5() {
 }
 
 # pod_lsblk_size <namespace> <pod> <device> — block-device size in
-# bytes as observed from inside the pod (via `lsblk -bno SIZE`).
-# Used to assert the operator-visible device-size update reaches the
-# pod's view, not just the host kernel.
+# bytes as observed from inside the pod. Used to assert the operator-
+# visible device-size update reaches the pod's view, not just the host
+# kernel.
+#
+# The pod image is busybox, which ships neither `lsblk` nor a block-
+# device node for the DRBD volume (kubelet bind-mounts the filesystem,
+# not /dev/drbdN). Read the size out of sysfs instead: the block
+# layer exposes /sys/class/block/<name>/size in 512-byte sectors for
+# any device that backs a mounted fs, regardless of whether its /dev
+# node is visible in the container. Fall back to blockdev if the node
+# happens to be present (host-path mounts).
 pod_lsblk_size() {
     local ns=$1 pod=$2 dev=$3
-    kubectl -n "$ns" exec "$pod" -- sh -c "lsblk -bno SIZE '$dev' 2>/dev/null | head -1 | tr -d ' '" 2>/dev/null
+    local name=${dev##*/}
+    kubectl -n "$ns" exec "$pod" -- sh -c "
+        if [ -r /sys/class/block/${name}/size ]; then
+            sectors=\$(cat /sys/class/block/${name}/size 2>/dev/null)
+            [ -n \"\$sectors\" ] && echo \$(( sectors * 512 )) && exit 0
+        fi
+        blockdev --getsize64 '${dev}' 2>/dev/null \
+            || lsblk -bno SIZE '${dev}' 2>/dev/null | head -1 | tr -d ' '
+    " 2>/dev/null
 }
 
 # pod_device_for_pvc <namespace> <pod> [mount=/data] — discover the
-# block device the PVC volume is mounted on inside the pod. Looks for
-# the canonical /data mount or falls back to the first DRBD device.
+# block device the PVC volume is mounted on inside the pod. busybox
+# lacks `df --output` and `findmnt`, so parse /proc/mounts directly
+# (column 1 = source device); fall back to the first DRBD node.
 pod_device_for_pvc() {
     local ns=$1 pod=$2 mount=${3:-/data}
     kubectl -n "$ns" exec "$pod" -- sh -c "
-        df --output=source '$mount' 2>/dev/null | tail -1 \
-            || findmnt -n -o SOURCE '$mount' 2>/dev/null \
+        awk -v m='${mount}' '\$2==m {print \$1; exit}' /proc/mounts 2>/dev/null \
             || ls /dev/drbd* 2>/dev/null | head -1
     " 2>/dev/null
 }
 
-# create_pvc_for_rd <ns> <pvc> <rd> <size> — create a PVC bound to a
-# pre-existing RD. Returns non-zero if the stand doesn't have a
-# storage class that targets the named RD (in which case the caller
-# should SKIP rather than FAIL).
+# Node (set by create_pvc_for_rd) that holds a diskful replica of the
+# RD and whose DRBD device the helper has pre-formatted. create_writer_pod
+# pins the pod here so linstor-csi's NodePublishVolume mounts the formatted
+# local replica rather than a freshly-attached diskless one.
+BS_RESIZE_PVC_NODE=""
+
+# expandable_linstor_csi_sc — name of a StorageClass that (a) is
+# provisioned by linstor-csi and (b) has allowVolumeExpansion=true.
+# Empty string if none exists. We bind the static PV/PVC to this SC so
+# that — after the operator grows the volume out-of-band via `linstor
+# vd s` — a one-line PVC.Spec request bump can drive the csi external-
+# resizer to propagate PVC.Status.Capacity + run the in-guest fs grow
+# (the operator-visible half of the resize chain). A static PVC bound to
+# storageClassName:"" cannot be resized at all ("only dynamically
+# provisioned pvc can be resized"), so the expandable SC is required for
+# the Status.Capacity assertion to be exercisable.
+expandable_linstor_csi_sc() {
+    kubectl get storageclass -o json 2>/dev/null | jq -r '
+        .items[]?
+        | select(.provisioner=="linstor.csi.linbit.com")
+        | select(.allowVolumeExpansion==true)
+        | .metadata.name' 2>/dev/null | head -1
+}
+
+# format_drbd_device <rd> <node> [fstype=ext4] [vol=0] — lay down a
+# fresh filesystem on the RD's local DRBD device on NODE. A
+# CLI-created (not CSI-provisioned) resource has a raw block device:
+# linstor-csi's NodePublishVolume runs `fsck` on it (not `mkfs`, since
+# the FsType property only gets stamped during CSI's own CreateVolume)
+# and aborts with "bad magic number in super-block". We pre-format
+# through the satellite so the subsequent CSI mount sees a valid fs.
 #
-# Strategy: enumerate StorageClasses with provisioner=blockstor.io
-# (fall back to linstor.csi.linbit.com) and pick the first one. Then
-# PVC waits up to 60s for Bound phase.
+# DRBD only permits writes while Primary, so we promote --force,
+# mkfs, then demote back to Secondary (same primary/secondary dance the
+# snap-*-lifecycle cells use to write anchor data). Idempotent: a second
+# call just rewrites the fs.
+format_drbd_device() {
+    local rd=$1 node=$2 fstype=${3:-ext4} vol=${4:-0}
+    on_node "$node" sh -c "
+        set -e
+        dev=\$(ls /dev/drbd/by-res/${rd}/${vol} 2>/dev/null) || dev=''
+        if [ -z \"\$dev\" ]; then
+            # by-res symlink is not always present in the satellite
+            # mount namespace; fall back to the minor reported by
+            # drbdsetup status for this resource.
+            minor=\$(drbdsetup status '${rd}' 2>/dev/null \
+                | grep -oE 'minor:[0-9]+' | head -1 | cut -d: -f2)
+            [ -n \"\$minor\" ] && dev=\"/dev/drbd\${minor}\"
+        fi
+        [ -n \"\$dev\" ] || { echo 'format_drbd_device: cannot resolve drbd device' >&2; exit 1; }
+        drbdadm primary --force '${rd}'
+        # Settle the role change before mkfs opens the device.
+        sleep 1
+        mkfs.${fstype} -F -q \"\$dev\"
+        sync
+        drbdadm secondary '${rd}'
+    "
+}
+
+# create_pvc_for_rd <ns> <pvc> <rd> <size> — bind a pod-mountable PVC
+# to a pre-existing, CLI-created RD via a *static* (pre-provisioned)
+# PersistentVolume — no dynamic provisioner, no custom annotation.
+# Returns non-zero (caller SKIPs) only when linstor-csi is genuinely
+# absent from the stand.
+#
+# Flow:
+#   1. Require the linstor.csi.linbit.com CSIDriver + an expandable
+#      linstor-csi StorageClass; else SKIP.
+#   2. Pick a node that holds a diskful replica of the RD and pre-format
+#      its DRBD device (CLI-created volumes ship raw — see
+#      format_drbd_device). Record it in BS_RESIZE_PVC_NODE so the
+#      writer pod can be pinned there.
+#   3. Create a static PV (csi.volumeHandle=<rd>, fsType=ext4) with a
+#      claimRef + the matching PVC, both on the expandable SC, and wait
+#      for Bound.
 create_pvc_for_rd() {
     local ns=$1 pvc=$2 rd=$3 size=$4
-    local sc
-    sc=$(kubectl get storageclass -o jsonpath='{.items[?(@.provisioner=="blockstor.io")].metadata.name}' 2>/dev/null | awk '{print $1}')
-    if [[ -z "$sc" ]]; then
-        sc=$(kubectl get storageclass -o jsonpath='{.items[?(@.provisioner=="linstor.csi.linbit.com")].metadata.name}' 2>/dev/null | awk '{print $1}')
+    local pv="${pvc}-pv"
+
+    # linstor-csi present on the stand?
+    if ! kubectl get csidriver linstor.csi.linbit.com >/dev/null 2>&1; then
+        echo "create_pvc_for_rd: linstor.csi.linbit.com CSIDriver not installed on stand" >&2
+        return 1
     fi
+    local sc
+    sc=$(expandable_linstor_csi_sc)
     if [[ -z "$sc" ]]; then
-        echo "create_pvc_for_rd: no blockstor.io / linstor csi StorageClass on stand" >&2
+        echo "create_pvc_for_rd: no expandable linstor-csi StorageClass on stand" >&2
         return 1
     fi
 
+    # Resolve a diskful node and pre-format its DRBD device so the CSI
+    # mount (which only fsck's, never mkfs's, a static volume) succeeds.
+    local node
+    node=$(linstor_diskful_nodes "$rd" | head -1)
+    if [[ -z "$node" ]]; then
+        echo "create_pvc_for_rd: no diskful replica found for $rd" >&2
+        return 1
+    fi
+    if ! format_drbd_device "$rd" "$node" ext4 0; then
+        echo "create_pvc_for_rd: mkfs on $rd@$node failed" >&2
+        return 1
+    fi
+    BS_RESIZE_PVC_NODE="$node"
+
     kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ${pv}
+spec:
+  capacity:
+    storage: ${size}
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ${sc}
+  claimRef:
+    namespace: ${ns}
+    name: ${pvc}
+  csi:
+    driver: linstor.csi.linbit.com
+    volumeHandle: ${rd}
+    fsType: ext4
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: ${pvc}
   namespace: ${ns}
-  annotations:
-    blockstor.io/existing-rd: "${rd}"
 spec:
   accessModes: ["ReadWriteOnce"]
   storageClassName: ${sc}
+  volumeName: ${pv}
   resources:
     requests:
       storage: ${size}
@@ -660,12 +778,27 @@ EOF
     return 1
 }
 
-# create_writer_pod <ns> <pod> <pvc> <mount> — start a tiny pod that
-# mounts PVC at MOUNT and stays alive for the rest of the scenario.
-# Uses busybox so it's available on the stand without extra image
-# pulls.
+# delete_static_pv_for_pvc <pvc> — remove the static PV created by
+# create_pvc_for_rd (Retain reclaim policy means it is NOT garbage-
+# collected when the PVC is deleted, so cells must drop it explicitly).
+delete_static_pv_for_pvc() {
+    local pvc=$1
+    kubectl delete pv "${pvc}-pv" --wait=false 2>/dev/null || true
+}
+
+# create_writer_pod <ns> <pod> <pvc> <mount> [node] — start a tiny pod
+# that mounts PVC at MOUNT and stays alive for the rest of the scenario.
+# Uses busybox so it's available on the stand without extra image pulls.
+#
+# When NODE is given (or BS_RESIZE_PVC_NODE is set by create_pvc_for_rd)
+# the pod is pinned there: for a static PV bound to a CLI-created RD we
+# want the pod on a node that holds a diskful replica so linstor-csi
+# mounts the local pre-formatted device rather than attaching a fresh
+# diskless replica elsewhere.
 create_writer_pod() {
-    local ns=$1 pod=$2 pvc=$3 mount=$4
+    local ns=$1 pod=$2 pvc=$3 mount=$4 node=${5:-${BS_RESIZE_PVC_NODE:-}}
+    local node_pin=""
+    [[ -n "$node" ]] && node_pin="  nodeName: ${node}"
     kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -673,6 +806,7 @@ metadata:
   name: ${pod}
   namespace: ${ns}
 spec:
+${node_pin}
   terminationGracePeriodSeconds: 5
   restartPolicy: Never
   containers:
@@ -774,6 +908,18 @@ assert_resize_converged() {
     done
 
     echo "   4. PVC.Status.Capacity reaches $pvc_capacity"
+    # `linstor vd s` grows the volume out-of-band — it does not touch
+    # the PVC, so the csi external-resizer never wakes up on its own.
+    # To exercise the operator-visible PVC.Status.Capacity propagation
+    # (and the in-guest fs grow) we bump PVC.Spec.requests to the new
+    # size, which the resizer reconciles: ControllerExpandVolume is a
+    # no-op (LINSTOR already has the new size from `vd s`), then
+    # NodeExpandVolume runs resize2fs and Status.Capacity follows.
+    # This requires the PVC to be bound on an expandable SC — a static
+    # PVC on storageClassName:"" rejects the request outright.
+    kubectl -n "$pvc_ns" patch pvc "$pvc" --type=merge \
+        -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"${pvc_capacity}\"}}}}" \
+        >/dev/null 2>&1 || true
     wait_pvc_capacity "$pvc_ns" "$pvc" "$pvc_capacity" 120
 
     echo "   5. lsblk inside pod sees device >= $expected_kib KiB"
