@@ -531,7 +531,24 @@ func crdToWireResource(crd *crdv1alpha1.Resource) apiv1.Resource {
 		),
 		UUID:        string(crd.UID),
 		Annotations: cloneAnnotations(crd.Annotations),
+		// Upstream LINSTOR populates `create_timestamp` (the Python
+		// CLI's `CreatedOn` column). The Resource CRD's
+		// metadata.creationTimestamp is the per-replica creation time
+		// and the natural, persistence-free source for it.
+		CreateTimestamp: crdCreateTimestampMs(crd),
 	}
+}
+
+// crdCreateTimestampMs translates a Resource CRD's
+// metadata.creationTimestamp into the upstream `create_timestamp`
+// wire field (unix milliseconds). Returns 0 (dropped by omitempty)
+// when the timestamp is unset, e.g. a hand-built CRD in a unit test.
+func crdCreateTimestampMs(crd *crdv1alpha1.Resource) int64 {
+	if crd.CreationTimestamp.IsZero() {
+		return 0
+	}
+
+	return crd.CreationTimestamp.UnixMilli()
 }
 
 // volumesFromStatus projects the CRD `Status.Volumes` onto wire
