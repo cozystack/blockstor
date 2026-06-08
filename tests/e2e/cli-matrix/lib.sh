@@ -666,15 +666,13 @@ format_drbd_device() {
     local rd=$1 node=$2 fstype=${3:-ext4} vol=${4:-0}
     on_node "$node" sh -c "
         set -e
-        dev=\$(ls /dev/drbd/by-res/${rd}/${vol} 2>/dev/null) || dev=''
-        if [ -z \"\$dev\" ]; then
-            # by-res symlink is not always present in the satellite
-            # mount namespace; fall back to the minor reported by
-            # drbdsetup status for this resource.
-            minor=\$(drbdsetup status '${rd}' 2>/dev/null \
-                | grep -oE 'minor:[0-9]+' | head -1 | cut -d: -f2)
-            [ -n \"\$minor\" ] && dev=\"/dev/drbd\${minor}\"
-        fi
+        # drbdadm sh-dev prints the volume's /dev/drbdN path directly.
+        # The /dev/drbd/by-res/<rd>/<vol> symlink is not reliably present
+        # in the satellite mount namespace, and 'drbdsetup status' (no
+        # --json, jq absent) does not print the minor — so sh-dev is the
+        # one portable resolver here.
+        dev=\$(drbdadm sh-dev '${rd}/${vol}' 2>/dev/null) \
+            || dev=\$(drbdadm sh-dev '${rd}' 2>/dev/null) || dev=''
         [ -n \"\$dev\" ] || { echo 'format_drbd_device: cannot resolve drbd device' >&2; exit 1; }
         drbdadm primary --force '${rd}'
         # Settle the role change before mkfs opens the device.
