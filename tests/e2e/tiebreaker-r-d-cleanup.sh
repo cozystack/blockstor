@@ -194,11 +194,16 @@ wait_witness_count() {
 # ---- STEP 1: 3 diskful replicas on workers 1+2+3 -------------------
 
 echo ">> create RD $RD with 3 diskful replicas on $N1, $N2, $N3"
-"${LCTL[@]}" resource-definition create "$RD"
-"${LCTL[@]}" volume-definition create "$RD" 64M
-"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool stand
-"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool stand
-"${LCTL[@]}" resource create "$N3" "$RD" --storage-pool stand
+# Create-class CLI calls go through lctl_idempotent so a dropped
+# port-forward read that triggers python-linstor's blind POST resend
+# (see lctl_idempotent in lib.sh) does not flake the scenario with a
+# spurious "already diskful: object already exists" 409 on a create that
+# already landed server-side.
+lctl_idempotent resource-definition create "$RD"
+lctl_idempotent volume-definition create "$RD" 64M
+lctl_idempotent resource create "$N1" "$RD" --storage-pool stand
+lctl_idempotent resource create "$N2" "$RD" --storage-pool stand
+lctl_idempotent resource create "$N3" "$RD" --storage-pool stand
 
 echo ">> wait all 3 replicas UpToDate (<=180s)"
 wait_disk_state "$RD" "$N1" UpToDate 180 0
