@@ -927,7 +927,15 @@ assert_resize_converged() {
         >/dev/null 2>&1 || true
     wait_pvc_capacity "$pvc_ns" "$pvc" "$pvc_capacity" 120
 
-    echo "   5. lsblk inside pod sees device >= $expected_kib KiB"
+    # The DRBD device is a few MiB smaller than the gross VolumeDefinition
+    # size because DRBD subtracts its internal metadata, so the pod-visible
+    # block device never quite reaches the nominal KiB. Allow a fixed slack
+    # (8 MiB) below the nominal size — far smaller than the 1 GiB growth
+    # step, so this still proves the resize reached the pod while tolerating
+    # metadata overhead.
+    local meta_slack_kib=8192
+    local pod_min_kib=$(( expected_kib - meta_slack_kib ))
+    echo "   5. in-pod device size reaches ~$expected_kib KiB (>= $pod_min_kib KiB net)"
     local pod_dev pod_size_bytes pod_kib=0
     pod_dev=$(pod_device_for_pvc "$pvc_ns" "$pod" "$mount")
     if [[ -n "$pod_dev" ]]; then
@@ -935,17 +943,17 @@ assert_resize_converged() {
         while (( $(date +%s) < deadline )); do
             pod_size_bytes=$(pod_lsblk_size "$pvc_ns" "$pod" "$pod_dev" 2>/dev/null || echo 0)
             pod_kib=$(( ${pod_size_bytes:-0} / 1024 ))
-            if (( pod_kib >= expected_kib )); then
+            if (( pod_kib >= pod_min_kib )); then
                 break
             fi
             sleep 2
         done
-        if (( pod_kib < expected_kib )); then
-            echo "FAIL: pod-side lsblk size $pod_kib KiB < expected $expected_kib KiB (device=$pod_dev)" >&2
+        if (( pod_kib < pod_min_kib )); then
+            echo "FAIL: pod-side device size $pod_kib KiB < $pod_min_kib KiB (nominal $expected_kib, device=$pod_dev)" >&2
             return 1
         fi
     else
-        echo "   (skipping lsblk: could not resolve pod device for $mount)"
+        echo "   (skipping in-pod size check: could not resolve pod device for $mount)"
     fi
 
     echo "   6. md5 anchor over original 256 MiB region unchanged"
