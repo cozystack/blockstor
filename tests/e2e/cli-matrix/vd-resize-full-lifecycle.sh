@@ -83,6 +83,9 @@ run_resize_lifecycle() {
         local _rd=${RD:-}
         [[ -n "$_pod" ]] && kubectl -n "$_ns" delete pod "$_pod" --wait=true --timeout=60s 2>/dev/null || true
         [[ -n "$_pvc" ]] && kubectl -n "$_ns" delete pvc "$_pvc" --wait=true --timeout=60s 2>/dev/null || true
+        # The static PV has reclaimPolicy=Retain, so deleting the PVC
+        # does not GC it — drop it explicitly or it leaks across runs.
+        [[ -n "$_pvc" ]] && delete_static_pv_for_pvc "$_pvc"
         [[ -n "$_rd" ]] && delete_rd "$_rd"
         [[ -n "$_rd" ]] && assert_no_orphans "$_rd"
 
@@ -150,13 +153,12 @@ run_resize_lifecycle() {
     wait_uptodate "$RD" "$N1" "$N2"
 
     echo ">> create PVC + pod, write 256 MiB random with md5 anchor"
-    # The PVC binds via the existing storage-class machinery — same
-    # mechanics as tests/e2e/pvc-lifecycle.sh. We don't care which SC
-    # is used as long as it lands on this RD's storage pool; for the
-    # operator-visible PVC.Status.Capacity bit we just need a PVC that
-    # IS bound to a PV backed by this RD. To avoid coupling to whatever
-    # SC the stand has provisioned, we pre-create the PV directly with
-    # the CSI driver and bind the PVC to it.
+    # We bind a pod to the exact CLI-created RD via a *static*
+    # (pre-provisioned) PersistentVolume whose csi.volumeHandle is the
+    # RD name — no dynamic provisioner, no custom annotation. The helper
+    # pre-formats the RD's local DRBD device (CLI-created volumes ship
+    # raw; linstor-csi only fsck's a static volume, never mkfs's it) and
+    # pins the pod to that diskful node. See create_pvc_for_rd in lib.sh.
     create_pvc_for_rd "$PVC_NS" "$PVC_NAME" "$RD" 1Gi || {
         echo "SKIP ($POOL): could not bind PVC to existing RD (CSI plumbing not present on stand)"
         return 0
