@@ -952,19 +952,19 @@ func TestIsAutoQuorumDisabled(t *testing.T) {
 	}
 }
 
-// TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless pins Bug
-// 104. Starting from the steady state the auto-witness path creates
-// (2 diskful + 1 TIE_BREAKER), an operator toggles one diskful to
-// DISKLESS via `linstor r td --diskless`. The pre-Bug-104 invariant
-// recomputed wantWitness from scratch and saw "1 diskful, 1
-// non-witness diskless" — flipping the decision to "no witness
-// needed" and DELETING the TIE_BREAKER. That collapses the cluster
-// to 1 diskful + 1 diskless with no third voter, so the next
-// network partition freezes the volume read-only (UG9 §"Quorum"
-// failure-mode 2). The fix keeps the witness whenever it already
-// exists and diskful is in [1, 3): the cluster needs the witness
-// MORE in that window, not less.
-func TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless(t *testing.T) {
+// TestEnsureTiebreakerReapedAfterToggleDiskful2Diskless pins the
+// upstream-parity contract for the toggle-to-1-diskful path. Starting
+// from the steady state the auto-witness path creates (2 diskful + 1
+// TIE_BREAKER), an operator toggles one diskful to DISKLESS via
+// `linstor r td --diskless`. The post-toggle topology is 1 diskful +
+// 1 user-diskless, at which point `quorumPolicy` returns quorum=off —
+// there is no diskful tie to break and no majority to freeze. Upstream
+// LINSTOR's shouldTieBreakerExist never manages a witness below 2
+// diskful, so blockstor reaps the now-redundant TIE_BREAKER, leaving 2
+// replicas. (This reverts the former Bug 104/108 keep/create branches,
+// which retained the witness on the false premise that 1 diskful + 1
+// diskless freezes quorum:majority.)
+func TestEnsureTiebreakerReapedAfterToggleDiskful2Diskless(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
@@ -1028,15 +1028,16 @@ func TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless(t *testing.T) {
 		t.Fatalf("EnsureTiebreaker: %v", err)
 	}
 
-	// Bug 104 invariant: all three Resources MUST still exist.
-	// Pre-fix, n3 (TIE_BREAKER) got removed by applyWitnessDecision.
+	// Upstream-parity invariant: the witness is reaped, leaving 2
+	// Resources (1 diskful + 1 user-diskless). Pre-revert, Bug 104
+	// kept n3 (TIE_BREAKER) at 1 diskful.
 	all, err := st.Resources().ListByDefinition(ctx, "pvc-bug104")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 
-	if len(all) != 3 {
-		t.Fatalf("replica count: got %d, want 3 (1 diskful + 1 diskless + 1 TIE_BREAKER); entries=%v",
+	if len(all) != 2 {
+		t.Fatalf("replica count: got %d, want 2 (1 diskful + 1 diskless, witness reaped); entries=%v",
 			len(all), all)
 	}
 
@@ -1068,49 +1069,40 @@ func TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless(t *testing.T) {
 		}
 	}
 
-	if diskfulCount != 1 || disklessCount != 1 || witnessCount != 1 {
-		t.Errorf("post-toggle composition: diskful=%d diskless=%d witness=%d, want 1/1/1; entries=%v",
+	if diskfulCount != 1 || disklessCount != 1 || witnessCount != 0 {
+		t.Errorf("post-toggle composition: diskful=%d diskless=%d witness=%d, want 1/1/0; entries=%v",
 			diskfulCount, disklessCount, witnessCount, all)
 	}
 
-	// Quorum prop must remain "majority": diskful=1 + diskless=2
-	// (1 user-diskless + 1 witness) still satisfies the
-	// `(diskful == 2 AND diskless ≥ 1) OR diskful ≥ 3` upstream
-	// rule? No — diskful=1 + diskless=2 falls into the "off" branch
-	// of quorumPolicy. The witness preservation is about not making
-	// the situation WORSE: with the witness gone we'd have
-	// diskful=1+diskless=1=2, still "off", but the operator can
-	// recover by re-toggling. Without the witness, re-toggling
-	// gives 2 diskful + 1 user-diskless and quorumPolicy returns
-	// "majority" — but during the partition-vulnerable window the
-	// witness was still useful as a connection-mesh participant.
-	// We do not pin a specific quorum prop value here because the
-	// 1-diskful state is intentionally a transient operator
-	// workflow, not steady state.
+	// quorumPolicy(diskful=1, diskless=1) falls into the "off" branch
+	// — a lone diskful runs cleanly under quorum=off, so the reaped
+	// witness leaves no majority to freeze. Matches upstream LINSTOR,
+	// which never manages a tiebreaker below 2 diskful.
 }
 
-// TestBug108EnsureTiebreakerFullSequenceAfterToggle reproduces the
-// EXACT production sequence reported in bug-hunt v2 for Bug 108:
+// TestEnsureTiebreakerReapedFullSequenceAfterToggle exercises the full
+// auto-place → toggle cycle and pins the upstream-parity outcome:
 //
 //  1. `rd ap --place-count 2` lands 2 diskful replicas; the RD
 //     reconciler runs `EnsureTiebreaker` and AUTO-CREATES the
 //     TIE_BREAKER witness on the third node (so we don't pre-seed
-//     n3 — the reconciler picks it).
+//     n3 — the reconciler picks it). Steady state: 2 diskful + 1 TB.
 //  2. `r td --diskless dev-kvaps-worker-1 <rd>` updates the n1
 //     replica spec to add the DISKLESS flag (the only thing
 //     handleResourceToggleDiskToDiskless does — see
 //     pkg/rest/resource_toggle_disk.go).
 //  3. The Resource Update event fires the RD-reconciler watch.
-//     `EnsureTiebreaker` runs a SECOND time and must NOT drop the
-//     auto-stamped witness.
+//     `EnsureTiebreaker` runs a SECOND time over 1 diskful + 1
+//     user-diskless and REAPS the now-redundant witness — quorum is
+//     off at 1 diskful, and upstream LINSTOR carries no tiebreaker
+//     below 2 diskful. Final state: 2 replicas.
 //
-// Unlike TestEnsureTiebreakerPreservedAfterToggleDiskful2Diskless
-// (which pre-seeds the witness with the TIE_BREAKER flag), this
-// test verifies the witness survives across the
-// create-then-evaluate cycle the auto-place flow actually
-// exercises in production. This is the no-race path: the witness
-// IS stamped before the toggle fires.
-func TestBug108EnsureTiebreakerFullSequenceAfterToggle(t *testing.T) {
+// Unlike TestEnsureTiebreakerReapedAfterToggleDiskful2Diskless (which
+// pre-seeds the witness), this test verifies the reap across the
+// create-then-evaluate cycle the auto-place flow actually exercises in
+// production. This is the no-race path: the witness IS stamped before
+// the toggle fires, then removed once diskful drops to 1.
+func TestEnsureTiebreakerReapedFullSequenceAfterToggle(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
@@ -1207,33 +1199,32 @@ func TestBug108EnsureTiebreakerFullSequenceAfterToggle(t *testing.T) {
 		t.Fatalf("list post-toggle: %v", err)
 	}
 
-	// Bug 108 invariant: TIE_BREAKER on witnessNode MUST survive.
-	if len(post) != 3 {
-		t.Fatalf("post-toggle: got %d replicas, want 3; entries=%v", len(post), post)
+	// Upstream-parity invariant: toggling the 2nd diskful to diskless
+	// drops the cluster to 1 diskful + 1 user-diskless. At 1 diskful
+	// quorumPolicy returns quorum=off, so the witness on witnessNode is
+	// reaped — exactly what upstream LINSTOR settles on. Final: 2 replicas.
+	if len(post) != 2 {
+		t.Fatalf("post-toggle: got %d replicas, want 2; entries=%v", len(post), post)
 	}
 
-	witnessSurvived := false
+	witnessCount := 0
 
 	for i := range post {
-		if post[i].NodeName != witnessNode {
-			continue
-		}
-
 		for _, f := range post[i].Flags {
 			if f == apiv1.ResourceFlagTieBreaker {
-				witnessSurvived = true
+				witnessCount++
 			}
 		}
 	}
 
-	if !witnessSurvived {
-		t.Fatalf("Bug 108: TIE_BREAKER on %s reaped after toggle; post=%v",
+	if witnessCount != 0 {
+		t.Fatalf("TIE_BREAKER on %s survived toggle; want 0 (no witness below 2 diskful); post=%v",
 			witnessNode, post)
 	}
 }
 
-// TestBug108EnsureTiebreakerToggleBeforeWitnessLands pins the EXACT
-// regression the bug-hunt v2 agent reported (3/3 repros):
+// TestEnsureTiebreakerNoWitnessCreatedAtSingleDiskful pins the
+// upstream-parity contract on the race path the former Bug 108 covered:
 //
 //  1. `rd c <rd>; vd c <rd> 32M; rd ap --place-count 2` posts the
 //     two diskful replicas. The RD reconciler is enqueued but the
@@ -1242,18 +1233,16 @@ func TestBug108EnsureTiebreakerFullSequenceAfterToggle(t *testing.T) {
 //     Resource hits the apiserver. Toggle handler updates n1 →
 //     Resource Update event fires the RD watch.
 //  3. The (now-final) reconcile sees 1 diskful + 1 user-diskless +
-//     0 witness. Bug 104's keep-branch only preserves an EXISTING
-//     witness; with none present, both branches gate to false and
-//     `wantWitness=false`. Final state: 2 replicas, no witness.
+//     0 witness. No witness is created: at 1 diskful `quorumPolicy`
+//     returns quorum=off (no majority to freeze) and upstream LINSTOR
+//     never manages a tiebreaker below 2 diskful. Final state: 2
+//     replicas, no witness — exactly what upstream settles on.
 //
-// Bug 108's invariant is "TIE_BREAKER survives the toggle, full
-// stop" — that has to extend to "a witness is created when the
-// post-toggle state needs one, even if the steady-state precursor
-// reconcile never landed it". Without this, an unlucky timing
-// permanently kills the witness; subsequent reconciles see "1
-// diskful + 1 diskless" and stay in the no-witness branch forever.
-// Mirrors the v2 report's curl observation: `len(resources) == 2`.
-func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
+// This reverts the former Bug 108 repairAfterToggleRace branch, which
+// re-created the witness here on the false premise that 1 diskful + 1
+// diskless freezes quorum:majority. The 2-replica outcome the v2 report
+// flagged as a regression is in fact the upstream-correct steady state.
+func TestEnsureTiebreakerNoWitnessCreatedAtSingleDiskful(t *testing.T) {
 	t.Parallel()
 
 	scheme := newScheme(t)
@@ -1303,9 +1292,7 @@ func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
 	}
 
 	// RD-reconciler drains its work queue and runs (post-toggle
-	// view). Bug 104's keep-branch can't help — no witness was
-	// ever stamped. The fix must extend wantWitness to cover this
-	// transient case.
+	// view): 1 diskful + 1 user-diskless. No witness is created.
 	if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
 		t.Fatalf("EnsureTiebreaker: %v", err)
 	}
@@ -1315,12 +1302,10 @@ func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	// Bug 108 invariant from v2 report: a TIE_BREAKER witness MUST
-	// land on the unused node (n3). Pre-fix the controller settled
-	// at 2 replicas with no witness — len==2 in the v2 curl trace.
-	if len(post) != 3 {
-		t.Fatalf("Bug 108: post-toggle replica count = %d, want 3 "+
-			"(1 diskful + 1 user-diskless + 1 auto-witness); entries=%v",
+	// Upstream-parity invariant: no witness at 1 diskful → 2 replicas.
+	if len(post) != 2 {
+		t.Fatalf("post-toggle replica count = %d, want 2 "+
+			"(1 diskful + 1 user-diskless, no witness); entries=%v",
 			len(post), post)
 	}
 
@@ -1334,8 +1319,8 @@ func TestBug108EnsureTiebreakerToggleBeforeWitnessLands(t *testing.T) {
 		}
 	}
 
-	if witnessCount != 1 {
-		t.Fatalf("Bug 108: TIE_BREAKER count = %d, want 1; entries=%v",
+	if witnessCount != 0 {
+		t.Fatalf("TIE_BREAKER count = %d, want 0 (no witness below 2 diskful); entries=%v",
 			witnessCount, post)
 	}
 }
