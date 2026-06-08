@@ -58,9 +58,13 @@ trap cleanup EXIT
 # Phase 1: initial autoplace → 2 diskful + auto-tiebreaker
 # =====================================================================
 echo ">> Phase 1: rd c + vd c + r c --auto-place=2 -s $SP"
-"${LCTL[@]}" resource-definition create "$RD" >/dev/null
-"${LCTL[@]}" volume-definition create "$RD" 512M >/dev/null
-"${LCTL[@]}" resource create --auto-place=2 --storage-pool="$SP" "$RD" >/dev/null
+# Create-class calls go through lctl_idempotent so a dropped port-forward
+# read that triggers python-linstor's blind POST resend (see
+# lctl_idempotent in ../lib.sh) does not flake the lifecycle catcher with a
+# spurious "object already exists" 409 on a create that already landed.
+lctl_idempotent resource-definition create "$RD" >/dev/null
+lctl_idempotent volume-definition create "$RD" 512M >/dev/null
+lctl_idempotent resource create --auto-place=2 --storage-pool="$SP" "$RD" >/dev/null
 
 # 3 rows: 2 diskful + 1 TIE_BREAKER (Bug 338's pre-condition shape).
 wait_replica_count "$RD" 3 90 \
@@ -104,7 +108,7 @@ wait_replica_absent "$RD" "$n1" 60 \
 # satellite renders a new .res, re-creates the backing volume, and the
 # kernel resyncs the slot from the surviving peer.
 echo ">> Phase 2: r c $n1 $RD  (Bug 327/339 trigger — bare form must spawn diskful)"
-"${LCTL[@]}" resource create "$n1" "$RD" >/dev/null
+lctl_idempotent resource create "$n1" "$RD" >/dev/null
 
 wait_status_state "$RD" "$n1" UpToDate 120 \
     || die "Phase 2 (Bug 327/329): ${n1} never reached UpToDate after r c"
@@ -163,7 +167,7 @@ done
     || die "Phase 3: no relocate target found (workers: $WORKER_1 $WORKER_2 $WORKER_3, n1=$n1, n_to_evict=$n_to_evict)"
 
 echo ">> Phase 3: r c $relocate_node $RD  (diskful on the tiebreaker's old node)"
-"${LCTL[@]}" resource create "$relocate_node" "$RD" >/dev/null
+lctl_idempotent resource create "$relocate_node" "$RD" >/dev/null
 wait_status_state "$RD" "$relocate_node" UpToDate 120 \
     || die "Phase 3: ${relocate_node} never reached UpToDate after relocate"
 
@@ -211,7 +215,7 @@ diskful_left=$(linstor_diskful_count "$RD")
 # Phase 5: re-add as diskless
 # =====================================================================
 echo ">> Phase 5: r c $n1 $RD --diskless"
-"${LCTL[@]}" resource create "$n1" "$RD" --diskless >/dev/null
+lctl_idempotent resource create "$n1" "$RD" --diskless >/dev/null
 wait_status_diskless "$RD" "$n1" 60 \
     || die "Phase 5: ${n1} never reached Diskless within 60s"
 
