@@ -4,6 +4,34 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.11 — 2026-06-08
+
+Campaign-2 release. 48 corner cases mined from user-reported bugs in the LINBIT/linstor-server GitHub issue tracker were reproduced and validated on the live Talos+QEMU stand, ⚖️-ambiguous cases compared against the upstream LINSTOR oracle. This release also restores day0 skip-initial-sync on the default FILE_THIN pool — a performance regression introduced in v0.1.10 — and fixes a spawn-size unit bug.
+
+### Fixed
+
+- **day0 skip-initial-sync restored on FILE_THIN pools (#121)** — v0.1.10's #112 set an explicit `discard-zeroes-if-aligned=no` on FILE_THIN to avoid a loop-backing bitmap-dirtying wedge, but that also defeated DRBD's day0 skip-initial-sync, so every fresh `resource create` on the default (FILE_THIN) pool did a full whole-device resync (minutes for a 512 MiB volume) instead of coming up instantly UpToDate. Restored via three coordinated changes: `discard-zeroes-if-aligned` is back to `yes` on FILE_THIN (the kernel treats the whole fresh device as an assumed-zeroed new region — Path A of the attach clean-bitmap logic — so the loop-wedge no longer occurs); the non-winner replica is GI-seeded `WasUpToDate` without `Consistent`, so it carries no authority yet still skips the sync; and the `RD.Spec.Initialized` latch is gated on a *proven* observed GI to close a mid-create stamping race. Bundled with two related satellite fixes the same full-lifecycle gate surfaced: a mid-delete promote against a DELETE-flagged tiebreaker row is now routed into the retry loop instead of silently promoting a dying witness (Bug 359), and a healthy SyncSource/WFBitMapS peer is no longer force-promoted by the recovery-promote scan (Bug 366). The full `resource create` lifecycle now converges in ~45 s with zero resync.
+- **`rg spawn-resources <rg> <rd> 32M` created a 32 KiB volume (#124, Bug 391)** — the spawn handler divided every `volume_sizes` entry by 1024 (treating the field as bytes), but it is KiB: the python linstor client encodes the operator's size with `parse_volume_size_to_kib` before POSTing (`32M` → `32768`), and the REST spec documents the field as KiB. Each entry is now stamped directly as `size_kib`, matching the `vd c` path; every `rg spawn-resources` with a human size was previously provisioned 1024× too small.
+- **`node evacuate` / eviction never drops the last diskful copy (#114)** — evacuate and evict guards aligned with upstream so the final diskful replica is preserved; node-lifecycle and tiebreaker-reliability corner cases pinned (U18–U427).
+- **A lone, peerless diskful replica wedged below UpToDate is force-promoted (#120)** — a single diskful replica with no peers that comes up Consistent-but-not-UpToDate is promoted to UpToDate, matching upstream's single-node behavior, instead of staying unpromotable.
+- **Mid-sync delete of the last diskful replica is guarded; DELETING stays idempotent and relocation-safe (#115, U130)** — deleting the last diskful while a sync is in flight no longer risks data, and the DELETING flag survives repeated delete calls and relocation.
+
+### Corner-case parity coverage (mined from upstream user-reported issues)
+
+48 issue-mined corner cases were validated on the live stand (⚖️-ambiguous cases against the oracle) and pinned at L1 / L6 cli-matrix / L7 replay:
+
+- **Sync correctness (#122)** — adding a diskful replica over written data syncs rather than silently coming up empty (U145); add-peer regenerates the connection mesh with no StandAlone (U216); an Inconsistent replica with no source is never classified SyncTarget (U203); a rejoined node's resyncs drain cleanly with no stuck done-% (U251); bulk create converges (U268).
+- **Snapshot robustness (#113)** — IO-unwind on snapshot failure, delete-retry idempotency, and related guards (U138/U52/U258/U32/U282/U290/U464/U318).
+- **Resize family (#119)** — volume-size / resize cases vs user reports (U48/U329/U389/U204/U388/U421/U360).
+- **Placement family (#117)** and **props / envelopes / scale (#118)** — placement and property-surface cases (upstream-issues U6; U337/U302/U222/U64/U110/U187).
+- **Residual quorum / lifecycle (#123)** — quorum held across a `toggle-disk --migrate-from` migration with no transient quorum loss (U341); `node lost` with live resources prunes cleanly with no dangling refs (U173); the migrate source is pruned as diskful while an auto-quorum tiebreaker legitimately re-occupies the vacated node (U435); redundancy is auto-restored after a node failure (U236).
+
+### Testing & infrastructure
+
+- **vd-resize CSI leg now runs end-to-end (#126)** — the resize lifecycle's pod-attach cross-check (in-pod block-device growth + PVC capacity propagation + md5 data preservation across `vd s` 1G→2G→4G) previously SKIPped because it bound through a non-existent `blockstor.io/existing-rd` provisioner. It now attaches the pod to the CLI-created resource via a static pre-provisioned PV on stock linstor-csi (pre-formatting the device, since linstor-csi only `fsck`s a static volume, never `mkfs`s it), validated on both lvm-thin and zfs-thin.
+- **E2E tolerance for python-linstor's blind POST-resend (#125)** — when a dropped read makes the python client re-send a `resource create`, the server's correct `409 already-exists` is now tolerated in the harness only when the step expected success. The upstream-faithful 409 is unchanged: the only production consumer, linstor-csi, is already idempotent (FindByID-first) and uses the Go client, not the python blind-resend path.
+- Replay harness gained a `quorum` await kind and a `show_defaults` option on `drbd_option`.
+
 ## v0.1.10 — 2026-06-06
 
 Corner-case parity campaign release. Every behavior in this release was validated on a live Talos+QEMU stand, with the ⚖️-ambiguous cases compared against an upstream LINSTOR 1.33.2 oracle cluster (controller + 3 satellites) running side-by-side on the same DRBD kernel. 61 corner-case plan items closed; 15 new rows added to the known-deltas whitelist.
