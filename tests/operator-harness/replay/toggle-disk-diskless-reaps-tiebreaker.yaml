@@ -1,0 +1,102 @@
+name: toggle-disk-diskless-reaps-tiebreaker
+description: |
+  Auto-tiebreaker reaped on the `r td --diskless` (toggle) path, the
+  L7 companion to the cli-matrix r-td-diskless-reaps-tiebreaker cell.
+
+  Shape: 2 diskful replicas on node1/node2 + 1 auto TIE_BREAKER witness
+  on the third node (the canonical 2r-tb shape the RD reconciler spawns
+  for an even-diskful RD with no user-diskless). The operator then flips
+  node2 to diskless with `r td --diskless`. That drops diskful from 2 to
+  1 while leaving 1 user-diskless behind — at 1 diskful quorumPolicy
+  returns quorum=off, so the witness is pointless and MUST be reaped.
+  Final state: exactly 2 replicas (1 diskful UpToDate + 1 user-diskless),
+  no TIE_BREAKER — exactly what upstream LINSTOR settles on.
+
+  Pre-fix the keep-branch (Bug 104) preserved the witness across this
+  toggle on the false premise that "1 diskful + 1 diskless freezes
+  quorum:majority"; this YAML pins the upstream-parity reap.
+
+  Verbatim operator repro:
+    $ linstor r td --diskless dev-worker-2 test
+    $ linstor r l
+     test  dev-worker-1  DRBD,STORAGE  UpToDate
+     test  dev-worker-2  DRBD          Diskless
+     test  dev-worker-3  …             TieBreaker   ← WRONG: should be gone
+
+prerequisites:
+  min_nodes: 3
+  storage_pool: stand
+
+vars:
+  sp: stand
+  # Short rd: the descriptive workflow name + default replay-<name>-<rand4>
+  # would exceed the 48-char LINSTOR resource-name limit.
+  rd: tb-reap-toggle
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: r-c-node1
+    cmd: ["resource", "create", "{{node1}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: r-c-node2
+    cmd: ["resource", "create", "{{node2}}", "{{rd}}", "--storage-pool", "{{sp}}"]
+    expect_exit: 0
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: wait-tiebreaker-spawned
+    # 2 diskful + no user-diskless → the RD reconciler spawns the
+    # auto-witness. Gate the scenario on it so a no-witness stand
+    # fails loudly here rather than passing the reap check vacuously.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: tiebreaker_present
+      rd: "{{rd}}"
+      timeout_s: 60
+  - name: r-td-diskless-node2
+    # Toggle the 2nd diskful to diskless: diskful 2 → 1, user-diskless
+    # 0 → 1. The witness must be reaped (no majority to freeze at 1
+    # diskful).
+    cmd: ["resource", "toggle-disk", "--diskless", "{{node2}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_diskless
+      rd: "{{rd}}"
+      node: "{{node2}}"
+      timeout_s: 30
+  - name: witness-reaped
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: no_tiebreaker
+      rd: "{{rd}}"
+      timeout_s: 30
+  - name: surviving-diskful-healthy
+    # The lone remaining diskful (node1) keeps running UpToDate under
+    # quorum=off — reaping the witness must not disturb it. Together
+    # with replica_diskless(node2) + no_tiebreaker this pins the exact
+    # post-toggle shape: 1 diskful UpToDate + 1 user-diskless, 0 witness.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: disk_state
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      expected: UpToDate
+      timeout_s: 30
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
