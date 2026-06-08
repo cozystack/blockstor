@@ -85,6 +85,17 @@ type Resource struct {
 	// Drives the `(R)` inherited-property marker in
 	// `linstor r lp <rd> <node>`.
 	EffectiveProps EffectiveProperties `json:"effective_props,omitempty"`
+
+	// CreateTimestamp is the replica creation time in unix
+	// milliseconds, sourced from the backing Resource CRD's
+	// metadata.creationTimestamp. Upstream LINSTOR populates the same
+	// `create_timestamp` field — the Python CLI renders it as the
+	// `CreatedOn` column (dividing by 1000) on `linstor r list`.
+	// blockstor previously left it unset, so CreatedOn was empty.
+	// Per-replica: each node's Resource CRD carries its own creation
+	// time, matching upstream's per-resource timestamp. Set only on
+	// the read path (crdToWireResource); ignored on writes.
+	CreateTimestamp int64 `json:"create_timestamp,omitempty"`
 }
 
 // ResourceState is the runtime state surface of a Resource.
