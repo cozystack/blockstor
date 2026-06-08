@@ -4,6 +4,15 @@ All notable changes to blockstor are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.1.12 — 2026-06-08
+
+Bugfix release. Two operator-CLI parity fixes mined against the upstream LINSTOR 1.33.2 oracle, both validated on the live Talos+QEMU stand.
+
+### Fixed
+
+- **Auto-tiebreaker no longer kept below 2 diskful (#129)** — blockstor kept (and in a post-toggle race re-created) an auto-managed `TIE_BREAKER` witness for the "1 diskful + 1 diskless" shape, which upstream LINSTOR never does. At 1 diskful `quorumPolicy` returns `quorum=off`, so there is no majority to freeze and the witness only occupied a node for no benefit. The keep and race-repair branches rested on the false premise that "1 diskful + 1 diskless freezes quorum:majority" and are removed together; the auto-witness now lives iff there are exactly 2 diskful replicas, matching upstream's `shouldTieBreakerExist`. Subsumes the former single-diskful witness-collapse carve-out. Pinned at L1, L6 cli-matrix (`r-td-diskless-reaps-tiebreaker`), and L7 replay.
+- **`linstor r list` CreatedOn was blank (#128)** — upstream fills the `create_timestamp` wire field on every resource (rendered as the `CreatedOn` column); blockstor left it unset, verified divergent against the 1.33.2 oracle. Now sourced, persistence-free, from the backing Resource CRD's `metadata.creationTimestamp` (per replica) in `crdToWireResource` — read path only, ignored on writes. Pinned at L1 + L6 cli-matrix (`r-l-created-on`).
+
 ## v0.1.11 — 2026-06-08
 
 Campaign-2 release. 48 corner cases mined from user-reported bugs in the LINBIT/linstor-server GitHub issue tracker were reproduced and validated on the live Talos+QEMU stand, ⚖️-ambiguous cases compared against the upstream LINSTOR oracle. This release also restores day0 skip-initial-sync on the default FILE_THIN pool — a performance regression introduced in v0.1.10 — and fixes a spawn-size unit bug.
