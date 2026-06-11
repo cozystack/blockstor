@@ -21,10 +21,10 @@ limitations under the License.
 // Oracle trace replay is part of the dedicated contract test tier
 // (Dockerised drbd-utils + recorded LINSTOR traces). Gated behind
 // the `contract` build tag so plain `go test ./...` in the unit job
-// does NOT pick it up — without the tag the replay is exercised
-// against an in-process REST shim that legitimately emits new
-// fields (layer_data) absent from the recorded oracle, and those
-// drifts are tracked separately (Bug 58 family).
+// does NOT pick it up. Deliberate wire-shape supersets the shim
+// emits over the recorded oracle (e.g. RD layer_data, Bug 349) are
+// scrubbed per-field in Normalize and documented as rows in
+// docs/cli-parity-known-deltas.md (#81).
 
 package contract_test
 
@@ -50,7 +50,9 @@ import (
 // /v1/controller/properties/{key} route, VolumeDefinitions POST
 // 200) or allow-listed in Normalize (stand-default property keys,
 // piraeus-operator topology / last-applied props, ApiCallRc
-// pipeline noise). Any new diff here means the contract regressed.
+// pipeline noise, RD layer_data — known-delta #81 in
+// docs/cli-parity-known-deltas.md, Bug 349). Any new diff here
+// means the contract regressed.
 func TestOracleTraceReplay(t *testing.T) {
 	baseURL, stop := resolveTarget(t)
 	defer stop()
