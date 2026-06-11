@@ -55,6 +55,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/internal/controller"
@@ -282,7 +283,7 @@ func TestGroupG(t *testing.T) {
 	t.Run("SnapDeleteIdempotent", func(t *testing.T) { testGroupGSnapDeleteIdempotent(t, stack, cli) })
 	t.Run("SnapRestoreCreatesNewRD", func(t *testing.T) { testGroupGSnapRestoreCreatesNewRD(t, stack, cli) })
 	t.Run("SnapRollbackOnExistingRD", func(t *testing.T) { testGroupGSnapRollbackOnExistingRD(t, stack, cli) })
-	t.Run("SnapShipCrossNode", func(t *testing.T) { testGroupGSnapShipCrossNode(t, stack, cli) })
+	t.Run("SnapRestoreSnapshotHolderOnly", func(t *testing.T) { testGroupGSnapRestoreSnapshotHolderOnly(t, stack, cli) })
 	t.Run("SnapOrphanCleanup", func(t *testing.T) { testGroupGSnapOrphanCleanup(t, stack, cli) })
 	t.Run("SnapDeleteBlockedByLater", func(t *testing.T) { testGroupGSnapDeleteBlockedByLater(t, stack, cli) })
 	t.Run("AutoSnapshotPeriodicTick", func(t *testing.T) { testGroupGAutoSnapshotPeriodicTick(t, stack) })
@@ -564,20 +565,24 @@ func testGroupGSnapRollbackOnExistingRD(t *testing.T, stack *harness.Stack, cli 
 	}
 }
 
-// testGroupGSnapShipCrossNode pins F8: cross-node snapshot ship.
+// testGroupGSnapRestoreSnapshotHolderOnly pins the Bug 397 (P0 DATA
+// INTEGRITY) restore-target contract at the integration tier
+// (supersedes the pre-397 "cross-node ship via restore" pin):
 //
-// Phase 0 caveat (harness/satellite.go:152): the satellite mock's
-// FakeExec is a slot-only stub — it does not actually capture
-// shell-outs. So instead of asserting that `zfs send | zfs recv`
-// was invoked, we assert the controller-side seed shape a real
-// ship flow depends on: the cross-node snapshot-restore endpoint
-// accepts a `node_names` body, the restored RD is created with the
-// satellite-dispatcher routing prop set, and the Snapshot CRD's
-// per-node materialisation includes only the source-side nodes (so
-// populating the destination node would require an actual ship).
-// The send-recv command capture lands in Group F or in the
-// satellite unit tests once FakeExec graduates from stub.
-func testGroupGSnapShipCrossNode(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
+//  1. An explicit `node_names` restore onto a node that does NOT
+//     hold the snapshot is REFUSED with 400 before any Store
+//     mutation — a diskful replica on a snapshot-less node would be
+//     created empty and could silently latch UpToDate without the
+//     snapshot's data (promotable-on-failover empty copy).
+//  2. A restore onto a snapshot-HOLDING node succeeds (201) and the
+//     restored RD carries the `BlockstorRestoreFromSnapshot=
+//     <src>:<snap>` routing prop the satellite-side dispatcher
+//     reads to materialise the clone.
+//
+// The per-node REST/store seed shape (snapshot present only on the
+// source diskful set) is asserted en route, matching the unit pin in
+// pkg/rest/bug_397_restore_snapshotless_node_test.go.
+func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack, cli *harness.CLI) {
 	ctx := context.Background()
 
 	srcRD := groupGRDName("ship-src")
@@ -631,8 +636,10 @@ func testGroupGSnapShipCrossNode(t *testing.T, stack *harness.Stack, cli *harnes
 		t.Fatalf("snap.Spec.Nodes = %v, want %v (source diskful set)", snap.Spec.Nodes, want)
 	}
 
-	// Restore into a fresh RD — production semantics would have
-	// the satellite-side reconciler then ship from N1/N2 to N3.
+	// Bug 397 refusal: worker-3 does NOT hold the snapshot, so an
+	// explicit node_names restore onto it must be rejected with 400
+	// (and no target RD created) — never silently stamp a diskful
+	// Resource that would be materialised empty.
 	dstRD := groupGRDName("ship-dst")
 	status, body := httpPostJSON(t,
 		stack.RestURL+"/v1/resource-definitions/"+srcRD+"/snapshot-restore-resource",
@@ -641,8 +648,30 @@ func testGroupGSnapShipCrossNode(t *testing.T, stack *harness.Stack, cli *harnes
 			"snapshot_name": "ship-snap",
 			"node_names":    []string{harness.NodeWorker3},
 		})
+	if status != http.StatusBadRequest {
+		t.Fatalf("snapshot-restore onto snapshot-less node: status %d, want 400; body %s",
+			status, string(body))
+	}
+
+	var refusedRD blockstoriov1alpha1.ResourceDefinition
+
+	err := stack.Env.Client.Get(ctx, types.NamespacedName{Name: dstRD}, &refusedRD)
+	if err == nil {
+		t.Fatalf("refused restore still created target RD %q", dstRD)
+	}
+
+	// Holder-node restore: worker-1 holds the snapshot, so the same
+	// request against it succeeds and stamps the dispatcher routing
+	// prop on the restored RD.
+	status, body = httpPostJSON(t,
+		stack.RestURL+"/v1/resource-definitions/"+srcRD+"/snapshot-restore-resource",
+		map[string]any{
+			"to_resource":   dstRD,
+			"snapshot_name": "ship-snap",
+			"node_names":    []string{harness.NodeWorker1},
+		})
 	if status != http.StatusCreated {
-		t.Fatalf("snapshot-restore: status %d, body %s", status, string(body))
+		t.Fatalf("snapshot-restore onto holder node: status %d, body %s", status, string(body))
 	}
 
 	// The restored RD carries the cross-node ship marker
@@ -820,22 +849,30 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	ctx := context.Background()
 	rdName := seedRDWithVolume(t, stack, "auto-snap")
 
-	var rd blockstoriov1alpha1.ResourceDefinition
-	if err := stack.Env.Client.Get(ctx,
-		types.NamespacedName{Name: rdName}, &rd); err != nil {
-		t.Fatalf("Get RD: %v", err)
-	}
-
-	if rd.Spec.Props == nil {
-		rd.Spec.Props = map[string]string{}
-	}
-
 	// Stamp `AutoSnapshot/RunEvery=1` (minutes) so the runnable
 	// considers this RD due. Keep defaults to 10 — prune is a
 	// no-op until we exceed that.
-	rd.Spec.Props[controller.PropAutoSnapshotRunEvery] = "1"
+	//
+	// Retry-on-conflict: the RD reconciler runs live on the manager
+	// and routinely bumps the RD's resourceVersion between our Get
+	// and Update (e.g. the auto-tiebreaker pass right after the
+	// fixture spawn) — a single-shot Update flakes with "the object
+	// has been modified".
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var rd blockstoriov1alpha1.ResourceDefinition
+		if err := stack.Env.Client.Get(ctx,
+			types.NamespacedName{Name: rdName}, &rd); err != nil {
+			return err
+		}
 
-	if err := stack.Env.Client.Update(ctx, &rd); err != nil {
+		if rd.Spec.Props == nil {
+			rd.Spec.Props = map[string]string{}
+		}
+
+		rd.Spec.Props[controller.PropAutoSnapshotRunEvery] = "1"
+
+		return stack.Env.Client.Update(ctx, &rd)
+	}); err != nil {
 		t.Fatalf("set AutoSnapshot/RunEvery: %v", err)
 	}
 
