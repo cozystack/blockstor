@@ -49,8 +49,8 @@ smoke: ## run piraeus-stack smoke (PVC + linstor-csi) (NAME=<n>)
 smoke-blockstor: ## blockstor end-to-end smoke (RD → 2 replicas → bytes-perfect failover) (NAME=<n>)
 	@./tests/smoke-blockstor.sh "$(WORK_DIR)"
 
-burnin-blockstor: ## continuous PVC churn for DURATION seconds (default 86400 = 24h) (NAME=<n>, DURATION=<sec>)
-	@./tests/burnin-blockstor.sh "$(WORK_DIR)" "$${DURATION:-86400}"
+burnin-blockstor: ## continuous PVC churn for DURATION seconds (default 86400 = 24h) (NAME=<n>, DURATION=<sec>, POOL=<storage-pool, default stand>)
+	@./tests/burnin-blockstor.sh "$(WORK_DIR)" "$${DURATION:-86400}" "$${POOL:-stand}"
 
 e2e: ## run a single e2e scenario (NAME=<cluster>, SCENARIO=<basename without .sh>)
 	@test -n "$${SCENARIO}" || (echo "usage: make e2e NAME=<cluster> SCENARIO=<name>"; exit 2)

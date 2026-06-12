@@ -1026,8 +1026,8 @@ func (s *Server) refuseSnapshotOnNonSnapshotPool(w http.ResponseWriter, r *http.
 			"plain FILE, or DISKLESS); only thin LVM and ZFS (and FILE_THIN) " +
 			"can take copy-on-write snapshots",
 		Correc: "place the resource on a thin-provisioned snapshot-capable " +
-			"pool (LVM_THIN / ZFS_THIN / FILE_THIN), or use `linstor rd clone` " +
-			"for a full-copy duplicate that does not require snapshot support",
+			"pool (LVM_THIN / ZFS_THIN / FILE_THIN); `linstor rd clone` also " +
+			"relies on snapshots (Bug-020) so it is no workaround on a thick pool",
 	}})
 
 	return false
