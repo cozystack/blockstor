@@ -30,8 +30,10 @@ import (
 	"sync"
 
 	"github.com/cockroachdb/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -70,47 +72,65 @@ func New(c ctrlclient.Client) *Store {
 	s.volumeDefinitions = &volumeDefinitions{c: c}
 	s.snapshots = &snapshots{c: c}
 	s.physicalDevices = &physicalDevices{c: c}
-	s.controllerProps = &controllerProps{props: map[string]string{}}
+	s.controllerProps = &controllerProps{c: c}
 	s.storagePoolDefinitions = &storagePoolDefinitions{m: map[string]store.StoragePoolDefinition{}}
 
 	return s
 }
 
-// controllerProps is a process-local stand-in for the singleton
-// controller-scope props bag. A future iteration will swap this for a
-// dedicated CRD (or a ConfigMap-backed shim) so the value survives
-// controller restarts; until then the autoplacer's weights revert to
-// defaults across restarts, which is acceptable because the four
-// `Autoplacer/Weights/*` knobs are pure scoring multipliers — no
-// persisted state depends on them and operators that set them today
-// can re-set after a restart with no data risk.
+// controllerProps is the CRD-backed view of the singleton
+// controller-scope props bag: `ControllerConfig.Spec.ExtraProps` on
+// the cluster-wide `default` instance — the same record the REST
+// shim mutates on `linstor controller set-property`.
+//
+// BUG-022: this used to be a process-local map populated only at
+// construction, so every controller-scope knob written via the CLI
+// (BalanceResources*, Autoplacer/Weights/*, ...) was invisible to
+// running reconcilers and the placer until a process restart. Reading
+// through the client keeps the bag fresh: in production the client is
+// the manager's informer-cached client, so Get is a cache hit kept in
+// sync by the ControllerConfig watch — the same mechanism every other
+// kind in this store relies on. Thread-safety comes from the client
+// (concurrent reconcilers call Get; the cache reader is safe for
+// concurrent use).
 type controllerProps struct {
-	mu    sync.RWMutex
-	props map[string]string
+	c ctrlclient.Client
 }
 
-// Get returns a defensive copy (never nil).
-func (s *controllerProps) Get(_ context.Context) (map[string]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// Get returns a defensive copy of `Spec.ExtraProps` (never nil). A
+// missing ControllerConfig CRD — fresh cluster, nothing written yet —
+// folds into an empty map, mirroring the InMemory store's "no value
+// written yet" contract.
+func (s *controllerProps) Get(ctx context.Context) (map[string]string, error) {
+	var cfg crdv1alpha1.ControllerConfig
 
-	out := make(map[string]string, len(s.props))
-	maps.Copy(out, s.props)
+	err := s.c.Get(ctx, ctrlclient.ObjectKey{Name: crdv1alpha1.ControllerConfigName}, &cfg)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return map[string]string{}, nil
+		}
+
+		return nil, errors.Wrap(err, "get ControllerConfig")
+	}
+
+	out := make(map[string]string, len(cfg.Spec.ExtraProps))
+	maps.Copy(out, cfg.Spec.ExtraProps)
 
 	return out, nil
 }
 
-// Set replaces the props map atomically.
-func (s *controllerProps) Set(_ context.Context, props map[string]string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Set replaces `Spec.ExtraProps` atomically, routed through
+// PatchControllerExtraProps so it inherits the auto-create-on-NotFound
+// and retry-on-conflict semantics the REST write path already uses —
+// a Set racing a `linstor controller set-property` converges instead
+// of clobbering.
+func (s *controllerProps) Set(ctx context.Context, props map[string]string) error {
+	return PatchControllerExtraProps(ctx, s.c, func(m map[string]string) error {
+		clear(m)
+		maps.Copy(m, props)
 
-	next := make(map[string]string, len(props))
-	maps.Copy(next, props)
-
-	s.props = next
-
-	return nil
+		return nil
+	})
 }
 
 // Nodes returns the NodeStore view of this store.
