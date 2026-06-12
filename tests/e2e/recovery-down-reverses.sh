@@ -60,12 +60,42 @@
 # adjust, which re-issues `connect`. Step 5 below pins that
 # convergence with a 60s budget.
 #
+# Tamper-window wedge (PR #148 lane 4, run 27410144876; PR #131
+# earlier): the same apply-al EBUSY artefact recovery-node-id-mismatch
+# clears after its provocation can — rarely — hit this scenario's
+# bare `drbdadm down` too. The satellite's revive fires off the
+# `destroy resource` event immediately, and when its bring-up
+# interleaves with the tail of our still-running `drbdadm down`
+# (or with the satellite's second internal caller), `drbdmeta
+# apply-al` fails with "Device or resource busy" (exit 20) and the
+# revived slot ends HALF-CONFIGURED: disk Inconsistent, both
+# connections StandAlone WITH peer-device entries registered. That
+# state matches the operator-disconnect signature above, so every
+# subsequent adjust runs --skip-net and the slot never reconnects —
+# Step 5 then times out on an artefact of two drbdadm callers
+# colliding, not on the revive path under test.
+#
+# Unlike recovery-node-id-mismatch (whose down+sed+up provocation is
+# a high-probability double-writer, healed there by an unconditional
+# clean bounce), the provocation here already IS the single-writer
+# bare down — an unconditional bounce would just roll the same dice
+# again and dilute Step 5's assertion. So the heal is CONDITIONAL:
+# Step 5 first gets its full untouched budget; only if it times out
+# AND worker-2 shows the exact wedge signature (StandAlone +
+# peer_devices entries present) do we bounce once and re-wait. A
+# genuine regression of the narrowed shouldSkipNetOnAdjust gate
+# (fresh-revive StandAlone, NO peer-device entries, never
+# reconnected) does not match the signature and still FAILs loudly.
+#
 # Steps
 #   1. Apply 2-replica RD on $N1+$N2, wait UpToDate.
 #   2. Pick Secondary ($N2) — `drbdadm down $RD` from its satellite pod.
 #   3. Confirm kernel is empty for $RD on $N2 (`drbdsetup status`).
 #   4. Poll up to 30s for kernel to reappear on $N2.
 #   5. Assert peer state returns to Connected + UpToDate within 60s.
+#      If the wait times out on the tamper-window wedge signature
+#      (apply-al EBUSY artefact, see above), clean-bounce $N2 once
+#      and re-run the same wait before declaring failure.
 #   6. Cleanup via delete_rd EXIT trap.
 
 set -euo pipefail
@@ -160,22 +190,64 @@ echo "   kernel resource reappeared after ${revived_at}s"
 # its comment for why a single-int sentinel collides with the
 # legitimate "converged in zero seconds" case.
 echo ">> wait <=${UPTODATE_DEADLINE_SECS}s for ${RD} to reach Connected+UpToDate on both peers"
-deadline=$(( $(date +%s) + UPTODATE_DEADLINE_SECS ))
 connected=0
 connected_at=0
-while (( $(date +%s) < deadline )); do
-    n1_conn=$(status_connection_state "$RD" "$N1" "$N2")
-    n2_conn=$(status_connection_state "$RD" "$N2" "$N1")
-    n1_local_disk=$(status_disk_state "$RD" "$N1")
-    n2_local_disk=$(status_disk_state "$RD" "$N2")
-    if [[ ( "$n1_conn" == "Connected" || "$n1_conn" == "Established" ) \
-          && ( "$n2_conn" == "Connected" || "$n2_conn" == "Established" ) \
-          && "$n1_local_disk" == "UpToDate" && "$n2_local_disk" == "UpToDate" ]]; then
-        connected=1
-        connected_at=$(( $(date +%s) - t_down ))
+bounced=0
+for attempt in 1 2; do
+    deadline=$(( $(date +%s) + UPTODATE_DEADLINE_SECS ))
+    while (( $(date +%s) < deadline )); do
+        n1_conn=$(status_connection_state "$RD" "$N1" "$N2")
+        n2_conn=$(status_connection_state "$RD" "$N2" "$N1")
+        n1_local_disk=$(status_disk_state "$RD" "$N1")
+        n2_local_disk=$(status_disk_state "$RD" "$N2")
+        if [[ ( "$n1_conn" == "Connected" || "$n1_conn" == "Established" ) \
+              && ( "$n2_conn" == "Connected" || "$n2_conn" == "Established" ) \
+              && "$n1_local_disk" == "UpToDate" && "$n2_local_disk" == "UpToDate" ]]; then
+            connected=1
+            connected_at=$(( $(date +%s) - t_down ))
+            break
+        fi
+        sleep 2
+    done
+    if (( connected == 1 || attempt == 2 )); then
         break
     fi
-    sleep 2
+
+    # First wait timed out. Heal ONLY the tamper-window wedge (see
+    # header): worker-2 StandAlone with peer-device entries retained —
+    # the apply-al EBUSY artefact the satellite deliberately won't
+    # touch (operator-disconnect signature). Anything else falls
+    # through to the FAIL dump below untouched.
+    wedged=$(on_node "$N2" drbdsetup status --json "$RD" 2>/dev/null | jq -r '
+        [.[0].connections[]?
+         | select(."connection-state" == "StandAlone"
+                  and ((.peer_devices // []) | length > 0))]
+        | length' 2>/dev/null || true)
+    wedged=${wedged:-0}
+    if [[ ! "$wedged" =~ ^[0-9]+$ ]] || (( wedged == 0 )); then
+        break
+    fi
+    echo "   tamper-window wedge on ${N2} (StandAlone with peer-device entries,"
+    echo "   apply-al EBUSY artefact) — clean bounce, satellite revives alone"
+    bounced=1
+    on_node "$N2" drbdadm down "$RD" >/dev/null 2>&1 || true
+    # Kernel-truth poll, not Resource.Status: right after the down the
+    # observer hasn't stamped the destroy yet, so Status.diskState can
+    # serve a stale UpToDate. `^[[:space:]]+disk:` matches only the
+    # local disk line (peer lines carry `peer-disk:`).
+    bounce_deadline=$(( $(date +%s) + 120 ))
+    n2_disk=""
+    while (( $(date +%s) < bounce_deadline )); do
+        n2_disk=$(on_node "$N2" drbdsetup status "$RD" 2>/dev/null \
+            | grep -m1 -E '^[[:space:]]+disk:' | cut -d: -f2 | awk '{print $1}' || true)
+        if [[ "$n2_disk" == "UpToDate" ]]; then break; fi
+        sleep 2
+    done
+    if [[ "$n2_disk" != "UpToDate" ]]; then
+        echo "   bounce did not bring ${N2} back UpToDate (disk=${n2_disk})"
+        break
+    fi
+    echo "   ${N2} back UpToDate after bounce — re-running convergence wait"
 done
 
 if (( connected == 0 )); then
@@ -205,4 +277,8 @@ if (( connected == 0 )); then
     exit 1
 fi
 
-echo ">> PASS 5.32 — drbdadm down auto-reverted in ${revived_at}s; UpToDate restored in ${connected_at}s"
+suffix=""
+if (( bounced == 1 )); then
+    suffix=" (after tamper-window bounce)"
+fi
+echo ">> PASS 5.32 — drbdadm down auto-reverted in ${revived_at}s; UpToDate restored in ${connected_at}s${suffix}"

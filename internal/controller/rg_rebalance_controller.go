@@ -97,6 +97,7 @@ type RGRebalanceReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
 
 // Reconcile is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =
@@ -367,10 +368,15 @@ func (r *RGRebalanceReconciler) stripShortfallAnnotation(ctx context.Context, rd
 
 	delete(rd.Annotations, apiv1.RDSpawnShortfallAnnotation)
 
-	if len(rd.Annotations) == 0 {
-		rd.Annotations = nil
-	}
-
+	// Keep the now-empty map NON-nil. The store Update contract
+	// (pinned by storetest's UpdateAnnotationContract) reads a nil
+	// wire map as "annotations untouched" — the k8s backend's
+	// mergeUserAnnotationsInto early-returns on nil — so nil-ing it
+	// here would turn the strip into a silent no-op on the CRD and
+	// the marker would survive forever (Bug-021). An EMPTY map means
+	// "replace the user-annotation set with nothing", which is the
+	// strip semantic. Wire-JSON shape is unaffected: the
+	// `annotations,omitempty` tag elides empty and nil alike.
 	return r.Store.ResourceDefinitions().Update(ctx, rd)
 }
 
@@ -385,13 +391,17 @@ func (r *RGRebalanceReconciler) stripRebalanceAnnotation(ctx context.Context, rg
 
 	delete(rg.Annotations, apiv1.AnnotationRGRebalancePending)
 
-	// Nil-out an empty map so the wire envelope round-trips as the
-	// pre-Bug-60 shape — round-trip stability matters for the JSON
-	// goldens that pin the RG payload.
-	if len(rg.Annotations) == 0 {
-		rg.Annotations = nil
-	}
-
+	// Keep the now-empty map NON-nil (Bug-021). An earlier revision
+	// nil-ed it "for wire-envelope round-trip stability", but the
+	// store Update contract reads a nil wire map as "annotations
+	// untouched" (the k8s backend's mergeUserAnnotationsInto
+	// early-returns on nil to protect reconciler-stamped keys), so
+	// the deletion never reached the CRD when the marker was the
+	// only annotation — and the rebalance pass re-fired on every
+	// event. An EMPTY map means "replace the user-annotation set
+	// with nothing", which is exactly the strip semantic. The JSON
+	// goldens are unaffected: `annotations,omitempty` elides empty
+	// and nil alike.
 	return r.Store.ResourceGroups().Update(ctx, rg)
 }
 
@@ -414,7 +424,10 @@ func (r *RGRebalanceReconciler) resolveTuning(ctx context.Context) (time.Duratio
 		interval = time.Duration(m) * time.Minute
 	}
 
-	if m, ok := parsePositiveMinutes(props[apiv1.PropBalanceResourcesGracePeriod]); ok {
+	// GracePeriod permits an explicit 0 ("no grace window") — a legal
+	// upstream value parsePositiveMinutes used to reject, silently
+	// pinning the default instead.
+	if m, ok := parseNonNegativeMinutes(props[apiv1.PropBalanceResourcesGracePeriod]); ok {
 		grace = time.Duration(m) * time.Minute
 	}
 
