@@ -50,7 +50,7 @@
 #
 #     2. IO during INACTIVE:
 #        - Promote N1 to Primary if not already
-#        - Write ~64 MiB random pattern to /dev/drbd/by-res/<RD>/0
+#        - Write ~64 MiB random pattern to the RD's /dev/drbdN device
 #        - Must complete without quorum block (single-replica quorum
 #          override). Capture md5 of pattern.
 #
@@ -153,9 +153,14 @@ wait_role "$RD" "$N1" "Primary" 30 \
 # written BEFORE the first deactivate so both replicas hold the
 # same bytes and the GI baseline is established.
 echo ">> seed initial ${IO_MIB} MiB pattern on $N1 (will be the md5 anchor)"
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+# Last-resort minor enumeration kept for stands where sh-dev fails.
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
 on_node "$N1" bash -c "
     set -e
-    dev=\$(readlink -f /dev/drbd/by-res/${RD}/0 2>/dev/null || true)
+    dev='$dev'
     if [ -z \"\$dev\" ]; then
         dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     fi
@@ -289,9 +294,11 @@ for cycle in 1 2 3; do
     # the sole voter and DRBD's single-replica quorum override must
     # let writes through. A failure here = quorum frame is wrong on
     # INACTIVE peers.
+    # Same portable resolver as the seeding step (sh-dev, not by-res).
+    dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
     io_out=$(on_node "$N1" bash -c "
         set -e
-        dev=\$(readlink -f /dev/drbd/by-res/${RD}/0 2>/dev/null || true)
+        dev='$dev'
         if [ -z \"\$dev\" ]; then
             dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
         fi
@@ -317,8 +324,9 @@ for cycle in 1 2 3; do
     # — the deactivate path must not have corrupted it. (md5 of the
     # FIRST ${IO_MIB} MiB of the device, since the seed lives at
     # offset 0 and the new write was at offset ${IO_MIB} MiB.)
+    dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
     seed_md5_now=$(on_node "$N1" bash -c "
-        dev=\$(readlink -f /dev/drbd/by-res/${RD}/0 2>/dev/null || true)
+        dev='$dev'
         if [ -z \"\$dev\" ]; then
             dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
         fi
@@ -424,8 +432,9 @@ for cycle in 1 2 3; do
     # the pre-deact pattern. The partial-sync handshake must not
     # have written stale bytes onto the surviving replica's data.
     echo ">>   md5 of seed on $N1 still matches pre-deact pattern"
+    dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
     seed_md5_after=$(on_node "$N1" bash -c "
-        dev=\$(readlink -f /dev/drbd/by-res/${RD}/0 2>/dev/null || true)
+        dev='$dev'
         if [ -z \"\$dev\" ]; then
             dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
         fi

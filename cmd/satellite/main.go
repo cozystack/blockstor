@@ -58,9 +58,10 @@ func main() {
 // as the os.Exit call.
 func run() int {
 	var (
-		nodeName  string
-		stateDir  string
-		probeAddr string
+		nodeName            string
+		stateDir            string
+		probeAddr           string
+		controllerNamespace string
 	)
 
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"),
@@ -69,8 +70,12 @@ func run() int {
 		"directory the satellite uses to persist DRBD .res files and per-resource state")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
 		"The address the /healthz and /readyz probe endpoints bind to.")
+	flag.StringVar(&controllerNamespace, "controller-namespace", "",
+		"Namespace where the controller's Secrets (cluster master passphrase) live (default: $POD_NAMESPACE, then 'blockstor-system').")
 
 	flag.Parse()
+
+	controllerNamespace = resolveControllerNamespace(controllerNamespace)
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -193,7 +198,7 @@ func run() int {
 		LocalAddress:           localAddress,
 		Logger:                 logger,
 		RESTConfig:             restCfg,
-		ManagerFactory:         mgrFactory(ready, logger, ueventListener),
+		ManagerFactory:         mgrFactory(ready, logger, ueventListener, controllerNamespace),
 		HealthProbeBindAddress: probeAddr,
 		OnCacheSynced: func() {
 			logger.Info("satellite cache sync complete, marking ready")
@@ -240,13 +245,18 @@ func loadRESTConfig() (*rest.Config, error) {
 // The factory shape lets the agent stay ignorant of the readyState
 // + logger plumbing — it only sees the standard
 // satellite.ManagerFactory signature.
-func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier) satellite.ManagerFactory {
+func mgrFactory(ready *readyState, logger *slog.Logger, ueventListener controllers.UeventNotifier, controllerNamespace string) satellite.ManagerFactory {
 	return func(restCfg *rest.Config, nodeName, probeAddr string, rec *satellite.Reconciler) (manager.Manager, error) {
 		mgr, err := controllers.NewManager(restCfg, &controllers.Config{
 			NodeName:               nodeName,
 			Apply:                  rec,
 			Exec:                   storage.RealExec{},
 			HealthProbeBindAddress: probeAddr,
+			// Bug 023: where the cluster master passphrase Secret
+			// lives — the ResourceReconciler reads it so LUKS RDs
+			// provisioned via `linstor encryption create-passphrase`
+			// receive their key (see controllers/luks_passphrase.go).
+			Namespace: controllerNamespace,
 			// Optional: nil when `uevent.New` failed at startup —
 			// PhysicalDeviceDiscoveryRunnable falls back to pure-
 			// polling discovery.
@@ -629,4 +639,23 @@ func replicationStateIsLive(s string) bool {
 	default:
 		return true
 	}
+}
+
+// resolveControllerNamespace picks the namespace the controller's
+// Secrets (cluster master passphrase) live in. Precedence: explicit
+// flag value wins, then $POD_NAMESPACE (the standard downward-API
+// env var — the satellite DaemonSet deploys into the same namespace
+// as the controller), then the kustomize default `blockstor-system`.
+// Mirrors cmd/controller/main.go's resolver so the two binaries
+// never drift on the lookup rules.
+func resolveControllerNamespace(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+
+	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
+		return ns
+	}
+
+	return "blockstor-system"
 }

@@ -184,6 +184,13 @@ spec:
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
             - name: POD_IP
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            # Bug 023: where the cluster master passphrase Secret
+            # lives — the satellite reads it for LUKS-layered RDs
+            # provisioned via `linstor encryption create-passphrase`.
+            # The DaemonSet deploys into the controller's namespace,
+            # so the downward API value is the right default.
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
           ports:
             # Satellite-to-satellite snapshot stream (cross-node clone).
             # The receiving satellite GETs the raw byte stream from a

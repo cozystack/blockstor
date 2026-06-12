@@ -82,6 +82,13 @@ type Satellite struct {
 	// drbdState[rdName][node] → forced DrbdState for that replica.
 	drbdState map[string]map[string]string
 
+	// nodeOffline[node] true → satellite stamps ConnectionStatus
+	// OFFLINE instead of ONLINE — models a dead satellite so `linstor
+	// n lost` flows can pass the Bug 111 online-refusal gate the way
+	// they do in production (the documented `n lost` precondition is
+	// a satellite that no longer heartbeats).
+	nodeOffline map[string]bool
+
 	// failNext is the queue of pending FakeExec-style failures the
 	// satellite mock is asked to inject the next time it sees a
 	// matching command. Phase 0 stores them but does not consult
@@ -99,6 +106,7 @@ func NewSatellite(cli client.Client) *Satellite {
 		client:       cli,
 		poolMissing:  map[string]map[string]bool{},
 		drbdState:    map[string]map[string]string{},
+		nodeOffline:  map[string]bool{},
 		tickInterval: satelliteTickInterval,
 	}
 }
@@ -135,6 +143,18 @@ func (s *Satellite) SimulatePoolMissing(node, pool string) {
 	}
 
 	s.poolMissing[node][pool] = true
+}
+
+// SimulateNodeOffline makes the mock stamp ConnectionStatus OFFLINE
+// for the named node from the next tick on (instead of the default
+// ONLINE heartbeat). Models a dead/unreachable satellite — the
+// documented precondition for `linstor n lost` (Bug 111 gate: the
+// REST handler refuses `n lost` against an ONLINE satellite).
+func (s *Satellite) SimulateNodeOffline(node string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.nodeOffline[node] = true
 }
 
 // SimulateDRBDState pins the DrbdState the satellite will stamp on
@@ -190,6 +210,10 @@ func (s *Satellite) reconcileNodes(ctx context.Context) {
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
 		desiredStatus := blockstoriov1alpha1.NodeConnectionStatusOnline
+
+		if s.isNodeOffline(node.Name) {
+			desiredStatus = blockstoriov1alpha1.NodeConnectionStatusOffline
+		}
 
 		if node.Status.ConnectionStatus == desiredStatus && hasReadyTrue(node.Status.Conditions) {
 			continue
@@ -318,6 +342,13 @@ func (s *Satellite) isPoolMissing(node, pool string) bool {
 	defer s.mu.Unlock()
 
 	return s.poolMissing[node][pool]
+}
+
+func (s *Satellite) isNodeOffline(node string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.nodeOffline[node]
 }
 
 // hasReadyTrue is a tiny helper kept off the global namespace so

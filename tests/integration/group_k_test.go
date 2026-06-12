@@ -97,7 +97,17 @@ func TestGroupKWFHappyPath(t *testing.T) {
 
 	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG)
 	cli.Run(t, "volume-definition", "create", rdName, "4M")
-	cli.Run(t, "resource", "create", "--auto-place", "2", rdName)
+	// Pin the autoplace to a thin (snapshot-capable) pool the way
+	// linstor-csi always does via its StorageClass `storagePool`
+	// parameter. Unpinned, the placer is free to land on the
+	// fixture's thick `file` pool and the snapshot step below is
+	// then correctly refused by the G5 thick-provider gate (only
+	// LVM_THIN / ZFS_THIN / FILE_THIN can take COW snapshots).
+	// (Positional-first ordering: 1.27.1's argparse mis-counts the
+	// trailing positional after two valued options — same form
+	// Group F uses.)
+	cli.Run(t, "resource", "create", rdName, "--auto-place", "2",
+		"--storage-pool", "lvm-thin")
 
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 	waitForDRBDUpToDate(t, stack, rdName, 2)
@@ -154,13 +164,21 @@ func TestGroupKWFLateVD(t *testing.T) {
 
 	waitForDRBDUpToDate(t, stack, rdName, 2)
 
+	// The Bug-79 failure mode is a DISKFUL replica left pinned to
+	// DISKLESS. The auto-tiebreaker WITNESS on the third node is
+	// expected here — post-#129 the invariant is "witness lives iff
+	// exactly 2 diskful replicas", and this RD has exactly 2 — so
+	// the TIE_BREAKER (which is DISKLESS by construction) is
+	// excluded from the regression check.
 	resources := listResourcesOfRD(t, stack, rdName)
 	for i := range resources {
-		for _, fl := range resources[i].Spec.Flags {
-			if fl == "DISKLESS" {
-				t.Fatalf("Bug 79 regression: replica %s pinned to DISKLESS after late VD add",
-					resources[i].Name)
-			}
+		if resourceHasFlag(&resources[i], "TIE_BREAKER") {
+			continue
+		}
+
+		if resourceHasFlag(&resources[i], "DISKLESS") {
+			t.Fatalf("Bug 79 regression: replica %s pinned to DISKLESS after late VD add",
+				resources[i].Name)
 		}
 	}
 
@@ -324,7 +342,18 @@ func TestGroupKWFNodeLostCascade(t *testing.T) {
 	cli.Run(t, "resource", "create", "--auto-place", "3", rdName)
 	waitForDiskfulReplicaCount(t, stack, rdName, 3)
 
+	// Take worker-2's satellite offline first — that is the
+	// documented `n lost` precondition. The Bug 111 gate refuses
+	// `n lost` against an ONLINE satellite with 409 (the safe
+	// alternatives are `n d` / `n evacuate`), and the
+	// machine-readable CLI exits 0 even on refusal envelopes, so
+	// losing an online node here would silently no-op and the
+	// cascade asserts below would time out.
 	lost := harness.NodeWorker2
+	stack.Satellite.SimulateNodeOffline(lost)
+	waitForNodeConnectionStatus(t, stack, lost,
+		blockstoriov1alpha1.NodeConnectionStatusOffline)
+
 	cli.Run(t, "node", "lost", lost)
 
 	// Node row must vanish.
@@ -418,17 +447,30 @@ func TestGroupKWFPoolDestroyedDropsFromPlacer(t *testing.T) {
 	// Now spawn an RD pinned to the lvm-thin storage pool with
 	// PlaceCount=2. The placer MUST skip worker-1's missing pool and
 	// land both replicas on worker-2/worker-3.
+	// `rd create` in the pinned linstor-client 1.27.1 has no
+	// `--storage-pool` flag — the pool constraint rides on the
+	// autoplace call below, exactly like the operator flow.
 	rdName := "wf-pool-gone"
-	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG, "--storage-pool", deadPool)
+	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG)
 	cli.Run(t, "volume-definition", "create", rdName, "4M")
-	cli.Run(t, "resource", "create", "--auto-place", "2",
-		"--storage-pool", deadPool, rdName)
+	cli.Run(t, "resource", "create", rdName, "--auto-place", "2",
+		"--storage-pool", deadPool)
 
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 
-	for _, r := range listResourcesOfRD(t, stack, rdName) {
-		if r.Spec.NodeName == deadNode {
-			t.Errorf("placer landed replica on node %s with PoolMissing pool %s — Bug 83 regression",
+	// Diskful replicas only: the auto-tiebreaker witness (expected on
+	// the remaining node for a 2-diskful RD post-#129) is a
+	// network-only DISKLESS attachment that consumes no pool, so a
+	// witness on the dead-pool node is fine — Bug 83 is about the
+	// placer backing a DISKFUL replica with a missing pool.
+	resources := listResourcesOfRD(t, stack, rdName)
+	for i := range resources {
+		if resourceHasFlag(&resources[i], "DISKLESS") {
+			continue
+		}
+
+		if resources[i].Spec.NodeName == deadNode {
+			t.Errorf("placer landed diskful replica on node %s with PoolMissing pool %s — Bug 83 regression",
 				deadNode, deadPool)
 		}
 	}
@@ -467,15 +509,25 @@ func TestGroupKWFReplicasOnSame(t *testing.T) {
 	cli.Run(t, "resource", "create", "--auto-place", "2", rdName)
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 
+	// `replicas-on-same` constrains DISKFUL placement. The
+	// auto-tiebreaker witness (DISKLESS + TIE_BREAKER, expected on
+	// the third node post-#129 because the RD has exactly 2 diskful
+	// replicas) is a network-only attachment that deliberately lands
+	// OUTSIDE the diskful zone group, so it is excluded from the
+	// zone-spread assertion.
 	resources := listResourcesOfRD(t, stack, rdName)
 	zoneSeen := map[string]bool{}
 
 	for i := range resources {
+		if resourceHasFlag(&resources[i], "DISKLESS") {
+			continue
+		}
+
 		zoneSeen[nodeZones[resources[i].Spec.NodeName]] = true
 	}
 
 	if len(zoneSeen) != 1 {
-		t.Errorf("replicas-on-same violated: replicas span %d zones %v; %+v",
+		t.Errorf("replicas-on-same violated: diskful replicas span %d zones %v; %+v",
 			len(zoneSeen), zoneSeen, resources)
 	}
 
@@ -514,13 +566,22 @@ func TestGroupKWFReplicasOnDifferent(t *testing.T) {
 	cli.Run(t, "resource", "create", "--auto-place", "2", rdName)
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 
+	// Diskful replicas only — the auto-tiebreaker witness is a
+	// network-only attachment outside the placement constraint and
+	// would otherwise mask a violation by adding its own zone.
 	zones := map[string]bool{}
-	for _, r := range listResourcesOfRD(t, stack, rdName) {
-		zones[nodeZones[r.Spec.NodeName]] = true
+
+	resources := listResourcesOfRD(t, stack, rdName)
+	for i := range resources {
+		if resourceHasFlag(&resources[i], "DISKLESS") {
+			continue
+		}
+
+		zones[nodeZones[resources[i].Spec.NodeName]] = true
 	}
 
 	if len(zones) < 2 {
-		t.Errorf("replicas-on-different violated: replicas all in %v", zones)
+		t.Errorf("replicas-on-different violated: diskful replicas all in %v", zones)
 	}
 }
 
@@ -541,7 +602,9 @@ func TestGroupKWFLUKSStackEndToEnd(t *testing.T) {
 	cli := &harness.CLI{URL: stack.RestURL}
 
 	// Unlock the controller before any LUKS-stack provisioning.
-	cli.Run(t, "encryption", "create-passphrase", "--new-passphrase", "supersecret-passphrase-1")
+	// The pinned linstor-client 1.27.1 spells the flag
+	// `-p/--passphrase` (no `--new-passphrase`).
+	cli.Run(t, "encryption", "create-passphrase", "--passphrase", "supersecret-passphrase-1")
 
 	rdName := "wf-luks"
 	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG,
@@ -867,6 +930,19 @@ func waitForSnapshotAbsent(t *testing.T, stack *harness.Stack, rdName, snapName 
 
 		return apierrors.IsNotFound(err)
 	}, "Snapshot "+full+" not deleted")
+}
+
+// resourceHasFlag reports whether the Resource's Spec.Flags carries
+// the named flag. Used to tell auto-tiebreaker witnesses (DISKLESS +
+// TIE_BREAKER) apart from diskful replicas in placement asserts.
+func resourceHasFlag(r *blockstoriov1alpha1.Resource, flag string) bool {
+	for _, fl := range r.Spec.Flags {
+		if fl == flag {
+			return true
+		}
+	}
+
+	return false
 }
 
 // getRDWithVDs fetches the RD CRD; tests use it to read
