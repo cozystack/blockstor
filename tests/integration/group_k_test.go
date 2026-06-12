@@ -164,7 +164,7 @@ func TestGroupKWFLateVD(t *testing.T) {
 
 	waitForDRBDUpToDate(t, stack, rdName, 2)
 
-	// Bug 79's failure mode is a DISKFUL replica left pinned to
+	// The Bug-79 failure mode is a DISKFUL replica left pinned to
 	// DISKLESS. The auto-tiebreaker WITNESS on the third node is
 	// expected here — post-#129 the invariant is "witness lives iff
 	// exactly 2 diskful replicas", and this RD has exactly 2 — so

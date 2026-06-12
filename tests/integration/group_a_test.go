@@ -282,10 +282,9 @@ func TestGroupANodeEvacuatePUT(t *testing.T) {
 	// `PUT /v1/nodes/{node}/evacuate?force=true` wire shape
 	// handleRGDelete's force precedent documents. The envelope must
 	// decode as the LINSTOR `[]ApiCallRc` array (Bug 78 wire).
-	forceResp := httpPutGroupH(t,
+	putRequireAPICallRcEnvelope(t,
 		stack.RestURL+"/v1/nodes/"+harness.NodeWorker2+"/evacuate?force=true",
-		[]byte("{}"))
-	requireAPICallRcEnvelope(t, forceResp, http.StatusOK)
+		http.StatusOK)
 
 	flagsAfter := nodeFlags(t, stack, harness.NodeWorker2)
 	if !containsString(flagsAfter, "EVICTED") {
@@ -308,10 +307,9 @@ func TestGroupANodeEvictPUT(t *testing.T) {
 	stack := harness.StartStack(t)
 	harness.SeedThreeNodeCluster(t, stack)
 
-	evictResp := httpPutGroupH(t,
+	putRequireAPICallRcEnvelope(t,
 		stack.RestURL+"/v1/nodes/"+harness.NodeWorker3+"/evict",
-		[]byte("{}"))
-	requireAPICallRcEnvelope(t, evictResp, http.StatusOK)
+		http.StatusOK)
 
 	flags := nodeFlags(t, stack, harness.NodeWorker3)
 	if !containsString(flags, "EVICTED") {
@@ -645,13 +643,15 @@ func retryStatusPatch(ctx context.Context, stack *harness.Stack, name string,
 	return lastErr
 }
 
-// requireAPICallRcEnvelope asserts the response status matches and
-// the body decodes as the LINSTOR `[]ApiCallRc` array shape — the
-// envelope python-linstor/golinstor expect from the node-lifecycle
-// PUT routes (Bug 78: an empty or non-JSON body crashes the python
-// decoder). Closes the response body.
-func requireAPICallRcEnvelope(t *testing.T, resp *http.Response, wantStatus int) {
+// putRequireAPICallRcEnvelope issues a JSON PUT with an empty-object
+// body and asserts the response status matches and the body decodes
+// as the LINSTOR `[]ApiCallRc` array shape — the envelope
+// python-linstor/golinstor expect from the node-lifecycle PUT routes
+// (Bug 78: an empty or non-JSON body crashes the python decoder).
+func putRequireAPICallRcEnvelope(t *testing.T, url string, wantStatus int) {
 	t.Helper()
+
+	resp := httpPutGroupH(t, url, []byte("{}"))
 
 	defer func() { _ = resp.Body.Close() }()
 

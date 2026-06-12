@@ -636,7 +636,7 @@ func testGroupGSnapRestoreSnapshotHolderOnly(t *testing.T, stack *harness.Stack,
 		t.Fatalf("snap.Spec.Nodes = %v, want %v (source diskful set)", snap.Spec.Nodes, want)
 	}
 
-	// Bug 397 refusal: worker-3 does NOT hold the snapshot, so an
+	// The Bug-397 refusal: worker-3 does NOT hold the snapshot, so an
 	// explicit node_names restore onto it must be rejected with 400
 	// (and no target RD created) — never silently stamp a diskful
 	// Resource that would be materialised empty.
@@ -860,9 +860,9 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 	// has been modified".
 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		var rd blockstoriov1alpha1.ResourceDefinition
-		if err := stack.Env.Client.Get(ctx,
-			types.NamespacedName{Name: rdName}, &rd); err != nil {
-			return err
+		if gErr := stack.Env.Client.Get(ctx,
+			types.NamespacedName{Name: rdName}, &rd); gErr != nil {
+			return fmt.Errorf("get RD %q: %w", rdName, gErr)
 		}
 
 		if rd.Spec.Props == nil {
@@ -871,7 +871,11 @@ func testGroupGAutoSnapshotPeriodicTick(t *testing.T, stack *harness.Stack) {
 
 		rd.Spec.Props[controller.PropAutoSnapshotRunEvery] = "1"
 
-		return stack.Env.Client.Update(ctx, &rd)
+		if uErr := stack.Env.Client.Update(ctx, &rd); uErr != nil {
+			return fmt.Errorf("update RD %q: %w", rdName, uErr)
+		}
+
+		return nil
 	}); err != nil {
 		t.Fatalf("set AutoSnapshot/RunEvery: %v", err)
 	}
