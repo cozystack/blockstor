@@ -1556,11 +1556,18 @@ func (s *Server) createOneResource(w http.ResponseWriter, r *http.Request, rdNam
 	// Persist onto rd.LayerStack if not already set so the satellite
 	// reconciler sees the right composition.
 	if len(env.LayerList) > 0 {
-		rd, getErr := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-		if getErr == nil && len(rd.LayerStack) == 0 {
-			rd.LayerStack = append([]string(nil), env.LayerList...)
-			_ = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
-		}
+		// Bug 204b shape: typed-Patch with retry-on-conflict; the
+		// "only if unset" guard re-runs against the live RD on every
+		// retry so a concurrent reconciler write can't surface a 409
+		// (and a concurrent LayerStack set isn't clobbered).
+		_ = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
+			func(rd *apiv1.ResourceDefinition) error {
+				if len(rd.LayerStack) == 0 {
+					rd.LayerStack = append([]string(nil), env.LayerList...)
+				}
+
+				return nil
+			})
 	}
 
 	// Bug 327 (P1, recurring — reported 5×): a bare `linstor r c <node>
@@ -2514,10 +2521,20 @@ func (s *Server) handleResourceMakeAvailable(w http.ResponseWriter, r *http.Requ
 
 	// Pass-through for CSI-supplied layer_list, identical to the
 	// autoplace / explicit-create flows. RD-level LayerStack wins.
+	//
+	// Bug 204b shape: typed-Patch with retry-on-conflict; the "only
+	// if unset" guard re-runs against the live RD on every retry so
+	// a concurrent reconciler write can't surface a 409 to the
+	// make-available caller.
 	if len(req.LayerList) > 0 && len(rd.LayerStack) == 0 {
-		rd.LayerStack = append([]string(nil), req.LayerList...)
+		err = s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
+			func(live *apiv1.ResourceDefinition) error {
+				if len(live.LayerStack) == 0 {
+					live.LayerStack = append([]string(nil), req.LayerList...)
+				}
 
-		err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+				return nil
+			})
 		if err != nil {
 			writeStoreError(w, err)
 
