@@ -119,6 +119,10 @@ type FakeExec struct {
 	mu sync.Mutex
 
 	// Calls records every Run / RunWithStdin invocation in order.
+	// Direct reads are only safe once no goroutine can still be
+	// executing commands against this FakeExec; tests that inspect
+	// the log while a product goroutine is live MUST use
+	// CallsSnapshot instead.
 	Calls []FakeCall
 
 	// Stdins parallels Calls: Stdins[i] is the string read from the
@@ -207,6 +211,20 @@ func (f *FakeExec) StdinFor(i int) string {
 	}
 
 	return f.Stdins[i]
+}
+
+// CallsSnapshot returns a mutex-guarded copy of the recorded calls.
+// Use it instead of reading Calls directly whenever the FakeExec may
+// still be receiving commands from a live goroutine (e.g. a started
+// Runnable) — direct reads in that situation are a data race.
+func (f *FakeExec) CallsSnapshot() []FakeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]FakeCall, len(f.Calls))
+	copy(out, f.Calls)
+
+	return out
 }
 
 // Expect registers a canned response. Match is exact on the command line.
