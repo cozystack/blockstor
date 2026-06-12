@@ -15,6 +15,14 @@ rules:
 - apiGroups:
   - blockstor.cozystack.io
   resources:
+  - controllerconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - blockstor.cozystack.io
+  resources:
   - nodes
   - resourcedefinitions
   - resourcegroups
