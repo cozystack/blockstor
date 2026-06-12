@@ -263,6 +263,62 @@ func TestRebalanceGracePeriod(t *testing.T) {
 	}
 }
 
+// TestRebalanceGracePeriodZero pins the BUG-022 secondary fix: an
+// explicit `BalanceResourcesGracePeriod 0` is a legal upstream value
+// meaning "no grace window" — the scheduled pass must fire even while
+// a node is freshly OFFLINE. Pre-fix the positive-only parser
+// rejected "0" and silently fell back to the 60-minute default, so an
+// operator who explicitly disabled the grace window kept waiting an
+// hour anyway.
+func TestRebalanceGracePeriodZero(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	st := store.NewInMemory()
+
+	// Deficit of 2 (only n1 carries a replica) so the pass has an
+	// ONLINE node (n2) to land on while n3 is offline.
+	rg := seedIntervalFixture(t, ctx, st, 3, []string{"n1"})
+
+	if err := st.ControllerProps().Set(ctx, map[string]string{
+		apiv1.PropBalanceResourcesInterval:    "5",
+		apiv1.PropBalanceResourcesGracePeriod: "0",
+	}); err != nil {
+		t.Fatalf("set BalanceResources props: %v", err)
+	}
+
+	// n3 goes OFFLINE just before the tick. With grace=0 there is no
+	// suppression window; with the (wrongly applied) 60-minute default
+	// the whole pass would be gated.
+	if err := st.Nodes().SetConnectionStatus(ctx, "n3", apiv1.NodeTypeOffline); err != nil {
+		t.Fatalf("set n3 offline: %v", err)
+	}
+
+	t0 := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+
+	rec := &controllerpkg.RGRebalanceReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+		Now:    func() time.Time { return t0 },
+	}
+
+	if _, err := rec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: rg.Name}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-interval")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(got) < 2 {
+		t.Fatalf("GracePeriod=0 must not gate the pass: got %d replicas, want >= 2 (entries=%v)", len(got), got)
+	}
+}
+
 // TestRebalanceHonoursDisabled pins the wave2 2.W02 contract: the
 // controller-scope `BalanceResourcesEnabled=false` kill-switch wins
 // over the new scheduled-tick path. Even at a scheduled tick (no

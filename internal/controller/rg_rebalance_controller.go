@@ -97,6 +97,7 @@ type RGRebalanceReconciler struct {
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resourcedefinitions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=resources,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=blockstor.cozystack.io,resources=controllerconfigs,verbs=get;list;watch
 
 // Reconcile is the explicit + periodic rebalance pass. See the type
 // comment for the five-step lifecycle. Returns `RequeueAfter =
@@ -414,7 +415,10 @@ func (r *RGRebalanceReconciler) resolveTuning(ctx context.Context) (time.Duratio
 		interval = time.Duration(m) * time.Minute
 	}
 
-	if m, ok := parsePositiveMinutes(props[apiv1.PropBalanceResourcesGracePeriod]); ok {
+	// GracePeriod permits an explicit 0 ("no grace window") — a legal
+	// upstream value parsePositiveMinutes used to reject, silently
+	// pinning the default instead.
+	if m, ok := parseNonNegativeMinutes(props[apiv1.PropBalanceResourcesGracePeriod]); ok {
 		grace = time.Duration(m) * time.Minute
 	}
 
