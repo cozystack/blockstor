@@ -102,21 +102,16 @@ func seedRDWithVolume(t *testing.T, stack *harness.Stack, suffix string) string 
 	ctx := context.Background()
 	rdName := groupGRDName(suffix)
 
-	rd := &blockstoriov1alpha1.ResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: rdName},
-		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
-			ResourceGroupName: harness.FixtureDefaultRG,
-			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
-				{VolumeNumber: 0, SizeKib: 1024 * 1024},
-			},
-		},
-	}
-
-	err := stack.Env.Client.Create(ctx, rd)
-	if err != nil {
-		t.Fatalf("seed RD %q: %v", rdName, err)
-	}
-
+	// Seed the per-node Resources BEFORE the RD: the RD reconciler's
+	// auto-tiebreaker pass fires as soon as the RD lands, and with
+	// only worker-1/worker-2 visible (2 diskful) it races this loop
+	// to worker-3 with its own DISKLESS TIE_BREAKER row — the seeded
+	// worker-3 create then flakes with AlreadyExists. With all three
+	// diskful rows in place first, the reconciler sees 3 diskful and
+	// wants no witness (post-#129 invariant: witness iff exactly 2).
+	// Fresh Resource stubs without a parent RD are deliberately left
+	// alone by the orphan path (see resource_controller.go
+	// resourceWasApplied), so the reversed order is safe.
 	for _, node := range harness.FixtureNodes() {
 		r := &blockstoriov1alpha1.Resource{
 			ObjectMeta: metav1.ObjectMeta{
@@ -141,6 +136,21 @@ func seedRDWithVolume(t *testing.T, stack *harness.Stack, suffix string) string 
 		if err != nil {
 			t.Fatalf("seed Resource %q: %v", r.Name, err)
 		}
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: rdName},
+		Spec: blockstoriov1alpha1.ResourceDefinitionSpec{
+			ResourceGroupName: harness.FixtureDefaultRG,
+			VolumeDefinitions: []blockstoriov1alpha1.ResourceDefinitionVolume{
+				{VolumeNumber: 0, SizeKib: 1024 * 1024},
+			},
+		},
+	}
+
+	err := stack.Env.Client.Create(ctx, rd)
+	if err != nil {
+		t.Fatalf("seed RD %q: %v", rdName, err)
 	}
 
 	return rdName
