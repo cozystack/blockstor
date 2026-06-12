@@ -31,6 +31,16 @@ import (
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
+// Sentinels for the VG handlers' Patch closures: they abort the
+// PatchResourceGroup write (no persist happens) and signal the
+// handler to emit the status-specific envelope (409 duplicate / 404
+// or warn-mask absent) instead of the generic writeStoreError
+// mapping. Exported nowhere — wire shape is owned by the handlers.
+var (
+	errVGAlreadyExists    = errors.New("volume group already exists")
+	errVGNotFoundSentinel = errors.New("volume group not found")
+)
+
 // registerResourceGroupExtras wires the secondary ResourceGroup
 // surface the upstream `linstor` CLI exercises beyond CRUD:
 //
@@ -221,25 +231,30 @@ func (s *Server) handleVGCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// Bug 204b shape: typed-Patch with retry-on-conflict — the
+	// duplicate check and the append both re-run against the live
+	// RG on every retry, so a concurrent reconciler / sibling write
+	// can't surface a 409 and a racing duplicate create can't slip
+	// past the check.
+	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), rgName,
+		func(rg *apiv1.ResourceGroup) error {
+			for i := range rg.VolumeGroups {
+				if rg.VolumeGroups[i].VolumeNumber == in.VolumeNumber {
+					return errVGAlreadyExists
+				}
+			}
+
+			rg.VolumeGroups = append(rg.VolumeGroups, in)
+
+			return nil
+		})
 	if err != nil {
-		writeStoreError(w, err)
-
-		return
-	}
-
-	for i := range rg.VolumeGroups {
-		if rg.VolumeGroups[i].VolumeNumber == in.VolumeNumber {
+		if errors.Is(err, errVGAlreadyExists) {
 			writeError(w, http.StatusConflict, "volume group already exists")
 
 			return
 		}
-	}
 
-	rg.VolumeGroups = append(rg.VolumeGroups, in)
-
-	err = s.Store.ResourceGroups().Update(r.Context(), &rg)
-	if err != nil {
 		writeStoreError(w, err)
 
 		return
@@ -271,33 +286,29 @@ func (s *Server) handleVGUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// Bug 204b shape: typed-Patch with retry-on-conflict — the
+	// vlmNr lookup and the prop merge re-run against the live RG on
+	// every retry, so a concurrent reconciler / sibling write can't
+	// surface a 409 to `linstor rg vg m`.
+	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), rgName,
+		func(rg *apiv1.ResourceGroup) error {
+			for i := range rg.VolumeGroups {
+				if rg.VolumeGroups[i].VolumeNumber == vlmNr {
+					mergeVGProps(&rg.VolumeGroups[i], in.OverrideProps, in.DeleteProps)
+
+					return nil
+				}
+			}
+
+			return errVGNotFoundSentinel
+		})
 	if err != nil {
-		writeStoreError(w, err)
+		if errors.Is(err, errVGNotFoundSentinel) {
+			writeError(w, http.StatusNotFound, "volume group not found")
 
-		return
-	}
-
-	idx := -1
-
-	for i := range rg.VolumeGroups {
-		if rg.VolumeGroups[i].VolumeNumber == vlmNr {
-			idx = i
-
-			break
+			return
 		}
-	}
 
-	if idx < 0 {
-		writeError(w, http.StatusNotFound, "volume group not found")
-
-		return
-	}
-
-	mergeVGProps(&rg.VolumeGroups[idx], in.OverrideProps, in.DeleteProps)
-
-	err = s.Store.ResourceGroups().Update(r.Context(), &rg)
-	if err != nil {
 		writeStoreError(w, err)
 
 		return
@@ -333,9 +344,37 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// Bug 204b shape: typed-Patch with retry-on-conflict — the
+	// membership scan and the removal re-run against the live RG on
+	// every retry, so a concurrent reconciler / sibling write can't
+	// surface a 409. The vlmNr-absent no-op aborts the write via
+	// sentinel so the idempotent warn envelope below still fires
+	// without a spurious persist.
+	err := s.Store.ResourceGroups().PatchResourceGroup(r.Context(), rgName,
+		func(rg *apiv1.ResourceGroup) error {
+			dst := rg.VolumeGroups[:0]
+			found := false
+
+			for i := range rg.VolumeGroups {
+				if rg.VolumeGroups[i].VolumeNumber == vlmNr {
+					found = true
+
+					continue
+				}
+
+				dst = append(dst, rg.VolumeGroups[i])
+			}
+
+			if !found {
+				return errVGNotFoundSentinel
+			}
+
+			rg.VolumeGroups = dst
+
+			return nil
+		})
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, errVGNotFoundSentinel) {
 			writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
 				RetCode: warnVGNotFound,
 				Message: fmt.Sprintf("volume group already absent: %s/%d", rgName, vlmNr),
@@ -344,37 +383,6 @@ func (s *Server) handleVGDelete(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		writeStoreError(w, err)
-
-		return
-	}
-
-	dst := rg.VolumeGroups[:0]
-	found := false
-
-	for i := range rg.VolumeGroups {
-		if rg.VolumeGroups[i].VolumeNumber == vlmNr {
-			found = true
-
-			continue
-		}
-
-		dst = append(dst, rg.VolumeGroups[i])
-	}
-
-	if !found {
-		writeJSON(w, http.StatusOK, []apiv1.APICallRc{{
-			RetCode: warnVGNotFound,
-			Message: fmt.Sprintf("volume group already absent: %s/%d", rgName, vlmNr),
-		}})
-
-		return
-	}
-
-	rg.VolumeGroups = dst
-
-	err = s.Store.ResourceGroups().Update(r.Context(), &rg)
-	if err != nil {
 		writeStoreError(w, err)
 
 		return

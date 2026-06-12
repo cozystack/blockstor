@@ -446,22 +446,24 @@ func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) e
 		return nil
 	}
 
-	rd, err := s.Store.ResourceDefinitions().Get(ctx, req.Name)
-	if err != nil {
-		return err //nolint:wrapcheck // message wrapped by the caller's envelope
-	}
+	// Bug 204b shape: typed-Patch with retry-on-conflict so the
+	// freshly-materialised clone target's reconciler can't race this
+	// prop fold-in into a 409 (the edits re-apply to fresh state).
+	//nolint:wrapcheck // message wrapped by the caller's envelope
+	return s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(ctx, req.Name,
+		func(rd *apiv1.ResourceDefinition) error {
+			if rd.Props == nil {
+				rd.Props = make(map[string]string, len(req.OverrideProps))
+			}
 
-	if rd.Props == nil {
-		rd.Props = make(map[string]string, len(req.OverrideProps))
-	}
+			maps.Copy(rd.Props, req.OverrideProps)
 
-	maps.Copy(rd.Props, req.OverrideProps)
+			for _, k := range req.DeleteProps {
+				delete(rd.Props, k)
+			}
 
-	for _, k := range req.DeleteProps {
-		delete(rd.Props, k)
-	}
-
-	return s.Store.ResourceDefinitions().Update(ctx, &rd) //nolint:wrapcheck // message wrapped by the caller's envelope
+			return nil
+		})
 }
 
 // writeCloneRefused stamps a clone refusal in the CloneStarted OBJECT

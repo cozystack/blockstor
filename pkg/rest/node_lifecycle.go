@@ -620,24 +620,25 @@ func (s *Server) cascadeOrphansForLostNode(ctx context.Context, name string) err
 	return nil
 }
 
-// updateNodeFlags loads the Node, applies each mutator, and persists.
-// Common shape across all three endpoints; lives here so the handler
-// bodies stay one-line.
+// updateNodeFlags applies each mutator to the Node's flag list and
+// persists. Common shape across all three endpoints; lives here so the
+// handler bodies stay one-line.
+//
+// Bug 205 shape: routed through PatchNodeSpec so a satellite Hello /
+// reconciler write landing between the read and the write re-runs the
+// flag mutation against fresh state under RetryOnConflict instead of
+// leaking a 409 to the operator (same conflict class as the
+// activate/deactivate release-gate flake on mutateResourceFlag).
 func updateNodeFlags(w http.ResponseWriter, r *http.Request, s *Server, mutators ...func([]string) []string) {
 	name := r.PathValue("node")
 
-	node, err := s.Store.Nodes().Get(r.Context(), name)
-	if err != nil {
-		writeStoreError(w, err)
+	err := s.Store.Nodes().PatchNodeSpec(r.Context(), name, func(node *apiv1.Node) error {
+		for _, m := range mutators {
+			node.Flags = m(node.Flags)
+		}
 
-		return
-	}
-
-	for _, m := range mutators {
-		node.Flags = m(node.Flags)
-	}
-
-	err = s.Store.Nodes().Update(r.Context(), &node)
+		return nil
+	})
 	if err != nil {
 		writeStoreError(w, err)
 

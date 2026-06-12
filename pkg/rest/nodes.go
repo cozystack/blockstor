@@ -573,7 +573,16 @@ func (s *Server) upsertNodeAndDiskless(w http.ResponseWriter, r *http.Request, n
 	case err == nil:
 		// fresh create — normal path
 	case errors.Is(err, store.ErrAlreadyExists):
-		err = s.Store.Nodes().Update(r.Context(), n)
+		// Bug 205 shape: the re-register replace is routed through
+		// PatchNodeSpec so a satellite Hello / reconciler write
+		// landing between the AlreadyExists probe and the persist
+		// re-applies the wire snapshot under RetryOnConflict
+		// instead of leaking a 409 into the registration loop.
+		err = s.Store.Nodes().PatchNodeSpec(r.Context(), n.Name, func(live *apiv1.Node) error {
+			*live = *n
+
+			return nil
+		})
 		if err != nil {
 			writeStoreError(w, err)
 
@@ -913,9 +922,14 @@ func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if patch.NodeType != "" && patch.NodeType != existing.Type {
-		existing.Type = patch.NodeType
+		// Bug 205 shape: typed-Patch with retry-on-conflict so a
+		// concurrent satellite Hello / reconciler write can't bounce
+		// the rare node_type toggle with a 409.
+		err = s.Store.Nodes().PatchNodeSpec(r.Context(), name, func(live *apiv1.Node) error {
+			live.Type = patch.NodeType
 
-		err = s.Store.Nodes().Update(r.Context(), &existing)
+			return nil
+		})
 		if err != nil {
 			writeStoreError(w, err)
 

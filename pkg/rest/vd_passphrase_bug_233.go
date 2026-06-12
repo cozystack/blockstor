@@ -111,7 +111,10 @@ func (s *Server) handleVDPassphraseRotate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	vd, err := s.Store.VolumeDefinitions().Get(r.Context(), rdName, int32(vlmNr))
+	// Probe for existence up-front so a missing VD surfaces 404
+	// before the body validation's 400 — preserves the pre-Patch
+	// error-precedence contract.
+	_, err = s.Store.VolumeDefinitions().Get(r.Context(), rdName, int32(vlmNr))
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -136,13 +139,20 @@ func (s *Server) handleVDPassphraseRotate(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if vd.Props == nil {
-		vd.Props = map[string]string{}
-	}
+	// Bug 204b shape: typed-Patch with retry-on-conflict so a
+	// reconciler write on the parent RD between the read and the
+	// write re-applies the rotation onto fresh state instead of
+	// surfacing a 409 to the operator.
+	err = s.Store.VolumeDefinitions().PatchVolumeDefinitionSpec(r.Context(), rdName, int32(vlmNr),
+		func(live *apiv1.VolumeDefinition) error {
+			if live.Props == nil {
+				live.Props = map[string]string{}
+			}
 
-	vd.Props[vdPassphrasePropKey] = want
+			live.Props[vdPassphrasePropKey] = want
 
-	err = s.Store.VolumeDefinitions().Update(r.Context(), rdName, &vd)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
