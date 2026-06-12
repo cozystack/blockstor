@@ -234,14 +234,9 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	// only. Stranded witnesses are reaped explicitly below so a fresh one
 	// can land on a healthy spare (or quorum falls to off when none
 	// remains) — never by demoting a healthy diskful to TIE_BREAKER.
-	disabled, err := r.disabledNodeSet(ctx)
-	if err != nil {
-		return err
-	}
-
-	live, stranded := splitByDisabledNode(replicas, disabled)
-
-	err = r.removeStrandedWitnesses(ctx, rd.Name, stranded)
+	// Bug-024 extends the same treatment to replicas whose node row is
+	// gone entirely (ghost witnesses left behind by `n lost`).
+	live, err := r.dropStrandedReplicas(ctx, rd.Name, replicas)
 	if err != nil {
 		return err
 	}
@@ -795,6 +790,29 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 		return nil
 	}
 
+	// Bug-024 placement guard: the candidate list above comes from
+	// Store.Nodes().List, which in production reads the manager's
+	// informer cache — after `n lost` deletes a node, the lagging
+	// cache re-offers it for tens to hundreds of ms and the Create
+	// below would stamp a `[DISKLESS TIE_BREAKER]` ghost on the
+	// just-deleted node (nothing reaps it: no DeletionTimestamp
+	// event, no finalizer). Re-validate the pick against the
+	// authoritative reader right before the write — the same shape
+	// as the REST layer's Bug 174 node-deleted-race guard. On a miss
+	// (or a freshly-stamped drain flag) skip this pass; the standing
+	// rdReconcileRequeue retries with a fresh candidate list.
+	probe, err := r.probeNodeDirect(ctx, tiebreakerNode)
+	if err != nil {
+		return err
+	}
+
+	if !probe.found || probe.drained {
+		logf.FromContext(ctx).Info("witness candidate vanished or drained; deferring witness create",
+			"rd", rd.Name, "node", tiebreakerNode, "found", probe.found)
+
+		return nil
+	}
+
 	newWitness := apiv1.Resource{
 		Name:     rd.Name,
 		NodeName: tiebreakerNode,
@@ -808,7 +826,29 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 
 	r.rollbackWitnessIfRDGone(ctx, rd.Name, tiebreakerNode)
 
+	// Bug-024, post-write half (mirrors Bug 174's two-sided close):
+	// the node can vanish between the pre-write probe and the Create.
+	// Re-probe and roll the witness back if the node is gone — the
+	// next reconcile re-picks from a fresh list. Best-effort like
+	// rollbackWitnessIfRDGone: a failed rollback is caught by the
+	// repair leg (dropStrandedReplicas) on the next pass.
+	r.rollbackWitnessIfNodeGone(ctx, rd.Name, tiebreakerNode)
+
 	return nil
+}
+
+// rollbackWitnessIfNodeGone deletes the just-created witness when its
+// host node no longer exists per the authoritative reader. Swallows
+// every error: the witness Create already succeeded, and the ghost-
+// repair leg in dropStrandedReplicas reaps whatever slips through on
+// the next reconcile.
+func (r *ResourceDefinitionReconciler) rollbackWitnessIfNodeGone(ctx context.Context, rdName, witnessNode string) {
+	probe, err := r.probeNodeDirect(ctx, witnessNode)
+	if err != nil || probe.found {
+		return
+	}
+
+	_ = r.Store.Resources().Delete(ctx, rdName, witnessNode)
 }
 
 // rollbackWitnessIfRDGone probes the parent RD via the APIReader
@@ -1227,27 +1267,199 @@ func isDisabledNode(node *apiv1.Node) bool {
 	return false
 }
 
-// disabledNodeSet returns the set of node names flagged EVICTED / LOST.
-// Bug 385: the RD-level witness / quorum decision must treat replicas on
-// these nodes as draining placements, not live ones — mirroring the
-// placer's `disabledNodes` semantic. Re-probed from the store on every
-// reconcile so a freshly-stamped EVICTED flag takes effect on the next
-// witness pass.
-func (r *ResourceDefinitionReconciler) disabledNodeSet(ctx context.Context) (map[string]struct{}, error) {
-	nodes, err := r.Store.Nodes().List(ctx)
+// dropStrandedReplicas reduces the RD's replica snapshot to the live
+// voting set and reaps stranded witnesses along the way. Two classes
+// of replica are excluded:
+//
+//   - Bug 385: replicas hosted on EVICTED / LOST nodes — draining
+//     placements, not live voters.
+//   - Bug-024: replicas whose Node row no longer exists at all (e.g.
+//     a TIE_BREAKER ghost stamped on a node that `n lost` just
+//     deleted — nothing else ever reaps it: the node object is gone,
+//     so there is no DeletionTimestamp event and no finalizer pass).
+//     Absence is confirmed against the authoritative reader (direct
+//     read, not the informer cache) so a momentarily-lagging cache
+//     can't trigger a wrongful reap.
+//
+// TIE_BREAKER rows in either class are deleted via
+// removeStrandedWitnesses so a fresh witness can land on a healthy
+// spare; stranded diskful replicas are left alone (relocating those
+// is the NodeReconciler's job) but still excluded from the count.
+func (r *ResourceDefinitionReconciler) dropStrandedReplicas(
+	ctx context.Context,
+	rdName string,
+	replicas []apiv1.Resource,
+) ([]apiv1.Resource, error) {
+	disabled, known, err := r.nodeSets(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	live, stranded := splitByDisabledNode(replicas, disabled)
+
+	live, ghosts, err := r.confirmGhostReplicas(ctx, live, known)
+	if err != nil {
+		return nil, err
+	}
+
+	stranded = append(stranded, ghosts...)
+
+	err = r.removeStrandedWitnesses(ctx, rdName, stranded)
+	if err != nil {
+		return nil, err
+	}
+
+	return live, nil
+}
+
+// nodeSets returns (disabled, known): the set of node names flagged
+// EVICTED / LOST and the set of ALL node names the store currently
+// lists. Bug 385: the RD-level witness / quorum decision must treat
+// replicas on disabled nodes as draining placements, not live ones —
+// mirroring the placer's `disabledNodes` semantic. Bug-024 extends
+// the same idea to nodes that are gone entirely: a replica whose
+// node is absent from `known` is a ghost candidate (confirmed
+// against the authoritative reader in confirmGhostReplicas before
+// any reap). Re-probed from the store on every reconcile so a
+// freshly-stamped flag — or a freshly-deleted node — takes effect on
+// the next witness pass.
+func (r *ResourceDefinitionReconciler) nodeSets(ctx context.Context) (map[string]struct{}, map[string]struct{}, error) {
+	nodes, err := r.Store.Nodes().List(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	disabled := make(map[string]struct{})
+	known := make(map[string]struct{}, len(nodes))
 
 	for i := range nodes {
+		known[nodes[i].Name] = struct{}{}
+
 		if isDisabledNode(&nodes[i]) {
 			disabled[nodes[i].Name] = struct{}{}
 		}
 	}
 
-	return disabled, nil
+	return disabled, known, nil
+}
+
+// confirmGhostReplicas partitions `replicas` into (live, ghosts):
+// a ghost is a replica whose node is missing from the cached `known`
+// set AND confirmed absent by the authoritative reader. The double
+// check matters in both directions — the informer cache can lag the
+// apiserver, so `known` alone could briefly miss a real node (which
+// must NOT get its witness reaped), while the cache can also still
+// serve a node `n lost` already deleted (the Bug-024 ghost-create
+// source, handled separately in createWitness).
+func (r *ResourceDefinitionReconciler) confirmGhostReplicas(
+	ctx context.Context,
+	replicas []apiv1.Resource,
+	known map[string]struct{},
+) ([]apiv1.Resource, []apiv1.Resource, error) {
+	var live, ghosts []apiv1.Resource
+
+	for i := range replicas {
+		if _, ok := known[replicas[i].NodeName]; ok {
+			live = append(live, replicas[i])
+
+			continue
+		}
+
+		probe, err := r.probeNodeDirect(ctx, replicas[i].NodeName)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if probe.found {
+			// Cached list lagged a just-created node; the replica is
+			// real. Never reap on a stale negative.
+			live = append(live, replicas[i])
+
+			continue
+		}
+
+		ghosts = append(ghosts, replicas[i])
+	}
+
+	return live, ghosts, nil
+}
+
+// linstorNameAnnotation mirrors pkg/store/k8s.AnnotationLinstorName.
+// The literal is duplicated (same pattern as snapshotGroupIDLabel in
+// snapshot_controller.go) to avoid a controller→store/k8s dependency.
+// Node CRDs whose LINSTOR name needed slugifying carry the original
+// wire name here; probeNodeDirect matches against both spellings.
+const linstorNameAnnotation = "blockstor.io/linstor-name"
+
+// nodeProbe is the answer probeNodeDirect returns about a node's
+// authoritative state.
+type nodeProbe struct {
+	// found reports the node row exists.
+	found bool
+	// drained reports an EVICTED / LOST drain flag on the found node.
+	drained bool
+}
+
+// probeNodeDirect answers "does this node exist right NOW, and is it
+// usable as a witness host?" against the authoritative source rather
+// than the manager's informer cache. Bug-024: the witness-placement
+// candidate list comes from Store.Nodes().List, which in production
+// is backed by the cached client and trails the apiserver — after
+// `n lost` deletes a node, the lagging cache happily re-offers it
+// and the controller would stamp a `[DISKLESS TIE_BREAKER]` ghost on
+// the just-deleted node. Mirrors the REST layer's Bug 174 node-
+// deleted-race guard (pkg/rest/autoplace.go::
+// refuseResourceCreateOnNodeDeletedRace), which re-validates the
+// pinned node against the store right after the write.
+//
+// Production path: APIReader (direct apiserver reads, no cache).
+// LINSTOR node names are matched case-insensitively against both the
+// CRD name and the preserved original-name annotation, the same
+// resolution pkg/store/k8s applies. Unit tests construct the
+// reconciler without APIReader — the Store fallback is authoritative
+// there (InMemory has no cache to lag).
+func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wireName string) (nodeProbe, error) {
+	if r.APIReader == nil {
+		node, err := r.Store.Nodes().Get(ctx, wireName)
+		if stderrors.Is(err, store.ErrNotFound) {
+			return nodeProbe{}, nil
+		}
+
+		if err != nil {
+			return nodeProbe{}, err
+		}
+
+		return nodeProbe{found: true, drained: isDisabledNode(&node)}, nil
+	}
+
+	var list blockstoriov1alpha1.NodeList
+	if err := r.APIReader.List(ctx, &list); err != nil {
+		return nodeProbe{}, err
+	}
+
+	for i := range list.Items {
+		if !nodeCRDMatchesWireName(&list.Items[i], wireName) {
+			continue
+		}
+
+		return nodeProbe{found: true, drained: nodeHasDrainFlag(&list.Items[i])}, nil
+	}
+
+	return nodeProbe{}, nil
+}
+
+// nodeCRDMatchesWireName reports whether a Node CRD addresses the
+// given LINSTOR wire name: either directly via metadata.name or via
+// the preserved original-name annotation (slugified names). LINSTOR
+// identifiers are case-insensitive, so both comparisons fold case.
+func nodeCRDMatchesWireName(node *blockstoriov1alpha1.Node, wireName string) bool {
+	if strings.EqualFold(node.Name, wireName) {
+		return true
+	}
+
+	original, ok := node.Annotations[linstorNameAnnotation]
+
+	return ok && strings.EqualFold(original, wireName)
 }
 
 // splitByDisabledNode partitions replicas into (live, stranded) by the
@@ -1506,7 +1718,14 @@ func nodeDrainFlagChanged() predicate.Predicate {
 
 			return nodeHasDrainFlag(oldNode) != nodeHasDrainFlag(newNode)
 		},
-		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
+		// Bug-024: a node DELETE is the strongest drain signal there
+		// is — `n lost` removes the Node row outright. Re-running the
+		// witness invariant on it lets the ghost-repair leg
+		// (dropStrandedReplicas) reap a TIE_BREAKER stranded on the
+		// deleted node as soon as the event lands instead of waiting
+		// for the periodic requeue. Node deletion is rare, so the
+		// all-RD fan-out stays cheap.
+		DeleteFunc:  func(_ event.DeleteEvent) bool { return true },
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
 }
