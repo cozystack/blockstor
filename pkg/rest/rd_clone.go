@@ -22,6 +22,7 @@ import (
 	"context"
 	"maps"
 	"net/http"
+	"strings"
 
 	"github.com/LINBIT/golinstor/client"
 	"github.com/LINBIT/golinstor/clonestatus"
@@ -53,18 +54,31 @@ import (
 //     to the live-RD shell-copy path. Pre-Bug-239 the field was
 //     accepted-and-no-op (Bug 232), which gave operators a fresh
 //     empty shell with no error — the "snap" intent vanished.
-//     Until the snapshot-based clone data plane lands (Phase 12)
-//     the operator should fall back to the snapshot-then-restore
-//     workflow the writeCloneNotImplemented envelope hints at.
-//
-// TODO(bug-239-followup / Phase 12): when the snapshot-based clone
-// data plane lands, replace the 501 branch with a snapshot-restore-
-// equivalent path instead of the live-RD shell copy.
+//     The operator should fall back to the snapshot-then-restore
+//     workflow the writeSnapshotCloneNotImplemented envelope hints
+//     at (the live-RD clone path below takes its own internal
+//     snapshot; honouring an OPERATOR-named snapshot here is a
+//     different contract and stays explicit-refusal until wired).
+//   - `use_zfs_clone` (bool): Bug-020 — golinstor v0.58+ /
+//     linstor-csi send this on CSI clone-from-source
+//     (`CreateVolume` with `VolumeContentSource_Volume`). Upstream
+//     semantics: `true` requests a `zfs clone` of an internal
+//     snapshot instead of the default `zfs send | zfs recv` full
+//     copy. blockstor's only clone data plane IS the snapshot-
+//     restore machinery, whose ZFS provider materialises restore
+//     targets with `zfs clone` (pkg/storage/zfs
+//     RestoreVolumeFromSnapshot) — i.e. exactly the semantics
+//     `use_zfs_clone=true` requests. The field is therefore
+//     accepted and honoured by construction for the `true` case;
+//     `false`/absent (upstream: full send/recv copy) currently
+//     lands on the same snapshot-clone path — an accepted
+//     divergence documented in docs/cli-parity-known-deltas.md.
 type rdCloneRequest struct {
 	Name          string            `json:"name"`
 	OverrideProps map[string]string `json:"override_props,omitempty"`
 	DeleteProps   []string          `json:"delete_props,omitempty"`
 	SrcSnapName   string            `json:"src_snap_name,omitempty"`
+	UseZfsClone   bool              `json:"use_zfs_clone,omitempty"`
 }
 
 // registerRDClone wires the /v1/resource-definitions/{rd}/clone endpoints.
@@ -81,22 +95,31 @@ func (s *Server) registerRDClone(mux *http.ServeMux) {
 		s.requireStore(s.handleRDCloneStatus))
 }
 
-// handleRDClone duplicates the source RD's metadata (props, RG ref)
-// under a new name when the source carries no VolumeDefinitions. When
-// the source HAS VDs, the apiserver refuses with HTTP 501 — Bug 114:
-// the previous handler answered 201 + a synthetic "Completed cloning"
-// CLI line, but produced an empty target shell because nothing copies
-// VolumeDefinitions and no satellite-side data-plane (zfs send/recv,
-// dd, ZFS-clone) is wired. Operators followed the success message,
-// `mkfs`'d the clone, and discovered their "clone" had no backing.
+// handleRDClone clones a ResourceDefinition under a new name.
 //
-// We deliberately keep the empty-source path working: Group D's
-// integration smoke test seeds a vol-less RD and clones the shell
-// to verify Props/RG propagation; that contract still holds.
+// Two materialisation paths, switched on the source's
+// VolumeDefinition count:
 //
-// When data-plane clone lands in a future commit, replace the
-// 501 branch with the materialisation logic and update the
-// matching pin in clone_bug_114_test.go.
+//   - Source with no VDs: shallow metadata copy (Props, RG ref) —
+//     Group D's integration smoke test pins this contract.
+//   - Source with VDs (Bug-020): clone via the snapshot-restore
+//     machinery — an internal snapshot of the source is taken and
+//     the target RD is materialised from it exactly like
+//     `linstor s resource restore` (VDs hydrated, the
+//     `BlockstorRestoreFromSnapshot` marker routes the satellite's
+//     storage provider to RestoreVolumeFromSnapshot — `zfs clone`
+//     on ZFS — instead of a blank CreateVolume). This replaces the
+//     Bug 114 explicit 501 refusal: linstor-csi's CSI
+//     clone-from-source (`CreateVolume` +
+//     `VolumeContentSource_Volume`) POSTs here with
+//     `use_zfs_clone` and needs a real clone, not a refusal.
+//
+// Bug 114 history: before the 501 gate, this handler answered 201 +
+// a synthetic "Completed cloning" line while producing an empty
+// target shell. The 501 gate made the gap honest; the snapshot-based
+// materialisation now closes it. The matching pins live in
+// clone_bug_114_test.go (refusal contract for un-deployed sources)
+// and clone_use_zfs_clone_bug020_test.go (materialisation contract).
 func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	srcName := r.PathValue("rd")
 
@@ -112,13 +135,15 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 239: snapshot-based clone is not implemented yet. The Bug 232
-	// decoder accepts `src_snap_name` so the CLI stops crashing on the
-	// wire-shape mismatch, but silently dropping it gave operators a
-	// fresh empty shell that lied about the snapshot. Surface an
-	// explicit 501 + CloneStarted envelope so the operator sees the gap
-	// (and the matching snapshot-then-restore workaround) before the
-	// snapshot-clone data plane lands in Phase 12.
+	// Bug 239: clone-from-an-OPERATOR-NAMED-snapshot is not wired.
+	// The Bug 232 decoder accepts `src_snap_name` so the CLI stops
+	// crashing on the wire-shape mismatch, but silently dropping it
+	// gave operators a fresh empty shell that lied about the
+	// snapshot. Surface an explicit 501 + CloneStarted envelope so
+	// the operator sees the gap (and the matching snapshot-then-
+	// restore workaround). Note the LIVE-clone path below (Bug-020)
+	// takes its own internal snapshot — that is a different
+	// contract from honouring a caller-chosen point-in-time.
 	if req.SrcSnapName != "" {
 		writeSnapshotCloneNotImplemented(w, srcName, req.Name, req.SrcSnapName)
 
@@ -132,11 +157,9 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bug 114: refuse to create a structurally-incomplete clone when
-	// the source carries VolumeDefinitions. The legacy handler
-	// happily wrote an empty target RD and lied about success; the
-	// honest answer is a LINSTOR `[]ApiCallRc` envelope describing
-	// the gap and pointing at the snapshot-ship workaround.
+	// VD-bearing sources take the snapshot-based data-plane path
+	// (Bug-020); vol-less sources keep the legacy shallow-copy
+	// contract Group D pins.
 	srcVDs, err := s.Store.VolumeDefinitions().List(r.Context(), srcName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -145,12 +168,320 @@ func (s *Server) handleRDClone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(srcVDs) > 0 {
-		writeCloneNotImplemented(w, srcName, req.Name)
+		s.cloneWithData(w, r, &src, &req)
 
 		return
 	}
 
 	s.cloneEmptyRDShell(w, r, &src, &req)
+}
+
+// cloneWithData materialises a clone of a VD-bearing source RD by
+// routing through the snapshot-restore machinery (Bug-020):
+//
+//  1. take (or reuse) an internal snapshot `clone-<target>` of the
+//     source — same guards as the operator-facing snapshot create
+//     (source deployed, targets online, snapshot-capable pools);
+//  2. materialise the target RD from it via materializeRestoredRD —
+//     VDs hydrated from the snapshot's recorded layout, the
+//     `BlockstorRestoreFromSnapshot` marker stamped so satellites
+//     route the storage provider to RestoreVolumeFromSnapshot
+//     (`zfs clone` on ZFS — the `use_zfs_clone=true` semantics
+//     linstor-csi requests), replicas placed via the parent RG
+//     constrained to snapshot-holding nodes;
+//  3. apply the operator's `override_props` / `delete_props` edits
+//     on the freshly-created target (Bug 232 parity with the
+//     empty-shell path).
+//
+// Every refusal on this path is emitted through writeCloneRefused —
+// the CloneStarted OBJECT envelope — because python-linstor's
+// `resource_dfn_clone` decodes the body into CloneStarted
+// unconditionally and a bare `[]ApiCallRc` array crashes the CLI
+// (see writeSnapshotCloneNotImplemented's wire-shape note).
+func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, req *rdCloneRequest) {
+	ctx := r.Context()
+
+	if s.cloneTargetPreexists(ctx, w, src.Name, req.Name) {
+		return
+	}
+
+	// Mirror the snapshot-create Bug 180 gate: a source RD mid-tear-
+	// down would reap the internal snapshot + clone marker from
+	// under the satellite's restore.
+	if rdHasDeleteFlag(ctx, s, src.Name) {
+		writeCloneRefused(w, http.StatusConflict, src.Name, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' refused: the source is being deleted",
+			Cause:   "the source RD carries the DELETE flag; its backing data is being torn down",
+			Correc:  "clone before deleting the source, or restore from a snapshot taken earlier",
+		})
+
+		return
+	}
+
+	snap, ok := s.ensureCloneSnapshot(w, r, src, req.Name)
+	if !ok {
+		return
+	}
+
+	restoreReq := &snapshotRestoreRequest{ToResource: req.Name}
+
+	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return
+	}
+
+	err = s.applyClonePropEdits(ctx, req)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' created, but applying " +
+				"override_props/delete_props failed: " + err.Error(),
+		})
+
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, cloneStartedResponse{
+		Location:   "/v1/resource-definitions/" + src.Name + "/clone/" + req.Name,
+		SourceName: src.Name,
+		CloneName:  req.Name,
+		Messages: &[]apiv1.APICallRc{{
+			RetCode: maskInfo,
+			Message: "resource definition cloned: " + req.Name,
+		}},
+	})
+}
+
+// cloneSnapshotName derives the internal snapshot name backing a
+// data-plane clone. Deterministic (`clone-<target>`) so an
+// interrupted clone retried by linstor-csi reuses the same snapshot
+// instead of accreting one per attempt. The snapshot is visible in
+// `linstor s l` like any other — it must outlive the clone because
+// `zfs clone` targets stay dependent on their origin snapshot.
+func cloneSnapshotName(cloneName string) string {
+	return "clone-" + cloneName
+}
+
+// cloneTargetPreexists handles the clone-target-already-exists edge
+// up front (true = response already written):
+//
+//   - target carrying OUR restore marker for this exact source +
+//     internal snapshot → idempotent retry of a clone that already
+//     materialised (linstor-csi replays CreateVolume until it sees
+//     success); answer 201 + the same CloneStarted envelope.
+//   - any other pre-existing RD under that name → 409 refusal in
+//     CloneStarted shape (a bare store AlreadyExists envelope would
+//     crash python-linstor's clone decode).
+func (s *Server) cloneTargetPreexists(ctx context.Context, w http.ResponseWriter, srcName, cloneName string) bool {
+	existing, err := s.Store.ResourceDefinitions().Get(ctx, cloneName)
+	if err != nil {
+		// NotFound (or any read blip) → proceed with the create;
+		// a real store outage surfaces on the next write anyway.
+		return false
+	}
+
+	if existing.Props["BlockstorRestoreFromSnapshot"] == srcName+":"+cloneSnapshotName(cloneName) {
+		writeJSON(w, http.StatusCreated, cloneStartedResponse{
+			Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
+			SourceName: srcName,
+			CloneName:  cloneName,
+			Messages: &[]apiv1.APICallRc{{
+				RetCode: maskInfo,
+				Message: "resource definition already cloned: " + cloneName,
+			}},
+		})
+
+		return true
+	}
+
+	writeCloneRefused(w, http.StatusConflict, srcName, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError,
+		Message: "clone target '" + cloneName + "' already exists and is not a clone of '" + srcName + "'",
+		Correc:  "pick a different clone name, or delete the existing resource definition first",
+	})
+
+	return true
+}
+
+// ensureCloneSnapshot takes (or reuses) the internal snapshot backing
+// a data-plane clone. Returns (snap, true) when the caller may
+// proceed; (nil, false) when a refusal envelope was already written.
+// Guards mirror handleSnapshotCreate's: the source must have at
+// least one ACTIVE diskful replica, every replica's node must be
+// online, and every backing pool must be snapshot-capable (thin LVM
+// / ZFS / FILE_THIN) — the clone data plane IS a snapshot restore,
+// so a source that cannot be snapshotted cannot be cloned.
+func (s *Server) ensureCloneSnapshot(w http.ResponseWriter, r *http.Request, src *apiv1.ResourceDefinition, cloneName string) (*apiv1.Snapshot, bool) {
+	ctx := r.Context()
+	snapName := cloneSnapshotName(cloneName)
+
+	existing, err := s.Store.Snapshots().Get(ctx, src.Name, snapName)
+	if err == nil {
+		// Interrupted-clone retry: the snapshot landed on a previous
+		// attempt; reuse it so the restore sees the same point-in-time.
+		return &existing, true
+	}
+
+	snap := apiv1.Snapshot{Name: snapName, ResourceName: src.Name}
+
+	err = s.hydrateSnapshotFromRD(ctx, &snap, src.Name)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return nil, false
+	}
+
+	if !s.cloneSnapshotPreconditionsHold(ctx, w, src, &snap, cloneName) {
+		return nil, false
+	}
+
+	snap.Snapshots = makeSnapshotPerNode(snapName, snap.Nodes, snap.VolumeDefinitions)
+
+	err = s.Store.Snapshots().Create(ctx, &snap)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name +
+				"' failed: internal snapshot create: " + err.Error(),
+		})
+
+		return nil, false
+	}
+
+	return &snap, true
+}
+
+// cloneSnapshotPreconditionsHold runs the snapshot-feasibility guards
+// for the clone path, emitting CloneStarted-shaped refusals (true =
+// caller may proceed). Same checks handleSnapshotCreate applies, but
+// the refusal envelopes are CloneStarted objects, not bare
+// `[]ApiCallRc` arrays (python-linstor wire-shape; see cloneWithData).
+// Split out of ensureCloneSnapshot for the funlen budget.
+func (s *Server) cloneSnapshotPreconditionsHold(ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot, cloneName string) bool {
+	// An un-deployed source (no ACTIVE diskful replica) has no
+	// backing data to snapshot — a "clone" of it would be the Bug
+	// 114 empty shell all over again.
+	if len(snap.Nodes) == 0 {
+		writeCloneRefused(w, http.StatusConflict, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name +
+				"' refused: the source has no active diskful replicas to clone from",
+			Cause: "the clone data plane snapshots the source and restores the target " +
+				"from it; with no deployed diskful replica there is nothing to snapshot " +
+				"and the result would be an empty shell (Bug 114)",
+			Correc: "deploy the source first (`linstor rd ap " + src.Name + "`), " +
+				"or clone before removing its replicas",
+		})
+
+		return false
+	}
+
+	if offline := s.offlineTargetNodes(ctx, snap.Nodes); len(offline) > 0 {
+		writeCloneRefused(w, http.StatusServiceUnavailable, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' refused: node(s) " +
+				strings.Join(offline, ", ") + " are offline",
+			Cause: "the internal clone snapshot must be taken on every diskful replica; " +
+				"an offline node would leave the snapshot (and the clone) incomplete",
+			Correc: "retry once the node(s) reconnect",
+		})
+
+		return false
+	}
+
+	return s.clonePoolsSupportSnapshots(ctx, w, src, snap, cloneName)
+}
+
+// clonePoolsSupportSnapshots is the G5 capability gate applied to the
+// clone path: every diskful replica of the source must sit in a
+// snapshot-capable pool, because the clone data plane is a snapshot
+// restore. Thick LVM / plain FILE sources surface an actionable
+// refusal instead of an internal snapshot that the satellite could
+// never take. True = caller may proceed.
+func (s *Server) clonePoolsSupportSnapshots(ctx context.Context, w http.ResponseWriter, src *apiv1.ResourceDefinition, snap *apiv1.Snapshot, cloneName string) bool {
+	resList, err := s.Store.Resources().ListByDefinition(ctx, src.Name)
+	if err != nil {
+		writeCloneRefused(w, http.StatusInternalServerError, src.Name, cloneName, &apiv1.APICallRc{
+			RetCode: apiCallRcError,
+			Message: "clone of resource definition '" + src.Name + "' failed: " + err.Error(),
+		})
+
+		return false
+	}
+
+	locs := s.nonSnapshotPoolLocations(ctx, resList, snap.Nodes)
+	if len(locs) == 0 {
+		return true
+	}
+
+	writeCloneRefused(w, http.StatusBadRequest, src.Name, cloneName, &apiv1.APICallRc{
+		RetCode: apiCallRcError | apiCallRcFailSnapshotsNotSupported,
+		Message: "clone of resource definition '" + src.Name + "' refused: storage pool(s) " +
+			strings.Join(locs, ", ") + " do not support snapshots",
+		Cause: "the clone data plane takes an internal snapshot of the source and " +
+			"restores the target from it; thick providers (thick LVM, plain FILE, " +
+			"DISKLESS) cannot take copy-on-write snapshots",
+		Correc: "place the source on a thin-provisioned snapshot-capable pool " +
+			"(LVM_THIN / ZFS_THIN / FILE_THIN) before cloning",
+	})
+
+	return false
+}
+
+// applyClonePropEdits applies the Bug 232 `override_props` /
+// `delete_props` edits onto the freshly-materialised clone target —
+// parity with the empty-shell path, which folds them in during the
+// shallow copy. No-op when the request carries neither.
+func (s *Server) applyClonePropEdits(ctx context.Context, req *rdCloneRequest) error {
+	if len(req.OverrideProps) == 0 && len(req.DeleteProps) == 0 {
+		return nil
+	}
+
+	rd, err := s.Store.ResourceDefinitions().Get(ctx, req.Name)
+	if err != nil {
+		return err //nolint:wrapcheck // message wrapped by the caller's envelope
+	}
+
+	if rd.Props == nil {
+		rd.Props = make(map[string]string, len(req.OverrideProps))
+	}
+
+	maps.Copy(rd.Props, req.OverrideProps)
+
+	for _, k := range req.DeleteProps {
+		delete(rd.Props, k)
+	}
+
+	return s.Store.ResourceDefinitions().Update(ctx, &rd) //nolint:wrapcheck // message wrapped by the caller's envelope
+}
+
+// writeCloneRefused stamps a clone refusal in the CloneStarted OBJECT
+// envelope. python-linstor's `resource_dfn_clone` decodes the
+// response body into CloneStarted unconditionally (success AND
+// error), so every non-2xx answer on the clone POST must keep the
+// object shape — a bare `[]ApiCallRc` array crashes the CLI with
+// `AttributeError: 'list' object has no attribute 'get'` before the
+// error line reaches the operator (see writeSnapshotCloneNotImplemented).
+func writeCloneRefused(w http.ResponseWriter, status int, srcName, cloneName string, callRc *apiv1.APICallRc) {
+	if callRc.ObjRefs == nil {
+		callRc.ObjRefs = map[string]string{objRefRscDfn: srcName}
+	}
+
+	writeJSON(w, status, cloneStartedResponse{
+		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
+		SourceName: srcName,
+		CloneName:  cloneName,
+		Messages:   &[]apiv1.APICallRc{*callRc},
+	})
 }
 
 // cloneEmptyRDShell materialises the empty-source clone path: shallow-copy
@@ -270,52 +601,9 @@ func computeCloneStatus(ctx context.Context, st store.Store, srcName, targetName
 	return clonestatus.Complete
 }
 
-// writeCloneNotImplemented stamps the Bug 114 refusal envelope.
-//
-// Wire shape gotcha: upstream LINSTOR returns a
-// `ResourceDefinitionCloneStarted` object on BOTH success (201) and
-// error (500) — the error is conveyed through the `messages` field
-// inside the object, NOT by switching the body to a bare ApiCallRc
-// array (see linstor-server's `mapToCloneStarted`). python-linstor's
-// CLI relies on this: `resource_dfn_clone` calls
-// `_rest_request_raw` which skips the standard error-status handler
-// and decodes the body straight into `CloneStarted`. If we return a
-// bare array on 501 the CLI crashes with
-// `AttributeError: 'list' object has no attribute 'get'` on the next
-// `.messages` access, rather than printing the operator-actionable
-// error line we authored. Mirror the upstream object-with-embedded-
-// messages shape so the CLI surfaces the refusal as an ERROR line.
-//
-// golinstor's SDK still handles this correctly: the non-2xx status
-// (501) triggers `c.do`'s ApiCallError fallback path, but only when
-// `doJSON` decodes — for clone POST the body is decoded straight
-// into `ResourceDefinitionCloneStarted` and golinstor would also
-// crash without the object shape.
-func writeCloneNotImplemented(w http.ResponseWriter, srcName, cloneName string) {
-	writeJSON(w, http.StatusNotImplemented, cloneStartedResponse{
-		Location:   "/v1/resource-definitions/" + srcName + "/clone/" + cloneName,
-		SourceName: srcName,
-		CloneName:  cloneName,
-		Messages: &[]apiv1.APICallRc{{
-			RetCode: apiCallRcError,
-			Message: "resource definition clone is not yet fully implemented",
-			Cause: "the apiserver creates the clone RD shell but does not copy " +
-				"volume definitions or trigger satellite-side data copy, so " +
-				"the resulting clone is an empty shell with no usable volumes",
-			Correc: "snapshot the source and restore into a fresh RD instead: " +
-				"`linstor s create " + srcName + " <snap>` then " +
-				"`linstor s resource restore --from-resource " + srcName +
-				" --from-snapshot <snap> --to-resource " + cloneName + "`",
-			ObjRefs: map[string]string{
-				"RscDfn": srcName,
-			},
-		}},
-	})
-}
-
 // writeSnapshotCloneNotImplemented stamps the Bug 239 refusal envelope
 // for the `src_snap_name`-bearing clone path. Same wire shape as
-// writeCloneNotImplemented (CloneStarted-object on 501 so python-
+// writeCloneRefused (CloneStarted-object on 501 so python-
 // linstor's `resource_dfn_clone` can decode it without crashing), but
 // the messages are scoped to the snapshot-clone gap rather than the
 // VD-copy gap. The operator gets a concrete fallback that uses the
