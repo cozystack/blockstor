@@ -49,7 +49,11 @@ func (s *Server) registerQuerySizeInfo(mux *http.ServeMux) {
 func (s *Server) handleQuerySizeInfo(w http.ResponseWriter, r *http.Request) {
 	rgName := r.PathValue("rg")
 
-	rg, err := s.Store.ResourceGroups().Get(r.Context(), rgName)
+	// CreateVolume hot path: linstor-csi runs the capacity preflight
+	// right after ensuring the StorageClass's RG exists; the RG read
+	// may be served from a cache that still trails the RG create —
+	// see pkg/rest/cache_retry.go.
+	rg, err := getRGWithCacheRetry(r.Context(), s.Store, rgName)
 	if err != nil {
 		writeStoreError(w, err)
 

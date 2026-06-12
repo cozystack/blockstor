@@ -63,7 +63,11 @@ func (s *Server) handleVolumesPerResourceList(w http.ResponseWriter, r *http.Req
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	// Replica-create hot path: `linstor v l` / golinstor volume reads
+	// land right after autoplace / make-available wrote the replica,
+	// while the local informer cache may still trail the write — see
+	// pkg/rest/cache_retry.go.
+	res, err := getResourceWithCacheRetry(r.Context(), s.Store, rdName, node)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -95,7 +99,8 @@ func (s *Server) handleVolumesPerResourceGet(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	// Same replica-create hot path as the list sibling above.
+	res, err := getResourceWithCacheRetry(r.Context(), s.Store, rdName, node)
 	if err != nil {
 		writeStoreError(w, err)
 

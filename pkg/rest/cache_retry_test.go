@@ -129,14 +129,89 @@ func (f *lagSnapshotStore) Get(ctx context.Context, rdName, snapName string) (ap
 	return f.SnapshotStore.Get(ctx, rdName, snapName) //nolint:wrapcheck // pass-through
 }
 
-// flakyStore lets us substitute the RG / RD / Snapshot views with
-// flaky ones while everything else keeps using the wrapped InMemory.
+// lagPhysicalDeviceStore wraps an underlying PhysicalDeviceStore and
+// models the CDP-side informer-cache lag: the first `missBudget`
+// ListForNode() calls hide the named device from the result (the
+// cache has not observed the discovery loop's write yet), then reads
+// delegate to the real store (the watch event arrived). This is the
+// exact shape TestGroupB/PhysicalStorageCDPPropsPerKind trips over:
+// the PhysicalDevice CRD + Status land straight on the apiserver,
+// then `POST /v1/physical-storage/{node}` lists devices through a
+// cache that may still trail.
+type lagPhysicalDeviceStore struct {
+	store.PhysicalDeviceStore
+
+	hideName   string
+	missBudget int
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *lagPhysicalDeviceStore) ListForNode(ctx context.Context, nodeName string) ([]apiv1.PhysicalDevice, error) {
+	devs, err := f.PhysicalDeviceStore.ListForNode(ctx, nodeName)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // pass-through
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.calls >= f.missBudget {
+		return devs, nil
+	}
+
+	f.calls++
+
+	out := make([]apiv1.PhysicalDevice, 0, len(devs))
+
+	for i := range devs {
+		if devs[i].Name == f.hideName {
+			continue
+		}
+
+		out = append(out, devs[i])
+	}
+
+	return out, nil
+}
+
+// lagNodePatchStore wraps an underlying NodeStore and returns
+// store.ErrNotFound from the first `missBudget` PatchNodeSpec()
+// calls on the configured name. Models the re-register fall-through:
+// Nodes().Create just returned ErrAlreadyExists (apiserver-side,
+// authoritative), but the patch helper's read is served by an
+// informer cache that has not observed the original registration yet.
+type lagNodePatchStore struct {
+	store.NodeStore
+
+	target        string
+	notFoundUntil int
+	calls         atomic.Int32
+}
+
+func (f *lagNodePatchStore) PatchNodeSpec(ctx context.Context, name string, mutate func(*apiv1.Node) error) error {
+	if name == f.target {
+		n := f.calls.Add(1)
+		if int(n) <= f.notFoundUntil {
+			return errors.Wrapf(store.ErrNotFound, "node %q", name)
+		}
+	}
+
+	return f.NodeStore.PatchNodeSpec(ctx, name, mutate) //nolint:wrapcheck // pass-through
+}
+
+// flakyStore lets us substitute the RG / RD / Snapshot / Node /
+// PhysicalDevice views with flaky ones while everything else keeps
+// using the wrapped InMemory.
 type flakyStore struct {
 	store.Store
 
 	rgs   *flakyRGStore
 	rds   *flakyRDStore
 	snaps *lagSnapshotStore
+	pds   *lagPhysicalDeviceStore
+	nodes *lagNodePatchStore
 }
 
 func (f *flakyStore) ResourceGroups() store.ResourceGroupStore {
@@ -161,6 +236,22 @@ func (f *flakyStore) Snapshots() store.SnapshotStore {
 	}
 
 	return f.snaps
+}
+
+func (f *flakyStore) PhysicalDevices() store.PhysicalDeviceStore {
+	if f.pds == nil {
+		return f.Store.PhysicalDevices()
+	}
+
+	return f.pds
+}
+
+func (f *flakyStore) Nodes() store.NodeStore {
+	if f.nodes == nil {
+		return f.Store.Nodes()
+	}
+
+	return f.nodes
 }
 
 func TestGetRGWithCacheRetry_SucceedsAfterCacheMiss(t *testing.T) {
@@ -483,5 +574,171 @@ func TestSnapshotRestore_SurvivesCacheMissAfterCreate(t *testing.T) {
 	if restoreResp.StatusCode != http.StatusCreated {
 		t.Fatalf("restore-after-create status: got %d, want 201 (cache-lag 404 must be absorbed)",
 			restoreResp.StatusCode)
+	}
+}
+
+// TestPhysicalStorageCDP_SurvivesCacheMissOnDeviceList pins the
+// TestGroupB/PhysicalStorageCDPPropsPerKind regression on the wire:
+// the satellite discovery loop writes the PhysicalDevice CRD (and its
+// Status.DevicePath) straight to the apiserver; the operator's
+// `linstor ps cdp` lands moments later on a REST replica whose
+// informer cache has not observed the device yet. The CDP handler
+// must absorb the lag instead of 404-ing the create-device-pool
+// (`status: got 404, want 202`).
+func TestPhysicalStorageCDP_SurvivesCacheMissOnDeviceList(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-cdp-lag",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/scsi-cdp-lag",
+		Phase:      "Available",
+	}); err != nil {
+		t.Fatalf("seed PhysicalDevice: %v", err)
+	}
+
+	flaky := &flakyStore{
+		Store: st,
+		pds: &lagPhysicalDeviceStore{
+			PhysicalDeviceStore: st.PhysicalDevices(),
+			hideName:            "n1-cdp-lag",
+			missBudget:          1, // first list → device invisible, then real
+		},
+	}
+
+	base, stop := startServerWithStore(t, flaky)
+	defer stop()
+
+	resp := httpPost(t, base+"/v1/physical-storage/n1", []byte(`{
+		"provider_kind": "FILE_THIN",
+		"pool_name": "/var/lib/blockstor/cdp-filethin",
+		"device_paths": ["/dev/disk/by-id/scsi-cdp-lag"],
+		"with_storage_pool": {"name": "cdp-filethin"}
+	}`))
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("cdp under cache-miss status: got %d, want 202", resp.StatusCode)
+	}
+
+	// The attach must have landed on the real device, not been
+	// silently dropped.
+	got, err := st.PhysicalDevices().Get(t.Context(), "n1-cdp-lag")
+	if err != nil {
+		t.Fatalf("get device: %v", err)
+	}
+
+	if got.AttachTo == nil || got.AttachTo.StoragePoolName != "cdp-filethin" {
+		t.Fatalf("AttachTo after cdp: got %+v, want StoragePoolName=cdp-filethin", got.AttachTo)
+	}
+}
+
+// TestPickCDPDevicesWithCacheRetry_RealNoMatchStillEmpty pins the
+// other half of the contract: a genuinely-bogus device path keeps
+// the 404 behaviour, surfacing only after the retry budget elapsed.
+func TestPickCDPDevicesWithCacheRetry_RealNoMatchStillEmpty(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	start := time.Now()
+
+	targets, busy, err := pickCDPDevicesWithCacheRetry(t.Context(), st, "n1", []string{"/dev/never-there"})
+	if err != nil {
+		t.Fatalf("pickCDPDevicesWithCacheRetry: %v", err)
+	}
+
+	if len(targets) != 0 || busy != nil {
+		t.Fatalf("expected no match, got targets=%v busy=%v", targets, busy)
+	}
+
+	minWait := time.Duration(cacheRetryAttempts-1) * cacheRetryDelay
+	if elapsed := time.Since(start); elapsed < minWait {
+		t.Fatalf("retry loop returned in %s, expected at least %s", elapsed, minWait)
+	}
+}
+
+// TestPickCDPDevicesWithCacheRetry_BusyDeviceReturnsImmediately pins
+// the Bug 89 interplay: a busy device IS observable in the cache, so
+// the 409 must not pay the retry budget.
+func TestPickCDPDevicesWithCacheRetry_BusyDeviceReturnsImmediately(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	free := false
+	if err := st.PhysicalDevices().Create(t.Context(), &apiv1.PhysicalDevice{
+		Name:       "n1-busy",
+		NodeName:   "n1",
+		DevicePath: "/dev/disk/by-id/scsi-busy",
+		Phase:      "Available",
+		Free:       &free,
+	}); err != nil {
+		t.Fatalf("seed PhysicalDevice: %v", err)
+	}
+
+	start := time.Now()
+
+	targets, busy, err := pickCDPDevicesWithCacheRetry(t.Context(), st, "n1", []string{"/dev/disk/by-id/scsi-busy"})
+	if err != nil {
+		t.Fatalf("pickCDPDevicesWithCacheRetry: %v", err)
+	}
+
+	if busy == nil || len(targets) != 0 {
+		t.Fatalf("expected busy device, got targets=%v busy=%v", targets, busy)
+	}
+
+	if elapsed := time.Since(start); elapsed >= cacheRetryDelay {
+		t.Fatalf("busy short-circuit took %s, expected < one cacheRetryDelay (%s)", elapsed, cacheRetryDelay)
+	}
+}
+
+// TestNodeReRegister_SurvivesCacheMissOnPatch pins the node
+// re-register fall-through: the second `POST /v1/nodes` gets
+// ErrAlreadyExists from Create (authoritative proof the Node exists),
+// but the PatchNodeSpec read is served by a cache that has not
+// observed the original registration yet. The registration loop must
+// not see a spurious 404.
+func TestNodeReRegister_SurvivesCacheMissOnPatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	flaky := &flakyStore{
+		Store: st,
+		nodes: &lagNodePatchStore{
+			NodeStore:     st.Nodes(),
+			target:        "n1",
+			notFoundUntil: 1, // first patch → NotFound, then real
+		},
+	}
+
+	base, stop := startServerWithStore(t, flaky)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Node{Name: "n1", Type: apiv1.NodeTypeSatellite})
+	if err != nil {
+		t.Fatalf("marshal node: %v", err)
+	}
+
+	first := httpPost(t, base+"/v1/nodes", body)
+	_ = first.Body.Close()
+
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first register status: got %d, want 201", first.StatusCode)
+	}
+
+	second := httpPost(t, base+"/v1/nodes", body)
+	defer func() { _ = second.Body.Close() }()
+
+	if second.StatusCode != http.StatusCreated {
+		t.Fatalf("re-register under cache-miss status: got %d, want 201 (idempotent upsert; cache-lag 404 must be absorbed)",
+			second.StatusCode)
+	}
+
+	if got := flaky.nodes.calls.Load(); got < 2 {
+		t.Fatalf("expected at least 2 PatchNodeSpec attempts (NotFound, then hit), got %d", got)
 	}
 }
