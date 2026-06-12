@@ -55,20 +55,20 @@ func (s *Server) handleDRBDPassphraseSet(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 204b shape: typed-Patch with retry-on-conflict so a
+	// reconciler write on the RD between the read and the write
+	// re-applies the secret onto fresh state instead of surfacing
+	// a 409 to the operator.
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			if rd.Props == nil {
+				rd.Props = map[string]string{}
+			}
 
-		return
-	}
+			rd.Props[drbdSharedSecretKey] = req.Passphrase
 
-	if rd.Props == nil {
-		rd.Props = map[string]string{}
-	}
-
-	rd.Props[drbdSharedSecretKey] = req.Passphrase
-
-	err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 

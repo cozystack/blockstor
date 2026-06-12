@@ -348,31 +348,25 @@ func (s *Server) handleResourceConnectionPathDelete(w http.ResponseWriter, r *ht
 	nodeB := r.PathValue("nodeB")
 	name := r.PathValue("name")
 
-	rd, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
-	if err != nil {
-		writeStoreError(w, err)
+	// Bug 204b shape: typed-Patch with retry-on-conflict — the
+	// load → delete → store cycle re-runs against the live RD on
+	// every retry so a concurrent reconciler write can't surface a
+	// 409 (mirrors the path-create sibling above). `existed` is
+	// captured from the last (winning) attempt.
+	var existed bool
 
-		return
-	}
+	err := s.Store.ResourceDefinitions().PatchResourceDefinitionSpec(r.Context(), rdName,
+		func(rd *apiv1.ResourceDefinition) error {
+			paths, _, loadErr := loadPaths(rd, nodeA, nodeB)
+			if loadErr != nil {
+				return loadErr
+			}
 
-	paths, _, err := loadPaths(&rd, nodeA, nodeB)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+			existed = containsPathName(paths, name)
+			paths = deleteByName(paths, name)
 
-		return
-	}
-
-	existed := containsPathName(paths, name)
-	paths = deleteByName(paths, name)
-
-	err = storePaths(&rd, nodeA, nodeB, paths)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-
-		return
-	}
-
-	err = s.Store.ResourceDefinitions().Update(r.Context(), &rd)
+			return storePaths(rd, nodeA, nodeB, paths)
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
