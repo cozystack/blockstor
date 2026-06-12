@@ -103,8 +103,11 @@ func TestGroupKWFHappyPath(t *testing.T) {
 	// fixture's thick `file` pool and the snapshot step below is
 	// then correctly refused by the G5 thick-provider gate (only
 	// LVM_THIN / ZFS_THIN / FILE_THIN can take COW snapshots).
-	cli.Run(t, "resource", "create", "--auto-place", "2",
-		"--storage-pool", "lvm-thin", rdName)
+	// (Positional-first ordering: 1.27.1's argparse mis-counts the
+	// trailing positional after two valued options — same form
+	// Group F uses.)
+	cli.Run(t, "resource", "create", rdName, "--auto-place", "2",
+		"--storage-pool", "lvm-thin")
 
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 	waitForDRBDUpToDate(t, stack, rdName, 2)
@@ -450,14 +453,24 @@ func TestGroupKWFPoolDestroyedDropsFromPlacer(t *testing.T) {
 	rdName := "wf-pool-gone"
 	cli.Run(t, "resource-definition", "create", rdName, "--resource-group", wfRG)
 	cli.Run(t, "volume-definition", "create", rdName, "4M")
-	cli.Run(t, "resource", "create", "--auto-place", "2",
-		"--storage-pool", deadPool, rdName)
+	cli.Run(t, "resource", "create", rdName, "--auto-place", "2",
+		"--storage-pool", deadPool)
 
 	waitForDiskfulReplicaCount(t, stack, rdName, 2)
 
-	for _, r := range listResourcesOfRD(t, stack, rdName) {
-		if r.Spec.NodeName == deadNode {
-			t.Errorf("placer landed replica on node %s with PoolMissing pool %s — Bug 83 regression",
+	// Diskful replicas only: the auto-tiebreaker witness (expected on
+	// the remaining node for a 2-diskful RD post-#129) is a
+	// network-only DISKLESS attachment that consumes no pool, so a
+	// witness on the dead-pool node is fine — Bug 83 is about the
+	// placer backing a DISKFUL replica with a missing pool.
+	resources := listResourcesOfRD(t, stack, rdName)
+	for i := range resources {
+		if resourceHasFlag(&resources[i], "DISKLESS") {
+			continue
+		}
+
+		if resources[i].Spec.NodeName == deadNode {
+			t.Errorf("placer landed diskful replica on node %s with PoolMissing pool %s — Bug 83 regression",
 				deadNode, deadPool)
 		}
 	}
