@@ -366,7 +366,14 @@ func (s *Server) refuseRDCreateOnRGDeletedRace(w http.ResponseWriter, r *http.Re
 		return true
 	}
 
-	_, err := s.Store.ResourceGroups().Get(r.Context(), rd.ResourceGroupName)
+	// CreateVolume hot path: the RG may have been created moments ago
+	// (first volume of a fresh StorageClass) and the local informer
+	// cache may not have observed it yet. Without the retry this
+	// post-write re-check would mistake cache lag for the Bug 174
+	// delete race, ROLL BACK the just-persisted RD, and fail the whole
+	// CreateVolume — see pkg/rest/cache_retry.go. A real concurrent
+	// `rg d` still trips the rollback after the budget.
+	_, err := getRGWithCacheRetry(r.Context(), s.Store, rd.ResourceGroupName)
 	if err == nil {
 		return true
 	}
@@ -466,7 +473,13 @@ func (s *Server) refuseRDCreateOnUnknownRG(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	_, err := s.Store.ResourceGroups().Get(r.Context(), rd.ResourceGroupName)
+	// CreateVolume hot path: linstor-csi ensures the StorageClass's RG
+	// (POST /v1/resource-groups) and POSTs the RD referencing it
+	// back-to-back; the local informer cache may not have observed the
+	// RG write yet. Retry the NotFound under the standard budget so
+	// the Bug 134 gate doesn't refuse a perfectly valid create — see
+	// pkg/rest/cache_retry.go. A real typo still 404s after the budget.
+	_, err := getRGWithCacheRetry(r.Context(), s.Store, rd.ResourceGroupName)
 	if err == nil {
 		return true
 	}

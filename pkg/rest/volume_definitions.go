@@ -192,7 +192,11 @@ func (s *Server) handleVDList(w http.ResponseWriter, r *http.Request) {
 
 	// Verify the parent RD exists so a missing RD is 404, not 200 with [].
 	// k8s store does this internally; in-memory does not, so we do it here.
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rd)
+	//
+	// CreateVolume hot path: `vd l` / golinstor VD reads land right
+	// after the RD create while the local informer cache may still
+	// trail the write — see pkg/rest/cache_retry.go.
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -240,7 +244,12 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vd, err := s.Store.VolumeDefinitions().Get(r.Context(), rd, vn)
+	// VD-create hot path: VolumeDefinitions live inline on the parent
+	// RD, so a `vd c` immediately followed by this GET can be served
+	// from a cache that still holds the pre-create RD revision —
+	// retry the NotFound under the standard budget. See
+	// pkg/rest/cache_retry.go.
+	vd, err := getVDWithCacheRetry(r.Context(), s.Store, rd, vn)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -271,6 +280,20 @@ func (s *Server) handleVDGet(w http.ResponseWriter, r *http.Request) {
 // smallest free non-negative integer.
 func (s *Server) handleVDCreate(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
+
+	// CreateVolume hot path: linstor-csi POSTs the RD and this VD
+	// create back-to-back (sub-ms gap); the auto-assign walk and the
+	// store-level Create both read the parent RD through the informer
+	// cache, which may not have observed the RD write yet. Probe with
+	// the standard retry budget so the whole CreateVolume doesn't fail
+	// on a spurious "resource definition not found" — see
+	// pkg/rest/cache_retry.go.
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rd)
+	if err != nil {
+		writeStoreError(w, err)
+
+		return
+	}
 
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {

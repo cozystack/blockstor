@@ -421,7 +421,11 @@ func (s *Server) handleNodesList(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("node")
 
-	n, err := s.Store.Nodes().Get(r.Context(), name)
+	// Node-register hot path: `POST /v1/nodes` is immediately followed
+	// by this GET (piraeus-operator reconcile, linstor-wait-node-online)
+	// while the local informer cache may still trail the write — see
+	// pkg/rest/cache_retry.go.
+	n, err := getNodeWithCacheRetry(r.Context(), s.Store, name)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -578,7 +582,15 @@ func (s *Server) upsertNodeAndDiskless(w http.ResponseWriter, r *http.Request, n
 		// landing between the AlreadyExists probe and the persist
 		// re-applies the wire snapshot under RetryOnConflict
 		// instead of leaking a 409 into the registration loop.
-		err = s.Store.Nodes().PatchNodeSpec(r.Context(), n.Name, func(live *apiv1.Node) error {
+		//
+		// Cache-lag guard: Create just returned ErrAlreadyExists —
+		// authoritative apiserver-side proof the Node exists — but
+		// PatchNodeSpec's read is served from the informer cache,
+		// which may not have observed the original registration yet.
+		// Retry the NotFound under the standard budget so a fast
+		// re-register doesn't leak a spurious 404 into the
+		// registration loop — see pkg/rest/cache_retry.go.
+		err = patchNodeSpecWithCacheRetry(r.Context(), s.Store, n.Name, func(live *apiv1.Node) error {
 			*live = *n
 
 			return nil
