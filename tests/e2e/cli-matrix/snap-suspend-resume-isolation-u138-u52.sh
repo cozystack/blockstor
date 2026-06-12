@@ -112,10 +112,14 @@ snap_ready() {
 # timeout. A still-suspended device makes dd block; `timeout` then kills
 # it and we FAIL — that is the U138 outage signal.
 write_survives() {
-    local rd=$1
+    local rd=$1 dev
     on_node "$N1" drbdadm primary --force "$rd" 2>/dev/null || true
+    # Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+    # /dev/drbd/by-res symlink is not reliably present in the satellite
+    # mount namespace, so readlink-based resolution aborts on the stand.
+    dev=$(resolve_drbd_device "$N1" "$rd" 0 2>/dev/null) || dev=""
     if ! on_node "$N1" bash -c "
-        dev=\$(readlink -f /dev/drbd/by-res/$rd/0 2>/dev/null || true)
+        dev='$dev'
         [ -z \"\$dev\" ] && { echo 'no drbd device node for $rd' >&2; exit 2; }
         timeout 20 dd if=/dev/zero of=\"\$dev\" bs=4096 count=16 oflag=direct conv=fsync status=none
     "; then
