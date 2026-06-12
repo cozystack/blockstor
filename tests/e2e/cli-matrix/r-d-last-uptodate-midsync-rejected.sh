@@ -82,7 +82,11 @@ echo ">> Phase 2: write data on $N1 so the second replica must really resync"
 # Primary + dd a chunk to bump the GI; a fresh empty volume could
 # skip-sync and erase the SyncTarget window.
 on_node "$N1" bash -c "drbdadm primary --force $RD 2>/dev/null" || true
-on_node "$N1" bash -c "dd if=/dev/urandom of=/dev/drbd/by-res/$RD/0 bs=1M count=256 status=none oflag=direct 2>/dev/null" || true
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so the by-res dd silently no-ops on the stand.
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
+[ -n "$dev" ] && on_node "$N1" bash -c "dd if=/dev/urandom of=$dev bs=1M count=256 status=none oflag=direct 2>/dev/null" || true
 on_node "$N1" bash -c "drbdadm secondary $RD 2>/dev/null" || true
 
 echo ">> Phase 3: throttle resync (c-max-rate 1024 KiB/s) so the add stays SyncTarget"

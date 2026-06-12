@@ -91,9 +91,14 @@ on_node "$N1" drbdadm primary --force "$RD" 2>/dev/null || true
 # capture (one snap took data at byte N, the other at byte N+delta)
 # yields visibly different md5.
 echo ">> seed deterministic 256 MiB pattern on $N1's DRBD device"
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+# Last-resort minor enumeration kept for stands where sh-dev fails.
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
 on_node "$N1" bash -c "
     set -e
-    dev=\$(readlink -f /dev/drbd/by-res/$RD/0 2>/dev/null || true)
+    dev='$dev'
     if [ -z \"\$dev\" ]; then
         dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     fi
@@ -111,8 +116,10 @@ wait_uptodate "$RD" "$N1" "$N2"
 # AFTER replica $N1 already finished its snapshot — and the two
 # resulting snapshots reflect that delta.
 echo ">> start continuous writer on $N1 (urandom → DRBD device)"
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
 on_node "$N1" bash -c "
-    dev=\$(readlink -f /dev/drbd/by-res/$RD/0 2>/dev/null || ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
+    dev='$dev'
+    [ -n \"\$dev\" ] || dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     while true; do
         dd if=/dev/urandom of=\$dev bs=4K count=128 oflag=direct status=none 2>/dev/null || break
     done >/tmp/cli-matrix-snap-writer.log 2>&1 &

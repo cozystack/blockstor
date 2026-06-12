@@ -101,8 +101,12 @@ wait_uptodate "$SRC" "$N1" "$N2"
 # call and asserts Resource CRDs are stamped).
 echo ">> seed deterministic pattern on $N1 $SRC"
 on_node "$N1" drbdadm primary --force "$SRC" 2>/dev/null || true
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+dev=$(resolve_drbd_device "$N1" "$SRC" 0 2>/dev/null) || dev=""
 on_node "$N1" bash -c "
-    dev=\$(readlink -f /dev/drbd/by-res/$SRC/0 2>/dev/null || true)
+    dev='$dev'
     if [ -n \"\$dev\" ]; then
         printf 'BLOCKSTOR-BUG354-MARKER' | dd of=\"\$dev\" bs=1 count=24 conv=fsync status=none
     fi
@@ -212,10 +216,13 @@ fi
 
 # ---- Bonus: read the marker on the restored replica ----------------------
 echo ">> bonus assert: marker bytes restored from snapshot on $N1 $TGT"
+# Same portable resolver as the seeding step: by-res symlinks are
+# not reliably present in the satellite mount namespace.
+dev=$(resolve_drbd_device "$N1" "$TGT" 0 2>/dev/null) || dev=""
 marker_read=$(on_node "$N1" bash -c "
     on_node_drbdadm() { drbdadm primary --force \$1 2>/dev/null; }
     on_node_drbdadm $TGT
-    dev=\$(readlink -f /dev/drbd/by-res/$TGT/0 2>/dev/null || true)
+    dev='$dev'
     if [ -n \"\$dev\" ]; then
         head -c 24 \"\$dev\" 2>/dev/null
     fi

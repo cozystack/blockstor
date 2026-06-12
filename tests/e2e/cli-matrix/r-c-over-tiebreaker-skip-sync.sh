@@ -224,7 +224,11 @@ fi
 # Write 32 MiB; secondary will need to catch up. With skip-sync
 # the catch-up is fast but still passes through SyncSource on
 # the source side per upstream events2 semantics.
-on_node "$prim" bash -c "dd if=/dev/urandom of=/dev/drbd/by-res/$RD/0 bs=1M count=32 status=none oflag=direct 2>/dev/null" || true
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so the by-res dd silently no-ops on the stand.
+dev=$(resolve_drbd_device "$prim" "$RD" 0 2>/dev/null) || dev=""
+[ -n "$dev" ] && on_node "$prim" bash -c "dd if=/dev/urandom of=$dev bs=1M count=32 status=none oflag=direct 2>/dev/null" || true
 
 # Capture wire-shape for ~10s post-mutation.
 shape_ok=false
