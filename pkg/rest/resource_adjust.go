@@ -145,6 +145,16 @@ func (s *Server) handleResourceDeactivate(w http.ResponseWriter, r *http.Request
 // deactivate. set=true adds the flag; set=false removes every
 // occurrence. Idempotent.
 //
+// Routed through PatchResourceSpec (Bug 204b shape) so a controller
+// reconciler writing the same Resource CRD between the read and the
+// write cannot surface a 409 to the operator: the store re-fetches
+// the live object and re-applies the flag mutation under
+// RetryOnConflict with backoff. Upstream LINSTOR never returns 409
+// on activate/deactivate and the Python CLI does not retry it — the
+// pre-fix Get → mutate → Update shape leaked the optimistic-lock
+// conflict straight onto the wire (release-gate
+// TestGroupFRActivateDeactivate flake).
+//
 // Responds with an `[]ApiCallRc` envelope (Bug 45): golinstor's
 // response parser calls `json.Unmarshal` against this shape
 // unconditionally and fails with "Unable to parse REST json data:
@@ -155,16 +165,12 @@ func mutateResourceFlag(w http.ResponseWriter, r *http.Request, s *Server, flag 
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
-	if err != nil {
-		writeStoreError(w, err)
+	err := s.Store.Resources().PatchResourceSpec(r.Context(), rdName, node,
+		func(res *apiv1.Resource) error {
+			res.Flags = applyFlagMutation(res.Flags, flag, set)
 
-		return
-	}
-
-	res.Flags = applyFlagMutation(res.Flags, flag, set)
-
-	err = s.Store.Resources().Update(r.Context(), &res)
+			return nil
+		})
 	if err != nil {
 		writeStoreError(w, err)
 
