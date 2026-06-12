@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,13 +79,64 @@ func (f *flakyRDStore) Get(ctx context.Context, name string) (apiv1.ResourceDefi
 	return f.ResourceDefinitionStore.Get(ctx, name) //nolint:wrapcheck // pass-through
 }
 
-// flakyStore lets us substitute the RG / RD views with flaky ones
-// while everything else keeps using the wrapped InMemory.
+// lagSnapshotStore wraps an underlying SnapshotStore and models the
+// production read-after-write informer-cache lag: a successful
+// Create() arms `missBudget` — the next `missBudget` Get() calls on
+// the just-created snapshot return store.ErrNotFound (the cache has
+// not observed the apiserver write yet), then reads delegate to the
+// real store (the watch event arrived). This is the exact shape
+// linstor-csi's CreateVolume-from-snapshot trips over: POST snapshot
+// create, then an immediate GET on a replica whose cache trails.
+type lagSnapshotStore struct {
+	store.SnapshotStore
+
+	missBudget int
+
+	mu      sync.Mutex
+	pending map[string]int
+}
+
+func (f *lagSnapshotStore) Create(ctx context.Context, snap *apiv1.Snapshot) error {
+	err := f.SnapshotStore.Create(ctx, snap)
+	if err != nil {
+		return err //nolint:wrapcheck // pass-through
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.pending == nil {
+		f.pending = map[string]int{}
+	}
+
+	f.pending[snap.ResourceName+"/"+snap.Name] = f.missBudget
+
+	return nil
+}
+
+func (f *lagSnapshotStore) Get(ctx context.Context, rdName, snapName string) (apiv1.Snapshot, error) {
+	f.mu.Lock()
+
+	key := rdName + "/" + snapName
+	if left := f.pending[key]; left > 0 {
+		f.pending[key] = left - 1
+		f.mu.Unlock()
+
+		return apiv1.Snapshot{}, errors.Wrapf(store.ErrNotFound, "snapshot %q on RD %q", snapName, rdName)
+	}
+	f.mu.Unlock()
+
+	return f.SnapshotStore.Get(ctx, rdName, snapName) //nolint:wrapcheck // pass-through
+}
+
+// flakyStore lets us substitute the RG / RD / Snapshot views with
+// flaky ones while everything else keeps using the wrapped InMemory.
 type flakyStore struct {
 	store.Store
 
-	rgs *flakyRGStore
-	rds *flakyRDStore
+	rgs   *flakyRGStore
+	rds   *flakyRDStore
+	snaps *lagSnapshotStore
 }
 
 func (f *flakyStore) ResourceGroups() store.ResourceGroupStore {
@@ -101,6 +153,14 @@ func (f *flakyStore) ResourceDefinitions() store.ResourceDefinitionStore {
 	}
 
 	return f.rds
+}
+
+func (f *flakyStore) Snapshots() store.SnapshotStore {
+	if f.snaps == nil {
+		return f.Store.Snapshots()
+	}
+
+	return f.snaps
 }
 
 func TestGetRGWithCacheRetry_SucceedsAfterCacheMiss(t *testing.T) {
@@ -250,5 +310,178 @@ func TestSpawn_SurvivesCacheMissOnRGGet(t *testing.T) {
 
 	if flaky.rgs.calls.Load() < 2 {
 		t.Fatalf("expected at least 2 RG Get attempts, got %d", flaky.rgs.calls.Load())
+	}
+}
+
+func TestGetSnapshotWithCacheRetry_SucceedsAfterCacheMiss(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-1"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	flaky := &flakyStore{
+		Store: st,
+		snaps: &lagSnapshotStore{
+			SnapshotStore: st.Snapshots(),
+			missBudget:    2, // two cache misses after the create, then real
+		},
+	}
+
+	err := flaky.Snapshots().Create(t.Context(),
+		&apiv1.Snapshot{Name: "snap-1", ResourceName: "pvc-1"})
+	if err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	snap, err := getSnapshotWithCacheRetry(t.Context(), flaky, "pvc-1", "snap-1")
+	if err != nil {
+		t.Fatalf("getSnapshotWithCacheRetry: %v", err)
+	}
+
+	if snap.Name != "snap-1" || snap.ResourceName != "pvc-1" {
+		t.Fatalf("got %q on %q, want snap-1 on pvc-1", snap.Name, snap.ResourceName)
+	}
+}
+
+func TestGetSnapshotWithCacheRetry_RealNotFoundStillSurfaces(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	// Snapshot is never created, so every retry returns NotFound —
+	// the caller's 404 contract (unknown snapshot → 404 envelope)
+	// must survive the retry wrapper.
+	start := time.Now()
+
+	_, err := getSnapshotWithCacheRetry(t.Context(), st, "pvc-1", "does-not-exist")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+
+	minWait := time.Duration(cacheRetryAttempts-1) * cacheRetryDelay
+	if elapsed := time.Since(start); elapsed < minWait {
+		t.Fatalf("retry loop returned in %s, expected at least %s", elapsed, minWait)
+	}
+}
+
+// TestSnapshotGet_SurvivesCacheMissAfterCreate pins the F1 hot path
+// end-to-end on the wire: linstor-csi's CreateVolume-from-snapshot
+// GETs the snapshot IMMEDIATELY after the create POST (size guard
+// before snapshot-restore-resource). With the informer-cached store
+// the create writes straight to the apiserver while the follow-up
+// read is served from a cache that may not have observed the write
+// yet — the GET must absorb that lag instead of 404-ing the whole
+// CreateVolume (TestGroupJ/CSICreateVolumeFromSnapshot regression).
+func TestSnapshotGet_SurvivesCacheMissAfterCreate(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+
+	if err := st.ResourceDefinitions().Create(t.Context(), &apiv1.ResourceDefinition{Name: "pvc-clone-src"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	flaky := &flakyStore{
+		Store: st,
+		snaps: &lagSnapshotStore{
+			SnapshotStore: st.Snapshots(),
+			missBudget:    1, // first read after create → NotFound, then real
+		},
+	}
+
+	base, stop := startServerWithStore(t, flaky)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	createResp := httpPost(t, base+"/v1/resource-definitions/pvc-clone-src/snapshots", body)
+	defer func() { _ = createResp.Body.Close() }()
+
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", createResp.StatusCode)
+	}
+
+	// Immediate follow-up GET — the exact linstor-csi sequence.
+	getResp := httpGet(t, base+"/v1/resource-definitions/pvc-clone-src/snapshots/snap-1")
+	defer func() { _ = getResp.Body.Close() }()
+
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get-after-create status: got %d, want 200 (cache-lag 404 must be absorbed)",
+			getResp.StatusCode)
+	}
+
+	var got apiv1.Snapshot
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+
+	if got.Name != "snap-1" || got.ResourceName != "pvc-clone-src" {
+		t.Fatalf("got %q on %q, want snap-1 on pvc-clone-src", got.Name, got.ResourceName)
+	}
+}
+
+// TestSnapshotRestore_SurvivesCacheMissAfterCreate pins the second
+// half of the same hot path: `POST .../snapshot-restore-resource/
+// {snap}` right after the snapshot create. In production with N
+// apiserver replicas the restore POST can land on a replica whose
+// cache has not observed the snapshot yet — the source-snapshot read
+// must absorb the lag instead of failing the restore with 404.
+func TestSnapshotRestore_SurvivesCacheMissAfterCreate(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	ctx := t.Context()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-clone-src"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	// The restore path refuses vol-less snapshots (Bug 151), so the
+	// seeded source carries one VD.
+	if err := st.VolumeDefinitions().Create(ctx, "pvc-clone-src", &apiv1.VolumeDefinition{
+		VolumeNumber: 0,
+		SizeKib:      1024,
+	}); err != nil {
+		t.Fatalf("seed VD: %v", err)
+	}
+
+	flaky := &flakyStore{
+		Store: st,
+		snaps: &lagSnapshotStore{
+			SnapshotStore: st.Snapshots(),
+			missBudget:    1, // first read after create → NotFound, then real
+		},
+	}
+
+	base, stop := startServerWithStore(t, flaky)
+	defer stop()
+
+	body, err := json.Marshal(apiv1.Snapshot{Name: "snap-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	createResp := httpPost(t, base+"/v1/resource-definitions/pvc-clone-src/snapshots", body)
+	defer func() { _ = createResp.Body.Close() }()
+
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create status: got %d, want 201", createResp.StatusCode)
+	}
+
+	restoreBody := []byte(`{"to_resource":"pvc-clone-dest"}`)
+
+	restoreResp := httpPost(t,
+		base+"/v1/resource-definitions/pvc-clone-src/snapshot-restore-resource/snap-1", restoreBody)
+	defer func() { _ = restoreResp.Body.Close() }()
+
+	if restoreResp.StatusCode != http.StatusCreated {
+		t.Fatalf("restore-after-create status: got %d, want 201 (cache-lag 404 must be absorbed)",
+			restoreResp.StatusCode)
 	}
 }

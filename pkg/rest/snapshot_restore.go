@@ -101,7 +101,10 @@ func (s *Server) handleSnapshotRestoreVolumeDefinition(w http.ResponseWriter, r 
 		return
 	}
 
-	snap, err := s.Store.Snapshots().Get(r.Context(), srcRD, snapName)
+	// Cache-retry (Bug 124 class): linstor-csi restores VDs right
+	// after the snapshot create POST; absorb informer-cache lag on
+	// the source-snapshot read instead of 404-ing the restore.
+	snap, err := getSnapshotWithCacheRetry(r.Context(), s.Store, srcRD, snapName)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -257,7 +260,11 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := s.Store.Snapshots().Get(r.Context(), srcRD, snapName)
+	// Cache-retry (Bug 124 class): linstor-csi's CreateVolume-from-
+	// snapshot POSTs the restore right after the snapshot create;
+	// absorb informer-cache lag on the source-snapshot read instead
+	// of 404-ing the restore.
+	snap, err := getSnapshotWithCacheRetry(r.Context(), s.Store, srcRD, snapName)
 	if err != nil {
 		writeStoreError(w, err)
 
