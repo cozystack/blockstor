@@ -935,6 +935,82 @@ func (a *Adm) AnyConnectedPeerHasDataForVolume(ctx context.Context, resource str
 	return false
 }
 
+// SafeForMkfsRetryPromote probes `drbdsetup status <res> --json` and
+// reports whether a promote→mkfs→demote retry is provably safe to run
+// RIGHT NOW on this node without the dispatcher's auto-primary
+// blessing (the BUG-028 latch-free mkfs retry; see the satellite's
+// latchFreeMkfsRetryAllowed for the full story of the false
+// RD.Spec.Initialized latch that kills the auto-primary election).
+//
+// Returns true ONLY when ALL hold:
+//
+//   - the local role is NOT Primary (we are about to promote; an
+//     already-Primary local slot means some consumer or a previous
+//     dance holds the device — let it finish);
+//   - every local volume is diskful UpToDate (the retry exists to add
+//     a missing filesystem to a HEALTHY converged replica set, never
+//     to promote an Inconsistent local copy);
+//   - NO peer is Primary (an external promoter — drbd-reactor's RWX
+//     mount loop — may briefly hold the device; the caller simply
+//     retries on a later reconcile once it has demoted again);
+//   - every connected peer-device is UpToDate or an intentional
+//     Diskless witness. UpToDate-while-Connected means the peer is in
+//     the SAME data generation as the local volume (bit-identical), so
+//     `primary --force` mints nothing unrelated and the subsequent
+//     mkfs writes replicate to copies that already equal ours. ANY
+//     other peer-disk state (Inconsistent, DUnknown of a disconnected
+//     peer, Negotiating, …) vetoes — a disconnected diskful peer could
+//     be an offline data holder, and forcing primary against one is
+//     exactly the Bug 342 unrelated-data wedge.
+//
+// Conservative on any probe / parse failure: returns false, the retry
+// just waits for the next reconcile.
+func (a *Adm) SafeForMkfsRetryPromote(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 {
+		return false
+	}
+
+	res := status[0]
+
+	if Role(res.Role).IsPrimary() {
+		return false
+	}
+
+	if !localIsUpToDate(res.Devices) {
+		return false
+	}
+
+	for _, conn := range res.Connections {
+		if Role(conn.PeerRole).IsPrimary() {
+			return false
+		}
+
+		for _, pd := range conn.PeerDevices {
+			switch DiskState(pd.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateDiskless:
+				// Lock-step sibling or intentional witness — safe.
+			case DiskStateConsistent, DiskStateOutdated, DiskStateAttaching,
+				DiskStateDetaching, DiskStateFailed, DiskStateNegotiating,
+				DiskStateInconsistent, DiskStateDUnknown:
+				return false
+			default:
+				// Unknown/empty token — refuse, conservative.
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 // NeedsRecoveryPromote probes the live kernel via `drbdsetup status
 // <res> --json` and reports whether THIS node should re-arm the
 // auto-primary seed to unstick a fresh RD whose initial sync wedged
