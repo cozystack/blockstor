@@ -2767,6 +2767,25 @@ func (r *Reconciler) shouldRetryAutoMkfs(ctx context.Context, dr *intent.Desired
 // respawn-StandAlone protections of Bug 342/356 intact: this function
 // can only ever ADD an mkfs on a provably day0-empty generation, never
 // remove a veto protecting real data.
+//
+// KNOWN RESIDUAL AMBIGUITY (pre-existing, inherited, not widened): a
+// volume whose entire write history happened while ALL peers were
+// connected never advances its current-UUID past day0 (DRBD only
+// mints on promote/write with an absent/weak peer). A respawned
+// replica joining such a data-bearing-but-day0 survivor is
+// indistinguishable from a fresh day0 sibling by GI bookkeeping —
+// this is the SAME ambiguity resolveVolumeSeed documents for the
+// day0 seed path and the same shape the pre-existing Bug-311 retry
+// (auto-primary + absent marker, NO kernel veto at all) already had.
+// In every production auto-mkfs topology (RWX ganesha) a diskless
+// tiebreaker is part of the set, so the first consumer promote mints
+// a new UUID (weak_nodes != 0, observed on the stand), the RD
+// latches Initialized, the respawned replica is stamped
+// SkipInitialSync=false, and condition 2 above refuses the bypass.
+// Only a hand-built no-witness FileSystem/Type RD whose data never
+// saw a degraded write retains the ambiguity — accepted and
+// documented rather than "solved" with a heuristic that would
+// reintroduce the BUG-028 wedge.
 func (r *Reconciler) day0EmptyMkfsBypass(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
 	if !needsMkfs(dr) || r.cfg.Exec == nil {
 		return false
