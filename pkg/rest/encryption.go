@@ -33,8 +33,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	blockstoriov1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
+	"github.com/cozystack/blockstor/pkg/passphrase"
 )
 
 // passphraseOpTimeout bounds every Secret access from an encryption
@@ -91,13 +91,17 @@ func (r passphraseRequest) proofOfKnowledge() string {
 
 // defaultPassphraseSecretName is the Secret the controller falls
 // back to when ControllerConfig.Spec.PassphraseSecretRef is unset.
-// Operators override via the ControllerConfig CRD.
-const defaultPassphraseSecretName = "blockstor-cluster-passphrase"
+// Operators override via the ControllerConfig CRD. Canonical home:
+// pkg/passphrase (Bug 023 hoisted the Secret access there so the
+// LUKS RD-create gate and the satellite-side dispatch read the same
+// Secret this file writes); aliased locally for the existing
+// REST-side callers.
+const defaultPassphraseSecretName = passphrase.DefaultSecretName
 
 // passphraseSecretKey is the data key inside the Secret carrying
 // the cluster passphrase. Matches the upstream-LINSTOR-on-k8s
 // convention so existing Secret YAML manifests continue to work.
-const passphraseSecretKey = "passphrase"
+const passphraseSecretKey = passphrase.SecretKey
 
 // registerEncryption wires `linstor encryption *` endpoints. The
 // cluster passphrase is the master key used to encrypt LUKS volume
@@ -638,25 +642,11 @@ func (s *Server) writePassphrase(ctx context.Context, value string) error {
 // readPassphraseSecret reads the passphrase from a native Secret.
 // Empty string for "Secret missing" is the explicit signal upstream
 // uses for "no passphrase set yet" so the POST→PATCH handshake
-// works the same as on the KV path.
+// works the same as on the KV path. Delegates to the shared
+// pkg/passphrase reader (Bug 023) so the LUKS RD-create gate and the
+// satellite-side dispatch resolve the exact same Secret.
 func (s *Server) readPassphraseSecret(ctx context.Context) (string, error) {
-	name, err := s.resolvePassphraseSecretName(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	var sec corev1.Secret
-
-	err = s.Client.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: name}, &sec)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-
-		return "", errors.Wrap(err, "get passphrase Secret")
-	}
-
-	return string(sec.Data[passphraseSecretKey]), nil
+	return passphrase.Read(ctx, s.Client, s.Namespace) //nolint:wrapcheck // pkg/passphrase wraps with context already
 }
 
 // writePassphraseSecret create-or-updates the Secret. The Secret is
@@ -664,9 +654,9 @@ func (s *Server) readPassphraseSecret(ctx context.Context) (string, error) {
 // key added rather than the whole data map replaced so operators
 // can carry extra annotations / data fields out-of-band.
 func (s *Server) writePassphraseSecret(ctx context.Context, value string) error {
-	name, err := s.resolvePassphraseSecretName(ctx)
+	name, err := passphrase.SecretName(ctx, s.Client)
 	if err != nil {
-		return err
+		return err //nolint:wrapcheck // pkg/passphrase wraps with context already
 	}
 
 	var sec corev1.Secret
@@ -703,28 +693,4 @@ func (s *Server) writePassphraseSecret(ctx context.Context, value string) error 
 	}
 
 	return nil
-}
-
-// resolvePassphraseSecretName reads the singleton ControllerConfig
-// and returns the configured Secret name, falling back to the
-// default when the ControllerConfig is absent or doesn't pin a
-// reference. The fallback lets operators get a working cluster
-// without first applying a ControllerConfig CRD.
-func (s *Server) resolvePassphraseSecretName(ctx context.Context) (string, error) {
-	var ctrlConfig blockstoriov1alpha1.ControllerConfig
-
-	err := s.Client.Get(ctx, client.ObjectKey{Name: blockstoriov1alpha1.ControllerConfigName}, &ctrlConfig)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return defaultPassphraseSecretName, nil
-		}
-
-		return "", errors.Wrap(err, "get ControllerConfig")
-	}
-
-	if ctrlConfig.Spec.PassphraseSecretRef != nil && ctrlConfig.Spec.PassphraseSecretRef.Name != "" {
-		return ctrlConfig.Spec.PassphraseSecretRef.Name, nil
-	}
-
-	return defaultPassphraseSecretName, nil
 }
