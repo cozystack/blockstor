@@ -146,9 +146,12 @@ preflight_check() {
 #   - resize-pvc: needs a blockstor-side CSI StorageClass, which is not
 #     shipped yet; it can only exercise piraeus's SC, so it stays an
 #     explicit xfail until the blockstor CSI provisioner lands.
+#   - quorum-loss-2tb-recovery: stand-"big"-only (zfs-thick StoragePool
+#     with providerKind=ZFS + 2 TiB of zpool headroom per diskful node);
+#     SKIPs by design on the regular CI lanes' small disks.
 # EVERY other scenario that skips is a regression (a mandatory test
 # silently opting out) and is recorded as FAIL so the lane goes red.
-SKIP_ALLOWLIST="backing-device-fail storage-error-injection quorum-loss-recovery recovery-bitmap-drop resize-pvc"
+SKIP_ALLOWLIST="backing-device-fail storage-error-injection quorum-loss-recovery recovery-bitmap-drop resize-pvc quorum-loss-2tb-recovery"
 
 scenario_count=${#SCENARIOS[@]}
 scenario_idx=0

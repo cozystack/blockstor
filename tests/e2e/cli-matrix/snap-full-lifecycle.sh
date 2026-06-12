@@ -115,9 +115,14 @@ on_node "$N1" drbdadm primary --force "$RD" 2>/dev/null || true
 #   We therefore read the device's actual byte size and feed dd via
 #   count_bytes so the write stops exactly at the DRBD boundary.
 echo ">> Phase 2: seed deterministic random pattern on $N1 (DRBD-fit bytes), then start writer"
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+# Last-resort minor enumeration kept for stands where sh-dev fails.
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
 seed_out=$(on_node "$N1" bash -c "
     set -e
-    dev=\$(readlink -f /dev/drbd/by-res/$RD/0 2>/dev/null || true)
+    dev='$dev'
     if [ -z \"\$dev\" ]; then
         dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     fi
@@ -136,8 +141,10 @@ echo "$seed_out"
 wait_uptodate "$RD" "$N1" "$N2"
 
 echo ">> Phase 2: start continuous writer on $N1"
+dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
 on_node "$N1" bash -c "
-    dev=\$(readlink -f /dev/drbd/by-res/$RD/0 2>/dev/null || ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
+    dev='$dev'
+    [ -n \"\$dev\" ] || dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     while true; do
         dd if=/dev/urandom of=\$dev bs=4K count=128 oflag=direct status=none 2>/dev/null || break
     done >/tmp/cli-matrix-snap-lifecycle-writer.log 2>&1 &

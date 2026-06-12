@@ -50,9 +50,13 @@ func (f *fakeUeventNotifier) Emit(event uevent.Event) { f.events <- event }
 // countLsblkCalls counts how many times the FakeExec saw an `lsblk`
 // invocation. FakeExec records every Run as a FakeCall with the
 // program name; one scanOnce always shells out to lsblk first, so
-// the count is a 1:1 proxy for "scanOnce ran".
+// the count is a 1:1 proxy for "scanOnce ran". The discovery
+// runnable is still appending to the call log from its own
+// goroutine while we poll, so the read MUST go through the
+// mutex-guarded CallsSnapshot — a direct fx.Calls read here is a
+// data race.
 func countLsblkCalls(fx *storage.FakeExec) int {
-	calls := fx.Calls
+	calls := fx.CallsSnapshot()
 
 	n := 0
 

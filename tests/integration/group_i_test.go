@@ -184,9 +184,12 @@ func TestGroupI(t *testing.T) {
 // the contract that matters — accepting the modify body without
 // rejecting on shape.
 //
-// Re-reading the connection via GET confirms the canonical empty-bag
-// envelope still surfaces (golinstor decodes `{node_a, node_b,
-// properties:{}}` into a zero-value NodeConnection without error).
+// Re-reading the connection via GET confirms the canonical envelope
+// still surfaces. The upstream wire key for the property bag is
+// `props` — golinstor's NodeConnection struct is `{node_a, node_b,
+// props, flags, port}` (client/connection.go) and blockstor's
+// handler emits an empty `props` object (never `null`) when no
+// properties are set.
 func groupINodeConnectionSetProperty(t *testing.T, stack *harness.Stack) {
 	t.Helper()
 
@@ -234,8 +237,8 @@ func groupINodeConnectionSetProperty(t *testing.T, stack *harness.Stack) {
 		t.Errorf("envelope node fields: got %+v", got)
 	}
 
-	if _, ok := got["properties"].(map[string]any); !ok {
-		t.Errorf("envelope missing properties map: %+v", got)
+	if _, ok := got["props"].(map[string]any); !ok {
+		t.Errorf("envelope missing props map (upstream NodeConnection wire key): %+v", got)
 	}
 }
 

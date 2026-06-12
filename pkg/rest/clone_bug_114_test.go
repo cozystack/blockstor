@@ -45,18 +45,21 @@ import (
 // poll then answered COMPLETE as soon as the empty RD existed,
 // which lied to the operator about clone progress.
 //
-// The fix below pins the contract this REST surface honours today:
+// The contract this REST surface honours today (post-Bug-020 the
+// VD-bearing path materialises a real clone via the snapshot-restore
+// machinery — see clone_use_zfs_clone_bug020_test.go):
 //
 //   1. Source with no VolumeDefinitions clones to a target with no
 //      VolumeDefinitions (matches Group D's seed-then-clone smoke
 //      test) and clone-status answers COMPLETE — the operator
 //      explicitly asked to clone a vol-less RD shell.
-//   2. Source with at least one VolumeDefinition surfaces the
-//      satellite-side data-plane gap: the apiserver refuses with
-//      HTTP 501 + a LINSTOR `[]ApiCallRc` envelope carrying
-//      `cause` + `correction`. We deliberately leave no half-baked
-//      target RD behind, so `kubectl get rd <clone>` is `NotFound`
-//      after the refuse.
+//   2. Source with VolumeDefinitions but NO deployed diskful replica
+//      cannot be snapshotted, so the clone data plane has nothing to
+//      copy — the apiserver refuses with HTTP 409 + a CloneStarted
+//      envelope carrying `cause` + `correction` (the Bug 114 class:
+//      a 201 here would hand the operator an empty shell again). We
+//      deliberately leave no half-baked target RD behind, so
+//      `kubectl get rd <clone>` is `NotFound` after the refuse.
 //   3. clone-status reflects reality: COMPLETE only when the target
 //      RD survived the POST and its VD count matches the source's.
 //      A leftover empty target (legacy data, or a partial roll-back
@@ -112,11 +115,14 @@ func TestBug114CloneEmptySourceRefusedOrCreated(t *testing.T) {
 }
 
 // TestBug114CloneNonEmptySourceRefusesWithEnvelope is the core
-// regression guard. Source has 1 VolumeDefinition. The old handler
-// answered 201 + a `Completed cloning clone112.` message while
-// leaving the target VD-less. The new contract is:
+// regression guard against the empty-shell clone class. Source has 1
+// VolumeDefinition but NO deployed diskful replica. The original Bug
+// 114 handler answered 201 + a `Completed cloning clone112.` message
+// while leaving the target VD-less; the Bug-020 data plane clones
+// via an internal snapshot, and an un-deployed source has nothing to
+// snapshot — a 201 here would be the same lie. The contract is:
 //
-//   - status 501 (Not Implemented)
+//   - status 409 (Conflict — source not cloneable in this state)
 //   - body is the upstream `ResourceDefinitionCloneStarted` object
 //     shape — same envelope as the success path — but with the
 //     `messages[]` field carrying the error, `cause`, and
@@ -127,8 +133,8 @@ func TestBug114CloneEmptySourceRefusedOrCreated(t *testing.T) {
 //   - no half-baked target RD persists; a follow-up GET on the
 //     target name 404s
 //
-// If a future commit wires satellite-side data copy, flip this guard
-// to assert the materialised state instead.
+// The materialised-clone happy path (deployed source) is pinned in
+// clone_use_zfs_clone_bug020_test.go.
 func TestBug114CloneNonEmptySourceRefusesWithEnvelope(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
@@ -154,8 +160,8 @@ func TestBug114CloneNonEmptySourceRefusesWithEnvelope(t *testing.T) {
 	resp := httpPost(t, base+"/v1/resource-definitions/srcrd114/clone", body)
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("non-empty-source clone: status got %d, want 501 (Not Implemented)",
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("un-deployed non-empty-source clone: status got %d, want 409 (Conflict)",
 			resp.StatusCode)
 	}
 
@@ -190,8 +196,8 @@ func TestBug114CloneNonEmptySourceRefusesWithEnvelope(t *testing.T) {
 	first := started.Messages[0]
 
 	if !strings.Contains(strings.ToLower(first.Message), "clone") ||
-		!strings.Contains(strings.ToLower(first.Message), "not") {
-		t.Errorf("message should explain clone is not implemented; got %q",
+		!strings.Contains(strings.ToLower(first.Message), "refused") {
+		t.Errorf("message should explain the clone was refused; got %q",
 			first.Message)
 	}
 

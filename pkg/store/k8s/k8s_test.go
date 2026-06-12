@@ -178,6 +178,23 @@ func TestK8sSnapshotStore(t *testing.T) {
 	})
 }
 
+// TestK8sControllerPropsStore runs the shared ControllerPropsStore
+// suite against the CRD-backed store (BUG-022: keeps the k8s
+// implementation behaviourally identical to InMemory — the old
+// process-local map drifted silently).
+func TestK8sControllerPropsStore(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	storetest.RunControllerPropsStore(t, func(t *testing.T) store.Store {
+		t.Helper()
+		t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+		return k8s.New(fixture.client)
+	})
+}
+
 // envtestAvailable returns whether KUBEBUILDER_ASSETS or a known asset
 // directory exists; without binaries we cannot start envtest.
 func envtestAvailable() bool {
@@ -280,5 +297,11 @@ func wipeAll(t *testing.T, c client.Client) {
 
 	if err := c.DeleteAllOf(ctx, &crdv1alpha1.Snapshot{}); err != nil {
 		t.Logf("wipe Snapshots: %v", err)
+	}
+
+	// The ControllerConfig singleton backs ControllerProps (BUG-022);
+	// leftover ExtraProps would leak between subtests.
+	if err := c.DeleteAllOf(ctx, &crdv1alpha1.ControllerConfig{}); err != nil {
+		t.Logf("wipe ControllerConfigs: %v", err)
 	}
 }

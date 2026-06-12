@@ -260,19 +260,22 @@ func TestGroupFRToggleCancel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestGroupFRToggleDiskful2DisklessPreservesTieBreaker — Bug 104
-// (P1, QUORUM HAZARD). Starting from the steady auto-place(2) state
-// (2 diskful + 1 TIE_BREAKER on the 3rd node), `linstor r td
-// --diskless <one-of-diskful>` MUST leave the TIE_BREAKER Resource
-// intact. Pre-fix, the RD reconciler recomputed wantWitness from
-// scratch after the toggle, saw "1 diskful + 1 non-witness diskless"
-// (the freshly-flipped replica), flipped its decision to "no witness
-// needed", and DELETED the TIE_BREAKER Resource — collapsing the
-// quorum surface to 1 diskful + 1 diskless with no third voter. The
-// next network partition would freeze the volume read-only.
+// TestGroupFRToggleDiskful2DisklessReapsTieBreaker — upstream-parity
+// contract for the toggle-to-1-diskful path (supersedes the Bug 104
+// "preserve" pin, inverted alongside the L1 specs in
+// internal/controller/ensure_tiebreaker_test.go). Starting from the
+// steady auto-place(2) state (2 diskful + 1 TIE_BREAKER on the 3rd
+// node), `linstor r td --diskless <one-of-diskful>` leaves 1 diskful
+// + 1 user-diskless — at which point quorumPolicy returns quorum=off:
+// there is no diskful tie to break and no majority to freeze.
+// Upstream LINSTOR's shouldTieBreakerExist never manages a witness
+// below 2 diskful, so blockstor REAPS the now-redundant TIE_BREAKER,
+// leaving exactly 2 replicas. (The former Bug 104/108 keep/create
+// branches rested on the false premise that 1 diskful + 1 diskless
+// freezes quorum:majority.)
 // ---------------------------------------------------------------------------
 
-func TestGroupFRToggleDiskful2DisklessPreservesTieBreaker(t *testing.T) {
+func TestGroupFRToggleDiskful2DisklessReapsTieBreaker(t *testing.T) {
 	stack, cli, rd := setupGroupFRD(t, "td-tb")
 
 	// Steady state: auto-place 2 lands diskful on worker-1+worker-2,
@@ -299,22 +302,22 @@ func TestGroupFRToggleDiskful2DisklessPreservesTieBreaker(t *testing.T) {
 		return r != nil && groupFContains(r.Spec.Flags, "DISKLESS")
 	}, "Resource "+rd+"."+target+" never gained DISKLESS flag")
 
-	// Bug 104 invariant: the TIE_BREAKER Resource on `witnessNode`
-	// MUST still exist after the toggle settles. We give the RD
-	// reconciler a generous beat (rdReconcileRequeue + apply) and
-	// poll for a STABLE 3-replica composition: 1 diskful + 1
-	// non-witness diskless + 1 TIE_BREAKER.
+	// Upstream-parity invariant: the TIE_BREAKER on `witnessNode` is
+	// REAPED once the toggle settles. We give the RD reconciler a
+	// generous beat (rdReconcileRequeue + apply) and poll for a
+	// STABLE 2-replica composition: 1 diskful + 1 user-diskless,
+	// 0 witnesses.
 	deadline := time.Now().Add(groupFAssertTimeout)
 
 	for time.Now().Before(deadline) {
 		all := listResourcesByRD(t, stack, rd)
 
-		if assertBug104Composition(all, witnessNode) {
+		if assertWitnessReapedComposition(all) {
 			time.Sleep(2 * time.Second) // settle window
 
 			all = listResourcesByRD(t, stack, rd)
 
-			if assertBug104Composition(all, witnessNode) {
+			if assertWitnessReapedComposition(all) {
 				return // success
 			}
 		}
@@ -323,23 +326,24 @@ func TestGroupFRToggleDiskful2DisklessPreservesTieBreaker(t *testing.T) {
 	}
 
 	all := listResourcesByRD(t, stack, rd)
-	t.Fatalf("Bug 104: post-toggle replica set drifted from "+
-		"{1 diskful + 1 user-diskless + 1 TIE_BREAKER on %s}; got %d entries: %v",
+	t.Fatalf("post-toggle replica set drifted from "+
+		"{1 diskful + 1 user-diskless, witness on %s reaped}; got %d entries: %v",
 		witnessNode, len(all), all)
 }
 
-// assertBug104Composition returns true iff the replica set looks
-// like {1 diskful + 1 user-diskless + 1 TIE_BREAKER on witnessNode}.
-// Bug 104's failure mode is the TIE_BREAKER on witnessNode getting
-// reaped, so we pin both the count (3) and the node identity.
-func assertBug104Composition(all []blockstoriov1alpha1.Resource, witnessNode string) bool {
-	if len(all) != 3 {
+// assertWitnessReapedComposition returns true iff the replica set
+// looks like {1 diskful + 1 user-diskless} with NO TIE_BREAKER left.
+// The upstream-parity failure mode is the auto-witness surviving (or
+// being re-created) below 2 diskful, so we pin the exact count (2)
+// and a zero witness count.
+func assertWitnessReapedComposition(all []blockstoriov1alpha1.Resource) bool {
+	if len(all) != 2 {
 		return false
 	}
 
-	witnessFound := false
 	diskfulCount := 0
 	userDisklessCount := 0
+	witnessCount := 0
 
 	for i := range all {
 		isDiskless := groupFContains(all[i].Spec.Flags, "DISKLESS")
@@ -347,9 +351,7 @@ func assertBug104Composition(all []blockstoriov1alpha1.Resource, witnessNode str
 
 		switch {
 		case isTB:
-			if all[i].Spec.NodeName == witnessNode {
-				witnessFound = true
-			}
+			witnessCount++
 		case isDiskless:
 			userDisklessCount++
 		default:
@@ -357,7 +359,7 @@ func assertBug104Composition(all []blockstoriov1alpha1.Resource, witnessNode str
 		}
 	}
 
-	return witnessFound && diskfulCount == 1 && userDisklessCount == 1
+	return witnessCount == 0 && diskfulCount == 1 && userDisklessCount == 1
 }
 
 // ---------------------------------------------------------------------------

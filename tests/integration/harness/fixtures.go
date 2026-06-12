@@ -134,7 +134,16 @@ func seedStoragePool(ctx context.Context, t *testing.T, cli client.Client, node,
 	pool2 := &blockstoriov1alpha1.StoragePool{
 		// Composite name pinned by the CEL XValidation rule on
 		// StoragePool — keep `<pool>.<node>` exactly.
-		ObjectMeta: metav1.ObjectMeta{Name: pool + "." + node},
+		//
+		// The `blockstor.io/node-name` label mirrors what
+		// pkg/store/k8s.(*storagePools).Create stamps on every
+		// store-created pool: the store's ListByNode runs a label
+		// selector, so a fixture pool seeded without it is invisible
+		// to per-node store reads (e.g. the `n lost` SP cascade).
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   pool + "." + node,
+			Labels: map[string]string{"blockstor.io/node-name": node},
+		},
 		Spec: blockstoriov1alpha1.StoragePoolSpec{
 			NodeName:     node,
 			PoolName:     pool,

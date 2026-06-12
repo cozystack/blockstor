@@ -119,10 +119,16 @@ done
 # Phase 2: cross-RD correlated writer (counter into bytes 0-7 of all 3)
 # =====================================================================
 echo ">> Phase 2: start cross-RD correlated writer on $N1"
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+dev_a=$(resolve_drbd_device "$N1" "$RD_A" 0 2>/dev/null) || dev_a=""
+dev_b=$(resolve_drbd_device "$N1" "$RD_B" 0 2>/dev/null) || dev_b=""
+dev_c=$(resolve_drbd_device "$N1" "$RD_C" 0 2>/dev/null) || dev_c=""
 on_node "$N1" bash -c "
-    dev_a=\$(readlink -f /dev/drbd/by-res/$RD_A/0 2>/dev/null || true)
-    dev_b=\$(readlink -f /dev/drbd/by-res/$RD_B/0 2>/dev/null || true)
-    dev_c=\$(readlink -f /dev/drbd/by-res/$RD_C/0 2>/dev/null || true)
+    dev_a='$dev_a'
+    dev_b='$dev_b'
+    dev_c='$dev_c'
     if [ -z \"\$dev_a\" ] || [ -z \"\$dev_b\" ] || [ -z \"\$dev_c\" ]; then
         echo 'note: could not resolve all 3 drbd device paths'
         exit 0

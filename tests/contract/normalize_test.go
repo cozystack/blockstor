@@ -185,6 +185,82 @@ func TestNormalizeOperatorPropsDropped(t *testing.T) {
 	}
 }
 
+// TestNormalizeRDLayerDataDropped pins known-delta #81
+// (docs/cli-parity-known-deltas.md): blockstor stamps `layer_data`
+// on every RD GET / list response (stampRDLayerDataFromStack,
+// Bug 349) while upstream LINSTOR 1.33.2 omits the field on RDs
+// without placed resources — verified live against the dev-stand
+// oracle 2026-06-12. Normalize drops the field from RD-shaped
+// objects (those carrying `resource_group_name`) on both sides,
+// and ONLY from those: an object without the RD marker keeps its
+// `layer_data` so a drift elsewhere still fails the replay.
+func TestNormalizeRDLayerDataDropped(t *testing.T) {
+	// blockstor's synthesised flat shape on a single-RD GET.
+	bs := []byte(`{"layer_data":[{"type":"DRBD"},{"type":"STORAGE"}],"name":"trace-rd-1","resource_group_name":"DfltRscGrp"}`)
+	// Upstream's enriched shape (placed RD): volatile DRBD `data`.
+	up := []byte(`{"layer_data":[{"type":"DRBD","data":{"peer_slots":7,"port":-1,"secret":"8uJMd+d4Glx6v1RYieCT","down":false}},{"type":"STORAGE"}],"name":"orc-tbtest","resource_group_name":"DfltRscGrp"}`)
+
+	for name, in := range map[string][]byte{"blockstor-flat": bs, "oracle-enriched": up} {
+		out, err := contract.Normalize(in)
+		if err != nil {
+			t.Fatalf("%s: normalize: %v", name, err)
+		}
+
+		var decoded map[string]any
+		if err := json.Unmarshal(out, &decoded); err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+
+		if _, present := decoded["layer_data"]; present {
+			t.Errorf("%s: RD layer_data should be dropped (known-delta #81): %s", name, out)
+		}
+
+		if _, present := decoded["name"]; !present {
+			t.Errorf("%s: name lost: %s", name, out)
+		}
+	}
+
+	// List responses: the drop applies per-element.
+	list := []byte(`[{"layer_data":[{"type":"DRBD"},{"type":"STORAGE"}],"name":"trace-rd-1","resource_group_name":"DfltRscGrp"}]`)
+
+	out, err := contract.Normalize(list)
+	if err != nil {
+		t.Fatalf("list: normalize: %v", err)
+	}
+
+	var decodedList []map[string]any
+	if err := json.Unmarshal(out, &decodedList); err != nil {
+		t.Fatalf("list: decode: %v", err)
+	}
+
+	if len(decodedList) != 1 {
+		t.Fatalf("list: unexpected length: %s", out)
+	}
+
+	if _, present := decodedList[0]["layer_data"]; present {
+		t.Errorf("list: RD layer_data should be dropped (known-delta #81): %s", out)
+	}
+
+	// Scoping guard: NO `resource_group_name` marker → not an RD →
+	// `layer_data` survives. Keeps the exemption from silently
+	// swallowing a future drift on a non-RD object.
+	nonRD := []byte(`{"layer_data":[{"type":"DRBD"}],"name":"not-an-rd"}`)
+
+	out, err = contract.Normalize(nonRD)
+	if err != nil {
+		t.Fatalf("non-RD: normalize: %v", err)
+	}
+
+	var decodedNonRD map[string]any
+	if err := json.Unmarshal(out, &decodedNonRD); err != nil {
+		t.Fatalf("non-RD: decode: %v", err)
+	}
+
+	if _, present := decodedNonRD["layer_data"]; !present {
+		t.Errorf("non-RD: layer_data must survive on objects without resource_group_name: %s", out)
+	}
+}
+
 // TestNormalizePropertyBagDropsStandDefaults pins the
 // /v1/controller/properties scrub rule: when the response is a flat
 // LINSTOR property bag, stand-default keys (DrbdOptions/*, NetCom/*,

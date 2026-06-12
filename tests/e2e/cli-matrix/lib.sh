@@ -658,26 +658,39 @@ expandable_linstor_csi_sc() {
 # and aborts with "bad magic number in super-block". We pre-format
 # through the satellite so the subsequent CSI mount sees a valid fs.
 #
+# resolve_drbd_device <node> <rd> [vol=0] — print the RD's local
+# /dev/drbdN path on NODE. drbdadm sh-dev prints the volume's
+# /dev/drbdN path directly. The /dev/drbd/by-res/<rd>/<vol> symlink
+# is not reliably present in the satellite mount namespace, and
+# 'drbdsetup status' (no --json, jq absent) does not print the minor
+# — so sh-dev is the one portable resolver here. Falls back to the
+# bare-RD spelling for drbd-utils that reject '<rd>/<vol>'. Returns
+# non-zero when the device cannot be resolved.
+resolve_drbd_device() {
+    local node=$1 rd=$2 vol=${3:-0}
+    on_node "$node" sh -c "
+        dev=\$(drbdadm sh-dev '${rd}/${vol}' 2>/dev/null) \
+            || dev=\$(drbdadm sh-dev '${rd}' 2>/dev/null) || dev=''
+        [ -n \"\$dev\" ] || exit 1
+        printf '%s\n' \"\$dev\"
+    "
+}
+
 # DRBD only permits writes while Primary, so we promote --force,
 # mkfs, then demote back to Secondary (same primary/secondary dance the
 # snap-*-lifecycle cells use to write anchor data). Idempotent: a second
 # call just rewrites the fs.
 format_drbd_device() {
     local rd=$1 node=$2 fstype=${3:-ext4} vol=${4:-0}
+    local dev
+    dev=$(resolve_drbd_device "$node" "$rd" "$vol") \
+        || { echo 'format_drbd_device: cannot resolve drbd device' >&2; return 1; }
     on_node "$node" sh -c "
         set -e
-        # drbdadm sh-dev prints the volume's /dev/drbdN path directly.
-        # The /dev/drbd/by-res/<rd>/<vol> symlink is not reliably present
-        # in the satellite mount namespace, and 'drbdsetup status' (no
-        # --json, jq absent) does not print the minor — so sh-dev is the
-        # one portable resolver here.
-        dev=\$(drbdadm sh-dev '${rd}/${vol}' 2>/dev/null) \
-            || dev=\$(drbdadm sh-dev '${rd}' 2>/dev/null) || dev=''
-        [ -n \"\$dev\" ] || { echo 'format_drbd_device: cannot resolve drbd device' >&2; exit 1; }
         drbdadm primary --force '${rd}'
         # Settle the role change before mkfs opens the device.
         sleep 1
-        mkfs.${fstype} -F -q \"\$dev\"
+        mkfs.${fstype} -F -q '${dev}'
         sync
         drbdadm secondary '${rd}'
     "

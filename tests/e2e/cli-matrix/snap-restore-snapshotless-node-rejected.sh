@@ -82,15 +82,15 @@ wait_uptodate "$SRC" "$N1" "$N2"
 
 echo ">> seed deterministic marker on $N1 $SRC"
 on_node "$N1" drbdadm primary --force "$SRC" 2>/dev/null || true
-on_node "$N1" bash -c "
-    dev=\$(readlink -f /dev/drbd/by-res/$SRC/0 2>/dev/null || true)
-    if [ -n \"\$dev\" ]; then
-        printf '$MARKER' | dd of=\"\$dev\" bs=1 count=${#MARKER} conv=fsync status=none
-    else
-        echo 'ABORT: could not resolve /dev/drbd for $SRC on $N1' >&2
-        exit 2
-    fi
-"
+# Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
+# /dev/drbd/by-res symlink is not reliably present in the satellite
+# mount namespace, so readlink-based resolution aborts on the stand.
+dev=$(resolve_drbd_device "$N1" "$SRC" 0) || {
+    echo "ABORT: could not resolve /dev/drbd for $SRC on $N1" >&2
+    exit 2
+}
+on_node "$N1" bash -c \
+    "printf '$MARKER' | dd of='$dev' bs=1 count=${#MARKER} conv=fsync status=none"
 wait_uptodate "$SRC" "$N1" "$N2"
 
 echo ">> snap c $SRC $SNAP"
@@ -203,11 +203,15 @@ for node in "${placed_nodes[0]}" "${placed_nodes[1]}"; do
         on_node "$other" drbdadm secondary "$TGT_OK" 2>/dev/null || true
     done
 
+    # Same portable resolver as the seeding step: by-res symlinks are
+    # not reliably present in the satellite mount namespace. An
+    # unresolved device leaves marker_read empty and fails the
+    # data-integrity assertion below, exactly like before.
+    dev=$(resolve_drbd_device "$node" "$TGT_OK" 0 2>/dev/null) || dev=""
     marker_read=$(on_node "$node" bash -c "
         drbdadm primary --force $TGT_OK 2>/dev/null || true
-        dev=\$(readlink -f /dev/drbd/by-res/$TGT_OK/0 2>/dev/null || true)
-        if [ -n \"\$dev\" ]; then
-            head -c ${#MARKER} \"\$dev\" 2>/dev/null
+        if [ -n '$dev' ]; then
+            head -c ${#MARKER} '$dev' 2>/dev/null
         fi
     " 2>/dev/null || echo "")
 

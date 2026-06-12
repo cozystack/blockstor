@@ -1,0 +1,89 @@
+name: rd-clone-vd-data-plane
+description: |
+  Bug-020 catcher (fix: accept use_zfs_clone and materialise VD-bearing
+  RD clones). Exercises the operator clone flow end-to-end:
+    1. rd create + vd create + r create --auto-place=2
+    2. wait the source UpToDate
+    3. linstor resource-definition clone <src> <dst>
+       (linstor-client 1.27.1: bare verb POSTs WITHOUT use_zfs_clone --
+       --use-zfs-clone is store_true/default=None and python-linstor
+       only serialises non-None kwargs; the CLI then polls
+       GET /v1/resource-definitions/{src}/clone/{dst} until COMPLETE)
+    4. the clone RD materialises 2 replicas on the snapshot-holding
+       nodes and every diskful replica converges UpToDate
+
+  Pre-fix failure modes pinned: 501 refusal on a VD-bearing source
+  (Bug 114 gate) and an empty target shell that never grows replicas.
+
+  NOTE: the runner only executes `linstor` argv (no dd/curl steps), so
+  the byte-level data-plane assert (marker seeded on the source read
+  back per-replica on the clone) lives in the L6 cell
+  tests/e2e/cli-matrix/rd-clone-vd-data-plane.sh. This replay pins the
+  verb + convergence shape the runner CAN express; awaits on the clone
+  RD use the literal "{{rd}}-cl" name (await rd: fields pass through
+  the same substitution as cmd argv).
+
+  Teardown order matters: the clone depends on the internal source
+  snapshot `clone-<target>` (delta row 82 -- it must outlive the
+  clone), and `rd delete` on the source is blocked while snapshots
+  exist, so: delete the clone RD, then the internal snapshot, then the
+  source RD.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  # Short fixed name: the clone suffix and the internal snapshot name
+  # clone-{{rd}}-cl must all stay under LINSTOR's 48-char ceiling.
+  rd: replay-cl020
+  sp: stand
+
+steps:
+  - name: create-rd
+    cmd: ["resource-definition", "create", "{{rd}}"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "64M"]
+    expect_exit: 0
+  - name: auto-place-2
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-source-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: clone
+    # Pre-fix: exit non-zero (501 CloneStarted refusal on a VD-bearing
+    # source). Post-fix: the CLI waits for clone status COMPLETE.
+    cmd: ["resource-definition", "clone", "{{rd}}", "{{rd}}-cl"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}-cl"
+      min: 2
+      timeout_s: 120
+  - name: wait-clone-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}-cl"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}-cl"
+      timeout_s: 240
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}-cl"]
+  - cmd: ["snapshot", "delete", "{{rd}}", "clone-{{rd}}-cl"]
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  # Prefix-match on vars.rd also covers "{{rd}}-cl" leftovers.
+  - no_orphans
