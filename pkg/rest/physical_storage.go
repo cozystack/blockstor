@@ -159,14 +159,19 @@ func (s *Server) handlePhysicalStorageCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	devs, err := s.Store.PhysicalDevices().ListForNode(r.Context(), node)
+	// The satellite discovery loop writes PhysicalDevice CRDs (and
+	// their Status.DevicePath) straight to the apiserver; this
+	// handler's list is served from the informer cache, which may not
+	// have observed the just-discovered device yet. Retry the match
+	// under the standard cache-lag budget instead of 404-ing a valid
+	// `ps cdp` — see pkg/rest/cache_retry.go.
+	targets, busy, err := pickCDPDevicesWithCacheRetry(r.Context(), s.Store, node, req.DevicePaths)
 	if err != nil {
 		writeStoreError(w, err)
 
 		return
 	}
 
-	targets, busy := pickFreeDeviceForAttach(devs, req.DevicePaths)
 	if busy != nil {
 		writePhysicalStorageBusyDevice(w, node, busy)
 

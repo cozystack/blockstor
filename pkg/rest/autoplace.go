@@ -185,7 +185,12 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 	rdName := r.PathValue("rd")
 	node := r.PathValue("node")
 
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rdName)
+	// CreateVolume / Attach hot path: autoplace, spawn and
+	// make-available create replicas server-side and the caller reads
+	// the replica back immediately; both the RD probe and the replica
+	// read may be served by a cache that still trails those writes —
+	// see pkg/rest/cache_retry.go.
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rdName)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound,
@@ -200,7 +205,7 @@ func (s *Server) handleResourceGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.Store.Resources().Get(r.Context(), rdName, node)
+	res, err := getResourceWithCacheRetry(r.Context(), s.Store, rdName, node)
 	if err != nil {
 		writeStoreError(w, err)
 

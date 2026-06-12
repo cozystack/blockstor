@@ -222,7 +222,11 @@ func (s *Server) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 
 	// Verify the parent RD exists so missing RD is 404, not [].
-	_, err := s.Store.ResourceDefinitions().Get(r.Context(), rd)
+	//
+	// CreateSnapshot hot path: linstor-csi lists snapshots immediately
+	// after the create while the local informer cache may still trail
+	// the RD / snapshot writes — see pkg/rest/cache_retry.go.
+	_, err := getRDWithCacheRetry(r.Context(), s.Store, rd)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -905,9 +909,13 @@ func makeSnapshotPerNode(name string, nodes []string, vds []apiv1.SnapshotVolume
 //     of the parent RD's props) — both are surfaced via the wire
 //     DTO so CLI consumers don't need a second round-trip.
 func (s *Server) hydrateSnapshotFromRD(ctx context.Context, snap *apiv1.Snapshot, rd string) error {
-	srcRD, err := s.Store.ResourceDefinitions().Get(ctx, rd)
+	// CreateSnapshot hot path: csi-sanity (and impatient operators)
+	// snapshot a volume right after CreateVolume returns; the source-RD
+	// read may be served from a cache that still trails the RD write —
+	// see pkg/rest/cache_retry.go.
+	srcRD, err := getRDWithCacheRetry(ctx, s.Store, rd)
 	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
+		return err
 	}
 
 	vds, err := s.Store.VolumeDefinitions().List(ctx, rd)

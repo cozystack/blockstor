@@ -512,7 +512,11 @@ func (s *Server) handleNodeStoragePoolGet(w http.ResponseWriter, r *http.Request
 	node := r.PathValue("node")
 	pool := r.PathValue("pool")
 
-	sp, err := s.Store.StoragePools().Get(r.Context(), node, pool)
+	// Pool-create hot path: `linstor sp c` / the CDP one-shot create
+	// the pool and piraeus-operator / GetCapacity read it back
+	// immediately, while the local informer cache may still trail the
+	// write — see pkg/rest/cache_retry.go.
+	sp, err := getStoragePoolWithCacheRetry(r.Context(), s.Store, node, pool)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -592,7 +596,13 @@ func (s *Server) handleNodeStoragePoolCreate(w http.ResponseWriter, r *http.Requ
 	// (node, pool) and doesn't FK to NodeStore) and the satellite
 	// would learn about a pool on a node the controller doesn't
 	// know — a permanent orphan from the controller's POV.
-	nodeObj, nodeErr := s.Store.Nodes().Get(r.Context(), node)
+	//
+	// Node-register hot path: piraeus-operator registers the node and
+	// creates its pools in the same reconcile pass; the local informer
+	// cache may still trail the registration write, so retry the
+	// NotFound under the standard budget before refusing — see
+	// pkg/rest/cache_retry.go.
+	nodeObj, nodeErr := getNodeWithCacheRetry(r.Context(), s.Store, node)
 	if nodeErr != nil {
 		if errors.Is(nodeErr, store.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "node not found: "+node)
