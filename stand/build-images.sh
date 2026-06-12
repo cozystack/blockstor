@@ -14,10 +14,13 @@
 # ARG defaults leak through (`GIT_HASH=unknown`) because
 # `.dockerignore` excludes `.git`, so the in-container `git rev-parse
 # HEAD` fallback has no repo to read. We resolve the SHA on the host
-# (where the .git tree DOES exist) and pass it via --build-arg.
-# Tarball builds (no .git) fall back to `sha-unavailable-tarball` so a
-# bad build is distinguishable from a build that simply lacks VCS
-# context.
+# (where the VCS context DOES exist) and pass it via --build-arg.
+# Detection goes through `git rev-parse HEAD` rather than a `.git`
+# directory check: in git worktrees `.git` is a file, not a
+# directory, and a `[ -d .git ]` test wrongly classified worktree
+# builds as tarball builds. Tarball exports (no VCS context at all)
+# fall back to `sha-unavailable-tarball` so a bad build is
+# distinguishable from a build that simply lacks VCS context.
 #
 # Post-mortem Run 26-35: each `docker push` line emits
 #   <tag>: digest: sha256:<hex> size: <n>
@@ -39,13 +42,13 @@ cd "$REPO_ROOT"
 
 # GIT_HASH / BUILD_TIME can be overridden by callers (CI, dev shims)
 # that already know the right values; otherwise resolve from the host
-# checkout. Tarball builds (no .git) fall back to a structured
-# sentinel so a bad build is distinguishable from a missing VCS
-# context.
+# checkout. `git rev-parse HEAD` works in regular clones AND in git
+# worktrees (where `.git` is a file, so `[ -d .git ]` would be
+# false); only true tarball exports (rev-parse fails / git missing)
+# fall back to the structured sentinel so a bad build is
+# distinguishable from a missing VCS context.
 if [ -z "${GIT_HASH:-}" ]; then
-    if [ -d .git ] && command -v git >/dev/null 2>&1; then
-        GIT_HASH=$(git rev-parse HEAD)
-    else
+    if ! GIT_HASH=$(git rev-parse HEAD 2>/dev/null) || [ -z "$GIT_HASH" ]; then
         GIT_HASH="sha-unavailable-tarball"
     fi
 fi

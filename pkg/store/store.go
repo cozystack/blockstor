@@ -116,6 +116,16 @@ type StoragePoolStore interface {
 }
 
 // ResourceGroupStore persists ResourceGroup objects. Keyed by name.
+//
+// Annotation contract (Bug-021; shared by every annotation-carrying
+// store — RG, RD, Resource, Snapshot): on Update/Patch a NIL wire
+// `Annotations` map means "leave the stored user annotations
+// untouched", while a NON-NIL map — including an empty one — means
+// "replace the user-annotation set with exactly this set". Callers
+// that delete the last remaining annotation must therefore keep the
+// emptied map non-nil, or the deletion is silently dropped. Pinned
+// by storetest's UpdateAnnotationContract suites against both the
+// in-memory and the CRD-backed implementations.
 type ResourceGroupStore interface {
 	List(ctx context.Context) ([]apiv1.ResourceGroup, error)
 	Get(ctx context.Context, name string) (apiv1.ResourceGroup, error)
@@ -136,6 +146,8 @@ type ResourceGroupStore interface {
 }
 
 // ResourceDefinitionStore persists ResourceDefinition objects. Keyed by name.
+// Update/Patch follow the annotation contract documented on
+// ResourceGroupStore (nil = untouched, empty = clear).
 type ResourceDefinitionStore interface {
 	List(ctx context.Context) ([]apiv1.ResourceDefinition, error)
 	Get(ctx context.Context, name string) (apiv1.ResourceDefinition, error)
@@ -155,6 +167,8 @@ type ResourceDefinitionStore interface {
 
 // ResourceStore persists Resource (replica placement) objects. The
 // composite key is (resource_definition_name, node_name).
+// Update/Patch follow the annotation contract documented on
+// ResourceGroupStore (nil = untouched, empty = clear).
 type ResourceStore interface {
 	List(ctx context.Context) ([]apiv1.Resource, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error)
@@ -230,6 +244,8 @@ type VolumeDefinitionStore interface {
 
 // SnapshotStore persists Snapshot objects. The composite key is
 // (resource definition, snapshot name).
+// Update follows the annotation contract documented on
+// ResourceGroupStore (nil = untouched, empty = clear).
 type SnapshotStore interface {
 	List(ctx context.Context) ([]apiv1.Snapshot, error)
 	ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Snapshot, error)

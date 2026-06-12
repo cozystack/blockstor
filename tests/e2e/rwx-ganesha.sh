@@ -78,12 +78,52 @@ dump_diag() {
     echo "----- diag ($label): linstor-csi-controller log tail -----" >&2
     kubectl -n piraeus-datastore logs deploy/linstor-csi-controller \
         -c linstor-csi --tail=80 2>&1 >&2 || true
-    echo "----- diag ($label): linstor-csi-node logs (per worker) -----" >&2
-    kubectl -n piraeus-datastore logs ds/linstor-csi-node \
-        -c linstor-csi --tail=80 --prefix=true 2>&1 >&2 || true
-    echo "----- diag ($label): linstor r l (via blockstor controller) -----" >&2
-    kubectl -n blockstor-system exec deploy/blockstor-controller -- \
-        linstor r l 2>&1 >&2 || true
+    # `kubectl logs ds/...` follows only ONE pod ("Found 3 pods, using
+    # pod/..."), hiding the workers that actually hit the failure. Loop
+    # over every pod explicitly, all containers.
+    echo "----- diag ($label): linstor-csi-node logs (every pod, all containers) -----" >&2
+    for pod in $(kubectl -n piraeus-datastore get pods \
+            -l app.kubernetes.io/component=linstor-csi-node \
+            -o name 2>/dev/null); do
+        echo "--- $pod ---" >&2
+        kubectl -n piraeus-datastore logs "$pod" --all-containers \
+            --prefix --tail=80 2>&1 >&2 || true
+    done
+    # The NFS-Ganesha export pods and their in-pod drbd-reactor promoter
+    # are the usual suspects when consumers see `mount.nfs: Connection
+    # refused`: if the promoter never promotes the backing DRBD resource,
+    # ganesha never starts listening on any of them.
+    echo "----- diag ($label): linstor-csi-nfs-server logs (every pod, all containers) -----" >&2
+    for pod in $(kubectl -n piraeus-datastore get pods \
+            -l app.kubernetes.io/component=linstor-csi-nfs-server \
+            -o name 2>/dev/null); do
+        echo "--- $pod ---" >&2
+        kubectl -n piraeus-datastore logs "$pod" --all-containers \
+            --prefix --tail=120 2>&1 >&2 || true
+    done
+    echo "----- diag ($label): drbd-reactor promoter ConfigMap -----" >&2
+    kubectl -n piraeus-datastore get cm linstor-csi-nfs-server-reactor-config \
+        -o yaml 2>&1 >&2 || true
+    echo "----- diag ($label): EndpointSlices for svc linstor-csi-nfs -----" >&2
+    kubectl -n piraeus-datastore get endpointslices \
+        -l kubernetes.io/service-name=linstor-csi-nfs -o yaml 2>&1 >&2 || true
+    # blockstor-side view of the volume. The previous shape exec'd
+    # `linstor r l` inside the blockstor-controller image, which ships no
+    # `linstor` binary — that dump always died with "executable file not
+    # found in \$PATH". The blockstor CRDs carry the same RD/Resource
+    # state without needing any in-pod binary or a port-forward.
+    echo "----- diag ($label): blockstor RD + Resource CRDs -----" >&2
+    kubectl get resourcedefinitions.blockstor.cozystack.io 2>&1 >&2 || true
+    if [[ -n "${PV:-}" ]]; then
+        kubectl get "resourcedefinitions.blockstor.cozystack.io/$PV" \
+            -o yaml 2>&1 >&2 || true
+        for res in $(kubectl get resources.blockstor.cozystack.io \
+                -o name 2>/dev/null | grep -F "$PV" || true); do
+            kubectl get "$res" -o yaml 2>&1 >&2 || true
+        done
+    else
+        kubectl get resources.blockstor.cozystack.io 2>&1 >&2 || true
+    fi
 }
 
 cleanup() {

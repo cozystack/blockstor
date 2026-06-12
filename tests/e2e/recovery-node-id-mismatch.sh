@@ -303,6 +303,53 @@ else
     echo "         assertions are the load-bearing ones."
 fi
 
+# Clear the tamper-window wedge before applying the SKILL recipe.
+#
+# The down+sed+up above intentionally races the satellite's Bug-287
+# revive (the satellite sees the `destroy resource` event from our
+# `drbdadm down` and immediately re-ups the slot itself). When the
+# two `drbdadm` invocations interleave badly, `drbdmeta apply-al`
+# hits "Device or resource busy" (exit 20) on the backing device and
+# worker-2's kernel slot ends HALF-CONFIGURED: disk attached
+# Inconsistent with `al-suspended:yes`, both peers registered with
+# peer-device entries but `connect` never issued — connection state
+# StandAlone. The satellite then deliberately leaves it alone: a
+# StandAlone slot that retains peer-device entries matches the
+# operator-disconnect signature (see shouldSkipNetOnAdjust in
+# pkg/satellite/reconciler.go — the W12 split-brain-recipe guard),
+# so every subsequent adjust runs with --skip-net and the slot never
+# reconnects. The recovery wait below would then time out with
+# worker-2 stuck Inconsistent/StandAlone.
+#
+# That half-up wedge is an artefact of two drbdadm callers colliding
+# in the provocation step — NOT the .res node-id mismatch this
+# scenario is about (UG cases 10-11). Clear it deterministically:
+# bounce the slot with a bare `drbdadm down` and let the satellite's
+# revive (the well-tested scenario 5.32 / recovery-down-reverses
+# path, a SINGLE writer this time) bring it back up cleanly, then
+# require worker-2 UpToDate before applying the SKILL recipe.
+echo ">> clear tamper-window wedge: bounce worker-2 and wait for satellite revive"
+on_node "$WORKER_2" drbdadm down "$RD" >/dev/null 2>&1 || true
+# Kernel-truth poll, not Resource.Status: right after the down the
+# observer hasn't stamped the destroy yet, so Status.diskState can
+# serve a stale UpToDate and wave the gate through before the
+# revive actually ran. `^[[:space:]]+disk:` matches only the local
+# disk line (peer lines carry `peer-disk:`).
+deadline=$(( $(date +%s) + 120 ))
+w2_disk=""
+while (( $(date +%s) < deadline )); do
+    w2_disk=$(on_node "$WORKER_2" drbdsetup status "$RD" 2>/dev/null \
+        | grep -m1 -E '^[[:space:]]+disk:' | cut -d: -f2 | awk '{print $1}' || true)
+    if [[ "$w2_disk" == "UpToDate" ]]; then break; fi
+    sleep 2
+done
+if [[ "$w2_disk" != "UpToDate" ]]; then
+    echo "FAIL: worker-2 not UpToDate after tamper-window bounce (disk=$w2_disk)"
+    on_node "$WORKER_2" drbdsetup status "$RD" 2>&1 | head -20 || true
+    exit 1
+fi
+echo "   worker-2 back UpToDate after bounce"
+
 # SKILL recipe: drop worker-3's replica, then re-place via
 # autoplace. The CLI delete tears down the kernel resource on
 # worker-3 + removes the Resource CRD; the autoplace re-stamps a

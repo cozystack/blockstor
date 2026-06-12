@@ -237,6 +237,28 @@ func scrubMap(input map[string]any, opts NormalizeOptions) map[string]any {
 			continue
 		}
 
+		// Known-delta #81 (docs/cli-parity-known-deltas.md): blockstor
+		// stamps `layer_data` on EVERY ResourceDefinition GET / list
+		// response from Spec.LayerStack (stampRDLayerDataFromStack,
+		// Bug 349) so the CLI's `rd l` Layers column renders; upstream
+		// LINSTOR 1.33.2 emits the field only once DRBD layer data
+		// actually exists (resources placed → port/secret allocated),
+		// and then with a volatile `data` payload (port, secret, ...)
+		// blockstor never synthesises. Verified live against the
+		// dev-stand oracle 2026-06-12: a bare `rd c` and an RD with
+		// only a VD both omit `layer_data` entirely. Drop the field
+		// from RD-shaped objects on BOTH sides of the diff.
+		//
+		// Deliberately narrow: keyed on `resource_group_name`, which
+		// only the RD wire type carries. Resources' `layer_object` and
+		// volumes' `layer_data_list` are NOT touched — a drift there
+		// must still fail the replay.
+		if key == "layer_data" {
+			if _, isRD := input["resource_group_name"]; isRD {
+				continue
+			}
+		}
+
 		if key == "props" || key == "override_props" {
 			scrubbedProps := scrubProps(raw)
 			if !isEmptyValue(scrubbedProps) {

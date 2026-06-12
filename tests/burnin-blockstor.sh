@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# usage: burnin-blockstor.sh WORK_DIR [DURATION_SEC]
+# usage: burnin-blockstor.sh WORK_DIR [DURATION_SEC] [POOL]
 #
 # Continuous PVC churn against the deployed blockstor stack. Each
 # iteration:
@@ -14,6 +14,12 @@
 # Default DURATION_SEC = 86400 (24h). The "stand running for
 # 24h continuous PVC churn" item points at this script.
 #
+# POOL selects the storage pool every churn resource is placed on
+# (StorPoolName prop on both Resources). Settable as the third
+# positional arg or via the POOL env var; defaults to "stand" so
+# existing flows are unchanged. The release gate's ZFS thick burn-in
+# runs with e.g. POOL=zfs-thick.
+#
 # Reports a summary every 60 iterations: pass/fail counts + recent
 # convergence timings.
 
@@ -21,8 +27,15 @@ set -euo pipefail
 
 WORK_DIR=${1:?work_dir required}
 DURATION=${2:-86400}
+POOL=${3:-${POOL:-stand}}
 
 export KUBECONFIG="$WORK_DIR/kubeconfig"
+
+# Self-identifying startup banner: the 24h burn-in log must record
+# which pool was exercised and which commit was running.
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+GIT_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "sha-unavailable")
+echo "[$(date -u +%FT%TZ)] burnin: pool=$POOL git=$GIT_SHA duration=${DURATION}s"
 
 # PRIMARY / PEER auto-discover when not pinned: pick two worker nodes
 # (those WITHOUT the control-plane role label). Falls back to first two
@@ -93,12 +106,12 @@ spec:
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PRIMARY}}
-spec: {resourceDefinitionName: ${RD}, nodeName: ${PRIMARY}, props: {StorPoolName: stand}}
+spec: {resourceDefinitionName: ${RD}, nodeName: ${PRIMARY}, props: {StorPoolName: ${POOL}}}
 ---
 apiVersion: blockstor.cozystack.io/v1alpha1
 kind: Resource
 metadata: {name: ${RD}.${PEER}}
-spec: {resourceDefinitionName: ${RD}, nodeName: ${PEER}, props: {StorPoolName: stand}}
+spec: {resourceDefinitionName: ${RD}, nodeName: ${PEER}, props: {StorPoolName: ${POOL}}}
 EOF
 
     # Wait for UpToDate convergence — bail out fast if it doesn't

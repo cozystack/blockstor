@@ -386,6 +386,9 @@ func RunSnapshotStore(t *testing.T, newStore Factory) {
 	// can't crash the controller process.
 	t.Run("CreateNilArg", func(t *testing.T) { testSnapshotCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testSnapshotUpdateNilArg(t, newStore) })
+	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
+	// See annotation_contract.go.
+	t.Run("UpdateAnnotationContract", func(t *testing.T) { testSnapshotUpdateAnnotationContract(t, newStore) })
 	t.Run("CreateThenGet", func(t *testing.T) {
 		s := newStore(t).Snapshots()
 		ctx := t.Context()
@@ -592,6 +595,9 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 	// deterministic order, every poll reorders the list and CSI
 	// pagination would skip / duplicate entries.
 	t.Run("ListSorted", func(t *testing.T) { testResourceListSorted(t, newStore) })
+	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
+	// See annotation_contract.go.
+	t.Run("UpdateAnnotationContract", func(t *testing.T) { testResourceUpdateAnnotationContract(t, newStore) })
 	t.Run("CreateDuplicate", func(t *testing.T) {
 		s := newStore(t).Resources()
 		ctx := t.Context()
@@ -990,6 +996,9 @@ func RunResourceDefinitionStore(t *testing.T, newStore Factory) {
 			t.Errorf("Update(nil): want error, got nil")
 		}
 	})
+	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
+	// See annotation_contract.go.
+	t.Run("UpdateAnnotationContract", func(t *testing.T) { testRDUpdateAnnotationContract(t, newStore) })
 	t.Run("UpdateChangesProps", func(t *testing.T) {
 		s := newStore(t).ResourceDefinitions()
 		ctx := t.Context()
@@ -1037,6 +1046,9 @@ func RunResourceGroupStore(t *testing.T, newStore Factory) {
 	t.Run("ListSorted", func(t *testing.T) { testRGListSorted(t, newStore) })
 	t.Run("CreateNilArg", func(t *testing.T) { testRGCreateNilArg(t, newStore) })
 	t.Run("UpdateNilArg", func(t *testing.T) { testRGUpdateNilArg(t, newStore) })
+	// Bug-021: nil = untouched / non-nil = replace / empty = clear.
+	// See annotation_contract.go.
+	t.Run("UpdateAnnotationContract", func(t *testing.T) { testRGUpdateAnnotationContract(t, newStore) })
 }
 
 func testRGCreateNilArg(t *testing.T, newStore Factory) {

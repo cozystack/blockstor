@@ -530,6 +530,24 @@ func parsePositiveMinutes(s string) (int, bool) {
 	return n, true
 }
 
+// parseNonNegativeMinutes is the zero-permitting sibling of
+// parsePositiveMinutes for knobs where 0 is a legal explicit value —
+// upstream LINSTOR accepts `BalanceResourcesGracePeriod 0` as "no
+// grace window". Negative values and garbage still return
+// (0, false) so the resolver falls back to the default.
+func parseNonNegativeMinutes(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+
+	return n, true
+}
+
 // readDeadline pulls the stamped wall-clock deadline off the RD's
 // annotations. Bad / unparseable values are treated as "not set" so
 // a hand-edited annotation can't permanently disarm or wedge the
