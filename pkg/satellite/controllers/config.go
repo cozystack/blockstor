@@ -61,6 +61,17 @@ type Config struct {
 	// nil and the reconciler falls back to the cached client.
 	APIReader client.Reader
 
+	// Namespace is where the controller-side Secrets live — in
+	// particular the cluster master passphrase Secret stamped by
+	// `linstor encryption create-passphrase` (Bug 023: the
+	// ResourceReconciler reads it so the LUKS layer receives the
+	// key the upstream-standard flow set, not just the legacy
+	// plaintext controller prop). Production wires it from
+	// cmd/satellite/main.go ($POD_NAMESPACE, then the kustomize
+	// default `blockstor-system`); unit tests can leave it empty,
+	// which disables the Secret lookup entirely.
+	Namespace string
+
 	// HealthProbeBindAddress is the address the manager's healthz /
 	// readyz HTTP endpoints bind to. Empty disables the probe
 	// server (controller-runtime default). Production wires

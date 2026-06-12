@@ -122,6 +122,8 @@ After `node interface modify ... --active`, satellite re-dials the controller vi
 
 **Status (Outcome B — deferred):** Phase 10.6 retired the satellite→controller gRPC wire entirely; the satellite now talks only to the kube-apiserver via `ctrl.GetConfig()`. There is no `--controller-bind-address` flag and `NodeNetInterface` has no `Active` field — `IsActive` on the REST wire is synthesised as `i == 0` (pure presentation). Implementing live re-dial (Outcome A) would require resurrecting a custom controller wire that the Phase 10.6 design intentionally removed. Pinned by `pkg/satellite/stream/redial_spec_test.go` (`TestSatelliteFlagsLackControllerBindAddress`, `TestNodeCRDHasNoActiveField`) — both fail if anyone starts implementing Outcome A, forcing a positive re-dial test to replace them. Tracked as Bug 49 in `docs/known-issues.md`.
 
+Note on `--controller-namespace` (Bug 023): the satellite binary grew this flag to name the NAMESPACE the cluster master passphrase Secret (`linstor encryption create-passphrase`) lives in — defaulting to `$POD_NAMESPACE` then `blockstor-system`. It is read through the kube-apiserver like every other satellite input; it carries no controller ADDRESS and does not change the Outcome B posture above.
+
 ---
 
 ## End-to-end on dedicated replication network
