@@ -27,6 +27,9 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"os/exec"
 	"sort"
 	"testing"
@@ -272,10 +275,16 @@ func TestGroupANodeEvacuatePUT(t *testing.T) {
 		t.Fatalf("EVICTED stamped despite in-use refusal; flags=%v", flagsMid)
 	}
 
-	// Second call: --force MUST stamp EVICTED. This is the PUT
-	// route smoke — CLI wrapper fatals on traceback so reaching
-	// the next assert means the wire shape is intact.
-	cli.JSON(t, "node", "evacuate", "--force", harness.NodeWorker2)
+	// Second call: ?force=true MUST stamp EVICTED. The pinned CLI
+	// (linstor-client 1.27.1, asserted by Group H) has no `--force`
+	// flag on `node evacuate`, so the force override is exercised
+	// through the PUT route directly — the same
+	// `PUT /v1/nodes/{node}/evacuate?force=true` wire shape
+	// handleRGDelete's force precedent documents. The envelope must
+	// decode as the LINSTOR `[]ApiCallRc` array (Bug 78 wire).
+	putRequireAPICallRcEnvelope(t,
+		stack.RestURL+"/v1/nodes/"+harness.NodeWorker2+"/evacuate?force=true",
+		http.StatusOK)
 
 	flagsAfter := nodeFlags(t, stack, harness.NodeWorker2)
 	if !containsString(flagsAfter, "EVICTED") {
@@ -288,13 +297,19 @@ func TestGroupANodeEvacuatePUT(t *testing.T) {
 // evacuate (blockstor's REST shim wires both to handleNodeEvacuate);
 // without the PUT route, golinstor's `NodeService.Evict` (which
 // `doPUT`s) crashes the python decoder with an empty 405 body.
+//
+// The pinned CLI (linstor-client 1.27.1, asserted by Group H) does
+// not ship the `node evict` verb yet, so the PUT route is driven
+// directly over HTTP — the exact wire shape golinstor's
+// NodeService.Evict emits (`PUT /v1/nodes/{node}/evict`, empty JSON
+// body, `[]ApiCallRc` response).
 func TestGroupANodeEvictPUT(t *testing.T) {
 	stack := harness.StartStack(t)
 	harness.SeedThreeNodeCluster(t, stack)
 
-	cli := &harness.CLI{URL: stack.RestURL}
-	// `linstor node evict <node>` — same wire as evacuate.
-	cli.JSON(t, "node", "evict", harness.NodeWorker3)
+	putRequireAPICallRcEnvelope(t,
+		stack.RestURL+"/v1/nodes/"+harness.NodeWorker3+"/evict",
+		http.StatusOK)
 
 	flags := nodeFlags(t, stack, harness.NodeWorker3)
 	if !containsString(flags, "EVICTED") {
@@ -310,12 +325,24 @@ func TestGroupANodeEvictPUT(t *testing.T) {
 // DeletionTimestamp stamp would hang every orphan forever and brick
 // the next RD-create that recycles the name/port allocation.
 //
-// We seed a Resource on worker-1 + a peer replica on worker-2, then
-// call `n lost worker-1` and assert the worker-1 replica is gone
-// while worker-2 survives.
+// We seed a Resource on worker-1 + a peer replica on worker-2, take
+// worker-1's satellite offline (the documented `n lost` precondition
+// — the Bug 111 gate refuses `n lost` against an ONLINE satellite),
+// then call `n lost worker-1` and assert the worker-1 replica is
+// gone while worker-2 survives.
 func TestGroupANodeLostCascadesOrphans(t *testing.T) {
 	stack := harness.StartStack(t)
 	harness.SeedThreeNodeCluster(t, stack)
+
+	// Kill worker-1's satellite heartbeat and wait for the OFFLINE
+	// status to land — `n lost` against an ONLINE satellite is
+	// correctly refused with 409 (Bug 111), and the machine-readable
+	// CLI exits 0 even on refusal envelopes, so calling too early
+	// would silently no-op and the cascade assert below would time
+	// out with a misleading message.
+	stack.Satellite.SimulateNodeOffline(harness.NodeWorker1)
+	waitForNodeConnectionStatus(t, stack, harness.NodeWorker1,
+		blockstoriov1alpha1.NodeConnectionStatusOffline)
 
 	ctx := context.Background()
 
@@ -614,6 +641,55 @@ func retryStatusPatch(ctx context.Context, stack *harness.Stack, name string,
 	}
 
 	return lastErr
+}
+
+// putRequireAPICallRcEnvelope issues a JSON PUT with an empty-object
+// body and asserts the response status matches and the body decodes
+// as the LINSTOR `[]ApiCallRc` array shape — the envelope
+// python-linstor/golinstor expect from the node-lifecycle PUT routes
+// (Bug 78: an empty or non-JSON body crashes the python decoder).
+func putRequireAPICallRcEnvelope(t *testing.T, url string, wantStatus int) {
+	t.Helper()
+
+	resp := httpPutGroupH(t, url, []byte("{}"))
+
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("status: got %d, want %d; body: %s", resp.StatusCode, wantStatus, body)
+	}
+
+	var envelope []map[string]any
+
+	err = json.Unmarshal(body, &envelope)
+	if err != nil {
+		t.Fatalf("body is not a []ApiCallRc envelope: %v; body: %s", err, body)
+	}
+
+	if len(envelope) == 0 {
+		t.Fatalf("empty []ApiCallRc envelope; body: %s", body)
+	}
+}
+
+// waitForNodeConnectionStatus blocks until the Node CRD's
+// Status.ConnectionStatus reaches `want` — used to sequence the
+// satellite-offline simulation before `n lost` (Bug 111 gate).
+func waitForNodeConnectionStatus(t *testing.T, stack *harness.Stack, node, want string) {
+	t.Helper()
+
+	harness.Eventually(t, 10*time.Second, func() bool {
+		var got blockstoriov1alpha1.Node
+
+		err := stack.Env.Client.Get(context.Background(),
+			types.NamespacedName{Name: node}, &got)
+
+		return err == nil && got.Status.ConnectionStatus == want
+	}, "node "+node+" never reached ConnectionStatus="+want)
 }
 
 // runCLINoFatal runs the CLI and returns stdout + a best-effort

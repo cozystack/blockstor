@@ -371,6 +371,9 @@ linters:
         path: pkg/rest/
       - linters:
           - godox
+        path: pkg/passphrase/
+      - linters:
+          - godox
         path: pkg/satellite/
       - linters:
           - godox
