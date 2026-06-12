@@ -84,11 +84,16 @@ func (s *inMemoryResourceGroups) Update(_ context.Context, rg *apiv1.ResourceGro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.m[rg.Name]; !exists {
+	prev, exists := s.m[rg.Name]
+	if !exists {
 		return errors.Wrapf(ErrNotFound, "resource group %q", rg.Name)
 	}
 
-	s.m[rg.Name] = *rg
+	next := *rg
+	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
+	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
+	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
+	s.m[rg.Name] = next
 
 	return nil
 }
@@ -110,11 +115,16 @@ func (s *inMemoryResourceGroups) PatchResourceGroup(_ context.Context, name stri
 		return errors.Wrapf(ErrNotFound, "resource group %q", name)
 	}
 
+	prevAnnotations := rg.Annotations
+
 	err := mutate(&rg)
 	if err != nil {
 		return errors.Wrapf(err, "patch ResourceGroup %q", name)
 	}
 
+	// Bug-021: same annotation contract as Update — a closure that
+	// nils the map means "untouched", not "clear".
+	rg.Annotations = carryAnnotationsOnNil(rg.Annotations, prevAnnotations)
 	s.m[name] = rg
 
 	return nil

@@ -60,6 +60,25 @@ func NewInMemory() *InMemory {
 	}
 }
 
+// carryAnnotationsOnNil implements the store-wide Update/Patch
+// annotation contract (Bug-021, pinned by storetest's
+// UpdateAnnotationContract suites): a nil wire-side annotation map
+// means "leave the stored annotations untouched", while a non-nil
+// (including empty) map means "replace the user-annotation set with
+// exactly this". The k8s backend gets this behaviour from
+// mergeUserAnnotationsInto's early-return on nil; the in-memory
+// store replaces rows wholesale, so the carry-over has to be
+// explicit or the two backends diverge — which is how the
+// rebalance-pending strip silently no-op'd in production while
+// every InMemory-backed unit test stayed green.
+func carryAnnotationsOnNil(next, prev map[string]string) map[string]string {
+	if next == nil {
+		return prev
+	}
+
+	return next
+}
+
 // Nodes returns the NodeStore view of this store.
 func (s *InMemory) Nodes() NodeStore { return s.nodes }
 

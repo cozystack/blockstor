@@ -113,12 +113,18 @@ func (s *inMemorySnapshots) Update(_ context.Context, snap *apiv1.Snapshot) erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	k := snapKey{snap.ResourceName, snap.Name}
-	if _, exists := s.m[k]; !exists {
+	key := snapKey{snap.ResourceName, snap.Name}
+
+	prev, exists := s.m[key]
+	if !exists {
 		return errors.Wrapf(ErrNotFound, "snapshot %q on resource definition %q", snap.Name, snap.ResourceName)
 	}
 
-	s.m[k] = *snap
+	next := *snap
+	// Bug-021: nil wire annotations = "untouched"; empty = "clear".
+	// Mirrors the k8s store's mergeUserAnnotationsInto contract.
+	next.Annotations = carryAnnotationsOnNil(next.Annotations, prev.Annotations)
+	s.m[key] = next
 
 	return nil
 }
