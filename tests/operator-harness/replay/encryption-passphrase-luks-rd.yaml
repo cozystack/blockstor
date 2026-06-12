@@ -1,0 +1,95 @@
+name: encryption-passphrase-luks-rd
+description: |
+  Bug-023 catcher (fix: encryption create-passphrase unlocks LUKS
+  provisioning). Pins the upstream-parity Secret-only flow:
+    1. clear the legacy DrbdOptions/EncryptPassphrase controller prop
+       (empty value = delete) and assert it is ABSENT
+    2. encryption create-passphrase (master passphrase → Secret)
+    3. rd create -l drbd,luks,storage  -- pre-fix this step is
+       rejected with "LUKS layer requires DrbdOptions/EncryptPassphrase
+       to be set first" (exit 10); post-fix the Secret satisfies the
+       LUKS gate
+    4. vd create + r create --auto-place=2 -- every replica converges
+       UpToDate, proving the satellite folded the Secret value into
+       the LuksPassphrase wire prop (a gate-only patch would pass step
+       3 but loop on "LUKS in layer stack but Props.LuksPassphrase
+       empty" and never converge)
+    5. legacy prop STILL absent after provisioning
+
+  Contrast with replay/luks-encrypted-rd.yaml, which sets the legacy
+  controller prop and keeps covering the deprecated path; this
+  workflow proves the prop is no longer required.
+
+  NOTE: the runner only executes `linstor` argv, so the kernel-level
+  asserts (cryptsetup luksDump / --test-passphrase on each replica's
+  backing device) live in the L6 cell
+  tests/e2e/cli-matrix/encryption-passphrase-luks-rd.sh.
+
+prerequisites:
+  min_nodes: 2
+  storage_pool: stand
+
+vars:
+  rd: replay-pp023
+  sp: stand
+
+steps:
+  - name: clear-legacy-prop
+    # Empty value = delete (same idiom the auto-diskful workflows use
+    # in teardown; "delete a property that wasn't set" is a no-op, not
+    # an error). Establishes the Secret-only baseline on a shared
+    # stand where a sibling LUKS workflow may have left the prop.
+    cmd: ["controller", "set-property", "DrbdOptions/EncryptPassphrase", ""]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: controller
+      key: DrbdOptions/EncryptPassphrase
+      timeout_s: 30
+  - name: create-passphrase
+    # Passphrase goes via the -p flag (positional would prompt
+    # interactively). On a shared stand a cluster passphrase may
+    # already exist -- the controller answers "already exists" (exit
+    # 10), which is benign here: ANY Secret-backed passphrase
+    # satisfies the post-fix LUKS gate.
+    cmd: ["encryption", "create-passphrase", "-p", "replay-pp023-do-not-rely-on"]
+    expect_exit: [0, 10]
+  - name: create-rd-luks-no-legacy-prop
+    # THE Bug-023 step: pre-fix exit 10 ("LUKS layer requires
+    # DrbdOptions/EncryptPassphrase to be set first"), post-fix 0.
+    cmd: ["resource-definition", "create", "{{rd}}", "-l", "drbd,luks,storage"]
+    expect_exit: 0
+  - name: create-vd
+    cmd: ["volume-definition", "create", "{{rd}}", "32M"]
+    expect_exit: 0
+  - name: auto-place-2-encrypted
+    cmd: ["resource", "create", "--auto-place", "2", "--storage-pool={{sp}}", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: replica_count
+      rd: "{{rd}}"
+      min: 2
+      timeout_s: 120
+  - name: wait-uptodate
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: all_uptodate
+      rd: "{{rd}}"
+      timeout_s: 240
+  - name: legacy-prop-still-absent
+    # `expected` omitted ⇒ absence assertion: nothing may have
+    # back-filled the deprecated prop to make provisioning work.
+    cmd: ["controller", "list-properties"]
+    expect_exit: 0
+    await:
+      kind: prop_value
+      obj: controller
+      key: DrbdOptions/EncryptPassphrase
+      timeout_s: 10
+
+teardown:
+  - cmd: ["resource-definition", "delete", "{{rd}}"]
+
+invariants:
+  - no_orphans
