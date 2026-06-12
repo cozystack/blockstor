@@ -273,7 +273,13 @@ func (s *Server) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 	rd := r.PathValue("rd")
 	snapName := r.PathValue("snap")
 
-	snap, err := s.Store.Snapshots().Get(r.Context(), rd, snapName)
+	// Cache-retry (Bug 124 class): linstor-csi GETs the snapshot
+	// immediately after the create POST (CreateVolume-from-snapshot
+	// size guard). The create wrote straight to the apiserver; this
+	// read is served from the informer cache, which may not have
+	// observed the write yet — absorb the lag instead of failing
+	// the whole CreateVolume with a spurious 404.
+	snap, err := getSnapshotWithCacheRetry(r.Context(), s.Store, rd, snapName)
 	if err != nil {
 		writeStoreError(w, err)
 

@@ -125,3 +125,46 @@ func getRDWithCacheRetry(ctx context.Context, st store.Store, name string) (apiv
 
 	return apiv1.ResourceDefinition{}, errors.Wrapf(err, "get resource definition %q after %d retries", name, cacheRetryAttempts)
 }
+
+// getSnapshotWithCacheRetry returns the Snapshot `snapName` on RD
+// `rdName`, retrying on store.ErrNotFound to absorb informer-cache
+// lag after a fresh write that landed on a sibling apiserver replica.
+// Same semantics as getRGWithCacheRetry.
+//
+// linstor-csi's CreateVolume-from-snapshot sequence is `POST
+// /v1/resource-definitions/{rd}/snapshots`, then an immediate `GET
+// /v1/resource-definitions/{rd}/snapshots/{snap}` (size guard), then
+// `POST .../snapshot-restore-resource/{snap}`. The follow-up reads
+// race the informer cache exactly like the RG/RD reads above — the
+// create wrote straight to the apiserver, the read is served from a
+// cache that may not have observed the write yet — and a spurious
+// 404 fails the whole CreateVolume.
+func getSnapshotWithCacheRetry(ctx context.Context, st store.Store, rdName, snapName string) (apiv1.Snapshot, error) {
+	var (
+		snap apiv1.Snapshot
+		err  error
+	)
+
+	for attempt := range cacheRetryAttempts {
+		snap, err = st.Snapshots().Get(ctx, rdName, snapName)
+		if err == nil {
+			return snap, nil
+		}
+
+		if !errors.Is(err, store.ErrNotFound) {
+			return apiv1.Snapshot{}, errors.Wrapf(err, "get snapshot %s/%s", rdName, snapName)
+		}
+
+		if attempt == cacheRetryAttempts-1 {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return apiv1.Snapshot{}, errors.Wrap(ctx.Err(), "get snapshot: context cancelled")
+		case <-time.After(cacheRetryDelay):
+		}
+	}
+
+	return apiv1.Snapshot{}, errors.Wrapf(err, "get snapshot %s/%s after %d retries", rdName, snapName, cacheRetryAttempts)
+}
