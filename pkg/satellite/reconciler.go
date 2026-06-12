@@ -2189,7 +2189,7 @@ func (r *Reconciler) applyDRBD(ctx context.Context, dr *intent.DesiredResource, 
 		return err
 	}
 
-	return r.finishDRBDApply(ctx, dr, diskless, effectiveFirstActivation, resized, cloned)
+	return r.finishDRBDApply(ctx, dr, diskless, effectiveFirstActivation, resized, cloned, devices)
 }
 
 // healAndDispatchFsm runs the Bug 360 my-node-id self-heal and then
@@ -2293,7 +2293,7 @@ func (r *Reconciler) reconcileKernelMyNodeID(ctx context.Context, dr *intent.Des
 // adjust, and drbd-utils' compare_volume schedules attach_cmd
 // automatically when kern->disk=="none" but conf->disk points at a
 // real path. Matches upstream LINSTOR's DrbdLayer pipeline.
-func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool) error {
+func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredResource, diskless, firstActivation, resized, cloned bool, devices map[int32]string) error {
 	// Pickup-time resize: the storage layer was just grown, drbdadm
 	// resize tells the kernel to extend the replicated device to
 	// match. Adjust on its own won't do this — only resize re-reads
@@ -2342,13 +2342,41 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	_ = cloned
 
 	if autoPromote && !r.shouldForcePromote(ctx, dr) {
-		// Bug 342 force-promote gate fired: a data-bearing peer exists,
-		// so SKIP `drbdadm primary --force`. The fresh replica stays
-		// Inconsistent and SyncTargets from the peer (full resync,
-		// data-safe). Returning here also skips the mkfs-retry below —
-		// correct, since the replica adopts the peer's filesystem via
-		// the resync rather than formatting locally.
-		return nil
+		// Bug 342 force-promote gate fired: the kernel probe saw a
+		// connected peer-disk in UpToDate/Consistent/Outdated.
+		//
+		// BUG-028: that probe cannot tell an EMPTY day0 skip-initial-sync
+		// sibling (both fresh diskful replicas reach Connected+UpToDate at
+		// the shared day0 GI within ~2s, BEFORE the elected winner gets
+		// here) from a real data-bearing peer. Blindly returning here
+		// silently skipped the first-activation mkfs, latched
+		// firstActivation=false, and an external promoter (drbd-reactor
+		// RWX path) then bumped the current-UUID past day0 without
+		// writing data → the controller false-latched RD.Spec.Initialized
+		// → the dispatcher dropped auto-primary → the Bug-311 retry was
+		// permanently dead → "Bad magic number in super-block" forever.
+		//
+		// day0EmptyMkfsBypass re-checks with day0-aware evidence: ONLY
+		// when the controller-persisted SkipInitialSync says this is a
+		// genuinely-fresh generation, no peer is a proven data holder,
+		// every local volume still sits at the deterministic day0 GI
+		// (kernel-truth: a Connected+UpToDate peer necessarily shares the
+		// local current-UUID, so day0 here proves every connected peer is
+		// a never-written day0 sibling too), and no volume carries a
+		// filesystem signature, do we fall through to the promote+mkfs.
+		if !r.day0EmptyMkfsBypass(ctx, dr, devices) {
+			// Genuine data-bearing peer (or any evidence is missing —
+			// conservative): SKIP `drbdadm primary --force`. The fresh
+			// replica stays Inconsistent and SyncTargets from the peer
+			// (full resync, data-safe). Returning here also skips the
+			// mkfs-retry below — correct, since the replica adopts the
+			// peer's filesystem via the resync rather than formatting
+			// locally.
+			return nil
+		}
+
+		log.FromContext(ctx).Info("BUG-028: force-promote veto bypassed — every connected peer is a day0-empty sibling, proceeding to first-activation mkfs",
+			"resource", dr.GetName())
 	}
 
 	// Reaching UpToDate no longer depends on this promote. The elected
@@ -2396,7 +2424,19 @@ func (r *Reconciler) finishDRBDApply(ctx context.Context, dr *intent.DesiredReso
 	// already populated from a previous attempt), runAutoMkfs writes
 	// the marker and this branch becomes a no-op for the rest of the
 	// resource's life.
-	if !autoPromote && autoPrimaryReplica && r.needsAutoMkfsRetry(dr) {
+	//
+	// BUG-028: the retry can no longer depend SOLELY on
+	// autoPrimaryReplica. When the false RD.Spec.Initialized latch fires
+	// (an external promoter bumped the current-UUID past day0 without
+	// writing data), the dispatcher stops stamping `auto-primary` and the
+	// autoPrimaryReplica-only gate left this retry permanently dead on a
+	// volume that NEVER got a filesystem. latchFreeMkfsRetryAllowed
+	// re-enables the retry from first principles instead: deterministic
+	// lowest-diskful-node-id winner, kernel state safe for a promote (all
+	// replicas Secondary + lock-step UpToDate — retried later when a
+	// foreign Primary such as drbd-reactor briefly holds the device), and
+	// an actual filesystem-absence probe on every local volume.
+	if r.shouldRetryAutoMkfs(ctx, dr, autoPromote, autoPrimaryReplica, diskless, devices) {
 		err := r.runAutoPromote(ctx, dr)
 		if err != nil {
 			return err
@@ -2658,6 +2698,215 @@ func (r *Reconciler) needsAutoMkfsRetry(dr *intent.DesiredResource) bool {
 	_, err := os.Stat(markerPath)
 
 	return os.IsNotExist(err)
+}
+
+// shouldRetryAutoMkfs is the Bug-311 mkfs-retry predicate (see the
+// finishDRBDApply call-site comment for the full history): re-enter the
+// promote→mkfs→demote dance on a steady-state reconcile when the
+// first-activation mkfs never finished. The replica must be diskful and
+// past its first activation, the marker/Condition must be absent
+// (needsAutoMkfsRetry), and the node must be authorised either by the
+// dispatcher's auto-primary election or — BUG-028 — by the latch-free
+// evidence chain (latchFreeMkfsRetryAllowed) when the false
+// RD.Spec.Initialized latch killed that election.
+func (r *Reconciler) shouldRetryAutoMkfs(ctx context.Context, dr *intent.DesiredResource, autoPromote, autoPrimaryReplica, diskless bool, devices map[int32]string) bool {
+	if autoPromote || diskless || !r.needsAutoMkfsRetry(dr) {
+		return false
+	}
+
+	return autoPrimaryReplica || r.latchFreeMkfsRetryAllowed(ctx, dr, devices)
+}
+
+// day0EmptyMkfsBypass is the BUG-028 narrow escape hatch from the Bug
+// 342 force-promote veto. The veto's kernel probe (peer-disk UpToDate/
+// Consistent/Outdated) is the right conservative default, but it cannot
+// distinguish a real data-bearing peer from an EMPTY day0
+// skip-initial-sync sibling: both fresh diskful replicas of a
+// skip-seeded RD reach Connected+UpToDate at the SHARED deterministic
+// day0 current-UUID within seconds — often before the elected
+// mkfs winner reaches finishDRBDApply. Honouring the veto there
+// silently dropped the one-and-only first-activation mkfs.
+//
+// Returns true ONLY when every signal proves "all connected peers are
+// day0-empty siblings of the same never-initialized generation" (belt
+// and braces, all four must hold):
+//
+//  1. The RD asks for a filesystem and the satellite can run mkfs at
+//     all (needsMkfs + Exec wired) — otherwise the bypass is moot.
+//  2. The controller-persisted Spec.SkipInitialSync is explicitly true:
+//     the OFFLINE-SAFE proof this replica was born into a genuinely-
+//     fresh, never-initialized RD generation (relocate / migrate /
+//     extra-replica destinations are stamped false and never bypass).
+//  3. The dispatcher's CRD view reports no proven data-bearing diskful
+//     peer (PeerHasData=false; day0 siblings are already excluded by
+//     isDay0SeededVolume, a real survivor is not).
+//  4. Kernel/metadata truth per volume: the LOCAL current-UUID still
+//     equals the deterministic day0 GI. DRBD only lets two replicas
+//     sit Connected+UpToDate when they are in the same data
+//     generation, so local==day0 proves every connected UpToDate peer
+//     — exactly the ones that fired the veto — is at day0 too, i.e. a
+//     never-written sibling. A real data holder mints a runtime UUID
+//     that cannot collide with day0 (2^-64), so this discriminator is
+//     exact. AND the volume's backing device carries no filesystem
+//     signature (blkid probe; the DRBD device itself is unopenable
+//     while Secondary, and with internal metadata the backing device
+//     exposes the same data bytes at offset 0).
+//
+// Any probe failure, missing device path, or unknown GI refuses the
+// bypass — the veto then stands and behaviour is exactly pre-BUG-028
+// (skip promote, full-resync path). That keeps the relocate /
+// respawn-StandAlone protections of Bug 342/356 intact: this function
+// can only ever ADD an mkfs on a provably day0-empty generation, never
+// remove a veto protecting real data.
+func (r *Reconciler) day0EmptyMkfsBypass(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	if !needsMkfs(dr) || r.cfg.Exec == nil {
+		return false
+	}
+
+	if skip := dr.GetSkipInitialSync(); skip == nil || !*skip {
+		return false
+	}
+
+	if dr.GetPeerHasData() {
+		return false
+	}
+
+	return r.allVolumesDay0Empty(ctx, dr, devices)
+}
+
+// allVolumesDay0Empty reports whether EVERY desired volume of dr still
+// sits at the deterministic day0 current-UUID in its on-disk DRBD
+// metadata AND carries no filesystem signature on its backing device.
+// Conservative: any missing device path, drbdmeta/blkid probe failure,
+// or non-day0 GI returns false. See day0EmptyMkfsBypass for why this
+// is the exact "all connected peers are day0-empty siblings" proof.
+func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	for _, vol := range dr.GetVolumes() {
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			return false
+		}
+
+		gi, err := r.cfg.Adm.CurrentGI(ctx, dr.GetName(), vol.GetVolumeNumber(), device)
+		if err != nil || gi == "" {
+			return false
+		}
+
+		if !strings.EqualFold(gi, day0GiFor(dr.GetName(), vol.GetVolumeNumber())) {
+			return false
+		}
+
+		if r.deviceHasFilesystem(ctx, device) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// latchFreeMkfsRetryAllowed is the BUG-028 replacement evidence for the
+// Bug-311 mkfs retry when the dispatcher no longer stamps
+// `auto-primary`. The dispatcher's election is gated on
+// !RD.Spec.Initialized, and that latch can fire FALSELY on a volume
+// that never received its filesystem: an external promoter
+// (drbd-reactor's RWX promote→mount-fail→demote loop) bumps the DRBD
+// current-UUID past day0 WITHOUT writing data, the controller reads
+// "UpToDate diskful with CurrentGI != day0" as proven data, latches
+// Initialized=true, and the auto-primary-only retry gate goes
+// permanently dead. This helper re-derives the retry permission from
+// first principles instead of the (unprovable-here) latch:
+//
+//   - This node is the DETERMINISTIC retry winner: lowest diskful
+//     node-id among itself and its configured peers — the same
+//     election rule the dispatcher uses — so at most ONE node ever
+//     re-enters the promote→mkfs→demote dance.
+//   - Kernel state is promote-safe (Adm.SafeForMkfsRetryPromote): the
+//     local replica is Secondary with every volume UpToDate, no
+//     replica anywhere is Primary (a foreign Primary — drbd-reactor
+//     mid-cycle — simply defers the retry to a later reconcile, when
+//     it has demoted again), and every connected peer-device is
+//     UpToDate or an intentional Diskless witness. An UNKNOWN /
+//     disconnected diskful peer vetoes: it could be an offline data
+//     holder, and `primary --force` against it is the Bug 342 wedge.
+//     Conversely all-UpToDate-while-Connected proves every replica is
+//     in the SAME data generation as the local one, so the promote
+//     mints nothing unrelated and the mkfs writes replicate to peers
+//     that are by construction bit-identical to the local volume.
+//   - Every local volume's backing device has NO filesystem signature
+//     (blkid): real data in the mkfs context means a filesystem (the
+//     RD requests FileSystem/Type; consumers only ever write through
+//     it), so fs-absence both proves the retry is still needed and
+//     that there is nothing to destroy. The post-promote blkid probe
+//     inside runAutoMkfs remains the per-volume double-mkfs safety
+//     net on the replicated device itself.
+//   - Throttled through recoveryPromoteDue (shared with the Bug 366
+//     recovery-promote): the promote→demote dance churns kernel state
+//     and may race the external promoter's own cycle; one nudge per
+//     throttle window is enough and keeps the reconcile loop cold.
+//
+// Callers must have already checked needsAutoMkfsRetry (marker and
+// Condition absent) so the probes below only ever run on a resource
+// that is genuinely missing its filesystem marker — never in steady
+// state.
+func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.DesiredResource, devices map[int32]string) bool {
+	if !r.isLowestDiskfulNodeID(dr) {
+		return false
+	}
+
+	if !r.cfg.Adm.SafeForMkfsRetryPromote(ctx, dr.GetName()) {
+		return false
+	}
+
+	for _, vol := range dr.GetVolumes() {
+		device := devices[vol.GetVolumeNumber()]
+		if device == "" {
+			return false
+		}
+
+		if r.deviceHasFilesystem(ctx, device) {
+			return false
+		}
+	}
+
+	// Consume the throttle slot LAST so a pass vetoed by a foreign
+	// Primary / probe failure does not burn the window.
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return false
+	}
+
+	log.FromContext(ctx).Info("BUG-028: latch-free mkfs retry — no auto-primary election but filesystem is provably absent, re-entering promote+mkfs+demote",
+		"resource", dr.GetName())
+
+	return true
+}
+
+// isLowestDiskfulNodeID replicates the dispatcher's mkfs-winner
+// election on the satellite side from the wire DrbdOptions: true when
+// the LOCAL node-id is resolved and is strictly the lowest among the
+// local node and every configured non-diskless peer. Missing /
+// unparsable local id refuses (conservative — an unresolved identity
+// must never promote); a peer with a missing id is treated as diskful
+// id-unknown and also refuses, since the election would be ambiguous.
+func (r *Reconciler) isLowestDiskfulNodeID(dr *intent.DesiredResource) bool {
+	opts := dr.GetDrbdOptions()
+
+	selfID, err := strconv.Atoi(opts["node-id"])
+	if err != nil {
+		return false
+	}
+
+	for _, peer := range dr.GetPeerNames() {
+		if opts["peer."+peer+".diskless"] == drbdBoolPropTrue {
+			continue
+		}
+
+		peerID, peerErr := strconv.Atoi(opts["peer."+peer+".node-id"])
+		if peerErr != nil || peerID < selfID {
+			return false
+		}
+	}
+
+	return true
 }
 
 // isDisklessToDiskfulFlip probes whether the local kernel slot is
