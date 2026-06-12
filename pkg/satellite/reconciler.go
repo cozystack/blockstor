@@ -2737,9 +2737,18 @@ func (r *Reconciler) shouldRetryAutoMkfs(ctx context.Context, dr *intent.Desired
 //     the OFFLINE-SAFE proof this replica was born into a genuinely-
 //     fresh, never-initialized RD generation (relocate / migrate /
 //     extra-replica destinations are stamped false and never bypass).
-//  3. The dispatcher's CRD view reports no proven data-bearing diskful
-//     peer (PeerHasData=false; day0 siblings are already excluded by
-//     isDay0SeededVolume, a real survivor is not).
+//  3. Kernel coverage of the whole configured replica set
+//     (Adm.Day0SiblingSetConnected): no Primary anywhere, local
+//     UpToDate, every connected peer-device UpToDate/Diskless, and any
+//     not-yet-handshaken peer is an intentional diskless witness. An
+//     un-handshaken DISKFUL peer (potential offline data holder)
+//     refuses. NOTE this deliberately supersedes the dispatcher's
+//     CRD-level PeerHasData: that flag treats an UpToDate day0 sibling
+//     whose CurrentGI backfill has not landed yet as data-bearing
+//     (correct for the re-computed seed gates, but a FALSE positive
+//     here would permanently cost the one-shot first-activation mkfs).
+//     Every state PeerHasData correctly protects is still refused by
+//     this kernel check plus the GI proof below.
 //  4. Kernel/metadata truth per volume: the LOCAL current-UUID still
 //     equals the deterministic day0 GI. DRBD only lets two replicas
 //     sit Connected+UpToDate when they are in the same data
@@ -2767,11 +2776,31 @@ func (r *Reconciler) day0EmptyMkfsBypass(ctx context.Context, dr *intent.Desired
 		return false
 	}
 
-	if dr.GetPeerHasData() {
+	if !r.cfg.Adm.Day0SiblingSetConnected(ctx, dr.GetName(), disklessPeerSet(dr)) {
 		return false
 	}
 
 	return r.allVolumesDay0Empty(ctx, dr, devices)
+}
+
+// disklessPeerSet collects the configured peers the dispatcher marked
+// as intentional diskless witnesses (`peer.<name>.diskless=true` in
+// the wire DrbdOptions). Consumed by the day0 bypass coverage probe to
+// tolerate a witness whose connection has not handshaken yet — it
+// carries no data by construction, so it cannot be a data holder the
+// bypass must wait for.
+func disklessPeerSet(dr *intent.DesiredResource) map[string]bool {
+	opts := dr.GetDrbdOptions()
+
+	out := make(map[string]bool)
+
+	for _, peer := range dr.GetPeerNames() {
+		if opts["peer."+peer+".diskless"] == drbdBoolPropTrue {
+			out[peer] = true
+		}
+	}
+
+	return out
 }
 
 // allVolumesDay0Empty reports whether EVERY desired volume of dr still
@@ -2796,7 +2825,12 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 			return false
 		}
 
-		if r.deviceHasFilesystem(ctx, device) {
+		// backingHasUserFilesystem, NOT deviceHasFilesystem: the
+		// backing device of an internal-metadata DRBD volume always
+		// shows blkid TYPE=drbd (the meta superblock at its tail) —
+		// only a non-drbd signature is user data (stand forensics
+		// pinned this; the naive probe wedged the bypass forever).
+		if r.backingHasUserFilesystem(ctx, device) {
 			return false
 		}
 	}
@@ -2832,13 +2866,18 @@ func (r *Reconciler) allVolumesDay0Empty(ctx context.Context, dr *intent.Desired
 //     in the SAME data generation as the local one, so the promote
 //     mints nothing unrelated and the mkfs writes replicate to peers
 //     that are by construction bit-identical to the local volume.
-//   - Every local volume's backing device has NO filesystem signature
-//     (blkid): real data in the mkfs context means a filesystem (the
-//     RD requests FileSystem/Type; consumers only ever write through
-//     it), so fs-absence both proves the retry is still needed and
-//     that there is nothing to destroy. The post-promote blkid probe
-//     inside runAutoMkfs remains the per-volume double-mkfs safety
-//     net on the replicated device itself.
+//   - At least one local volume's backing device has NO USER
+//     filesystem signature (backingHasUserFilesystem — blkid that
+//     ignores TYPE=drbd, the internal-metadata superblock libblkid
+//     always sees at the backing device's tail; the naive probe
+//     wedged this gate forever on real hardware). Real data in the
+//     mkfs context means a filesystem (the RD requests
+//     FileSystem/Type; consumers only ever write through it), so a
+//     volume missing one both proves the retry is still needed and
+//     that there is nothing to destroy there; volumes that DO carry a
+//     filesystem are adopted untouched by runAutoMkfs's post-promote
+//     blkid probe on the replicated device (the Bug 311 partial-mkfs
+//     shape), which remains the per-volume double-mkfs safety net.
 //   - Throttled through recoveryPromoteDue (shared with the Bug 366
 //     recovery-promote): the promote→demote dance churns kernel state
 //     and may race the external promoter's own cycle; one nudge per
@@ -2857,24 +2896,43 @@ func (r *Reconciler) latchFreeMkfsRetryAllowed(ctx context.Context, dr *intent.D
 		return false
 	}
 
+	// At least one desired volume must still be missing a USER
+	// filesystem (backing probe; TYPE=drbd is the internal-metadata
+	// signature, not user data) — otherwise there is nothing to retry.
+	// Volumes that already carry a filesystem are fine: runAutoMkfs's
+	// per-volume blkid probe on the promoted DRBD device adopts them
+	// untouched (the Bug 311 partial-mkfs shape).
+	anyVolumeNeedsMkfs := false
+
 	for _, vol := range dr.GetVolumes() {
 		device := devices[vol.GetVolumeNumber()]
 		if device == "" {
-			return false
+			continue
 		}
 
-		if r.deviceHasFilesystem(ctx, device) {
-			return false
+		if !r.backingHasUserFilesystem(ctx, device) {
+			anyVolumeNeedsMkfs = true
+
+			break
 		}
 	}
 
+	if !anyVolumeNeedsMkfs {
+		return false
+	}
+
 	// Consume the throttle slot LAST so a pass vetoed by a foreign
-	// Primary / probe failure does not burn the window.
+	// Primary / probe failure does not burn the window — the retry
+	// must land in the very next clear gap of the external promoter's
+	// cycle. Probe overhead while a candidate stays unconverged is
+	// bounded by the controller's steady-state requeue cadence, and
+	// this branch only runs at all on the rare initialized-RD-without-
+	// filesystem shape (auto-primary replicas short-circuit before it).
 	if !r.recoveryPromoteDue(dr.GetName()) {
 		return false
 	}
 
-	log.FromContext(ctx).Info("BUG-028: latch-free mkfs retry — no auto-primary election but filesystem is provably absent, re-entering promote+mkfs+demote",
+	log.FromContext(ctx).Info("BUG-028: latch-free mkfs retry — no auto-primary election but a volume provably lacks its filesystem, re-entering promote+mkfs+demote",
 		"resource", dr.GetName())
 
 	return true
@@ -3825,6 +3883,37 @@ func (r *Reconciler) deviceHasFilesystem(ctx context.Context, device string) boo
 
 	for line := range strings.SplitSeq(string(out), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "TYPE=") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// backingHasUserFilesystem is the BACKING-device variant of
+// deviceHasFilesystem for the BUG-028 pre-promote probes. The backing
+// LV/zvol/loop of a DRBD-stacked volume with INTERNAL metadata always
+// carries the DRBD meta-data superblock at its tail, and libblkid
+// recognises it: `blkid -o export /dev/loopN` on a never-formatted
+// volume reports `TYPE=drbd`. Counting that as "a filesystem is
+// present" permanently wedged both BUG-028 probes on real hardware
+// (stand forensics: every fresh ganesha volume showed TYPE=drbd, the
+// bypass and the latch-free retry never fired, while the post-promote
+// probe on /dev/drbdN — which hides the metadata — correctly saw
+// nothing). Only a non-drbd TYPE counts as user data here; anything
+// else (no signature, probe failure, the drbd meta signature itself)
+// reads as "no filesystem". The post-promote blkid probe inside
+// runAutoMkfs on the DRBD device remains the authoritative
+// double-mkfs guard.
+func (r *Reconciler) backingHasUserFilesystem(ctx context.Context, device string) bool {
+	out, err := r.cfg.Exec.Run(ctx, "blkid", "-o", "export", device)
+	if err != nil {
+		return false
+	}
+
+	for line := range strings.SplitSeq(string(out), "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "TYPE=")
+		if ok && value != "drbd" {
 			return true
 		}
 	}

@@ -175,3 +175,91 @@ func TestSafeForMkfsRetryPromote_ProbeFailureRefuses(t *testing.T) {
 		t.Fatal("a malformed status probe must refuse the latch-free mkfs retry")
 	}
 }
+
+// Day0SiblingSetConnected pins (BUG-028 bypass coverage probe). Same
+// conservatism contract as SafeForMkfsRetryPromote, with ONE deliberate
+// relaxation: a not-yet-handshaken (DUnknown) peer is tolerated when it
+// is a configured diskless witness — it carries no data by construction
+// and must not cost the one-shot first-activation mkfs.
+
+// TestDay0SiblingSetConnected_DisklessWitnessStillConnecting: the day0
+// race shape — diskful sibling Connected+UpToDate, tiebreaker witness
+// still handshaking → covered.
+func TestDay0SiblingSetConnected_DisklessWitnessStillConnecting(t *testing.T) {
+	adm := admWithMkfsRetryStatus(t, `[{
+	  "name":"pvc-b028","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"disk-state":"UpToDate"}],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]
+	  },{
+	    "peer-node-id":2,"name":"n3","connection-state":"Connecting",
+	    "peer-role":"Unknown",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]
+	  }]
+	}]`)
+
+	if !adm.Day0SiblingSetConnected(t.Context(), "pvc-b028", map[string]bool{"n3": true}) {
+		t.Fatal("a still-connecting DISKLESS witness must not block the day0 bypass coverage")
+	}
+}
+
+// TestDay0SiblingSetConnected_DiskfulPeerStillConnecting: the same
+// DUnknown peer WITHOUT the diskless marking is a potential offline
+// data holder → refuse.
+func TestDay0SiblingSetConnected_DiskfulPeerStillConnecting(t *testing.T) {
+	adm := admWithMkfsRetryStatus(t, `[{
+	  "name":"pvc-b028","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"disk-state":"UpToDate"}],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]
+	  },{
+	    "peer-node-id":2,"name":"n3","connection-state":"Connecting",
+	    "peer-role":"Unknown",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]
+	  }]
+	}]`)
+
+	if adm.Day0SiblingSetConnected(t.Context(), "pvc-b028", map[string]bool{}) {
+		t.Fatal("a not-yet-handshaken DISKFUL peer must refuse the day0 bypass coverage")
+	}
+}
+
+// TestDay0SiblingSetConnected_ForeignPrimaryRefuses: an external
+// promoter already holds the device → defer to the latch-free retry.
+func TestDay0SiblingSetConnected_ForeignPrimaryRefuses(t *testing.T) {
+	adm := admWithMkfsRetryStatus(t, `[{
+	  "name":"pvc-b028","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"disk-state":"UpToDate"}],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Primary",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]
+	  }]
+	}]`)
+
+	if adm.Day0SiblingSetConnected(t.Context(), "pvc-b028", map[string]bool{}) {
+		t.Fatal("a foreign Primary must refuse the day0 bypass coverage")
+	}
+}
+
+// TestDay0SiblingSetConnected_InconsistentPeerRefuses: an Inconsistent
+// peer-device is not a lock-step day0 sibling → refuse.
+func TestDay0SiblingSetConnected_InconsistentPeerRefuses(t *testing.T) {
+	adm := admWithMkfsRetryStatus(t, `[{
+	  "name":"pvc-b028","node-id":0,"role":"Secondary",
+	  "devices":[{"volume":0,"disk-state":"UpToDate"}],
+	  "connections":[{
+	    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+	    "peer-role":"Secondary",
+	    "peer_devices":[{"volume":0,"peer-disk-state":"Inconsistent","replication-state":"Established","resync-suspended":"no"}]
+	  }]
+	}]`)
+
+	if adm.Day0SiblingSetConnected(t.Context(), "pvc-b028", map[string]bool{}) {
+		t.Fatal("an Inconsistent peer must refuse the day0 bypass coverage")
+	}
+}

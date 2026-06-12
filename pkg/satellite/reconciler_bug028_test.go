@@ -103,6 +103,18 @@ func expectGetGI(fx *storage.FakeExec, rd, device, currentGI string) {
 		storage.FakeResponse{Stdout: []byte(currentGI + ":0000000000000000:0:0:1:1:0:0:0:0\n")})
 }
 
+// expectDrbdMetaSignature cans the blkid answer real hardware gives
+// for the BACKING device of an internal-metadata DRBD volume: libblkid
+// recognises the DRBD meta superblock at the device tail and reports
+// TYPE=drbd even on a never-formatted volume (stand forensics,
+// bug028-fix-validation-20260612-054452/iter2). The BUG-028 probes
+// MUST read this as "no user filesystem" — the naive any-TYPE= probe
+// wedged both the bypass and the latch-free retry forever.
+func expectDrbdMetaSignature(fx *storage.FakeExec, device string) {
+	fx.Expect("blkid -o export "+device,
+		storage.FakeResponse{Stdout: []byte("DEVNAME=" + device + "\nUUID=6715da3a6dd3182a\nTYPE=drbd\n")})
+}
+
 func newThinReconciler(fx *storage.FakeExec, dir string) *satellite.Reconciler {
 	thin := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "tp"}, fx)
 
@@ -194,8 +206,11 @@ func TestApplyBug028Day0RaceVetoBypassedMkfsRuns(t *testing.T) {
 	// the exact proof that every Connected+UpToDate peer is a
 	// never-written day0 sibling of the same generation.
 	expectGetGI(fx, "pvc-b028", device, satellite.Day0GiForTest("pvc-b028", 0))
-	// blkid probes (backing pre-promote, /dev/drbd post-promote) return
-	// the FakeExec default (empty, no TYPE= line) → no fs anywhere.
+	// Backing-device blkid answers TYPE=drbd (the real-hardware shape:
+	// libblkid sees the internal DRBD metadata superblock) — the bypass
+	// must read that as "no user filesystem". The post-promote probe on
+	// /dev/drbd6500 returns the FakeExec default (no signature).
+	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
 
@@ -263,18 +278,41 @@ func TestApplyBug028VetoHoldsOnFsSignature(t *testing.T) {
 	assertNoPromoteNoMkfs(t, fx.CommandLines())
 }
 
-// TestApplyBug028VetoHoldsOnPeerHasData: the dispatcher's CRD view
-// reports a PROVEN data-bearing diskful peer (non-day0 GI observed on
-// the peer's Status) → bypass refused before any kernel probe runs.
-func TestApplyBug028VetoHoldsOnPeerHasData(t *testing.T) {
+// TestApplyBug028VetoHoldsOnUnconnectedDiskfulPeer: data-safety
+// counter-case for the kernel-coverage gate — a configured DISKFUL
+// peer whose connection has not handshaken (peer-disk DUnknown) could
+// be an offline data holder, so the bypass must refuse even when the
+// local volume is day0-empty. (The OTHER connected peer being UpToDate
+// is what fired the veto.)
+func TestApplyBug028VetoHoldsOnUnconnectedDiskfulPeer(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	expectThinBacking(fx, "pvc-b028p")
+	device := expectThinBacking(fx, "pvc-b028u")
+	fx.Expect("drbdsetup status pvc-b028u --json",
+		storage.FakeResponse{Stdout: []byte(`[{
+		  "name":"pvc-b028u","node-id":0,"role":"Secondary",
+		  "devices":[{"volume":0,"disk-state":"UpToDate"}],
+		  "connections":[{
+		    "peer-node-id":1,"name":"n2","connection-state":"Connected",
+		    "peer-role":"Secondary",
+		    "peer_devices":[{"volume":0,"peer-disk-state":"UpToDate"}]
+		  },{
+		    "peer-node-id":2,"name":"n3","connection-state":"Connecting",
+		    "peer-role":"Unknown",
+		    "peer_devices":[{"volume":0,"peer-disk-state":"DUnknown"}]
+		  }]
+		}]`)})
+	expectGetGI(fx, "pvc-b028u", device, satellite.Day0GiForTest("pvc-b028u", 0))
+	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
 
-	dr := bug028WinnerDR("pvc-b028p", "6530")
-	dr[0].PeerHasData = true
+	dr := bug028WinnerDR("pvc-b028u", "6530")
+	dr[0].Peers = []intent.DesiredPeer{{Name: "n2"}, {Name: "n3"}}
+	dr[0].DrbdOptions["peer.n3.port"] = "7000"
+	dr[0].DrbdOptions["peer.n3.node-id"] = "2"
+	dr[0].DrbdOptions["peer.n3.address"] = "10.0.0.3"
+	// n3 is DISKFUL (no peer.n3.diskless) — its DUnknown must refuse.
 
 	_, err := rec.Apply(t.Context(), dr)
 	if err != nil {
@@ -282,6 +320,35 @@ func TestApplyBug028VetoHoldsOnPeerHasData(t *testing.T) {
 	}
 
 	assertNoPromoteNoMkfs(t, fx.CommandLines())
+}
+
+// TestApplyBug028BypassFiresDespitePeerHasDataLag pins the CRD-lag
+// acceptance: the dispatcher conservatively reports PeerHasData=true
+// for an UpToDate day0 sibling whose CurrentGI backfill has not been
+// observed yet. That signal is correct for the re-computed seed gates
+// but must NOT cost the one-shot first-activation mkfs when kernel
+// truth (full coverage + local day0 GI + no user fs) proves the whole
+// connected set is day0-empty.
+func TestApplyBug028BypassFiresDespitePeerHasDataLag(t *testing.T) {
+	dir := t.TempDir()
+	fx := storage.NewFakeExec()
+	device := expectThinBacking(fx, "pvc-b028g")
+	fx.Expect("drbdsetup status pvc-b028g --json",
+		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028g"))})
+	expectGetGI(fx, "pvc-b028g", device, satellite.Day0GiForTest("pvc-b028g", 0))
+	expectDrbdMetaSignature(fx, device)
+
+	rec := newThinReconciler(fx, dir)
+
+	dr := bug028WinnerDR("pvc-b028g", "6540")
+	dr[0].PeerHasData = true // CRD lag: day0 sibling, CurrentGI unobserved
+
+	_, err := rec.Apply(t.Context(), dr)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	assertPromoteMkfsDemoteOrder(t, fx.CommandLines(), "pvc-b028g", "/dev/drbd6540")
 }
 
 // bug028FalseLatchDR is the wire payload of the BUG-028 TERMINAL state:
@@ -322,11 +389,14 @@ func bug028FalseLatchDR(rd, minor string) []*intent.DesiredResource {
 func TestApplyBug028FalseLatchRetryFiresWithoutAutoPrimary(t *testing.T) {
 	dir := t.TempDir()
 	fx := storage.NewFakeExec()
-	expectThinBacking(fx, "pvc-b028r")
+	device := expectThinBacking(fx, "pvc-b028r")
 	fx.Expect("drbdsetup status pvc-b028r --json",
 		storage.FakeResponse{Stdout: []byte(statusBothUpToDateSecondary("pvc-b028r"))})
-	// blkid on the backing device and on /dev/drbd6600: FakeExec default
-	// (no TYPE=) → filesystem provably absent.
+	// Backing blkid answers TYPE=drbd (the real-hardware shape — see
+	// expectDrbdMetaSignature): the retry must read it as "no user
+	// filesystem". /dev/drbd6600's post-promote probe stays at the
+	// FakeExec default (no signature) → mkfs runs.
+	expectDrbdMetaSignature(fx, device)
 
 	rec := newThinReconciler(fx, dir)
 
