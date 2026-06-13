@@ -62,7 +62,9 @@ echo ">> [F6] rd c + vd c + r c --auto-place=2 -s $POOL"
 "${LCTL[@]}" resource-definition create "$RD" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 256M >/dev/null
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
-wait_replica_count "$RD" 2 90
+# Diskful count, not total rows: the auto-tiebreaker witness lands on
+# the spare node within seconds and is a legal third row (BUG-040).
+wait_diskful_count "$RD" 2 90
 
 mapfile -t diskful < <(linstor_diskful_nodes "$RD")
 if (( ${#diskful[@]} < 2 )); then

@@ -43,10 +43,12 @@
 #  TestBug385EvictTiebreakerNodeRelocatesWitnessToSpare).
 #
 # This L6 cell is the stand-side companion: it builds the 2r+tb shape on
-# 3 workers, evicts the tiebreaker node via the real `linstor n e` CLI,
-# and asserts that within 30s (a) the EVICTED node no longer hosts a
-# witness, and (b) BOTH original diskful replicas are still diskful — no
-# healthy UpToDate replica was demoted to TIE_BREAKER.
+# 3 workers, drains the tiebreaker node into EVICTED via the real
+# `linstor node evacuate` CLI (linstor-client has no `node evict` verb —
+# the repro's `n e` reached EVICTED through the evacuate/auto-evict
+# machinery), and asserts that within 30s (a) the EVICTED node no longer
+# hosts a witness, and (b) BOTH original diskful replicas are still
+# diskful — no healthy UpToDate replica was demoted to TIE_BREAKER.
 
 set -euo pipefail
 
@@ -121,13 +123,22 @@ echo "   diskful pair: $uptodate_pair  tiebreaker: $tb_node"
 DISKFUL_A=$(echo "$uptodate_pair" | awk '{print $1}')
 DISKFUL_B=$(echo "$uptodate_pair" | awk '{print $2}')
 
-# Evict the tiebreaker node — the exact operator action from the repro.
-echo ">> linstor n e $tb_node  (evict the tiebreaker node)"
+# Drain the tiebreaker node into the EVICTED state. NOTE: linstor-client
+# (1.27.1) has NO `node evict` verb — eviction is either automatic
+# (auto-evict) or operator-driven via `node evacuate`, which stamps the
+# same EVICTED flag this cell asserts on. The original `node evict`
+# invocation died in the CLI's argparse (exit 2, no REST call) and the
+# cell could never pass (BUG-040 triage).
+echo ">> linstor n evacuate $tb_node  (drain the tiebreaker node → EVICTED)"
 EVICTED_NODE=$tb_node
-"${LCTL[@]}" node evict "$tb_node" >/dev/null 2>&1 || {
-    echo "FAIL: n e (node evict) exited non-zero" >&2
+err_file=$(mktemp)
+if ! "${LCTL[@]}" node evacuate "$tb_node" >/dev/null 2>"$err_file"; then
+    echo "FAIL: n evacuate exited non-zero" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
     exit 1
-}
+fi
+rm -f "$err_file"
 
 # The node must show EVICTED in `linstor n l` (evict took effect at the
 # node level).

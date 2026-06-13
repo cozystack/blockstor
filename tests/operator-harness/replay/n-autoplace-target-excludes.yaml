@@ -54,13 +54,14 @@ steps:
     expect_exit: 0
     await:
       # THE F4 ASSERTION: the AutoplaceTarget=false node never received
-      # a DISKFUL replica — both copies landed on node2 + node3. On a
-      # 3-worker stand the auto-tiebreaker witness legitimately lands on
-      # the only remaining node (node1), so a Resource CRD for node1
-      # exists as a diskless TIE_BREAKER and resource_absent can never
-      # hold — assert "not diskful" instead (same lesson as the
-      # toggle-disk --migrate-from replay).
-      kind: replica_diskless
+      # ANY auto-placed replica — both copies landed on node2 + node3,
+      # and (BUG-040) the auto-tiebreaker witness is an automatic
+      # placement too, so it must not land on the drained node either.
+      # With node1 the only remaining spare, no witness is possible
+      # (quorum falls back to off) and node1 carries no Resource CRD at
+      # all. An earlier revision asserted replica_diskless here, which
+      # codified the pre-BUG-040 witness-on-drained-node violation.
+      kind: resource_absent
       rd: "{{rd}}"
       node: "{{node1}}"
       timeout_s: 30
