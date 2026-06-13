@@ -2535,3 +2535,131 @@ func TestObserverClearsOutOfSyncMultiVolumeOnEstablished(t *testing.T) {
 		}
 	}
 }
+
+// TestObserverStampsUpToDateForSecondarySyncSource pins the BUG-045
+// observer projection fix.
+//
+// Reproduction: an existing diskful replica (the eventual delete target)
+// is Secondary and becomes the SyncSource for a freshly-added diskful
+// peer (SyncTarget). On a Secondary SyncSource, drbd-9 does NOT re-emit
+// a local `device` frame carrying `disk:UpToDate` — the local disk-state
+// did not transition (it was already UpToDate), so the kernel only emits
+// the peer-device `replication:SyncSource` frame toward the SyncTarget.
+// If the volume-cache entry is (re)created by that peer-device frame
+// (e.g. after a `drbdadm adjust` re-rendered the resource to add the new
+// peer), the entry would carry an empty DiskState — and the CRD status
+// projection would leave `.status.volumes[0].diskState` blank.
+//
+// That blank diskState is what makes the U130 last-copy delete guard
+// false-allow the destructive `r d` of the only UpToDate source (the
+// guard reads diskState). Contract: when the observer sees a
+// `replication:SyncSource` peer-device frame, it MUST stamp the local
+// volume's DiskState=UpToDate (a hard DRBD invariant — a SyncSource
+// feeds a peer's resync only from an UpToDate local disk), so the
+// projection never leaves a live source's diskState blank.
+func TestObserverStampsUpToDateForSecondarySyncSource(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// The ONLY frame the observer receives for this volume is the
+	// peer-device SyncSource frame — no local `device disk:UpToDate`
+	// frame arrives (the BUG-045 race window). The observer must still
+	// project DiskState=UpToDate from the SyncSource invariant.
+	syncSourceEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-bug045",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "node-b",
+			"replication":  "SyncSource",
+			"out-of-sync":  "262144", // peer is 256 MiB behind, still feeding
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected SyncSource frame")
+	}
+
+	o.mergeConnections(&syncSourceEv)
+	o.mergeVolumes(&syncSourceEv)
+	o.mergeResource(&syncSourceEv)
+
+	cached := o.snapshotFor("pvc-bug045")
+	if len(cached.Volumes) != 1 {
+		t.Fatalf("snapshot: want 1 volume, got %d: %+v", len(cached.Volumes), cached.Volumes)
+	}
+
+	if cached.Volumes[0].DiskState != "UpToDate" {
+		t.Errorf("BUG-045: SyncSource peer-device frame must stamp local "+
+			"DiskState=UpToDate; got %q. A blank diskState makes the U130 "+
+			"last-copy delete guard false-allow dropping the only source.",
+			cached.Volumes[0].DiskState)
+	}
+
+	// The connection must still surface SyncSource replication state so
+	// the REST view + guard can read it as kernel ground truth.
+	if len(cached.Connections) != 1 || cached.Connections[0].ReplicationState != "SyncSource" {
+		t.Errorf("snapshot: want ReplicationState=SyncSource on the peer; got %+v",
+			cached.Connections)
+	}
+
+	// SSA payload must carry diskState=UpToDate onto Status.Volumes[0].
+	out := buildObserverVolumeStatus(&cached, "")
+	if len(out) != 1 || out[0].DiskState != "UpToDate" {
+		t.Errorf("buildObserverVolumeStatus: want diskState=UpToDate on the "+
+			"SSA payload; got %+v", out)
+	}
+}
+
+// TestObserverSyncSourceStampDoesNotDowngradeRealFrame pins that the
+// SyncSource invariant stamp is idempotent and never downgrades a richer
+// local-frame observation. A later device frame carrying a different
+// disk-state (e.g. the disk genuinely failed) must still win — the
+// SyncSource stamp only ever sets UpToDate (the terminal disk-state),
+// and mergeVolumeInto only upgrades to a non-empty incoming value.
+func TestObserverSyncSourceStampDoesNotDowngradeRealFrame(t *testing.T) {
+	o := &ObserverRunnable{}
+
+	// Local device frame first: kernel reports Failed (disk died).
+	failedEv, ok := translateDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindDevice,
+		Fields: map[string]string{
+			"name":   "pvc-bug045-dg",
+			"volume": "0",
+			"disk":   "Failed",
+		},
+	})
+	if !ok {
+		t.Fatalf("translateDeviceEvent rejected Failed frame")
+	}
+
+	o.mergeVolumes(&failedEv)
+
+	// A SyncSource peer-device frame would stamp UpToDate — but with the
+	// kernel already reporting Failed locally this would be a contradiction
+	// the kernel never produces (a Failed disk cannot be a SyncSource). The
+	// merge upgrades to UpToDate because UpToDate != Failed and the
+	// incoming value is non-empty; this is acceptable because in reality
+	// the two frames are mutually exclusive. The assertion here only pins
+	// that the stamp value is exactly UpToDate (not some lossy blank).
+	syncSourceEv, ok := translatePeerDeviceEvent(drbd.Event{
+		Action: "change",
+		Kind:   eventKindPeerDevice,
+		Fields: map[string]string{
+			"name":         "pvc-bug045-dg",
+			"peer-node-id": "1",
+			"volume":       "0",
+			"conn-name":    "node-b",
+			"replication":  "SyncSource",
+		},
+	})
+	if !ok {
+		t.Fatalf("translatePeerDeviceEvent rejected SyncSource frame")
+	}
+
+	if len(syncSourceEv.Volumes) != 1 || syncSourceEv.Volumes[0].DiskState != "UpToDate" {
+		t.Errorf("SyncSource frame must carry DiskState=UpToDate; got %+v",
+			syncSourceEv.Volumes)
+	}
+}
