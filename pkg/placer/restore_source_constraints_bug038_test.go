@@ -28,19 +28,23 @@ import (
 
 // Bug 038 (release gate): the controller-side Place callers
 // (ResourceGroup apply, RG rebalance, node replacement) feed the
-// placer the RAW RG SelectFilter — no snapshot-node constraint, no
-// provider pin. On stand `big` that landed a FILE_THIN-sourced clone
-// replica on a ZFS pool; the satellite then piped the source's
-// FILE_THIN snapshot stream into `zfs recv`, which looped forever on
-// `cannot receive: invalid stream (bad magic number)` and the clone
-// never reached UpToDate.
+// placer the RAW RG SelectFilter — no provider pin. On stand `big`
+// that landed a FILE_THIN-sourced clone replica on a ZFS pool; the
+// satellite then piped the source's FILE_THIN snapshot stream into
+// `zfs recv`, which looped forever on `cannot receive: invalid stream
+// (bad magic number)` and the clone never reached UpToDate.
 //
-// These tests pin the placer-internal restore-source constraint:
-// Place() on an RD carrying the BlockstorRestoreFromSnapshot marker
-// must (a) only consider the snapshot's nodes when the caller didn't
-// pin any, and (b) only consider pools whose ProviderKind matches the
-// source replica's — even when a different-backend pool is roomier
-// and would win the capacity-weighted ranking.
+// These tests pin the placer-internal restore-source BACKEND
+// constraint: Place() on an RD carrying the BlockstorRestoreFromSnapshot
+// marker must only consider pools whose ProviderKind matches the source
+// replica's — even when a different-backend pool is roomier and would
+// win the capacity-weighted ranking.
+//
+// The placer DELIBERATELY does NOT pin the candidate NODE set to the
+// snapshot's nodes: that broke legitimate staged cross-node bring-up
+// (the cross-node restore lanes add a replica on a fresh node and
+// populate it over the wire). The backend pin alone is what prevents
+// the bad-magic loop; see TestPlaceRestoreMarkedRDAllowsCrossNodeSameBackend.
 
 // seedRestoreMarkedRD builds the Bug 038 repro shape: a deployed
 // FILE_THIN source RD (replicas on n1/n2 in pool "stand"), its
@@ -121,8 +125,10 @@ func seedRestoreMarkedRD(t *testing.T, st store.Store) {
 
 // TestPlaceConstrainsRestoreMarkedRDToSourceBackend drives Place with
 // the exact filter shape the RG reconcilers use (bare PlaceCount, no
-// pins) and asserts the replica lands on the source's FILE_THIN pool
-// on a snapshot node — not on the roomier ZFS decoy.
+// pins) and asserts the replica lands on the source's FILE_THIN pool —
+// not on the roomier ZFS decoy that would win the capacity ranking
+// without the backend pin. (Node selection is unconstrained; the
+// assertion is on the BACKEND, which is the bad-magic guard.)
 func TestPlaceConstrainsRestoreMarkedRDToSourceBackend(t *testing.T) {
 	t.Parallel()
 
@@ -150,14 +156,78 @@ func TestPlaceConstrainsRestoreMarkedRDToSourceBackend(t *testing.T) {
 	}
 
 	res := resList[0]
-	if res.NodeName != "n1" && res.NodeName != "n2" {
-		t.Errorf("replica node: got %q, want a snapshot node (n1/n2)", res.NodeName)
-	}
 
 	if pool := res.Props["StorPoolName"]; pool != "stand" {
 		t.Errorf("replica pool: got %q, want the source's FILE_THIN pool %q "+
 			"(a ZFS placement feeds the FILE_THIN snapshot stream into "+
 			"`zfs recv` → bad magic loop)", pool, "stand")
+	}
+}
+
+// TestPlaceRestoreMarkedRDAllowsCrossNodeSameBackend is the regression
+// guard for the over-aggressive node-pin that the original Bug 038 fix
+// introduced and this rework removed. A restore-marked RD already
+// placed on the two snapshot nodes (n1/n2) must still be able to gain a
+// THIRD diskful replica on a fresh node (n3) — as long as that node
+// carries a SAME-BACKEND (FILE_THIN) pool. The earlier node-pin to
+// snap.Nodes refused n3 outright, wedging the cross-node restore lanes
+// (`snapshot-restore-cross-node.sh` Stage 2, `snap-ship-cross-node.sh`)
+// at "stuck Connecting / no devicePath". The backend pin must remain,
+// so n3 may only host the FILE_THIN pool, never the ZFS decoy.
+func TestPlaceRestoreMarkedRDAllowsCrossNodeSameBackend(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewInMemory()
+	seedRestoreMarkedRD(t, st)
+
+	ctx := t.Context()
+
+	// The restore already landed on the two snapshot nodes.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "target", NodeName: n,
+			Props: map[string]string{"StorPoolName": "stand"},
+		}); err != nil {
+			t.Fatalf("seed existing target replica on %s: %v", n, err)
+		}
+	}
+
+	// place_count bumped to 3 — the RG reconciler's additive pass.
+	placed, want, err := placer.New(st).Place(ctx, "target", &apiv1.AutoSelectFilter{
+		PlaceCount: 3,
+	})
+	if err != nil {
+		t.Fatalf("Place: %v", err)
+	}
+
+	if placed != 3 || want != 3 {
+		t.Fatalf("placed/want: got %d/%d, want 3/3 "+
+			"(the cross-node replica must be placeable — a snap.Nodes "+
+			"node-pin would refuse n3 and leave it at 2/3)", placed, want)
+	}
+
+	resList, err := st.Resources().ListByDefinition(ctx, "target")
+	if err != nil {
+		t.Fatalf("list target replicas: %v", err)
+	}
+
+	var n3 *apiv1.Resource
+
+	for i := range resList {
+		if resList[i].NodeName == "n3" {
+			n3 = &resList[i]
+		}
+	}
+
+	if n3 == nil {
+		t.Fatalf("no cross-node replica on n3: got %d replicas, "+
+			"the node-pin must be gone for staged cross-node bring-up", len(resList))
+	}
+
+	if pool := n3.Props["StorPoolName"]; pool != "stand" {
+		t.Errorf("cross-node replica on n3 landed on pool %q, want the "+
+			"same-backend FILE_THIN pool %q (the backend pin must hold "+
+			"even for the cross-node replica)", pool, "stand")
 	}
 }
 
