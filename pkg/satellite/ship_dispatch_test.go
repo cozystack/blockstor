@@ -485,7 +485,7 @@ func TestCrossNodeCloneNoFetcherFallsBackToBlankCreate(t *testing.T) {
 	})
 	// Intentionally no SetCrossNodeFetcher.
 
-	_, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+	dr := []*intent.DesiredResource{
 		{
 			Name: "pvc-fallback", NodeName: "n1",
 			Volumes: []*intent.DesiredVolume{{
@@ -495,9 +495,32 @@ func TestCrossNodeCloneNoFetcherFallsBackToBlankCreate(t *testing.T) {
 				SourceSnapshot: "pvc-src:snap-missing",
 			}},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
+	}
+
+	// Bug 038 defense-in-depth: a node-local restore whose `@snap` is
+	// not yet materialised REQUEUES for a bounded budget before
+	// conceding to the blank create — the async SnapshotReconciler may
+	// still be taking it. Apply repeatedly; the early passes requeue
+	// (Apply surfaces a non-nil error), then the blank fallback lands.
+	// The budget is small (single digits); 32 passes is a generous cap.
+	const maxApplies = 32
+
+	for i := range maxApplies {
+		results, err := rec.Apply(t.Context(), dr)
+		if err != nil {
+			t.Fatalf("apply %d: unexpected top-level error: %v", i+1, err)
+		}
+
+		if len(prov.createCalls) > 0 {
+			break
+		}
+
+		// Within the budget the per-resource apply must NOT report Ok
+		// (the materialize requeues with ErrNotFound).
+		if len(results) != 1 || results[0].GetOk() {
+			t.Fatalf("apply %d: snapshot still missing must requeue (result Ok=false) "+
+				"until the budget is exhausted; got %+v", i+1, results)
+		}
 	}
 
 	if len(prov.recvCalls) != 0 {
@@ -505,7 +528,7 @@ func TestCrossNodeCloneNoFetcherFallsBackToBlankCreate(t *testing.T) {
 	}
 
 	if len(prov.createCalls) != 1 {
-		t.Fatalf("CreateVolume blank-fallback: got %d calls, want 1", len(prov.createCalls))
+		t.Fatalf("CreateVolume blank-fallback after the requeue budget: got %d calls, want 1", len(prov.createCalls))
 	}
 }
 
