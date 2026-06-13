@@ -118,8 +118,16 @@ deadline=$(( $(date +%s) + 120 ))
 both_up=false
 while (( $(date +%s) < deadline )); do
     # 2 diskful replicas × 2 volumes = 4 disk_state strings, all UpToDate.
+    # Wire keys: the blockstor `r l -m` rows expose `.flags` (resource
+    # flags) and `.volumes[]` (per-volume rows with `.state.disk_state`)
+    # — NOT the golinstor/upstream `.rsc_flags` / `.vlms` spellings. The
+    # latter never matched on the wire (pkg/api/v1/resource.go: Flags
+    # `json:"flags"`, Volumes `json:"volumes"`), so `.rsc_flags//[]`
+    # excluded NOTHING and `.vlms[]?` selected NOTHING — count_uptodate
+    # stayed 0 and the wait timed out / FAILed even on a healthy RD.
+    # Same wire-key class as BUG-044.
     states=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '[.[][]? | select((.rsc_flags//[]) | (map(. == "DISKLESS" or . == "TIE_BREAKER") | any | not)) | .vlms[]? | .state.disk_state // "Unknown"] | join(",")' \
+        | jq -r '[.[][]? | select((.flags//[]) | (map(. == "DISKLESS" or . == "TIE_BREAKER") | any | not)) | .volumes[]? | .state.disk_state // "Unknown"] | join(",")' \
         2>/dev/null || echo "")
     count_uptodate=$(awk -F, '{ for (i=1;i<=NF;i++) if ($i=="UpToDate") n++ } END { print n+0 }' <<<"$states")
     if (( count_uptodate == 4 )); then
