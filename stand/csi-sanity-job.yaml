@@ -38,12 +38,30 @@ spec:
             - {name: CSI_ENDPOINT,  value: "unix:///csi/csi.sock"}
             # mTLS endpoint. golinstor (which linstor-csi wraps) upgrades
             # to HTTPS and presents the client cert when LS_USER_*/
-            # LS_ROOT_CA point at PEM files. The Service exposes ONLY
-            # :3371 now, so the old http://...:3370 endpoint is gone.
+            # LS_ROOT_CA are set. The Service exposes ONLY :3371 now, so
+            # the old http://...:3370 endpoint is gone.
+            #
+            # IMPORTANT: golinstor v0.58.0 (vendored by piraeus-csi
+            # v1.10.1) reads LS_ROOT_CA / LS_USER_CERTIFICATE / LS_USER_KEY
+            # as PEM *content*, not file paths — the env value is fed
+            # straight into x509.CertPool.AppendCertsFromPEM /
+            # tls.X509KeyPair. The path-based LS_*_FILE variants only exist
+            # from golinstor v0.61.0. Passing a path made golinstor try to
+            # PEM-decode the literal string "/etc/linstor/client/ca.crt"
+            # and fail with "failed to get a valid certificate from
+            # 'LS_ROOT_CA'", so linstor-csi never opened the socket and the
+            # whole Job hung until the harness wait timed out. Inject the
+            # PEM bytes directly from the cert-manager secret instead.
             - {name: LS_CONTROLLERS, value: "https://blockstor-controller.blockstor-system.svc:3371"}
-            - {name: LS_USER_CERTIFICATE, value: "/etc/linstor/client/tls.crt"}
-            - {name: LS_USER_KEY, value: "/etc/linstor/client/tls.key"}
-            - {name: LS_ROOT_CA, value: "/etc/linstor/client/ca.crt"}
+            - name: LS_USER_CERTIFICATE
+              valueFrom:
+                secretKeyRef: {name: blockstor-apiserver-client-tls, key: tls.crt}
+            - name: LS_USER_KEY
+              valueFrom:
+                secretKeyRef: {name: blockstor-apiserver-client-tls, key: tls.key}
+            - name: LS_ROOT_CA
+              valueFrom:
+                secretKeyRef: {name: blockstor-apiserver-client-tls, key: ca.crt}
             # Resolved from a downward-API spec.nodeName if the job
             # is scheduled onto a worker, otherwise hard-coded to a
             # known stand worker. The recorder e2e6 stand uses
@@ -52,13 +70,12 @@ spec:
             - name: BLOCKSTOR_NODE
               valueFrom:
                 fieldRef: {fieldPath: spec.nodeName}
+          # The client cert (tls.crt/tls.key/ca.crt) from
+          # blockstor-apiserver-client-tls is injected as PEM content via
+          # the LS_USER_*/LS_ROOT_CA env vars above (golinstor v0.58.0 wants
+          # content, not a mount path), so no volume mount is needed here.
           volumeMounts:
             - {name: csi, mountPath: /csi}
-            # cert-manager-issued client cert (tls.crt/tls.key/ca.crt)
-            # presented to the apiserver's RequireAndVerifyClientCert
-            # listener. No reloader.stakater.com — the Job is short-lived
-            # so cert rotation is out of scope for it.
-            - {name: client-tls, mountPath: /etc/linstor/client, readOnly: true}
 
         - name: csi-sanity
           image: golang:1.25
@@ -92,9 +109,6 @@ spec:
         - {name: csi, emptyDir: {}}
         - name: scparams
           configMap: {name: csi-sanity-params}
-        - name: client-tls
-          secret:
-            secretName: blockstor-apiserver-client-tls
 
 ---
 apiVersion: v1
