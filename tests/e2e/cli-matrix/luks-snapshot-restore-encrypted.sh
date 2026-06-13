@@ -80,13 +80,14 @@ echo ">> [Bug 333] create source encrypted RD"
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_SRC" >/dev/null
 
 # Resolve placed nodes.
+# BUG-039: count DISKFUL replicas only. auto-place=2 on a 3-worker
+# stand adds (and flaps) a DISKLESS TIE_BREAKER witness, so a naive
+# all-CRD count oscillates 2→3→2 and an `== 2` equality check times
+# out spuriously. Same convention as encryption-passphrase-luks-rd.
 deadline=$(( $(date +%s) + 60 ))
 placed_src=()
 while (( $(date +%s) < deadline )); do
-    mapfile -t placed_src < <(
-        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
-            | awk -v rd="$RD_SRC." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
-    )
+    mapfile -t placed_src < <(linstor_diskful_nodes "$RD_SRC")
     if (( ${#placed_src[@]} == 2 )); then break; fi
     sleep 2
 done
@@ -139,13 +140,11 @@ echo ">> [Bug 333] linstor r c $RD_DST --auto-place=2"
 # driven snapshot-restore-cross-node.sh.
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD_DST" >/dev/null
 
+# BUG-039: diskful-only count — see the placed_src loop above.
 deadline=$(( $(date +%s) + 60 ))
 placed_dst=()
 while (( $(date +%s) < deadline )); do
-    mapfile -t placed_dst < <(
-        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
-            | awk -v rd="$RD_DST." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
-    )
+    mapfile -t placed_dst < <(linstor_diskful_nodes "$RD_DST")
     if (( ${#placed_dst[@]} == 2 )); then break; fi
     sleep 2
 done

@@ -73,13 +73,14 @@ echo ">> [Bug 333] linstor rd c $RD -l drbd,luks,storage + vd c 64M + r c --auto
 # Resolve the placed pair so we can wait_uptodate against the actual
 # nodes the autoplacer picked rather than $WORKER_1+$WORKER_2 by
 # convention.
+# BUG-039: count DISKFUL replicas only. auto-place=2 on a 3-worker
+# stand adds (and flaps) a DISKLESS TIE_BREAKER witness, so a naive
+# all-CRD count oscillates 2→3→2 and an `== 2` equality check times
+# out spuriously. Same convention as encryption-passphrase-luks-rd.
 deadline=$(( $(date +%s) + 60 ))
 placed_nodes=()
 while (( $(date +%s) < deadline )); do
-    mapfile -t placed_nodes < <(
-        kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
-            | awk -v rd="$RD." '$1 ~ "^"rd {sub(rd, "", $1); print $1}'
-    )
+    mapfile -t placed_nodes < <(linstor_diskful_nodes "$RD")
     if (( ${#placed_nodes[@]} == 2 )); then break; fi
     sleep 2
 done
