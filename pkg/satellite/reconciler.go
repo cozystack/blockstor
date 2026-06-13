@@ -282,6 +282,25 @@ type Reconciler struct {
 	// to make progress between nudges. Process-memory only; a restart
 	// resets it (at worst one extra promote).
 	lastRecoveryPromoteAt map[string]time.Time
+
+	// restoreSnapshotMissingTries counts, per "<resource>/<volNumber>",
+	// how many consecutive reconcile passes a snapshot-restore-backed
+	// volume found its source `@snap` ABSENT locally (ErrNotFound from
+	// RestoreVolumeFromSnapshot) with no cross-node fetcher configured.
+	// Bug 038 (defense-in-depth): the per-node `@snap` is materialised
+	// ASYNCHRONOUSLY by the SnapshotReconciler, so a node-local restore
+	// replica that reconciles a beat early would otherwise fall straight
+	// through to a TERMINAL blank CreateVolume (poisoning datasetExists
+	// so the later clone never runs). Instead we REQUEUE the reconcile
+	// up to restoreSnapshotMissingBudget times — giving the local
+	// snapshot time to land — before falling back to the blank create.
+	// A genuinely cross-node / ship-only replica (the snapshot will
+	// never be local) exhausts the budget quickly and degrades to the
+	// pre-fix blank-fallback + DRBD resync path. The REST-side
+	// snapshot-readiness gate is the primary fix; this is the backstop
+	// for the residual CRD-status-vs-on-disk window. Process-memory
+	// only; a restart resets the counter (at worst a few extra requeues).
+	restoreSnapshotMissingTries map[string]int
 }
 
 // recoveryPromoteThrottle bounds how often a single resource may fire
@@ -290,6 +309,18 @@ type Reconciler struct {
 // wedge (peer truly stuck Inconsistent with no Primary) still gets a
 // fresh nudge promptly.
 const recoveryPromoteThrottle = 10 * time.Second
+
+// restoreSnapshotMissingBudget bounds how many consecutive reconcile
+// passes a node-local snapshot-restore volume may REQUEUE on a
+// not-yet-materialised local `@snap` before falling through to the
+// blank-fallback CreateVolume (Bug 038 defense-in-depth — see
+// Reconciler.restoreSnapshotMissingTries). Controller-runtime requeues
+// with backoff, so a handful of attempts covers the
+// SnapshotReconciler's sub-second per-node create latency with room to
+// spare, while a genuinely cross-node / ship-only replica (snapshot
+// never local) exhausts the budget within seconds and degrades to the
+// pre-fix DRBD-resync blank fallback.
+const restoreSnapshotMissingBudget = 5
 
 // NewReconciler constructs a Reconciler from cfg.
 //
@@ -302,11 +333,12 @@ func NewReconciler(cfg ReconcilerConfig) *Reconciler {
 	}
 
 	return &Reconciler{
-		cfg:                   cfg,
-		resourceToPool:        map[string]string{},
-		seenStuckAt:           map[string]time.Time{},
-		restoreBlankFallback:  map[string]bool{},
-		lastRecoveryPromoteAt: map[string]time.Time{},
+		cfg:                         cfg,
+		resourceToPool:              map[string]string{},
+		seenStuckAt:                 map[string]time.Time{},
+		restoreBlankFallback:        map[string]bool{},
+		lastRecoveryPromoteAt:       map[string]time.Time{},
+		restoreSnapshotMissingTries: map[string]int{},
 	}
 }
 
@@ -1523,8 +1555,10 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 		if err == nil {
 			// Local clone succeeded: this replica holds the snapshot's
 			// data. Clear any stale blank-fallback marker so the
-			// legitimate all-clone restore fast-path keeps its skip.
+			// legitimate all-clone restore fast-path keeps its skip, and
+			// reset the Bug 038 not-yet-materialised requeue budget.
 			r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), false)
+			r.clearRestoreSnapshotMissing(rdName, vol.GetVolumeNumber())
 		}
 
 		return err //nolint:wrapcheck // caller wraps
@@ -1534,15 +1568,62 @@ func (r *Reconciler) materializeVolume(ctx context.Context, provider storage.Pro
 	// also doesn't pan out we fall through to a blank CreateVolume
 	// so DRBD has something to resync into.
 	if r.cfg.CrossNodeFetcher == nil {
-		// Bug 397: blank fallback — this replica did NOT receive the
-		// snapshot data. Mark it so resolveVolumeSeed refuses the day0
-		// skip and DRBD SyncTargets the real restored peer.
-		r.recordRestoreBlankFallback(rdName, vol.GetVolumeNumber(), true)
+		// Bug 038 defense-in-depth: the per-node `@snap` materialises
+		// ASYNCHRONOUSLY (SnapshotReconciler), so a node-local restore
+		// replica reconciling a beat early sees ErrNotFound here. A
+		// blank CreateVolume would be TERMINAL — datasetExists then
+		// short-circuits the real clone forever and the Bug 397 guard
+		// SyncTargets every replica into an all-empty deadlock. REQUEUE
+		// a bounded number of times to let the local snapshot land
+		// before conceding to the blank fallback. The REST-side
+		// snapshot-readiness gate makes this window vanishingly small in
+		// practice; the budget bounds it for the residual race and for a
+		// genuinely cross-node / ship-only replica (snapshot never
+		// local), which exhausts the budget and degrades to the pre-fix
+		// DRBD-resync blank fallback below.
+		volNum := vol.GetVolumeNumber()
+		if r.bumpRestoreSnapshotMissing(rdName, volNum) <= restoreSnapshotMissingBudget {
+			return errors.Wrapf(storage.ErrNotFound,
+				"snapshot %s for %s/%d not yet materialised on this node; requeueing",
+				src, rdName, volNum)
+		}
+
+		// Budget exhausted: the snapshot is not coming locally. Bug 397:
+		// blank fallback — this replica did NOT receive the snapshot
+		// data. Mark it so resolveVolumeSeed refuses the day0 skip and
+		// DRBD SyncTargets the real restored peer.
+		r.clearRestoreSnapshotMissing(rdName, volNum)
+		r.recordRestoreBlankFallback(rdName, volNum, true)
 
 		return provider.CreateVolume(ctx, target) //nolint:wrapcheck // caller wraps
 	}
 
 	return r.crossNodeClone(ctx, provider, target, rdName, srcRD, snapName, vol.GetVolumeNumber())
+}
+
+// bumpRestoreSnapshotMissing increments and returns the consecutive
+// "local snapshot still absent" counter for a restore-backed volume
+// (Bug 038 defense-in-depth requeue budget — see materializeVolume).
+// Keyed by "<resource>/<volNumber>".
+func (r *Reconciler) bumpRestoreSnapshotMissing(rdName string, volNum int32) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key := restoreSeedKey(rdName, volNum)
+	r.restoreSnapshotMissingTries[key]++
+
+	return r.restoreSnapshotMissingTries[key]
+}
+
+// clearRestoreSnapshotMissing resets the requeue budget for a
+// restore-backed volume once the local clone succeeded or the budget
+// was conceded to the blank fallback. Keeps the map from growing
+// without bound across distinct resources.
+func (r *Reconciler) clearRestoreSnapshotMissing(rdName string, volNum int32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.restoreSnapshotMissingTries, restoreSeedKey(rdName, volNum))
 }
 
 // crossNodeClone is materializeVolume's cross-node fallback branch.

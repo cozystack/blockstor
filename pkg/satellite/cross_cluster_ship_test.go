@@ -213,7 +213,7 @@ func TestSourceSnapshotTwoPartFormStillAccepted(t *testing.T) {
 		Providers: map[string]storage.Provider{"zfs1": prov},
 	})
 
-	results, err := rec.Apply(t.Context(), []*intent.DesiredResource{
+	dr := []*intent.DesiredResource{
 		{
 			Name: "pvc-in-cluster-clone", NodeName: "n1",
 			Volumes: []*intent.DesiredVolume{{
@@ -223,19 +223,44 @@ func TestSourceSnapshotTwoPartFormStillAccepted(t *testing.T) {
 				SourceSnapshot: "pvc-source:snap-1",
 			}},
 		},
-	})
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
+	}
+
+	// The 2-part form is accepted and routed to the restore path. Bug
+	// 038: a node-local restore whose `@snap` isn't materialised yet
+	// REQUEUES for a bounded budget before the no-fetcher blank-create
+	// fallback runs, so apply repeatedly until the create lands.
+	const maxApplies = 32
+
+	var results []*intent.ResourceApplyResult
+
+	for range maxApplies {
+		var err error
+
+		results, err = rec.Apply(t.Context(), dr)
+		if err != nil {
+			t.Fatalf("unexpected top-level error: %v", err)
+		}
+
+		if prov.createCalls > 0 {
+			break
+		}
+
+		// Within the budget the per-resource apply requeues (Ok=false).
+		if len(results) != 1 || results[0].GetOk() {
+			t.Fatalf("snapshot still missing must requeue (result Ok=false) "+
+				"until the budget is exhausted; got results=%+v", results)
+		}
 	}
 
 	if len(results) != 1 || !results[0].GetOk() {
-		t.Fatalf("2-part source must be accepted; got %+v", results[0])
+		t.Fatalf("2-part source must be accepted; got %+v", results)
 	}
 
-	// Restore was attempted (returns ErrNotFound from the fake),
-	// then the no-CrossNodeFetcher fallback ran CreateVolume.
-	if prov.restoreCalls != 1 {
-		t.Errorf("RestoreVolumeFromSnapshot calls: got %d, want 1", prov.restoreCalls)
+	// Restore was attempted on every pass (the fake returns
+	// ErrNotFound), then the no-CrossNodeFetcher fallback ran
+	// CreateVolume exactly once after the requeue budget was exhausted.
+	if prov.restoreCalls < 1 {
+		t.Errorf("RestoreVolumeFromSnapshot calls: got %d, want >= 1", prov.restoreCalls)
 	}
 
 	if prov.createCalls != 1 {

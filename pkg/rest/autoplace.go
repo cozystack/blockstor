@@ -844,11 +844,11 @@ func writeAutoplaceTopology(buf *strings.Builder, filter *apiv1.AutoSelectFilter
 // at satellite SendSnapshot/RecvSnapshot time.
 //
 // Lookup path: BlockstorRestoreFromSnapshot → source RD name →
-// first non-Diskless Resource on source RD → its StorPoolName +
-// NodeName → StoragePool.ProviderKind. We walk Resources rather
-// than trusting a hypothetical Snapshot.ProviderKind field because
-// the snapshot CRD doesn't stamp it today (potential future
-// optimisation — see the report).
+// placer.SourceProviderKind (first non-Diskless Resource on the
+// source RD → its StorPoolName + NodeName → StoragePool.ProviderKind).
+// The walk lives in pkg/placer since Bug 038, where Place() re-applies
+// the same pin internally for the controller-side callers (RG apply /
+// rebalance / node replacement) that bypass this handler.
 func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *apiv1.ResourceDefinition) string {
 	const restoreFromKey = "BlockstorRestoreFromSnapshot"
 
@@ -862,35 +862,7 @@ func resolveCloneSourceProviderKind(ctx context.Context, st store.Store, rd *api
 		return ""
 	}
 
-	resList, err := st.Resources().ListByDefinition(ctx, srcRD)
-	if err != nil {
-		return ""
-	}
-
-	for i := range resList {
-		res := &resList[i]
-		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
-			continue
-		}
-
-		stor := res.Props["StorPoolName"]
-		if stor == "" {
-			continue
-		}
-
-		pool, err := st.StoragePools().Get(ctx, res.NodeName, stor)
-		if err != nil {
-			continue
-		}
-
-		if pool.ProviderKind == "" || pool.ProviderKind == apiv1.StoragePoolKindDiskless {
-			continue
-		}
-
-		return pool.ProviderKind
-	}
-
-	return ""
+	return placer.SourceProviderKind(ctx, st, srcRD)
 }
 
 // constrainAutoplaceToSnapshotNodes restricts the filter's

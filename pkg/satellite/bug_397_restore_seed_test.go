@@ -20,6 +20,7 @@ package satellite
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/cozystack/blockstor/pkg/drbd"
@@ -180,7 +181,14 @@ func TestResolveVolumeSeedBug397BlankFallbackRefusesSkip(t *testing.T) {
 // when the clone genuinely succeeds. This is what feeds the seed gate above
 // in a real reconcile pass.
 func TestMaterializeVolumeBug397RecordsBlankFallback(t *testing.T) {
-	t.Run("local_clone_miss_no_fetcher_marks_blank", func(t *testing.T) {
+	t.Run("local_clone_miss_no_fetcher_requeues_then_marks_blank", func(t *testing.T) {
+		// Bug 038 defense-in-depth: a node-local restore whose `@snap`
+		// is not yet materialised must REQUEUE (return ErrNotFound) for
+		// the bounded budget BEFORE conceding to a TERMINAL blank create
+		// — the async SnapshotReconciler may still be taking it. Only
+		// once the budget is exhausted (the snapshot is genuinely never
+		// local, no fetcher) do we fall through to the blank fallback +
+		// Bug 397 marker so DRBD SyncTargets the real restored peer.
 		prov := &restoreSeedFakeProvider{kind: ProviderKindZFSThin, restoreErr: storage.ErrNotFound}
 		rec := NewReconciler(ReconcilerConfig{
 			Providers: map[string]storage.Provider{"zfsthin1": prov},
@@ -194,16 +202,34 @@ func TestMaterializeVolumeBug397RecordsBlankFallback(t *testing.T) {
 			SourceSnapshot: "pvc-src:snap-1",
 		}
 
+		// Every call within the budget requeues, never blank-creates.
+		for i := range restoreSnapshotMissingBudget {
+			err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol)
+			if !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("attempt %d: expected ErrNotFound requeue, got %v", i+1, err)
+			}
+
+			if prov.createCalls != 0 {
+				t.Fatalf("attempt %d: must NOT blank-create while within the "+
+					"requeue budget, got %d create calls", i+1, prov.createCalls)
+			}
+
+			if rec.isRestoreBlankFallback("pvc-bf", 0) {
+				t.Fatalf("attempt %d: must NOT mark blank-fallback while requeueing", i+1)
+			}
+		}
+
+		// Budget exhausted: now it concedes to the blank fallback.
 		if err := rec.materializeVolume(t.Context(), prov, "pvc-bf", vol); err != nil {
-			t.Fatalf("materializeVolume: %v", err)
+			t.Fatalf("materializeVolume (budget exhausted): %v", err)
 		}
 
 		if prov.createCalls != 1 {
-			t.Fatalf("expected blank CreateVolume fallback, got %d create calls", prov.createCalls)
+			t.Fatalf("expected blank CreateVolume fallback after budget, got %d create calls", prov.createCalls)
 		}
 
 		if !rec.isRestoreBlankFallback("pvc-bf", 0) {
-			t.Errorf("blank-fallback marker must be set after a missed clone with no fetcher")
+			t.Errorf("blank-fallback marker must be set once the requeue budget is exhausted")
 		}
 	})
 

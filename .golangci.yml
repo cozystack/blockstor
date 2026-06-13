@@ -380,6 +380,9 @@ linters:
         path: pkg/dispatcher/
       - linters:
           - godox
+        path: pkg/placer/
+      - linters:
+          - godox
         path: pkg/version/
       # linstor-trace-recorder is a dev tool that writes JSON traces
       # under -out-dir; gosec G703 flags the os.WriteFile call despite

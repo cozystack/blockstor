@@ -186,7 +186,16 @@ fi
 rm -f "$err_file"
 
 echo ">> [Bug 020 / A] clone replicas materialise + converge UpToDate"
-mapfile -t cli_nodes < <(wait_clone_replicas "$DST_CLI" 120)
+# NB: `mapfile < <(fn)` swallows fn's exit status, and indexing the
+# then-empty array under `set -u` aborted with the unhelpful
+# `cli_nodes[0]: unbound variable` (masking wait_clone_replicas'
+# diagnostic). Capture through a plain substitution so a timeout
+# fails loudly with the function's own message.
+cli_nodes_raw=$(wait_clone_replicas "$DST_CLI" 120) || {
+    echo "FAIL (Bug 020 / A): clone $DST_CLI did not materialise its replicas" >&2
+    exit 1
+}
+mapfile -t cli_nodes <<<"$cli_nodes_raw"
 wait_uptodate "$DST_CLI" "${cli_nodes[0]}" "${cli_nodes[1]}"
 
 echo ">> [Bug 020 / A] marker bytes present on EVERY clone replica"
@@ -226,7 +235,11 @@ if [[ "$clone_status" != "COMPLETE" ]]; then
 fi
 
 echo ">> [Bug 020 / B] clone replicas materialise + converge UpToDate"
-mapfile -t zfs_nodes < <(wait_clone_replicas "$DST_ZFS" 120)
+zfs_nodes_raw=$(wait_clone_replicas "$DST_ZFS" 120) || {
+    echo "FAIL (Bug 020 / B): clone $DST_ZFS did not materialise its replicas" >&2
+    exit 1
+}
+mapfile -t zfs_nodes <<<"$zfs_nodes_raw"
 wait_uptodate "$DST_ZFS" "${zfs_nodes[0]}" "${zfs_nodes[1]}"
 
 echo ">> [Bug 020 / B] marker bytes present on EVERY clone replica"
