@@ -159,6 +159,13 @@ func New(st store.Store) *Placer {
 // the migration semantic: even if 2 replicas exist, if one is on an
 // evicted node the placer will create a third on a healthy peer.
 func (p *Placer) Place(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) (int, int, error) {
+	// Bug 038: an RD born from a snapshot restore / clone must never
+	// gain a diskful replica on a foreign backend or a snapshot-less
+	// node — enforce the restore-source constraints HERE so every
+	// Place caller (REST autoplace, RG apply, RG rebalance, node
+	// replacement) honours them, not just the REST edge.
+	filter = p.constrainFilterToRestoreSource(ctx, rdName, filter)
+
 	plan, err := p.buildPlan(ctx, rdName, filter)
 	if err != nil {
 		return 0, 0, err
@@ -1733,4 +1740,112 @@ func tupleKey(tuple map[string]string) string {
 	}
 
 	return buf.String()
+}
+
+// restoreFromSnapshotProp is the RD prop the snapshot-restore /
+// clone REST handlers stamp on a restored target
+// (`<srcRD>:<snapName>`). The placer keys its Bug 038 restore-source
+// constraints on it; the literal mirrors pkg/rest and pkg/dispatcher.
+const restoreFromSnapshotProp = "BlockstorRestoreFromSnapshot"
+
+// constrainFilterToRestoreSource applies the restore-source placement
+// constraints for an RD that was materialised from a snapshot
+// (BlockstorRestoreFromSnapshot prop): candidate nodes default to the
+// snapshot's node set, and candidate pools are pinned to the source
+// replica's ProviderKind. Returns the caller's filter untouched when
+// the RD carries no restore marker (the overwhelmingly common case).
+//
+// Bug 038 (release gate): the REST autoplace handler already applied
+// both constraints at the wire edge, but the controller-side Place
+// callers (ResourceGroup apply, RG rebalance, node replacement) fed
+// the placer the RAW RG SelectFilter. On a clone whose source lived
+// on a FILE_THIN pool, the RG reconciler's pass landed the target
+// replica on a ZFS pool — the satellite then piped the FILE_THIN
+// snapshot stream into `zfs recv`, which looped forever on `cannot
+// receive: invalid stream (bad magic number)` and the clone never
+// reached UpToDate. Enforcing the constraint inside Place closes the
+// gap for every current and future caller.
+//
+// The provider pin overrides any caller-supplied ProviderList (same
+// contract as the REST autoplace handler): snapshot streams of
+// different backends are not interchangeable, so a wider caller list
+// can never be honoured safely. An explicit caller NodeNameList is
+// respected — the REST layer validates it against the snapshot's
+// nodes (Bug 397) before any Store mutation.
+//
+// Every lookup is best-effort: when the marker is malformed, the
+// snapshot is gone, or the source has no diskful replica left, the
+// filter passes through unchanged and the regular placement gates
+// apply (satellite-side Bug 397 blank-fallback seeding still protects
+// data integrity in those edge cases).
+func (p *Placer) constrainFilterToRestoreSource(ctx context.Context, rdName string, filter *apiv1.AutoSelectFilter) *apiv1.AutoSelectFilter {
+	rd, err := p.store.ResourceDefinitions().Get(ctx, rdName)
+	if err != nil {
+		return filter
+	}
+
+	stamp := rd.Props[restoreFromSnapshotProp]
+	if stamp == "" {
+		return filter
+	}
+
+	srcRD, snapName, ok := strings.Cut(stamp, ":")
+	if !ok || srcRD == "" || snapName == "" {
+		return filter
+	}
+
+	// Copy so the constraint never leaks into the caller's filter
+	// (RG reconcilers reuse their filter across sibling RDs).
+	out := *filter
+
+	if len(out.NodeNameList) == 0 {
+		snap, snapErr := p.store.Snapshots().Get(ctx, srcRD, snapName)
+		if snapErr == nil && len(snap.Nodes) > 0 {
+			out.NodeNameList = append([]string(nil), snap.Nodes...)
+		}
+	}
+
+	if kind := SourceProviderKind(ctx, p.store, srcRD); kind != "" {
+		out.ProviderList = []string{kind}
+	}
+
+	return &out
+}
+
+// SourceProviderKind returns the ProviderKind of the pool backing the
+// named RD's first non-Diskless replica, or "" when none is
+// resolvable. Shared by the placer's restore-source constraint and
+// the REST autoplace handler's clone provider pin — `zfs send` and
+// dd/lvm payloads are not interchangeable, so a clone target must
+// stay on the source's backend.
+func SourceProviderKind(ctx context.Context, st store.Store, srcRDName string) string {
+	resList, err := st.Resources().ListByDefinition(ctx, srcRDName)
+	if err != nil {
+		return ""
+	}
+
+	for i := range resList {
+		res := &resList[i]
+		if slices.Contains(res.Flags, apiv1.ResourceFlagDiskless) {
+			continue
+		}
+
+		pool := res.Props[storPoolNameProp]
+		if pool == "" {
+			continue
+		}
+
+		sp, err := st.StoragePools().Get(ctx, res.NodeName, pool)
+		if err != nil {
+			continue
+		}
+
+		if sp.ProviderKind == "" || sp.ProviderKind == apiv1.StoragePoolKindDiskless {
+			continue
+		}
+
+		return sp.ProviderKind
+	}
+
+	return ""
 }
