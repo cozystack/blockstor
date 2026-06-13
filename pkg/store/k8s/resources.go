@@ -73,30 +73,33 @@ func (s *resources) List(ctx context.Context) ([]apiv1.Resource, error) {
 }
 
 func (s *resources) ListByDefinition(ctx context.Context, rdName string) ([]apiv1.Resource, error) {
-	// Fast path: label-selector via apiserver. REST-created Resources
-	// always carry `LabelResourceDefinition`, so the cache filters
-	// server-side. For clusters with thousands of Resources this
-	// avoids a full scan on every `linstor r l -r <rd>` and every CSI
-	// reconcile loop.
+	// Scan-and-filter on the authoritative Spec.ResourceDefinitionName.
+	//
+	// Bug 038: an earlier "fast path" trusted a label-selector
+	// (`LabelResourceDefinition`) and only fell back to a full scan
+	// when the selector returned ZERO items, on the assumption that a
+	// partial-but-correct subset was impossible because "every REST
+	// writer sets the label". That assumption breaks for MIXED RDs: a
+	// source RD whose diskful replicas were applied via `kubectl apply`
+	// (e2e fixtures, operator-authored manifests — NO label) but whose
+	// auto-tiebreaker witness was stamped by the controller (WITH the
+	// label). The selector then returned only the labeled witness, the
+	// fallback was skipped, and the unlabeled diskful replicas became
+	// invisible. The snapshot-restore / clone handler reads this list
+	// to resolve the SOURCE pool (storPoolsByNodeFromSourceRD); with
+	// the diskful replicas hidden it stamped the clone replicas with an
+	// EMPTY StorPoolName and the satellite failed every reconcile with
+	// `unknown storage pool ""` (clone.sh never converges).
+	//
+	// The List below is served from the controller-runtime informer
+	// cache (no apiserver round-trip), so filtering on the spec field
+	// in-memory costs the same as a cache-side label index but is
+	// correct for labeled and unlabeled replicas alike.
 	var crdList crdv1alpha1.ResourceList
 
-	err := s.c.List(ctx, &crdList,
-		ctrlclient.MatchingLabels{LabelResourceDefinition: rdName})
+	err := s.c.List(ctx, &crdList)
 	if err != nil {
 		return nil, errors.Wrapf(err, "list Resource CRDs for RD %q", rdName)
-	}
-
-	// Correctness backstop: Resources applied via `kubectl apply`
-	// (e2e fixtures, operator-authored manifests) may lack the label.
-	// On an empty hit, fall back to a full scan and filter by
-	// Spec.ResourceDefinitionName. If the label-selector found
-	// matches, trust it — a partial-but-correct subset isn't possible
-	// here since every REST writer sets the label.
-	if len(crdList.Items) == 0 {
-		err = s.c.List(ctx, &crdList)
-		if err != nil {
-			return nil, errors.Wrapf(err, "fallback list Resource CRDs for RD %q", rdName)
-		}
 	}
 
 	out := make([]apiv1.Resource, 0, len(crdList.Items))
