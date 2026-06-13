@@ -514,6 +514,17 @@ func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, n
 		nodes = snap.Nodes
 	}
 
+	// Bug 038 race gate: the restore data plane is a node-local
+	// RestoreVolumeFromSnapshot, so a replica stamped before its
+	// co-located `@snap` materialises poisons the dataset with a blank
+	// CreateVolume (see waitSnapshotReadyOnNodes). Wait for the
+	// snapshot to report a non-zero per-node CreateTimestamp on the
+	// target nodes before stamping. Best-effort: a timeout (or a
+	// legacy snapshot with no per-node tracking) falls through to the
+	// stamp anyway — the satellite-side blank-fallback requeue is the
+	// backstop — so a degenerate snapshot never wedges the restore.
+	s.waitSnapshotReadyOnNodes(ctx, srcRDName, snap.Name, nodes)
+
 	return s.stampRestoredResourcesOnNodes(ctx, srcRDName, newRD.Name, nodes)
 }
 

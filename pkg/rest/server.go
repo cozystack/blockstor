@@ -145,6 +145,25 @@ type Server struct {
 	// net.DefaultResolver via defaultResolveHost".
 	resolveHost resolveHostFunc
 
+	// SnapshotReadyTimeout / SnapshotReadyPoll tune the Bug 038
+	// snapshot-readiness gate the clone / restore handlers apply
+	// BEFORE stamping the restore-marked replicas (see
+	// waitSnapshotReadyOnNodes). The clone/restore data plane is a
+	// node-local RestoreVolumeFromSnapshot: a replica that reconciles
+	// before its co-located `@snap` materialises hits ErrNotFound and
+	// poisons the dataset with a blank CreateVolume (the Bug 038
+	// regression). Gating placement on the per-node snapshot
+	// CreateTimestamp closes the race — the SnapshotReconciler stamps
+	// it only AFTER `CreateSnapshot` has created the on-disk snapshot,
+	// so a non-zero timestamp proves the local snapshot exists.
+	//
+	// Zero values fall back to the production defaults
+	// (snapshotReadyTimeoutDefault / snapshotReadyPollDefault) via
+	// snapshotReadyTuning. Tests shrink them to keep the suite fast
+	// while still exercising the wait loop.
+	SnapshotReadyTimeout time.Duration
+	SnapshotReadyPoll    time.Duration
+
 	// OnReady, when non-nil, is invoked exactly once after the
 	// TCP listener has been successfully bound and BEFORE the
 	// HTTP serve loop accepts the first connection. The apiserver
