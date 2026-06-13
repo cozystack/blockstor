@@ -697,9 +697,20 @@ func (r *ResourceDefinitionReconciler) applyWitnessDecision(
 ) ([]apiv1.Resource, error) {
 	switch {
 	case wantWitness && len(witness) == 0:
-		err := r.createWitness(ctx, rd, replicas)
+		created, err := r.createWitness(ctx, rd, replicas)
 		if err != nil {
 			return nil, err
+		}
+
+		if !created {
+			// No eligible spare node (every candidate is busy, drained,
+			// or AutoplaceTarget=false — BUG-040). The witness was NOT
+			// created, so the quorum computation below must not count a
+			// phantom third voter: 2 diskful + 0 diskless is quorum=off
+			// per upstream isQuorumFeasible. Pre-fix this branch appended
+			// the phantom unconditionally and stamped quorum=majority on
+			// a 2-voter RD, arming a both-halves-freeze on partition.
+			return diskless, nil
 		}
 
 		return append(diskless, apiv1.Resource{
@@ -768,7 +779,13 @@ func quorumPolicy(diskful, diskless int) string {
 // The probe only runs when APIReader is non-nil — unit-test setups
 // that construct the reconciler directly and rely on the
 // Bug 104/108 fake-client-only fixtures stay unaffected.
-func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) error {
+//
+// The bool return reports whether a witness was actually created (or
+// already existed under a concurrent reconcile). The no-candidate /
+// deferred-probe paths return false so the caller's quorum
+// computation reflects the real post-write replica set instead of a
+// phantom witness (BUG-040).
+func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *blockstoriov1alpha1.ResourceDefinition, existing []apiv1.Resource) (bool, error) {
 	hostingReplica := map[string]bool{}
 	for i := range existing {
 		hostingReplica[existing[i].NodeName] = true
@@ -781,13 +798,13 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	// in-depth against caller-snapshot staleness.
 	tiebreakerNode, err := r.pickTiebreakerNodeForRD(ctx, rd.Name, hostingReplica)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if tiebreakerNode == "" {
 		// No spare healthy node; the witness can't be created
 		// today. Quorum will fall back to off below.
-		return nil
+		return false, nil
 	}
 
 	// Bug-024 placement guard: the candidate list above comes from
@@ -803,14 +820,14 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	// rdReconcileRequeue retries with a fresh candidate list.
 	probe, err := r.probeNodeDirect(ctx, tiebreakerNode)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if !probe.found || probe.drained {
 		logf.FromContext(ctx).Info("witness candidate vanished or drained; deferring witness create",
 			"rd", rd.Name, "node", tiebreakerNode, "found", probe.found)
 
-		return nil
+		return false, nil
 	}
 
 	newWitness := apiv1.Resource{
@@ -821,7 +838,7 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 
 	err = r.Store.Resources().Create(ctx, &newWitness)
 	if err != nil && !stderrors.Is(err, store.ErrAlreadyExists) && !alreadyExists(err) {
-		return err
+		return false, err
 	}
 
 	r.rollbackWitnessIfRDGone(ctx, rd.Name, tiebreakerNode)
@@ -834,7 +851,7 @@ func (r *ResourceDefinitionReconciler) createWitness(ctx context.Context, rd *bl
 	// repair leg (dropStrandedReplicas) on the next pass.
 	r.rollbackWitnessIfNodeGone(ctx, rd.Name, tiebreakerNode)
 
-	return nil
+	return true, nil
 }
 
 // rollbackWitnessIfNodeGone deletes the just-created witness when its
@@ -1239,6 +1256,13 @@ func (r *ResourceDefinitionReconciler) pickTiebreakerNodeForRD(
 			continue
 		}
 
+		// BUG-040: AutoplaceTarget=false is the maintenance-drain
+		// opt-out from autoplace targeting, and the auto-witness is
+		// an automatic placement — never pin it to a drained node.
+		if isAutoplaceExcludedNode(&nodes[i]) {
+			continue
+		}
+
 		if nodes[i].Type != "" && nodes[i].Type != apiv1.NodeTypeSatellite && nodes[i].Type != apiv1.NodeTypeCombined {
 			continue
 		}
@@ -1265,6 +1289,30 @@ func isDisabledNode(node *apiv1.Node) bool {
 	}
 
 	return false
+}
+
+// isAutoplaceExcludedNode mirrors placer.autoplaceExcludedNodes for the
+// RD-level tiebreaker path (BUG-040): a node whose `AutoplaceTarget`
+// prop parses to an explicit false has opted out of autoplace TARGETING
+// — and the auto-tiebreaker witness is an automatic placement, so the
+// picker must never select it. Upstream LINSTOR routes tiebreaker
+// selection through the same autoplacer that honours AutoplaceTarget,
+// so a drained maintenance node never receives the witness either; on
+// a topology with no other spare the witness is simply not created and
+// quorum falls back to off.
+//
+// Only a parseable false excludes the node — true / unset / typo keep
+// it eligible, the same fail-open parse the placer uses, so a
+// fat-fingered prop can never silently exclude the node.
+func isAutoplaceExcludedNode(node *apiv1.Node) bool {
+	raw, ok := node.Props[apiv1.PropAutoplaceTarget]
+	if !ok {
+		return false
+	}
+
+	v, err := strconv.ParseBool(raw)
+
+	return err == nil && !v
 }
 
 // dropStrandedReplicas reduces the RD's replica snapshot to the live
@@ -1429,7 +1477,10 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 			return nodeProbe{}, err
 		}
 
-		return nodeProbe{found: true, drained: isDisabledNode(&node)}, nil
+		return nodeProbe{
+			found:   true,
+			drained: isDisabledNode(&node) || isAutoplaceExcludedNode(&node),
+		}, nil
 	}
 
 	var list blockstoriov1alpha1.NodeList
@@ -1442,7 +1493,10 @@ func (r *ResourceDefinitionReconciler) probeNodeDirect(ctx context.Context, wire
 			continue
 		}
 
-		return nodeProbe{found: true, drained: nodeHasDrainFlag(&list.Items[i])}, nil
+		return nodeProbe{
+			found:   true,
+			drained: nodeHasDrainFlag(&list.Items[i]) || nodeCRDAutoplaceExcluded(&list.Items[i]),
+		}, nil
 	}
 
 	return nodeProbe{}, nil
@@ -1749,6 +1803,24 @@ func nodeHasDrainFlag(n *blockstoriov1alpha1.Node) bool {
 	}
 
 	return false
+}
+
+// nodeCRDAutoplaceExcluded is the Node-CRD-shaped twin of
+// isAutoplaceExcludedNode for the probeNodeDirect authoritative-reader
+// leg (BUG-040): the per-node `AutoplaceTarget` prop lives verbatim in
+// Spec.Props on the CRD, and a freshly-stamped false must veto the
+// witness create the same way a freshly-stamped EVICTED flag does —
+// the informer-backed candidate list can lag the REST set-property by
+// tens of milliseconds.
+func nodeCRDAutoplaceExcluded(n *blockstoriov1alpha1.Node) bool {
+	raw, ok := n.Spec.Props[apiv1.PropAutoplaceTarget]
+	if !ok {
+		return false
+	}
+
+	v, err := strconv.ParseBool(raw)
+
+	return err == nil && !v
 }
 
 // enqueueRDsForNode maps a Node flag-change event to every
