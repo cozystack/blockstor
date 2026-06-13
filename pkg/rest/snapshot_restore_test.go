@@ -293,26 +293,27 @@ func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 		t.Fatalf("restore status: got %d, want 201", resp.StatusCode)
 	}
 
-	// 2) the restore itself stamped replicas on the snapshot's nodes
-	// in the SOURCE pool (Bug 038 / upstream restore semantics).
+	// 2) the bare restore (no --node-name) leaves an EMPTY shell — the
+	// operator / linstor-csi drives placement, preserving the
+	// restore-then-scale-out workflow and the staged cross-node
+	// bring-up the e2e restore lanes rely on. The cross-backend
+	// protection moved to the placer, asserted in step 3.
 	got, err := st.Resources().ListByDefinition(ctx, "pvc-2")
 	if err != nil {
 		t.Fatalf("list pvc-2: %v", err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("restored replicas: got %d, want 2 (one per snapshot node)", len(got))
+	if len(got) != 0 {
+		t.Fatalf("bare restore replicas: got %d, want 0 (empty shell — "+
+			"placement is the operator's call)", len(got))
 	}
 
-	for i := range got {
-		if stor := got[i].Props["StorPoolName"]; stor != "zpool" {
-			t.Errorf("replica on %s landed on %q, want the source pool %q",
-				got[i].NodeName, stor, "zpool")
-		}
-	}
-
-	// 3) a follow-up autoplace at the same place_count is an
-	// idempotent no-op — no extra replicas, no pool churn.
+	// 3) the operator's autoplace honours the restore-source BACKEND
+	// pin: even though the LVM_THIN candidates are roomier (FreeCapacity
+	// 9000 vs the ZFS_THIN 1000), every diskful replica must land on a
+	// ZFS_THIN pool — the placer's constrainFilterToRestoreSource drops
+	// the mismatched backend (Bug 038: a ZFS snapshot stream piped into
+	// an LVM receiver fails opaquely).
 	body, _ = json.Marshal(map[string]any{
 		"select_filter": map[string]any{"place_count": 2},
 	})
@@ -330,7 +331,16 @@ func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 	}
 
 	if len(got) != 2 {
-		t.Fatalf("replicas after idempotent autoplace: got %d, want 2", len(got))
+		t.Fatalf("replicas after autoplace: got %d, want 2", len(got))
+	}
+
+	for i := range got {
+		stor := got[i].Props["StorPoolName"]
+		if stor != "zfs-target-n1" && stor != "zfs-target-n2" {
+			t.Errorf("replica on %s landed on %q, want a ZFS_THIN target "+
+				"(the LVM_THIN decoy must be filtered by the backend pin)",
+				got[i].NodeName, stor)
+		}
 	}
 }
 
@@ -922,39 +932,51 @@ func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 		t.Fatalf("status: got %d, want 201", resp.StatusCode)
 	}
 
+	// The bare restore (no --node-name) leaves an EMPTY shell — the
+	// operator / linstor-csi drives placement. (Bug 354 was about
+	// stamping SOMETHING so satellites reconcile; the explicit
+	// autoplace below does that, while the placer's backend pin keeps
+	// it on the source backend — the Bug 038 fix without the eager
+	// all-nodes stamp that broke staged cross-node bring-up.)
 	got, err := st.Resources().ListByDefinition(ctx, "pvc-restored")
 	if err != nil {
 		t.Fatalf("list restored Resources: %v", err)
 	}
 
+	if len(got) != 0 {
+		t.Fatalf("bare restore Resource CRDs: got %d, want 0 (empty shell)", len(got))
+	}
+
+	// Operator autoplace: with the parent RG's empty SelectFilter the
+	// caller supplies place_count explicitly. The placer's restore-
+	// source backend pin must keep every replica on the ZFS_THIN source
+	// pool, never the roomier LVM_THIN decoy (Bug 038: a ZFS snapshot
+	// stream into an LVM receiver fails opaquely at the satellite).
+	body, _ = json.Marshal(map[string]any{
+		"select_filter": map[string]any{"place_count": 2},
+	})
+
+	resp = httpPost(t, base+"/v1/resource-definitions/pvc-restored/autoplace", body)
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("autoplace status: got %d, want 200", resp.StatusCode)
+	}
+
+	got, err = st.Resources().ListByDefinition(ctx, "pvc-restored")
+	if err != nil {
+		t.Fatalf("list restored Resources after autoplace: %v", err)
+	}
+
 	if len(got) != 2 {
-		t.Fatalf("Resource CRDs stamped: got %d, want %d (one per snapshot node)",
-			len(got), 2)
+		t.Fatalf("Resource CRDs after autoplace: got %d, want 2", len(got))
 	}
 
-	// Both replicas must land on the snapshot's nodes, in the
-	// SOURCE pool — never on the roomier different-backend decoy
-	// (Bug 038: a FILE_THIN→ZFS placement loops forever on
-	// `zfs recv … bad magic number` at the satellite).
-	wantNodes := map[string]bool{"n1": false, "n2": false}
 	for _, res := range got {
-		if _, ok := wantNodes[res.NodeName]; !ok {
-			t.Errorf("placed off snapshot node set: got %q", res.NodeName)
-
-			continue
-		}
-
-		wantNodes[res.NodeName] = true
-
 		if pool := res.Props["StorPoolName"]; pool != "zpool" {
-			t.Errorf("replica on %s landed on pool %q, want the source pool %q",
+			t.Errorf("replica on %s landed on pool %q, want the source pool %q "+
+				"(the LVM_THIN decoy must be filtered by the backend pin)",
 				res.NodeName, pool, "zpool")
-		}
-	}
-
-	for n, placed := range wantNodes {
-		if !placed {
-			t.Errorf("expected a replica on snapshot node %q, none placed", n)
 		}
 	}
 }

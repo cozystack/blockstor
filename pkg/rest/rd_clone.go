@@ -226,7 +226,11 @@ func (s *Server) cloneWithData(w http.ResponseWriter, r *http.Request, src *apiv
 
 	restoreReq := &snapshotRestoreRequest{ToResource: req.Name}
 
-	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap)
+	// Clone path: eagerPlace=true. `rd clone` is a one-shot CSI
+	// operation with no follow-up autoplace, so the clone replicas must
+	// materialise on the snapshot-holding nodes in the source pool here
+	// (same backend by construction — Bug 038).
+	_, err := s.materializeRestoredRD(ctx, src.Name, restoreReq, snap, true)
 	if err != nil {
 		writeCloneRefused(w, http.StatusInternalServerError, src.Name, req.Name, &apiv1.APICallRc{
 			RetCode: apiCallRcError,

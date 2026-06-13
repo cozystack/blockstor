@@ -308,7 +308,11 @@ func (s *Server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap)
+	// Bare restore: eagerPlace=false. With no explicit --node-name the
+	// target is left an empty shell for the operator / linstor-csi to
+	// place (restore-then-scale-out); an explicit node list is still
+	// stamped verbatim inside materializeRestoredRD.
+	newRDName, err := s.materializeRestoredRD(r.Context(), srcRD, &req, &snap, false)
 	if err != nil {
 		writeStoreError(w, err)
 
@@ -411,7 +415,29 @@ func resolveSnapshotName(r *http.Request, req *snapshotRestoreRequest) string {
 // RD's LayerStack + Props (snapshot Props win when set) and hydrates
 // its VolumeDefinitions from the snapshot's recorded volume layout.
 // Returns the new RD's name on success.
-func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot) (string, error) {
+//
+// eagerPlace selects the placement policy for an EMPTY caller node list:
+//
+//   - true (the clone path, cloneWithData): stamp one diskful replica on
+//     EVERY snapshot-holding node in the source pool. `rd clone` is a
+//     one-shot CSI operation with no follow-up autoplace, so the clone
+//     replicas must materialise here; keeping them on the snapshot nodes
+//     in the SOURCE backend is what closes Bug 038 (no cross-backend
+//     stream into `zfs recv`).
+//   - false (the bare snapshot-restore handler): leave an EMPTY shell —
+//     no Resources stamped — so the operator / linstor-csi drives
+//     placement explicitly via `rd ap`. This preserves upstream's
+//     restore-then-scale-out workflow and the legitimate STAGED
+//     cross-node bring-up the e2e restore lanes rely on (place the
+//     data-bearing replica on a snapshot node first, then add a
+//     cross-node replica that SyncTargets it). The placer's restore-
+//     source backend pin (constrainFilterToRestoreSource) keeps that
+//     later autoplace same-backend, so Bug 038 stays fixed without the
+//     eager all-nodes stamp.
+//
+// An explicit caller node list is always stamped verbatim, regardless of
+// eagerPlace.
+func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) (string, error) {
 	srcRDObj, err := s.Store.ResourceDefinitions().Get(ctx, srcRD)
 	if err != nil {
 		return "", err //nolint:wrapcheck // surfaced via writeStoreError
@@ -464,7 +490,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// observed a Resource for the new RD, so the BlockstorRestoreFromSnapshot
 	// prop marker on the RD was dead code and the restored RD stayed an
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
-	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap)
+	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap, eagerPlace)
 	if err != nil {
 		return "", err
 	}
@@ -502,15 +528,29 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 //
 // The Nodes / NodeNames request fields are aliased — callers may use
 // either; we normalise to one canonical list before iterating.
-func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot) error {
+func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot, eagerPlace bool) error {
 	nodes := canonicalRestoreNodeList(req)
 
 	if len(nodes) == 0 {
-		// Upstream default: restore on every node the snapshot exists
-		// on. An empty snap.Nodes (legacy snapshot CRD without the
+		if !eagerPlace {
+			// Bare restore with no explicit nodes → EMPTY shell. The
+			// operator / linstor-csi drives placement via `rd ap`,
+			// which the placer keeps on the source backend
+			// (constrainFilterToRestoreSource). This preserves the
+			// upstream restore-then-scale-out workflow and the staged
+			// cross-node bring-up the e2e restore lanes rely on. _ =
+			// snap keeps the signature uniform with the eager branch.
+			_ = snap
+
+			return nil
+		}
+
+		// Clone path (eager): stamp one replica on every snapshot node
+		// in the source pool. `rd clone` is a one-shot CSI op with no
+		// follow-up autoplace, so the clone replicas must materialise
+		// here. An empty snap.Nodes (legacy snapshot CRD without the
 		// node list) stamps nothing — the operator can still drive
-		// placement explicitly via `linstor rd ap <new>`, which the
-		// autoplace handler constrains to snapshot-compatible pools.
+		// placement explicitly via `linstor rd ap <new>`.
 		nodes = snap.Nodes
 	}
 
