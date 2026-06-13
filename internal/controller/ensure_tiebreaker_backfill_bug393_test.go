@@ -270,3 +270,108 @@ func TestBug393WitnessStillReapedWhenGenuineOrphan(t *testing.T) {
 		}
 	}
 }
+
+// TestBug393WitnessKeptWhileInactivePresent pins the decision-level fix
+// and is the direct unit-level reproduction of the
+// inactive-return-backfills-redundancy stand hang.
+//
+// Topology after `r deactivate node2`: 1 active diskful (node1) + 1
+// INACTIVE diskful (node2) + 1 auto-tiebreaker witness (node3, left over
+// from the pre-deactivate 2-active-diskful state). The placer's
+// `r c --auto-place=2` wants to promote the node3 witness to a diskful
+// backfill to restore active redundancy to 2.
+//
+// Pre-fix: ensureTiebreaker filters the INACTIVE node2 out, sees `1
+// diskful + 1 witness`, treats the witness as a genuine orphan, and
+// reaps node3 — clobbering the backfill target. The reconciler then
+// oscillates 1↔2 active diskful forever and active_diskful_count never
+// stabilises at 2 (the 240s assertion timeout observed on stand).
+//
+// Post-fix: the INACTIVE replica marks the cluster as degraded /
+// backfill-in-progress, so the witness on node3 is HELD — it is the
+// backfill target, not an orphan. The placer can promote it (or it stays
+// as the third voter once node2 returns).
+func TestBug393WitnessKeptWhileInactivePresent(t *testing.T) {
+	t.Parallel()
+
+	scheme := newScheme(t)
+	st := store.NewInMemory()
+	ctx := context.Background()
+
+	for _, n := range []string{"n1", "n2", "n3"} {
+		if err := st.Nodes().Create(ctx, &apiv1.Node{
+			Name: n, Type: apiv1.NodeTypeSatellite,
+		}); err != nil {
+			t.Fatalf("seed node %s: %v", n, err)
+		}
+	}
+
+	// n1: active diskful (the only voting peer).
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug393-keep", NodeName: "n1",
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed active diskful: %v", err)
+	}
+
+	// n2: INACTIVE diskful (operator-deactivated; redundancy degraded).
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug393-keep", NodeName: "n2",
+		Flags: []string{apiv1.ResourceFlagInactive},
+		Props: map[string]string{"StorPoolName": "pool"},
+	}); err != nil {
+		t.Fatalf("seed inactive diskful: %v", err)
+	}
+
+	// n3: leftover auto-tiebreaker witness — the backfill target.
+	if err := st.Resources().Create(ctx, &apiv1.Resource{
+		Name: "pvc-bug393-keep", NodeName: "n3",
+		Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+	}); err != nil {
+		t.Fatalf("seed witness: %v", err)
+	}
+
+	rd := &blockstoriov1alpha1.ResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "pvc-bug393-keep"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rd).Build()
+
+	rec := &controllerpkg.ResourceDefinitionReconciler{
+		Client: cli,
+		Scheme: scheme,
+		Store:  st,
+	}
+
+	// Run the full reconcile decision several times — the pre-fix
+	// behaviour reaped the witness on the very first pass; a stable fix
+	// must keep it across repeated reconciles (the reconciler fires many
+	// times per second under the Resource watch fan-out).
+	for pass := range 3 {
+		if err := rec.EnsureTiebreaker(ctx, rd); err != nil {
+			t.Fatalf("EnsureTiebreaker pass %d: %v", pass, err)
+		}
+
+		got, err := st.Resources().Get(ctx, "pvc-bug393-keep", "n3")
+		if err != nil {
+			t.Fatalf("pass %d: witness on n3 was reaped while an INACTIVE replica is present "+
+				"(backfill target clobbered — the oscillation root cause): %v", pass, err)
+		}
+
+		if !slices.Contains(got.Flags, apiv1.ResourceFlagTieBreaker) {
+			t.Fatalf("pass %d: n3 lost TIE_BREAKER unexpectedly: %v", pass, got.Flags)
+		}
+	}
+
+	// The INACTIVE replica must not have been touched, and no spurious
+	// extra witness/replica should have been created.
+	all, err := st.Resources().ListByDefinition(ctx, "pvc-bug393-keep")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(all) != 3 {
+		t.Errorf("replica set churned: got %d rows, want 3 (n1 active, n2 inactive, n3 witness); %+v",
+			len(all), all)
+	}
+}
