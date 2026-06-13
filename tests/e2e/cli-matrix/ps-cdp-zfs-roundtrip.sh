@@ -105,7 +105,19 @@ echo ">> pick first free /dev/sdX on $NODE from linstor ps l"
 # Why: wire schema is `[{size, rotational, nodes:{<node>:[{device,...}]}}]`
 # — `.[0]` may be `[]` when no spare devices, so guard with `// empty`
 # and never crash on a stand whose disks are all already attached.
-DEV=$("${LCTL[@]}" --machine-readable physical-storage list 2>/dev/null \
+#
+# SKIP-gate robustness: the python `linstor physical-storage list`
+# render path can raise a KeyError / AttributeError inside
+# responses.py while formatting a device whose `size` field is absent
+# (observed on stands whose only spare is a zero-size zram), so the
+# CLI exits non-zero. Capture the machine-readable stdout into a
+# variable FIRST with `|| true`, so a throwing CLI under
+# `set -o pipefail` degrades to an empty result and the no-free-device
+# SKIP below fires cleanly instead of aborting the whole script as a
+# spurious FAIL. The jq parse then runs on the captured (possibly
+# empty) string, isolated from the CLI's exit status.
+ps_json=$("${LCTL[@]}" --machine-readable physical-storage list 2>/dev/null || true)
+DEV=$(printf '%s' "$ps_json" \
     | jq -r --arg n "$NODE" '
         # Why: golinstor wraps result in `[[{...}, {...}]]` (double
         # array). Flatten with `.[]?[]?` so each inner element is an
@@ -114,11 +126,13 @@ DEV=$("${LCTL[@]}" --machine-readable physical-storage list 2>/dev/null \
         # entries without aborting the whole expression.
         .[]?[]?
         | try (.nodes[$n][]?.device) catch empty
-        | select(. != null and test("^/dev/sd[a-z]+$"))' \
-    | head -1)
+        | select(. != null and test("^/dev/sd[a-z]+$"))' 2>/dev/null \
+    | head -1 || true)
 if [[ -z "$DEV" ]]; then
     echo "SKIP: no free /dev/sdX on $NODE in linstor ps l (already all attached or no spare disks on stand)"
-    "${LCTL[@]}" physical-storage list 2>&1 | head -20
+    # NB: dump the machine-readable JSON, NOT the plain `ps l` render
+    # path — the latter is exactly what raises the python KeyError.
+    printf '%s\n' "$ps_json" | head -40
     exit 0
 fi
 echo "   picked $DEV"
