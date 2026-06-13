@@ -119,7 +119,7 @@ both_up=false
 while (( $(date +%s) < deadline )); do
     # 2 diskful replicas × 2 volumes = 4 disk_state strings, all UpToDate.
     states=$("${LCTL[@]}" --machine-readable resource list --resources "$RD" 2>/dev/null \
-        | jq -r '[.[][]? | select((.rsc_flags//[]) | (map(. == "DISKLESS" or . == "TIE_BREAKER") | any | not)) | .vlms[]? | .state.disk_state // "Unknown"] | join(",")' \
+        | jq -r '[.[][]? | select((.flags//[]) | (map(. == "DISKLESS" or . == "TIE_BREAKER") | any | not)) | .vlms[]? | .state.disk_state // "Unknown"] | join(",")' \
         2>/dev/null || echo "")
     count_uptodate=$(awk -F, '{ for (i=1;i<=NF;i++) if ($i=="UpToDate") n++ } END { print n+0 }' <<<"$states")
     if (( count_uptodate == 4 )); then

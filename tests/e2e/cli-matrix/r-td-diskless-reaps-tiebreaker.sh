@@ -171,11 +171,11 @@ wire=$(linstor_r_l_json "$RD")
 n_wire=$(printf '%s' "$wire" | jq -r '.[][] | .name' 2>/dev/null | wc -l | tr -d ' ' || echo 0)
 if [[ "$n_wire" != "2" ]]; then
     echo "FAIL: linstor r l shows $n_wire rows for $RD, want 2" >&2
-    printf '%s\n' "$wire" | jq '.[][]| {name, node_name, flags: .rsc_flags}' 2>/dev/null >&2 || true
+    printf '%s\n' "$wire" | jq '.[][]| {name, node_name, flags: .flags}' 2>/dev/null >&2 || true
     exit 1
 fi
 
-wire_flags=$(printf '%s' "$wire" | jq -r '.[][] | .rsc_flags // [] | join(",")' 2>/dev/null || echo "")
+wire_flags=$(printf '%s' "$wire" | jq -r '.[][] | .flags // [] | join(",")' 2>/dev/null || echo "")
 if [[ "$wire_flags" == *"TIE_BREAKER"* ]]; then
     echo "FAIL: a surviving row still carries TIE_BREAKER (flags=$wire_flags)" >&2
     exit 1
