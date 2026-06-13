@@ -127,6 +127,17 @@ fi
 echo "   backing LV = ${lv_kib} KiB (>= 2 GiB) OK"
 
 echo ">> 3. kernel DRBD device grew on $N1"
+# The DRBD NET device is a few MiB smaller than the GROSS VolumeDefinition
+# size: DRBD carves its internal metadata out of the same backing volume,
+# so a 2 GiB VD presents a kernel block device of ~2096156 KiB, never the
+# full 2097152 KiB. Asserting `dev_kib >= SIZE_2G_KIB` therefore FAILed by
+# the metadata reserve even on a perfectly-converged resize. Require the
+# device to have grown to within a fixed 8 MiB slack of the nominal size —
+# far smaller than the 1 GiB growth step, so this still proves the resize
+# reached the kernel while tolerating the net-vs-gross overhead (same
+# slack assert_resize_converged uses).
+META_SLACK_KIB=8192
+DRBD_MIN_KIB=$(( SIZE_2G_KIB - META_SLACK_KIB ))
 dev=$(device_for_rd "$RD" "$N1" || true)
 if [[ -n "$dev" ]]; then
     drbd_deadline=$(( $(date +%s) + 60 ))
@@ -135,15 +146,15 @@ if [[ -n "$dev" ]]; then
         # blockdev --getsize64 reports bytes; convert to KiB.
         bytes=$(on_node "$N1" bash -c "blockdev --getsize64 '${dev}' 2>/dev/null || echo 0" 2>/dev/null || echo 0)
         dev_kib=$(( ${bytes:-0} / 1024 ))
-        if (( dev_kib >= SIZE_2G_KIB )); then break; fi
+        if (( dev_kib >= DRBD_MIN_KIB )); then break; fi
         sleep 3
     done
-    if (( dev_kib < SIZE_2G_KIB )); then
-        echo "FAIL (U329): kernel DRBD device ${dev} on $N1 is ${dev_kib} KiB, want >= 2 GiB" >&2
+    if (( dev_kib < DRBD_MIN_KIB )); then
+        echo "FAIL (U329): kernel DRBD device ${dev} on $N1 is ${dev_kib} KiB, want >= ${DRBD_MIN_KIB} KiB (2 GiB net of metadata)" >&2
         echo "      drbdadm resize did not run / did not re-probe the grown disk." >&2
         exit 1
     fi
-    echo "   kernel device ${dev} = ${dev_kib} KiB (>= 2 GiB) OK"
+    echo "   kernel device ${dev} = ${dev_kib} KiB (>= ${DRBD_MIN_KIB} KiB net) OK"
 else
     echo "   WARN: could not resolve /dev/drbdN for $RD on $N1 — skipping kernel-size check"
 fi
