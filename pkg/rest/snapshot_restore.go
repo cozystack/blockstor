@@ -554,17 +554,21 @@ func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, n
 		nodes = snap.Nodes
 	}
 
-	// Bug 038 race gate: the restore data plane is a node-local
-	// RestoreVolumeFromSnapshot, so a replica stamped before its
-	// co-located `@snap` materialises poisons the dataset with a blank
-	// CreateVolume (see waitSnapshotReadyOnNodes). Wait for the
-	// snapshot to report a non-zero per-node CreateTimestamp on the
-	// target nodes before stamping. Best-effort: a timeout (or a
-	// legacy snapshot with no per-node tracking) falls through to the
-	// stamp anyway — the satellite-side blank-fallback requeue is the
-	// backstop — so a degenerate snapshot never wedges the restore.
-	s.waitSnapshotReadyOnNodes(ctx, srcRDName, snap.Name, nodes)
-
+	// Bug 038: stamp the restore-marked replicas SYNCHRONOUSLY and
+	// return promptly — the HTTP handler must never block on async
+	// reconciler state. The restore data plane is a node-local
+	// RestoreVolumeFromSnapshot, but the per-node `@snap` is created
+	// ASYNCHRONOUSLY by the satellite SnapshotReconciler, so a replica
+	// can reconcile before its co-located `@snap` exists. That race is
+	// absorbed entirely on the SATELLITE side: materializeVolume REQUEUES
+	// the reconcile (restoreSnapshotMissingBudget passes, ~5s backoff
+	// each) on RestoreVolumeFromSnapshot ErrNotFound BEFORE conceding to
+	// the terminal blank CreateVolume, giving the local snapshot time to
+	// land. Blocking the POST here on a satellite-set CreateTimestamp
+	// would hang the restore until the client deadline whenever the
+	// snapshot is slow / never Ready (and deadlocks envtest, which has no
+	// satellite to stamp the timestamp at all) — so the handler does NOT
+	// wait.
 	return s.stampRestoredResourcesOnNodes(ctx, srcRDName, newRD.Name, nodes)
 }
 

@@ -30,7 +30,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/errors"
 
@@ -52,16 +51,6 @@ func startServerWithStore(t *testing.T, st store.Store) (string, func()) {
 		Store:     st,
 		Client:    newFakeRESTClient(t),
 		Namespace: testRESTNamespace,
-		// Keep the Bug 038 snapshot-readiness gate fast in the unit
-		// suite: the in-memory store has no SnapshotReconciler to stamp
-		// per-node CreateTimestamps, so a production-length wait would
-		// stall every clone/restore test for the full timeout. A tight
-		// timeout + poll exercises the wait loop and then falls through
-		// to placement (the gate is best-effort by design). Tests that
-		// assert the gate actually WAITS (snapshot_ready_test.go) inject
-		// their own readiness via a lag store.
-		SnapshotReadyTimeout: 50 * time.Millisecond,
-		SnapshotReadyPoll:    5 * time.Millisecond,
 	})
 }
 
