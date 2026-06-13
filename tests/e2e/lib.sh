@@ -109,6 +109,35 @@ on_node() {
     kubectl -n "$NS" exec "$pod" -- "$@"
 }
 
+# on_node_stdin runs CMD inside the satellite pod scheduled on NODE
+# with the caller's stdin forwarded into the container (`kubectl
+# exec -i`). Use this — never plain on_node — whenever the remote
+# command reads stdin (e.g. `cryptsetup --key-file=-`).
+#
+# BUG-039 root cause: on_node execs WITHOUT `-i`, so kubectl never
+# forwards the pipe and the remote command sees EOF on fd 0.
+# `printf pass | on_node ... cryptsetup luksOpen --key-file=-` fed
+# cryptsetup an EMPTY key ("Nothing to read on input"), making every
+# kernel-level passphrase assertion fail on every stand regardless of
+# what key the satellite actually formatted with. Kept separate from
+# on_node because an unconditional `-i` would let no-stdin callers
+# (poll loops, `while read` bodies) steal the calling script's stdin.
+on_node_stdin() {
+    local node=$1
+    shift
+    local pod
+    pod=$(kubectl -n "$NS" get pods -l app=blockstor-satellite \
+        --field-selector "spec.nodeName=${node},status.phase=Running" \
+        -o "jsonpath={.items[0].metadata.name}")
+
+    if [[ -z "$pod" ]]; then
+        echo "no Running satellite pod on node $node" >&2
+        return 1
+    fi
+
+    kubectl -n "$NS" exec -i "$pod" -- "$@"
+}
+
 # ---- k8s-native readers (preferred over drbdsetup-status grep) ----
 #
 # Replaces `kubectl exec satellite -- drbdsetup status ... | grep ...`
