@@ -89,6 +89,13 @@ func TestSnapshotCreateMultiFansOut(t *testing.T) {
 
 	// Per-RD store side-effect: both snapshots ended up in the
 	// store. Pin both since the handler must hit both entries.
+	//
+	// Bug 046 / Bug-353: every entry of one batch must carry the SAME
+	// non-empty GroupID + GroupSize == batch length so the controller-
+	// side suspend barrier knows when the group is fully assembled and
+	// opens suspend on every sibling in one pass.
+	var groupID string
+
 	for _, rd := range []string{"pvc-a", "pvc-b"} {
 		snaps, sErr := st.Snapshots().ListByDefinition(ctx, rd)
 		if sErr != nil {
@@ -97,6 +104,24 @@ func TestSnapshotCreateMultiFansOut(t *testing.T) {
 
 		if len(snaps) != 1 {
 			t.Errorf("snapshots for %s: got %d, want 1", rd, len(snaps))
+
+			continue
+		}
+
+		got := snaps[0]
+		if got.GroupID == "" {
+			t.Errorf("snapshot %s: empty GroupID, want shared batch handle", rd)
+		}
+
+		if got.GroupSize != 2 {
+			t.Errorf("snapshot %s: GroupSize=%d, want 2 (batch length)", rd, got.GroupSize)
+		}
+
+		if groupID == "" {
+			groupID = got.GroupID
+		} else if got.GroupID != groupID {
+			t.Errorf("snapshot %s: GroupID=%q, want shared %q across the batch",
+				rd, got.GroupID, groupID)
 		}
 	}
 }
