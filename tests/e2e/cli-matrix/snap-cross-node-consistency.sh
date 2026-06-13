@@ -87,22 +87,51 @@ wait_uptodate "$RD" "$N1" "$N2"
 echo ">> promote $N1 Primary"
 on_node "$N1" drbdadm primary --force "$RD" 2>/dev/null || true
 
-# Lay down a deterministic-but-large pattern so that any partial
-# capture (one snap took data at byte N, the other at byte N+delta)
-# yields visibly different md5.
-echo ">> seed deterministic 256 MiB pattern on $N1's DRBD device"
 # Resolve via `drbdadm sh-dev` (lib.sh resolve_drbd_device): the
 # /dev/drbd/by-res symlink is not reliably present in the satellite
 # mount namespace, so readlink-based resolution aborts on the stand.
 # Last-resort minor enumeration kept for stands where sh-dev fails.
 dev=$(resolve_drbd_device "$N1" "$RD" 0 2>/dev/null) || dev=""
+
+# The DRBD NET device is smaller than the GROSS VolumeDefinition size:
+# internal DRBD metadata is carved out of the same backing volume, so a
+# 256 MiB VD presents only ~255.8 MiB of usable block device. Writing a
+# full $SIZE_MIB MiB with `dd bs=1M count=$SIZE_MIB` overruns the last
+# block by the metadata reserve and aborts with ENOSPC ("No space left
+# on device") — the seed fails before any snapshot is taken (Bug-351
+# fixture not actually exercised). Derive the writable size from the
+# device's own net byte count (floor to whole MiB) so the deterministic
+# pattern always fits. Both the seed write and the per-node snapshot
+# read below use this same SEED_MIB so the md5 comparison stays apples-
+# to-apples.
+net_bytes=$(on_node "$N1" bash -c "
+    dev='$dev'
+    [ -n \"\$dev\" ] || dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
+    blockdev --getsize64 \"\$dev\" 2>/dev/null
+" 2>/dev/null | tr -dc '0-9')
+SEED_MIB=$SIZE_MIB
+if [[ -n "$net_bytes" && "$net_bytes" -gt 0 ]]; then
+    net_mib=$(( net_bytes / 1024 / 1024 ))
+    if (( net_mib < SEED_MIB )); then
+        SEED_MIB=$net_mib
+    fi
+fi
+if (( SEED_MIB < 1 )); then
+    echo "SKIP (Bug 351): could not resolve a usable DRBD net device size on $N1 (shape unavailable)"
+    exit 0
+fi
+
+# Lay down a deterministic-but-large pattern so that any partial
+# capture (one snap took data at byte N, the other at byte N+delta)
+# yields visibly different md5.
+echo ">> seed deterministic ${SEED_MIB} MiB pattern on $N1's DRBD device (net size, fits under metadata reserve)"
 on_node "$N1" bash -c "
     set -e
     dev='$dev'
     if [ -z \"\$dev\" ]; then
         dev=\$(ls -1 /dev/drbd* 2>/dev/null | grep -vE 'by-(res|disk)' | head -1)
     fi
-    dd if=/dev/urandom of=\$dev bs=1M count=$SIZE_MIB conv=fsync status=none
+    dd if=/dev/urandom of=\$dev bs=1M count=$SEED_MIB conv=fsync status=none
 " || { echo "FAIL: seed write on $N1"; exit 1; }
 
 # Wait for replication so both peers are UpToDate on the seed.
@@ -211,7 +240,7 @@ probe_md5() {
         if [ -n \"\$lv\" ]; then
             lvchange -ay \"\$lv\" 2>/dev/null || true
             dev=\"/dev/\$lv\"
-            dd if=\"\$dev\" bs=1M count=$SIZE_MIB status=none 2>/dev/null \
+            dd if=\"\$dev\" bs=1M count=$SEED_MIB status=none 2>/dev/null \
                 | md5sum | awk '{print \$1}'
             lvchange -an \"\$lv\" 2>/dev/null || true
             exit 0
