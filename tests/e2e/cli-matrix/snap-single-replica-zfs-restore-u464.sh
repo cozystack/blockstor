@@ -74,7 +74,11 @@ _out=$("${LCTL[@]}" volume-definition create "$SRC" "${SIZE_MIB}M" 2>&1) \
 _out=$("${LCTL[@]}" resource create "$N1" "$SRC" --storage-pool="$SP" 2>&1) \
     || { echo "FAIL: r c $N1 $SRC: $_out" >&2; exit 1; }
 
-wait_uptodate "$SRC" "$N1"
+# Single replica: wait_uptodate needs a peer ($3), which is unbound here
+# (one-node RD) → `$3: unbound variable` under `set -u`. Poll the lone
+# node's observer-stamped disk state directly; it reaches UpToDate from
+# its own day0 GI seed with no peer to sync from.
+wait_disk_state "$SRC" "$N1" "UpToDate" 180 0
 
 # =====================================================================
 # Step 1: snapshot create (single-replica suspend/take/resume barrier)
@@ -129,7 +133,9 @@ if ! "${LCTL[@]}" resource-definition list --resource-definitions "$TGT" 2>/dev/
 fi
 
 echo ">>   wait up to 180s for the single restored replica to reach UpToDate on $N1"
-wait_uptodate "$TGT" "$N1"
+# Single restored replica — same 2-peer-helper trap as the source RD
+# above: poll the lone node's observer disk state directly.
+wait_disk_state "$TGT" "$N1" "UpToDate" 180 0
 
 # =====================================================================
 # Step 3: in-place rollback of the SAME snapshot still 501s (delta #73)
