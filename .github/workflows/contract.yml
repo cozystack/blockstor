@@ -50,7 +50,10 @@ jobs:
           docker images blockstor-drbd-contract:local
 
       - name: Contract tests
+        # pipefail: without it `| tee` masks go test's exit code and
+        # the job goes green even when the suite fails.
         run: |
+          set -o pipefail
           go test -tags=contract -count=1 -timeout=5m -v ./tests/contract/... \
             | tee contract.log
 

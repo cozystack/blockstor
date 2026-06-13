@@ -78,7 +78,10 @@ jobs:
         run: go build ./...
 
       - name: Integration tests
+        # pipefail: without it `| tee` masks go test's exit code and
+        # the job goes green even when the suite fails.
         run: |
+          set -o pipefail
           go test -tags=integration -count=1 -timeout=15m ./tests/integration/... | tee integration.log
 
       - name: Upload logs on failure
