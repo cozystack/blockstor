@@ -140,6 +140,39 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.requeueIfSuspended(&snap, siblings), nil
 	}
 
+	return r.advancePhase(ctx, logger, &snap, siblings, next)
+}
+
+// advancePhase commits the Spec-flag transition nextPhase decided is
+// due. Split out of Reconcile (which already carries the get / abort /
+// degenerate-guard preamble) to keep each under the funlen budget and
+// to keep the consistency-critical transitions — the group suspend
+// barrier and the Phase-2 UpToDate guard — grouped where they read in
+// sequence.
+func (r *SnapshotReconciler) advancePhase(
+	ctx context.Context,
+	logger logr.Logger,
+	snap *blockstoriov1alpha1.Snapshot,
+	siblings []blockstoriov1alpha1.Snapshot,
+	next snapshotPhaseDecision,
+) (ctrl.Result, error) {
+	// Bug 046 / Bug-353 suspend barrier: the Phase 0 → Phase 1 entry
+	// (the very first SuspendIO=true flip) is the consistency-critical
+	// transition for a grouped batch. If each sibling flipped its own
+	// SuspendIO independently as the controller happened to reconcile
+	// it, the satellites would start `drbdsetup suspend-io` at
+	// staggered instants (the ~15s slip Bug 046 reports) and the
+	// group's volumes would freeze at different points in time. The
+	// barrier instead holds the whole group until every member exists
+	// (groupAssembled) and then opens suspend on EVERY sibling in a
+	// single pass, so they all enter suspend within one controller
+	// cycle — bounding the suspend-entry slip far under the ≤5s
+	// budget. Non-grouped (Bug-351 single-snap) Snapshots skip the
+	// barrier entirely and keep flipping their own flag.
+	if isPhase1Entry(snap, next) && snap.Spec.GroupID != "" {
+		return r.openGroupSuspendBarrier(ctx, logger, snap, siblings)
+	}
+
 	// Consistency guard: before flipping Phase 1 → Phase 2
 	// (TakeSnapshot=true), refuse to snapshot a non-UpToDate device.
 	// The Phase-2 gate (allSiblingsSuspendAcked) only proves the
@@ -148,7 +181,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// captures torn data; upstream LINSTOR refuses with "Cannot take
 	// snapshot from non-UpToDate DRBD device". On a non-UpToDate
 	// target, abort+resume rather than take a bad snapshot.
-	if isPhase2Promotion(&snap, next) {
+	if isPhase2Promotion(snap, next) {
 		ok, offending, err := r.allTargetedReplicasUpToDate(ctx, siblings)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -168,7 +201,7 @@ func (r *SnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		"suspendIO", next.SuspendIO, "takeSnapshot", next.TakeSnapshot,
 		"group_id", snap.Spec.GroupID)
 
-	return r.maybeFlipSpec(ctx, &snap, next.SuspendIO, next.TakeSnapshot)
+	return r.maybeFlipSpec(ctx, snap, next.SuspendIO, next.TakeSnapshot)
 }
 
 // checkAbortConditions evaluates the two abort triggers that outrank
@@ -215,6 +248,110 @@ func (r *SnapshotReconciler) checkAbortConditions(
 	}
 
 	return false, ctrl.Result{}, nil
+}
+
+// isPhase1Entry reports whether the pending phase decision is the
+// Phase 0 → Phase 1 transition (the very first SuspendIO=true flip on
+// a Snapshot that is not yet suspended and has not taken its
+// snapshot). This is the consistency-critical moment for a grouped
+// batch — the barrier in Reconcile intercepts exactly this transition
+// so every sibling enters suspend together rather than at staggered
+// per-sibling reconcile times.
+func isPhase1Entry(snap *blockstoriov1alpha1.Snapshot, next snapshotPhaseDecision) bool {
+	return next.Advance && next.SuspendIO && !next.TakeSnapshot &&
+		!snap.Spec.SuspendIO && !snap.Spec.TakeSnapshot
+}
+
+// openGroupSuspendBarrier drives the Phase 0 → Phase 1 entry for a
+// grouped (multi-RD) batch as a single coordinated step:
+//
+//  1. Wait until the group is fully ASSEMBLED — every member CRD the
+//     apiserver fanned out (Spec.GroupSize) is observable. Until then
+//     no sibling's SuspendIO is flipped, so no volume freezes early.
+//     A still-assembling group requeues so the barrier re-evaluates
+//     promptly once the remaining siblings' CRDs propagate.
+//  2. Before freezing anything, refuse to suspend a group whose
+//     targeted replicas are not all UpToDate — there is no point
+//     freezing application I/O for a snapshot that the Phase-2 gate
+//     would only abort. On a non-UpToDate target, abort+resume the
+//     group (a no-op resume here since nothing is suspended yet) and
+//     record the reason.
+//  3. Flip SuspendIO=true on EVERY sibling in one pass (suspendGroup)
+//     so all satellites observe the suspend within one controller
+//     cycle — the bounded, near-simultaneous suspend entry that gives
+//     the group its single point-in-time.
+func (r *SnapshotReconciler) openGroupSuspendBarrier(
+	ctx context.Context,
+	logger logr.Logger,
+	snap *blockstoriov1alpha1.Snapshot,
+	siblings []blockstoriov1alpha1.Snapshot,
+) (ctrl.Result, error) {
+	if !groupAssembled(snap, siblings) {
+		logger.V(1).Info("snapshot group still assembling; holding suspend barrier",
+			"group_id", snap.Spec.GroupID,
+			"observed", len(siblings), "expected", snap.Spec.GroupSize)
+
+		return ctrl.Result{RequeueAfter: groupAssembleRequeueAfter}, nil
+	}
+
+	ok, offending, err := r.allTargetedReplicasUpToDate(ctx, siblings)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !ok {
+		logger.Info("refusing to open suspend barrier: targeted replica not UpToDate",
+			"group_id", snap.Spec.GroupID, "node", offending)
+
+		return r.abortGroupWithReason(ctx, siblings,
+			"snapshot aborted: replica on node '"+offending+
+				"' is not UpToDate; I/O not suspended")
+	}
+
+	logger.V(1).Info("opening group suspend barrier",
+		"group_id", snap.Spec.GroupID, "members", len(siblings))
+
+	return ctrl.Result{}, r.suspendGroup(ctx, siblings)
+}
+
+// groupAssembled reports whether every member of the transactional
+// batch is observable yet. The denominator is Spec.GroupSize (the
+// count the apiserver fanned out); the numerator is the observed
+// sibling count. A zero / unset GroupSize means "denominator unknown"
+// (a legacy grouped Snapshot from before the field existed, or a
+// hand-built CRD) — in that case we don't gate, so the group still
+// makes progress on whatever siblings are present rather than hanging
+// forever on a missing count.
+func groupAssembled(snap *blockstoriov1alpha1.Snapshot, siblings []blockstoriov1alpha1.Snapshot) bool {
+	if snap.Spec.GroupSize <= 0 {
+		return true
+	}
+
+	return len(siblings) >= int(snap.Spec.GroupSize)
+}
+
+// suspendGroup opens the suspend-io barrier on the whole batch: it
+// flips Spec.SuspendIO=true on EVERY sibling in one reconcile pass so
+// the satellites all start `drbdsetup suspend-io` within one controller
+// cycle. This single-pass fan-out is what bounds the suspend-entry slip
+// — the cross-RD point-in-time guarantee Bug 046 / Bug-353 requires.
+//
+// Symmetric with abortGroup (which clears SuspendIO across the batch):
+// each per-sibling flip goes through maybeFlipSpec, which is a no-op
+// when the sibling already carries SuspendIO=true, so re-entering
+// suspendGroup after a partial flip is idempotent.
+func (r *SnapshotReconciler) suspendGroup(
+	ctx context.Context, siblings []blockstoriov1alpha1.Snapshot,
+) error {
+	for i := range siblings {
+		_, err := r.maybeFlipSpec(ctx, &siblings[i], true, false)
+		if err != nil {
+			return errors.Wrapf(err,
+				"suspend barrier: open SuspendIO on sibling %q", siblings[i].Name)
+		}
+	}
+
+	return nil
 }
 
 // isPhase2Promotion reports whether the pending phase decision is the

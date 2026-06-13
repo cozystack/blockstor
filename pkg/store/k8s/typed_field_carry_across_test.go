@@ -215,6 +215,13 @@ var classifications = map[string]specClassification{ //nolint:gochecknoglobals /
 			// omits the field doesn't silently demote a grouped
 			// Snapshot to the single-snap orchestrator mid-batch.
 			"GroupID": true,
+			// b046/b353: GroupSize is wire-derived (set from
+			// apiv1.Snapshot.GroupSize by wireToCRDSnapshotSpec). Like
+			// GroupID the Update path also preserves it so a REST
+			// prop-patch that omits the field can't drop the
+			// group-assembled denominator the controller's suspend
+			// barrier gates on.
+			"GroupSize": true,
 		},
 		// Bug 351: SuspendIO + TakeSnapshot are the
 		// controller-side orchestration's phase-flag pair. They

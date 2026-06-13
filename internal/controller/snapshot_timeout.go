@@ -62,6 +62,20 @@ const snapshotSuspendDeadline = 2 * time.Minute
 // (metadata.CreationTimestamp) is far in the future.
 const snapshotSuspendRequeueCap = 15 * time.Second
 
+// groupAssembleRequeueAfter is how often the controller re-checks a
+// grouped snapshot that is still ASSEMBLING — i.e. some siblings of the
+// `snapshot create-multiple` batch have not yet had their CRD
+// propagate to the controller's watch cache. The suspend barrier holds
+// the whole group at Phase 0 until every member is observable; this
+// short requeue makes the barrier re-evaluate promptly once the
+// remaining siblings land, instead of waiting for the next unrelated
+// watch event. It is well under the ≤5s consistency budget so the
+// extra siblings are picked up and the whole group is suspended in one
+// pass with negligible added latency. A Create event for each sibling
+// also wakes the others (they share the GroupID label), so this is a
+// backstop, not the primary trigger.
+const groupAssembleRequeueAfter = time.Second
+
 // inSuspendPhase reports whether the Snapshot is currently frozen in
 // the suspend/take window — Spec.SuspendIO=true and the orchestration
 // has not yet drained back to all-Ready (or already-cleared). This is
