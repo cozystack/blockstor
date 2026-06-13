@@ -118,6 +118,10 @@ func (v *midDeleteTBResources) Delete(ctx context.Context, rdName, node string) 
 	return v.inner.Delete(ctx, rdName, node) //nolint:wrapcheck // test helper
 }
 
+func (v *midDeleteTBResources) DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error) {
+	return v.inner.DeleteIfTieBreaker(ctx, rdName, node) //nolint:wrapcheck // test helper
+}
+
 func (v *midDeleteTBResources) SetState(ctx context.Context, rdName, node string,
 	state apiv1.ResourceState, volumes []apiv1.VolumeObservation,
 ) error {

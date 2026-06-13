@@ -106,6 +106,10 @@ func (v *vanishingTBResources) Delete(ctx context.Context, rdName, node string) 
 	return v.inner.Delete(ctx, rdName, node) //nolint:wrapcheck // test helper
 }
 
+func (v *vanishingTBResources) DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error) {
+	return v.inner.DeleteIfTieBreaker(ctx, rdName, node) //nolint:wrapcheck // test helper
+}
+
 func (v *vanishingTBResources) SetState(ctx context.Context, rdName, node string,
 	state apiv1.ResourceState, volumes []apiv1.VolumeObservation,
 ) error {
@@ -420,6 +424,10 @@ func (v *alwaysVanishingTBResources) Update(ctx context.Context, r *apiv1.Resour
 
 func (v *alwaysVanishingTBResources) Delete(ctx context.Context, rdName, node string) error {
 	return v.inner.Delete(ctx, rdName, node) //nolint:wrapcheck // test helper
+}
+
+func (v *alwaysVanishingTBResources) DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error) {
+	return v.inner.DeleteIfTieBreaker(ctx, rdName, node) //nolint:wrapcheck // test helper
 }
 
 func (v *alwaysVanishingTBResources) SetState(ctx context.Context, rdName, node string,
