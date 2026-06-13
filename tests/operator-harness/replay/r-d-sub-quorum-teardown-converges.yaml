@@ -47,18 +47,38 @@ steps:
       kind: all_uptodate
       rd: "{{rd}}"
       timeout_s: 240
-  - name: r-d-node1
-    # First delete: 3 → 2 voters, still majority. Must complete cleanly.
+  - name: r-d-node1-diskful-removed
+    # First delete: 3 → 2 DISKFUL, still majority. node1's diskful
+    # backing is removed cleanly.
+    #
+    # An earlier revision asserted `resource_absent node1` here — that
+    # could never hold (134s sweep timeout) and the assertion was wrong:
+    # dropping to an EVEN 2-diskful shape re-arms the auto-tiebreaker
+    # invariant (shouldTieBreakerExist: diskful==2 → wantWitness), and
+    # with node2+node3 the only diskful peers, node1 is the sole spare —
+    # so the controller immediately re-occupies node1 with a DISKLESS
+    # TIE_BREAKER witness. node1's Resource CRD therefore stays present
+    # (now a diskless witness, no backing disk). This is correct,
+    # parity-matching behaviour — the same auto-witness-re-occupies-a-
+    # vacated-node lesson as n-autoplace-target-excludes (#154) and
+    # r-c-with-tiebreaker-peer. Assert the OBSERVABLE truth: node1's
+    # diskful backing is gone (it is now Diskless), not that the CRD
+    # vanished. The real U197 contract — sub-quorum teardown converges
+    # without a wedge — is gated by the second delete + clean rd delete
+    # below.
     cmd: ["resource", "delete", "{{node1}}", "{{rd}}"]
     expect_exit: 0
     await:
-      kind: resource_absent
+      kind: replica_diskless
       rd: "{{rd}}"
       node: "{{node1}}"
       timeout_s: 120
   - name: r-d-node2-below-quorum
-    # Second delete: 2 → 1 voter, BELOW quorum. The teardown of the
-    # deleted replica must STILL converge — no wedged DELETING row.
+    # Second delete: 2 → 1 DISKFUL, BELOW quorum. The teardown of the
+    # deleted replica must STILL converge — no wedged DELETING row. At 1
+    # diskful the auto-tiebreaker invariant reaps the node1 witness too
+    # (shouldTieBreakerExist: diskful<2 → no witness), so BOTH node1 and
+    # node2 converge to absent, leaving only node3.
     cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
     expect_exit: 0
     await:
@@ -66,15 +86,28 @@ steps:
       rd: "{{rd}}"
       node: "{{node2}}"
       timeout_s: 120
+  - name: witness-reaped-at-sub-quorum
+    # The node1 witness is reaped once the shape drops to a lone diskful
+    # — the sub-quorum collapse removed exactly the deleted diskful
+    # replicas AND the now-unnecessary witness, with no wedged row.
+    cmd: ["resource", "list", "--resources", "{{rd}}"]
+    expect_exit: 0
+    await:
+      kind: resource_absent
+      rd: "{{rd}}"
+      node: "{{node1}}"
+      timeout_s: 120
   - name: surviving-replica-present
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
     await:
-      # The lone surviving replica on node3 is still there — the deletes
-      # removed exactly the requested replicas, nothing more.
-      kind: replica_count
+      # The lone surviving diskful replica on node3 is still there — the
+      # teardown removed exactly the deleted replicas + the witness,
+      # nothing more.
+      kind: disk_state
       rd: "{{rd}}"
-      min: 1
+      node: "{{node3}}"
+      expected: UpToDate
       timeout_s: 60
   - name: rd-deletes-cleanly
     # The whole RD must then delete cleanly — no orphan / stuck finalizer

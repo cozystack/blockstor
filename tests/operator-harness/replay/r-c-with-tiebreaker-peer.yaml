@@ -45,22 +45,33 @@ steps:
       node: "{{node3}}"
       timeout_s: 30
   - name: r-d-node2-diskful
-    # Dropping node2's diskful replica leaves node1 diskful + the node3
-    # witness. With auto-add-quorum-tiebreaker default-on (parity with
-    # upstream; INFRA oracle smoke confirmed the witness re-occupies a
-    # vacated node on low-diskful shapes) the controller keeps a
-    # DISKLESS TieBreaker resident for quorum rather than leaving node2
-    # bare. So instead of asserting node2 is absent (a false FAIL of
-    # correct, parity-matching behaviour) we assert a TieBreaker witness
-    # exists for the rd -- same lesson as toggle-disk-migrate-from (#103)
-    # and n-autoplace-target-excludes (#109). The diskful backing on
-    # node2 is gone; the bare `r c node2` below proves it re-spawns
-    # DISKFUL despite a resident witness (the actual Bug-327 contract).
+    # Dropping node2's diskful replica leaves node1 diskful + the
+    # hand-created node3 diskless peer. The shape is now 1 diskful + 1
+    # user-diskless.
+    #
+    # An earlier revision asserted `tiebreaker_present` here, on the
+    # premise that the controller keeps a DISKLESS *TieBreaker* resident
+    # at this shape. That premise is wrong on two counts and the assert
+    # could never hold (138s sweep timeout):
+    #   1. node3 was created with a bare `r c --diskless` — it carries
+    #      the DISKLESS flag only, NOT TIE_BREAKER, so it renders as
+    #      `Diskless` (not `TieBreaker`) in `r l`; the case-sensitive
+    #      `tiebreaker_present` grep never matches it.
+    #   2. At 1 diskful the auto-tiebreaker invariant does NOT manage a
+    #      witness at all — `shouldTieBreakerExist` only creates / keeps
+    #      one at >= 2 diskful (quorum is off for a lone diskful;
+    #      Bug-338 / BUG-040 #154). So no row ever flips to TIE_BREAKER.
+    # The user-diskless peer simply stays resident (ensureTiebreaker
+    # only reaps AUTO-managed witnesses, never operator-added diskless).
+    # Assert exactly that observable truth: node3 is still Diskless. The
+    # actual Bug-327 contract is the bare `r c node2` below — it must
+    # come up DISKFUL despite a resident diskless peer.
     cmd: ["resource", "delete", "{{node2}}", "{{rd}}"]
     expect_exit: 0
     await:
-      kind: tiebreaker_present
+      kind: replica_diskless
       rd: "{{rd}}"
+      node: "{{node3}}"
       timeout_s: 120
   - name: r-c-node2-bare
     # No flag — operator expects diskful. Must NOT coerce to Diskless
