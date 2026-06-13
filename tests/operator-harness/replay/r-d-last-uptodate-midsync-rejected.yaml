@@ -65,13 +65,32 @@ steps:
     expect_exit: 0
     await:
       # Gate on a LIVE mid-sync state: node2 must be observed SyncTarget
-      # before we probe the rejection. If the stand skip-syncs through
-      # this faster than the throttle should allow, bump c-max-rate down
-      # / the volume size up rather than weakening the assertion.
+      # before we probe the U130 rejection, so the assertion is not racing
+      # the resync.
+      #
+      # NOT-EXERCISABLE SKIP (skip_if_reached): some stands' pools
+      # SKIP-SYNC a fresh replica — FILE_THIN day0 skip-initial-sync seeds
+      # the 2nd replica "assumed-zeroed" so it reaches UpToDate in <10s
+      # without ever exposing a CRD-observable SyncTarget/Inconsistent
+      # state, regardless of volume size or c-max-rate (validated on stand
+      # "dev": 2G vol + 512MiB written + c-max-rate 256 still skip-synced
+      # to UpToDate in 8s, no mid-sync state ever stamped into the CRD).
+      # On such a stand the U130 mid-sync window cannot be held open at the
+      # CRD layer, so the rejection is not exercisable as a pure-CLI replay
+      # here — the contract is instead pinned at L1 (the
+      # resourceMidSyncDeleteRefusal unit tests, which cover both the
+      # Inconsistent-only and SyncTarget peer states) and the L6
+      # cli-matrix cell (which writes data via kubectl-exec). The previous
+      # SyncTarget-only await with no skip path was a guaranteed 132s FAIL
+      # on a skip-sync stand. `skip_if_reached: UpToDate` converts that
+      # into a clean workflow SKIP the instant node2 reaches UpToDate
+      # without a mid-sync observation; on a slow-sync pool the mid-sync
+      # state IS observed first and the scenario runs in full.
       kind: disk_state
       rd: "{{rd}}"
       node: "{{node2}}"
       expected: SyncTarget
+      skip_if_reached: UpToDate
       timeout_s: 120
   - name: r-d-node1-rejected-midsync
     # THE U130 ASSERTION: `r d node1` (the only UpToDate source) MUST be

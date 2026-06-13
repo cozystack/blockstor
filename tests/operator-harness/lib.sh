@@ -211,28 +211,71 @@ for it in d if isinstance(d, list) else []:
 print(len(nodes))" 2>/dev/null || echo 0
 }
 
+# fixture_free_physical_device_on_node <device-path> <node>
+#
+# Returns 0 if <device-path> is a FREE physical device the controller can
+# turn into a storage pool on <node>, 1 otherwise. Used by the
+# prerequisites.device_on_any_node SKIP gate so the ps-cdp-zfs workflow
+# (which needs a sacrificial device that only some stands provision)
+# SKIPs cleanly instead of FAILing on stands without it.
+#
+# Why this is stricter than the old `test -b on any worker` probe (which
+# produced the 1s false-FAIL this gate must turn into a clean SKIP):
+#
+#   1. NODE-SPECIFIC. The ps-cdp workflow always pins the device-pool
+#      create to {{node1}} (`create-device-pool zfs <node1> <dev>`). The
+#      old gate accepted the device being present on ANY worker, so a
+#      stand where /dev/loop9 was attached on node2 (e.g. backing an
+#      unrelated blockstor volume) passed the gate while the create on
+#      node1 — where the device is bare/unconfigured — failed with
+#      "no free PhysicalDevice ... matches device_paths [/dev/loop9]".
+#      The gate now probes the SAME node the workflow uses.
+#
+#   2. FREE, not merely PRESENT. `test -b /dev/loop9` passes on EVERY
+#      stand because the kernel pre-creates loop NODES whether or not
+#      anything is attached, and a device already consumed by a pool /
+#      backing a volume is also not free. `create-device-pool` needs a
+#      FREE PhysicalDevice. The controller's own free-device view is the
+#      REST GET /v1/physical-storage surface (the python CLI
+#      `physical-storage list` is unusable here — it tracebacks on a nil
+#      device.size). We consult that authoritative list for <node>.
+#
+# Conservative on any read failure (no apiserver / parse error) → report
+# absent so the caller SKIPs rather than FAILs on a fixture we cannot
+# confirm.
+fixture_free_physical_device_on_node() {
+    local dev=$1 node=$2
+    [[ -n "$node" ]] || return 1
+    # The CLI `physical-storage list` table-renderer tracebacks on this
+    # controller version, so go straight to the REST surface the runner
+    # already talks to (BS_URL). The payload is a list of disk groups,
+    # each with a per-node device array.
+    local base=${BS_URL:?BS_URL required}
+    curl -fsS -m 10 "${base%/}/v1/physical-storage" 2>/dev/null \
+        | DEV="$dev" NODE="$node" python3 -c "import json,sys,os
+dev=os.environ['DEV']; node=os.environ['NODE']
+try:
+    groups=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for g in groups if isinstance(groups, list) else []:
+    for d in (g.get('nodes',{}) or {}).get(node,[]) or []:
+        if d.get('device')==dev:
+            sys.exit(0)
+sys.exit(1)"
+}
+
 # fixture_device_on_any_worker <device-path>
 #
-# Returns 0 if <device-path> is a present block device on at least one
-# worker's satellite pod, 1 otherwise. Used by the
-# prerequisites.device_on_any_node SKIP gate so the ps-cdp-zfs workflow
-# (which needs a sacrificial loop device that only some stands provision)
-# SKIPs cleanly instead of FAILing on stands without it. Probes the
-# satellite pod via kubectl exec; if no satellite pod is reachable we
-# conservatively report absent (the caller SKIPs).
+# Back-compat shim for the prerequisites.device_on_any_node gate. The gate
+# is documented as "on any worker", but the only consumer (ps-cdp-zfs)
+# pins the create to node1, so a node-1-scoped free-device probe is the
+# correct semantic (see fixture_free_physical_device_on_node). Callers
+# that genuinely need an any-worker probe should call the node-scoped
+# helper per node themselves.
 fixture_device_on_any_worker() {
     local dev=$1
-    local ns=${SATELLITE_NS:-blockstor-system}
-    local pods
-    mapfile -t pods < <(kubectl -n "$ns" get pods -l app=blockstor-satellite         --field-selector status.phase=Running         -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
-    local p
-    for p in "${pods[@]}"; do
-        [[ -z "$p" ]] && continue
-        if kubectl -n "$ns" exec "$p" -- test -b "$dev" >/dev/null 2>&1; then
-            return 0
-        fi
-    done
-    return 1
+    fixture_free_physical_device_on_node "$dev" "${NODE1:-}"
 }
 
 # ----------------------------------------------------------------------
@@ -256,6 +299,27 @@ await_assertion() {
     deadline=$(( $(date +%s) + timeout_s + hold_s ))
     held_since=""
 
+    # Optional skip_if_reached: a disk_state value on the assertion's
+    # `node` that means "the condition this await is gating can no longer
+    # be observed — SKIP the whole workflow cleanly instead of FAILing".
+    #
+    # Used by the U130 mid-sync-rejection replay: it must observe the
+    # freshly-added replica mid-sync (SyncTarget/Inconsistent) before it
+    # can probe the last-UpToDate-delete rejection. On a stand whose pool
+    # SKIP-SYNCS a fresh replica (FILE_THIN day0 skip-initial-sync — see
+    # docs/cli-parity-known-deltas.md row 76; empirically the 2nd replica
+    # reaches UpToDate in <10s, never showing a CRD-observable mid-sync
+    # state regardless of volume size / c-max-rate throttle), the mid-sync
+    # window is not exercisable. That is "not exercisable here", not a
+    # product fault — so reaching `skip_if_reached` (e.g. UpToDate) before
+    # the awaited mid-sync state returns sentinel 2 = clean workflow SKIP.
+    local skip_state skip_node skip_rd
+    skip_state=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('skip_if_reached',''))" "$spec")
+    if [[ -n "$skip_state" ]]; then
+        skip_node=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('node',''))" "$spec")")
+        skip_rd=$(substitute "$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('rd',''))" "$spec")")
+    fi
+
     while (( $(date +%s) < deadline )); do
         if check_assertion "$kind" "$spec"; then
             if (( hold_s == 0 )); then
@@ -268,6 +332,14 @@ await_assertion() {
             fi
         else
             held_since=""
+            if [[ -n "$skip_state" ]]; then
+                local cur_state
+                cur_state=$(kubectl get resource "${skip_rd}.${skip_node}" -o jsonpath='{.status.volumes[0].diskState}' 2>/dev/null || echo "")
+                if [[ "$cur_state" == "$skip_state" ]]; then
+                    echo "    ASSERTION SKIP: kind=$kind reached skip_if_reached=$skip_state on $skip_node before the awaited state — scenario not exercisable on this stand (skip-sync pool)" >&2
+                    return 2
+                fi
+            fi
         fi
         sleep 2
     done
@@ -863,7 +935,17 @@ print(json.loads(sys.argv[1]).get('tolerate_resend_409', True))" "$step")
 s=json.loads(sys.argv[1]).get('await')
 print(json.dumps(s) if s else '')" "$step")
     if [[ -n "$await_json" ]]; then
-        await_assertion "$await_json" || return 1
+        local await_rc=0
+        await_assertion "$await_json" || await_rc=$?
+        # await_assertion returns 2 = "skip_if_reached hit" (the scenario
+        # is not exercisable on this stand). Propagate the sentinel so the
+        # runner converts it to a clean workflow SKIP instead of a FAIL.
+        if (( await_rc == 2 )); then
+            return 2
+        fi
+        if (( await_rc != 0 )); then
+            return 1
+        fi
     fi
 }
 

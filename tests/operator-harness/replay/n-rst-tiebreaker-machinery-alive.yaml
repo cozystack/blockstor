@@ -70,9 +70,15 @@ steps:
     cmd: ["resource", "list", "--resources", "{{rd}}"]
     expect_exit: 0
   - name: delete-the-witness
-    # `r d` of the TIE_BREAKER stamps the short suppression window; the
-    # witness should AUTO re-add once that window lapses — proving the
-    # machinery still creates witnesses after the evict/restore cycle.
+    # `r d` of the TIE_BREAKER stamps the auto-tiebreaker SUPPRESSION
+    # window on the parent RD (maybeStampTiebreakerSuppressionOnDelete →
+    # stampTiebreakerSuppression). That window is a DELIBERATE product
+    # constant of FIVE MINUTES (pkg/rest/autoplace.go:
+    # autoTiebreakerSuppressionWindow = 5 * time.Minute) so the next
+    # reconcile does not immediately re-stamp a witness the operator just
+    # removed. The witness AUTO re-adds only AFTER the window lapses —
+    # which is exactly the U382 contract (the machinery still fires after
+    # the evict/restore cycle).
     cmd: ["resource", "delete", "{{node3}}", "{{rd}}"]
     expect_exit: 0
   - name: witness-auto-readded
@@ -80,10 +86,20 @@ steps:
     expect_exit: 0
     await:
       # THE U382 ASSERTION: the auto-tiebreaker machinery still fires
-      # after the evict + restore cycle — a fresh witness lands.
+      # after the evict + restore cycle — a fresh witness lands once the
+      # 5-minute delete-suppression window lapses.
+      #
+      # The timeout MUST clear that 5-minute window. The previous 120s
+      # value was shorter than the suppression constant, so the witness
+      # was still suppressed when the assertion gave up — a guaranteed
+      # 138s sweep timeout that no product behaviour could satisfy. 330s
+      # = 5min window + a settle margin. This is NOT blind timeout
+      # inflation: it is bounded on a known, deliberate product constant
+      # (autoTiebreakerSuppressionWindow). If that constant changes,
+      # this timeout must track it.
       kind: tiebreaker_present
       rd: "{{rd}}"
-      timeout_s: 120
+      timeout_s: 330
 
 teardown:
   - cmd: ["node", "restore", "{{node3}}"]

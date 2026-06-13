@@ -94,6 +94,19 @@
 #                           before the new diskful is UpToDate
 #                           (upstream-issue U341)
 #
+# Optional await modifier (any disk_state-shaped await with a `node`):
+#
+#   skip_if_reached: <disk_state>
+#       SKIP the WHOLE workflow cleanly (exit 0, neither PASS nor FAIL)
+#       if rd@node reaches <disk_state> before the awaited `expected`
+#       state. For scenarios that need a transient state which a fast
+#       stand can race past — e.g. the U130 mid-sync rejection needs the
+#       new replica observed SyncTarget, but a FILE_THIN skip-sync stand
+#       seeds it straight to UpToDate (no CRD-observable mid-sync). On
+#       such a stand the scenario is "not exercisable here", not a fault:
+#       `expected: SyncTarget` + `skip_if_reached: UpToDate` turns the
+#       would-be timeout FAIL into a clean SKIP. Teardown still runs.
+#
 # Invariants (post-teardown):
 #
 #   - no_orphans           no leftover Resource CRDs, no kernel slots, no
@@ -246,9 +259,20 @@ fi
 
 # steps
 FAILED=0
+SKIPPED=0
 while IFS= read -r step; do
     [[ -z "$step" ]] && continue
-    if ! run_step "$step"; then
+    step_rc=0
+    run_step "$step" || step_rc=$?
+    # run_step returns 2 when an await with `skip_if_reached` fired — the
+    # scenario is not exercisable on this stand (e.g. the pool skip-synced
+    # so the U130 mid-sync window never materialised). Treat as a clean
+    # SKIP: stop running steps, fall through to teardown, exit 0.
+    if (( step_rc == 2 )); then
+        SKIPPED=1
+        break
+    fi
+    if (( step_rc != 0 )); then
         FAILED=1
         break
     fi
@@ -260,6 +284,15 @@ while IFS= read -r step; do
     [[ -z "$step" ]] && continue
     run_step "$step" || echo "  teardown step failed (continuing)" >&2
 done < <(yaml_teardown "$WORKFLOW")
+
+# A workflow that SKIPPED mid-run is "not exercisable on this stand" — it
+# still ran teardown above to leave no residue, but it is neither PASS nor
+# FAIL. Report a clean SKIP (exit 0) and do not run invariants (the
+# scenario never reached the shape they assert about).
+if [[ "$SKIPPED" == "1" ]]; then
+    echo "SKIP: $NAME -- scenario not exercisable on this stand (see ASSERTION SKIP above)"
+    exit 0
+fi
 
 # invariants — only checked if steps passed
 if [[ "$FAILED" == "0" ]]; then
