@@ -439,15 +439,24 @@ wait_luks_header_present() {
 # replica of an encrypted RD so a Bug-175-class wire-injection / Bug-
 # 233-class wrong-passphrase regression is caught at the kernel level
 # rather than just at the REST envelope. Non-zero exit on failure.
+#
+# BUG-039: MUST go through on_node_stdin — plain on_node drops stdin
+# (kubectl exec without -i), so cryptsetup read an empty key-file and
+# this assert failed on every stand while the satellite had in fact
+# formatted with the correct master passphrase. The old 2>/dev/null
+# also swallowed cryptsetup's "Nothing to read on input." tell, so we
+# now keep stderr and print it on the failure path for triage.
 assert_luks_passphrase_opens() {
     local node=$1 dev=$2 passphrase=$3
-    # NUL on stdin avoids leaking the passphrase via `ps -ef` argv and
+    # Passphrase on stdin avoids leaking it via `ps -ef` argv and
     # also avoids re-quoting headaches if the passphrase contains shell
     # metachars (the e2e default has `!!` in it, which would trigger
     # bash history expansion inside `bash -c` without the heredoc).
-    if ! printf '%s' "$passphrase" | on_node "$node" \
-            cryptsetup luksOpen --test-passphrase --key-file=- "$dev" 2>/dev/null; then
+    local err
+    if ! err=$(printf '%s' "$passphrase" | on_node_stdin "$node" \
+            cryptsetup luksOpen --test-passphrase --key-file=- "$dev" 2>&1); then
         echo "assert_luks_passphrase_opens: passphrase does NOT open ${node}:${dev}" >&2
+        echo "  cryptsetup said: $err" >&2
         return 1
     fi
     return 0
