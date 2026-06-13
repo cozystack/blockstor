@@ -211,12 +211,17 @@ func TestSnapshotRestoreBadJSON(t *testing.T) {
 	}
 }
 
-// TestSnapshotRestoreConstrainsProviderToSource: a clone whose source
-// snapshot lives on ZFS_THIN must only land on ZFS_THIN candidate
-// pools, even when LVM_THIN pools share the same candidate nodes.
-// Pinned because `zfs send` payloads can't be replayed onto an LVM
-// pool via `dd` — without the provider filter the satellite would
-// fail opaquely at SendSnapshot/RecvSnapshot time. Bug 15.
+// TestSnapshotRestoreConstrainsProviderToSource: a restore whose
+// source snapshot lives on ZFS_THIN must land in the SOURCE's own
+// pool, even when other pools (matching or mismatched kind) share the
+// candidate nodes. Pinned because `zfs send` payloads can't be
+// replayed onto an LVM pool via `dd` — a cross-backend placement
+// fails opaquely at satellite SendSnapshot/RecvSnapshot time. Bug 15,
+// retargeted by Bug 038: the restore no longer defers placement to
+// the autoplacer — it stamps replicas on the snapshot's nodes in the
+// source replica's pool up front (upstream LINSTOR restore semantics,
+// verified against the live linstor-oracle), and a follow-up
+// autoplace at the same place_count is an idempotent no-op.
 func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
@@ -288,7 +293,26 @@ func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 		t.Fatalf("restore status: got %d, want 201", resp.StatusCode)
 	}
 
-	// 2) autoplace — placer must filter candidates to ZFS_THIN only.
+	// 2) the restore itself stamped replicas on the snapshot's nodes
+	// in the SOURCE pool (Bug 038 / upstream restore semantics).
+	got, err := st.Resources().ListByDefinition(ctx, "pvc-2")
+	if err != nil {
+		t.Fatalf("list pvc-2: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("restored replicas: got %d, want 2 (one per snapshot node)", len(got))
+	}
+
+	for i := range got {
+		if stor := got[i].Props["StorPoolName"]; stor != "zpool" {
+			t.Errorf("replica on %s landed on %q, want the source pool %q",
+				got[i].NodeName, stor, "zpool")
+		}
+	}
+
+	// 3) a follow-up autoplace at the same place_count is an
+	// idempotent no-op — no extra replicas, no pool churn.
 	body, _ = json.Marshal(map[string]any{
 		"select_filter": map[string]any{"place_count": 2},
 	})
@@ -300,22 +324,13 @@ func TestSnapshotRestoreConstrainsProviderToSource(t *testing.T) {
 		t.Fatalf("autoplace status: got %d, want 200", resp.StatusCode)
 	}
 
-	got, err := st.Resources().ListByDefinition(ctx, "pvc-2")
+	got, err = st.Resources().ListByDefinition(ctx, "pvc-2")
 	if err != nil {
-		t.Fatalf("list pvc-2: %v", err)
+		t.Fatalf("list pvc-2 after autoplace: %v", err)
 	}
 
 	if len(got) != 2 {
-		t.Fatalf("placed: got %d, want 2", len(got))
-	}
-
-	for i := range got {
-		stor := got[i].Props["StorPoolName"]
-		// Every placed replica must be on a zfs-target-* pool.
-		if stor == "" || stor[:4] != "zfs-" {
-			t.Errorf("replica on %s landed on %q, want a zfs-target-* pool",
-				got[i].NodeName, stor)
-		}
+		t.Fatalf("replicas after idempotent autoplace: got %d, want 2", len(got))
 	}
 }
 
@@ -815,26 +830,30 @@ func TestSnapshotRestoreBug354AcceptsNodeNamesAlias(t *testing.T) {
 }
 
 // TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty exercises the
-// empty-nodes branch: no `--node-name` arguments → the handler looks
-// up the source RD's parent ResourceGroup and auto-places against the
-// RG's SelectFilter.PlaceCount. Mirrors upstream LINSTOR's behaviour
-// when `linstor s r rst --to-resource X` runs without explicit nodes.
+// empty-nodes branch: no `--node-name` arguments → the handler stamps
+// one replica on EVERY node holding the snapshot, in the source
+// replica's storage pool. Mirrors upstream LINSTOR's behaviour when
+// `linstor s r rst --to-resource X` runs without explicit nodes
+// (verified against the live linstor-oracle: the restore lands on
+// exactly the snapshot's nodes, same pool, regardless of the parent
+// RG's SelectFilter).
 //
-// Pre-fix the empty-nodes branch was a silent no-op alongside the
-// broken explicit-nodes branch — the new RD landed with zero
-// Resources regardless of how the operator invoked the CLI.
+// History: Bug 354 — the empty-nodes branch was a silent no-op (zero
+// Resources). Bug 038 — the interim fix auto-placed via the parent
+// RG's SelectFilter.PlaceCount, which placed NOTHING under the
+// empty-spec DfltRscGrp default and left the real placement to the
+// controller-side RG reconcilers, whose unconstrained placer pass
+// could land a clone replica on a different backend (FILE_THIN
+// snapshot stream piped into `zfs recv` → bad magic loop).
 func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 	st := store.NewInMemory()
 	ctx := t.Context()
 
-	// Parent RG with place_count=2 — the new RD inherits the RG
-	// via the source RD, so the empty-nodes branch must place
-	// exactly 2 Resources via the placer.
+	// Parent RG with an EMPTY SelectFilter — the stand-default
+	// DfltRscGrp shape that reproduced Bug 038. Placement must not
+	// depend on the RG's place_count at all.
 	if err := st.ResourceGroups().Create(ctx, &apiv1.ResourceGroup{
 		Name: "rg-1",
-		SelectFilter: apiv1.AutoSelectFilter{
-			PlaceCount: 2,
-		},
 	}); err != nil {
 		t.Fatalf("seed RG: %v", err)
 	}
@@ -846,27 +865,34 @@ func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 		t.Fatalf("seed source RD: %v", err)
 	}
 
-	// Two candidate ZFS pools, one each on the snapshot's nodes.
-	// constrainAutoplaceToSnapshotNodes restricts placement to the
-	// snapshot's local nodes (no send-recv yet), so the placer
-	// must find exactly these two candidates.
+	// The source's pool exists on both snapshot nodes (LINSTOR pool
+	// names are cluster-wide), plus a DIFFERENT-backend pool with
+	// more free space on each node — the Bug 038 trap the restore
+	// must never fall into.
 	for _, n := range []string{"n1", "n2"} {
 		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
-			StoragePoolName: "zpool-" + n, NodeName: n,
+			StoragePoolName: "zpool", NodeName: n,
 			ProviderKind: apiv1.StoragePoolKindZFSThin, FreeCapacity: 10 * 1024 * 1024,
 		}); err != nil {
-			t.Fatalf("seed candidate pool on %s: %v", n, err)
+			t.Fatalf("seed source pool on %s: %v", n, err)
+		}
+
+		if err := st.StoragePools().Create(ctx, &apiv1.StoragePool{
+			StoragePoolName: "lvm-big", NodeName: n,
+			ProviderKind: apiv1.StoragePoolKindLVMThin, FreeCapacity: 100 * 1024 * 1024,
+		}); err != nil {
+			t.Fatalf("seed decoy pool on %s: %v", n, err)
 		}
 	}
 
-	// Source resource pins the source provider to ZFS_THIN so
-	// resolveCloneSourceProviderKind returns it and the placer
-	// only considers ZFS_THIN candidates.
-	if err := st.Resources().Create(ctx, &apiv1.Resource{
-		Name: "pvc-src", NodeName: "n1",
-		Props: map[string]string{"StorPoolName": "zpool-n1"},
-	}); err != nil {
-		t.Fatalf("seed source resource: %v", err)
+	// Source replicas pin the source pool per node.
+	for _, n := range []string{"n1", "n2"} {
+		if err := st.Resources().Create(ctx, &apiv1.Resource{
+			Name: "pvc-src", NodeName: n,
+			Props: map[string]string{"StorPoolName": "zpool"},
+		}); err != nil {
+			t.Fatalf("seed source resource on %s: %v", n, err)
+		}
 	}
 
 	if err := st.Snapshots().Create(ctx, &apiv1.Snapshot{
@@ -902,12 +928,14 @@ func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 	}
 
 	if len(got) != 2 {
-		t.Fatalf("Resource CRDs stamped: got %d, want %d (inherited from RG place_count)",
+		t.Fatalf("Resource CRDs stamped: got %d, want %d (one per snapshot node)",
 			len(got), 2)
 	}
 
-	// Both replicas must land on the snapshot's nodes (no
-	// cross-node clone until send-recv lands).
+	// Both replicas must land on the snapshot's nodes, in the
+	// SOURCE pool — never on the roomier different-backend decoy
+	// (Bug 038: a FILE_THIN→ZFS placement loops forever on
+	// `zfs recv … bad magic number` at the satellite).
 	wantNodes := map[string]bool{"n1": false, "n2": false}
 	for _, res := range got {
 		if _, ok := wantNodes[res.NodeName]; !ok {
@@ -917,6 +945,11 @@ func TestSnapshotRestoreBug354AutoplacesWhenNodesEmpty(t *testing.T) {
 		}
 
 		wantNodes[res.NodeName] = true
+
+		if pool := res.Props["StorPoolName"]; pool != "zpool" {
+			t.Errorf("replica on %s landed on pool %q, want the source pool %q",
+				res.NodeName, pool, "zpool")
+		}
 	}
 
 	for n, placed := range wantNodes {

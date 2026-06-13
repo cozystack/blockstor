@@ -27,7 +27,6 @@ import (
 	"strings"
 
 	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
-	"github.com/cozystack/blockstor/pkg/placer"
 	"github.com/cozystack/blockstor/pkg/store"
 )
 
@@ -465,7 +464,7 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 	// observed a Resource for the new RD, so the BlockstorRestoreFromSnapshot
 	// prop marker on the RD was dead code and the restored RD stayed an
 	// empty shell. Mirrors upstream CtrlSnapshotRestoreApiCallHandler.
-	err = s.placeRestoredResources(ctx, srcRD, &srcRDObj, &newRD, req)
+	err = s.placeRestoredResources(ctx, srcRD, &newRD, req, snap)
 	if err != nil {
 		return "", err
 	}
@@ -478,71 +477,54 @@ func (s *Server) materializeRestoredRD(ctx context.Context, srcRD string, req *s
 // snapshot-restore handler:
 //
 //   - Explicit `--node-name` list (req.Nodes / req.NodeNames): stamp
-//     one Resource per requested node, resolving Spec.Props["StorPoolName"]
-//     from the source RD's first diskful replica.
-//   - Empty node list: auto-place against the parent ResourceGroup's
-//     SelectFilter.PlaceCount. Mirrors `linstor s r rst --to-resource X`
-//     without `--node-name`, which upstream resolves via the placer.
+//     one Resource per requested node.
+//   - Empty node list: stamp one Resource on EVERY node that holds the
+//     snapshot. Bug 038: this branch used to auto-place against the
+//     parent ResourceGroup's SelectFilter, which (a) silently placed
+//     ZERO replicas when the RG had no place_count (the empty-spec
+//     DfltRscGrp default), and (b) left the real placement to the
+//     controller-side RG reconcilers, whose unconstrained placer pass
+//     could land a replica on a pool of a DIFFERENT backend — the
+//     satellite then piped the source's snapshot stream into the wrong
+//     receiver (`zfs recv … bad magic number` looping forever on a
+//     FILE_THIN→ZFS clone). Upstream LINSTOR restores onto all
+//     snapshot-holding nodes in the snapshot's own storage pool and
+//     never consults the autoplacer (verified against the live
+//     linstor-oracle, LINSTOR 1.33.2: restore of a 2-node FILE_THIN
+//     snapshot landed on exactly those 2 nodes, same pool, despite
+//     DfltRscGrp PlaceCount=2 and a third candidate node).
+//
+// Each stamped Resource pins Spec.Props["StorPoolName"] to the pool the
+// SOURCE replica uses on that node (fallback: the source's first
+// diskful pool), so the satellite materialises the clone in the same
+// pool — node-local RestoreVolumeFromSnapshot, same backend by
+// construction.
 //
 // The Nodes / NodeNames request fields are aliased — callers may use
 // either; we normalise to one canonical list before iterating.
-func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, srcRD, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest) error {
+func (s *Server) placeRestoredResources(ctx context.Context, srcRDName string, newRD *apiv1.ResourceDefinition, req *snapshotRestoreRequest, snap *apiv1.Snapshot) error {
 	nodes := canonicalRestoreNodeList(req)
 
-	if len(nodes) > 0 {
-		return s.stampRestoredResourcesOnNodes(ctx, srcRDName, newRD.Name, nodes)
+	if len(nodes) == 0 {
+		// Upstream default: restore on every node the snapshot exists
+		// on. An empty snap.Nodes (legacy snapshot CRD without the
+		// node list) stamps nothing — the operator can still drive
+		// placement explicitly via `linstor rd ap <new>`, which the
+		// autoplace handler constrains to snapshot-compatible pools.
+		nodes = snap.Nodes
 	}
 
-	// Empty node list → auto-place via parent RG's place_count.
-	// Mirrors upstream LINSTOR's behaviour when `--node-name` is omitted:
-	// the placer picks free pools matching the snapshot's provider and
-	// constraint set. Bail silently when the source RD has no parent RG
-	// (manually-created RDs without an RG) — the operator can still
-	// drive placement explicitly via `linstor rd ap <new>`.
-	if srcRD.ResourceGroupName == "" {
-		return nil
-	}
-
-	rg, err := s.Store.ResourceGroups().Get(ctx, srcRD.ResourceGroupName)
-	if err != nil {
-		// Parent RG missing → treat the same as no-RG: defer to the
-		// caller's explicit autoplace. Don't surface as an error;
-		// the RD itself is already materialised correctly.
-		return nil //nolint:nilerr // intentional fall-through; see comment
-	}
-
-	filter := rg.SelectFilter
-	if filter.PlaceCount <= 0 {
-		return nil
-	}
-
-	// Constrain to the snapshot's nodes (cross-node clone needs
-	// send-recv; until that lands, the placer must stay on snapshot-
-	// local nodes). Re-uses the same constraint the autoplace handler
-	// applies for snapshot-restored RDs.
-	constrainAutoplaceToSnapshotNodes(ctx, s.Store, newRD, &filter)
-
-	// Pin the provider-kind filter so a ZFS_THIN snapshot can't be
-	// auto-placed onto an LVM_THIN candidate pool.
-	srcKind := resolveCloneSourceProviderKind(ctx, s.Store, newRD)
-	if srcKind != "" {
-		filter.ProviderList = []string{srcKind}
-	}
-
-	_, _, err = placer.New(s.Store).Place(ctx, newRD.Name, &filter)
-	if err != nil {
-		return err //nolint:wrapcheck // surfaced via writeStoreError
-	}
-
-	return nil
+	return s.stampRestoredResourcesOnNodes(ctx, srcRDName, newRD.Name, nodes)
 }
 
-// stampRestoredResourcesOnNodes iterates the explicit-node list and
-// stamps one Resource CRD per node, resolving the storage pool from
-// the source RD's first diskful replica. Idempotent on duplicates in
-// the list (one Create per unique node).
+// stampRestoredResourcesOnNodes iterates the node list and stamps one
+// Resource CRD per node, resolving the storage pool from the source
+// RD's replica on that same node (fallback: the source's first diskful
+// pool — pool names are cluster-wide in LINSTOR, so the fallback only
+// matters when the source replica on that node is already gone).
+// Idempotent on duplicates in the list (one Create per unique node).
 func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, newRDName string, nodes []string) error {
-	pool := storPoolFromSourceRD(ctx, s.Store, srcRDName)
+	poolByNode, fallbackPool := storPoolsByNodeFromSourceRD(ctx, s.Store, srcRDName)
 
 	seen := make(map[string]struct{}, len(nodes))
 
@@ -560,6 +542,11 @@ func (s *Server) stampRestoredResourcesOnNodes(ctx context.Context, srcRDName, n
 		res := apiv1.Resource{
 			Name:     newRDName,
 			NodeName: node,
+		}
+
+		pool := poolByNode[node]
+		if pool == "" {
+			pool = fallbackPool
 		}
 
 		if pool != "" {
@@ -588,29 +575,43 @@ func canonicalRestoreNodeList(req *snapshotRestoreRequest) []string {
 	return req.NodeNames
 }
 
-// storPoolFromSourceRD returns the StorPoolName of the source RD's
-// first non-Diskless Resource, or "" when no diskful replica exists.
-// Used to seed the restored Resources' Spec.Props["StorPoolName"]
-// so satellites stage the clone on the same provider as the source.
-// Best-effort: a missing pool falls through to upstream LINSTOR's
-// `r c <node> <rd>` resolution path on the satellite side.
-func storPoolFromSourceRD(ctx context.Context, st store.Store, srcRDName string) string {
+// storPoolsByNodeFromSourceRD maps each of the source RD's diskful
+// replica nodes to the StorPoolName backing the replica there, plus
+// the first diskful pool as a fallback for nodes without a live
+// source replica (pool names are cluster-wide in LINSTOR, so the
+// fallback names the same pool on the other node in the common case).
+// Used to seed the restored Resources' Spec.Props["StorPoolName"] so
+// satellites stage the clone in the SAME pool as the source — the
+// restore data plane is a node-local RestoreVolumeFromSnapshot, never
+// a cross-backend stream (Bug 038). Best-effort: an empty result
+// falls through to the satellite-side pool resolution.
+func storPoolsByNodeFromSourceRD(ctx context.Context, st store.Store, srcRDName string) (map[string]string, string) {
 	resList, err := st.Resources().ListByDefinition(ctx, srcRDName)
 	if err != nil {
-		return ""
+		return nil, ""
 	}
+
+	byNode := make(map[string]string, len(resList))
+	fallback := ""
 
 	for i := range resList {
 		if slices.Contains(resList[i].Flags, apiv1.ResourceFlagDiskless) {
 			continue
 		}
 
-		if pool := resList[i].Props["StorPoolName"]; pool != "" {
-			return pool
+		pool := resList[i].Props["StorPoolName"]
+		if pool == "" {
+			continue
+		}
+
+		byNode[resList[i].NodeName] = pool
+
+		if fallback == "" {
+			fallback = pool
 		}
 	}
 
-	return ""
+	return byNode, fallback
 }
 
 // hydrateVolumesFromSnapshot copies the snapshot's recorded
