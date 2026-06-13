@@ -74,7 +74,9 @@ echo ">> [Bug 389] rd c + vd c + r c --auto-place=2 -s $POOL"
 "${LCTL[@]}" resource create --auto-place=2 --storage-pool="$POOL" "$RD" >/dev/null
 
 echo ">> wait for 2 diskful replicas, both UpToDate"
-wait_replica_count "$RD" 2 90
+# Diskful count, not total rows: the auto-tiebreaker witness lands on
+# the spare node within seconds and is a legal third row (BUG-040).
+wait_diskful_count "$RD" 2 90
 mapfile -t diskful < <(linstor_diskful_nodes "$RD")
 if (( ${#diskful[@]} != 2 )); then
     die "[Bug 389] expected 2 diskful replicas after autoplace=2, got ${#diskful[@]}: ${diskful[*]}"
@@ -88,9 +90,17 @@ EVAC_NODE="${diskful[0]}"
 KEEP_NODE="${diskful[1]}"
 echo ">> [Bug 389] evacuating $EVAC_NODE (keeping $KEEP_NODE)"
 
-# The replacement must land on the one node that has the pool but no
-# replica yet.
-SPARE_NODE=$(linstor_pick_free_node "$RD" "$EVAC_NODE" "$KEEP_NODE")
+# The replacement must land on the one node that holds no DISKFUL
+# replica yet. NOTE: do not use linstor_pick_free_node here — the
+# auto-tiebreaker witness legally occupies the spare node's Resource
+# CRD slot (BUG-040), and the evacuation replacement promotes that
+# witness in place rather than creating a fresh row.
+SPARE_NODE=""
+for n in "$WORKER_1" "$WORKER_2" "$WORKER_3"; do
+    [[ -z "$n" || "$n" == "$EVAC_NODE" || "$n" == "$KEEP_NODE" ]] && continue
+    SPARE_NODE="$n"
+    break
+done
 if [[ -z "$SPARE_NODE" ]]; then
     echo "SKIP: no spare $POOL node free for the evacuation replacement"
     exit 0
@@ -99,18 +109,22 @@ echo "   replacement expected on $SPARE_NODE"
 
 "${LCTL[@]}" node evacuate "$EVAC_NODE" >/dev/null
 
-echo ">> [Bug 389] wait for replacement on $SPARE_NODE to reach UpToDate"
-# The replacement Resource CRD must appear and converge before the
-# source is allowed to drop (strict add-before-drop).
+echo ">> [Bug 389] wait for replacement on $SPARE_NODE to become DISKFUL"
+# The replacement must appear AS A DISKFUL replica (a fresh create, or
+# an in-place promote of the tiebreaker witness already parked there)
+# and converge before the source is allowed to drop (strict
+# add-before-drop).
 deadline=$(( $(date +%s) + 120 ))
+spare_diskful=false
 while (( $(date +%s) < deadline )); do
-    if kubectl get "resources.blockstor.cozystack.io/${RD}.${SPARE_NODE}" >/dev/null 2>&1; then
+    if linstor_diskful_nodes "$RD" | grep -qx "$SPARE_NODE"; then
+        spare_diskful=true
         break
     fi
     sleep 3
 done
-if ! kubectl get "resources.blockstor.cozystack.io/${RD}.${SPARE_NODE}" >/dev/null 2>&1; then
-    die "[Bug 389] evacuate never placed a replacement replica on $SPARE_NODE"
+if [[ "$spare_diskful" != "true" ]]; then
+    die "[Bug 389] evacuate never placed a diskful replacement replica on $SPARE_NODE"
 fi
 wait_status_state "$RD" "$SPARE_NODE" "UpToDate|UpToDate\\(100%\\)" 240
 

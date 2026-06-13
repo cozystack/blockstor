@@ -2,37 +2,45 @@
 #
 # usage: auto-diskful-evicted-node.sh WORK_DIR
 #
-# L6 cli-matrix cell — Bug 390.
+# L6 cli-matrix cell — Bug 390 (auto-diskful must ignore disabled-node
+# replicas) / BUG-040 cell repair.
 #
 # The auto-diskful controller partitions an RD's replicas to decide
-# whether place_count is satisfied. Pre-fix the partition was blind to
-# node state: a diskful replica on an EVICTED/LOST node was still
-# counted as a live diskful, so the deficit created by draining a node
-# was masked — the timer never armed and the lost diskful was never
-# replaced. Worse, promoteOne could re-stamp StorPoolName onto a
-# replica whose node was being drained, re-creating diskful storage on
-# a node the operator is trying to evict.
+# whether the parent RG's place_count is satisfied. Pre-Bug-390 the
+# partition was blind to node state: a diskful replica on an
+# EVICTED/LOST node was still counted as a live diskful, so the deficit
+# created by draining a node was masked — the timer never armed and the
+# lost diskful was never replaced. Worse, promoteOne could promote a
+# diskless replica sitting on a node the operator was draining.
 #
-# Reproduction (operator-CLI level):
+# BUG-040 triage note: the original revision of this cell asserted
+# "refill to >= 3 diskful on healthy nodes" after evacuating one of 3
+# workers — topologically impossible (only 2 healthy workers remain) —
+# and created the RD in DfltRscGrp, whose empty SelectFilter
+# (place_count 0) makes the auto-diskful controller skip the RD
+# entirely (`placeCountForRD` finds no target). The cell could never
+# pass; the sweep exposed it. This revision pins the same product
+# contract on an achievable 3-worker shape:
 #
-#   $ linstor rd c <rd>; linstor vd c <rd> 128M
-#   $ linstor r c <n1> <rd> -s stand
-#   $ linstor r c <n2> <rd> -s stand
-#   $ linstor r c <n3> <rd> -s stand          # 3 diskful, UpToDate
-#   $ linstor controller set-property DrbdOptions/auto-diskful 1
-#   $ linstor node evacuate <n3>              # n3 → EVICTED
+#   1. rg c --place-count 2 + rd c --resource-group + vd c.
+#   2. r c <spare> --diskless        # user-diskless promotion candidate
+#      (created FIRST so no auto-tiebreaker witness ever spawns:
+#       a non-witness diskless already breaks the tie).
+#   3. r c <d1> / r c <d2> diskful   # place_count satisfied.
+#   4. controller set-property DrbdOptions/auto-diskful 1 (minutes).
+#   5. node evacuate <d2>            # -> EVICTED, deficit of 1.
 #
-# Expected (post-fix): the evicted node's diskful no longer counts
-# toward place_count, so the controller refills a diskful replica on a
-# HEALTHY node and the cluster reconverges to 3 diskful — and crucially
-# NONE of the resulting diskful replicas sits on the evicted node.
+# Expected (Bug 390 contract, outcome-level): the EVICTED node's
+# diskful no longer counts toward place_count, so the cluster repairs
+# the deficit by promoting the healthy spare's diskless replica to
+# diskful (the auto-diskful timer and the evacuate add-before-drop
+# migration both converge on the same outcome — the spare is the only
+# eligible candidate). End state: 2 healthy diskful (d1 + spare), and
+# crucially NO diskful replica on the evacuated node.
 #
-# Pre-fix: the cluster stayed "satisfied" at 2 live + 1 evicted diskful
-# (the evicted one masked the deficit), or a replacement was stamped
+# Pre-fix: the cluster stayed "satisfied" at 1 live + 1 evicted diskful
+# (the evicted one masked the deficit), or the replacement was stamped
 # back onto the evicted node.
-#
-# Contract: after evacuate + convergence, assert there are >= 3 diskful
-# replicas AND the evicted node hosts no diskful replica.
 
 set -euo pipefail
 
@@ -47,73 +55,83 @@ require_workers 3
 
 linstor_cli_setup
 
+RG=apg-390
 RD=cli-matrix-390
 POOL=${POOL:-stand}
 
-N1=$WORKER_1
-N2=$WORKER_2
-N3=$WORKER_3
+D1=$WORKER_1
+D2=$WORKER_2
+SPARE=$WORKER_3
 
 cleanup() {
-    # Best-effort restore of the evicted node so the stand is reusable
-    # by later cells. `node evacuate --restore` (or re-create) is
-    # idempotent; ignore failures.
-    "${LCTL[@]}" node evacuate --restore "$N3" >/dev/null 2>&1 || true
+    # Best-effort restore of the evacuated node so the stand is
+    # reusable by later cells; disarm the controller-scope timer.
+    "${LCTL[@]}" node restore "$D2" >/dev/null 2>&1 || true
     "${LCTL[@]}" controller set-property DrbdOptions/auto-diskful "" >/dev/null 2>&1 || true
     delete_rd "$RD"
     assert_no_orphans "$RD"
+    "${LCTL[@]}" resource-group delete "$RG" >/dev/null 2>&1 || true
     linstor_cli_teardown
 }
 trap cleanup EXIT
 
-echo ">> [Bug 390] 3-replica diskful RD on $N1+$N2+$N3"
-"${LCTL[@]}" resource-definition create "$RD" >/dev/null
+echo ">> [Bug 390] rg c $RG --place-count 2 + rd c $RD"
+"${LCTL[@]}" resource-group create "$RG" --place-count 2 --storage-pool="$POOL" >/dev/null
+"${LCTL[@]}" resource-definition create "$RD" --resource-group "$RG" >/dev/null
 "${LCTL[@]}" volume-definition create "$RD" 128M >/dev/null
-"${LCTL[@]}" resource create "$N1" "$RD" --storage-pool="$POOL" >/dev/null
-"${LCTL[@]}" resource create "$N2" "$RD" --storage-pool="$POOL" >/dev/null
-"${LCTL[@]}" resource create "$N3" "$RD" --storage-pool="$POOL" >/dev/null
 
-echo ">> wait for all three diskful UpToDate"
-# wait_uptodate asserts a pair at a time; chain the two pairs that
-# cover all three replicas (n1↔n2 and n2↔n3).
-wait_uptodate "$RD" "$N1" "$N2"
-wait_uptodate "$RD" "$N2" "$N3"
+# The promotion candidate FIRST: a user diskless on the spare. Created
+# before any diskful so the auto-tiebreaker never wants a witness
+# (non-witness diskless count >= 1 breaks the tie by itself) and the
+# candidate carries no TIE_BREAKER flag — promoteOne refuses witnesses.
+echo ">> [Bug 390] r c $SPARE $RD --diskless (promotion candidate)"
+"${LCTL[@]}" resource create "$SPARE" "$RD" --diskless >/dev/null
+
+echo ">> [Bug 390] diskful pair on $D1 + $D2"
+"${LCTL[@]}" resource create "$D1" "$RD" --storage-pool="$POOL" >/dev/null
+"${LCTL[@]}" resource create "$D2" "$RD" --storage-pool="$POOL" >/dev/null
+
+echo ">> wait for both diskful UpToDate"
+wait_uptodate "$RD" "$D1" "$D2"
 
 echo ">> arm auto-diskful (1 minute) at controller scope"
 "${LCTL[@]}" controller set-property DrbdOptions/auto-diskful 1 >/dev/null
 
-echo ">> linstor node evacuate $N3 (Bug 390 trigger — drains/evicts the node)"
+echo ">> linstor node evacuate $D2 (Bug 390 trigger — drains/evicts the node)"
 err_file=$(mktemp)
-if ! "${LCTL[@]}" node evacuate "$N3" 2>"$err_file"; then
+if ! "${LCTL[@]}" node evacuate "$D2" 2>"$err_file"; then
     rc=$?
-    echo "FAIL (Bug 390): node evacuate $N3 exited $rc" >&2
+    echo "FAIL (Bug 390): node evacuate $D2 exited $rc" >&2
     cat "$err_file" >&2
     rm -f "$err_file"
     exit 1
 fi
 rm -f "$err_file"
 
-# Give the auto-diskful timer (1m) + the placer refill time to fire.
-# 180s budget covers the 1-minute deadline plus replacement create +
-# initial sync to UpToDate.
-echo ">> wait up to 180s for the cluster to refill to 3 diskful on healthy nodes"
-deadline=$(( $(date +%s) + 180 ))
+# Budget: the 1-minute auto-diskful deadline + promotion + sync. The
+# evacuate add-before-drop migration may repair the deficit earlier;
+# either path must converge on the same end state.
+echo ">> wait up to 240s for the deficit repair: $SPARE promoted diskful, no diskful on $D2"
+deadline=$(( $(date +%s) + 240 ))
 ok=0
 while (( $(date +%s) < deadline )); do
-    # Diskful nodes excluding the evicted one.
     mapfile -t diskful < <(linstor_diskful_nodes "$RD")
-    healthy_diskful=0
+    spare_diskful=0
     evicted_diskful=0
+    healthy_diskful=0
     for n in "${diskful[@]}"; do
         [[ -z "$n" ]] && continue
-        if [[ "$n" == "$N3" ]]; then
+        if [[ "$n" == "$D2" ]]; then
             evicted_diskful=1
         else
             healthy_diskful=$(( healthy_diskful + 1 ))
         fi
+        if [[ "$n" == "$SPARE" ]]; then
+            spare_diskful=1
+        fi
     done
 
-    if (( healthy_diskful >= 3 && evicted_diskful == 0 )); then
+    if (( spare_diskful == 1 && healthy_diskful >= 2 && evicted_diskful == 0 )); then
         ok=1
         break
     fi
@@ -121,19 +139,21 @@ while (( $(date +%s) < deadline )); do
 done
 
 if (( ok != 1 )); then
-    echo "FAIL (Bug 390 regression): cluster did not refill to 3 diskful on healthy nodes" >&2
-    echo "  evicted node:  $N3" >&2
-    echo "  diskful nodes: $(linstor_diskful_nodes "$RD" | tr '\n' ' ')" >&2
+    echo "FAIL (Bug 390 regression): deficit behind the EVICTED node was not repaired" >&2
+    echo "  evacuated node: $D2" >&2
+    echo "  diskful nodes:  $(linstor_diskful_nodes "$RD" | tr '\n' ' ')" >&2
     kubectl get resources.blockstor.cozystack.io --no-headers 2>/dev/null \
         | awk -v rd="${RD}." '$1 ~ "^"rd' >&2 || true
     exit 1
 fi
 
-# Defensive double-check: the evicted node must host NO diskful replica
-# (promoteOne must never select / re-stamp a disabled node — Bug 390 #4).
-if linstor_diskful_nodes "$RD" | grep -qx "$N3"; then
-    echo "FAIL (Bug 390 #4): a diskful replica was placed/kept on the EVICTED node $N3" >&2
+# Defensive double-check (Bug 390 #4): the surviving diskful pair is
+# d1 + spare, and the original healthy diskful was never demoted.
+flags=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${D1}" \
+    -o jsonpath='{.spec.flags}' 2>/dev/null || echo "__absent__")
+if [[ "$flags" == "__absent__" || "$flags" == *"DISKLESS"* ]]; then
+    echo "FAIL (Bug 390): healthy diskful on $D1 was lost/demoted during the repair; flags=$flags" >&2
     exit 1
 fi
 
-echo ">> auto-diskful-evicted-node OK (Bug 390 pinned: evicted diskful does not count; refill lands on a healthy node)"
+echo ">> auto-diskful-evicted-node OK (Bug 390 pinned: evicted diskful does not count; repair promotes the healthy spare)"

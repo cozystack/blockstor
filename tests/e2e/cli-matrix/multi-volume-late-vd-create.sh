@@ -69,8 +69,11 @@ echo ">> [Bug 332] rd c + vd c (vol-0)"
 echo ">> [Bug 332] r c --auto-place=3 -s $POOL"
 "${LCTL[@]}" resource create --auto-place=3 --storage-pool="$POOL" "$RD" >/dev/null
 
-echo ">> wait up to 120s for vol-0 to reach UpToDate on all 3 replicas"
-deadline=$(( $(date +%s) + 120 ))
+# 240s: a 1G x3 initial sync shares the stand with the rest of the
+# sweep; the previous 120s budget flaked under load (the failure dump
+# printed all three replicas UpToDate moments after the deadline).
+echo ">> wait up to 240s for vol-0 to reach UpToDate on all 3 replicas"
+deadline=$(( $(date +%s) + 240 ))
 all_up=false
 while (( $(date +%s) < deadline )); do
     # Per-replica volume-0 state, three rows expected. The wire

@@ -70,12 +70,35 @@ echo ">> wait for both diskful UpToDate"
 RD="$RD" wait_uptodate "$RD" "$N1" "$N2"
 
 echo ">> stamp DrbdOptions/SkipDisk=True onto $N2 (simulates pre-upgrade defensive stamp)"
-# Patch Resource.Spec.Props directly via kubectl — bypasses the
-# linstor CLI's prop-set path so we mirror the observer's SSA write
-# exactly. The Bug 278 fix gates auto-clear off "prop pinned AND
-# kernel healthy", regardless of the prop's origin.
-kubectl patch "resources.blockstor.cozystack.io/${RD}.${N2}" --type=merge -p \
-    '{"spec":{"props":{"DrbdOptions/SkipDisk":"True"}}}'
+# Server-side-apply under the OBSERVER's field manager
+# (`blockstor-satellite-skipdisk`, pkg/satellite/controllers/observer.go)
+# so the stamp carries the exact SSA ownership the real defensive write
+# has. The Bug 278 auto-clear RELEASES that owner's claim — that is the
+# whole product contract: the satellite un-stamps only its own
+# defensive writes, while an operator-set SkipDisk (different field
+# manager) survives the reattach. The previous revision of this cell
+# stamped via `kubectl patch --type=merge` (field manager
+# "kubectl-patch"), which the release path correctly refuses to clear —
+# the cell was asserting the opposite of the product contract and could
+# never pass (BUG-040 triage).
+#
+# The apply doc must carry the two +required immutable scalars
+# (resourceDefinitionName / nodeName) — same SSA-validation rule the
+# observer's writeSkipDiskProp follows.
+# --force-conflicts mirrors the observer's ForceOwnership: the apply
+# doc must claim the two required scalars even though the controller's
+# field manager owns them.
+kubectl apply --server-side --force-conflicts --field-manager=blockstor-satellite-skipdisk -f - <<EOF
+apiVersion: blockstor.cozystack.io/v1alpha1
+kind: Resource
+metadata:
+  name: ${RD}.${N2}
+spec:
+  resourceDefinitionName: ${RD}
+  nodeName: ${N2}
+  props:
+    DrbdOptions/SkipDisk: "True"
+EOF
 
 echo ">> confirm SkipDisk is stamped on $N2 Spec.Props"
 stamped=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${N2}" \

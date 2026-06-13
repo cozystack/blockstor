@@ -176,11 +176,23 @@ fi
 
 # Belt-and-suspenders: the operator-visible `linstor r l` surface the
 # bug report cited must show exactly one TIE_BREAKER row plus the two
-# diskful replicas.
-wire=$(linstor_r_l_json "$RD")
-n_tb=$(printf '%s' "$wire" \
-    | jq -r '.[][] | select((.rsc_flags // []) | index("TIE_BREAKER")) | .name' 2>/dev/null \
-    | wc -l | tr -d ' ' || echo 0)
+# diskful replicas. Poll briefly: the CRD loop above sees the witness
+# the instant it is created, but the apiserver's `r l` list view reads
+# its informer cache, which can lag the write by a moment (BUG-040
+# sweep: the one-shot check here flaked with "0 TIE_BREAKER rows" while
+# the witness CRD already existed).
+deadline=$(( $(date +%s) + 30 ))
+n_tb=0
+while (( $(date +%s) < deadline )); do
+    wire=$(linstor_r_l_json "$RD")
+    n_tb=$(printf '%s' "$wire" \
+        | jq -r '.[][] | select((.rsc_flags // []) | index("TIE_BREAKER")) | .name' 2>/dev/null \
+        | wc -l | tr -d ' ' || echo 0)
+    if [[ "$n_tb" == "1" ]]; then
+        break
+    fi
+    sleep 2
+done
 if [[ "$n_tb" != "1" ]]; then
     echo "FAIL (Bug 386): linstor r l shows $n_tb TIE_BREAKER rows for $RD, want 1" >&2
     printf '%s\n' "$wire" | jq '.[][]| {name, node_name, flags: .rsc_flags}' 2>/dev/null >&2 || true

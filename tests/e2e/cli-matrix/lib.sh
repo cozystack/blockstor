@@ -322,6 +322,29 @@ wait_replica_count() {
     return 1
 }
 
+# wait_diskful_count <rd> <expected> [timeout=60] — poll until exactly
+# <expected> DISKFUL replicas exist (DISKLESS / TIE_BREAKER rows are
+# ignored). Use this — not wait_replica_count — after `r c --auto-place`
+# of an even count: the auto-quorum machinery legitimately adds a
+# diskless TIE_BREAKER witness on a spare node within seconds, so the
+# total-row count overshoots the requested place count and the
+# total-count wait flakes on the witness race (BUG-040 sweep signature:
+# "never reached count=2 (last=3)").
+wait_diskful_count() {
+    local rd=$1 expected=$2 timeout=${3:-60}
+    local deadline=$(( $(date +%s) + timeout ))
+    local cur=0
+    while (( $(date +%s) < deadline )); do
+        cur=$(linstor_diskful_count "$rd")
+        if [[ "$cur" == "$expected" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "wait_diskful_count: ${rd} never reached diskful=${expected} (last=${cur}) within ${timeout}s" >&2
+    return 1
+}
+
 # wait_replica_absent <rd> <node> [timeout=30] — poll until no Resource
 # CRD exists for (rd, node). Used after `linstor r d <node> <rd>` so the
 # next phase can act on a known-clean shape.
