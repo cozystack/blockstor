@@ -252,12 +252,29 @@ func (r *ResourceDefinitionReconciler) ensureTiebreaker(ctx context.Context, rd 
 	// INACTIVE replicas from the (already disabled-node-filtered) voting
 	// set before the split so neither disabled-node nor deactivated
 	// replicas influence the diskful or diskless/witness count.
+	// Bug 393: an INACTIVE diskful replica means active redundancy is
+	// degraded and a backfill is expected (the placer's `r c --auto-place`
+	// gap-fills a replacement active diskful on a healthy spare). While
+	// that is true, an EXISTING witness on a spare node is the backfill
+	// target the placer is about to promote in place — reaping it
+	// collapses the very node redundancy is being restored onto, and the
+	// reconciler oscillates 1↔2 active diskful forever (the
+	// inactive-return-backfills-redundancy hang). Detect the INACTIVE
+	// replica BEFORE filterActiveReplicas drops it from the voting set, so
+	// shouldTieBreakerExist can hold the witness through the backfill
+	// window. This never grows a NEW witness (the create branch is
+	// unaffected) — it only preserves one that already exists, which is
+	// also the forward-correct shape: when the INACTIVE replica returns
+	// (`r activate`) the cluster is immediately at the 2-diskful +
+	// 1-witness three-voter quorum with no recreate churn.
+	hasInactive := containsInactiveReplica(live)
+
 	live = filterActiveReplicas(live)
 
 	diskful, diskless := splitByDiskless(live)
 	witness := filterTieBreaker(diskless)
 
-	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness)
+	wantWitness := shouldTieBreakerExist(rd, diskful, diskless, witness, hasInactive)
 
 	// Bug 338: the orphan-witness shape (1 diskful + 1 TIE_BREAKER +
 	// 0 user-diskless) collapses on this reconcile — no grace timer.
@@ -376,6 +393,7 @@ func shouldKeepExistingWitness(diskful, _, witnessUnnecessaryDiskfulCount int) b
 func shouldTieBreakerExist(
 	rd *blockstoriov1alpha1.ResourceDefinition,
 	diskful, diskless, witness []apiv1.Resource,
+	hasInactive bool,
 ) bool {
 	if !isAutoTieBreakerEnabled(rd) {
 		return false
@@ -388,10 +406,37 @@ func shouldTieBreakerExist(
 
 	const witnessUnnecessaryDiskfulCount = 3
 
+	// Bug 393: hold an EXISTING witness through the backfill window when
+	// an INACTIVE diskful replica is present (active redundancy degraded,
+	// a replacement active diskful is being backfilled onto the witness's
+	// node). Without this the orphan-collapse branch (1 active diskful +
+	// 1 witness) reaps the very spare the placer is promoting, and the
+	// reconciler flaps 1↔2 active diskful forever. Gated on an existing
+	// witness, so it never grows a new one.
+	if hasInactive && len(witness) > 0 && len(diskful) >= 1 {
+		return true
+	}
+
 	keepExistingWitness := keepExistingWitnessFor(rd, diskful, witness, nonWitnessDiskless,
 		witnessUnnecessaryDiskfulCount)
 
 	return wantNewWitness || keepExistingWitness
+}
+
+// containsInactiveReplica reports whether any replica in the slice
+// carries the INACTIVE flag (`drbdadm down`). Used by the tiebreaker
+// decision to recognise the degraded-redundancy / backfill-in-progress
+// state — see the Bug 393 keep branch in shouldTieBreakerExist. Probed
+// on the pre-filter slice, before filterActiveReplicas drops INACTIVE
+// replicas from the voting set.
+func containsInactiveReplica(replicas []apiv1.Resource) bool {
+	for i := range replicas {
+		if slices.Contains(replicas[i].Flags, apiv1.ResourceFlagInactive) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // keepExistingWitnessFor folds the two "preserve an existing
@@ -1109,34 +1154,36 @@ func quorumPropsAlreadySet(rd *blockstoriov1alpha1.ResourceDefinition, value, qu
 }
 
 // removeWitnesses deletes every TIE_BREAKER replica of the named RD.
-// Best-effort: ErrNotFound is swallowed so concurrent reconciles
-// converge.
+// Best-effort: a witness that was already reaped, or has been promoted
+// to a diskful backfill/relocate target, is silently skipped so
+// concurrent reconciles converge.
 //
-// Why the live re-check before each Delete: the `witnesses` slice is a
-// snapshot taken at the top of ensureTiebreaker. During the Phase-3
-// relocate-onto-the-tiebreaker transition (`r-full-lifecycle.sh`:
-// `r d <other-diskful>` leaves 1 diskful + 1 orphan witness, then
-// `r c <tiebreaker-node>` promotes that SAME witness row in-place to
-// the diskful relocate target via promoteDisklessReplica — TIE_BREAKER
-// + DISKLESS stripped, StorPoolName stamped on the same (rd, node)
-// key). If the Bug-338 orphan-collapse fires concurrently it would
-// Delete the just-promoted relocate target by node key, the topology
-// resets, the next `r c`/reconcile re-creates, and the diskful count
-// flip-flops 1↔2 forever (the ensureTiebreaker oscillation). Re-read
-// each row and skip any that no longer carries TIE_BREAKER: a witness
-// that became diskful is the relocate target, not an orphan, and must
-// never be reaped here.
+// Why the delete must be a version-guarded conditional, not a plain
+// Get-then-Delete: the `witnesses` slice is a snapshot taken at the top
+// of ensureTiebreaker, and two distinct concurrent transitions promote a
+// witness row IN PLACE on the same (rd, node) key:
+//
+//   - Phase-3 relocate-onto-the-tiebreaker (`r-full-lifecycle.sh`:
+//     `r d <other-diskful>` leaves 1 diskful + 1 orphan witness, then
+//     `r c <tiebreaker-node>` promotes that SAME witness via
+//     promoteDisklessReplica — TIE_BREAKER+DISKLESS stripped,
+//     StorPoolName stamped).
+//   - Bug 393 redundancy backfill: after an inactive-replica return /
+//     node event, `r c --auto-place` promotes the witness to a diskful
+//     backfill replica via pkg/placer.promoteWitness (corner-D2b).
+//
+// A non-atomic Get-then-Delete narrows but does NOT close the window: the
+// promotion can land in the gap between our re-Get and the Delete, and an
+// unconditional Delete-by-name then clobbers the freshly-promoted diskful
+// replica — redundancy is silently never restored (fewer diskful replicas
+// than place_count). DeleteIfTieBreaker carries the re-check and the
+// delete across as one optimistic-concurrency operation (ResourceVersion
+// + UID precondition on the k8s store; lock-held on the in-memory store),
+// so a racing promotion aborts the delete instead of clobbering it.
 func (r *ResourceDefinitionReconciler) removeWitnesses(ctx context.Context, rdName string, witnesses []apiv1.Resource) error {
 	for i := range witnesses {
-		live, getErr := r.Store.Resources().Get(ctx, rdName, witnesses[i].NodeName)
-		if getErr == nil && !slices.Contains(live.Flags, apiv1.ResourceFlagTieBreaker) {
-			// Promoted to the diskful relocate target between the
-			// snapshot and now — leave it; it is no longer a witness.
-			continue
-		}
-
-		err := r.Store.Resources().Delete(ctx, rdName, witnesses[i].NodeName)
-		if err != nil && !stderrors.Is(err, store.ErrNotFound) {
+		_, err := r.Store.Resources().DeleteIfTieBreaker(ctx, rdName, witnesses[i].NodeName)
+		if err != nil {
 			return err
 		}
 	}

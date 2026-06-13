@@ -93,6 +93,10 @@ func (l *laggingResources) Update(ctx context.Context, r *apiv1.Resource) error 
 	return l.inner.Update(ctx, r) //nolint:wrapcheck // test helper
 }
 
+func (l *laggingResources) DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error) {
+	return l.inner.DeleteIfTieBreaker(ctx, rdName, node) //nolint:wrapcheck // test helper
+}
+
 func (l *laggingResources) Delete(ctx context.Context, rdName, node string) error {
 	// Confirm the row exists right now so the caller still sees
 	// ErrNotFound for a row that genuinely never existed. The

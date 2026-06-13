@@ -665,6 +665,11 @@ func RunResourceStore(t *testing.T, newStore Factory) {
 			t.Errorf("Get missing: got %v, want ErrNotFound", err)
 		}
 	})
+	// DeleteIfTieBreaker pins the Bug 393 conditional-delete contract
+	// across both backends: a TIE_BREAKER row is reaped; a row that has
+	// been promoted to diskful (TIE_BREAKER stripped) is left intact and
+	// the call reports (false, nil); a missing row is a benign no-op.
+	t.Run("DeleteIfTieBreaker", func(t *testing.T) { testResourceDeleteIfTieBreaker(t, newStore) })
 	// SetState pins the path the satellite's events2 observer drives:
 	// runtime State (InUse) + DRBD-state props land on the existing
 	// Resource without disturbing Spec. Tested across both InMemory
@@ -892,6 +897,82 @@ func testResourceListSorted(t *testing.T, newStore Factory) {
 				i, got[i].Name, got[i].NodeName, w.name, w.node)
 		}
 	}
+}
+
+// testResourceDeleteIfTieBreaker pins the Bug 393 conditional-delete
+// contract. It must behave identically on both the in-memory and the
+// CRD-backed store: a witness row is reaped, a promoted (diskful) row is
+// preserved, and a missing row is a benign no-op. This is the store-level
+// half of the inactive-return-backfills-redundancy fix — the controller's
+// removeWitnesses relies on it to never clobber a freshly-promoted
+// backfill replica.
+func testResourceDeleteIfTieBreaker(t *testing.T, newStore Factory) {
+	t.Helper()
+
+	t.Run("ReapsWitness", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+
+		if err := s.Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: "n1",
+			Flags: []string{apiv1.ResourceFlagDiskless, apiv1.ResourceFlagTieBreaker},
+		}); err != nil {
+			t.Fatalf("Create witness: %v", err)
+		}
+
+		deleted, err := s.DeleteIfTieBreaker(ctx, "pvc-1", "n1")
+		if err != nil {
+			t.Fatalf("DeleteIfTieBreaker: %v", err)
+		}
+
+		if !deleted {
+			t.Errorf("witness must be reaped: got deleted=false")
+		}
+
+		if _, err := s.Get(ctx, "pvc-1", "n1"); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("witness survived: got %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("PreservesPromotedDiskful", func(t *testing.T) {
+		s := newStore(t).Resources()
+		ctx := t.Context()
+
+		// A diskful replica that USED to be a witness but has since been
+		// promoted (TIE_BREAKER stripped). It must never be reaped.
+		if err := s.Create(ctx, &apiv1.Resource{
+			Name: "pvc-1", NodeName: "n1",
+			Props: map[string]string{"StorPoolName": "pool"},
+		}); err != nil {
+			t.Fatalf("Create diskful: %v", err)
+		}
+
+		deleted, err := s.DeleteIfTieBreaker(ctx, "pvc-1", "n1")
+		if err != nil {
+			t.Fatalf("DeleteIfTieBreaker: %v", err)
+		}
+
+		if deleted {
+			t.Errorf("promoted diskful must NOT be reaped: got deleted=true")
+		}
+
+		if _, err := s.Get(ctx, "pvc-1", "n1"); err != nil {
+			t.Errorf("promoted diskful clobbered: %v", err)
+		}
+	})
+
+	t.Run("MissingIsNoOp", func(t *testing.T) {
+		s := newStore(t).Resources()
+
+		deleted, err := s.DeleteIfTieBreaker(t.Context(), "ghost", "n1")
+		if err != nil {
+			t.Errorf("DeleteIfTieBreaker(missing): got %v, want nil", err)
+		}
+
+		if deleted {
+			t.Errorf("DeleteIfTieBreaker(missing): got deleted=true, want false")
+		}
+	})
 }
 
 // RunResourceDefinitionStore exercises every branch of

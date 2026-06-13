@@ -177,6 +177,29 @@ type ResourceStore interface {
 	Update(ctx context.Context, r *apiv1.Resource) error
 	Delete(ctx context.Context, rdName, node string) error
 
+	// DeleteIfTieBreaker atomically deletes the named replica ONLY if,
+	// at the observed object version, it still carries the TIE_BREAKER
+	// flag (i.e. it is still an auto-tiebreaker witness). The delete is
+	// guarded by an optimistic-concurrency precondition on the backing
+	// object's identity: a concurrent promotion of that same (rd, node)
+	// row from witness/diskless to a diskful backfill replica (the
+	// placer's redundancy backfill — pkg/placer.promoteWitness flips the
+	// flags via PatchResourceSpec, bumping the object version) makes the
+	// delete a no-op instead of clobbering the freshly-promoted replica.
+	//
+	// This closes the Bug 393 / inactive-return-backfills-redundancy
+	// race: the witness reaper's plain Get-then-Delete was non-atomic —
+	// it re-read the flags but the Delete had no version precondition, so
+	// a promotion landing in the gap between the read and the Delete was
+	// silently deleted by name and redundancy was never restored.
+	//
+	// Returns (true, nil) when the witness was deleted; (false, nil) when
+	// it was skipped because it is no longer a witness (promoted, or the
+	// flags otherwise changed under us) or already gone — both are benign
+	// convergence outcomes the reaper swallows. A genuine error (lost
+	// connectivity, etc.) is returned as (false, err).
+	DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error)
+
 	// SetState writes the runtime-observed state subresource (InUse,
 	// DrbdState, per-volume observations) without touching Spec.
 	// Required because the satellite's events2 observer can race a

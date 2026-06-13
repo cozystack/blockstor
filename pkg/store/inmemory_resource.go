@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"sync"
 
@@ -178,6 +179,35 @@ func (s *inMemoryResources) Delete(_ context.Context, rdName, node string) error
 	delete(s.m, key)
 
 	return nil
+}
+
+// DeleteIfTieBreaker deletes the named replica only if it still carries
+// TIE_BREAKER, atomically under the write lock. The InMemory store has no
+// resourceVersion surface, so the lock-held read-check-delete covers what
+// the k8s store's ResourceVersion/UID Delete precondition does: a
+// concurrent promoteWitness (PatchResourceSpec, also lock-held) either
+// commits fully before us — in which case we observe the stripped flags
+// and skip — or fully after us. There is no interleaving in which we
+// delete a row the promote has already turned diskful. Same shim contract
+// as PatchResourceSpec (Bug 204b). Bug 393.
+func (s *inMemoryResources) DeleteIfTieBreaker(_ context.Context, rdName, node string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := rKey{rdName, node}
+
+	r, exists := s.m[key]
+	if !exists {
+		return false, nil
+	}
+
+	if !slices.Contains(r.Flags, apiv1.ResourceFlagTieBreaker) {
+		return false, nil
+	}
+
+	delete(s.m, key)
+
+	return true, nil
 }
 
 // SetState mutates the runtime-observed state without touching Spec.
