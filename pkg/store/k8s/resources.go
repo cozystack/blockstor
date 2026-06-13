@@ -308,6 +308,72 @@ func (s *resources) Delete(ctx context.Context, rdName, node string) error {
 	return nil
 }
 
+// DeleteIfTieBreaker deletes the named replica only if it is still an
+// auto-tiebreaker witness (carries TIE_BREAKER) at the freshly-observed
+// object version. The delete is issued under a Preconditions guard on
+// both the ResourceVersion AND the UID of the object we just read:
+//
+//   - ResourceVersion precondition: a concurrent in-place promotion
+//     (pkg/placer.promoteWitness flips DISKLESS+TIE_BREAKER → diskful via
+//     a JSON-merge-patch, bumping ResourceVersion) lands in the gap
+//     between our Get and our Delete. The apiserver rejects the
+//     version-guarded delete with Conflict, so the just-promoted diskful
+//     replica is NOT clobbered — the exact Bug 393 race. We translate the
+//     Conflict into a benign "skipped" (false, nil): the next reconcile
+//     re-evaluates the now-diskful row and leaves it alone.
+//   - UID precondition: closes the delete-then-recreate ABA window — if
+//     the witness were deleted and a fresh Resource recreated on the same
+//     (rd, node) name between our Get and Delete, the UID would differ and
+//     the apiserver rejects the delete rather than removing the new row.
+//
+// A NotFound (already reaped by a racing reconcile) is also a benign
+// (false, nil). Genuine transport/permission errors propagate.
+func (s *resources) DeleteIfTieBreaker(ctx context.Context, rdName, node string) (bool, error) {
+	name := resourceCRDName(rdName, node)
+
+	var crd crdv1alpha1.Resource
+
+	err := s.c.Get(ctx, types.NamespacedName{Name: name}, &crd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "get Resource %s/%s", rdName, node)
+	}
+
+	// Re-check identity under the version we are about to pin: a row that
+	// no longer carries TIE_BREAKER has been promoted to the relocate /
+	// backfill target (or downgraded to a plain diskless peer) and must
+	// never be reaped by the witness pass.
+	if !slices.Contains(crd.Spec.Flags, apiv1.ResourceFlagTieBreaker) {
+		return false, nil
+	}
+
+	resourceVersion := crd.ResourceVersion
+	uid := crd.UID
+
+	del := &crdv1alpha1.Resource{ObjectMeta: metav1.ObjectMeta{Name: name}}
+
+	err = s.c.Delete(ctx, del, ctrlclient.Preconditions{
+		ResourceVersion: &resourceVersion,
+		UID:             &uid,
+	})
+	if err != nil {
+		// Conflict: the row was mutated (promoted to diskful) between
+		// our Get and the version-guarded Delete — abort the reap so the
+		// freshly-promoted replica survives. NotFound: already reaped by
+		// a racing reconcile. Both are convergence-benign no-ops.
+		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, errors.Wrapf(err, "delete Resource %s/%s", rdName, node)
+	}
+
+	return true, nil
+}
+
 // SatelliteFieldOwner is the SSA field-manager identity the
 // satellite uses for its observed-state writes (DrbdState,
 // per-volume DiskState/CurrentGI). The controller uses
