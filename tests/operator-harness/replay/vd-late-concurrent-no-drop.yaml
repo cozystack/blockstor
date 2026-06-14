@@ -1,6 +1,11 @@
-name: vd-late-create-concurrent-no-lost-update
+name: vd-late-concurrent-no-drop
 description: |
-  BUG-048 catcher (P1, availability). Two back-to-back number-less
+  BUG-048 catcher (P1, availability). Short name on purpose: the
+  replay-runner prefixes `replay-` and suffixes a random token, and the
+  resulting RD name must stay within DRBD's resource-name length limit —
+  a longer name makes `resource-definition create` fail outright.
+
+  Two back-to-back number-less
   `linstor vd c <rd>` calls against an RD that already carries vol-0
   (and whose RD.Spec.Initialized has flipped true) must BOTH land at
   distinct VolumeNumbers — none silently dropped.
