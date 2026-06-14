@@ -346,6 +346,52 @@ func TestThinCreateSnapshot(t *testing.T) {
 	}
 }
 
+// TestThinRestoreVolumeFromSnapshotIssuesThinSnapshotLvcreate is the
+// BUG-043 regression pin. The clone / snapshot-restore seed path on
+// LVM-thin must drive a plain thin-snapshot `lvcreate --snapshot
+// --setactivationskip n --activate y --name <tgt> <vg>/<src-snap>` —
+// the original code emitted a `--kernel` token, which is NOT a valid
+// lvcreate option (`lvcreate: unrecognized option '--kernel'`, exit 3)
+// on LVM >= 2.03. With that flag the destination backing LV was never
+// created, so DRBD never came up and clone/restore onto LVM-thin pools
+// never converged to UpToDate. The negative assertion (no `--kernel`)
+// is load-bearing; the positive assertion pins the activation
+// semantics so the cloned LV is actually usable (skip-activation
+// cleared, activated).
+func TestThinRestoreVolumeFromSnapshotIssuesThinSnapshotLvcreate(t *testing.T) {
+	fx := storage.NewFakeExec()
+	// Target LV not yet present → restore proceeds past the
+	// idempotency short-circuit.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-2_00000",
+		storage.FakeResponse{Stdout: []byte("")})
+	// Source snapshot LV exists → clone source is found.
+	fx.Expect("lvs --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --noheadings -o lv_name vg/pvc-1_snap-1_00000",
+		storage.FakeResponse{Stdout: []byte("  pvc-1_snap-1_00000")})
+
+	p := lvm.NewThin(lvm.ThinConfig{VolumeGroup: "vg", ThinPool: "thinpool"}, fx)
+
+	err := p.RestoreVolumeFromSnapshot(t.Context(),
+		storage.Volume{ResourceName: "pvc-2", VolumeNumber: 0},
+		storage.Snapshot{ResourceName: "pvc-1", SnapshotName: "snap-1"})
+	if err != nil {
+		t.Fatalf("RestoreVolumeFromSnapshot: %v", err)
+	}
+
+	want := "lvcreate --config devices { filter=['r|^/dev/drbd|','r|^/dev/zd|'] } --snapshot --setactivationskip n --activate y --name pvc-2_00000 vg/pvc-1_snap-1_00000"
+	if !slices.Contains(fx.CommandLines(), want) {
+		t.Errorf("expected %q in calls; got %v", want, fx.CommandLines())
+	}
+
+	// BUG-043: no lvcreate invocation may carry the invalid `--kernel`
+	// flag — it makes LVM >= 2.03 reject the command with exit 3.
+	for _, line := range fx.CommandLines() {
+		if strings.HasPrefix(line, "lvcreate ") && strings.Contains(line, "--kernel") {
+			t.Errorf("BUG-043: thin restore lvcreate must NOT pass the invalid "+
+				"--kernel flag; got %q", line)
+		}
+	}
+}
+
 // TestThinExecError surfaces the wrapped exec error verbatim.
 func TestThinExecError(t *testing.T) {
 	fx := storage.NewFakeExec()

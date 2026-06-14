@@ -186,7 +186,7 @@ n_tb=0
 while (( $(date +%s) < deadline )); do
     wire=$(linstor_r_l_json "$RD")
     n_tb=$(printf '%s' "$wire" \
-        | jq -r '.[][] | select((.rsc_flags // []) | index("TIE_BREAKER")) | .name' 2>/dev/null \
+        | jq -r '.[][] | select((.flags // []) | index("TIE_BREAKER")) | .name' 2>/dev/null \
         | wc -l | tr -d ' ' || echo 0)
     if [[ "$n_tb" == "1" ]]; then
         break
@@ -195,7 +195,7 @@ while (( $(date +%s) < deadline )); do
 done
 if [[ "$n_tb" != "1" ]]; then
     echo "FAIL (Bug 386): linstor r l shows $n_tb TIE_BREAKER rows for $RD, want 1" >&2
-    printf '%s\n' "$wire" | jq '.[][]| {name, node_name, flags: .rsc_flags}' 2>/dev/null >&2 || true
+    printf '%s\n' "$wire" | jq '.[][]| {name, node_name, flags: .flags}' 2>/dev/null >&2 || true
     exit 1
 fi
 
