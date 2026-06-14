@@ -58,16 +58,19 @@ import (
 func TestSnapshotRestoreRejectsInvalidRdName(t *testing.T) {
 	t.Parallel()
 
+	// BUG-047: mixed-case / uppercase / underscore / trailing-hyphen are
+	// now valid upstream (and accepted by the shared validator), so the
+	// reject set keeps only the forms upstream still refuses.
 	cases := []struct {
 		name string
 		to   string
 	}{
-		{"mixed-case", "hunt3-Bad"},
-		{"uppercase-only", "BADNAME"},
-		{"underscore", "bad_underscore"},
-		{"trailing-hyphen", "bad-"},
 		{"leading-hyphen", "-bad"},
+		{"leading-digit", "1bad"},
 		{"embedded-dot", "bad.name"},
+		{"embedded-space", "bad name"},
+		{"path-separator", "bad/name"},
+		{"single-char", "a"},
 		{"empty", ""},
 	}
 
@@ -169,7 +172,10 @@ func TestSnapshotRestoreVolumeDefinitionRejectsInvalidRdName(t *testing.T) {
 	defer stop()
 
 	body, _ := json.Marshal(map[string]string{
-		"to_resource": "hunt3-Bad",
+		// BUG-047: embedded dot is still refused upstream (the
+		// `<rd>.<node>` split-safety constraint); mixed-case names like
+		// the old "hunt3-Bad" are now valid and no longer a reject case.
+		"to_resource": "bad.name",
 	})
 
 	resp := httpPost(t, base+"/v1/resource-definitions/src/snapshot-restore-volume-definition/snap1", body)
@@ -199,16 +205,19 @@ func TestSnapshotRestoreVolumeDefinitionRejectsInvalidRdName(t *testing.T) {
 func TestResourceGroupSpawnRejectsInvalidRdName(t *testing.T) {
 	t.Parallel()
 
+	// BUG-047: mixed-case / uppercase / underscore / trailing-hyphen are
+	// now valid upstream, so the reject set keeps only the still-invalid
+	// forms.
 	cases := []struct {
 		name string
 		rd   string
 	}{
-		{"mixed-case", "hunt3-A1"},
-		{"uppercase-only", "BADNAME"},
-		{"underscore", "bad_underscore"},
-		{"trailing-hyphen", "bad-"},
 		{"leading-hyphen", "-bad"},
+		{"leading-digit", "1bad"},
 		{"embedded-dot", "bad.name"},
+		{"embedded-space", "bad name"},
+		{"path-separator", "bad/name"},
+		{"single-char", "a"},
 		{"empty", ""},
 	}
 
