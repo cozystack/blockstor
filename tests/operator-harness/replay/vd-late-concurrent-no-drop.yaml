@@ -85,14 +85,18 @@ steps:
     expect_exit: 0
     await:
       # Every volume of every replica converges — the elected per-fresh-
-      # volume winner seeds a SyncSource for both late adds. When the
-      # concurrent seed races and a volume comes up Inconsistent on every
-      # replica, the late-add-promote self-heal recovers it, but that adds
-      # latency (wedge-detect + the recoveryPromoteThrottle window + the
-      # force-primary + resync). On a contended stand that recovery path
-      # runs past the bare-convergence budget, so allow 360s — still far
-      # inside the wedge discriminator (a real unfixed wedge never
-      # advances at all).
+      # volume winner seeds a SyncSource for both late adds. Two BUG-048
+      # self-heals recover a concurrent-seed race: (a) when a volume comes
+      # up Inconsistent on EVERY replica with no source, the
+      # late-add-promote self-heal force-primaries the lowest-id node; (b)
+      # when a resync IS elected but STALLS (paused/bitmap-exchange-wedged
+      # on a >=3-replica add — out-of-sync frozen, two replicas never
+      # converge), the late-add resync-KICK self-heal disconnect+adjusts to
+      # restart it. Both add latency (wedge-detect + the 45s stall-dwell /
+      # recoveryPromoteThrottle window + the kick/promote + resync). On a
+      # contended stand those recovery paths run past the bare-convergence
+      # budget, so allow 360s — still far inside the wedge discriminator (a
+      # real unfixed wedge never advances at all).
       kind: all_uptodate
       rd: "{{rd}}"
       timeout_s: 360
