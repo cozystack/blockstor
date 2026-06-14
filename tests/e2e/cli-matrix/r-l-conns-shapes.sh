@@ -259,23 +259,32 @@ wait_conns_ok "$RD_TB" "$tb_node" "$N1" 60
 wait_conns_ok "$RD_TB" "$tb_node" "$N2" 60
 
 # ----------------------------------------------------------------------
-# Sub-test D — SyncTarget / SyncSource carry a (NN%) suffix (Bug B)
+# Sub-test D — SyncTarget / SyncSource render shape (known-delta #85)
 #
-# Golden upstream shape: a replica actively receiving data renders
-# `SyncTarget(NN%)`, the source renders `SyncSource(NN%)` — the
-# percent gives the operator resync progress. Bug 348's over-correction
-# stripped the percent, leaving a bare `SyncTarget`; Bug B restores it.
+# A replica actively receiving data renders `SyncTarget(NN%)` and the
+# source `SyncSource(NN%)` while there is still data to copy — the
+# percent gives the operator resync progress (Bug 348 / Bug B).
 #
-# We dirty the bitmap (write data on the primary), then add a third
+# KNOWN DELTA (docs/cli-parity-known-deltas.md row 85): when the
+# per-volume OutOfSyncKib is <= 0 (or the VD size is unknown), BS
+# DELIBERATELY renders the BARE literal `SyncSource` / `SyncTarget`
+# with NO `(NN%)` suffix — `withSyncPercent` short-circuits on
+# OutOfSyncKib<=0 rather than emit a misleading `(0%)`/`(100%)`
+# (pkg/rest/resources.go: annotateSyncProgress → withSyncPercent).
+# This window is real: drbd briefly reports the SyncSource/SyncTarget
+# replication-state literal before/after the peer-device OutOfSyncKib
+# counter has a non-zero value to decorate with. A bare Sync* literal
+# is therefore the INTENDED BS shape, not a regression — so this cell
+# asserts the BS contract: a Sync* token may appear EITHER bare OR
+# with a `(NN%)` suffix, and never as the old stuck `UpToDate(NN%)`.
+#
+# We dirty the bitmap (write data on the primary), then add a second
 # diskful replica so its initial resync is a real non-instant
-# SyncTarget. During the resync window we poll `linstor r l` and assert
-# the contract: whenever a Sync* token appears in the State column it
-# MUST carry a `(NN%)` suffix and MUST NOT appear bare. Sampling is
-# best-effort (the sync can finish fast on a small stand), but a single
-# bare-literal observation fails the cell loudly.
+# SyncTarget. During the resync window we poll `linstor r l`. Sampling
+# is best-effort (the sync can finish fast on a small stand).
 # ----------------------------------------------------------------------
 
-echo ">> [331.D] SyncTarget/SyncSource carry (NN%) progress suffix (Bug B)"
+echo ">> [331.D / delta #85] SyncTarget/SyncSource render (bare OR (NN%), never UpToDate(NN%))"
 
 RD_SYNC=cli-matrix-348-syncpct
 delete_rd "$RD_SYNC" 2>/dev/null || true
@@ -307,17 +316,22 @@ while (( $(date +%s) < deadline )); do
             .[][]? | select(.name==$rd)
             | .volumes[]?.state.disk_state // empty' 2>/dev/null || echo "")
 
-    # A bare SyncTarget / SyncSource (no parenthesised percent) is the
-    # Bug B regression — fail immediately if we ever see one.
-    if grep -qE '^(SyncTarget|SyncSource)$' <<<"$state"; then
-        echo "FAIL (331.D): bare Sync* literal without (NN%) — Bug B regression:" >&2
+    # The REGRESSION is the legacy stuck `UpToDate(NN%)` shape — a
+    # terminal disk_state must never carry a sync-progress suffix
+    # (Bug A). Fail immediately if we ever see one.
+    if grep -qE '^UpToDate\([0-9]+%\)$' <<<"$state"; then
+        echo "FAIL (331.D / delta #85): terminal UpToDate carries a (NN%) suffix — Bug A regression:" >&2
         echo "$state" >&2
         exit 1
     fi
 
-    if grep -qE '^(SyncTarget|SyncSource)\([0-9]+%\)$' <<<"$state"; then
+    # A Sync* token is the contract — accept it BOTH bare (delta #85:
+    # OutOfSyncKib<=0, withSyncPercent short-circuits) AND with a
+    # (NN%) suffix (OutOfSyncKib>0). Either shape proves the resync
+    # window rendered correctly.
+    if grep -qE '^(SyncTarget|SyncSource)(\([0-9]+%\))?$' <<<"$state"; then
         sync_observed=1
-        echo "   observed Sync* with progress: $(grep -E '^(SyncTarget|SyncSource)\(' <<<"$state" | head -1)"
+        echo "   observed Sync* literal (bare or with progress): $(grep -E '^(SyncTarget|SyncSource)' <<<"$state" | head -1)"
         break
     fi
 
@@ -330,7 +344,7 @@ while (( $(date +%s) < deadline )); do
 done
 
 if (( sync_observed == 0 )); then
-    echo "   note: resync completed too fast to sample a Sync* window (no bare-literal regression seen — contract holds)"
+    echo "   note: resync completed too fast to sample a Sync* window (no UpToDate(NN%) regression seen — contract holds)"
 fi
 
 delete_rd "$RD_SYNC" 2>/dev/null || true

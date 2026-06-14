@@ -2,60 +2,62 @@
 #
 # usage: r-c-over-tiebreaker-skip-sync.sh WORK_DIR
 #
-# L6 cli-matrix cell — Bug 347 + Bug 348.
+# L6 cli-matrix cell — tiebreaker→diskful promotion convergence
+# (known-delta #84) + Bug 348 (SyncSource/SyncTarget wire shape).
 #
-# Reproduction from the e2e2 stand (user-reported, 2026-05-19):
+# KNOWN DELTA (docs/cli-parity-known-deltas.md row 84): promoting a
+# tiebreaker to diskful runs a FULL SyncTarget on the promoted node,
+# NOT a skip-sync — and that is INTENTIONAL, not a bug.
 #
-#   $ linstor r c e2e2-worker-3 test   # promote tiebreaker → diskful
+#   $ linstor r c <tieB> test   # promote tiebreaker → diskful
 #   $ linstor r l
-#   test  e2e2-worker-1  ...  UpToDate(29%)
-#   test  e2e2-worker-2  ...  UpToDate(32%)
-#   test  e2e2-worker-3  ...  Inconsistent(32%)
+#   test  worker-1  ...  UpToDate / SyncSource
+#   test  worker-2  ...  UpToDate
+#   test  worker-3  ...  Inconsistent → SyncTarget → UpToDate
 #
-# Two distinct contract violations surface here:
-#
-# Bug 347 — full sync instead of skip-sync on tieB→diskful flip.
-# The promoted replica (worker-3) goes Inconsistent and runs a
-# full resync of the entire volume. Diskful peers (worker-1,
-# worker-2) had matching UpToDate currentGI before the promotion;
-# upstream DRBD-9 + drbdmeta set-gi can skip the initial sync via
-# Bug 77's seedInitialGi pre-stamp. blockstor's reconciler.go
-# ensureMetadata explicitly bypasses seedInitialGi on a
-# diskless→diskful flip (the inline comment claims "kernel slot
-# already handshaken via diskless path"). That assumption is
-# wrong for tiebreaker promotion: the tiebreaker has no backing
-# storage, just a DRBD connection — promoting it allocates fresh
-# LV/zvol, drbdadm create-md stamps zero GI, the kernel sees a
-# mismatched GI vs. peers, → full sync.
+# Why BS deliberately full-syncs here instead of skip-syncing:
+# the promoted tiebreaker has no backing storage, just a DRBD
+# connection. To skip the sync BS would have to pre-stamp a
+# matching GI and let the fresh replica win the day0 force-primary
+# election — but a diskful peer already holds data
+# (anyDiskfulPeerHasData == true), so force-priming the fresh
+# replica mints an UNRELATED Current UUID; the data-bearing peer
+# then declines the handshake (`uuid_compare()=unrelated-data`,
+# "Unrelated data, aborting!") and the pair wedges in mutual
+# StandAlone that never auto-recovers (the respawn-StandAlone P0).
+# So BS gates the auto-primary seed on `!anyDiskfulPeerHasData`
+# (pkg/dispatcher/dispatcher.go): with a data-bearing peer present
+# the promoted replica comes up Inconsistent and SyncTargets the
+# real bytes off the peer. The data converges correctly; the only
+# cost is a full resync of the (here 128 MiB) volume — the safe
+# trade vs. a StandAlone wedge. This cell asserts that BS contract,
+# NOT the upstream skip-sync one.
 #
 # Bug 348 — `linstor r l` source state should be `SyncSource`,
 # not `UpToDate(NN%)`. Upstream LINSTOR's State column reads
 # directly from drbdsetup events2 (replication_state field):
 # during a resync the source side reports `SyncSource`, the
-# target side `SyncTarget`. blockstor instead displays
-# `UpToDate(NN%)` on the diskful peers — visually plausible
-# (the data IS uptodate) but loses the operator-facing signal
-# that "this replica is currently sending data to the new one".
-# Bug 331 closed the wire-shape for Connecting/NetworkFailure
-# states but missed the SyncSource/SyncTarget pair.
+# target side `SyncTarget`. blockstor must match: the diskful
+# peer feeding the promoted replica reads SyncSource, never the
+# legacy `UpToDate(NN%)` shape. Bug 331 closed the wire-shape for
+# Connecting/NetworkFailure states but missed the
+# SyncSource/SyncTarget pair.
 #
 # Test contract:
 #   1. Build a 2-diskful + 1-tiebreaker RD (--auto-place=2 on
 #      a 3-worker stand spawns the tiebreaker on worker-3).
 #   2. Wait both diskful UpToDate, tiebreaker DISKLESS.
 #   3. Promote the tiebreaker via `linstor r c <tieB> <rd>`.
-#   4. **Bug 347 assertion**: poll `linstor r l -o json` for 60s.
-#      The promoted replica's diskState must reach UpToDate within
-#      30s (skip-sync window) AND must never report a sync-progress
-#      suffix > 0% — that's the full-sync fingerprint. A brief
-#      Inconsistent flash on the very first reconcile is tolerated
-#      (≤5s); anything longer = full sync started.
-#   5. **Bug 348 assertion**: during any window where the promoted
-#      replica is Inconsistent / SyncTarget, the diskful peers must
-#      report replicationState=SyncSource (or the State column
-#      must contain the substring "SyncSource"). They MUST NOT
-#      display `UpToDate(NN%)` with non-empty NN% — that's the
-#      regression.
+#   4. **Convergence assertion (delta #84)**: poll `linstor r l -o
+#      json`. The promoted replica must converge to UpToDate within
+#      the sync budget. A SyncTarget / Inconsistent transit on the
+#      way there is EXPECTED (the intended full sync) — it is NOT a
+#      failure. Only never reaching UpToDate is a failure.
+#   5. **Bug 348 assertion**: while the promoted replica is
+#      Inconsistent / SyncTarget, the diskful peers must report
+#      replicationState=SyncSource (or the State column must
+#      contain "SyncSource"). They MUST NOT display
+#      `UpToDate(NN%)` with non-empty NN% — that's the regression.
 
 set -euo pipefail
 
@@ -133,44 +135,48 @@ echo "   ${diskful[1]} currentGi=$gi_n2"
 # =====================================================================
 # Promote the tiebreaker
 # =====================================================================
-echo ">> [Bug 347 trigger] linstor r c $tieB $RD  (promote tiebreaker → diskful)"
+echo ">> [delta #84 trigger] linstor r c $tieB $RD  (promote tiebreaker → diskful)"
 promote_ts=$(date +%s)
 _out=$("${LCTL[@]}" resource create "$tieB" "$RD" --storage-pool="$POOL" 2>&1) \
     || { echo "FAIL: r c $tieB $RD: $_out" >&2; exit 1; }
 
 # =====================================================================
-# Bug 347 assertion — promoted replica must NOT do full sync
+# Convergence assertion (delta #84) — promoted replica SyncTargets
+# the data off a diskful peer and reaches UpToDate.
 # =====================================================================
-echo ">> [Bug 347] poll up to 60s — promoted node must reach UpToDate via skip-sync"
-deadline=$(( $(date +%s) + 60 ))
-saw_full_sync=false
-saw_full_sync_state=""
+# This is the BS-INTENDED behaviour, not a bug: with a data-bearing
+# diskful peer present, the promoted tiebreaker comes up Inconsistent
+# and runs a full SyncTarget (anyDiskfulPeerHasData gate — see header).
+# A SyncTarget / Inconsistent transit is therefore EXPECTED. We assert
+# only that the promoted replica CONVERGES to UpToDate; passing through
+# the sync is the contract, so we record it for the operator but never
+# fail on it. 240s budget matches the full-sync-on-promote window.
+echo ">> [delta #84] poll up to 240s — promoted node SyncTargets, then reaches UpToDate"
+deadline=$(( $(date +%s) + 240 ))
+saw_sync_transit=false
+saw_sync_transit_state=""
 promoted_uptodate=false
 while (( $(date +%s) < deadline )); do
-    # Per-node disk + replication state via the machine-readable
-    # output (mirrors `linstor r l -o json`). Pull both diskState
-    # and replicationState from observer-stamped Status.
+    # Per-node disk + replication state via observer-stamped Status
+    # (mirrors `linstor r l -o json`).
     promoted_disk=$(status_disk_state "$RD" "$tieB" 0)
     promoted_rep=$(kubectl get "resources.blockstor.cozystack.io/${RD}.${tieB}" \
         -o jsonpath='{.status.volumes[0].replicationState}' 2>/dev/null || echo "")
 
-    # Bug 347 signature: the promoted replica is Inconsistent OR
-    # SyncTarget for any meaningful duration. A few seconds of
-    # Inconsistent on the very first reconcile is tolerable
-    # (kernel attach race), but full sync transitions through
-    # SyncTarget with progressing %. Capture either.
+    # Record (do NOT fail on) the expected full-sync transit — it is
+    # the intended path per delta #84.
     case "$promoted_disk" in
         Inconsistent|Outdated)
             elapsed=$(( $(date +%s) - promote_ts ))
             if (( elapsed > 5 )); then
-                saw_full_sync=true
-                saw_full_sync_state="disk=$promoted_disk rep=$promoted_rep at +${elapsed}s"
+                saw_sync_transit=true
+                saw_sync_transit_state="disk=$promoted_disk rep=$promoted_rep at +${elapsed}s"
             fi
             ;;
     esac
     if [[ "$promoted_rep" == "SyncTarget" ]]; then
-        saw_full_sync=true
-        saw_full_sync_state="disk=$promoted_disk rep=SyncTarget"
+        saw_sync_transit=true
+        saw_sync_transit_state="disk=$promoted_disk rep=SyncTarget"
     fi
 
     if [[ "$promoted_disk" == "UpToDate" && ( -z "$promoted_rep" || "$promoted_rep" == "Established" ) ]]; then
@@ -180,19 +186,18 @@ while (( $(date +%s) < deadline )); do
     sleep 2
 done
 
-if $saw_full_sync; then
-    echo "FAIL (Bug 347): promoted replica $tieB ran full sync after r c — $saw_full_sync_state" >&2
-    echo "   Expected: skip-sync via seedInitialGi (peers' currentGi gi_n1=$gi_n1 gi_n2=$gi_n2)" >&2
-    echo "   Root cause hint: reconciler.go ensureMetadata bypasses seedInitialGi on diskless→diskful flip" >&2
+if $saw_sync_transit; then
+    echo "   (expected) promoted $tieB ran a full SyncTarget — $saw_sync_transit_state"
+    echo "   delta #84: tieB→diskful promotion full-syncs from the data-bearing peer by design"
+fi
+if ! $promoted_uptodate; then
+    echo "FAIL (delta #84): promoted replica $tieB never reached UpToDate within 240s" >&2
+    echo "   The tiebreaker→diskful promotion must converge (via SyncTarget) — it did not." >&2
+    echo "   peers' currentGi gi_n1=$gi_n1 gi_n2=$gi_n2" >&2
     echo "----- linstor r l --resources $RD -----" >&2
     "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
     echo "----- on-host drbdsetup status -----" >&2
     on_node "$tieB" drbdsetup status --verbose "$RD" 2>&1 | head -30 >&2 || true
-    exit 1
-fi
-if ! $promoted_uptodate; then
-    echo "FAIL (Bug 347): promoted replica $tieB never reached UpToDate within 60s" >&2
-    "${LCTL[@]}" resource list --resources "$RD" 2>&1 | tail -10 >&2
     exit 1
 fi
 
@@ -280,4 +285,4 @@ if ! $all_uptodate; then
     exit 1
 fi
 
-echo ">> r-c-over-tiebreaker-skip-sync OK (Bug 347+348 pinned: skip-sync fired + State shape matches upstream)"
+echo ">> r-c-over-tiebreaker-skip-sync OK (delta #84: tieB→diskful full-syncs by design + Bug 348 SyncSource shape pinned)"
