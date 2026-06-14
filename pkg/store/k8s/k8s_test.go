@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	crdv1alpha1 "github.com/cozystack/blockstor/api/v1alpha1"
+	apiv1 "github.com/cozystack/blockstor/pkg/api/v1"
 	"github.com/cozystack/blockstor/pkg/store"
 	"github.com/cozystack/blockstor/pkg/store/k8s"
 	"github.com/cozystack/blockstor/pkg/store/storetest"
@@ -162,6 +164,83 @@ func TestK8sVolumeDefinitionStore(t *testing.T) {
 
 		return k8s.New(fixture.client)
 	})
+}
+
+// TestK8sVolumeDefinitionConcurrentAutoNumber is the BUG-048 (P1,
+// availability) regression at the store layer against a REAL apiserver:
+// N goroutines each call CreateAutoNumbered on the same RD concurrently.
+// Every call must succeed and land at a DISTINCT VolumeNumber — the
+// allocate-inside-RetryOnConflict loop must converge under genuine
+// optimistic-lock 409s rather than dropping the racing creates.
+//
+// envtest's client is a direct (uncached) reader, so this exercises the
+// retry-on-409 convergence; the cache-lag half of BUG-048 (which needs
+// the informer-cached client + GetAPIReader fallback) is covered by the
+// live-stand cli-matrix cell. Together they pin both halves.
+func TestK8sVolumeDefinitionConcurrentAutoNumber(t *testing.T) {
+	if fixture == nil {
+		t.Skip("envtest assets not installed; run `make setup-envtest` to enable")
+	}
+
+	t.Cleanup(func() { wipeAll(t, fixture.client) })
+
+	st := k8s.New(fixture.client)
+	ctx := context.Background()
+
+	if err := st.ResourceDefinitions().Create(ctx, &apiv1.ResourceDefinition{Name: "pvc-conc"}); err != nil {
+		t.Fatalf("seed RD: %v", err)
+	}
+
+	const n = 6
+
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	for range n {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			vd := apiv1.VolumeDefinition{SizeKib: 4096}
+			if _, err := st.VolumeDefinitions().CreateAutoNumbered(ctx, "pvc-conc", &vd); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	for _, e := range errs {
+		t.Errorf("concurrent CreateAutoNumbered failed (a volume was dropped): %v", e)
+	}
+
+	vds, err := st.VolumeDefinitions().List(ctx, "pvc-conc")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(vds) != n {
+		t.Fatalf("got %d VDs after %d concurrent auto-numbered creates, want %d (lost update)", len(vds), n, n)
+	}
+
+	seen := map[int32]bool{}
+	for i := range vds {
+		if seen[vds[i].VolumeNumber] {
+			t.Fatalf("duplicate VolumeNumber %d", vds[i].VolumeNumber)
+		}
+		seen[vds[i].VolumeNumber] = true
+	}
+
+	for want := range int32(n) {
+		if !seen[want] {
+			t.Errorf("missing VolumeNumber %d in %v — a concurrent create was dropped", want, seen)
+		}
+	}
 }
 
 // TestK8sSnapshotStore runs the shared SnapshotStore suite.

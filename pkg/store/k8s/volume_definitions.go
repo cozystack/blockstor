@@ -39,6 +39,18 @@ import (
 // RD anyway, and a single CRD makes ownership/reclamation trivially correct.
 type volumeDefinitions struct {
 	c ctrlclient.Client
+
+	// apiReader is a direct, UNCACHED reader (mgr.GetAPIReader()) used
+	// only by CreateAutoNumbered's retry loop. The cached client's Get
+	// trails a just-committed write by the informer round-trip, so
+	// retrying an optimistic-lock conflict against the cache re-reads
+	// the stale RD, re-derives the SAME smallest-free VolumeNumber, and
+	// the loop never converges — the BUG-048 lost-update where the
+	// second of two concurrent `vd c` is dropped. Reading live on each
+	// attempt makes the allocation see the winner's committed write.
+	// nil in non-production stores (in-memory / unit) → fall back to the
+	// cached client.
+	apiReader ctrlclient.Reader
 }
 
 func (s *volumeDefinitions) List(ctx context.Context, rdName string) ([]apiv1.VolumeDefinition, error) {
@@ -130,8 +142,17 @@ func (s *volumeDefinitions) CreateAutoNumbered(ctx context.Context, rdName strin
 
 	var assigned int32
 
-	err := retry.OnError(retry.DefaultRetry, isConflictOrNotFound, func() error {
-		rd, fetchErr := s.fetchRD(ctx, rdName)
+	// Generous retry budget: each attempt does a LIVE (uncached) RD read
+	// so a conflict-retry sees the racing winner's committed VD and lands
+	// at the next free number. retry.DefaultRetry (≈5 steps) is enough
+	// for the common 2-way race, but widen it so a burst of concurrent
+	// `vd c` against one RD still converges rather than dropping the
+	// straggler.
+	backoff := retry.DefaultRetry
+	backoff.Steps = 12
+
+	err := retry.OnError(backoff, isConflictOrNotFound, func() error {
+		rd, fetchErr := s.fetchRDLive(ctx, rdName)
 		if fetchErr != nil {
 			return fetchErr
 		}
@@ -307,6 +328,33 @@ func (s *volumeDefinitions) fetchRD(ctx context.Context, rdName string) (*crdv1a
 		}
 
 		return nil, errors.Wrapf(err, "get ResourceDefinition %q", rdName)
+	}
+
+	return &rd, nil
+}
+
+// fetchRDLive reads the RD through the direct, UNCACHED API reader when
+// one is wired (production), so CreateAutoNumbered's retry sees the
+// latest committed VolumeDefinitions rather than a stale informer-cache
+// revision (BUG-048). Falls back to the cached client when no apiReader
+// is configured (in-memory / unit harnesses). The returned object is
+// still safe to mutate + write back through s.c (the resourceVersion the
+// live read carries is what the subsequent optimistic-locked Update
+// checks against).
+func (s *volumeDefinitions) fetchRDLive(ctx context.Context, rdName string) (*crdv1alpha1.ResourceDefinition, error) {
+	if s.apiReader == nil {
+		return s.fetchRD(ctx, rdName)
+	}
+
+	var rd crdv1alpha1.ResourceDefinition
+
+	err := s.apiReader.Get(ctx, types.NamespacedName{Name: Name(rdName)}, &rd)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, errors.Wrapf(store.ErrNotFound, "resource definition %q", rdName)
+		}
+
+		return nil, errors.Wrapf(err, "get ResourceDefinition %q (live)", rdName)
 	}
 
 	return &rd, nil
