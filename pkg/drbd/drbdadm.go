@@ -1374,6 +1374,153 @@ func localIsUpToDate(devices []drbdsetupStatusDevice) bool {
 	return true
 }
 
+// NeedsLateAddPromote probes the live kernel via `drbdsetup status
+// <res> --json` and reports whether THIS node must `primary --force`
+// to unstick a LATE-ADDED volume that wedged Inconsistent on every
+// diskful replica with no SyncSource (BUG-048, the concurrent two-VD
+// add on a ≥3-diskful RD).
+//
+// Why a separate gate from NeedsRecoveryPromote / NeedsSoloPromote:
+//   - NeedsRecoveryPromote requires the LOCAL to be already UpToDate and
+//     a PEER Inconsistent — but in this wedge the local volume is ALSO
+//     Inconsistent (no replica ever won the volume's UpToDate seed), so
+//     that predicate can never fire. It is also gated by the dispatcher's
+//     `auto-primary`, which is suppressed on an INITIALIZED RD (every
+//     late-add lands on one) so the satellite-side maybeRecoveryPromote
+//     short-circuits before even probing.
+//   - NeedsSoloPromote requires ZERO peers; here peers exist.
+//
+// Returns true ONLY when ALL hold, so EXACTLY ONE deterministic node
+// promotes and the force-primary is data-safe + self-limiting:
+//   - the kernel slot exists and reports a my-node-id;
+//   - the local role is NOT Primary and NO peer is Primary (never
+//     disturb an existing Primary that already drives the sync);
+//   - at least one LOCAL diskful volume is Inconsistent, and for EVERY
+//     such volume NO connected peer exposes committed data
+//     (peer-disk UpToDate / Consistent / Outdated) — i.e. there is no
+//     real data source anywhere, the defining late-add wedge. If any
+//     peer held data the correct action is to SyncTarget from it, never
+//     force-primary (that is the Bug 342 unrelated-data guard);
+//   - none of those wedged volumes is already being actively resynced
+//     from a peer (SyncTarget/WFBitMapT in progress) — let a live resync
+//     finish on its own;
+//   - this node's my-node-id is the LOWEST among the diskful replicas
+//     (local + every peer that is NOT diskless on the wedged volume), so
+//     a single deterministic node promotes — no split-brain race.
+//
+// Data-safety: a fresh late-added volume's metadata was seeded at the
+// deterministic day0 current-UUID on every replica (the seed path runs
+// before bring-up), so `primary --force` here mints no UNRELATED UUID;
+// the Inconsistent peers simply SyncTarget from this now-Primary source.
+// Self-limiting: once the peers reach UpToDate they are no longer
+// Inconsistent and the predicate stops holding. Conservative on any
+// probe/parse failure → false (a missed promote just retries next pass).
+func (a *Adm) NeedsLateAddPromote(ctx context.Context, resource string) bool {
+	out, err := a.exec.Run(ctx, "drbdsetup", "status", resource, "--json")
+	if err != nil {
+		return false
+	}
+
+	var status drbdsetupStatusRoot
+
+	err = json.Unmarshal(out, &status)
+	if err != nil || len(status) == 0 || status[0].NodeID == nil {
+		return false
+	}
+
+	res := status[0]
+
+	// Never disturb an existing Primary anywhere in the RD.
+	if Role(res.Role).IsPrimary() {
+		return false
+	}
+
+	for _, conn := range res.Connections {
+		if Role(conn.PeerRole).IsPrimary() {
+			return false
+		}
+	}
+
+	// Which local diskful volumes are wedged Inconsistent?
+	wedged := localInconsistentVolumes(res.Devices)
+	if len(wedged) == 0 {
+		return false
+	}
+
+	// For every wedged volume: no peer may hold data (else SyncTarget),
+	// none may be actively resyncing (else let it finish), and we must be
+	// the lowest node-id among its non-diskless diskful replicas.
+	for vol := range wedged {
+		ok := lateAddVolumeNeedsLocalPromote(res.Connections, vol, *res.NodeID)
+		if !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+// localInconsistentVolumes returns the set of local volume numbers whose
+// disk-state is Inconsistent. A volume in any other state (UpToDate,
+// Diskless, Negotiating, …) is excluded — only a stuck-Inconsistent
+// local volume is a late-add-promote candidate.
+func localInconsistentVolumes(devices []drbdsetupStatusDevice) map[int32]struct{} {
+	out := map[int32]struct{}{}
+
+	for _, d := range devices {
+		if DiskState(d.DiskState) == DiskStateInconsistent {
+			out[d.VolumeNumber] = struct{}{}
+		}
+	}
+
+	return out
+}
+
+// lateAddVolumeNeedsLocalPromote reports whether `vol` is a genuine
+// late-add wedge that THIS node (myID) must force-primary: no connected
+// peer exposes committed data for it, no peer is actively resyncing it,
+// and myID is the lowest node-id among the volume's non-diskless diskful
+// replicas. Conservative: any peer with data, any active resync, or any
+// lower-id non-diskless peer returns false.
+func lateAddVolumeNeedsLocalPromote(conns []drbdsetupStatusConnection, vol, myID int32) bool {
+	weAreLowest := true
+
+	for _, conn := range conns {
+		for _, peerDev := range conn.PeerDevices {
+			if peerDev.VolumeNumber != vol {
+				continue
+			}
+
+			switch DiskState(peerDev.PeerDiskState) {
+			case DiskStateUpToDate, DiskStateConsistent, DiskStateOutdated:
+				// A peer holds real data — must SyncTarget from it, never
+				// force-primary (Bug 342 unrelated-data guard).
+				return false
+			case DiskStateInconsistent:
+				// A fellow wedged diskful replica. It competes for the
+				// lowest-id promoter election; if it outranks us, defer.
+				if conn.PeerNodeID < myID {
+					weAreLowest = false
+				}
+
+				if peerDeviceActivelySyncing(peerDev) {
+					// A live resync is already driving this volume — let
+					// it finish rather than churn a promote.
+					return false
+				}
+			case DiskStateDiskless, DiskStateAttaching, DiskStateDetaching,
+				DiskStateFailed, DiskStateNegotiating, DiskStateDUnknown:
+				// Diskless witness / transient — not a data source and
+				// not a competing diskful promoter; ignore.
+			default:
+				// Unknown/empty — ignore.
+			}
+		}
+	}
+
+	return weAreLowest
+}
+
 // DownVeto is the tri-state outcome of the Bug 350 kernel-truth probe
 // the satellite consults before committing a `drbdadm down` on the
 // INACTIVE path. It separates "definitely safe to down" from "must

@@ -2509,6 +2509,17 @@ func (r *Reconciler) maybePromoteSelfHeals(ctx context.Context, dr *intent.Desir
 		return err
 	}
 
+	// BUG-048 late-add-promote self-heal — drive a late-added volume that
+	// wedged Inconsistent on EVERY diskful replica (no SyncSource, no peer
+	// holds data) to UpToDate. Distinct from maybeRecoveryPromote: that
+	// path needs the local already-UpToDate + the dispatcher's
+	// auto-primary, BOTH false for a late-add to an initialized RD. See
+	// maybeLateAddPromote / Adm.NeedsLateAddPromote.
+	err = r.maybeLateAddPromote(ctx, dr, diskless)
+	if err != nil {
+		return err
+	}
+
 	// Solo diskless→diskful toggle self-heal — force-promote a lone,
 	// peerless diskful replica wedged below UpToDate. See maybeSoloPromote
 	// for the full why (the auto-primary suppression × offline-safety
@@ -2663,6 +2674,51 @@ func (r *Reconciler) maybeRecoveryPromote(ctx context.Context, dr *intent.Desire
 	}
 
 	log.FromContext(ctx).Info("Bug 366 recovery-promote: re-arming auto-primary to unstick wedged initial sync",
+		"resource", dr.GetName())
+
+	return r.runAutoPromote(ctx, dr)
+}
+
+// maybeLateAddPromote is the BUG-048 self-heal for a late-added volume
+// that wedged Inconsistent on EVERY diskful replica with no SyncSource.
+//
+// Why it cannot reuse maybeRecoveryPromote: that path is gated on the
+// dispatcher's `auto-primary` (autoPrimaryReplica), which is suppressed
+// on an INITIALIZED RD — and a late `vd c` ALWAYS lands on an
+// initialized RD. Its kernel-truth predicate (NeedsRecoveryPromote) also
+// requires the local replica to be already UpToDate; in this wedge the
+// local late-added volume is itself Inconsistent. So neither the gate
+// nor the predicate can ever fire for the late-add wedge.
+//
+// NeedsLateAddPromote is the dedicated kernel-truth gate: it fires ONLY
+// when a local diskful volume is Inconsistent, NO connected peer holds
+// committed data for it (so there is no real SyncSource to wait for),
+// no replica is Primary, and this node is the deterministic lowest
+// node-id — so exactly one node force-primaries and it is data-safe
+// (every replica shares the volume's day0 current-UUID; primary --force
+// mints no unrelated UUID, and the Inconsistent peers SyncTarget from
+// this now-Primary source). Self-limiting: once the peers converge the
+// predicate stops holding.
+//
+// NOT gated on autoPromote/autoPrimaryReplica by design — those are
+// exactly what is missing on the late-add path. It IS gated on the same
+// recoveryPromoteThrottle so a still-converging resync isn't churned by
+// repeated promotes. Skipped on diskless replicas (no disk to promote)
+// and when Adm is unwired (storage-only unit tests).
+func (r *Reconciler) maybeLateAddPromote(ctx context.Context, dr *intent.DesiredResource, diskless bool) error {
+	if diskless || r.cfg.Adm == nil {
+		return nil
+	}
+
+	if !r.cfg.Adm.NeedsLateAddPromote(ctx, dr.GetName()) {
+		return nil
+	}
+
+	if !r.recoveryPromoteDue(dr.GetName()) {
+		return nil
+	}
+
+	log.FromContext(ctx).Info("BUG-048 late-add-promote: force-primary to seed SyncSource for late-added volume wedged Inconsistent on every replica",
 		"resource", dr.GetName())
 
 	return r.runAutoPromote(ctx, dr)
