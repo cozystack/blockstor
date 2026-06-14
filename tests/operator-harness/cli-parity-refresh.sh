@@ -101,6 +101,72 @@ fi
 bs() { linstor --controllers "$BS_URL" "$@"; }
 up() { linstor --controllers "$UP_URL" "$@"; }
 
+# normalize_side_output <side> <file> — rewrite a captured stdout/stderr
+# file IN PLACE so per-environment naming drift cannot masquerade as a
+# BS↔UP divergence in the plain-text diff:
+#
+#   - Storage-pool names differ purely by environment config: BS's stand
+#     uses `stand` / `lvm-thin` / `zfs-thin` / `zfs-thick`, the upstream
+#     oracle uses `pool`. A `sp l` / `r l` / `vd l` row that is otherwise
+#     identical would diff solely on the pool column. Collapse every
+#     side's pool token to a canonical `<POOL>` so only REAL shape
+#     divergence survives the diff.
+#   - The PARITY_PREFIX-suffixed object names already match across sides
+#     (same prefix seeded on both), so they need no normalization.
+#
+# Side = "bs" or "up" selects which pool-name set to canonicalize.
+normalize_side_output() {
+    local side=$1 file=$2
+    [[ -s "$file" ]] || return 0
+    local pools
+    if [[ "$side" == "bs" ]]; then
+        # BS_PARITY_POOLS may be overridden; default to the stand's set.
+        pools="${BS_PARITY_POOLS:-$PARITY_SP lvm-thin zfs-thin zfs-thick stand}"
+    else
+        pools="${UP_PARITY_POOLS:-$PARITY_UP_SP pool}"
+    fi
+    local p
+    for p in $pools; do
+        [[ -n "$p" ]] || continue
+        # Word-boundary replace so `stand` doesn't clobber `standby` etc.
+        sed -i -E "s/\\b${p}\\b/<POOL>/g" "$file" 2>/dev/null || true
+    done
+}
+
+# reap_residual_resource_groups <side> — delete leftover resource-groups
+# that are neither the parity seed nor a built-in default, so a diff of
+# `rg l` reflects only the seeded objects. The chief offender is the
+# csi-sanity Job, which provisions StorageClass-backed RGs named
+# `sc-<uuid>` (linstor-csi's per-SC resource-group) that outlive the Job
+# and make BS's `rg l` carry rows the upstream oracle never had → a
+# spurious MISSING_FEATURE/WIRE_SHAPE row. Only csi-sanity-shaped
+# residue (sc-<hex/uuid>) is reaped; the parity seed RG and any
+# operator/default RG are left untouched.
+reap_residual_resource_groups() {
+    local side=$1
+    local rgs
+    if [[ "$side" == "bs" ]]; then
+        rgs=$(bs --machine-readable resource-group list 2>/dev/null \
+            | jq -r '.[]?[]?.name // empty' 2>/dev/null || true)
+    else
+        rgs=$(up --machine-readable resource-group list 2>/dev/null \
+            | jq -r '.[]?[]?.name // empty' 2>/dev/null || true)
+    fi
+    local rg
+    while IFS= read -r rg; do
+        [[ -z "$rg" ]] && continue
+        # Reap only csi-sanity StorageClass residue: sc-<uuid|hex>.
+        if [[ "$rg" =~ ^sc-[0-9a-fA-F-]{8,}$ ]]; then
+            echo "   reaping residual csi-sanity RG on $side: $rg"
+            if [[ "$side" == "bs" ]]; then
+                bs resource-group delete "$rg" >/dev/null 2>&1 || true
+            else
+                up resource-group delete "$rg" >/dev/null 2>&1 || true
+            fi
+        fi
+    done <<<"$rgs"
+}
+
 # slugify a command for the filename. "n l --pastable" -> "n-l--pastable"
 slugify() {
     local s=$1
@@ -189,13 +255,24 @@ classify() {
         return
     fi
 
-    # 3. Plain stdout diff (modulo whitespace).
-    if ! diff -q -B -w "$bs_out" "$up_out" >/dev/null 2>&1; then
+    # 3. Plain stdout diff (modulo whitespace), AFTER per-side pool-name
+    #    normalization so environment naming drift (BS stand/lvm-thin/
+    #    zfs-thin vs UP pool) does not masquerade as a real divergence.
+    #    Normalize on COPIES so the raw artefacts stay verbatim for
+    #    human triage.
+    local bs_norm up_norm
+    bs_norm="$WORK_DIR/raw/${idx}-${slug}.bs.out.norm"
+    up_norm="$WORK_DIR/raw/${idx}-${slug}.up.out.norm"
+    cp "$bs_out" "$bs_norm" 2>/dev/null || true
+    cp "$up_out" "$up_norm" 2>/dev/null || true
+    normalize_side_output bs "$bs_norm"
+    normalize_side_output up "$up_norm"
+    if ! diff -q -B -w "$bs_norm" "$up_norm" >/dev/null 2>&1; then
         printf '%s\t%s\n' "WIRE_SHAPE" "stdout differs (see diff $bs_out vs $up_out)"
         return
     fi
 
-    printf '%s\t%s\n' "PARITY" "identical exit + stdout"
+    printf '%s\t%s\n' "PARITY" "identical exit + stdout (pool-name normalized)"
 }
 
 # ----------------------------------------------------------------------
@@ -251,6 +328,16 @@ EOF
 
 seed() {
     [[ -n "${SKIP_SEED:-}" ]] && return 0
+
+    # Reap environment residue BEFORE seeding/diffing so leftover RGs
+    # (notably csi-sanity's sc-<uuid> StorageClass resource-groups) on
+    # one side don't show up as a spurious `rg l` divergence. Best-effort
+    # and gated to the csi-sanity shape only — see reap_residual_resource_groups.
+    if command -v jq >/dev/null 2>&1; then
+        echo ">> reaping residual csi-sanity resource-groups (env drift guard)"
+        reap_residual_resource_groups bs
+        reap_residual_resource_groups up
+    fi
 
     echo ">> seeding ephemeral objects on BS and UP (prefix=$PARITY_PREFIX)"
 
