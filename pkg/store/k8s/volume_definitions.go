@@ -24,6 +24,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -164,7 +165,25 @@ func (s *volumeDefinitions) CreateAutoNumbered(ctx context.Context, rdName strin
 
 		rd.Spec.VolumeDefinitions = append(rd.Spec.VolumeDefinitions, entry)
 
-		return s.c.Update(ctx, rd)
+		updErr := s.c.Update(ctx, rd)
+		if updErr != nil {
+			return updErr //nolint:wrapcheck // outer errors.Wrapf adds context; the bare error preserves the apierrors type isConflictOrNotFound matches on
+		}
+
+		// Post-commit verification (BUG-048 defence-in-depth). The
+		// optimistic-lock Update normally guarantees no racing writer
+		// clobbered us — a stale resourceVersion 409s and we retry. But
+		// under heavy apiserver/etcd load a follower read can hand back a
+		// resourceVersion that is already superseded yet still accepted on
+		// Update, so two concurrent creates could both "succeed" while
+		// only one VolumeDefinition lands (the silent lost-update the
+		// operator hit). Re-read live and confirm our assigned number is
+		// actually present; if it vanished (a racer's clobber won), force
+		// a retry by surfacing a synthetic Conflict so the whole
+		// allocate+append re-runs against the now-correct state. This
+		// makes the silent drop impossible: the create either persists or
+		// retries — it never returns success having lost the volume.
+		return s.verifyVolumeLanded(ctx, rdName, assigned)
 	})
 	if err != nil {
 		return 0, errors.Wrapf(err, "auto-numbered create on RD %q", rdName)
@@ -358,6 +377,31 @@ func (s *volumeDefinitions) fetchRDLive(ctx context.Context, rdName string) (*cr
 	}
 
 	return &rd, nil
+}
+
+// verifyVolumeLanded re-reads the RD live and returns a synthetic
+// Conflict error (so the CreateAutoNumbered retry loop re-runs) when the
+// just-written VolumeNumber is NOT present — the BUG-048 stale-read
+// clobber. Returns nil when the volume is durably present. A NotFound
+// (RD vanished) is surfaced as-is so the retry loop's isConflictOrNotFound
+// also catches it.
+func (s *volumeDefinitions) verifyVolumeLanded(ctx context.Context, rdName string, assigned int32) error {
+	rd, err := s.fetchRDLive(ctx, rdName)
+	if err != nil {
+		return err
+	}
+
+	for i := range rd.Spec.VolumeDefinitions {
+		if rd.Spec.VolumeDefinitions[i].VolumeNumber == assigned {
+			return nil
+		}
+	}
+
+	return apierrors.NewConflict(
+		schema.GroupResource{Group: crdv1alpha1.GroupVersion.Group, Resource: "resourcedefinitions"},
+		Name(rdName),
+		errors.Newf("volume %d did not persist (concurrent clobber); retrying allocation", assigned),
+	)
 }
 
 func crdToWireVD(vd *crdv1alpha1.ResourceDefinitionVolume) apiv1.VolumeDefinition {
